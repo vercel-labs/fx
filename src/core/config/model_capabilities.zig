@@ -92,6 +92,18 @@ fn localCapabilitiesForModel(model: []const u8) Capabilities {
     return capabilities;
 }
 
+/// Catalog max_tokens is often a copy of the context window, not a real
+/// generation cap. Sending that value as maxOutputTokens is rejected by some
+/// providers, including Meta Muse Spark.
+pub fn usableMaxOutputTokens(context_window: ?u32, max_output_tokens: ?u32) ?u32 {
+    const tokens = max_output_tokens orelse return null;
+    if (tokens == 0) return null;
+    if (context_window) |window| {
+        if (window > 0 and tokens >= window) return null;
+    }
+    return tokens;
+}
+
 pub fn resolveCapabilities(model: []const u8, gateway_metadata: ?GatewayMetadata) Capabilities {
     var capabilities = localCapabilitiesForModel(model);
     if (gateway_metadata) |metadata| {
@@ -105,7 +117,10 @@ pub fn resolveCapabilities(model: []const u8, gateway_metadata: ?GatewayMetadata
         capabilities.supports_explicit_caching = metadata.supports_explicit_caching;
         capabilities.supports_implicit_caching = metadata.supports_implicit_caching;
         if (metadata.context_window) |window| capabilities.context_window = window;
-        if (metadata.max_output_tokens) |tokens| capabilities.max_output_tokens = tokens;
+        capabilities.max_output_tokens = usableMaxOutputTokens(
+            capabilities.context_window,
+            metadata.max_output_tokens,
+        );
     }
     return capabilities;
 }
@@ -250,6 +265,27 @@ test "resolveCapabilities preserves Gateway controls and unrelated local policy"
     try std.testing.expect(capabilities.prompt_caching);
     try std.testing.expectEqual(@as(?u32, 300_000), capabilities.context_window);
     try std.testing.expectEqual(@as(?u32, 32_000), capabilities.max_output_tokens);
+}
+
+test "resolveCapabilities omits catalog output limits that fill the context window" {
+    const muse = resolveCapabilities("meta/muse-spark-1.2-contributor", .{
+        .context_window = 1_048_576,
+        .max_output_tokens = 1_048_576,
+    });
+    try std.testing.expectEqual(@as(?u32, 1_048_576), muse.context_window);
+    try std.testing.expectEqual(@as(?u32, null), muse.max_output_tokens);
+
+    const over_window = resolveCapabilities("provider/model", .{
+        .context_window = 128_000,
+        .max_output_tokens = 256_000,
+    });
+    try std.testing.expectEqual(@as(?u32, null), over_window.max_output_tokens);
+
+    const real_cap = resolveCapabilities("provider/model", .{
+        .context_window = 256_000,
+        .max_output_tokens = 32_000,
+    });
+    try std.testing.expectEqual(@as(?u32, 32_000), real_cap.max_output_tokens);
 }
 
 test "reasoning effort picker helpers prepend default and preserve Gateway order" {

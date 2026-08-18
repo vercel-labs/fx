@@ -304,6 +304,29 @@ test "agent request builder keeps default reasoning silent and emits output limi
     try std.testing.expect(std.mem.find(u8, body, "\"providerOptions\"") == null);
 }
 
+test "agent request builder omits output limit when catalog copies the context window" {
+    const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
+    const capabilities = model_capabilities.resolveCapabilities("meta/muse-spark-1.2-contributor", .{
+        .context_window = 1_048_576,
+        .max_output_tokens = 1_048_576,
+    });
+    const body = try agent_stream_provider.build(std.testing.allocator, .{
+        .model = "meta/muse-spark-1.2-contributor",
+        .serialized_tools = "[]",
+        .messages = &messages,
+        .tool_choice = .auto,
+        .provider_options = model_capabilities.resolveProviderOptionsForCapabilities(
+            capabilities,
+            .auto,
+            false,
+        ),
+        .max_output_tokens = capabilities.max_output_tokens,
+    });
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"maxOutputTokens\"") == null);
+}
+
 test "agent request builder scopes the product user agent to GLM 5.2" {
     const alloc = std.testing.allocator;
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};

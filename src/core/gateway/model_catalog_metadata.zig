@@ -19,7 +19,10 @@ pub fn fromCatalogEntry(entry: model_catalog.ModelCatalogEntry) model_capabiliti
         .supports_explicit_caching = entry.has_explicit_caching,
         .supports_implicit_caching = entry.has_implicit_caching,
         .context_window = optionalPositiveU32(entry.context_window),
-        .max_output_tokens = optionalPositiveU32(entry.max_tokens),
+        .max_output_tokens = model_capabilities.usableMaxOutputTokens(
+            optionalPositiveU32(entry.context_window),
+            optionalPositiveU32(entry.max_tokens),
+        ),
     };
 }
 
@@ -61,4 +64,23 @@ test "fromCatalogEntry preserves catalog capability metadata" {
     });
     try std.testing.expectEqual(@as(?u32, null), unknown_limits.context_window);
     try std.testing.expectEqual(@as(?u32, null), unknown_limits.max_output_tokens);
+}
+
+test "fromCatalogEntry keeps a real output cap and drops a full-window copy" {
+    const full_window = fromCatalogEntry(.{
+        .id = @constCast("meta/muse-spark-1.2-contributor"),
+        .model_type = @constCast("language"),
+        .context_window = 1_048_576,
+        .max_tokens = 1_048_576,
+    });
+    try std.testing.expectEqual(@as(?u32, 1_048_576), full_window.context_window);
+    try std.testing.expectEqual(@as(?u32, null), full_window.max_output_tokens);
+
+    const real_cap = fromCatalogEntry(.{
+        .id = @constCast("provider/model"),
+        .model_type = @constCast("language"),
+        .context_window = 256_000,
+        .max_tokens = 32_000,
+    });
+    try std.testing.expectEqual(@as(?u32, 32_000), real_cap.max_output_tokens);
 }
