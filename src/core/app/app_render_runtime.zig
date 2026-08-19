@@ -46,6 +46,8 @@ const skills_screen = @import("../../ui/skills_screen.zig");
 const help_screen = @import("../../ui/help_screen.zig");
 const settings_screen = @import("../../ui/settings_screen.zig");
 const full_transcript_screen = @import("../../ui/full_transcript_screen.zig");
+const code_viewer_screen = @import("../../ui/code_viewer_screen.zig");
+const app_code_viewer_runtime = @import("app_code_viewer_runtime.zig");
 const render_engine = @import("../../ui/render_engine.zig");
 const build_checkpoint = @import("../../ui/render_engine/build_checkpoint.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
@@ -144,6 +146,7 @@ const RenderReconciliation = union(enum) {
     resume_screen,
     help_screen,
     settings_screen,
+    code_viewer_screen,
     frame_result: FrameAttemptResult,
 };
 
@@ -1478,6 +1481,9 @@ pub fn Runtime(comptime App: type) type {
                 )) {
                     try requestNormalViewportRecovery(app);
                 }
+                if (try closeCodeViewerIfActive(app)) {
+                    try requestNormalViewportRecovery(app);
+                }
                 if (app.terminal.catalogMenuScreenActive()) {
                     try app_lifecycle.leaveCatalogMenuScreen(&app.terminal, &app.shell, &app.metrics);
                     try requestNormalViewportRecovery(app);
@@ -1494,6 +1500,9 @@ pub fn Runtime(comptime App: type) type {
                 );
                 if (app.terminal.catalogMenuScreenActive()) {
                     try app_lifecycle.leaveCatalogMenuScreen(&app.terminal, &app.shell, &app.metrics);
+                    if (!approval_screen_active) try requestNormalViewportRecovery(app);
+                }
+                if (try closeCodeViewerIfActive(app)) {
                     if (!approval_screen_active) try requestNormalViewportRecovery(app);
                 }
                 switch (try app_lifecycle.transitionFullTranscriptForApproval(
@@ -1539,6 +1548,9 @@ pub fn Runtime(comptime App: type) type {
                 )) {
                     try requestNormalViewportRecovery(app);
                 }
+                if (try closeCodeViewerIfActive(app)) {
+                    try requestNormalViewportRecovery(app);
+                }
                 if (settingsMenuActive(app)) return .settings_screen;
                 if (modelMenuActive(app)) return .models_screen;
                 if (sessionMenuActive(app)) return .resume_screen;
@@ -1550,6 +1562,8 @@ pub fn Runtime(comptime App: type) type {
                 try app_lifecycle.leaveCatalogMenuScreen(&app.terminal, &app.shell, &app.metrics);
                 try requestNormalViewportRecovery(app);
             }
+
+            if (codeViewerOwnsScreen(app)) return .code_viewer_screen;
 
             return .{ .inline_render = .{
                 .alternate_screen_owns_rendering = app.terminal.alternate_screen_owner != .none,
@@ -1673,6 +1687,7 @@ pub fn Runtime(comptime App: type) type {
                 .resume_screen => return renderResumeScreen(app, footer_ctx),
                 .help_screen => return renderHelpScreen(app, footer_ctx),
                 .settings_screen => return renderSettingsScreen(app, footer_ctx),
+                .code_viewer_screen => return renderCodeViewerScreen(app),
                 .frame_result => |result| return result,
             };
             const presentation_commits_transcript =
@@ -2673,6 +2688,76 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        fn codeViewerOwnsScreen(app: *App) bool {
+            if (comptime @hasField(App, "code_viewer") and @hasField(App, "terminal")) {
+                return app.terminal.codeViewerScreenActive() and app.code_viewer.active();
+            }
+            return false;
+        }
+
+        fn closeCodeViewerIfActive(app: *App) !bool {
+            if (comptime @hasField(App, "code_viewer")) {
+                return app_code_viewer_runtime.Runtime(App).closeIfActive(app);
+            }
+            return false;
+        }
+
+        fn renderCodeViewerScreen(app: *App) !FrameAttemptResult {
+            if (comptime @hasField(App, "code_viewer") and @hasField(App, "terminal")) {
+                if (!app.code_viewer.active()) {
+                    try app_lifecycle.leaveCodeViewerScreen(&app.terminal, &app.shell, &app.metrics);
+                    try requestNormalViewportRecovery(app);
+                    return .{
+                        .shadow_state = .committed,
+                        .animation_visible = false,
+                    };
+                }
+
+                const clear_display = !app.terminal.codeViewerScreenActive();
+                try app_lifecycle.enterCodeViewerScreen(&app.terminal, &app.shell, &app.metrics);
+                if (app.shell.shadow_vt) |grid| {
+                    if (grid.cols != app.shell.layout.cols or grid.rows != app.shell.layout.rows) {
+                        try grid.resize(app.shell.layout.cols, app.shell.layout.rows);
+                    }
+                }
+
+                app.code_viewer.syncScroll(app.shell.layout.rows -| 3);
+                var screen = try code_viewer_screen.paint(app.alloc, .{
+                    .rows = app.shell.layout.rows,
+                    .cols = app.shell.layout.cols,
+                    .kind = app.code_viewer.kind,
+                    .path = app.code_viewer.path,
+                    .language = app.code_viewer.language,
+                    .cursor = app.code_viewer.cursor,
+                    .scroll = app.code_viewer.scroll,
+                    .mode = app.code_viewer.mode,
+                    .query = app.code_viewer.query.items,
+                    .matches = app.code_viewer.matches.items,
+                    .match_index = app.code_viewer.match_index,
+                    .goto_buf = app.code_viewer.goto_buf.items,
+                    .file = .{
+                        .lines = app.code_viewer.lines.items,
+                        .highlighted = app.code_viewer.highlighted_lines.items,
+                    },
+                    .diff = .{
+                        .lines = app.code_viewer.diff_lines,
+                        .pairs = app.code_viewer.pairs.items,
+                        .hunks = app.code_viewer.hunks.items,
+                        .hunk_index = app.code_viewer.hunk_index,
+                        .display = app.code_viewer.diff_layout,
+                    },
+                    .clear_display = clear_display,
+                });
+                defer screen.deinit(app.alloc);
+                try app_lifecycle.writeLifecycleTerminalBytes(&app.shell, &app.metrics, screen.bytes);
+                return .{
+                    .shadow_state = .committed,
+                    .animation_visible = false,
+                };
+            }
+            return error.MissingCodeViewerRuntime;
+        }
+
         fn skillsMenuActive(app: *const App) bool {
             if (comptime @hasField(App, "skills")) return app.skills.menu.active;
             return false;
@@ -2756,6 +2841,9 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             if (comptime @hasField(App, "terminal")) {
+                if (try closeCodeViewerIfActive(app)) {
+                    try requestNormalViewportRecovery(app);
+                }
                 if (app.terminal.fileApprovalScreenActive()) {
                     try app_lifecycle.handoffApprovalToSubagentManager(
                         &app.terminal,

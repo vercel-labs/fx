@@ -30,7 +30,7 @@ pub const Host = struct {
     provider: *const fn (ctx: *anyopaque) []const u8 = emptyString,
     get_opt: *const fn (ctx: *anyopaque, alloc: Allocator, key: []const u8) anyerror!?[]u8 = missingOpt,
     set_opt: *const fn (ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!void = rejectOpt,
-    open_view: *const fn (ctx: *anyopaque, path: []const u8) anyerror!void = rejectView,
+    open_view: *const fn (ctx: *anyopaque, path: []const u8, line: ?u32) anyerror!void = rejectView,
     allow_process: *const fn (ctx: *anyopaque) bool = denyProcess,
 };
 
@@ -578,7 +578,7 @@ fn missingOpt(_: *anyopaque, _: Allocator, _: []const u8) anyerror!?[]u8 {
 fn rejectOpt(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {
     return error.Unsupported;
 }
-fn rejectView(_: *anyopaque, _: []const u8) anyerror!void {
+fn rejectView(_: *anyopaque, _: []const u8, _: ?u32) anyerror!void {
     return error.Unsupported;
 }
 
@@ -813,7 +813,18 @@ fn apiViewOpen(L: ?*lua.State) callconv(.c) c_int {
     const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
     lua.luaL_checktype(L, 1, lua.TSTRING);
     const path = lua.tostring(L, 1) orelse return lua.raise(L, "path required");
-    rt.host.open_view(rt.host.ctx, path) catch |err| {
+    var line: ?u32 = null;
+    if (lua.lua_gettop(L) >= 2 and lua.istable(L, 2)) {
+        _ = lua.lua_getfield(L, 2, "line");
+        if (lua.lua_type(L, -1) == lua.TNUMBER) {
+            const value = lua.tointeger(L, -1);
+            if (value > 0 and value <= std.math.maxInt(u32)) {
+                line = @intCast(value);
+            }
+        }
+        lua.pop(L, 1);
+    }
+    rt.host.open_view(rt.host.ctx, path, line) catch |err| {
         return lua.raise(L, @errorName(err));
     };
     return 0;
@@ -1122,4 +1133,47 @@ test "profile then workspace init.lua load in order" {
     try std.testing.expect(runtime.hasCommand("/from_profile"));
     try std.testing.expect(runtime.hasCommand("/from_workspace"));
     try std.testing.expectEqual(@as(usize, 2), runtime.loaded_files.items.len);
+}
+
+test "fx.view.open calls the host with an optional line" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(),
+        \\fx.command("openit", function()
+        \\  fx.view.open("src/main.zig", { line = 12 })
+        \\end)
+        \\
+    );
+
+    const Ctx = struct {
+        path: std.ArrayList(u8),
+        line: ?u32 = null,
+        alloc: Allocator,
+        fn open(raw: *anyopaque, path: []const u8, line: ?u32) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            ctx.path.clearRetainingCapacity();
+            try ctx.path.appendSlice(ctx.alloc, path);
+            ctx.line = line;
+        }
+    };
+    var ctx = Ctx{ .path = .empty, .alloc = alloc };
+    defer ctx.path.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.bindHost(.{
+        .ctx = &ctx,
+        .open_view = Ctx.open,
+    });
+    runtime.loadInit(null, workspace);
+    runtime.invokeCommand("/openit", "");
+    try std.testing.expectEqualStrings("src/main.zig", ctx.path.items);
+    try std.testing.expectEqual(@as(?u32, 12), ctx.line);
 }

@@ -61,6 +61,7 @@ pub const AlternateScreenOwner = enum {
     catalog_menu,
     subagent_manager,
     terminal_session,
+    code_viewer,
 };
 
 pub const TerminalState = struct {
@@ -91,6 +92,10 @@ pub const TerminalState = struct {
 
     pub fn terminalSessionScreenActive(self: TerminalState) bool {
         return self.alternate_screen_owner == .terminal_session;
+    }
+
+    pub fn codeViewerScreenActive(self: TerminalState) bool {
+        return self.alternate_screen_owner == .code_viewer;
     }
 
     pub fn ensureInteractive(self: TerminalState) !void {

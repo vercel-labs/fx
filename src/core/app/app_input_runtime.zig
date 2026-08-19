@@ -66,6 +66,7 @@ const input_submit_runtime = @import("input_submit_runtime.zig");
 const input_approval_runtime = @import("input_approval_runtime.zig");
 const input_question_runtime = @import("input_question_runtime.zig");
 const input_full_transcript_runtime = @import("input_full_transcript_runtime.zig");
+const input_code_viewer_runtime = @import("input_code_viewer_runtime.zig");
 const input_selection_runtime = @import("input_selection_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
 const app_upgrade_runtime = @import("app_upgrade_runtime.zig");
@@ -199,6 +200,7 @@ pub fn Runtime(comptime App: type) type {
         const interrupt_rt = input_interrupt_runtime.InterruptRuntime(App);
         const queue_rt = input_queue_runtime.Runtime(App);
         const full_transcript_rt = input_full_transcript_runtime.Runtime(App);
+        const code_viewer_rt = input_code_viewer_runtime.Runtime(App);
 
         const ctrl_c_exit_window_ms = gesture_state.ctrl_c_exit_window_ms;
         const ResolvedEscapeRoute = union(enum) {
@@ -891,6 +893,7 @@ pub fn Runtime(comptime App: type) type {
                 if (try app_auth_runtime.Runtime(App).routeAuthPickerByte(app, byte)) return;
             }
             if (try full_transcript_rt.routeByte(app, byte)) return;
+            if (try code_viewer_rt.routeByte(app, byte)) return;
 
             if (try routeActiveModalInput(app, raw, input_limits.decision_bytes)) return;
             if (byte >= 0x80) {
@@ -939,6 +942,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             if (resolved == .escape) {
+                if (try code_viewer_rt.routeAction(app, resolved)) return .done;
                 if (try full_transcript_rt.routeAction(app, resolved)) return .done;
                 const now = io_mod.milliTimestamp();
                 expireEscClearArm(app, now);
@@ -951,6 +955,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             if (try full_transcript_rt.routeAction(app, resolved)) return .done;
+            if (try code_viewer_rt.routeAction(app, resolved)) return .done;
 
             if (resolved == .paste_start) {
                 if (comptime @hasDecl(@TypeOf(app.subagents), "beginManagerPaste")) {
@@ -1156,6 +1161,7 @@ pub fn Runtime(comptime App: type) type {
             if (app.question_prompt.isActive() or approvalOwnsCurrentSurface(app)) return false;
             if (comptime @hasField(App, "terminal")) {
                 if (app.terminal.fullTranscriptScreenActive()) return false;
+                if (app.terminal.codeViewerScreenActive()) return false;
             }
             return true;
         }
@@ -1167,6 +1173,7 @@ pub fn Runtime(comptime App: type) type {
                 if (helpMenuActive(app) or settingsMenuActive(app)) return false;
                 if (comptime @hasField(App, "terminal")) {
                     if (app.terminal.fullTranscriptScreenActive()) return false;
+                    if (app.terminal.codeViewerScreenActive()) return false;
                 }
                 const app_lua_runtime = @import("app_lua_runtime.zig");
                 return app_lua_runtime.Runtime(App).dispatchKeymap(app, byte);

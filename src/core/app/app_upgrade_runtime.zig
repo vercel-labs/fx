@@ -129,6 +129,7 @@ pub fn Runtime(comptime App: type) type {
             }
             if (comptime @hasField(App, "terminal")) {
                 if (app.terminal.fullTranscriptScreenActive()) return "close the transcript view before upgrading";
+                if (app.terminal.codeViewerScreenActive()) return "close the code viewer before upgrading";
             }
             if (comptime @hasField(App, "input_runtime")) {
                 if (app.input_runtime.paste.active()) return "finish the paste before upgrading";

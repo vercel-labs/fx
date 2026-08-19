@@ -48,6 +48,7 @@ pub const ParsedCommand = union(enum) {
     workspace: []const u8,
     version,
     lua: LuaCommand,
+    view: []const u8,
     unknown,
 };
 
@@ -102,6 +103,7 @@ pub const CommandHandlers = struct {
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
     handle_lua: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_lua_command: *const fn (ctx: *anyopaque, command: []const u8, payload: []const u8) anyerror!void,
+    handle_view: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     unknown: *const fn (ctx: *anyopaque, cmd: []const u8) anyerror!void,
 };
 
@@ -154,6 +156,7 @@ fn parsedFromSpec(spec: *const command_specs.SlashSpec, payload: []const u8) Par
         .workspace => .{ .workspace = payload },
         .version => .version,
         .lua => .{ .lua = .{ .command = spec.command, .payload = payload } },
+        .view => .{ .view = payload },
     };
 }
 
@@ -221,6 +224,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
                 try handlers.handle_lua_command(handlers.ctx, info.command, info.payload);
             }
         },
+        .view => |rest| try handlers.handle_view(handlers.ctx, rest),
         .unknown => try handlers.unknown(handlers.ctx, cmd),
     }
 }
@@ -248,6 +252,21 @@ test "parse recognizes models" {
 test "parse extracts allowlist command payload" {
     switch (parse(testSlashRegistry(), "/allowlist add command \"git *\"")) {
         .allowlist => |rest| try std.testing.expectEqualStrings("add command \"git *\"", rest),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "parse extracts view command payload" {
+    switch (parse(testSlashRegistry(), "/view")) {
+        .view => |rest| try std.testing.expectEqualStrings("", rest),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/view src/main.zig:12")) {
+        .view => |rest| try std.testing.expectEqualStrings("src/main.zig:12", rest),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/view --diff src/app.zig")) {
+        .view => |rest| try std.testing.expectEqualStrings("--diff src/app.zig", rest),
         else => return error.TestExpectedEqual,
     }
 }
@@ -654,6 +673,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .show_version = unexpectedNoPayload,
         .handle_lua = unexpectedPayload,
         .handle_lua_command = unexpectedLuaCommand,
+        .handle_view = unexpectedPayload,
         .unknown = unexpectedPayload,
     };
 }

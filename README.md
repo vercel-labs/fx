@@ -120,7 +120,7 @@ fx.command("hello", function()
 end)
 ```
 
-`fx.command`, `fx.keymap`, `fx.hook`, `fx.notify`, `fx.opt`, `fx.model`, `fx.provider`, and `fx.view.open` are the v1 API. Lua file reads stay inside `~/.fx/lua`, `~/.fx/pack`, and the workspace `.fx/` tree. `os.execute` and `io.popen` stay blocked unless permission mode is yolo. WebAssembly and NAPI hosts skip Lua.
+`fx.command`, `fx.keymap`, `fx.hook`, `fx.notify`, `fx.opt`, `fx.model`, `fx.provider`, and `fx.view.open` are the v1 API. `/view [path]` opens the read-only code viewer; `/view --diff` opens the latest edit hunks. `fx.view.open(path, { line = n })` opens the same viewer. Lua file reads stay inside `~/.fx/lua`, `~/.fx/pack`, and the workspace `.fx/` tree. `os.execute` and `io.popen` stay blocked unless permission mode is yolo. WebAssembly and NAPI hosts skip Lua.
 
 ## Documentation
 

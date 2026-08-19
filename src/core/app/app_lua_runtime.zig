@@ -175,11 +175,16 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn openView(raw: *anyopaque, path: []const u8) anyerror!void {
+        fn openView(raw: *anyopaque, path: []const u8, line: ?u32) anyerror!void {
             const app: *App = @ptrCast(@alignCast(raw));
+            if (comptime @hasField(App, "code_viewer")) {
+                const app_code_viewer_runtime = @import("app_code_viewer_runtime.zig");
+                try app_code_viewer_runtime.Runtime(App).openPath(app, path, line);
+                return;
+            }
             const message = try std.fmt.allocPrint(
                 app.alloc,
-                "code viewer is not available yet ({s})",
+                "code viewer is unavailable ({s})",
                 .{path},
             );
             defer app.alloc.free(message);

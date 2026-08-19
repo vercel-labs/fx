@@ -616,6 +616,7 @@ fn leaveAlternateScreens(terminal: *TerminalState, shell: *TranscriptRuntime, me
         .catalog_menu => _ = leaveCatalogMenuScreen(terminal, shell, metrics) catch {},
         .subagent_manager => _ = leaveSubagentManagerScreen(terminal, shell, metrics) catch {},
         .terminal_session => _ = leaveTerminalSessionScreen(terminal, shell, metrics) catch {},
+        .code_viewer => _ = leaveCodeViewerScreen(terminal, shell, metrics) catch {},
     }
 }
 
@@ -830,6 +831,14 @@ pub fn leaveSubagentManagerScreen(
     metrics: *Metrics,
 ) !void {
     try leaveAlternateScreen(terminal, shell, metrics, .subagent_manager);
+}
+
+pub fn enterCodeViewerScreen(terminal: *TerminalState, shell: *TranscriptRuntime, metrics: *Metrics) !void {
+    try enterAlternateScreen(terminal, shell, metrics, .code_viewer);
+}
+
+pub fn leaveCodeViewerScreen(terminal: *TerminalState, shell: *TranscriptRuntime, metrics: *Metrics) !void {
+    try leaveAlternateScreen(terminal, shell, metrics, .code_viewer);
 }
 
 pub fn enterTerminalSessionScreen(
@@ -1483,6 +1492,48 @@ test "full transcript alternate screen lifecycle restores the shadow terminal on
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1006l"));
     try std.testing.expect(!terminal.fullTranscriptScreenActive());
     try std.testing.expect(!terminal.alternate_mouse_tracking_active);
+}
+
+test "code viewer alternate screen lifecycle restores the shadow terminal once" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_path = "code-viewer-screen.out";
+    const out_file = try tmp.dir.createFile(io_mod.getIo(), out_path, .{ .truncate = true });
+    var shell = TranscriptRuntime{
+        .stdout_file = out_file,
+        .layout = .{
+            .rows = 4,
+            .cols = 16,
+            .content_bottom = 1,
+            .divider_top_row = 1,
+            .input_row = 2,
+            .divider_bottom_row = 3,
+            .hint_row = 4,
+        },
+    };
+    defer shell.deinit(alloc);
+    try shell.enableShadowVt(alloc);
+
+    var metrics = Metrics{};
+    var terminal = TerminalState{};
+    try enterCodeViewerScreen(&terminal, &shell, &metrics);
+    try enterCodeViewerScreen(&terminal, &shell, &metrics);
+    try writeLifecycleTerminalBytes(&shell, &metrics, "viewer");
+    try leaveCodeViewerScreen(&terminal, &shell, &metrics);
+    try leaveCodeViewerScreen(&terminal, &shell, &metrics);
+    shell.stdout_file.close(io_mod.getIo());
+
+    var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
+    defer read_file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(alloc, &read_file, 256);
+    defer alloc.free(bytes);
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1049h"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1049l"));
+    try std.testing.expect(!terminal.codeViewerScreenActive());
+    try std.testing.expectEqual(@as(u21, ' '), shell.shadow_vt.?.cellAt(1, 1).?.codepoint);
 }
 
 test "skills menu alternate screen lifecycle restores the shadow terminal once" {

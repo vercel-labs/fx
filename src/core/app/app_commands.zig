@@ -12,6 +12,7 @@ const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const command_router = @import("../slash_commands/command_router.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const app_lua_runtime = @import("app_lua_runtime.zig");
+const app_code_viewer_runtime = @import("app_code_viewer_runtime.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const input_appearance = @import("../config/input_appearance.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -315,6 +316,7 @@ pub fn Handlers(comptime App: type) type {
                 .show_version = commandShowVersion,
                 .handle_lua = commandHandleLua,
                 .handle_lua_command = commandHandleLuaCommand,
+                .handle_view = commandHandleView,
                 .unknown = commandUnknown,
             };
         }
@@ -1699,6 +1701,19 @@ pub fn Handlers(comptime App: type) type {
                 .topic = "lua",
                 .tone = .@"error",
                 .body = "Unknown command. Try /help.",
+            }, true);
+        }
+
+        fn commandHandleView(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasField(App, "code_viewer")) {
+                try app_code_viewer_runtime.Runtime(App).handleView(app, rest);
+                return;
+            }
+            try app.writeDomainNotice(.{
+                .topic = "view",
+                .tone = .@"error",
+                .body = "The code viewer is unavailable in this runtime.",
             }, true);
         }
 
