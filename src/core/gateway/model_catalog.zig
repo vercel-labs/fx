@@ -373,7 +373,8 @@ pub fn compareModelCatalogEntries(_: void, a: ModelCatalogEntry, b: ModelCatalog
 
 fn modelProviderRank(id: []const u8) u8 {
     if (std.mem.startsWith(u8, id, "anthropic/")) return 0;
-    if (std.mem.startsWith(u8, id, "openai/")) return 1;
+    if (std.mem.startsWith(u8, id, "openai/") or
+        std.mem.startsWith(u8, id, "openai-codex/")) return 1;
     if (std.mem.startsWith(u8, id, "google/")) return 2;
     if (std.mem.startsWith(u8, id, "xai/")) return 3;
     if (std.mem.startsWith(u8, id, "deepseek/")) return 4;
@@ -414,6 +415,7 @@ const FeaturedPickerFamily = struct {
 const featured_picker_families = [_]FeaturedPickerFamily{
     .{ .family = "anthropic/claude-fable", .count = 1 },
     .{ .family = "openai/gpt", .count = 1 },
+    .{ .family = "openai-codex/gpt", .count = 1 },
     .{ .family = "xai/grok-build", .count = 1 },
     .{ .family = "anthropic/claude-opus", .count = 1 },
     .{ .family = "zai/glm", .count = 1 },
@@ -545,7 +547,10 @@ fn modelPickerProvider(id: []const u8) []const u8 {
 }
 
 fn pickerProviderLimit(provider: []const u8) usize {
-    if (std.mem.eql(u8, provider, "anthropic") or std.mem.eql(u8, provider, "openai")) {
+    if (std.mem.eql(u8, provider, "anthropic") or
+        std.mem.eql(u8, provider, "openai") or
+        std.mem.eql(u8, provider, "openai-codex"))
+    {
         return extended_picker_provider_limit;
     }
     return picker_provider_limit;
@@ -851,6 +856,21 @@ test "catalog order prefers tool use, tier, provider, then recency" {
     try std.testing.expectEqualStrings("xai/grok-flash", entries[3].id);
     try std.testing.expectEqualStrings("anthropic/claude-haiku-4.5", entries[4].id);
     try std.testing.expectEqualStrings("mistral/large-x", entries[5].id);
+}
+
+test "picker preserves equivalent Gateway and ChatGPT model routes" {
+    const candidates = [_]ModelCatalogEntry{
+        .{ .id = @constCast("openai/gpt-5.6-sol"), .model_type = @constCast("language"), .released = 200, .has_tool_use = true },
+        .{ .id = @constCast("openai-codex/gpt-5.6-sol"), .model_type = @constCast("language"), .released = 200, .has_tool_use = true },
+        .{ .id = @constCast("openai-codex/gpt-5.6-terra"), .model_type = @constCast("language"), .released = 200, .has_tool_use = true },
+    };
+
+    var curated = try projectPickerModelCatalog(std.testing.allocator, &candidates);
+    defer freeModelCatalog(std.testing.allocator, &curated);
+
+    try std.testing.expectEqual(@as(usize, 3), curated.items.len);
+    try std.testing.expect(pickerCatalogContains(curated.items, "openai/gpt-5.6-sol"));
+    try std.testing.expect(pickerCatalogContains(curated.items, "openai-codex/gpt-5.6-sol"));
 }
 
 test "featured deepseek slot prefers the pro variant at equal recency" {

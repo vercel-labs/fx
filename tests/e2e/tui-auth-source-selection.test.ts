@@ -339,16 +339,21 @@ function startFakeChatGptOAuth(
     method: string;
     path: string;
     authorization: string | null;
+    body: string | null;
   }> = [];
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     async fetch(request) {
       const url = new URL(request.url);
+      const body = url.pathname === "/chatgpt/responses"
+        ? await request.text()
+        : null;
       requests.push({
         method: request.method,
         path: url.pathname,
         authorization: request.headers.get("authorization"),
+        body,
       });
       if (url.pathname === "/chatgpt/device") {
         return Response.json({
@@ -527,7 +532,11 @@ tmuxTest(
     home = mkdtempSync(join(tmpdir(), "fx-tui-chatgpt-success-"));
     stderrPath = join(home, "stderr.log");
     writeFileSync(stderrPath, "");
-    gateway = startFakeGateway([]);
+    gateway = startFakeGateway([], {
+      models() {
+        return [{ id: "openai/gpt-5.6-sol", type: "language", tags: ["tool-use"] }];
+      },
+    });
     chatgptOauth = startFakeChatGptOAuth({ tokenDelayMs: 500 });
 
     session = await startFx(
@@ -562,7 +571,7 @@ tmuxTest(
     await session.sendText("/model");
     const picker = await session.waitForPane(
       (pane) =>
-        pane.includes("openai-codex/gpt-5.4") &&
+        pane.includes("openai-codex/gpt-5.6-sol") &&
         pane.includes("ChatGPT subscription"),
       TIMEOUT,
     );
@@ -570,17 +579,18 @@ tmuxTest(
     await session.sendKeys("Escape");
     await session.sendKeys("C-c");
     await session.waitForComposer(TIMEOUT);
-    await session.sendLiteralText("/model openai-codex/gpt-5.4");
+    await session.sendLiteralText("/model openai-codex/gpt-5.6-sol");
     await session.sendKeys("Space");
     await session.sendLiteralText("auto");
     await session.sendKeys("Enter");
-    await session.waitForText("Switched to openai-codex/gpt-5.4", TIMEOUT);
+    await session.waitForText("Switched to openai-codex/gpt-5.6-sol", TIMEOUT);
     await session.sendText("Use the ChatGPT subscription directly.");
     await session.waitForText("CHATGPT_DIRECT_RESPONSE", TIMEOUT);
     const directRequest = chatgptOauth.requests.find(
       (request) => request.path === "/chatgpt/responses",
     );
     expect(directRequest?.authorization).toBe(`Bearer ${chatgptOauth.accessToken}`);
+    expect(JSON.parse(directRequest?.body ?? "{}").model).toBe("gpt-5.6-sol");
     for (const request of [...gateway.requests, ...gateway.modelRequests]) {
       expect(request.headers.get("authorization")).not.toBe(
         `Bearer ${chatgptOauth.accessToken}`,
@@ -588,7 +598,11 @@ tmuxTest(
     }
     await session.sendText("/models");
     await session.waitForPane(
-      (pane) => pane.includes("Models") && pane.includes("ChatGPT subscription"),
+      (pane) =>
+        pane.includes("Models") &&
+        pane.includes("openai/gpt-5.6-sol") &&
+        pane.includes("openai-codex/gpt-5.6-sol") &&
+        pane.includes("ChatGPT subscription"),
       TIMEOUT,
     );
     await session.sendKeys("Escape");
@@ -1310,7 +1324,11 @@ test(
   "ChatGPT CLI login survives restart and exposes sourced models without FX_MODEL",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-chatgpt-cli-login-"));
-    gateway = startFakeGateway([]);
+    gateway = startFakeGateway([], {
+      models() {
+        return [{ id: "openai/gpt-5.6-sol", type: "language", tags: ["tool-use"] }];
+      },
+    });
     chatgptOauth = startFakeChatGptOAuth({ unauthorizedResponses: 1 });
     const env = {
       HOME: home,
@@ -1352,7 +1370,11 @@ test(
       models: Array<{ id: string; source: string }>;
     };
     expect(modelsJson.models).toContainEqual({
-      id: "openai-codex/gpt-5.4",
+      id: "openai/gpt-5.6-sol",
+      source: "Vercel AI Gateway",
+    });
+    expect(modelsJson.models).toContainEqual({
+      id: "openai-codex/gpt-5.6-sol",
       source: "ChatGPT subscription",
     });
 
@@ -1370,12 +1392,12 @@ test(
     ).toBe(0);
     expect(
       (JSON.parse(offlineModels.stdout) as { models: Array<{ id: string }> }).models
-        .some((model) => model.id === "openai-codex/gpt-5.4"),
+        .some((model) => model.id === "openai-codex/gpt-5.6-sol"),
     ).toBe(true);
 
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ model: "openai-codex/gpt-5.4" }) + "\n",
+      JSON.stringify({ model: "openai-codex/gpt-5.6-sol" }) + "\n",
       { mode: 0o600 },
     );
     const ask = await runFx(
