@@ -2,7 +2,7 @@
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const scripts = ["test-term.mjs", "test-core.mjs", "test-core-cancel.mjs"];
+const scripts = ["test-term.mjs", "test-core.mjs", "test-core-cancel.mjs", "test-core-home-unavailable.mjs"];
 for (const script of scripts) {
   const path = fileURLToPath(new URL(script, import.meta.url));
   const result = spawnSync(process.execPath, ["--experimental-wasm-jspi", path], {

@@ -3,6 +3,7 @@ const background_runtime = @import("../core/background/background_runtime.zig");
 const change_tracker = @import("../core/workspace/change_tracker.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const host = @import("../core/hosts/host.zig");
+const host_target = @import("../core/hosts/target.zig");
 const io_mod = @import("../core/shared/io.zig");
 const model_context_encoding = @import("../core/shared/model_context_encoding.zig");
 const pathing = @import("../core/workspace/pathing.zig");
@@ -242,7 +243,12 @@ const SelectionScratch = struct {
     }
 };
 
+fn loadsProjectInstructionFiles() bool {
+    return !host_target.is_wasm;
+}
+
 fn gatherProjectContext(alloc: Allocator, input: InitialContextInput) context_contract.ProviderError!ProviderContext {
+    if (!loadsProjectInstructionFiles()) return .{};
     return gatherProjectContextWithHome(alloc, input, io_mod.getenv("HOME"));
 }
 
@@ -263,6 +269,7 @@ fn gatherProjectContextWithHome(
 }
 
 fn selectApplicableProjectContext(alloc: Allocator, input: LaterContextInput) context_contract.ProviderError!ProviderContext {
+    if (!loadsProjectInstructionFiles()) return .{};
     return selectProjectContext(alloc, .{
         .workspace_root = input.workspace_root,
         .targets = input.targets,
@@ -1632,6 +1639,10 @@ test "later added-root targets are evaluated without loading added instructions"
     try std.testing.expectEqual(@as(usize, 0), context.notices.len);
     try std.testing.expect(std.mem.find(u8, context.modelVisibleBytes(), "ADDED_ROOT_SENTINEL") == null);
     try std.testing.expect(std.mem.find(u8, context.modelVisibleBytes(), "target outside workspace") == null);
+}
+
+test "native hosts still load project instruction files" {
+    try std.testing.expect(loadsProjectInstructionFiles());
 }
 
 test "HOME availability failures and non-ancestor diagnostics stay explicit" {

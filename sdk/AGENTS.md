@@ -59,6 +59,7 @@ Core validation from the repository root:
 zig build -Dwasm-surface=core
 node --experimental-wasm-jspi sdk/tests/test-core.mjs
 node --experimental-wasm-jspi sdk/tests/test-core-cancel.mjs
+node --experimental-wasm-jspi sdk/tests/test-core-home-unavailable.mjs
 node sdk/tests/test-core-browser.mjs
 ```
 
