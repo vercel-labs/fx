@@ -14,6 +14,7 @@ pub const mcp_credentials_dir_name = "mcp-credentials";
 pub const mcp_credentials_file_name = "credentials.json";
 pub const providers_dir_name = "providers";
 pub const openai_compatible_dir_name = "openai_compatible";
+pub const chatgpt_dir_name = "chatgpt";
 
 const settings_file_name = "settings.json";
 const mcp_config_file_name = "mcp.json";
@@ -111,6 +112,25 @@ pub fn openaiCompatibleApiKeyPath(alloc: Allocator, home: []const u8) ![]u8 {
     });
 }
 
+pub fn chatgptDir(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{
+        home,
+        root_dir_name,
+        providers_dir_name,
+        chatgpt_dir_name,
+    });
+}
+
+pub fn chatgptAuthPath(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{
+        home,
+        root_dir_name,
+        providers_dir_name,
+        chatgpt_dir_name,
+        auth_file_name,
+    });
+}
+
 test "profile path helpers preserve current default locations" {
     const alloc = std.testing.allocator;
 
@@ -196,5 +216,19 @@ test "profile path helpers preserve current default locations" {
     try std.testing.expectEqualStrings(
         "/tmp/fake-home/.fx/providers/openai_compatible/api-key",
         openai_key,
+    );
+
+    const chatgpt_dir = try chatgptDir(alloc, "/tmp/fake-home");
+    defer alloc.free(chatgpt_dir);
+    try std.testing.expectEqualStrings(
+        "/tmp/fake-home/.fx/providers/chatgpt",
+        chatgpt_dir,
+    );
+
+    const chatgpt_auth = try chatgptAuthPath(alloc, "/tmp/fake-home");
+    defer alloc.free(chatgpt_auth);
+    try std.testing.expectEqualStrings(
+        "/tmp/fake-home/.fx/providers/chatgpt/auth.json",
+        chatgpt_auth,
     );
 }

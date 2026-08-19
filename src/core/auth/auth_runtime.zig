@@ -118,6 +118,7 @@ pub fn refreshFxLoginToken(
 
 pub const AcquisitionAction = enum {
     login,
+    chatgpt,
     setup,
     openai_compatible,
     change_team,
@@ -348,7 +349,7 @@ pub const PickerView = struct {
 
     pub fn choiceCount(self: PickerView) usize {
         return switch (self.stage) {
-            .root => if (self.include_skip) 3 else 5,
+            .root => if (self.include_skip) 4 else 6,
             .sign_in, .api_key, .openai_url, .openai_key => 0,
             .change_team => blk: {
                 var count: usize = 0;
@@ -366,16 +367,18 @@ pub const PickerView = struct {
             .root => if (self.include_skip)
                 switch (index) {
                     0 => .{ .action = .login },
-                    1 => .{ .action = .setup },
-                    2 => .{ .action = .openai_compatible },
+                    1 => .{ .action = .chatgpt },
+                    2 => .{ .action = .setup },
+                    3 => .{ .action = .openai_compatible },
                     else => null,
                 }
             else switch (index) {
                 0 => .{ .action = .login },
-                1 => .{ .action = .setup },
-                2 => .{ .action = .openai_compatible },
-                3 => .{ .action = .change_team },
-                4 => .{ .action = .switch_credential },
+                1 => .{ .action = .chatgpt },
+                2 => .{ .action = .setup },
+                3 => .{ .action = .openai_compatible },
+                4 => .{ .action = .change_team },
+                5 => .{ .action = .switch_credential },
                 else => null,
             },
             .sign_in, .api_key, .openai_url, .openai_key => null,
@@ -416,6 +419,7 @@ pub const PickerView = struct {
             .source => |source| credentials.sourceLabel(source),
             .action => |action| switch (action) {
                 .login => "Sign in with Vercel",
+                .chatgpt => "Sign in with ChatGPT",
                 .setup => if (self.include_skip) "Add an API key" else "API key",
                 .openai_compatible => if (self.include_skip)
                     "OpenAI-compatible URL and key"
@@ -433,7 +437,7 @@ pub const PickerView = struct {
         return switch (choice) {
             .source => |source| if (self.active_source == source) "current" else "available",
             .action => |action| switch (action) {
-                .login, .setup, .openai_compatible, .switch_credential => "",
+                .login, .chatgpt, .setup, .openai_compatible, .switch_credential => "",
                 .automatic => "use normal precedence",
                 .change_team => if (self.fx_login_session_available) "choose a team" else "sign in first",
             },
@@ -1130,7 +1134,7 @@ pub const Runtime = struct {
                     .setup, .openai_compatible => {},
                     // Only reachable from the switch screen, never the root.
                     .automatic => unreachable,
-                    .login => self.closePicker(alloc),
+                    .login, .chatgpt => self.closePicker(alloc),
                 },
                 .team => unreachable,
             },
@@ -2046,16 +2050,18 @@ test "auth picker root starts on sign in and keeps sources in the switch stage" 
     const picker = runtime.pickerView();
     try std.testing.expect(picker.active);
     try std.testing.expect((Choice{ .action = .login }).eql(picker.selected_choice.?));
-    try std.testing.expectEqual(@as(usize, 5), picker.choiceCount());
-    try std.testing.expect(picker.choiceAt(5) == null);
+    try std.testing.expectEqual(@as(usize, 6), picker.choiceCount());
+    try std.testing.expect(picker.choiceAt(6) == null);
 }
 
-test "auth picker navigation wraps across the five hub actions" {
+test "auth picker navigation wraps across the hub actions" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     runtime.source_inventory = SourceSet.initMany(&.{ .ai_gateway_api_key, .fx_login });
     runtime.openPicker(alloc);
 
+    try std.testing.expect(runtime.movePicker(1));
+    try std.testing.expect((Choice{ .action = .chatgpt }).eql(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
     try std.testing.expect((Choice{ .action = .setup }).eql(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
@@ -2091,7 +2097,7 @@ test "auth picker without credentials exposes acquisition actions" {
     try std.testing.expect(picker.active_source == null);
     try std.testing.expect((Choice{ .action = .login }).eql(picker.selected_choice.?));
     try std.testing.expectEqual(@as(usize, 0), picker.available_sources.count());
-    try std.testing.expectEqual(@as(usize, 5), picker.choiceCount());
+    try std.testing.expectEqual(@as(usize, 6), picker.choiceCount());
     try std.testing.expect(!picker.choiceEnabled(.{ .action = .change_team }));
     try std.testing.expectEqualStrings("missing", picker.activeSourceLabel());
 }
@@ -2103,13 +2109,15 @@ test "auth onboarding picker exposes vercel and openai-compatible setup paths" {
 
     const picker = runtime.pickerView();
     try std.testing.expect(picker.include_skip);
-    try std.testing.expectEqual(@as(usize, 3), picker.choiceCount());
+    try std.testing.expectEqual(@as(usize, 4), picker.choiceCount());
     try std.testing.expect((Choice{ .action = .login }).eql(picker.choiceAt(0).?));
-    try std.testing.expect((Choice{ .action = .setup }).eql(picker.choiceAt(1).?));
-    try std.testing.expect((Choice{ .action = .openai_compatible }).eql(picker.choiceAt(2).?));
-    try std.testing.expectEqualStrings("Add an API key", picker.choiceLabel(picker.choiceAt(1).?));
-    try std.testing.expectEqualStrings("OpenAI-compatible URL and key", picker.choiceLabel(picker.choiceAt(2).?));
-    try std.testing.expect(picker.choiceAt(3) == null);
+    try std.testing.expect((Choice{ .action = .chatgpt }).eql(picker.choiceAt(1).?));
+    try std.testing.expect((Choice{ .action = .setup }).eql(picker.choiceAt(2).?));
+    try std.testing.expect((Choice{ .action = .openai_compatible }).eql(picker.choiceAt(3).?));
+    try std.testing.expectEqualStrings("Sign in with ChatGPT", picker.choiceLabel(picker.choiceAt(1).?));
+    try std.testing.expectEqualStrings("Add an API key", picker.choiceLabel(picker.choiceAt(2).?));
+    try std.testing.expectEqualStrings("OpenAI-compatible URL and key", picker.choiceLabel(picker.choiceAt(3).?));
+    try std.testing.expect(picker.choiceAt(4) == null);
 }
 
 test "clearing a remembered choice re-resolves even when no login was active" {

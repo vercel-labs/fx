@@ -25,6 +25,8 @@ const oauth_transport = @import("../auth/oauth_transport.zig");
 const secret = @import("../auth/secret.zig");
 const providers_config = @import("../providers/config.zig");
 const openai_secret = @import("../providers/openai_secret.zig");
+const chatgpt_auth = @import("../providers/chatgpt_auth.zig");
+const model_backend = @import("../providers/model_backend.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
@@ -711,50 +713,98 @@ fn runNonInteractiveWithDeps(
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
-            if (rest.len != 0) {
-                try writeStderr(deps, "usage: fx login\n");
-                return .handled_failure;
-            }
-            login_flow.runLogin(
-                alloc,
-                cfg.gateway_provider.oauth_transport,
-                cfg.url_opener,
-            ) catch |err| {
-                const message = switch (err) {
-                    error.ClientIdMissing => "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first\n",
-                    error.AccessDenied => "fx login: authorization denied\n",
-                    error.ExpiredToken, error.LoginTimedOut => "fx login: authorization expired; run fx login again\n",
-                    else => "fx login: failed to sign in\n",
-                };
-                try writeStderr(deps, message);
+            const target = parseLoginTargetArgs(rest) catch {
+                try writeStderr(deps, "usage: fx login [vercel|chatgpt]\n");
                 return .handled_failure;
             };
-            return .handled_success;
-        },
-        .logout => |rest| {
-            if (rest.len != 0) {
-                try writeStderr(deps, "usage: fx logout\n");
-                return .handled_failure;
-            }
-            const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
-                error.SessionDeleteFailed => {
-                    try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
+            switch (target) {
+                .vercel => {
+                    login_flow.runLogin(
+                        alloc,
+                        cfg.gateway_provider.oauth_transport,
+                        cfg.url_opener,
+                    ) catch |err| {
+                        const message = switch (err) {
+                            error.ClientIdMissing => "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first\n",
+                            error.AccessDenied => "fx login: authorization denied\n",
+                            error.ExpiredToken, error.LoginTimedOut => "fx login: authorization expired; run fx login again\n",
+                            else => "fx login: failed to sign in\n",
+                        };
+                        try writeStderr(deps, message);
+                        return .handled_failure;
+                    };
+                    return .handled_success;
+                },
+                .chatgpt => {
+                    chatgpt_auth.runLogin(alloc, .{
+                        .url_opener = cfg.url_opener,
+                    }) catch |err| {
+                        const message = switch (err) {
+                            error.AccessDenied => "fx login chatgpt: authorization denied\n",
+                            error.Cancelled => "fx login chatgpt: authorization cancelled\n",
+                            error.LoopbackUnavailable => "fx login chatgpt: could not bind the local callback port\n",
+                            error.InteractiveAuthorizationUnsupported => "fx login chatgpt: interactive ChatGPT login is unavailable in this runtime\n",
+                            else => "fx login chatgpt: failed to sign in\n",
+                        };
+                        try writeStderr(deps, message);
+                        return .handled_failure;
+                    };
+                    try persistProvider(alloc, deps, .chatgpt);
+                    return .handled_success;
+                },
+                .grok, .cursor => {
+                    try writeStderr(deps, "fx login: that subscription backend is not implemented yet\n");
                     return .handled_failure;
                 },
+            }
+        },
+        .logout => |rest| {
+            const target = parseLoginTargetArgs(rest) catch {
+                try writeStderr(deps, "usage: fx logout [vercel|chatgpt]\n");
+                return .handled_failure;
             };
-            if (result.local_durability_failed) {
-                try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
-            } else {
-                try writeStdout(
-                    deps,
-                    if (result.session_deleted) "Signed out of fx.\n" else "No fx login session found.\n",
-                );
+            switch (target) {
+                .vercel => {
+                    const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
+                        error.SessionDeleteFailed => {
+                            try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
+                            return .handled_failure;
+                        },
+                    };
+                    if (result.local_durability_failed) {
+                        try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
+                    } else {
+                        try writeStdout(
+                            deps,
+                            if (result.session_deleted) "Signed out of fx.\n" else "No fx login session found.\n",
+                        );
+                    }
+                    if (result.remote_revocation_failed) {
+                        try writeStderr(deps, login_flow.remote_revocation_warning);
+                        try writeStderr(deps, "\n");
+                    }
+                    return if (result.local_durability_failed) .handled_failure else .handled_success;
+                },
+                .chatgpt => {
+                    const result = chatgpt_auth.logout(alloc) catch {
+                        try writeStderr(deps, "fx logout chatgpt: failed to durably remove the ChatGPT session\n");
+                        return .handled_failure;
+                    };
+                    if (result.local_durability_failed) {
+                        try writeStderr(deps, "fx logout chatgpt: failed to durably remove the ChatGPT session\n");
+                        return .handled_failure;
+                    }
+                    try writeStdout(
+                        deps,
+                        if (result.session_deleted) "Signed out of ChatGPT.\n" else "No ChatGPT session found.\n",
+                    );
+                    return .handled_success;
+                },
+                .grok, .cursor => {
+                    try writeStderr(deps, "fx logout: that subscription backend is not implemented yet\n");
+                    return .handled_failure;
+                },
             }
-            if (result.remote_revocation_failed) {
-                try writeStderr(deps, login_flow.remote_revocation_warning);
-                try writeStderr(deps, "\n");
-            }
-            return if (result.local_durability_failed) .handled_failure else .handled_success;
         },
         .teams => |rest| {
             if (rest.len != 0) {
@@ -778,6 +828,23 @@ fn runNonInteractiveWithDeps(
         .setup => |rest| {
             if (rest.len == 1 and std.mem.eql(u8, rest[0], "openai-compatible")) {
                 return if (try runOpenaiCompatibleSetup(alloc, deps)) .handled_success else .handled_failure;
+            }
+            if (rest.len == 1 and std.mem.eql(u8, rest[0], "chatgpt")) {
+                chatgpt_auth.runLogin(alloc, .{
+                    .url_opener = cfg.url_opener,
+                }) catch |err| {
+                    const message = switch (err) {
+                        error.AccessDenied => "fx setup chatgpt: authorization denied\n",
+                        error.Cancelled => "fx setup chatgpt: authorization cancelled\n",
+                        error.LoopbackUnavailable => "fx setup chatgpt: could not bind the local callback port\n",
+                        error.InteractiveAuthorizationUnsupported => "fx setup chatgpt: interactive ChatGPT login is unavailable in this runtime\n",
+                        else => "fx setup chatgpt: failed to sign in\n",
+                    };
+                    try writeStderr(deps, message);
+                    return .handled_failure;
+                };
+                try persistProvider(alloc, deps, .chatgpt);
+                return .handled_success;
             }
             if (rest.len != 0) {
                 try writeTopLevelUsage(cfg.command_catalog, deps, .setup);
@@ -1455,6 +1522,22 @@ fn runGithubWorkflow(
     try writeStdout(deps, published.text);
     try writeStdout(deps, "\n");
     return .handled_success;
+}
+
+fn parseLoginTargetArgs(rest: []const [:0]const u8) !model_backend.LoginTarget {
+    if (rest.len == 0) return .vercel;
+    if (rest.len != 1) return error.InvalidLoginTarget;
+    return model_backend.parseLoginTarget(rest[0]) orelse error.InvalidLoginTarget;
+}
+
+fn persistProvider(alloc: Allocator, deps: RunDeps, backend: model_backend.ModelBackend) !void {
+    var outcome = config_runtime.attemptUserPreferences(alloc, .{ .provider = backend });
+    defer outcome.deinit(alloc);
+    providers_config.invalidateRemembered();
+    switch (outcome) {
+        .failure => try writeStderr(deps, "Signed in, but fx could not persist the provider in ~/.fx/settings.json.\n"),
+        .outcome => {},
+    }
 }
 
 fn writeStdout(deps: RunDeps, text: []const u8) !void {
@@ -3247,6 +3330,14 @@ test "parse recognizes every top-level command and preserves unknown commands" {
     }
     switch (parse(command_catalog, &.{ @constCast("setup"), @constCast("openai-compatible") })) {
         .setup => |rest| try std.testing.expectEqualStrings("openai-compatible", rest[0]),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(command_catalog, &.{ @constCast("login"), @constCast("chatgpt") })) {
+        .login => |rest| try std.testing.expectEqualStrings("chatgpt", rest[0]),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(command_catalog, &.{@constCast("login")})) {
+        .login => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{ @constCast("status"), @constCast("--json") })) {

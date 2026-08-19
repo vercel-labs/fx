@@ -49,6 +49,7 @@ const builtin_context = @import("builtins/context.zig");
 const builtin_devbox = @import("builtins/devbox.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const openai_compatible_provider = @import("builtins/providers/openai_compatible.zig");
+const chatgpt_provider = @import("builtins/providers/chatgpt.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const providers_compose = @import("core/providers/compose.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
@@ -95,6 +96,7 @@ const compiled_update_channel = update_target.Channel.parse(build_options.update
 const composed_backend_context = providers_compose.Context{
     .vercel = builtin_gateway.provider,
     .openai_compatible = openai_compatible_provider.provider,
+    .chatgpt = chatgpt_provider.provider,
 };
 const composed_gateway_provider = providers_compose.provider(&composed_backend_context);
 const background_runtime = @import("core/background/background_runtime.zig");
@@ -916,12 +918,12 @@ const App = struct {
         try AuthAppRuntime.openSetupHub(self);
     }
 
-    pub fn runLoginCommand(self: *App) !void {
-        try AuthAppRuntime.runLoginCommand(self);
+    pub fn runLoginCommand(self: *App, rest: []const u8) !void {
+        try AuthAppRuntime.runLoginCommand(self, rest);
     }
 
-    pub fn runLogoutCommand(self: *App) !void {
-        try AuthAppRuntime.runLogoutCommand(self);
+    pub fn runLogoutCommand(self: *App, rest: []const u8) !void {
+        try AuthAppRuntime.runLogoutCommand(self, rest);
     }
 
     pub fn applyAuthPickerChoice(self: *App, choice: auth_runtime.Choice) !void {
@@ -3895,6 +3897,7 @@ test {
     _ = @import("ui/ask_presentation.zig");
     _ = @import("ui/footer/approval_ui.zig");
     _ = @import("ui/footer/surface_invalidation.zig");
+    _ = @import("ui/footer/picker_presentation.zig");
     _ = @import("ui/full_transcript_screen.zig");
     _ = @import("ui/render_engine/frame_fixed_point.zig");
     _ = @import("ui/transcript/runtime.zig");
@@ -3902,4 +3905,16 @@ test {
     _ = @import("core/agent/worker_runtime.zig");
     _ = @import("gateway/client.zig");
     _ = @import("gateway/host_stream_provider.zig");
+    _ = @import("gateway/openai_compatible.zig");
+    _ = @import("gateway/openai_responses.zig");
+    _ = @import("core/auth/pkce.zig");
+    _ = @import("core/auth/pkce_loopback.zig");
+    _ = @import("core/providers/model_backend.zig");
+    _ = @import("core/providers/config.zig");
+    _ = @import("core/providers/catalog.zig");
+    _ = @import("core/providers/session_store.zig");
+    _ = @import("core/providers/chatgpt_auth.zig");
+    _ = @import("core/providers/chatgpt_catalog.zig");
+    _ = @import("builtins/providers/openai_compatible.zig");
+    _ = @import("builtins/providers/chatgpt.zig");
 }

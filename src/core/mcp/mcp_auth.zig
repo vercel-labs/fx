@@ -4,6 +4,8 @@ const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const operation_control = @import("operation_control.zig");
+const pkce = @import("../auth/pkce.zig");
+const pkce_loopback = @import("../auth/pkce_loopback.zig");
 const secret = @import("../auth/secret.zig");
 
 const Allocator = std.mem.Allocator;
@@ -12,7 +14,6 @@ pub const max_document_bytes: usize = 256 * 1024;
 pub const expiry_skew_ms: i64 = 60 * 1000;
 pub const max_scope_reauthorizations: u8 = 2;
 const request_timeout_seconds: i64 = 30;
-const callback_io_timeout_seconds: i64 = 30;
 const max_scope_tokens: usize = 64;
 const max_scope_token_bytes: usize = 256;
 
@@ -696,13 +697,7 @@ pub fn generatePkce(
     challenge_buf: *[43]u8,
     random: std.Random,
 ) struct { verifier: []const u8, challenge: []const u8 } {
-    var entropy: [48]u8 = undefined;
-    random.bytes(&entropy);
-    const verifier = std.base64.url_safe_no_pad.Encoder.encode(verifier_buf, &entropy);
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(verifier, &digest, .{});
-    const challenge = std.base64.url_safe_no_pad.Encoder.encode(challenge_buf, &digest);
-    return .{ .verifier = verifier, .challenge = challenge };
+    return pkce.generateFromRandom(verifier_buf, challenge_buf, random);
 }
 
 pub fn bearerHeaderAlloc(alloc: Allocator, access_token: []const u8) ![]u8 {
@@ -1041,27 +1036,13 @@ fn authorizeWithRedirect(
     );
     defer if (scope) |value| alloc.free(value);
 
-    var verifier_entropy: [48]u8 = undefined;
-    try io_mod.getIo().randomSecure(&verifier_entropy);
-    var verifier_buf: [64]u8 = undefined;
-    const verifier = std.base64.url_safe_no_pad.Encoder.encode(
-        &verifier_buf,
-        &verifier_entropy,
-    );
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(verifier, &digest, .{});
-    var challenge_buf: [43]u8 = undefined;
-    const code_challenge = std.base64.url_safe_no_pad.Encoder.encode(
-        &challenge_buf,
-        &digest,
-    );
-    var state_entropy: [32]u8 = undefined;
-    try io_mod.getIo().randomSecure(&state_entropy);
-    var state_buf: [43]u8 = undefined;
-    const state = std.base64.url_safe_no_pad.Encoder.encode(
-        &state_buf,
-        &state_entropy,
-    );
+    var verifier_buf: [pkce.verifier_max_bytes]u8 = undefined;
+    var challenge_buf: [pkce.challenge_bytes]u8 = undefined;
+    const pair = try pkce.generate(&verifier_buf, &challenge_buf);
+    const verifier = pair.verifier;
+    const code_challenge = pair.challenge;
+    var state_buf: [pkce.state_bytes]u8 = undefined;
+    const state = try pkce.generateState(&state_buf);
 
     const authorization_url = try buildAuthorizationUrl(
         alloc,
@@ -1221,47 +1202,27 @@ fn requestInteractiveAuthorization(
     if (!try ctx.open_url(ctx.open_ctx, alloc, authorization_url)) {
         return error.McpAuthorizationBrowserOpenFailed;
     }
-    try waitForInteractiveCallback(ctx.listener, ctx.lifecycle_cancel_flag);
-
-    var stream = try ctx.listener.accept(io_mod.getIo());
-    defer stream.close(io_mod.getIo());
-    setSocketTimeouts(stream.socket.handle, callback_io_timeout_seconds);
-    var socket_buffer: [4096]u8 = undefined;
-    var reader = stream.reader(io_mod.getIo(), &socket_buffer);
-    var request_bytes: [16 * 1024]u8 = undefined;
-    var request_len: usize = 0;
-    while (request_len < request_bytes.len) {
-        request_bytes[request_len] = reader.interface.takeByte() catch |err| switch (err) {
-            error.EndOfStream => return error.InvalidAuthorizationCallback,
-            else => return err,
-        };
-        request_len += 1;
-        if (std.mem.endsWith(u8, request_bytes[0..request_len], "\r\n\r\n")) break;
-    }
-    if (request_len == request_bytes.len) return error.AuthorizationCallbackTooLarge;
-    const line_end = std.mem.indexOf(u8, request_bytes[0..request_len], "\r\n") orelse
-        return error.InvalidAuthorizationCallback;
-    const request_line = request_bytes[0..line_end];
-    if (!std.mem.startsWith(u8, request_line, "GET ")) {
-        return error.InvalidAuthorizationCallback;
-    }
-    const target_end = std.mem.indexOfScalarPos(u8, request_line, 4, ' ') orelse
-        return error.InvalidAuthorizationCallback;
-    const target = request_line[4..target_end];
-    if (!std.mem.startsWith(u8, target, "/callback?")) {
-        return error.InvalidAuthorizationCallback;
-    }
-    var writer_buffer: [1024]u8 = undefined;
-    var writer = stream.writer(io_mod.getIo(), &writer_buffer);
-    try writer.interface.writeAll(
-        "HTTP/1.1 200 OK\r\n" ++
-            "Content-Type: text/plain; charset=utf-8\r\n" ++
-            "Content-Length: 49\r\n" ++
-            "Connection: close\r\n\r\n" ++
-            "Authorization received. You can return to fx now.",
-    );
-    try writer.interface.flush();
-    return parseAuthorizationRedirect(alloc, target);
+    var callback = pkce_loopback.acceptCallback(
+        alloc,
+        ctx.listener,
+        "/callback",
+        ctx.lifecycle_cancel_flag,
+    ) catch |err| switch (err) {
+        error.AuthorizationCallbackTimedOut => return error.McpAuthorizationCallbackTimedOut,
+        else => return err,
+    };
+    defer callback.deinit(alloc);
+    if (callback.error_code != null) return error.AccessDenied;
+    const owned_code = try alloc.dupe(u8, callback.code);
+    errdefer secret.zeroAndFree(alloc, owned_code);
+    const owned_state = try alloc.dupe(u8, callback.state);
+    errdefer secret.zeroAndFree(alloc, owned_state);
+    const owned_issuer = if (callback.issuer) |value| try alloc.dupe(u8, value) else null;
+    return .{
+        .code = owned_code,
+        .state = owned_state,
+        .issuer = owned_issuer,
+    };
 }
 
 fn validateRedirectTarget(location: []const u8, redirect_uri: []const u8) !void {

@@ -170,11 +170,13 @@ fn onboardingProjectedRowIndex(view: auth_runtime.PickerView, row_index: u16, ro
     const selected_row: u16 = switch (view.selectedIndex()) {
         0 => 8,
         1 => 9,
-        else => 10,
+        2 => 10,
+        else => 11,
     };
     const other_row: u16 = if (selected_row == 8) 9 else 8;
     const third_row: u16 = if (selected_row == 10) 9 else 10;
-    const priority = [_]u16{ selected_row, other_row, 14, third_row, 7, 11, 5, 0, 2, 3, 6, 12, 13, 1, 4, 15, 16 };
+    const fourth_row: u16 = if (selected_row == 11) 10 else 11;
+    const priority = [_]u16{ selected_row, other_row, 14, third_row, fourth_row, 7, 12, 5, 0, 2, 3, 6, 13, 1, 4, 15, 16 };
 
     var projected_index: u16 = 0;
     for (0..17) |source_row| {
@@ -204,6 +206,7 @@ fn composeOnboardingPickerRow(
         8 => 0,
         9 => 1,
         10 => 2,
+        11 => 3,
         else => null,
     };
     if (maybe_choice_index) |choice_index| {
@@ -231,9 +234,7 @@ fn composeOnboardingPickerRow(
         5 => "   You can change this anytime with /setup.",
         6 => "",
         7 => "   Get started",
-        10 => "",
-        11 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
-        12 => "",
+        12 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
         13 => "",
         14 => "   Esc to set up later · Explore all commands with /help",
         15, 16 => "",
@@ -1618,6 +1619,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
     try std.testing.expect(std.mem.find(u8, screen.items, "⚠︎ Note: fx is experimental and defaults to auto mode. \x1b]8;id=fx-onboarding;https://fx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Learn more: https://") == null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Vercel") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with ChatGPT") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Add an API key") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "OpenAI-compatible URL and key") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Esc to set up later · Explore all commands with /help") != null);
@@ -1634,15 +1636,19 @@ test "auth onboarding composes the welcome copy and setup choices" {
     defer selected_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, selected_row.items, "› Sign in with Vercel") != null);
 
-    var unselected_row = try composeAuthPickerRow(alloc, view, 9, authPickerRowCount(view), 100);
+    var chatgpt_row = try composeAuthPickerRow(alloc, view, 9, authPickerRowCount(view), 100);
+    defer chatgpt_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, chatgpt_row.items, "Sign in with ChatGPT") != null);
+
+    var unselected_row = try composeAuthPickerRow(alloc, view, 10, authPickerRowCount(view), 100);
     defer unselected_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, unselected_row.items, "Add an API key") != null);
 
-    var openai_row = try composeAuthPickerRow(alloc, view, 10, authPickerRowCount(view), 100);
+    var openai_row = try composeAuthPickerRow(alloc, view, 11, authPickerRowCount(view), 100);
     defer openai_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, openai_row.items, "OpenAI-compatible URL and key") != null);
 
-    var narrow_note = try composeAuthPickerRow(alloc, view, 11, authPickerRowCount(view), 58);
+    var narrow_note = try composeAuthPickerRow(alloc, view, 12, authPickerRowCount(view), 58);
     defer narrow_note.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, narrow_note.items, "https://fx.sh/docs/stability") == null);
 
@@ -1655,7 +1661,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
         try compact_screen.append(alloc, '\n');
     }
     try std.testing.expect(std.mem.find(u8, compact_screen.items, "Sign in with Vercel") != null);
-    try std.testing.expect(std.mem.find(u8, compact_screen.items, "Add an API key") != null);
+    try std.testing.expect(std.mem.find(u8, compact_screen.items, "Sign in with ChatGPT") != null);
     try std.testing.expect(std.mem.find(u8, compact_screen.items, "Esc to set up later") != null);
 }
 
@@ -1669,7 +1675,7 @@ test "auth picker composes only detected credential sources" {
         .include_skip = false,
     };
     const row_count = authPickerRowCount(view);
-    try std.testing.expectEqual(@as(u16, 6), row_count);
+    try std.testing.expectEqual(@as(u16, 7), row_count);
 
     var header = try composeAuthPickerRow(alloc, view, 0, row_count, 80);
     defer header.deinit(alloc);
@@ -1679,20 +1685,24 @@ test "auth picker composes only detected credential sources" {
     defer sign_in.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, sign_in.items, "Sign in with Vercel") != null);
 
-    var setup = try composeAuthPickerRow(alloc, view, 2, row_count, 80);
+    var chatgpt = try composeAuthPickerRow(alloc, view, 2, row_count, 80);
+    defer chatgpt.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, chatgpt.items, "Sign in with ChatGPT") != null);
+
+    var setup = try composeAuthPickerRow(alloc, view, 3, row_count, 80);
     defer setup.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, setup.items, "API key") != null);
 
-    var openai_compatible = try composeAuthPickerRow(alloc, view, 3, row_count, 80);
+    var openai_compatible = try composeAuthPickerRow(alloc, view, 4, row_count, 80);
     defer openai_compatible.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, openai_compatible.items, "OpenAI-compatible") != null);
 
-    var change_team = try composeAuthPickerRow(alloc, view, 4, row_count, 80);
+    var change_team = try composeAuthPickerRow(alloc, view, 5, row_count, 80);
     defer change_team.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, change_team.items, "Change team") != null);
     try std.testing.expect(std.mem.find(u8, change_team.items, "sign in first") != null);
 
-    var switch_credential = try composeAuthPickerRow(alloc, view, 5, row_count, 80);
+    var switch_credential = try composeAuthPickerRow(alloc, view, 6, row_count, 80);
     defer switch_credential.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, switch_credential.items, "Switch credential") != null);
 }

@@ -3875,7 +3875,7 @@ test "app_input_runtime routes auth picker navigation before composer history" {
 
     try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .down, 1);
 
-    try std.testing.expect((auth_runtime.Choice{ .action = .setup }).eql(app.auth.pickerView().selected_choice.?));
+    try std.testing.expect((auth_runtime.Choice{ .action = .chatgpt }).eql(app.auth.pickerView().selected_choice.?));
     try std.testing.expectEqual(@as(?usize, null), app.input_runtime.composer_history.activeIndex());
 }
 
@@ -3888,7 +3888,7 @@ test "app_input_runtime Tab cycles the active auth picker" {
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
 
-    try std.testing.expect((auth_runtime.Choice{ .action = .setup }).eql(app.auth.pickerView().selected_choice.?));
+    try std.testing.expect((auth_runtime.Choice{ .action = .chatgpt }).eql(app.auth.pickerView().selected_choice.?));
 }
 
 test "app_input_runtime Tab leaves a dismissed slash query unchanged" {

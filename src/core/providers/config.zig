@@ -4,6 +4,7 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const secret = @import("../auth/secret.zig");
 const model_backend = @import("model_backend.zig");
 const openai_secret = @import("openai_secret.zig");
+const chatgpt_auth = @import("chatgpt_auth.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -19,6 +20,8 @@ pub const missing_openai_credential_message =
 pub const missing_openai_interactive_credential_message =
     "Fx needs an OpenAI-compatible API key. Run /setup to add a URL and key, or set FX_OPENAI_BASE_URL and FX_OPENAI_API_KEY.";
 pub const unimplemented_backend_message = "that model backend is not implemented yet";
+pub const missing_chatgpt_credential_message = chatgpt_auth.missing_session_message;
+pub const missing_chatgpt_interactive_credential_message = chatgpt_auth.missing_interactive_session_message;
 
 pub const OpenAiCompatibleSettings = struct {
     base_url: ?[]const u8 = null,
@@ -63,6 +66,10 @@ pub const Resolved = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return null,
         };
+    }
+
+    pub fn hasChatgptSession(self: Resolved) bool {
+        return self.kind == .chatgpt and chatgpt_auth.hasSession();
     }
 
     pub fn hasApiKey(self: Resolved) bool {

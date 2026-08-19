@@ -39,13 +39,21 @@ Or add an AI Gateway API key:
 fx setup
 ```
 
+To use a ChatGPT subscription instead of Vercel AI Gateway:
+
+```bash
+fx login chatgpt
+```
+
+That stores the session under `~/.fx/providers/chatgpt/` and is billed to ChatGPT, not Vercel. Interactive `/login chatgpt` and the `/setup` ChatGPT option run the same flow. Bare `fx login` and `/login` stay Vercel.
+
 fx talks to Vercel AI Gateway by default. To use an OpenAI-compatible Chat Completions server instead, save a base URL and API key:
 
 ```bash
 fx setup openai-compatible
 ```
 
-Or set `FX_PROVIDER=openai_compatible`, `FX_OPENAI_BASE_URL`, and `FX_OPENAI_API_KEY`. Those values are profile-owned (`~/.fx/settings.json`) and are ignored from project `.fx.json`.
+Or set `FX_PROVIDER=openai_compatible`, `FX_OPENAI_BASE_URL`, and `FX_OPENAI_API_KEY`. Those values are profile-owned (`~/.fx/settings.json`) and are ignored from project `.fx.json`. Set `FX_PROVIDER=chatgpt` after `fx login chatgpt` if you need to reselect that backend.
 
 Run fx from a project:
 

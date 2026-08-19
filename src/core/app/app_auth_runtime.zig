@@ -11,6 +11,8 @@ const secret = @import("../auth/secret.zig");
 const types = @import("../shared/types.zig");
 const providers_config = @import("../providers/config.zig");
 const openai_secret = @import("../providers/openai_secret.zig");
+const chatgpt_auth = @import("../providers/chatgpt_auth.zig");
+const model_backend = @import("../providers/model_backend.zig");
 
 fn oauthAuthEnabled(comptime App: type) bool {
     return runtime_profile.allows(App, .native_auth) or
@@ -23,6 +25,20 @@ pub fn Runtime(comptime App: type) type {
             const backend = providers_config.resolveActive().kind;
             if (backend == .openai_compatible) {
                 if (providers_config.resolveActive().hasApiKey()) return true;
+                if (!app.auth.pickerView().active) {
+                    try app.auth.refreshSourceInventory(app.alloc);
+                    app.auth.openPicker(app.alloc);
+                }
+                app.shell.render_requests.request(.footer);
+                return false;
+            }
+            if (backend == .chatgpt) {
+                if (providers_config.resolveActive().hasChatgptSession()) return true;
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = chatgpt_auth.missing_interactive_session_message,
+                }, true);
                 if (!app.auth.pickerView().active) {
                     try app.auth.refreshSourceInventory(app.alloc);
                     app.auth.openPicker(app.alloc);
@@ -47,7 +63,7 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
-        pub fn runLoginCommand(app: *App) !void {
+        pub fn runLoginCommand(app: *App, rest: []const u8) !void {
             if (comptime !oauthAuthEnabled(App)) {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -56,10 +72,26 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
-            try beginSignIn(app, false);
+            const target = model_backend.parseLoginTarget(rest) orelse {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = "usage: /login [vercel|chatgpt]",
+                });
+                return;
+            };
+            switch (target) {
+                .vercel => try beginSignIn(app, false),
+                .chatgpt => try beginChatgptSignIn(app),
+                .grok, .cursor => try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = providers_config.unimplemented_backend_message,
+                }),
+            }
         }
 
-        pub fn runLogoutCommand(app: *App) !void {
+        pub fn runLogoutCommand(app: *App, rest: []const u8) !void {
             if (comptime !oauthAuthEnabled(App)) {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -68,18 +100,64 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
-            try app.flushBeforeBlockingExternalWork();
-            const result = login_flow.logout(app.alloc, app.auth.oauthTransport()) catch |err| switch (err) {
-                error.SessionDeleteFailed => {
-                    try writeAuthNotice(app, .{
-                        .topic = "auth",
-                        .tone = .@"error",
-                        .body = "Could not complete fx logout. The current source is unchanged.",
-                    });
-                    return;
-                },
+            const target = model_backend.parseLoginTarget(rest) orelse {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = "usage: /logout [vercel|chatgpt]",
+                });
+                return;
             };
-            try applyLogoutResult(app, result);
+            try app.flushBeforeBlockingExternalWork();
+            switch (target) {
+                .vercel => {
+                    const result = login_flow.logout(app.alloc, app.auth.oauthTransport()) catch |err| switch (err) {
+                        error.SessionDeleteFailed => {
+                            try writeAuthNotice(app, .{
+                                .topic = "auth",
+                                .tone = .@"error",
+                                .body = "Could not complete fx logout. The current source is unchanged.",
+                            });
+                            return;
+                        },
+                    };
+                    try applyLogoutResult(app, result);
+                },
+                .chatgpt => {
+                    const result = chatgpt_auth.logout(app.alloc) catch {
+                        try writeAuthNotice(app, .{
+                            .topic = "auth",
+                            .tone = .@"error",
+                            .body = "Could not complete ChatGPT logout. The current source is unchanged.",
+                        });
+                        return;
+                    };
+                    providers_config.invalidateRemembered();
+                    try writeAuthNotice(app, if (result.local_durability_failed)
+                        .{
+                            .topic = "auth",
+                            .tone = .warning,
+                            .body = "Could not confirm durable ChatGPT logout.",
+                        }
+                    else if (result.session_deleted)
+                        .{
+                            .topic = "auth",
+                            .tone = .neutral,
+                            .body = "Signed out of ChatGPT.",
+                        }
+                    else
+                        .{
+                            .topic = "auth",
+                            .tone = .neutral,
+                            .body = "No ChatGPT session found.",
+                        });
+                },
+                .grok, .cursor => try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = providers_config.unimplemented_backend_message,
+                }),
+            }
         }
 
         pub fn openSetupHub(app: *App) !void {
@@ -144,6 +222,17 @@ pub fn Runtime(comptime App: type) type {
                 .source => |source| try applySourceChoice(app, source),
                 .action => |action| switch (action) {
                     .login => try beginSignIn(app, true),
+                    .chatgpt => {
+                        if (comptime !runtime_profile.allows(App, .native_auth)) {
+                            try app.writeDomainNotice(.{
+                                .topic = "auth",
+                                .tone = .warning,
+                                .body = "ChatGPT login is unavailable in this WASM session.",
+                            }, true);
+                            return;
+                        }
+                        try beginChatgptSignIn(app);
+                    },
                     .setup => {
                         if (comptime !runtime_profile.allows(App, .native_auth)) {
                             try app.writeDomainNotice(.{
@@ -558,6 +647,26 @@ pub fn Runtime(comptime App: type) type {
             }, true);
         }
 
+        fn beginChatgptSignIn(app: *App) !void {
+            try app.flushBeforeBlockingExternalWork();
+            chatgpt_auth.runLogin(app.alloc, .{
+                .url_opener = app.urlOpener(),
+            }) catch |err| {
+                debug_trace.logf("auth", "chatgpt login failed err={s}", .{@errorName(err)});
+                try writeChatgptLoginError(app, err);
+                return;
+            };
+            var attempt = config_runtime.attemptUserPreferences(app.alloc, .{ .provider = .chatgpt });
+            defer attempt.deinit(app.alloc);
+            providers_config.invalidateRemembered();
+            app.auth.closePicker(app.alloc);
+            try writeAuthNotice(app, .{
+                .topic = "auth",
+                .tone = .neutral,
+                .body = "Signed in to ChatGPT.",
+            });
+        }
+
         fn beginSignIn(app: *App, from_root: bool) !void {
             try app.flushBeforeBlockingExternalWork();
 
@@ -684,6 +793,17 @@ pub fn Runtime(comptime App: type) type {
                 error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in was denied. The current credential is unchanged." },
                 error.ExpiredToken, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "The Vercel sign-in code expired. The current credential is unchanged; run /login to try again." },
                 else => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in failed. The current credential is unchanged." },
+            };
+            try writeAuthNotice(app, notice);
+        }
+
+        fn writeChatgptLoginError(app: *App, err: anyerror) !void {
+            const notice: types.SemanticNotice = switch (err) {
+                error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "ChatGPT sign-in was denied. The current credential is unchanged." },
+                error.Cancelled => .{ .topic = "auth", .tone = .warning, .body = "ChatGPT sign-in was cancelled." },
+                error.LoopbackUnavailable => .{ .topic = "auth", .tone = .@"error", .body = "Could not bind the local ChatGPT callback. The current credential is unchanged." },
+                error.InteractiveAuthorizationUnsupported => .{ .topic = "auth", .tone = .warning, .body = "ChatGPT login is unavailable in this runtime." },
+                else => .{ .topic = "auth", .tone = .@"error", .body = "ChatGPT sign-in failed. The current credential is unchanged." },
             };
             try writeAuthNotice(app, notice);
         }

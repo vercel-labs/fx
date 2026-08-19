@@ -25,8 +25,8 @@ pub const ModelBackend = enum {
 
     pub fn isImplemented(self: ModelBackend) bool {
         return switch (self) {
-            .vercel_gateway, .openai_compatible => true,
-            .chatgpt, .grok, .cursor => false,
+            .vercel_gateway, .openai_compatible, .chatgpt => true,
+            .grok, .cursor => false,
         };
     }
 
@@ -62,10 +62,47 @@ test "model backend round trips through its persisted name" {
 test "model backend implementation and billing flags stay conservative" {
     try std.testing.expect(ModelBackend.vercel_gateway.isImplemented());
     try std.testing.expect(ModelBackend.openai_compatible.isImplemented());
-    try std.testing.expect(!ModelBackend.chatgpt.isImplemented());
+    try std.testing.expect(ModelBackend.chatgpt.isImplemented());
     try std.testing.expect(!ModelBackend.grok.isImplemented());
     try std.testing.expect(!ModelBackend.cursor.isImplemented());
     try std.testing.expect(ModelBackend.vercel_gateway.usesGatewayBalance());
     try std.testing.expect(!ModelBackend.openai_compatible.usesGatewayBalance());
+    try std.testing.expect(!ModelBackend.chatgpt.usesGatewayBalance());
     try std.testing.expectEqualStrings("OpenAI-compatible", ModelBackend.openai_compatible.label());
+    try std.testing.expectEqualStrings("ChatGPT", ModelBackend.chatgpt.label());
+}
+
+pub const LoginTarget = enum {
+    vercel,
+    chatgpt,
+    grok,
+    cursor,
+
+    pub fn backend(self: LoginTarget) ?ModelBackend {
+        return switch (self) {
+            .vercel => .vercel_gateway,
+            .chatgpt => .chatgpt,
+            .grok => .grok,
+            .cursor => .cursor,
+        };
+    }
+};
+
+pub fn parseLoginTarget(text: []const u8) ?LoginTarget {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return .vercel;
+    if (std.mem.eql(u8, trimmed, "vercel")) return .vercel;
+    if (std.mem.eql(u8, trimmed, "chatgpt")) return .chatgpt;
+    if (std.mem.eql(u8, trimmed, "grok")) return .grok;
+    if (std.mem.eql(u8, trimmed, "cursor")) return .cursor;
+    return null;
+}
+
+test "login target parses vercel as the default and chatgpt by name" {
+    try std.testing.expectEqual(LoginTarget.vercel, parseLoginTarget(""));
+    try std.testing.expectEqual(LoginTarget.vercel, parseLoginTarget(" vercel "));
+    try std.testing.expectEqual(LoginTarget.chatgpt, parseLoginTarget("chatgpt"));
+    try std.testing.expect(parseLoginTarget("openai") == null);
+    try std.testing.expectEqual(ModelBackend.chatgpt, LoginTarget.chatgpt.backend().?);
+    try std.testing.expectEqual(ModelBackend.vercel_gateway, LoginTarget.vercel.backend().?);
 }
