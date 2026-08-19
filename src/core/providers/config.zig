@@ -5,6 +5,7 @@ const secret = @import("../auth/secret.zig");
 const model_backend = @import("model_backend.zig");
 const openai_secret = @import("openai_secret.zig");
 const chatgpt_auth = @import("chatgpt_auth.zig");
+const grok_auth = @import("grok_auth.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -22,6 +23,8 @@ pub const missing_openai_interactive_credential_message =
 pub const unimplemented_backend_message = "that model backend is not implemented yet";
 pub const missing_chatgpt_credential_message = chatgpt_auth.missing_session_message;
 pub const missing_chatgpt_interactive_credential_message = chatgpt_auth.missing_interactive_session_message;
+pub const missing_grok_credential_message = grok_auth.missing_session_message;
+pub const missing_grok_interactive_credential_message = grok_auth.missing_interactive_session_message;
 
 pub const OpenAiCompatibleSettings = struct {
     base_url: ?[]const u8 = null,
@@ -70,6 +73,10 @@ pub const Resolved = struct {
 
     pub fn hasChatgptSession(self: Resolved) bool {
         return self.kind == .chatgpt and chatgpt_auth.hasSession();
+    }
+
+    pub fn hasGrokSession(self: Resolved) bool {
+        return self.kind == .grok and grok_auth.hasSession();
     }
 
     pub fn hasApiKey(self: Resolved) bool {

@@ -12,6 +12,7 @@ const types = @import("../shared/types.zig");
 const providers_config = @import("../providers/config.zig");
 const openai_secret = @import("../providers/openai_secret.zig");
 const chatgpt_auth = @import("../providers/chatgpt_auth.zig");
+const grok_auth = @import("../providers/grok_auth.zig");
 const model_backend = @import("../providers/model_backend.zig");
 
 fn oauthAuthEnabled(comptime App: type) bool {
@@ -38,6 +39,20 @@ pub fn Runtime(comptime App: type) type {
                     .topic = "auth",
                     .tone = .@"error",
                     .body = chatgpt_auth.missing_interactive_session_message,
+                }, true);
+                if (!app.auth.pickerView().active) {
+                    try app.auth.refreshSourceInventory(app.alloc);
+                    app.auth.openPicker(app.alloc);
+                }
+                app.shell.render_requests.request(.footer);
+                return false;
+            }
+            if (backend == .grok) {
+                if (providers_config.resolveActive().hasGrokSession()) return true;
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = grok_auth.missing_interactive_session_message,
                 }, true);
                 if (!app.auth.pickerView().active) {
                     try app.auth.refreshSourceInventory(app.alloc);
@@ -76,14 +91,15 @@ pub fn Runtime(comptime App: type) type {
                 try writeAuthNotice(app, .{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "usage: /login [vercel|chatgpt]",
+                    .body = "usage: /login [vercel|chatgpt|grok]",
                 });
                 return;
             };
             switch (target) {
                 .vercel => try beginSignIn(app, false),
                 .chatgpt => try beginChatgptSignIn(app),
-                .grok, .cursor => try writeAuthNotice(app, .{
+                .grok => try beginGrokSignIn(app),
+                .cursor => try writeAuthNotice(app, .{
                     .topic = "auth",
                     .tone = .warning,
                     .body = providers_config.unimplemented_backend_message,
@@ -104,7 +120,7 @@ pub fn Runtime(comptime App: type) type {
                 try writeAuthNotice(app, .{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "usage: /logout [vercel|chatgpt]",
+                    .body = "usage: /logout [vercel|chatgpt|grok]",
                 });
                 return;
             };
@@ -152,7 +168,36 @@ pub fn Runtime(comptime App: type) type {
                             .body = "No ChatGPT session found.",
                         });
                 },
-                .grok, .cursor => try writeAuthNotice(app, .{
+                .grok => {
+                    const result = grok_auth.logout(app.alloc) catch {
+                        try writeAuthNotice(app, .{
+                            .topic = "auth",
+                            .tone = .@"error",
+                            .body = "Could not complete Grok logout. The current source is unchanged.",
+                        });
+                        return;
+                    };
+                    providers_config.invalidateRemembered();
+                    try writeAuthNotice(app, if (result.local_durability_failed)
+                        .{
+                            .topic = "auth",
+                            .tone = .warning,
+                            .body = "Could not confirm durable Grok logout.",
+                        }
+                    else if (result.session_deleted)
+                        .{
+                            .topic = "auth",
+                            .tone = .neutral,
+                            .body = "Signed out of Grok.",
+                        }
+                    else
+                        .{
+                            .topic = "auth",
+                            .tone = .neutral,
+                            .body = "No Grok session found.",
+                        });
+                },
+                .cursor => try writeAuthNotice(app, .{
                     .topic = "auth",
                     .tone = .warning,
                     .body = providers_config.unimplemented_backend_message,
@@ -232,6 +277,17 @@ pub fn Runtime(comptime App: type) type {
                             return;
                         }
                         try beginChatgptSignIn(app);
+                    },
+                    .grok => {
+                        if (comptime !runtime_profile.allows(App, .native_auth)) {
+                            try app.writeDomainNotice(.{
+                                .topic = "auth",
+                                .tone = .warning,
+                                .body = "Grok login is unavailable in this WASM session.",
+                            }, true);
+                            return;
+                        }
+                        try beginGrokSignIn(app);
                     },
                     .setup => {
                         if (comptime !runtime_profile.allows(App, .native_auth)) {
@@ -667,6 +723,26 @@ pub fn Runtime(comptime App: type) type {
             });
         }
 
+        fn beginGrokSignIn(app: *App) !void {
+            try app.flushBeforeBlockingExternalWork();
+            grok_auth.runLogin(app.alloc, .{
+                .url_opener = app.urlOpener(),
+            }) catch |err| {
+                debug_trace.logf("auth", "grok login failed err={s}", .{@errorName(err)});
+                try writeGrokLoginError(app, err);
+                return;
+            };
+            var attempt = config_runtime.attemptUserPreferences(app.alloc, .{ .provider = .grok });
+            defer attempt.deinit(app.alloc);
+            providers_config.invalidateRemembered();
+            app.auth.closePicker(app.alloc);
+            try writeAuthNotice(app, .{
+                .topic = "auth",
+                .tone = .neutral,
+                .body = "Signed in to Grok.",
+            });
+        }
+
         fn beginSignIn(app: *App, from_root: bool) !void {
             try app.flushBeforeBlockingExternalWork();
 
@@ -804,6 +880,17 @@ pub fn Runtime(comptime App: type) type {
                 error.LoopbackUnavailable => .{ .topic = "auth", .tone = .@"error", .body = "Could not bind the local ChatGPT callback. The current credential is unchanged." },
                 error.InteractiveAuthorizationUnsupported => .{ .topic = "auth", .tone = .warning, .body = "ChatGPT login is unavailable in this runtime." },
                 else => .{ .topic = "auth", .tone = .@"error", .body = "ChatGPT sign-in failed. The current credential is unchanged." },
+            };
+            try writeAuthNotice(app, notice);
+        }
+
+        fn writeGrokLoginError(app: *App, err: anyerror) !void {
+            const notice: types.SemanticNotice = switch (err) {
+                error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "Grok sign-in was denied. The current credential is unchanged." },
+                error.Cancelled => .{ .topic = "auth", .tone = .warning, .body = "Grok sign-in was cancelled." },
+                error.LoginTimedOut, error.ExpiredToken => .{ .topic = "auth", .tone = .warning, .body = "The Grok sign-in code expired. The current credential is unchanged; run /login grok to try again." },
+                error.InteractiveAuthorizationUnsupported => .{ .topic = "auth", .tone = .warning, .body = "Grok login is unavailable in this runtime." },
+                else => .{ .topic = "auth", .tone = .@"error", .body = "Grok sign-in failed. The current credential is unchanged." },
             };
             try writeAuthNotice(app, notice);
         }

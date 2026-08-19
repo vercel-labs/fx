@@ -4,6 +4,7 @@
   { "file": "ask-presentation.test.ts", "weight": 5 },
   { "file": "auth-refresh.test.ts", "weight": 2 },
   { "file": "chatgpt-login.test.ts", "weight": 4 },
+  { "file": "grok-login.test.ts", "weight": 4 },
   { "file": "ci-shards.test.ts", "weight": 15 },
   { "file": "cli.test.ts", "weight": 19 },
   { "file": "config-persistence.test.ts", "weight": 64 },

@@ -213,7 +213,7 @@ fn loadFromDir(alloc: Allocator, backend_dir: *std.Io.Dir, mode: LoadMode) !?Ses
     }) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => {
-            debug_trace.logf("chatgpt", "session load failed step=open_file err={s}", .{@errorName(err)});
+            debug_trace.logf("providers", "session load failed step=open_file err={s}", .{@errorName(err)});
             if (mode == .tolerate_open_failure) return null else return err;
         },
     };
@@ -221,7 +221,7 @@ fn loadFromDir(alloc: Allocator, backend_dir: *std.Io.Dir, mode: LoadMode) !?Ses
 
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) {
-        debug_trace.logf("chatgpt", "session load failed step=permissions err=InsecureAuthFile", .{});
+        debug_trace.logf("providers", "session load failed step=permissions err=InsecureAuthFile", .{});
         return null;
     }
 
@@ -230,7 +230,7 @@ fn loadFromDir(alloc: Allocator, backend_dir: *std.Io.Dir, mode: LoadMode) !?Ses
     return parse(alloc, bytes) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
-            debug_trace.logf("chatgpt", "session load failed step=parse err={s}", .{@errorName(err)});
+            debug_trace.logf("providers", "session load failed step=parse err={s}", .{@errorName(err)});
             return null;
         },
     };

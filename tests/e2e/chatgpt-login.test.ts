@@ -222,21 +222,14 @@ test(
         timeoutMs: 8_000,
       });
       expect(extra.code).toBe(1);
-      expect(extra.stderr).toContain("usage: fx login [vercel|chatgpt]");
+      expect(extra.stderr).toContain("usage: fx login [vercel|chatgpt|grok]");
 
       const unknown = await runFx(["login", "openai"], {
         env: { HOME: home, FX_AUTO_UPGRADE: "0" },
         timeoutMs: 8_000,
       });
       expect(unknown.code).toBe(1);
-      expect(unknown.stderr).toContain("usage: fx login [vercel|chatgpt]");
-
-      const grok = await runFx(["login", "grok"], {
-        env: { HOME: home, FX_AUTO_UPGRADE: "0" },
-        timeoutMs: 8_000,
-      });
-      expect(grok.code).toBe(1);
-      expect(grok.stderr).toContain("not implemented yet");
+      expect(unknown.stderr).toContain("usage: fx login [vercel|chatgpt|grok]");
 
       const logout = await runFx(["logout", "chatgpt"], {
         env: { HOME: home, FX_AUTO_UPGRADE: "0" },
