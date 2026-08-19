@@ -26,6 +26,7 @@ const ViewerKey = union(enum) {
     bottom,
     search,
     goto_line,
+    definition,
     next_match,
     previous_match,
     next_hunk,
@@ -79,6 +80,9 @@ pub fn Runtime(comptime App: type) type {
                             .bottom => owned_app.code_viewer.gotoBottom(),
                             .search => try owned_app.code_viewer.beginSearch(),
                             .goto_line => owned_app.code_viewer.beginGoto(),
+                            .definition => {
+                                try app_code_viewer_runtime.Runtime(App).gotoDefinition(owned_app);
+                            },
                             .next_match => owned_app.code_viewer.nextMatch(),
                             .previous_match => owned_app.code_viewer.previousMatch(),
                             .next_hunk => owned_app.code_viewer.nextHunk(),
@@ -127,6 +131,7 @@ fn keyForByte(mode: app_code_viewer_runtime.Mode, byte: u8) ?ViewerKey {
         'G' => .bottom,
         '/' => .search,
         ':' => .goto_line,
+        'd' => .definition,
         'n' => .next_match,
         'N' => .previous_match,
         ']', ctrl_n => .next_hunk,

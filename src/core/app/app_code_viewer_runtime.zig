@@ -615,6 +615,29 @@ pub fn Runtime(comptime App: type) type {
             try openPath(app, parsed.path, parsed.line);
         }
 
+        pub fn gotoDefinition(app: *App) !void {
+            if (comptime !@hasField(App, "lsp") or !@hasField(App, "code_viewer")) return;
+            if (app.lsp.clients.items.len == 0) {
+                try writeViewNotice(app, .neutral, "No language server is running. Start one with fx.lsp.start.");
+                return;
+            }
+            if (app.code_viewer.kind != .file or app.code_viewer.path.len == 0) return;
+            const line: u32 = @intCast(app.code_viewer.cursor);
+            const location = app.lsp.definition(app.code_viewer.path, line, 0) catch null;
+            const found = location orelse {
+                try writeViewNotice(app, .neutral, "No definition found.");
+                return;
+            };
+            defer found.deinit(app.alloc);
+            const protocol = @import("../lsp/protocol.zig");
+            const path = protocol.decodeUriPath(app.alloc, found.uri) catch {
+                try writeViewNotice(app, .@"error", "Definition path is invalid.");
+                return;
+            };
+            defer app.alloc.free(path);
+            try openPath(app, path, found.line + 1);
+        }
+
         pub fn openPath(app: *App, path: []const u8, line: ?u32) !void {
             if (comptime @hasField(App, "code_viewer") and @hasField(App, "terminal")) {
                 const source = readWorkspaceFile(app, path) catch |err| {
@@ -630,6 +653,10 @@ pub fn Runtime(comptime App: type) type {
                     try noticePathError(app, path, err);
                     return;
                 };
+                if (comptime @hasField(App, "lsp")) {
+                    const app_lsp_runtime = @import("app_lsp_runtime.zig");
+                    app_lsp_runtime.Runtime(App).didOpen(app, path, source);
+                }
                 try enterScreen(app);
                 return;
             }

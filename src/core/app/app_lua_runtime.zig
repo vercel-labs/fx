@@ -92,6 +92,8 @@ pub fn Runtime(comptime App: type) type {
                 .set_opt = setOpt,
                 .open_view = openView,
                 .allow_process = allowProcess,
+                .start_lsp = startLsp,
+                .stop_lsp = stopLsp,
             };
         }
 
@@ -199,6 +201,30 @@ pub fn Runtime(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(raw));
             if (comptime !@hasField(App, "permission_engine")) return false;
             return app.permission_engine.mode == .yolo;
+        }
+
+        fn startLsp(raw: *anyopaque, spec: scripting.LspStartSpec) anyerror!void {
+            const app: *App = @ptrCast(@alignCast(raw));
+            if (comptime @hasField(App, "lsp")) {
+                const app_lsp_runtime = @import("app_lsp_runtime.zig");
+                try app_lsp_runtime.Runtime(App).start(app, .{
+                    .name = spec.name,
+                    .argv = spec.argv,
+                    .root = if (spec.root.len == 0) app.workspace_root else spec.root,
+                });
+                return;
+            }
+            return error.LspUnavailable;
+        }
+
+        fn stopLsp(raw: *anyopaque, name: []const u8) anyerror!void {
+            const app: *App = @ptrCast(@alignCast(raw));
+            if (comptime @hasField(App, "lsp")) {
+                const app_lsp_runtime = @import("app_lsp_runtime.zig");
+                try app_lsp_runtime.Runtime(App).stop(app, name);
+                return;
+            }
+            return error.LspUnavailable;
         }
     };
 }

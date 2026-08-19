@@ -14,9 +14,17 @@ pub const Kind = enum { file, diff };
 
 pub const DiffLayout = enum { unified, side_by_side };
 
+pub const DiagnosticSeverity = enum { err, warning, information, hint };
+
+pub const DiagnosticMark = struct {
+    line: usize,
+    severity: DiagnosticSeverity,
+};
+
 pub const FileModel = struct {
     lines: []const []const u8,
     highlighted: []const []const u8 = &.{},
+    diagnostics: []const DiagnosticMark = &.{},
 };
 
 pub const DiffModel = struct {
@@ -180,7 +188,13 @@ fn composeFileRow(alloc: Allocator, input: PaintInput, line_index: usize, curren
     const gutter = layout.gutterWidth(input.file.lines.len);
     const match = isMatch(input.matches, line_index);
     try appendGutter(alloc, &row, line_index + 1, gutter, current, match);
-    const text_width = input.cols -| gutter;
+    const diagnostic = diagnosticForLine(input.file.diagnostics, line_index);
+    var marker_width: u16 = 0;
+    if (input.file.diagnostics.len > 0) {
+        marker_width = 2;
+        try appendDiagnosticMarker(alloc, &row, diagnostic);
+    }
+    const text_width = input.cols -| gutter -| marker_width;
     const styled = if (line_index < input.file.highlighted.len)
         input.file.highlighted[line_index]
     else
@@ -267,12 +281,21 @@ fn composeStatus(alloc: Allocator, input: PaintInput) !std.ArrayList(u8) {
     try row.appendSlice(alloc, ui_render.dim_style);
     switch (input.mode) {
         .browse => {
+            const counts = diagnosticCounts(input.file.diagnostics);
             if (input.query.len > 0) {
                 const n = if (input.matches.len == 0) 0 else input.match_index + 1;
                 const text = try std.fmt.allocPrint(
                     alloc,
                     "/{s}  {d}/{d}",
                     .{ input.query, n, input.matches.len },
+                );
+                defer alloc.free(text);
+                try row_text.appendClipped(alloc, &row, text, input.cols);
+            } else if (counts.errors > 0 or counts.warnings > 0) {
+                const text = try std.fmt.allocPrint(
+                    alloc,
+                    "{d}E  {d}W",
+                    .{ counts.errors, counts.warnings },
                 );
                 defer alloc.free(text);
                 try row_text.appendClipped(alloc, &row, text, input.cols);
@@ -299,7 +322,7 @@ fn composeHint(alloc: Allocator, input: PaintInput) !std.ArrayList(u8) {
         .browse => if (input.kind == .diff)
             "q quit  / search  : line  n/N match  [/] hunk  t layout"
         else
-            "q quit  / search  : line  n/N next  j/k scroll",
+            "q quit  / search  : line  n/N next  d def  j/k scroll",
         .search => "enter find  n/N next  esc clear",
         .goto_line => "enter jump  esc cancel",
     };
@@ -344,6 +367,54 @@ fn isMatch(matches: []const usize, line_index: usize) bool {
         if (match == line_index) return true;
     }
     return false;
+}
+
+fn diagnosticForLine(marks: []const DiagnosticMark, line_index: usize) ?DiagnosticSeverity {
+    var found: ?DiagnosticSeverity = null;
+    for (marks) |mark| {
+        if (mark.line != line_index) continue;
+        found = if (found) |current| worseSeverity(current, mark.severity) else mark.severity;
+    }
+    return found;
+}
+
+fn diagnosticCounts(marks: []const DiagnosticMark) struct { errors: usize, warnings: usize } {
+    var errors: usize = 0;
+    var warnings: usize = 0;
+    for (marks) |mark| {
+        switch (mark.severity) {
+            .err => errors += 1,
+            .warning => warnings += 1,
+            else => {},
+        }
+    }
+    return .{ .errors = errors, .warnings = warnings };
+}
+
+fn worseSeverity(left: DiagnosticSeverity, right: DiagnosticSeverity) DiagnosticSeverity {
+    return if (@intFromEnum(left) <= @intFromEnum(right)) left else right;
+}
+
+fn appendDiagnosticMarker(alloc: Allocator, row: *std.ArrayList(u8), severity: ?DiagnosticSeverity) !void {
+    const style = if (severity) |value| switch (value) {
+        .err => ui_render.diff_removed_marker_style,
+        .warning => ui_render.warning_style,
+        .information, .hint => ui_render.dim_style,
+    } else ui_render.dim_style;
+    try row.appendSlice(alloc, style);
+    if (severity) |value| {
+        const marker: u8 = switch (value) {
+            .err => 'E',
+            .warning => 'W',
+            .information => 'I',
+            .hint => 'H',
+        };
+        try row.append(alloc, marker);
+    } else {
+        try row.append(alloc, ' ');
+    }
+    try row.append(alloc, ' ');
+    try row.appendSlice(alloc, ui_render.reset_style);
 }
 
 fn maxOldLine(lines: []const diff_mod.DiffLine) u32 {
@@ -409,6 +480,41 @@ test "file viewer paints line numbers and the file path" {
     defer hint.deinit(alloc);
     try grid.rowTextTrimmed(10, &hint);
     try std.testing.expect(std.mem.find(u8, hint.items, "q quit") != null);
+}
+
+test "file viewer paints diagnostic markers and counts" {
+    const alloc = std.testing.allocator;
+    const lines = [_][]const u8{ "const x = 1;", "const y = 2;" };
+    const diagnostics = [_]DiagnosticMark{
+        .{ .line = 0, .severity = .err },
+        .{ .line = 1, .severity = .warning },
+    };
+    var screen = try paint(alloc, .{
+        .rows = 8,
+        .cols = 40,
+        .kind = .file,
+        .path = "demo.zig",
+        .cursor = 0,
+        .scroll = 0,
+        .file = .{ .lines = &lines, .diagnostics = &diagnostics },
+    });
+    defer screen.deinit(alloc);
+
+    var grid = try vt_emulator.Grid.init(alloc, 40, 8);
+    defer grid.deinit();
+    try grid.feed(screen.bytes);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(alloc);
+    try grid.rowTextTrimmed(2, &body);
+    try std.testing.expect(std.mem.find(u8, body.items, "E") != null);
+    try std.testing.expect(std.mem.find(u8, body.items, "const x") != null);
+
+    var status: std.ArrayList(u8) = .empty;
+    defer status.deinit(alloc);
+    try grid.rowTextTrimmed(7, &status);
+    try std.testing.expect(std.mem.find(u8, status.items, "1E") != null);
+    try std.testing.expect(std.mem.find(u8, status.items, "1W") != null);
 }
 
 test "diff viewer paints unified hunks and the path" {

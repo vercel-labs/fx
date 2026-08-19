@@ -23,6 +23,12 @@ pub const Notice = struct {
     body: []u8,
 };
 
+pub const LspStartSpec = struct {
+    name: []const u8,
+    argv: []const []const u8,
+    root: []const u8,
+};
+
 pub const Host = struct {
     ctx: *anyopaque = undefined,
     notify: *const fn (ctx: *anyopaque, message: []const u8, tone: types.NoticeTone) void = silentNotify,
@@ -32,6 +38,8 @@ pub const Host = struct {
     set_opt: *const fn (ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!void = rejectOpt,
     open_view: *const fn (ctx: *anyopaque, path: []const u8, line: ?u32) anyerror!void = rejectView,
     allow_process: *const fn (ctx: *anyopaque) bool = denyProcess,
+    start_lsp: *const fn (ctx: *anyopaque, spec: LspStartSpec) anyerror!void = rejectLsp,
+    stop_lsp: *const fn (ctx: *anyopaque, name: []const u8) anyerror!void = rejectLspStop,
 };
 
 const RegisteredCommand = struct {
@@ -501,6 +509,20 @@ pub const Runtime = struct {
         lua.lua_setfield(L, -2, "open");
         lua.lua_setfield(L, -2, "view");
 
+        lua.newtable(L);
+        lua.pushcfunction(L, apiLspStart);
+        lua.lua_setfield(L, -2, "start");
+        lua.pushcfunction(L, apiLspStop);
+        lua.lua_setfield(L, -2, "stop");
+        lua.lua_setfield(L, -2, "lsp");
+
+        lua.newtable(L);
+        lua.newtable(L);
+        lua.pushcfunction(L, apiWorkspaceIndex);
+        lua.lua_setfield(L, -2, "__index");
+        _ = lua.lua_setmetatable(L, -2);
+        lua.lua_setfield(L, -2, "workspace");
+
         lua.lua_setglobal(L, "fx");
     }
 
@@ -580,6 +602,12 @@ fn rejectOpt(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {
 }
 fn rejectView(_: *anyopaque, _: []const u8, _: ?u32) anyerror!void {
     return error.Unsupported;
+}
+fn rejectLsp(_: *anyopaque, _: LspStartSpec) anyerror!void {
+    return error.LspUnavailable;
+}
+fn rejectLspStop(_: *anyopaque, _: []const u8) anyerror!void {
+    return error.LspUnavailable;
 }
 
 fn sandboxedDenied(L: ?*lua.State) callconv(.c) c_int {
@@ -828,6 +856,154 @@ fn apiViewOpen(L: ?*lua.State) callconv(.c) c_int {
         return lua.raise(L, @errorName(err));
     };
     return 0;
+}
+
+fn apiWorkspaceIndex(L: ?*lua.State) callconv(.c) c_int {
+    if (comptime !enabled) return 0;
+    const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
+    const key = lua.tostring(L, 2) orelse {
+        lua.lua_pushnil(L);
+        return 1;
+    };
+    if (std.mem.eql(u8, key, "root")) {
+        lua.pushslice(L, rt.workspace_root);
+        return 1;
+    }
+    lua.lua_pushnil(L);
+    return 1;
+}
+
+fn apiLspStart(L: ?*lua.State) callconv(.c) c_int {
+    if (comptime !enabled) return 0;
+    const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
+    lua.luaL_checktype(L, 1, lua.TTABLE);
+    _ = lua.lua_getfield(L, 1, "name");
+    const name_text = lua.tostring(L, -1) orelse {
+        lua.pop(L, 1);
+        return lua.raise(L, "name required");
+    };
+    if (name_text.len == 0) {
+        lua.pop(L, 1);
+        return lua.raise(L, "name required");
+    }
+    const name = rt.alloc.dupe(u8, name_text) catch {
+        lua.pop(L, 1);
+        return lua.raise(L, "OutOfMemory");
+    };
+    lua.pop(L, 1);
+    defer rt.alloc.free(name);
+
+    var argv_store: std.ArrayList([]u8) = .empty;
+    defer {
+        for (argv_store.items) |item| rt.alloc.free(item);
+        argv_store.deinit(rt.alloc);
+    }
+    _ = lua.lua_getfield(L, 1, "cmd");
+    if (lua.isstring(L, -1)) {
+        const cmd = lua.tostring(L, -1) orelse {
+            lua.pop(L, 1);
+            return lua.raise(L, "cmd required");
+        };
+        appendArg(&argv_store, rt.alloc, cmd) catch {
+            lua.pop(L, 1);
+            rt.addNotice(.@"error", "OutOfMemory", .{}) catch {};
+            return 0;
+        };
+    } else if (lua.istable(L, -1)) {
+        var index: lua.Integer = 1;
+        while (true) : (index += 1) {
+            _ = lua.lua_rawgeti(L, -1, index);
+            if (lua.isnoneornil(L, -1)) {
+                lua.pop(L, 1);
+                break;
+            }
+            const arg = lua.tostring(L, -1) orelse {
+                lua.pop(L, 1);
+                rt.addNotice(.@"error", "cmd entries must be strings", .{}) catch {};
+                return 0;
+            };
+            appendArg(&argv_store, rt.alloc, arg) catch {
+                lua.pop(L, 1);
+                rt.addNotice(.@"error", "OutOfMemory", .{}) catch {};
+                return 0;
+            };
+            lua.pop(L, 1);
+        }
+    } else {
+        lua.pop(L, 1);
+        rt.addNotice(.@"error", "cmd required", .{}) catch {};
+        return 0;
+    }
+    lua.pop(L, 1);
+    if (argv_store.items.len == 0) {
+        rt.addNotice(.@"error", "cmd required", .{}) catch {};
+        return 0;
+    }
+
+    var root = rt.workspace_root;
+    var root_owned: ?[]u8 = null;
+    defer if (root_owned) |value| rt.alloc.free(value);
+    _ = lua.lua_getfield(L, 1, "root");
+    if (lua.tostring(L, -1)) |text| {
+        if (text.len > 0) {
+            root_owned = rt.alloc.dupe(u8, text) catch {
+                lua.pop(L, 1);
+                rt.addNotice(.@"error", "OutOfMemory", .{}) catch {};
+                return 0;
+            };
+            root = root_owned.?;
+        }
+    }
+    lua.pop(L, 1);
+
+    const argv_view = rt.alloc.alloc([]const u8, argv_store.items.len) catch {
+        rt.addNotice(.@"error", "OutOfMemory", .{}) catch {};
+        return 0;
+    };
+    defer rt.alloc.free(argv_view);
+    for (argv_store.items, 0..) |item, i| argv_view[i] = item;
+
+    rt.host.start_lsp(rt.host.ctx, .{
+        .name = name,
+        .argv = argv_view,
+        .root = root,
+    }) catch |err| {
+        if (err == error.PermissionDenied) {
+            rt.addNotice(.@"error", "fx.lsp.start is not permitted", .{}) catch {};
+            return 0;
+        }
+        if (err == error.LspUnavailable) {
+            rt.addNotice(.@"error", "LSP is not available on this host", .{}) catch {};
+            return 0;
+        }
+        rt.addNotice(.@"error", "{s}", .{@errorName(err)}) catch {};
+        return 0;
+    };
+    return 0;
+}
+
+fn apiLspStop(L: ?*lua.State) callconv(.c) c_int {
+    if (comptime !enabled) return 0;
+    const rt = Runtime.current(L) orelse return lua.raise(L, "Lua runtime is unavailable");
+    var name: []const u8 = "";
+    if (!lua.isnoneornil(L, 1)) {
+        if (lua.istable(L, 1)) {
+            _ = lua.lua_getfield(L, 1, "name");
+            name = lua.tostring(L, -1) orelse "";
+        } else {
+            name = lua.tostring(L, 1) orelse "";
+        }
+    }
+    rt.host.stop_lsp(rt.host.ctx, name) catch |err| {
+        return lua.raise(L, @errorName(err));
+    };
+    return 0;
+}
+
+fn appendArg(store: *std.ArrayList([]u8), alloc: Allocator, value: []const u8) !void {
+    const copied = try alloc.dupe(u8, value);
+    errdefer alloc.free(copied);
+    try store.append(alloc, copied);
 }
 
 fn builtinHasCommand(specs: []const SlashSpec, slash: []const u8) bool {
@@ -1176,4 +1352,84 @@ test "fx.view.open calls the host with an optional line" {
     runtime.invokeCommand("/openit", "");
     try std.testing.expectEqualStrings("src/main.zig", ctx.path.items);
     try std.testing.expectEqual(@as(?u32, 12), ctx.line);
+}
+
+test "fx.lsp.start passes name cmd and workspace root to the host" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(),
+        \\fx.lsp.start({
+        \\  name = "zls",
+        \\  cmd = { "zls" },
+        \\  root = fx.workspace.root,
+        \\})
+        \\
+    );
+
+    const Ctx = struct {
+        name: std.ArrayList(u8) = .empty,
+        cmd: std.ArrayList(u8) = .empty,
+        root: std.ArrayList(u8) = .empty,
+        alloc: Allocator,
+        fn start(raw: *anyopaque, spec: LspStartSpec) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            try ctx.name.appendSlice(ctx.alloc, spec.name);
+            try ctx.cmd.appendSlice(ctx.alloc, spec.argv[0]);
+            try ctx.root.appendSlice(ctx.alloc, spec.root);
+        }
+    };
+    var ctx = Ctx{ .alloc = alloc };
+    defer ctx.name.deinit(alloc);
+    defer ctx.cmd.deinit(alloc);
+    defer ctx.root.deinit(alloc);
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.bindHost(.{
+        .ctx = &ctx,
+        .start_lsp = Ctx.start,
+    });
+    runtime.loadInit(null, workspace);
+    try std.testing.expectEqual(@as(usize, 0), runtime.notices.items.len);
+    try std.testing.expectEqualStrings("zls", ctx.name.items);
+    try std.testing.expectEqualStrings("zls", ctx.cmd.items);
+    try std.testing.expectEqualStrings(workspace, ctx.root.items);
+}
+
+test "fx.lsp.start is a notice when the host denies process spawn" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/init.lua", .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(),
+        \\fx.lsp.start({ name = "zls", cmd = { "zls" } })
+        \\
+    );
+
+    const Ctx = struct {
+        fn start(_: *anyopaque, _: LspStartSpec) anyerror!void {
+            return error.PermissionDenied;
+        }
+    };
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    runtime.bindHost(.{
+        .ctx = undefined,
+        .start_lsp = Ctx.start,
+    });
+    runtime.loadInit(null, workspace);
+    try std.testing.expect(runtime.notices.items.len >= 1);
+    try std.testing.expect(std.mem.find(u8, runtime.notices.items[0].body, "not permitted") != null);
 }

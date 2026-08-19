@@ -2722,6 +2722,23 @@ pub fn Runtime(comptime App: type) type {
                 }
 
                 app.code_viewer.syncScroll(app.shell.layout.rows -| 3);
+                var diagnostic_buf: std.ArrayList(code_viewer_screen.DiagnosticMark) = .empty;
+                defer diagnostic_buf.deinit(app.alloc);
+                if (comptime @hasField(App, "lsp")) {
+                    const marks = try app.lsp.marksForPath(app.alloc, app.code_viewer.path);
+                    defer app.alloc.free(marks);
+                    for (marks) |mark| {
+                        try diagnostic_buf.append(app.alloc, .{
+                            .line = mark.line,
+                            .severity = switch (mark.severity) {
+                                .err => .err,
+                                .warning => .warning,
+                                .information => .information,
+                                .hint => .hint,
+                            },
+                        });
+                    }
+                }
                 var screen = try code_viewer_screen.paint(app.alloc, .{
                     .rows = app.shell.layout.rows,
                     .cols = app.shell.layout.cols,
@@ -2738,6 +2755,7 @@ pub fn Runtime(comptime App: type) type {
                     .file = .{
                         .lines = app.code_viewer.lines.items,
                         .highlighted = app.code_viewer.highlighted_lines.items,
+                        .diagnostics = diagnostic_buf.items,
                     },
                     .diff = .{
                         .lines = app.code_viewer.diff_lines,

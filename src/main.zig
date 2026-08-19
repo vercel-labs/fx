@@ -37,6 +37,7 @@ const app_callbacks = @import("core/app/app_callbacks.zig");
 const app_commands = @import("core/app/app_commands.zig");
 const app_lua_runtime = @import("core/app/app_lua_runtime.zig");
 const app_code_viewer_runtime = @import("core/app/app_code_viewer_runtime.zig");
+const app_lsp_runtime = @import("core/app/app_lsp_runtime.zig");
 const scripting = @import("core/scripting/runtime.zig");
 const change_tracker_mod = @import("core/workspace/change_tracker.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
@@ -517,6 +518,7 @@ const App = struct {
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     scripting: scripting.Runtime = .{},
     code_viewer: app_code_viewer_runtime.Session = .{},
+    lsp: app_lsp_runtime.Registry = .{},
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
 
@@ -589,6 +591,7 @@ const App = struct {
             .lifecycle_runtime = hooks.Runtime.init(alloc),
             .scripting = scripting.Runtime.init(alloc),
             .code_viewer = app_code_viewer_runtime.Session.init(alloc),
+            .lsp = app_lsp_runtime.Registry.init(alloc),
             .background = BackgroundRuntime.init(if (comptime host_target.is_wasm)
                 background_process_provider.unavailable_provider
             else
@@ -871,6 +874,7 @@ const App = struct {
         self.lifecycle_runtime.deinit();
         self.scripting.deinit();
         self.code_viewer.deinit();
+        self.lsp.deinit();
 
         self.auth.deinit(self.alloc);
         WorkspaceAppRuntime.deinit(self);
@@ -3939,9 +3943,13 @@ test {
     _ = @import("core/providers/grok_auth.zig");
     _ = @import("core/providers/grok_catalog.zig");
     _ = @import("core/scripting/runtime.zig");
+    _ = @import("core/lsp/framing.zig");
+    _ = @import("core/lsp/protocol.zig");
+    _ = @import("core/lsp/client.zig");
     _ = @import("ui/code_viewer_layout.zig");
     _ = @import("ui/code_viewer_screen.zig");
     _ = @import("core/app/app_code_viewer_runtime.zig");
+    _ = @import("core/app/app_lsp_runtime.zig");
     _ = @import("core/providers/cursor_auth.zig");
     _ = @import("core/providers/cursor_catalog.zig");
     _ = @import("builtins/providers/openai_compatible.zig");
