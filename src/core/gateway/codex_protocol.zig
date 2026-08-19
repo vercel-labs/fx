@@ -211,12 +211,6 @@ pub fn translateGatewayPayload(
     try out.writer.writeAll(",\"tool_choice\":");
     try std.json.Stringify.value(tool_choice, .{}, &out.writer);
 
-    if (parsed.value.object.get("maxOutputTokens")) |max_tokens| {
-        if (max_tokens == .integer and max_tokens.integer > 0) {
-            try out.writer.print(",\"max_output_tokens\":{d}", .{max_tokens.integer});
-        }
-    }
-
     try out.writer.writeAll(",\"reasoning\":{\"summary\":\"auto\",\"context\":\"all_turns\"");
     if (objectString(parsed.value.object, "reasoning")) |effort| {
         if (!std.mem.eql(u8, effort, "auto")) {
@@ -554,6 +548,7 @@ test "gateway payload translates into a Responses request" {
     try std.testing.expect(std.mem.find(u8, body, "\"prompt_cache_key\":\"session-1\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"medium\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"context\":\"all_turns\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "max_output_tokens") == null);
 }
 
 test "Responses SSE events project onto the Gateway stream contract" {
