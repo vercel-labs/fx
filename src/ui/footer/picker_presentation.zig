@@ -1814,7 +1814,8 @@ test "partially visible auth picker shows a source window without duplicates" {
     scrolled_view.selected_choice = .{ .source = .stored_key };
     var scrolled_first = try composeAuthPickerRow(alloc, scrolled_view, 1, 3, 80);
     defer scrolled_first.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, scrolled_first.items, "fx login") != null);
+    try std.testing.expect(std.mem.find(u8, scrolled_first.items, credentials.sourceLabel(.codex_oauth)) != null);
+    try std.testing.expect(std.mem.find(u8, scrolled_first.items, "fx login") == null);
 
     var scrolled_selected = try composeAuthPickerRow(alloc, scrolled_view, 2, 3, 80);
     defer scrolled_selected.deinit(alloc);

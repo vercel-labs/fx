@@ -6,6 +6,7 @@ const io_mod = @import("../shared/io.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
+const codex_oauth = @import("codex_oauth.zig");
 const secret = @import("secret.zig");
 const types = @import("../shared/types.zig");
 
@@ -35,6 +36,7 @@ pub const CatalogAuthenticatedSource = enum {
     ai_gateway_api_key,
     fx_login,
     stored_key,
+    codex_oauth,
 
     fn credentialSource(self: CatalogAuthenticatedSource) Source {
         return switch (self) {
@@ -42,6 +44,7 @@ pub const CatalogAuthenticatedSource = enum {
             .ai_gateway_api_key => .ai_gateway_api_key,
             .fx_login => .fx_login,
             .stored_key => .stored_key,
+            .codex_oauth => .codex_oauth,
         };
     }
 };
@@ -133,6 +136,7 @@ pub fn catalogAccessForCredential(
         .vercel_oidc_token => .vercel_oidc_token,
         .ai_gateway_api_key => .ai_gateway_api_key,
         .stored_key => .stored_key,
+        .codex_oauth => .codex_oauth,
         .fx_login => blk: {
             const team = team_context orelse
                 return .{ .public_only = .fx_login_team_required };
@@ -243,6 +247,12 @@ pub fn resolvePreferring(
     };
     if (fx_login) |credential| return .{ .credential = credential };
 
+    const codex = switch (mode) {
+        .stored => try loadStoredCodexCredential(alloc),
+        .refresh_if_needed => try loadCodexCredential(alloc, transport),
+    };
+    if (codex) |credential| return .{ .credential = credential };
+
     if (secret_store.isDisabled()) return .{};
 
     var status: StoredKeyReadStatus = .not_found;
@@ -266,11 +276,19 @@ fn loadPreferredSource(
     mode: LoadMode,
     source: Source,
 ) !?Credential {
-    if (source != .fx_login) return loadSource(alloc, transport, secret_store, source);
-    return switch (mode) {
-        .stored => loadStoredFxLoginCredential(alloc),
-        .refresh_if_needed => loadFxLoginCredential(alloc, transport),
-    };
+    if (source == .fx_login) {
+        return switch (mode) {
+            .stored => loadStoredFxLoginCredential(alloc),
+            .refresh_if_needed => loadFxLoginCredential(alloc, transport),
+        };
+    }
+    if (source == .codex_oauth) {
+        return switch (mode) {
+            .stored => loadStoredCodexCredential(alloc),
+            .refresh_if_needed => loadCodexCredential(alloc, transport),
+        };
+    }
+    return loadSource(alloc, transport, secret_store, source);
 }
 
 pub fn loadSource(
@@ -284,6 +302,7 @@ pub fn loadSource(
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
         .fx_login => loadFxLoginCredential(alloc, transport),
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
+        .codex_oauth => loadCodexCredential(alloc, transport),
     };
 }
 
@@ -320,6 +339,7 @@ pub fn sourceExists(
             secret.zeroAndFree(alloc, value);
             break :blk true;
         },
+        .codex_oauth => try codex_oauth.sourceExists(alloc),
     };
 }
 
@@ -372,6 +392,40 @@ fn loadStoredFxLoginCredential(alloc: std.mem.Allocator) !?Credential {
     var session = (try oauth_session.load(alloc)) orelse return null;
     defer session.deinit(alloc);
     return takeCredentialFromSession(&session, null);
+}
+
+pub fn loadCodexCredential(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+) !?Credential {
+    var loaded = (try codex_oauth.load(alloc, transport)) orelse return null;
+    return takeCredentialFromCodex(&loaded);
+}
+
+fn loadStoredCodexCredential(alloc: std.mem.Allocator) !?Credential {
+    var loaded = (try codex_oauth.loadStored(alloc)) orelse return null;
+    return takeCredentialFromCodex(&loaded);
+}
+
+pub fn refreshCodexCredential(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+) !?Credential {
+    var loaded = (try codex_oauth.refresh(alloc, transport)) orelse return null;
+    return takeCredentialFromCodex(&loaded);
+}
+
+fn takeCredentialFromCodex(loaded: *codex_oauth.Loaded) Credential {
+    const token = loaded.access_token;
+    loaded.access_token = &.{};
+    const account_id = loaded.account_id;
+    loaded.account_id = null;
+    return .{
+        .token = token,
+        .source = .codex_oauth,
+        .team_id = account_id,
+        .refresh_after_ms = loaded.refresh_after_ms,
+    };
 }
 
 pub fn refreshFxLoginCredential(
@@ -471,11 +525,12 @@ pub fn sourceLabel(source: Source) []const u8 {
         .ai_gateway_api_key => "AI_GATEWAY_API_KEY",
         .fx_login => "fx login",
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
+        .codex_oauth => "Codex OAuth (~/.codex)",
     };
 }
 
 pub fn sourceRefreshable(source: Source) bool {
-    return source == .fx_login;
+    return source == .fx_login or source == .codex_oauth;
 }
 
 test "stored key label discloses the backend that answered" {
@@ -568,7 +623,7 @@ test "fx login catalog access requires a fresh credential and selected team" {
 }
 
 test "authenticated catalog access carries source and permitted request context" {
-    for ([_]Source{ .vercel_oidc_token, .ai_gateway_api_key, .stored_key }) |source| {
+    for ([_]Source{ .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .codex_oauth }) |source| {
         var credential = Credential{
             .token = try std.testing.allocator.dupe(u8, "token"),
             .source = source,
@@ -686,6 +741,58 @@ const SecretStoreFixture = struct {
         return false;
     }
 };
+
+test "Codex OAuth loads from FX_CODEX_AUTH_FILE behind Vercel environment keys" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const auth_path = try std.fs.path.join(alloc, &.{ root, "auth.json" });
+    defer alloc.free(auth_path);
+
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const payload = "{\"exp\":4000000000}";
+    var encoded: [64]u8 = undefined;
+    const encoded_len = encoder.calcSize(payload.len);
+    _ = encoder.encode(encoded[0..encoded_len], payload);
+    const jwt = try std.fmt.allocPrint(alloc, "e30.{s}.sig", .{encoded[0..encoded_len]});
+    defer alloc.free(jwt);
+    const document = try std.fmt.allocPrint(alloc,
+        \\{{"auth_mode":"chatgpt","tokens":{{"id_token":"{s}","access_token":"{s}","refresh_token":"refresh","account_id":"acct_1"}}}}
+    , .{ jwt, jwt });
+    defer alloc.free(document);
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "auth.json", .data = document });
+
+    const env = try CredentialTestEnv.install(alloc, &.{
+        .{ "AI_GATEWAY_API_KEY", "api-key" },
+        .{ "FX_CODEX_AUTH_FILE", auth_path },
+    });
+    defer env.deinit();
+
+    try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .codex_oauth));
+    var preferred = (try loadSource(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .codex_oauth)).?;
+    defer preferred.deinit(alloc);
+    try std.testing.expectEqual(Source.codex_oauth, preferred.source);
+    try std.testing.expectEqualStrings(jwt, preferred.token);
+    try std.testing.expectEqualStrings("acct_1", preferred.team_id.?);
+
+    const resolution = try resolve(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .refresh_if_needed);
+    var startup = resolution.credential orelse return error.TestExpectedCredential;
+    defer startup.deinit(alloc);
+    try std.testing.expectEqual(Source.ai_gateway_api_key, startup.source);
+
+    const remembered = try resolvePreferring(
+        alloc,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        .refresh_if_needed,
+        .codex_oauth,
+    );
+    var chosen = remembered.credential orelse return error.TestExpectedCredential;
+    defer chosen.deinit(alloc);
+    try std.testing.expectEqual(Source.codex_oauth, chosen.source);
+}
 
 test "source-specific credential loading bypasses generic precedence" {
     const alloc = std.testing.allocator;

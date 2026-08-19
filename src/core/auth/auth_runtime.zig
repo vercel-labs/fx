@@ -22,6 +22,7 @@ const credential_source_order = [_]credentials.Source{
     .vercel_oidc_token,
     .ai_gateway_api_key,
     .fx_login,
+    .codex_oauth,
     .stored_key,
 };
 
@@ -103,11 +104,16 @@ pub fn refreshFxLoginToken(
     source: credentials.Source,
     mode: CredentialRefreshMode,
 ) !?[]u8 {
-    if (source != .fx_login) return null;
-
-    var credential = switch (mode) {
-        .if_needed => (try credentials.loadFxLoginCredential(alloc, transport)) orelse return null,
-        .force => (try credentials.refreshFxLoginCredential(alloc, transport)) orelse return null,
+    var credential = switch (source) {
+        .fx_login => switch (mode) {
+            .if_needed => (try credentials.loadFxLoginCredential(alloc, transport)) orelse return null,
+            .force => (try credentials.refreshFxLoginCredential(alloc, transport)) orelse return null,
+        },
+        .codex_oauth => switch (mode) {
+            .if_needed => (try credentials.loadCodexCredential(alloc, transport)) orelse return null,
+            .force => (try credentials.refreshCodexCredential(alloc, transport)) orelse return null,
+        },
+        else => return null,
     };
     defer credential.deinit(alloc);
 
@@ -1122,9 +1128,14 @@ pub const Runtime = struct {
 
     pub fn refreshFxLoginIfNeeded(self: *Self, alloc: Allocator) !bool {
         const source = self.credentialSource() orelse return false;
-        if (source != .fx_login) return false;
+        if (!credentials.sourceRefreshable(source)) return false;
 
-        const loaded = (try credentials.loadFxLoginCredential(alloc, self.oauth_transport)) orelse {
+        const loaded = (try credentials.loadSource(
+            alloc,
+            self.oauth_transport,
+            self.secret_store,
+            source,
+        )) orelse {
             if (self.credentialNeedsRefresh()) return error.CredentialRefreshUnavailable;
             return false;
         };
@@ -1451,6 +1462,7 @@ test "auth failure snapshot names every selected source without exposing styling
         .vercel_oidc_token,
         .ai_gateway_api_key,
         .fx_login,
+        .codex_oauth,
         .stored_key,
     };
     for (sources) |source| {
@@ -1626,6 +1638,7 @@ test "auth status snapshot labels every credential source without exposing token
         .vercel_oidc_token,
         .ai_gateway_api_key,
         .fx_login,
+        .codex_oauth,
         .stored_key,
     };
 

@@ -64,12 +64,16 @@ fn executeOAuthRequest(
             .name = "content-type",
             .value = "application/x-www-form-urlencoded",
         }},
+        .post_json => &.{.{
+            .name = "content-type",
+            .value = "application/json",
+        }},
     };
     var response = try executeRequest(
         alloc,
         switch (request.method) {
             .get => "GET",
-            .post_form => "POST",
+            .post_form, .post_json => "POST",
         },
         request.url,
         headers,

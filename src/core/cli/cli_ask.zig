@@ -14,6 +14,7 @@ const process_supervisor = @import("../background/process_supervisor.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const devbox_executor = @import("../execution/devbox_executor.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
+const codex_protocol = @import("../gateway/codex_protocol.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
@@ -1432,6 +1433,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.gateway_team = credential.gatewayTeam();
     ctx.credential_source = credential.source;
     ctx.model_catalog_access = credentials.catalogAccessForCredential(credential.source, api_key, credential.gatewayTeam());
+    ctx.model = codex_protocol.resolvedModel(credential.source, ctx.model);
 
     const restored_image_catalog = try ctx.session.snapshotImageCatalog(alloc, &.{});
     defer types.freeImageAttachmentSlice(alloc, restored_image_catalog);
@@ -1575,7 +1577,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .skills_prompt_section = skills_section,
         .explicit_skills_prompt_section = explicit_skills.text,
         .gateway_retry_count = cfg.gateway_retry_count,
-        .gateway_chat_url = cfg.gateway_chat_url,
+        .gateway_chat_url = codex_protocol.effectiveChatUrl(credential.source, cfg.gateway_chat_url),
         .gateway_tools_json = tool_projection.tools_json,
         .custom_tool_guidance = tool_projection.custom_guidance,
         .agent_step_limit = startup.agent_step_limit,

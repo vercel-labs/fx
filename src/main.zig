@@ -3767,6 +3767,8 @@ test {
     _ = @import("core/auth/login_flow.zig");
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");
+    _ = @import("core/auth/codex_oauth.zig");
+    _ = @import("core/gateway/codex_protocol.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/gateway/gateway_json.zig");
     _ = @import("core/github/git_context.zig");

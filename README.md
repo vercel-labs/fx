@@ -39,6 +39,8 @@ Or add an AI Gateway API key:
 fx setup
 ```
 
+If you already signed in with Codex or Nanocodex, fx also uses the ChatGPT tokens in `~/.codex/auth.json` and talks to OpenAI Codex. Switch credentials from the hub if more than one source is available.
+
 Run fx from a project:
 
 ```bash

@@ -36,6 +36,7 @@ const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
+const codex_protocol = @import("../gateway/codex_protocol.zig");
 const test_builtin_gateway = if (@import("builtin").is_test)
     @import("../../builtins/gateway.zig")
 else
@@ -1093,7 +1094,7 @@ pub fn Runtime(comptime App: type) type {
                     &app.worker.worker_recovery_pause_requested
                 else
                     null,
-                .gateway_chat_url = gateway_chat_url,
+                .gateway_chat_url = codex_protocol.effectiveChatUrl(job.credential_source, gateway_chat_url),
                 .gateway_tools_json = tool_projection.tools_json,
                 .custom_tool_guidance = tool_projection.custom_guidance,
                 .agent_step_limit = app.agent_step_limit,

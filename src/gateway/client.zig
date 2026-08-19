@@ -6,6 +6,7 @@ const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
+const codex_protocol = @import("../core/gateway/codex_protocol.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
     return err == error.HttpConnectionClosing or
@@ -1165,25 +1166,34 @@ fn streamGatewayCompletionCoreWithOptions(
     core_options: StreamCoreOptions,
 ) !StreamResult {
     const model = request.model;
-    const payload = request.payload;
     const retry_count = switch (request.provider_attempt_owner) {
         .agent => 1,
         .transport => request.retry_count,
     };
     const trace_ctx = request.trace_ctx;
     const request_url = try resolveE2eGatewayUrl(e2e_gateway_chat_url_env, request.chat_url);
+    const openai_codex = codex_protocol.isCodexChatUrl(request_url);
+    var owned_payload: ?[]u8 = null;
+    defer if (owned_payload) |bytes| alloc.free(bytes);
+    const payload = if (openai_codex) blk: {
+        owned_payload = try codex_protocol.translateGatewayPayload(
+            alloc,
+            model,
+            request.payload,
+            request.session_id,
+        );
+        break :blk owned_payload.?;
+    } else request.payload;
     const uri = try std.Uri.parse(request_url);
 
     const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});
     defer alloc.free(auth_header);
 
-    var extra_headers_buf: [9]std.http.Header = undefined;
-    const extra_headers = gatewayExtraHeaders(
-        &extra_headers_buf,
-        model,
-        request.team,
-        request.session_id,
-    );
+    var extra_headers_buf: [12]std.http.Header = undefined;
+    const extra_headers = if (openai_codex)
+        codexExtraHeaders(&extra_headers_buf, request.team, request.session_id)
+    else
+        gatewayExtraHeaders(extra_headers_buf[0..9], model, request.team, request.session_id);
 
     var attempt: usize = 0;
     var delivery_ambiguous = false;
@@ -1399,6 +1409,7 @@ fn streamGatewayCompletionCoreWithOptions(
             .{ .requested_model = model, .ctx = trace_ctx },
             expected_provider_tool_name,
             request.content_capture_limit,
+            openai_codex,
         ) catch |err| {
             debug_trace.eventf("gateway", "sse_consume_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
             return @as(anyerror!StreamResult, connectedIoFailure(
@@ -1487,6 +1498,34 @@ fn gatewayExtraHeaders(
             buf[len] = .{ .name = "x-session-id", .value = id };
             len += 1;
             buf[len] = .{ .name = "x-session-affinity", .value = id };
+            len += 1;
+        }
+    }
+    return buf[0..len];
+}
+
+fn codexExtraHeaders(
+    buf: []std.http.Header,
+    account_id: ?[]const u8,
+    session_id: ?[]const u8,
+) []const std.http.Header {
+    std.debug.assert(buf.len >= 5);
+    var len: usize = 0;
+    buf[len] = .{ .name = "Accept", .value = "text/event-stream" };
+    len += 1;
+    if (account_id) |account| {
+        if (account.len > 0) {
+            buf[len] = .{ .name = codex_protocol.account_header, .value = account };
+            len += 1;
+        }
+    }
+    if (session_id) |id| {
+        if (id.len > 0) {
+            buf[len] = .{ .name = "session-id", .value = id };
+            len += 1;
+            buf[len] = .{ .name = "thread-id", .value = id };
+            len += 1;
+            buf[len] = .{ .name = "x-client-request-id", .value = id };
             len += 1;
         }
     }
@@ -2715,7 +2754,7 @@ fn consumeSseStream(
     on_tool_start: ?ToolStartCallback,
     cancel_flag: *std.atomic.Value(bool),
 ) !types.GatewayCompletion {
-    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, cancel_flag, null, null, null);
+    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, cancel_flag, null, null, null, false);
 }
 
 /// Decodes an AI Gateway SSE response from a transport-owned reader.
@@ -2745,6 +2784,7 @@ pub fn consumeGatewaySseStream(
         null,
         null,
         content_capture_limit,
+        false,
     );
 }
 
@@ -2760,6 +2800,7 @@ fn consumeSseStreamTraced(
     resolved_model_trace: ?ResolvedModelTrace,
     expected_provider_tool_name: ?[]const u8,
     content_capture_limit: ?usize,
+    openai_codex: bool,
 ) !types.GatewayCompletion {
     var content_buf: std.ArrayList(u8) = .empty;
     defer content_buf.deinit(alloc);
@@ -2794,8 +2835,13 @@ fn consumeSseStreamTraced(
 
     var event_reader = SseEventReader{ .max_line_bytes = max_sse_event_line_bytes };
     defer event_reader.deinit(alloc);
+    var translate_state: ?codex_protocol.TranslateState = if (openai_codex) .{} else null;
+    defer if (translate_state) |*state| state.deinit(alloc);
 
     while (true) {
+        var owned_json: ?[]u8 = null;
+        defer if (owned_json) |bytes| alloc.free(bytes);
+
         if (cancel_flag.load(.seq_cst)) {
             traceSseTermination(resolved_model_trace, "cancellation", finish_reason_holder);
             break;
@@ -2805,7 +2851,14 @@ fn consumeSseStreamTraced(
         defer event_reader.releaseLine();
 
         const json_text = switch (event) {
-            .data => |json_text| json_text,
+            .data => |raw| blk: {
+                if (translate_state) |*state| {
+                    const translated = (try codex_protocol.translateResponsesSseData(alloc, raw, state)) orelse continue;
+                    owned_json = translated;
+                    break :blk translated;
+                }
+                break :blk raw;
+            },
             .done => {
                 traceSseTermination(resolved_model_trace, "done_without_finish", finish_reason_holder);
                 break;

@@ -17,6 +17,7 @@ const gateway_json = @import("../core/gateway/gateway_json.zig");
 const io_mod = @import("../core/shared/io.zig");
 const gateway_generation_usage = @import("../gateway/generation_usage.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
+const codex_protocol = @import("../core/gateway/codex_protocol.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const output_contracts = @import("../core/output/output_contracts.zig");
@@ -460,12 +461,13 @@ fn streamAgentCompletion(
         gateway_failure_diagnostics.FailureDiagnostics{}
     else
         gateway_failure_diagnostics.collect(alloc, request.payload, result.err_body);
+    const openai_codex = codex_protocol.isCodexChatUrl(request.chat_url);
     return .{
         .status = result.status,
         .completion = result.completion,
         .err_body = result.err_body,
         .generation_origin = gateway_client.generationBaseUrl(),
-        .reconcile_generation_usage = true,
+        .reconcile_generation_usage = !openai_codex,
         .failure_schema = diagnostics.schema,
         .failure_request_shape = diagnostics.request_shape,
         .retry_after_seconds = result.retry_after_seconds,
@@ -609,14 +611,15 @@ const OAuthHttpOperation = struct {
             .location = .{ .url = self.request.url },
             .method = switch (self.request.method) {
                 .get => .GET,
-                .post_form => .POST,
+                .post_form, .post_json => .POST,
             },
             .payload = self.request.payload,
             .headers = .{
-                .content_type = if (self.request.method == .post_form)
-                    .{ .override = "application/x-www-form-urlencoded" }
-                else
-                    .default,
+                .content_type = switch (self.request.method) {
+                    .post_form => .{ .override = "application/x-www-form-urlencoded" },
+                    .post_json => .{ .override = "application/json" },
+                    .get => .default,
+                },
                 .user_agent = .{ .override = gateway_client.user_agent },
                 .accept_encoding = .omit,
             },
@@ -2007,11 +2010,42 @@ fn parseSortedModelIds(alloc: std.mem.Allocator, json_text: []const u8) !std.Arr
 
 const ModelCatalogView = model_catalog.View;
 
+fn buildCodexCatalog(alloc: std.mem.Allocator) std.mem.Allocator.Error!std.ArrayList(ModelCatalogEntry) {
+    var catalog: std.ArrayList(ModelCatalogEntry) = .empty;
+    errdefer freeModelCatalog(alloc, &catalog);
+    try catalog.ensureTotalCapacity(alloc, codex_protocol.catalog_models.len);
+    for (codex_protocol.catalog_models) |model| {
+        const id = try alloc.dupe(u8, model.id);
+        errdefer alloc.free(id);
+        const model_type = try alloc.dupe(u8, "language");
+        errdefer alloc.free(model_type);
+        catalog.appendAssumeCapacity(.{
+            .id = id,
+            .model_type = model_type,
+            .released = 90,
+            .has_tool_use = true,
+            .has_reasoning = true,
+            .supports_fast_mode = false,
+            .context_window = model.context_window,
+            .max_tokens = model.max_tokens,
+        });
+    }
+    return catalog;
+}
+
 fn fetchCatalogForProvider(
     _: ?*anyopaque,
     alloc: std.mem.Allocator,
     input: model_catalog.FetchInput,
 ) std.mem.Allocator.Error!model_catalog.ProviderResult {
+    if (input.access.credentialSource() == .codex_oauth) {
+        const catalog = buildCodexCatalog(alloc) catch |err| return .{
+            .failure = .{
+                .category = if (err == error.OutOfMemory) .resource_exhausted else .runtime,
+            },
+        };
+        return .{ .catalog = catalog };
+    }
     const response = fetchModelCatalogResponse(
         alloc,
         input.access,
@@ -2053,6 +2087,9 @@ fn fetchModelCatalogForView(
     cancel_flag: ?*std.atomic.Value(bool),
     view: ModelCatalogView,
 ) !std.ArrayList(ModelCatalogEntry) {
+    if (access.credentialSource() == .codex_oauth) {
+        return buildCodexCatalog(alloc);
+    }
     const response = try fetchModelCatalogResponse(alloc, access, path, cancel_flag);
     const json_text = switch (response) {
         .success => |body| body,
