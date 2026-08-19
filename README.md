@@ -42,7 +42,7 @@ fx
 
 Inside fx, `/login` offers both providers and `/model` lists available `openai-codex/` models after ChatGPT sign-in. No model environment variable is required. Use `/logout chatgpt` to remove the ChatGPT session without affecting Vercel access.
 
-The OpenAI Codex route uses ChatGPT subscription access directly and never sends its OAuth token to Vercel AI Gateway. The session is stored privately at `~/.fx/chatgpt-auth.json` and refreshed when needed.
+The OpenAI Codex route uses ChatGPT subscription access directly and never sends its OAuth token to Vercel AI Gateway. The session is stored privately at `~/.fx/chatgpt-auth.json` and refreshed when needed. On supported Codex models, `/fast` requests OpenAI's priority service tier and consumes ChatGPT credits at the higher Fast mode rate.
 
 To use an AI Gateway API key instead:
 

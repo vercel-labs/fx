@@ -58,6 +58,9 @@ pub fn buildRequest(
     try writer.writeAll(",\"tool_choice\":");
     try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
     try writer.writeAll(",\"parallel_tool_calls\":true,\"include\":[\"reasoning.encrypted_content\"]");
+    // Codex exposes Fast mode as its priority service tier for supported
+    // ChatGPT subscription models.
+    if (request.provider_options.fast) try writer.writeAll(",\"service_tier\":\"priority\"");
 
     try writer.writeAll(",\"text\":{\"verbosity\":\"low\"");
     if (request.response_format) |format| {
@@ -80,7 +83,8 @@ pub fn buildRequest(
         try std.json.Stringify.value(label, .{}, writer);
         try writer.writeAll(",\"summary\":\"auto\"}");
     }
-    if (request.max_output_tokens) |limit| try writer.print(",\"max_output_tokens\":{d}", .{limit});
+    // The ChatGPT Codex endpoint chooses the model's output limit and rejects
+    // the public Responses API max_output_tokens parameter.
     if (tool_count == 0 and request.tool_choice == .none) {
         // Explicitly keeping the empty tool set out of the request avoids a
         // backend validation difference between no tools and `tools: []`.
@@ -736,7 +740,7 @@ test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas
         .serialized_tools = "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\"}}]",
         .messages = &messages,
         .tool_choice = .auto,
-        .provider_options = .{ .reasoning = types.ReasoningEffort.literal("high") },
+        .provider_options = .{ .reasoning = types.ReasoningEffort.literal("high"), .fast = true },
     });
     defer std.testing.allocator.free(body);
 
@@ -746,6 +750,22 @@ test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas
     try std.testing.expect(std.mem.find(u8, body, "\"encrypted_content\":\"opaque\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"parameters\":{\"type\":\"object\"}") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning\":{\"effort\":\"high\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"service_tier\":\"priority\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"max_output_tokens\"") == null);
+}
+
+test "OpenAI Codex standard requests omit the priority service tier" {
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Hello." }};
+    const body = try agent_stream_provider.build(std.testing.allocator, .{
+        .model = "openai-codex/gpt-5.6-sol",
+        .serialized_tools = "[]",
+        .messages = &messages,
+        .tool_choice = .none,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"service_tier\"") == null);
 }
 
 test "OpenAI Codex SSE maps text reasoning tools and usage" {

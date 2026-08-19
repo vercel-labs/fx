@@ -581,16 +581,31 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     await session.sendLiteralText("/model openai-codex/gpt-5.6-sol");
     await session.sendKeys("Space");
-    await session.sendLiteralText("auto");
+    await session.sendLiteralText("max");
+    await session.sendKeys("Space");
+    await session.sendLiteralText("fast");
     await session.sendKeys("Enter");
     await session.waitForText("Switched to openai-codex/gpt-5.6-sol", TIMEOUT);
+    await session.sendText("/fast");
+    await session.waitForText("Fast: off", TIMEOUT);
+    await session.sendText("/fast");
+    await session.waitForText("Fast: on", TIMEOUT);
     await session.sendText("Use the ChatGPT subscription directly.");
     await session.waitForText("CHATGPT_DIRECT_RESPONSE", TIMEOUT);
     const directRequest = chatgptOauth.requests.find(
       (request) => request.path === "/chatgpt/responses",
     );
     expect(directRequest?.authorization).toBe(`Bearer ${chatgptOauth.accessToken}`);
-    expect(JSON.parse(directRequest?.body ?? "{}").model).toBe("gpt-5.6-sol");
+    const directBody = JSON.parse(directRequest?.body ?? "{}") as {
+      model?: string;
+      service_tier?: string;
+      max_output_tokens?: number;
+      reasoning?: { effort?: string };
+    };
+    expect(directBody.model).toBe("gpt-5.6-sol");
+    expect(directBody.service_tier).toBe("priority");
+    expect(directBody.max_output_tokens).toBeUndefined();
+    expect(directBody.reasoning?.effort).toBe("max");
     for (const request of [...gateway.requests, ...gateway.modelRequests]) {
       expect(request.headers.get("authorization")).not.toBe(
         `Bearer ${chatgptOauth.accessToken}`,

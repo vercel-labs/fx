@@ -8,6 +8,7 @@ const Model = struct {
     context_window: u32,
     vision: bool,
     supports_max_effort: bool = false,
+    supports_fast_mode: bool = false,
 };
 
 // OpenAI does not expose a stable unauthenticated model catalog for the Codex
@@ -15,12 +16,12 @@ const Model = struct {
 // openai-codex-responses catalog. Provider-qualified IDs intentionally remain
 // distinct from otherwise equivalent openai/* Gateway entries.
 const models = [_]Model{
-    .{ .id = "openai-codex/gpt-5.6-sol", .released = 1_783_555_200, .context_window = 272_000, .vision = true, .supports_max_effort = true },
-    .{ .id = "openai-codex/gpt-5.6-terra", .released = 1_783_555_200, .context_window = 272_000, .vision = true, .supports_max_effort = true },
-    .{ .id = "openai-codex/gpt-5.6-luna", .released = 1_783_555_200, .context_window = 272_000, .vision = true, .supports_max_effort = true },
-    .{ .id = "openai-codex/gpt-5.5", .released = 1_776_988_800, .context_window = 272_000, .vision = true },
+    .{ .id = "openai-codex/gpt-5.6-sol", .released = 1_783_555_200, .context_window = 272_000, .vision = true, .supports_max_effort = true, .supports_fast_mode = true },
+    .{ .id = "openai-codex/gpt-5.6-terra", .released = 1_783_555_200, .context_window = 272_000, .vision = true, .supports_max_effort = true, .supports_fast_mode = true },
+    .{ .id = "openai-codex/gpt-5.6-luna", .released = 1_783_555_200, .context_window = 272_000, .vision = true, .supports_max_effort = true, .supports_fast_mode = true },
+    .{ .id = "openai-codex/gpt-5.5", .released = 1_776_988_800, .context_window = 272_000, .vision = true, .supports_fast_mode = true },
     .{ .id = "openai-codex/gpt-5.4-mini", .released = 1_773_705_600, .context_window = 272_000, .vision = true },
-    .{ .id = "openai-codex/gpt-5.4", .released = 1_772_668_800, .context_window = 272_000, .vision = true },
+    .{ .id = "openai-codex/gpt-5.4", .released = 1_772_668_800, .context_window = 272_000, .vision = true, .supports_fast_mode = true },
     .{ .id = "openai-codex/gpt-5.3-codex-spark", .released = 0, .context_window = 128_000, .vision = false },
 };
 
@@ -55,6 +56,7 @@ pub fn append(alloc: std.mem.Allocator, catalog: *std.ArrayList(model_catalog.Mo
             .has_tool_use = true,
             .has_reasoning = true,
             .reasoning_efforts = efforts,
+            .supports_fast_mode = model.supports_fast_mode,
             .has_vision = model.vision,
             .has_file_input = model.vision,
             .has_implicit_caching = true,
@@ -79,9 +81,11 @@ test "ChatGPT subscription models append once with tool and reasoning metadata" 
     try std.testing.expectEqual(models.len, catalog.items.len);
     try std.testing.expect(catalog.items[0].has_tool_use);
     try std.testing.expect(catalog.items[0].has_reasoning);
+    try std.testing.expect(catalog.items[0].supports_fast_mode);
     try std.testing.expectEqual(@as(usize, 5), catalog.items[0].reasoning_efforts.items.len);
     try std.testing.expectEqualStrings("max", catalog.items[0].reasoning_efforts.items[4].label());
     try std.testing.expectEqual(@as(usize, 4), catalog.items[3].reasoning_efforts.items.len);
+    try std.testing.expect(!catalog.items[4].supports_fast_mode);
 }
 
 test "Gateway and ChatGPT versions of the same model remain distinct" {
