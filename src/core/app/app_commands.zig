@@ -492,10 +492,10 @@ pub fn Handlers(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        fn commandLogin(ctx: *anyopaque) !void {
+        fn commandLogin(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "runLoginCommand")) {
-                try app.runLoginCommand();
+                try app.runLoginCommand(rest);
             } else {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -505,10 +505,10 @@ pub fn Handlers(comptime App: type) type {
             }
         }
 
-        fn commandLogout(ctx: *anyopaque) !void {
+        fn commandLogout(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "runLogoutCommand")) {
-                try app.runLogoutCommand();
+                try app.runLogoutCommand(rest);
             } else {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -1542,6 +1542,7 @@ pub fn Handlers(comptime App: type) type {
             var snapshot = app.creditsProvider().fetch(app.alloc, .{
                 .credential = app.auth.apiKey(),
                 .tenant = app.auth.gatewayTeam(),
+                .source = app.auth.credentialSource(),
             });
             defer snapshot.deinit(app.alloc);
             const text = snapshot.renderInteractiveBody(app.alloc) catch {
@@ -3509,12 +3510,18 @@ const SurfaceOnlyApp = struct {};
 
 const CreditsCommandFakeApp = struct {
     const FakeAuth = struct {
+        source: ?credentials.Source = null,
+
         fn apiKey(_: *const FakeAuth) ?[]const u8 {
             return "credential";
         }
 
         fn gatewayTeam(_: *const FakeAuth) ?[]const u8 {
             return "tenant";
+        }
+
+        fn credentialSource(self: *const FakeAuth) ?credentials.Source {
+            return self.source;
         }
     };
 
@@ -3546,7 +3553,8 @@ const CreditsCommandFakeApp = struct {
         self.calls += 1;
         self.saw_expected_input =
             std.mem.eql(u8, input.credential orelse "", "credential") and
-            std.mem.eql(u8, input.tenant orelse "", "tenant");
+            std.mem.eql(u8, input.tenant orelse "", "tenant") and
+            input.source == self.auth.source;
         return .{ .balance = alloc.dupe(u8, "10") catch null };
     }
 

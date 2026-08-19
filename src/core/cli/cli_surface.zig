@@ -20,6 +20,7 @@ const background_process_provider = @import(
 const github_publish = @import("../github/github_publish.zig");
 const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
+const grok_login_flow = @import("../auth/grok_login_flow.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const secret = @import("../auth/secret.zig");
@@ -707,9 +708,38 @@ fn runNonInteractiveWithDeps(
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
-            if (rest.len != 0) {
-                try writeStderr(deps, "usage: fx login\n");
+            const grok = parseGrokLoginArgs(rest) catch {
+                try writeStderr(deps, "usage: fx login [grok] [--import]\n");
                 return .handled_failure;
+            };
+            if (grok) |opts| {
+                if (opts.import_cli) {
+                    grok_login_flow.runImport(alloc) catch |err| {
+                        const message = switch (err) {
+                            error.GrokCliAuthMissing => "fx login grok: no ~/.grok/auth.json found\n",
+                            error.InvalidGrokCliAuth => "fx login grok: ~/.grok/auth.json is not a usable Grok session\n",
+                            else => "fx login grok: failed to import Grok CLI credentials\n",
+                        };
+                        try writeStderr(deps, message);
+                        return .handled_failure;
+                    };
+                    return .handled_success;
+                }
+                grok_login_flow.runLogin(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.url_opener,
+                ) catch |err| {
+                    const message = switch (err) {
+                        error.ClientIdMissing => "fx login grok: missing FX_GROK_OAUTH_CLIENT_ID\n",
+                        error.AccessDenied => "fx login grok: authorization denied\n",
+                        error.ExpiredToken, error.LoginTimedOut => "fx login grok: authorization expired; run fx login grok again\n",
+                        else => "fx login grok: failed to sign in\n",
+                    };
+                    try writeStderr(deps, message);
+                    return .handled_failure;
+                };
+                return .handled_success;
             }
             login_flow.runLogin(
                 alloc,
@@ -728,8 +758,23 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .logout => |rest| {
+            if (rest.len == 1 and std.mem.eql(u8, rest[0], "grok")) {
+                const result = grok_login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch {
+                    try writeStderr(deps, "fx logout grok: failed to durably remove saved Grok OAuth\n");
+                    return .handled_failure;
+                };
+                if (result.local_durability_failed) {
+                    try writeStderr(deps, "fx logout grok: failed to durably remove saved Grok OAuth\n");
+                } else {
+                    try writeStdout(
+                        deps,
+                        if (result.session_deleted) "Signed out of Grok OAuth.\n" else "No Grok OAuth session found.\n",
+                    );
+                }
+                return if (result.local_durability_failed) .handled_failure else .handled_success;
+            }
             if (rest.len != 0) {
-                try writeStderr(deps, "usage: fx logout\n");
+                try writeStderr(deps, "usage: fx logout [grok]\n");
                 return .handled_failure;
             }
             const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
@@ -1251,6 +1296,7 @@ fn runNonInteractiveWithDeps(
             var snapshot = cfg.gateway_provider.credits.fetch(alloc, .{
                 .credential = startup.apiKey(),
                 .tenant = startup.gatewayTeam(),
+                .source = if (startup.credential) |credential| credential.source else null,
             });
             defer snapshot.deinit(alloc);
             const text = try snapshot.render(alloc, opts.format);
@@ -1452,6 +1498,25 @@ fn runGithubWorkflow(
 
 fn writeStdout(deps: RunDeps, text: []const u8) !void {
     try deps.write_stdout(deps.stdout_ctx, text);
+}
+
+const GrokLoginOpts = struct {
+    import_cli: bool = false,
+};
+
+fn parseGrokLoginArgs(rest: []const [:0]const u8) error{InvalidLoginArgs}!?GrokLoginOpts {
+    if (rest.len == 0) return null;
+    if (!std.mem.eql(u8, rest[0], "grok")) return error.InvalidLoginArgs;
+    var opts = GrokLoginOpts{};
+    var i: usize = 1;
+    while (i < rest.len) : (i += 1) {
+        if (std.mem.eql(u8, rest[i], "--import")) {
+            opts.import_cli = true;
+            continue;
+        }
+        return error.InvalidLoginArgs;
+    }
+    return opts;
 }
 
 fn writeStderr(deps: RunDeps, text: []const u8) !void {

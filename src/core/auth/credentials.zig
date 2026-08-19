@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
+const grok_oauth_session = @import("grok_oauth_session.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
@@ -15,6 +16,8 @@ pub const CatalogPublicOnly = union(enum) {
     no_credential,
     fx_login_team_required,
     fx_login_refresh_required,
+    grok_oauth,
+    grok_oauth_refresh_required,
     credential_refresh_failed: Source,
     authenticated_credential_rejected: Source,
 
@@ -22,6 +25,7 @@ pub const CatalogPublicOnly = union(enum) {
         return switch (self) {
             .no_credential => null,
             .fx_login_team_required, .fx_login_refresh_required => .fx_login,
+            .grok_oauth, .grok_oauth_refresh_required => .grok_oauth,
             .credential_refresh_failed => |source| source,
             .authenticated_credential_rejected => |source| source,
         };
@@ -108,6 +112,9 @@ pub fn catalogAccessAt(credential: ?Credential, now_ms: i64) CatalogAccess {
     if (selected.source == .fx_login and selected.needsRefreshAt(now_ms)) {
         return .{ .public_only = .fx_login_refresh_required };
     }
+    if (selected.source == .grok_oauth and selected.needsRefreshAt(now_ms)) {
+        return .{ .public_only = .grok_oauth_refresh_required };
+    }
     return catalogAccessForCredential(
         selected.source,
         selected.token,
@@ -133,6 +140,7 @@ pub fn catalogAccessForCredential(
         .vercel_oidc_token => .vercel_oidc_token,
         .ai_gateway_api_key => .ai_gateway_api_key,
         .stored_key => .stored_key,
+        .grok_oauth => return .{ .public_only = .grok_oauth },
         .fx_login => blk: {
             const team = team_context orelse
                 return .{ .public_only = .fx_login_team_required };
@@ -266,11 +274,19 @@ fn loadPreferredSource(
     mode: LoadMode,
     source: Source,
 ) !?Credential {
-    if (source != .fx_login) return loadSource(alloc, transport, secret_store, source);
-    return switch (mode) {
-        .stored => loadStoredFxLoginCredential(alloc),
-        .refresh_if_needed => loadFxLoginCredential(alloc, transport),
-    };
+    if (source == .fx_login) {
+        return switch (mode) {
+            .stored => loadStoredFxLoginCredential(alloc),
+            .refresh_if_needed => loadFxLoginCredential(alloc, transport),
+        };
+    }
+    if (source == .grok_oauth) {
+        return switch (mode) {
+            .stored => loadStoredGrokOAuthCredential(alloc),
+            .refresh_if_needed => loadGrokOAuthCredential(alloc, transport),
+        };
+    }
+    return loadSource(alloc, transport, secret_store, source);
 }
 
 pub fn loadSource(
@@ -283,6 +299,7 @@ pub fn loadSource(
         .vercel_oidc_token => loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", source),
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
         .fx_login => loadFxLoginCredential(alloc, transport),
+        .grok_oauth => loadGrokOAuthCredential(alloc, transport),
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
     };
 }
@@ -295,6 +312,18 @@ pub fn sourceExists(
     return switch (source) {
         .vercel_oidc_token => nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
         .ai_gateway_api_key => nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null,
+        .grok_oauth => blk: {
+            const loaded = grok_oauth_session.load(alloc) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    debug_trace.logf("auth", "source probe failed source=grok_oauth err={s}", .{@errorName(err)});
+                    break :blk false;
+                },
+            };
+            var session = loaded orelse break :blk false;
+            defer session.deinit(alloc);
+            break :blk true;
+        },
         .fx_login => blk: {
             const loaded = oauth_session.load(alloc) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -442,6 +471,104 @@ pub fn refreshFxSession(
     try mutation.save(alloc, session.*);
 }
 
+pub fn loadGrokOAuthCredential(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+) !?Credential {
+    var session = (try grok_oauth_session.load(alloc)) orelse return null;
+    defer session.deinit(alloc);
+
+    if (session.expired(io_mod.milliTimestamp())) {
+        return refreshGrokOAuthCredentialLocked(alloc, transport, .if_needed);
+    }
+
+    return takeCredentialFromGrokSession(&session, null);
+}
+
+fn loadStoredGrokOAuthCredential(alloc: std.mem.Allocator) !?Credential {
+    var session = (try grok_oauth_session.load(alloc)) orelse return null;
+    defer session.deinit(alloc);
+    return takeCredentialFromGrokSession(&session, null);
+}
+
+pub fn refreshGrokOAuthCredential(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+) !?Credential {
+    return refreshGrokOAuthCredentialLocked(alloc, transport, .force);
+}
+
+fn refreshGrokOAuthCredentialLocked(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mode: FxLoginRefreshMode,
+) !?Credential {
+    var mutation = (try grok_oauth_session.beginExistingMutation()) orelse return null;
+    defer mutation.deinit();
+
+    var session = (try mutation.load(alloc)) orelse return null;
+    defer session.deinit(alloc);
+
+    var refreshed_at_ms: ?i64 = null;
+    if (mode == .force or session.expired(io_mod.milliTimestamp())) {
+        try refreshGrokSession(alloc, transport, &mutation, &session);
+        refreshed_at_ms = io_mod.milliTimestamp();
+    }
+    return takeCredentialFromGrokSession(&session, refreshed_at_ms);
+}
+
+pub fn refreshGrokSession(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mutation: *grok_oauth_session.Mutation,
+    session: *grok_oauth_session.Session,
+) !void {
+    const issuer_url = session.issuer;
+    var metadata = try oauth.discover(alloc, transport, issuer_url);
+    defer metadata.deinit(alloc);
+    try grok_oauth_session.validateE2EEndpoint(issuer_url, metadata.token_endpoint);
+
+    var refreshed = try oauth.refreshToken(
+        alloc,
+        transport,
+        metadata,
+        session.client_id,
+        session.refresh_token,
+    );
+    defer refreshed.deinit(alloc);
+
+    secret.zeroAndFree(alloc, session.access_token);
+    session.access_token = refreshed.access_token;
+    refreshed.access_token = &.{};
+
+    if (refreshed.refresh_token) |value| {
+        secret.zeroAndFree(alloc, session.refresh_token);
+        session.refresh_token = value;
+        refreshed.refresh_token = null;
+    }
+
+    alloc.free(session.scope);
+    session.scope = refreshed.scope;
+    refreshed.scope = &.{};
+
+    alloc.free(session.token_type);
+    session.token_type = refreshed.token_type;
+    refreshed.token_type = &.{};
+
+    session.expires_at_ms = try oauth.expiry_timestamp_ms(io_mod.milliTimestamp(), refreshed.expires_in);
+    try mutation.save(alloc, session.*);
+}
+
+fn takeCredentialFromGrokSession(session: *grok_oauth_session.Session, refreshed_at_ms: ?i64) Credential {
+    const token = session.access_token;
+    session.access_token = &.{};
+    return .{
+        .token = token,
+        .source = .grok_oauth,
+        .refresh_after_ms = credentialRefreshAfterMs(session.expires_at_ms, refreshed_at_ms),
+    };
+}
+
 fn takeCredentialFromSession(session: *oauth_session.Session, refreshed_at_ms: ?i64) Credential {
     const token = session.access_token;
     session.access_token = &.{};
@@ -470,20 +597,24 @@ pub fn sourceLabel(source: Source) []const u8 {
         .vercel_oidc_token => "VERCEL_OIDC_TOKEN",
         .ai_gateway_api_key => "AI_GATEWAY_API_KEY",
         .fx_login => "fx login",
+        .grok_oauth => "Grok OAuth",
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
     };
 }
 
 pub fn sourceRefreshable(source: Source) bool {
-    return source == .fx_login;
+    return source == .fx_login or source == .grok_oauth;
 }
 
 test "stored key label discloses the backend that answered" {
     try std.testing.expect(std.mem.find(u8, sourceLabel(.stored_key), stored_key_backend_label) != null);
     try std.testing.expect(std.mem.find(u8, unreadable_store_message, stored_key_backend_label) != null);
-    for ([_]Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login }) |source| {
+    for ([_]Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .grok_oauth }) |source| {
         try std.testing.expect(!std.mem.eql(u8, sourceLabel(source), sourceLabel(.stored_key)));
     }
+    try std.testing.expectEqualStrings("Grok OAuth", sourceLabel(.grok_oauth));
+    try std.testing.expect(sourceRefreshable(.grok_oauth));
+    try std.testing.expect(!sourceRefreshable(.ai_gateway_api_key));
 }
 
 test "missing credential messages use surface commands in preferred order" {
@@ -565,6 +696,27 @@ test "fx login catalog access requires a fresh credential and selected team" {
     try std.testing.expectEqual(CatalogPublicOnlyReason.fx_login_team_required, missing_team.publicOnlyReason().?);
     try std.testing.expect(missing_team.authorizationCredential() == null);
     try std.testing.expect(missing_team.teamContext() == null);
+}
+
+test "grok oauth catalog access never sends a token to the gateway" {
+    var grok = Credential{
+        .token = try std.testing.allocator.dupe(u8, "grok-token"),
+        .source = .grok_oauth,
+        .refresh_after_ms = 10,
+    };
+    defer grok.deinit(std.testing.allocator);
+
+    const expired = catalogAccessAt(grok, 10);
+    try std.testing.expectEqual(CatalogPublicOnlyReason.grok_oauth_refresh_required, expired.publicOnlyReason().?);
+    try std.testing.expectEqual(Source.grok_oauth, expired.credentialSource().?);
+    try std.testing.expect(expired.authorizationCredential() == null);
+
+    grok.refresh_after_ms = null;
+    const access = catalogAccessAt(grok, 10);
+    try std.testing.expectEqual(CatalogPublicOnlyReason.grok_oauth, access.publicOnlyReason().?);
+    try std.testing.expectEqual(Source.grok_oauth, access.credentialSource().?);
+    try std.testing.expect(access.authorizationCredential() == null);
+    try std.testing.expect(access.teamContext() == null);
 }
 
 test "authenticated catalog access carries source and permitted request context" {

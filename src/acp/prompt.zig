@@ -3,6 +3,7 @@ const std_builtin = @import("builtin");
 const command_admission = @import("../core/permissions/command_admission.zig");
 const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const credentials = @import("../core/auth/credentials.zig");
+const xai_stream_provider = @import("../gateway/xai_stream_provider.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -728,7 +729,10 @@ fn buildAgentConfig(state: *server.ServerState, session: *server.ActiveSessionSt
         .skills_prompt_section = sections.skills_prompt_section,
         .explicit_skills_prompt_section = sections.explicit_skills_prompt_section,
         .gateway_retry_count = state.cfg.gateway_retry_count,
-        .gateway_chat_url = state.cfg.gateway_chat_url,
+        .gateway_chat_url = blk: {
+            const grok_url = xai_stream_provider.chatUrlForSource(session.credential_source);
+            break :blk if (grok_url.len > 0) grok_url else state.cfg.gateway_chat_url;
+        },
         .gateway_tools_json = sections.gateway_tools_json,
         .custom_tool_guidance = sections.custom_tool_guidance,
         .agent_step_limit = session.agent_step_limit,

@@ -33,6 +33,20 @@ To get started, sign in with Vercel:
 fx login
 ```
 
+Or sign in with a SuperGrok or X Premium+ account:
+
+```bash
+fx login grok
+```
+
+Chat then uses Grok Build (`xai/grok-4.6`) billed to that subscription, not AI Gateway credits.
+
+If the official Grok CLI is already signed in, import that session without changing `~/.grok/auth.json`:
+
+```bash
+fx login grok --import
+```
+
 Or add an AI Gateway API key:
 
 ```bash

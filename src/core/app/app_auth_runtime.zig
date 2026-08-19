@@ -34,7 +34,7 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
-        pub fn runLoginCommand(app: *App) !void {
+        pub fn runLoginCommand(app: *App, rest: []const u8) !void {
             if (comptime !oauthAuthEnabled(App)) {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -43,10 +43,26 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
+            if (isGrokAuthArg(rest)) {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .information,
+                    .body = "Run fx login grok in a terminal to sign in with SuperGrok or X Premium+.",
+                });
+                return;
+            }
+            if (std.mem.trim(u8, rest, " \t").len != 0) {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = "usage: /login [grok]",
+                });
+                return;
+            }
             try beginSignIn(app, false);
         }
 
-        pub fn runLogoutCommand(app: *App) !void {
+        pub fn runLogoutCommand(app: *App, rest: []const u8) !void {
             if (comptime !oauthAuthEnabled(App)) {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -56,6 +72,34 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             try app.flushBeforeBlockingExternalWork();
+            if (isGrokAuthArg(rest)) {
+                const grok_login_flow = @import("../auth/grok_login_flow.zig");
+                const result = grok_login_flow.logout(app.alloc, app.auth.oauthTransport()) catch {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Could not complete Grok logout. The current source is unchanged.",
+                    });
+                    return;
+                };
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = if (result.session_deleted) .success else .information,
+                    .body = if (result.session_deleted)
+                        "Signed out of Grok OAuth."
+                    else
+                        "No Grok OAuth session found.",
+                });
+                return;
+            }
+            if (std.mem.trim(u8, rest, " \t").len != 0) {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = "usage: /logout [grok]",
+                });
+                return;
+            }
             const result = login_flow.logout(app.alloc, app.auth.oauthTransport()) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
                     try writeAuthNotice(app, .{
@@ -593,6 +637,10 @@ pub fn Runtime(comptime App: type) type {
             try app.writeDomainNotice(notice, true);
             app.shell.render_requests.request(.first_frame);
             try app.flushBeforeBlockingExternalWork();
+        }
+
+        fn isGrokAuthArg(rest: []const u8) bool {
+            return std.ascii.eqlIgnoreCase(std.mem.trim(u8, rest, " \t"), "grok");
         }
     };
 }

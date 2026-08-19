@@ -91,6 +91,7 @@ pub const CredentialSource = enum {
     vercel_oidc_token,
     ai_gateway_api_key,
     fx_login,
+    grok_oauth,
     stored_key,
 };
 

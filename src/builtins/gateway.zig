@@ -14,6 +14,8 @@ const gateway_error_format = @import("../core/shared/gateway_error_format.zig");
 const gateway_client = @import("../gateway/client.zig");
 const gateway_failure_diagnostics = @import("../core/gateway/gateway_failure_diagnostics.zig");
 const gateway_json = @import("../core/gateway/gateway_json.zig");
+const xai_json = @import("../gateway/xai_json.zig");
+const xai_stream_provider = @import("../gateway/xai_stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const gateway_generation_usage = @import("../gateway/generation_usage.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
@@ -144,6 +146,16 @@ pub fn buildAgentRequest(
     alloc: Allocator,
     request: agent_stream_provider_contract.BuildRequest,
 ) anyerror![]u8 {
+    if (request.transport == .xai) {
+        return xai_json.buildChatCompletionsBody(
+            alloc,
+            request.model,
+            request.serialized_tools,
+            request.messages,
+            request.provider_options,
+            request.tool_choice,
+        );
+    }
     const budget: ?gateway_json.BuildBudget = if (request.budget) |value|
         .{ .deadline = value.deadline, .cancel_flag = value.cancel_flag }
     else
@@ -425,6 +437,9 @@ fn streamAgentCompletion(
     alloc: Allocator,
     request: agent_stream_provider_contract.Request,
 ) anyerror!agent_stream_provider_contract.Result {
+    if (xai_json.isXaiChatUrl(request.chat_url)) {
+        return xai_stream_provider.stream(alloc, request);
+    }
     const result = gateway_client.streamGatewayCompletion(
         alloc,
         .{
@@ -478,12 +493,23 @@ fn fetchCredits(
     alloc: Allocator,
     input: gateway_provider.CreditsLookupInput,
 ) output_contracts.CreditsSnapshot {
+    if (input.source == .grok_oauth) return grokCreditsSnapshot(alloc);
     return fetchCreditsWithFetch(
         alloc,
         input.credential,
         input.tenant,
         gateway_client.fetchGatewayGetResult,
     );
+}
+
+fn grokCreditsSnapshot(alloc: Allocator) output_contracts.CreditsSnapshot {
+    const plan = alloc.dupe(u8, "SuperGrok or X Premium+") catch {
+        return creditsErrorSnapshot(
+            alloc,
+            "Grok OAuth bills chat to SuperGrok or X Premium+. AI Gateway credits do not apply.",
+        );
+    };
+    return .{ .plan = plan };
 }
 
 /// An fx login can reach several teams, so `/v1/credits` rejects it outright
@@ -714,6 +740,11 @@ pub fn chatUrl(fallback: []const u8) []const u8 {
 
 pub fn defaultChatUrl() []const u8 {
     return chatUrl(default_chat_url);
+}
+
+pub fn chatUrlForCredentialSource(source: ?shared_types.CredentialSource) []const u8 {
+    if (source == .grok_oauth) return xai_stream_provider.resolveChatUrl();
+    return defaultChatUrl();
 }
 
 fn resolveChatUrlForProvider(_: ?*anyopaque, fallback: []const u8) []const u8 {
@@ -1750,6 +1781,19 @@ test "built-in credits provider maps fetch failure" {
         "failed to fetch credits from gateway",
         snapshot.err_message.?,
     );
+}
+
+test "built-in credits provider skips gateway for grok oauth" {
+    captured_credits_path_len = 0;
+    var snapshot = fetchCredits(null, std.testing.allocator, .{
+        .credential = "grok-access-token",
+        .tenant = "team_123",
+        .source = .grok_oauth,
+    });
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), captured_credits_path_len);
+    try std.testing.expect(snapshot.err_message == null);
+    try std.testing.expectEqualStrings("SuperGrok or X Premium+", snapshot.plan.?);
 }
 
 test "built-in credits provider maps Gateway HTTP denial" {

@@ -90,8 +90,14 @@ pub const StructuredResponseFormat = struct {
     schema_json: []const u8,
 };
 
+pub const TransportKind = enum {
+    gateway,
+    xai,
+};
+
 pub const BuildRequest = struct {
     model: []const u8,
+    transport: TransportKind = .gateway,
     tool_registry: tool_dispatch.Registry = .{},
     serialized_tools: []const u8,
     messages: []const types.ChatMessage,
