@@ -11,6 +11,8 @@ pub const auth_file_env = "FX_CODEX_AUTH_FILE";
 pub const token_url_env = "FX_CODEX_TOKEN_URL";
 pub const oauth_client_id = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const default_token_url = "https://auth.openai.com/oauth/token";
+pub const issuer_env = "FX_CODEX_ISSUER";
+pub const default_issuer = "https://auth.openai.com";
 pub const refresh_early_seconds: i64 = 5 * 60;
 const max_auth_file_bytes: usize = 256 * 1024;
 const personal_access_token_prefix = "at-";
@@ -80,6 +82,28 @@ pub fn resolveAuthFilePath(alloc: Allocator) !?[]u8 {
 
 pub fn tokenUrl() []const u8 {
     return nonEmptyEnv(token_url_env) orelse default_token_url;
+}
+
+pub fn issuer() []const u8 {
+    const value = nonEmptyEnv(issuer_env) orelse return default_issuer;
+    return std.mem.trimEnd(u8, value, "/");
+}
+
+pub fn persistTokens(alloc: Allocator, tokens: StoredTokens) !void {
+    if (comptime host_target.is_wasm) return error.CodexAuthUnavailable;
+    const path = (try resolveAuthFilePath(alloc)) orelse return error.HomeNotSet;
+    defer alloc.free(path);
+    try ensureAuthFileParent(path);
+    const existing = readAuthFile(alloc, path) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (existing) |bytes| secret.zeroAndFree(alloc, bytes);
+    try writeRefreshedDocument(alloc, path, existing orelse "{}", tokens);
+}
+
+pub fn copyAccountId(id_token: []const u8, buf: []u8) ?[]const u8 {
+    return jwtAccountId(id_token, buf);
 }
 
 pub fn parseLoaded(alloc: Allocator, bytes: []const u8) !?Loaded {
@@ -344,6 +368,21 @@ fn writeRefreshedDocument(
     try io_mod.writeFileAtomic(alloc, path, out.written());
 }
 
+fn ensureAuthFileParent(path: []const u8) !void {
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidCodexAuthPath;
+    if (std.Io.Dir.openDirAbsolute(io_mod.getIo(), parent, .{})) |*dir| {
+        dir.close(io_mod.getIo());
+        return;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    std.Io.Dir.createDirAbsolute(io_mod.getIo(), parent, .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+}
+
 fn readAuthFile(alloc: Allocator, path: []const u8) ![]u8 {
     var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{
         .mode = .read_only,
@@ -361,7 +400,9 @@ fn objectString(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 }
 
 fn jwtAccountId(jwt: []const u8, buf: []u8) ?[]const u8 {
-    const payload = decodeJwtPayload(jwt, buf) orelse return null;
+    // ChatGPT id_token payloads are ~1KiB. `buf` is only the account-id output.
+    var payload_buf: [jwt_payload_max_bytes]u8 = undefined;
+    const payload = decodeJwtPayload(jwt, &payload_buf) orelse return null;
     var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, payload, .{}) catch return null;
     defer parsed.deinit();
     if (parsed.value != .object) return null;
@@ -369,10 +410,7 @@ fn jwtAccountId(jwt: []const u8, buf: []u8) ?[]const u8 {
     if (nested != .object) return null;
     const account = objectString(nested.object, "chatgpt_account_id") orelse return null;
     if (account.len == 0 or account.len > buf.len) return null;
-    var copy: [256]u8 = undefined;
-    if (account.len > copy.len) return null;
-    @memcpy(copy[0..account.len], account);
-    @memcpy(buf[0..account.len], copy[0..account.len]);
+    @memcpy(buf[0..account.len], account);
     return buf[0..account.len];
 }
 
@@ -475,6 +513,18 @@ fn encodeJwt(alloc: Allocator, payload: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "e30.{s}.sig", .{encoded});
 }
 
+fn encodePaddedJwt(alloc: Allocator, account_id: []const u8, pad_len: usize) ![]u8 {
+    var payload: std.Io.Writer.Allocating = .init(alloc);
+    defer payload.deinit();
+    try payload.writer.writeAll("{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":");
+    try std.json.Stringify.value(account_id, .{}, &payload.writer);
+    try payload.writer.writeAll("},\"pad\":\"");
+    var index: usize = 0;
+    while (index < pad_len) : (index += 1) try payload.writer.writeByte('x');
+    try payload.writer.writeAll("\"}");
+    return encodeJwt(alloc, payload.written());
+}
+
 const FakeTransportState = struct {
     body: []const u8,
     disposition: oauth_transport.Disposition,
@@ -518,6 +568,16 @@ test "auth file path prefers FX_CODEX_AUTH_FILE then CODEX_HOME then ~/.codex" {
     const fallback_path = (try resolveAuthFilePath(alloc)).?;
     defer alloc.free(fallback_path);
     try std.testing.expectEqualStrings("/tmp/home/.codex/auth.json", fallback_path);
+}
+
+test "copyAccountId extracts chatgpt_account_id from a ChatGPT JWT larger than 256 bytes" {
+    const alloc = std.testing.allocator;
+    const jwt = try encodePaddedJwt(alloc, "acct_real", 900);
+    defer alloc.free(jwt);
+
+    var tiny: [256]u8 = undefined;
+    const account = copyAccountId(jwt, &tiny) orelse return error.TestExpectedAccountId;
+    try std.testing.expectEqualStrings("acct_real", account);
 }
 
 test "parseLoaded reads ChatGPT tokens and JWT expiry" {

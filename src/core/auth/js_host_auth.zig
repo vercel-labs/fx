@@ -131,6 +131,7 @@ fn executeRequest(
     return .{
         .disposition = if (status == 200) .accepted else .rejected,
         .body = try alloc.dupe(u8, response_buffer[0..@intCast(response_len)]),
+        .status = @enumFromInt(status),
     };
 }
 

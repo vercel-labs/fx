@@ -89,8 +89,11 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .login,
         .token = "login",
-        .usage = "login",
-        .summary = "Sign in with Vercel",
+        .usage = "login [--codex]",
+        .summary = "Sign in with Vercel, or with ChatGPT Codex via a device code",
+        .options = &.{
+            .{ .flag = "--codex", .description = "Sign in with ChatGPT Codex using a device code" },
+        },
     },
     .{
         .kind = .logout,
@@ -286,7 +289,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .replay, .usage = "replay <tape>" },
     } },
     .{ .entries = &.{
-        .{ .kind = .login, .usage = "login" },
+        .{ .kind = .login, .usage = "login [--codex]" },
         .{ .kind = .logout, .usage = "logout" },
         .{ .kind = .setup, .usage = "setup" },
         .{ .kind = .teams, .usage = "teams" },

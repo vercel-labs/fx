@@ -21,6 +21,7 @@ const github_publish = @import("../github/github_publish.zig");
 const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
+const codex_login = @import("../auth/codex_login.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -723,24 +724,44 @@ fn runNonInteractiveWithDeps(
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
-            if (rest.len != 0) {
-                try writeStderr(deps, "usage: fx login\n");
-                return .handled_failure;
-            }
-            login_flow.runLogin(
-                alloc,
-                cfg.gateway_provider.oauth_transport,
-                cfg.url_opener,
-            ) catch |err| {
-                const message = switch (err) {
-                    error.ClientIdMissing => "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first\n",
-                    error.AccessDenied => "fx login: authorization denied\n",
-                    error.ExpiredToken, error.LoginTimedOut => "fx login: authorization expired; run fx login again\n",
-                    else => "fx login: failed to sign in\n",
-                };
-                try writeStderr(deps, message);
+            const provider = parseLoginProvider(rest) catch {
+                try writeStderr(deps, "usage: fx login [--codex]\n");
                 return .handled_failure;
             };
+            switch (provider) {
+                .vercel => login_flow.runLogin(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.url_opener,
+                ) catch |err| {
+                    const message = switch (err) {
+                        error.ClientIdMissing => "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first\n",
+                        error.AccessDenied => "fx login: authorization denied\n",
+                        error.ExpiredToken, error.LoginTimedOut => "fx login: authorization expired; run fx login again\n",
+                        else => "fx login: failed to sign in\n",
+                    };
+                    try writeStderr(deps, message);
+                    return .handled_failure;
+                },
+                .codex => codex_login.runLogin(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.url_opener,
+                ) catch |err| {
+                    const message = switch (err) {
+                        error.DeviceCodeUnavailable => "fx login: Codex device-code login is not available\n",
+                        error.InvalidDeviceCodeResponse => "fx login: Codex device-code response was invalid\n",
+                        error.InvalidAuthorizationGrant => "fx login: Codex authorization grant was invalid\n",
+                        error.InvalidTokenExchange => "fx login: Codex token exchange failed\n",
+                        error.AccessDenied => "fx login: Codex authorization denied\n",
+                        error.LoginTimedOut => "fx login: Codex authorization expired; run fx login --codex again\n",
+                        error.HomeNotSet => "fx login: home directory is unavailable; set HOME or FX_CODEX_AUTH_FILE\n",
+                        else => "fx login: failed to sign in to Codex\n",
+                    };
+                    try writeStderr(deps, message);
+                    return .handled_failure;
+                },
+            }
             return .handled_success;
         },
         .logout => |rest| {
@@ -2724,6 +2745,16 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     };
 }
 
+const LoginProvider = enum { vercel, codex };
+
+fn parseLoginProvider(args: []const [:0]const u8) !LoginProvider {
+    if (args.len == 0) return .vercel;
+    if (args.len == 1 and (std.mem.eql(u8, args[0], "--codex") or std.mem.eql(u8, args[0], "codex"))) {
+        return .codex;
+    }
+    return error.InvalidLoginUsage;
+}
+
 fn parseAcpArgs(args: []const [:0]const u8) !AcpOptions {
     var opts = AcpOptions{};
     var i: usize = 0;
@@ -3146,6 +3177,13 @@ fn isVersionFlag(arg: []const u8) bool {
 fn testCommandCatalog() CommandCatalog {
     const builtin_commands = @import("../../builtins/commands.zig");
     return builtin_commands.top_level_registry;
+}
+
+test "login accepts an optional Codex device-code provider" {
+    try std.testing.expectEqual(LoginProvider.vercel, try parseLoginProvider(&.{}));
+    try std.testing.expectEqual(LoginProvider.codex, try parseLoginProvider(&.{@constCast("--codex")}));
+    try std.testing.expectEqual(LoginProvider.codex, try parseLoginProvider(&.{@constCast("codex")}));
+    try std.testing.expectError(error.InvalidLoginUsage, parseLoginProvider(&.{@constCast("--json")}));
 }
 
 test "parse recognizes every top-level command and preserves unknown commands" {

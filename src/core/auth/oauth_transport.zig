@@ -26,6 +26,7 @@ pub const Response = struct {
     disposition: Disposition,
     /// Owned bytes allocated with the allocator passed to `Provider.execute`.
     body: []u8,
+    status: ?std.http.Status = null,
 
     pub fn deinit(self: *Response, alloc: Allocator) void {
         secret.zeroAndFree(alloc, self.body);

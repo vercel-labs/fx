@@ -66,6 +66,19 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addImport("build_options", build_options.createModule());
 
+    _ = b.addModule("fx_mod", .{
+        .root_source_file = b.path("src/mod_api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    _ = b.addModule("fx_default_distribution", .{
+        .root_source_file = b.path("src/default_distribution.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);

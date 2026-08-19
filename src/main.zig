@@ -107,7 +107,7 @@ const session_runtime = @import("core/session/session.zig");
 const session_codec = @import("core/session/session_codec.zig");
 const session_child_store = @import("core/session/session_child_store.zig");
 const session_log = @import("core/session/session_log.zig");
-const builtin_tools = @import("builtins/tools.zig");
+const default_distribution = @import("default_distribution.zig");
 const browser_workspace_tools = @import("builtins/browser_workspace_tools.zig");
 const tool_admission = @import("core/tooling/tool_admission.zig");
 const tool_advertisement = @import("core/tooling/tool_advertisement.zig");
@@ -649,8 +649,9 @@ const App = struct {
     }
 
     pub fn configureNotifications(self: *App) !void {
-        // Register herdr hooks before NotificationAppRuntime.configure freezes
-        // the lifecycle runtime (its call to freeze() is the sole freeze site).
+        // Register distribution and first-party hooks before
+        // NotificationAppRuntime.configure freezes the lifecycle runtime.
+        try default_distribution.Catalog.registerHooks(&self.lifecycle_runtime);
         try HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
         try NotificationAppRuntime.configure(self);
     }
@@ -974,6 +975,10 @@ const App = struct {
     }
 
     pub fn handleCommand(self: *App, cmd: []const u8) !void {
+        if (try default_distribution.native_command_registry.dispatch(.{
+            .allocator = self.alloc,
+            .app = self,
+        }, cmd)) return;
         try app_commands.Handlers(App).route(self, cmd);
     }
 
@@ -1399,7 +1404,7 @@ const App = struct {
 
     fn effectiveToolSet(self: *const App) tool_set_contract.ToolSet {
         if (comptime host_profile.tools) {
-            return builtin_tools.advertisement_set;
+            return default_distribution.tool_set;
         }
         return browser_workspace_tools.selectToolSet(
             false,
@@ -3177,12 +3182,12 @@ test "native app preserves the built-in tool set without workspace metadata" {
     try std.testing.expect(app.workspaceHostInfo() == null);
 
     const registry = app.toolRegistry();
-    try std.testing.expect(registry.tools.ptr == builtin_tools.registry.tools.ptr);
-    try std.testing.expectEqual(builtin_tools.registry.tools.len, registry.tools.len);
+    try std.testing.expect(registry.tools.ptr == default_distribution.tool_registry.tools.ptr);
+    try std.testing.expectEqual(default_distribution.tool_registry.tools.len, registry.tools.len);
 
     const advertised = app.toolAdvertisementSet();
-    try std.testing.expect(advertised.order.ptr == builtin_tools.advertisement_set.order.ptr);
-    try std.testing.expectEqual(builtin_tools.advertisement_set.order.len, advertised.order.len);
+    try std.testing.expect(advertised.order.ptr == default_distribution.tool_set.order.ptr);
+    try std.testing.expectEqual(default_distribution.tool_set.order.len, advertised.order.len);
 }
 
 fn fullEntryConfig() app_entry_runtime.Config {
@@ -3212,7 +3217,7 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .max_history_turns = max_history_turns,
         .context_registry = default_context_registry,
         .mode_registry = builtin_modes.registry,
-        .tool_set = builtin_tools.advertisement_set,
+        .tool_set = default_distribution.tool_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
         .acp_runner = .{ .run_fn = runAcpServer },
@@ -3248,7 +3253,7 @@ fn localEntryConfig() app_entry_runtime.Config {
         .max_history_turns = 0,
         .context_registry = default_context_registry,
         .mode_registry = builtin_modes.registry,
-        .tool_set = builtin_tools.advertisement_set,
+        .tool_set = default_distribution.tool_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
         .acp_runner = .{ .run_fn = runAcpServer },
@@ -3283,7 +3288,7 @@ fn emptyEntryConfig() app_entry_runtime.Config {
         .max_history_turns = 0,
         .context_registry = default_context_registry,
         .mode_registry = builtin_modes.registry,
-        .tool_set = builtin_tools.advertisement_set,
+        .tool_set = default_distribution.tool_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
         .acp_runner = .{ .run_fn = runAcpServer },
@@ -3753,6 +3758,9 @@ test {
     _ = @import("core/shared/collections.zig");
     _ = @import("core/slash_commands/command_router.zig");
     _ = @import("core/slash_commands/command_specs.zig");
+    _ = @import("core/mods/catalog.zig");
+    _ = @import("core/mods/command.zig");
+    _ = @import("core/mods/manifest.zig");
     _ = @import("core/config/config_runtime.zig");
     _ = @import("ui/footer/appearance_menu_presentation.zig");
     _ = @import("ui/footer/compact_command_menu_presentation.zig");
@@ -3768,6 +3776,7 @@ test {
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");
     _ = @import("core/auth/codex_oauth.zig");
+    _ = @import("core/auth/codex_login.zig");
     _ = @import("core/gateway/codex_protocol.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/gateway/gateway_json.zig");
