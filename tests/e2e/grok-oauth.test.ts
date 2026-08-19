@@ -13,7 +13,11 @@ import { runFx } from "../evals/eval-helpers";
 
 const TIMEOUT = 30_000;
 
-function writeGrokAuth(home: string, token = "grok-access-token"): string {
+function writeGrokAuth(
+  home: string,
+  token = "grok-access-token",
+  model: string | null = "xai/grok-4.6",
+): string {
   const fxDir = join(home, ".fx");
   mkdirSync(fxDir, { recursive: true, mode: 0o700 });
   chmodSync(fxDir, 0o700);
@@ -33,11 +37,13 @@ function writeGrokAuth(home: string, token = "grok-access-token"): string {
     { mode: 0o600 },
   );
   chmodSync(path, 0o600);
-  writeFileSync(
-    join(fxDir, "settings.json"),
-    JSON.stringify({ credential_source: "grok_oauth", model: "xai/grok-4.6" }) + "\n",
-    { mode: 0o600 },
-  );
+  const settings: { credential_source: string; model?: string } = {
+    credential_source: "grok_oauth",
+  };
+  if (model != null) settings.model = model;
+  writeFileSync(join(fxDir, "settings.json"), JSON.stringify(settings) + "\n", {
+    mode: 0o600,
+  });
   return path;
 }
 
@@ -140,6 +146,155 @@ test(
       expect(xai.requests[0].userAgent).not.toContain("xai-grok-cli");
       expect(xai.requests[0].body).toContain("\"model\":\"grok-4.6\"");
       expect(xai.requests[0].body).toContain("\"messages\":[");
+      expect(xai.requests[0].body.startsWith("{\"model\":\"grok-4.6\"")).toBe(true);
+    } finally {
+      xai.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT,
+);
+
+test("fx status with Grok OAuth selects grok-4.6 without a saved model", async () => {
+  const home = mkdtempSync(join(tmpdir(), "fx-e2e-grok-status-"));
+  try {
+    writeGrokAuth(home, "grok-access-token", null);
+    const result = await runFx(["status", "--json"], {
+      env: {
+        HOME: realpathSync(home),
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_MODEL: undefined,
+      },
+    });
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    const json = JSON.parse(result.stdout.trim());
+    expect(json.auth).toBe("Grok OAuth");
+    expect(json.model).toBe("xai/grok-4.6");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("fx credits with Grok OAuth does not call AI Gateway", async () => {
+  const home = mkdtempSync(join(tmpdir(), "fx-e2e-grok-credits-"));
+  const requests: string[] = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      requests.push(new URL(request.url).pathname);
+      return Response.json(
+        {
+          error: {
+            code: "customer_verification_required",
+            message: "AI Gateway requires a valid credit card on file.",
+          },
+        },
+        { status: 403 },
+      );
+    },
+  });
+  try {
+    writeGrokAuth(home, "grok-access-token", null);
+    const result = await runFx(["credits", "--json"], {
+      env: {
+        HOME: realpathSync(home),
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_E2E_GATEWAY_CREDITS_URL: `http://127.0.0.1:${server.port}/v1/credits`,
+      },
+    });
+    expect(requests).toEqual([]);
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    const json = JSON.parse(result.stdout.trim());
+    expect(json.kind).toBe("credits");
+    expect(json.plan).toBe("SuperGrok or X Premium+");
+    expect(json.error).toBeUndefined();
+  } finally {
+    server.stop(true);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("fx models with Grok OAuth lists grok-4.6 without calling AI Gateway", async () => {
+  const home = mkdtempSync(join(tmpdir(), "fx-e2e-grok-models-"));
+  const requests: string[] = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      requests.push(new URL(request.url).pathname);
+      return Response.json(
+        {
+          error: {
+            code: "customer_verification_required",
+            message: "AI Gateway requires a valid credit card on file.",
+          },
+        },
+        { status: 403 },
+      );
+    },
+  });
+  try {
+    writeGrokAuth(home, "grok-access-token", null);
+    const result = await runFx(["models", "--json"], {
+      env: {
+        HOME: realpathSync(home),
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_E2E_GATEWAY_MODELS_URL: `http://127.0.0.1:${server.port}/v1/models`,
+      },
+    });
+    expect(requests).toEqual([]);
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    const json = JSON.parse(result.stdout.trim());
+    expect(json.ids).toContain("xai/grok-4.6");
+  } finally {
+    server.stop(true);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test(
+  "fx ask with Grok OAuth defaults to grok-4.6 without FX_MODEL",
+  async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-e2e-grok-ask-default-"));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    mkdirSync(workspace);
+    const token = "grok-e2e-default-token";
+    writeGrokAuth(home, token, null);
+    const xai = startFakeXaiChat("grok build ok");
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Say exactly: grok build ok"],
+        {
+          cwd: realpathSync(workspace),
+          env: {
+            HOME: realpathSync(home),
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_SKIP_ONBOARDING: "1",
+            FX_MODEL: undefined,
+            FX_E2E_XAI_CHAT_URL: xai.chatUrl,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(result.stderr).toBe("");
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("grok build ok");
+      expect(xai.requests.length).toBeGreaterThan(0);
+      expect(xai.requests[0].authorization).toBe(`Bearer ${token}`);
       expect(xai.requests[0].body.startsWith("{\"model\":\"grok-4.6\"")).toBe(true);
     } finally {
       xai.stop();

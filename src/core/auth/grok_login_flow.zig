@@ -3,6 +3,7 @@ const grok_oauth_session = @import("grok_oauth_session.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
+const model_catalog = @import("../gateway/model_catalog.zig");
 const oauth = @import("oauth.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
@@ -346,6 +347,7 @@ fn requiredObjectString(object: std.json.ObjectMap, key: []const u8) ?[]const u8
 fn persistGrokCredentialPreference(alloc: Allocator) void {
     var attempt = config_runtime.attemptUserPreferences(alloc, .{
         .credential_source = .grok_oauth,
+        .model = model_catalog.grok_build_model_id,
     });
     defer attempt.deinit(alloc);
 }
@@ -387,6 +389,44 @@ test "parse grok cli auth rejects a vercel issuer" {
             0,
         ),
     );
+}
+
+var stable_grok_login_test_environ: ?*std.process.Environ.Map = null;
+
+fn stableGrokLoginTestEnviron() !*const std.process.Environ.Map {
+    if (stable_grok_login_test_environ) |map| return map;
+    const alloc = std.heap.page_allocator;
+    const map = try alloc.create(std.process.Environ.Map);
+    map.* = std.process.Environ.Map.init(alloc);
+    stable_grok_login_test_environ = map;
+    return map;
+}
+
+test "grok login preference persists grok oauth and grok build model" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home);
+
+    _ = try stableGrokLoginTestEnviron();
+    var map = std.process.Environ.Map.init(std.testing.allocator);
+    defer map.deinit();
+    try map.put("HOME", home);
+    const previous = io_mod.environMap();
+    io_mod.setEnvironMap(&map);
+    defer io_mod.setEnvironMap(previous orelse stable_grok_login_test_environ.?);
+
+    persistGrokCredentialPreference(std.testing.allocator);
+
+    const settings_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".fx", "settings.json" });
+    defer std.testing.allocator.free(settings_path);
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), settings_path, .{});
+    defer file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(std.testing.allocator, &file, 64 * 1024);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"credential_source\":\"grok_oauth\"") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"model\":\"xai/grok-4.6\"") != null);
 }
 
 test "grok login session requires a refresh token" {

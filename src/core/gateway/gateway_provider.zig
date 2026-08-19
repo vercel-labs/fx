@@ -62,6 +62,7 @@ pub const CliModelCatalogProvider = struct {
 pub const CreditsLookupInput = struct {
     credential: ?[]const u8,
     tenant: ?[]const u8,
+    source: ?credentials.Source = null,
 };
 
 pub const FetchCreditsFn = *const fn (

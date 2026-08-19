@@ -493,12 +493,23 @@ fn fetchCredits(
     alloc: Allocator,
     input: gateway_provider.CreditsLookupInput,
 ) output_contracts.CreditsSnapshot {
+    if (input.source == .grok_oauth) return grokCreditsSnapshot(alloc);
     return fetchCreditsWithFetch(
         alloc,
         input.credential,
         input.tenant,
         gateway_client.fetchGatewayGetResult,
     );
+}
+
+fn grokCreditsSnapshot(alloc: Allocator) output_contracts.CreditsSnapshot {
+    const plan = alloc.dupe(u8, "SuperGrok or X Premium+") catch {
+        return creditsErrorSnapshot(
+            alloc,
+            "Grok OAuth bills chat to SuperGrok or X Premium+. AI Gateway credits do not apply.",
+        );
+    };
+    return .{ .plan = plan };
 }
 
 /// An fx login can reach several teams, so `/v1/credits` rejects it outright
@@ -1770,6 +1781,19 @@ test "built-in credits provider maps fetch failure" {
         "failed to fetch credits from gateway",
         snapshot.err_message.?,
     );
+}
+
+test "built-in credits provider skips gateway for grok oauth" {
+    captured_credits_path_len = 0;
+    var snapshot = fetchCredits(null, std.testing.allocator, .{
+        .credential = "grok-access-token",
+        .tenant = "team_123",
+        .source = .grok_oauth,
+    });
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), captured_credits_path_len);
+    try std.testing.expect(snapshot.err_message == null);
+    try std.testing.expectEqualStrings("SuperGrok or X Premium+", snapshot.plan.?);
 }
 
 test "built-in credits provider maps Gateway HTTP denial" {

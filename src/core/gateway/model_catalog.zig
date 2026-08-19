@@ -173,11 +173,62 @@ pub fn fetchWithPublicFallback(
     return result;
 }
 
+pub const grok_build_model_id = "xai/grok-4.6";
+
+pub fn usesGrokBuildCatalog(access: credentials.CatalogAccess) bool {
+    const reason = access.publicOnlyReason() orelse return false;
+    return reason == .grok_oauth or reason == .grok_oauth_refresh_required;
+}
+
+pub fn modelForGrokOAuth(selected: []const u8, source: ?credentials.Source) []const u8 {
+    if (source != .grok_oauth) return selected;
+    if (std.mem.startsWith(u8, selected, "xai/")) return selected;
+    return grok_build_model_id;
+}
+
+pub fn grokBuildCatalog(alloc: Allocator) Allocator.Error!std.ArrayList(ModelCatalogEntry) {
+    var entries: std.ArrayList(ModelCatalogEntry) = .empty;
+    errdefer freeModelCatalog(alloc, &entries);
+    try entries.append(alloc, try grokBuildEntry(alloc));
+    return entries;
+}
+
+fn grokBuildEntry(alloc: Allocator) Allocator.Error!ModelCatalogEntry {
+    const id = try alloc.dupe(u8, grok_build_model_id);
+    errdefer alloc.free(id);
+    const model_type = try alloc.dupe(u8, "language");
+    errdefer alloc.free(model_type);
+    var reasoning_efforts: std.ArrayList(types.ReasoningEffort) = .empty;
+    errdefer reasoning_efforts.deinit(alloc);
+    try reasoning_efforts.append(alloc, types.ReasoningEffort.literal("low"));
+    try reasoning_efforts.append(alloc, types.ReasoningEffort.literal("high"));
+    return .{
+        .id = id,
+        .model_type = model_type,
+        .released = 1,
+        .has_tool_use = true,
+        .has_reasoning = true,
+        .reasoning_efforts = reasoning_efforts,
+        .has_vision = true,
+        .context_window = 131_072,
+        .max_tokens = 32_768,
+    };
+}
+
 fn fetchWithPublicFallbackUntraced(
     provider: Provider,
     alloc: Allocator,
     input: FetchInput,
 ) FetchResult {
+    if (usesGrokBuildCatalog(input.access)) {
+        const catalog = grokBuildCatalog(alloc) catch
+            return failedOutcome(input.access, false, .{ .category = .resource_exhausted });
+        return .{ .loaded = .{
+            .catalog = catalog,
+            .provenance = .{ .access = .init(input.access) },
+        } };
+    }
+
     var attempt = input;
     const first = provider.fetch(alloc, attempt) catch
         return failedOutcome(attempt.access, false, .{ .category = .resource_exhausted });
@@ -867,4 +918,55 @@ test "featured deepseek slot prefers the pro variant at equal recency" {
     try std.testing.expectEqualStrings("deepseek/deepseek-v4-pro", curated.items[0].id);
     try std.testing.expectEqualStrings("deepseek/deepseek-v4", curated.items[1].id);
     try std.testing.expectEqualStrings("deepseek/deepseek-v4-flash", curated.items[2].id);
+}
+
+test "grok oauth keeps an xai model and otherwise selects grok build" {
+    try std.testing.expectEqualStrings(
+        grok_build_model_id,
+        modelForGrokOAuth("zai/glm-5.2", .grok_oauth),
+    );
+    try std.testing.expectEqualStrings(
+        "xai/grok-4",
+        modelForGrokOAuth("xai/grok-4", .grok_oauth),
+    );
+    try std.testing.expectEqualStrings(
+        "zai/glm-5.2",
+        modelForGrokOAuth("zai/glm-5.2", .fx_login),
+    );
+    try std.testing.expectEqualStrings(
+        "zai/glm-5.2",
+        modelForGrokOAuth("zai/glm-5.2", null),
+    );
+}
+
+test "grok oauth catalog is local and skips the gateway provider" {
+    for ([_]credentials.CatalogPublicOnly{ .grok_oauth, .grok_oauth_refresh_required }) |reason| {
+        var probe = FallbackProbe{ .failures = .{ null, null } };
+        var result = fetchWithPublicFallback(probe.provider(), std.testing.allocator, .{
+            .access = .{ .public_only = reason },
+            .endpoint = "/coding-agent/v1/models",
+        });
+        switch (result) {
+            .loaded => |*loaded| {
+                defer freeModelCatalog(std.testing.allocator, &loaded.catalog);
+                try std.testing.expectEqual(@as(usize, 0), probe.calls);
+                try std.testing.expectEqual(@as(usize, 1), loaded.catalog.items.len);
+                try std.testing.expectEqualStrings(grok_build_model_id, loaded.catalog.items[0].id);
+                try std.testing.expect(loaded.catalog.items[0].has_tool_use);
+                try std.testing.expect(loaded.catalog.items[0].has_reasoning);
+                try std.testing.expectEqual(AccessLevel.public_only, loaded.provenance.access.level);
+                try std.testing.expectEqual(credentials.Source.grok_oauth, loaded.provenance.access.source.?);
+                try std.testing.expect(!loaded.provenance.anonymous_fallback_used);
+            },
+            .failed => return error.TestExpectedEqual,
+        }
+    }
+
+    var probe = FallbackProbe{ .failures = .{ null, null } };
+    var loaded = fetchWithPublicFallback(probe.provider(), std.testing.allocator, .{
+        .access = .{ .public_only = .no_credential },
+        .endpoint = "/coding-agent/v1/models",
+    });
+    defer freeModelCatalog(std.testing.allocator, &loaded.loaded.catalog);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
 }

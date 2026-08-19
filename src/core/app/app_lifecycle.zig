@@ -5,6 +5,7 @@ const config_runtime = @import("../config/config_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const host = @import("../hosts/host.zig");
+const model_catalog = @import("../gateway/model_catalog.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const input_appearance = @import("../config/input_appearance.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -317,11 +318,18 @@ pub fn loadStartupStatus(
     defer detailed.deinit(alloc);
     const settings = &detailed.settings;
 
-    const selected_model = try loadStartupStatusModel(alloc, default_model, settings.model);
+    var selected_model = try loadStartupStatusModel(alloc, default_model, settings.model);
     errdefer if (selected_model.owned) |model| alloc.free(model);
 
     var auth_status = try auth_runtime.loadStatusSnapshot(alloc, secret_store, settings.credential_source);
     errdefer auth_status.deinit(alloc);
+
+    if (!hasProcessModelOverride()) {
+        if (try takeGrokBuildModelIfNeeded(alloc, selected_model.value, auth_status.active_source)) |owned| {
+            if (selected_model.owned) |previous| alloc.free(previous);
+            selected_model = .{ .value = owned, .owned = owned };
+        }
+    }
 
     const result = StartupStatus{
         .workspace_root = workspace_root,
@@ -402,6 +410,14 @@ fn loadStartupStateFromOwnedWorkspace(
         const resolution = try credentials.resolvePreferring(alloc, transport, secret_store, mode, settings.credential_source);
         state.credential = resolution.credential;
         state.stored_key_status = resolution.stored_key_status;
+    }
+    if (!hasProcessModelOverride()) {
+        if (state.credential) |credential| {
+            if (try takeGrokBuildModelIfNeeded(alloc, state.selected_model, credential.source)) |owned| {
+                alloc.free(state.selected_model);
+                state.selected_model = owned;
+            }
+        }
     }
     state.permission_mode = loadPermissionMode(settings.permission_mode);
     state.yolo_acknowledged = settings.yolo_acknowledged orelse false;
@@ -1101,6 +1117,16 @@ fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8
 
 fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) ![]u8 {
     return alloc.dupe(u8, initialModelId(default_model, configured));
+}
+
+fn takeGrokBuildModelIfNeeded(
+    alloc: Allocator,
+    selected: []const u8,
+    source: ?credentials.Source,
+) !?[]u8 {
+    const resolved = model_catalog.modelForGrokOAuth(selected, source);
+    if (std.mem.eql(u8, resolved, selected)) return null;
+    return try alloc.dupe(u8, resolved);
 }
 
 fn initialInputAppearance(configured: ?[]const u8) input_appearance.InputAppearance {
@@ -2028,6 +2054,49 @@ test "loadStartupState defaults fast mode off and preserves explicit preferences
     try std.testing.expectEqualStrings("zai/glm-5.2", enabled.selected_model);
     try std.testing.expectEqualStrings("zai/glm-5.2", enabled.configured_model);
     try std.testing.expect(enabled.fast_mode);
+}
+
+test "loadStartupState selects grok build when grok oauth is active" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"credential_source\":\"grok_oauth\"}\n");
+    var auth_file = try tmp.dir.createFile(io_mod.getIo(), "home/.fx/grok-auth.json", .{
+        .truncate = true,
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    try auth_file.writeStreamingAll(io_mod.getIo(),
+        \\{"version":1,"issuer":"https://auth.x.ai","client_id":"test-client","access_token":"grok-access","refresh_token":"grok-refresh","expires_at_ms":4102444800000,"scope":"openid","token_type":"Bearer"}
+        \\
+    );
+    auth_file.close(io_mod.getIo());
+
+    var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
+    defer env.deinit();
+
+    const owned_workspace = try std.testing.allocator.dupe(u8, workspace_root);
+    var state = try loadStartupStateFromOwnedWorkspace(
+        std.testing.allocator,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        owned_workspace,
+        "zai/glm-5.2",
+        25,
+        null,
+        .stored,
+    );
+    defer state.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(credentials.Source.grok_oauth, state.credential.?.source);
+    try std.testing.expectEqualStrings(model_catalog.grok_build_model_id, state.selected_model);
 }
 
 test "loadStartupState resolves startup scrollback default and explicit false" {
