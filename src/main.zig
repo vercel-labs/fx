@@ -35,6 +35,8 @@ const app_worker_runtime = @import("core/app/app_worker_runtime.zig");
 const app_workspace_runtime = @import("core/app/app_workspace_runtime.zig");
 const app_callbacks = @import("core/app/app_callbacks.zig");
 const app_commands = @import("core/app/app_commands.zig");
+const app_lua_runtime = @import("core/app/app_lua_runtime.zig");
+const scripting = @import("core/scripting/runtime.zig");
 const change_tracker_mod = @import("core/workspace/change_tracker.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const collections = @import("core/shared/collections.zig");
@@ -391,6 +393,7 @@ const App = struct {
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
     const WorkerAppRuntime = app_worker_runtime.Runtime(Self);
     const WorkspaceAppRuntime = app_workspace_runtime.Runtime(Self);
+    const LuaAppRuntime = app_lua_runtime.Runtime(Self);
 
     fn devboxProvider(_: *Self) @import("core/execution/devbox_executor.zig").Provider {
         return builtin_devbox.provider;
@@ -414,8 +417,12 @@ const App = struct {
         return builtin_context.prompt_policy;
     }
 
-    pub fn slashRegistry(_: *const Self) command_specs.SlashRegistry {
-        return builtin_commands.slash_registry;
+    pub fn slashRegistry(self: *const Self) command_specs.SlashRegistry {
+        return self.scripting.slashRegistry(builtin_commands.slash_registry);
+    }
+
+    pub fn builtinSlashSpecs() []const command_specs.SlashSpec {
+        return builtin_commands.slash_specs[0..];
     }
 
     pub fn mcpCommandProvider(_: *const Self) mcp_command_provider.Provider {
@@ -507,6 +514,7 @@ const App = struct {
     web_search_models_path: []const u8 = builtin_gateway.models_path,
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
+    scripting: scripting.Runtime = .{},
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
 
@@ -577,6 +585,7 @@ const App = struct {
         var app = Self{
             .alloc = alloc,
             .lifecycle_runtime = hooks.Runtime.init(alloc),
+            .scripting = scripting.Runtime.init(alloc),
             .background = BackgroundRuntime.init(if (comptime host_target.is_wasm)
                 background_process_provider.unavailable_provider
             else
@@ -665,10 +674,12 @@ const App = struct {
     }
 
     pub fn configureNotifications(self: *App) !void {
-        // Register herdr hooks before NotificationAppRuntime.configure freezes
-        // the lifecycle runtime (its call to freeze() is the sole freeze site).
+        // Register herdr and Lua trampolines before NotificationAppRuntime.configure
+        // freezes the lifecycle runtime (its call to freeze() is the sole freeze site).
+        try LuaAppRuntime.registerHooks(self);
         try HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
         try NotificationAppRuntime.configure(self);
+        try LuaAppRuntime.configure(self);
     }
 
     pub fn rebindAfterInit(self: *App) void {
@@ -855,6 +866,7 @@ const App = struct {
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
         self.lifecycle_runtime.deinit();
+        self.scripting.deinit();
 
         self.auth.deinit(self.alloc);
         WorkspaceAppRuntime.deinit(self);
@@ -3921,6 +3933,7 @@ test {
     _ = @import("core/providers/chatgpt_catalog.zig");
     _ = @import("core/providers/grok_auth.zig");
     _ = @import("core/providers/grok_catalog.zig");
+    _ = @import("core/scripting/runtime.zig");
     _ = @import("core/providers/cursor_auth.zig");
     _ = @import("core/providers/cursor_catalog.zig");
     _ = @import("builtins/providers/openai_compatible.zig");

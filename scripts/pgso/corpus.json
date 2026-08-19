@@ -96,6 +96,7 @@
     {"name": "e2e-session-recovery", "argv": ["bun", "test", "--max-concurrency", "1", "./session-recovery.test.ts"], "test_file": "session-recovery.test.ts"},
     {"name": "e2e-terminal-host", "argv": ["bun", "test", "--max-concurrency", "1", "./terminal-host.test.ts"], "test_file": "terminal-host.test.ts"},
     {"name": "e2e-tui-startup", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-startup.test.ts"], "test_file": "tui-startup.test.ts"},
+    {"name": "e2e-lua-init", "argv": ["bun", "test", "--max-concurrency", "1", "./lua-init.test.ts"], "test_file": "lua-init.test.ts"},
     {"name": "e2e-permission-errors", "argv": ["bun", "test", "--max-concurrency", "1", "./permission-errors.test.ts"], "test_file": "permission-errors.test.ts"},
     {"name": "e2e-tui-resize", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-resize.test.ts"], "test_file": "tui-resize.test.ts"},
     {"name": "e2e-tui-render-stress", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-render-stress.test.ts"], "test_file": "tui-render-stress.test.ts"},

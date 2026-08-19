@@ -17,6 +17,9 @@ pub const openai_compatible_dir_name = "openai_compatible";
 pub const chatgpt_dir_name = "chatgpt";
 pub const grok_dir_name = "grok";
 pub const cursor_dir_name = "cursor";
+pub const init_lua_name = "init.lua";
+pub const lua_dir_name = "lua";
+pub const pack_dir_name = "pack";
 
 const settings_file_name = "settings.json";
 const mcp_config_file_name = "mcp.json";
@@ -171,6 +174,26 @@ pub fn cursorAuthPath(alloc: Allocator, home: []const u8) ![]u8 {
     });
 }
 
+pub fn initLuaPath(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{ home, root_dir_name, init_lua_name });
+}
+
+pub fn luaDir(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{ home, root_dir_name, lua_dir_name });
+}
+
+pub fn packDir(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{ home, root_dir_name, pack_dir_name });
+}
+
+pub fn workspaceFxDir(alloc: Allocator, workspace_root: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{ workspace_root, root_dir_name });
+}
+
+pub fn workspaceInitLuaPath(alloc: Allocator, workspace_root: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{ workspace_root, root_dir_name, init_lua_name });
+}
+
 test "profile path helpers preserve current default locations" {
     const alloc = std.testing.allocator;
 
@@ -299,4 +322,20 @@ test "profile path helpers preserve current default locations" {
         "/tmp/fake-home/.fx/providers/cursor/auth.json",
         cursor_auth,
     );
+
+    const init_lua = try initLuaPath(alloc, "/tmp/fake-home");
+    defer alloc.free(init_lua);
+    try std.testing.expectEqualStrings("/tmp/fake-home/.fx/init.lua", init_lua);
+
+    const lua_dir = try luaDir(alloc, "/tmp/fake-home");
+    defer alloc.free(lua_dir);
+    try std.testing.expectEqualStrings("/tmp/fake-home/.fx/lua", lua_dir);
+
+    const pack_dir = try packDir(alloc, "/tmp/fake-home");
+    defer alloc.free(pack_dir);
+    try std.testing.expectEqualStrings("/tmp/fake-home/.fx/pack", pack_dir);
+
+    const workspace_init = try workspaceInitLuaPath(alloc, "/tmp/workspace");
+    defer alloc.free(workspace_init);
+    try std.testing.expectEqualStrings("/tmp/workspace/.fx/init.lua", workspace_init);
 }

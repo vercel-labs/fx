@@ -65,6 +65,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("build_options", build_options.createModule());
+    addLuaLibrary(exe.root_module);
 
     b.installArtifact(exe);
 
@@ -306,6 +307,53 @@ pub fn build(b: *std.Build) void {
         );
         pgso_ir_step.dependOn(&missing_artifact.step);
     }
+}
+
+fn addLuaLibrary(mod: *std.Build.Module) void {
+    const b = mod.owner;
+    mod.addIncludePath(b.path("third_party/lua"));
+    mod.addCSourceFiles(.{
+        .root = b.path("third_party/lua"),
+        .files = &.{
+            "lapi.c",
+            "lauxlib.c",
+            "lbaselib.c",
+            "lcode.c",
+            "lcorolib.c",
+            "lctype.c",
+            "ldblib.c",
+            "ldebug.c",
+            "ldo.c",
+            "ldump.c",
+            "lfunc.c",
+            "lgc.c",
+            "linit.c",
+            "liolib.c",
+            "llex.c",
+            "lmathlib.c",
+            "lmem.c",
+            "loadlib.c",
+            "lobject.c",
+            "lopcodes.c",
+            "loslib.c",
+            "lparser.c",
+            "lstate.c",
+            "lstring.c",
+            "lstrlib.c",
+            "ltable.c",
+            "ltablib.c",
+            "ltm.c",
+            "lundump.c",
+            "lutf8lib.c",
+            "lvm.c",
+            "lzio.c",
+        },
+        .flags = &.{
+            "-std=gnu99",
+            "-DLUA_USE_POSIX",
+            "-fno-stack-protector",
+        },
+    });
 }
 
 fn addWasmArtifact(

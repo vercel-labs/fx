@@ -47,7 +47,13 @@ pub const ParsedCommand = union(enum) {
     notifications: []const u8,
     workspace: []const u8,
     version,
+    lua: LuaCommand,
     unknown,
+};
+
+pub const LuaCommand = struct {
+    command: []const u8,
+    payload: []const u8,
 };
 
 pub const CommandHandlers = struct {
@@ -94,6 +100,8 @@ pub const CommandHandlers = struct {
     handle_notifications: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_workspace: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
+    handle_lua: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    handle_lua_command: *const fn (ctx: *anyopaque, command: []const u8, payload: []const u8) anyerror!void,
     unknown: *const fn (ctx: *anyopaque, cmd: []const u8) anyerror!void,
 };
 
@@ -101,8 +109,8 @@ fn command_payload(cmd: []const u8, prefix: []const u8) []const u8 {
     return std.mem.trim(u8, cmd[prefix.len..], " \t");
 }
 
-fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
-    return switch (kind) {
+fn parsedFromSpec(spec: *const command_specs.SlashSpec, payload: []const u8) ParsedCommand {
+    return switch (spec.kind) {
         .quit => .quit,
         .clear_screen => .clear_screen,
         .new_session => .new_session,
@@ -145,17 +153,18 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .notifications => .{ .notifications = payload },
         .workspace => .{ .workspace = payload },
         .version => .version,
+        .lua => .{ .lua = .{ .command = spec.command, .payload = payload } },
     };
 }
 
 pub fn parse(registry: SlashRegistry, cmd: []const u8) ParsedCommand {
-    for (registry.commands) |spec| {
+    for (registry.commands) |*spec| {
         if (spec.accepts_payload) {
-            if (command_specs.matchedSlashPrefix(registry, cmd, spec.kind)) |prefix| {
-                return parsedCommand(spec.kind, command_payload(cmd, prefix));
+            if (registry.matchEntryPrefix(cmd, spec)) |prefix| {
+                return parsedFromSpec(spec, command_payload(cmd, prefix));
             }
         } else if (command_specs.matchesSlashExact(registry, cmd, spec.kind)) {
-            return parsedCommand(spec.kind, "");
+            return parsedFromSpec(spec, "");
         }
     }
     return .unknown;
@@ -205,6 +214,13 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .notifications => |rest| try handlers.handle_notifications(handlers.ctx, rest),
         .workspace => |rest| try handlers.handle_workspace(handlers.ctx, rest),
         .version => try handlers.show_version(handlers.ctx),
+        .lua => |info| {
+            if (std.mem.eql(u8, info.command, "/lua")) {
+                try handlers.handle_lua(handlers.ctx, info.payload);
+            } else {
+                try handlers.handle_lua_command(handlers.ctx, info.command, info.payload);
+            }
+        },
         .unknown => try handlers.unknown(handlers.ctx, cmd),
     }
 }
@@ -232,6 +248,23 @@ test "parse recognizes models" {
 test "parse extracts allowlist command payload" {
     switch (parse(testSlashRegistry(), "/allowlist add command \"git *\"")) {
         .allowlist => |rest| try std.testing.expectEqualStrings("add command \"git *\"", rest),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "parse extracts lua command payload" {
+    switch (parse(testSlashRegistry(), "/lua")) {
+        .lua => |info| {
+            try std.testing.expectEqualStrings("/lua", info.command);
+            try std.testing.expectEqualStrings("", info.payload);
+        },
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/lua reload")) {
+        .lua => |info| {
+            try std.testing.expectEqualStrings("/lua", info.command);
+            try std.testing.expectEqualStrings("reload", info.payload);
+        },
         else => return error.TestExpectedEqual,
     }
 }
@@ -619,8 +652,15 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .handle_notifications = unexpectedPayload,
         .handle_workspace = unexpectedPayload,
         .show_version = unexpectedNoPayload,
+        .handle_lua = unexpectedPayload,
+        .handle_lua_command = unexpectedLuaCommand,
         .unknown = unexpectedPayload,
     };
+}
+
+fn unexpectedLuaCommand(ctx: *anyopaque, _: []const u8, _: []const u8) anyerror!void {
+    _ = ctx;
+    return error.TestUnexpectedHandler;
 }
 
 test "route calls expected no-payload handler" {

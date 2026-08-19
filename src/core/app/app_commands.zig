@@ -11,6 +11,7 @@ const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const command_router = @import("../slash_commands/command_router.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
+const app_lua_runtime = @import("app_lua_runtime.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const input_appearance = @import("../config/input_appearance.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -312,6 +313,8 @@ pub fn Handlers(comptime App: type) type {
                 .handle_notifications = commandHandleNotifications,
                 .handle_workspace = commandHandleWorkspace,
                 .show_version = commandShowVersion,
+                .handle_lua = commandHandleLua,
+                .handle_lua_command = commandHandleLuaCommand,
                 .unknown = commandUnknown,
             };
         }
@@ -1670,6 +1673,32 @@ pub fn Handlers(comptime App: type) type {
                 .topic = "version",
                 .tone = .neutral,
                 .body = App.app_version,
+            }, true);
+        }
+
+        fn commandHandleLua(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasField(App, "scripting")) {
+                try app_lua_runtime.Runtime(App).handleLua(app, rest);
+                return;
+            }
+            try app.writeDomainNotice(.{
+                .topic = "lua",
+                .tone = .neutral,
+                .body = "Lua is not available on this host.",
+            }, true);
+        }
+
+        fn commandHandleLuaCommand(ctx: *anyopaque, command: []const u8, payload: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasField(App, "scripting")) {
+                try app_lua_runtime.Runtime(App).handleLuaCommand(app, command, payload);
+                return;
+            }
+            try app.writeDomainNotice(.{
+                .topic = "lua",
+                .tone = .@"error",
+                .body = "Unknown command. Try /help.",
             }, true);
         }
 

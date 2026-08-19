@@ -870,6 +870,7 @@ pub fn Runtime(comptime App: type) type {
             const slash_menu_was_visible = slashMenuVisibleForCue(app);
             defer announceSlashMenuOpened(app, slash_menu_was_visible);
             if (try routeActivePasteByte(app, byte)) return;
+            if (try routeLuaKeymap(app, byte)) return;
 
             if (byte != 3 and byte != 0x1b) disarmCtrlCExit(app, "raw_input");
 
@@ -1157,6 +1158,20 @@ pub fn Runtime(comptime App: type) type {
                 if (app.terminal.fullTranscriptScreenActive()) return false;
             }
             return true;
+        }
+
+        fn routeLuaKeymap(app: *App, byte: u8) !bool {
+            if (comptime @hasField(App, "scripting")) {
+                if (byte == 3 or byte == 26) return false;
+                if (app.question_prompt.isActive() or approvalOwnsCurrentSurface(app)) return false;
+                if (helpMenuActive(app) or settingsMenuActive(app)) return false;
+                if (comptime @hasField(App, "terminal")) {
+                    if (app.terminal.fullTranscriptScreenActive()) return false;
+                }
+                const app_lua_runtime = @import("app_lua_runtime.zig");
+                return app_lua_runtime.Runtime(App).dispatchKeymap(app, byte);
+            }
+            return false;
         }
 
         fn routeUpgradeShortcut(app: *App, byte: u8) !bool {
