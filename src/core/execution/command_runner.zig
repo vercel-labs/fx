@@ -8,6 +8,7 @@ const background_process_provider = @import(
     "background_process_provider.zig",
 );
 const io_mod = @import("../shared/io.zig");
+const self_exe = @import("../shared/self_exe.zig");
 const background_launch_output = @import("../background/background_launch_output.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const session_child_store = @import("../session/session_child_store.zig");
@@ -1013,7 +1014,7 @@ fn foregroundSessionExecutable(scratch: Allocator) ![]const u8 {
             return error.TestProductExecutableMissing;
         return std.mem.sliceTo(path_z, 0);
     }
-    return std.process.executablePathAlloc(io_mod.getIo(), scratch);
+    return self_exe.pathForReexec(scratch);
 }
 
 fn waitForForegroundSessionReady(

@@ -6,6 +6,7 @@ const protocol = @import("protocol.zig");
 const host = @import("host.zig");
 const policy = @import("host_policy.zig");
 const io_mod = @import("../shared/io.zig");
+const self_exe = @import("../shared/self_exe.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
@@ -931,7 +932,7 @@ fn waitForHost(endpoint_path: []const u8) !std.Io.net.Stream {
 }
 
 fn launchHost(alloc: Allocator) !void {
-    const executable = try std.process.executablePathAlloc(io_mod.getIo(), alloc);
+    const executable = try self_exe.pathForReexec(alloc);
     defer alloc.free(executable);
     const argv = [_][]const u8{ executable, host.internal_mode };
     const child = try std.process.spawn(io_mod.getIo(), .{
