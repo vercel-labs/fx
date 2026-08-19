@@ -104,6 +104,7 @@ const PathSpan = struct {
 
 pub const Info = struct {
     storage: [max_info_bytes]u8 = undefined,
+    version: u32,
     root_span: PathSpan,
     cwd_span: PathSpan,
     home_span: PathSpan,
@@ -181,11 +182,15 @@ pub fn Adapter(comptime Host: type) type {
             };
             defer parsed.deinit();
             const value = parsed.value;
-            if (value.version != 1 or value.git or !value.ephemeral) return error.InvalidContract;
             if (!validAbsolutePath(value.root) or
                 !validAbsolutePath(value.cwd) or
-                !validAbsolutePath(value.home) or
-                !std.mem.eql(u8, value.root, value.cwd)) return error.InvalidContract;
+                !validAbsolutePath(value.home)) return error.InvalidContract;
+            const valid_contract = switch (value.version) {
+                1 => !value.git and value.ephemeral and std.mem.eql(u8, value.root, value.cwd),
+                2 => value.git and !value.ephemeral and pathContains(value.root, value.cwd),
+                else => false,
+            };
+            if (!valid_contract) return error.InvalidContract;
             const permission: Permission = if (std.mem.eql(u8, value.permission, "allow-sandboxed"))
                 .allow_sandboxed
             else if (std.mem.eql(u8, value.permission, "prompt"))
@@ -194,11 +199,12 @@ pub fn Adapter(comptime Host: type) type {
                 return error.InvalidContract;
 
             var info = Info{
+                .version = value.version,
                 .root_span = undefined,
                 .cwd_span = undefined,
                 .home_span = undefined,
-                .git_available = false,
-                .ephemeral = true,
+                .git_available = value.git,
+                .ephemeral = value.ephemeral,
                 .permission = permission,
             };
             var offset: usize = 0;
@@ -358,6 +364,13 @@ fn validAbsolutePath(path: []const u8) bool {
     return true;
 }
 
+fn pathContains(root: []const u8, path: []const u8) bool {
+    if (std.mem.eql(u8, root, path) or std.mem.eql(u8, root, "/")) return true;
+    return path.len > root.len and
+        std.mem.startsWith(u8, path, root) and
+        path[root.len] == '/';
+}
+
 const valid_info_json =
     "{\"version\":1,\"root\":\"/workspace\",\"cwd\":\"/workspace\",\"home\":\"/home/visitor\",\"git\":false,\"ephemeral\":true,\"permission\":\"allow-sandboxed\"}";
 
@@ -401,12 +414,28 @@ test "workspace info is unavailable when the host adapter is absent" {
 
 test "workspace info accepts the bounded v1 browser contract" {
     const info = try Adapter(FakeInfoHost).loadInfo(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 1), info.version);
     try std.testing.expectEqualStrings("/workspace", info.root());
     try std.testing.expectEqualStrings("/workspace", info.cwd());
     try std.testing.expectEqualStrings("/home/visitor", info.home());
     try std.testing.expect(!info.git_available);
     try std.testing.expect(info.ephemeral);
     try std.testing.expectEqual(Permission.allow_sandboxed, info.permission);
+}
+
+test "workspace info accepts a persistent v2 git workspace with nested cwd" {
+    FakeInfoHost.info_json =
+        "{\"version\":2,\"root\":\"/workspace\",\"cwd\":\"/workspace/src\",\"home\":\"/home/visitor\",\"git\":true,\"ephemeral\":false,\"permission\":\"prompt\"}";
+    defer FakeInfoHost.info_json = valid_info_json;
+
+    const info = try Adapter(FakeInfoHost).loadInfo(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 2), info.version);
+    try std.testing.expectEqualStrings("/workspace", info.root());
+    try std.testing.expectEqualStrings("/workspace/src", info.cwd());
+    try std.testing.expectEqualStrings("/home/visitor", info.home());
+    try std.testing.expect(info.git_available);
+    try std.testing.expect(!info.ephemeral);
+    try std.testing.expectEqual(Permission.prompt, info.permission);
 }
 
 test "workspace runtime keeps one validated metadata and executor snapshot" {
@@ -427,7 +456,7 @@ test "workspace info rejects invalid host contracts and stable error codes" {
         FakeInfoHost.info_json = valid_info_json;
     }
     const invalid = [_][]const u8{
-        "{\"version\":2,\"root\":\"/workspace\",\"cwd\":\"/workspace\",\"home\":\"/home/visitor\",\"git\":false,\"ephemeral\":true,\"permission\":\"prompt\"}",
+        "{\"version\":3,\"root\":\"/workspace\",\"cwd\":\"/workspace\",\"home\":\"/home/visitor\",\"git\":true,\"ephemeral\":false,\"permission\":\"prompt\"}",
         "{\"version\":1,\"root\":\"workspace\",\"cwd\":\"/workspace\",\"home\":\"/home/visitor\",\"git\":false,\"ephemeral\":true,\"permission\":\"prompt\"}",
         "{\"version\":1,\"root\":\"/workspace/./src\",\"cwd\":\"/workspace/src\",\"home\":\"/home/visitor\",\"git\":false,\"ephemeral\":true,\"permission\":\"prompt\"}",
         "{\"version\":1,\"root\":\"/workspace\",\"cwd\":\"/workspace/src\",\"home\":\"/home/visitor\",\"git\":false,\"ephemeral\":true,\"permission\":\"prompt\"}",
@@ -436,6 +465,9 @@ test "workspace info rejects invalid host contracts and stable error codes" {
         "{\"version\":1,\"root\":\"/workspace\",\"cwd\":\"/workspace\",\"home\":\"/home/visitor\",\"git\":true,\"ephemeral\":true,\"permission\":\"prompt\"}",
         "{\"version\":1,\"root\":\"/workspace\",\"cwd\":\"/workspace\",\"home\":\"/home/visitor\",\"git\":false,\"ephemeral\":false,\"permission\":\"prompt\"}",
         "{\"version\":1,\"root\":\"/workspace\",\"cwd\":\"/workspace\",\"home\":\"/home/visitor\",\"git\":false,\"ephemeral\":true,\"permission\":\"allow\"}",
+        "{\"version\":2,\"root\":\"/workspace\",\"cwd\":\"/workspace\",\"home\":\"/home/visitor\",\"git\":false,\"ephemeral\":false,\"permission\":\"prompt\"}",
+        "{\"version\":2,\"root\":\"/workspace\",\"cwd\":\"/workspace\",\"home\":\"/home/visitor\",\"git\":true,\"ephemeral\":true,\"permission\":\"prompt\"}",
+        "{\"version\":2,\"root\":\"/workspace\",\"cwd\":\"/workspace-other\",\"home\":\"/home/visitor\",\"git\":true,\"ephemeral\":false,\"permission\":\"prompt\"}",
     };
     for (invalid) |payload| {
         FakeInfoHost.info_json = payload;

@@ -23,22 +23,23 @@ const execCalls = [];
 let abortStarted = false;
 let abortObserved = false;
 let checkedToolProjection = false;
+let checkedWorkspaceContext = false;
 const truncatedOutput = `start\n${"🙂".repeat(17_000)}\nend\n`;
 const truncatedBytes = encoder.encode(truncatedOutput).length;
 
 const workspace = {
   info: {
-    version: 1,
+    version: 2,
     root: "/workspace",
-    cwd: "/workspace",
+    cwd: "/workspace/src",
     home: "/home/visitor",
-    gitAvailable: false,
-    ephemeral: true,
+    gitAvailable: true,
+    ephemeral: false,
   },
   permission: "allow-sandboxed",
   exec({ command, cwd, signal, timeoutMs, outputLimitBytes }) {
     execCalls.push(command);
-    if (cwd !== "/workspace" || timeoutMs !== 30_000 || outputLimitBytes !== 65_536) {
+    if (cwd !== "/workspace/src" || timeoutMs !== 30_000 || outputLimitBytes !== 65_536) {
       throw new Error(`unexpected workspace exec contract: cwd=${cwd} timeout=${timeoutMs} outputLimit=${outputLimitBytes}`);
     }
     if (command === "printf adapter-success") {
@@ -164,6 +165,19 @@ const fetch = async (_url, init = {}) => {
     }
     checkedToolProjection = true;
   }
+  if (!checkedWorkspaceContext) {
+    const prompt = JSON.stringify(body.prompt || []);
+    for (const expected of [
+      "workspace_root: /workspace",
+      "current_directory: /workspace/src",
+      "workspace_ephemeral: false",
+      "git_available: true",
+      "git_worktree: unknown",
+    ]) {
+      if (!prompt.includes(expected)) throw new Error(`workspace context omitted ${expected}: ${prompt}`);
+    }
+    checkedWorkspaceContext = true;
+  }
   if (toolResult(body, "workspace-success")) {
     requireResult(body, "workspace-success", ["adapter-success", "exit_code=0"]);
     return textResponse("success record checked");
@@ -258,7 +272,8 @@ const exitCode = await Promise.race([
 ]);
 if (exitCode !== 0) throw new Error(`fx-term exited with ${exitCode}`);
 if (!checkedToolProjection) throw new Error("workspace tool projection was not checked");
+if (!checkedWorkspaceContext) throw new Error("workspace metadata projection was not checked");
 if (execCalls.join(",") !== "printf adapter-success,generate-truncated-output,timeout-command,hold-command") {
   throw new Error(`unexpected workspace exec calls: ${execCalls.join(",")}`);
 }
-console.log("headless workspace passed: success, truncation, timeout, Ctrl-C abort, and strict invalid boundaries mapped through the host adapter");
+console.log("headless v2 workspace passed: nested cwd, persistent git metadata, success, truncation, timeout, Ctrl-C abort, and strict invalid boundaries mapped through the host adapter");

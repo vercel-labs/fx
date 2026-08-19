@@ -2032,11 +2032,20 @@ fn buildTurnContextFragmentForHost(
     try model_context_encoding.writeScalar(&out.writer, workspace.cwd);
     try out.writer.print("\noperating_system: {s}\nshell_path: just-bash\ndate_utc: {s}\nhome_directory: ", .{ os_text, date_text });
     try model_context_encoding.writeScalar(&out.writer, workspace.home);
-    try out.writer.writeAll(
-        "\ngit_available: false\n" ++
-            "git_worktree: unavailable\n" ++
-            "</fx-turn-context>",
-    );
+    if (workspace.git_available and !workspace.ephemeral) {
+        try out.writer.writeAll(
+            "\nworkspace_ephemeral: false\n" ++
+                "git_available: true\n" ++
+                "git_worktree: unknown\n" ++
+                "</fx-turn-context>",
+        );
+    } else {
+        try out.writer.writeAll(
+            "\ngit_available: false\n" ++
+                "git_worktree: unavailable\n" ++
+                "</fx-turn-context>",
+        );
+    }
     return try out.toOwnedSlice();
 }
 
@@ -2721,15 +2730,39 @@ test "turn context uses explicit browser workspace and git unavailable state" {
             .root = "/workspace",
             .cwd = "/workspace/src",
             .home = "/home/visitor",
+            .git_available = false,
+            .ephemeral = true,
         },
     );
     try expectContains(fragment, "workspace_root: /workspace\n");
     try expectContains(fragment, "current_directory: /workspace/src\n");
     try expectContains(fragment, "shell_path: just-bash\n");
     try expectContains(fragment, "home_directory: /home/visitor\n");
+    try expectNotContains(fragment, "workspace_ephemeral:");
     try expectContains(fragment, "git_available: false\n");
     try expectContains(fragment, "git_worktree: unavailable\n");
     try expectNotContains(fragment, "/native/path");
+    try expectNotContains(fragment, "git_branch:");
+}
+
+test "turn context reports persistent host git without inventing repository state" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const fragment = try buildTurnContextFragmentForHost(
+        arena_state.allocator(),
+        "/native/path",
+        context_contract.HostWorkspaceContext{
+            .root = "/workspace",
+            .cwd = "/workspace/src",
+            .home = "/home/visitor",
+            .git_available = true,
+            .ephemeral = false,
+        },
+    );
+    try expectContains(fragment, "workspace_ephemeral: false\n");
+    try expectContains(fragment, "git_available: true\n");
+    try expectContains(fragment, "git_worktree: unknown\n");
     try expectNotContains(fragment, "git_branch:");
 }
 

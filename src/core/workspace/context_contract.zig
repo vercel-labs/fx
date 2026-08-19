@@ -245,6 +245,8 @@ pub const HostWorkspaceContext = struct {
     root: []const u8,
     cwd: []const u8,
     home: []const u8,
+    git_available: bool,
+    ephemeral: bool,
 };
 
 pub const TransientContextInput = struct {

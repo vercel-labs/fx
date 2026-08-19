@@ -817,6 +817,8 @@ pub fn Runtime(comptime App: type) type {
                     .root = info.root(),
                     .cwd = info.cwd(),
                     .home = info.home(),
+                    .git_available = info.git_available,
+                    .ephemeral = info.ephemeral,
                 } else null,
                 .access_scope = if (host_workspace != null)
                     workspace_access.AccessScope.primaryOnly(workspace_root)

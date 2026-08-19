@@ -14,25 +14,32 @@ function validWorkspacePath(path) {
   return path.slice(1).split("/").every((part) => part && part !== "." && part !== "..");
 }
 
+function workspacePathContains(root, path) {
+  return path === root || root === "/" || path.startsWith(`${root}/`);
+}
+
 function prepareWorkspaceAdapter(workspace) {
   if (workspace == null) return { present: false, valid: false };
   try {
     const info = workspace.info;
     const permission = workspace.permission;
-    if (!info || typeof workspace.exec !== "function" || info.version !== 1 ||
+    const validV1 = info?.version === 1 && info.cwd === info.root &&
+      info.gitAvailable === false && info.ephemeral === true;
+    const validV2 = info?.version === 2 && workspacePathContains(info.root, info.cwd) &&
+      info.gitAvailable === true && info.ephemeral === false;
+    if (!info || typeof workspace.exec !== "function" || (!validV1 && !validV2) ||
       !validWorkspacePath(info.root) || !validWorkspacePath(info.cwd) ||
-      !validWorkspacePath(info.home) || info.cwd !== info.root ||
-      info.gitAvailable !== false || info.ephemeral !== true ||
+      !validWorkspacePath(info.home) ||
       (permission !== "allow-sandboxed" && permission !== "prompt")) {
       return { present: true, valid: false };
     }
     const value = {
-      version: 1,
+      version: info.version,
       root: info.root,
       cwd: info.cwd,
       home: info.home,
-      git: false,
-      ephemeral: true,
+      git: info.gitAvailable,
+      ephemeral: info.ephemeral,
       permission,
     };
     const encoded = encoder.encode(JSON.stringify(value));

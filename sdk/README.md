@@ -73,6 +73,15 @@ The staging script includes `zig-out/lib/libfx.node` by default for local testin
 
 The npm `latest` dist-tag is the stable channel. The `dev` dist-tag tracks successful builds from `main` and uses immutable prerelease versions. Publishing runs through `.github/workflows/publish-libfx.yml` with npm trusted publishing and provenance. Configure the npm trusted publisher for the `vercel-labs/fx` repository, workflow filename `publish-libfx.yml`, and GitHub environment `npm`. Because npm requires a package to exist before trusted publishing can be configured, the first `libfx` version must be published once by a maintainer before enabling that relationship.
 
-JavaScript hosts can provide configuration, prompt history, session persistence, device login, URL opening, and a foreground workspace. The optional workspace adapter exposes only `terminal` with `{ action: "exec", command }`; command execution is delegated to the host in a clean, root-fixed environment.
+JavaScript hosts can provide configuration, prompt history, session persistence, device login, URL opening, and a foreground workspace. The optional workspace adapter exposes only `terminal` with `{ action: "exec", command }`; command execution is delegated to the host with the workspace's validated current directory.
+
+The workspace metadata contract has two exact versions:
+
+| Version | Git | Storage | Current directory |
+| --- | --- | --- | --- |
+| 1 | unavailable | ephemeral | must equal `root` |
+| 2 | available | persistent | `root` or a directory beneath it |
+
+Both versions require normalized absolute `root`, `cwd`, and `home` paths plus a permission of `allow-sandboxed` or `prompt`. Hosts own workspace provisioning, persistence, source synchronization, and cleanup; FX keeps provider lifecycle code and dependencies outside the SDK. Command execution remains bounded to 64 KiB of input and output, a 30-second maximum deadline, and host `AbortSignal` cancellation.
 
 WebAssembly builds do not include native processes, OS sandboxing, native MCP, subagents, skills, auto-upgrade, clipboard integration, arbitrary WASI filesystem access, or web search.
