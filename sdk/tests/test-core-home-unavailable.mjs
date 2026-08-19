@@ -40,10 +40,15 @@ const mockFetch = async (url, init) => {
   }), { status: 200, headers: { "content-type": "text/event-stream" } });
 };
 
-const timeout = (label, ms = 8000) => new Promise((_, reject) => {
-  setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), ms);
-});
+const timeout = (label, ms = 8000) => {
+  let timer;
+  const promise = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), ms);
+  });
+  return { promise, cancel() { clearTimeout(timer); } };
+};
 
+const initializeTimeout = timeout("fx-core initialize");
 const agent = await Promise.race([
   createFxAgent({
     backend: "wasm",
@@ -69,8 +74,8 @@ const agent = await Promise.race([
       },
     },
   }),
-  timeout("fx-core initialize"),
-]);
+  initializeTimeout.promise,
+]).finally(() => initializeTimeout.cancel());
 
 const session = await agent.createSession();
 const turn = session.prompt("say hello");
@@ -82,7 +87,8 @@ for await (const update of turn) {
   if (text.startsWith("[context]")) notices.push(text);
   else chunks.push(text);
 }
-const result = await Promise.race([turn.result, timeout("prompt result")]);
+const resultTimeout = timeout("prompt result");
+const result = await Promise.race([turn.result, resultTimeout.promise]).finally(() => resultTimeout.cancel());
 const streamedText = chunks.join("").trimEnd();
 if (notices.some((notice) => notice.includes("home unavailable"))) {
   throw new Error(`home unavailable notice replaced the turn: ${JSON.stringify(notices)}`);
