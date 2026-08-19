@@ -3,6 +3,7 @@ const display_width = @import("../../core/shared/display_width.zig");
 const list_window = @import("../../core/shared/list_window.zig");
 const model_cache_runtime = @import("../../core/app/model_cache_runtime.zig");
 const model_capabilities = @import("../../core/config/model_capabilities.zig");
+const model_provider = @import("../../core/config/model_provider.zig");
 const ui_render = @import("../render.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
@@ -231,7 +232,7 @@ fn modelFactsColumn(projection: ModelMenuProjection, width: u16) ?usize {
     const content_width: usize = width;
     var facts_width: usize = 0;
     for (projection.items) |item| {
-        facts_width = @max(facts_width, compactFactsWidth(item.capabilities));
+        facts_width = @max(facts_width, compactFactsWidth(item.id, item.capabilities));
     }
     if (facts_width == 0 or content_width < indent_width + 8 + 2 + facts_width) return null;
     return content_width - facts_width;
@@ -252,7 +253,7 @@ fn composeTitleRow(
 
     var facts: std.ArrayList(u8) = .empty;
     defer facts.deinit(alloc);
-    try appendCompactFacts(alloc, &facts, item.capabilities);
+    try appendCompactFacts(alloc, &facts, item.id, item.capabilities);
 
     const prefix_width = display_width.visibleWidthIgnoringAnsi(row.items);
     const content_width = @as(usize, width);
@@ -274,16 +275,21 @@ fn composeTitleRow(
 fn appendCompactFacts(
     alloc: Allocator,
     facts: *std.ArrayList(u8),
+    model: []const u8,
     capabilities: model_capabilities.Capabilities,
 ) !void {
+    try appendMetadataFact(alloc, facts, model_provider.sourceLabel(model));
     if (capabilities.context_window) |tokens| try appendTokenFact(alloc, facts, tokens, "context");
     if (capabilities.max_output_tokens) |tokens| try appendTokenFact(alloc, facts, tokens, "output");
     if (capabilities.supports_fast_mode) try appendMetadataFact(alloc, facts, "Fast");
 }
 
-fn compactFactsWidth(capabilities: model_capabilities.Capabilities) usize {
-    var width: usize = 0;
-    if (capabilities.context_window) |tokens| width += tokenFactWidth(tokens, "context");
+fn compactFactsWidth(model: []const u8, capabilities: model_capabilities.Capabilities) usize {
+    var width: usize = display_width.visibleWidth(model_provider.sourceLabel(model));
+    if (capabilities.context_window) |tokens| {
+        if (width > 0) width += display_width.visibleWidth(" · ");
+        width += tokenFactWidth(tokens, "context");
+    }
     if (capabilities.max_output_tokens) |tokens| {
         if (width > 0) width += display_width.visibleWidth(" · ");
         width += tokenFactWidth(tokens, "output");
@@ -341,6 +347,17 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
             .fx_login_refresh_required => "Vercel sign-in must refresh before team-private models can load.",
             .credential_refresh_failed => "Vercel sign-in refresh failed; using the public model catalog.",
             .authenticated_credential_rejected => "Your Gateway credential was rejected; using the public model catalog.",
+            .chatgpt_subscription => "ChatGPT subscription models are available with the public Gateway catalog.",
+        };
+    }
+    if (state.access_level == .authenticated) {
+        const source = state.source orelse return "Using an authenticated AI Gateway catalog.";
+        return switch (source) {
+            .fx_login => "Gateway catalog: authenticated with fx login.",
+            .ai_gateway_api_key => "Gateway catalog: authenticated with an API key.",
+            .vercel_oidc_token => "Gateway catalog: authenticated with the Vercel session.",
+            .stored_key => "Gateway catalog: authenticated with the stored API key.",
+            .chatgpt_subscription => "ChatGPT subscription models are available.",
         };
     }
     return null;
@@ -477,6 +494,19 @@ test "model menu keeps shared-prefix model ids distinguishable when narrow" {
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(beta_row.items) <= 40);
 }
 
+test "full model menu renders per-model account provenance" {
+    const alloc = std.testing.allocator;
+    const item: model_cache_runtime.ModelMenuItem = .{
+        .id = @constCast("openai-codex/gpt-5.4"),
+        .provider = "openai-codex",
+        .capabilities = .{},
+    };
+    var row = try composeTitleRow(alloc, item, true, 55, 80);
+    defer row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, row.items, "openai-codex/gpt-5.4") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "ChatGPT subscription") != null);
+}
+
 test "model menu states and navigation budget stay bounded" {
     const alloc = std.testing.allocator;
     const loading: ModelMenuProjection = .{ .active = true, .load_state = .loading };
@@ -506,7 +536,10 @@ test "model menu states and navigation budget stay bounded" {
 }
 
 test "model menu status follows provenance and retryable failure precedence" {
-    try std.testing.expect(loadedCatalogStatusText(.{ .access_level = .authenticated }) == null);
+    try std.testing.expectEqualStrings(
+        "Gateway catalog: authenticated with fx login.",
+        loadedCatalogStatusText(.{ .access_level = .authenticated, .source = .fx_login }).?,
+    );
 
     const cases = [_]struct {
         state: model_cache_runtime.ModelMenuCatalogState,

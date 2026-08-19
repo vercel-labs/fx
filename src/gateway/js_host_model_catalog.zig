@@ -1,5 +1,6 @@
 const std = @import("std");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
+const model_provider = @import("../core/config/model_provider.zig");
 const builtin_gateway = @import("../builtins/gateway.zig");
 
 const Allocator = std.mem.Allocator;
@@ -78,7 +79,7 @@ fn fetch(
         return .{ .failure = model_catalog.failureForHttpStatus(@enumFromInt(status)) };
     }
 
-    const catalog = builtin_gateway.parseModelCatalogForView(
+    var catalog = builtin_gateway.parseModelCatalogForView(
         alloc,
         response[0..@intCast(response_len)],
         input.view,
@@ -86,5 +87,13 @@ fn fetch(
         .category = if (err == error.OutOfMemory) .resource_exhausted else .malformed_response,
         .http_status = .ok,
     } };
+    var index: usize = 0;
+    while (index < catalog.items.len) {
+        if (!model_provider.isChatGptSubscriptionModel(catalog.items[index].id)) {
+            index += 1;
+            continue;
+        }
+        model_catalog.freeModelCatalogEntry(alloc, catalog.orderedRemove(index));
+    }
     return .{ .catalog = catalog };
 }

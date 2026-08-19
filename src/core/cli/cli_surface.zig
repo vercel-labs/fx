@@ -4,6 +4,7 @@ const io_mod = @import("../shared/io.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const background_record_liveness = @import("../background/background_record_liveness.zig");
 const background_store = @import("../background/background_store.zig");
+const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
@@ -22,6 +23,7 @@ const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
+const provider_catalog = @import("../auth/provider_catalog.zig");
 const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
@@ -194,6 +196,12 @@ pub const Config = struct {
 const LocalSurfaceOptions = struct {
     format: output_contracts.OutputFormat = .text,
 };
+
+fn parseLoginProvider(rest: []const [:0]const u8) !?provider_catalog.Id {
+    if (rest.len == 0) return null;
+    if (rest.len != 1) return error.InvalidLoginProviderArgs;
+    return provider_catalog.parse(rest[0]) orelse error.InvalidLoginProviderArgs;
+}
 
 const UpgradeOptions = struct {
     format: output_contracts.OutputFormat = .text,
@@ -707,30 +715,69 @@ fn runNonInteractiveWithDeps(
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
-            if (rest.len != 0) {
-                try writeStderr(deps, "usage: fx login\n");
-                return .handled_failure;
-            }
-            login_flow.runLogin(
-                alloc,
-                cfg.gateway_provider.oauth_transport,
-                cfg.url_opener,
-            ) catch |err| {
-                const message = switch (err) {
-                    error.ClientIdMissing => "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first\n",
-                    error.AccessDenied => "fx login: authorization denied\n",
-                    error.ExpiredToken, error.LoginTimedOut => "fx login: authorization expired; run fx login again\n",
-                    else => "fx login: failed to sign in\n",
-                };
-                try writeStderr(deps, message);
+            const maybe_login_provider = parseLoginProvider(rest) catch {
+                try writeStderr(deps, "usage: fx login [vercel|openai-codex]\n");
                 return .handled_failure;
             };
+            // Preserve the original `fx login` behavior for scripts and users.
+            const login_provider = maybe_login_provider orelse .vercel;
+            switch (login_provider) {
+                .vercel => login_flow.runLogin(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.url_opener,
+                ) catch |err| {
+                    const message = switch (err) {
+                        error.ClientIdMissing => "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first\n",
+                        error.AccessDenied => "fx login: authorization denied\n",
+                        error.ExpiredToken, error.LoginTimedOut => "fx login: authorization expired; run fx login again\n",
+                        else => "fx login: failed to sign in\n",
+                    };
+                    try writeStderr(deps, message);
+                    return .handled_failure;
+                },
+                .openai_codex => chatgpt_oauth.runLogin(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.url_opener,
+                ) catch |err| {
+                    const message = switch (err) {
+                        error.ChatGptLoginTimedOut => "fx login: ChatGPT authorization expired; run fx login openai-codex again\n",
+                        error.ChatGptAuthorizationFailed => "fx login: ChatGPT authorization denied\n",
+                        else => "fx login: failed to sign in with ChatGPT\n",
+                    };
+                    try writeStderr(deps, message);
+                    return .handled_failure;
+                },
+            }
             return .handled_success;
         },
         .logout => |rest| {
-            if (rest.len != 0) {
-                try writeStderr(deps, "usage: fx logout\n");
+            const maybe_login_provider = parseLoginProvider(rest) catch {
+                try writeStderr(deps, "usage: fx logout [vercel|openai-codex]\n");
                 return .handled_failure;
+            };
+            // Preserve the original `fx logout` behavior for scripts and users.
+            const login_provider = maybe_login_provider orelse .vercel;
+            if (login_provider == .openai_codex) {
+                const outcome = chatgpt_oauth.logout() catch {
+                    try writeStderr(deps, "fx logout: failed to durably remove saved ChatGPT login\n");
+                    return .handled_failure;
+                };
+                return switch (outcome) {
+                    .deleted => result: {
+                        try writeStdout(deps, "Signed out of ChatGPT.\n");
+                        break :result .handled_success;
+                    },
+                    .missing => result: {
+                        try writeStdout(deps, "No ChatGPT login session found.\n");
+                        break :result .handled_success;
+                    },
+                    .deleted_not_durable => result: {
+                        try writeStderr(deps, "fx logout: failed to durably remove saved ChatGPT login\n");
+                        break :result .handled_failure;
+                    },
+                };
             }
             const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
@@ -1250,6 +1297,7 @@ fn runNonInteractiveWithDeps(
 
             var snapshot = cfg.gateway_provider.credits.fetch(alloc, .{
                 .credential = startup.apiKey(),
+                .credential_source = if (startup.credential) |credential| credential.source else null,
                 .tenant = startup.gatewayTeam(),
             });
             defer snapshot.deinit(alloc);
@@ -4520,7 +4568,7 @@ test "runIfRequested models passes startup team to fetch seam" {
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expect(probe.called);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false,\"ids\":[\"private/blue-hornbill\"]}\n",
+        "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false,\"ids\":[\"private/blue-hornbill\"],\"models\":[{\"id\":\"private/blue-hornbill\",\"source\":\"Vercel AI Gateway\"}]}\n",
         capture.stdout.written(),
     );
 }
@@ -4599,7 +4647,7 @@ test "runIfRequested local json success appends exactly one newline" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json") }, testConfig(), deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"sandbox\":\"none\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_source\":\"Vercel AI Gateway\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"connected_providers\":[],\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"sandbox\":\"none\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
         capture.stdout.written(),
     );
     try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
@@ -4692,7 +4740,7 @@ test "writeRenderedJsonLine falls back to heap and appends exactly one newline" 
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"sandbox\":\"none\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_source\":\"Vercel AI Gateway\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"connected_providers\":[],\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"sandbox\":\"none\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
         capture.stdout.written(),
     );
 }
@@ -4738,7 +4786,7 @@ test "writeRenderedJsonLine renders doctor json through output contract" {
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"workspace\":\"/tmp/fx\",\"model\":\"test-model\",\"auth\":\"AI_GATEWAY_API_KEY\",\"auth_refreshable\":false,\"permission_mode\":\"auto\",\"agent_step_limit\":42,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\"}]}\n",
+        "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"workspace\":\"/tmp/fx\",\"model\":\"test-model\",\"model_source\":\"Vercel AI Gateway\",\"auth\":\"AI_GATEWAY_API_KEY\",\"auth_refreshable\":false,\"permission_mode\":\"auto\",\"agent_step_limit\":42,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\"}]}\n",
         capture.stdout.written(),
     );
 }

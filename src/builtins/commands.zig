@@ -86,14 +86,14 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .login,
         .token = "login",
-        .usage = "login",
-        .summary = "Sign in with Vercel",
+        .usage = "login [vercel|openai-codex]",
+        .summary = "Sign in to Vercel or a selected provider",
     },
     .{
         .kind = .logout,
         .token = "logout",
-        .usage = "logout",
-        .summary = "Sign out of the current Vercel session",
+        .usage = "logout [vercel|openai-codex]",
+        .summary = "Sign out of Vercel or a selected provider session",
     },
     .{
         .kind = .setup,
@@ -281,8 +281,8 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .replay, .usage = "replay <tape>" },
     } },
     .{ .entries = &.{
-        .{ .kind = .login, .usage = "login" },
-        .{ .kind = .logout, .usage = "logout" },
+        .{ .kind = .login, .usage = "login [vercel|openai-codex]" },
+        .{ .kind = .logout, .usage = "logout [vercel|openai-codex]" },
         .{ .kind = .setup, .usage = "setup" },
         .{ .kind = .teams, .usage = "teams" },
         .{ .kind = .credits, .usage = "credits|balance" },
@@ -407,9 +407,9 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .resume_session, .command = "/resume", .help_entry = "/resume", .completion_description = "resume a saved session", .presentation_category = .session },
     .{ .kind = .continue_recovery, .command = "/continue", .help_entry = "/continue", .completion_description = "continue a paused model response", .presentation_category = .session, .requires_prompt_credential = true },
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
-    .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "sign in with Vercel", .presentation_category = .account },
-    .{ .kind = .logout, .command = "/logout", .help_entry = "/logout", .completion_description = "sign out of fx login", .presentation_category = .account },
-    .{ .kind = .setup, .command = "/setup", .help_entry = "/setup", .completion_description = "set up AI Gateway access", .presentation_category = .account },
+    .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "choose Vercel or ChatGPT sign-in", .presentation_category = .account },
+    .{ .kind = .logout, .command = "/logout", .help_entry = "/logout [vercel|chatgpt]", .completion_description = "sign out of a provider session", .presentation_category = .account, .has_args = true, .accepts_payload = true },
+    .{ .kind = .setup, .command = "/setup", .help_entry = "/setup", .completion_description = "manage accounts and AI Gateway access", .presentation_category = .account },
     .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show token and turn statistics", .presentation_category = .account },
     .{ .kind = .usage, .command = "/usage", .aliases = &.{"/cost"}, .help_entry = "/usage (/cost)", .completion_description = "show local fx tokens, models, and spend", .presentation_category = .account },
     .{ .kind = .status, .command = "/status", .help_entry = "/status", .completion_description = "show runtime configuration", .presentation_category = .general, .show_in_welcome = true },
@@ -419,7 +419,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .background_logs, .command = "/background logs", .accepts_payload = true },
     .{ .kind = .image, .command = "/image", .aliases = &.{"/img"}, .help_entry = "/image <path> (/img)", .completion_description = "attach an image by path", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },
-    .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true, .accepts_payload = true, .requires_prompt_credential = true },
+    .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true, .accepts_payload = true },
     .{ .kind = .models, .command = "/models", .help_entry = "/models", .completion_description = "browse available models", .presentation_category = .model },
     .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|yolo|reset]", .completion_description = "choose what fx is allowed to do", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .allowlist, .command = "/allowlist", .help_entry = "/allowlist [view [effective|local|user]|[local|user] add|remove|reset ...]", .completion_description = "manage trusted commands, tools, and URLs", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
@@ -571,13 +571,13 @@ test "built-in slash registry resolves primary commands and aliases" {
     const model = command_specs.matchedSlashPrefix(slash_registry, "/model\tmodel-id", .model) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("/model", model);
 
-    for ([_][]const u8{ "/model", "/credits" }) |command| {
-        const credential_backed = slash_registry.lookup(command) orelse return error.TestExpectedEqual;
-        try std.testing.expect(credential_backed.requires_prompt_credential);
-    }
+    const credits = slash_registry.lookup("/credits") orelse return error.TestExpectedEqual;
+    try std.testing.expect(credits.requires_prompt_credential);
 
-    const models = slash_registry.lookup("/models") orelse return error.TestExpectedEqual;
-    try std.testing.expect(!models.requires_prompt_credential);
+    for ([_][]const u8{ "/model", "/models" }) |command| {
+        const catalog_command = slash_registry.lookup(command) orelse return error.TestExpectedEqual;
+        try std.testing.expect(!catalog_command.requires_prompt_credential);
+    }
 
     try std.testing.expect(command_specs.matchedSlashPrefix(slash_registry, "/model\nmodel-id", .model) == null);
 }

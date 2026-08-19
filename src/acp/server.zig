@@ -14,6 +14,9 @@ const app_runtime_setup = @import("../core/app/app_runtime_setup.zig");
 const builtin_skills = @import("../builtins/skills.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const credentials = @import("../core/auth/credentials.zig");
+const secret = @import("../core/auth/secret.zig");
+const auth_runtime = @import("../core/auth/auth_runtime.zig");
+const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const hooks = @import("../core/hooks/hooks.zig");
@@ -263,7 +266,7 @@ pub const ServerState = struct {
         };
         self.workspace_access.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
-        if (self.api_key.len > 0) self.alloc.free(self.api_key);
+        if (self.api_key.len > 0) secret.zeroAndFree(self.alloc, self.api_key);
         if (self.gateway_team) |team| self.alloc.free(team);
         if (self.selected_model.len > 0) self.alloc.free(self.selected_model);
         if (self.configured_model.len > 0) self.alloc.free(self.configured_model);
@@ -286,6 +289,77 @@ pub const ServerState = struct {
     }
 };
 
+fn credentialMatchesModel(source: ?types.CredentialSource, model: []const u8) bool {
+    return model_provider.isChatGptSubscriptionModel(model) ==
+        (source == .chatgpt_subscription);
+}
+
+fn adoptServerCredential(state: *ServerState, credential: *credentials.Credential) void {
+    if (state.active_session) |*active| active.api_key = &.{};
+    if (state.api_key.len > 0) secret.zeroAndFree(state.alloc, state.api_key);
+    if (state.gateway_team) |team| state.alloc.free(team);
+
+    state.api_key = credential.token;
+    credential.token = &.{};
+    state.credential_source = credential.source;
+    state.gateway_team = if (credential.team_id) |team| team else credential.team_slug;
+    if (credential.team_id != null) {
+        credential.team_id = null;
+        if (credential.team_slug) |slug| state.alloc.free(slug);
+        credential.team_slug = null;
+    } else {
+        credential.team_slug = null;
+    }
+    if (state.active_session) |*active| {
+        active.api_key = state.api_key;
+        active.credential_source = state.credential_source;
+    }
+}
+
+/// Ensures the process and active ACP session use a credential authorized for
+/// the final model route. Returns false when that route has no credential.
+pub fn selectCredentialForModel(state: *ServerState, model: []const u8) !bool {
+    if (state.active_session) |active| {
+        if (credentialMatchesModel(active.credential_source, model)) return true;
+    }
+    if (credentialMatchesModel(state.credential_source, model) and state.api_key.len > 0) return true;
+
+    var credential = if (!model_provider.isChatGptSubscriptionModel(model) and state.cfg.credential_override != null)
+        credentials.Credential{
+            .token = try state.alloc.dupe(u8, state.cfg.credential_override.?),
+            .source = .ai_gateway_api_key,
+        }
+    else blk: {
+        const resolution = try credentials.resolveForModel(
+            state.alloc,
+            state.cfg.gateway_provider.oauth_transport,
+            state.cfg.secret_store,
+            .refresh_if_needed,
+            model,
+            state.credential_source,
+        );
+        break :blk resolution.credential orelse return false;
+    };
+    defer credential.deinit(state.alloc);
+    adoptServerCredential(state, &credential);
+    return true;
+}
+
+pub fn refreshModelCredential(
+    raw: *anyopaque,
+    alloc: Allocator,
+    source: types.CredentialSource,
+    mode: auth_runtime.CredentialRefreshMode,
+) !?[]u8 {
+    const state: *ServerState = @ptrCast(@alignCast(raw));
+    return auth_runtime.refreshCredentialToken(
+        state.cfg.gateway_provider.oauth_transport,
+        alloc,
+        source,
+        mode,
+    );
+}
+
 pub fn releaseActiveSession(state: *ServerState) !void {
     clearPendingLegacyUrls(state);
     const active = if (state.active_session) |*session| session else return;
@@ -294,10 +368,14 @@ pub fn releaseActiveSession(state: *ServerState) !void {
         active.session_rt.usage.cancelReconciliation();
         active.session_rt.usage.finishProfilePublicationsBeforeShutdown();
         flushActiveSessionUsage(state) catch |err| {
-            active.session_rt.usage.startReconciliation(
-                state.alloc,
-                state.api_key,
-            );
+            if (state.credential_source == .chatgpt_subscription) {
+                active.session_rt.usage.clearReconciliationCredential();
+            } else {
+                active.session_rt.usage.startReconciliation(
+                    state.alloc,
+                    state.api_key,
+                );
+            }
             return err;
         };
         active.session_rt.usage.configurePublicationSink(null);
@@ -1194,32 +1272,6 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
 
     state.workspace_root = startup.takeWorkspaceRoot();
     state.workspace_access = startup.takeWorkspaceAccess();
-    var credential = if (state.cfg.credential_override) |override| credentials.Credential{
-        .token = try alloc.dupe(u8, override),
-        .source = .ai_gateway_api_key,
-    } else startup.takeCredential() orelse {
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_request,
-            .message = credentials.missing_credential_message,
-        });
-    };
-    defer credential.deinit(alloc);
-    if (credential.token.len == 0) {
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_request,
-            .message = credentials.missing_credential_message,
-        });
-    }
-    state.credential_source = credential.source;
-    state.api_key = credential.token;
-    credential.token = &.{};
-    if (credential.team_id) |team| {
-        state.gateway_team = team;
-        credential.team_id = null;
-    } else if (credential.team_slug) |team| {
-        state.gateway_team = team;
-        credential.team_slug = null;
-    }
 
     if (state.cfg.model_override) |override| {
         state.selected_model = try alloc.dupe(u8, override);
@@ -1230,6 +1282,55 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.process_model_override = startup.model_source == .process_override;
     }
     state.configured_model = try alloc.dupe(u8, startup.configured_model);
+
+    var startup_credential = startup.takeCredential();
+    defer if (startup_credential) |*credential| credential.deinit(alloc);
+    var routed_credential: ?credentials.Credential = null;
+    defer if (routed_credential) |*credential| credential.deinit(alloc);
+    const startup_matches_model = if (startup_credential) |credential|
+        credentialMatchesModel(credential.source, state.selected_model)
+    else
+        false;
+    const credential: *credentials.Credential = if (!model_provider.isChatGptSubscriptionModel(state.selected_model) and state.cfg.credential_override != null) override: {
+        routed_credential = .{
+            .token = try alloc.dupe(u8, state.cfg.credential_override.?),
+            .source = .ai_gateway_api_key,
+        };
+        break :override &routed_credential.?;
+    } else if (startup_matches_model)
+        &startup_credential.?
+    else routed: {
+        const preferred = if (startup_credential) |value| value.source else null;
+        const resolution = try credentials.resolveForModel(
+            alloc,
+            state.cfg.gateway_provider.oauth_transport,
+            state.cfg.secret_store,
+            .refresh_if_needed,
+            state.selected_model,
+            preferred,
+        );
+        routed_credential = resolution.credential;
+        if (routed_credential == null) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = if (model_provider.isChatGptSubscriptionModel(state.selected_model))
+                    credentials.missing_chatgpt_credential_message
+                else
+                    credentials.missing_credential_message,
+            });
+        }
+        break :routed &routed_credential.?;
+    };
+    if (credential.token.len == 0) {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = if (model_provider.isChatGptSubscriptionModel(state.selected_model))
+                credentials.missing_chatgpt_credential_message
+            else
+                credentials.missing_credential_message,
+        });
+    }
+    adoptServerCredential(state, credential);
 
     state.permission_mode = startup.permission_mode;
     state.permission_rules = startup.takePermissionRules();
@@ -1373,6 +1474,15 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .code = ErrorCode.invalid_params,
                 .message = "Invalid session model",
             });
+        if (!try selectCredentialForModel(state, value)) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = if (model_provider.isChatGptSubscriptionModel(value))
+                    credentials.missing_chatgpt_credential_message
+                else
+                    credentials.missing_credential_message,
+            });
+        }
         if (host_target.is_wasm and session.writable == null) {
             const next_model = alloc.dupe(u8, value) catch
                 return state.writer.writeError(alloc, msg.id, .{

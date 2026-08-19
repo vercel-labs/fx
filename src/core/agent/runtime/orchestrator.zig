@@ -14,6 +14,7 @@ const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig
 const io_mod = @import("../../shared/io.zig");
 const host_target = @import("../../hosts/target.zig");
 const secret = @import("../../auth/secret.zig");
+const credentials = @import("../../auth/credentials.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
@@ -634,6 +635,7 @@ fn materializeConfirmedProviderTools(
         within_turn_suffix,
         null,
         novel_calls,
+        completion.provider_state_json,
     );
     var batch: runtime_tool_batch.StepBatchState = .{};
     for (novel_calls) |call| {
@@ -1400,7 +1402,7 @@ fn refreshGatewayCredentialForJob(
     trace_ctx: TraceContext,
 ) !bool {
     const source = job.credential_source orelse return false;
-    if (source != .fx_login) return false;
+    if (!credentials.sourceRefreshable(source)) return false;
     const refresh = deps.refresh_gateway_credential orelse return false;
 
     const refreshed = refresh(deps.ctx, alloc, source, mode) catch |err| {
@@ -1417,11 +1419,15 @@ fn refreshGatewayCredentialForJob(
     const previous_api_key = active_api_key.*;
     if (comptime !host_target.is_wasm) {
         if (deps.usage) |usage| {
-            usage.refreshReconciliationCredential(
-                deps.usage_allocator,
-                previous_api_key,
-                refreshed,
-            );
+            if (source == .chatgpt_subscription) {
+                usage.clearReconciliationCredential();
+            } else {
+                usage.refreshReconciliationCredential(
+                    deps.usage_allocator,
+                    previous_api_key,
+                    refreshed,
+                );
+            }
         }
     }
     if (owned_api_key.*) |old| secret.zeroAndFree(alloc, old);
@@ -2687,6 +2693,7 @@ fn processQueuedPromptLoop(
                 deps.agent_stream_provider,
                 arena,
                 active_api_key,
+                job.credential_source,
                 job.gateway_team,
                 lifecycle.scope.session_id,
                 gateway_model,
@@ -4211,6 +4218,7 @@ fn processQueuedPromptLoop(
             else
                 partial_assistant,
             .tool_calls = effective_tool_calls,
+            .provider_state_json = completion.provider_state_json,
         };
 
         var preparation_batch = tool_preparation.ReadyCallBatch.init(
@@ -4442,6 +4450,7 @@ fn processQueuedPromptLoop(
             &within_turn_suffix,
             if (terminal_provider_completion) null else completion.content,
             effective_tool_calls,
+            completion.provider_state_json,
         );
 
         const step_has_content = !terminal_provider_completion and completion.content != null and completion.content.?.len > 0;

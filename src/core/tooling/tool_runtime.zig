@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
+const host_mod = @import("../hosts/host.zig");
 const command_contract = @import("../execution/command_contract.zig");
 const command_environment = @import("../execution/command_environment.zig");
 const background_process_provider = @import(
@@ -136,6 +137,7 @@ pub const Context = struct {
     gateway_team: ?[]const u8 = null,
     credential_source: ?types.CredentialSource = null,
     oauth_transport: oauth_transport.Provider = oauth_transport.unavailable_provider,
+    secret_store: host_mod.SecretStore = host_mod.unavailable_secret_store,
     model: []const u8,
     permission_review_turn: ?permission_auto_classifier.ReviewTurnContext = null,
     root_user_intent_context: []const u8 = "",
@@ -995,6 +997,7 @@ fn executeVisionRequest(
     const config: vision_executor.Config = .{
         .stream_provider = state.runtime.agent_stream_provider,
         .api_key = state.runtime.api_key,
+        .credential_source = state.runtime.credential_source,
         .gateway_team = state.runtime.gateway_team,
         .session_id = state.runtime.lifecycle_scope.session_id,
         .retry_count = state.runtime.gateway_retry_count,

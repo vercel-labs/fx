@@ -7,6 +7,9 @@ const io_mod = @import("../shared/io.zig");
 const credentials = @import("../auth/credentials.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const login_flow = @import("../auth/login_flow.zig");
+const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
+const provider_catalog = @import("../auth/provider_catalog.zig");
+const model_provider = @import("../config/model_provider.zig");
 const types = @import("../shared/types.zig");
 
 fn oauthAuthEnabled(comptime App: type) bool {
@@ -17,6 +20,32 @@ fn oauthAuthEnabled(comptime App: type) bool {
 pub fn Runtime(comptime App: type) type {
     return struct {
         fn ensurePromptCredential(app: *App) !bool {
+            if (comptime @hasField(App, "selected_model") and
+                @hasDecl(@TypeOf(app.auth), "selectForModel"))
+            {
+                const model = app.selected_model.items;
+                const required_source: credentials.Source = if (model_provider.isChatGptSubscriptionModel(model))
+                    .chatgpt_subscription
+                else
+                    app.auth.credentialSource() orelse .fx_login;
+                const route_change = app.auth.selectForModel(app.alloc, model) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return recoverCredentialFailure(app, required_source, err),
+                };
+                if (route_change) |changed| {
+                    applyCredentialChange(app, changed);
+                } else if (model_provider.isChatGptSubscriptionModel(model) and
+                    app.auth.credentialSource() != .chatgpt_subscription)
+                {
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .warning,
+                        .body = credentials.missing_chatgpt_interactive_credential_message,
+                    }, true);
+                    app.shell.render_requests.request(.footer);
+                    return false;
+                }
+            }
             if (app.auth.credentialSource() != null) return true;
 
             const auth_view = app.auth.view();
@@ -43,10 +72,12 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
-            try beginSignIn(app, false);
+            try app.auth.refreshSourceInventory(app.alloc);
+            app.auth.openPicker(app.alloc);
+            app.shell.render_requests.request(.footer);
         }
 
-        pub fn runLogoutCommand(app: *App) !void {
+        pub fn runLogoutCommand(app: *App, target: []const u8) !void {
             if (comptime !oauthAuthEnabled(App)) {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -55,7 +86,55 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
+            const requested_provider = if (std.mem.trim(u8, target, " \t\r\n").len == 0)
+                null
+            else
+                provider_catalog.parse(std.mem.trim(u8, target, " \t\r\n")) orelse {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .warning,
+                        .body = "Usage: /logout [vercel|chatgpt]",
+                    });
+                    return;
+                };
             try app.flushBeforeBlockingExternalWork();
+            const selected_model_uses_chatgpt = if (comptime @hasField(App, "selected_model"))
+                model_provider.isChatGptSubscriptionModel(app.selected_model.items)
+            else
+                false;
+            const provider_inventory = if (comptime @hasDecl(@TypeOf(app.auth), "pickerView")) inventory: {
+                try app.auth.refreshSourceInventory(app.alloc);
+                break :inventory app.auth.pickerView().available_sources;
+            } else @as(auth_runtime.SourceSet, .empty);
+            const chatgpt_is_only_logout_session = provider_inventory.contains(.chatgpt_subscription) and
+                !provider_inventory.contains(.fx_login);
+            const logout_chatgpt = if (requested_provider) |provider|
+                provider == .openai_codex
+            else
+                selected_model_uses_chatgpt or
+                    app.auth.credentialSource() == .chatgpt_subscription or
+                    chatgpt_is_only_logout_session;
+            if (logout_chatgpt) {
+                const outcome = chatgpt_oauth.logout() catch {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Could not durably sign out of ChatGPT. The current source is unchanged.",
+                    });
+                    return;
+                };
+                const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterChatGptLogout"))
+                    try app.auth.reconcileAfterChatGptLogout(app.alloc)
+                else
+                    false;
+                applyCredentialChange(app, changed);
+                try writeAuthNotice(app, switch (outcome) {
+                    .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of ChatGPT." },
+                    .missing => .{ .topic = "auth", .tone = .neutral, .body = "No ChatGPT login session found." },
+                    .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of ChatGPT, but could not confirm the profile directory update." },
+                });
+                return;
+            }
             const result = login_flow.logout(app.alloc, app.auth.oauthTransport()) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
                     try writeAuthNotice(app, .{
@@ -131,6 +210,7 @@ pub fn Runtime(comptime App: type) type {
                 .source => |source| try applySourceChoice(app, source),
                 .action => |action| switch (action) {
                     .login => try beginSignIn(app, true),
+                    .chatgpt_login => try beginChatGptSignIn(app),
                     .setup => {
                         if (comptime !runtime_profile.allows(App, .native_auth)) {
                             try app.writeDomainNotice(.{
@@ -192,40 +272,75 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn collectSignInFacts(app: *App) !void {
             if (comptime !oauthAuthEnabled(App)) return;
+            const sign_in_source: credentials.Source = if (comptime @hasDecl(@TypeOf(app.auth), "pickerView"))
+                app.auth.pickerView().sign_in_source
+            else
+                .fx_login;
             app.auth.pulseSignIn(app.alloc);
             switch (app.auth.pollSignInTransition(app.alloc)) {
                 .none => {},
                 .cancelled => app.shell.render_requests.request(.footer),
                 .failed => |err| {
-                    debug_trace.logf("auth", "login failed err={s}", .{@errorName(err)});
+                    debug_trace.logf("auth", "login failed source={t} err={s}", .{ sign_in_source, @errorName(err) });
                     _ = app.auth.popPickerStage(app.alloc);
-                    try writeLoginError(app, err);
+                    try writeLoginError(app, sign_in_source, err);
                 },
                 .succeeded => |completed| {
-                    var selection = completed;
-                    defer selection.deinit(app.alloc);
+                    var owned = completed;
+                    defer owned.deinit(app.alloc);
+                    switch (owned) {
+                        .vercel => |*selection| {
+                            if (!try selectCredentialSource(app, .fx_login)) {
+                                _ = app.auth.popPickerStage(app.alloc);
+                                try writeAuthNotice(app, .{
+                                    .topic = "auth",
+                                    .tone = .@"error",
+                                    .body = "Signed in, but the fx login credential could not be loaded.",
+                                });
+                                return;
+                            }
+                            rememberCredentialSource(app, .fx_login);
 
-                    if (!try selectCredentialSource(app, .fx_login)) {
-                        _ = app.auth.popPickerStage(app.alloc);
-                        try writeAuthNotice(app, .{
-                            .topic = "auth",
-                            .tone = .@"error",
-                            .body = "Signed in, but the fx login credential could not be loaded.",
-                        });
-                        return;
+                            if (selection.teams.items.len > 0) {
+                                app.auth.openTeamPicker(app.alloc, selection);
+                            } else {
+                                app.auth.closePicker(app.alloc);
+                            }
+                            try writeAuthNotice(app, .{
+                                .topic = "auth",
+                                .tone = .neutral,
+                                .body = "Signed in to Vercel.",
+                            });
+                        },
+                        .chatgpt => {
+                            try app.auth.refreshSourceInventory(app.alloc);
+                            const selected_model_uses_chatgpt = if (comptime @hasField(App, "selected_model"))
+                                model_provider.isChatGptSubscriptionModel(app.selected_model.items)
+                            else
+                                false;
+                            if (selected_model_uses_chatgpt and
+                                !try selectCredentialSource(app, .chatgpt_subscription))
+                            {
+                                _ = app.auth.popPickerStage(app.alloc);
+                                try writeAuthNotice(app, .{
+                                    .topic = "auth",
+                                    .tone = .@"error",
+                                    .body = "Signed in, but the ChatGPT subscription credential could not be loaded.",
+                                });
+                                return;
+                            }
+                            if (!selected_model_uses_chatgpt) {
+                                app.model_cache.reset();
+                                if (comptime @hasDecl(App, "startModelCacheWarmup")) app.startModelCacheWarmup();
+                            }
+                            app.auth.closePicker(app.alloc);
+                            try writeAuthNotice(app, .{
+                                .topic = "auth",
+                                .tone = .neutral,
+                                .body = "Signed in with ChatGPT.",
+                            });
+                        },
                     }
-                    rememberCredentialSource(app, .fx_login);
-
-                    if (selection.teams.items.len > 0) {
-                        app.auth.openTeamPicker(app.alloc, &selection);
-                    } else {
-                        _ = app.auth.popPickerStage(app.alloc);
-                    }
-                    try writeAuthNotice(app, .{
-                        .topic = "auth",
-                        .tone = .neutral,
-                        .body = "Signed in to Vercel.",
-                    });
                 },
             }
         }
@@ -371,6 +486,9 @@ pub fn Runtime(comptime App: type) type {
         /// leaves the source active for this run rather than refusing a working
         /// credential the user already selected.
         fn rememberCredentialSource(app: *App, source: credentials.Source) void {
+            // ChatGPT is selected by model route, not as a global Gateway
+            // credential preference. Its saved session coexists independently.
+            if (source == .chatgpt_subscription) return;
             if (comptime @hasDecl(App, "persistCredentialSourcePreference")) {
                 app.persistCredentialSourcePreference(source);
                 return;
@@ -388,6 +506,19 @@ pub fn Runtime(comptime App: type) type {
                     "credential choice not persisted source={t} err={s}",
                     .{ source, @errorName(failure.err) },
                 ),
+            }
+        }
+
+        fn beginChatGptSignIn(app: *App) !void {
+            try app.flushBeforeBlockingExternalWork();
+            const started = app.auth.openChatGptSignInPickerFromRoot(app.alloc);
+            if (started catch |err| {
+                debug_trace.logf("auth", "ChatGPT login failed err={s}", .{@errorName(err)});
+                try writeLoginError(app, .chatgpt_subscription, err);
+                return;
+            }) {
+                app.shell.render_requests.request(.footer);
+                if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
             }
         }
 
@@ -468,7 +599,7 @@ pub fn Runtime(comptime App: type) type {
                 app.auth.openSignInPicker(app.alloc);
             if (started catch |err| {
                 debug_trace.logf("auth", "login failed err={s}", .{@errorName(err)});
-                try writeLoginError(app, err);
+                try writeLoginError(app, .fx_login, err);
                 return;
             }) {
                 app.shell.render_requests.request(.footer);
@@ -529,12 +660,21 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn recoverPromptCredentialRefreshFailure(app: *App, err: anyerror) !bool {
-            debug_trace.logf("auth", "prompt credential refresh failed source=fx_login err={s}", .{@errorName(err)});
-            app.auth.recordCredentialRefreshFailure(.fx_login);
+            const active_source = app.auth.credentialSource();
+            const source = if (active_source) |active|
+                if (credentials.sourceRefreshable(active)) active else .fx_login
+            else
+                .fx_login;
+            return recoverCredentialFailure(app, source, err);
+        }
+
+        fn recoverCredentialFailure(app: *App, source: credentials.Source, err: anyerror) !bool {
+            debug_trace.logf("auth", "prompt credential refresh failed source={t} err={s}", .{ source, @errorName(err) });
+            if (app.auth.credentialSource() == source) app.auth.recordCredentialRefreshFailure(source);
             try app.auth.refreshSourceInventory(app.alloc);
             app.auth.openPicker(app.alloc);
             const failure = auth_runtime.FailureSnapshot{
-                .source = .fx_login,
+                .source = source,
                 .reason = .credential_refresh_failed,
             };
             const failure_text = try failure.renderText(app.alloc);
@@ -569,18 +709,32 @@ pub fn Runtime(comptime App: type) type {
                 @hasField(@TypeOf(app.session), "usage"))
             {
                 if (app.auth.gatewayCredential()) |credential| {
-                    app.session.usage.replaceReconciliationCredential(
-                        app.alloc,
-                        credential.api_key,
-                    );
+                    const chatgpt_subscription = if (comptime @hasField(@TypeOf(credential), "source"))
+                        credential.source == .chatgpt_subscription
+                    else
+                        false;
+                    if (chatgpt_subscription) {
+                        app.session.usage.clearReconciliationCredential();
+                    } else {
+                        app.session.usage.replaceReconciliationCredential(
+                            app.alloc,
+                            credential.api_key,
+                        );
+                    }
                 } else {
                     app.session.usage.clearReconciliationCredential();
                 }
             }
         }
 
-        fn writeLoginError(app: *App, err: anyerror) !void {
-            const notice: types.SemanticNotice = switch (err) {
+        fn writeLoginError(app: *App, source: credentials.Source, err: anyerror) !void {
+            const notice: types.SemanticNotice = if (source == .chatgpt_subscription)
+                switch (err) {
+                    error.ChatGptAuthorizationFailed => .{ .topic = "auth", .tone = .@"error", .body = "ChatGPT sign-in was denied. The current credential is unchanged." },
+                    error.ChatGptLoginTimedOut, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "The ChatGPT sign-in code expired. The current credential is unchanged; run /login to try again." },
+                    else => .{ .topic = "auth", .tone = .@"error", .body = "ChatGPT sign-in failed. The current credential is unchanged." },
+                }
+            else switch (err) {
                 error.ClientIdMissing => .{ .topic = "auth", .tone = .@"error", .body = "fx login is not configured yet. The current credential is unchanged." },
                 error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in was denied. The current credential is unchanged." },
                 error.ExpiredToken, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "The Vercel sign-in code expired. The current credential is unchanged; run /login to try again." },
@@ -1011,7 +1165,7 @@ test "successful direct login remembers fx login after activation" {
     var app: TestApp = .{};
     defer app.deinit();
     app.auth.select_result = true;
-    app.auth.sign_in_transition = .{ .succeeded = .{} };
+    app.auth.sign_in_transition = .{ .succeeded = .{ .vercel = .{} } };
 
     try Runtime(TestApp).collectSignInFacts(&app);
 
@@ -1025,7 +1179,7 @@ test "direct login source load failure leaves the environment preference unchang
     var app: TestApp = .{};
     defer app.deinit();
     app.auth.select_result = null;
-    app.auth.sign_in_transition = .{ .succeeded = .{} };
+    app.auth.sign_in_transition = .{ .succeeded = .{ .vercel = .{} } };
 
     try Runtime(TestApp).collectSignInFacts(&app);
 
@@ -1039,7 +1193,7 @@ test "failed preference persistence keeps a successful direct login active" {
     var app: TestApp = .{};
     defer app.deinit();
     app.auth.select_result = true;
-    app.auth.sign_in_transition = .{ .succeeded = .{} };
+    app.auth.sign_in_transition = .{ .succeeded = .{ .vercel = .{} } };
     app.preference_write_succeeds = false;
 
     try Runtime(TestApp).collectSignInFacts(&app);
@@ -1176,7 +1330,7 @@ test "prompt credential refresh failure is recoverable and detail-free" {
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "OAuthRequestFailed") == null);
     try std.testing.expect(app.shell.render_requests.footer_requested);
     try std.testing.expectEqual(@as(usize, 1), app.auth.source_inventory_refresh_count);
-    try std.testing.expectEqual(credentials.Source.fx_login, app.auth.refresh_failure_source.?);
+    try std.testing.expect(app.auth.refresh_failure_source == null);
     try std.testing.expect(app.auth.picker_opened);
     try std.testing.expectEqual(@as(usize, 0), app.model_cache.reset_count);
 }

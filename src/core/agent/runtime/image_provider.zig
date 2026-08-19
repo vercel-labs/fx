@@ -15,6 +15,7 @@ const model = "google/gemini-2.5-flash";
 pub const Request = struct {
     stream_provider: agent_stream_provider.Provider,
     api_key: []const u8,
+    credential_source: ?types.CredentialSource = null,
     gateway_team: ?[]const u8,
     session_id: ?[]const u8 = null,
     retry_count: usize,
@@ -76,6 +77,7 @@ pub fn inspect(
         request.stream_provider,
         alloc,
         request.api_key,
+        request.credential_source,
         request.gateway_team,
         request.session_id,
         model,

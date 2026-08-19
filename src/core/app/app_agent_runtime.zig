@@ -5,6 +5,7 @@ const command_admission = @import("../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const app_callbacks = @import("app_callbacks.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
+const host = @import("../hosts/host.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
@@ -215,6 +216,10 @@ pub fn Runtime(comptime App: type) type {
                 .gateway_team = app.auth.gatewayTeam(),
                 .credential_source = app.auth.credentialSource(),
                 .oauth_transport = app.auth.oauthTransport(),
+                .secret_store = if (comptime @hasDecl(@TypeOf(app.auth), "secretStore"))
+                    app.auth.secretStore()
+                else
+                    host.unavailable_secret_store,
                 .model = app.selected_model.items,
                 .gateway_retry_count = gateway_retry_count,
                 .gateway_chat_url = gateway_chat_url,
@@ -261,7 +266,7 @@ pub fn Runtime(comptime App: type) type {
                     .allow_sandboxed => .allow_sandboxed,
                     .prompt => .prompt,
                 } else .none,
-                .permission_reviewer_provider = if (comptime @hasDecl(App, "permissionReviewerProvider")) app.permissionReviewerProvider() else null,
+                .permission_reviewer_provider = if (app.auth.credentialSource() != .chatgpt_subscription and comptime @hasDecl(App, "permissionReviewerProvider")) app.permissionReviewerProvider() else null,
                 .tracker = &app.change_tracker,
                 .mcp_ctx = @ptrCast(app),
                 .mcp_has_tool = if (comptime runtime_profile.allows(App, .mcp)) mcpHasTool else null,
@@ -283,17 +288,19 @@ pub fn Runtime(comptime App: type) type {
                 ctx.on_web_fetch_progress = app_callbacks.Bindings(App).onWebFetchProgress;
             }
             if (comptime @hasField(App, "web_search_runtime")) {
-                app.web_search_runtime.configure(.{
-                    .api_key = app.auth.apiKey() orelse "",
-                    .gateway_team = app.auth.gatewayTeam(),
-                    .worker_model = app.selected_model.items,
-                    .gateway_retry_count = gateway_retry_count,
-                    .gateway_chat_url = gateway_chat_url,
-                    .usage = &app.session.usage,
-                    .usage_allocator = app.alloc,
-                });
+                if (app.auth.credentialSource() != .chatgpt_subscription) {
+                    app.web_search_runtime.configure(.{
+                        .api_key = app.auth.apiKey() orelse "",
+                        .gateway_team = app.auth.gatewayTeam(),
+                        .worker_model = app.selected_model.items,
+                        .gateway_retry_count = gateway_retry_count,
+                        .gateway_chat_url = gateway_chat_url,
+                        .usage = &app.session.usage,
+                        .usage_allocator = app.alloc,
+                    });
+                    ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
+                }
                 ctx.web_search_runtime_ready = false;
-                ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
                 ctx.web_search_progress_ctx = @ptrCast(app);
                 ctx.on_web_search_progress = app_callbacks.Bindings(App).onWebSearchProgress;
             }
@@ -1920,6 +1927,32 @@ test "app prompt projection configures web search then blocks native execution" 
     try std.testing.expectEqualStrings(test_gateway_chat_url, app.web_search_runtime.gateway_chat_url);
     try std.testing.expectEqual(.failure, execution.status);
     try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
+}
+
+test "app ChatGPT route removes Gateway-backed auxiliary capabilities" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    var credential = credentials.Credential{
+        .token = try alloc.dupe(u8, "chatgpt-secret"),
+        .source = .chatgpt_subscription,
+    };
+    defer credential.deinit(alloc);
+    _ = app.auth.adoptCredential(alloc, &credential);
+
+    const ctx = Runtime(FakeApp).toolContext(
+        &app,
+        &test_ignored_list_entries,
+        100,
+        1024,
+        40,
+        120,
+        2048,
+        2,
+        test_gateway_chat_url,
+    );
+    try std.testing.expect(ctx.web_search_backend == null);
+    try std.testing.expect(ctx.permission_reviewer_provider == null);
 }
 
 test "app agent runtime tool context prefers active queued turn settings" {

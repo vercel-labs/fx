@@ -849,6 +849,7 @@ pub fn freeGatewayCompletion(alloc: std.mem.Allocator, completion: GatewayComple
         alloc.free(tool_call.arguments_json);
     }
     if (completion.tool_calls.len > 0) alloc.free(completion.tool_calls);
+    if (completion.provider_state_json) |state| alloc.free(state);
 }
 
 fn checkParseGatewayCompletionAllocFailures(alloc: std.mem.Allocator) !void {

@@ -1738,6 +1738,14 @@ fn suspendGapDetected(previous: SuspendClockSample, current: SuspendClockSample)
     return boot_elapsed - awake_elapsed > suspend_gap_tolerance_ns;
 }
 
+pub fn spawnHttpCancelWatcher(
+    done: *std.atomic.Value(bool),
+    cancel_flag: *std.atomic.Value(bool),
+    stream: std.Io.net.Stream,
+) !std.Thread {
+    return spawn_gateway_cancel_watcher(done, cancel_flag, null, stream);
+}
+
 fn spawn_gateway_cancel_watcher(
     done: *std.atomic.Value(bool),
     cancel_flag: *std.atomic.Value(bool),

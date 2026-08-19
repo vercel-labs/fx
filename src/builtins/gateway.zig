@@ -5,6 +5,7 @@ pub const permission_reviewer = @import("gateway/permission_reviewer.zig");
 
 const api_key_validator_contract = @import("../core/auth/api_key_validator.zig");
 const agent_stream_provider_contract = @import("../core/agent/stream_provider.zig");
+const chatgpt_oauth = @import("../core/auth/chatgpt_oauth.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const oauth_transport = @import("../core/auth/oauth_transport.zig");
 const secret = @import("../core/auth/secret.zig");
@@ -15,6 +16,7 @@ const gateway_client = @import("../gateway/client.zig");
 const gateway_failure_diagnostics = @import("../core/gateway/gateway_failure_diagnostics.zig");
 const gateway_json = @import("../core/gateway/gateway_json.zig");
 const io_mod = @import("../core/shared/io.zig");
+const openai_codex_models = @import("../gateway/openai_codex_models.zig");
 const gateway_generation_usage = @import("../gateway/generation_usage.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
@@ -478,6 +480,9 @@ fn fetchCredits(
     alloc: Allocator,
     input: gateway_provider.CreditsLookupInput,
 ) output_contracts.CreditsSnapshot {
+    if (input.credential_source == .chatgpt_subscription) {
+        return creditsErrorSnapshot(alloc, "AI Gateway credits are unavailable for a ChatGPT subscription.");
+    }
     return fetchCreditsWithFetch(
         alloc,
         input.credential,
@@ -609,14 +614,15 @@ const OAuthHttpOperation = struct {
             .location = .{ .url = self.request.url },
             .method = switch (self.request.method) {
                 .get => .GET,
-                .post_form => .POST,
+                .post_form, .post_json => .POST,
             },
             .payload = self.request.payload,
             .headers = .{
-                .content_type = if (self.request.method == .post_form)
-                    .{ .override = "application/x-www-form-urlencoded" }
-                else
-                    .default,
+                .content_type = switch (self.request.method) {
+                    .get => .default,
+                    .post_form => .{ .override = "application/x-www-form-urlencoded" },
+                    .post_json => .{ .override = "application/json" },
+                },
                 .user_agent = .{ .override = gateway_client.user_agent },
                 .accept_encoding = .omit,
             },
@@ -1710,6 +1716,19 @@ fn stubFetchForbiddenCredits(
     };
 }
 
+test "built-in credits provider rejects ChatGPT credentials before Gateway I/O" {
+    var snapshot = fetchCredits(null, std.testing.allocator, .{
+        .credential = "chatgpt-secret",
+        .credential_source = .chatgpt_subscription,
+        .tenant = null,
+    });
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "AI Gateway credits are unavailable for a ChatGPT subscription.",
+        snapshot.err_message.?,
+    );
+}
+
 test "built-in credits provider names the team query only when valid" {
     const cases = [_]struct { team: ?[]const u8, want: []const u8 }{
         .{ .team = null, .want = "/coding-agent/v1/credits" },
@@ -2012,24 +2031,50 @@ fn fetchCatalogForProvider(
     alloc: std.mem.Allocator,
     input: model_catalog.FetchInput,
 ) std.mem.Allocator.Error!model_catalog.ProviderResult {
+    const chatgpt_available = input.access.credentialSource() == .chatgpt_subscription or
+        (chatgpt_oauth.sourceExists(alloc) catch false);
     const response = fetchModelCatalogResponse(
         alloc,
         input.access,
         input.endpoint,
         input.cancel_flag,
-    ) catch |err| return .{ .failure = catalogRequestFailure(err) };
+    ) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (chatgpt_available and err != error.Cancelled) return localChatGptCatalog(alloc);
+        return .{ .failure = catalogRequestFailure(err) };
+    };
     const json_text = switch (response) {
         .success => |body| body,
-        .http_status => |status| return .{ .failure = model_catalog.failureForHttpStatus(status) },
+        .http_status => |status| {
+            const failure = model_catalog.failureForHttpStatus(status);
+            // Preserve the shared authenticated-to-public retry before falling
+            // back to the independent local ChatGPT catalog.
+            if (failure.allowsPublicFallback()) return .{ .failure = failure };
+            if (chatgpt_available) return localChatGptCatalog(alloc);
+            return .{ .failure = failure };
+        },
     };
     defer alloc.free(json_text);
 
-    const catalog = parseModelCatalogForView(alloc, json_text, input.view) catch |err| return .{
-        .failure = .{
-            .category = if (err == error.OutOfMemory) .resource_exhausted else .malformed_response,
-            .http_status = .ok,
-        },
+    var catalog = parseModelCatalogForView(alloc, json_text, input.view) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (chatgpt_available) return localChatGptCatalog(alloc);
+        return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
+    if (chatgpt_available) {
+        openai_codex_models.append(alloc, &catalog) catch {
+            freeModelCatalog(alloc, &catalog);
+            return .{ .failure = .{ .category = .resource_exhausted } };
+        };
+        std.mem.sort(ModelCatalogEntry, catalog.items, {}, model_catalog.compareModelCatalogEntries);
+    }
+    return .{ .catalog = catalog };
+}
+
+fn localChatGptCatalog(alloc: std.mem.Allocator) std.mem.Allocator.Error!model_catalog.ProviderResult {
+    var catalog: std.ArrayList(ModelCatalogEntry) = .empty;
+    errdefer freeModelCatalog(alloc, &catalog);
+    try openai_codex_models.append(alloc, &catalog);
     return .{ .catalog = catalog };
 }
 
@@ -2060,7 +2105,18 @@ fn fetchModelCatalogForView(
     };
     defer alloc.free(json_text);
 
-    return parseModelCatalogForView(alloc, json_text, view);
+    var catalog = try parseModelCatalogForView(alloc, json_text, view);
+    errdefer freeModelCatalog(alloc, &catalog);
+
+    // The model-id completion path must expose ChatGPT subscription models too;
+    // otherwise users can authenticate successfully but still have to set
+    // FX_MODEL manually to reach the Codex route.
+    const chatgpt_available = (chatgpt_oauth.sourceExists(alloc) catch false);
+    if (chatgpt_available) {
+        openai_codex_models.append(alloc, &catalog) catch return error.OutOfMemory;
+        std.mem.sort(ModelCatalogEntry, catalog.items, {}, model_catalog.compareModelCatalogEntries);
+    }
+    return catalog;
 }
 
 fn fetchModelCatalogResponse(

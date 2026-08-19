@@ -107,6 +107,7 @@ pub const BuildRequest = struct {
 
 pub const Request = struct {
     api_key: []const u8,
+    credential_source: ?types.CredentialSource = null,
     team: ?[]const u8,
     /// Borrowed for the duration of `Provider.stream`.
     session_id: ?[]const u8 = null,
@@ -155,6 +156,7 @@ pub const Result = struct {
             if (self.completion.billing) |billing| alloc.free(@constCast(billing.model));
             types.freeToolCallSlice(alloc, @constCast(self.completion.tool_calls));
             if (self.completion.provider_failure_detail) |detail| alloc.free(@constCast(detail));
+            if (self.completion.provider_state_json) |state| alloc.free(@constCast(state));
             if (self.failure_schema) |schema| alloc.free(schema);
             if (self.failure_request_shape) |shape| alloc.free(shape);
         }

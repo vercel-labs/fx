@@ -14,6 +14,8 @@ const session_runtime = @import("../core/session/session.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const host = @import("../core/hosts/host.zig");
+const credentials = @import("../core/auth/credentials.zig");
+const model_provider = @import("../core/config/model_provider.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
 const subagent_resume_admission = @import("../core/subagent/resume_admission.zig");
 const types = @import("../core/shared/types.zig");
@@ -301,6 +303,12 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     const sid_copy = try alloc.dupe(u8, loaded.state.id);
     var sid_owned = true;
     defer if (sid_owned) alloc.free(sid_copy);
+    if (model_provider.isChatGptSubscriptionModel(loaded.state.preferences.model)) {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "ChatGPT subscription models are unavailable in this WASM runtime",
+        });
+    }
     const model_copy = try alloc.dupe(u8, loaded.state.preferences.model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model_copy);
@@ -537,6 +545,15 @@ fn handleRestoreSession(
         state.selected_model
     else
         writable.state.preferences.model;
+    if (!try server.selectCredentialForModel(state, effective_model)) {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = if (model_provider.isChatGptSubscriptionModel(effective_model))
+                credentials.missing_chatgpt_credential_message
+            else
+                credentials.missing_credential_message,
+        });
+    }
     const model_copy = try alloc.dupe(u8, effective_model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model_copy);
@@ -754,10 +771,14 @@ fn activateSession(
     };
     server.enableSubagentHost(state);
     state.active_session.?.session_rt.attachProfileUsagePublisher(state.alloc);
-    state.active_session.?.session_rt.usage.startReconciliation(
-        state.alloc,
-        state.api_key,
-    );
+    if (state.credential_source == .chatgpt_subscription) {
+        state.active_session.?.session_rt.usage.clearReconciliationCredential();
+    } else {
+        state.active_session.?.session_rt.usage.startReconciliation(
+            state.alloc,
+            state.api_key,
+        );
+    }
     activateManagedBackground(state, store);
 }
 

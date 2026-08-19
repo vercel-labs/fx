@@ -505,10 +505,10 @@ pub fn Handlers(comptime App: type) type {
             }
         }
 
-        fn commandLogout(ctx: *anyopaque) !void {
+        fn commandLogout(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "runLogoutCommand")) {
-                try app.runLogoutCommand();
+                try app.runLogoutCommand(rest);
             } else {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -1541,6 +1541,10 @@ pub fn Handlers(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             var snapshot = app.creditsProvider().fetch(app.alloc, .{
                 .credential = app.auth.apiKey(),
+                .credential_source = if (comptime @hasDecl(@TypeOf(app.auth), "credentialSource"))
+                    app.auth.credentialSource()
+                else
+                    null,
                 .tenant = app.auth.gatewayTeam(),
             });
             defer snapshot.deinit(app.alloc);
