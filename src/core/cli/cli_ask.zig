@@ -14,6 +14,7 @@ const process_supervisor = @import("../background/process_supervisor.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const devbox_executor = @import("../execution/devbox_executor.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
+const xai_stream_provider = @import("../../gateway/xai_stream_provider.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
@@ -1570,7 +1571,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .skills_prompt_section = skills_section,
         .explicit_skills_prompt_section = explicit_skills.text,
         .gateway_retry_count = cfg.gateway_retry_count,
-        .gateway_chat_url = cfg.gateway_chat_url,
+        .gateway_chat_url = blk: {
+            const grok_url = xai_stream_provider.chatUrlForSource(credential.source);
+            break :blk if (grok_url.len > 0) grok_url else cfg.gateway_chat_url;
+        },
         .gateway_tools_json = tool_projection.tools_json,
         .custom_tool_guidance = tool_projection.custom_guidance,
         .agent_step_limit = startup.agent_step_limit,

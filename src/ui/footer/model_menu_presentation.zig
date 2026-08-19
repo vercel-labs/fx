@@ -339,6 +339,8 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
             .no_credential => "Using the public model catalog; sign in or use an API key for team-private models.",
             .fx_login_team_required => "Choose a Vercel team to load its private models.",
             .fx_login_refresh_required => "Vercel sign-in must refresh before team-private models can load.",
+            .grok_oauth => "Grok OAuth is active; model discovery uses xAI instead of AI Gateway.",
+            .grok_oauth_refresh_required => "Grok OAuth must refresh before xAI models can load.",
             .credential_refresh_failed => "Vercel sign-in refresh failed; using the public model catalog.",
             .authenticated_credential_rejected => "Your Gateway credential was rejected; using the public model catalog.",
         };

@@ -34,6 +34,7 @@ const runtime_prompt_context = @import("prompt_context.zig");
 const runtime_telemetry = @import("telemetry.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
 const runtime_gateway_step = @import("gateway_step.zig");
+const xai_json = @import("../../../gateway/xai_json.zig");
 const runtime_vision_contracts = @import("vision_contracts.zig");
 const image_attachments = @import("../../images/image_attachments.zig");
 const runtime_assistant_stream = @import("assistant_stream.zig");
@@ -2629,6 +2630,7 @@ fn processQueuedPromptLoop(
                 overlay_arena,
                 .{
                     .model = gateway_model,
+                    .transport = if (xai_json.isXaiChatUrl(config.gateway_chat_url)) .xai else .gateway,
                     .tool_registry = if (final_permission_response)
                         .{ .tools = &.{} }
                     else

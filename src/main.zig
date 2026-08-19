@@ -906,12 +906,12 @@ const App = struct {
         try AuthAppRuntime.openSetupHub(self);
     }
 
-    pub fn runLoginCommand(self: *App) !void {
-        try AuthAppRuntime.runLoginCommand(self);
+    pub fn runLoginCommand(self: *App, rest: []const u8) !void {
+        try AuthAppRuntime.runLoginCommand(self, rest);
     }
 
-    pub fn runLogoutCommand(self: *App) !void {
-        try AuthAppRuntime.runLogoutCommand(self);
+    pub fn runLogoutCommand(self: *App, rest: []const u8) !void {
+        try AuthAppRuntime.runLogoutCommand(self, rest);
     }
 
     pub fn applyAuthPickerChoice(self: *App, choice: auth_runtime.Choice) !void {
@@ -1816,7 +1816,7 @@ const App = struct {
             self,
             job,
             builtin_gateway.retry_count,
-            builtin_gateway.defaultChatUrl(),
+            builtin_gateway.chatUrlForCredentialSource(self.auth.credentialSource()),
         ) catch |err| {
             if (err == error.TurnFinalizationDeliveryFailed) return;
             return err;
@@ -3764,10 +3764,14 @@ test {
     _ = @import("core/shared/display_width.zig");
     _ = @import("core/cli/doctor_runtime.zig");
     _ = @import("core/auth/login_flow.zig");
+    _ = @import("core/auth/grok_login_flow.zig");
+    _ = @import("core/auth/grok_oauth_session.zig");
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/gateway/gateway_json.zig");
+    _ = @import("gateway/xai_json.zig");
+    _ = @import("gateway/xai_stream_provider.zig");
     _ = @import("core/github/git_context.zig");
     _ = @import("core/github/github_publish.zig");
     _ = @import("core/github/github_workflows.zig");

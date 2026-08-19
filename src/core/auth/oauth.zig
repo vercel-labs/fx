@@ -121,11 +121,21 @@ pub fn requestDeviceAuthorization(
     metadata: Metadata,
     client_id: []const u8,
 ) !DeviceAuthorization {
+    return requestDeviceAuthorizationWithScope(alloc, transport, metadata, client_id, default_scope);
+}
+
+pub fn requestDeviceAuthorizationWithScope(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    metadata: Metadata,
+    client_id: []const u8,
+    scope: []const u8,
+) !DeviceAuthorization {
     var form: FormBody = .{};
     var writer: std.Io.Writer.Allocating = .init(alloc);
     defer writer.deinit();
     try form.append(&writer.writer, "client_id", client_id);
-    try form.append(&writer.writer, "scope", default_scope);
+    try form.append(&writer.writer, "scope", scope);
     const bytes = try fetchJson(
         alloc,
         transport,
@@ -476,6 +486,32 @@ test "oauth device authorization owns form mapping while transport owns executio
         probe.provider(),
         metadata,
         "client id",
+    );
+    defer device.deinit(std.testing.allocator);
+
+    try std.testing.expect(probe.matched);
+    try std.testing.expectEqualStrings("device", device.device_code);
+}
+
+test "oauth device authorization sends the requested scope" {
+    var probe = TransportProbe{
+        .expected_method = .post_form,
+        .expected_url = "https://vercel.test/device",
+        .expected_payload = "client_id=client&scope=openid%20profile%20email%20offline_access%20grok-cli%3Aaccess%20api%3Aaccess",
+        .response_body = "{\"device_code\":\"device\",\"user_code\":\"CODE\",\"verification_uri\":\"https://vercel.test/verify\",\"expires_in\":600,\"interval\":5}",
+    };
+    const metadata = Metadata{
+        .issuer = @constCast("https://vercel.test"),
+        .device_authorization_endpoint = @constCast("https://vercel.test/device"),
+        .token_endpoint = @constCast("https://vercel.test/token"),
+    };
+
+    var device = try requestDeviceAuthorizationWithScope(
+        std.testing.allocator,
+        probe.provider(),
+        metadata,
+        "client",
+        "openid profile email offline_access grok-cli:access api:access",
     );
     defer device.deinit(std.testing.allocator);
 
