@@ -523,21 +523,50 @@ test "render width zero emits no row bytes and first cursor column" {
     try std.testing.expectEqual(@as(u16, 1), view.cursor_col);
 }
 
-pub const terminal_title: host.TerminalTitle = .{
-    .set_model_fn = setTerminalTitleModel,
-    .clear_fn = clearTerminalTitleProvider,
-};
-
-fn setTerminalTitleModel(_: ?*anyopaque, model: []const u8) void {
-    const stdout = std.Io.File.stdout();
-    stdout.writeStreamingAll(io_mod.getIo(), "\x1b]2;fx · ") catch return;
-    stdout.writeStreamingAll(io_mod.getIo(), model) catch return;
-    stdout.writeStreamingAll(io_mod.getIo(), "\x07") catch return;
+/// Writes the title to the same file the transcript renders to, so a host
+/// that redirects its output keeps the escape sequence out of the real
+/// stdout. `out` must outlive every call.
+pub fn terminalTitleFor(out: *const std.Io.File) host.TerminalTitle {
+    return .{
+        .context = @constCast(out),
+        .set_fn = setTerminalTitleLabel,
+        .clear_fn = clearTerminalTitleProvider,
+    };
 }
 
-fn clearTerminalTitleProvider(_: ?*anyopaque) void {
-    const stdout = std.Io.File.stdout();
-    stdout.writeStreamingAll(io_mod.getIo(), "\x1b]2;\x07") catch return;
+fn titleOutput(raw: ?*anyopaque) std.Io.File {
+    const out: *const std.Io.File = @ptrCast(@alignCast(raw.?));
+    return out.*;
+}
+
+fn setTerminalTitleLabel(raw: ?*anyopaque, label: []const u8) void {
+    const out = titleOutput(raw);
+    out.writeStreamingAll(io_mod.getIo(), "\x1b]2;fx · ") catch return;
+    out.writeStreamingAll(io_mod.getIo(), label) catch return;
+    out.writeStreamingAll(io_mod.getIo(), "\x07") catch return;
+}
+
+fn clearTerminalTitleProvider(raw: ?*anyopaque) void {
+    const out = titleOutput(raw);
+    out.writeStreamingAll(io_mod.getIo(), "\x1b]2;\x07") catch return;
+}
+
+test "terminal title writes the label to the caller's output file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var sink = try tmp.dir.createFile(std.testing.io, "terminal-title.log", .{});
+    defer sink.close(io_mod.getIo());
+
+    // A host that redirects its output keeps the escape sequence off the
+    // real stdout, which the Zig test runner owns as its protocol channel.
+    terminalTitleFor(&sink).set("release notes");
+
+    var written_file = try tmp.dir.openFile(io_mod.getIo(), "terminal-title.log", .{});
+    defer written_file.close(io_mod.getIo());
+    const written = try io_mod.readFileToEnd(alloc, &written_file, 128);
+    defer alloc.free(written);
+    try std.testing.expectEqualStrings("\x1b]2;fx · release notes\x07", written);
 }
 
 pub fn formatResumeHandoff(

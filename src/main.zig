@@ -459,8 +459,8 @@ const App = struct {
         return if (comptime host_profile.clipboard) native_host.clipboard else host.unavailable_clipboard;
     }
 
-    pub fn terminalTitle(_: *const Self) host.TerminalTitle {
-        return ui_render.terminal_title;
+    pub fn terminalTitle(self: *const Self) host.TerminalTitle {
+        return ui_render.terminalTitleFor(&self.shell.stdout_file);
     }
 
     alloc: Allocator,
@@ -602,7 +602,7 @@ const App = struct {
             .{
                 .load_mcp_runtime = if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
                 .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
-                .terminal_title = ui_render.terminal_title,
+                .terminal_title = app.terminalTitle(),
             },
         );
         errdefer app.deinit();
@@ -622,7 +622,7 @@ const App = struct {
                 } else {
                     try SessionAppRuntime.resumeRequestedSession(&app);
                 }
-                app.terminalTitle().setModel(app.selected_model.items);
+                SessionAppRuntime.syncTerminalTitle(&app);
             }
         }
         if (comptime host_profile.durable_sessions) {

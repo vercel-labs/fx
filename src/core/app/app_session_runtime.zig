@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const question_answer = @import("../agent/question_answer.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -6,6 +7,7 @@ const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const tool_presentation = @import("../agent/runtime/tool_presentation.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
+const host_capability = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const diff = @import("../output/diff.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
@@ -2869,16 +2871,51 @@ pub fn Runtime(comptime App: type) type {
             return null;
         }
 
-        /// Replaces the cached footer title. App owns the copy.
+        /// Replaces the cached footer title. App owns the copy. Keeps the
+        /// terminal title in step because both surfaces read this cache.
         pub fn setCachedSessionTitle(app: *App, title: []const u8) !void {
             if (comptime !@hasField(App, "session_title")) return;
             app.session_title.clearRetainingCapacity();
-            try app.session_title.appendSlice(app.alloc, title);
+            try appendTitleWithoutControlBytes(app, title);
+            syncTerminalTitle(app);
         }
 
         pub fn clearCachedSessionTitle(app: *App) void {
             if (comptime !@hasField(App, "session_title")) return;
             app.session_title.clearRetainingCapacity();
+            syncTerminalTitle(app);
+        }
+
+        /// Drops C0 and DEL bytes. The cached title feeds the statusline and
+        /// the OSC 2 terminal title, where a stray BEL or ESC would close the
+        /// escape sequence early and hand the remaining bytes to the terminal
+        /// as commands. Derived titles come from prompt text and from the
+        /// display sidecar, so neither source is trusted here; `/rename` input
+        /// is already rejected by `validateSessionTitle`.
+        fn appendTitleWithoutControlBytes(app: *App, title: []const u8) !void {
+            var start: usize = 0;
+            for (title, 0..) |byte, index| {
+                if (byte >= 0x20 and byte != 0x7f) continue;
+                try app.session_title.appendSlice(app.alloc, title[start..index]);
+                start = index + 1;
+            }
+            try app.session_title.appendSlice(app.alloc, title[start..]);
+        }
+
+        fn terminalTitle(app: *App) host_capability.TerminalTitle {
+            if (comptime @hasDecl(App, "terminalTitle")) {
+                return app.terminalTitle();
+            }
+            if (comptime builtin.is_test) return host_capability.unavailable_terminal_title;
+            @compileError("interactive session runtime requires a terminal title host capability");
+        }
+
+        /// Terminal tabs carry the session name once one exists so several fx
+        /// tabs stay distinguishable, and fall back to the model before the
+        /// first turn names the session.
+        pub fn syncTerminalTitle(app: *App) void {
+            if (comptime !@hasField(App, "selected_model")) return;
+            terminalTitle(app).set(cachedSessionTitle(app) orelse app.selected_model.items);
         }
 
         pub fn cachedSessionTitle(app: *App) ?[]const u8 {
@@ -4994,6 +5031,8 @@ const TestApp = struct {
     session: session_runtime.SessionRuntime = .{ .max_history_turns = 8 },
     session_persistence: Persistence = .{},
     session_title: std.ArrayList(u8) = .empty,
+    terminal_title_label: [128]u8 = undefined,
+    terminal_title_label_len: usize = 0,
     input_runtime: core_input_runtime.Runtime = .{},
     terminal_input_runtime: ui_input.Runtime = .{},
     shell: transcript_runtime.TranscriptRuntime = .{},
@@ -5077,6 +5116,32 @@ const TestApp = struct {
             initialized += 1;
         }
         return names;
+    }
+
+    fn terminalTitle(self: *TestApp) host_capability.TerminalTitle {
+        return .{
+            .context = self,
+            .set_fn = setTerminalTitleLabelForTest,
+            .clear_fn = clearTerminalTitleForTest,
+        };
+    }
+
+    fn setTerminalTitleLabelForTest(raw: ?*anyopaque, label: []const u8) void {
+        const self: *TestApp = @ptrCast(@alignCast(raw.?));
+        self.terminal_title_label_len = @min(label.len, self.terminal_title_label.len);
+        @memcpy(
+            self.terminal_title_label[0..self.terminal_title_label_len],
+            label[0..self.terminal_title_label_len],
+        );
+    }
+
+    fn clearTerminalTitleForTest(raw: ?*anyopaque) void {
+        const self: *TestApp = @ptrCast(@alignCast(raw.?));
+        self.terminal_title_label_len = 0;
+    }
+
+    fn terminalTitleLabelText(self: *const TestApp) []const u8 {
+        return self.terminal_title_label[0..self.terminal_title_label_len];
     }
 
     fn deinit(self: *TestApp) void {
@@ -9564,6 +9629,9 @@ test "renameActiveSession persists the title to the sidecar and session index" {
         Runtime(TestApp).cachedSessionTitle(&app).?,
     );
 
+    // And carried to the terminal tab.
+    try std.testing.expectEqualStrings("deploy pipeline fix", app.terminalTitleLabelText());
+
     // Durable in the sidecar.
     const loaded = &app.session_persistence.writable.?;
     var display = try session_display_metadata.readSidecarOrFallback(alloc, &loaded.log.dir);
@@ -9615,4 +9683,72 @@ test "ensureCachedSessionTitle derives from the first prompt and then freezes" {
     // A fresh session clears it.
     Runtime(TestApp).clearCachedSessionTitle(&app);
     try std.testing.expect(Runtime(TestApp).cachedSessionTitle(&app) == null);
+}
+
+test "terminal title follows the session name and falls back to the model" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+
+    try app.selected_model.appendSlice(alloc, "zai/glm-5.2");
+
+    // Before the first turn names the session, tabs show the model.
+    Runtime(TestApp).syncTerminalTitle(&app);
+    try std.testing.expectEqualStrings("zai/glm-5.2", app.terminalTitleLabelText());
+
+    try app.session.appendHistoryEntry(alloc, .{ .assistant = .{
+        .user = .{ .text = @constCast("wire the release notes generator") },
+        .assistant = @constCast("ok"),
+        .execution = .{},
+    } });
+    try Runtime(TestApp).ensureCachedSessionTitle(&app);
+    try std.testing.expectEqualStrings(
+        "wire the release notes generator",
+        app.terminalTitleLabelText(),
+    );
+
+    // A model switch must not take the tab name back from the session.
+    app.selected_model.clearRetainingCapacity();
+    try app.selected_model.appendSlice(alloc, "anthropic/claude-opus-5");
+    Runtime(TestApp).syncTerminalTitle(&app);
+    try std.testing.expectEqualStrings(
+        "wire the release notes generator",
+        app.terminalTitleLabelText(),
+    );
+
+    // Starting over hands the tab back to the model.
+    Runtime(TestApp).clearCachedSessionTitle(&app);
+    try std.testing.expectEqualStrings("anthropic/claude-opus-5", app.terminalTitleLabelText());
+}
+
+test "cached session title drops control bytes before they reach the terminal" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+
+    // Derived titles come from prompt text and from the display sidecar, so a
+    // BEL could otherwise close the OSC 2 sequence and hand the rest of the
+    // title to the terminal as commands.
+    try Runtime(TestApp).setCachedSessionTitle(&app, "safe\x07\x1b]2;owned\x7ftail");
+    try std.testing.expectEqualStrings(
+        "safe]2;ownedtail",
+        Runtime(TestApp).cachedSessionTitle(&app).?,
+    );
+    try std.testing.expectEqualStrings("safe]2;ownedtail", app.terminalTitleLabelText());
 }

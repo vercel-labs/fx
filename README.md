@@ -55,6 +55,8 @@ fx session resume last
 fx session resume --id <id>
 ```
 
+Each session names its terminal tab. The title carries the session name once one exists, so parallel fx tabs stay distinguishable, and falls back to the active model before the first turn names the session. Renaming a session with `/rename` renames its tab.
+
 Run `/feedback` to open the feedback form at `fx.sh/feedback`. It does not create a diagnostic or change the clipboard.
 
 Run `/trace` to create a private Markdown diagnostic with logs, session context, runtime state, permissions, and recent activity. On macOS, fx copies the `.md` file to the clipboard; on other platforms, it saves the file and prints its path. Review and redact the trace before sharing it.

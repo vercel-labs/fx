@@ -437,7 +437,7 @@ pub fn Runtime(comptime App: type) type {
             if (app.requested_resume == null) {
                 try deps.begin_fresh_persisted_session(app);
                 deps.enable_session_stores(app);
-                deps.terminal_title.setModel(app.selected_model.items);
+                deps.terminal_title.set(app.selected_model.items);
             }
 
             switch (staged_resume_view) {
@@ -629,7 +629,7 @@ fn testDeps() BootstrapDeps(TestApp) {
         .begin_fresh_persisted_session = beginFreshPersistedSessionForTest,
         .enable_session_stores = enableSessionStoresForTest,
         .terminal_title = .{
-            .set_model_fn = setTerminalTitleModelForTest,
+            .set_fn = setTerminalTitleLabelForTest,
             .clear_fn = clearTerminalTitleForTest,
         },
     };
@@ -802,10 +802,10 @@ fn enableSessionStoresForTest(_: *TestApp) void {
     capture.recordEvent("enable_stores");
 }
 
-fn setTerminalTitleModelForTest(_: ?*anyopaque, model: []const u8) void {
+fn setTerminalTitleLabelForTest(_: ?*anyopaque, label: []const u8) void {
     const capture = active_capture.?;
-    capture.title_len = @min(model.len, capture.title.len);
-    @memcpy(capture.title[0..capture.title_len], model[0..capture.title_len]);
+    capture.title_len = @min(label.len, capture.title.len);
+    @memcpy(capture.title[0..capture.title_len], label[0..capture.title_len]);
     capture.recordEvent("title");
 }
 
