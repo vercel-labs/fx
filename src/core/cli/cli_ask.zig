@@ -6,6 +6,8 @@ const app_lifecycle = @import("../app/app_lifecycle.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+const providers_config = @import("../providers/config.zig");
+const secret = @import("../auth/secret.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const background_runtime = @import("../background/background_runtime.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
@@ -1395,13 +1397,36 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     }
 
-    const credential = startup.credential orelse
-        return missingCredentialResult(alloc, options);
-    const api_key = credential.token;
-    ctx.api_key = api_key;
-    ctx.gateway_team = credential.gatewayTeam();
-    ctx.credential_source = credential.source;
-    ctx.model_catalog_access = credentials.catalogAccessForCredential(credential.source, api_key, credential.gatewayTeam());
+    var owned_openai_key: ?[]u8 = null;
+    defer if (owned_openai_key) |key| secret.zeroAndFree(alloc, key);
+    const resolved_backend = providers_config.resolveActive();
+    if (resolved_backend.kind == .openai_compatible) {
+        const openai_key = try resolved_backend.loadApiKey(alloc);
+        owned_openai_key = openai_key;
+        const api_key = openai_key orelse {
+            try options.deps.write_stderr(
+                options.deps.stderr_ctx,
+                "fx ask: " ++ providers_config.missing_openai_credential_message ++ "\n",
+            );
+            return .{
+                .exit_code = 1,
+                .assistant_output = try alloc.dupe(u8, ""),
+                .error_code = "MissingCredentials",
+            };
+        };
+        ctx.api_key = api_key;
+        ctx.gateway_team = null;
+        ctx.credential_source = null;
+        ctx.model_catalog_access = .{ .public_only = .no_credential };
+    } else {
+        const credential = startup.credential orelse
+            return missingCredentialResult(alloc, options);
+        const api_key = credential.token;
+        ctx.api_key = api_key;
+        ctx.gateway_team = credential.gatewayTeam();
+        ctx.credential_source = credential.source;
+        ctx.model_catalog_access = credentials.catalogAccessForCredential(credential.source, api_key, credential.gatewayTeam());
+    }
 
     const restored_image_catalog = try ctx.session.snapshotImageCatalog(alloc, &.{});
     defer types.freeImageAttachmentSlice(alloc, restored_image_catalog);
@@ -1522,9 +1547,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .images = current_images,
         .authorized_image_catalog = authorized_image_catalog,
         .model = @constCast(ctx.model),
-        .api_key = api_key,
-        .gateway_team = if (credential.gatewayTeam()) |team| @constCast(team) else null,
-        .credential_source = credential.source,
+        .api_key = @constCast(ctx.api_key),
+        .gateway_team = if (ctx.gateway_team) |team| @constCast(team) else null,
+        .credential_source = ctx.credential_source,
         .permission_mode = ctx.permission_mode,
         .sandbox_backend = ctx.sandbox_backend,
         .history = context_history,

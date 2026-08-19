@@ -48,7 +48,9 @@ const command_specs = @import("core/slash_commands/command_specs.zig");
 const builtin_context = @import("builtins/context.zig");
 const builtin_devbox = @import("builtins/devbox.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
+const openai_compatible_provider = @import("builtins/providers/openai_compatible.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
+const providers_compose = @import("core/providers/compose.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
 const builtin_hooks = @import("builtins/hooks.zig");
@@ -90,6 +92,11 @@ const update_target = @import("core/upgrade/update_target.zig");
 
 const compiled_update_channel = update_target.Channel.parse(build_options.update_channel) orelse
     @compileError("invalid compiled update channel");
+const composed_backend_context = providers_compose.Context{
+    .vercel = builtin_gateway.provider,
+    .openai_compatible = openai_compatible_provider.provider,
+};
+const composed_gateway_provider = providers_compose.provider(&composed_backend_context);
 const background_runtime = @import("core/background/background_runtime.zig");
 const background_process_provider = @import(
     "core/execution/background_process_provider.zig",
@@ -423,14 +430,17 @@ const App = struct {
     }
 
     pub fn creditsProvider(_: *const Self) gateway_provider.CreditsProvider {
-        return builtin_gateway.credits_provider;
+        return if (comptime host_target.is_wasm)
+            builtin_gateway.credits_provider
+        else
+            composed_gateway_provider.credits;
     }
 
     pub fn agentStreamProvider(_: *const Self) agent_stream_provider.Provider {
         return if (comptime host_target.is_wasm)
             js_host_stream_provider.provider()
         else
-            builtin_gateway.agent_stream_provider;
+            composed_gateway_provider.agent_stream;
     }
 
     pub fn cooperativeTransportPulse(self: *Self) !void {
@@ -3195,7 +3205,7 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .models_path = builtin_gateway.models_path,
         .gateway_retry_count = builtin_gateway.retry_count,
         .gateway_chat_url = builtin_gateway.default_chat_url,
-        .gateway_provider = builtin_gateway.provider,
+        .gateway_provider = composed_gateway_provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3231,7 +3241,7 @@ fn localEntryConfig() app_entry_runtime.Config {
         .models_path = builtin_gateway.models_path,
         .gateway_retry_count = builtin_gateway.retry_count,
         .gateway_chat_url = builtin_gateway.default_chat_url,
-        .gateway_provider = builtin_gateway.provider,
+        .gateway_provider = composed_gateway_provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3266,7 +3276,7 @@ fn emptyEntryConfig() app_entry_runtime.Config {
         .models_path = "",
         .gateway_retry_count = 0,
         .gateway_chat_url = "",
-        .gateway_provider = builtin_gateway.provider,
+        .gateway_provider = composed_gateway_provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,

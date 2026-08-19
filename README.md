@@ -39,6 +39,14 @@ Or add an AI Gateway API key:
 fx setup
 ```
 
+fx talks to Vercel AI Gateway by default. To use an OpenAI-compatible Chat Completions server instead, save a base URL and API key:
+
+```bash
+fx setup openai-compatible
+```
+
+Or set `FX_PROVIDER=openai_compatible`, `FX_OPENAI_BASE_URL`, and `FX_OPENAI_API_KEY`. Those values are profile-owned (`~/.fx/settings.json`) and are ignored from project `.fx.json`.
+
 Run fx from a project:
 
 ```bash

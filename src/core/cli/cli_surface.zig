@@ -23,6 +23,8 @@ const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const secret = @import("../auth/secret.zig");
+const providers_config = @import("../providers/config.zig");
+const openai_secret = @import("../providers/openai_secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
@@ -297,6 +299,7 @@ const GetenvFn = *const fn (?*anyopaque, []const u8) ?[]const u8;
 const EnvironMapFn = *const fn (?*anyopaque) ?*const std.process.Environ.Map;
 const SelfExePathFn = *const fn (?*anyopaque, Allocator) anyerror![]u8;
 const ReadMaskedKeyFn = *const fn (?*anyopaque, Allocator, WriteFn, ?*anyopaque) anyerror![]u8;
+const ReadLineFn = *const fn (?*anyopaque, Allocator) anyerror![]u8;
 const SetupTerminalAvailableFn = *const fn (?*anyopaque) bool;
 const RunDeps = struct {
     stdout_ctx: ?*anyopaque = null,
@@ -314,6 +317,7 @@ const RunDeps = struct {
     environ_map: EnvironMapFn = environMapDefault,
     self_exe_path: SelfExePathFn = selfExePathDefault,
     read_masked_key: ReadMaskedKeyFn = readMaskedKeyDefault,
+    read_line: ReadLineFn = readLineDefault,
     setup_terminal_available: SetupTerminalAvailableFn = setupTerminalAvailableDefault,
 };
 
@@ -772,6 +776,9 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .setup => |rest| {
+            if (rest.len == 1 and std.mem.eql(u8, rest[0], "openai-compatible")) {
+                return if (try runOpenaiCompatibleSetup(alloc, deps)) .handled_success else .handled_failure;
+            }
             if (rest.len != 0) {
                 try writeTopLevelUsage(cfg.command_catalog, deps, .setup);
                 return .handled_failure;
@@ -1503,6 +1510,87 @@ fn runPasteSetup(
     defer alloc.free(message);
     try writeStdout(deps, message);
     return true;
+}
+
+fn runOpenaiCompatibleSetup(
+    alloc: Allocator,
+    deps: RunDeps,
+) !bool {
+    if (!deps.setup_terminal_available(deps.setup_ctx)) {
+        try writeStderr(deps, "fx setup: an interactive terminal is required to configure an OpenAI-compatible backend\n");
+        return false;
+    }
+
+    try writeStderr(deps, "OpenAI-compatible base URL: ");
+    const url_raw = deps.read_line(deps.setup_ctx, alloc) catch {
+        try writeStderr(deps, "\nfx setup: OpenAI-compatible URL was not saved\n");
+        return false;
+    };
+    defer alloc.free(url_raw);
+    const url = providers_config.validateBaseUrl(url_raw) catch {
+        try writeStderr(deps, "\nfx setup: enter an http or https base URL\n");
+        return false;
+    };
+
+    try writeStderr(deps, "Paste OpenAI-compatible API key (input hidden): ");
+    const key = deps.read_masked_key(
+        deps.setup_ctx,
+        alloc,
+        deps.write_stderr,
+        deps.stderr_ctx,
+    ) catch {
+        try writeStderr(deps, "\nfx setup: OpenAI-compatible API key was not saved\n");
+        return false;
+    };
+    defer secret.zeroAndFree(alloc, key);
+    try writeStderr(deps, "\n");
+    if (key.len == 0) {
+        try writeStderr(deps, "fx setup: OpenAI-compatible API key was not saved\n");
+        return false;
+    }
+
+    openai_secret.store(alloc, key) catch {
+        try writeStderr(deps, "fx setup: OpenAI-compatible API key was not saved\n");
+        return false;
+    };
+    var outcome = config_runtime.attemptUserPreferences(alloc, .{
+        .provider = .openai_compatible,
+        .openai_compatible_base_url = url,
+        .openai_compatible_api_key_env = providers_config.openai_api_key_env,
+    });
+    defer outcome.deinit(alloc);
+    providers_config.invalidateRemembered();
+    switch (outcome) {
+        .failure => {
+            try writeStderr(deps, "fx setup: could not persist OpenAI-compatible settings\n");
+            return false;
+        },
+        .outcome => {},
+    }
+
+    try writeStdout(deps, "Saved OpenAI-compatible provider in ~/.fx/settings.json.\n");
+    return true;
+}
+
+fn readLineDefault(_: ?*anyopaque, alloc: Allocator) ![]u8 {
+    var input: std.ArrayList(u8) = .empty;
+    errdefer input.deinit(alloc);
+    while (input.items.len < providers_config.max_base_url_bytes) {
+        var byte: [1]u8 = undefined;
+        if (try std.posix.read(std.posix.STDIN_FILENO, &byte) == 0) break;
+        switch (byte[0]) {
+            '\r', '\n' => break,
+            3, 4, 0x1b => return error.SetupCancelled,
+            8, 127 => if (input.items.len > 0) {
+                _ = input.pop();
+            },
+            else => try input.append(alloc, byte[0]),
+        }
+    }
+    const trimmed = std.mem.trim(u8, input.items, " \t\r\n");
+    const owned = try alloc.dupe(u8, trimmed);
+    input.deinit(alloc);
+    return owned;
 }
 
 fn setupTerminalAvailableDefault(_: ?*anyopaque) bool {
@@ -3157,6 +3245,10 @@ test "parse recognizes every top-level command and preserves unknown commands" {
         .setup => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
         else => return error.TestExpectedEqual,
     }
+    switch (parse(command_catalog, &.{ @constCast("setup"), @constCast("openai-compatible") })) {
+        .setup => |rest| try std.testing.expectEqualStrings("openai-compatible", rest[0]),
+        else => return error.TestExpectedEqual,
+    }
     switch (parse(command_catalog, &.{ @constCast("status"), @constCast("--json") })) {
         .status => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
         else => return error.TestExpectedEqual,
@@ -4772,6 +4864,7 @@ const CaptureOutput = struct {
             .write_stdout = captureStdout,
             .write_stderr = captureStderr,
             .read_masked_key = captureReadMaskedKey,
+            .read_line = captureReadLine,
             .setup_terminal_available = captureSetupTerminalAvailable,
         };
     }
@@ -4811,6 +4904,14 @@ fn captureReadMaskedKey(
     const capture: *CaptureOutput = @ptrCast(@alignCast(ctx.?));
     capture.setup_read_calls += 1;
     return alloc.dupe(u8, "paste-only-test-key");
+}
+
+fn captureReadLine(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+) ![]u8 {
+    _ = ctx;
+    return alloc.dupe(u8, "http://127.0.0.1:9/v1");
 }
 
 fn captureSecretStoreIsDisabled(ctx: ?*anyopaque) bool {

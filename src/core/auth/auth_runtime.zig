@@ -119,6 +119,7 @@ pub fn refreshFxLoginToken(
 pub const AcquisitionAction = enum {
     login,
     setup,
+    openai_compatible,
     change_team,
     switch_credential,
     /// Clears a remembered choice so resolution returns to plain precedence.
@@ -130,6 +131,8 @@ pub const PickerStage = enum {
     root,
     sign_in,
     api_key,
+    openai_url,
+    openai_key,
     change_team,
     switch_credential,
 };
@@ -337,6 +340,7 @@ pub const PickerView = struct {
     team_query: []const u8 = &.{},
     sign_in: login_flow.SignInSnapshot = .{},
     api_key_mask_count: usize = 0,
+    openai_url: []const u8 = &.{},
 
     pub fn activeSourceLabel(self: PickerView) []const u8 {
         return sourceLabelOrMissing(self.active_source);
@@ -344,8 +348,8 @@ pub const PickerView = struct {
 
     pub fn choiceCount(self: PickerView) usize {
         return switch (self.stage) {
-            .root => if (self.include_skip) 2 else 4,
-            .sign_in, .api_key => 0,
+            .root => if (self.include_skip) 3 else 5,
+            .sign_in, .api_key, .openai_url, .openai_key => 0,
             .change_team => blk: {
                 var count: usize = 0;
                 for (self.teams) |team| {
@@ -363,16 +367,18 @@ pub const PickerView = struct {
                 switch (index) {
                     0 => .{ .action = .login },
                     1 => .{ .action = .setup },
+                    2 => .{ .action = .openai_compatible },
                     else => null,
                 }
             else switch (index) {
                 0 => .{ .action = .login },
                 1 => .{ .action = .setup },
-                2 => .{ .action = .change_team },
-                3 => .{ .action = .switch_credential },
+                2 => .{ .action = .openai_compatible },
+                3 => .{ .action = .change_team },
+                4 => .{ .action = .switch_credential },
                 else => null,
             },
-            .sign_in, .api_key => null,
+            .sign_in, .api_key, .openai_url, .openai_key => null,
             .change_team => blk: {
                 var visible_index: usize = 0;
                 for (self.teams, 0..) |team, team_index| {
@@ -411,6 +417,10 @@ pub const PickerView = struct {
             .action => |action| switch (action) {
                 .login => "Sign in with Vercel",
                 .setup => if (self.include_skip) "Add an API key" else "API key",
+                .openai_compatible => if (self.include_skip)
+                    "OpenAI-compatible URL and key"
+                else
+                    "OpenAI-compatible",
                 .change_team => "Change team",
                 .switch_credential => "Switch credential",
                 .automatic => "Automatic",
@@ -423,7 +433,7 @@ pub const PickerView = struct {
         return switch (choice) {
             .source => |source| if (self.active_source == source) "current" else "available",
             .action => |action| switch (action) {
-                .login, .setup, .switch_credential => "",
+                .login, .setup, .openai_compatible, .switch_credential => "",
                 .automatic => "use normal precedence",
                 .change_team => if (self.fx_login_session_available) "choose a team" else "sign in first",
             },
@@ -602,6 +612,8 @@ pub const Runtime = struct {
     api_key_input: std.ArrayList(u8) = .empty,
     api_key_returns_to_root: bool = false,
     api_key_save: ApiKeySaveRuntime = .{},
+    openai_url_input: std.ArrayList(u8) = .empty,
+    openai_returns_to_root: bool = false,
 
     pub fn init(
         validator: api_key_validator.Provider,
@@ -619,6 +631,7 @@ pub const Runtime = struct {
         self.api_key_save.deinit(alloc);
         self.sign_in_flow.deinit(alloc);
         self.exitApiKeyStage(alloc, .runtime_deinit);
+        self.exitOpenaiUrlStage(alloc);
         self.clearTeamSelection(alloc);
         self.team_query.deinit(alloc);
         if (self.selected_credential) |*credential| credential.deinit(alloc);
@@ -751,6 +764,7 @@ pub const Runtime = struct {
     fn openPickerWithSkip(self: *Self, alloc: Allocator, include_skip: bool) void {
         self.exitSignInStage(alloc);
         self.exitApiKeyStage(alloc, .screen_replacement);
+        self.exitOpenaiUrlStage(alloc);
         self.clearTeamSelection(alloc);
         self.picker_active = true;
         self.picker_include_skip = include_skip;
@@ -772,6 +786,7 @@ pub const Runtime = struct {
             .team_query = self.team_query.items,
             .sign_in = self.sign_in_flow.snapshot(),
             .api_key_mask_count = @min(self.api_key_input.items.len, max_api_key_mask_glyphs),
+            .openai_url = self.openai_url_input.items,
         };
     }
 
@@ -794,6 +809,7 @@ pub const Runtime = struct {
     pub fn openTeamPicker(self: *Self, alloc: Allocator, selection: *login_flow.TeamSelection) void {
         self.exitSignInStage(alloc);
         self.exitApiKeyStage(alloc, .screen_replacement);
+        self.exitOpenaiUrlStage(alloc);
         self.clearTeamSelection(alloc);
         self.team_selection = selection.take();
         self.picker_stage = .change_team;
@@ -830,6 +846,7 @@ pub const Runtime = struct {
     pub fn openSwitchCredentialPicker(self: *Self, alloc: Allocator) void {
         self.exitSignInStage(alloc);
         self.exitApiKeyStage(alloc, .screen_replacement);
+        self.exitOpenaiUrlStage(alloc);
         self.picker_stage = .switch_credential;
         const active_source = self.credentialSource();
         self.picker_selection = if (active_source) |source|
@@ -849,6 +866,7 @@ pub const Runtime = struct {
     fn openApiKeyPickerWithParent(self: *Self, alloc: Allocator, returns_to_root: bool) void {
         self.exitSignInStage(alloc);
         self.exitApiKeyStage(alloc, .screen_replacement);
+        self.exitOpenaiUrlStage(alloc);
         self.clearTeamSelection(alloc);
         self.picker_active = true;
         self.picker_stage = .api_key;
@@ -868,6 +886,7 @@ pub const Runtime = struct {
         self.exitSignInStage(alloc);
         if (!try self.sign_in_flow.start(alloc, self.oauth_transport)) return false;
         self.exitApiKeyStage(alloc, .screen_replacement);
+        self.exitOpenaiUrlStage(alloc);
         self.clearTeamSelection(alloc);
         self.picker_active = true;
         self.picker_stage = .sign_in;
@@ -894,7 +913,66 @@ pub const Runtime = struct {
     }
 
     pub fn apiKeyEntryActive(self: *const Self) bool {
-        return self.picker_active and self.picker_stage == .api_key;
+        return self.picker_active and (self.picker_stage == .api_key or self.picker_stage == .openai_key);
+    }
+
+    pub fn openaiUrlEntryActive(self: *const Self) bool {
+        return self.picker_active and self.picker_stage == .openai_url;
+    }
+
+    pub fn openaiKeyEntryActive(self: *const Self) bool {
+        return self.picker_active and self.picker_stage == .openai_key;
+    }
+
+    pub fn openOpenaiCompatiblePickerFromRoot(self: *Self, alloc: Allocator) void {
+        self.openOpenaiCompatiblePickerWithParent(alloc, true);
+    }
+
+    pub fn openOpenaiCompatiblePicker(self: *Self, alloc: Allocator) void {
+        self.openOpenaiCompatiblePickerWithParent(alloc, false);
+    }
+
+    fn openOpenaiCompatiblePickerWithParent(self: *Self, alloc: Allocator, returns_to_root: bool) void {
+        self.exitSignInStage(alloc);
+        self.exitApiKeyStage(alloc, .screen_replacement);
+        self.exitOpenaiUrlStage(alloc);
+        self.clearTeamSelection(alloc);
+        self.picker_active = true;
+        self.picker_stage = .openai_url;
+        self.picker_selection = null;
+        self.openai_returns_to_root = returns_to_root;
+    }
+
+    pub fn appendOpenaiUrlByte(self: *Self, alloc: Allocator, byte: u8) !bool {
+        if (!self.openaiUrlEntryActive()) return false;
+        if (self.openai_url_input.items.len >= max_api_key_entry_bytes) return true;
+        if (byte < 0x20 or byte == 0x7f) return true;
+        try self.openai_url_input.append(alloc, byte);
+        return true;
+    }
+
+    pub fn deleteOpenaiUrlByte(self: *Self) bool {
+        if (!self.openaiUrlEntryActive()) return false;
+        if (self.openai_url_input.items.len > 0) _ = self.openai_url_input.pop();
+        return true;
+    }
+
+    pub fn openaiUrlText(self: *const Self) []const u8 {
+        return self.openai_url_input.items;
+    }
+
+    pub fn advanceOpenaiUrlToKey(self: *Self) bool {
+        if (!self.openaiUrlEntryActive() or self.openai_url_input.items.len == 0) return false;
+        self.picker_stage = .openai_key;
+        self.picker_selection = null;
+        return true;
+    }
+
+    pub fn takeOpenaiKey(self: *Self, alloc: Allocator) ?[]u8 {
+        if (!self.openaiKeyEntryActive() or self.api_key_input.items.len == 0) return null;
+        const key = self.api_key_input.toOwnedSlice(alloc) catch return null;
+        self.api_key_input = .empty;
+        return key;
     }
 
     pub fn appendApiKeyByte(self: *Self, alloc: Allocator, byte: u8) !bool {
@@ -995,12 +1073,25 @@ pub const Runtime = struct {
             }
         }
 
+        if (stage == .openai_url or stage == .openai_key) {
+            const returns_to_root = self.openai_returns_to_root;
+            self.exitApiKeyStage(alloc, .cancel);
+            self.exitOpenaiUrlStage(alloc);
+            if (!returns_to_root) {
+                self.picker_active = false;
+                self.picker_stage = .root;
+                self.picker_selection = null;
+                return true;
+            }
+        }
+
         self.clearTeamSelection(alloc);
         self.picker_stage = .root;
         self.picker_selection = .{ .action = switch (stage) {
             .root => unreachable,
             .sign_in => .login,
             .api_key => .setup,
+            .openai_url, .openai_key => .openai_compatible,
             .change_team => .change_team,
             .switch_credential => .switch_credential,
         } };
@@ -1010,6 +1101,7 @@ pub const Runtime = struct {
     pub fn closePicker(self: *Self, alloc: Allocator) void {
         self.exitSignInStage(alloc);
         self.exitApiKeyStage(alloc, .screen_replacement);
+        self.exitOpenaiUrlStage(alloc);
         self.clearTeamSelection(alloc);
         self.picker_active = false;
         self.picker_stage = .root;
@@ -1017,13 +1109,16 @@ pub const Runtime = struct {
 
     pub fn takePickerChoice(self: *Self, alloc: Allocator) ?Choice {
         if (!self.picker_active) return null;
-        if (self.picker_stage == .sign_in or self.picker_stage == .api_key) return null;
+        if (self.picker_stage == .sign_in or
+            self.picker_stage == .api_key or
+            self.picker_stage == .openai_url or
+            self.picker_stage == .openai_key) return null;
         const choice = self.picker_selection;
         const selected = choice orelse return null;
         if (!self.pickerView().choiceEnabled(selected)) return null;
 
         switch (self.picker_stage) {
-            .sign_in, .api_key => unreachable,
+            .sign_in, .api_key, .openai_url, .openai_key => unreachable,
             .root => switch (selected) {
                 .source => self.closePicker(alloc),
                 .action => |action| switch (action) {
@@ -1032,7 +1127,7 @@ pub const Runtime = struct {
                         self.openSwitchCredentialPicker(alloc);
                         return null;
                     },
-                    .setup => {},
+                    .setup, .openai_compatible => {},
                     // Only reachable from the switch screen, never the root.
                     .automatic => unreachable,
                     .login => self.closePicker(alloc),
@@ -1235,6 +1330,12 @@ pub const Runtime = struct {
                 .{ @tagName(reason), byte_count },
             );
         }
+    }
+
+    fn exitOpenaiUrlStage(self: *Self, alloc: Allocator) void {
+        self.openai_url_input.deinit(alloc);
+        self.openai_url_input = .empty;
+        self.openai_returns_to_root = false;
     }
 };
 
@@ -1945,11 +2046,11 @@ test "auth picker root starts on sign in and keeps sources in the switch stage" 
     const picker = runtime.pickerView();
     try std.testing.expect(picker.active);
     try std.testing.expect((Choice{ .action = .login }).eql(picker.selected_choice.?));
-    try std.testing.expectEqual(@as(usize, 4), picker.choiceCount());
-    try std.testing.expect(picker.choiceAt(4) == null);
+    try std.testing.expectEqual(@as(usize, 5), picker.choiceCount());
+    try std.testing.expect(picker.choiceAt(5) == null);
 }
 
-test "auth picker navigation wraps across the four hub actions" {
+test "auth picker navigation wraps across the five hub actions" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     runtime.source_inventory = SourceSet.initMany(&.{ .ai_gateway_api_key, .fx_login });
@@ -1957,6 +2058,8 @@ test "auth picker navigation wraps across the four hub actions" {
 
     try std.testing.expect(runtime.movePicker(1));
     try std.testing.expect((Choice{ .action = .setup }).eql(runtime.pickerView().selected_choice.?));
+    try std.testing.expect(runtime.movePicker(1));
+    try std.testing.expect((Choice{ .action = .openai_compatible }).eql(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
     try std.testing.expect((Choice{ .action = .change_team }).eql(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
@@ -1988,23 +2091,25 @@ test "auth picker without credentials exposes acquisition actions" {
     try std.testing.expect(picker.active_source == null);
     try std.testing.expect((Choice{ .action = .login }).eql(picker.selected_choice.?));
     try std.testing.expectEqual(@as(usize, 0), picker.available_sources.count());
-    try std.testing.expectEqual(@as(usize, 4), picker.choiceCount());
+    try std.testing.expectEqual(@as(usize, 5), picker.choiceCount());
     try std.testing.expect(!picker.choiceEnabled(.{ .action = .change_team }));
     try std.testing.expectEqualStrings("missing", picker.activeSourceLabel());
 }
 
-test "auth onboarding picker exposes only the two setup paths" {
+test "auth onboarding picker exposes vercel and openai-compatible setup paths" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     runtime.openOnboardingPicker(alloc);
 
     const picker = runtime.pickerView();
     try std.testing.expect(picker.include_skip);
-    try std.testing.expectEqual(@as(usize, 2), picker.choiceCount());
+    try std.testing.expectEqual(@as(usize, 3), picker.choiceCount());
     try std.testing.expect((Choice{ .action = .login }).eql(picker.choiceAt(0).?));
     try std.testing.expect((Choice{ .action = .setup }).eql(picker.choiceAt(1).?));
+    try std.testing.expect((Choice{ .action = .openai_compatible }).eql(picker.choiceAt(2).?));
     try std.testing.expectEqualStrings("Add an API key", picker.choiceLabel(picker.choiceAt(1).?));
-    try std.testing.expect(picker.choiceAt(2) == null);
+    try std.testing.expectEqualStrings("OpenAI-compatible URL and key", picker.choiceLabel(picker.choiceAt(2).?));
+    try std.testing.expect(picker.choiceAt(3) == null);
 }
 
 test "clearing a remembered choice re-resolves even when no login was active" {

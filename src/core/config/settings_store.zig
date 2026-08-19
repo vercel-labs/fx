@@ -4,6 +4,8 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const types = @import("../shared/types.zig");
+const model_backend = @import("../providers/model_backend.zig");
+const providers_config = @import("../providers/config.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const context_limits = @import("context_limits.zig");
 const input_appearance = @import("input_appearance.zig");
@@ -93,6 +95,10 @@ pub const UserSettingsPatch = struct {
     /// Removes the key entirely so resolution returns to plain precedence.
     /// Distinct from a null `credential_source`, which means "leave unchanged".
     clear_credential_source: bool = false,
+    provider: ?model_backend.ModelBackend = null,
+    clear_provider: bool = false,
+    openai_compatible_base_url: ?[]const u8 = null,
+    openai_compatible_api_key_env: ?[]const u8 = null,
     yolo_acknowledged: ?bool = null,
     effort: ?types.ReasoningEffort = null,
     fast_mode: ?bool = null,
@@ -112,6 +118,10 @@ pub const UserSettingsPatch = struct {
             self.permission_mode == null and
             self.credential_source == null and
             !self.clear_credential_source and
+            self.provider == null and
+            !self.clear_provider and
+            self.openai_compatible_base_url == null and
+            self.openai_compatible_api_key_env == null and
             self.yolo_acknowledged == null and
             self.effort == null and
             self.fast_mode == null and
@@ -892,6 +902,12 @@ fn validateUserPatch(patch: UserSettingsPatch) !void {
     if (patch.model) |model| try validateModel(model);
     if (patch.input_appearance) |appearance| try validateInputAppearance(appearance);
     if (patch.maxxing_mode) |mode| try validateMaxxingMode(mode);
+    if (patch.openai_compatible_base_url) |url| {
+        _ = providers_config.validateBaseUrl(url) catch return error.InvalidDurableField;
+    }
+    if (patch.openai_compatible_api_key_env) |name| {
+        _ = providers_config.validateApiKeyEnvName(name) catch return error.InvalidDurableField;
+    }
 }
 
 fn validatePatch(patch: WorkspaceSettingsPatch) !void {
@@ -914,6 +930,29 @@ pub fn validateInputAppearance(appearance: []const u8) !void {
 
 pub fn validateMaxxingMode(mode: []const u8) !void {
     if (!presentation_mode.MaxxingMode.isPersistedLabel(mode)) return error.InvalidDurableField;
+}
+
+test "provider patch persists openai-compatible settings as a nested object" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    var root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        "{\"model\":\"m\"}",
+        .{},
+    );
+    const application = try applyUserPatchToRoot(arena.allocator(), &root, .{
+        .provider = .openai_compatible,
+        .openai_compatible_base_url = "http://127.0.0.1:8080/v1",
+        .openai_compatible_api_key_env = "FX_OPENAI_API_KEY",
+    });
+    try std.testing.expect(application.changed);
+    try std.testing.expectEqualStrings("openai_compatible", root.object.get("provider").?.string);
+    const openai = root.object.get("openai_compatible").?;
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/v1", openai.object.get("base_url").?.string);
+    try std.testing.expectEqualStrings("FX_OPENAI_API_KEY", openai.object.get("api_key_env").?.string);
 }
 
 test "clearing the credential choice removes the key rather than blanking it" {
@@ -982,6 +1021,26 @@ fn applyUserPatchToRoot(
     if (patch.clear_credential_source and root.object.contains("credential_source")) {
         _ = root.object.orderedRemove("credential_source");
         application.changed = true;
+    }
+    if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", @tagName(value)) or application.changed;
+    if (patch.clear_provider and root.object.contains("provider")) {
+        _ = root.object.orderedRemove("provider");
+        application.changed = true;
+    }
+    if (patch.openai_compatible_base_url != null or patch.openai_compatible_api_key_env != null) {
+        var openai_compatible = if (root.object.getPtr("openai_compatible")) |value| blk: {
+            if (value.* != .object) return error.InvalidSettingsFormat;
+            break :blk value;
+        } else blk: {
+            try root.object.put(arena, "openai_compatible", .{ .object = .empty });
+            break :blk root.object.getPtr("openai_compatible").?;
+        };
+        if (patch.openai_compatible_base_url) |value| {
+            application.changed = try putString(arena, &openai_compatible.object, "base_url", value) or application.changed;
+        }
+        if (patch.openai_compatible_api_key_env) |value| {
+            application.changed = try putString(arena, &openai_compatible.object, "api_key_env", value) or application.changed;
+        }
     }
     if (patch.yolo_acknowledged) |value| application.changed = try putBool(arena, &root.object, "yolo_acknowledged", value) or application.changed;
     if (patch.effort) |value| application.changed = try putString(arena, &root.object, "effort", value.label()) or application.changed;
@@ -1667,6 +1726,22 @@ fn validateKnownSettingsObject(
     if (object.get("credential_source")) |value| {
         if (value != .string or types.parseCredentialSource(value.string) == null) {
             return error.InvalidSettingsFormat;
+        }
+    }
+    if (object.get("provider")) |value| {
+        if (value != .string or model_backend.parseStrict(value.string) == null) {
+            return error.InvalidSettingsFormat;
+        }
+    }
+    if (object.get("openai_compatible")) |value| {
+        if (value != .object) return error.InvalidSettingsFormat;
+        if (value.object.get("base_url")) |url| {
+            if (url != .string) return error.InvalidSettingsFormat;
+            _ = providers_config.validateBaseUrl(url.string) catch return error.InvalidSettingsFormat;
+        }
+        if (value.object.get("api_key_env")) |name| {
+            if (name != .string) return error.InvalidSettingsFormat;
+            _ = providers_config.validateApiKeyEnvName(name.string) catch return error.InvalidSettingsFormat;
         }
     }
     if (object.get("max_agent_steps")) |value| {

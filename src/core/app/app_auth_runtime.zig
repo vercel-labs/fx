@@ -7,7 +7,10 @@ const io_mod = @import("../shared/io.zig");
 const credentials = @import("../auth/credentials.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const login_flow = @import("../auth/login_flow.zig");
+const secret = @import("../auth/secret.zig");
 const types = @import("../shared/types.zig");
+const providers_config = @import("../providers/config.zig");
+const openai_secret = @import("../providers/openai_secret.zig");
 
 fn oauthAuthEnabled(comptime App: type) bool {
     return runtime_profile.allows(App, .native_auth) or
@@ -17,6 +20,16 @@ fn oauthAuthEnabled(comptime App: type) bool {
 pub fn Runtime(comptime App: type) type {
     return struct {
         fn ensurePromptCredential(app: *App) !bool {
+            const backend = providers_config.resolveActive().kind;
+            if (backend == .openai_compatible) {
+                if (providers_config.resolveActive().hasApiKey()) return true;
+                if (!app.auth.pickerView().active) {
+                    try app.auth.refreshSourceInventory(app.alloc);
+                    app.auth.openPicker(app.alloc);
+                }
+                app.shell.render_requests.request(.footer);
+                return false;
+            }
             if (app.auth.credentialSource() != null) return true;
 
             const auth_view = app.auth.view();
@@ -143,6 +156,18 @@ pub fn Runtime(comptime App: type) type {
                         prepareApiKeyInputBoundary(app);
                         app.auth.openApiKeyPickerFromRoot(app.alloc);
                     },
+                    .openai_compatible => {
+                        if (comptime !runtime_profile.allows(App, .native_auth)) {
+                            try app.writeDomainNotice(.{
+                                .topic = "auth",
+                                .tone = .warning,
+                                .body = "OpenAI-compatible setup is unavailable in this WASM session.",
+                            }, true);
+                            return;
+                        }
+                        prepareApiKeyInputBoundary(app);
+                        app.auth.openOpenaiCompatiblePickerFromRoot(app.alloc);
+                    },
                     .change_team => try beginTeamPicker(app),
                     .switch_credential => app.auth.openSwitchCredentialPicker(app.alloc),
                     .automatic => try applyAutomaticCredential(app),
@@ -161,6 +186,16 @@ pub fn Runtime(comptime App: type) type {
                 app.shell.render_requests.request(.footer);
                 return true;
             }
+            if (app.auth.openaiUrlEntryActive()) {
+                switch (byte) {
+                    3, 4 => _ = app.auth.popPickerStage(app.alloc),
+                    '\r', '\n' => try submitOpenaiUrlEntry(app),
+                    8, 127 => _ = app.auth.deleteOpenaiUrlByte(),
+                    else => _ = try app.auth.appendOpenaiUrlByte(app.alloc, byte),
+                }
+                app.shell.render_requests.request(.footer);
+                return true;
+            }
             if (app.auth.teamPickerActive()) {
                 const consumed = switch (byte) {
                     8, 127 => app.auth.deleteTeamQueryByte(),
@@ -170,6 +205,16 @@ pub fn Runtime(comptime App: type) type {
                     app.shell.render_requests.request(.footer);
                     return true;
                 }
+            }
+            if (app.auth.openaiKeyEntryActive()) {
+                switch (byte) {
+                    3, 4 => _ = app.auth.popPickerStage(app.alloc),
+                    '\r', '\n' => try submitOpenaiKeyEntry(app),
+                    8, 127 => _ = app.auth.deleteApiKeyByte(),
+                    else => _ = try app.auth.appendApiKeyByte(app.alloc, byte),
+                }
+                app.shell.render_requests.request(.footer);
+                return true;
             }
             if (!app.auth.apiKeyEntryActive()) return false;
             switch (byte) {
@@ -183,7 +228,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn routeAuthPickerEscapeAction(app: *App, action: anytype) bool {
-            if (!app.auth.signInEntryActive() and !app.auth.apiKeyEntryActive()) return false;
+            if (!app.auth.signInEntryActive() and
+                !app.auth.apiKeyEntryActive() and
+                !app.auth.openaiUrlEntryActive()) return false;
             return switch (action) {
                 .escape, .remapped_byte => false,
                 else => true,
@@ -236,7 +283,59 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        fn submitOpenaiUrlEntry(app: *App) !void {
+            const raw = app.auth.openaiUrlText();
+            _ = providers_config.validateBaseUrl(raw) catch {
+                try app.writeDomainNotice(.{
+                    .topic = "setup",
+                    .tone = .@"error",
+                    .body = "Enter an http or https OpenAI-compatible base URL.",
+                }, true);
+                return;
+            };
+            if (!app.auth.advanceOpenaiUrlToKey()) return;
+        }
+
+        fn submitOpenaiKeyEntry(app: *App) !void {
+            if (app.auth.pickerView().api_key_mask_count == 0) return;
+            const url = providers_config.validateBaseUrl(app.auth.openaiUrlText()) catch {
+                try app.writeDomainNotice(.{
+                    .topic = "setup",
+                    .tone = .@"error",
+                    .body = "Enter an http or https OpenAI-compatible base URL.",
+                }, true);
+                return;
+            };
+            const key = app.auth.takeOpenaiKey(app.alloc) orelse return;
+            defer secret.zeroAndFree(app.alloc, key);
+            openai_secret.store(app.alloc, key) catch {
+                try app.writeDomainNotice(.{
+                    .topic = "setup",
+                    .tone = .@"error",
+                    .body = "Could not store the OpenAI-compatible API key.",
+                }, true);
+                return;
+            };
+            var attempt = config_runtime.attemptUserPreferences(app.alloc, .{
+                .provider = .openai_compatible,
+                .openai_compatible_base_url = url,
+                .openai_compatible_api_key_env = providers_config.openai_api_key_env,
+            });
+            defer attempt.deinit(app.alloc);
+            providers_config.invalidateRemembered();
+            _ = app.auth.popPickerStage(app.alloc);
+            try app.writeDomainNotice(.{
+                .topic = "setup",
+                .tone = .neutral,
+                .body = "Saved the OpenAI-compatible URL and key. fx will use that backend.",
+            }, true);
+        }
+
         fn submitApiKeyEntry(app: *App) !void {
+            if (app.auth.openaiKeyEntryActive()) {
+                try submitOpenaiKeyEntry(app);
+                return;
+            }
             if (app.auth.pickerView().api_key_mask_count == 0) return;
             switch (app.auth.beginApiKeySave(app.alloc)) {
                 .started => app.shell.render_requests.request(.footer),

@@ -6,6 +6,8 @@ const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
+const model_backend = @import("../providers/model_backend.zig");
+const providers_config = @import("../providers/config.zig");
 const sandbox = @import("../permissions/sandbox.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const settings_store = @import("settings_store.zig");
@@ -39,6 +41,9 @@ pub const Settings = struct {
     model: ?[]u8 = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
+    provider: ?model_backend.ModelBackend = null,
+    openai_compatible_base_url: ?[]u8 = null,
+    openai_compatible_api_key_env: ?[]u8 = null,
     yolo_acknowledged: ?bool = null,
     max_agent_steps: ?usize = null,
     max_tool_result_bytes: ?usize = null,
@@ -66,6 +71,8 @@ pub const Settings = struct {
 
     pub fn deinit(self: *Settings, alloc: Allocator) void {
         if (self.model) |value| alloc.free(value);
+        if (self.openai_compatible_base_url) |value| alloc.free(value);
+        if (self.openai_compatible_api_key_env) |value| alloc.free(value);
         if (self.input_appearance) |value| alloc.free(value);
         if (self.maxxing_mode) |value| alloc.free(value);
         if (self.sandbox) |value| alloc.free(value);
@@ -119,6 +126,7 @@ pub const ConfigSources = struct {
     notification_attention_required: ConfigSource = .compiled_default,
     notification_max: ConfigSource = .compiled_default,
     sandbox: ConfigSource = .compiled_default,
+    provider: ConfigSource = .compiled_default,
 };
 
 pub fn resolveContextLimits(settings: *const Settings, command_line: []const context_limits.Override) context_limits.Values {
@@ -445,6 +453,11 @@ fn loadMergedSettingsDetailedWithOptionalHome(
             sources.model = .process_override;
         }
     }
+    if (io_mod.getenv(providers_config.provider_env)) |provider_override| {
+        if (model_backend.parse(provider_override) != null) {
+            sources.provider = .process_override;
+        }
+    }
 
     return .{
         .settings = settings,
@@ -557,6 +570,8 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "update_channel",
         "permission_mode",
         "credential_source",
+        "provider",
+        "openai_compatible",
         "yolo_acknowledged",
         "permission",
         "additional_directories",
@@ -600,6 +615,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.notification_attention_required != null) sources.notification_attention_required = source;
     if (settings.notification_max != null) sources.notification_max = source;
     if (settings.sandbox != null) sources.sandbox = source;
+    if (settings.provider != null) sources.provider = source;
 }
 
 const DetailedPermissionSource = enum {
@@ -1321,6 +1337,25 @@ fn parseProfileOnlyFields(
             return error.InvalidCredentialSource;
     }
 
+    if (root.object.get("provider")) |provider_value| {
+        if (provider_value != .string) return error.InvalidProviderType;
+        settings.provider = model_backend.parse(provider_value.string) orelse return error.InvalidProvider;
+    }
+
+    if (root.object.get("openai_compatible")) |openai_value| {
+        if (openai_value != .object) return error.InvalidOpenAiCompatibleType;
+        if (openai_value.object.get("base_url")) |url_value| {
+            if (url_value != .string) return error.InvalidOpenAiBaseUrlType;
+            const url = providers_config.validateBaseUrl(url_value.string) catch return error.InvalidOpenAiBaseUrl;
+            settings.openai_compatible_base_url = try alloc.dupe(u8, url);
+        }
+        if (openai_value.object.get("api_key_env")) |env_value| {
+            if (env_value != .string) return error.InvalidOpenAiApiKeyEnvType;
+            const name = providers_config.validateApiKeyEnvName(env_value.string) catch return error.InvalidOpenAiApiKeyEnv;
+            settings.openai_compatible_api_key_env = try alloc.dupe(u8, name);
+        }
+    }
+
     if (root.object.get("yolo_acknowledged")) |acknowledged_value| {
         if (acknowledged_value != .bool) return error.InvalidYoloAcknowledgedType;
         settings.yolo_acknowledged = acknowledged_value.bool;
@@ -1491,6 +1526,17 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
     }
     if (incoming.permission_mode) |value| target.permission_mode = value;
     if (incoming.credential_source) |value| target.credential_source = value;
+    if (incoming.provider) |value| target.provider = value;
+    if (incoming.openai_compatible_base_url) |value| {
+        if (target.openai_compatible_base_url) |current| alloc.free(current);
+        target.openai_compatible_base_url = value;
+        incoming.openai_compatible_base_url = null;
+    }
+    if (incoming.openai_compatible_api_key_env) |value| {
+        if (target.openai_compatible_api_key_env) |current| alloc.free(current);
+        target.openai_compatible_api_key_env = value;
+        incoming.openai_compatible_api_key_env = null;
+    }
     if (incoming.yolo_acknowledged) |value| target.yolo_acknowledged = value;
     if (incoming.max_agent_steps) |value| target.max_agent_steps = value;
     if (incoming.max_tool_result_bytes) |value| target.max_tool_result_bytes = value;
@@ -3381,6 +3427,37 @@ test "detailed settings expose target sources and permission views" {
     try expectPermissionRule(result.settings.permission_rules.rules[0], "bash", "local *", .allow);
     try expectIgnoredProjectKey(result.diagnostics, "permission");
     try expectIgnoredProjectKey(result.diagnostics, "effort");
+}
+
+test "project provider and openai_compatible keys are ignored as profile-only" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"provider\":\"openai_compatible\",\"openai_compatible\":{\"base_url\":\"http://127.0.0.1:9/v1\",\"api_key_env\":\"FX_OPENAI_API_KEY\"}}\n",
+    );
+    try writeFixtureFile(
+        tmp.dir,
+        "workspace/.fx.json",
+        "{\"provider\":\"chatgpt\",\"openai_compatible\":{\"base_url\":\"https://evil.example/v1\"}}\n",
+    );
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(model_backend.ModelBackend.openai_compatible, result.settings.provider.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9/v1", result.settings.openai_compatible_base_url.?);
+    try expectIgnoredProjectKey(result.diagnostics, "provider");
+    try expectIgnoredProjectKey(result.diagnostics, "openai_compatible");
 }
 
 test "detailed settings report non-empty process model override as winning source" {

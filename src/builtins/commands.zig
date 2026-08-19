@@ -98,8 +98,12 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .setup,
         .token = "setup",
-        .usage = "setup",
-        .summary = "Configure an AI Gateway API key",
+        .usage = "setup [openai-compatible]",
+        .summary = "Configure an AI Gateway or OpenAI-compatible API key",
+        .details = &.{
+            "With no arguments, paste an AI Gateway API key.",
+            "Use `openai-compatible` to save a Chat Completions base URL and API key.",
+        },
     },
     .{
         .kind = .status,
@@ -283,7 +287,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .login, .usage = "login" },
         .{ .kind = .logout, .usage = "logout" },
-        .{ .kind = .setup, .usage = "setup" },
+        .{ .kind = .setup, .usage = "setup [openai-compatible]" },
         .{ .kind = .teams, .usage = "teams" },
         .{ .kind = .credits, .usage = "credits|balance" },
         .{ .kind = .usage, .usage = "usage [--period <24h|7d|30d>]" },
@@ -409,7 +413,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
     .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "sign in with Vercel", .presentation_category = .account },
     .{ .kind = .logout, .command = "/logout", .help_entry = "/logout", .completion_description = "sign out of fx login", .presentation_category = .account },
-    .{ .kind = .setup, .command = "/setup", .help_entry = "/setup", .completion_description = "set up AI Gateway access", .presentation_category = .account },
+    .{ .kind = .setup, .command = "/setup", .help_entry = "/setup", .completion_description = "set up AI Gateway or OpenAI-compatible access", .presentation_category = .account },
     .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show token and turn statistics", .presentation_category = .account },
     .{ .kind = .usage, .command = "/usage", .aliases = &.{"/cost"}, .help_entry = "/usage (/cost)", .completion_description = "show local fx tokens, models, and spend", .presentation_category = .account },
     .{ .kind = .status, .command = "/status", .help_entry = "/status", .completion_description = "show runtime configuration", .presentation_category = .general, .show_in_welcome = true },

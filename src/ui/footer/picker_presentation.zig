@@ -54,7 +54,7 @@ fn teamQueryProjection(query: []const u8, width: u16) TeamQueryProjection {
 
 pub fn authPickerRowCount(view: auth_runtime.PickerView) u16 {
     if (view.stage == .sign_in) return 7;
-    if (view.stage == .api_key) return 4;
+    if (view.stage == .api_key or view.stage == .openai_url or view.stage == .openai_key) return 4;
     if (view.stage == .root and view.include_skip) return 17;
     return @intCast(1 + @max(view.choiceCount(), 1));
 }
@@ -71,6 +71,12 @@ pub noinline fn composeAuthPickerRow(
     }
     if (view.stage == .api_key) {
         return composeApiKeyPickerRow(alloc, view.api_key_mask_count, row_index, width);
+    }
+    if (view.stage == .openai_url) {
+        return composeOpenaiUrlPickerRow(alloc, view.openai_url, row_index, width);
+    }
+    if (view.stage == .openai_key) {
+        return composeOpenaiKeyPickerRow(alloc, view.api_key_mask_count, row_index, width);
     }
     if (view.stage == .root and view.include_skip) {
         return composeOnboardingPickerRow(alloc, view, row_index, row_count, width);
@@ -94,6 +100,8 @@ pub noinline fn composeAuthPickerRow(
             .root => "   Setup",
             .sign_in => unreachable,
             .api_key => unreachable,
+            .openai_url => unreachable,
+            .openai_key => unreachable,
             .change_team => unreachable,
             .switch_credential => "   Use this credential",
         };
@@ -116,6 +124,8 @@ pub noinline fn composeAuthPickerRow(
             .root => "",
             .sign_in => unreachable,
             .api_key => unreachable,
+            .openai_url => unreachable,
+            .openai_key => unreachable,
             .change_team => if (view.team_query.len == 0)
                 "     No Vercel teams available"
             else
@@ -157,9 +167,14 @@ const onboarding_note_link = onboarding_note ++ " \x1b]8;id=fx-onboarding;https:
 fn onboardingProjectedRowIndex(view: auth_runtime.PickerView, row_index: u16, row_count: u16) u16 {
     if (row_count >= 17) return row_index;
 
-    const selected_row: u16 = if (view.selectedIndex() == 0) 8 else 9;
+    const selected_row: u16 = switch (view.selectedIndex()) {
+        0 => 8,
+        1 => 9,
+        else => 10,
+    };
     const other_row: u16 = if (selected_row == 8) 9 else 8;
-    const priority = [_]u16{ selected_row, other_row, 14, 7, 11, 5, 0, 2, 3, 6, 10, 12, 13, 1, 4, 15, 16 };
+    const third_row: u16 = if (selected_row == 10) 9 else 10;
+    const priority = [_]u16{ selected_row, other_row, 14, third_row, 7, 11, 5, 0, 2, 3, 6, 12, 13, 1, 4, 15, 16 };
 
     var projected_index: u16 = 0;
     for (0..17) |source_row| {
@@ -188,6 +203,7 @@ fn composeOnboardingPickerRow(
     const maybe_choice_index: ?usize = switch (source_row_index) {
         8 => 0,
         9 => 1,
+        10 => 2,
         else => null,
     };
     if (maybe_choice_index) |choice_index| {
@@ -309,6 +325,72 @@ fn composeApiKeyPickerRow(
             ) catch "   Saves to configured credential store";
             try row_text.appendClipped(alloc, &row, label, width);
         },
+        else => {},
+    }
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
+fn composeOpenaiUrlPickerRow(
+    alloc: Allocator,
+    url: []const u8,
+    row_index: u16,
+    width: u16,
+) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    if (width == 0) return row;
+
+    try row.appendSlice(alloc, if (row_index == 1)
+        ui_render.selected_completion_style
+    else
+        ui_render.dim_style);
+    switch (row_index) {
+        0 => try row_text.appendClipped(alloc, &row, "   OpenAI-compatible base URL", width),
+        1 => {
+            try row_text.appendClipped(alloc, &row, "   ┃ ", width);
+            if (url.len == 0) {
+                try row.appendSlice(alloc, ui_render.dim_style);
+                try row_text.appendClipped(alloc, &row, "https://api.openai.com/v1", width -| 5);
+            } else {
+                try row_text.appendClipped(alloc, &row, url, width -| 5);
+            }
+        },
+        2 => try row_text.appendClipped(alloc, &row, "   Enter continues · Esc cancels", width),
+        3 => try row_text.appendClipped(alloc, &row, "   Saved in ~/.fx/settings.json", width),
+        else => {},
+    }
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
+fn composeOpenaiKeyPickerRow(
+    alloc: Allocator,
+    mask_count: usize,
+    row_index: u16,
+    width: u16,
+) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    if (width == 0) return row;
+
+    try row.appendSlice(alloc, if (row_index == 1)
+        ui_render.selected_completion_style
+    else
+        ui_render.dim_style);
+    switch (row_index) {
+        0 => try row_text.appendClipped(alloc, &row, "   Paste your OpenAI-compatible API key", width),
+        1 => {
+            try row_text.appendClipped(alloc, &row, "   ┃ ", width);
+            if (mask_count == 0) {
+                try row.appendSlice(alloc, ui_render.dim_style);
+                try row_text.appendClipped(alloc, &row, "Paste or type a key", width -| 5);
+            } else {
+                for (0..@min(mask_count, width -| 5)) |_| try row.appendSlice(alloc, "•");
+            }
+        },
+        2 => try row_text.appendClipped(alloc, &row, "   Enter saves · Esc cancels", width),
+        3 => try row_text.appendClipped(alloc, &row, "   Stored separately from Vercel Gateway keys", width),
         else => {},
     }
     try row.appendSlice(alloc, ui_render.reset_style);
@@ -1537,6 +1619,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
     try std.testing.expect(std.mem.find(u8, screen.items, "Learn more: https://") == null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Vercel") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Add an API key") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "OpenAI-compatible URL and key") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Esc to set up later · Explore all commands with /help") != null);
 
     var body_row = try composeAuthPickerRow(alloc, view, 2, authPickerRowCount(view), 100);
@@ -1554,6 +1637,10 @@ test "auth onboarding composes the welcome copy and setup choices" {
     var unselected_row = try composeAuthPickerRow(alloc, view, 9, authPickerRowCount(view), 100);
     defer unselected_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, unselected_row.items, "Add an API key") != null);
+
+    var openai_row = try composeAuthPickerRow(alloc, view, 10, authPickerRowCount(view), 100);
+    defer openai_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, openai_row.items, "OpenAI-compatible URL and key") != null);
 
     var narrow_note = try composeAuthPickerRow(alloc, view, 11, authPickerRowCount(view), 58);
     defer narrow_note.deinit(alloc);
@@ -1582,7 +1669,7 @@ test "auth picker composes only detected credential sources" {
         .include_skip = false,
     };
     const row_count = authPickerRowCount(view);
-    try std.testing.expectEqual(@as(u16, 5), row_count);
+    try std.testing.expectEqual(@as(u16, 6), row_count);
 
     var header = try composeAuthPickerRow(alloc, view, 0, row_count, 80);
     defer header.deinit(alloc);
@@ -1596,12 +1683,16 @@ test "auth picker composes only detected credential sources" {
     defer setup.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, setup.items, "API key") != null);
 
-    var change_team = try composeAuthPickerRow(alloc, view, 3, row_count, 80);
+    var openai_compatible = try composeAuthPickerRow(alloc, view, 3, row_count, 80);
+    defer openai_compatible.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, openai_compatible.items, "OpenAI-compatible") != null);
+
+    var change_team = try composeAuthPickerRow(alloc, view, 4, row_count, 80);
     defer change_team.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, change_team.items, "Change team") != null);
     try std.testing.expect(std.mem.find(u8, change_team.items, "sign in first") != null);
 
-    var switch_credential = try composeAuthPickerRow(alloc, view, 4, row_count, 80);
+    var switch_credential = try composeAuthPickerRow(alloc, view, 5, row_count, 80);
     defer switch_credential.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, switch_credential.items, "Switch credential") != null);
 }
