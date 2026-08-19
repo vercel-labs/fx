@@ -98,8 +98,13 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .setup,
         .token = "setup",
-        .usage = "setup",
-        .summary = "Configure an AI Gateway API key",
+        .usage = "setup [--base-url <url> [--no-key]] [--gateway]",
+        .summary = "Configure an API key, or a custom OpenAI-compatible endpoint",
+        .options = &.{
+            .{ .flag = "--base-url <url>", .description = "Use a custom OpenAI-compatible endpoint and store its key" },
+            .{ .flag = "--no-key", .description = "Configure the endpoint without a key, for a local server" },
+            .{ .flag = "--gateway", .description = "Clear the custom endpoint and use Vercel AI Gateway" },
+        },
     },
     .{
         .kind = .status,

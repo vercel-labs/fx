@@ -18,12 +18,22 @@ pub const CredentialRefreshMode = enum {
     force,
 };
 
+/// Must list every `credentials.Source`: the picker indexes selectable sources
+/// through this order while bounding on the full source set, so a missing entry
+/// makes those two disagree.
 const credential_source_order = [_]credentials.Source{
     .vercel_oidc_token,
     .ai_gateway_api_key,
     .fx_login,
     .stored_key,
+    .custom_endpoint,
 };
+
+comptime {
+    if (credential_source_order.len != @typeInfo(credentials.Source).@"enum".fields.len) {
+        @compileError("credential_source_order must list every credentials.Source");
+    }
+}
 
 const SourceProbeFn = *const fn (?*anyopaque, Allocator, credentials.Source) anyerror!bool;
 const CredentialLoaderFn = *const fn (?*anyopaque, Allocator, credentials.Source) anyerror!?credentials.Credential;

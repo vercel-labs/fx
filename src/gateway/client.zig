@@ -5,6 +5,7 @@ const secret = @import("../core/auth/secret.zig");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
+const openai_sse = @import("openai_sse.zig");
 const types = @import("../core/shared/types.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
@@ -185,7 +186,7 @@ const provider_failure_detail_max_bytes: usize = 600;
 const generation_response_max_bytes: usize = 128 * 1024;
 const generation_lookup_timeout_ms: i64 = 30_000;
 // Covers a 4 MiB string at worst-case JSON escaping plus SSE framing.
-const max_sse_event_line_bytes: usize = 32 * 1024 * 1024;
+pub const max_sse_event_line_bytes: usize = 32 * 1024 * 1024;
 const e2e_gateway_chat_url_env = "FX_E2E_GATEWAY_CHAT_URL";
 const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
 const e2e_gateway_credits_url_env = "FX_E2E_GATEWAY_CREDITS_URL";
@@ -988,12 +989,23 @@ test "connection setup policy bounds retry by deadline attempts and delivery" {
     }
 }
 
+/// Wire protocol spoken at `chat_url`. `.gateway` is the Vercel AI SDK
+/// LanguageModelV2 protocol; `.openai_compat` is the OpenAI chat-completions
+/// protocol used by custom endpoints (see `builtins/openai_compat.zig`).
+pub const WireProtocol = enum {
+    gateway,
+    openai_compat,
+};
+
 pub const StreamRequest = struct {
+    /// Empty means the request is sent without an Authorization header
+    /// (supported for `.openai_compat` local servers only).
     api_key: []const u8,
     model: []const u8,
     retry_count: usize,
     chat_url: []const u8,
     payload: []const u8,
+    protocol: WireProtocol = .gateway,
     team: ?[]const u8 = null,
     /// Borrowed until `streamGatewayCompletion` returns.
     session_id: ?[]const u8 = null,
@@ -1174,16 +1186,29 @@ fn streamGatewayCompletionCoreWithOptions(
     const request_url = try resolveE2eGatewayUrl(e2e_gateway_chat_url_env, request.chat_url);
     const uri = try std.Uri.parse(request_url);
 
-    const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});
-    defer alloc.free(auth_header);
+    const auth_header: ?[]u8 = if (request.api_key.len > 0)
+        try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key})
+    else
+        null;
+    defer if (auth_header) |header| alloc.free(header);
+    const authorization: std.http.Client.Request.Headers.Value = if (auth_header) |header|
+        .{ .override = header }
+    else
+        .omit;
 
     var extra_headers_buf: [9]std.http.Header = undefined;
-    const extra_headers = gatewayExtraHeaders(
-        &extra_headers_buf,
-        model,
-        request.team,
-        request.session_id,
-    );
+    const extra_headers = switch (request.protocol) {
+        .gateway => gatewayExtraHeaders(
+            &extra_headers_buf,
+            model,
+            request.team,
+            request.session_id,
+        ),
+        .openai_compat => blk: {
+            extra_headers_buf[0] = .{ .name = "accept", .value = "text/event-stream" };
+            break :blk extra_headers_buf[0..1];
+        },
+    };
 
     var attempt: usize = 0;
     var delivery_ambiguous = false;
@@ -1210,7 +1235,7 @@ fn streamGatewayCompletionCoreWithOptions(
         var req = openGatewayRequestBounded(&client, uri, .{
             .headers = .{
                 .content_type = .{ .override = "application/json" },
-                .authorization = .{ .override = auth_header },
+                .authorization = authorization,
                 .accept_encoding = .omit,
                 .user_agent = .{ .override = user_agent },
             },
@@ -1387,19 +1412,32 @@ fn streamGatewayCompletionCoreWithOptions(
         var transfer_buf: [gateway_transfer_buffer_bytes]u8 = undefined;
         const body_reader = response.reader(&transfer_buf);
         debug_trace.eventf("gateway", "before_sse_consume", trace_ctx, "attempt={d}", .{attempt + 1});
-        var completion = consumeSseStreamTraced(
-            alloc,
-            body_reader,
-            callback_ctx,
-            on_content_chunk,
-            on_tool_start,
-            request.on_reasoning_chunk,
-            request.on_tool_input_chunk,
-            cancel_flag,
-            .{ .requested_model = model, .ctx = trace_ctx },
-            expected_provider_tool_name,
-            request.content_capture_limit,
-        ) catch |err| {
+        var completion = switch (request.protocol) {
+            .gateway => consumeSseStreamTraced(
+                alloc,
+                body_reader,
+                callback_ctx,
+                on_content_chunk,
+                on_tool_start,
+                request.on_reasoning_chunk,
+                request.on_tool_input_chunk,
+                cancel_flag,
+                .{ .requested_model = model, .ctx = trace_ctx },
+                expected_provider_tool_name,
+                request.content_capture_limit,
+            ),
+            .openai_compat => openai_sse.consumeOpenAiSseStream(
+                alloc,
+                body_reader,
+                callback_ctx,
+                on_content_chunk,
+                on_tool_start,
+                request.on_reasoning_chunk,
+                request.on_tool_input_chunk,
+                cancel_flag,
+                request.content_capture_limit,
+            ),
+        } catch |err| {
             debug_trace.eventf("gateway", "sse_consume_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
             return @as(anyerror!StreamResult, connectedIoFailure(
                 cancel_flag.load(.seq_cst),
@@ -2608,7 +2646,7 @@ const SseLineRead = union(enum) {
     eof,
 };
 
-const SseEventRead = union(enum) {
+pub const SseEventRead = union(enum) {
     data: []const u8,
     done,
     ignored,
@@ -2616,19 +2654,20 @@ const SseEventRead = union(enum) {
     eof,
 };
 
-const SseEventReader = struct {
+/// Shared by the AI Gateway and OpenAI-compatible SSE consumers.
+pub const SseEventReader = struct {
     pending_line: std.ArrayList(u8) = .empty,
     max_line_bytes: usize,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.pending_line.deinit(alloc);
     }
 
-    fn releaseLine(self: *@This()) void {
+    pub fn releaseLine(self: *@This()) void {
         self.pending_line.clearRetainingCapacity();
     }
 
-    fn next(self: *@This(), alloc: std.mem.Allocator, reader: anytype) !SseEventRead {
+    pub fn next(self: *@This(), alloc: std.mem.Allocator, reader: anytype) !SseEventRead {
         const line = switch (try self.readLine(alloc, reader)) {
             .line => |line| line,
             .read_failed => return .read_failed,

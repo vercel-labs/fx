@@ -10,6 +10,7 @@ const cli_replay = @import("cli_replay.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const custom_endpoint = @import("../config/custom_endpoint.zig");
 const devbox_executor = @import("../execution/devbox_executor.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
@@ -772,11 +773,11 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .setup => |rest| {
-            if (rest.len != 0) {
+            const opts = parseSetupArgs(rest) catch {
                 try writeTopLevelUsage(cfg.command_catalog, deps, .setup);
                 return .handled_failure;
-            }
-            return if (try runPasteSetup(alloc, cfg.secret_store, deps)) .handled_success else .handled_failure;
+            };
+            return if (try runSetup(alloc, cfg.secret_store, deps, opts)) .handled_success else .handled_failure;
         },
         .status => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
@@ -1458,6 +1459,127 @@ fn writeStderr(deps: RunDeps, text: []const u8) !void {
     try deps.write_stderr(deps.stderr_ctx, text);
 }
 
+const SetupOptions = struct {
+    /// Endpoint to configure, or null to configure AI Gateway.
+    base_url: ?[]const u8 = null,
+    /// Removes a stored endpoint and returns inference to AI Gateway.
+    clear_base_url: bool = false,
+    /// Configures an endpoint that takes no credential, such as a local server.
+    no_key: bool = false,
+};
+
+fn parseSetupArgs(args: []const [:0]const u8) !SetupOptions {
+    var options = SetupOptions{};
+    var base_url_seen = false;
+    var no_key_seen = false;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--no-key")) {
+            if (no_key_seen) return error.InvalidSetupArgs;
+            no_key_seen = true;
+            options.no_key = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--gateway")) {
+            if (base_url_seen) return error.InvalidSetupArgs;
+            base_url_seen = true;
+            options.clear_base_url = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--base-url")) {
+            if (base_url_seen or index + 1 >= args.len) return error.InvalidSetupArgs;
+            base_url_seen = true;
+            index += 1;
+            options.base_url = args[index];
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--base-url=")) {
+            if (base_url_seen) return error.InvalidSetupArgs;
+            base_url_seen = true;
+            options.base_url = arg["--base-url=".len..];
+            continue;
+        }
+        return error.InvalidSetupArgs;
+    }
+    if (options.no_key and options.base_url == null) return error.InvalidSetupArgs;
+    return options;
+}
+
+fn runSetup(
+    alloc: Allocator,
+    secret_store: host.SecretStore,
+    deps: RunDeps,
+    options: SetupOptions,
+) !bool {
+    if (options.clear_base_url) return runGatewayReset(alloc, deps);
+    if (options.base_url) |base_url| {
+        return runEndpointSetup(alloc, secret_store, deps, base_url, options.no_key);
+    }
+    return runPasteSetup(alloc, secret_store, deps);
+}
+
+fn runGatewayReset(alloc: Allocator, deps: RunDeps) !bool {
+    var cleared = config_runtime.setUserPreferences(alloc, .{ .clear_base_url = true }) catch {
+        try writeStderr(deps, "fx setup: could not update the stored endpoint\n");
+        return false;
+    };
+    cleared.deinit(alloc);
+    custom_endpoint.invalidateStored();
+    try writeStdout(deps, "Cleared the custom endpoint. Inference uses Vercel AI Gateway.\n");
+    return true;
+}
+
+/// Stores the endpoint in the user profile and its key in the secret store.
+/// The key is optional so a keyless local server (Ollama, LM Studio) can be
+/// configured in one step.
+fn runEndpointSetup(
+    alloc: Allocator,
+    secret_store: host.SecretStore,
+    deps: RunDeps,
+    raw_base_url: []const u8,
+    no_key: bool,
+) !bool {
+    const base_url = custom_endpoint.normalize(raw_base_url) orelse {
+        try writeStderr(deps, "fx setup: --base-url must be an http(s) URL without credentials, for example https://api.openai.com/v1\n");
+        return false;
+    };
+
+    var stored = config_runtime.setUserPreferences(alloc, .{ .base_url = base_url }) catch {
+        try writeStderr(deps, "fx setup: could not save the endpoint\n");
+        return false;
+    };
+    stored.deinit(alloc);
+    custom_endpoint.invalidateStored();
+
+    const saved = try std.fmt.allocPrint(alloc, "Saved endpoint {s}.\n", .{base_url});
+    defer alloc.free(saved);
+    try writeStdout(deps, saved);
+
+    if (no_key) {
+        try writeStdout(deps, "Requests to this endpoint are sent without an API key.\n");
+        return true;
+    }
+    if (custom_endpoint.envApiKey().len > 0) {
+        try writeStdout(deps, "Using the API key from FX_API_KEY.\n");
+        return true;
+    }
+    if (secret_store.isDisabled()) {
+        try writeStdout(deps, "Stored API keys are disabled by FX_DISABLE_KEYCHAIN; set FX_API_KEY for this endpoint.\n");
+        return true;
+    }
+    if (!deps.setup_terminal_available(deps.setup_ctx)) {
+        try writeStdout(deps, "Set FX_API_KEY for this endpoint, or run fx setup from a terminal to store its key.\n");
+        return true;
+    }
+    return storeApiKey(
+        alloc,
+        secret_store,
+        deps,
+        "Paste the API key for this endpoint (input hidden): ",
+    );
+}
+
 fn runPasteSetup(
     alloc: Allocator,
     secret_store: host.SecretStore,
@@ -1471,8 +1593,18 @@ fn runPasteSetup(
         try writeStderr(deps, "fx setup: an interactive terminal is required to paste an API key\n");
         return false;
     }
+    return storeApiKey(alloc, secret_store, deps, "Paste AI Gateway API key (input hidden): ");
+}
 
-    try writeStderr(deps, "Paste AI Gateway API key (input hidden): ");
+/// Prefers the platform's own secure prompt so plaintext never enters this
+/// process, falling back to a masked read where no such prompt exists.
+fn storeApiKey(
+    alloc: Allocator,
+    secret_store: host.SecretStore,
+    deps: RunDeps,
+    prompt: []const u8,
+) !bool {
+    try writeStderr(deps, prompt);
     const stored_interactively = secret_store.storeInteractive() catch {
         try writeStderr(deps, "\nfx setup: API key was not saved\n");
         return false;
@@ -1688,6 +1820,7 @@ fn statusSnapshotFromStartupWithBuild(
 ) output_contracts.StatusSnapshot {
     return .{
         .model = startup.selected_model,
+        .endpoint = custom_endpoint.baseUrl(),
         .auth = startup.auth,
         .auth_help = startup.auth.missingHelp(.cli),
         .permission_mode = permissionModeForSnapshot(startup.permission_mode),
@@ -3962,6 +4095,54 @@ test "setup delegates secure input to an interactive host store" {
     try std.testing.expectEqual(@as(usize, 1), capture.setup_store_calls);
     try std.testing.expectEqual(@as(usize, 0), capture.setup_read_calls);
     try std.testing.expect(!capture.setup_value_matched);
+}
+
+test "setup parses endpoint arguments and rejects conflicting ones" {
+    const endpoint = try parseSetupArgs(&.{ @constCast("--base-url"), @constCast("https://api.openai.com/v1") });
+    try std.testing.expectEqualStrings("https://api.openai.com/v1", endpoint.base_url.?);
+    try std.testing.expect(!endpoint.no_key);
+
+    const inline_form = try parseSetupArgs(&.{@constCast("--base-url=http://localhost:11434/v1")});
+    try std.testing.expectEqualStrings("http://localhost:11434/v1", inline_form.base_url.?);
+
+    const keyless = try parseSetupArgs(&.{
+        @constCast("--base-url"),
+        @constCast("http://localhost:11434/v1"),
+        @constCast("--no-key"),
+    });
+    try std.testing.expect(keyless.no_key);
+
+    const gateway = try parseSetupArgs(&.{@constCast("--gateway")});
+    try std.testing.expect(gateway.clear_base_url);
+    try std.testing.expect(gateway.base_url == null);
+
+    try std.testing.expectEqual(SetupOptions{}, try parseSetupArgs(&.{}));
+    try std.testing.expectError(error.InvalidSetupArgs, parseSetupArgs(&.{@constCast("--base-url")}));
+    try std.testing.expectError(error.InvalidSetupArgs, parseSetupArgs(&.{@constCast("--no-key")}));
+    try std.testing.expectError(error.InvalidSetupArgs, parseSetupArgs(&.{
+        @constCast("--gateway"),
+        @constCast("--base-url"),
+        @constCast("https://api.openai.com/v1"),
+    }));
+    try std.testing.expectError(error.InvalidSetupArgs, parseSetupArgs(&.{@constCast("--unknown")}));
+}
+
+test "setup rejects an endpoint url that is not a credential-free http origin" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+    var cfg = testConfig();
+    cfg.secret_store = capture.secretStore();
+
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{ @constCast("setup"), @constCast("--base-url"), @constCast("https://user:pass@api.openai.com/v1") },
+        cfg,
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(RunResult.handled_failure, result);
+    try std.testing.expectEqual(@as(usize, 0), capture.setup_store_calls);
+    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "--base-url must be an http(s) URL") != null);
 }
 
 test "setup preserves the disabled secret-store failure" {

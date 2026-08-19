@@ -92,6 +92,9 @@ pub const CredentialSource = enum {
     ai_gateway_api_key,
     fx_login,
     stored_key,
+    /// Credential for a custom OpenAI-compatible endpoint. Never valid against
+    /// Vercel AI Gateway.
+    custom_endpoint,
 };
 
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {

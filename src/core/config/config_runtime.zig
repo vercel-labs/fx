@@ -37,6 +37,8 @@ pub const Paths = struct {
 
 pub const Settings = struct {
     model: ?[]u8 = null,
+    /// Base URL of a custom OpenAI-compatible endpoint, when configured.
+    base_url: ?[]u8 = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     yolo_acknowledged: ?bool = null,
@@ -66,6 +68,7 @@ pub const Settings = struct {
 
     pub fn deinit(self: *Settings, alloc: Allocator) void {
         if (self.model) |value| alloc.free(value);
+        if (self.base_url) |value| alloc.free(value);
         if (self.input_appearance) |value| alloc.free(value);
         if (self.maxxing_mode) |value| alloc.free(value);
         if (self.sandbox) |value| alloc.free(value);
@@ -541,6 +544,7 @@ fn hasLegacyWorkspacePreferences(root: std.json.Value) bool {
 fn isProfileOnlySettingKey(key: []const u8) bool {
     inline for (&.{
         "model",
+        "base_url",
         "effort",
         "fast_mode",
         "input_appearance",
@@ -1321,6 +1325,13 @@ fn parseProfileOnlyFields(
             return error.InvalidCredentialSource;
     }
 
+    if (root.object.get("base_url")) |base_url_value| {
+        if (base_url_value != .string) return error.InvalidBaseUrlType;
+        settings_store.validateBaseUrl(base_url_value.string) catch return error.InvalidBaseUrl;
+        if (settings.base_url) |existing| alloc.free(existing);
+        settings.base_url = try alloc.dupe(u8, base_url_value.string);
+    }
+
     if (root.object.get("yolo_acknowledged")) |acknowledged_value| {
         if (acknowledged_value != .bool) return error.InvalidYoloAcknowledgedType;
         settings.yolo_acknowledged = acknowledged_value.bool;
@@ -1488,6 +1499,11 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
         if (target.model) |current| alloc.free(current);
         target.model = value;
         incoming.model = null;
+    }
+    if (incoming.base_url) |value| {
+        if (target.base_url) |current| alloc.free(current);
+        target.base_url = value;
+        incoming.base_url = null;
     }
     if (incoming.permission_mode) |value| target.permission_mode = value;
     if (incoming.credential_source) |value| target.credential_source = value;

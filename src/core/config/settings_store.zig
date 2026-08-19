@@ -88,6 +88,12 @@ pub const WorkspaceDirectoryMutation = struct {
 
 pub const UserSettingsPatch = struct {
     model: ?[]const u8 = null,
+    /// Base URL of a custom OpenAI-compatible endpoint. Routes inference away
+    /// from Vercel AI Gateway for every surface.
+    base_url: ?[]const u8 = null,
+    /// Removes the key entirely so inference returns to AI Gateway. Distinct
+    /// from a null `base_url`, which means "leave unchanged".
+    clear_base_url: bool = false,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     /// Removes the key entirely so resolution returns to plain precedence.
@@ -109,6 +115,8 @@ pub const UserSettingsPatch = struct {
 
     fn isEmpty(self: UserSettingsPatch) bool {
         return self.model == null and
+            self.base_url == null and
+            !self.clear_base_url and
             self.permission_mode == null and
             self.credential_source == null and
             !self.clear_credential_source and
@@ -908,12 +916,72 @@ fn validAdditionalDirectoryPath(path: []const u8) bool {
         std.mem.findScalar(u8, path, 0) == null;
 }
 
+pub const base_url_max_bytes: usize = 2048;
+
+/// Accepts only an absolute http(s) origin with a path, which is what the
+/// OpenAI-compatible transport appends its routes to.
+pub fn validateBaseUrl(base_url: []const u8) !void {
+    if (base_url.len == 0 or base_url.len > base_url_max_bytes) return error.InvalidBaseUrl;
+    if (!std.mem.startsWith(u8, base_url, "https://") and
+        !std.mem.startsWith(u8, base_url, "http://")) return error.InvalidBaseUrl;
+    const scheme_end = (std.mem.find(u8, base_url, "://") orelse return error.InvalidBaseUrl) + 3;
+    if (scheme_end >= base_url.len) return error.InvalidBaseUrl;
+    for (base_url) |byte| {
+        if (byte <= ' ' or byte == 127) return error.InvalidBaseUrl;
+    }
+    if (std.mem.find(u8, base_url[scheme_end..], "@") != null) return error.InvalidBaseUrl;
+}
+
 pub fn validateInputAppearance(appearance: []const u8) !void {
     if (!input_appearance.InputAppearance.isPersistedLabel(appearance)) return error.InvalidDurableField;
 }
 
 pub fn validateMaxxingMode(mode: []const u8) !void {
     if (!presentation_mode.MaxxingMode.isPersistedLabel(mode)) return error.InvalidDurableField;
+}
+
+test "base_url round-trips through the user patch and clears to absent" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{}", .{});
+    var application = try applyUserPatchToRoot(arena.allocator(), &root, .{
+        .base_url = "https://api.openai.com/v1",
+    });
+    try std.testing.expect(application.changed);
+    try std.testing.expectEqualStrings(
+        "https://api.openai.com/v1",
+        root.object.get("base_url").?.string,
+    );
+    try validateKnownSettingsObject(root.object, false);
+
+    application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .clear_base_url = true });
+    try std.testing.expect(application.changed);
+    try std.testing.expect(!root.object.contains("base_url"));
+
+    application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .clear_base_url = true });
+    try std.testing.expect(!application.changed);
+}
+
+test "settings validation rejects a base_url that is not a credential-free http origin" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    for ([_][]const u8{
+        "{\"base_url\":\"api.openai.com/v1\"}",
+        "{\"base_url\":\"file:///etc/passwd\"}",
+        "{\"base_url\":\"https://user:pass@api.openai.com/v1\"}",
+        "{\"base_url\":\"\"}",
+        "{\"base_url\":42}",
+    }) |text| {
+        const root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), text, .{});
+        try std.testing.expectError(
+            error.InvalidSettingsFormat,
+            validateKnownSettingsObject(root.object, false),
+        );
+    }
 }
 
 test "clearing the credential choice removes the key rather than blanking it" {
@@ -977,6 +1045,11 @@ fn applyUserPatchToRoot(
 ) !PatchApplication {
     var application = PatchApplication{};
     if (patch.model) |value| application.changed = try putString(arena, &root.object, "model", value) or application.changed;
+    if (patch.base_url) |value| application.changed = try putString(arena, &root.object, "base_url", value) or application.changed;
+    if (patch.clear_base_url and root.object.contains("base_url")) {
+        _ = root.object.orderedRemove("base_url");
+        application.changed = true;
+    }
     if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", @tagName(value)) or application.changed;
     if (patch.credential_source) |value| application.changed = try putString(arena, &root.object, "credential_source", @tagName(value)) or application.changed;
     if (patch.clear_credential_source and root.object.contains("credential_source")) {
@@ -1668,6 +1741,10 @@ fn validateKnownSettingsObject(
         if (value != .string or types.parseCredentialSource(value.string) == null) {
             return error.InvalidSettingsFormat;
         }
+    }
+    if (object.get("base_url")) |value| {
+        if (value != .string) return error.InvalidSettingsFormat;
+        validateBaseUrl(value.string) catch return error.InvalidSettingsFormat;
     }
     if (object.get("max_agent_steps")) |value| {
         if (value != .integer or value.integer < 0) return error.InvalidSettingsFormat;
