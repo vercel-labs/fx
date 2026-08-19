@@ -13538,6 +13538,140 @@ test "app_input_runtime repeated image path paste appends keep pending images so
     try std.testing.expect(!(try app.input_runtime.undoState().undo(alloc)));
 }
 
+test "app_input_runtime file url paste attaches images as vision chips" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(&tmp, "drop.png");
+    const path = try realTmpPath(alloc, &tmp, "drop.png");
+    defer alloc.free(path);
+    const url = try std.fmt.allocPrint(alloc, "file://{s}", .{path});
+    defer alloc.free(url);
+    const root = try realTmpPath(alloc, &tmp, ".");
+    defer alloc.free(root);
+    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    defer alloc.free(snapshot_dir);
+
+    var app = FakeSubmitApp{ .alloc = alloc, .snapshot_dir = snapshot_dir };
+    defer app.deinit();
+    try Runtime(FakeSubmitApp).handlePastedBytes(&app, url, FakeSubmitApp.input_byte_limit);
+
+    try std.testing.expectEqualStrings("[Image #1]", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
+    try std.testing.expectEqualStrings("image/png", app.pending_images.items[0].media_type);
+    try std.testing.expect(std.mem.find(u8, app.input_runtime.edit_state.input.items, "file://") == null);
+    try std.testing.expectEqual(@as(usize, 1), try countTestSnapshotFiles(snapshot_dir));
+}
+
+test "app_input_runtime file url paste inserts decoded non-image paths" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "notes.txt",
+        .data = "hello",
+    });
+    const path = try realTmpPath(alloc, &tmp, "notes.txt");
+    defer alloc.free(path);
+    const url = try std.fmt.allocPrint(alloc, "file://{s}", .{path});
+    defer alloc.free(url);
+
+    var app = FakeSubmitApp{ .alloc = alloc };
+    defer app.deinit();
+    try Runtime(FakeSubmitApp).handlePastedBytes(&app, url, FakeSubmitApp.input_byte_limit);
+
+    const expected = try std.fmt.allocPrint(alloc, "{s} ", .{path});
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
+    try std.testing.expect(std.mem.find(u8, app.input_runtime.edit_state.input.items, "file://") == null);
+}
+
+test "app_input_runtime mixed file url paste keeps image chips ahead of path text" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(&tmp, "snap.png");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "notes.txt",
+        .data = "x",
+    });
+    const png = try realTmpPath(alloc, &tmp, "snap.png");
+    defer alloc.free(png);
+    const txt = try realTmpPath(alloc, &tmp, "notes.txt");
+    defer alloc.free(txt);
+    const pasted = try std.fmt.allocPrint(alloc, "file://{s}\nfile://{s}", .{ png, txt });
+    defer alloc.free(pasted);
+
+    var app = FakeSubmitApp{ .alloc = alloc };
+    defer app.deinit();
+    try Runtime(FakeSubmitApp).handlePastedBytes(&app, pasted, FakeSubmitApp.input_byte_limit);
+
+    try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
+    try std.testing.expect(std.mem.find(u8, app.input_runtime.edit_state.input.items, "[Image #1]") != null);
+    try std.testing.expect(std.mem.find(u8, app.input_runtime.edit_state.input.items, txt) != null);
+    try std.testing.expect(std.mem.find(u8, app.input_runtime.edit_state.input.items, "file://") == null);
+    const chip_idx = std.mem.find(u8, app.input_runtime.edit_state.input.items, "[Image #1]").?;
+    const path_idx = std.mem.find(u8, app.input_runtime.edit_state.input.items, txt).?;
+    try std.testing.expect(chip_idx < path_idx);
+}
+
+fn encodeTestBase64(alloc: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const encoder = std.base64.standard.Encoder;
+    const buf = try alloc.alloc(u8, encoder.calcSize(bytes.len));
+    const encoded = encoder.encode(buf, bytes);
+    std.debug.assert(encoded.ptr == buf.ptr);
+    return buf[0..encoded.len];
+}
+
+test "app_input_runtime pasted raster data uri and OSC 52 attach as vision chips" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try realTmpPath(alloc, &tmp, ".");
+    defer alloc.free(root);
+    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    defer alloc.free(snapshot_dir);
+    const png = "\x89PNG\r\n\x1a\npasted";
+    const encoded = try encodeTestBase64(alloc, png);
+    defer alloc.free(encoded);
+
+    {
+        var app = FakeSubmitApp{ .alloc = alloc, .snapshot_dir = snapshot_dir };
+        defer app.deinit();
+        try app.input_runtime.paste.buffer.appendSlice(alloc, png);
+        try Runtime(FakeSubmitApp).finalizePastedBlock(&app, FakeSubmitApp.input_byte_limit);
+        try std.testing.expectEqualStrings("[Image #1]", app.input_runtime.edit_state.input.items);
+        try std.testing.expectEqualStrings("image/png", app.pending_images.items[0].media_type);
+        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.paste.buffer.items.len);
+    }
+
+    {
+        const uri = try std.fmt.allocPrint(alloc, "data:image/png;base64,{s}", .{encoded});
+        defer alloc.free(uri);
+        var app = FakeSubmitApp{ .alloc = alloc, .snapshot_dir = snapshot_dir };
+        defer app.deinit();
+        try app.input_runtime.paste.buffer.appendSlice(alloc, uri);
+        try Runtime(FakeSubmitApp).finalizePastedBlock(&app, FakeSubmitApp.input_byte_limit);
+        try std.testing.expectEqualStrings("[Image #1]", app.input_runtime.edit_state.input.items);
+        try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
+    }
+
+    {
+        const sequence = try std.fmt.allocPrint(alloc, "\x1b]52;c;{s}\x07", .{encoded});
+        defer alloc.free(sequence);
+        var app = FakeSubmitApp{ .alloc = alloc, .snapshot_dir = snapshot_dir };
+        defer app.deinit();
+        try app.input_runtime.edit_state.input.appendSlice(alloc, "caption ");
+        app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+        try app.input_runtime.paste.buffer.appendSlice(alloc, sequence);
+        try Runtime(FakeSubmitApp).finalizePastedBlock(&app, FakeSubmitApp.input_byte_limit);
+        try std.testing.expectEqualStrings("caption [Image #1]", app.input_runtime.edit_state.input.items);
+        try std.testing.expect(std.mem.find(u8, app.input_runtime.edit_state.input.items, "caption [Image #1]") != null);
+        try std.testing.expect(std.mem.find(u8, app.input_runtime.edit_state.input.items, encoded) == null);
+    }
+}
+
 test "app_input_runtime finalizePastedBlock registers large text placeholder atomically" {
     const alloc = std.testing.allocator;
     var app = FakeSubmitApp{ .alloc = alloc };

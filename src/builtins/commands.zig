@@ -454,7 +454,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .lua, .command = "/lua", .help_entry = "/lua [reload]", .completion_description = "list loaded Lua files and commands, or reload init.lua", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .view, .command = "/view", .help_entry = "/view [path|--diff [path]]", .completion_description = "open a read-only code or diff viewer", .presentation_category = .workspace, .has_args = true, .accepts_payload = true },
     .{ .kind = .credits, .command = "/credits", .aliases = &.{"/balance"}, .help_entry = "/credits (/balance)", .completion_description = "show gateway credits balance", .presentation_category = .account, .requires_prompt_credential = true },
-    .{ .kind = .paste, .command = "/paste", .help_entry = "/paste", .completion_description = "attach an image from the clipboard when supported", .presentation_category = .media },
+    .{ .kind = .paste, .command = "/paste", .help_entry = "/paste", .completion_description = "attach a clipboard image, or paste with Ctrl+V", .presentation_category = .media },
     .{ .kind = .fast, .command = "/fast", .help_entry = "/fast", .completion_description = "toggle Fast mode when supported", .presentation_category = .model },
     .{ .kind = .appearance, .command = "/appearance", .aliases = &.{ "/input", "/maxxing" }, .show_aliases_in_completion = false, .help_entry = "/appearance [input lines|tint|presentation normal|minimal]", .completion_description = "choose input and transcript presentation", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .sandbox, .command = "/sandbox", .help_entry = "/sandbox [os|none]", .completion_description = "choose command sandbox behavior", .presentation_category = .security, .has_args = true, .accepts_payload = true },
@@ -618,5 +618,5 @@ test "built-in paste completion describes clipboard image attachment" {
     try std.testing.expectEqualStrings("/paste", completion);
 
     const description = nthSlashCompletionDescription("/pas", 0) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("attach an image from the clipboard when supported", description);
+    try std.testing.expectEqualStrings("attach a clipboard image, or paste with Ctrl+V", description);
 }

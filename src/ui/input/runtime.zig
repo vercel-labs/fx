@@ -2986,6 +2986,7 @@ test "input escape parser handles modifyOtherKeys shift+enter sequence" {
 test "input escape parser handles delivered command editing shortcuts" {
     try expectEscapeAction("[97;9u", .{ .composer_shortcut = .select_all });
     try expectEscapeAction("[99;9u", .{ .composer_shortcut = .copy_selection });
+    try expectEscapeAction("[118;9u", .{ .remapped_byte = 22 });
     try expectEscapeAction("[120;9u", .{ .composer_shortcut = .cut_selection });
     try expectEscapeAction("[122;9u", .{ .composer_shortcut = .undo });
     try expectEscapeAction("[122;10u", .{ .composer_shortcut = .redo });
@@ -2993,6 +2994,7 @@ test "input escape parser handles delivered command editing shortcuts" {
 
     try expectEscapeAction("[27;9;97~", .{ .composer_shortcut = .select_all });
     try expectEscapeAction("[27;9;99~", .{ .composer_shortcut = .copy_selection });
+    try expectEscapeAction("[27;9;118~", .{ .remapped_byte = 22 });
     try expectEscapeAction("[27;9;120~", .{ .composer_shortcut = .cut_selection });
     try expectEscapeAction("[27;9;122~", .{ .composer_shortcut = .undo });
     try expectEscapeAction("[27;10;122~", .{ .composer_shortcut = .redo });

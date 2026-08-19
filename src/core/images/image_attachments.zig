@@ -1454,9 +1454,51 @@ pub const ClipboardImageAttachment = struct {
     }
 };
 
+pub fn persistImageBytes(alloc: std.mem.Allocator, bytes: []const u8) !ClipboardImageAttachment {
+    if (bytes.len > max_image_bytes) return error.ImageTooLarge;
+    const media_type = detectMediaTypeFromBytes(bytes) orelse return error.UnsupportedImageType;
+
+    const source_dir = try createTempSnapshotDir(alloc);
+    errdefer {
+        cleanupSnapshotDir(source_dir);
+        alloc.free(source_dir);
+    }
+
+    const file_name = clipboardFileName(media_type);
+    const temp_path = try std.fs.path.join(alloc, &.{ source_dir, file_name });
+    defer alloc.free(temp_path);
+
+    var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), temp_path, .{
+        .exclusive = true,
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(), bytes);
+
+    const attachment = try loadImageAttachment(alloc, temp_path);
+    return .{
+        .attachment = attachment,
+        .source_dir = source_dir,
+    };
+}
+
+fn clipboardFileName(media_type: []const u8) []const u8 {
+    return if (std.mem.eql(u8, media_type, "image/jpeg"))
+        "clipboard.jpg"
+    else if (std.mem.eql(u8, media_type, "image/gif"))
+        "clipboard.gif"
+    else if (std.mem.eql(u8, media_type, "image/webp"))
+        "clipboard.webp"
+    else
+        "clipboard.png";
+}
+
 pub fn loadClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAttachment {
     if (builtin.os.tag != .macos) return error.Unsupported;
+    return loadMacosClipboardImageAttachment(alloc);
+}
 
+fn loadMacosClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAttachment {
     const source_dir = try createTempSnapshotDir(alloc);
     errdefer {
         cleanupSnapshotDir(source_dir);
@@ -1545,7 +1587,7 @@ fn normalizePathInput(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
-fn detectMediaTypeFromBytes(bytes: []const u8) ?[]const u8 {
+pub fn detectMediaTypeFromBytes(bytes: []const u8) ?[]const u8 {
     if (bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n")) return "image/png";
     if (bytes.len >= 3 and bytes[0] == 0xff and bytes[1] == 0xd8 and bytes[2] == 0xff) return "image/jpeg";
     if (bytes.len >= 6 and (std.mem.eql(u8, bytes[0..6], "GIF87a") or std.mem.eql(u8, bytes[0..6], "GIF89a"))) return "image/gif";
@@ -1616,7 +1658,7 @@ fn isSentencePunctuation(byte: u8) bool {
         byte == ':' or byte == '!' or byte == '?';
 }
 
-fn stripBalancedOuterQuotes(bytes: []const u8) []const u8 {
+pub fn stripBalancedOuterQuotes(bytes: []const u8) []const u8 {
     if (bytes.len < 2) return bytes;
     if ((bytes[0] == '"' and bytes[bytes.len - 1] == '"') or
         (bytes[0] == '\'' and bytes[bytes.len - 1] == '\''))
@@ -2068,6 +2110,35 @@ test "detect media type from supported magic bytes" {
     try std.testing.expectEqualStrings("image/jpeg", detectMediaTypeFromBytes("\xff\xd8\xffrest").?);
     try std.testing.expectEqualStrings("image/gif", detectMediaTypeFromBytes("GIF89arest").?);
     try std.testing.expectEqualStrings("image/webp", detectMediaTypeFromBytes("RIFFxxxxWEBPrest").?);
+}
+
+test "persistImageBytes writes a snapshot source for png jpeg gif and webp" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        bytes: []const u8,
+        media_type: []const u8,
+    }{
+        .{ .bytes = "\x89PNG\r\n\x1a\nrest", .media_type = "image/png" },
+        .{ .bytes = "\xff\xd8\xffrest", .media_type = "image/jpeg" },
+        .{ .bytes = "GIF89arest", .media_type = "image/gif" },
+        .{ .bytes = "RIFFxxxxWEBPrest", .media_type = "image/webp" },
+    };
+
+    for (cases) |case| {
+        var persisted = try persistImageBytes(alloc, case.bytes);
+        defer persisted.deinit(alloc);
+        const attachment = persisted.attachment orelse return error.TestExpectedEqual;
+        try std.testing.expectEqualStrings(case.media_type, attachment.media_type);
+        try std.testing.expect(std.fs.path.isAbsolute(attachment.path));
+    }
+
+    try std.testing.expectError(error.UnsupportedImageType, persistImageBytes(alloc, "not-an-image"));
+
+    const huge = try alloc.alloc(u8, max_image_bytes + 1);
+    defer alloc.free(huge);
+    @memset(huge, 'x');
+    @memcpy(huge[0..8], "\x89PNG\r\n\x1a\n");
+    try std.testing.expectError(error.ImageTooLarge, persistImageBytes(alloc, huge));
 }
 
 test "loadImageAttachment accepts files larger than header length" {

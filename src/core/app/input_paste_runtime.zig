@@ -3,6 +3,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const image_attachments = @import("../images/image_attachments.zig");
+const paste_decoder = @import("../images/paste_decoder.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
 const gesture_state = @import("../input/gesture_state.zig");
 const input_limit_rejection = @import("../input/input_limit_rejection.zig");
@@ -247,14 +248,28 @@ pub fn PasteEditRuntime(comptime App: type) type {
         pub fn finalizePastedBlock(app: *App, max_input_len: usize) !void {
             if (app.input_runtime.paste.buffer.items.len == 0) return;
 
-            // Inline image paths create pending attachments, not pasted-text blocks.
-            if (image_attachments.hasImagePathToken(app.input_runtime.paste.buffer.items)) {
-                try handlePastedBytes(app, app.input_runtime.paste.buffer.items, max_input_len);
+            const unwrapped = try paste_decoder.unwrapPaste(app.alloc, app.input_runtime.paste.buffer.items);
+            defer unwrapped.deinit(app.alloc);
+            const payload = switch (unwrapped) {
+                .raster => |image| {
+                    try attachRasterBytes(app, image.bytes, max_input_len);
+                    app.input_runtime.paste.buffer.clearRetainingCapacity();
+                    return;
+                },
+                .text => |text| text,
+                .unchanged => app.input_runtime.paste.buffer.items,
+            };
+
+            if (paste_decoder.isDropShapedPaste(payload) or
+                image_attachments.hasImagePathToken(payload) or
+                paste_decoder.hasFileUrlToken(payload))
+            {
+                try handlePastedBytes(app, payload, max_input_len);
                 app.input_runtime.paste.buffer.clearRetainingCapacity();
                 return;
             }
 
-            const text = try app.alloc.dupe(u8, app.input_runtime.paste.buffer.items);
+            const text = try app.alloc.dupe(u8, payload);
             var text_owned_by_block = false;
             errdefer if (!text_owned_by_block) app.alloc.free(text);
 
@@ -320,10 +335,59 @@ pub fn PasteEditRuntime(comptime App: type) type {
             app.input_runtime.paste.buffer.clearRetainingCapacity();
         }
 
+        fn attachRasterBytes(app: *App, bytes: []const u8, max_input_len: usize) !void {
+            var persisted = image_attachments.persistImageBytes(app.alloc, bytes) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                error.ImageTooLarge => {
+                    try reportImageTooLarge(app);
+                    return;
+                },
+                else => {
+                    try reportImageAttachFailure(app, err);
+                    return;
+                },
+            };
+            var cleanup_source = true;
+            defer if (cleanup_source) persisted.deinit(app.alloc);
+
+            var attached = persisted.takeAttachment();
+            var owns_attached = true;
+            defer if (owns_attached) image_attachments.discardImageAttachment(app.alloc, attached);
+
+            var stage: ImagePasteStage = .{};
+            defer stage.deinit(app.alloc);
+
+            const id = app.peekNextImageId();
+            attached.id = id;
+            switch (try image_attachments.captureImageAttachmentForAdmission(App, app, &attached)) {
+                .captured => {},
+                .rejected => return,
+            }
+            if (attached.snapshot_path) |snapshot_path| {
+                const display_path = try app.alloc.dupe(u8, snapshot_path);
+                app.alloc.free(attached.path);
+                attached.path = display_path;
+            } else {
+                cleanup_source = false;
+            }
+
+            var ph_buf: [32]u8 = undefined;
+            const placeholder = try image_attachments.formatImagePlaceholder(&ph_buf, id);
+            try stage.replacement.appendSlice(app.alloc, placeholder);
+            try stage.tokens.append(app.alloc, .{
+                .span = .{ .raw_start = 0, .raw_end = placeholder.len },
+                .id = id,
+            });
+            try stage.images.append(app.alloc, attached);
+            owns_attached = false;
+            try commitImagePasteStage(app, &stage, id, bytes.len, max_input_len);
+        }
+
         pub fn handlePastedBytes(app: *App, bytes: []const u8, max_input_len: usize) !void {
             var stage: ImagePasteStage = .{};
             defer stage.deinit(app.alloc);
 
+            const drop_shaped = paste_decoder.isDropShapedPaste(bytes);
             const first_image_id = app.peekNextImageId();
             var prev: usize = 0;
             var i: usize = 0;
@@ -334,10 +398,13 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 i = image_attachments.nextShellTokenEnd(bytes, start);
                 const raw = bytes[start..i];
                 if (image_attachments.splitImagePathToken(raw)) |token| {
+                    const decoded_image_url = try paste_decoder.decodeFileUrl(app.alloc, token.path);
+                    defer if (decoded_image_url) |path| app.alloc.free(path);
+                    const load_path = decoded_image_url orelse token.path;
                     const maybe_img = image_attachments.loadUserImageAttachment(
                         app.alloc,
                         app.workspace_root,
-                        token.path,
+                        load_path,
                     ) catch |err| switch (err) {
                         error.OutOfMemory => return err,
                         error.ImageTooLarge => blk: {
@@ -380,11 +447,39 @@ pub fn PasteEditRuntime(comptime App: type) type {
                         try stage.images.append(app.alloc, attached);
                         owns_attached = false;
                         prev = i;
+                        continue;
+                    }
+                } else if (drop_shaped) {
+                    const decoded_file_url = try paste_decoder.decodeFileUrl(app.alloc, raw);
+                    defer if (decoded_file_url) |path| app.alloc.free(path);
+                    const path: ?[]const u8 = if (decoded_file_url) |owned|
+                        owned
+                    else
+                        dropAbsolutePath(raw);
+                    if (path) |dropped_path| {
+                        try stage.replacement.appendSlice(app.alloc, bytes[prev..start]);
+                        try stage.replacement.appendSlice(app.alloc, dropped_path);
+                        try stage.replacement.append(app.alloc, ' ');
+                        prev = i;
                     }
                 }
             }
             try stage.replacement.appendSlice(app.alloc, bytes[prev..]);
+            try commitImagePasteStage(app, &stage, first_image_id, bytes.len, max_input_len);
+        }
 
+        fn dropAbsolutePath(raw: []const u8) ?[]const u8 {
+            const trimmed = image_attachments.stripBalancedOuterQuotes(std.mem.trim(u8, raw, " \t\r\n"));
+            return if (trimmed.len > 0 and trimmed[0] == '/') trimmed else null;
+        }
+
+        fn commitImagePasteStage(
+            app: *App,
+            stage: *ImagePasteStage,
+            first_image_id: usize,
+            attempted_bytes: usize,
+            max_input_len: usize,
+        ) !void {
             const image_count = stage.images.items.len;
             const start = if (app.input_runtime.edit_state.selectionRange()) |selection|
                 selection.start
@@ -410,7 +505,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                         App,
                         app,
                         .composer,
-                        bytes.len,
+                        attempted_bytes,
                     ),
                 }
                 return;
@@ -421,7 +516,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 stage.replacement.items.len,
                 max_input_len,
             )) {
-                try input_limit_feedback.report(App, app, .composer, bytes.len);
+                try input_limit_feedback.report(App, app, .composer, attempted_bytes);
                 return;
             }
 
@@ -492,6 +587,17 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 .topic = "images",
                 .tone = .@"error",
                 .body = image_attachments.image_too_large_notice,
+            }, true);
+        }
+
+        fn reportImageAttachFailure(app: *App, err: anyerror) !void {
+            if (comptime !@hasDecl(App, "writeDomainNotice")) return err;
+            const line = try std.fmt.allocPrint(app.alloc, "failed to attach pasted image: {s}", .{@errorName(err)});
+            defer app.alloc.free(line);
+            try app.writeDomainNotice(.{
+                .topic = "images",
+                .tone = .@"error",
+                .body = line,
             }, true);
         }
 

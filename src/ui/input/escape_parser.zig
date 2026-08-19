@@ -119,6 +119,9 @@ fn kittyUnicodeKeyAction(keycode: u16, modifiers: u16, meta_prefixed: bool) Inpu
     if ((keycode == 'x' or keycode == 'X') and (modifiers & super_modifier) != 0) {
         return .{ .composer_shortcut = .cut_selection };
     }
+    if ((keycode == 'v' or keycode == 'V') and (modifiers & super_modifier) != 0) {
+        return .{ .remapped_byte = 22 };
+    }
     if ((keycode == 'z' or keycode == 'Z') and (modifiers & super_modifier) != 0) {
         return .{ .composer_shortcut = if ((modifiers & shift_modifier) != 0) .redo else .undo };
     }

@@ -80,7 +80,7 @@ cd your_project
 fx
 ```
 
-The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands.
+The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands. Paste a screenshot with Ctrl+V, drop a png/jpg/gif/webp file into the prompt, or run `/paste` and `/image <path>` to attach it as vision input.
 
 Run `/feedback` to open the feedback form at `fx.sh/feedback`. It does not create a diagnostic or change the clipboard.
 

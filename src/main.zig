@@ -3810,6 +3810,7 @@ test {
     _ = @import("core/hooks/runtime.zig");
     _ = @import("core/images/image_attachments.zig");
     _ = @import("core/images/image_commands.zig");
+    _ = @import("core/images/paste_decoder.zig");
     _ = @import("core/shared/io.zig");
     _ = @import("core/shared/message.zig");
     _ = @import("core/shared/token_estimate.zig");
