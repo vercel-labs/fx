@@ -106,6 +106,82 @@ pub fn copyAccountId(id_token: []const u8, buf: []u8) ?[]const u8 {
     return jwtAccountId(id_token, buf);
 }
 
+pub const LogoutResult = struct {
+    session_deleted: bool = false,
+    local_durability_failed: bool = false,
+    remote_revocation_failed: bool = false,
+};
+
+pub fn revokeRefreshToken(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    refresh_token: []const u8,
+) !void {
+    var request_body: std.Io.Writer.Allocating = .init(alloc);
+    defer request_body.deinit();
+    try request_body.writer.writeAll("{\"client_id\":");
+    try std.json.Stringify.value(oauth_client_id, .{}, &request_body.writer);
+    try request_body.writer.writeAll(",\"token\":");
+    try std.json.Stringify.value(refresh_token, .{}, &request_body.writer);
+    try request_body.writer.writeAll(",\"token_type_hint\":\"refresh_token\"}");
+
+    var response = transport.execute(alloc, .{
+        .method = .post_json,
+        .url = tokenUrl(),
+        .payload = request_body.written(),
+    }) catch return;
+    defer response.deinit(alloc);
+}
+
+pub fn clearStoredTokens(alloc: Allocator) !LogoutResult {
+    if (comptime host_target.is_wasm) return error.CodexAuthUnavailable;
+    const path = (try resolveAuthFilePath(alloc)) orelse return error.HomeNotSet;
+    defer alloc.free(path);
+
+    const existing = readAuthFile(alloc, path) catch |err| switch (err) {
+        error.FileNotFound => return .{},
+        else => return err,
+    };
+    defer secret.zeroAndFree(alloc, existing);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, existing, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidCodexAuthFile,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidCodexAuthFile;
+    if (parsed.value.object.get("tokens") == null) return .{};
+
+    _ = parsed.value.object.orderedRemove("tokens");
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try std.json.Stringify.value(parsed.value, .{ .whitespace = .indent_2 }, &out.writer);
+    io_mod.writeFileAtomic(alloc, path, out.written()) catch return .{
+        .local_durability_failed = true,
+    };
+    return .{ .session_deleted = true };
+}
+
+pub fn loadStoredRefreshToken(alloc: Allocator) !?[]u8 {
+    if (comptime host_target.is_wasm) return null;
+    const path = (try resolveAuthFilePath(alloc)) orelse return null;
+    defer alloc.free(path);
+    const bytes = readAuthFile(alloc, path) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer secret.zeroAndFree(alloc, bytes);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const tokens = storedTokensFromDocument(parsed.value.object) orelse return null;
+    if (tokens.refresh_token.len == 0) return null;
+    return try alloc.dupe(u8, tokens.refresh_token);
+}
+
 pub fn parseLoaded(alloc: Allocator, bytes: []const u8) !?Loaded {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

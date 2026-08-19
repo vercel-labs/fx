@@ -765,29 +765,57 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .logout => |rest| {
-            if (rest.len != 0) {
-                try writeStderr(deps, "usage: fx logout\n");
+            const provider = parseLoginProvider(rest) catch {
+                try writeStderr(deps, "usage: fx logout [--codex]\n");
                 return .handled_failure;
-            }
-            const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
-                error.SessionDeleteFailed => {
-                    try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
-                    return .handled_failure;
-                },
             };
-            if (result.local_durability_failed) {
-                try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
-            } else {
-                try writeStdout(
-                    deps,
-                    if (result.session_deleted) "Signed out of fx.\n" else "No fx login session found.\n",
-                );
+            switch (provider) {
+                .vercel => {
+                    const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
+                        error.SessionDeleteFailed => {
+                            try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
+                            return .handled_failure;
+                        },
+                    };
+                    if (result.local_durability_failed) {
+                        try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
+                    } else {
+                        try writeStdout(
+                            deps,
+                            if (result.session_deleted) "Signed out of fx.\n" else "No fx login session found.\n",
+                        );
+                    }
+                    if (result.remote_revocation_failed) {
+                        try writeStderr(deps, login_flow.remote_revocation_warning);
+                        try writeStderr(deps, "\n");
+                    }
+                    return if (result.local_durability_failed) .handled_failure else .handled_success;
+                },
+                .codex => {
+                    const result = codex_login.runLogout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
+                        error.HomeNotSet => {
+                            try writeStderr(deps, "fx logout: home directory is unavailable; set HOME or FX_CODEX_AUTH_FILE\n");
+                            return .handled_failure;
+                        },
+                        else => {
+                            try writeStderr(deps, "fx logout: failed to sign out of Codex\n");
+                            return .handled_failure;
+                        },
+                    };
+                    if (result.local_durability_failed) {
+                        try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
+                    } else {
+                        try writeStdout(
+                            deps,
+                            if (result.session_deleted) "Signed out of Codex.\n" else "No Codex login session found.\n",
+                        );
+                    }
+                    if (result.remote_revocation_failed) {
+                        try writeStderr(deps, "fx logout: Codex token revocation failed; the local session was removed\n");
+                    }
+                    return if (result.local_durability_failed) .handled_failure else .handled_success;
+                },
             }
-            if (result.remote_revocation_failed) {
-                try writeStderr(deps, login_flow.remote_revocation_warning);
-                try writeStderr(deps, "\n");
-            }
-            return if (result.local_durability_failed) .handled_failure else .handled_success;
         },
         .teams => |rest| {
             if (rest.len != 0) {

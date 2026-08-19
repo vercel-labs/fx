@@ -98,8 +98,11 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .logout,
         .token = "logout",
-        .usage = "logout",
-        .summary = "Sign out of the current Vercel session",
+        .usage = "logout [--codex]",
+        .summary = "Sign out of Vercel, or of ChatGPT Codex",
+        .options = &.{
+            .{ .flag = "--codex", .description = "Sign out of ChatGPT Codex and revoke its tokens" },
+        },
     },
     .{
         .kind = .setup,
@@ -290,7 +293,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     } },
     .{ .entries = &.{
         .{ .kind = .login, .usage = "login [--codex]" },
-        .{ .kind = .logout, .usage = "logout" },
+        .{ .kind = .logout, .usage = "logout [--codex]" },
         .{ .kind = .setup, .usage = "setup" },
         .{ .kind = .teams, .usage = "teams" },
         .{ .kind = .credits, .usage = "credits|balance" },

@@ -277,6 +277,22 @@ pub fn runLogin(
     try writeStdout("Signed in to ChatGPT Codex.\n");
 }
 
+pub fn runLogout(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+) !codex_oauth.LogoutResult {
+    var remote_revocation_failed = false;
+    if (try codex_oauth.loadStoredRefreshToken(alloc)) |refresh_token| {
+        defer secret.zeroAndFree(alloc, refresh_token);
+        codex_oauth.revokeRefreshToken(alloc, transport, refresh_token) catch {
+            remote_revocation_failed = true;
+        };
+    }
+    var result = try codex_oauth.clearStoredTokens(alloc);
+    result.remote_revocation_failed = remote_revocation_failed;
+    return result;
+}
+
 fn isPendingStatus(status: ?std.http.Status) bool {
     return status == .forbidden or status == .not_found;
 }
