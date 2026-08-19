@@ -1,7 +1,7 @@
 const std = @import("std");
 const agent_stream_provider = @import("../../core/agent/stream_provider.zig");
-const grok_auth = @import("../../core/providers/grok_auth.zig");
-const grok_catalog = @import("../../core/providers/grok_catalog.zig");
+const cursor_auth = @import("../../core/providers/cursor_auth.zig");
+const cursor_catalog = @import("../../core/providers/cursor_catalog.zig");
 const secret = @import("../../core/auth/secret.zig");
 const gateway_provider = @import("../../core/gateway/gateway_provider.zig");
 const model_catalog = @import("../../core/gateway/model_catalog.zig");
@@ -17,6 +17,17 @@ const collections = @import("../../core/shared/collections.zig");
 const Allocator = std.mem.Allocator;
 
 pub const no_gateway_balance_message = "this backend has no gateway balance";
+
+/// Cursor client identity and agent headers live only here so a ToS break can
+/// drop this adapter without touching the agent loop.
+pub const client_id = cursor_auth.client_id;
+pub const client_version = "1.0.0";
+pub const default_chat_url = cursor_auth.default_chat_url;
+pub const header_client_version = "x-cursor-client-version";
+pub const header_ghost_mode = "x-ghost-mode";
+pub const header_timezone = "x-cursor-timezone";
+pub const ghost_mode_value = "false";
+pub const timezone_value = "UTC";
 
 pub const agent_stream_provider_value = agent_stream_provider.Provider{
     .build_fn = buildAgentRequest,
@@ -55,6 +66,14 @@ pub const provider = gateway_provider.Provider{
     .model_catalog = .{ .fetch_fn = fetchModelCatalog },
 };
 
+fn requiredAgentHeaders() [3]std.http.Header {
+    return .{
+        .{ .name = header_client_version, .value = client_version },
+        .{ .name = header_ghost_mode, .value = ghost_mode_value },
+        .{ .name = header_timezone, .value = timezone_value },
+    };
+}
+
 fn preferredWebSearchBackends(_: ?*anyopaque) anyerror!?[]const web_search_contract.SearchBackendId {
     return null;
 }
@@ -76,7 +95,7 @@ fn buildAgentRequest(
     request: agent_stream_provider.BuildRequest,
 ) anyerror![]u8 {
     var rewritten = request;
-    rewritten.model = grok_catalog.resolveModel(request.model);
+    rewritten.model = cursor_catalog.resolveModel(request.model);
     return openai_compatible.buildChatCompletionsBody(alloc, rewritten);
 }
 
@@ -88,7 +107,7 @@ fn streamAgentCompletion(
     var owned_token: ?[]u8 = null;
     defer if (owned_token) |value| secret.zeroAndFree(alloc, value);
 
-    var session = grok_auth.loadValidSession(alloc) catch |err| switch (err) {
+    var session = cursor_auth.loadValidSession(alloc) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MissingCredentials,
     };
@@ -105,14 +124,15 @@ fn streamAgentCompletion(
 
     const chat_url = blk: {
         if (std.mem.endsWith(u8, request.chat_url, "chat/completions")) break :blk request.chat_url;
-        break :blk grok_auth.configuredChatUrl();
+        break :blk cursor_auth.configuredChatUrl();
     };
 
+    const extra_headers = requiredAgentHeaders();
     const result = openai_compatible.streamChatCompletions(
         alloc,
         .{
             .api_key = access_token,
-            .model = grok_catalog.resolveModel(request.model),
+            .model = cursor_catalog.resolveModel(request.model),
             .retry_count = request.retry_count,
             .chat_url = chat_url,
             .payload = request.payload,
@@ -122,6 +142,7 @@ fn streamAgentCompletion(
             .on_reasoning_chunk = request.on_reasoning_chunk,
             .on_tool_input_chunk = request.on_tool_input_chunk,
             .provider_attempt_owner = request.provider_attempt_owner,
+            .extra_headers = &extra_headers,
         },
         request.callback_ctx,
         request.on_content_chunk,
@@ -146,7 +167,7 @@ fn streamAgentCompletion(
 }
 
 fn resolveChatUrl(_: ?*anyopaque, _: []const u8) []const u8 {
-    return grok_auth.configuredChatUrl();
+    return cursor_auth.configuredChatUrl();
 }
 
 fn fetchCredits(
@@ -165,7 +186,7 @@ fn fetchCliModelCatalog(
     input: gateway_provider.CliModelCatalogInput,
 ) gateway_provider.CliModelCatalogResult {
     if (tryLiveCatalog(alloc, input)) |result| return result;
-    const ids = grok_catalog.ownedIds(alloc) catch {
+    const ids = cursor_catalog.ownedIds(alloc) catch {
         return catalogFailure(input);
     };
     return .{
@@ -183,11 +204,16 @@ fn tryLiveCatalog(
     alloc: Allocator,
     input: gateway_provider.CliModelCatalogInput,
 ) ?gateway_provider.CliModelCatalogResult {
-    const token = grok_auth.loadAccessToken(alloc) catch return null;
+    const token = cursor_auth.loadAccessToken(alloc) catch return null;
     defer if (token) |value| secret.zeroAndFree(alloc, value);
     const api_key = token orelse return null;
-    var ids = openai_compatible.fetchModelIds(alloc, api_key, grok_auth.configuredModelsUrl(), &.{}) catch
-        return null;
+    const extra_headers = requiredAgentHeaders();
+    var ids = openai_compatible.fetchModelIds(
+        alloc,
+        api_key,
+        cursor_auth.configuredModelsUrl(),
+        &extra_headers,
+    ) catch return null;
     if (ids.items.len == 0) {
         collections.freeStringList(alloc, &ids);
         return null;
@@ -221,7 +247,7 @@ fn fetchModelCatalog(
     return .{ .failure = .{ .category = .runtime } };
 }
 
-test "grok credits never claim a gateway balance" {
+test "cursor credits never claim a gateway balance" {
     var snapshot = fetchCredits(null, std.testing.allocator, .{ .credential = null, .tenant = null });
     defer snapshot.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(no_gateway_balance_message, snapshot.notice.?);
@@ -229,10 +255,10 @@ test "grok credits never claim a gateway balance" {
     try std.testing.expect(snapshot.err_message == null);
 }
 
-test "grok catalog falls back to documented Grok Build ids" {
+test "cursor catalog falls back to documented Cursor-native ids" {
     const result = fetchCliModelCatalog(null, std.testing.allocator, .{
         .access = .{ .public_only = .no_credential },
-        .endpoint = grok_auth.default_chat_url,
+        .endpoint = cursor_auth.default_chat_url,
     });
     switch (result) {
         .loaded => |loaded| {
@@ -241,10 +267,22 @@ test "grok catalog falls back to documented Grok Build ids" {
                 var ids = loaded.ids;
                 ids.deinit(std.testing.allocator);
             }
-            try std.testing.expectEqual(grok_catalog.catalog_ids.len, loaded.ids.items.len);
-            try std.testing.expectEqualStrings("grok-4.6", loaded.ids.items[0]);
-            try std.testing.expectEqualStrings("grok-build-0.1", loaded.ids.items[3]);
+            try std.testing.expectEqual(cursor_catalog.catalog_ids.len, loaded.ids.items.len);
+            try std.testing.expectEqualStrings("composer-2.5", loaded.ids.items[0]);
+            try std.testing.expectEqualStrings("auto", loaded.ids.items[3]);
         },
         else => return error.TestUnexpectedCatalogFailure,
     }
+}
+
+test "cursor adapter isolates unofficial client id and required headers" {
+    try std.testing.expectEqualStrings(cursor_auth.client_id, client_id);
+    try std.testing.expectEqualStrings(cursor_auth.default_chat_url, default_chat_url);
+    const headers = requiredAgentHeaders();
+    try std.testing.expectEqualStrings(header_client_version, headers[0].name);
+    try std.testing.expectEqualStrings(client_version, headers[0].value);
+    try std.testing.expectEqualStrings(header_ghost_mode, headers[1].name);
+    try std.testing.expectEqualStrings(ghost_mode_value, headers[1].value);
+    try std.testing.expectEqualStrings(header_timezone, headers[2].name);
+    try std.testing.expectEqualStrings(timezone_value, headers[2].value);
 }

@@ -111,6 +111,7 @@
   "verification_scenarios": [
     {"name": "verify-chatgpt-login", "argv": ["bun", "test", "--max-concurrency", "1", "./chatgpt-login.test.ts"], "test_file": "chatgpt-login.test.ts", "requires_tmux": false},
     {"name": "verify-grok-login", "argv": ["bun", "test", "--max-concurrency", "1", "./grok-login.test.ts"], "test_file": "grok-login.test.ts", "requires_tmux": false},
+    {"name": "verify-cursor-login", "argv": ["bun", "test", "--max-concurrency", "1", "./cursor-login.test.ts"], "test_file": "cursor-login.test.ts", "requires_tmux": false},
     {"name": "verify-auto-mode-reliability", "argv": ["bun", "test", "--max-concurrency", "1", "./auto-mode-reliability.test.ts"], "test_file": "auto-mode-reliability.test.ts"},
     {"name": "verify-tui-auth-source-selection", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-auth-source-selection.test.ts"], "test_file": "tui-auth-source-selection.test.ts"},
     {"name": "verify-tui-composer-edit-contracts", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-composer-edit-contracts.test.ts"], "test_file": "tui-composer-edit-contracts.test.ts"},

@@ -30,6 +30,7 @@ pub const StreamRequest = struct {
     on_reasoning_chunk: ?StreamCallback = null,
     on_tool_input_chunk: ?StreamCallback = null,
     provider_attempt_owner: agent_stream_provider.ProviderAttemptOwner = .transport,
+    extra_headers: []const std.http.Header = &.{},
 };
 
 pub fn buildChatCompletionsBody(
@@ -437,6 +438,7 @@ pub fn streamChatCompletions(
                 .accept_encoding = .omit,
                 .user_agent = .{ .override = gateway_client.user_agent },
             },
+            .extra_headers = request.extra_headers,
             .keep_alive = false,
             .redirect_behavior = .unhandled,
         }) catch |err| {
@@ -495,7 +497,12 @@ pub fn streamChatCompletions(
     return error.ReadFailed;
 }
 
-pub fn fetchModelIds(alloc: Allocator, api_key: []const u8, models_url: []const u8) !std.ArrayList([]u8) {
+pub fn fetchModelIds(
+    alloc: Allocator,
+    api_key: []const u8,
+    models_url: []const u8,
+    extra_headers: []const std.http.Header,
+) !std.ArrayList([]u8) {
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
     const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{api_key});
@@ -511,6 +518,7 @@ pub fn fetchModelIds(alloc: Allocator, api_key: []const u8, models_url: []const 
             .accept_encoding = .omit,
             .user_agent = .{ .override = gateway_client.user_agent },
         },
+        .extra_headers = extra_headers,
         .response_writer = &out.writer,
         .redirect_behavior = .unhandled,
     });

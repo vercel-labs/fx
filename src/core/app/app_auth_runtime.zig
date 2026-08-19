@@ -13,6 +13,7 @@ const providers_config = @import("../providers/config.zig");
 const openai_secret = @import("../providers/openai_secret.zig");
 const chatgpt_auth = @import("../providers/chatgpt_auth.zig");
 const grok_auth = @import("../providers/grok_auth.zig");
+const cursor_auth = @import("../providers/cursor_auth.zig");
 const model_backend = @import("../providers/model_backend.zig");
 
 fn oauthAuthEnabled(comptime App: type) bool {
@@ -61,6 +62,20 @@ pub fn Runtime(comptime App: type) type {
                 app.shell.render_requests.request(.footer);
                 return false;
             }
+            if (backend == .cursor) {
+                if (providers_config.resolveActive().hasCursorSession()) return true;
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = cursor_auth.missing_interactive_session_message,
+                }, true);
+                if (!app.auth.pickerView().active) {
+                    try app.auth.refreshSourceInventory(app.alloc);
+                    app.auth.openPicker(app.alloc);
+                }
+                app.shell.render_requests.request(.footer);
+                return false;
+            }
             if (app.auth.credentialSource() != null) return true;
 
             const auth_view = app.auth.view();
@@ -91,7 +106,7 @@ pub fn Runtime(comptime App: type) type {
                 try writeAuthNotice(app, .{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "usage: /login [vercel|chatgpt|grok]",
+                    .body = "usage: /login [vercel|chatgpt|grok|cursor]",
                 });
                 return;
             };
@@ -99,11 +114,7 @@ pub fn Runtime(comptime App: type) type {
                 .vercel => try beginSignIn(app, false),
                 .chatgpt => try beginChatgptSignIn(app),
                 .grok => try beginGrokSignIn(app),
-                .cursor => try writeAuthNotice(app, .{
-                    .topic = "auth",
-                    .tone = .warning,
-                    .body = providers_config.unimplemented_backend_message,
-                }),
+                .cursor => try beginCursorSignIn(app),
             }
         }
 
@@ -120,7 +131,7 @@ pub fn Runtime(comptime App: type) type {
                 try writeAuthNotice(app, .{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "usage: /logout [vercel|chatgpt|grok]",
+                    .body = "usage: /logout [vercel|chatgpt|grok|cursor]",
                 });
                 return;
             };
@@ -197,11 +208,35 @@ pub fn Runtime(comptime App: type) type {
                             .body = "No Grok session found.",
                         });
                 },
-                .cursor => try writeAuthNotice(app, .{
-                    .topic = "auth",
-                    .tone = .warning,
-                    .body = providers_config.unimplemented_backend_message,
-                }),
+                .cursor => {
+                    const result = cursor_auth.logout(app.alloc) catch {
+                        try writeAuthNotice(app, .{
+                            .topic = "auth",
+                            .tone = .@"error",
+                            .body = "Could not complete Cursor logout. The current source is unchanged.",
+                        });
+                        return;
+                    };
+                    providers_config.invalidateRemembered();
+                    try writeAuthNotice(app, if (result.local_durability_failed)
+                        .{
+                            .topic = "auth",
+                            .tone = .warning,
+                            .body = "Could not confirm durable Cursor logout.",
+                        }
+                    else if (result.session_deleted)
+                        .{
+                            .topic = "auth",
+                            .tone = .neutral,
+                            .body = "Signed out of Cursor.",
+                        }
+                    else
+                        .{
+                            .topic = "auth",
+                            .tone = .neutral,
+                            .body = "No Cursor session found.",
+                        });
+                },
             }
         }
 
@@ -288,6 +323,17 @@ pub fn Runtime(comptime App: type) type {
                             return;
                         }
                         try beginGrokSignIn(app);
+                    },
+                    .cursor => {
+                        if (comptime !runtime_profile.allows(App, .native_auth)) {
+                            try app.writeDomainNotice(.{
+                                .topic = "auth",
+                                .tone = .warning,
+                                .body = "Cursor login is unavailable in this WASM session.",
+                            }, true);
+                            return;
+                        }
+                        try beginCursorSignIn(app);
                     },
                     .setup => {
                         if (comptime !runtime_profile.allows(App, .native_auth)) {
@@ -743,6 +789,26 @@ pub fn Runtime(comptime App: type) type {
             });
         }
 
+        fn beginCursorSignIn(app: *App) !void {
+            try app.flushBeforeBlockingExternalWork();
+            cursor_auth.runLogin(app.alloc, .{
+                .url_opener = app.urlOpener(),
+            }) catch |err| {
+                debug_trace.logf("auth", "cursor login failed err={s}", .{@errorName(err)});
+                try writeCursorLoginError(app, err);
+                return;
+            };
+            var attempt = config_runtime.attemptUserPreferences(app.alloc, .{ .provider = .cursor });
+            defer attempt.deinit(app.alloc);
+            providers_config.invalidateRemembered();
+            app.auth.closePicker(app.alloc);
+            try writeAuthNotice(app, .{
+                .topic = "auth",
+                .tone = .neutral,
+                .body = "Signed in to Cursor.",
+            });
+        }
+
         fn beginSignIn(app: *App, from_root: bool) !void {
             try app.flushBeforeBlockingExternalWork();
 
@@ -891,6 +957,17 @@ pub fn Runtime(comptime App: type) type {
                 error.LoginTimedOut, error.ExpiredToken => .{ .topic = "auth", .tone = .warning, .body = "The Grok sign-in code expired. The current credential is unchanged; run /login grok to try again." },
                 error.InteractiveAuthorizationUnsupported => .{ .topic = "auth", .tone = .warning, .body = "Grok login is unavailable in this runtime." },
                 else => .{ .topic = "auth", .tone = .@"error", .body = "Grok sign-in failed. The current credential is unchanged." },
+            };
+            try writeAuthNotice(app, notice);
+        }
+
+        fn writeCursorLoginError(app: *App, err: anyerror) !void {
+            const notice: types.SemanticNotice = switch (err) {
+                error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "Cursor sign-in was denied. The current credential is unchanged." },
+                error.Cancelled => .{ .topic = "auth", .tone = .warning, .body = "Cursor sign-in was cancelled." },
+                error.LoopbackUnavailable => .{ .topic = "auth", .tone = .@"error", .body = "Could not bind the local Cursor callback. The current credential is unchanged." },
+                error.InteractiveAuthorizationUnsupported => .{ .topic = "auth", .tone = .warning, .body = "Cursor login is unavailable in this runtime." },
+                else => .{ .topic = "auth", .tone = .@"error", .body = "Cursor sign-in failed. The current credential is unchanged." },
             };
             try writeAuthNotice(app, notice);
         }

@@ -55,6 +55,14 @@ fx login grok
 
 That runs device-code login against xAI, stores the session under `~/.fx/providers/grok/`, and sends Chat Completions traffic with the subscription token. Interactive `/login grok` and the `/setup` Grok option run the same flow. Grok usage is billed to that subscription, not Vercel.
 
+To use a Cursor subscription:
+
+```bash
+fx login cursor
+```
+
+That runs PKCE loopback login, stores the session under `~/.fx/providers/cursor/`, and sends OpenAI-compatible Chat Completions traffic with Cursor's required headers. Interactive `/login cursor` and the `/setup` Cursor option run the same flow. If Cursor rejects unofficial clients, login prints their error body and exits. Cursor usage is billed to that subscription, not Vercel.
+
 Bare `fx login` and `/login` stay Vercel.
 
 fx talks to Vercel AI Gateway by default. To use an OpenAI-compatible Chat Completions server instead, save a base URL and API key:
@@ -63,7 +71,7 @@ fx talks to Vercel AI Gateway by default. To use an OpenAI-compatible Chat Compl
 fx setup openai-compatible
 ```
 
-Or set `FX_PROVIDER=openai_compatible`, `FX_OPENAI_BASE_URL`, and `FX_OPENAI_API_KEY`. Those values are profile-owned (`~/.fx/settings.json`) and are ignored from project `.fx.json`. Set `FX_PROVIDER=chatgpt` or `FX_PROVIDER=grok` after the matching login if you need to reselect that backend.
+Or set `FX_PROVIDER=openai_compatible`, `FX_OPENAI_BASE_URL`, and `FX_OPENAI_API_KEY`. Those values are profile-owned (`~/.fx/settings.json`) and are ignored from project `.fx.json`. Set `FX_PROVIDER=chatgpt`, `FX_PROVIDER=grok`, or `FX_PROVIDER=cursor` after the matching login if you need to reselect that backend.
 
 Run fx from a project:
 

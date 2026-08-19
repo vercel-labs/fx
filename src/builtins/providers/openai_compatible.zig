@@ -179,7 +179,7 @@ fn fetchCliModelCatalog(
     defer if (api_key) |key| secret.zeroAndFree(alloc, key);
     const key = api_key orelse return catalogFailure(input);
 
-    const ids = openai_compatible.fetchModelIds(alloc, key, url) catch {
+    const ids = openai_compatible.fetchModelIds(alloc, key, url, &.{}) catch {
         return catalogFailure(input);
     };
     return .{

@@ -9,6 +9,7 @@ const credentials = @import("../auth/credentials.zig");
 const providers_config = @import("../providers/config.zig");
 const chatgpt_auth = @import("../providers/chatgpt_auth.zig");
 const grok_auth = @import("../providers/grok_auth.zig");
+const cursor_auth = @import("../providers/cursor_auth.zig");
 const secret = @import("../auth/secret.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const background_runtime = @import("../background/background_runtime.zig");
@@ -1405,6 +1406,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer if (owned_chatgpt_token) |key| secret.zeroAndFree(alloc, key);
     var owned_grok_token: ?[]u8 = null;
     defer if (owned_grok_token) |key| secret.zeroAndFree(alloc, key);
+    var owned_cursor_token: ?[]u8 = null;
+    defer if (owned_cursor_token) |key| secret.zeroAndFree(alloc, key);
     const resolved_backend = providers_config.resolveActive();
     if (resolved_backend.kind == .chatgpt) {
         const token = chatgpt_auth.loadAccessToken(alloc) catch {
@@ -1463,15 +1466,33 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         ctx.credential_source = null;
         ctx.model_catalog_access = .{ .public_only = .no_credential };
     } else if (resolved_backend.kind == .cursor) {
-        try options.deps.write_stderr(
-            options.deps.stderr_ctx,
-            "fx ask: " ++ providers_config.unimplemented_backend_message ++ "\n",
-        );
-        return .{
-            .exit_code = 1,
-            .assistant_output = try alloc.dupe(u8, ""),
-            .error_code = "UnsupportedBackend",
+        const token = cursor_auth.loadAccessToken(alloc) catch {
+            try options.deps.write_stderr(
+                options.deps.stderr_ctx,
+                "fx ask: " ++ providers_config.missing_cursor_credential_message ++ "\n",
+            );
+            return .{
+                .exit_code = 1,
+                .assistant_output = try alloc.dupe(u8, ""),
+                .error_code = "MissingCredentials",
+            };
         };
+        owned_cursor_token = token;
+        const api_key = token orelse {
+            try options.deps.write_stderr(
+                options.deps.stderr_ctx,
+                "fx ask: " ++ providers_config.missing_cursor_credential_message ++ "\n",
+            );
+            return .{
+                .exit_code = 1,
+                .assistant_output = try alloc.dupe(u8, ""),
+                .error_code = "MissingCredentials",
+            };
+        };
+        ctx.api_key = api_key;
+        ctx.gateway_team = null;
+        ctx.credential_source = null;
+        ctx.model_catalog_access = .{ .public_only = .no_credential };
     } else if (resolved_backend.kind == .openai_compatible) {
         const openai_key = try resolved_backend.loadApiKey(alloc);
         owned_openai_key = openai_key;

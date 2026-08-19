@@ -11,6 +11,7 @@ pub const Context = struct {
     openai_compatible: gateway_provider.Provider,
     chatgpt: gateway_provider.Provider,
     grok: gateway_provider.Provider,
+    cursor: gateway_provider.Provider,
 };
 
 pub fn provider(context: *const Context) gateway_provider.Provider {
@@ -49,8 +50,8 @@ fn buildAgentRequest(
         .openai_compatible => context.openai_compatible.agent_stream.build(alloc, request),
         .chatgpt => context.chatgpt.agent_stream.build(alloc, request),
         .grok => context.grok.agent_stream.build(alloc, request),
+        .cursor => context.cursor.agent_stream.build(alloc, request),
         .vercel_gateway => context.vercel.agent_stream.build(alloc, request),
-        .cursor => error.ModelBackendUnsupported,
     };
 }
 
@@ -64,8 +65,8 @@ fn streamAgentCompletion(
         .openai_compatible => context.openai_compatible.agent_stream.stream(alloc, request),
         .chatgpt => context.chatgpt.agent_stream.stream(alloc, request),
         .grok => context.grok.agent_stream.stream(alloc, request),
+        .cursor => context.cursor.agent_stream.stream(alloc, request),
         .vercel_gateway => context.vercel.agent_stream.stream(alloc, request),
-        .cursor => error.ModelBackendUnsupported,
     };
 }
 
@@ -75,6 +76,7 @@ fn resolveChatUrl(raw: ?*anyopaque, fallback: []const u8) []const u8 {
         .openai_compatible => context.openai_compatible.chat_url.resolve(fallback),
         .chatgpt => context.chatgpt.chat_url.resolve(fallback),
         .grok => context.grok.chat_url.resolve(fallback),
+        .cursor => context.cursor.chat_url.resolve(fallback),
         else => context.vercel.chat_url.resolve(fallback),
     };
 }
@@ -89,6 +91,7 @@ fn fetchCliModelCatalog(
         .openai_compatible => context.openai_compatible.cli_model_catalog.fetch(alloc, input),
         .chatgpt => context.chatgpt.cli_model_catalog.fetch(alloc, input),
         .grok => context.grok.cli_model_catalog.fetch(alloc, input),
+        .cursor => context.cursor.cli_model_catalog.fetch(alloc, input),
         else => context.vercel.cli_model_catalog.fetch(alloc, input),
     };
 }
@@ -103,9 +106,7 @@ fn fetchCredits(
         .openai_compatible => context.openai_compatible.credits.fetch(alloc, input),
         .chatgpt => context.chatgpt.credits.fetch(alloc, input),
         .grok => context.grok.credits.fetch(alloc, input),
-        .cursor => .{
-            .notice = alloc.dupe(u8, "this backend has no gateway balance") catch null,
-        },
+        .cursor => context.cursor.credits.fetch(alloc, input),
         .vercel_gateway => context.vercel.credits.fetch(alloc, input),
     };
 }

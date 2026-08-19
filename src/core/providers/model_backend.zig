@@ -25,8 +25,7 @@ pub const ModelBackend = enum {
 
     pub fn isImplemented(self: ModelBackend) bool {
         return switch (self) {
-            .vercel_gateway, .openai_compatible, .chatgpt, .grok => true,
-            .cursor => false,
+            .vercel_gateway, .openai_compatible, .chatgpt, .grok, .cursor => true,
         };
     }
 
@@ -64,7 +63,7 @@ test "model backend implementation and billing flags stay conservative" {
     try std.testing.expect(ModelBackend.openai_compatible.isImplemented());
     try std.testing.expect(ModelBackend.chatgpt.isImplemented());
     try std.testing.expect(ModelBackend.grok.isImplemented());
-    try std.testing.expect(!ModelBackend.cursor.isImplemented());
+    try std.testing.expect(ModelBackend.cursor.isImplemented());
     try std.testing.expect(ModelBackend.vercel_gateway.usesGatewayBalance());
     try std.testing.expect(!ModelBackend.openai_compatible.usesGatewayBalance());
     try std.testing.expect(!ModelBackend.chatgpt.usesGatewayBalance());
@@ -105,6 +104,7 @@ test "login target parses vercel as the default and named subscription backends"
     try std.testing.expectEqual(LoginTarget.vercel, parseLoginTarget(" vercel "));
     try std.testing.expectEqual(LoginTarget.chatgpt, parseLoginTarget("chatgpt"));
     try std.testing.expectEqual(LoginTarget.grok, parseLoginTarget(" grok "));
+    try std.testing.expectEqual(LoginTarget.cursor, parseLoginTarget("cursor"));
     try std.testing.expect(parseLoginTarget("openai") == null);
     try std.testing.expectEqual(ModelBackend.chatgpt, LoginTarget.chatgpt.backend().?);
     try std.testing.expectEqual(ModelBackend.grok, LoginTarget.grok.backend().?);

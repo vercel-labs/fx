@@ -27,6 +27,7 @@ const providers_config = @import("../providers/config.zig");
 const openai_secret = @import("../providers/openai_secret.zig");
 const chatgpt_auth = @import("../providers/chatgpt_auth.zig");
 const grok_auth = @import("../providers/grok_auth.zig");
+const cursor_auth = @import("../providers/cursor_auth.zig");
 const model_backend = @import("../providers/model_backend.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
@@ -715,7 +716,7 @@ fn runNonInteractiveWithDeps(
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
             const target = parseLoginTargetArgs(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel|chatgpt|grok]\n");
+                try writeStderr(deps, "usage: fx login [vercel|chatgpt|grok|cursor]\n");
                 return .handled_failure;
             };
             switch (target) {
@@ -771,14 +772,28 @@ fn runNonInteractiveWithDeps(
                     return .handled_success;
                 },
                 .cursor => {
-                    try writeStderr(deps, "fx login: that subscription backend is not implemented yet\n");
-                    return .handled_failure;
+                    cursor_auth.runLogin(alloc, .{
+                        .url_opener = cfg.url_opener,
+                    }) catch |err| {
+                        const message = switch (err) {
+                            error.AccessDenied => "fx login cursor: authorization denied\n",
+                            error.Cancelled => "fx login cursor: authorization cancelled\n",
+                            error.LoopbackUnavailable => "fx login cursor: could not bind the local callback port\n",
+                            error.InteractiveAuthorizationUnsupported => "fx login cursor: interactive Cursor login is unavailable in this runtime\n",
+                            error.AuthorizationFailed => "fx login cursor: failed to sign in\n",
+                            else => "fx login cursor: failed to sign in\n",
+                        };
+                        try writeStderr(deps, message);
+                        return .handled_failure;
+                    };
+                    try persistProvider(alloc, deps, .cursor);
+                    return .handled_success;
                 },
             }
         },
         .logout => |rest| {
             const target = parseLoginTargetArgs(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|chatgpt|grok]\n");
+                try writeStderr(deps, "usage: fx logout [vercel|chatgpt|grok|cursor]\n");
                 return .handled_failure;
             };
             switch (target) {
@@ -834,8 +849,19 @@ fn runNonInteractiveWithDeps(
                     return .handled_success;
                 },
                 .cursor => {
-                    try writeStderr(deps, "fx logout: that subscription backend is not implemented yet\n");
-                    return .handled_failure;
+                    const result = cursor_auth.logout(alloc) catch {
+                        try writeStderr(deps, "fx logout cursor: failed to durably remove the Cursor session\n");
+                        return .handled_failure;
+                    };
+                    if (result.local_durability_failed) {
+                        try writeStderr(deps, "fx logout cursor: failed to durably remove the Cursor session\n");
+                        return .handled_failure;
+                    }
+                    try writeStdout(
+                        deps,
+                        if (result.session_deleted) "Signed out of Cursor.\n" else "No Cursor session found.\n",
+                    );
+                    return .handled_success;
                 },
             }
         },
@@ -894,6 +920,24 @@ fn runNonInteractiveWithDeps(
                     return .handled_failure;
                 };
                 try persistProvider(alloc, deps, .grok);
+                return .handled_success;
+            }
+            if (rest.len == 1 and std.mem.eql(u8, rest[0], "cursor")) {
+                cursor_auth.runLogin(alloc, .{
+                    .url_opener = cfg.url_opener,
+                }) catch |err| {
+                    const message = switch (err) {
+                        error.AccessDenied => "fx setup cursor: authorization denied\n",
+                        error.Cancelled => "fx setup cursor: authorization cancelled\n",
+                        error.LoopbackUnavailable => "fx setup cursor: could not bind the local callback port\n",
+                        error.InteractiveAuthorizationUnsupported => "fx setup cursor: interactive Cursor login is unavailable in this runtime\n",
+                        error.AuthorizationFailed => "fx setup cursor: failed to sign in\n",
+                        else => "fx setup cursor: failed to sign in\n",
+                    };
+                    try writeStderr(deps, message);
+                    return .handled_failure;
+                };
+                try persistProvider(alloc, deps, .cursor);
                 return .handled_success;
             }
             if (rest.len != 0) {
@@ -3388,6 +3432,10 @@ test "parse recognizes every top-level command and preserves unknown commands" {
     }
     switch (parse(command_catalog, &.{ @constCast("login"), @constCast("grok") })) {
         .login => |rest| try std.testing.expectEqualStrings("grok", rest[0]),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(command_catalog, &.{ @constCast("login"), @constCast("cursor") })) {
+        .login => |rest| try std.testing.expectEqualStrings("cursor", rest[0]),
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{@constCast("login")})) {

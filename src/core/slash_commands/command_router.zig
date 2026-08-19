@@ -276,6 +276,10 @@ test "parse extracts login and logout backend payloads" {
         .login => |rest| try std.testing.expectEqualStrings("grok", rest),
         else => return error.TestExpectedEqual,
     }
+    switch (parse(testSlashRegistry(), "/login cursor")) {
+        .login => |rest| try std.testing.expectEqualStrings("cursor", rest),
+        else => return error.TestExpectedEqual,
+    }
     switch (parse(testSlashRegistry(), "/login")) {
         .login => |rest| try std.testing.expectEqualStrings("", rest),
         else => return error.TestExpectedEqual,
@@ -286,6 +290,10 @@ test "parse extracts login and logout backend payloads" {
     }
     switch (parse(testSlashRegistry(), "/logout grok")) {
         .logout => |rest| try std.testing.expectEqualStrings("grok", rest),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/logout cursor")) {
+        .logout => |rest| try std.testing.expectEqualStrings("cursor", rest),
         else => return error.TestExpectedEqual,
     }
 }

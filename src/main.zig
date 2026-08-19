@@ -51,6 +51,7 @@ const builtin_gateway = @import("builtins/gateway.zig");
 const openai_compatible_provider = @import("builtins/providers/openai_compatible.zig");
 const chatgpt_provider = @import("builtins/providers/chatgpt.zig");
 const grok_provider = @import("builtins/providers/grok.zig");
+const cursor_provider = @import("builtins/providers/cursor.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const providers_compose = @import("core/providers/compose.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
@@ -99,6 +100,7 @@ const composed_backend_context = providers_compose.Context{
     .openai_compatible = openai_compatible_provider.provider,
     .chatgpt = chatgpt_provider.provider,
     .grok = grok_provider.provider,
+    .cursor = cursor_provider.provider,
 };
 const composed_gateway_provider = providers_compose.provider(&composed_backend_context);
 const background_runtime = @import("core/background/background_runtime.zig");
@@ -3919,7 +3921,10 @@ test {
     _ = @import("core/providers/chatgpt_catalog.zig");
     _ = @import("core/providers/grok_auth.zig");
     _ = @import("core/providers/grok_catalog.zig");
+    _ = @import("core/providers/cursor_auth.zig");
+    _ = @import("core/providers/cursor_catalog.zig");
     _ = @import("builtins/providers/openai_compatible.zig");
     _ = @import("builtins/providers/chatgpt.zig");
     _ = @import("builtins/providers/grok.zig");
+    _ = @import("builtins/providers/cursor.zig");
 }
