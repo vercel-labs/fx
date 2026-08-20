@@ -1,4 +1,5 @@
 const std = @import("std");
+const adapter_auth = @import("../gateway/adapter_auth.zig");
 const account_usage_provider = @import("../gateway/account_usage_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -488,6 +489,7 @@ pub const AdapterStreamFn = *const fn (
 
 pub const ProviderAdapter = struct {
     kind: []const u8,
+    auth: ?adapter_auth.Provider = null,
     /// When set, context must remain valid until every in-flight stream returns.
     context: ?*anyopaque = null,
     /// Bounded G1 bridge for existing injected Vercel stream providers. G11

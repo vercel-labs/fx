@@ -6,7 +6,7 @@ const runtime_profile = @import("../hosts/runtime_profile.zig");
 const io_mod = @import("../shared/io.zig");
 const credentials = @import("../auth/credentials.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
-const login_flow = @import("../auth/login_flow.zig");
+const adapter_auth = @import("../gateway/adapter_auth.zig");
 const types = @import("../shared/types.zig");
 
 fn oauthAuthEnabled(comptime App: type) bool {
@@ -56,8 +56,25 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             try app.flushBeforeBlockingExternalWork();
-            const result = login_flow.logout(app.alloc, app.auth.oauthTransport()) catch |err| switch (err) {
-                error.SessionDeleteFailed => {
+            const outcome = app.auth.logoutSelected(app.alloc) catch {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = "Could not complete fx logout. The current source is unchanged.",
+                });
+                return;
+            };
+            const result = switch (outcome) {
+                .completed => |value| value,
+                .failed => {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Could not complete fx logout. The current source is unchanged.",
+                    });
+                    return;
+                },
+                .cancelled => {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .@"error",
@@ -83,7 +100,7 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        fn applyLogoutResult(app: *App, result: login_flow.LogoutResult) !void {
+        fn applyLogoutResult(app: *App, result: adapter_auth.LogoutResult) !void {
             // Logging out is an explicit rejection of that credential, so a
             // remembered pointer to it would silently reactivate on next login.
             // A remembered source always wins resolution, so an active fx login
@@ -113,7 +130,7 @@ pub fn Runtime(comptime App: type) type {
                 try writeAuthNotice(app, .{
                     .topic = "auth",
                     .tone = .warning,
-                    .body = login_flow.remote_revocation_warning,
+                    .body = "Warning: signed out locally, but the remote session could not be revoked.",
                 });
             }
         }
@@ -191,15 +208,13 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn collectSignInFacts(app: *App) !void {
-            if (comptime !oauthAuthEnabled(App)) return;
-            app.auth.pulseSignIn(app.alloc);
-            switch (app.auth.pollSignInTransition(app.alloc)) {
+            switch (try app.auth.pollSignInTransition(app.alloc)) {
                 .none => {},
                 .cancelled => app.shell.render_requests.request(.footer),
-                .failed => |err| {
-                    debug_trace.logf("auth", "login failed err={s}", .{@errorName(err)});
+                .failed => |failure| {
+                    debug_trace.logf("auth", "login failed category={t}", .{failure.category});
                     _ = app.auth.popPickerStage(app.alloc);
-                    try writeLoginError(app, err);
+                    try writeLoginFailure(app, failure);
                 },
                 .succeeded => |completed| {
                     var selection = completed;
@@ -216,7 +231,7 @@ pub fn Runtime(comptime App: type) type {
                     }
                     rememberCredentialSource(app, .fx_login);
 
-                    if (selection.teams.items.len > 0) {
+                    if (selection.teams.len > 0) {
                         app.auth.openTeamPicker(app.alloc, &selection);
                     } else {
                         _ = app.auth.popPickerStage(app.alloc);
@@ -418,18 +433,31 @@ pub fn Runtime(comptime App: type) type {
             if (!app.auth.pickerView().fx_login_session_available) return;
             try app.flushBeforeBlockingExternalWork();
 
-            var selection = login_flow.loadTeamSelection(app.alloc, app.auth.oauthTransport()) catch |err| {
+            const outcome = app.auth.loadSelectedTeams(app.alloc) catch |err| {
                 debug_trace.logf("auth", "team picker load failed err={s}", .{@errorName(err)});
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = switch (err) {
-                        error.NoSession => "The fx login session is no longer available. Sign in to change teams.",
-                        error.NoTeams => "No Vercel teams are available for this account.",
-                        else => "Could not load Vercel teams. The current team is unchanged.",
-                    },
+                    .body = "Could not load Vercel teams. The current team is unchanged.",
                 }, true);
                 return;
+            };
+            var selection = switch (outcome) {
+                .loaded => |value| value,
+                .cancelled => return,
+                .failed => |failure| {
+                    debug_trace.logf("auth", "team picker load failed category={t}", .{failure.category});
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = switch (failure.category) {
+                            .missing_session => "The fx login session is no longer available. Sign in to change teams.",
+                            .no_teams => "No Vercel teams are available for this account.",
+                            else => "Could not load Vercel teams. The current team is unchanged.",
+                        },
+                    }, true);
+                    return;
+                },
             };
             defer selection.deinit(app.alloc);
             app.auth.openTeamPicker(app.alloc, &selection);
@@ -438,8 +466,8 @@ pub fn Runtime(comptime App: type) type {
 
         fn applyTeamChoice(app: *App, index: usize) !void {
             const selection = app.auth.teamSelection() orelse return;
-            if (index >= selection.teams.items.len) return;
-            const team = selection.teams.items[index];
+            if (index >= selection.teams.len) return;
+            const team = selection.teams[index];
             const body = try std.fmt.allocPrint(
                 app.alloc,
                 "Changed Vercel team to {s} ({s}).",
@@ -447,18 +475,31 @@ pub fn Runtime(comptime App: type) type {
             );
             defer app.alloc.free(body);
 
-            var selected_team = selection.select(app.alloc, index) catch |err| {
+            const selection_outcome = selection.select(app.alloc, index) catch |err| {
                 debug_trace.logf("auth", "team change failed err={s}", .{@errorName(err)});
                 app.auth.closePicker(app.alloc);
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = switch (err) {
-                        error.SessionChanged, error.NoSession => "The fx login session changed before the team could be saved.",
-                        else => "Could not change the Vercel team. The current team is unchanged.",
-                    },
+                    .body = "Could not change the Vercel team. The current team is unchanged.",
                 }, true);
                 return;
+            };
+            var selected_team = switch (selection_outcome) {
+                .selected => |value| value,
+                .failed => |failure| {
+                    debug_trace.logf("auth", "team change failed category={t}", .{failure.category});
+                    app.auth.closePicker(app.alloc);
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = switch (failure.category) {
+                            .session_changed, .missing_session => "The fx login session changed before the team could be saved.",
+                            else => "Could not change the Vercel team. The current team is unchanged.",
+                        },
+                    }, true);
+                    return;
+                },
             };
             defer selected_team.deinit(app.alloc);
 
@@ -602,9 +643,19 @@ pub fn Runtime(comptime App: type) type {
 
         fn writeLoginError(app: *App, err: anyerror) !void {
             const notice: types.SemanticNotice = switch (err) {
-                error.ClientIdMissing => .{ .topic = "auth", .tone = .@"error", .body = "fx login is not configured yet. The current credential is unchanged." },
-                error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in was denied. The current credential is unchanged." },
-                error.ExpiredToken, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "The Vercel sign-in code expired. The current credential is unchanged; run /login to try again." },
+                error.AuthConfiguration => .{ .topic = "auth", .tone = .@"error", .body = "fx login is not configured yet. The current credential is unchanged." },
+                error.AuthDenied => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in was denied. The current credential is unchanged." },
+                error.AuthExpired => .{ .topic = "auth", .tone = .warning, .body = "The Vercel sign-in code expired. The current credential is unchanged; run /login to try again." },
+                else => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in failed. The current credential is unchanged." },
+            };
+            try writeAuthNotice(app, notice);
+        }
+
+        fn writeLoginFailure(app: *App, failure: adapter_auth.Failure) !void {
+            const notice: types.SemanticNotice = switch (failure.category) {
+                .configuration => .{ .topic = "auth", .tone = .@"error", .body = "fx login is not configured yet. The current credential is unchanged." },
+                .denied => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in was denied. The current credential is unchanged." },
+                .expired => .{ .topic = "auth", .tone = .warning, .body = "The Vercel sign-in code expired. The current credential is unchanged; run /login to try again." },
                 else => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in failed. The current credential is unchanged." },
             };
             try writeAuthNotice(app, notice);
@@ -636,30 +687,27 @@ const test_teams = [_]TestTeam{.{
     .slug = "vercel-labs",
 }};
 
-const TestSelectedTeam = struct {
-    fn deinit(_: *TestSelectedTeam, _: std.mem.Allocator) void {}
-};
-
 const TestTeamSelection = struct {
-    teams: struct {
-        items: []const TestTeam = &test_teams,
-    } = .{},
+    teams: []const TestTeam = &test_teams,
     select_count: usize = 0,
 
     fn select(
         self: *TestTeamSelection,
-        _: std.mem.Allocator,
+        alloc: std.mem.Allocator,
         index: usize,
-    ) error{ InvalidTeamSelection, SessionChanged, NoSession }!TestSelectedTeam {
-        if (index >= self.teams.items.len) return error.InvalidTeamSelection;
+    ) std.mem.Allocator.Error!adapter_auth.SelectOutcome {
+        if (index >= self.teams.len) return .{ .failed = .{ .category = .invalid_selection } };
         self.select_count += 1;
-        return .{};
+        const team = self.teams[index];
+        const id = try alloc.dupe(u8, team.slug);
+        errdefer alloc.free(id);
+        return .{ .selected = .{ .id = id, .slug = try alloc.dupe(u8, team.slug) } };
     }
 };
 
 const TestAuth = struct {
     select_result: ?bool = false,
-    sign_in_transition: login_flow.SignInTransition = .none,
+    sign_in_transition: adapter_auth.SignInTransition = .none,
     logout_changed: bool = false,
     refresh_changed: bool = false,
     refresh_error: ?anyerror = null,
@@ -689,7 +737,7 @@ const TestAuth = struct {
         return self.select_result;
     }
 
-    fn pollSignInTransition(self: *TestAuth, _: std.mem.Allocator) login_flow.SignInTransition {
+    fn pollSignInTransition(self: *TestAuth, _: std.mem.Allocator) !adapter_auth.SignInTransition {
         const transition = self.sign_in_transition;
         self.sign_in_transition = .none;
         return transition;
@@ -702,7 +750,7 @@ const TestAuth = struct {
         return true;
     }
 
-    fn openTeamPicker(_: *TestAuth, _: std.mem.Allocator, _: *login_flow.TeamSelection) void {}
+    fn openTeamPicker(_: *TestAuth, _: std.mem.Allocator, _: *adapter_auth.TeamSelection) void {}
 
     fn refreshFxLoginIfNeeded(self: *TestAuth, _: std.mem.Allocator) !bool {
         self.refresh_count += 1;
@@ -743,7 +791,7 @@ const TestAuth = struct {
         return &self.team_selection;
     }
 
-    fn adoptSelectedTeam(self: *TestAuth, _: std.mem.Allocator, _: *TestSelectedTeam) bool {
+    fn adoptSelectedTeam(self: *TestAuth, _: std.mem.Allocator, _: *adapter_auth.SelectedTeam) bool {
         self.selected_team_adopted = true;
         return true;
     }
@@ -1024,7 +1072,7 @@ test "successful direct login remembers fx login after activation" {
     var app: TestApp = .{};
     defer app.deinit();
     app.auth.select_result = true;
-    app.auth.sign_in_transition = .{ .succeeded = .{} };
+    app.auth.sign_in_transition = .{ .succeeded = adapter_auth.unavailable_team_selection };
 
     try Runtime(TestApp).collectSignInFacts(&app);
 
@@ -1038,7 +1086,7 @@ test "direct login source load failure leaves the environment preference unchang
     var app: TestApp = .{};
     defer app.deinit();
     app.auth.select_result = null;
-    app.auth.sign_in_transition = .{ .succeeded = .{} };
+    app.auth.sign_in_transition = .{ .succeeded = adapter_auth.unavailable_team_selection };
 
     try Runtime(TestApp).collectSignInFacts(&app);
 
@@ -1052,7 +1100,7 @@ test "failed preference persistence keeps a successful direct login active" {
     var app: TestApp = .{};
     defer app.deinit();
     app.auth.select_result = true;
-    app.auth.sign_in_transition = .{ .succeeded = .{} };
+    app.auth.sign_in_transition = .{ .succeeded = adapter_auth.unavailable_team_selection };
     app.preference_write_succeeds = false;
 
     try Runtime(TestApp).collectSignInFacts(&app);
@@ -1154,7 +1202,7 @@ test "logout result reconciles live auth and renders only sanitized notices" {
     try std.testing.expectEqual(@as(usize, 1), app.model_cache.reset_count);
     try std.testing.expectEqual(@as(usize, 1), app.model_cache_warmup_count);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Signed out of fx.") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, login_flow.remote_revocation_warning) != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "remote session could not be revoked") != null);
     for ([_][]const u8{ "access-secret", "refresh-secret", "RemoteRevokeFailed", "https://issuer.example" }) |detail| {
         try std.testing.expect(std.mem.find(u8, app.transcript.items, detail) == null);
     }
@@ -1174,7 +1222,7 @@ test "logout durability failure still reconciles live auth" {
     try std.testing.expectEqual(@as(usize, 1), app.auth.logout_reconcile_count);
     try std.testing.expectEqual(@as(usize, 1), app.model_cache.reset_count);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Could not confirm durable fx logout.") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, login_flow.remote_revocation_warning) != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "remote session could not be revoked") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "current source is unchanged") == null);
 }
 

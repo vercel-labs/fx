@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
+const adapter_auth = @import("../gateway/adapter_auth.zig");
+const auth_runtime = @import("../auth/auth_runtime.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const background_record_liveness = @import("../background/background_record_liveness.zig");
 const background_store = @import("../background/background_store.zig");
@@ -21,7 +23,6 @@ const background_process_provider = @import(
 const github_publish = @import("../github/github_publish.zig");
 const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
-const login_flow = @import("../auth/login_flow.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -322,6 +323,37 @@ const RunDeps = struct {
     read_masked_key: ReadMaskedKeyFn = readMaskedKeyDefault,
     setup_terminal_available: SetupTerminalAvailableFn = setupTerminalAvailableDefault,
 };
+
+const TopLevelAuthBinding = struct {
+    startup: app_lifecycle.StartupState,
+    profile: connection_registry.Profile,
+    auth: adapter_auth.Provider,
+    host: adapter_auth.AuthHost,
+
+    fn deinit(self: *TopLevelAuthBinding, alloc: Allocator) void {
+        self.startup.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+fn resolveTopLevelAuth(alloc: Allocator, cfg: Config, deps: RunDeps) !TopLevelAuthBinding {
+    var startup = try deps.load_startup_state_without_credentials(
+        alloc,
+        cfg.default_model,
+        cfg.default_fast_mode,
+        cfg.default_agent_step_limit,
+        cfg.gateway_provider.connection_seed,
+    );
+    errdefer startup.deinit(alloc);
+    const connections = if (startup.connections) |*value| value else return error.ConnectionRegistryUnavailable;
+    const profile = connections.selectedProfile();
+    return .{
+        .startup = startup,
+        .profile = profile,
+        .auth = try cfg.gateway_provider.adapter_registry.resolveAuthForProfile(profile),
+        .host = .{ .secret_store = cfg.secret_store, .url_opener = cfg.url_opener },
+    };
+}
 
 const GlobalLaunchArgs = struct {
     remaining: []const [:0]const u8,
@@ -729,29 +761,54 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, "usage: fx login\n");
                 return .handled_failure;
             }
-            login_flow.runLogin(
-                alloc,
-                cfg.gateway_provider.oauth_transport,
-                cfg.url_opener,
-            ) catch |err| {
-                const message = switch (err) {
-                    error.ClientIdMissing => "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first\n",
-                    error.AccessDenied => "fx login: authorization denied\n",
-                    error.ExpiredToken, error.LoginTimedOut => "fx login: authorization expired; run fx login again\n",
-                    else => "fx login: failed to sign in\n",
-                };
-                try writeStderr(deps, message);
-                return .handled_failure;
+            var binding = resolveTopLevelAuth(alloc, cfg, deps) catch |err| switch (err) {
+                error.MissingAdapter, error.MissingAuthCapability => {
+                    try writeStderr(deps, "fx login: unsupported connection adapter\n");
+                    return .handled_failure;
+                },
+                else => return err,
             };
-            return .handled_success;
+            defer binding.deinit(alloc);
+            const outcome = try binding.auth.login(alloc, binding.profile, binding.host);
+            switch (outcome) {
+                .succeeded => return .handled_success,
+                .cancelled => {
+                    try writeStderr(deps, "fx login: authorization cancelled\n");
+                    return .handled_failure;
+                },
+                .failed => |failure| {
+                    const message = switch (failure.category) {
+                        .configuration => "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first\n",
+                        .denied => "fx login: authorization denied\n",
+                        .expired => "fx login: authorization expired; run fx login again\n",
+                        else => "fx login: failed to sign in\n",
+                    };
+                    try writeStderr(deps, message);
+                    return .handled_failure;
+                },
+            }
         },
         .logout => |rest| {
             if (rest.len != 0) {
                 try writeStderr(deps, "usage: fx logout\n");
                 return .handled_failure;
             }
-            const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
-                error.SessionDeleteFailed => {
+            var binding = resolveTopLevelAuth(alloc, cfg, deps) catch |err| switch (err) {
+                error.MissingAdapter, error.MissingAuthCapability => {
+                    try writeStderr(deps, "fx logout: unsupported connection adapter\n");
+                    return .handled_failure;
+                },
+                else => return err,
+            };
+            defer binding.deinit(alloc);
+            const outcome = try binding.auth.logout(alloc, binding.profile, binding.host);
+            const result = switch (outcome) {
+                .completed => |value| value,
+                .failed => {
+                    try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
+                    return .handled_failure;
+                },
+                .cancelled => {
                     try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
                     return .handled_failure;
                 },
@@ -765,7 +822,7 @@ fn runNonInteractiveWithDeps(
                 );
             }
             if (result.remote_revocation_failed) {
-                try writeStderr(deps, login_flow.remote_revocation_warning);
+                try writeStderr(deps, "Warning: signed out locally, but the remote session could not be revoked.");
                 try writeStderr(deps, "\n");
             }
             return if (result.local_durability_failed) .handled_failure else .handled_success;
@@ -775,19 +832,33 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, "usage: fx teams\n");
                 return .handled_failure;
             }
-            login_flow.runTeams(alloc, cfg.gateway_provider.oauth_transport) catch |err| {
-                const message = switch (err) {
-                    error.NoSession => "fx teams: run fx login first\n",
-                    error.SessionChanged => "fx teams: authentication changed; try again\n",
-                    error.TeamRequestFailed => "fx teams: failed to list Vercel teams\n",
-                    error.InvalidTeamSelection => "fx teams: no team selected\n",
-                    error.AccessDenied => "fx teams: authorization denied\n",
-                    else => "fx teams: failed to switch team\n",
-                };
-                try writeStderr(deps, message);
-                return .handled_failure;
+            var binding = resolveTopLevelAuth(alloc, cfg, deps) catch |err| switch (err) {
+                error.MissingAdapter, error.MissingAuthCapability => {
+                    try writeStderr(deps, "fx teams: unsupported connection adapter\n");
+                    return .handled_failure;
+                },
+                else => return err,
             };
-            return .handled_success;
+            defer binding.deinit(alloc);
+            const outcome = try binding.auth.teams(alloc, binding.profile, binding.host);
+            switch (outcome) {
+                .succeeded => return .handled_success,
+                .cancelled => {
+                    try writeStderr(deps, "fx teams: failed to switch team\n");
+                    return .handled_failure;
+                },
+                .failed => |failure| {
+                    const message = switch (failure.category) {
+                        .missing_session => "fx teams: run fx login first\n",
+                        .session_changed => "fx teams: authentication changed; try again\n",
+                        .invalid_selection => "fx teams: no team selected\n",
+                        .denied => "fx teams: authorization denied\n",
+                        else => "fx teams: failed to switch team\n",
+                    };
+                    try writeStderr(deps, message);
+                    return .handled_failure;
+                },
+            }
         },
         .setup => |rest| {
             if (rest.len != 0) {
@@ -803,11 +874,33 @@ fn runNonInteractiveWithDeps(
             };
             var startup = try deps.load_startup_status(
                 alloc,
-                cfg.secret_store,
+                host.unavailable_secret_store,
                 cfg.default_model,
                 cfg.default_agent_step_limit,
             );
             defer startup.deinit(alloc);
+            var binding = resolveTopLevelAuth(alloc, cfg, deps) catch |err| switch (err) {
+                error.MissingAdapter, error.MissingAuthCapability => {
+                    try writeStderr(deps, "fx status: unsupported connection adapter\n");
+                    return .handled_failure;
+                },
+                else => return err,
+            };
+            defer binding.deinit(alloc);
+            const replacement_auth: auth_runtime.StatusSnapshot = switch (try binding.auth.status(alloc, binding.profile, binding.host)) {
+                .loaded => |value| status: {
+                    var adapter_status = value;
+                    defer adapter_status.deinit(alloc);
+                    break :status try auth_runtime.takeAdapterStatus(&adapter_status);
+                },
+                .failed => |failure| .{ .failure = failure.category },
+                .cancelled => {
+                    try writeStderr(deps, "fx status: authentication check cancelled\n");
+                    return .handled_failure;
+                },
+            };
+            startup.auth.deinit(alloc);
+            startup.auth = replacement_auth;
             try startup.normalizeModel(alloc, cfg.gateway_provider.provider_adapter.model_descriptors);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
             const mcp_config_diagnostic = try cfg.inspect_mcp_profile_config(alloc);
@@ -4351,6 +4444,19 @@ test "runIfRequested invalid json local flags write json error" {
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), "\"code\":\"InvalidLocalSurfaceArgs\"") != null);
 }
 
+test "top-level auth does not relabel startup failures as unsupported adapters" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+    var deps = capture.deps();
+    deps.load_startup_state_without_credentials = failingStartupStateWithoutCredentials;
+
+    try std.testing.expectError(
+        error.StartupShouldNotRun,
+        runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("login")}, testConfig(), deps),
+    );
+    try std.testing.expectEqualStrings("", capture.stderr.written());
+}
+
 test "runIfRequested resume no args returns last target" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
@@ -5154,6 +5260,16 @@ fn failingStartupState(
     _: Allocator,
     _: oauth_transport.Provider,
     _: host.SecretStore,
+    _: []const u8,
+    _: bool,
+    _: usize,
+    _: connection_registry.Seed,
+) !app_lifecycle.StartupState {
+    return error.StartupShouldNotRun;
+}
+
+fn failingStartupStateWithoutCredentials(
+    _: Allocator,
     _: []const u8,
     _: bool,
     _: usize,

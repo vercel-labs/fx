@@ -1,7 +1,10 @@
 const std = @import("std");
+const adapter_auth = @import("../gateway/adapter_auth.zig");
+const agent_stream_provider = @import("../agent/stream_provider.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const connection_registry = @import("../gateway/connection_registry.zig");
+const adapter_registry = @import("../gateway/adapter_registry.zig");
 const app_input_runtime = @import("app_input_runtime.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
@@ -36,6 +39,7 @@ pub const CapabilityProviders = struct {
     skill_root_policy: skill_contract.RootPolicy,
     terminal_title: host.TerminalTitle,
     connection_seed: connection_registry.Seed,
+    adapter_registry: adapter_registry.AdapterRegistry = .{ .adapters = &.{} },
     model_descriptors: model_catalog.ModelDescriptorProvider = model_catalog.configured_model_descriptor_provider,
 };
 
@@ -97,6 +101,7 @@ pub fn Runtime(comptime App: type) type {
                 resize_handler,
                 record_requested,
                 capability_providers.connection_seed,
+                capability_providers.adapter_registry,
                 capability_providers.model_descriptors,
                 defaultDeps(capability_providers),
             );
@@ -188,6 +193,7 @@ pub fn Runtime(comptime App: type) type {
             resize_handler: app_lifecycle.ResizeHandler,
             record_requested: bool,
             connection_seed: connection_registry.Seed,
+            registry: adapter_registry.AdapterRegistry,
             model_descriptors: model_catalog.ModelDescriptorProvider,
             deps: BootstrapDeps(App),
         ) !void {
@@ -204,6 +210,7 @@ pub fn Runtime(comptime App: type) type {
                 .default_model = default_model,
                 .default_fast_mode = default_fast_mode,
                 .connection_seed = connection_seed,
+                .adapter_registry = registry,
                 .default_agent_step_limit = default_agent_step_limit,
                 .model_descriptors = model_descriptors,
                 .secret_store = if (comptime @hasDecl(App, "secretStore"))
@@ -537,6 +544,20 @@ const test_global_skill_roots = [_]skill_contract.RootSpec{
     .{ .source = .global_codex, .path = ".codex/skills" },
 };
 
+const test_connection_seed = connection_registry.Seed{
+    .id = "test",
+    .display_name = "Test Gateway",
+    .adapter_id = "test_gateway",
+    .credential_ref = "automatic",
+};
+const test_auth_provider = adapter_auth.Provider{ .kind = "test_gateway" };
+const test_adapters = [_]agent_stream_provider.ProviderAdapter{.{
+    .kind = "test_gateway",
+    .auth = test_auth_provider,
+    .stream_fn = agent_stream_provider.unavailable_adapter.stream_fn,
+}};
+const test_adapter_registry = adapter_registry.AdapterRegistry{ .adapters = &test_adapters };
+
 const TestApp = struct {
     pub const app_version = "0.2.10-test";
 
@@ -570,7 +591,10 @@ const TestApp = struct {
     deinit_calls: usize = 0,
 
     fn init(alloc: Allocator) TestApp {
-        return .{ .alloc = alloc };
+        return .{
+            .alloc = alloc,
+            .auth = .{ .adapter_registry = test_adapter_registry },
+        };
     }
 
     fn deinit(self: *TestApp) void {
@@ -687,6 +711,13 @@ fn makeStartupState(alloc: Allocator) !app_lifecycle.StartupState {
     state.first_call_tool_choice = .none;
     state.workspace_root = try alloc.dupe(u8, "/workspace");
     errdefer alloc.free(state.workspace_root);
+    state.connections = try connection_registry.Runtime.init(
+        alloc,
+        test_connection_seed.profile("model-x", null),
+        null,
+        .unavailable,
+    );
+    errdefer state.connections.?.deinit();
     if (active_capture.?.startup_with_credential) {
         const credential_token = try alloc.dupe(u8, "api-key");
         errdefer alloc.free(credential_token);
@@ -849,12 +880,8 @@ fn runBootstrapForTest(app: *TestApp, capture: *TestCapture) !void {
         24,
         resizeHandlerForTest,
         false,
-        .{
-            .id = "test",
-            .display_name = "Test Gateway",
-            .adapter_id = "test_gateway",
-            .credential_ref = "automatic",
-        },
+        test_connection_seed,
+        test_adapter_registry,
         model_catalog.configured_model_descriptor_provider,
         testDeps(),
     );

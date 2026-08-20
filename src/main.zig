@@ -48,6 +48,7 @@ const command_specs = @import("core/slash_commands/command_specs.zig");
 const builtin_context = @import("builtins/context.zig");
 const builtin_devbox = @import("builtins/devbox.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
+const adapter_registry = @import("core/gateway/adapter_registry.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const output_contracts = @import("core/output/output_contracts.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
@@ -359,6 +360,22 @@ fn currentBuild() update_target.CurrentBuild {
     };
 }
 
+const wasm_provider_adapter = agent_stream_provider.ProviderAdapter{
+    .kind = builtin_gateway.connection_seed.adapter_id,
+    .auth = builtin_gateway.auth_provider_for_transport(&js_host_auth.oauth_provider),
+    .model_catalog = js_host_model_catalog.provider,
+    .model_descriptors = builtin_gateway.model_descriptor_provider,
+    .provider_tools = &.{.web_search},
+    .stream_fn = builtin_gateway.streamVercelAdapter,
+};
+
+const wasm_production_adapters = [_]agent_stream_provider.ProviderAdapter{wasm_provider_adapter};
+
+const production_adapter_registry = if (host_target.is_wasm)
+    adapter_registry.AdapterRegistry{ .adapters = &wasm_production_adapters }
+else
+    builtin_gateway.production_adapter_registry;
+
 const App = struct {
     pub const app_version = version;
     pub const host_profile = if (host_target.is_wasm) host_runtime_profile.wasm else host_runtime_profile.native;
@@ -476,13 +493,7 @@ const App = struct {
 
     pub fn providerAdapter(self: *const Self) agent_stream_provider.ProviderAdapter {
         var adapter = if (comptime host_target.is_wasm)
-            agent_stream_provider.ProviderAdapter{
-                .kind = builtin_gateway.connection_seed.adapter_id,
-                .model_catalog = js_host_model_catalog.provider,
-                .model_descriptors = builtin_gateway.model_descriptor_provider,
-                .provider_tools = &.{.web_search},
-                .stream_fn = builtin_gateway.streamVercelAdapter,
-            }
+            wasm_provider_adapter
         else
             builtin_gateway.provider_adapter;
         adapter.legacy_provider = self.agentStreamProvider();
@@ -506,6 +517,8 @@ const App = struct {
         alloc: Allocator,
         route: *const route_snapshot.RouteSnapshot,
     ) !agent_runtime.RouteCredential {
+        var profile = try self.auth.connectionProfile(route.connection_id);
+        if (!std.mem.eql(u8, profile.adapter_id, route.adapter_kind)) return error.RouteAdapterMismatch;
         const selected = try self.auth.selectedConnectionProfile();
         if (std.mem.eql(u8, route.connection_id, selected.id)) {
             if (self.auth.gatewayCredential()) |credential| {
@@ -523,7 +536,8 @@ const App = struct {
                 return result;
             }
         }
-        var credential = try self.auth.resolveCredentialReference(alloc, route.credential_ref);
+        profile.credential_ref = @constCast(route.credential_ref);
+        var credential = try self.auth.resolveExactProfileCredential(alloc, profile, .if_needed, null);
         defer credential.deinit(alloc);
         const tenant = if (credential.gatewayTeam()) |value| try alloc.dupe(u8, value) else null;
         errdefer if (tenant) |value| alloc.free(value);
@@ -594,7 +608,7 @@ const App = struct {
             preferences.connection_id orelse session_codec.legacy_connection_id
         else
             (try self.auth.selectedConnectionProfile()).id;
-        const profile = self.auth.connectionProfile(connection_id) catch |err| switch (err) {
+        const profile = self.auth.connectionProfileForRoute(connection_id) catch |err| switch (err) {
             error.UnknownConnection => return error.MissingSessionConnection,
             else => return err,
         };
@@ -631,6 +645,7 @@ const App = struct {
         else
             oauth_transport.unavailable_provider,
         if (host_target.is_wasm) host.unavailable_secret_store else native_host.secret_store,
+        production_adapter_registry,
     ),
     selected_model: std.ArrayList(u8) = .empty,
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
@@ -755,6 +770,7 @@ const App = struct {
                 .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
                 .terminal_title = app.terminalTitle(),
                 .connection_seed = builtin_gateway.connection_seed,
+                .adapter_registry = production_adapter_registry,
                 .model_descriptors = builtin_gateway.model_descriptor_provider,
             },
         );
@@ -1424,7 +1440,7 @@ const App = struct {
             preferences.connection_id orelse session_codec.legacy_connection_id
         else
             (try self.auth.selectedConnectionProfile()).id;
-        const profile = self.auth.connectionProfile(connection_id) catch |err| switch (err) {
+        const profile = self.auth.connectionProfileForRoute(connection_id) catch |err| switch (err) {
             error.UnknownConnection => return error.MissingSessionConnection,
             else => return err,
         };
@@ -3428,6 +3444,84 @@ test "native app preserves the built-in tool set without workspace metadata" {
     const advertised = app.toolAdvertisementSet();
     try std.testing.expect(advertised.order.ptr == builtin_tools.advertisement_set.order.ptr);
     try std.testing.expectEqual(builtin_tools.advertisement_set.order.len, advertised.order.len);
+}
+
+test "interactive route credential resolution keeps the admitted source exact" {
+    const adapter_auth = @import("core/gateway/adapter_auth.zig");
+    const connection_registry = @import("core/gateway/connection_registry.zig");
+    const Probe = struct {
+        calls: usize = 0,
+        fallback_reads: usize = 0,
+
+        fn acquire(
+            raw: *const anyopaque,
+            alloc: std.mem.Allocator,
+            request: adapter_auth.Request,
+        ) std.mem.Allocator.Error!adapter_auth.Acquisition {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (request.source_resolution == .exact) {
+                return .{ .failed = .{ .category = .unavailable } };
+            }
+            self.fallback_reads += 1;
+            return .{ .acquired = .{
+                .secret_bytes = try alloc.dupe(u8, "fallback-secret"),
+                .source = .{ .id = "ai_gateway_api_key", .label = "fallback", .refreshable = false },
+                .catalog_access = .authenticated,
+            } };
+        }
+    };
+    const alloc = std.testing.allocator;
+    var probe: Probe = .{};
+    const adapters = [_]agent_stream_provider.ProviderAdapter{.{
+        .kind = "test_adapter",
+        .auth = .{
+            .kind = "test_adapter",
+            .context = &probe,
+            .acquire_fn = Probe.acquire,
+        },
+        .stream_fn = agent_stream_provider.unavailable_adapter.stream_fn,
+    }};
+    var app = App{ .alloc = alloc };
+    app.auth.adapter_registry = try adapter_registry.AdapterRegistry.init(&adapters);
+    var connections = try connection_registry.Runtime.init(alloc, .{
+        .id = "test",
+        .display_name = "Test",
+        .adapter_id = "test_adapter",
+        .endpoint = "https://example.invalid",
+        .protocol = "test",
+        .credential_ref = "fx_login",
+        .remembered_model = "test/model",
+    }, null, .unavailable);
+    app.auth.adoptConnections(alloc, &connections);
+    defer app.auth.deinit(alloc);
+
+    const route = route_snapshot.RouteSnapshot{
+        .connection_id = "test",
+        .adapter_kind = "test_adapter",
+        .endpoint = "https://example.invalid",
+        .protocol = "test",
+        .credential_ref = "fx_login",
+        .primary_model_id = "test/model",
+        .permission_review_model_id = null,
+        .vision_model_id = null,
+        .subagent_model_id = "test/model",
+        .capabilities = .{},
+        .capability_source = .@"adapter-static",
+        .selected_fast_mode = false,
+        .fast_model_suffix = null,
+    };
+    var failed = false;
+    if (app.resolveRouteCredential(alloc, &route)) |value| {
+        var credential = value;
+        credential.deinit(alloc);
+    } else |err| {
+        failed = true;
+        try std.testing.expectEqual(error.CredentialAcquisitionFailed, err);
+    }
+    try std.testing.expect(failed);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.fallback_reads);
 }
 
 fn fullEntryConfig() app_entry_runtime.Config {

@@ -382,12 +382,11 @@ pub fn Bindings(comptime App: type) type {
             mode: auth_runtime.CredentialRefreshMode,
         ) !?[]u8 {
             const app: *App = @ptrCast(@alignCast(raw_ctx));
-            return auth_runtime.refreshFxLoginToken(
-                app.auth.oauthTransport(),
-                alloc,
-                source,
-                mode,
-            );
+            if (source != .fx_login) return null;
+            return app.auth.refreshSelectedCredential(alloc, switch (mode) {
+                .if_needed => .if_needed,
+                .force => .force,
+            });
         }
 
         pub fn modelCapabilityResolver(app: *App) model_capabilities.Resolver {

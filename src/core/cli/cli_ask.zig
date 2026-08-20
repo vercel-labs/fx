@@ -15,6 +15,8 @@ const process_supervisor = @import("../background/process_supervisor.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const devbox_executor = @import("../execution/devbox_executor.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
+const adapter_auth = @import("../gateway/adapter_auth.zig");
+const adapter_registry = @import("../gateway/adapter_registry.zig");
 const connection_registry = @import("../gateway/connection_registry.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const route_snapshot = @import("../gateway/route_snapshot.zig");
@@ -1987,12 +1989,39 @@ fn refreshGatewayCredential(
     mode: auth_runtime.CredentialRefreshMode,
 ) !?[]u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    return auth_runtime.refreshFxLoginToken(
-        ctx.cfg.gateway_provider.oauth_transport,
-        alloc,
-        source,
-        mode,
-    );
+    if (source != .fx_login) return null;
+    const profile = connection_registry.Profile{
+        .id = @constCast(ctx.connection_id),
+        .display_name = @constCast(ctx.connection_id),
+        .adapter_id = @constCast(ctx.connection_adapter_kind),
+        .endpoint = null,
+        .protocol = null,
+        .credential_ref = @constCast(ctx.connection_credential_ref),
+        .remembered_model = @constCast(ctx.model),
+        .internal_models = .{},
+    };
+    const auth = try ctx.cfg.gateway_provider.adapter_registry.resolveAuthForProfile(profile);
+    const acquisition = try auth.acquire(alloc, .{
+        .profile = profile,
+        .host = .{ .secret_store = ctx.cfg.secret_store },
+        .mode = switch (mode) {
+            .if_needed => .if_needed,
+            .force => .force,
+        },
+        .source_resolution = .exact,
+        .current_source_id = @tagName(source),
+        .cancel_flag = ctx.cancelFlag(),
+    });
+    var credential = switch (acquisition) {
+        .acquired => |value| value,
+        .missing => return null,
+        .failed => return error.CredentialRefreshFailed,
+        .cancelled => return error.Cancelled,
+    };
+    defer credential.deinit(alloc);
+    const token = credential.secret_bytes;
+    credential.secret_bytes = &.{};
+    return token;
 }
 
 fn persistUsageCheckpoint(
@@ -3969,6 +3998,77 @@ fn testConfig() Config {
         .load_mcp_runtime = testNoMcpRuntime,
         .devbox_provider = .{ .execute_fn = unavailableDevboxForTest },
     };
+}
+
+test "ask refresh handles every adapter acquisition outcome without fallback" {
+    const RefreshProbe = struct {
+        outcome: enum { acquired, missing, failed, cancelled } = .acquired,
+        calls: usize = 0,
+        exact_calls: usize = 0,
+        saw_if_needed: bool = false,
+        saw_force: bool = false,
+
+        fn acquire(raw: *const anyopaque, alloc: Allocator, request: adapter_auth.Request) Allocator.Error!adapter_auth.Acquisition {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            self.exact_calls += @intFromBool(request.source_resolution == .exact);
+            self.saw_if_needed = self.saw_if_needed or request.mode == .if_needed;
+            self.saw_force = self.saw_force or request.mode == .force;
+            return switch (self.outcome) {
+                .acquired => .{ .acquired = .{
+                    .secret_bytes = try alloc.dupe(u8, "refreshed-secret"),
+                    .source = .{ .id = "fx_login", .label = "test login", .refreshable = true },
+                    .catalog_access = .authenticated,
+                } },
+                .missing => .{ .missing = .not_attempted },
+                .failed => .{ .failed = .{ .category = .unavailable } },
+                .cancelled => .cancelled,
+            };
+        }
+    };
+    var probe: RefreshProbe = .{};
+    const auth = adapter_auth.Provider{
+        .kind = test_builtin_gateway.connection_seed.adapter_id,
+        .context = &probe,
+        .acquire_fn = RefreshProbe.acquire,
+    };
+    const adapters = [_]agent_stream_provider.ProviderAdapter{.{
+        .kind = test_builtin_gateway.connection_seed.adapter_id,
+        .auth = auth,
+        .stream_fn = agent_stream_provider.unavailable_adapter.stream_fn,
+    }};
+    var cfg = testConfig();
+    cfg.gateway_provider.adapter_registry = try adapter_registry.AdapterRegistry.init(&adapters);
+    var ctx = AskContext.init(std.testing.allocator, cfg, .{
+        .context_registry = test_no_context_registry,
+        .tool_set = test_builtin_tools.advertisement_set,
+        .load_mcp_runtime = testNoMcpRuntime,
+    }, "/tmp/workspace");
+    defer ctx.deinit();
+    ctx.connection_id = test_builtin_gateway.connection_seed.id;
+    ctx.connection_adapter_kind = test_builtin_gateway.connection_seed.adapter_id;
+    ctx.connection_credential_ref = "fx_login";
+    ctx.model = "model";
+
+    const refreshed = (try refreshGatewayCredential(&ctx, std.testing.allocator, .fx_login, .if_needed)).?;
+    @memset(refreshed, 0);
+    std.testing.allocator.free(refreshed);
+    probe.outcome = .missing;
+    try std.testing.expect((try refreshGatewayCredential(&ctx, std.testing.allocator, .fx_login, .force)) == null);
+    probe.outcome = .failed;
+    try std.testing.expectError(
+        error.CredentialRefreshFailed,
+        refreshGatewayCredential(&ctx, std.testing.allocator, .fx_login, .if_needed),
+    );
+    probe.outcome = .cancelled;
+    try std.testing.expectError(
+        error.Cancelled,
+        refreshGatewayCredential(&ctx, std.testing.allocator, .fx_login, .force),
+    );
+    try std.testing.expectEqual(@as(usize, 4), probe.calls);
+    try std.testing.expectEqual(probe.calls, probe.exact_calls);
+    try std.testing.expect(probe.saw_if_needed);
+    try std.testing.expect(probe.saw_force);
 }
 
 fn testMissingKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.SecretStore, default_model: []const u8, default_fast_mode: bool, default_agent_step_limit: usize, connection_seed: connection_registry.Seed) !app_lifecycle.StartupState {

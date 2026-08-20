@@ -225,7 +225,7 @@ pub fn resolvePreferring(
     if (preferred) |source| {
         if (source != .stored_key or !secret_store.isDisabled()) {
             const chosen = loadPreferredSource(alloc, transport, secret_store, mode, source) catch |err| blk: {
-                if (err == error.OutOfMemory) return err;
+                if (err == error.OutOfMemory or err == error.Cancelled) return err;
                 debug_trace.logf("auth", "preferred source load failed source={t} err={s}", .{ source, @errorName(err) });
                 break :blk null;
             };
@@ -254,6 +254,25 @@ pub fn resolvePreferring(
     };
     if (stored) |credential| return .{ .credential = credential };
     return .{ .stored_key_status = status };
+}
+
+/// An exact lookup never substitutes a different credential source.
+pub fn resolveExact(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    mode: LoadMode,
+    source: Source,
+) !Resolution {
+    if (source == .stored_key and secret_store.isDisabled()) return .{};
+    const credential = loadPreferredSource(alloc, transport, secret_store, mode, source) catch |err| {
+        if (err == error.OutOfMemory or err == error.Cancelled) return err;
+        debug_trace.logf("auth", "exact source load failed source={t} err={s}", .{ source, @errorName(err) });
+        if (source == .stored_key) return .{ .stored_key_status = .unavailable };
+        return err;
+    };
+    if (credential) |value| return .{ .credential = value };
+    return .{ .stored_key_status = if (source == .stored_key) .not_found else .not_attempted };
 }
 
 /// `loadSource` always refreshes an expired fx login, which `.stored` mode
@@ -762,6 +781,23 @@ test "a remembered choice that no longer resolves falls back to precedence" {
     try std.testing.expectEqual(Source.ai_gateway_api_key, credential.source);
 }
 
+test "an exact source that no longer resolves does not fall through" {
+    const alloc = std.testing.allocator;
+    const env = try CredentialTestEnv.install(alloc, &.{
+        .{ "AI_GATEWAY_API_KEY", "api-key" },
+    });
+    defer env.deinit();
+
+    const resolution = try resolveExact(
+        alloc,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        .refresh_if_needed,
+        .fx_login,
+    );
+    try std.testing.expect(resolution.credential == null);
+}
+
 test "no remembered choice resolves exactly as plain precedence" {
     const alloc = std.testing.allocator;
     const env = try CredentialTestEnv.install(alloc, &.{
@@ -830,4 +866,15 @@ test "credential resolution preserves unreadable store classification" {
     try std.testing.expectEqual(@as(usize, 1), store_fixture.load_calls);
     try std.testing.expect(resolution.credential == null);
     try std.testing.expectEqual(StoredKeyReadStatus.unavailable, resolution.stored_key_status);
+
+    const exact = try resolveExact(
+        alloc,
+        oauth_transport.unavailable_provider,
+        store_fixture.provider(),
+        .stored,
+        .stored_key,
+    );
+    try std.testing.expectEqual(@as(usize, 2), store_fixture.load_calls);
+    try std.testing.expect(exact.credential == null);
+    try std.testing.expectEqual(StoredKeyReadStatus.unavailable, exact.stored_key_status);
 }

@@ -1,8 +1,10 @@
 const std = @import("std");
 const api_key_validator = @import("api_key_validator.zig");
 const credentials = @import("credentials.zig");
+const adapter_auth = @import("../gateway/adapter_auth.zig");
+const adapter_registry = @import("../gateway/adapter_registry.zig");
+const stream_provider = @import("../agent/stream_provider.zig");
 const host = @import("../hosts/host.zig");
-const login_flow = @import("login_flow.zig");
 const connection_registry = @import("../gateway/connection_registry.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
@@ -96,27 +98,6 @@ pub const FailureSnapshot = struct {
         try writer.writeByte('}');
     }
 };
-
-/// Returns an owned token when the selected fx-login credential can be
-/// refreshed. The caller must release it with `secret.zeroAndFree`.
-pub fn refreshFxLoginToken(
-    transport: oauth_transport.Provider,
-    alloc: Allocator,
-    source: credentials.Source,
-    mode: CredentialRefreshMode,
-) !?[]u8 {
-    if (source != .fx_login) return null;
-
-    var credential = switch (mode) {
-        .if_needed => (try credentials.loadFxLoginCredential(alloc, transport)) orelse return null,
-        .force => (try credentials.refreshFxLoginCredential(alloc, transport)) orelse return null,
-    };
-    defer credential.deinit(alloc);
-
-    const token = credential.token;
-    credential.token = &.{};
-    return token;
-}
 
 pub const AcquisitionAction = enum {
     login,
@@ -334,10 +315,10 @@ pub const PickerView = struct {
     include_skip: bool,
     stage: PickerStage = .root,
     fx_login_session_available: bool = false,
-    teams: []const login_flow.Team = &.{},
+    teams: []const adapter_auth.Team = &.{},
     current_team: ?[]const u8 = null,
     team_query: []const u8 = &.{},
-    sign_in: login_flow.SignInSnapshot = .{},
+    sign_in: adapter_auth.SignInSnapshot = .{},
     api_key_mask_count: usize = 0,
 
     pub fn activeSourceLabel(self: PickerView) []const u8 {
@@ -448,7 +429,7 @@ pub const PickerView = struct {
     }
 };
 
-fn teamMatchesQuery(team: login_flow.Team, query: []const u8) bool {
+fn teamMatchesQuery(team: adapter_auth.Team, query: []const u8) bool {
     return text_utils.containsIgnoreCase(team.name, query) or
         text_utils.containsIgnoreCase(team.slug, query);
 }
@@ -477,6 +458,7 @@ pub const StatusSnapshot = struct {
     team: ?[]const u8 = null,
     owned_team: ?[]u8 = null,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
+    failure: ?adapter_auth.FailureCategory = null,
     /// The active credential is past its refresh deadline. Distinct from `refreshable`,
     /// which answers whether this source type can refresh at all.
     expired: bool = false,
@@ -487,6 +469,12 @@ pub const StatusSnapshot = struct {
     }
 
     pub fn activeSourceLabel(self: StatusSnapshot) []const u8 {
+        if (self.active_source == null) {
+            if (self.failure) |failure| return switch (failure) {
+                .configuration => "invalid_configuration",
+                else => @tagName(failure),
+            };
+        }
         return sourceLabelOrMissing(self.active_source);
     }
 
@@ -496,7 +484,7 @@ pub const StatusSnapshot = struct {
     }
 
     pub fn missingHelp(self: StatusSnapshot, surface: MissingHelpSurface) ?[]const u8 {
-        if (self.active_source != null) return null;
+        if (self.active_source != null or self.failure != null) return null;
         if (self.stored_key_status == .unavailable) return credentials.unreadable_store_message;
         return switch (surface) {
             .cli => credentials.missing_credential_message,
@@ -557,6 +545,27 @@ pub fn loadStatusSnapshot(
     return .{ .stored_key_status = resolution.stored_key_status };
 }
 
+pub fn takeAdapterStatus(status: *adapter_auth.Status) !StatusSnapshot {
+    const active_source = if (status.source) |source|
+        types.parseCredentialSource(source.id) orelse return error.InvalidCredentialReference
+    else
+        null;
+    const owned_team = status.team;
+    const result = StatusSnapshot{
+        .active_source = active_source,
+        .team = owned_team,
+        .owned_team = owned_team,
+        .stored_key_status = switch (status.store_status) {
+            .not_attempted => .not_attempted,
+            .not_found => .not_found,
+            .unavailable => .unavailable,
+        },
+        .expired = status.expired,
+    };
+    status.team = null;
+    return result;
+}
+
 pub const View = struct {
     active_source: ?credentials.Source,
     available_inactive_sources: SourceSet,
@@ -587,6 +596,7 @@ pub const Runtime = struct {
     api_key_validator: api_key_validator.Provider = api_key_validator.unavailable_provider,
     oauth_transport: oauth_transport.Provider = oauth_transport.unavailable_provider,
     secret_store: host.SecretStore = host.unavailable_secret_store,
+    adapter_registry: adapter_registry.AdapterRegistry = .{ .adapters = &.{} },
     connections: ?connection_registry.Runtime = null,
     selected_credential: ?credentials.Credential = null,
     credential_connection_id: [connection_registry.max_connection_id_bytes]u8 = undefined,
@@ -600,9 +610,10 @@ pub const Runtime = struct {
     picker_include_skip: bool = false,
     picker_stage: PickerStage = .root,
     fx_login_session_available: bool = false,
-    team_selection: ?login_flow.TeamSelection = null,
+    team_selection: ?adapter_auth.TeamSelection = null,
     team_query: std.ArrayList(u8) = .empty,
-    sign_in_flow: login_flow.SignInRuntime = .{},
+    sign_in_session: adapter_auth.SignInSession = adapter_auth.unavailable_sign_in_session,
+    sign_in_session_active: bool = false,
     sign_in_returns_to_root: bool = false,
     api_key_input: std.ArrayList(u8) = .empty,
     api_key_returns_to_root: bool = false,
@@ -612,17 +623,19 @@ pub const Runtime = struct {
         validator: api_key_validator.Provider,
         transport: oauth_transport.Provider,
         secret_store: host.SecretStore,
+        registry: adapter_registry.AdapterRegistry,
     ) Self {
         return .{
             .api_key_validator = validator,
             .oauth_transport = transport,
             .secret_store = secret_store,
+            .adapter_registry = registry,
         };
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
         self.api_key_save.deinit(alloc);
-        self.sign_in_flow.deinit(alloc);
+        self.clearSignInSession(alloc);
         self.exitApiKeyStage(alloc, .runtime_deinit);
         self.clearTeamSelection(alloc);
         self.team_query.deinit(alloc);
@@ -652,9 +665,25 @@ pub const Runtime = struct {
         return connections.selectedProfile();
     }
 
+    fn authHost(self: *const Self) adapter_auth.AuthHost {
+        return .{ .secret_store = self.secret_store };
+    }
+
     pub fn connectionProfile(self: *const Self, id: []const u8) !connection_registry.Profile {
         const connections = if (self.connections) |*value| value else return error.ConnectionRegistryUnavailable;
         return connections.profile(id);
+    }
+
+    /// Returns the admitted connection with this session's acquired source.
+    /// A failed preference write must not make route resolution fall back.
+    pub fn connectionProfileForRoute(self: *const Self, id: []const u8) !connection_registry.Profile {
+        var profile = try self.connectionProfile(id);
+        if (!self.credentialMatchesSelectedConnection()) return profile;
+        const selected = try self.selectedConnectionProfile();
+        if (!std.mem.eql(u8, profile.id, selected.id)) return profile;
+        const credential = self.selected_credential orelse return profile;
+        profile.credential_ref = @constCast(@tagName(credential.source));
+        return profile;
     }
 
     /// Resolves one owned credential from an admitted reference without
@@ -664,18 +693,71 @@ pub const Runtime = struct {
         alloc: Allocator,
         reference: []const u8,
     ) !credentials.Credential {
-        const preferred = if (std.mem.eql(u8, reference, "automatic"))
-            null
-        else
-            types.parseCredentialSource(reference) orelse return error.InvalidCredentialReference;
-        const resolution = try credentials.resolvePreferring(
+        var profile = try self.selectedConnectionProfile();
+        profile.credential_ref = @constCast(reference);
+        return self.resolveProfileCredential(alloc, profile, .if_needed, null);
+    }
+
+    pub fn resolveProfileCredential(
+        self: *const Self,
+        alloc: Allocator,
+        profile: connection_registry.Profile,
+        mode: adapter_auth.RefreshMode,
+        current_source_id: ?[]const u8,
+    ) !credentials.Credential {
+        return self.resolveProfileCredentialWithSourceResolution(
             alloc,
-            self.oauth_transport,
-            self.secret_store,
-            .refresh_if_needed,
-            preferred,
+            profile,
+            mode,
+            current_source_id,
+            .allow_fallback,
         );
-        return resolution.credential orelse error.MissingCredential;
+    }
+
+    pub fn resolveExactProfileCredential(
+        self: *const Self,
+        alloc: Allocator,
+        profile: connection_registry.Profile,
+        mode: adapter_auth.RefreshMode,
+        current_source_id: ?[]const u8,
+    ) !credentials.Credential {
+        return self.resolveProfileCredentialWithSourceResolution(
+            alloc,
+            profile,
+            mode,
+            current_source_id,
+            .exact,
+        );
+    }
+
+    fn resolveProfileCredentialWithSourceResolution(
+        self: *const Self,
+        alloc: Allocator,
+        profile: connection_registry.Profile,
+        mode: adapter_auth.RefreshMode,
+        current_source_id: ?[]const u8,
+        source_resolution: adapter_auth.SourceResolution,
+    ) !credentials.Credential {
+        const auth = try self.adapter_registry.resolveAuthForProfile(profile);
+        const acquisition = try auth.acquire(alloc, .{
+            .profile = profile,
+            .host = self.authHost(),
+            .mode = mode,
+            .source_resolution = source_resolution,
+            .current_source_id = current_source_id,
+        });
+        var normalized = switch (acquisition) {
+            .acquired => |value| value,
+            .missing => return error.MissingCredential,
+            .failed => |failure| return switch (failure.category) {
+                .configuration => error.InvalidCredentialReference,
+                .cancelled => error.Cancelled,
+                else => error.CredentialAcquisitionFailed,
+            },
+            .cancelled => return error.Cancelled,
+        };
+        defer normalized.deinit(alloc);
+        return takeAdapterCredential(&normalized) orelse error.InvalidCredentialReference;
     }
 
     pub fn addConnection(self: *Self, input: connection_registry.ProfileInput) !void {
@@ -714,7 +796,10 @@ pub const Runtime = struct {
     }
 
     pub fn recordSelectedAuthenticationFailure(self: *Self, alloc: Allocator) void {
-        self.clearCredential(alloc);
+        const profile = self.selectedConnectionProfile() catch return;
+        const auth = self.adapter_registry.resolveAuthForProfile(profile) catch return;
+        const invalidation = auth.invalidate(profile, .{ .category = .denied }) catch return;
+        if (invalidation.drop_credential) self.clearCredential(alloc);
         const connections = if (self.connections) |*value| value else return;
         connections.markSelectedDisconnected(.authentication_failed);
     }
@@ -785,12 +870,26 @@ pub const Runtime = struct {
     }
 
     fn statusSnapshotAt(self: *const Self, now_ms: i64) StatusSnapshot {
-        if (!self.credentialMatchesSelectedConnection()) return .{};
-        const credential = self.selected_credential orelse return .{};
+        if (!self.credentialMatchesSelectedConnection()) return self.disconnectedStatusSnapshot();
+        const credential = self.selected_credential orelse return self.disconnectedStatusSnapshot();
         return .{
             .active_source = credential.source,
             .team = displayTeam(credential),
             .expired = credential.needsRefreshAt(now_ms),
+        };
+    }
+
+    fn disconnectedStatusSnapshot(self: *const Self) StatusSnapshot {
+        const failure: ?adapter_auth.FailureCategory = if (self.connections) |*connections|
+            switch (connections.selectedProfile().auth) {
+                .disconnected => |reason| if (reason == .invalid_credential_reference) .configuration else null,
+                .connected => null,
+            }
+        else
+            null;
+        return .{
+            .stored_key_status = self.stored_key_status,
+            .failure = failure,
         };
     }
 
@@ -823,6 +922,7 @@ pub const Runtime = struct {
     }
 
     pub fn refreshSourceInventory(self: *Self, alloc: Allocator) !void {
+        _ = try self.adapter_registry.resolveAuthForProfile(try self.selectedConnectionProfile());
         try self.refreshSourceInventoryWithProbe(alloc, self, probeCredentialSource);
     }
 
@@ -868,10 +968,10 @@ pub const Runtime = struct {
             .include_skip = self.picker_include_skip,
             .stage = self.picker_stage,
             .fx_login_session_available = self.fx_login_session_available,
-            .teams = if (self.team_selection) |*selection| selection.teams.items else &.{},
-            .current_team = if (self.team_selection) |*selection| selection.currentTeam() else null,
+            .teams = if (self.team_selection) |*selection| selection.teams else &.{},
+            .current_team = if (self.team_selection) |*selection| selection.current_team else null,
             .team_query = self.team_query.items,
-            .sign_in = self.sign_in_flow.snapshot(),
+            .sign_in = if (self.sign_in_session_active) self.sign_in_session.snapshot() else .{},
             .api_key_mask_count = @min(self.api_key_input.items.len, max_api_key_mask_glyphs),
         };
     }
@@ -892,7 +992,7 @@ pub const Runtime = struct {
         return true;
     }
 
-    pub fn openTeamPicker(self: *Self, alloc: Allocator, selection: *login_flow.TeamSelection) void {
+    pub fn openTeamPicker(self: *Self, alloc: Allocator, selection: *adapter_auth.TeamSelection) void {
         self.exitSignInStage(alloc);
         self.exitApiKeyStage(alloc, .screen_replacement);
         self.clearTeamSelection(alloc);
@@ -967,7 +1067,18 @@ pub const Runtime = struct {
 
     fn openSignInPickerWithParent(self: *Self, alloc: Allocator, returns_to_root: bool) !bool {
         self.exitSignInStage(alloc);
-        if (!try self.sign_in_flow.start(alloc, self.oauth_transport)) return false;
+        const profile = try self.selectedConnectionProfile();
+        const auth = try self.adapter_registry.resolveAuthForProfile(profile);
+        const outcome = try auth.startSignIn(alloc, profile, self.authHost());
+        switch (outcome) {
+            .started => |session| {
+                self.sign_in_session = session;
+                self.sign_in_session_active = true;
+            },
+            .busy => return false,
+            .cancelled => return error.Cancelled,
+            .failed => |failure| return errorForAuthFailure(failure),
+        }
         self.exitApiKeyStage(alloc, .screen_replacement);
         self.clearTeamSelection(alloc);
         self.picker_active = true;
@@ -983,11 +1094,12 @@ pub const Runtime = struct {
 
     pub fn signInBrowserUrlAlloc(self: *Self, alloc: Allocator) !?[]u8 {
         if (!self.signInEntryActive()) return null;
-        return self.sign_in_flow.browserUrlAlloc(alloc);
+        return self.sign_in_session.browserUrlAlloc(alloc);
     }
 
-    pub fn pollSignInTransition(self: *Self, alloc: Allocator) login_flow.SignInTransition {
-        return self.sign_in_flow.pollTransition(alloc);
+    pub fn pollSignInTransition(self: *Self, alloc: Allocator) !adapter_auth.SignInTransition {
+        if (!self.sign_in_session_active) return .none;
+        return self.sign_in_session.poll(alloc);
     }
 
     pub fn pulseSignIn(self: *Self, alloc: Allocator) void {
@@ -1075,7 +1187,7 @@ pub const Runtime = struct {
 
         if (stage == .sign_in) {
             const returns_to_root = self.sign_in_returns_to_root;
-            _ = self.sign_in_flow.cancel(alloc);
+            self.clearSignInSession(alloc);
             self.sign_in_returns_to_root = false;
             if (!returns_to_root) {
                 self.picker_active = false;
@@ -1157,11 +1269,11 @@ pub const Runtime = struct {
 
     fn exitSignInStage(self: *Self, alloc: Allocator) void {
         if (self.picker_stage != .sign_in) return;
-        _ = self.sign_in_flow.cancel(alloc);
+        self.clearSignInSession(alloc);
         self.sign_in_returns_to_root = false;
     }
 
-    pub fn teamSelection(self: *Self) ?*login_flow.TeamSelection {
+    pub fn teamSelection(self: *Self) ?*adapter_auth.TeamSelection {
         if (!self.picker_active or self.picker_stage != .change_team) return null;
         return if (self.team_selection) |*selection| selection else null;
     }
@@ -1225,7 +1337,7 @@ pub const Runtime = struct {
         self.credential_connection_id_len = 0;
     }
 
-    pub fn adoptSelectedTeam(self: *Self, alloc: Allocator, selected_team: *login_flow.SelectedTeam) bool {
+    pub fn adoptSelectedTeam(self: *Self, alloc: Allocator, selected_team: *adapter_auth.SelectedTeam) bool {
         const credential = if (self.selected_credential) |*selected| selected else return false;
         if (credential.source != .fx_login) return false;
 
@@ -1254,26 +1366,95 @@ pub const Runtime = struct {
     }
 
     pub fn selectSource(self: *Self, alloc: Allocator, source: credentials.Source) !?bool {
-        return self.selectSourceWithLoader(alloc, source, self, loadRuntimeCredentialSource);
+        var profile = try self.selectedConnectionProfile();
+        profile.credential_ref = @constCast(@tagName(source));
+        var credential = self.resolveProfileCredentialWithSourceResolution(
+            alloc,
+            profile,
+            .if_needed,
+            @tagName(source),
+            .exact,
+        ) catch |err| switch (err) {
+            error.MissingCredential => return null,
+            else => return err,
+        };
+        defer credential.deinit(alloc);
+        if (credential.source != source) return error.CredentialSourceMismatch;
+        return self.adoptCredential(alloc, &credential);
     }
 
     pub fn refreshFxLoginIfNeeded(self: *Self, alloc: Allocator) !bool {
         const source = self.credentialSource() orelse return false;
         if (source != .fx_login) return false;
-
-        const loaded = (try credentials.loadFxLoginCredential(alloc, self.oauth_transport)) orelse {
-            if (self.credentialNeedsRefresh()) return error.CredentialRefreshUnavailable;
-            return false;
+        const profile = try self.selectedConnectionProfile();
+        var credential = self.resolveProfileCredentialWithSourceResolution(
+            alloc,
+            profile,
+            .if_needed,
+            @tagName(source),
+            .exact,
+        ) catch |err| switch (err) {
+            error.MissingCredential => {
+                if (self.credentialNeedsRefresh()) return error.CredentialRefreshUnavailable;
+                return false;
+            },
+            else => return err,
         };
-        var credential = loaded;
         defer credential.deinit(alloc);
         return self.adoptCredential(alloc, &credential);
     }
 
-    /// Drops the current selection and re-runs precedence after the user clears
-    /// a remembered credential source.
+    pub fn refreshSelectedCredential(self: *Self, alloc: Allocator, mode: adapter_auth.RefreshMode) !?[]u8 {
+        const source = self.credentialSource() orelse return null;
+        const profile = try self.selectedConnectionProfile();
+        var credential = self.resolveProfileCredentialWithSourceResolution(
+            alloc,
+            profile,
+            mode,
+            @tagName(source),
+            .exact,
+        ) catch |err| switch (err) {
+            error.MissingCredential => return null,
+            else => return err,
+        };
+        defer credential.deinit(alloc);
+        const token = credential.token;
+        credential.token = &.{};
+        return token;
+    }
+
+    pub fn logoutSelected(self: *Self, alloc: Allocator) !adapter_auth.LogoutOutcome {
+        const profile = try self.selectedConnectionProfile();
+        const auth = try self.adapter_registry.resolveAuthForProfile(profile);
+        return auth.logout(alloc, profile, self.authHost());
+    }
+
+    pub fn loadSelectedTeams(self: *Self, alloc: Allocator) !adapter_auth.TeamsOutcome {
+        const profile = try self.selectedConnectionProfile();
+        const auth = try self.adapter_registry.resolveAuthForProfile(profile);
+        return auth.loadTeams(alloc, profile, self.authHost());
+    }
+
+    /// Drops the current selection and re-runs precedence. Distinct from the
+    /// logout reconcile, which only acts when a login was active: clearing a
+    /// remembered choice can leave any source selected, and leaving it in place
+    /// would keep the session on the source the user just un-remembered.
     pub fn reselectByPrecedence(self: *Self, alloc: Allocator) !bool {
-        return self.reselectByPrecedenceWithDeps(alloc, self, probeCredentialSource, loadRuntimeCredentialSource);
+        const previous = self.credentialSource();
+        self.clearCredential(alloc);
+        var profile = try self.selectedConnectionProfile();
+        profile.credential_ref = @constCast("automatic");
+        var credential = self.resolveProfileCredential(alloc, profile, .if_needed, null) catch |err| switch (err) {
+            error.MissingCredential => {
+                self.onboarding_skipped = false;
+                return previous != null;
+            },
+            else => return err,
+        };
+        defer credential.deinit(alloc);
+        _ = self.adoptCredential(alloc, &credential);
+        try self.refreshSourceInventory(alloc);
+        return self.credentialSource() != previous;
     }
 
     fn reselectByPrecedenceWithDeps(
@@ -1299,12 +1480,27 @@ pub const Runtime = struct {
     }
 
     pub fn reconcileAfterFxLoginLogout(self: *Self, alloc: Allocator) !bool {
-        return self.reconcileAfterFxLoginLogoutWithDeps(
-            alloc,
-            self,
-            probeCredentialSource,
-            loadRuntimeCredentialSource,
-        );
+        const login_was_active = self.credentialSource() == .fx_login;
+        if (login_was_active) self.clearCredential(alloc);
+        if (!login_was_active) {
+            try self.refreshSourceInventory(alloc);
+            return false;
+        }
+
+        var profile = try self.selectedConnectionProfile();
+        profile.credential_ref = @constCast("automatic");
+        var credential = self.resolveProfileCredential(alloc, profile, .if_needed, null) catch |err| switch (err) {
+            error.MissingCredential => {
+                self.source_inventory = .empty;
+                self.onboarding_skipped = false;
+                return true;
+            },
+            else => return err,
+        };
+        defer credential.deinit(alloc);
+        _ = self.adoptCredential(alloc, &credential);
+        try self.refreshSourceInventory(alloc);
+        return true;
     }
 
     fn reconcileAfterFxLoginLogoutWithDeps(
@@ -1344,6 +1540,13 @@ pub const Runtime = struct {
         if (self.team_selection) |*selection| selection.deinit(alloc);
         self.team_selection = null;
         self.team_query.clearRetainingCapacity();
+    }
+
+    fn clearSignInSession(self: *Self, alloc: Allocator) void {
+        if (!self.sign_in_session_active) return;
+        _ = self.sign_in_session.cancel(alloc);
+        self.sign_in_session.deinit(alloc);
+        self.sign_in_session_active = false;
     }
 
     fn resetTeamPickerSelection(self: *Self) void {
@@ -1429,6 +1632,36 @@ fn optionalBytesEqual(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
     return std.mem.eql(u8, a.?, b.?);
+}
+
+pub fn takeAdapterCredential(value: *adapter_auth.Credential) ?credentials.Credential {
+    const source = types.parseCredentialSource(value.source.id) orelse return null;
+    const result = credentials.Credential{
+        .token = value.secret_bytes,
+        .source = source,
+        .team_id = value.tenant_id,
+        .team_slug = value.tenant_slug,
+        .refresh_after_ms = value.refresh_after_ms,
+    };
+    value.secret_bytes = &.{};
+    value.tenant_id = null;
+    value.tenant_slug = null;
+    return result;
+}
+
+fn errorForAuthFailure(failure: adapter_auth.Failure) anyerror {
+    return switch (failure.category) {
+        .configuration => error.AuthConfiguration,
+        .denied => error.AuthDenied,
+        .expired => error.AuthExpired,
+        .missing_session => error.AuthSessionMissing,
+        .no_teams => error.AuthTeamsMissing,
+        .session_changed => error.AuthSessionChanged,
+        .invalid_selection => error.AuthSelectionInvalid,
+        .persistence => error.AuthPersistence,
+        .cancelled => error.Cancelled,
+        .unavailable => error.AuthUnavailable,
+    };
 }
 
 fn makeTestCredential(
@@ -1542,20 +1775,60 @@ fn enterTestApiKey(runtime: *Runtime, alloc: Allocator, value: []const u8) !void
     for (value) |byte| try std.testing.expect(try runtime.appendApiKeyByte(alloc, byte));
 }
 
-fn appendTestTeam(
-    selection: *login_flow.TeamSelection,
+const TestTeamSelectionState = struct {
+    teams: []adapter_auth.Team,
+
+    fn select(raw: ?*anyopaque, alloc: Allocator, index: usize) Allocator.Error!adapter_auth.SelectOutcome {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        const team = self.teams[index];
+        const id = try alloc.dupe(u8, team.id);
+        errdefer alloc.free(id);
+        return .{ .selected = .{ .id = id, .slug = try alloc.dupe(u8, team.slug) } };
+    }
+
+    fn deinit(raw: ?*anyopaque, alloc: Allocator) void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        for (self.teams) |team| {
+            alloc.free(@constCast(team.id));
+            alloc.free(@constCast(team.slug));
+            alloc.free(@constCast(team.name));
+        }
+        alloc.free(self.teams);
+        alloc.destroy(self);
+    }
+};
+
+fn makeTestTeamSelection(
     alloc: Allocator,
-    id_value: []const u8,
-    slug_value: []const u8,
-    name_value: []const u8,
-) !void {
-    const id = try alloc.dupe(u8, id_value);
-    errdefer alloc.free(id);
-    const slug = try alloc.dupe(u8, slug_value);
-    errdefer alloc.free(slug);
-    const name = try alloc.dupe(u8, name_value);
-    errdefer alloc.free(name);
-    try selection.teams.append(alloc, .{ .id = id, .slug = slug, .name = name });
+    inputs: []const adapter_auth.Team,
+    current_team: ?[]const u8,
+) !adapter_auth.TeamSelection {
+    const state = try alloc.create(TestTeamSelectionState);
+    errdefer alloc.destroy(state);
+    state.teams = try alloc.alloc(adapter_auth.Team, inputs.len);
+    errdefer alloc.free(state.teams);
+    var initialized: usize = 0;
+    errdefer for (state.teams[0..initialized]) |team| {
+        alloc.free(@constCast(team.id));
+        alloc.free(@constCast(team.slug));
+        alloc.free(@constCast(team.name));
+    };
+    for (inputs, 0..) |input, index| {
+        const id = try alloc.dupe(u8, input.id);
+        errdefer alloc.free(id);
+        const slug = try alloc.dupe(u8, input.slug);
+        errdefer alloc.free(slug);
+        const name = try alloc.dupe(u8, input.name);
+        state.teams[index] = .{ .id = id, .slug = slug, .name = name };
+        initialized += 1;
+    }
+    return .{
+        .context = state,
+        .teams = state.teams,
+        .current_team = current_team,
+        .select_fn = TestTeamSelectionState.select,
+        .deinit_fn = TestTeamSelectionState.deinit,
+    };
 }
 
 fn expectApiKeyAllocationCleared(
@@ -1566,17 +1839,6 @@ fn expectApiKeyAllocationCleared(
     try std.testing.expectEqual(@as(usize, 0), runtime.api_key_input.items.len);
     try std.testing.expectEqual(@as(usize, 0), runtime.api_key_input.capacity);
     try std.testing.expect(std.mem.indexOf(u8, backing, sentinel) == null);
-}
-
-test "auth runtime token refresher ignores non-refreshable credential sources" {
-    for ([_]credentials.Source{ .vercel_oidc_token, .ai_gateway_api_key, .stored_key }) |source| {
-        try std.testing.expect((try refreshFxLoginToken(
-            oauth_transport.unavailable_provider,
-            std.testing.allocator,
-            source,
-            .force,
-        )) == null);
-    }
 }
 
 test "auth failure snapshot names every selected source without exposing styling" {
@@ -1795,6 +2057,19 @@ test "auth status snapshot preserves display team and surface-specific missing h
     const selected = runtime.statusSnapshot();
     try std.testing.expectEqualStrings("vercel-labs", selected.team.?);
     try std.testing.expect(selected.missingHelp(.cli) == null);
+}
+
+test "auth status keeps an invalid credential reference distinct from missing" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var connections = try initTestConnectionRegistry(alloc);
+    connections.markSelectedDisconnected(.invalid_credential_reference);
+    runtime.adoptConnections(alloc, &connections);
+
+    const status = runtime.statusSnapshot();
+    try std.testing.expectEqualStrings("invalid_configuration", status.activeSourceLabel());
+    try std.testing.expect(status.missingHelp(.cli) == null);
 }
 
 test "auth status snapshot distinguishes an absent store from an unreadable one" {
@@ -2200,9 +2475,12 @@ test "change team stage owns fetched rows and releases them when popped" {
     defer runtime.deinit(alloc);
     runtime.openPicker(alloc);
 
-    var selection: login_flow.TeamSelection = .{};
+    var selection = try makeTestTeamSelection(alloc, &.{.{
+        .id = "team_123",
+        .slug = "vercel-labs",
+        .name = "Vercel Labs",
+    }}, null);
     defer selection.deinit(alloc);
-    try appendTestTeam(&selection, alloc, "team_123", "vercel-labs", "Vercel Labs");
 
     runtime.openTeamPicker(alloc, &selection);
     const team_view = runtime.pickerView();
@@ -2221,28 +2499,22 @@ test "change team search filters by name and slug without losing original indexe
     defer runtime.deinit(alloc);
     runtime.openPicker(alloc);
 
-    var selection: login_flow.TeamSelection = .{};
+    var selection = try makeTestTeamSelection(alloc, &.{
+        .{ .id = "team_456", .slug = "other-team", .name = "Other Team" },
+        .{ .id = "team_123", .slug = "example-playground", .name = "Example Playground" },
+        .{ .id = "team_789", .slug = "zero-conf", .name = "Zero Conf" },
+    }, null);
     defer selection.deinit(alloc);
-    try appendTestTeam(&selection, alloc, "team_456", "other-team", "Other Team");
-    try appendTestTeam(
-        &selection,
-        alloc,
-        "team_123",
-        "example-internal-team",
-        "Example Internal Team",
-    );
-    try appendTestTeam(&selection, alloc, "team_789", "zero-conf", "Zero Conf");
-
     runtime.openTeamPicker(alloc, &selection);
-    for ("EXAMPLE") |byte| try std.testing.expect(try runtime.appendTeamQueryByte(alloc, byte));
+    for ("PLAY") |byte| try std.testing.expect(try runtime.appendTeamQueryByte(alloc, byte));
 
     const name_match = runtime.pickerView();
-    try std.testing.expectEqualStrings("EXAMPLE", name_match.team_query);
+    try std.testing.expectEqualStrings("PLAY", name_match.team_query);
     try std.testing.expectEqual(@as(usize, 1), name_match.choiceCount());
     try std.testing.expect((Choice{ .team = 1 }).eql(name_match.choiceAt(0).?));
-    try std.testing.expectEqualStrings("Example Internal Team", name_match.choiceLabel(name_match.choiceAt(0).?));
+    try std.testing.expectEqualStrings("Example Playground", name_match.choiceLabel(name_match.choiceAt(0).?));
 
-    for (0..7) |_| try std.testing.expect(runtime.deleteTeamQueryByte());
+    for (0..4) |_| try std.testing.expect(runtime.deleteTeamQueryByte());
     for ("zero-conf") |byte| try std.testing.expect(try runtime.appendTeamQueryByte(alloc, byte));
     const slug_match = runtime.pickerView();
     try std.testing.expectEqual(@as(usize, 1), slug_match.choiceCount());
@@ -2253,13 +2525,10 @@ test "change team search filters by name and slug without losing original indexe
 }
 
 test "change team view marks the session team as current" {
-    var team_id = [_]u8{ 't', 'e', 'a', 'm', '_', '1' };
-    var team_slug = [_]u8{ 'v', 'e', 'r', 'c', 'e', 'l' };
-    var team_name = [_]u8{ 'V', 'e', 'r', 'c', 'e', 'l' };
-    const teams = [_]login_flow.Team{.{
-        .id = &team_id,
-        .slug = &team_slug,
-        .name = &team_name,
+    const teams = [_]adapter_auth.Team{.{
+        .id = "team_1",
+        .slug = "vercel",
+        .name = "Vercel",
     }};
     const view = PickerView{
         .active = true,
@@ -2328,6 +2597,7 @@ test "auth runtime saves and reloads through its injected secret store" {
         fixture.validator(),
         oauth_transport.unavailable_provider,
         fixture.secretStore(),
+        .{ .adapters = &.{} },
     );
     defer runtime.deinit(alloc);
 
@@ -2647,6 +2917,90 @@ fn initTestConnectionRegistry(alloc: Allocator) !connection_registry.Runtime {
     );
 }
 
+test "auth runtime preserves every adapter acquisition outcome" {
+    const AcquireProbe = struct {
+        outcome: enum { acquired, missing, configuration, failed, cancelled } = .acquired,
+        calls: usize = 0,
+
+        fn acquire(raw: *const anyopaque, alloc: Allocator, _: adapter_auth.Request) Allocator.Error!adapter_auth.Acquisition {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            return switch (self.outcome) {
+                .acquired => .{ .acquired = .{
+                    .secret_bytes = try alloc.dupe(u8, "adapter-secret"),
+                    .source = .{ .id = "ai_gateway_api_key", .label = "test key", .refreshable = false },
+                    .catalog_access = .authenticated,
+                } },
+                .missing => .{ .missing = .unavailable },
+                .configuration => .{ .failed = .{ .category = .configuration } },
+                .failed => .{ .failed = .{ .category = .unavailable } },
+                .cancelled => .cancelled,
+            };
+        }
+    };
+    const alloc = std.testing.allocator;
+    var probe: AcquireProbe = .{};
+    const auth = adapter_auth.Provider{
+        .kind = "vercel_ai_gateway",
+        .context = &probe,
+        .acquire_fn = AcquireProbe.acquire,
+    };
+    const adapters = [_]stream_provider.ProviderAdapter{.{
+        .kind = "vercel_ai_gateway",
+        .auth = auth,
+        .stream_fn = stream_provider.unavailable_adapter.stream_fn,
+    }};
+    var runtime: Runtime = .{ .adapter_registry = try adapter_registry.AdapterRegistry.init(&adapters) };
+    defer runtime.deinit(alloc);
+    var connections = try initTestConnectionRegistry(alloc);
+    runtime.adoptConnections(alloc, &connections);
+    const profile = try runtime.selectedConnectionProfile();
+
+    var credential = try runtime.resolveProfileCredential(alloc, profile, .if_needed, null);
+    credential.deinit(alloc);
+    probe.outcome = .missing;
+    try std.testing.expectError(error.MissingCredential, runtime.resolveProfileCredential(alloc, profile, .if_needed, null));
+    probe.outcome = .configuration;
+    try std.testing.expectError(error.InvalidCredentialReference, runtime.resolveProfileCredential(alloc, profile, .if_needed, null));
+    probe.outcome = .failed;
+    try std.testing.expectError(error.CredentialAcquisitionFailed, runtime.resolveProfileCredential(alloc, profile, .force, "fx_login"));
+    probe.outcome = .cancelled;
+    try std.testing.expectError(error.Cancelled, runtime.resolveProfileCredential(alloc, profile, .if_needed, null));
+    try std.testing.expectEqual(@as(usize, 5), probe.calls);
+}
+
+test "route profile preserves the acquired source when preference persistence fails" {
+    const alloc = std.testing.allocator;
+    var connections = try initTestConnectionRegistry(alloc);
+    try connections.add(.{
+        .id = "peer",
+        .display_name = "Peer",
+        .adapter_id = "test_peer",
+        .credential_ref = "peer_key",
+        .remembered_model = "model/peer",
+    });
+
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.adoptConnections(alloc, &connections);
+    var credential = try makeTestCredential(alloc, "login-token", .fx_login, null, null);
+    defer credential.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &credential);
+
+    var persistence: ConnectionSelectionPersistence = .{};
+    runtime.connections.?.persistence = .{
+        .context = &persistence,
+        .write_fn = ConnectionSelectionPersistence.write,
+    };
+    try std.testing.expectError(
+        error.ConnectionWriteFailed,
+        runtime.rememberSelectedCredentialReference("fx_login"),
+    );
+    try std.testing.expectEqualStrings("automatic", (try runtime.selectedConnectionProfile()).credential_ref);
+    try std.testing.expectEqualStrings("fx_login", (try runtime.connectionProfileForRoute("vercel")).credential_ref);
+    try std.testing.expectEqualStrings("peer_key", (try runtime.connectionProfileForRoute("peer")).credential_ref);
+}
+
 test "credentials are bound to the selected connection and invalid auth disconnects it" {
     const alloc = std.testing.allocator;
     var connections = try connection_registry.Runtime.init(
@@ -2671,6 +3025,21 @@ test "credentials are bound to the selected connection and invalid auth disconne
 
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
+    const Invalidating = struct {
+        fn invalidate(_: *const anyopaque, _: connection_registry.Profile, _: adapter_auth.Failure) adapter_auth.Invalidation {
+            return .{ .drop_credential = true };
+        }
+    };
+    const auth = adapter_auth.Provider{
+        .kind = "vercel_ai_gateway",
+        .invalidate_fn = Invalidating.invalidate,
+    };
+    const adapters = [_]stream_provider.ProviderAdapter{.{
+        .kind = "vercel_ai_gateway",
+        .auth = auth,
+        .stream_fn = stream_provider.unavailable_adapter.stream_fn,
+    }};
+    runtime.adapter_registry = try adapter_registry.AdapterRegistry.init(&adapters);
     runtime.adoptConnections(alloc, &connections);
     var credential = credentials.Credential{
         .token = try alloc.dupe(u8, "vercel-secret"),

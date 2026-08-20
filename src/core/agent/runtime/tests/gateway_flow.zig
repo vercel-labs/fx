@@ -5806,15 +5806,9 @@ test "processQueuedPrompt keeps the selected fx login credential when forced ref
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
 }
 
-test "processQueuedPrompt reports the selected login after refresh failure without fallback" {
+test "processQueuedPrompt stops before Gateway after conditional refresh failure" {
     const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{
-        .{
-            .status = .unauthorized,
-            .err_body = "{\"error\":{\"message\":\"expired\"}}",
-        },
-        .{ .content = "must not be requested" },
-    };
+    const completions = [_]FakeCompletion{.{ .content = "must not be requested" }};
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -5824,16 +5818,14 @@ test "processQueuedPrompt reports the selected login after refresh failure witho
     var fixture = PromptFixture{};
     const job = fixture.job();
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    try std.testing.expectError(
+        error.OAuthRequestFailed,
+        runFakePrompt(&gateway, &hooks, fixture.config(), job),
+    );
 
-    try std.testing.expectEqual(@as(usize, 1), gateway.request_api_keys.items.len);
-    try std.testing.expectEqualStrings("key", gateway.request_api_keys.items[0]);
-    try std.testing.expectEqual(@as(usize, 2), hooks.credential_refresh_modes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), gateway.request_api_keys.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.credential_refresh_modes.items.len);
     try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.if_needed, hooks.credential_refresh_modes.items[0]);
-    try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.force, hooks.credential_refresh_modes.items[1]);
-    try std.testing.expectEqual(std.http.Status.unauthorized, hooks.http_status.?);
-    try std.testing.expectEqual(types.CredentialSource.fx_login, hooks.http_credential_source.?);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
 }
 
 test "processQueuedPrompt does not refresh or retry non-refreshable credential sources" {

@@ -2,9 +2,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const api_key_validator_contract = @import("../core/auth/api_key_validator.zig");
+const adapter_auth = @import("../core/gateway/adapter_auth.zig");
+const adapter_registry = @import("../core/gateway/adapter_registry.zig");
 const agent_stream_provider_contract = @import("../core/agent/stream_provider.zig");
 const agent_runtime_telemetry = @import("../core/agent/runtime/telemetry.zig");
 const credentials = @import("../core/auth/credentials.zig");
+const login_flow = @import("../core/auth/login_flow.zig");
+const oauth_session = @import("../core/auth/oauth_session.zig");
 const oauth_transport = @import("../core/auth/oauth_transport.zig");
 const secret = @import("../core/auth/secret.zig");
 const collections = @import("../core/shared/collections.zig");
@@ -14,6 +18,7 @@ const gateway_client = @import("../gateway/client.zig");
 const gateway_failure_diagnostics = @import("../core/gateway/gateway_failure_diagnostics.zig");
 const gateway_json = @import("../core/gateway/gateway_json.zig");
 const io_mod = @import("../core/shared/io.zig");
+const host = @import("../core/hosts/host.zig");
 const gateway_generation_usage = @import("../gateway/generation_usage.zig");
 const connection_registry = @import("../core/gateway/connection_registry.zig");
 const route_snapshot_contract = @import("../core/gateway/route_snapshot.zig");
@@ -141,8 +146,32 @@ pub const agent_stream_provider = agent_stream_provider_contract.Provider{
     .stream_fn = streamAgentCompletion,
 };
 
+/// The transport must outlive every operation through the returned provider.
+pub fn auth_provider_for_transport(transport: *const oauth_transport.Provider) adapter_auth.Provider {
+    return .{
+        .kind = connection_seed.adapter_id,
+        .context = transport,
+        .acquire_fn = acquireVercelCredential,
+        .logout_fn = logoutVercel,
+        .start_sign_in_fn = startVercelSignIn,
+        .load_teams_fn = loadVercelTeams,
+        .invalidate_fn = invalidateVercelCredential,
+        .status_fn = loadVercelStatus,
+    };
+}
+
+fn native_auth_provider() adapter_auth.Provider {
+    var value = auth_provider_for_transport(&oauth_transport_provider);
+    value.login_fn = runVercelLogin;
+    value.teams_fn = runVercelTeams;
+    return value;
+}
+
+pub const auth_provider = native_auth_provider();
+
 pub const provider_adapter = agent_stream_provider_contract.ProviderAdapter{
     .kind = connection_seed.adapter_id,
+    .auth = auth_provider,
     .account_usage = account_usage,
     .generation_usage = generation_usage_provider,
     .model_catalog = model_catalog_provider,
@@ -152,13 +181,384 @@ pub const provider_adapter = agent_stream_provider_contract.ProviderAdapter{
     .stream_fn = streamVercelAdapter,
 };
 
+const production_adapters = [_]agent_stream_provider_contract.ProviderAdapter{provider_adapter};
+
+pub const production_adapter_registry = adapter_registry.AdapterRegistry{
+    .adapters = &production_adapters,
+};
+
 pub const provider = gateway_provider.Provider{
     .connection_seed = connection_seed,
     .agent_stream = agent_stream_provider,
     .provider_adapter = provider_adapter,
+    .adapter_registry = production_adapter_registry,
     .oauth_transport = oauth_transport_provider,
     .chat_url = chat_url_provider,
 };
+
+fn vercelTransport(raw: *const anyopaque) oauth_transport.Provider {
+    return @as(*const oauth_transport.Provider, @ptrCast(@alignCast(raw))).*;
+}
+
+fn credentialSourceFromReference(reference: []const u8) !?credentials.Source {
+    if (std.mem.eql(u8, reference, "automatic")) return null;
+    return shared_types.parseCredentialSource(reference) orelse error.InvalidCredentialReference;
+}
+
+fn normalizeAuthFailure(err: anyerror) adapter_auth.Failure {
+    return .{ .category = switch (err) {
+        error.ClientIdMissing, error.InvalidCredentialReference => .configuration,
+        error.AccessDenied => .denied,
+        error.ExpiredToken, error.LoginTimedOut => .expired,
+        error.NoSession => .missing_session,
+        error.NoTeams => .no_teams,
+        error.SessionChanged => .session_changed,
+        error.InvalidTeamSelection => .invalid_selection,
+        error.SessionDeleteFailed => .persistence,
+        error.Cancelled => .cancelled,
+        else => .unavailable,
+    } };
+}
+
+fn normalizedSource(source: credentials.Source) adapter_auth.Source {
+    return .{
+        .id = @tagName(source),
+        .label = credentials.sourceLabel(source),
+        .refreshable = credentials.sourceRefreshable(source),
+    };
+}
+
+fn normalizedCatalogAccess(access: credentials.CatalogAccess) adapter_auth.CatalogAccess {
+    return switch (access) {
+        .authenticated => .authenticated,
+        .public_only => |value| .{ .public_only = switch (value) {
+            .no_credential => .no_credential,
+            .fx_login_team_required => .tenant_required,
+            .fx_login_refresh_required => .refresh_required,
+            .credential_refresh_failed => .refresh_failed,
+            .authenticated_credential_rejected => .credential_rejected,
+        } },
+    };
+}
+
+fn takeNormalizedCredential(credential: *credentials.Credential) adapter_auth.Credential {
+    const source = credential.source;
+    const catalog_access = normalizedCatalogAccess(credentials.catalogAccessAt(credential.*, io_mod.milliTimestamp()));
+    const result = adapter_auth.Credential{
+        .secret_bytes = credential.token,
+        .source = normalizedSource(source),
+        .tenant_id = credential.team_id,
+        .tenant_slug = credential.team_slug,
+        .refresh_after_ms = credential.refresh_after_ms,
+        .catalog_access = catalog_access,
+    };
+    credential.token = &.{};
+    credential.team_id = null;
+    credential.team_slug = null;
+    return result;
+}
+
+fn normalizedStoreStatus(status: credentials.StoredKeyReadStatus) adapter_auth.StoreStatus {
+    return switch (status) {
+        .not_attempted => .not_attempted,
+        .not_found => .not_found,
+        .unavailable => .unavailable,
+    };
+}
+
+fn normalizedAcquisitionFailure(err: anyerror) adapter_auth.Acquisition {
+    const failure = normalizeAuthFailure(err);
+    return if (failure.category == .cancelled) .cancelled else .{ .failed = failure };
+}
+
+fn acquireVercelCredential(
+    raw: *const anyopaque,
+    alloc: Allocator,
+    request: adapter_auth.Request,
+) Allocator.Error!adapter_auth.Acquisition {
+    const transport = vercelTransport(raw);
+
+    const resolution = switch (request.mode) {
+        .stored, .if_needed => acquisition: {
+            const source = credentialSourceFromReference(
+                request.current_source_id orelse request.profile.credential_ref,
+            ) catch return .{ .failed = .{ .category = .configuration } };
+            const resolved = switch (request.source_resolution) {
+                .allow_fallback => credentials.resolvePreferring(
+                    alloc,
+                    transport,
+                    request.host.secret_store,
+                    if (request.mode == .stored) .stored else .refresh_if_needed,
+                    source,
+                ),
+                .exact => if (source) |selected|
+                    credentials.resolveExact(
+                        alloc,
+                        transport,
+                        request.host.secret_store,
+                        if (request.mode == .stored) .stored else .refresh_if_needed,
+                        selected,
+                    )
+                else
+                    return .{ .missing = .not_attempted },
+            } catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                return normalizedAcquisitionFailure(err);
+            };
+            break :acquisition resolved;
+        },
+        .force => force: {
+            const source_id = request.current_source_id orelse
+                return .{ .failed = .{ .category = .configuration } };
+            if (!std.mem.eql(u8, source_id, @tagName(credentials.Source.fx_login))) {
+                return .{ .failed = .{ .category = .unavailable } };
+            }
+            const credential = credentials.refreshFxLoginCredential(alloc, transport) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                return normalizedAcquisitionFailure(err);
+            };
+            if (credential == null) return .{ .missing = .not_attempted };
+            break :force credentials.Resolution{ .credential = credential };
+        },
+    };
+    if (resolution.credential) |value| {
+        var credential = value;
+        defer credential.deinit(alloc);
+        return .{ .acquired = takeNormalizedCredential(&credential) };
+    }
+    return .{ .missing = normalizedStoreStatus(resolution.stored_key_status) };
+}
+
+fn runVercelLogin(
+    raw: *const anyopaque,
+    alloc: Allocator,
+    _: connection_registry.Profile,
+    auth_host: adapter_auth.AuthHost,
+) Allocator.Error!adapter_auth.OperationOutcome {
+    login_flow.runLogin(alloc, vercelTransport(raw), auth_host.url_opener) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        const failure = normalizeAuthFailure(err);
+        return if (failure.category == .cancelled) .cancelled else .{ .failed = failure };
+    };
+    return .succeeded;
+}
+
+fn logoutVercel(
+    raw: *const anyopaque,
+    alloc: Allocator,
+    _: connection_registry.Profile,
+    _: adapter_auth.AuthHost,
+) Allocator.Error!adapter_auth.LogoutOutcome {
+    const result = login_flow.logout(alloc, vercelTransport(raw)) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .failed = normalizeAuthFailure(err) };
+    };
+    return .{ .completed = .{
+        .session_deleted = result.session_deleted,
+        .local_durability_failed = result.local_durability_failed,
+        .remote_revocation_failed = result.remote_revocation_failed,
+    } };
+}
+
+fn runVercelTeams(
+    raw: *const anyopaque,
+    alloc: Allocator,
+    _: connection_registry.Profile,
+    _: adapter_auth.AuthHost,
+) Allocator.Error!adapter_auth.OperationOutcome {
+    login_flow.runTeams(alloc, vercelTransport(raw)) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        const failure = normalizeAuthFailure(err);
+        return if (failure.category == .cancelled) .cancelled else .{ .failed = failure };
+    };
+    return .succeeded;
+}
+
+const VercelTeamSelection = struct {
+    selection: login_flow.TeamSelection,
+    teams: []adapter_auth.Team,
+};
+
+fn takeVercelTeamSelection(
+    alloc: Allocator,
+    selection: *login_flow.TeamSelection,
+) Allocator.Error!adapter_auth.TeamSelection {
+    const team_count = selection.teams.items.len;
+    const state = try alloc.create(VercelTeamSelection);
+    errdefer alloc.destroy(state);
+    state.* = .{
+        .selection = selection.take(),
+        .teams = &.{},
+    };
+    errdefer state.selection.deinit(alloc);
+    state.teams = try alloc.alloc(adapter_auth.Team, team_count);
+    for (state.selection.teams.items, 0..) |team, index| {
+        state.teams[index] = .{ .id = team.id, .slug = team.slug, .name = team.name };
+    }
+    return .{
+        .context = state,
+        .teams = state.teams,
+        .current_team = state.selection.currentTeam(),
+        .select_fn = selectVercelTeam,
+        .deinit_fn = deinitVercelTeamSelection,
+    };
+}
+
+fn selectVercelTeam(raw: ?*anyopaque, alloc: Allocator, index: usize) Allocator.Error!adapter_auth.SelectOutcome {
+    const state: *VercelTeamSelection = @ptrCast(@alignCast(raw.?));
+    const selected = state.selection.select(alloc, index) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .failed = normalizeAuthFailure(err) };
+    };
+    return .{ .selected = .{ .id = selected.id, .slug = selected.slug } };
+}
+
+fn deinitVercelTeamSelection(raw: ?*anyopaque, alloc: Allocator) void {
+    const state: *VercelTeamSelection = @ptrCast(@alignCast(raw.?));
+    state.selection.deinit(alloc);
+    alloc.free(state.teams);
+    alloc.destroy(state);
+}
+
+const VercelSignIn = struct {
+    runtime: login_flow.SignInRuntime = .{},
+};
+
+fn startVercelSignIn(
+    raw: *const anyopaque,
+    alloc: Allocator,
+    _: connection_registry.Profile,
+    _: adapter_auth.AuthHost,
+) Allocator.Error!adapter_auth.StartSignInOutcome {
+    const state = try alloc.create(VercelSignIn);
+    state.* = .{};
+    const started = state.runtime.start(alloc, vercelTransport(raw)) catch |err| {
+        state.runtime.deinit(alloc);
+        alloc.destroy(state);
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        const failure = normalizeAuthFailure(err);
+        return if (failure.category == .cancelled) .cancelled else .{ .failed = failure };
+    };
+    if (!started) {
+        state.runtime.deinit(alloc);
+        alloc.destroy(state);
+        return .busy;
+    }
+    return .{ .started = .{
+        .context = state,
+        .snapshot_fn = snapshotVercelSignIn,
+        .browser_url_fn = vercelSignInBrowserUrl,
+        .poll_fn = pollVercelSignIn,
+        .cancel_fn = cancelVercelSignIn,
+        .deinit_fn = deinitVercelSignIn,
+    } };
+}
+
+fn snapshotVercelSignIn(raw: ?*anyopaque) adapter_auth.SignInSnapshot {
+    const state: *VercelSignIn = @ptrCast(@alignCast(raw.?));
+    const snapshot = state.runtime.snapshot();
+    return .{
+        .state = switch (snapshot.state) {
+            .idle => .idle,
+            .polling => .polling,
+            .succeeded => .succeeded,
+            .failed => .failed,
+            .cancelled => .cancelled,
+        },
+        .verification_uri = snapshot.verification_uri,
+        .verification_uri_complete = snapshot.verification_uri_complete,
+        .user_code = snapshot.user_code,
+    };
+}
+
+fn vercelSignInBrowserUrl(raw: ?*anyopaque, alloc: Allocator) Allocator.Error!?[]u8 {
+    const state: *VercelSignIn = @ptrCast(@alignCast(raw.?));
+    return state.runtime.browserUrlAlloc(alloc);
+}
+
+fn pollVercelSignIn(raw: ?*anyopaque, alloc: Allocator) Allocator.Error!adapter_auth.SignInTransition {
+    const state: *VercelSignIn = @ptrCast(@alignCast(raw.?));
+    state.runtime.pulse(alloc);
+    return switch (state.runtime.pollTransition(alloc)) {
+        .none => .none,
+        .cancelled => .cancelled,
+        .failed => |err| .{ .failed = normalizeAuthFailure(err) },
+        .succeeded => |value| blk: {
+            var selection = value;
+            defer selection.deinit(alloc);
+            break :blk .{ .succeeded = try takeVercelTeamSelection(alloc, &selection) };
+        },
+    };
+}
+
+fn cancelVercelSignIn(raw: ?*anyopaque, alloc: Allocator) bool {
+    const state: *VercelSignIn = @ptrCast(@alignCast(raw.?));
+    return state.runtime.cancel(alloc);
+}
+
+fn deinitVercelSignIn(raw: ?*anyopaque, alloc: Allocator) void {
+    const state: *VercelSignIn = @ptrCast(@alignCast(raw.?));
+    state.runtime.deinit(alloc);
+    alloc.destroy(state);
+}
+
+fn loadVercelTeams(
+    raw: *const anyopaque,
+    alloc: Allocator,
+    _: connection_registry.Profile,
+    _: adapter_auth.AuthHost,
+) Allocator.Error!adapter_auth.TeamsOutcome {
+    var selection = login_flow.loadTeamSelection(alloc, vercelTransport(raw)) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        const failure = normalizeAuthFailure(err);
+        return if (failure.category == .cancelled) .cancelled else .{ .failed = failure };
+    };
+    defer selection.deinit(alloc);
+    return .{ .loaded = try takeVercelTeamSelection(alloc, &selection) };
+}
+
+fn invalidateVercelCredential(
+    _: *const anyopaque,
+    _: connection_registry.Profile,
+    failure: adapter_auth.Failure,
+) adapter_auth.Invalidation {
+    return .{ .drop_credential = failure.category == .denied };
+}
+
+fn loadVercelStatus(
+    raw: *const anyopaque,
+    alloc: Allocator,
+    profile: connection_registry.Profile,
+    auth_host: adapter_auth.AuthHost,
+) Allocator.Error!adapter_auth.StatusOutcome {
+    const acquisition = try acquireVercelCredential(raw, alloc, .{
+        .profile = profile,
+        .host = auth_host,
+        .mode = .stored,
+        .source_resolution = .allow_fallback,
+    });
+    var credential = switch (acquisition) {
+        .acquired => |value| value,
+        .missing => |store_status| return .{ .loaded = .{
+            .store_status = store_status,
+        } },
+        .failed => |failure| return .{ .failed = failure },
+        .cancelled => return .cancelled,
+    };
+    defer credential.deinit(alloc);
+    const owned_team = if (credential.tenant_slug) |value| blk: {
+        credential.tenant_slug = null;
+        break :blk value;
+    } else if (credential.tenant_id) |value| blk: {
+        credential.tenant_id = null;
+        break :blk value;
+    } else null;
+    return .{ .loaded = .{
+        .source = credential.source,
+        .team = owned_team,
+        .expired = if (credential.refresh_after_ms) |deadline| deadline <= io_mod.milliTimestamp() else false,
+    } };
+}
 
 const AdapterEventBridge = struct {
     events: agent_stream_provider_contract.EventSink,
@@ -3213,4 +3613,315 @@ test "gateway catalog controls are explicit ordered and bounded" {
     try std.testing.expectEqualStrings("provider/malformed", catalog.items[2].id);
     try std.testing.expectEqual(@as(usize, 0), catalog.items[2].reasoning_efforts.items.len);
     try std.testing.expect(!catalog.items[2].supports_fast_mode);
+}
+
+const AdapterAuthStoreProbe = struct {
+    loads: usize = 0,
+    value: []const u8,
+
+    fn store(self: *@This()) host.SecretStore {
+        return .{
+            .context = self,
+            .backend_label = "adapter test store",
+            .is_disabled_fn = isDisabled,
+            .load_fn = load,
+            .store_fn = write,
+            .store_interactive_fn = writeInteractive,
+        };
+    }
+
+    fn isDisabled(_: ?*anyopaque) bool {
+        return false;
+    }
+
+    fn load(raw: ?*anyopaque, alloc: Allocator) host.SecretStoreLoadError!?[]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.loads += 1;
+        return try alloc.dupe(u8, self.value);
+    }
+
+    fn write(_: ?*anyopaque, _: Allocator, _: []const u8) host.SecretStoreWriteError!void {}
+
+    fn writeInteractive(_: ?*anyopaque) host.SecretStoreWriteError!bool {
+        return false;
+    }
+};
+
+const PeerAuthProbe = struct {
+    acquire_calls: usize = 0,
+    cancel_during_acquire: ?*std.atomic.Value(bool) = null,
+
+    fn acquire(raw: *const anyopaque, alloc: Allocator, request: adapter_auth.Request) Allocator.Error!adapter_auth.Acquisition {
+        const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+        self.acquire_calls += 1;
+        const value = request.host.secret_store.load(alloc) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .missing = .unavailable };
+        } orelse return .{ .missing = .not_found };
+        if (self.cancel_during_acquire) |flag| flag.store(true, .seq_cst);
+        return .{ .acquired = .{
+            .secret_bytes = value,
+            .source = .{ .id = "peer_key", .label = "peer key", .refreshable = false },
+            .catalog_access = .authenticated,
+        } };
+    }
+};
+
+const AdapterAuthTestEnv = struct {
+    alloc: Allocator,
+    map: std.process.Environ.Map,
+
+    fn install(alloc: Allocator, entries: []const [2][]const u8) !*AdapterAuthTestEnv {
+        _ = try stableModelsTestEnviron();
+        const self = try alloc.create(AdapterAuthTestEnv);
+        errdefer alloc.destroy(self);
+        self.* = .{ .alloc = alloc, .map = std.process.Environ.Map.init(alloc) };
+        errdefer self.map.deinit();
+        for (entries) |entry| try self.map.put(entry[0], entry[1]);
+        io_mod.setEnvironMap(&self.map);
+        return self;
+    }
+
+    fn deinit(self: *AdapterAuthTestEnv) void {
+        if (stable_models_test_environ) |map| io_mod.setEnvironMap(map);
+        self.map.deinit();
+        const alloc = self.alloc;
+        alloc.destroy(self);
+    }
+};
+
+fn adapterAuthTestProfile(kind: []const u8, credential_ref: []const u8) connection_registry.Profile {
+    return .{
+        .id = @constCast("test"),
+        .display_name = @constCast("Test"),
+        .adapter_id = @constCast(kind),
+        .endpoint = null,
+        .protocol = null,
+        .credential_ref = @constCast(credential_ref),
+        .remembered_model = @constCast("model"),
+        .internal_models = .{},
+    };
+}
+
+test "production registry contains only Vercel" {
+    const validated = try adapter_registry.AdapterRegistry.init(production_adapter_registry.adapters);
+    try std.testing.expectEqual(@as(usize, 1), validated.adapters.len);
+    try std.testing.expectEqualStrings(connection_seed.adapter_id, validated.adapters[0].kind);
+}
+
+test "top-level status and interactive acquire resolve one adapter with zero cross traffic" {
+    var peer_probe: PeerAuthProbe = .{};
+    const peer_auth = adapter_auth.Provider{
+        .kind = "test_peer",
+        .context = &peer_probe,
+        .acquire_fn = PeerAuthProbe.acquire,
+    };
+    const peer_adapter = agent_stream_provider_contract.ProviderAdapter{
+        .kind = "test_peer",
+        .auth = peer_auth,
+        .stream_fn = agent_stream_provider_contract.unavailable_adapter.stream_fn,
+    };
+    const adapters = [_]agent_stream_provider_contract.ProviderAdapter{ provider_adapter, peer_adapter };
+    const registry = try adapter_registry.AdapterRegistry.init(&adapters);
+    var vercel_store = AdapterAuthStoreProbe{ .value = "vercel-secret" };
+    var peer_store = AdapterAuthStoreProbe{ .value = "peer-secret" };
+
+    const vercel_profile = adapterAuthTestProfile(connection_seed.adapter_id, "stored_key");
+    const vercel_auth = try registry.resolveAuthForProfile(vercel_profile);
+    var status = switch (try vercel_auth.status(std.testing.allocator, vercel_profile, .{
+        .secret_store = vercel_store.store(),
+    })) {
+        .loaded => |value| value,
+        .failed, .cancelled => return error.UnexpectedAdapterStatus,
+    };
+    defer status.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), vercel_store.loads);
+    try std.testing.expectEqual(@as(usize, 0), peer_store.loads);
+    try std.testing.expectEqual(@as(usize, 0), peer_probe.acquire_calls);
+    try std.testing.expectEqualStrings(credentials.sourceLabel(.stored_key), status.source.?.label);
+
+    const peer_profile = adapterAuthTestProfile("test_peer", "automatic");
+    const selected_peer = try registry.resolveAuthForProfile(peer_profile);
+    var credential = switch (try selected_peer.acquire(std.testing.allocator, .{
+        .profile = peer_profile,
+        .host = .{ .secret_store = peer_store.store() },
+        .mode = .if_needed,
+        .source_resolution = .allow_fallback,
+    })) {
+        .acquired => |value| value,
+        .missing, .failed, .cancelled => return error.UnexpectedAdapterAcquisition,
+    };
+    defer credential.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), vercel_store.loads);
+    try std.testing.expectEqual(@as(usize, 1), peer_store.loads);
+    try std.testing.expectEqual(@as(usize, 1), peer_probe.acquire_calls);
+
+    try std.testing.expectError(
+        error.MissingAdapter,
+        registry.resolveAuthForProfile(adapterAuthTestProfile("missing", "automatic")),
+    );
+    try std.testing.expectEqual(@as(usize, 1), vercel_store.loads);
+    try std.testing.expectEqual(@as(usize, 1), peer_store.loads);
+}
+
+test "adapter auth preserves invalid references refresh failures and late cancellation" {
+    const env_secret = "invalid-reference-must-not-fallback";
+    const env = try AdapterAuthTestEnv.install(std.testing.allocator, &.{.{ "AI_GATEWAY_API_KEY", env_secret }});
+    defer env.deinit();
+    var vercel_store = AdapterAuthStoreProbe{ .value = "stored-secret" };
+
+    const invalid_profile = adapterAuthTestProfile(connection_seed.adapter_id, "not_a_credential_source");
+    const invalid = try auth_provider.acquire(std.testing.allocator, .{
+        .profile = invalid_profile,
+        .host = .{ .secret_store = vercel_store.store() },
+        .mode = .if_needed,
+        .source_resolution = .exact,
+    });
+    switch (invalid) {
+        .failed => |failure| try std.testing.expectEqual(adapter_auth.FailureCategory.configuration, failure.category),
+        .acquired, .missing, .cancelled => return error.UnexpectedInvalidReferenceOutcome,
+    }
+    var failure_json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer failure_json.deinit();
+    try std.json.Stringify.value(invalid, .{}, &failure_json.writer);
+    try std.testing.expect(std.mem.find(u8, failure_json.written(), env_secret) == null);
+    const invalid_status = try auth_provider.status(std.testing.allocator, invalid_profile, .{
+        .secret_store = vercel_store.store(),
+    });
+    switch (invalid_status) {
+        .failed => |failure| try std.testing.expectEqual(adapter_auth.FailureCategory.configuration, failure.category),
+        .loaded, .cancelled => return error.UnexpectedInvalidReferenceStatus,
+    }
+    try std.testing.expectEqual(@as(usize, 0), vercel_store.loads);
+
+    const refresh = try auth_provider.acquire(std.testing.allocator, .{
+        .profile = adapterAuthTestProfile(connection_seed.adapter_id, "fx_login"),
+        .host = .{ .secret_store = vercel_store.store() },
+        .mode = .force,
+        .source_resolution = .exact,
+        .current_source_id = "fx_login",
+    });
+    switch (refresh) {
+        .failed => |failure| try std.testing.expectEqual(adapter_auth.FailureCategory.unavailable, failure.category),
+        .acquired, .missing, .cancelled => return error.UnexpectedRefreshFailureOutcome,
+    }
+    try std.testing.expectEqual(@as(usize, 0), vercel_store.loads);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var peer_probe = PeerAuthProbe{ .cancel_during_acquire = &cancel_flag };
+    const peer_auth = adapter_auth.Provider{
+        .kind = "test_peer",
+        .context = &peer_probe,
+        .acquire_fn = PeerAuthProbe.acquire,
+    };
+    const adapters = [_]agent_stream_provider_contract.ProviderAdapter{
+        provider_adapter,
+        .{
+            .kind = "test_peer",
+            .auth = peer_auth,
+            .stream_fn = agent_stream_provider_contract.unavailable_adapter.stream_fn,
+        },
+    };
+    const registry = try adapter_registry.AdapterRegistry.init(&adapters);
+    const peer_profile = adapterAuthTestProfile("test_peer", "automatic");
+    var backing: [128]u8 = [_]u8{0xa5} ** 128;
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    var peer_store = AdapterAuthStoreProbe{ .value = "late-cancel-secret" };
+    const cancelled = try (try registry.resolveAuthForProfile(peer_profile)).acquire(fixed.allocator(), .{
+        .profile = peer_profile,
+        .host = .{ .secret_store = peer_store.store() },
+        .mode = .if_needed,
+        .source_resolution = .exact,
+        .cancel_flag = &cancel_flag,
+    });
+    try std.testing.expect(cancelled == .cancelled);
+    try std.testing.expectEqual(@as(usize, 1), peer_store.loads);
+    try std.testing.expectEqual(@as(usize, 1), peer_probe.acquire_calls);
+    try std.testing.expect(std.mem.find(u8, &backing, "late-cancel-secret") == null);
+}
+
+const ConditionalRefreshProbe = struct {
+    discovery_calls: usize = 0,
+    refresh_calls: usize = 0,
+    saw_refresh_secret: bool = false,
+
+    fn provider(self: *@This()) oauth_transport.Provider {
+        return .{ .context = self, .execute_fn = execute };
+    }
+
+    fn execute(raw: ?*anyopaque, alloc: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        return switch (request.method) {
+            .get => blk: {
+                self.discovery_calls += 1;
+                break :blk .{
+                    .disposition = .accepted,
+                    .body = try alloc.dupe(u8,
+                        \\{"issuer":"https://vercel.com","device_authorization_endpoint":"https://vercel.com/oauth/device","token_endpoint":"https://vercel.com/oauth/token"}
+                    ),
+                };
+            },
+            .post_form => {
+                self.refresh_calls += 1;
+                self.saw_refresh_secret = if (request.payload) |payload|
+                    std.mem.find(u8, payload, "conditional-refresh-secret") != null
+                else
+                    false;
+                return error.InjectedRefreshFailure;
+            },
+        };
+    }
+};
+
+test "exact conditional fx login refresh failure is normalized without fallback" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const fallback_secret = "conditional-fallback-secret";
+    const env = try AdapterAuthTestEnv.install(alloc, &.{
+        .{ "HOME", home },
+        .{ "AI_GATEWAY_API_KEY", fallback_secret },
+    });
+    defer env.deinit();
+
+    var session = oauth_session.Session{
+        .issuer = try alloc.dupe(u8, "https://vercel.com"),
+        .client_id = try alloc.dupe(u8, "test-client"),
+        .access_token = try alloc.dupe(u8, "expired-access-secret"),
+        .refresh_token = try alloc.dupe(u8, "conditional-refresh-secret"),
+        .expires_at_ms = 0,
+        .scope = try alloc.dupe(u8, "openid offline_access"),
+        .token_type = try alloc.dupe(u8, "Bearer"),
+    };
+    defer session.deinit(alloc);
+    try oauth_session.saveNewSession(alloc, session);
+
+    var refresh_probe: ConditionalRefreshProbe = .{};
+    const transport = refresh_probe.provider();
+    const test_provider = auth_provider_for_transport(&transport);
+    var store = AdapterAuthStoreProbe{ .value = "stored-fallback-secret" };
+    const outcome = try test_provider.acquire(alloc, .{
+        .profile = adapterAuthTestProfile(connection_seed.adapter_id, "fx_login"),
+        .host = .{ .secret_store = store.store() },
+        .mode = .if_needed,
+        .source_resolution = .exact,
+        .current_source_id = "fx_login",
+    });
+    switch (outcome) {
+        .failed => |failure| try std.testing.expectEqual(adapter_auth.FailureCategory.unavailable, failure.category),
+        .acquired, .missing, .cancelled => return error.UnexpectedConditionalRefreshOutcome,
+    }
+    try std.testing.expectEqual(@as(usize, 1), refresh_probe.discovery_calls);
+    try std.testing.expectEqual(@as(usize, 1), refresh_probe.refresh_calls);
+    try std.testing.expect(refresh_probe.saw_refresh_secret);
+    try std.testing.expectEqual(@as(usize, 0), store.loads);
+
+    var rendered: std.Io.Writer.Allocating = .init(alloc);
+    defer rendered.deinit();
+    try std.json.Stringify.value(outcome, .{}, &rendered.writer);
+    for ([_][]const u8{ "expired-access-secret", "conditional-refresh-secret", fallback_secret, store.value }) |value| {
+        try std.testing.expect(std.mem.find(u8, rendered.written(), value) == null);
+    }
 }

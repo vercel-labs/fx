@@ -1067,7 +1067,9 @@ fn selectTeam(alloc: Allocator, teams: []const Team, current: ?[]const u8) !?usi
     if (teams.len == 1) return 0;
 
     const default_index = defaultTeamIndex(teams, current);
-    const index = if (canUseInteractiveTeamPicker())
+    const index = if (comptime host_target.is_wasm)
+        try selectTeamByLine(alloc, teams, default_index)
+    else if (canUseInteractiveTeamPicker())
         selectTeamInteractive(alloc, teams, default_index) catch |err| switch (err) {
             error.NotATerminal => try selectTeamByLine(alloc, teams, default_index),
             else => return err,

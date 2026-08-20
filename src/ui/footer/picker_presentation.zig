@@ -1,7 +1,7 @@
 const std = @import("std");
 const auth_runtime = @import("../../core/auth/auth_runtime.zig");
+const adapter_auth = @import("../../core/gateway/adapter_auth.zig");
 const credentials = @import("../../core/auth/credentials.zig");
-const login_flow = @import("../../core/auth/login_flow.zig");
 const picker_state = @import("../../core/input/picker_state.zig");
 const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const display_width = @import("../../core/shared/display_width.zig");
@@ -230,7 +230,7 @@ fn composeOnboardingPickerRow(
 
 fn composeSignInPickerRow(
     alloc: Allocator,
-    snapshot: login_flow.SignInSnapshot,
+    snapshot: adapter_auth.SignInSnapshot,
     row_index: u16,
     width: u16,
 ) !std.ArrayList(u8) {

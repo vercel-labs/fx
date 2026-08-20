@@ -7,6 +7,9 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const host = @import("../hosts/host.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
+const stream_provider = if (builtin.is_test) @import("../agent/stream_provider.zig") else struct {};
+const adapter_auth = if (builtin.is_test) @import("../gateway/adapter_auth.zig") else struct {};
+const adapter_registry = @import("../gateway/adapter_registry.zig");
 const input_appearance = @import("../config/input_appearance.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const connection_registry = @import("../gateway/connection_registry.zig");
@@ -297,6 +300,7 @@ pub const BootstrapConfig = struct {
     default_model: []const u8,
     default_fast_mode: bool = false,
     connection_seed: connection_registry.Seed,
+    adapter_registry: adapter_registry.AdapterRegistry = .{ .adapters = &.{} },
     default_agent_step_limit: usize,
     model_descriptors: model_catalog.ModelDescriptorProvider,
     secret_store: host.SecretStore,
@@ -363,6 +367,69 @@ pub fn loadCatalogStartupState(
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_fast_mode, default_agent_step_limit, connection_seed, null, .stored);
+}
+
+pub fn loadCatalogStartupStateWithRegistry(
+    alloc: Allocator,
+    registry: adapter_registry.AdapterRegistry,
+    secret_store: host.SecretStore,
+    default_model: []const u8,
+    default_fast_mode: bool,
+    default_agent_step_limit: usize,
+    connection_seed: connection_registry.Seed,
+) !StartupState {
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    var state = try loadStartupStateFromOwnedWorkspace(
+        alloc,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        workspace_root,
+        default_model,
+        default_fast_mode,
+        default_agent_step_limit,
+        connection_seed,
+        null,
+        null,
+    );
+    errdefer state.deinit(alloc);
+    const connections = &state.connections.?;
+    const profile = connections.selectedProfile();
+    const auth = registry.resolveAuthForProfile(profile) catch {
+        connections.markSelectedDisconnected(.unsupported_adapter);
+        return state;
+    };
+    const acquisition = try auth.acquire(alloc, .{
+        .profile = profile,
+        .host = .{ .secret_store = secret_store },
+        .mode = .stored,
+        .source_resolution = .allow_fallback,
+    });
+    switch (acquisition) {
+        .acquired => |value| {
+            var normalized = value;
+            defer normalized.deinit(alloc);
+            state.credential = auth_runtime.takeAdapterCredential(&normalized) orelse {
+                connections.markSelectedDisconnected(.invalid_credential_reference);
+                return state;
+            };
+            connections.markSelectedConnected();
+        },
+        .missing => |store_status| {
+            state.stored_key_status = switch (store_status) {
+                .not_attempted => .not_attempted,
+                .not_found => .not_found,
+                .unavailable => .unavailable,
+            };
+            connections.markSelectedDisconnected(.missing_credential);
+        },
+        .failed => |failure| connections.markSelectedDisconnected(switch (failure.category) {
+            .configuration => .invalid_credential_reference,
+            .denied => .authentication_failed,
+            else => .not_checked,
+        }),
+        .cancelled => connections.markSelectedDisconnected(.not_checked),
+    }
+    return state;
 }
 
 pub fn loadStartupStatus(
@@ -611,8 +678,9 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     cfg.shell.layout = minimalLayout();
     try cfg.shell.initBacking(cfg.alloc);
 
-    var state = try loadCatalogStartupState(
+    var state = try loadCatalogStartupStateWithRegistry(
         cfg.alloc,
+        cfg.adapter_registry,
         cfg.secret_store,
         cfg.default_model,
         cfg.default_fast_mode,
@@ -2240,7 +2308,53 @@ test "built-in Vercel connection reuses credential resolution and CatalogAccess 
     try std.testing.expect(!@hasField(connection_registry.Profile, "api_key"));
 }
 
-test "loadStartupState canonicalizes fast model defaults" {
+test "registry startup preserves invalid credential references as configuration failures" {
+    const FailedAuth = struct {
+        calls: usize = 0,
+
+        fn acquire(raw: *const anyopaque, _: Allocator, _: adapter_auth.Request) Allocator.Error!adapter_auth.Acquisition {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            return .{ .failed = .{ .category = .configuration } };
+        }
+    };
+    var env = try TestEnv.install(std.testing.allocator, &.{});
+    defer env.deinit();
+    var failed_auth: FailedAuth = .{};
+    const auth = adapter_auth.Provider{
+        .kind = test_connection_seed.adapter_id,
+        .context = &failed_auth,
+        .acquire_fn = FailedAuth.acquire,
+    };
+    const adapters = [_]stream_provider.ProviderAdapter{.{
+        .kind = test_connection_seed.adapter_id,
+        .auth = auth,
+        .stream_fn = stream_provider.unavailable_adapter.stream_fn,
+    }};
+    const registry = try adapter_registry.AdapterRegistry.init(&adapters);
+    var seed = test_connection_seed;
+    seed.credential_ref = "invalid_reference";
+
+    var state = try loadCatalogStartupStateWithRegistry(
+        std.testing.allocator,
+        registry,
+        host.unavailable_secret_store,
+        "default-model",
+        false,
+        12,
+        seed,
+    );
+    defer state.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), failed_auth.calls);
+    try std.testing.expect(state.credential == null);
+    try std.testing.expectEqual(
+        connection_registry.DisconnectReason.invalid_credential_reference,
+        state.connections.?.selectedProfile().auth.disconnected,
+    );
+}
+
+test "loadStartupState preserves exact fast model defaults" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 

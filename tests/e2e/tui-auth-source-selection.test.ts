@@ -397,6 +397,72 @@ tmuxTest(
   60_000,
 );
 
+tmuxTest(
+  "invalid credential reference stays visible and normal auth still works",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-invalid-credential-reference-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([fakeGatewayFinalText(ENV_RESPONSE)]);
+    const fxDir = join(home, ".fx");
+    mkdirSync(fxDir, { recursive: true, mode: 0o700 });
+    const settingsPath = join(fxDir, "settings.json");
+    const settings = {
+      connections: {
+        selected: "vercel",
+        profiles: [{
+          id: "vercel",
+          display_name: "Vercel AI Gateway",
+          adapter_id: "vercel_ai_gateway",
+          endpoint: gateway.chatUrl,
+          protocol: "vercel_ai_gateway",
+          credential_ref: "invalid_reference",
+          remembered_model: FAKE_GATEWAY_MODEL,
+          permission_review_model: "openai/gpt-5.4",
+        }],
+      },
+    };
+    writeFileSync(settingsPath, JSON.stringify(settings) + "\n", { mode: 0o600 });
+
+    const env = {
+      HOME: home,
+      AI_GATEWAY_API_KEY: ENV_TOKEN,
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_MODEL: FAKE_GATEWAY_MODEL,
+    };
+    const status = await runFx(["status", "--json"], { env, timeoutMs: TIMEOUT });
+    expect(status.code).toBe(0);
+    expect(JSON.parse(status.stdout)).toMatchObject({
+      auth: "invalid_configuration",
+      auth_refreshable: false,
+    });
+    expect(status.stdout).not.toContain(ENV_TOKEN);
+
+    session = await startFx(home, stderrPath, gateway);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/status");
+    await session.waitForText("auth=invalid_configuration", TIMEOUT);
+    expect(gateway.requests).toHaveLength(0);
+
+    await session.kill();
+    settings.connections.profiles[0]!.credential_ref = "automatic";
+    writeFileSync(settingsPath, JSON.stringify(settings) + "\n", { mode: 0o600 });
+    session = await startFx(home, stderrPath, gateway);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/status");
+    await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
+    await session.sendText("use normal auth after fixing the reference");
+    await session.waitForText(ENV_RESPONSE, TIMEOUT);
+    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
+    expect(await session.captureFullScrollback()).not.toContain(ENV_TOKEN);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
 async function startFxWithoutAuth(
   testHome: string,
   testStderrPath: string,
@@ -1471,6 +1537,56 @@ tmuxTest(
       expect(trace).not.toContain(secret);
     }
     expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "initial expired login refresh failure is visible before any model request",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-auth-initial-refresh-failure-"));
+    stderrPath = join(home, "stderr.log");
+    const tracePath = join(home, "trace.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth(null);
+    writeSeededFxLogin(home, Date.now() - 60_000, oauth.issuerUrl);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ credential_source: "fx_login" }) + "\n",
+      { mode: 0o600 },
+    );
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, tracePath);
+    await session.waitForComposer(TIMEOUT);
+    const prompt = "stop before the initial model request";
+    await session.sendText(prompt);
+    const failed = await session.waitForPane(
+      (pane) =>
+        pane.includes(prompt) &&
+        pane.includes("fx login credential refresh failed.") &&
+        pane.includes("Choose another source below"),
+      TIMEOUT,
+    );
+
+    expect(gateway.requests).toHaveLength(0);
+    expect(gateway.classifierRequests).toHaveLength(0);
+    expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
+      "GET /.well-known/openid-configuration",
+      "POST /oauth/token",
+    ]);
+    const trace = readFileSync(tracePath, "utf8");
+    for (const secret of [LOGIN_TOKEN, ENV_TOKEN, "seeded-refresh-token", oauth.providerDetail]) {
+      expect(failed).not.toContain(secret);
+      expect(trace).not.toContain(secret);
+    }
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+    await session.sendKeys("Escape");
+    await session.sendKeys("C-u");
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
   },
   60_000,
 );

@@ -7,6 +7,7 @@ const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const connection_registry = @import("connection_registry.zig");
+const adapter_registry = @import("adapter_registry.zig");
 const model_catalog = @import("model_catalog.zig");
 const model_catalog_metadata = @import("model_catalog_metadata.zig");
 
@@ -28,6 +29,7 @@ pub const Provider = struct {
     connection_seed: connection_registry.Seed,
     agent_stream: agent_stream_provider.Provider,
     provider_adapter: agent_stream_provider.ProviderAdapter,
+    adapter_registry: adapter_registry.AdapterRegistry = .{ .adapters = &.{} },
     oauth_transport: oauth_transport.Provider,
     chat_url: ChatUrlProvider,
 };

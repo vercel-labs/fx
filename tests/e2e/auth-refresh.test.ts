@@ -296,6 +296,70 @@ test(
 );
 
 test(
+  "fx ask stops after a normalized forced-refresh failure",
+  async () => {
+    const home = mkdtempSync(join(tmpdir(), "fx-auth-forced-refresh-failure-e2e-"));
+    const tracePath = join(home, "trace.log");
+    writeFileSync(tracePath, "");
+    const oauth = startFakeOAuth([EXPIRED_REFRESH_TOKEN]);
+    writeFxLogin(home, oauth.issuerUrl);
+    const gateway = startFakeGateway([
+      new Response(JSON.stringify({ error: { message: "expired" } }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      }),
+    ]);
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--no-save", "stop after the failed forced refresh"],
+        {
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_SKIP_ONBOARDING: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "gateway",
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code).toBe(1);
+      expect(gateway.requests).toHaveLength(1);
+      expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
+        "GET /.well-known/openid-configuration",
+        "POST /oauth/token",
+        "GET /.well-known/openid-configuration",
+        "POST /oauth/token",
+      ]);
+      const trace = readFileSync(tracePath, "utf8");
+      const refreshFailure = trace.split("\n").find((line) =>
+        line.includes("event=credential_refresh_failed ")
+      );
+      expect(refreshFailure).toContain("source=fx_login mode=force err=CredentialRefreshFailed");
+      for (const secretValue of [EXPIRED_REFRESH_TOKEN, "seeded-refresh-token"]) {
+        expect(result.stdout).not.toContain(secretValue);
+        expect(result.stderr).not.toContain(secretValue);
+        expect(trace).not.toContain(secretValue);
+      }
+    } finally {
+      gateway.stop();
+      oauth.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT,
+);
+
+test(
   "status and doctor report an expired login instead of refreshing it",
   async () => {
     const home = mkdtempSync(join(tmpdir(), "fx-auth-expired-report-e2e-"));

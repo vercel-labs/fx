@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const agent_steps = @import("../../config/agent_steps.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const route_snapshot = @import("../../gateway/route_snapshot.zig");
+const adapter_auth = @import("../../gateway/adapter_auth.zig");
 const types = @import("../../shared/types.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
 const worker_runtime = @import("../worker_runtime.zig");
@@ -1804,7 +1805,7 @@ fn refreshGatewayCredentialForJob(
             "source={s} mode={s} err={s}",
             .{ @tagName(source), @tagName(mode), @errorName(err) },
         );
-        return false;
+        return err;
     } orelse return false;
     secret.zeroAndFree(alloc, route_credential.credential);
     route_credential.credential = refreshed;
@@ -3031,8 +3032,8 @@ fn processQueuedPromptLoop(
         var successful_vision_route: runtime_vision_contracts.VisionRoute = .native_images;
         var successful_vision_mode: runtime_gateway_step.VisionToolMode = .unavailable;
         var reset_stream_for_next_attempt = false;
-        var auth_retry_used = false;
         var assistant_prefill_recovery_used = false;
+        var unauthorized_refresh: adapter_auth.UnauthorizedRefresh = .{};
         var skip_next_preflight_refresh = false;
         var recovery_has_unexecuted_tool_start = false;
         var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
@@ -3725,28 +3726,31 @@ fn processQueuedPromptLoop(
             runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, summary_accumulator.reconcileTokenRequest(stream_result.completion.usage, stream_result.completion.delivery_ambiguous)) catch |progress_err| {
                 debug_trace.logf("agent", "token progress publication failed source=gateway_usage err={s}", .{@errorName(progress_err)});
             };
-            if (stream_result.status == .unauthorized and
-                !auth_retry_used and
-                semantic_attempt + 1 < semantic_limit)
-            {
-                if (try refreshGatewayCredentialForJob(
-                    deps,
-                    std.heap.c_allocator,
-                    &route_credential,
-                    .force,
-                    step_ctx,
-                )) {
-                    auth_retry_used = true;
-                    if (stream_result.err_body) |body| mem_utils.free(arena, body);
-                    stream_result.err_body = null;
-                    stream_result_set = false;
-                    semantic_attempt += 1;
-                    recovery_strategy = .retry_request;
-                    recovery_cause = .authentication;
-                    retry_pacing = .idle;
-                    reset_stream_for_next_attempt = true;
-                    skip_next_preflight_refresh = true;
-                    continue;
+            if (stream_result.status == .unauthorized and semantic_attempt + 1 < semantic_limit) {
+                const refreshable = route_credential.legacy_source == .fx_login;
+                if (unauthorized_refresh.next(refreshable)) |refresh_mode| {
+                    if (try refreshGatewayCredentialForJob(
+                        deps,
+                        std.heap.c_allocator,
+                        &route_credential,
+                        switch (refresh_mode) {
+                            .force => .force,
+                            .if_needed => .if_needed,
+                            .stored => unreachable,
+                        },
+                        step_ctx,
+                    )) {
+                        if (stream_result.err_body) |body| mem_utils.free(arena, body);
+                        stream_result.err_body = null;
+                        stream_result_set = false;
+                        semantic_attempt += 1;
+                        recovery_strategy = .retry_request;
+                        recovery_cause = .authentication;
+                        retry_pacing = .idle;
+                        reset_stream_for_next_attempt = true;
+                        skip_next_preflight_refresh = true;
+                        continue;
+                    }
                 }
             }
             const gateway_wait_finished_ms = io_mod.milliTimestamp();
