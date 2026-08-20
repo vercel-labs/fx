@@ -19,8 +19,11 @@
             '';
             postFixup = "wrapProgram $out/bin/fx --set-default FX_AUTO_UPGRADE 0";
             meta = {
+              description = "Tiny, open, embeddable, native coding agent";
+              homepage = "https://fx.sh";
               license = pkgs.lib.licenses.asl20;
               mainProgram = "fx";
+              platforms = [ "aarch64-darwin" "aarch64-linux" "x86_64-darwin" "x86_64-linux" ];
             };
           };
         });
