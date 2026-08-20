@@ -2920,20 +2920,36 @@ test.skipIf(!tmuxAvailable() || process.platform !== "linux")(
       command: "printf 'rebuild-tmux-ok\\n'; exit 0",
       shell: { executable: { path: "/bin/zsh", clean_start: true } },
       backend: "tmux",
-      returnWhen: { match: "rebuild-tmux-ok" },
+      returnWhen: { exit: {} },
       waitMs: 15_000,
     });
-    expect(tmux.outcome, "tmux").toEqual({ condition_met: {} });
+    expect(tmux.outcome, "tmux").toEqual({ exited: 0 });
+    const tmuxId = (tmux.session as { session_id: string }).session_id;
+    const tmuxOut = await readSession(
+      connected.client,
+      connected.revision!,
+      512,
+      tmuxId,
+    );
+    expect(tmuxOut.output, "tmux").toContain("rebuild-tmux-ok");
 
     const native = await startCommand(connected.client, connected.revision!, 511, {
       cwd: home,
       command: "printf 'rebuild-native-ok\\n'; exit 0",
       shell: { executable: { path: "/bin/zsh", clean_start: true } },
       backend: "native",
-      returnWhen: { match: "rebuild-native-ok" },
+      returnWhen: { exit: {} },
       waitMs: 15_000,
     });
-    expect(native.outcome, "native").toEqual({ condition_met: {} });
+    expect(native.outcome, "native").toEqual({ exited: 0 });
+    const nativeId = (native.session as { session_id: string }).session_id;
+    const nativeOut = await readSession(
+      connected.client,
+      connected.revision!,
+      513,
+      nativeId,
+    );
+    expect(nativeOut.output, "native").toContain("rebuild-native-ok");
 
     connected.client.close();
     host.kill("SIGKILL");
