@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("io.zig");
+const debug_trace = @import("debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -45,11 +46,23 @@ pub fn pathForPeerReexec(alloc: Allocator) ![]u8 {
 /// `productionPathForReexec` for why this split exists.
 fn productionPathForPeerReexec(alloc: Allocator) ![]u8 {
     if (comptime builtin.os.tag == .linux) {
+        const pid = std.c.getpid();
         if (std.process.executablePathAlloc(io_mod.getIo(), alloc)) |resolved| {
             defer alloc.free(resolved);
             if (onDiskPathIsExecutable(resolved)) return alloc.dupe(u8, resolved);
-        } else |_| {}
-        return std.fmt.allocPrint(alloc, "/proc/{d}/exe", .{std.c.getpid()});
+            debug_trace.logf(
+                "self_exe",
+                "peer re-exec falling back to /proc/{d}/exe on-disk={s}",
+                .{ pid, resolved },
+            );
+        } else |err| {
+            debug_trace.logf(
+                "self_exe",
+                "peer re-exec falling back to /proc/{d}/exe reason={s}",
+                .{ pid, @errorName(err) },
+            );
+        }
+        return std.fmt.allocPrint(alloc, "/proc/{d}/exe", .{pid});
     }
     const path_z = try std.process.executablePathAlloc(io_mod.getIo(), alloc);
     defer alloc.free(path_z);
