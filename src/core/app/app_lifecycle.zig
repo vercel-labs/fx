@@ -399,7 +399,14 @@ fn loadStartupStateFromOwnedWorkspace(
     state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
     if (credential_mode) |mode| {
-        const resolution = try credentials.resolvePreferring(alloc, transport, secret_store, mode, settings.credential_source);
+        const resolution = try credentials.resolveForModel(
+            alloc,
+            transport,
+            secret_store,
+            mode,
+            state.selected_model,
+            settings.credential_source,
+        );
         state.credential = resolution.credential;
         state.stored_key_status = resolution.stored_key_status;
     }

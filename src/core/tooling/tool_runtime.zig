@@ -992,6 +992,10 @@ fn executeVisionRequest(
     request: tool_contracts.vision.VisionRequest,
     authority: command_admission.ToolExecutionAuthority,
 ) !ToolExecutionResult {
+    if (state.runtime.credential_source) |source| switch (source) {
+        .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .stored_key => {},
+        .anthropic_oauth_token, .anthropic_api_key, .codex_login, .xai_api_key => return error.VisionProviderCredentialUnavailable,
+    };
     const config: vision_executor.Config = .{
         .stream_provider = state.runtime.agent_stream_provider,
         .api_key = state.runtime.api_key,

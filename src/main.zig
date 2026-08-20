@@ -50,6 +50,7 @@ const builtin_context = @import("builtins/context.zig");
 const builtin_devbox = @import("builtins/devbox.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
+const builtin_providers = @import("builtins/providers.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
 const builtin_hooks = @import("builtins/hooks.zig");
@@ -431,7 +432,7 @@ const App = struct {
         return if (comptime host_target.is_wasm)
             js_host_stream_provider.provider()
         else
-            builtin_gateway.agent_stream_provider;
+            builtin_providers.agent_stream_provider;
     }
 
     pub fn cooperativeTransportPulse(self: *Self) !void {
@@ -926,6 +927,10 @@ const App = struct {
         return AuthAppRuntime.selectCredentialSource(self, source);
     }
 
+    pub fn refreshCredentialForModel(self: *App, model: []const u8) !bool {
+        return self.auth.selectForModel(self.alloc, model);
+    }
+
     pub fn run(self: *App) !void {
         const callbacks = RenderAppRuntime.eventLoopCallbacks(self);
         while (true) {
@@ -1251,6 +1256,9 @@ const App = struct {
         errdefer std.heap.c_allocator.free(model_copy);
 
         const gateway_credential = self.auth.gatewayCredential() orelse return error.MissingApiKey;
+        if (!credentials.sourceSupportsModel(gateway_credential.source, self.selected_model.items)) {
+            return error.MissingProviderCredential;
+        }
         const api_key_copy = try std.heap.c_allocator.dupe(u8, gateway_credential.api_key);
         errdefer secret.zeroAndFree(std.heap.c_allocator, api_key_copy);
 
@@ -3200,7 +3208,7 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .models_path = builtin_gateway.models_path,
         .gateway_retry_count = builtin_gateway.retry_count,
         .gateway_chat_url = builtin_gateway.default_chat_url,
-        .gateway_provider = builtin_gateway.provider,
+        .gateway_provider = builtin_providers.provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3236,7 +3244,7 @@ fn localEntryConfig() app_entry_runtime.Config {
         .models_path = builtin_gateway.models_path,
         .gateway_retry_count = builtin_gateway.retry_count,
         .gateway_chat_url = builtin_gateway.default_chat_url,
-        .gateway_provider = builtin_gateway.provider,
+        .gateway_provider = builtin_providers.provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,

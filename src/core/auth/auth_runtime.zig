@@ -23,6 +23,10 @@ const credential_source_order = [_]credentials.Source{
     .ai_gateway_api_key,
     .fx_login,
     .stored_key,
+    .anthropic_oauth_token,
+    .anthropic_api_key,
+    .codex_login,
+    .xai_api_key,
 };
 
 const SourceProbeFn = *const fn (?*anyopaque, Allocator, credentials.Source) anyerror!bool;
@@ -1118,6 +1122,21 @@ pub const Runtime = struct {
 
     pub fn selectSource(self: *Self, alloc: Allocator, source: credentials.Source) !?bool {
         return self.selectSourceWithLoader(alloc, source, self, loadRuntimeCredentialSource);
+    }
+
+    pub fn selectForModel(self: *Self, alloc: Allocator, model: []const u8) !bool {
+        const resolution = try credentials.resolveForModel(
+            alloc,
+            self.oauth_transport,
+            self.secret_store,
+            .refresh_if_needed,
+            model,
+            self.credentialSource(),
+        );
+        self.stored_key_status = resolution.stored_key_status;
+        var credential = resolution.credential orelse return false;
+        defer credential.deinit(alloc);
+        return self.adoptCredential(alloc, &credential);
     }
 
     pub fn refreshFxLoginIfNeeded(self: *Self, alloc: Allocator) !bool {

@@ -83,12 +83,48 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 
 fn localCapabilitiesForModel(model: []const u8) Capabilities {
     var capabilities: Capabilities = .{};
-    if (std.mem.startsWith(u8, model, "anthropic/")) {
+    if (std.mem.startsWith(u8, model, "anthropic-max/")) {
+        capabilities.supports_reasoning = true;
+        capabilities.reasoning_efforts = .fromSlice(&.{
+            types.ReasoningEffort.literal("minimal"),
+            types.ReasoningEffort.literal("low"),
+            types.ReasoningEffort.literal("medium"),
+            types.ReasoningEffort.literal("high"),
+            types.ReasoningEffort.literal("max"),
+        });
+        capabilities.supports_tool_use = true;
+        capabilities.context_window = 200_000;
+        capabilities.max_output_tokens = 64_000;
+    } else if (std.mem.startsWith(u8, model, "openai-codex/")) {
+        capabilities.supports_reasoning = true;
+        capabilities.reasoning_efforts = .fromSlice(&.{
+            types.ReasoningEffort.literal("minimal"),
+            types.ReasoningEffort.literal("low"),
+            types.ReasoningEffort.literal("medium"),
+            types.ReasoningEffort.literal("high"),
+            types.ReasoningEffort.literal("xhigh"),
+        });
+        capabilities.supports_tool_use = true;
+        capabilities.parallel_tool_calls = true;
+        capabilities.context_window = 256_000;
+        capabilities.max_output_tokens = 128_000;
+    } else if (std.mem.startsWith(u8, model, "xai-direct/")) {
+        capabilities.supports_reasoning = true;
+        capabilities.reasoning_efforts = .fromSlice(&.{
+            types.ReasoningEffort.literal("low"),
+            types.ReasoningEffort.literal("medium"),
+            types.ReasoningEffort.literal("high"),
+        });
+        capabilities.supports_tool_use = true;
+        capabilities.parallel_tool_calls = true;
+        capabilities.context_window = 256_000;
+        capabilities.max_output_tokens = 64_000;
+    } else if (std.mem.startsWith(u8, model, "anthropic/")) {
         capabilities.prompt_caching = true;
     } else if (std.mem.startsWith(u8, model, "xai/")) {
         capabilities.parallel_tool_calls = true;
     }
-    capabilities.context_window = localContextWindowSize(model);
+    if (localContextWindowSize(model)) |window| capabilities.context_window = window;
     return capabilities;
 }
 
@@ -217,6 +253,22 @@ test "capabilities never infer reasoning or Fast controls from model IDs" {
         try std.testing.expectEqual(@as(usize, 0), capabilities.reasoning_efforts.len);
         try std.testing.expect(!capabilities.supports_fast_mode);
     }
+}
+
+test "direct provider routes expose their local runtime capabilities" {
+    const anthropic = capabilitiesForModel("anthropic-max/claude-opus-4-8");
+    try std.testing.expect(anthropic.supports_reasoning);
+    try std.testing.expect(anthropic.supports_tool_use);
+    try std.testing.expect(!anthropic.prompt_caching);
+
+    const codex = capabilitiesForModel("openai-codex/gpt-5.5");
+    try std.testing.expect(codex.supports_reasoning);
+    try std.testing.expect(codex.supports_tool_use);
+    try std.testing.expectEqual(@as(?bool, true), codex.parallel_tool_calls);
+
+    const xai = capabilitiesForModel("xai-direct/grok-4.6");
+    try std.testing.expect(xai.supports_reasoning);
+    try std.testing.expect(xai.supports_tool_use);
 }
 
 test "resolveCapabilities preserves Gateway controls and unrelated local policy" {

@@ -39,6 +39,26 @@ Or add an AI Gateway API key:
 fx setup
 ```
 
+The native CLI and ACP server can also connect directly to subscription and
+vendor providers with a provider-qualified model ID:
+
+```bash
+# Reuse an existing Claude Code Max/Pro login, or set ANTHROPIC_OAUTH_TOKEN.
+FX_MODEL=anthropic-max/claude-opus-4-8 fx
+
+# Reuse an existing Codex CLI ChatGPT Plus/Pro login, or set CODEX_ACCESS_TOKEN.
+FX_MODEL=openai-codex/gpt-5.5 fx
+
+# Use xAI directly with XAI_API_KEY.
+FX_MODEL=xai-direct/grok-4.6 fx
+```
+
+Anthropic API keys are also accepted through `ANTHROPIC_API_KEY`. Direct
+provider credentials are scoped to their route and are never sent to Vercel AI
+Gateway. Existing IDs such as `anthropic/...` and `xai/...` continue to use AI
+Gateway. Direct routes currently support text and function tools; the
+Gateway-backed vision helper is not advertised on those routes.
+
 Run fx from a project:
 
 ```bash

@@ -1120,6 +1120,9 @@ pub fn Commands(comptime App: type) type {
                 app.selected_model.appendSliceAssumeCapacity(stable);
             }
             const selected = app.selected_model.items;
+            if (comptime @hasDecl(App, "refreshCredentialForModel")) {
+                _ = try app.refreshCredentialForModel(selected);
+            }
             try app.worker.syncQueuedPromptModel(std.heap.c_allocator, selected);
             if (comptime @hasDecl(App, "persistAcceptedModel")) try app.persistAcceptedModel(selected);
             // Keep the session or workspace discriminator while updating the

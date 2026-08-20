@@ -8,6 +8,7 @@ const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 const types = @import("../shared/types.zig");
+const inference_provider = @import("../gateway/inference_provider.zig");
 
 pub const Source = types.CredentialSource;
 
@@ -133,6 +134,11 @@ pub fn catalogAccessForCredential(
         .vercel_oidc_token => .vercel_oidc_token,
         .ai_gateway_api_key => .ai_gateway_api_key,
         .stored_key => .stored_key,
+        .anthropic_oauth_token,
+        .anthropic_api_key,
+        .codex_login,
+        .xai_api_key,
+        => return .{ .public_only = .no_credential },
         .fx_login => blk: {
             const team = team_context orelse
                 return .{ .public_only = .fx_login_team_required };
@@ -211,6 +217,47 @@ pub fn resolve(
     return resolvePreferring(alloc, transport, secret_store, mode, null);
 }
 
+/// Resolves credentials for the route encoded by `model`. Existing model IDs
+/// remain Vercel AI Gateway routes; direct routes use provider-owned sources.
+pub fn resolveForModel(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    mode: LoadMode,
+    model: []const u8,
+    preferred: ?Source,
+) !Resolution {
+    const route = inference_provider.routeForModel(model);
+    return switch (route.provider) {
+        .vercel_ai_gateway => resolvePreferring(
+            alloc,
+            transport,
+            secret_store,
+            mode,
+            if (preferred) |source| if (sourceSupportsProvider(source, route.provider)) source else null else null,
+        ),
+        .anthropic_max => .{ .credential = try loadAnthropicCredential(alloc) },
+        .openai_codex => .{ .credential = try loadCodexCredential(alloc) },
+        .xai_direct => .{ .credential = try loadEnvCredential(alloc, "XAI_API_KEY", .xai_api_key) },
+    };
+}
+
+pub fn sourceSupportsModel(source: Source, model: []const u8) bool {
+    return sourceSupportsProvider(source, inference_provider.routeForModel(model).provider);
+}
+
+fn sourceSupportsProvider(source: Source, provider: inference_provider.ProviderId) bool {
+    return switch (provider) {
+        .vercel_ai_gateway => switch (source) {
+            .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .stored_key => true,
+            else => false,
+        },
+        .anthropic_max => source == .anthropic_oauth_token or source == .anthropic_api_key,
+        .openai_codex => source == .codex_login,
+        .xai_direct => source == .xai_api_key,
+    };
+}
+
 /// `preferred` is the source the user last chose in the hub. It wins over the
 /// precedence order below, including over the environment, because it is an
 /// explicit choice rather than a default. A preferred source that no longer
@@ -284,6 +331,10 @@ pub fn loadSource(
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
         .fx_login => loadFxLoginCredential(alloc, transport),
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
+        .anthropic_oauth_token => loadAnthropicOAuthCredential(alloc),
+        .anthropic_api_key => loadEnvCredential(alloc, "ANTHROPIC_API_KEY", source),
+        .codex_login => loadCodexCredential(alloc),
+        .xai_api_key => loadEnvCredential(alloc, "XAI_API_KEY", source),
     };
 }
 
@@ -320,7 +371,73 @@ pub fn sourceExists(
             secret.zeroAndFree(alloc, value);
             break :blk true;
         },
+        .anthropic_oauth_token => probeCredential(alloc, try loadAnthropicOAuthCredential(alloc)),
+        .anthropic_api_key => nonEmptyEnvValue("ANTHROPIC_API_KEY") != null,
+        .codex_login => probeCredential(alloc, try loadCodexCredential(alloc)),
+        .xai_api_key => nonEmptyEnvValue("XAI_API_KEY") != null,
     };
+}
+
+fn probeCredential(alloc: std.mem.Allocator, loaded: ?Credential) bool {
+    var credential = loaded orelse return false;
+    credential.deinit(alloc);
+    return true;
+}
+
+fn loadAnthropicCredential(alloc: std.mem.Allocator) !?Credential {
+    if (try loadAnthropicOAuthCredential(alloc)) |credential| return credential;
+    return loadEnvCredential(alloc, "ANTHROPIC_API_KEY", .anthropic_api_key);
+}
+
+fn loadAnthropicOAuthCredential(alloc: std.mem.Allocator) !?Credential {
+    inline for (&.{ "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN" }) |name| {
+        if (try loadEnvCredential(alloc, name, .anthropic_oauth_token)) |credential| {
+            if (std.mem.startsWith(u8, credential.token, "sk-ant-oat")) return credential;
+            var rejected = credential;
+            rejected.deinit(alloc);
+        }
+    }
+    if (try loadJsonCredential(alloc, ".claude/.credentials.json", &.{ "claudeAiOauth", "accessToken" }, .anthropic_oauth_token)) |credential| {
+        if (std.mem.startsWith(u8, credential.token, "sk-ant-oat")) return credential;
+        var rejected = credential;
+        rejected.deinit(alloc);
+    }
+    return null;
+}
+
+fn loadCodexCredential(alloc: std.mem.Allocator) !?Credential {
+    if (try loadEnvCredential(alloc, "CODEX_ACCESS_TOKEN", .codex_login)) |credential| return credential;
+    return loadJsonCredential(alloc, ".codex/auth.json", &.{ "tokens", "access_token" }, .codex_login);
+}
+
+fn loadJsonCredential(
+    alloc: std.mem.Allocator,
+    relative_path: []const u8,
+    keys: []const []const u8,
+    source: Source,
+) !?Credential {
+    const home = io_mod.getenv("HOME") orelse return null;
+    const path = try std.fs.path.join(alloc, &.{ home, relative_path });
+    defer alloc.free(path);
+    var file = io_mod.openExistingRegularFile(std.Io.Dir.cwd(), path, .read_only) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close(io_mod.getIo());
+    const stat = try file.stat(io_mod.getIo());
+    if (stat.kind != .file or stat.size > 1024 * 1024) return null;
+    const bytes = try io_mod.readFileToEnd(alloc, &file, 1024 * 1024 + 1);
+    defer secret.zeroAndFree(alloc, bytes);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch return null;
+    defer parsed.deinit();
+    var value = parsed.value;
+    for (keys) |key| {
+        if (value != .object) return null;
+        value = value.object.get(key) orelse return null;
+    }
+    if (value != .string) return null;
+    const token = nonEmptyValue(value.string) orelse return null;
+    return .{ .token = try alloc.dupe(u8, token), .source = source };
 }
 
 fn loadEnvCredential(
@@ -471,6 +588,10 @@ pub fn sourceLabel(source: Source) []const u8 {
         .ai_gateway_api_key => "AI_GATEWAY_API_KEY",
         .fx_login => "fx login",
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
+        .anthropic_oauth_token => "Anthropic Max login",
+        .anthropic_api_key => "ANTHROPIC_API_KEY",
+        .codex_login => "ChatGPT/Codex login",
+        .xai_api_key => "XAI_API_KEY",
     };
 }
 
@@ -714,6 +835,64 @@ test "source-specific credential loading bypasses generic precedence" {
     try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .ai_gateway_api_key));
     try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .vercel_oidc_token));
     try std.testing.expect(!(try sourceExists(alloc, host.unavailable_secret_store, .stored_key)));
+}
+
+test "provider-qualified models resolve only their provider credential" {
+    const alloc = std.testing.allocator;
+    const env = try CredentialTestEnv.install(alloc, &.{
+        .{ "AI_GATEWAY_API_KEY", "gateway-key" },
+        .{ "ANTHROPIC_OAUTH_TOKEN", "sk-ant-oat-test" },
+        .{ "CODEX_ACCESS_TOKEN", "codex-token" },
+        .{ "XAI_API_KEY", "xai-key" },
+    });
+    defer env.deinit();
+
+    const cases = [_]struct {
+        model: []const u8,
+        source: Source,
+        token: []const u8,
+    }{
+        .{ .model = "anthropic-max/claude-opus", .source = .anthropic_oauth_token, .token = "sk-ant-oat-test" },
+        .{ .model = "openai-codex/gpt-5", .source = .codex_login, .token = "codex-token" },
+        .{ .model = "xai-direct/grok-4", .source = .xai_api_key, .token = "xai-key" },
+        .{ .model = "anthropic/claude-opus", .source = .ai_gateway_api_key, .token = "gateway-key" },
+    };
+    for (cases) |case| {
+        var resolution = try resolveForModel(
+            alloc,
+            oauth_transport.unavailable_provider,
+            host.unavailable_secret_store,
+            .stored,
+            case.model,
+            null,
+        );
+        defer if (resolution.credential) |*credential| credential.deinit(alloc);
+        try std.testing.expectEqual(case.source, resolution.credential.?.source);
+        try std.testing.expectEqualStrings(case.token, resolution.credential.?.token);
+    }
+}
+
+test "direct provider credentials never authorize the Gateway catalog" {
+    const direct_sources = [_]Source{
+        .anthropic_oauth_token,
+        .anthropic_api_key,
+        .codex_login,
+        .xai_api_key,
+    };
+    for (direct_sources) |source| {
+        const access = catalogAccessForCredential(source, "provider-secret", null);
+        try std.testing.expect(access.authorizationCredential() == null);
+        try std.testing.expect(access.teamContext() == null);
+    }
+}
+
+test "credential sources are scoped to their model route" {
+    try std.testing.expect(sourceSupportsModel(.fx_login, "anthropic/claude-opus"));
+    try std.testing.expect(!sourceSupportsModel(.anthropic_oauth_token, "anthropic/claude-opus"));
+    try std.testing.expect(sourceSupportsModel(.anthropic_oauth_token, "anthropic-max/claude-opus"));
+    try std.testing.expect(!sourceSupportsModel(.ai_gateway_api_key, "anthropic-max/claude-opus"));
+    try std.testing.expect(sourceSupportsModel(.codex_login, "openai-codex/gpt-5"));
+    try std.testing.expect(sourceSupportsModel(.xai_api_key, "xai-direct/grok-4"));
 }
 
 test "a remembered choice outranks the environment" {
