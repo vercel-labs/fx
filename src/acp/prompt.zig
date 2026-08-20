@@ -214,8 +214,8 @@ const AcpContext = struct {
             .usage_allocator = self.state.alloc,
         });
         var tc: tool_runtime.Context = .{
-            .workspace_root = self.state.workspace_root,
-            .access_scope = self.state.workspace_access.scope(self.state.workspace_root),
+            .workspace_root = session.workspace_root,
+            .access_scope = self.state.workspace_access.scope(session.workspace_root),
             .ignored_list_entries = self.state.cfg.ignored_list_entries,
             .max_list_entries = self.state.cfg.max_list_entries,
             .max_read_file_bytes = self.state.cfg.max_read_file_bytes,

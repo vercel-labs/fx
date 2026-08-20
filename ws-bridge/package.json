@@ -1,0 +1,23 @@
+{
+  "name": "fx-ws-bridge",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "WebSocket transport bridge for fx acp stdio JSON-RPC",
+  "bin": {
+    "fx-ws-bridge": "bridge.mjs"
+  },
+  "scripts": {
+    "start": "node bridge.mjs",
+    "test": "node test-bridge.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "Apache-2.0",
+  "main": "index.js",
+  "keywords": [],
+  "dependencies": {
+    "ws": "^8.21.3"
+  }
+}

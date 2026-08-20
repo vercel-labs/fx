@@ -27,11 +27,97 @@ else
 const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
 const writeJsonStr = jsonrpc.writeJsonStr;
+/// Parsed cwd and additionalDirectories from a session lifecycle request.
+const SessionWorkspaceParams = struct {
+    cwd: ?[]const u8 = null,
+    additional_directories: ?[]const []const u8 = null,
+
+    fn deinit(self: *SessionWorkspaceParams, alloc: Allocator) void {
+        if (self.cwd) |cwd| alloc.free(cwd);
+        if (self.additional_directories) |dirs| {
+            for (dirs) |dir| alloc.free(dir);
+            alloc.free(dirs);
+        }
+    }
+};
+
+fn parseSessionWorkspaceParams(alloc: Allocator, params_raw: ?[]const u8) !SessionWorkspaceParams {
+    const raw = params_raw orelse return .{};
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch
+        return .{};
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{};
+    var result: SessionWorkspaceParams = .{};
+    errdefer result.deinit(alloc);
+    if (parsed.value.object.get("cwd")) |cwd_val| {
+        if (cwd_val == .string and cwd_val.string.len > 0) {
+            if (!std.fs.path.isAbsolute(cwd_val.string)) {
+                result.deinit(alloc);
+                return error.InvalidParams;
+            }
+            result.cwd = try alloc.dupe(u8, cwd_val.string);
+        } else if (cwd_val == .string) {
+            // empty string treated as missing
+        } else {
+            result.deinit(alloc);
+            return error.InvalidParams;
+        }
+    }
+    if (parsed.value.object.get("additionalDirectories")) |dirs_val| {
+        if (dirs_val == .array) {
+            var dirs: std.ArrayList([]const u8) = .empty;
+            errdefer {
+                for (dirs.items) |d| alloc.free(d);
+                dirs.deinit(alloc);
+            }
+            for (dirs_val.array.items) |item| {
+                if (item != .string) {
+                    result.deinit(alloc);
+                    for (dirs.items) |d| alloc.free(d);
+                    dirs.deinit(alloc);
+                    return error.InvalidParams;
+                }
+                if (!std.fs.path.isAbsolute(item.string)) {
+                    result.deinit(alloc);
+                    for (dirs.items) |d| alloc.free(d);
+                    dirs.deinit(alloc);
+                    return error.InvalidParams;
+                }
+                try dirs.append(alloc, try alloc.dupe(u8, item.string));
+            }
+            if (dirs.items.len > 0) {
+                result.additional_directories = try dirs.toOwnedSlice(alloc);
+            } else {
+                dirs.deinit(alloc);
+            }
+        } else if (dirs_val != .null) {
+            result.deinit(alloc);
+            return error.InvalidParams;
+        }
+    }
+    return result;
+}
+
+fn resolveWorkspaceRoot(alloc: Allocator, requested: []const u8, fallback: []const u8) ![]u8 {
+    if (io_mod.realpathAlloc(alloc, requested)) |real| {
+        return real;
+    } else |err| switch (err) {
+        error.FileNotFound => return try alloc.dupe(u8, requested),
+        else => return try alloc.dupe(u8, fallback),
+    }
+}
 
 pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
+    var ws_params = parseSessionWorkspaceParams(alloc, msg.params_raw) catch {
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid cwd" });
+    };
+    defer ws_params.deinit(alloc);
+    const requested_cwd = ws_params.cwd orelse state.workspace_root;
+    const effective_cwd = try resolveWorkspaceRoot(alloc, requested_cwd, state.workspace_root);
+    defer alloc.free(effective_cwd);
     try server.releaseActiveSession(state);
 
-    var durable = try freshAcpState(state, alloc);
+    var durable = try freshAcpStateWithWorkspace(state, alloc, effective_cwd);
     var durable_owned = true;
     defer if (durable_owned) durable.deinit(alloc);
     const session_id = try alloc.dupe(u8, durable.id);
@@ -54,13 +140,15 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
     var revision_owned = true;
     defer if (revision_owned) alloc.free(revision);
 
+    // active.workspace_root shares allocation with durable.workspace_root; freed via wasm_state.deinit
+    const ws_ref = durable.workspace_root;
     state.active_session = .{
         .session_id = session_id,
         .wasm_state = durable,
         .wasm_revision = revision,
         .model = model,
         .mode = state.cfg.mode_registry.default_mode_id,
-        .workspace_root = state.workspace_root,
+        .workspace_root = ws_ref,
         .api_key = state.api_key,
         .credential_source = state.credential_source,
         .agent_step_limit = state.agent_step_limit,
@@ -121,6 +209,13 @@ pub fn commitWasmSession(alloc: Allocator, session: *server.ActiveSessionState) 
 }
 
 pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
+    var ws_params = parseSessionWorkspaceParams(alloc, msg.params_raw) catch {
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid cwd" });
+    };
+    defer ws_params.deinit(alloc);
+    const requested_cwd = ws_params.cwd orelse state.workspace_root;
+    const effective_cwd = try resolveWorkspaceRoot(alloc, requested_cwd, state.workspace_root);
+    defer alloc.free(effective_cwd);
     var mcp_configs = mcp_servers.parse(alloc, msg.params_raw) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return state.writer.writeError(alloc, msg.id, .{
@@ -169,7 +264,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     var store_owned = true;
     defer if (store_owned) store.deinit(alloc);
 
-    var initial = try freshAcpState(state, alloc);
+    var initial = try freshAcpStateWithWorkspace(state, alloc, effective_cwd);
     defer initial.deinit(alloc);
     var writable = store.startWritableSessionWithOptions(
         alloc,
@@ -288,6 +383,17 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
 
     if (state.active_session) |*active| {
         if (sameSessionId(active.session_id, session_id)) {
+            var ws_params_active = parseSessionWorkspaceParams(alloc, msg.params_raw) catch {
+                return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid cwd" });
+            };
+            defer ws_params_active.deinit(alloc);
+            if (ws_params_active.cwd) |requested| {
+                const effective = try resolveWorkspaceRoot(alloc, requested, active.workspace_root);
+                defer alloc.free(effective);
+                if (!std.mem.eql(u8, effective, active.workspace_root)) {
+                    return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "cwd does not match session cwd" });
+                }
+            }
             for (active.session_rt.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
             return writeLoadSessionResponse(state, alloc, msg, active.model);
         }
@@ -298,6 +404,17 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Session not found" });
     var loaded_owned = true;
     defer if (loaded_owned) loaded.deinit(alloc);
+    var ws_params_loaded = parseSessionWorkspaceParams(alloc, msg.params_raw) catch {
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid cwd" });
+    };
+    defer ws_params_loaded.deinit(alloc);
+    if (ws_params_loaded.cwd) |requested| {
+        const effective = try resolveWorkspaceRoot(alloc, requested, loaded.state.workspace_root);
+        defer alloc.free(effective);
+        if (!std.mem.eql(u8, effective, loaded.state.workspace_root)) {
+            return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "cwd does not match session cwd" });
+        }
+    }
     const sid_copy = try alloc.dupe(u8, loaded.state.id);
     var sid_owned = true;
     defer if (sid_owned) alloc.free(sid_copy);
@@ -317,13 +434,14 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     if (loaded.state.usage) |usage| try session_rt.usage.restore(alloc, usage, loaded.state.created_at_ms);
 
     try server.releaseActiveSession(state);
+    const wasm_ws_ref = loaded.state.workspace_root;
     state.active_session = .{
         .session_id = sid_copy,
         .wasm_state = loaded.state,
         .wasm_revision = loaded.revision,
         .model = model_copy,
         .mode = state.cfg.mode_registry.default_mode_id,
-        .workspace_root = state.workspace_root,
+        .workspace_root = wasm_ws_ref,
         .api_key = state.api_key,
         .credential_source = state.credential_source,
         .agent_step_limit = state.agent_step_limit,
@@ -460,9 +578,23 @@ fn handleRestoreSession(
             alloc.destroy(runtime);
         }
     };
+    var ws_params = parseSessionWorkspaceParams(alloc, msg.params_raw) catch {
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid cwd" });
+    };
+    defer ws_params.deinit(alloc);
 
     if (state.active_session) |*active| {
         if (sameSessionId(active.session_id, session_id)) {
+            if (ws_params.cwd) |requested| {
+                const effective = try resolveWorkspaceRoot(alloc, requested, active.workspace_root);
+                defer alloc.free(effective);
+                if (!std.mem.eql(u8, effective, active.workspace_root)) {
+                    return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.invalid_params,
+                        .message = "cwd does not match session cwd",
+                    });
+                }
+            }
             server.cancelAndReapActivePrompt(state);
             server.disableSubagentHost(state);
             state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
@@ -529,6 +661,16 @@ fn handleRestoreSession(
     ) catch |err| return handleLoadFailure(state, alloc, msg, err);
     var writable_owned = true;
     defer if (writable_owned) writable.deinit(alloc);
+    if (ws_params.cwd) |requested| {
+        const effective = try resolveWorkspaceRoot(alloc, requested, writable.state.workspace_root);
+        defer alloc.free(effective);
+        if (!std.mem.eql(u8, effective, writable.state.workspace_root)) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "cwd does not match session cwd",
+            });
+        }
+    }
 
     const sid_copy = try alloc.dupe(u8, writable.state.id);
     var sid_owned = true;
@@ -713,6 +855,39 @@ fn freshAcpState(
         .total_output_tokens = 0,
     };
 }
+fn freshAcpStateWithWorkspace(
+    state: *server.ServerState,
+    alloc: Allocator,
+    workspace_root: []const u8,
+) !session_codec.DurableSessionState {
+    const now = io_mod.milliTimestamp();
+    const id = try session_store.generateSessionId(alloc);
+    errdefer alloc.free(id);
+    const origin = try alloc.dupe(u8, workspace_root);
+    errdefer alloc.free(origin);
+    const workspace = try alloc.dupe(u8, workspace_root);
+    errdefer alloc.free(workspace);
+    const model = try alloc.dupe(u8, state.configured_model);
+    errdefer alloc.free(model);
+    const history = try alloc.alloc(types.HistoryTurn, 0);
+    errdefer alloc.free(history);
+    return .{
+        .id = id,
+        .origin_workspace_root = origin,
+        .workspace_root = workspace,
+        .created_at_ms = now,
+        .updated_at_ms = now,
+        .conversation_language = session_runtime.ConversationLanguage.default(),
+        .preferences = .{
+            .model = model,
+            .effort = state.effort,
+            .fast_mode = state.fast_mode,
+        },
+        .history = history,
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    };
+}
 
 const SessionActivation = struct {
     session_id: []u8,
@@ -736,7 +911,7 @@ fn activateSession(
         .writable = activation.writable,
         .model = activation.model,
         .mode = state.cfg.mode_registry.default_mode_id,
-        .workspace_root = state.workspace_root,
+        .workspace_root = activation.writable.state.workspace_root,
         .api_key = state.api_key,
         .credential_source = state.credential_source,
         .agent_step_limit = state.agent_step_limit,
@@ -872,7 +1047,8 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
         try out.writer.writeAll("{\"sessionId\":");
         try writeJsonStr(summary.id, &out.writer);
         try out.writer.writeAll(",\"cwd\":");
-        try writeJsonStr(state.workspace_root, &out.writer);
+        const cwd_to_report = summary.workspace_root orelse state.workspace_root;
+        try writeJsonStr(cwd_to_report, &out.writer);
         try out.writer.writeAll(",\"updatedAt\":");
         const iso = try formatIso8601(alloc, summary.updated_at_ms);
         defer alloc.free(iso);
