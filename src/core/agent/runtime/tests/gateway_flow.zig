@@ -2931,7 +2931,7 @@ test "processQueuedPrompt filters captured Fast by model capability" {
     }
 }
 
-test "selecting connection B during route A changes only the next admitted turn" {
+test "provider and Fx search stay on connection A after selecting B" {
     const Persistence = struct {
         fn write(
             _: ?*anyopaque,
@@ -2944,6 +2944,7 @@ test "selecting connection B during route A changes only the next admitted turn"
     const Capture = struct {
         registry: *connection_registry.Runtime,
         calls: usize = 0,
+        fx_search_calls: usize = 0,
         route_a_address: ?usize = null,
 
         fn expectRoute(
@@ -2977,10 +2978,21 @@ test "selecting connection B during route A changes only the next admitted turn"
                     try expectRoute(request, "connection-a", "fake://a", "fake-ref-a", "secret-a", "fake/model-a");
                     self.route_a_address = @intFromPtr(request.route);
                     try std.testing.expect(try self.registry.select("connection-b"));
+                    const provider_search = ToolCall{
+                        .id = "provider_search",
+                        .name = "perplexity_search",
+                        .arguments_json = "{}",
+                        .provenance = .provider_executed,
+                    };
+                    try events.emit(.{ .provider_tool_started = provider_search });
+                    try events.emit(.{ .provider_tool_result = .{
+                        .call_id = provider_search.id,
+                        .result = "{\"results\":[{\"title\":\"A\",\"url\":\"https://a.test\"}]}",
+                    } });
                     try events.emit(.{ .fx_tool_call = toolCall(
-                        "call_read",
-                        "read_file",
-                        "{\"path\":\"README.md\"}",
+                        "fx_search",
+                        "web_search",
+                        "{\"query\":\"connection-scoped search\"}",
                     ) });
                     try events.emit(.{ .finish = .{ .reason = .tool_calls } });
                 },
@@ -2998,6 +3010,18 @@ test "selecting connection B during route A changes only the next admitted turn"
                 },
                 else => return error.TestUnexpectedGatewayRequest,
             }
+        }
+
+        fn execute(raw: *anyopaque, request: ToolExecutionRequest) !ToolExecutionResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("web_search", request.call.name);
+            try std.testing.expectEqualStrings("connection-a", request.route.?.connection_id);
+            try std.testing.expectEqualStrings("fake://a", request.route.?.endpoint);
+            try std.testing.expectEqualStrings("fake-ref-a", request.route.?.credential_ref);
+            try std.testing.expectEqualStrings("secret-a", request.route_credential);
+            try std.testing.expectEqualStrings("test_non_vercel", request.provider_adapter.?.kind);
+            self.fx_search_calls += 1;
+            return .{ .model_output = "Fx search results from connection A" };
         }
     };
 
@@ -3045,7 +3069,10 @@ test "selecting connection B during route A changes only the next admitted turn"
         .{ .credential_ref = "fake-ref-b", .credential = "secret-b" },
     };
     hooks_a.permission_decisions = &.{.once};
-    hooks_a.exec_plans = &.{.{ .result = .{ .model_output = "file contents" } }};
+    hooks_a.tool_execution_override = .{
+        .context = &capture,
+        .execute_fn = Capture.execute,
+    };
     defer hooks_a.deinit();
     var deps_a = hooks_a.deps();
     deps_a.provider_adapter = adapter;
@@ -3058,6 +3085,9 @@ test "selecting connection B during route A changes only the next admitted turn"
         job_a,
     );
     try std.testing.expectEqual(@as(usize, 2), capture.calls);
+    try std.testing.expectEqual(@as(usize, 1), capture.fx_search_calls);
+    try std.testing.expectEqual(@as(usize, 1), hooks_a.permission_names.items.len);
+    try std.testing.expectEqualStrings("web_search", hooks_a.permission_names.items[0]);
     try std.testing.expectEqualStrings("done-a", hooks_a.finish_assistant_text.?);
     try std.testing.expectEqualStrings("connection-b", registry.selectedProfile().id);
 

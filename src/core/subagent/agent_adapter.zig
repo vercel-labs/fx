@@ -1,4 +1,5 @@
 const std = @import("std");
+const agent_stream_provider = @import("../agent/stream_provider.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const route_snapshot = @import("../gateway/route_snapshot.zig");
@@ -36,6 +37,7 @@ pub const Config = struct {
     skills_prompt_section: []const u8 = "",
     explicit_skills_prompt_section: []const u8 = "",
     gateway_tools_json: []const u8,
+    provider_tools: []const agent_stream_provider.ProviderToolAdvertisement = &.{},
     custom_tool_guidance: []const u8 = "",
     context_registry: context_contract.Registry,
     context_enabled: bool,
@@ -184,6 +186,7 @@ pub fn run(
             .gateway_retry_count = config.tool_context.gateway_retry_count,
             .gateway_chat_url = config.tool_context.gateway_chat_url,
             .gateway_tools_json = config.gateway_tools_json,
+            .provider_tools = config.provider_tools,
             .custom_tool_guidance = config.custom_tool_guidance,
             .agent_step_limit = config.tool_context.agent_step_limit,
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,

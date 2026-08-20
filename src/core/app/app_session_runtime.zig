@@ -1794,14 +1794,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn startResumedSessionReconciliation(app: *App) void {
-            if (comptime @hasField(App, "auth")) {
-                if (app.auth.apiKey()) |api_key| {
-                    app.session.usage.startReconciliation(
-                        app.alloc,
-                        api_key,
-                    );
-                }
-            }
+            app.session.usage.startReconciliation(app.alloc);
         }
 
         pub fn resumeSelectedSession(app: *App) !bool {

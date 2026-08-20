@@ -49,6 +49,7 @@ const builtin_context = @import("builtins/context.zig");
 const builtin_devbox = @import("builtins/devbox.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
+const output_contracts = @import("core/output/output_contracts.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
 const route_snapshot = @import("core/gateway/route_snapshot.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
@@ -122,6 +123,7 @@ const web_search_runtime = @import("core/tooling/web_search_runtime.zig");
 const worker_runtime = @import("core/agent/worker_runtime.zig");
 const question_prompt = @import("core/agent/question_prompt.zig");
 const gateway_client = @import("gateway/client.zig");
+const model_catalog = @import("core/gateway/model_catalog.zig");
 const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
 const js_host_model_catalog = @import("gateway/js_host_model_catalog.zig");
 const url_opener = @import("core/hosts/url_opener.zig");
@@ -423,8 +425,28 @@ const App = struct {
             host.unavailable_url_opener;
     }
 
-    pub fn creditsProvider(_: *const Self) gateway_provider.CreditsProvider {
-        return builtin_gateway.credits_provider;
+    pub fn fetchAccountUsage(self: *Self) !output_contracts.CreditsSnapshot {
+        const profile = try self.auth.selectedConnectionProfile();
+        const adapter = self.providerAdapter();
+        const provider = if (std.mem.eql(u8, profile.adapter_id, adapter.kind))
+            adapter.account_usage
+        else
+            null;
+        const account_usage = provider orelse return .{
+            .err_message = try self.alloc.dupe(
+                u8,
+                "account usage unavailable for selected connection",
+            ),
+        };
+        var credential = try self.auth.resolveCredentialReference(
+            self.alloc,
+            profile.credential_ref,
+        );
+        defer credential.deinit(self.alloc);
+        return account_usage.fetch(self.alloc, .{
+            .credential = credential.token,
+            .tenant = credential.gatewayTeam(),
+        });
     }
 
     pub fn agentStreamProvider(_: *const Self) agent_stream_provider.Provider {
@@ -453,9 +475,30 @@ const App = struct {
     }
 
     pub fn providerAdapter(self: *const Self) agent_stream_provider.ProviderAdapter {
-        var adapter = builtin_gateway.provider_adapter;
+        var adapter = if (comptime host_target.is_wasm)
+            agent_stream_provider.ProviderAdapter{
+                .kind = builtin_gateway.connection_seed.adapter_id,
+                .model_catalog = js_host_model_catalog.provider,
+                .model_descriptors = builtin_gateway.model_descriptor_provider,
+                .provider_tools = &.{.web_search},
+                .stream_fn = builtin_gateway.streamVercelAdapter,
+            }
+        else
+            builtin_gateway.provider_adapter;
         adapter.legacy_provider = self.agentStreamProvider();
         return adapter;
+    }
+
+    fn selectedModelCatalogProvider(self: *const Self) ?model_catalog.Provider {
+        const profile = self.auth.selectedConnectionProfile() catch return null;
+        const adapter = self.providerAdapter();
+        if (!std.mem.eql(u8, profile.adapter_id, adapter.kind)) return null;
+        return adapter.model_catalog;
+    }
+
+    pub fn activeConnectionId(self: *const Self) []const u8 {
+        return (self.auth.selectedConnectionProfile() catch
+            return builtin_gateway.connection_seed.id).id;
     }
 
     pub fn resolveRouteCredential(
@@ -491,6 +534,56 @@ const App = struct {
             .tenant = tenant,
             .legacy_source = credential.source,
         };
+    }
+
+    fn resolveGenerationUsageCredential(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+        credential_ref: []const u8,
+    ) generation_usage_provider.ResolveCredentialError!generation_usage_provider.ResolvedCredential {
+        const self: *App = @ptrCast(@alignCast(raw.?));
+        var credential = self.auth.resolveCredentialReference(
+            alloc,
+            credential_ref,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.Unavailable,
+        };
+        defer credential.deinit(alloc);
+        const tenant = if (credential.gatewayTeam()) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (tenant) |value| alloc.free(value);
+        const token = credential.token;
+        credential.token = &.{};
+        return .{ .token = token, .tenant = tenant };
+    }
+
+    fn prepareGenerationUsageDispatch(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+    ) generation_usage_provider.PrepareError!generation_usage_provider.Dispatch {
+        const self: *App = @ptrCast(@alignCast(raw.?));
+        const profiles = self.auth.connectionList();
+        if (profiles.len == 0) return error.Unavailable;
+        const inputs = try alloc.alloc(
+            generation_usage_provider.ConnectionInput,
+            profiles.len,
+        );
+        defer alloc.free(inputs);
+        const adapter = self.providerAdapter();
+        for (profiles, 0..) |profile, index| {
+            inputs[index] = .{
+                .id = profile.id,
+                .credential_ref = profile.credential_ref,
+                .provider = if (std.mem.eql(u8, profile.adapter_id, adapter.kind))
+                    adapter.generation_usage
+                else
+                    null,
+            };
+        }
+        return generation_usage_provider.Dispatch.init(alloc, inputs, .{
+            .context = self,
+            .resolve_fn = resolveGenerationUsageCredential,
+        });
     }
 
     pub fn admitSubagentWorkRoute(
@@ -549,22 +642,14 @@ const App = struct {
     permission_state: app_permission_runtime.State = .{},
     agent_step_limit: usize = default_max_agent_steps,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
-    web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
-        .provider = if (host_profile.web_search) builtin_gateway.default_web_search_provider else null,
-    }),
+    web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{}),
     web_search_models_path: []const u8 = builtin_gateway.models_path,
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
 
-    session: SessionRuntime = SessionRuntime.init(
-        max_history_turns,
-        if (host_profile.generation_usage)
-            builtin_gateway.generation_usage_provider
-        else
-            generation_usage_provider.unavailable_provider,
-    ),
+    session: SessionRuntime = SessionRuntime.init(max_history_turns),
     session_persistence: app_session_runtime.Persistence = .{},
     prompt_history: PromptHistoryRuntime = .{},
     requested_resume: ?cli_surface.ResumeTarget = null,
@@ -725,6 +810,10 @@ const App = struct {
     }
 
     pub fn rebindAfterInit(self: *App) void {
+        self.session.usage.configureReconciliationSource(.{
+            .context = self,
+            .prepare_fn = prepareGenerationUsageDispatch,
+        });
         SessionAppRuntime.rebindSubagentHost(self);
     }
 
@@ -1651,6 +1740,11 @@ const App = struct {
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = self.session_persistence.subagent_host != null,
+            .terminal_available = self.session_persistence.subagent_host != null and
+                tool_dispatch.ToolCapabilities.for_host(host.current()).terminalAvailable(),
+            .provider_tools = self.providerAdapter().provider_tools,
+            .fx_web_search_installed = host_profile.web_search and
+                self.providerAdapter().web_search != null,
         });
     }
 
@@ -1813,26 +1907,31 @@ const App = struct {
     }
 
     pub fn fetchModelIds(self: *App) !std.ArrayList([]u8) {
+        const provider = self.selectedModelCatalogProvider() orelse return error.Unavailable;
         return AgentAppRuntime.fetchModelIds(
             self,
-            if (comptime host_target.is_wasm) js_host_model_catalog.provider else builtin_gateway.model_catalog_provider,
+            provider,
             builtin_gateway.models_path,
         );
     }
 
     pub fn startModelCacheWarmup(self: *App) void {
+        const provider = self.selectedModelCatalogProvider() orelse {
+            debug_trace.logf("gateway", "model_cache_warmup_skipped reason=unsupported_adapter", .{});
+            return;
+        };
         if (comptime host_profile.cooperative_agent) {
             if (self.auth.credentialNeedsRefresh()) {
                 debug_trace.logf("auth", "model_cache_warmup_deferred reason=credential_refresh_required", .{});
                 return;
             }
             self.model_cache.loadCooperative(
-                js_host_model_catalog.provider,
+                provider,
                 self.auth.modelCatalogAccess(),
             );
         } else {
             self.model_cache.startWarmup(
-                builtin_gateway.model_catalog_provider,
+                provider,
                 self.auth.modelCatalogAccess(),
             );
         }

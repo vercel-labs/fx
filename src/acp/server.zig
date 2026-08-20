@@ -26,6 +26,7 @@ const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
 const session_store = @import("../core/session/session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
+const generation_usage_provider = @import("../core/session/generation_usage_provider.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const background_runtime = @import("../core/background/background_runtime.zig");
 const terminal_client_runtime = @import("../core/terminal/client.zig");
@@ -298,10 +299,7 @@ pub fn releaseActiveSession(state: *ServerState) !void {
         active.session_rt.usage.cancelReconciliation();
         active.session_rt.usage.finishProfilePublicationsBeforeShutdown();
         flushActiveSessionUsage(state) catch |err| {
-            active.session_rt.usage.startReconciliation(
-                state.alloc,
-                state.api_key,
-            );
+            active.session_rt.usage.startReconciliation(state.alloc);
             return err;
         };
         active.session_rt.usage.configurePublicationSink(null);
@@ -336,21 +334,69 @@ pub fn prepareConnectionCredential(
     var credential = resolution.credential orelse return error.MissingCredential;
     errdefer credential.deinit(alloc);
     var catalog_cancel_flag = std.atomic.Value(bool).init(false);
-    _ = try state.capability_resolver.resolve(
-        state.alloc,
-        state.cfg.gateway_provider.model_catalog,
-        .{
-            .access = credentials.catalogAccessForCredential(
-                credential.source,
-                credential.token,
-                credential.gatewayTeam(),
-            ),
-            .endpoint = state.cfg.gateway_models_path,
-            .cancel_flag = &catalog_cancel_flag,
-        },
-        model,
-    );
+    const adapter = state.cfg.gateway_provider.provider_adapter;
+    if (gateway_provider.modelCatalogForAdapter(profile.adapter_id, adapter)) |catalog| {
+        _ = try state.capability_resolver.resolve(
+            state.alloc,
+            catalog,
+            .{
+                .access = credentials.catalogAccessForCredential(
+                    credential.source,
+                    credential.token,
+                    credential.gatewayTeam(),
+                ),
+                .endpoint = state.cfg.gateway_models_path,
+                .cancel_flag = &catalog_cancel_flag,
+            },
+            model,
+        );
+    }
     return credential;
+}
+
+fn resolveGenerationUsageCredential(
+    raw: ?*anyopaque,
+    alloc: Allocator,
+    _: []const u8,
+) generation_usage_provider.ResolveCredentialError!generation_usage_provider.ResolvedCredential {
+    const state: *ServerState = @ptrCast(@alignCast(raw.?));
+    if (state.api_key.len == 0) return error.Unavailable;
+    const token = try alloc.dupe(u8, state.api_key);
+    errdefer alloc.free(token);
+    return .{
+        .token = token,
+        .tenant = if (state.gateway_team) |team| try alloc.dupe(u8, team) else null,
+    };
+}
+
+fn prepareGenerationUsageDispatch(
+    raw: ?*anyopaque,
+    alloc: Allocator,
+) generation_usage_provider.PrepareError!generation_usage_provider.Dispatch {
+    const state: *ServerState = @ptrCast(@alignCast(raw.?));
+    const connection_id = state.credential_connection_id orelse return error.Unavailable;
+    const connections = state.connections orelse return error.Unavailable;
+    const profile = connections.profile(connection_id) catch return error.Unavailable;
+    const adapter = state.cfg.gateway_provider.provider_adapter;
+    return generation_usage_provider.Dispatch.init(alloc, &.{.{
+        .id = profile.id,
+        .credential_ref = profile.credential_ref,
+        .provider = if (std.mem.eql(u8, profile.adapter_id, adapter.kind))
+            adapter.generation_usage
+        else
+            null,
+    }}, .{
+        .context = state,
+        .resolve_fn = resolveGenerationUsageCredential,
+    });
+}
+
+pub fn configureGenerationUsageSource(state: *ServerState) void {
+    const active = if (state.active_session) |*session| session else return;
+    active.session_rt.usage.configureReconciliationSource(.{
+        .context = state,
+        .prepare_fn = prepareGenerationUsageDispatch,
+    });
 }
 
 pub fn adoptConnectionCredential(
@@ -576,9 +622,7 @@ pub fn runWithTransport(
         .alloc = alloc,
         .cfg = cfg,
         .writer = writer_value,
-        .web_search_runtime = web_search_runtime.Runtime.init(.{
-            .provider = cfg.gateway_provider.web_search,
-        }),
+        .web_search_runtime = web_search_runtime.Runtime.init(.{}),
         .background = background_runtime.BackgroundRuntime.init(
             cfg.background_process_provider,
         ),
@@ -1239,6 +1283,10 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         });
     };
     defer startup.deinit(alloc);
+    try startup.normalizeModels(
+        alloc,
+        state.cfg.gateway_provider.provider_adapter.model_descriptors,
+    );
     try app_lifecycle.applyWorkspaceLaunch(
         &startup,
         alloc,
@@ -2171,8 +2219,8 @@ test "ACP usage flush preserves snapshot ownership on allocation failure" {
         1,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
 
     var durable = try acpModelTestState(

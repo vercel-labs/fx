@@ -442,7 +442,7 @@ pub fn buildSessionSnapshot(
 }
 
 pub fn validateFact(fact: GenerationFact) error{InvalidGenerationFact}!void {
-    if (!types.validGatewayGenerationId(fact.id) or
+    if (!types.validGenerationReferenceId(fact.id) or
         fact.created_at_ms < 0 or
         fact.model.len == 0 or
         fact.model.len > max_model_bytes or
@@ -464,7 +464,7 @@ pub fn validateFact(fact: GenerationFact) error{InvalidGenerationFact}!void {
 pub fn validatePendingMarker(
     marker: PendingMarker,
 ) error{InvalidPendingMarker}!void {
-    if (!types.validGatewayGenerationId(marker.id) or marker.observed_at_ms < 0) {
+    if (!types.validGenerationReferenceId(marker.id) or marker.observed_at_ms < 0) {
         return error.InvalidPendingMarker;
     }
 }

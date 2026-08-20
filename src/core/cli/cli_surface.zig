@@ -808,6 +808,7 @@ fn runNonInteractiveWithDeps(
                 cfg.default_agent_step_limit,
             );
             defer startup.deinit(alloc);
+            try startup.normalizeModel(alloc, cfg.gateway_provider.provider_adapter.model_descriptors);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
             const mcp_config_diagnostic = try cfg.inspect_mcp_profile_config(alloc);
 
@@ -839,6 +840,7 @@ fn runNonInteractiveWithDeps(
                 cfg.gateway_provider.connection_seed,
             );
             defer startup.deinit(alloc);
+            try startup.normalizeModels(alloc, cfg.gateway_provider.provider_adapter.model_descriptors);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
             const rules = try permissionRulesForSnapshot(alloc, startup.permission_rules);
             defer if (rules.rules.len > 0) alloc.free(rules.rules);
@@ -869,15 +871,30 @@ fn runNonInteractiveWithDeps(
                 cfg.gateway_provider.connection_seed,
             );
             defer startup.deinit(alloc);
+            try startup.normalizeModels(alloc, cfg.gateway_provider.provider_adapter.model_descriptors);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
             const catalog_access = startup.modelCatalogAccess();
-            const loaded = switch (cfg.gateway_provider.cli_model_catalog.fetch(alloc, .{
-                .access = catalog_access,
-                .endpoint = cfg.models_path,
-            })) {
+            const adapter = cfg.gateway_provider.provider_adapter;
+            const selected_adapter_id = if (startup.connections) |*connections|
+                connections.selectedProfile().adapter_id
+            else
+                cfg.gateway_provider.connection_seed.adapter_id;
+            const result = if (std.mem.eql(u8, selected_adapter_id, adapter.kind) and
+                adapter.model_catalog != null)
+                model_catalog.fetchWithPublicFallback(adapter.model_catalog.?, alloc, .{
+                    .access = catalog_access,
+                    .endpoint = cfg.models_path,
+                })
+            else
+                model_catalog.FetchResult{ .failed = .{
+                    .access = .init(catalog_access),
+                    .anonymous_fallback_used = false,
+                    .failure = .{ .category = .runtime },
+                } };
+            const loaded = switch (result) {
                 .loaded => |loaded| loaded,
-                .failure => |failure| {
+                .failed => |failure| {
                     const error_name = @errorName(failure.failure.asError());
                     const message = try std.fmt.allocPrint(
                         alloc,
@@ -901,7 +918,9 @@ fn runNonInteractiveWithDeps(
                     return .handled_failure;
                 },
             };
-            var ids = loaded.ids;
+            var catalog = loaded.catalog;
+            defer model_catalog.freeModelCatalog(alloc, &catalog);
+            var ids = try model_catalog.projectModelIds(alloc, catalog.items);
             defer collections.freeStringList(alloc, &ids);
 
             const text = try (output_contracts.ModelListSnapshot{
@@ -1220,6 +1239,7 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             };
             defer startup.deinit(alloc);
+            try startup.normalizeModels(alloc, cfg.gateway_provider.provider_adapter.model_descriptors);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
             if (opts.action == null) {
@@ -1276,12 +1296,27 @@ fn runNonInteractiveWithDeps(
                 cfg.gateway_provider.connection_seed,
             );
             defer startup.deinit(alloc);
+            try startup.normalizeModels(alloc, cfg.gateway_provider.provider_adapter.model_descriptors);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
-            var snapshot = cfg.gateway_provider.credits.fetch(alloc, .{
-                .credential = startup.apiKey(),
-                .tenant = startup.gatewayTeam(),
-            });
+            const adapter = cfg.gateway_provider.provider_adapter;
+            const selected_adapter_id = if (startup.connections) |*connections|
+                connections.selectedProfile().adapter_id
+            else
+                cfg.gateway_provider.connection_seed.adapter_id;
+            var snapshot = if (std.mem.eql(u8, selected_adapter_id, adapter.kind) and
+                adapter.account_usage != null)
+                adapter.account_usage.?.fetch(alloc, .{
+                    .credential = startup.apiKey(),
+                    .tenant = startup.gatewayTeam(),
+                })
+            else
+                output_contracts.CreditsSnapshot{
+                    .err_message = try alloc.dupe(
+                        u8,
+                        "account usage unavailable for selected connection",
+                    ),
+                };
             defer snapshot.deinit(alloc);
             const text = try snapshot.render(alloc, opts.format);
             defer alloc.free(text);
@@ -1349,6 +1384,7 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             };
             defer startup.deinit(alloc);
+            try startup.normalizeModels(alloc, cfg.gateway_provider.provider_adapter.model_descriptors);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
             const channel = opts.channel orelse startup.update_channel;
@@ -4517,7 +4553,7 @@ test "runIfRequested model fetch failure is handled" {
     defer capture.deinit();
     var probe = ModelFetchProbe{ .outcome = .failure };
     var cfg = testConfig();
-    cfg.gateway_provider.cli_model_catalog = probe.provider();
+    cfg.gateway_provider.provider_adapter.model_catalog = probe.provider();
 
     var deps = capture.deps();
     deps.load_startup_state = failingStartupState;
@@ -4536,7 +4572,7 @@ test "runIfRequested model fetch failure preserves json output" {
     defer capture.deinit();
     var probe = ModelFetchProbe{ .outcome = .failure };
     var cfg = testConfig();
-    cfg.gateway_provider.cli_model_catalog = probe.provider();
+    cfg.gateway_provider.provider_adapter.model_catalog = probe.provider();
 
     var deps = capture.deps();
     deps.load_catalog_startup_state = stubLoadCatalogStartupState;
@@ -4560,7 +4596,7 @@ test "runIfRequested model provider cancellation is handled" {
     defer capture.deinit();
     var probe = ModelFetchProbe{ .outcome = .cancelled };
     var cfg = testConfig();
-    cfg.gateway_provider.cli_model_catalog = probe.provider();
+    cfg.gateway_provider.provider_adapter.model_catalog = probe.provider();
 
     var deps = capture.deps();
     deps.load_catalog_startup_state = stubLoadCatalogStartupState;
@@ -4578,7 +4614,7 @@ test "runIfRequested models passes startup team to fetch seam" {
     defer capture.deinit();
     var probe = ModelFetchProbe{};
     var cfg = testConfig();
-    cfg.gateway_provider.cli_model_catalog = probe.provider();
+    cfg.gateway_provider.provider_adapter.model_catalog = probe.provider();
 
     var deps = capture.deps();
     deps.load_catalog_startup_state = stubLoadCatalogStartupState;
@@ -4592,12 +4628,33 @@ test "runIfRequested models passes startup team to fetch seam" {
     );
 }
 
+test "model catalog does not fall back across adapter kinds" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+    var probe = ModelFetchProbe{};
+    var cfg = testConfig();
+    cfg.gateway_provider.provider_adapter.kind = "other-adapter";
+    cfg.gateway_provider.provider_adapter.model_catalog = probe.provider();
+
+    var deps = capture.deps();
+    deps.load_catalog_startup_state = stubLoadCatalogStartupState;
+
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{@constCast("models")},
+        cfg,
+        deps,
+    );
+    try std.testing.expectEqual(RunResult.handled_failure, result);
+    try std.testing.expect(!probe.called);
+}
+
 test "runIfRequested credits renders through the configured provider" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
     var probe = CreditsProviderProbe{ .outcome = .success };
     var cfg = testConfig();
-    cfg.gateway_provider.credits = probe.provider();
+    cfg.gateway_provider.provider_adapter.account_usage = probe.provider();
 
     var deps = capture.deps();
     deps.load_startup_state = stubLoadStartupState;
@@ -4612,12 +4669,36 @@ test "runIfRequested credits renders through the configured provider" {
     );
 }
 
+test "account usage does not fall back across adapter kinds" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+    var probe = CreditsProviderProbe{ .outcome = .success };
+    var cfg = testConfig();
+    cfg.gateway_provider.provider_adapter.kind = "other";
+    cfg.gateway_provider.provider_adapter.account_usage = probe.provider();
+    var deps = capture.deps();
+    deps.load_startup_state = stubLoadStartupState;
+
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{ @constCast("credits"), @constCast("--json") },
+        cfg,
+        deps,
+    );
+    try std.testing.expectEqual(RunResult.handled_failure, result);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"credits\",\"error\":\"account usage unavailable for selected connection\"}\n",
+        capture.stdout.written(),
+    );
+}
+
 test "runIfRequested credits failures use nonzero text and json contracts" {
     var text_capture = CaptureOutput.init(std.testing.allocator);
     defer text_capture.deinit();
     var text_probe = CreditsProviderProbe{ .outcome = .failure };
     var text_cfg = testConfig();
-    text_cfg.gateway_provider.credits = text_probe.provider();
+    text_cfg.gateway_provider.provider_adapter.account_usage = text_probe.provider();
     var text_deps = text_capture.deps();
     text_deps.load_startup_state = stubLoadStartupState;
 
@@ -4638,7 +4719,7 @@ test "runIfRequested credits failures use nonzero text and json contracts" {
     defer json_capture.deinit();
     var json_probe = CreditsProviderProbe{ .outcome = .failure };
     var json_cfg = testConfig();
-    json_cfg.gateway_provider.credits = json_probe.provider();
+    json_cfg.gateway_provider.provider_adapter.account_usage = json_probe.provider();
     var json_deps = json_capture.deps();
     json_deps.load_startup_state = stubLoadStartupState;
 
@@ -5091,7 +5172,7 @@ const ModelFetchProbe = struct {
     called: bool = false,
     outcome: Outcome = .success,
 
-    fn provider(self: *ModelFetchProbe) gateway_provider.CliModelCatalogProvider {
+    fn provider(self: *ModelFetchProbe) model_catalog.Provider {
         return .{
             .context = self,
             .fetch_fn = fetch,
@@ -5099,21 +5180,16 @@ const ModelFetchProbe = struct {
     }
 
     fn failure(
-        input: gateway_provider.CliModelCatalogInput,
         category: model_catalog.FailureCategory,
-    ) gateway_provider.CliModelCatalogResult {
-        return .{ .failure = .{
-            .access = .init(input.access),
-            .anonymous_fallback_used = false,
-            .failure = .{ .category = category },
-        } };
+    ) model_catalog.ProviderResult {
+        return .{ .failure = .{ .category = category } };
     }
 
     fn fetch(
         raw: ?*anyopaque,
         alloc: Allocator,
-        input: gateway_provider.CliModelCatalogInput,
-    ) gateway_provider.CliModelCatalogResult {
+        input: model_catalog.FetchInput,
+    ) Allocator.Error!model_catalog.ProviderResult {
         const self: *ModelFetchProbe = @ptrCast(@alignCast(raw.?));
         self.called = true;
         if (!std.mem.eql(u8, input.access.authorizationCredential() orelse "", "test-key") or
@@ -5122,27 +5198,23 @@ const ModelFetchProbe = struct {
             !std.mem.eql(u8, input.endpoint, "/v1/models") or
             input.cancel_flag != null)
         {
-            return failure(input, .runtime);
+            return failure(.runtime);
         }
 
         switch (self.outcome) {
-            .failure => return failure(input, .runtime),
-            .cancelled => return failure(input, .cancellation),
+            .failure => return failure(.runtime),
+            .cancelled => return failure(.cancellation),
             .success => {},
         }
 
-        var ids: std.ArrayList([]u8) = .empty;
-        const id = alloc.dupe(u8, "private/blue-hornbill") catch {
-            return failure(input, .resource_exhausted);
-        };
-        ids.append(alloc, id) catch {
-            alloc.free(id);
-            return failure(input, .resource_exhausted);
-        };
-        return .{ .loaded = .{
-            .ids = ids,
-            .provenance = .{ .access = .init(input.access) },
-        } };
+        var catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+        errdefer model_catalog.freeModelCatalog(alloc, &catalog);
+        const id = try alloc.dupe(u8, "private/blue-hornbill");
+        errdefer alloc.free(id);
+        const model_type = try alloc.dupe(u8, "language");
+        errdefer alloc.free(model_type);
+        try catalog.append(alloc, .{ .id = id, .model_type = model_type });
+        return .{ .catalog = catalog };
     }
 };
 
@@ -5168,7 +5240,7 @@ const CreditsProviderProbe = struct {
     calls: usize = 0,
     saw_expected_input: bool = false,
 
-    fn provider(self: *CreditsProviderProbe) gateway_provider.CreditsProvider {
+    fn provider(self: *CreditsProviderProbe) gateway_provider.account_usage_provider.Provider {
         return .{
             .context = self,
             .fetch_fn = fetch,
@@ -5178,7 +5250,7 @@ const CreditsProviderProbe = struct {
     fn fetch(
         raw: ?*anyopaque,
         alloc: Allocator,
-        input: gateway_provider.CreditsLookupInput,
+        input: gateway_provider.account_usage_provider.Input,
     ) output_contracts.CreditsSnapshot {
         const self: *CreditsProviderProbe = @ptrCast(@alignCast(raw.?));
         self.calls += 1;

@@ -252,9 +252,11 @@ function startFakeGateway(
   model: string | ModelCatalogFixture = OUTER_MODEL,
 ) {
   const requests: GatewayRequest[] = [];
+  let traffic = 0;
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
+      traffic += 1;
       const url = new URL(req.url);
       if (url.pathname === "/coding-agent/v1/models") {
         return Response.json({
@@ -273,6 +275,9 @@ function startFakeGateway(
     chatUrl: `http://127.0.0.1:${server.port}/v3/ai/language-model`,
     baseUrl: `http://127.0.0.1:${server.port}`,
     requests,
+    get traffic() {
+      return traffic;
+    },
     stop() {
       server.stop(true);
     },
@@ -481,7 +486,7 @@ describe("web_search Gateway fixture", () => {
         expect(gateway.requests).toHaveLength(2);
         expect(gateway.requests[0].body).toContain("gateway.perplexity_search");
         expect(gateway.requests[1].body).toContain(
-          "web_search is unavailable: no local runtime with a configured Gateway transport policy is installed",
+          "web_search is unavailable: Fx search is not installed for this surface or selected connection",
         );
       } finally {
         gateway.stop();
@@ -513,7 +518,7 @@ describe("web_search Gateway fixture", () => {
         expect(result.stdout).toContain("native search call was rejected");
         expect(gateway.requests).toHaveLength(2);
         expect(gateway.requests[1].body).toContain(
-          "web_search is unavailable: no local runtime with a configured Gateway transport policy is installed",
+          "web_search is unavailable: Fx search is not installed for this surface or selected connection",
         );
       } finally {
         gateway.stop();
@@ -1124,6 +1129,63 @@ describe("web_search Gateway fixture", () => {
           guidanceMessageIndices: [],
         });
         expect(JSON.stringify(messages)).not.toContain("Found 1 result");
+      } finally {
+        await client.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "Ask and ACP adapter mismatch fails without fixture traffic",
+    async () => {
+      const gateway = startFakeGateway([]);
+      const root = createIsolatedRoot("allow", {
+        effort: "high",
+        connections: {
+          selected: "mismatched",
+          profiles: [{
+            id: "mismatched",
+            display_name: "Mismatched",
+            adapter_id: "unsupported_adapter",
+            endpoint: gateway.chatUrl,
+            protocol: "unsupported_adapter",
+            credential_ref: "ai_gateway_api_key",
+            remembered_model: "unsupported/model",
+            internal_models: {
+              permission_review: null,
+              vision: null,
+              subagent: null,
+            },
+          }],
+        },
+      });
+      const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined });
+      const client = AcpClient.create(root.workspace, env);
+      try {
+        const ask = await runFx(
+          ["ask", "--auto", "--json", "--no-save", "Force mismatched capability resolution."],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(ask.code).toBe(1);
+        expect(JSON.parse(ask.stdout).error).toBe("MissingCredentials");
+        expect(ask.stderr).toContain("Fx needs access to Vercel AI Gateway");
+
+        const initialized = await client.request(
+          "initialize",
+          { protocolVersion: 1 },
+          1,
+        );
+        expect(initialized.result).toBeDefined();
+        const session = await client.request(
+          "session/new",
+          { mcpServers: [] },
+          2,
+        );
+        expect(session.error.message).toBe("Failed to prepare session connection");
+        expect(gateway.traffic).toBe(0);
       } finally {
         await client.close();
         gateway.stop();

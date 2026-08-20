@@ -1,11 +1,12 @@
 const std = @import("std");
+const secret = @import("../auth/secret.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const LookupInput = struct {
     credential: []const u8,
     tenant: ?[]const u8,
-    origin: []const u8,
+    lookup_scope: ?[]const u8,
     generation_id: []const u8,
     cancel_flag: *std.atomic.Value(bool),
 };
@@ -41,10 +42,7 @@ pub const LookupOutcome = union(enum) {
     }
 };
 
-pub const LookupError = Allocator.Error || error{
-    Cancelled,
-    Unavailable,
-};
+pub const LookupError = Allocator.Error || error{Cancelled};
 
 pub const LookupFn = *const fn (
     context: ?*anyopaque,
@@ -73,11 +71,160 @@ fn lookupUnavailable(
     _: Allocator,
     _: LookupInput,
 ) LookupError!LookupOutcome {
-    return error.Unavailable;
+    return .preserve_pending;
 }
 
 pub const unavailable_provider = Provider{
     .lookup_fn = lookupUnavailable,
+};
+
+pub const ResolvedCredential = struct {
+    token: []u8,
+    tenant: ?[]u8 = null,
+
+    pub fn deinit(self: *ResolvedCredential, alloc: Allocator) void {
+        secret.zeroAndFree(alloc, self.token);
+        if (self.tenant) |tenant| alloc.free(tenant);
+        self.* = undefined;
+    }
+};
+
+pub const ResolveCredentialError = Allocator.Error || error{
+    Cancelled,
+    Unavailable,
+};
+
+pub const CredentialResolver = struct {
+    /// When set, context must outlive every prepared dispatch using it.
+    context: ?*anyopaque = null,
+    resolve_fn: *const fn (
+        context: ?*anyopaque,
+        alloc: Allocator,
+        credential_ref: []const u8,
+    ) ResolveCredentialError!ResolvedCredential,
+
+    pub fn resolve(
+        self: CredentialResolver,
+        alloc: Allocator,
+        credential_ref: []const u8,
+    ) ResolveCredentialError!ResolvedCredential {
+        return self.resolve_fn(self.context, alloc, credential_ref);
+    }
+};
+
+pub const ConnectionInput = struct {
+    id: []const u8,
+    credential_ref: []const u8,
+    provider: ?Provider,
+};
+
+const Connection = struct {
+    id: []u8,
+    credential_ref: []u8,
+    provider: ?Provider,
+
+    fn init(alloc: Allocator, input: ConnectionInput) Allocator.Error!Connection {
+        const id = try alloc.dupe(u8, input.id);
+        errdefer alloc.free(id);
+        return .{
+            .id = id,
+            .credential_ref = try alloc.dupe(u8, input.credential_ref),
+            .provider = input.provider,
+        };
+    }
+
+    fn deinit(self: *Connection, alloc: Allocator) void {
+        alloc.free(self.id);
+        alloc.free(self.credential_ref);
+        self.* = undefined;
+    }
+};
+
+/// Owned, immutable connection routing prepared on the application owner
+/// before the reconciliation worker starts. Credential bytes are resolved
+/// only by `lookup` and are never retained by this value.
+pub const Dispatch = struct {
+    connections: []Connection,
+    credential_resolver: CredentialResolver,
+
+    pub fn init(
+        alloc: Allocator,
+        inputs: []const ConnectionInput,
+        credential_resolver: CredentialResolver,
+    ) Allocator.Error!Dispatch {
+        const connections = try alloc.alloc(Connection, inputs.len);
+        errdefer alloc.free(connections);
+        var initialized: usize = 0;
+        errdefer for (connections[0..initialized]) |*connection| connection.deinit(alloc);
+        for (inputs, 0..) |input, index| {
+            connections[index] = try Connection.init(alloc, input);
+            initialized += 1;
+        }
+        return .{
+            .connections = connections,
+            .credential_resolver = credential_resolver,
+        };
+    }
+
+    pub fn deinit(self: *Dispatch, alloc: Allocator) void {
+        for (self.connections) |*connection| connection.deinit(alloc);
+        alloc.free(self.connections);
+        self.* = undefined;
+    }
+
+    pub fn lookup(
+        self: Dispatch,
+        alloc: Allocator,
+        connection_id: []const u8,
+        generation_id: []const u8,
+        lookup_scope: ?[]const u8,
+        cancel_flag: *std.atomic.Value(bool),
+    ) LookupError!LookupOutcome {
+        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+        const connection = for (self.connections) |connection| {
+            if (std.mem.eql(u8, connection.id, connection_id)) break connection;
+        } else return .preserve_pending;
+        const provider = connection.provider orelse return .preserve_pending;
+        var credential = self.credential_resolver.resolve(
+            alloc,
+            connection.credential_ref,
+        ) catch |err| switch (err) {
+            error.Cancelled => return error.Cancelled,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Unavailable => return .preserve_pending,
+        };
+        defer credential.deinit(alloc);
+        return provider.lookup(alloc, .{
+            .credential = credential.token,
+            .tenant = credential.tenant,
+            .lookup_scope = lookup_scope,
+            .generation_id = generation_id,
+            .cancel_flag = cancel_flag,
+        });
+    }
+};
+
+pub const PrepareError = Allocator.Error || error{Unavailable};
+
+pub const Source = struct {
+    /// Preparation runs on the owning application thread before worker spawn.
+    context: ?*anyopaque = null,
+    prepare_fn: *const fn (
+        context: ?*anyopaque,
+        alloc: Allocator,
+    ) PrepareError!Dispatch,
+
+    pub fn prepare(self: Source, alloc: Allocator) PrepareError!Dispatch {
+        return self.prepare_fn(self.context, alloc);
+    }
+};
+
+fn prepareUnavailable(_: ?*anyopaque, _: Allocator) PrepareError!Dispatch {
+    return error.Unavailable;
+}
+
+pub const unavailable_source = Source{
+    .prepare_fn = prepareUnavailable,
 };
 
 test "generation usage lookup dispatches through the injected provider" {
@@ -94,7 +241,8 @@ test "generation usage lookup dispatches through the injected provider" {
             self.calls += 1;
             self.saw_expected_input =
                 std.mem.eql(u8, "credential", input.credential) and
-                std.mem.eql(u8, "generation", input.generation_id);
+                std.mem.eql(u8, "generation", input.generation_id) and
+                std.mem.eql(u8, "scope", input.lookup_scope.?);
             const id = try alloc.dupe(u8, input.generation_id);
             errdefer alloc.free(id);
             const model = try alloc.dupe(u8, "provider/model");
@@ -120,7 +268,7 @@ test "generation usage lookup dispatches through the injected provider" {
     var outcome = try provider.lookup(std.testing.allocator, .{
         .credential = "credential",
         .tenant = null,
-        .origin = "https://provider.example",
+        .lookup_scope = "scope",
         .generation_id = "generation",
         .cancel_flag = &cancel,
     });
@@ -129,4 +277,72 @@ test "generation usage lookup dispatches through the injected provider" {
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expect(fake.saw_expected_input);
     try std.testing.expectEqualStrings("provider/model", outcome.found.model);
+}
+
+test "generation usage dispatch is connection scoped and missing connections are effect free" {
+    const Fake = struct {
+        calls: usize = 0,
+        resolved: usize = 0,
+
+        fn resolve(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            credential_ref: []const u8,
+        ) ResolveCredentialError!ResolvedCredential {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.resolved += 1;
+            return .{ .token = try alloc.dupe(u8, credential_ref) };
+        }
+
+        fn lookup(
+            raw: ?*anyopaque,
+            _: Allocator,
+            input: LookupInput,
+        ) LookupError!LookupOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (!std.mem.eql(u8, "credential-a", input.credential)) return error.Cancelled;
+            return .retry;
+        }
+    };
+
+    var fake: Fake = .{};
+    const provider = Provider{ .context = &fake, .lookup_fn = Fake.lookup };
+    var dispatch = try Dispatch.init(
+        std.testing.allocator,
+        &.{.{
+            .id = "connection-a",
+            .credential_ref = "credential-a",
+            .provider = provider,
+        }},
+        .{ .context = &fake, .resolve_fn = Fake.resolve },
+    );
+    defer dispatch.deinit(std.testing.allocator);
+    var cancel = std.atomic.Value(bool).init(false);
+
+    try std.testing.expectEqual(
+        LookupOutcome.retry,
+        try dispatch.lookup(
+            std.testing.allocator,
+            "connection-a",
+            "generation-a",
+            "scope-a",
+            &cancel,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.resolved);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+
+    try std.testing.expectEqual(
+        LookupOutcome.preserve_pending,
+        try dispatch.lookup(
+            std.testing.allocator,
+            "missing",
+            "generation-missing",
+            "scope-missing",
+            &cancel,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.resolved);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }

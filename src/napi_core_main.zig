@@ -433,21 +433,15 @@ const Runtime = struct {
 
     fn run(self: *Runtime) void {
         const agent_stream = host_stream_provider.provider(&self.stream_context);
+        var provider_adapter = builtin_gateway.provider_adapter;
+        provider_adapter.legacy_provider = agent_stream;
+        provider_adapter.generation_usage = generation_usage_provider.unavailable_provider;
         const provider = gateway_provider.Provider{
             .connection_seed = builtin_gateway.connection_seed,
             .agent_stream = agent_stream,
-            .provider_adapter = .{
-                .kind = builtin_gateway.connection_seed.adapter_id,
-                .legacy_provider = agent_stream,
-                .stream_fn = builtin_gateway.provider_adapter.stream_fn,
-            },
+            .provider_adapter = provider_adapter,
             .oauth_transport = oauth_transport.unavailable_provider,
             .chat_url = builtin_gateway.provider.chat_url,
-            .cli_model_catalog = builtin_gateway.provider.cli_model_catalog,
-            .credits = builtin_gateway.provider.credits,
-            .generation_usage = generation_usage_provider.unavailable_provider,
-            .web_search = builtin_gateway.provider.web_search,
-            .model_catalog = builtin_gateway.provider.model_catalog,
         };
         acp_server.runWithTransport(
             self.alloc,

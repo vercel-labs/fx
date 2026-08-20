@@ -6,7 +6,6 @@ const types = @import("../shared/types.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_result_errors = @import("tool_result_errors.zig");
 const model_request_budget = @import("model_request_budget.zig");
-const session_usage = @import("../session/session_usage.zig");
 const web_search_contract = @import("web_search_contract.zig");
 const web_search_policy = @import("web_search_policy.zig");
 const web_search_provider = @import("web_search_provider.zig");
@@ -31,95 +30,24 @@ pub const Clock = struct {
 };
 
 pub const Config = struct {
-    provider: ?web_search_provider.Provider = null,
     clock: Clock = .{},
-    policy: ?web_search_policy.WebSearchPolicy = null,
-    api_key: []const u8 = "",
-    gateway_team: ?[]const u8 = null,
-    worker_model: []const u8 = "",
-    gateway_retry_count: usize = 3,
-    gateway_chat_url: []const u8 = "https://ai-gateway.vercel.sh/v3/ai/language-model",
-    usage: ?*session_usage.Usage = null,
-    usage_allocator: Allocator = std.heap.c_allocator,
 };
 
 pub const Inputs = web_search_provider.Inputs;
 
-const OwnedInputs = struct {
-    api_key: []u8,
-    gateway_team: ?[]u8 = null,
-    worker_model: []u8,
-    gateway_retry_count: usize,
-    gateway_chat_url: []u8,
-    // The usage pointer and allocator borrow the parent session's lifetime.
-    usage: ?*session_usage.Usage,
-    usage_allocator: Allocator,
-
-    fn deinit(self: *OwnedInputs, alloc: Allocator) void {
-        alloc.free(self.api_key);
-        if (self.gateway_team) |team| alloc.free(team);
-        alloc.free(self.worker_model);
-        alloc.free(self.gateway_chat_url);
-        self.* = undefined;
-    }
-
-    fn borrowed(self: *const OwnedInputs) Inputs {
-        return .{
-            .api_key = self.api_key,
-            .gateway_team = self.gateway_team,
-            .worker_model = self.worker_model,
-            .gateway_retry_count = self.gateway_retry_count,
-            .gateway_chat_url = self.gateway_chat_url,
-            .usage = self.usage,
-            .usage_allocator = self.usage_allocator,
-        };
-    }
-};
-
 pub const ExecutionOutput = web_search_contract.ExecutionOutput;
 
 pub const Runtime = struct {
-    provider: ?web_search_provider.Provider,
     clock: Clock,
-    policy: web_search_policy.WebSearchPolicy,
-    api_key: []const u8,
-    gateway_team: ?[]const u8 = null,
-    worker_model: []const u8,
-    gateway_retry_count: usize,
-    gateway_chat_url: []const u8,
-    usage: ?*session_usage.Usage,
-    usage_allocator: Allocator,
-    config_mutex: std.Io.Mutex = .init,
     fallback_cancel_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(config: Config) Runtime {
         return .{
-            .provider = config.provider,
             .clock = config.clock,
-            .policy = config.policy orelse if (config.provider) |provider| provider.policy else .{},
-            .api_key = config.api_key,
-            .gateway_team = config.gateway_team,
-            .worker_model = config.worker_model,
-            .gateway_retry_count = config.gateway_retry_count,
-            .gateway_chat_url = config.gateway_chat_url,
-            .usage = config.usage,
-            .usage_allocator = config.usage_allocator,
         };
     }
 
     pub fn deinit(_: *Runtime) void {}
-
-    pub fn configure(self: *Runtime, inputs: Inputs) void {
-        self.config_mutex.lockUncancelable(io_mod.getIo());
-        defer self.config_mutex.unlock(io_mod.getIo());
-        self.api_key = inputs.api_key;
-        self.gateway_team = inputs.gateway_team;
-        self.worker_model = inputs.worker_model;
-        self.gateway_retry_count = inputs.gateway_retry_count;
-        self.gateway_chat_url = inputs.gateway_chat_url;
-        self.usage = inputs.usage;
-        self.usage_allocator = inputs.usage_allocator;
-    }
 
     pub fn dispatchBackend(self: *Runtime) tool_dispatch.WebSearchBackend {
         return .{ .ctx = @ptrCast(self), .execute_fn = executeForDispatch };
@@ -128,41 +56,41 @@ pub const Runtime = struct {
     pub fn execute(
         self: *Runtime,
         alloc: Allocator,
+        invocation: tool_dispatch.WebSearchInvocation,
         request: web_search_contract.Request,
         cancel_flag: *std.atomic.Value(bool),
     ) !ExecutionOutput {
-        return self.executeWithProgress(alloc, request, cancel_flag, null, null);
+        return self.executeWithProgress(alloc, invocation, request, cancel_flag, null, null);
     }
 
     pub fn executeWithProgress(
         self: *Runtime,
         alloc: Allocator,
+        invocation: tool_dispatch.WebSearchInvocation,
         input: web_search_contract.Request,
         cancel_flag: *std.atomic.Value(bool),
         on_progress: ?web_search_contract.ProgressFn,
         progress_ctx: ?*anyopaque,
     ) !ExecutionOutput {
         const started_at_ms = self.clock.now();
-        var inputs = try self.inputsSnapshot(alloc);
-        defer inputs.deinit(alloc);
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
-        var policy = self.policy;
-        if (self.provider) |provider| {
-            if (try provider.preferredBackends()) |preferred_backends| {
-                policy.preferred_backends = preferred_backends;
-            }
+        const provider = invocation.provider;
+        const inputs = invocation.inputs;
+        var policy = provider.policy;
+        if (try provider.preferredBackends()) |preferred_backends| {
+            policy.preferred_backends = preferred_backends;
         }
         const selected_backend = web_search_policy.selectBackend(policy, .{
             .has_allowed_domains = hasValues(input.allowed_domains),
             .has_blocked_domains = hasValues(input.blocked_domains),
         }) orelse return error.UnsupportedWebSearchFeatures;
         if (!model_request_budget.searchWorkerInputFitsLimit(
-            if (self.provider) |provider| provider.input_overhead_bytes else 0,
+            provider.input_overhead_bytes,
             input.query,
             input.allowed_domains,
             input.blocked_domains,
-            self.policy.max_input_bytes,
+            policy.max_input_bytes,
         )) return error.WebSearchRequestTooLarge;
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
@@ -171,18 +99,18 @@ pub const Runtime = struct {
             .query = input.query,
             .allowed_domains = input.allowed_domains,
             .blocked_domains = input.blocked_domains,
-            .max_uses = self.policy.max_uses,
-            .max_results = self.policy.max_results,
-            .max_output_tokens = self.policy.max_output_tokens,
-            .max_output_chars = self.policy.max_output_chars,
-            .timeout_ms = self.policy.timeout_ms,
+            .max_uses = policy.max_uses,
+            .max_results = policy.max_results,
+            .max_output_tokens = policy.max_output_tokens,
+            .max_output_chars = policy.max_output_chars,
+            .timeout_ms = policy.timeout_ms,
             .cancel_flag = cancel_flag,
         };
 
         const transport_started_at_ms = self.clock.now();
-        var response = self.executeProvider(alloc, inputs.borrowed(), request, on_progress, progress_ctx) catch |err| {
+        var response = provider.execute(alloc, inputs, request, on_progress, progress_ctx) catch |err| {
             if (shouldRecordFailedNetworkCall(err)) {
-                recordNetworkCall(inputs.worker_model, transport_started_at_ms, self.clock.now(), 0, null, null, @errorName(err));
+                recordNetworkCall(inputs.model, transport_started_at_ms, self.clock.now(), 0, null, null, @errorName(err));
             }
             return err;
         };
@@ -191,12 +119,12 @@ pub const Runtime = struct {
         const transport_finished_at_ms = self.clock.now();
         const usage = response.usage;
         const web_search_requests = if (usage) |value| value.web_search_requests else 0;
-        recordNetworkCall(inputs.worker_model, transport_started_at_ms, transport_finished_at_ms, @intFromEnum(std.http.Status.ok), usage, response.stop_reason, "");
+        recordNetworkCall(inputs.model, transport_started_at_ms, transport_finished_at_ms, @intFromEnum(std.http.Status.ok), usage, response.stop_reason, "");
         const results = response.takeContent();
         const duration_ms = elapsedMs(started_at_ms, self.clock.now());
         debug_trace.logf("web_search", "complete backend={s} model={s} duration_ms={d} requests={d} stop_reason={s}", .{
             selected_backend.id.value,
-            inputs.worker_model,
+            inputs.model,
             duration_ms,
             web_search_requests,
             response.stop_reason orelse "(none)",
@@ -211,39 +139,6 @@ pub const Runtime = struct {
             },
             .inner_usage = usage,
         };
-    }
-
-    fn inputsSnapshot(self: *Runtime, alloc: Allocator) !OwnedInputs {
-        self.config_mutex.lockUncancelable(io_mod.getIo());
-        defer self.config_mutex.unlock(io_mod.getIo());
-        const api_key = try alloc.dupe(u8, self.api_key);
-        errdefer alloc.free(api_key);
-        const gateway_team = if (self.gateway_team) |team| try alloc.dupe(u8, team) else null;
-        errdefer if (gateway_team) |team| alloc.free(team);
-        const worker_model = try alloc.dupe(u8, self.worker_model);
-        errdefer alloc.free(worker_model);
-        const gateway_chat_url = try alloc.dupe(u8, self.gateway_chat_url);
-        return .{
-            .api_key = api_key,
-            .gateway_team = gateway_team,
-            .worker_model = worker_model,
-            .gateway_retry_count = self.gateway_retry_count,
-            .gateway_chat_url = gateway_chat_url,
-            .usage = self.usage,
-            .usage_allocator = self.usage_allocator,
-        };
-    }
-
-    fn executeProvider(
-        self: *Runtime,
-        alloc: Allocator,
-        inputs: Inputs,
-        request: web_search_contract.ProviderRequest,
-        on_progress: ?web_search_contract.ProgressFn,
-        progress_ctx: ?*anyopaque,
-    ) !web_search_contract.ProviderResponse {
-        const provider = self.provider orelse return error.MissingWebSearchProvider;
-        return provider.execute(alloc, inputs, request, on_progress, progress_ctx);
     }
 };
 
@@ -271,9 +166,11 @@ fn executeForDispatch(
     request: web_search_contract.Request,
 ) anyerror!web_search_contract.ExecutionOutput {
     const self: *Runtime = @ptrCast(@alignCast(raw_ctx));
+    const invocation = ctx.web_search_invocation orelse return error.MissingWebSearchProvider;
     var progress_forwarder = ProgressForwarder{ .dispatch = ctx };
     return self.executeWithProgress(
         ctx.allocator,
+        invocation,
         request,
         ctx.cancel_flag orelse &self.fallback_cancel_flag,
         if (ctx.on_web_search_progress != null) ProgressForwarder.onProgress else null,
@@ -349,11 +246,12 @@ const FakeProvider = struct {
     configured_inputs_seen: bool = false,
     response_kind: enum { empty, source, incomplete, interleaved_incomplete } = .empty,
     transport_error: ?enum { cancelled, timeout } = null,
+    policy: web_search_policy.WebSearchPolicy = test_policy,
 
     fn provider(self: *@This()) web_search_provider.Provider {
         return .{
             .context = @ptrCast(self),
-            .policy = test_policy,
+            .policy = self.policy,
             .preferred_backends_fn = preferredBackends,
             .execute_fn = executeProvider,
         };
@@ -373,10 +271,10 @@ const FakeProvider = struct {
         progress_ctx: ?*anyopaque,
     ) !web_search_contract.ProviderResponse {
         const self: *@This() = @ptrCast(@alignCast(raw_ctx orelse return error.MissingTestProvider));
-        self.configured_inputs_seen = std.mem.eql(u8, inputs.api_key, "provider-key") and
-            std.mem.eql(u8, inputs.worker_model, "provider/private-worker") and
-            inputs.gateway_retry_count == 2 and
-            std.mem.eql(u8, inputs.gateway_chat_url, "https://gateway.test/chat");
+        self.configured_inputs_seen = std.mem.eql(u8, inputs.credential, "provider-key") and
+            std.mem.eql(u8, inputs.model, "provider/private-worker") and
+            inputs.retry_count == 2 and
+            std.mem.eql(u8, inputs.endpoint, "https://gateway.test/chat");
         return execute(@ptrCast(self), alloc, request, on_progress, progress_ctx);
     }
 
@@ -496,28 +394,28 @@ const test_policy = web_search_policy.WebSearchPolicy{
     .backend_policies = &test_backend_policies,
 };
 
-fn fakeRuntime(fake: *FakeProvider) Runtime {
-    return Runtime.init(.{
+fn testInvocation(fake: *FakeProvider) tool_dispatch.WebSearchInvocation {
+    return .{
         .provider = fake.provider(),
-        .worker_model = "provider/private-worker",
-    });
+        .inputs = .{
+            .connection_id = "connection-a",
+            .credential = "provider-key",
+            .model = "provider/private-worker",
+            .retry_count = 2,
+            .endpoint = "https://gateway.test/chat",
+        },
+    };
 }
 
 test "runtime routes configured inputs and backend selection through provider" {
     const alloc = std.testing.allocator;
     const secondary_only = [_]web_search_contract.SearchBackendId{test_secondary_backend};
     var fake = FakeProvider{ .preferred_backends = &secondary_only };
-    var runtime = Runtime.init(.{
-        .provider = fake.provider(),
-        .api_key = "provider-key",
-        .worker_model = "provider/private-worker",
-        .gateway_retry_count = 2,
-        .gateway_chat_url = "https://gateway.test/chat",
-    });
+    var runtime = Runtime.init(.{});
     var cancel_flag = std.atomic.Value(bool).init(false);
     const input = web_search_contract.Request{ .query = "latest Zig release" };
 
-    var output = try runtime.execute(alloc, input, &cancel_flag);
+    var output = try runtime.execute(alloc, testInvocation(&fake), input, &cancel_flag);
     defer output.deinit(alloc);
 
     try std.testing.expect(fake.configured_inputs_seen);
@@ -525,14 +423,38 @@ test "runtime routes configured inputs and backend selection through provider" {
     try std.testing.expect(test_secondary_backend.eql(fake.last_backend.?));
 }
 
+test "pinned connection A search ignores later connection B selection" {
+    const alloc = std.testing.allocator;
+    var connection_a = FakeProvider{ .response_kind = .source };
+    var connection_b = FakeProvider{};
+    const pinned_a = testInvocation(&connection_a);
+    var selected = pinned_a;
+    selected = testInvocation(&connection_b);
+    try std.testing.expect(selected.provider.context != pinned_a.provider.context);
+    var runtime = Runtime.init(.{});
+    var cancel_flag = std.atomic.Value(bool).init(false);
+
+    var output = try runtime.execute(
+        alloc,
+        pinned_a,
+        .{ .query = "latest Zig release" },
+        &cancel_flag,
+    );
+    defer output.deinit(alloc);
+
+    try std.testing.expect(connection_a.configured_inputs_seen);
+    try std.testing.expectEqual(@as(usize, 1), connection_a.calls);
+    try std.testing.expectEqual(@as(usize, 0), connection_b.calls);
+}
+
 test "runtime invokes primary backend after allow" {
     const alloc = std.testing.allocator;
     var fake = FakeProvider{};
-    var runtime = fakeRuntime(&fake);
+    var runtime = Runtime.init(.{});
     var cancel_flag = std.atomic.Value(bool).init(false);
     const input = web_search_contract.Request{ .query = "latest Zig release" };
 
-    var output = try runtime.execute(alloc, input, &cancel_flag);
+    var output = try runtime.execute(alloc, testInvocation(&fake), input, &cancel_flag);
     defer output.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
@@ -542,12 +464,12 @@ test "runtime invokes primary backend after allow" {
 test "runtime invokes secondary backend after allow" {
     const alloc = std.testing.allocator;
     var fake = FakeProvider{};
-    var runtime = fakeRuntime(&fake);
-    runtime.policy.preferred_backends = &.{test_secondary_backend};
+    var runtime = Runtime.init(.{});
+    fake.policy.preferred_backends = &.{test_secondary_backend};
     var cancel_flag = std.atomic.Value(bool).init(false);
     const input = web_search_contract.Request{ .query = "latest Zig release" };
 
-    var output = try runtime.execute(alloc, input, &cancel_flag);
+    var output = try runtime.execute(alloc, testInvocation(&fake), input, &cancel_flag);
     defer output.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
@@ -557,14 +479,14 @@ test "runtime invokes secondary backend after allow" {
 test "runtime falls back before request when first backend cannot satisfy strict filter" {
     const alloc = std.testing.allocator;
     var fake = FakeProvider{};
-    var runtime = fakeRuntime(&fake);
+    var runtime = Runtime.init(.{});
     var unsupported = test_backend_policies[0];
     unsupported.features.allowed_domains = .unsupported;
     const backends = [_]web_search_policy.BackendPolicy{
         unsupported,
         test_backend_policies[1],
     };
-    runtime.policy.backend_policies = &backends;
+    fake.policy.backend_policies = &backends;
     var cancel_flag = std.atomic.Value(bool).init(false);
     const allowed_domains = [_][]const u8{"ziglang.org"};
     const input = web_search_contract.Request{
@@ -572,7 +494,7 @@ test "runtime falls back before request when first backend cannot satisfy strict
         .allowed_domains = &allowed_domains,
     };
 
-    var output = try runtime.execute(alloc, input, &cancel_flag);
+    var output = try runtime.execute(alloc, testInvocation(&fake), input, &cancel_flag);
     defer output.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
@@ -582,11 +504,11 @@ test "runtime falls back before request when first backend cannot satisfy strict
 test "unsupported strict filters perform zero backend search requests" {
     const alloc = std.testing.allocator;
     var fake = FakeProvider{};
-    var runtime = fakeRuntime(&fake);
+    var runtime = Runtime.init(.{});
     var unsupported = test_backend_policies[0];
     unsupported.features.allowed_domains = .unsupported;
-    runtime.policy.preferred_backends = &.{test_primary_backend};
-    runtime.policy.backend_policies = &.{unsupported};
+    fake.policy.preferred_backends = &.{test_primary_backend};
+    fake.policy.backend_policies = &.{unsupported};
     var cancel_flag = std.atomic.Value(bool).init(false);
     const allowed_domains = [_][]const u8{"ziglang.org"};
     const input = web_search_contract.Request{
@@ -594,42 +516,43 @@ test "unsupported strict filters perform zero backend search requests" {
         .allowed_domains = &allowed_domains,
     };
 
-    try std.testing.expectError(error.UnsupportedWebSearchFeatures, runtime.execute(alloc, input, &cancel_flag));
+    try std.testing.expectError(error.UnsupportedWebSearchFeatures, runtime.execute(alloc, testInvocation(&fake), input, &cancel_flag));
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
 }
 
 test "oversized worker request performs zero backend search requests" {
     const alloc = std.testing.allocator;
     var fake = FakeProvider{};
-    var runtime = fakeRuntime(&fake);
-    runtime.policy.max_input_bytes = 8;
+    var runtime = Runtime.init(.{});
+    fake.policy.max_input_bytes = 8;
     var cancel_flag = std.atomic.Value(bool).init(false);
     const input = web_search_contract.Request{ .query = "latest Zig release" };
 
-    try std.testing.expectError(error.WebSearchRequestTooLarge, runtime.execute(alloc, input, &cancel_flag));
+    try std.testing.expectError(error.WebSearchRequestTooLarge, runtime.execute(alloc, testInvocation(&fake), input, &cancel_flag));
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
 }
 
 test "cancelled runtime performs zero backend search requests" {
     const alloc = std.testing.allocator;
     var fake = FakeProvider{};
-    var runtime = fakeRuntime(&fake);
+    var runtime = Runtime.init(.{});
     var cancel_flag = std.atomic.Value(bool).init(true);
     const input = web_search_contract.Request{ .query = "latest Zig release" };
 
-    try std.testing.expectError(error.Cancelled, runtime.execute(alloc, input, &cancel_flag));
+    try std.testing.expectError(error.Cancelled, runtime.execute(alloc, testInvocation(&fake), input, &cancel_flag));
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
 }
 
-test "missing provider records no network request" {
+test "missing selected adapter invocation records no network request" {
     const alloc = std.testing.allocator;
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
-    var runtime = Runtime.init(.{ .policy = test_policy });
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    const input = web_search_contract.Request{ .query = "latest Zig release" };
-
-    try std.testing.expectError(error.MissingWebSearchProvider, runtime.execute(alloc, input, &cancel_flag));
+    var runtime = Runtime.init(.{});
+    try std.testing.expectError(error.MissingWebSearchProvider, executeForDispatch(
+        @ptrCast(&runtime),
+        .{ .allocator = alloc },
+        .{ .query = "latest Zig release" },
+    ));
     var calls: [diagnostics.network_ring_capacity]diagnostics.NetworkCall = undefined;
     try std.testing.expectEqual(@as(usize, 0), diagnostics.snapshotNetworkCalls(&calls));
 }
@@ -637,18 +560,18 @@ test "missing provider records no network request" {
 test "runtime normalizes source usage and terminal incomplete state" {
     const alloc = std.testing.allocator;
     var source_fake = FakeProvider{ .response_kind = .source };
-    var source_runtime = fakeRuntime(&source_fake);
+    var source_runtime = Runtime.init(.{});
     var cancel_flag = std.atomic.Value(bool).init(false);
     const input = web_search_contract.Request{ .query = "latest Zig release" };
 
-    var source = try source_runtime.execute(alloc, input, &cancel_flag);
+    var source = try source_runtime.execute(alloc, testInvocation(&source_fake), input, &cancel_flag);
     defer source.deinit(alloc);
     try std.testing.expectEqualStrings("Zig release", source.output.results[0].search.content[0].title);
     try std.testing.expectEqual(@as(u32, 1), source.inner_usage.?.web_search_requests);
 
     var incomplete_fake = FakeProvider{ .response_kind = .incomplete };
-    var incomplete_runtime = fakeRuntime(&incomplete_fake);
-    var incomplete = try incomplete_runtime.execute(alloc, input, &cancel_flag);
+    var incomplete_runtime = Runtime.init(.{});
+    var incomplete = try incomplete_runtime.execute(alloc, testInvocation(&incomplete_fake), input, &cancel_flag);
     defer incomplete.deinit(alloc);
     try std.testing.expect(incomplete.output.incomplete);
     try std.testing.expectEqualStrings("max_tokens", incomplete.output.results[1].terminal_incomplete.stop_reason);
@@ -657,11 +580,11 @@ test "runtime normalizes source usage and terminal incomplete state" {
 test "runtime preserves ordered commentary search errors sources and terminal incomplete state" {
     const alloc = std.testing.allocator;
     var fake = FakeProvider{ .response_kind = .interleaved_incomplete };
-    var runtime = fakeRuntime(&fake);
+    var runtime = Runtime.init(.{});
     var cancel_flag = std.atomic.Value(bool).init(false);
     const input = web_search_contract.Request{ .query = "latest Zig release" };
 
-    var output = try runtime.execute(alloc, input, &cancel_flag);
+    var output = try runtime.execute(alloc, testInvocation(&fake), input, &cancel_flag);
     defer output.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 6), output.output.results.len);
@@ -677,11 +600,11 @@ test "runtime preserves ordered commentary search errors sources and terminal in
 test "runtime reports bounded backend timeout" {
     const alloc = std.testing.allocator;
     var fake = FakeProvider{ .transport_error = .timeout };
-    var runtime = fakeRuntime(&fake);
+    var runtime = Runtime.init(.{});
     var cancel_flag = std.atomic.Value(bool).init(false);
     const input = web_search_contract.Request{ .query = "latest Zig release" };
 
-    try std.testing.expectError(error.TimeoutExpired, runtime.execute(alloc, input, &cancel_flag));
+    try std.testing.expectError(error.TimeoutExpired, runtime.execute(alloc, testInvocation(&fake), input, &cancel_flag));
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }
 
@@ -700,7 +623,7 @@ fn allowPermission(_: *const tool_dispatch.Tool, _: tool_dispatch.ToolInput, _: 
 test "denied web_search performs zero backend search requests" {
     const alloc = std.testing.allocator;
     var fake = FakeProvider{};
-    var runtime = fakeRuntime(&fake);
+    var runtime = Runtime.init(.{});
     const registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.web_search} };
 
     permission_decider_calls = 0;
@@ -709,6 +632,7 @@ test "denied web_search performs zero backend search requests" {
         .permission_decider = denyPermission,
         .tool_capabilities = .{ .web_search_runtime_ready = true },
         .web_search_backend = runtime.dispatchBackend(),
+        .web_search_invocation = testInvocation(&fake),
     }, registry, .{
         .id = "search",
         .name = "web_search",
@@ -723,7 +647,7 @@ test "denied web_search performs zero backend search requests" {
 test "invalid web_search performs zero backend search requests" {
     const alloc = std.testing.allocator;
     var fake = FakeProvider{};
-    var runtime = fakeRuntime(&fake);
+    var runtime = Runtime.init(.{});
     const registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.web_search} };
 
     permission_decider_calls = 0;
@@ -732,6 +656,7 @@ test "invalid web_search performs zero backend search requests" {
         .permission_decider = allowPermission,
         .tool_capabilities = .{ .web_search_runtime_ready = true },
         .web_search_backend = runtime.dispatchBackend(),
+        .web_search_invocation = testInvocation(&fake),
     }, registry, .{
         .id = "search",
         .name = "web_search",
@@ -764,7 +689,7 @@ test "missing runtime web_search performs zero backend search requests" {
 test "allowed web_search invokes selected backend exactly once" {
     const alloc = std.testing.allocator;
     var fake = FakeProvider{ .response_kind = .source };
-    var runtime = fakeRuntime(&fake);
+    var runtime = Runtime.init(.{});
     const registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.web_search} };
 
     permission_decider_calls = 0;
@@ -773,6 +698,7 @@ test "allowed web_search invokes selected backend exactly once" {
         .permission_decider = allowPermission,
         .tool_capabilities = .{ .web_search_runtime_ready = true },
         .web_search_backend = runtime.dispatchBackend(),
+        .web_search_invocation = testInvocation(&fake),
     }, registry, .{
         .id = "search",
         .name = "web_search",
@@ -791,7 +717,7 @@ test "allowed web_search invokes selected backend exactly once" {
 test "cancelled registered web_search performs zero backend requests" {
     const alloc = std.testing.allocator;
     var fake = FakeProvider{};
-    var runtime = fakeRuntime(&fake);
+    var runtime = Runtime.init(.{});
     const registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.web_search} };
     var cancel_flag = std.atomic.Value(bool).init(true);
 
@@ -802,6 +728,7 @@ test "cancelled registered web_search performs zero backend requests" {
         .permission_decider = allowPermission,
         .tool_capabilities = .{ .web_search_runtime_ready = true },
         .web_search_backend = runtime.dispatchBackend(),
+        .web_search_invocation = testInvocation(&fake),
     }, registry, .{
         .id = "search",
         .name = "web_search",
@@ -813,80 +740,4 @@ test "cancelled registered web_search performs zero backend requests" {
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expectEqual(.failure, result.status);
     try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(result.body));
-}
-
-const SearchConfigStress = struct {
-    runtime: *Runtime,
-    inputs: Inputs,
-
-    fn run(self: SearchConfigStress) void {
-        for (0..2000) |_| self.runtime.configure(self.inputs);
-    }
-};
-
-test "web_search runtime updates its worker model during configuration" {
-    var runtime = Runtime.init(.{});
-    runtime.configure(.{
-        .api_key = "key",
-        .worker_model = "provider/model",
-        .gateway_retry_count = 2,
-        .gateway_chat_url = "https://gateway.test/chat",
-    });
-
-    try std.testing.expectEqualStrings("provider/model", runtime.worker_model);
-    try std.testing.expectEqualStrings("key", runtime.api_key);
-    try std.testing.expectEqual(@as(usize, 2), runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings("https://gateway.test/chat", runtime.gateway_chat_url);
-}
-
-test "web_search runtime preserves session usage through worker input snapshots" {
-    const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    var runtime = Runtime.init(.{
-        .usage = &usage,
-        .usage_allocator = alloc,
-    });
-
-    var inputs = try runtime.inputsSnapshot(alloc);
-    defer inputs.deinit(alloc);
-
-    try std.testing.expect(inputs.usage.? == &usage);
-    try std.testing.expect(std.meta.eql(alloc, inputs.usage_allocator));
-}
-
-test "web_search input snapshots stay coherent during parallel reconfiguration" {
-    var runtime = Runtime.init(.{});
-    const inputs_a = Inputs{
-        .api_key = "key-a",
-        .worker_model = "model-a",
-        .gateway_retry_count = 1,
-        .gateway_chat_url = "https://a.invalid/chat",
-    };
-    const inputs_b = Inputs{
-        .api_key = "key-b",
-        .worker_model = "model-b",
-        .gateway_retry_count = 2,
-        .gateway_chat_url = "https://b.invalid/chat",
-    };
-    runtime.configure(inputs_a);
-
-    const thread_a = try std.Thread.spawn(.{}, SearchConfigStress.run, .{SearchConfigStress{ .runtime = &runtime, .inputs = inputs_a }});
-    defer thread_a.join();
-    const thread_b = try std.Thread.spawn(.{}, SearchConfigStress.run, .{SearchConfigStress{ .runtime = &runtime, .inputs = inputs_b }});
-    defer thread_b.join();
-
-    for (0..2000) |_| {
-        var snapshot = try runtime.inputsSnapshot(std.testing.allocator);
-        defer snapshot.deinit(std.testing.allocator);
-        const matches_a = std.mem.eql(u8, snapshot.api_key, inputs_a.api_key) and
-            std.mem.eql(u8, snapshot.worker_model, inputs_a.worker_model) and
-            snapshot.gateway_retry_count == inputs_a.gateway_retry_count and
-            std.mem.eql(u8, snapshot.gateway_chat_url, inputs_a.gateway_chat_url);
-        const matches_b = std.mem.eql(u8, snapshot.api_key, inputs_b.api_key) and
-            std.mem.eql(u8, snapshot.worker_model, inputs_b.worker_model) and
-            snapshot.gateway_retry_count == inputs_b.gateway_retry_count and
-            std.mem.eql(u8, snapshot.gateway_chat_url, inputs_b.gateway_chat_url);
-        try std.testing.expect(matches_a or matches_b);
-    }
 }
