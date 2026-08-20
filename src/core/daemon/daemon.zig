@@ -1370,10 +1370,10 @@ test "daemon socket selection falls back safely for long native paths" {
 
 test "daemon socket selection preserves short profile paths" {
     const alloc = std.testing.allocator;
-    const root = "/Users/fx/.fx/daemon";
+    const root = "/profiles/fx/.fx/daemon";
     const socket = try socketPathForTarget(alloc, .macos, root, 501);
     defer alloc.free(socket);
-    try std.testing.expectEqualStrings("/Users/fx/.fx/daemon/supervisor.sock", socket);
+    try std.testing.expectEqualStrings("/profiles/fx/.fx/daemon/supervisor.sock", socket);
 }
 
 test "daemon request frames are versioned JSONL" {
