@@ -16,6 +16,7 @@ else
     struct {};
 
 const runtime_deps = @import("deps.zig");
+const agent_stream_provider = @import("../stream_provider.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
 
 const Allocator = std.mem.Allocator;
@@ -1265,7 +1266,7 @@ const ProvisionalStatusTestCapture = struct {
             .push_diff_block = noopPushDiffBlock,
             .push_system_notice = noopPushSystemNotice,
             .push_command_output_complete = noopPushCommandOutputComplete,
-            .push_http_error = noopPushHttpError,
+            .push_provider_failure = noopPushProviderFailure,
             .format_tool_execution_error = noopFormatToolExecutionError,
         };
     }
@@ -1296,7 +1297,7 @@ const ProvisionalStatusTestCapture = struct {
     fn noopPushDiffBlock(_: *anyopaque, _: DiffEntryPayload) !void {}
     fn noopPushSystemNotice(_: *anyopaque, _: []const u8) !void {}
     fn noopPushCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
-    fn noopPushHttpError(_: *anyopaque, _: std.http.Status, _: []const u8, _: ?types.CredentialSource) !void {}
+    fn noopPushProviderFailure(_: *anyopaque, _: agent_stream_provider.StreamFailure.Category, _: ?u16, _: []const u8, _: ?types.CredentialSource) !void {}
     fn noopFormatToolExecutionError(_: *anyopaque, arena: Allocator, _: []const u8, err: anyerror) ![]const u8 {
         return std.fmt.allocPrint(arena, "{s}", .{@errorName(err)});
     }

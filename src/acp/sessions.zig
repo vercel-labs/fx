@@ -63,7 +63,7 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
     defer if (revision_owned) alloc.free(revision);
 
     try server.releaseActiveSession(state);
-    server.adoptConnectionCredential(state, profile.id, route_credential);
+    server.adoptConnectionCredential(state, profile.id, profile.adapter_id, route_credential);
     credential_owned = false;
     state.active_session = .{
         .session_id = session_id,
@@ -235,6 +235,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         .session_rt = session_rt,
         .mcp = session_mcp,
         .connection_id = profile.id,
+        .adapter_kind = profile.adapter_id,
         .credential = route_credential,
     }) catch {
         _ = store.discardPristineStartedSession(alloc, &writable);
@@ -365,7 +366,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     if (loaded.state.usage) |usage| try session_rt.usage.restore(alloc, usage, loaded.state.created_at_ms);
 
     try server.releaseActiveSession(state);
-    server.adoptConnectionCredential(state, profile.id, route_credential);
+    server.adoptConnectionCredential(state, profile.id, profile.adapter_id, route_credential);
     credential_owned = false;
     state.active_session = .{
         .session_id = sid_copy,
@@ -650,6 +651,7 @@ fn handleRestoreSession(
         .session_rt = session_rt,
         .mcp = session_mcp,
         .connection_id = profile.id,
+        .adapter_kind = profile.adapter_id,
         .credential = route_credential,
     }) catch
         return state.writer.writeError(alloc, msg.id, .{
@@ -799,6 +801,7 @@ const SessionActivation = struct {
     session_rt: session_runtime.SessionRuntime,
     mcp: ?*mcp_runtime.McpRuntime,
     connection_id: []const u8,
+    adapter_kind: []const u8,
     credential: credentials.Credential,
 };
 
@@ -811,6 +814,7 @@ fn activateSession(
     server.adoptConnectionCredential(
         state,
         activation.connection_id,
+        activation.adapter_kind,
         activation.credential,
     );
     state.active_session = .{
@@ -1546,7 +1550,9 @@ fn initAcpSessionTestState(
         .writer = .{ .stdout = capture },
         .workspace_root = workspace,
         .api_key = api_key,
+        .credential_source = .ai_gateway_api_key,
         .credential_connection_id = cfg.gateway_provider.connection_seed.id,
+        .credential_adapter_kind = cfg.gateway_provider.connection_seed.adapter_id,
         .selected_model = selected_model,
         .configured_model = configured_model,
         .connections = connections,

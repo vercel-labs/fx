@@ -118,7 +118,8 @@ pub const SelectedDynamicToolSinkFn = *const fn (
     ?*anyopaque,
     []const u8,
     []const u8,
-) error{OutOfMemory}!void;
+    []const u8,
+) DispatchError!void;
 
 pub const ContextNoticeSinkFn = *const fn (?*anyopaque, []const u8) error{OutOfMemory}!void;
 
@@ -910,10 +911,11 @@ pub fn reportToolResultMemory(ctx: DispatchContext, memory: core_types.ToolResul
 pub fn reportSelectedDynamicTool(
     ctx: DispatchContext,
     name: []const u8,
-    schema_json: []const u8,
-) error{OutOfMemory}!void {
+    description: []const u8,
+    input_schema_json: []const u8,
+) DispatchError!void {
     const sink = ctx.on_selected_dynamic_tool orelse return;
-    try sink(ctx.selected_dynamic_tool_ctx, name, schema_json);
+    try sink(ctx.selected_dynamic_tool_ctx, name, description, input_schema_json);
 }
 
 pub fn reportContextNotice(ctx: DispatchContext, notice: []const u8) error{OutOfMemory}!void {

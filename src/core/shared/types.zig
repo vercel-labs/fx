@@ -198,6 +198,7 @@ pub const StreamState = struct {
     /// own, so the turn is producing output the transcript cannot show yet.
     /// Cleared as soon as assistant text resumes or the tool itself starts.
     composing_tool_payload: bool = false,
+    cancelled_tool_terminal_presented: bool = false,
 };
 
 pub const RouteRecoveryUnsafeReason = enum {

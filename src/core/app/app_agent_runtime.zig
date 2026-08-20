@@ -34,6 +34,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("../tooling/tool_args.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
 const tool_advertisement = @import("../tooling/tool_advertisement.zig");
+const gateway_schema = @import("../tooling/gateway_schema.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const context_contract = @import("../workspace/context_contract.zig");
@@ -959,10 +960,24 @@ pub fn Runtime(comptime App: type) type {
                     return error.McpRequiredServerUnavailable;
                 }
             }
-            var tool_projection = try app.snapshotGatewayToolProjection(
-                std.heap.c_allocator,
-                job.permission_mode,
-            );
+            const provider_adapter = if (comptime @hasDecl(App, "providerAdapterForRoute"))
+                try app.providerAdapterForRoute(&job.route)
+            else adapter: {
+                const value = app.providerAdapter();
+                if (!value.acceptsRoute(&job.route)) return error.RouteAdapterMismatch;
+                break :adapter value;
+            };
+            var tool_projection = if (comptime @hasDecl(App, "snapshotGatewayToolProjectionForAdapter"))
+                try app.snapshotGatewayToolProjectionForAdapter(
+                    std.heap.c_allocator,
+                    job.permission_mode,
+                    provider_adapter,
+                )
+            else
+                try app.snapshotGatewayToolProjection(
+                    std.heap.c_allocator,
+                    job.permission_mode,
+                );
             defer tool_projection.deinit(std.heap.c_allocator);
             const session_child_capability =
                 if (comptime @hasField(App, "session_persistence"))
@@ -970,7 +985,10 @@ pub fn Runtime(comptime App: type) type {
                 else
                     null;
 
-            const deps = app_callbacks.Bindings(App).agentRuntimeDeps(app);
+            const deps = app_callbacks.Bindings(App).agentRuntimeDepsForAdapter(
+                app,
+                provider_adapter,
+            );
             const semantic_presentation = app_callbacks.Bindings(App).semanticPresentationSink(app);
             const config = buildQueuedPromptConfig(
                 app,
@@ -1018,11 +1036,27 @@ pub fn Runtime(comptime App: type) type {
         ) subagent_execution.ServiceError!subagent_execution.RunOutcome {
             const app: *App = @ptrCast(@alignCast(raw.?));
             const alloc = std.heap.c_allocator;
-            var child_projection = app.snapshotSubagentGatewayToolProjection(
-                alloc,
-                admission.permission_mode,
-                admission.rules,
-            ) catch
+            const route = admission.route orelse return error.AdmissionFailed;
+            const provider_adapter = if (comptime @hasDecl(App, "providerAdapterForRoute"))
+                app.providerAdapterForRoute(&route) catch return error.ProviderFailed
+            else adapter: {
+                const value = app.providerAdapter();
+                if (!value.acceptsRoute(&route)) return error.AdmissionFailed;
+                break :adapter value;
+            };
+            var child_projection = (if (comptime @hasDecl(App, "snapshotSubagentGatewayToolProjectionForAdapter"))
+                app.snapshotSubagentGatewayToolProjectionForAdapter(
+                    alloc,
+                    admission.permission_mode,
+                    admission.rules,
+                    provider_adapter,
+                )
+            else
+                app.snapshotSubagentGatewayToolProjection(
+                    alloc,
+                    admission.permission_mode,
+                    admission.rules,
+                )) catch
                 return error.OutOfMemory;
             defer child_projection.deinit(alloc);
             var bounded_skills = app.skills.buildBoundedSystemPromptSection(
@@ -1042,12 +1076,15 @@ pub fn Runtime(comptime App: type) type {
             return subagent_agent_adapter.run(.{
                 .host = app_session_runtime.Runtime(App).subagentHost(app) orelse
                     return error.ProviderFailed,
-                .tool_context = childToolContext(app.subagentToolContextForAdmission(admission)),
+                .tool_context = childToolContext(if (comptime @hasDecl(App, "subagentToolContextForAdmissionAndAdapter"))
+                    app.subagentToolContextForAdmissionAndAdapter(admission, provider_adapter)
+                else
+                    app.subagentToolContextForAdmission(admission)),
                 .system_prompt = prompt_policy.system_prompt,
                 .model_prompt_overlay = prompt_policy.modelPromptOverlay(admission.model),
                 .skills_prompt_section = bounded_skills.text,
                 .explicit_skills_prompt_section = explicit_skills.text,
-                .gateway_tools_json = child_projection.tools_json,
+                .model_tools = child_projection.tools,
                 .provider_tools = child_projection.provider_tools,
                 .custom_tool_guidance = child_projection.custom_guidance,
                 .context_registry = app.contextRegistry(),
@@ -1104,7 +1141,7 @@ pub fn Runtime(comptime App: type) type {
                 else
                     null,
                 .gateway_chat_url = gateway_chat_url,
-                .gateway_tools_json = tool_projection.tools_json,
+                .model_tools = tool_projection.tools,
                 .provider_tools = tool_projection.provider_tools,
                 .custom_tool_guidance = tool_projection.custom_guidance,
                 .agent_step_limit = app.agent_step_limit,
@@ -1582,12 +1619,12 @@ const FakeApp = struct {
         else
             null;
         if (self.snapshot_tools_error) |err| return err;
-        const tools_json = try alloc.dupe(u8, "[]");
-        errdefer alloc.free(tools_json);
+        const tools = try alloc.alloc(gateway_schema.FunctionSchema, 0);
+        errdefer alloc.free(tools);
         const provider_tools = try alloc.alloc(agent_stream_provider.ProviderToolAdvertisement, 0);
         errdefer alloc.free(provider_tools);
         return .{
-            .tools_json = tools_json,
+            .tools = tools,
             .provider_tools = provider_tools,
             .custom_guidance = try alloc.dupe(u8, self.snapshot_custom_guidance),
         };
@@ -1607,12 +1644,12 @@ const FakeApp = struct {
         else
             null;
         if (self.snapshot_tools_error) |err| return err;
-        const tools_json = try alloc.dupe(u8, "[]");
-        errdefer alloc.free(tools_json);
+        const tools = try alloc.alloc(gateway_schema.FunctionSchema, 0);
+        errdefer alloc.free(tools);
         const provider_tools = try alloc.alloc(agent_stream_provider.ProviderToolAdvertisement, 0);
         errdefer alloc.free(provider_tools);
         return .{
-            .tools_json = tools_json,
+            .tools = tools,
             .provider_tools = provider_tools,
             .custom_guidance = try alloc.dupe(u8, self.snapshot_custom_guidance),
         };
@@ -2671,10 +2708,13 @@ test "subagent tool projection uses immutable admission permission rules" {
         .pattern = @constCast("admitted-rule"),
         .action = .allow,
     }};
+    var route = try route_snapshot_test_support.owned(alloc, "test-model");
+    defer route.deinit(alloc);
     var admission = try subagent_domain.captureAdmission(alloc, .{
         .parent_id = "parent",
         .source_id = "parent",
         .model = "test-model",
+        .route = &route,
         .effort = .auto,
         .permission_mode = .auto,
         .sandbox_backend = .none,
@@ -2923,12 +2963,12 @@ test "app agent runtime queued prompt config uses captured job settings over sta
         .fast_mode = true,
         .effort = types.ReasoningEffort.literal("high"),
     };
-    const tools_json = try alloc.dupe(u8, "[]");
-    errdefer alloc.free(tools_json);
+    const tools = try alloc.alloc(gateway_schema.FunctionSchema, 0);
+    errdefer alloc.free(tools);
     const custom_guidance = try alloc.dupe(u8, "app custom tool guidance");
     const provider_tools = try alloc.alloc(agent_stream_provider.ProviderToolAdvertisement, 0);
     var tool_projection = tool_advertisement.EffectiveToolProjection{
-        .tools_json = tools_json,
+        .tools = tools,
         .provider_tools = provider_tools,
         .custom_guidance = custom_guidance,
     };
@@ -2939,7 +2979,7 @@ test "app agent runtime queued prompt config uses captured job settings over sta
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), config.effort);
     try std.testing.expectEqual(@as(usize, 8192), config.max_tool_result_bytes);
     try std.testing.expectEqual(types.ToolChoice.none, config.first_call_tool_choice);
-    try std.testing.expectEqualStrings(tool_projection.tools_json, config.gateway_tools_json);
+    try std.testing.expectEqual(tool_projection.tools.len, config.model_tools.len);
     try std.testing.expectEqualStrings(tool_projection.custom_guidance, config.custom_tool_guidance);
     try std.testing.expectEqualStrings(test_prompt_policy.system_prompt, config.system_prompt);
     try std.testing.expectEqualStrings("test model overlay", config.model_prompt_overlay.?);

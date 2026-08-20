@@ -8,6 +8,7 @@ const command_environment = @import("../execution/command_environment.zig");
 const command_effect = @import("../shell_command/command_effect.zig");
 const file_mutation = @import("file_mutation.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
+const gateway_schema = @import("gateway_schema.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -741,7 +742,7 @@ fn schemaForReview(
     arena: Allocator,
     call: ToolCall,
     is_dynamic_tool: bool,
-) !?[]const u8 {
+) !?gateway_schema.FunctionSchema {
     if (is_dynamic_tool) {
         const context = input.mcp_runtime.context orelse return null;
         const tool_schema = input.mcp_runtime.tool_schema orelse return null;
@@ -754,7 +755,19 @@ fn schemaForReview(
             input.mcp_runtime.access,
         )) orelse return null;
         return switch (result) {
-            .selected => |payload| payload.model_output,
+            .selected => |payload| .{
+                .name = payload.name,
+                .description = payload.description,
+                .dynamic_input_schema = std.json.parseFromSliceLeaky(
+                    std.json.Value,
+                    arena,
+                    payload.input_schema_json,
+                    .{},
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return null,
+                },
+            },
             .rejected => null,
         };
     }
@@ -798,7 +811,7 @@ fn reviewRequestForCall(
             break :blk .{ .tool = .{
                 .tool_name = call.name,
                 .arguments_json = call.arguments_json,
-                .schema_json = try schemaForReview(
+                .descriptor = try schemaForReview(
                     input,
                     arena,
                     call,
@@ -3817,7 +3830,7 @@ const FakeAutoClassifier = struct {
     action_tag: ?std.meta.Tag(permission_auto_classifier.Action) = null,
     exact_command: ?[]const u8 = null,
     exact_arguments_json: ?[]const u8 = null,
-    schema_json: ?[]const u8 = null,
+    schema_name: ?[]const u8 = null,
     file_display_path: ?[]const u8 = null,
     file_additions: usize = 0,
     file_deletions: usize = 0,
@@ -3856,7 +3869,7 @@ const FakeAutoClassifier = struct {
             },
             .tool => |tool| {
                 self.exact_arguments_json = tool.arguments_json;
-                self.schema_json = tool.schema_json;
+                self.schema_name = if (tool.descriptor) |descriptor| descriptor.name else null;
             },
             .sandbox_widening => |widening| {
                 self.sandbox_command = widening.command;
@@ -6056,7 +6069,7 @@ test "built-in structured review sends exact arguments without redundant schema"
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqualStrings(arguments, fake.exact_arguments_json.?);
-    try std.testing.expect(fake.schema_json == null);
+    try std.testing.expect(fake.schema_name == null);
     try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
 }
 
@@ -6075,10 +6088,11 @@ test "selected dynamic MCP review receives exact arguments and advertised schema
             _: tool_mcp_runtime.Access,
         ) anyerror!?tool_mcp_runtime.ToolSchemaResult {
             if (!std.mem.eql(u8, name, "mcp_example_write")) return null;
-            return .{ .selected = .{ .model_output = try alloc.dupe(
-                u8,
-                "{\"name\":\"mcp_example_write\",\"inputSchema\":{\"type\":\"object\"}}",
-            ) } };
+            return .{ .selected = .{
+                .name = try alloc.dupe(u8, "mcp_example_write"),
+                .description = try alloc.dupe(u8, "Example write"),
+                .input_schema_json = try alloc.dupe(u8, "{\"type\":\"object\"}"),
+            } };
         }
     };
 
@@ -6121,9 +6135,7 @@ test "selected dynamic MCP review receives exact arguments and advertised schema
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqualStrings(arguments, fake.exact_arguments_json.?);
-    try std.testing.expect(
-        std.mem.find(u8, fake.schema_json.?, "mcp_example_write") != null,
-    );
+    try std.testing.expectEqualStrings("mcp_example_write", fake.schema_name.?);
     try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
     try std.testing.expect(outcome.execution_authority != null);
 }

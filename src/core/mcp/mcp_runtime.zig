@@ -5800,20 +5800,21 @@ pub const McpRuntime = struct {
                     instructions.?.len < value.len
                 else
                     false;
-                const schema = try buildToolSchemaJsonWithLimitMarker(
+                const description = try buildToolDescriptionWithLimitMarker(
                     alloc,
                     match.tool,
                     instructions,
                     instructions_truncated,
                     instruction_limit,
                 );
-                var schema_owned = true;
-                errdefer if (schema_owned) alloc.free(schema);
+                var description_owned = true;
+                errdefer if (description_owned) alloc.free(description);
                 const schema_limit = limits.mcp_selected_schema_bytes;
-                if (schema.len > schema_limit.effectiveBytes()) {
-                    const observed_schema_bytes = schema.len;
-                    alloc.free(schema);
-                    schema_owned = false;
+                const observed_schema_bytes = match.tool.prefixed_name.len +
+                    description.len + match.tool.input_schema_json.len;
+                if (observed_schema_bytes > schema_limit.effectiveBytes()) {
+                    alloc.free(description);
+                    description_owned = false;
                     var rejected: std.Io.Writer.Allocating = .init(alloc);
                     defer rejected.deinit();
                     try rejected.writer.writeAll("{\"context_limit_rejection\":{\"name\":\"mcp_selected_schema_bytes\",\"tool\":");
@@ -5850,9 +5851,18 @@ pub const McpRuntime = struct {
                 else
                     null;
                 errdefer if (notice) |value| alloc.free(value);
+                const owned_name = try alloc.dupe(u8, match.tool.prefixed_name);
+                errdefer alloc.free(owned_name);
+                const owned_input_schema = try alloc.dupe(u8, match.tool.input_schema_json);
+                errdefer alloc.free(owned_input_schema);
                 try validateCatalogAuthWitness(match.server, auth_witness);
                 break :result @as(?tool_mcp_runtime.ToolSchemaResult, .{
-                    .selected = .{ .model_output = schema, .notice = notice },
+                    .selected = .{
+                        .name = owned_name,
+                        .description = description,
+                        .input_schema_json = owned_input_schema,
+                        .notice = notice,
+                    },
                 });
             }
             break :result null;
@@ -11196,7 +11206,7 @@ fn optionalBytesEqual(left: ?[]const u8, right: ?[]const u8) bool {
     return true;
 }
 
-fn buildToolSchemaJsonWithLimitMarker(
+fn buildToolDescriptionWithLimitMarker(
     alloc: Allocator,
     tool: McpTool,
     instructions: ?[]const u8,
@@ -11218,13 +11228,7 @@ fn buildToolSchemaJsonWithLimitMarker(
             try std.fmt.allocPrint(alloc, "{s}\n\nServer instructions: {s}", .{ encoded_description, encoded_instructions.? })
     else
         try alloc.dupe(u8, encoded_description);
-    defer alloc.free(merged_description);
-    return gateway_schema.dynamicFunctionSchemaJsonAlloc(
-        alloc,
-        tool.prefixed_name,
-        merged_description,
-        tool.input_schema_json,
-    );
+    return merged_description;
 }
 
 fn renderSearchResult(
@@ -18141,11 +18145,11 @@ test "MCP server instructions are captured from initialize and exposed only when
 
     var schema_result = (try runtime.toolSchemaJsonByName(alloc, "mcp_github_create_issue", .{}, .{})) orelse return error.TestExpectedEqual;
     defer schema_result.deinit(alloc);
-    const schema = switch (schema_result) {
-        .selected => |payload| payload.model_output,
+    const description = switch (schema_result) {
+        .selected => |payload| payload.description,
         .rejected => return error.TestExpectedEqual,
     };
-    try std.testing.expect(std.mem.find(u8, schema, "Server instructions:") != null);
+    try std.testing.expect(std.mem.find(u8, description, "Server instructions:") != null);
 }
 
 test "MCP exact selection returns one executable schema by prefixed name" {
@@ -18166,15 +18170,15 @@ test "MCP exact selection returns one executable schema by prefixed name" {
 
     var schema_result = (try runtime.toolSchemaJsonByName(alloc, "mcp_fs_read", .{}, .{})) orelse return error.TestExpectedEqual;
     defer schema_result.deinit(alloc);
-    const schema = switch (schema_result) {
-        .selected => |payload| payload.model_output,
+    const selected = switch (schema_result) {
+        .selected => |payload| payload,
         .rejected => return error.TestExpectedEqual,
     };
 
-    try std.testing.expect(std.mem.find(u8, schema, "\"name\":\"mcp_fs_read\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema, "\"inputSchema\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema, "instruction tail") != null);
-    try std.testing.expect(std.mem.find(u8, schema, gateway_schema.truncation_marker) == null);
+    try std.testing.expectEqualStrings("mcp_fs_read", selected.name);
+    try std.testing.expect(std.mem.find(u8, selected.input_schema_json, "\"path\"") != null);
+    try std.testing.expect(std.mem.find(u8, selected.description, "instruction tail") != null);
+    try std.testing.expect(std.mem.find(u8, selected.description, gateway_schema.truncation_marker) == null);
     try std.testing.expect((try runtime.toolSchemaJsonByName(alloc, "mcp_missing", .{}, .{})) == null);
 }
 
@@ -18197,16 +18201,16 @@ test "MCP selection truncates instructions and rejects an oversized schema atomi
     limits.mcp_server_instructions_bytes = .{ .value = .{ .bytes = 11 }, .source = .user_workspace };
     var schema_result = (try runtime.toolSchemaJsonByName(alloc, "mcp_docs_lookup", .{}, limits)) orelse return error.TestExpectedEqual;
     defer schema_result.deinit(alloc);
-    const schema = switch (schema_result) {
-        .selected => |payload| payload.model_output,
+    const selected = switch (schema_result) {
+        .selected => |payload| payload,
         .rejected => return error.TestExpectedEqual,
     };
-    try std.testing.expect(std.mem.find(u8, schema, "first line&#x0a;") != null);
-    try std.testing.expect(std.mem.find(u8, schema, "second line") == null);
-    try std.testing.expect(std.mem.find(u8, schema, "mcp_server_instructions_bytes") != null);
-    try std.testing.expect(std.mem.find(u8, schema, "An exact query that must stay intact") != null);
+    try std.testing.expect(std.mem.find(u8, selected.description, "first line&#x0a;") != null);
+    try std.testing.expect(std.mem.find(u8, selected.description, "second line") == null);
+    try std.testing.expect(std.mem.find(u8, selected.description, "mcp_server_instructions_bytes") != null);
+    try std.testing.expect(std.mem.find(u8, selected.input_schema_json, "An exact query that must stay intact") != null);
 
-    limits.mcp_selected_schema_bytes = .{ .value = .{ .bytes = schema.len - 1 }, .source = .command_line };
+    limits.mcp_selected_schema_bytes = .{ .value = .{ .bytes = selected.name.len + selected.description.len + selected.input_schema_json.len - 1 }, .source = .command_line };
     var rejected_result = (try runtime.toolSchemaJsonByName(alloc, "mcp_docs_lookup", .{}, limits)) orelse return error.TestExpectedEqual;
     defer rejected_result.deinit(alloc);
     const rejected = switch (rejected_result) {
@@ -18295,16 +18299,16 @@ test "tool schema uses prefixed name and call request uses raw name" {
     const tool = server.tool_catalog.tools.items[0];
     try std.testing.expectEqualStrings("read/file", tool.original_name);
     try std.testing.expectEqualStrings("mcp_a_b_read_file", tool.prefixed_name);
-    const schema = try buildToolSchemaJsonWithLimitMarker(
+    const description = try buildToolDescriptionWithLimitMarker(
         alloc,
         tool,
         null,
         false,
         (context_limits.Values{}).mcp_server_instructions_bytes,
     );
-    defer alloc.free(schema);
-    try std.testing.expect(std.mem.find(u8, schema, "\"name\":\"mcp_a_b_read_file\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema, "read/file") == null);
+    defer alloc.free(description);
+    try std.testing.expectEqualStrings("mcp_a_b_read_file", tool.prefixed_name);
+    try std.testing.expectEqualStrings("Read", description);
 
     const request = try buildToolCallRequest(alloc, 9, tool.original_name, "{\"path\":\"/tmp/a\"}");
     defer alloc.free(request);

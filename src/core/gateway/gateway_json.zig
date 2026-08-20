@@ -1,4 +1,6 @@
 const std = @import("std");
+const model_history = @import("../agent/model_history.zig");
+const builtin = @import("builtin");
 const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -417,7 +419,10 @@ fn validatePendingToolReviewMessages(
     if (instruction.role != .system or instruction.content == null) return error.InvalidGatewayHistory;
     try validateToolMessageHistory(alloc, messages[0 .. messages.len - 2]);
     try budget.check();
-    try validateAssistantToolCalls(alloc, pending.tool_calls);
+    model_history.validateAssistantToolCalls(alloc, pending.tool_calls) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidGatewayHistory,
+    };
     try budget.check();
 
     var target_matches: usize = 0;
@@ -443,68 +448,10 @@ pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.
 }
 
 pub fn validateToolMessageHistory(alloc: std.mem.Allocator, messages: []const ChatMessage) !void {
-    var i: usize = 0;
-    while (i < messages.len) {
-        const msg = messages[i];
-        if (msg.role == .tool) return error.InvalidGatewayHistory;
-        if (msg.role != .assistant or msg.tool_calls.len == 0) {
-            i += 1;
-            continue;
-        }
-
-        try validateAssistantToolCalls(alloc, msg.tool_calls);
-        const seen = try alloc.alloc(bool, msg.tool_calls.len);
-        defer alloc.free(seen);
-
-        i = try validateAssistantToolResultBlock(messages, i + 1, msg.tool_calls, seen);
-    }
-}
-
-fn validateAssistantToolResultBlock(
-    messages: []const ChatMessage,
-    start_index: usize,
-    calls: []const ToolCall,
-    seen: []bool,
-) !usize {
-    @memset(seen, false);
-
-    var result_count: usize = 0;
-    var j = start_index;
-    while (result_count < calls.len) : (j += 1) {
-        if (j >= messages.len) return error.InvalidGatewayHistory;
-        const result = messages[j];
-        if (result.role != .tool) return error.InvalidGatewayHistory;
-        const tool_call_id = result.tool_call_id orelse return error.InvalidGatewayHistory;
-        const tool_name = result.tool_name orelse return error.InvalidGatewayHistory;
-        if (result.content == null) return error.InvalidGatewayHistory;
-
-        const matched_index = findToolCallIndex(calls, tool_call_id) orelse return error.InvalidGatewayHistory;
-        if (seen[matched_index]) return error.InvalidGatewayHistory;
-        if (!std.mem.eql(u8, calls[matched_index].name, tool_name)) return error.InvalidGatewayHistory;
-        seen[matched_index] = true;
-        result_count += 1;
-    }
-    return j;
-}
-
-fn validateAssistantToolCalls(alloc: std.mem.Allocator, calls: []const ToolCall) !void {
-    for (calls, 0..) |call, i| {
-        if (call.id.len == 0 or call.name.len == 0 or call.arguments_json.len == 0) return error.InvalidGatewayHistory;
-        if (try types.ToolArgumentIntegrity.classifySerialized(alloc, call.arguments_json) == .malformed_json) {
-            return error.InvalidGatewayHistory;
-        }
-        var j = i + 1;
-        while (j < calls.len) : (j += 1) {
-            if (std.mem.eql(u8, call.id, calls[j].id)) return error.InvalidGatewayHistory;
-        }
-    }
-}
-
-fn findToolCallIndex(calls: []const ToolCall, id: []const u8) ?usize {
-    for (calls, 0..) |call, i| {
-        if (std.mem.eql(u8, call.id, id)) return i;
-    }
-    return null;
+    model_history.validate(alloc, messages) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidGatewayHistory,
+    };
 }
 
 pub fn shouldCacheMessage(message: ChatMessage, index: usize, cache_breakpoint_idx: ?usize, prompt_caching: bool) bool {

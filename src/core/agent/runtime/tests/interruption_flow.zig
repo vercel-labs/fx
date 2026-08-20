@@ -12,8 +12,10 @@ const ToolCall = types.ToolCall;
 
 const removed_direct_question_guidance = "Treat it as interrupting any previous tool plan.";
 const removed_resume_guidance = "Continue from the latest meaningful state";
-const fixture_tools_json =
-    "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read a file\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]";
+const fixture_tools = &.{@import("../../../tooling/gateway_schema.zig").FunctionSchema{
+    .name = "read_file",
+    .description = "Read a file",
+}};
 
 const FakeCompletion = test_support.FakeCompletion;
 const FakeGateway = test_support.FakeGateway;
@@ -109,7 +111,7 @@ test "processQueuedPrompt sends former intent text normally with tools" {
         var job = fixture.job();
         job.prompt = @constCast(text);
         var config = fixture.config();
-        config.gateway_tools_json = fixture_tools_json;
+        config.model_tools = fixture_tools;
 
         try runFakePrompt(&gateway, &hooks, config, job);
 

@@ -730,6 +730,23 @@ pub const Runtime = struct {
         );
     }
 
+    pub fn resolveAdmittedProfileCredential(
+        self: *const Self,
+        alloc: Allocator,
+        profile: connection_registry.Profile,
+        mode: adapter_auth.RefreshMode,
+        current_source_id: ?[]const u8,
+    ) !credentials.Credential {
+        _ = try self.adapter_registry.resolveAuthForProfile(profile);
+        return self.resolveExactProfileCredential(alloc, profile, mode, current_source_id) catch |err| switch (err) {
+            error.MissingCredential => if (mode == .if_needed)
+                (try self.duplicateValidCredentialForAdmittedProfile(alloc, profile)) orelse return err
+            else
+                return err,
+            else => return err,
+        };
+    }
+
     fn resolveProfileCredentialWithSourceResolution(
         self: *const Self,
         alloc: Allocator,
@@ -751,13 +768,41 @@ pub const Runtime = struct {
             .missing => return error.MissingCredential,
             .failed => |failure| return switch (failure.category) {
                 .configuration => error.InvalidCredentialReference,
-                .cancelled => error.Cancelled,
                 else => error.CredentialAcquisitionFailed,
             },
             .cancelled => return error.Cancelled,
         };
         defer normalized.deinit(alloc);
         return takeAdapterCredential(&normalized) orelse error.InvalidCredentialReference;
+    }
+
+    fn duplicateValidCredentialForAdmittedProfile(
+        self: *const Self,
+        alloc: Allocator,
+        profile: connection_registry.Profile,
+    ) !?credentials.Credential {
+        if (self.credential_connection_id_len == 0 or
+            !std.mem.eql(
+                u8,
+                self.credential_connection_id[0..self.credential_connection_id_len],
+                profile.id,
+            )) return null;
+        const credential = self.selected_credential orelse return null;
+        if (!std.mem.eql(u8, profile.credential_ref, @tagName(credential.source))) return null;
+        if (credential.needsRefreshAt(io_mod.milliTimestamp())) return null;
+
+        const token = try alloc.dupe(u8, credential.token);
+        errdefer secret.zeroAndFree(alloc, token);
+        const team_id = if (credential.team_id) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (team_id) |value| alloc.free(value);
+        const team_slug = if (credential.team_slug) |value| try alloc.dupe(u8, value) else null;
+        return .{
+            .token = token,
+            .source = credential.source,
+            .team_id = team_id,
+            .team_slug = team_slug,
+            .refresh_after_ms = credential.refresh_after_ms,
+        };
     }
 
     pub fn addConnection(self: *Self, input: connection_registry.ProfileInput) !void {
@@ -1659,7 +1704,6 @@ fn errorForAuthFailure(failure: adapter_auth.Failure) anyerror {
         .session_changed => error.AuthSessionChanged,
         .invalid_selection => error.AuthSelectionInvalid,
         .persistence => error.AuthPersistence,
-        .cancelled => error.Cancelled,
         .unavailable => error.AuthUnavailable,
     };
 }
@@ -2967,6 +3011,50 @@ test "auth runtime preserves every adapter acquisition outcome" {
     probe.outcome = .cancelled;
     try std.testing.expectError(error.Cancelled, runtime.resolveProfileCredential(alloc, profile, .if_needed, null));
     try std.testing.expectEqual(@as(usize, 5), probe.calls);
+}
+
+test "admitted profile resolution falls back to a valid live credential only after an exact miss" {
+    const AcquireProbe = struct {
+        calls: usize = 0,
+
+        fn acquire(raw: *const anyopaque, _: Allocator, _: adapter_auth.Request) Allocator.Error!adapter_auth.Acquisition {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            return .{ .missing = .not_attempted };
+        }
+    };
+    const alloc = std.testing.allocator;
+    var probe: AcquireProbe = .{};
+    const adapters = [_]stream_provider.ProviderAdapter{.{
+        .kind = "vercel_ai_gateway",
+        .auth = .{
+            .kind = "vercel_ai_gateway",
+            .context = &probe,
+            .acquire_fn = AcquireProbe.acquire,
+        },
+        .stream_fn = stream_provider.unavailable_adapter.stream_fn,
+    }};
+    var runtime: Runtime = .{ .adapter_registry = try adapter_registry.AdapterRegistry.init(&adapters) };
+    defer runtime.deinit(alloc);
+    var connections = try initTestConnectionRegistry(alloc);
+    runtime.adoptConnections(alloc, &connections);
+    var active = try makeTestCredential(alloc, "active-login-token", .fx_login, null, null);
+    defer active.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &active);
+
+    var profile = try runtime.selectedConnectionProfile();
+    profile.credential_ref = @constCast("fx_login");
+    var resolved = try runtime.resolveAdmittedProfileCredential(alloc, profile, .if_needed, "fx_login");
+    defer resolved.deinit(alloc);
+
+    try std.testing.expectEqualStrings("active-login-token", resolved.token);
+    try std.testing.expectEqual(credentials.Source.fx_login, resolved.source);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectError(
+        error.MissingCredential,
+        runtime.resolveAdmittedProfileCredential(alloc, profile, .force, "fx_login"),
+    );
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
 }
 
 test "route profile preserves the acquired source when preference persistence fails" {

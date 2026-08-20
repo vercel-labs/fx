@@ -2608,7 +2608,7 @@ test "durable state round trips live history while discarding legacy authority" 
 }
 
 test "durable state repairs duplicate-key execution and interrupted tool arguments" {
-    const gateway_json = @import("../gateway/gateway_json.zig");
+    const model_history = @import("../agent/model_history.zig");
     const alloc = std.testing.allocator;
     const duplicate_arguments = "{\"depth\":1,\"depth\":2}";
 
@@ -2688,7 +2688,7 @@ test "durable state repairs duplicate-key execution and interrupted tool argumen
     const arena = arena_state.allocator();
     var messages: std.ArrayList(types.ChatMessage) = .empty;
     try session.appendHistoryChatMessages(arena, &messages, decoded.history);
-    try gateway_json.validateToolMessageHistory(arena, messages.items);
+    try model_history.validate(arena, messages.items);
 }
 
 test "current history decode rejects ambiguous malformed tool result pairings" {

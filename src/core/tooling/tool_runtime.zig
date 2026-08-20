@@ -21,6 +21,7 @@ const change_tracker = @import("../workspace/change_tracker.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation = @import("file_mutation.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
+const gateway_schema = @import("gateway_schema.zig");
 const hooks = @import("../hooks/hooks.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const glob_pattern = @import("../workspace/glob_pattern.zig");
@@ -745,8 +746,7 @@ fn executeRegisteredTool(
         execution.finish_turn = true;
         execution.status_detail = "McpInputRequired";
     }
-    execution.selected_dynamic_tool_name = selected_dynamic_tool_sink.name;
-    execution.selected_dynamic_tool_schema_json = selected_dynamic_tool_sink.schema_json;
+    execution.selected_dynamic_tool = selected_dynamic_tool_sink.descriptor;
     execution.context_notices = context_notice_sink.notices.items;
     return execution;
 }
@@ -814,8 +814,7 @@ fn toolExecutionResultFromDispatch(result: tool_dispatch.DispatchResult) ToolExe
 
 const SelectedDynamicToolSinkState = struct {
     allocator: Allocator,
-    name: ?[]const u8 = null,
-    schema_json: ?[]const u8 = null,
+    descriptor: ?gateway_schema.FunctionSchema = null,
 };
 
 const ContextNoticeSinkState = struct {
@@ -847,15 +846,29 @@ fn attachSelectedDynamicToolSink(
 fn recordSelectedDynamicToolForDispatch(
     raw_ctx: ?*anyopaque,
     name: []const u8,
-    schema_json: []const u8,
-) error{OutOfMemory}!void {
+    description: []const u8,
+    input_schema_json: []const u8,
+) tool_dispatch.DispatchError!void {
     const state_ptr = raw_ctx orelse return;
     const state: *SelectedDynamicToolSinkState = @ptrCast(@alignCast(state_ptr));
     const owned_name = try state.allocator.dupe(u8, name);
-    errdefer state.allocator.free(owned_name);
-    const owned_schema_json = try state.allocator.dupe(u8, schema_json);
-    state.name = owned_name;
-    state.schema_json = owned_schema_json;
+    const owned_description = try state.allocator.dupe(u8, description);
+    const input_schema = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        state.allocator,
+        input_schema_json,
+        .{},
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidToolArguments,
+    };
+    const descriptor: gateway_schema.FunctionSchema = .{
+        .name = owned_name,
+        .description = owned_description,
+        .dynamic_input_schema = input_schema,
+    };
+    descriptor.validate() catch return error.InvalidToolArguments;
+    state.descriptor = descriptor;
 }
 
 fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchContext {
@@ -6336,7 +6349,7 @@ test "run_command timeout returns model-visible failure" {
         .system_prompt = "",
         .gateway_retry_count = 0,
         .gateway_chat_url = "",
-        .gateway_tools_json = "[]",
+        .model_tools = &.{},
         .agent_step_limit = 1,
         .cancel_flag = &cancel,
         .session_child_capability = &capability,
@@ -7580,7 +7593,11 @@ const McpFixture = struct {
 
     fn schema(_: *anyopaque, arena: Allocator, name: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!?tool_mcp_runtime.ToolSchemaResult {
         if (!std.mem.eql(u8, name, "mcp_fs_read")) return null;
-        return .{ .selected = .{ .model_output = try arena.dupe(u8, "{\"type\":\"function\",\"name\":\"mcp_fs_read\",\"description\":\"Read <context_limit action='literal' />\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"context_limit_rejection\":{\"type\":\"string\"}}}}") } };
+        return .{ .selected = .{
+            .name = try arena.dupe(u8, "mcp_fs_read"),
+            .description = try arena.dupe(u8, "Read <context_limit action='literal' />"),
+            .input_schema_json = try arena.dupe(u8, "{\"type\":\"object\",\"properties\":{\"context_limit_rejection\":{\"type\":\"string\"}}}"),
+        } };
     }
 
     fn searchRecordingRules(raw_ctx: *anyopaque, arena: Allocator, query: []const u8, _: usize, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
@@ -7687,9 +7704,9 @@ test "MCP select does not authorize same-response dynamic execution" {
         .arguments_json = "{\"name\":\"mcp_fs_read\"}",
     });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, selected.status);
-    try std.testing.expectEqualStrings("mcp_fs_read", selected.selected_dynamic_tool_name.?);
-    try expectContains(selected.selected_dynamic_tool_schema_json.?, "context_limit_rejection");
-    try expectContains(selected.selected_dynamic_tool_schema_json.?, "<context_limit action='literal' />");
+    try std.testing.expectEqualStrings("mcp_fs_read", selected.selected_dynamic_tool.?.name);
+    try expectContains(selected.selected_dynamic_tool.?.description, "<context_limit action='literal' />");
+    try std.testing.expect(selected.selected_dynamic_tool.?.dynamic_input_schema != null);
 
     const result = try executeToolCall(rt.context(), arena, .{
         .id = "dynamic",

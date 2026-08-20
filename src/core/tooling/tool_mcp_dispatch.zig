@@ -173,10 +173,17 @@ pub fn callSelect(
             return .{ .failure = payload.model_output };
         },
         .selected => |payload| {
-            defer ctx.allocator.free(payload.model_output);
+            defer ctx.allocator.free(payload.name);
+            defer ctx.allocator.free(payload.description);
+            defer ctx.allocator.free(payload.input_schema_json);
             defer if (payload.notice) |notice| ctx.allocator.free(notice);
             if (payload.notice) |notice| try tool_dispatch.reportContextNotice(ctx, notice);
-            try tool_dispatch.reportSelectedDynamicTool(ctx, input.name, payload.model_output);
+            try tool_dispatch.reportSelectedDynamicTool(
+                ctx,
+                payload.name,
+                payload.description,
+                payload.input_schema_json,
+            );
         },
     }
     var success: std.Io.Writer.Allocating = .init(ctx.allocator);

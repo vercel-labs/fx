@@ -2773,6 +2773,24 @@ test "processQueuedPrompt does not dispatch a cancelled admitted route" {
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
 }
 
+test "processQueuedPrompt publishes normalized adapter cancellation to the turn" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .stream_error = error.Cancelled }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expect(fixture.cancel_flag.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.interrupted_history_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+}
+
 test "processQueuedPrompt keeps exact model identity and emits Gateway Fast" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .content = "Done" }};
@@ -5642,7 +5660,7 @@ test "processQueuedPrompt no-tool length bypasses silent-tool continuation" {
     try std.testing.expectEqualStrings("Done.", hooks.finish_assistant_text.?);
 }
 
-test "processQueuedPrompt non-ok gateway response trims and clips HTTP detail" {
+test "processQueuedPrompt non-ok gateway response sanitizes and clips HTTP detail" {
     const alloc = std.testing.allocator;
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(alloc);
@@ -5659,8 +5677,10 @@ test "processQueuedPrompt non-ok gateway response trims and clips HTTP detail" {
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
     try std.testing.expectEqual(std.http.Status.bad_request, hooks.http_status.?);
-    try std.testing.expectEqual(@as(usize, 4096), hooks.http_detail.?.len);
-    try std.testing.expect(hooks.http_detail.?[0] == 'x');
+    try std.testing.expect(hooks.http_detail.?.len <= 1024);
+    try std.testing.expect(hooks.http_detail.?.len > 1000);
+    try std.testing.expect(std.mem.startsWith(u8, hooks.http_detail.?, "\\x0a"));
+    try std.testing.expect(std.mem.indexOfScalar(u8, hooks.http_detail.?, '\n') == null);
 }
 
 test "processQueuedPrompt non-ok gateway response records schema diagnostics" {

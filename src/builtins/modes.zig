@@ -69,9 +69,7 @@ test "built-in mode projections use the supplied tool set" {
 
     var projection = try registry.buildGatewayToolProjection(std.testing.allocator, tool_set, "ask", .{});
     defer projection.deinit(std.testing.allocator);
-    const json = projection.tools_json;
-
-    try std.testing.expect(std.mem.find(u8, json, "\"name\":\"read_file\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"name\":\"write_file\"") == null);
+    try std.testing.expect(projection.contains("read_file"));
+    try std.testing.expect(!projection.contains("write_file"));
     try std.testing.expectEqualStrings("", projection.custom_guidance);
 }

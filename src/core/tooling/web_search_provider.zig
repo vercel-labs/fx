@@ -6,7 +6,7 @@ const web_search_policy = @import("web_search_policy.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Inputs = struct {
-    connection_id: []const u8 = "vercel",
+    connection_id: []const u8,
     credential: []const u8,
     tenant: ?[]const u8 = null,
     model: []const u8,
@@ -15,6 +15,12 @@ pub const Inputs = struct {
     usage: ?*session_usage.Usage = null,
     usage_allocator: Allocator = std.heap.c_allocator,
 };
+
+test "web search connection identity has no provider default" {
+    const fields = @typeInfo(Inputs).@"struct".fields;
+    try std.testing.expectEqualStrings("connection_id", fields[0].name);
+    try std.testing.expect(fields[0].default_value_ptr == null);
+}
 
 pub const PreferredBackendsFn = *const fn (?*anyopaque) anyerror!?[]const web_search_contract.SearchBackendId;
 

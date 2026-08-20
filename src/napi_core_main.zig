@@ -2,7 +2,10 @@ const std = @import("std");
 const build_options = @import("build_options");
 const acp_server = @import("acp/server.zig");
 const jsonrpc = @import("acp/jsonrpc.zig");
+const agent_stream_provider = @import("core/agent/stream_provider.zig");
 const background_process_provider = @import("core/execution/background_process_provider.zig");
+const adapter_auth = @import("core/gateway/adapter_auth.zig");
+const connection_registry = @import("core/gateway/connection_registry.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
 const host = @import("core/hosts/host.zig");
@@ -434,12 +437,15 @@ const Runtime = struct {
     fn run(self: *Runtime) void {
         const agent_stream = host_stream_provider.provider(&self.stream_context);
         var provider_adapter = builtin_gateway.provider_adapter;
+        provider_adapter.auth = self.authProvider();
         provider_adapter.legacy_provider = agent_stream;
         provider_adapter.generation_usage = generation_usage_provider.unavailable_provider;
+        const adapters = [_]agent_stream_provider.ProviderAdapter{provider_adapter};
         const provider = gateway_provider.Provider{
             .connection_seed = builtin_gateway.connection_seed,
             .agent_stream = agent_stream,
             .provider_adapter = provider_adapter,
+            .adapter_registry = .{ .adapters = &adapters },
             .oauth_transport = oauth_transport.unavailable_provider,
             .chat_url = builtin_gateway.provider.chat_url,
         };
@@ -479,6 +485,47 @@ const Runtime = struct {
             self.exit_code.store(1, .seq_cst);
         };
         self.exited.store(true, .seq_cst);
+    }
+
+    fn authProvider(self: *Runtime) adapter_auth.Provider {
+        return .{
+            .kind = builtin_gateway.connection_seed.adapter_id,
+            .context = self,
+            .acquire_fn = acquireCredential,
+            .status_fn = credentialStatus,
+        };
+    }
+
+    fn acquireCredential(
+        raw: *const anyopaque,
+        alloc: Allocator,
+        request: adapter_auth.Request,
+    ) Allocator.Error!adapter_auth.Acquisition {
+        const self: *const Runtime = @ptrCast(@alignCast(raw));
+        if (self.credential.len == 0) return .{ .missing = .not_found };
+        const source = builtin_gateway.credentialOverrideSource(request.profile.credential_ref) catch
+            return .{ .failed = .{ .category = .configuration } };
+        return .{ .acquired = .{
+            .secret_bytes = try alloc.dupe(u8, self.credential),
+            .source = source,
+            .catalog_access = .authenticated,
+        } };
+    }
+
+    fn credentialStatus(
+        raw: *const anyopaque,
+        _: Allocator,
+        profile: connection_registry.Profile,
+        _: adapter_auth.AuthHost,
+    ) Allocator.Error!adapter_auth.StatusOutcome {
+        const self: *const Runtime = @ptrCast(@alignCast(raw));
+        return .{ .loaded = .{
+            .source = if (self.credential.len > 0)
+                builtin_gateway.credentialOverrideSource(profile.credential_ref) catch null
+            else
+                null,
+            .store_status = if (self.credential.len > 0) .not_attempted else .not_found,
+        } };
     }
 
     fn closeInput(self: *Runtime) void {

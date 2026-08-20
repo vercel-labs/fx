@@ -4638,7 +4638,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "second Ctrl+C exits after active stream cancellation",
+    "second Ctrl+C exits after provisional tool stream cancellation",
     async () => {
       const artifacts = createArtifactRoot();
       const home = join(artifacts, "home");
@@ -4652,7 +4652,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       const hold: HoldState = { started: false, cancelled: false };
       const heldGateway = startFakeGateway([
-        () => heldGatewayResponse(hold),
+        () =>
+          heldGatewayResponse(hold, [
+            {
+              type: "tool-input-start",
+              id: "cancelled_read",
+              toolName: "read_file",
+            },
+          ]),
       ]);
       gateway = heldGateway;
       session = await TmuxSession.create({

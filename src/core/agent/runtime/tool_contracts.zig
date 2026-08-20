@@ -9,6 +9,7 @@ const session_permission_state = @import("../../permissions/session_permission_s
 const command_replay_store = @import("../../session/command_replay_store.zig");
 const route_snapshot = @import("../../gateway/route_snapshot.zig");
 const stream_provider = @import("../stream_provider.zig");
+const gateway_schema = @import("../../tooling/gateway_schema.zig");
 
 pub const vision = @import("vision_contracts.zig");
 
@@ -129,8 +130,7 @@ pub const ToolExecutionResult = struct {
     web_search_completion: ?types.WebSearchCompletion = null,
     web_fetch_completion: ?types.WebFetchCompletion = null,
     inner_usage: ?types.ToolUsage = null,
-    selected_dynamic_tool_name: ?[]const u8 = null,
-    selected_dynamic_tool_schema_json: ?[]const u8 = null,
+    selected_dynamic_tool: ?gateway_schema.FunctionSchema = null,
     tool_result_memory: ?types.ToolResultMemory = null,
     prepared_result_memory: ?types.ToolResultMemory = null,
     committed_file_handoff: ?file_mutation.CommittedFileHandoff = null,

@@ -647,17 +647,21 @@ test "missing and corrupt sidecars retain current pending connection with one fi
         fn resolve(
             raw: ?*anyopaque,
             allocator: Allocator,
-            credential_ref: []const u8,
+            reference: generation_usage.CredentialReference,
         ) generation_usage.ResolveCredentialError!generation_usage.ResolvedCredential {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
-            if (std.mem.eql(u8, credential_ref, "credential-a")) {
+            if (std.mem.eql(u8, reference.credential_ref, "credential-a") and
+                std.mem.eql(u8, reference.adapter_kind, "adapter-a"))
+            {
                 self.resolved_a += 1;
-            } else if (std.mem.eql(u8, credential_ref, "credential-vercel")) {
+            } else if (std.mem.eql(u8, reference.credential_ref, "credential-vercel") and
+                std.mem.eql(u8, reference.adapter_kind, "vercel_ai_gateway"))
+            {
                 self.resolved_vercel += 1;
             } else {
                 return error.Unavailable;
             }
-            return .{ .token = try allocator.dupe(u8, credential_ref) };
+            return .{ .token = try allocator.dupe(u8, reference.credential_ref) };
         }
 
         fn lookupA(
@@ -690,11 +694,13 @@ test "missing and corrupt sidecars retain current pending connection with one fi
     var dispatch = try generation_usage.Dispatch.init(alloc, &.{
         .{
             .id = "connection-a",
+            .adapter_kind = "adapter-a",
             .credential_ref = "credential-a",
             .provider = .{ .context = &probe, .lookup_fn = Probe.lookupA },
         },
         .{
             .id = "vercel",
+            .adapter_kind = "vercel_ai_gateway",
             .credential_ref = "credential-vercel",
             .provider = .{ .context = &probe, .lookup_fn = Probe.lookupVercel },
         },

@@ -29,7 +29,6 @@ const workspace_access = @import("../workspace/workspace_access.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation = @import("../tooling/file_mutation.zig");
-const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const hooks = @import("../hooks/hooks.zig");
 const notification_sound = @import("../notifications/sound.zig");
@@ -259,6 +258,9 @@ fn runAskChild(
     cancel: *std.atomic.Value(bool),
 ) subagent_execution.ServiceError!subagent_execution.RunOutcome {
     const ctx: *AskContext = @ptrCast(@alignCast(raw.?));
+    const route = admission.route orelse return error.AdmissionFailed;
+    const provider_adapter = ctx.cfg.gateway_provider.adapter_registry.resolveRoute(&route) catch
+        return error.ProviderFailed;
     var child_projection = ctx.cfg.mode_registry.buildGatewayToolProjection(
         ctx.alloc,
         ctx.deps.tool_set,
@@ -268,19 +270,21 @@ fn runAskChild(
             .permission_rules = admission.rules,
             .mcp_runtime = ctx.mcp,
             .subagent_available = true,
+            .provider_tools = provider_adapter.provider_tools,
             .terminal_available = tool_dispatch.ToolCapabilities.for_host(host.current()).terminalAvailable(),
-            .provider_tools = ctx.cfg.gateway_provider.provider_adapter.provider_tools,
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
+    var tool_context = ctx.toolContext();
+    tool_context.provider_adapter = provider_adapter;
     return subagent_agent_adapter.run(.{
         .host = ctx.subagent_host orelse return error.ProviderFailed,
-        .tool_context = ctx.toolContext(),
+        .tool_context = tool_context,
         .system_prompt = ctx.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = ctx.cfg.prompt_policy.modelPromptOverlay(admission.model),
         .skills_prompt_section = ctx.subagent_skills_prompt,
         .explicit_skills_prompt_section = ctx.subagent_explicit_skills_prompt,
-        .gateway_tools_json = child_projection.tools_json,
+        .model_tools = child_projection.tools,
         .provider_tools = child_projection.provider_tools,
         .custom_tool_guidance = child_projection.custom_guidance,
         .context_registry = ctx.deps.context_registry,
@@ -288,39 +292,8 @@ fn runAskChild(
         .project_context = ctx.modelVisibleProjectContext(),
         .lifecycle_view = ctx.lifecycle_view,
         .route_credential_ctx = ctx,
-        .resolve_route_credential_fn = resolveAskChildRouteCredential,
+        .resolve_route_credential_fn = resolveRouteCredential,
     }, turn, message, admission, cancel);
-}
-
-fn resolveAskChildRouteCredential(
-    raw: *anyopaque,
-    alloc: Allocator,
-    route: *const route_snapshot.RouteSnapshot,
-) !agent_runtime.RouteCredential {
-    const ctx: *AskContext = @ptrCast(@alignCast(raw));
-    const preferred = if (std.mem.eql(u8, route.credential_ref, "automatic"))
-        null
-    else
-        types.parseCredentialSource(route.credential_ref) orelse
-            return error.InvalidCredentialReference;
-    const resolution = try credentials.resolvePreferring(
-        alloc,
-        ctx.cfg.gateway_provider.oauth_transport,
-        ctx.cfg.secret_store,
-        .refresh_if_needed,
-        preferred,
-    );
-    var credential = resolution.credential orelse return error.MissingCredential;
-    defer credential.deinit(alloc);
-    const tenant = if (credential.gatewayTeam()) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (tenant) |value| alloc.free(value);
-    const token = credential.token;
-    credential.token = &.{};
-    return .{
-        .credential = token,
-        .tenant = tenant,
-        .legacy_source = credential.source,
-    };
 }
 
 pub const PromptRunResult = struct {
@@ -417,7 +390,7 @@ const NotifyAttentionFn = *const fn (?*anyopaque) void;
 const PermissionApprovalPromptFn = *const fn (?*anyopaque, ?*anyopaque, WriteFn, []const u8, ?*anyopaque, NotifyAttentionFn) anyerror!PermissionApprovalPromptResult;
 const IsTtyFn = *const fn (?*anyopaque) bool;
 const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, bool, usize, connection_registry.Seed) anyerror!app_lifecycle.StartupState;
-const ResolveConnectionCredentialFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, connection_registry.Profile, connection_registry.Seed, credentials.LoadMode) anyerror!credentials.Resolution;
+const ResolveConnectionCredentialFn = *const fn (Allocator, adapter_registry.AdapterRegistry, host.SecretStore, connection_registry.Profile, credentials.LoadMode, ?*const std.atomic.Value(bool)) anyerror!credentials.Resolution;
 const InitializeSessionStoresFn = *const fn (*AskContext) anyerror!void;
 const LoadSkillsFn = *const fn (
     Allocator,
@@ -439,7 +412,7 @@ const RunDeps = struct {
     stdin_is_tty: IsTtyFn = realStdinIsTty,
     stdout_is_tty: IsTtyFn = realStdoutIsTty,
     stderr_is_tty: IsTtyFn = realStderrIsTty,
-    load_startup_state: LoadStartupStateFn = loadStartupStateDefault,
+    load_startup_state: LoadStartupStateFn = loadStartupStateWithoutCredentialsDefault,
     load_startup_state_without_credentials: LoadStartupStateFn = loadStartupStateWithoutCredentialsDefault,
     resolve_connection_credential: ResolveConnectionCredentialFn = app_lifecycle.resolveConnectionCredential,
     initialize_session_stores: InitializeSessionStoresFn = initializeSessionStoresDefault,
@@ -530,6 +503,7 @@ const AskContext = struct {
     connection_id: []const u8 = session_codec.legacy_connection_id,
     connection_adapter_kind: []const u8 = "",
     connection_credential_ref: []const u8 = "",
+    provider_adapter: agent_stream_provider.ProviderAdapter = agent_stream_provider.unavailable_adapter,
     seed_model: []const u8 = "",
     command_timeout_ms: ?usize = null,
     session: SessionRuntime,
@@ -740,16 +714,21 @@ const AskContext = struct {
     fn resolveGenerationUsageCredential(
         raw: ?*anyopaque,
         alloc: Allocator,
-        _: []const u8,
+        reference: generation_usage_provider.CredentialReference,
     ) generation_usage_provider.ResolveCredentialError!generation_usage_provider.ResolvedCredential {
         const self: *AskContext = @ptrCast(@alignCast(raw.?));
-        if (self.api_key.len == 0) return error.Unavailable;
-        const token = try alloc.dupe(u8, self.api_key);
-        errdefer alloc.free(token);
-        return .{
-            .token = token,
-            .tenant = if (self.gateway_team) |team| try alloc.dupe(u8, team) else null,
-        };
+        if (self.api_key.len == 0 or
+            !std.mem.eql(u8, reference.connection_id, self.connection_id) or
+            !std.mem.eql(u8, reference.adapter_kind, self.connection_adapter_kind) or
+            !std.mem.eql(u8, reference.credential_ref, self.connection_credential_ref))
+        {
+            return error.Unavailable;
+        }
+        return generation_usage_provider.ResolvedCredential.initCopy(
+            alloc,
+            self.api_key,
+            self.gateway_team,
+        );
     }
 
     fn prepareGenerationUsageDispatch(
@@ -760,14 +739,14 @@ const AskContext = struct {
         if (self.connection_id.len == 0 or self.connection_credential_ref.len == 0) {
             return error.Unavailable;
         }
-        const adapter = self.cfg.gateway_provider.provider_adapter;
+        const adapter = self.cfg.gateway_provider.adapter_registry.resolve(
+            self.connection_adapter_kind,
+        ) catch return error.Unavailable;
         return generation_usage_provider.Dispatch.init(alloc, &.{.{
             .id = self.connection_id,
+            .adapter_kind = self.connection_adapter_kind,
             .credential_ref = self.connection_credential_ref,
-            .provider = if (std.mem.eql(u8, self.connection_adapter_kind, adapter.kind))
-                adapter.generation_usage
-            else
-                null,
+            .provider = adapter.generation_usage,
         }}, .{
             .context = self,
             .resolve_fn = resolveGenerationUsageCredential,
@@ -973,7 +952,7 @@ const AskContext = struct {
             .max_command_output_bytes = self.cfg.max_command_output_bytes,
             .max_tool_result_bytes = self.max_tool_result_bytes,
             .api_key = self.api_key,
-            .provider_adapter = self.cfg.gateway_provider.provider_adapter,
+            .provider_adapter = self.provider_adapter,
             .agent_stream_provider = self.cfg.gateway_provider.agent_stream,
             .gateway_team = self.gateway_team,
             .credential_source = self.credential_source,
@@ -1129,13 +1108,16 @@ fn freshAskState(
 }
 
 pub fn run(alloc: Allocator, args: []const [:0]const u8, cfg: Config, context_registry: context_contract.Registry, tool_set: tool_set_contract.ToolSet) !u8 {
-    return runWithDeps(alloc, args, cfg, .{
-        .load_startup_state = app_lifecycle.loadStartupState,
+    return runWithDeps(alloc, args, cfg, productionRunDeps(cfg, context_registry, tool_set));
+}
+
+fn productionRunDeps(cfg: Config, context_registry: context_contract.Registry, tool_set: tool_set_contract.ToolSet) RunDeps {
+    return .{
         .context_registry = context_registry,
         .tool_set = tool_set,
         .load_mcp_runtime = cfg.load_mcp_runtime,
         .install_headless_interrupt = true,
-    });
+    };
 }
 
 fn selectOutputMode(quiet: bool, json: bool, stdout_is_tty: bool, no_color: bool) OutputMode {
@@ -1383,16 +1365,30 @@ fn missingCredentialResult(alloc: Allocator, options: RunOptions) !PromptRunResu
     };
 }
 
+fn unsupportedAdapterResult(
+    alloc: Allocator,
+    options: RunOptions,
+    err: anyerror,
+) !PromptRunResult {
+    if (!options.output_mode.capturesJson()) {
+        try options.deps.write_stderr(
+            options.deps.stderr_ctx,
+            "fx ask: unsupported connection adapter\n",
+        );
+    }
+    return .{
+        .exit_code = 1,
+        .assistant_output = try alloc.dupe(u8, ""),
+        .error_code = @errorName(err),
+    };
+}
+
 fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: ?PermissionMode, cfg: Config, options: RunOptions) !PromptRunResult {
     var owned_prompt = try alloc.dupe(u8, prompt);
     defer alloc.free(owned_prompt);
 
     try checkHeadlessCancellation(options.deps);
-    const load_startup = if (options.resume_target == null)
-        options.deps.load_startup_state
-    else
-        options.deps.load_startup_state_without_credentials;
-    var startup = try load_startup(
+    var startup = try options.deps.load_startup_state_without_credentials(
         alloc,
         cfg.gateway_provider.oauth_transport,
         cfg.secret_store,
@@ -1402,10 +1398,12 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         cfg.gateway_provider.connection_seed,
     );
     defer startup.deinit(alloc);
-    try startup.normalizeModels(
-        alloc,
-        cfg.gateway_provider.provider_adapter.model_descriptors,
-    );
+    if (options.resume_target == null and !options.continue_recovery) {
+        const selected_profile = startup.connections.?.selectedProfile();
+        const selected_adapter = cfg.gateway_provider.adapter_registry.resolveProfile(selected_profile) catch |err|
+            return unsupportedAdapterResult(alloc, options, err);
+        try startup.normalizeModels(alloc, selected_adapter.model_descriptors);
+    }
     try checkHeadlessCancellation(options.deps);
 
     var permission_mode = toCorePermissionMode(startup.permission_mode);
@@ -1437,10 +1435,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         cfg.saved_directories_suppressed,
     );
     try checkHeadlessCancellation(options.deps);
-
-    if (options.resume_target == null and startup.credential == null) {
-        return missingCredentialResult(alloc, options);
-    }
 
     var owned_resumed_model: ?[]u8 = null;
     defer if (owned_resumed_model) |model| alloc.free(model);
@@ -1524,7 +1518,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         checkpoint.route_identity.?.connection_id
     else
         ctx.connection_id;
-    const profile = startup.connections.?.profile(route_connection_id) catch |err| switch (err) {
+    var profile = startup.connections.?.profile(route_connection_id) catch |err| switch (err) {
         error.UnknownConnection => {
             try ctx.writeStderr("fx ask: saved connection is unavailable; select or restore that connection before resuming\n");
             return error.MissingSessionConnection;
@@ -1536,31 +1530,33 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             checkpoint.route_identity.?.adapter_kind,
         );
     }
+    const profile_adapter = cfg.gateway_provider.adapter_registry.resolveProfile(profile) catch |err|
+        return unsupportedAdapterResult(alloc, options, err);
+    const normalized_profile_model = try alloc.dupe(
+        u8,
+        profile_adapter.model_descriptors.fallback(ctx.model).id,
+    );
+    defer alloc.free(normalized_profile_model);
+    ctx.model = normalized_profile_model;
     var owned_route_credential: ?credentials.Credential = null;
     defer if (owned_route_credential) |*credential| credential.deinit(alloc);
-    const credential = if (options.resume_target == null and std.mem.eql(
-        u8,
-        profile.id,
-        startup.connections.?.selectedProfile().id,
-    ))
-        startup.credential orelse return missingCredentialResult(alloc, options)
-    else credential: {
-        const resolution = try options.deps.resolve_connection_credential(
-            alloc,
-            cfg.gateway_provider.oauth_transport,
-            cfg.secret_store,
-            profile,
-            cfg.gateway_provider.connection_seed,
-            .refresh_if_needed,
-        );
-        owned_route_credential = resolution.credential orelse
-            return missingCredentialResult(alloc, options);
-        break :credential owned_route_credential.?;
-    };
+    const resolution = try options.deps.resolve_connection_credential(
+        alloc,
+        cfg.gateway_provider.adapter_registry,
+        cfg.secret_store,
+        profile,
+        .refresh_if_needed,
+        ctx.cancelFlag(),
+    );
+    owned_route_credential = resolution.credential orelse
+        return missingCredentialResult(alloc, options);
+    const credential = owned_route_credential.?;
+    profile.credential_ref = @constCast(@tagName(credential.source));
     const api_key = credential.token;
     ctx.connection_id = profile.id;
     ctx.connection_adapter_kind = profile.adapter_id;
     ctx.connection_credential_ref = profile.credential_ref;
+    ctx.provider_adapter = profile_adapter;
     ctx.api_key = api_key;
     ctx.gateway_team = credential.gatewayTeam();
     ctx.credential_source = credential.source;
@@ -1647,9 +1643,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .permission_rules = ctx.permission_rules,
         .mcp_runtime = ctx.mcp,
         .subagent_available = ctx.subagent_host != null,
+        .provider_tools = profile_adapter.provider_tools,
         .terminal_available = ctx.subagent_host != null and
             tool_dispatch.ToolCapabilities.for_host(host.current()).terminalAvailable(),
-        .provider_tools = ctx.cfg.gateway_provider.provider_adapter.provider_tools,
     });
     defer tool_projection.deinit(alloc);
 
@@ -1727,6 +1723,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             cfg.gateway_chat_url,
         );
     defer route.deinit(alloc);
+    ctx.provider_adapter = try cfg.gateway_provider.adapter_registry.resolveRoute(&route);
 
     const job: worker_runtime.QueuedPrompt = .{
         .turn_id = ctx.active_turn_id,
@@ -1755,7 +1752,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .explicit_skills_prompt_section = explicit_skills.text,
         .gateway_retry_count = cfg.gateway_retry_count,
         .gateway_chat_url = cfg.gateway_chat_url,
-        .gateway_tools_json = tool_projection.tools_json,
+        .model_tools = tool_projection.tools,
         .provider_tools = tool_projection.provider_tools,
         .custom_tool_guidance = tool_projection.custom_guidance,
         .agent_step_limit = startup.agent_step_limit,
@@ -1916,7 +1913,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
     );
     return .{
         .ctx = @ptrCast(ctx),
-        .provider_adapter = ctx.cfg.gateway_provider.provider_adapter,
+        .provider_adapter = ctx.provider_adapter,
         .agent_stream_provider = ctx.cfg.gateway_provider.agent_stream,
         .tool_registry = ctx.toolRegistry(),
         .context_registry = ctx.deps.context_registry,
@@ -1953,7 +1950,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .push_context_notice = pushContextNotice,
         .push_route_recovery_status = pushRouteRecoveryStatus,
         .push_command_output_complete = pushCommandOutputComplete,
-        .push_http_error = pushHttpError,
+        .push_provider_failure = pushProviderFailure,
         .resolve_route_credential = resolveRouteCredential,
         .refresh_gateway_credential = refreshGatewayCredential,
         .available_model_capabilities = availableModelCapabilities,
@@ -1969,27 +1966,41 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
 fn resolveRouteCredential(
     raw_ctx: *anyopaque,
     alloc: Allocator,
-    _: *const route_snapshot.RouteSnapshot,
+    route: *const route_snapshot.RouteSnapshot,
 ) !agent_runtime.RouteCredential {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const credential = try alloc.dupe(u8, ctx.api_key);
-    errdefer alloc.free(credential);
-    const tenant = if (ctx.gateway_team) |value| try alloc.dupe(u8, value) else null;
-    return .{
-        .credential = credential,
-        .tenant = tenant,
+    const source = ctx.credential_source orelse return error.RouteCredentialMismatch;
+    if (!std.mem.eql(u8, route.connection_id, ctx.connection_id) or
+        !std.mem.eql(u8, route.adapter_kind, ctx.connection_adapter_kind) or
+        !std.mem.eql(u8, route.credential_ref, ctx.connection_credential_ref) or
+        !std.mem.eql(u8, route.credential_ref, @tagName(source)))
+    {
+        return error.RouteCredentialMismatch;
+    }
+    var result = agent_runtime.RouteCredential{
+        .credential = try alloc.dupe(u8, ctx.api_key),
         .legacy_source = ctx.credential_source,
     };
+    errdefer result.deinit(alloc);
+    result.tenant = if (ctx.gateway_team) |value| try alloc.dupe(u8, value) else null;
+    return result;
 }
 
 fn refreshGatewayCredential(
     raw_ctx: *anyopaque,
     alloc: Allocator,
+    route: *const route_snapshot.RouteSnapshot,
     source: credentials.Source,
     mode: auth_runtime.CredentialRefreshMode,
 ) !?[]u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (source != .fx_login) return null;
+    if (!std.mem.eql(u8, route.connection_id, ctx.connection_id) or
+        !std.mem.eql(u8, route.adapter_kind, ctx.connection_adapter_kind) or
+        !std.mem.eql(u8, route.credential_ref, ctx.connection_credential_ref))
+    {
+        return error.RouteCredentialMismatch;
+    }
     const profile = connection_registry.Profile{
         .id = @constCast(ctx.connection_id),
         .display_name = @constCast(ctx.connection_id),
@@ -2081,11 +2092,8 @@ fn reportUsage(raw_ctx: *anyopaque, usage: types.Usage) void {
 
 fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const adapter = ctx.cfg.gateway_provider.provider_adapter;
-    const catalog = gateway_provider.modelCatalogForAdapter(
-        ctx.connection_adapter_kind,
-        adapter,
-    ) orelse return adapter.model_descriptors.fallback(model).capabilities;
+    const adapter = ctx.provider_adapter;
+    const catalog = adapter.model_catalog orelse return adapter.model_descriptors.fallback(model).capabilities;
     return ctx.capability_resolver.resolve(
         ctx.alloc,
         catalog,
@@ -2100,17 +2108,14 @@ fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8
 
 fn availableModelCapabilities(raw_ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const adapter = ctx.cfg.gateway_provider.provider_adapter;
-    if (gateway_provider.modelCatalogForAdapter(
-        ctx.connection_adapter_kind,
-        adapter,
-    ) == null) return adapter.model_descriptors.fallback(model).capabilities;
+    const adapter = ctx.provider_adapter;
+    if (adapter.model_catalog == null) return adapter.model_descriptors.fallback(model).capabilities;
     return ctx.capability_resolver.available(model);
 }
 
 fn resolveModelDescriptor(raw_ctx: *anyopaque, alloc: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.ModelDescriptor {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    var descriptor = ctx.cfg.gateway_provider.provider_adapter.model_descriptors.fallback(model);
+    var descriptor = ctx.provider_adapter.model_descriptors.fallback(model);
     descriptor.capabilities = try resolveModelCapabilities(raw_ctx, alloc, model);
     descriptor.source = .catalog;
     return descriptor;
@@ -2118,7 +2123,7 @@ fn resolveModelDescriptor(raw_ctx: *anyopaque, alloc: Allocator, model: []const 
 
 fn availableModelDescriptor(raw_ctx: *anyopaque, model: []const u8) model_capabilities.ModelDescriptor {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    var descriptor = ctx.cfg.gateway_provider.provider_adapter.model_descriptors.fallback(model);
+    var descriptor = ctx.provider_adapter.model_descriptors.fallback(model);
     descriptor.capabilities = availableModelCapabilities(raw_ctx, model);
     return descriptor;
 }
@@ -3090,15 +3095,19 @@ fn pushCommandOutputComplete(raw_ctx: *anyopaque, _: ?types.ToolLifecycleId) !vo
     ctx.command_output_line_open = false;
 }
 
-fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
+fn pushProviderFailure(raw_ctx: *anyopaque, category: agent_stream_provider.StreamFailure.Category, _: ?u16, detail: []const u8, credential_source: ?types.CredentialSource) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.failed = true;
-    const auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
+    const auth_failure = auth_runtime.FailureSnapshot.fromHttp(switch (category) {
+        .authentication => .unauthorized,
+        .authorization => .forbidden,
+        else => .ok,
+    }, credential_source);
     ctx.auth_failure = auth_failure;
     const message = if (auth_failure) |failure|
         try failure.renderText(ctx.alloc)
     else
-        try gateway_error_format.formatHttpErrorMessage(ctx.alloc, status, detail);
+        try std.fmt.allocPrint(ctx.alloc, "{s}", .{if (detail.len > 0) detail else @tagName(category)});
     defer ctx.alloc.free(message);
     try ctx.writeStderr("fx ask: ");
     try ctx.writeStderr(message);
@@ -3752,26 +3761,6 @@ fn toCoreSandbox(kind: anytype) @import("../permissions/sandbox.zig").BackendKin
     };
 }
 
-fn loadStartupStateDefault(
-    alloc: Allocator,
-    transport: oauth_transport.Provider,
-    secret_store: host.SecretStore,
-    default_model: []const u8,
-    default_fast_mode: bool,
-    default_agent_step_limit: usize,
-    connection_seed: connection_registry.Seed,
-) !app_lifecycle.StartupState {
-    return app_lifecycle.loadStartupState(
-        alloc,
-        transport,
-        secret_store,
-        default_model,
-        default_fast_mode,
-        default_agent_step_limit,
-        connection_seed,
-    );
-}
-
 fn loadStartupStateWithoutCredentialsDefault(
     alloc: Allocator,
     _: oauth_transport.Provider,
@@ -4049,21 +4038,38 @@ test "ask refresh handles every adapter acquisition outcome without fallback" {
     ctx.connection_adapter_kind = test_builtin_gateway.connection_seed.adapter_id;
     ctx.connection_credential_ref = "fx_login";
     ctx.model = "model";
+    var route = try route_snapshot.RouteSnapshot.admitSelected(
+        std.testing.allocator,
+        .{
+            .id = @constCast(ctx.connection_id),
+            .display_name = @constCast(ctx.connection_id),
+            .adapter_id = @constCast(ctx.connection_adapter_kind),
+            .endpoint = if (cfg.gateway_provider.connection_seed.endpoint) |value| @constCast(value) else null,
+            .protocol = if (cfg.gateway_provider.connection_seed.protocol) |value| @constCast(value) else null,
+            .credential_ref = @constCast(ctx.connection_credential_ref),
+            .remembered_model = @constCast(ctx.model),
+            .internal_models = .{},
+        },
+        cfg.gateway_provider.connection_seed,
+        model_capabilities.configuredDescriptor(ctx.model, .{}),
+        cfg.gateway_chat_url,
+    );
+    defer route.deinit(std.testing.allocator);
 
-    const refreshed = (try refreshGatewayCredential(&ctx, std.testing.allocator, .fx_login, .if_needed)).?;
+    const refreshed = (try refreshGatewayCredential(&ctx, std.testing.allocator, &route, .fx_login, .if_needed)).?;
     @memset(refreshed, 0);
     std.testing.allocator.free(refreshed);
     probe.outcome = .missing;
-    try std.testing.expect((try refreshGatewayCredential(&ctx, std.testing.allocator, .fx_login, .force)) == null);
+    try std.testing.expect((try refreshGatewayCredential(&ctx, std.testing.allocator, &route, .fx_login, .force)) == null);
     probe.outcome = .failed;
     try std.testing.expectError(
         error.CredentialRefreshFailed,
-        refreshGatewayCredential(&ctx, std.testing.allocator, .fx_login, .if_needed),
+        refreshGatewayCredential(&ctx, std.testing.allocator, &route, .fx_login, .if_needed),
     );
     probe.outcome = .cancelled;
     try std.testing.expectError(
         error.Cancelled,
-        refreshGatewayCredential(&ctx, std.testing.allocator, .fx_login, .force),
+        refreshGatewayCredential(&ctx, std.testing.allocator, &route, .fx_login, .force),
     );
     try std.testing.expectEqual(@as(usize, 4), probe.calls);
     try std.testing.expectEqual(probe.calls, probe.exact_calls);
@@ -4071,14 +4077,67 @@ test "ask refresh handles every adapter acquisition outcome without fallback" {
     try std.testing.expect(probe.saw_force);
 }
 
+test "Ask root and child credentials require the exact admitted route" {
+    const alloc = std.testing.allocator;
+    const cfg = testConfig();
+    var ctx = AskContext.init(alloc, cfg, .{
+        .context_registry = test_no_context_registry,
+        .tool_set = test_builtin_tools.advertisement_set,
+        .load_mcp_runtime = testNoMcpRuntime,
+    }, "/tmp/workspace");
+    defer ctx.deinit();
+    ctx.connection_id = cfg.gateway_provider.connection_seed.id;
+    ctx.connection_adapter_kind = cfg.gateway_provider.connection_seed.adapter_id;
+    ctx.connection_credential_ref = "fx_login";
+    ctx.api_key = "admitted-secret";
+    ctx.gateway_team = "team";
+    ctx.credential_source = .fx_login;
+    const seed = cfg.gateway_provider.connection_seed;
+    const profile = connection_registry.Profile{
+        .id = @constCast(seed.id),
+        .display_name = @constCast(seed.display_name),
+        .adapter_id = @constCast(seed.adapter_id),
+        .endpoint = if (seed.endpoint) |value| @constCast(value) else null,
+        .protocol = if (seed.protocol) |value| @constCast(value) else null,
+        .credential_ref = @constCast("fx_login"),
+        .remembered_model = @constCast("model"),
+        .internal_models = .{},
+    };
+    var route = try route_snapshot.RouteSnapshot.admitSelected(
+        alloc,
+        profile,
+        seed,
+        model_capabilities.configuredDescriptor("model", .{}),
+        cfg.gateway_chat_url,
+    );
+    defer route.deinit(alloc);
+
+    var root = try resolveRouteCredential(&ctx, alloc, &route);
+    defer root.deinit(alloc);
+    try std.testing.expectEqualStrings("admitted-secret", root.credential);
+    try std.testing.expectEqualStrings("team", root.tenant.?);
+
+    var mismatched = route;
+    mismatched.credential_ref = "stored_key";
+    try std.testing.expectError(error.RouteCredentialMismatch, resolveRouteCredential(&ctx, alloc, &mismatched));
+    mismatched = route;
+    mismatched.adapter_kind = "peer";
+    try std.testing.expectError(error.RouteCredentialMismatch, resolveRouteCredential(&ctx, alloc, &mismatched));
+    mismatched = route;
+    mismatched.connection_id = "other";
+    try std.testing.expectError(error.RouteCredentialMismatch, resolveRouteCredential(&ctx, alloc, &mismatched));
+}
+
 fn testMissingKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.SecretStore, default_model: []const u8, default_fast_mode: bool, default_agent_step_limit: usize, connection_seed: connection_registry.Seed) !app_lifecycle.StartupState {
     var state = app_lifecycle.StartupState{ .agent_step_limit = default_agent_step_limit, .fast_mode = default_fast_mode };
     errdefer state.deinit(alloc);
     state.workspace_root = try alloc.dupe(u8, "/tmp/fx-test");
     state.selected_model = try alloc.dupe(u8, default_model);
+    var profile = connection_seed.profile(default_model, null);
+    profile.credential_ref = "test_missing";
     state.connections = try connection_registry.Runtime.init(
         alloc,
-        connection_seed.profile(default_model, null),
+        profile,
         null,
         .unavailable,
     );
@@ -4219,11 +4278,10 @@ fn testProcessQueuedPromptChecksRealTools(deps: *const agent_runtime.AgentRuntim
     try std.testing.expect(semantic_presentation == null);
     const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
     try std.testing.expectEqualStrings("inspect", ctx.mode_id);
-    try std.testing.expect(!std.mem.eql(u8, cfg.gateway_tools_json, "[]"));
-    try std.testing.expect(std.mem.find(u8, cfg.gateway_tools_json, "\"name\":\"read_file\"") != null);
-    try std.testing.expect(std.mem.find(u8, cfg.gateway_tools_json, "\"name\":\"terminal\"") != null);
-    try std.testing.expect(std.mem.find(u8, cfg.gateway_tools_json, "\"name\":\"run_command\"") == null);
-    try std.testing.expect(std.mem.find(u8, cfg.gateway_tools_json, "\"name\":\"web_search\"") == null);
+    try std.testing.expect(cfg.model_tools.len > 0);
+    try std.testing.expect(tool_advertisement.containsDescriptor(cfg.model_tools, "read_file"));
+    try std.testing.expect(tool_advertisement.containsDescriptor(cfg.model_tools, "terminal"));
+    try std.testing.expect(!tool_advertisement.containsDescriptor(cfg.model_tools, "web_search"));
     try std.testing.expectEqual(@as(usize, 1), cfg.provider_tools.len);
     try std.testing.expectEqual(.web_search, cfg.provider_tools[0].tool);
     try std.testing.expectEqualStrings(test_builtin_tools.web_search.description, cfg.custom_tool_guidance);
@@ -4233,8 +4291,8 @@ fn testProcessQueuedPromptChecksRealTools(deps: *const agent_runtime.AgentRuntim
 
 fn testProcessQueuedPromptChecksInjectedToolSet(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
-    try std.testing.expect(std.mem.find(u8, cfg.gateway_tools_json, "\"name\":\"read_file\"") != null);
-    try std.testing.expect(std.mem.find(u8, cfg.gateway_tools_json, "\"name\":\"run_command\"") == null);
+    try std.testing.expect(tool_advertisement.containsDescriptor(cfg.model_tools, "read_file"));
+    try std.testing.expect(!tool_advertisement.containsDescriptor(cfg.model_tools, "terminal"));
     try std.testing.expectEqualStrings("", cfg.custom_tool_guidance);
 
     const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
@@ -4245,20 +4303,22 @@ fn testProcessQueuedPromptChecksInjectedToolSet(deps: *const agent_runtime.Agent
 
 fn testProcessQueuedPromptHttp413(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
-    try deps.push_http_error(
+    try deps.push_provider_failure(
         deps.ctx,
-        .payload_too_large,
-        "provider payload rejected\n\nprompt_too_long=true\nProvider rejected the prompt as too large. Latest local tool evidence remains in session history/result handles; no local tool actions were replayed.",
+        .request_too_large,
+        413,
+        "HTTP 413: provider payload rejected\n\nprompt_too_long=true\nProvider rejected the prompt as too large. Latest local tool evidence remains in session history/result handles; no local tool actions were replayed.",
         null,
     );
 }
 
 fn testProcessQueuedPromptRestrictedProvider(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
-    try deps.push_http_error(
+    try deps.push_provider_failure(
         deps.ctx,
-        .forbidden,
-        "{\"error\":{\"message\":\"Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer\",\"type\":\"no_providers_available\",\"param\":{\"name\":\"RestrictedProvidersError\",\"message\":\"Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer\"}},\"providerMetadata\":{\"gateway\":{\"routing\":{}}}}",
+        .authorization,
+        403,
+        "API access denied · HTTP 403 · Provider: wafer · Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer",
         null,
     );
 }
@@ -4266,9 +4326,10 @@ fn testProcessQueuedPromptRestrictedProvider(deps: *const agent_runtime.AgentRun
 fn testProcessQueuedPromptUnauthorized(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
     const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
-    try deps.push_http_error(
+    try deps.push_provider_failure(
         deps.ctx,
-        .unauthorized,
+        .authentication,
+        401,
         "provider rejected secret-key body",
         ctx.credential_source,
     );
@@ -4616,12 +4677,13 @@ fn testNoMcpRuntime(_: Allocator, _: mcp_elicitation.Capabilities) !?*mcp_runtim
 
 fn testResolveConnectionCredential(
     alloc: Allocator,
-    _: oauth_transport.Provider,
+    _: adapter_registry.AdapterRegistry,
     _: host.SecretStore,
-    _: connection_registry.Profile,
-    _: connection_registry.Seed,
+    profile: connection_registry.Profile,
     _: credentials.LoadMode,
+    _: ?*const std.atomic.Value(bool),
 ) !credentials.Resolution {
+    if (std.mem.eql(u8, profile.credential_ref, "test_missing")) return .{};
     return .{ .credential = .{
         .token = try alloc.dupe(u8, "key"),
         .source = .ai_gateway_api_key,
@@ -4632,21 +4694,36 @@ var test_route_credential_resolution_calls: usize = 0;
 
 fn testCountRouteCredentialResolution(
     alloc: Allocator,
-    transport: oauth_transport.Provider,
+    registry: adapter_registry.AdapterRegistry,
     secret_store: host.SecretStore,
     profile: connection_registry.Profile,
-    seed: connection_registry.Seed,
     mode: credentials.LoadMode,
+    cancel_flag: ?*const std.atomic.Value(bool),
 ) !credentials.Resolution {
     test_route_credential_resolution_calls += 1;
     return testResolveConnectionCredential(
         alloc,
-        transport,
+        registry,
         secret_store,
         profile,
-        seed,
         mode,
+        cancel_flag,
     );
+}
+
+fn testCountSuccessfulRouteCredentialResolution(
+    alloc: Allocator,
+    _: adapter_registry.AdapterRegistry,
+    _: host.SecretStore,
+    _: connection_registry.Profile,
+    _: credentials.LoadMode,
+    _: ?*const std.atomic.Value(bool),
+) !credentials.Resolution {
+    test_route_credential_resolution_calls += 1;
+    return .{ .credential = .{
+        .token = try alloc.dupe(u8, "key"),
+        .source = .ai_gateway_api_key,
+    } };
 }
 
 var test_rejected_recovery_provider_calls: usize = 0;
@@ -4685,6 +4762,37 @@ fn testPromptRunDepsWithProcess(stdout_capture: *TestCapture, stderr_capture: *T
     return deps;
 }
 
+test "production Ask loads configuration before registry credential acquisition" {
+    const deps = productionRunDeps(
+        testConfig(),
+        test_no_context_registry,
+        test_builtin_tools.advertisement_set,
+    );
+    try std.testing.expect(deps.load_startup_state == loadStartupStateWithoutCredentialsDefault);
+    try std.testing.expect(deps.resolve_connection_credential == app_lifecycle.resolveConnectionCredential);
+}
+
+test "fresh Ask acquires one credential after credential-free startup" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testMissingKeyStartup);
+    deps.resolve_connection_credential = testCountSuccessfulRouteCredentialResolution;
+    test_route_credential_resolution_calls = 0;
+
+    const exit_code = try runWithDeps(
+        alloc,
+        &.{ "--no-save", "hello" },
+        testConfig(),
+        deps,
+    );
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqual(@as(usize, 1), test_route_credential_resolution_calls);
+}
+
 test "fake non-Vercel adapter completes an Ask root turn on its admitted route" {
     const Fake = struct {
         calls: usize = 0,
@@ -4700,7 +4808,7 @@ test "fake non-Vercel adapter completes an Ask root turn on its admitted route" 
             try std.testing.expectEqualStrings("test_non_vercel", request.route.adapter_kind);
             try std.testing.expectEqualStrings("fake-protocol", request.route.protocol);
             try std.testing.expectEqualStrings("fake://ask", request.route.endpoint);
-            try std.testing.expectEqualStrings("automatic", request.route.credential_ref);
+            try std.testing.expectEqualStrings("ai_gateway_api_key", request.route.credential_ref);
             try std.testing.expectEqualStrings("key", request.credential);
             try events.emit(.provider_admitted);
             try events.emit(.{ .text_delta = "ask complete" });
@@ -4729,6 +4837,10 @@ test "fake non-Vercel adapter completes an Ask root turn on its admitted route" 
         .context = &fake,
         .stream_fn = Fake.stream,
     };
+    const adapters = [_]agent_stream_provider.ProviderAdapter{
+        cfg.gateway_provider.provider_adapter,
+    };
+    cfg.gateway_provider.adapter_registry = .{ .adapters = &adapters };
     var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup);
     deps.process_queued_prompt = processQueuedPromptDefault;
 
@@ -4838,7 +4950,7 @@ test "mismatched Ask adapter forces static capabilities without provider traffic
     });
     defer result.deinit(alloc);
 
-    try std.testing.expectEqualStrings("RouteAdapterMismatch", result.error_code.?);
+    try std.testing.expectEqualStrings("MissingAdapter", result.error_code.?);
     try std.testing.expectEqual(@as(usize, 0), traffic.catalog_calls);
     try std.testing.expectEqual(@as(usize, 0), traffic.search_calls);
     try std.testing.expectEqual(@as(usize, 0), traffic.model_calls);
@@ -6115,6 +6227,7 @@ test "headless ask startup cancellation prevents later hooks" {
             testProcessQueuedPromptAfterStartupCancellation,
         );
         deps.load_startup_state = testLoadStartupStateWithCancellation;
+        deps.load_startup_state_without_credentials = testLoadStartupStateWithCancellation;
         deps.initialize_session_stores = testInitializeSessionStoresWithCancellation;
         deps.context_registry = test_startup_cancellation_context_registry;
         deps.load_mcp_runtime = testLoadMcpRuntimeWithCancellation;

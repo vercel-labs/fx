@@ -640,21 +640,35 @@ const test_mirror_provider_tool = blk: {
     break :blk spec;
 };
 
-/// Owns the effective tools JSON and any separate guidance required by
-/// included custom advertisements. The caller must deinitialize the result
-/// with the allocator passed to the builder.
+/// Owns the ordered descriptor slice and any separate guidance required by
+/// included custom advertisements. Descriptor contents remain borrowed from
+/// the immutable tool registry.
 pub const EffectiveToolProjection = struct {
-    tools_json: []u8,
+    tools: []gateway_schema.FunctionSchema,
     provider_tools: []agent_stream_provider.ProviderToolAdvertisement,
     custom_guidance: []u8,
 
     pub fn deinit(self: *EffectiveToolProjection, alloc: Allocator) void {
-        alloc.free(self.tools_json);
+        alloc.free(self.tools);
         alloc.free(self.provider_tools);
         alloc.free(self.custom_guidance);
         self.* = undefined;
     }
+
+    pub fn contains(self: EffectiveToolProjection, name: []const u8) bool {
+        return containsDescriptor(self.tools, name);
+    }
 };
+
+pub fn containsDescriptor(
+    descriptors: []const gateway_schema.FunctionSchema,
+    name: []const u8,
+) bool {
+    for (descriptors) |descriptor| {
+        if (std.mem.eql(u8, descriptor.name, name)) return true;
+    }
+    return false;
+}
 
 const test_all_tools = [_]tool_dispatch.Tool{
     test_list_files,
@@ -751,117 +765,86 @@ pub fn buildReadOnlyGatewayToolProjectionForSet(alloc: Allocator, tool_set: tool
     return buildToolProjection(alloc, tool_set, .read_only, options);
 }
 
+pub fn buildModelTools(
+    alloc: Allocator,
+    base: []const gateway_schema.FunctionSchema,
+    selected_dynamic: []const gateway_schema.FunctionSchema,
+    vision_mode: agent_stream_provider.VisionMode,
+    vision: ?gateway_schema.FunctionSchema,
+) ![]gateway_schema.FunctionSchema {
+    if (vision_mode == .required) {
+        const descriptor = vision orelse return error.VisionToolNotRegistered;
+        try descriptor.validate();
+        const tools = try alloc.alloc(gateway_schema.FunctionSchema, 1);
+        tools[0] = descriptor;
+        return tools;
+    }
+
+    var tools: std.ArrayList(gateway_schema.FunctionSchema) = .empty;
+    errdefer tools.deinit(alloc);
+    for (base) |descriptor| try appendUniqueDescriptor(alloc, &tools, descriptor);
+    for (selected_dynamic) |descriptor| try appendUniqueDescriptor(alloc, &tools, descriptor);
+    if (vision_mode == .optional) {
+        try appendUniqueDescriptor(
+            alloc,
+            &tools,
+            vision orelse return error.VisionToolNotRegistered,
+        );
+    }
+    return tools.toOwnedSlice(alloc);
+}
+
+fn appendUniqueDescriptor(
+    alloc: Allocator,
+    tools: *std.ArrayList(gateway_schema.FunctionSchema),
+    descriptor: gateway_schema.FunctionSchema,
+) !void {
+    try descriptor.validate();
+    for (tools.items) |existing| {
+        if (std.mem.eql(u8, existing.name, descriptor.name)) return;
+    }
+    try tools.append(alloc, descriptor);
+}
+
 fn buildToolProjection(alloc: Allocator, tool_set: tool_set_contract.ToolSet, kind: BuildKind, options: Options) !EffectiveToolProjection {
-    var tools_out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer tools_out.deinit();
+    var tools: std.ArrayList(gateway_schema.FunctionSchema) = .empty;
+    errdefer tools.deinit(alloc);
     var guidance_out: std.Io.Writer.Allocating = .init(alloc);
     errdefer guidance_out.deinit();
     var provider_tools: std.ArrayList(agent_stream_provider.ProviderToolAdvertisement) = .empty;
     errdefer provider_tools.deinit(alloc);
 
-    var first = true;
     var first_custom_guidance = true;
-    var local_schema_count: usize = 0;
-    try tools_out.writer.writeByte('[');
 
     for (tool_set.order) |tool_name| {
         const tool = tool_set.registry.lookup(tool_name) orelse continue;
-        try writeBuiltinTool(alloc, &tools_out.writer, &guidance_out.writer, &provider_tools, &local_schema_count, &first, &first_custom_guidance, tool.*, kind, tool_set, options);
+        try appendBuiltinTool(alloc, &tools, &guidance_out.writer, &provider_tools, &first_custom_guidance, tool.*, kind, tool_set, options);
     }
 
     if (kind == .full) {
         for (tool_set.registry.tools) |tool| {
             if (isCanonicalToolName(tool_set, tool.name)) continue;
-            try writeBuiltinTool(alloc, &tools_out.writer, &guidance_out.writer, &provider_tools, &local_schema_count, &first, &first_custom_guidance, tool, kind, tool_set, options);
+            try appendBuiltinTool(alloc, &tools, &guidance_out.writer, &provider_tools, &first_custom_guidance, tool, kind, tool_set, options);
         }
     }
 
-    try tools_out.writer.writeByte(']');
-    const tools_json = try tools_out.toOwnedSlice();
-    errdefer alloc.free(tools_json);
+    const owned_tools = try tools.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_tools);
     const custom_guidance = try guidance_out.toOwnedSlice();
     errdefer alloc.free(custom_guidance);
     const owned_provider_tools = try provider_tools.toOwnedSlice(alloc);
     return .{
-        .tools_json = tools_json,
+        .tools = owned_tools,
         .provider_tools = owned_provider_tools,
         .custom_guidance = custom_guidance,
     };
 }
 
-pub fn buildGatewayToolsJsonWithSelectedDynamicSchemas(alloc: Allocator, base_tools_json: []const u8, selected_dynamic_schemas: []const []const u8) ![]u8 {
-    if (selected_dynamic_schemas.len == 0) return alloc.dupe(u8, base_tools_json);
-
-    const trimmed = std.mem.trim(u8, base_tools_json, " \n\r\t");
-    if (trimmed.len < 2 or trimmed[0] != '[' or trimmed[trimmed.len - 1] != ']') return error.InvalidToolArguments;
-
-    var used_names = try collectAdvertisedToolNames(alloc, trimmed);
-    defer freeAdvertisedToolNames(alloc, &used_names);
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-
-    try out.writer.writeAll(trimmed[0 .. trimmed.len - 1]);
-    var needs_comma = trimmed.len > 2;
-    for (selected_dynamic_schemas) |schema_json| {
-        const maybe_name = try advertisedToolNameFromSchema(alloc, schema_json);
-        defer if (maybe_name) |name| alloc.free(name);
-        if (maybe_name) |name| {
-            if (used_names.contains(name)) continue;
-            const owned_name = try alloc.dupe(u8, name);
-            errdefer alloc.free(owned_name);
-            try used_names.put(owned_name, {});
-        }
-        if (needs_comma) {
-            try out.writer.writeByte(',');
-        } else {
-            needs_comma = true;
-        }
-        try out.writer.writeAll(schema_json);
-    }
-    try out.writer.writeByte(']');
-    return try out.toOwnedSlice();
-}
-
-fn collectAdvertisedToolNames(alloc: Allocator, tools_json: []const u8) !std.StringHashMap(void) {
-    var names = std.StringHashMap(void).init(alloc);
-    errdefer freeAdvertisedToolNames(alloc, &names);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, tools_json, .{});
-    defer parsed.deinit();
-    if (parsed.value != .array) return error.InvalidToolArguments;
-
-    for (parsed.value.array.items) |item| {
-        const name = toolNameFromJsonValue(item) orelse continue;
-        const owned_name = try alloc.dupe(u8, name);
-        errdefer alloc.free(owned_name);
-        try names.put(owned_name, {});
-    }
-
-    return names;
-}
-
-fn advertisedToolNameFromSchema(alloc: Allocator, schema_json: []const u8) !?[]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
-    defer parsed.deinit();
-
-    const name = toolNameFromJsonValue(parsed.value) orelse return null;
-    return try alloc.dupe(u8, name);
-}
-
-fn freeAdvertisedToolNames(alloc: Allocator, names: *std.StringHashMap(void)) void {
-    var it = names.keyIterator();
-    while (it.next()) |name| alloc.free(name.*);
-    names.deinit();
-}
-
-fn writeBuiltinTool(
+fn appendBuiltinTool(
     alloc: Allocator,
-    tools_writer: *std.Io.Writer,
+    tools: *std.ArrayList(gateway_schema.FunctionSchema),
     guidance_writer: *std.Io.Writer,
     provider_tools: *std.ArrayList(agent_stream_provider.ProviderToolAdvertisement),
-    local_schema_count: *usize,
-    first: *bool,
     first_custom_guidance: *bool,
     tool: tool_dispatch.Tool,
     kind: BuildKind,
@@ -878,7 +861,7 @@ fn writeBuiltinTool(
             if (!providerAdvertisementIsPresent(provider_tools.items, provider_tool)) {
                 try provider_tools.append(alloc, .{
                     .tool = provider_tool,
-                    .local_schema_position = local_schema_count.*,
+                    .local_schema_position = tools.items.len,
                 });
             }
             if (first_custom_guidance.*) {
@@ -892,9 +875,8 @@ fn writeBuiltinTool(
     }
     if (options.permission_mode != .yolo and
         permissions.rulesDenyAllTargetsForTool(options.permission_rules, tool.name)) return;
-    try writeComma(tools_writer, first);
-    try gateway_schema.writeBuiltinFunctionSchema(alloc, tools_writer, tool.gateway_schema);
-    local_schema_count.* += 1;
+    try tool.gateway_schema.validate();
+    try tools.append(alloc, tool.gateway_schema);
 }
 
 fn providerToolIsSupported(
@@ -950,43 +932,16 @@ fn isCanonicalToolName(tool_set: tool_set_contract.ToolSet, name: []const u8) bo
     return false;
 }
 
-fn writeComma(writer: *std.Io.Writer, first: *bool) !void {
-    if (first.*) {
-        first.* = false;
-    } else {
-        try writer.writeByte(',');
-    }
-}
-
-fn expectGatewayJsonParses(json: []const u8) !void {
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
-    defer parsed.deinit();
-    try std.testing.expect(parsed.value == .array);
-}
-
-fn collectToolNames(alloc: Allocator, json: []const u8) !std.ArrayList([]const u8) {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
-    defer parsed.deinit();
-
+fn collectDescriptorNames(
+    alloc: Allocator,
+    descriptors: []const gateway_schema.FunctionSchema,
+) !std.ArrayList([]const u8) {
     var names: std.ArrayList([]const u8) = .empty;
-    errdefer {
-        for (names.items) |name| alloc.free(name);
-        names.deinit(alloc);
+    errdefer freeNames(alloc, &names);
+    for (descriptors) |descriptor| {
+        try names.append(alloc, try alloc.dupe(u8, descriptor.name));
     }
-
-    for (parsed.value.array.items) |item| {
-        const name = toolNameFromJsonValue(item) orelse continue;
-        try names.append(alloc, try alloc.dupe(u8, name));
-    }
-
     return names;
-}
-
-fn toolNameFromJsonValue(value: std.json.Value) ?[]const u8 {
-    if (value != .object) return null;
-    const name = value.object.get("name") orelse return null;
-    if (name != .string) return null;
-    return name.string;
 }
 
 fn freeNames(alloc: Allocator, names: *std.ArrayList([]const u8)) void {
@@ -1070,8 +1025,7 @@ test "full routes project neutral provider search separately from local schemas"
     defer registry_projection.deinit(std.testing.allocator);
 
     inline for (&.{ &default_projection, &registry_projection }) |projection| {
-        const json = projection.tools_json;
-        var names = try collectToolNames(std.testing.allocator, json);
+        var names = try collectDescriptorNames(std.testing.allocator, projection.tools);
         defer freeNames(std.testing.allocator, &names);
         try expectNotContainsName(names.items, "perplexity_search");
         try expectNotContainsName(names.items, "web_search");
@@ -1088,7 +1042,7 @@ test "explicit Fx search install keeps local and provider authorities separate" 
     });
     defer projection.deinit(std.testing.allocator);
 
-    var names = try collectToolNames(std.testing.allocator, projection.tools_json);
+    var names = try collectDescriptorNames(std.testing.allocator, projection.tools);
     defer freeNames(std.testing.allocator, &names);
     try expectContainsName(names.items, "web_search");
     try expectNotContainsName(names.items, "perplexity_search");
@@ -1106,7 +1060,9 @@ test "unsupported provider search advertises neither authority" {
     defer projection.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 0), projection.provider_tools.len);
-    try std.testing.expect(std.mem.find(u8, projection.tools_json, "\"name\":\"web_search\"") == null);
+    var names = try collectDescriptorNames(std.testing.allocator, projection.tools);
+    defer freeNames(std.testing.allocator, &names);
+    try expectNotContainsName(names.items, "web_search");
     try std.testing.expectEqualStrings("", projection.custom_guidance);
 }
 
@@ -1134,8 +1090,7 @@ test "provider search advertisement respects no-rule allow ask and deny" {
         defer full_projection.deinit(std.testing.allocator);
 
         inline for (&.{&full_projection}) |projection| {
-            const json = projection.tools_json;
-            var names = try collectToolNames(std.testing.allocator, json);
+            var names = try collectDescriptorNames(std.testing.allocator, projection.tools);
             defer freeNames(std.testing.allocator, &names);
             try std.testing.expectEqual(@as(usize, if (case.advertised) 1 else 0), projection.provider_tools.len);
             if (case.advertised) {
@@ -1193,7 +1148,7 @@ test "ask keeps advertising a tool the provider does not execute" {
     );
     defer projection.deinit(std.testing.allocator);
 
-    var names = try collectToolNames(std.testing.allocator, projection.tools_json);
+    var names = try collectDescriptorNames(std.testing.allocator, projection.tools);
     defer freeNames(std.testing.allocator, &names);
     try expectContainsName(names.items, "web_search");
 }
@@ -1214,7 +1169,7 @@ test "yolo advertisement ignores permission filtering" {
     });
     defer projection.deinit(std.testing.allocator);
 
-    var names = try collectToolNames(std.testing.allocator, projection.tools_json);
+    var names = try collectDescriptorNames(std.testing.allocator, projection.tools);
     defer freeNames(std.testing.allocator, &names);
     try expectContainsName(names.items, "terminal");
     try expectContainsName(names.items, "write_file");
@@ -1228,9 +1183,7 @@ test "edit category-wide deny strips aliased write tools" {
     };
     var projection = try buildTestGatewayToolProjection(std.testing.allocator, .{ .permission_rules = .{ .rules = &rules } });
     defer projection.deinit(std.testing.allocator);
-    const json = projection.tools_json;
-
-    var names = try collectToolNames(std.testing.allocator, json);
+    var names = try collectDescriptorNames(std.testing.allocator, projection.tools);
     defer freeNames(std.testing.allocator, &names);
 
     try expectNotContainsName(names.items, "edit_file");
@@ -1246,9 +1199,7 @@ test "later allow or ask after category deny keeps tools advertised" {
     };
     var projection = try buildTestGatewayToolProjection(std.testing.allocator, .{ .permission_rules = .{ .rules = &rules } });
     defer projection.deinit(std.testing.allocator);
-    const json = projection.tools_json;
-
-    var names = try collectToolNames(std.testing.allocator, json);
+    var names = try collectDescriptorNames(std.testing.allocator, projection.tools);
     defer freeNames(std.testing.allocator, &names);
 
     try expectContainsName(names.items, "edit_file");
@@ -1263,9 +1214,7 @@ test "later category deny hides earlier target-specific overrides" {
     };
     var projection = try buildTestGatewayToolProjection(std.testing.allocator, .{ .permission_rules = .{ .rules = &rules } });
     defer projection.deinit(std.testing.allocator);
-    const json = projection.tools_json;
-
-    var names = try collectToolNames(std.testing.allocator, json);
+    var names = try collectDescriptorNames(std.testing.allocator, projection.tools);
     defer freeNames(std.testing.allocator, &names);
 
     try expectNotContainsName(names.items, "edit_file");
@@ -1280,9 +1229,7 @@ test "target-specific later deny overrides target-specific allow" {
     };
     var projection = try buildTestGatewayToolProjection(std.testing.allocator, .{ .permission_rules = .{ .rules = &rules } });
     defer projection.deinit(std.testing.allocator);
-    const json = projection.tools_json;
-
-    var names = try collectToolNames(std.testing.allocator, json);
+    var names = try collectDescriptorNames(std.testing.allocator, projection.tools);
     defer freeNames(std.testing.allocator, &names);
 
     try expectNotContainsName(names.items, "edit_file");
@@ -1296,9 +1243,7 @@ test "target-specific edit and bash denies keep tools advertised" {
     };
     var projection = try buildTestGatewayToolProjection(std.testing.allocator, .{ .permission_rules = .{ .rules = &rules } });
     defer projection.deinit(std.testing.allocator);
-    const json = projection.tools_json;
-
-    var names = try collectToolNames(std.testing.allocator, json);
+    var names = try collectDescriptorNames(std.testing.allocator, projection.tools);
     defer freeNames(std.testing.allocator, &names);
 
     try expectContainsName(names.items, "edit_file");
@@ -1313,7 +1258,7 @@ fn checkEffectiveToolProjectionAllocationFailures(alloc: Allocator) !void {
             else => err,
         };
     defer projection.deinit(alloc);
-    try expectGatewayJsonParses(projection.tools_json);
+    for (projection.tools) |descriptor| try descriptor.validate();
     try std.testing.expectEqualStrings(test_web_search.description, projection.custom_guidance);
 }
 
@@ -1330,25 +1275,13 @@ test "full advertisement uses active structured builtin schemas" {
         .subagent_available = true,
     });
     defer projection.deinit(std.testing.allocator);
-    const json = projection.tools_json;
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
-    defer parsed.deinit();
-
     var builtin_count: usize = 0;
-    for (parsed.value.array.items) |tool_value| {
-        if (tool_value != .object) return error.TestUnexpectedResult;
-        const type_value = tool_value.object.get("type") orelse return error.TestUnexpectedResult;
-        if (type_value != .string) return error.TestUnexpectedResult;
-        if (!std.mem.eql(u8, type_value.string, "function")) continue;
-
-        const description_value = tool_value.object.get("description") orelse return error.TestUnexpectedResult;
-        if (description_value != .string) return error.TestUnexpectedResult;
-        const description = description_value.string;
+    for (projection.tools) |descriptor| {
+        try descriptor.validate();
+        const description = descriptor.description;
         try std.testing.expect(description.len <= gateway_schema.description_max_bytes);
         try std.testing.expect(std.mem.find(u8, description, "When to use") != null);
         try std.testing.expect(std.mem.find(u8, description, "When NOT to use") != null);
-        try std.testing.expect(tool_value.object.get("inputSchema") != null);
         builtin_count += 1;
     }
 
@@ -1365,8 +1298,7 @@ test "MCP dynamic tools are deferred from the base gateway advertisement" {
 
     var projection = try buildTestGatewayToolProjection(alloc, .{ .mcp_runtime = &runtime });
     defer projection.deinit(alloc);
-    const json = projection.tools_json;
-    var names = try collectToolNames(alloc, json);
+    var names = try collectDescriptorNames(alloc, projection.tools);
     defer freeNames(alloc, &names);
 
     try expectContainsName(names.items, "mcp_search_tools");
@@ -1393,42 +1325,97 @@ test "deferred MCP base advertisement is stable across schema churn" {
     var second_projection = try buildTestGatewayToolProjection(alloc, .{ .mcp_runtime = &second_runtime });
     defer second_projection.deinit(alloc);
 
-    try std.testing.expectEqualStrings(first_projection.tools_json, second_projection.tools_json);
+    try std.testing.expectEqual(first_projection.tools.len, second_projection.tools.len);
+    for (first_projection.tools, second_projection.tools) |first, second| {
+        try std.testing.expectEqualStrings(first.name, second.name);
+    }
     try std.testing.expectEqualStrings(first_projection.custom_guidance, second_projection.custom_guidance);
 }
 
 test "selected MCP schemas are appended after deferred discovery" {
     const alloc = std.testing.allocator;
-    const selected_schema = "{\"type\":\"function\",\"name\":\"mcp_fs_read\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}";
-    const json = try buildGatewayToolsJsonWithSelectedDynamicSchemas(alloc, "[]", &.{selected_schema});
-    defer alloc.free(json);
-
-    var names = try collectToolNames(alloc, json);
-    defer freeNames(alloc, &names);
-    try expectContainsName(names.items, "mcp_fs_read");
+    const tools = try buildModelTools(alloc, &.{}, &.{.{ .name = "mcp_fs_read", .description = "Read" }}, .unavailable, null);
+    defer alloc.free(tools);
+    try std.testing.expectEqualStrings("mcp_fs_read", tools[0].name);
 }
 
 test "selected MCP schemas cannot duplicate builtin tool names in gateway advertisement" {
     const alloc = std.testing.allocator;
     var projection = try buildTestGatewayToolProjection(alloc, .{});
     defer projection.deinit(alloc);
-    const base_json = projection.tools_json;
+    const tools = try buildModelTools(alloc, projection.tools, &.{.{
+        .name = "mcp_search_tools",
+        .description = "Dynamic collision",
+    }}, .unavailable, null);
+    defer alloc.free(tools);
+    var matches: usize = 0;
+    for (tools) |descriptor| if (std.mem.eql(u8, descriptor.name, "mcp_search_tools")) {
+        matches += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), matches);
+}
 
-    const selected_schema = "{\"type\":\"function\",\"name\":\"mcp_search_tools\",\"description\":\"Dynamic collision\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}";
-    const json = try buildGatewayToolsJsonWithSelectedDynamicSchemas(alloc, base_json, &.{selected_schema});
-    defer alloc.free(json);
+test "model tools preserve base dynamic vision order and first-name ownership" {
+    const base = [_]gateway_schema.FunctionSchema{
+        .{ .name = "read_file", .description = "base" },
+        .{ .name = "shared", .description = "base wins" },
+    };
+    const selected = [_]gateway_schema.FunctionSchema{
+        .{ .name = "shared", .description = "dynamic loses" },
+        .{ .name = "mcp_read", .description = "dynamic" },
+    };
+    const tools = try buildModelTools(
+        std.testing.allocator,
+        &base,
+        &selected,
+        .optional,
+        .{ .name = "vision", .description = "vision" },
+    );
+    defer std.testing.allocator.free(tools);
 
-    var names = try collectToolNames(alloc, json);
-    defer freeNames(alloc, &names);
+    try std.testing.expectEqual(@as(usize, 4), tools.len);
+    try std.testing.expectEqualStrings("read_file", tools[0].name);
+    try std.testing.expectEqualStrings("shared", tools[1].name);
+    try std.testing.expectEqualStrings("base wins", tools[1].description);
+    try std.testing.expectEqualStrings("mcp_read", tools[2].name);
+    try std.testing.expectEqualStrings("vision", tools[3].name);
 
-    try expectContainsName(names.items, "mcp_search_tools");
-    try std.testing.expectEqual(@as(usize, 1), countName(names.items, "mcp_search_tools"));
+    const required = try buildModelTools(
+        std.testing.allocator,
+        &base,
+        &selected,
+        .required,
+        .{ .name = "vision", .description = "vision" },
+    );
+    defer std.testing.allocator.free(required);
+    try std.testing.expectEqual(@as(usize, 1), required.len);
+    try std.testing.expectEqualStrings("vision", required[0].name);
+}
+
+fn checkModelToolAllocationFailures(alloc: Allocator) !void {
+    const tools = try buildModelTools(
+        alloc,
+        &.{.{ .name = "base", .description = "base" }},
+        &.{.{ .name = "dynamic", .description = "dynamic" }},
+        .optional,
+        .{ .name = "vision", .description = "vision" },
+    );
+    defer alloc.free(tools);
+    try std.testing.expectEqual(@as(usize, 3), tools.len);
+}
+
+test "model tool composition cleans up every partial allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkModelToolAllocationFailures,
+        .{},
+    );
 }
 
 test "subagent advertisement follows writable host capability and task never appears" {
     var unavailable = try buildTestGatewayToolProjection(std.testing.allocator, .{});
     defer unavailable.deinit(std.testing.allocator);
-    var unavailable_names = try collectToolNames(std.testing.allocator, unavailable.tools_json);
+    var unavailable_names = try collectDescriptorNames(std.testing.allocator, unavailable.tools);
     defer freeNames(std.testing.allocator, &unavailable_names);
     try expectNotContainsName(unavailable_names.items, "subagent");
     try expectNotContainsName(unavailable_names.items, "task");
@@ -1437,7 +1424,7 @@ test "subagent advertisement follows writable host capability and task never app
         .subagent_available = true,
     });
     defer available.deinit(std.testing.allocator);
-    var available_names = try collectToolNames(std.testing.allocator, available.tools_json);
+    var available_names = try collectDescriptorNames(std.testing.allocator, available.tools);
     defer freeNames(std.testing.allocator, &available_names);
     try expectContainsName(available_names.items, "subagent");
     try expectNotContainsName(available_names.items, "task");
@@ -1446,13 +1433,13 @@ test "subagent advertisement follows writable host capability and task never app
 test "terminal advertisement remains available for captured execution" {
     var unavailable = try buildTestGatewayToolProjection(std.testing.allocator, .{});
     defer unavailable.deinit(std.testing.allocator);
-    var unavailable_names = try collectToolNames(std.testing.allocator, unavailable.tools_json);
+    var unavailable_names = try collectDescriptorNames(std.testing.allocator, unavailable.tools);
     defer freeNames(std.testing.allocator, &unavailable_names);
     try expectContainsName(unavailable_names.items, "terminal");
 
     var available = try buildTestGatewayToolProjection(std.testing.allocator, .{});
     defer available.deinit(std.testing.allocator);
-    var available_names = try collectToolNames(std.testing.allocator, available.tools_json);
+    var available_names = try collectDescriptorNames(std.testing.allocator, available.tools);
     defer freeNames(std.testing.allocator, &available_names);
     try expectContainsName(available_names.items, "terminal");
 }

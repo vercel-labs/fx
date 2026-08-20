@@ -34,7 +34,6 @@ const web_search_contract = @import("../core/tooling/web_search_contract.zig");
 const web_search_policy = @import("../core/tooling/web_search_policy.zig");
 const web_search_provider = @import("../core/tooling/web_search_provider.zig");
 const gateway_schema = @import("../core/tooling/gateway_schema.zig");
-const tool_advertisement = @import("../core/tooling/tool_advertisement.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const sort_utils = @import("../core/shared/sort_utils.zig");
 
@@ -46,6 +45,7 @@ const Response = web_search_contract.ProviderResponse;
 const ProgressFn = web_search_contract.ProgressFn;
 
 pub const default_model = "zai/glm-5.2";
+pub const default_fast_mode = true;
 pub const default_chat_url = "https://ai-gateway.vercel.sh/v3/ai/language-model";
 pub const models_path = "/coding-agent/v1/models";
 const credits_path = "/coding-agent/v1/credits";
@@ -206,6 +206,7 @@ fn credentialSourceFromReference(reference: []const u8) !?credentials.Source {
 }
 
 fn normalizeAuthFailure(err: anyerror) adapter_auth.Failure {
+    std.debug.assert(err != error.Cancelled);
     return .{ .category = switch (err) {
         error.ClientIdMissing, error.InvalidCredentialReference => .configuration,
         error.AccessDenied => .denied,
@@ -215,7 +216,6 @@ fn normalizeAuthFailure(err: anyerror) adapter_auth.Failure {
         error.SessionChanged => .session_changed,
         error.InvalidTeamSelection => .invalid_selection,
         error.SessionDeleteFailed => .persistence,
-        error.Cancelled => .cancelled,
         else => .unavailable,
     } };
 }
@@ -226,6 +226,10 @@ fn normalizedSource(source: credentials.Source) adapter_auth.Source {
         .label = credentials.sourceLabel(source),
         .refreshable = credentials.sourceRefreshable(source),
     };
+}
+
+pub fn credentialOverrideSource(reference: []const u8) !adapter_auth.Source {
+    return normalizedSource((try credentialSourceFromReference(reference)) orelse .ai_gateway_api_key);
 }
 
 fn normalizedCatalogAccess(access: credentials.CatalogAccess) adapter_auth.CatalogAccess {
@@ -267,8 +271,8 @@ fn normalizedStoreStatus(status: credentials.StoredKeyReadStatus) adapter_auth.S
 }
 
 fn normalizedAcquisitionFailure(err: anyerror) adapter_auth.Acquisition {
-    const failure = normalizeAuthFailure(err);
-    return if (failure.category == .cancelled) .cancelled else .{ .failed = failure };
+    if (err == error.Cancelled) return .cancelled;
+    return .{ .failed = normalizeAuthFailure(err) };
 }
 
 fn acquireVercelCredential(
@@ -337,8 +341,8 @@ fn runVercelLogin(
 ) Allocator.Error!adapter_auth.OperationOutcome {
     login_flow.runLogin(alloc, vercelTransport(raw), auth_host.url_opener) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        const failure = normalizeAuthFailure(err);
-        return if (failure.category == .cancelled) .cancelled else .{ .failed = failure };
+        if (err == error.Cancelled) return .cancelled;
+        return .{ .failed = normalizeAuthFailure(err) };
     };
     return .succeeded;
 }
@@ -351,6 +355,7 @@ fn logoutVercel(
 ) Allocator.Error!adapter_auth.LogoutOutcome {
     const result = login_flow.logout(alloc, vercelTransport(raw)) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (err == error.Cancelled) return .cancelled;
         return .{ .failed = normalizeAuthFailure(err) };
     };
     return .{ .completed = .{
@@ -368,8 +373,8 @@ fn runVercelTeams(
 ) Allocator.Error!adapter_auth.OperationOutcome {
     login_flow.runTeams(alloc, vercelTransport(raw)) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        const failure = normalizeAuthFailure(err);
-        return if (failure.category == .cancelled) .cancelled else .{ .failed = failure };
+        if (err == error.Cancelled) return .cancelled;
+        return .{ .failed = normalizeAuthFailure(err) };
     };
     return .succeeded;
 }
@@ -436,8 +441,8 @@ fn startVercelSignIn(
         state.runtime.deinit(alloc);
         alloc.destroy(state);
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        const failure = normalizeAuthFailure(err);
-        return if (failure.category == .cancelled) .cancelled else .{ .failed = failure };
+        if (err == error.Cancelled) return .cancelled;
+        return .{ .failed = normalizeAuthFailure(err) };
     };
     if (!started) {
         state.runtime.deinit(alloc);
@@ -482,7 +487,10 @@ fn pollVercelSignIn(raw: ?*anyopaque, alloc: Allocator) Allocator.Error!adapter_
     return switch (state.runtime.pollTransition(alloc)) {
         .none => .none,
         .cancelled => .cancelled,
-        .failed => |err| .{ .failed = normalizeAuthFailure(err) },
+        .failed => |err| if (err == error.Cancelled)
+            .cancelled
+        else
+            .{ .failed = normalizeAuthFailure(err) },
         .succeeded => |value| blk: {
             var selection = value;
             defer selection.deinit(alloc);
@@ -510,8 +518,8 @@ fn loadVercelTeams(
 ) Allocator.Error!adapter_auth.TeamsOutcome {
     var selection = login_flow.loadTeamSelection(alloc, vercelTransport(raw)) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        const failure = normalizeAuthFailure(err);
-        return if (failure.category == .cancelled) .cancelled else .{ .failed = failure };
+        if (err == error.Cancelled) return .cancelled;
+        return .{ .failed = normalizeAuthFailure(err) };
     };
     defer selection.deinit(alloc);
     return .{ .loaded = try takeVercelTeamSelection(alloc, &selection) };
@@ -599,6 +607,109 @@ const AdapterEventBridge = struct {
     }
 };
 
+const VercelTransportOutcome = union(enum) {
+    cancelled,
+    normalized: agent_stream_provider_contract.StreamFailure,
+    propagate: anyerror,
+};
+
+fn classifyVercelTransportError(
+    err: anyerror,
+    cancel_requested: bool,
+    delivery_ambiguous: bool,
+) VercelTransportOutcome {
+    if (err == error.Cancelled or cancel_requested) return .cancelled;
+    const cause: agent_stream_provider_contract.StreamFailure.TransportCause = switch (err) {
+        error.ReadFailed => .read_failed,
+        error.ConnectionResetByPeer => .connection_reset,
+        error.ConnectionTimedOut => .connection_timed_out,
+        error.HttpConnectionClosing => .connection_closing,
+        error.SystemResumed => .system_resumed,
+        else => return .{ .propagate = err },
+    };
+    return .{ .normalized = .{
+        .category = .transport,
+        .retryable = true,
+        .delivery_ambiguous = delivery_ambiguous,
+        .detail = @errorName(err),
+        .transport_cause = cause,
+    } };
+}
+
+const VercelHttpFailureFacts = struct {
+    category: agent_stream_provider_contract.StreamFailure.Category,
+    retryable: bool,
+};
+
+fn classifyVercelHttpFailure(status: std.http.Status) VercelHttpFailureFacts {
+    const code: u16 = @intFromEnum(status);
+    return .{
+        .category = switch (status) {
+            .unauthorized => .authentication,
+            .forbidden => .authorization,
+            .request_timeout, .gateway_timeout => .timeout,
+            .too_many_requests => .rate_limited,
+            .bad_request => .configuration,
+            .unprocessable_entity => .invalid_content,
+            .payload_too_large => .request_too_large,
+            .internal_server_error => .provider_internal,
+            .bad_gateway => .upstream_failure,
+            .service_unavailable => .unavailable,
+            else => .protocol,
+        },
+        .retryable = code == 408 or code == 425 or code == 429 or code >= 500,
+    };
+}
+
+test "Vercel transport classification preserves every recovery transition" {
+    const cases = [_]struct {
+        err: anyerror,
+        cause: agent_stream_provider_contract.StreamFailure.TransportCause,
+    }{
+        .{ .err = error.ReadFailed, .cause = .read_failed },
+        .{ .err = error.ConnectionResetByPeer, .cause = .connection_reset },
+        .{ .err = error.ConnectionTimedOut, .cause = .connection_timed_out },
+        .{ .err = error.HttpConnectionClosing, .cause = .connection_closing },
+        .{ .err = error.SystemResumed, .cause = .system_resumed },
+    };
+    for (cases) |case| {
+        const outcome = classifyVercelTransportError(case.err, false, true);
+        try std.testing.expect(outcome == .normalized);
+        try std.testing.expectEqual(case.cause, outcome.normalized.transport_cause.?);
+        try std.testing.expect(outcome.normalized.retryable);
+        try std.testing.expect(outcome.normalized.delivery_ambiguous);
+    }
+
+    try std.testing.expect(classifyVercelTransportError(error.Cancelled, false, false) == .cancelled);
+    try std.testing.expect(classifyVercelTransportError(error.ReadFailed, true, false) == .cancelled);
+    const oom = classifyVercelTransportError(error.OutOfMemory, false, false);
+    try std.testing.expect(oom == .propagate);
+    try std.testing.expectEqual(error.OutOfMemory, oom.propagate);
+    const terminal = classifyVercelTransportError(error.UnknownHostName, false, false);
+    try std.testing.expect(terminal == .propagate);
+    try std.testing.expectEqual(error.UnknownHostName, terminal.propagate);
+}
+
+test "Vercel HTTP classification preserves exact neutral codes and retry policy" {
+    const cases = [_]struct {
+        status: std.http.Status,
+        category: agent_stream_provider_contract.StreamFailure.Category,
+        adapter_retryable: bool,
+    }{
+        .{ .status = .payment_required, .category = .protocol, .adapter_retryable = false },
+        .{ .status = .not_found, .category = .protocol, .adapter_retryable = false },
+        .{ .status = .request_timeout, .category = .timeout, .adapter_retryable = true },
+        .{ .status = .too_many_requests, .category = .rate_limited, .adapter_retryable = true },
+        .{ .status = .bad_gateway, .category = .upstream_failure, .adapter_retryable = true },
+        .{ .status = .gateway_timeout, .category = .timeout, .adapter_retryable = true },
+    };
+    for (cases) |case| {
+        const facts = classifyVercelHttpFailure(case.status);
+        try std.testing.expectEqual(case.category, facts.category);
+        try std.testing.expectEqual(case.adapter_retryable, facts.retryable);
+    }
+}
+
 pub fn streamVercelAdapter(
     adapter: *const agent_stream_provider_contract.ProviderAdapter,
     alloc: Allocator,
@@ -606,7 +717,8 @@ pub fn streamVercelAdapter(
     events: agent_stream_provider_contract.EventSink,
 ) anyerror!void {
     const stream_provider = adapter.legacy_provider orelse agent_stream_provider;
-    const payload = try stream_provider.build(alloc, request.model_request);
+    const built_payload = try stream_provider.build(alloc, request.model_request);
+    const payload = try finalizeAgentRequestBody(alloc, request.model_id, built_payload);
     defer alloc.free(payload);
     debug_trace.eventf("gateway", "after_payload_build", request.trace_ctx, "payload_bytes={d} model={s} gateway_messages={d}", .{
         payload.len,
@@ -618,7 +730,10 @@ pub fn streamVercelAdapter(
         request.model_id,
         payload.len,
         request.model_request.messages.len,
-        request.model_request.serialized_tools,
+        .{
+            .local_count = request.model_request.tools.len,
+            .provider_count = request.model_request.provider_tools.len,
+        },
     );
     if (request.serialized_request_limit_bytes) |limit| {
         if (payload.len > limit) {
@@ -654,17 +769,19 @@ pub fn streamVercelAdapter(
         .provider_attempt_owner = request.provider_attempt_owner,
     }) catch |err| {
         if (bridge.failure) |failure| return failure;
-        if (err == error.Cancelled or request.cancel_flag.load(.seq_cst)) {
-            try events.emit(.cancelled);
-        } else {
-            try events.emit(.{ .failure = .{
-                .category = .transport,
-                .retryable = gateway_client.isRetryableGatewayError(err),
-                .delivery_ambiguous = request.delivery.load() == .possibly_sent,
-                .detail = @errorName(err),
-            } });
+        switch (classifyVercelTransportError(
+            err,
+            request.cancel_flag.load(.seq_cst),
+            request.delivery.load() == .possibly_sent,
+        )) {
+            .cancelled => try events.emit(.cancelled),
+            .normalized => |failure| {
+                try events.emit(.{ .failure = failure });
+                return err;
+            },
+            .propagate => |failure| return failure,
         }
-        return err;
+        return;
     };
     defer result.deinit(alloc);
     if (bridge.failure) |failure| return failure;
@@ -717,32 +834,31 @@ pub fn streamVercelAdapter(
             .provider_failure_detail = result.completion.provider_failure_detail,
         } });
     } else {
+        const failure_facts = classifyVercelHttpFailure(result.status);
+        const raw_detail = result.err_body orelse "";
+        const detail = try gateway_error_format.formatHttpErrorMessage(
+            alloc,
+            result.status,
+            raw_detail,
+        );
+        defer alloc.free(detail);
+        const recovery_diagnostic = try gateway_error_format.formatHttpRecoveryDiagnostic(
+            alloc,
+            result.status,
+            raw_detail,
+        );
+        defer alloc.free(recovery_diagnostic);
         try events.emit(.{ .failure = .{
-            .category = switch (result.status) {
-                .unauthorized => .authentication,
-                .forbidden => .authorization,
-                .too_many_requests => .rate_limited,
-                .bad_request => .configuration,
-                .unprocessable_entity => .invalid_content,
-                .payload_too_large => .request_too_large,
-                .internal_server_error => .provider_internal,
-                .bad_gateway => .upstream_failure,
-                .service_unavailable => .unavailable,
-                .gateway_timeout => .timeout,
-                else => .protocol,
-            },
-            .retryable = blk: {
-                const code: u16 = @intFromEnum(result.status);
-                break :blk code == 408 or code == 425 or code == 429 or code >= 500;
-            },
-            .http_status = result.status,
+            .category = failure_facts.category,
+            .retryable = failure_facts.retryable,
+            .response_code = @intFromEnum(result.status),
             .delivery_ambiguous = result.completion.delivery_ambiguous,
-            .detail = result.err_body,
+            .detail = detail,
             .retry_after_seconds = result.retry_after_seconds,
-            .diagnostic = if (result.failure_schema) |summary| .{
-                .summary = summary,
+            .diagnostic = .{
+                .summary = result.failure_schema orelse recovery_diagnostic,
                 .request_shape = result.failure_request_shape,
-            } else null,
+            },
         } });
     }
 }
@@ -793,8 +909,7 @@ test "Vercel adapter sink failure does not mutate user cancellation" {
     };
     try std.testing.expectError(error.TestSinkFailure, adapter.stream(std.testing.allocator, .{
         .model_request = .{
-            .model = "test/model",
-            .serialized_tools = "[]",
+            .tools = &.{},
             .messages = &.{},
             .tool_choice = .none,
             .capabilities = .{},
@@ -821,10 +936,12 @@ test "Vercel adapter sink failure does not mutate user cancellation" {
 
 test "Vercel adapter enforces serialized request limit before admission" {
     const FakeLegacy = struct {
+        payload: []const u8,
         calls: usize = 0,
 
-        fn build(_: ?*anyopaque, alloc: Allocator, request: agent_stream_provider_contract.BuildRequest) anyerror![]u8 {
-            return alloc.dupe(u8, request.serialized_tools);
+        fn build(raw: ?*anyopaque, alloc: Allocator, _: agent_stream_provider_contract.BuildRequest) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return alloc.dupe(u8, self.payload);
         }
 
         fn stream(raw: ?*anyopaque, _: Allocator, _: agent_stream_provider_contract.Request) anyerror!agent_stream_provider_contract.Result {
@@ -854,7 +971,7 @@ test "Vercel adapter enforces serialized request limit before admission" {
 
     const accepted_payload = "x" ** (16 * 1024);
     const rejected_payload = accepted_payload ++ "x";
-    var fake: FakeLegacy = .{};
+    var fake = FakeLegacy{ .payload = rejected_payload };
     var adapter = provider_adapter;
     adapter.legacy_provider = .{
         .context = &fake,
@@ -864,10 +981,6 @@ test "Vercel adapter enforces serialized request limit before admission" {
     var cancelled = std.atomic.Value(bool).init(false);
     var delivery = agent_stream_provider_contract.DeliveryCertainty.init();
     var attempt_evidence: agent_stream_provider_contract.AttemptEvidence = .{};
-    var state = agent_stream_provider_contract.EventState.init(std.testing.allocator);
-    defer state.deinit();
-    var sink_error: ?anyerror = null;
-    var capture: Capture = .{};
     var route = route_snapshot_contract.RouteSnapshot{
         .connection_id = @constCast("vercel"),
         .adapter_kind = @constCast(connection_seed.adapter_id),
@@ -883,10 +996,9 @@ test "Vercel adapter enforces serialized request limit before admission" {
         .selected_fast_mode = false,
         .fast_model_suffix = null,
     };
-    var request = agent_stream_provider_contract.AdapterRequest{
+    const request = agent_stream_provider_contract.AdapterRequest{
         .model_request = .{
-            .model = "test/model",
-            .serialized_tools = rejected_payload,
+            .tools = &.{},
             .messages = &.{},
             .tool_choice = .none,
             .capabilities = .{},
@@ -903,6 +1015,11 @@ test "Vercel adapter enforces serialized request limit before admission" {
         .attempt_evidence = &attempt_evidence,
         .cancel_flag = &cancelled,
     };
+
+    var state = agent_stream_provider_contract.EventState.init(std.testing.allocator);
+    defer state.deinit();
+    var sink_error: ?anyerror = null;
+    var capture: Capture = .{};
     try adapter.stream(std.testing.allocator, request, .{
         .context = &capture,
         .state = &state,
@@ -916,9 +1033,9 @@ test "Vercel adapter enforces serialized request limit before admission" {
 
     state.deinit();
     state = agent_stream_provider_contract.EventState.init(std.testing.allocator);
+    fake.payload = accepted_payload;
     capture = .{};
     sink_error = null;
-    request.model_request.serialized_tools = accepted_payload;
     try adapter.stream(std.testing.allocator, request, .{
         .context = &capture,
         .state = &state,
@@ -929,6 +1046,184 @@ test "Vercel adapter enforces serialized request limit before admission" {
     try std.testing.expectEqual(@as(usize, 1), capture.admitted);
     try std.testing.expectEqual(@as(usize, 1), capture.finishes);
     try std.testing.expect(state.provider_admitted);
+}
+
+test "Vercel and peer adapters receive equivalent neutral requests with isolated wire formats" {
+    const Probe = struct {
+        vercel_calls: usize = 0,
+        peer_calls: usize = 0,
+        peer_received_neutral_tools: bool = false,
+        vercel_payload: ?[]u8 = null,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            if (self.vercel_payload) |payload| alloc.free(payload);
+            self.* = undefined;
+        }
+
+        fn vercelStream(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            request: agent_stream_provider_contract.Request,
+        ) anyerror!agent_stream_provider_contract.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.vercel_calls += 1;
+            self.vercel_payload = try alloc.dupe(u8, request.payload);
+            return .{
+                .status = .bad_gateway,
+                .err_body = @constCast("peer unavailable"),
+            };
+        }
+
+        fn peerStream(
+            adapter: *const agent_stream_provider_contract.ProviderAdapter,
+            _: Allocator,
+            request: agent_stream_provider_contract.AdapterRequest,
+            events: agent_stream_provider_contract.EventSink,
+        ) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(adapter.context.?));
+            self.peer_calls += 1;
+            self.peer_received_neutral_tools = request.model_request.tools.len == 2 and
+                std.mem.eql(u8, request.model_request.tools[0].name, "read_file") and
+                std.mem.eql(u8, request.model_request.tools[1].name, "mcp_read") and
+                request.model_request.provider_tools.len == 1;
+            try events.emit(.{ .failure = .{
+                .category = .upstream_failure,
+                .detail = "peer unavailable",
+            } });
+        }
+    };
+    const Capture = struct {
+        category: ?agent_stream_provider_contract.StreamFailure.Category = null,
+        response_code: ?u16 = null,
+        retryable: bool = false,
+        saw_http_detail: bool = false,
+
+        fn emit(raw: *anyopaque, event: agent_stream_provider_contract.StreamEvent) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (event == .failure) {
+                self.category = event.failure.category;
+                self.response_code = event.failure.response_code;
+                self.retryable = event.failure.retryable;
+                if (event.failure.detail) |detail| {
+                    self.saw_http_detail = std.mem.find(u8, detail, "HTTP 502") != null;
+                }
+            }
+        }
+    };
+    const makeRoute = struct {
+        fn call(kind: []const u8) route_snapshot_contract.RouteSnapshot {
+            return .{
+                .connection_id = @constCast(kind),
+                .adapter_kind = @constCast(kind),
+                .endpoint = @constCast("provider:endpoint"),
+                .protocol = @constCast(kind),
+                .credential_ref = @constCast("automatic"),
+                .primary_model_id = @constCast("test/model"),
+                .permission_review_model_id = null,
+                .vision_model_id = null,
+                .subagent_model_id = @constCast("test/model"),
+                .capabilities = .{},
+                .capability_source = .configured,
+                .selected_fast_mode = false,
+                .fast_model_suffix = null,
+            };
+        }
+    }.call;
+
+    const alloc = std.testing.allocator;
+    var probe: Probe = .{};
+    defer probe.deinit(alloc);
+    var vercel = provider_adapter;
+    vercel.legacy_provider = .{
+        .context = &probe,
+        .build_fn = buildAgentRequest,
+        .stream_fn = Probe.vercelStream,
+    };
+    const peer = agent_stream_provider_contract.ProviderAdapter{
+        .kind = "test_peer",
+        .context = &probe,
+        .stream_fn = Probe.peerStream,
+    };
+    const adapters = [_]agent_stream_provider_contract.ProviderAdapter{ vercel, peer };
+    const registry = try adapter_registry.AdapterRegistry.init(&adapters);
+    const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
+    const tools = [_]gateway_schema.FunctionSchema{
+        .{ .name = "read_file", .description = "Read" },
+        .{ .name = "mcp_read", .description = "MCP read" },
+    };
+    const neutral_request = agent_stream_provider_contract.ModelRequest{
+        .tools = &tools,
+        .provider_tools = &.{.{ .tool = .web_search, .local_schema_position = 1 }},
+        .messages = &messages,
+        .tool_choice = .auto,
+        .capabilities = .{},
+    };
+    var cancelled = std.atomic.Value(bool).init(false);
+    var delivery = agent_stream_provider_contract.DeliveryCertainty.init();
+    var vercel_attempt: agent_stream_provider_contract.AttemptEvidence = .{};
+    var peer_attempt: agent_stream_provider_contract.AttemptEvidence = .{};
+    var sink_error: ?anyerror = null;
+    var vercel_capture: Capture = .{};
+    var vercel_state = agent_stream_provider_contract.EventState.init(alloc);
+    defer vercel_state.deinit();
+    var vercel_route = makeRoute(connection_seed.adapter_id);
+    try (try registry.resolve(connection_seed.adapter_id)).stream(alloc, .{
+        .model_request = neutral_request,
+        .route = &vercel_route,
+        .credential = "wire-secret",
+        .tenant = null,
+        .model_id = "test/model",
+        .retry_count = 1,
+        .trace_ctx = .{},
+        .content_capture_limit = null,
+        .delivery = &delivery,
+        .attempt_evidence = &vercel_attempt,
+        .cancel_flag = &cancelled,
+    }, .{
+        .context = &vercel_capture,
+        .state = &vercel_state,
+        .sink_error = &sink_error,
+        .emit_fn = Capture.emit,
+    });
+
+    var peer_capture: Capture = .{};
+    var peer_state = agent_stream_provider_contract.EventState.init(alloc);
+    defer peer_state.deinit();
+    var peer_route = makeRoute("test_peer");
+    try (try registry.resolve("test_peer")).stream(alloc, .{
+        .model_request = neutral_request,
+        .route = &peer_route,
+        .credential = "peer-secret",
+        .tenant = null,
+        .model_id = "test/model",
+        .retry_count = 1,
+        .trace_ctx = .{},
+        .content_capture_limit = null,
+        .delivery = &delivery,
+        .attempt_evidence = &peer_attempt,
+        .cancel_flag = &cancelled,
+    }, .{
+        .context = &peer_capture,
+        .state = &peer_state,
+        .sink_error = &sink_error,
+        .emit_fn = Capture.emit,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), probe.vercel_calls);
+    try std.testing.expectEqual(@as(usize, 1), probe.peer_calls);
+    try std.testing.expect(probe.peer_received_neutral_tools);
+    try std.testing.expectEqual(agent_stream_provider_contract.StreamFailure.Category.upstream_failure, vercel_capture.category.?);
+    try std.testing.expectEqual(agent_stream_provider_contract.StreamFailure.Category.upstream_failure, peer_capture.category.?);
+    try std.testing.expectEqual(@as(?u16, 502), vercel_capture.response_code);
+    try std.testing.expect(vercel_capture.retryable);
+    try std.testing.expect(peer_capture.response_code == null);
+    try std.testing.expect(!peer_capture.retryable);
+    try std.testing.expect(vercel_capture.saw_http_detail);
+    try std.testing.expect(!peer_capture.saw_http_detail);
+    try std.testing.expect(std.mem.find(u8, probe.vercel_payload.?, "\"type\":\"function\"") != null);
+    try std.testing.expect(std.mem.find(u8, probe.vercel_payload.?, "gateway.perplexity_search") != null);
+    try std.testing.expect(std.mem.find(u8, probe.vercel_payload.?, "wire-secret") == null);
+    try std.testing.expect(std.mem.find(u8, probe.vercel_payload.?, "peer-secret") == null);
 }
 
 pub fn buildAgentRequest(
@@ -947,12 +1242,15 @@ pub fn buildAgentRequest(
         null;
     if (budget) |active| try active.check();
 
+    const adapter_tools_json = try buildVercelToolsJson(alloc, request);
+    defer alloc.free(adapter_tools_json);
+
     if (request.verified_images) |images| {
         const response_format = request.response_format orelse
             return error.MissingStructuredResponseFormat;
-        const body = try gateway_json.buildGatewayRequestBodyWithVerifiedImagesAndBudget(
+        return gateway_json.buildGatewayRequestBodyWithVerifiedImagesAndBudget(
             alloc,
-            request.serialized_tools,
+            adapter_tools_json,
             request.messages,
             images,
             provider_options,
@@ -964,83 +1262,27 @@ pub fn buildAgentRequest(
             },
             budget orelse .{},
         );
-        return finalizeAgentRequestBody(alloc, request.model, body);
     }
     if (request.response_format != null) return error.StructuredResponseRequiresVerifiedImages;
 
-    const adapter_tools_json = try buildVercelBaseToolsJson(alloc, request);
-    defer alloc.free(adapter_tools_json);
-
-    if (request.vision_mode == .unavailable and request.selected_dynamic_tool_schemas.len == 0) {
-        if (request.required_tool_call_id) |target_call_id| {
-            const active = budget orelse return error.PendingToolReviewRequiresBudget;
-            const body = try gateway_json.buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
-                alloc,
-                request.serialized_tools,
-                request.messages,
-                target_call_id,
-                provider_options,
-                request.max_output_tokens orelse 2048,
-                active.deadline orelse return error.PendingToolReviewRequiresDeadline,
-                active.cancel_flag orelse return error.PendingToolReviewRequiresCancellation,
-            );
-            return finalizeAgentRequestBody(alloc, request.model, body);
-        }
-        if (request.require_tool_call) {
-            const body = if (budget) |active|
-                gateway_json.buildGatewayRequiredToolRequestBodyWithOptionsAndBudget(
-                    alloc,
-                    adapter_tools_json,
-                    request.messages,
-                    provider_options,
-                    request.max_output_tokens,
-                    active,
-                )
-            else
-                gateway_json.buildGatewayRequiredToolRequestBodyWithOptionsAndOutputLimit(
-                    alloc,
-                    adapter_tools_json,
-                    request.messages,
-                    provider_options,
-                    request.max_output_tokens,
-                );
-            return finalizeAgentRequestBody(alloc, request.model, try body);
-        }
-        const body = if (budget) |active|
-            gateway_json.buildGatewayRequestBodyWithOptionsAndBudget(
-                alloc,
-                adapter_tools_json,
-                request.messages,
-                provider_options,
-                request.tool_choice,
-                request.max_output_tokens,
-                active,
-            )
-        else
-            gateway_json.buildGatewayRequestBodyWithOptionsAndOutputLimit(
-                alloc,
-                adapter_tools_json,
-                request.messages,
-                provider_options,
-                request.tool_choice,
-                request.max_output_tokens,
-            );
-        return finalizeAgentRequestBody(alloc, request.model, try body);
+    if (request.required_tool_call_id) |target_call_id| {
+        const active = budget orelse return error.PendingToolReviewRequiresBudget;
+        return gateway_json.buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
+            alloc,
+            adapter_tools_json,
+            request.messages,
+            target_call_id,
+            provider_options,
+            request.max_output_tokens orelse 2048,
+            active.deadline orelse return error.PendingToolReviewRequiresDeadline,
+            active.cancel_flag orelse return error.PendingToolReviewRequiresCancellation,
+        );
     }
-
-    const vision_schema = if (request.vision_mode != .unavailable)
-        try writeVisionGatewaySchema(alloc, request.vision_tool_schema orelse return error.VisionToolNotRegistered)
-    else
-        null;
-    defer if (vision_schema) |schema| alloc.free(schema);
-
-    if (request.vision_mode == .required) {
-        const tools_json = try std.fmt.allocPrint(alloc, "[{s}]", .{vision_schema.?});
-        defer alloc.free(tools_json);
-        const body = if (budget) |active|
+    if (request.require_tool_call) {
+        return if (budget) |active|
             gateway_json.buildGatewayRequiredToolRequestBodyWithOptionsAndBudget(
                 alloc,
-                tools_json,
+                adapter_tools_json,
                 request.messages,
                 provider_options,
                 request.max_output_tokens,
@@ -1049,28 +1291,17 @@ pub fn buildAgentRequest(
         else
             gateway_json.buildGatewayRequiredToolRequestBodyWithOptionsAndOutputLimit(
                 alloc,
-                tools_json,
+                adapter_tools_json,
                 request.messages,
                 provider_options,
                 request.max_output_tokens,
             );
-        return finalizeAgentRequestBody(alloc, request.model, try body);
     }
 
-    var schemas: std.ArrayList([]const u8) = .empty;
-    defer schemas.deinit(alloc);
-    try schemas.appendSlice(alloc, request.selected_dynamic_tool_schemas);
-    if (vision_schema) |schema| try schemas.append(alloc, schema);
-    const tools_json = try tool_advertisement.buildGatewayToolsJsonWithSelectedDynamicSchemas(
-        alloc,
-        adapter_tools_json,
-        schemas.items,
-    );
-    defer alloc.free(tools_json);
-    const body = if (budget) |active|
+    return if (budget) |active|
         gateway_json.buildGatewayRequestBodyWithOptionsAndBudget(
             alloc,
-            tools_json,
+            adapter_tools_json,
             request.messages,
             provider_options,
             request.tool_choice,
@@ -1080,13 +1311,12 @@ pub fn buildAgentRequest(
     else
         gateway_json.buildGatewayRequestBodyWithOptionsAndOutputLimit(
             alloc,
-            tools_json,
+            adapter_tools_json,
             request.messages,
             provider_options,
             request.tool_choice,
             request.max_output_tokens,
         );
-    return finalizeAgentRequestBody(alloc, request.model, try body);
 }
 
 fn finalizeAgentRequestBody(
@@ -1106,7 +1336,7 @@ fn finalizeAgentRequestBody(
     return identified;
 }
 
-fn buildVercelBaseToolsJson(
+fn buildVercelToolsJson(
     alloc: Allocator,
     request: agent_stream_provider_contract.ModelRequest,
 ) ![]u8 {
@@ -1135,16 +1365,12 @@ fn buildVercelBaseToolsJson(
             .json = schema,
         });
     }
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, request.serialized_tools, .{});
-    defer parsed.deinit();
-    if (parsed.value != .array) return error.InvalidToolArguments;
-
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     var provider_index: usize = 0;
     var first = true;
     try out.writer.writeByte('[');
-    for (0..parsed.value.array.items.len + 1) |position| {
+    for (0..request.tools.len + 1) |position| {
         while (provider_index < provider_schemas.items.len and
             provider_schemas.items[provider_index].position == position)
         {
@@ -1153,15 +1379,44 @@ fn buildVercelBaseToolsJson(
             try out.writer.writeAll(provider_schemas.items[provider_index].json);
             provider_index += 1;
         }
-        if (position < parsed.value.array.items.len) {
+        if (position < request.tools.len) {
             if (!first) try out.writer.writeByte(',');
             first = false;
-            try std.json.Stringify.value(parsed.value.array.items[position], .{}, &out.writer);
+            try writeVercelFunctionSchema(
+                alloc,
+                &out.writer,
+                request.tools[position],
+            );
         }
     }
     if (provider_index != provider_schemas.items.len) return error.InvalidGatewayAdvertisement;
     try out.writer.writeByte(']');
     return out.toOwnedSlice();
+}
+
+fn writeVercelFunctionSchema(
+    alloc: Allocator,
+    writer: *std.Io.Writer,
+    schema: gateway_schema.FunctionSchema,
+) !void {
+    try schema.validate();
+    var capped_description: ?[]u8 = null;
+    defer if (capped_description) |description| alloc.free(description);
+    if (schema.description.len > gateway_schema.description_max_bytes) {
+        const prefix_len = gateway_schema.description_max_bytes - gateway_schema.truncation_marker.len;
+        const description = try alloc.alloc(u8, gateway_schema.description_max_bytes);
+        @memcpy(description[0..prefix_len], schema.description[0..prefix_len]);
+        @memcpy(description[prefix_len..], gateway_schema.truncation_marker);
+        capped_description = description;
+    }
+
+    try writer.writeAll("{\"type\":\"function\",\"name\":");
+    try std.json.Stringify.value(schema.name, .{}, writer);
+    try writer.writeAll(",\"description\":");
+    try std.json.Stringify.value(capped_description orelse schema.description, .{}, writer);
+    try writer.writeAll(",\"inputSchema\":");
+    try gateway_schema.writeInputSchema(alloc, writer, schema);
+    try writer.writeByte('}');
 }
 
 fn vercelWebSearchToolJson(alloc: Allocator) ![]u8 {
@@ -1179,21 +1434,10 @@ fn vercelWebSearchToolJson(alloc: Allocator) ![]u8 {
     return alloc.dupe(u8, tools_json[1 .. tools_json.len - 1]);
 }
 
-fn writeVisionGatewaySchema(
-    alloc: Allocator,
-    schema: gateway_schema.FunctionSchema,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    try gateway_schema.writeBuiltinFunctionSchema(alloc, &out.writer, schema);
-    return out.toOwnedSlice();
-}
-
 test "agent request builder keeps default reasoning silent and emits output limit" {
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
     const body = try agent_stream_provider.build(std.testing.allocator, .{
-        .model = "anthropic/claude-opus-4.8",
-        .serialized_tools = "[]",
+        .tools = &.{},
         .messages = &messages,
         .tool_choice = .auto,
         .capabilities = model_capabilities.capabilitiesForModel("anthropic/claude-opus-4.8"),
@@ -1206,47 +1450,10 @@ test "agent request builder keeps default reasoning silent and emits output limi
     try std.testing.expect(std.mem.find(u8, body, "\"providerOptions\"") == null);
 }
 
-test "agent request builder scopes the product user agent to GLM 5.2" {
-    const alloc = std.testing.allocator;
-    const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
-    const cases = [_]struct {
-        model: []const u8,
-        include_user_agent: bool,
-    }{
-        .{ .model = "zai/glm-5.2", .include_user_agent = true },
-        .{ .model = "poolside/laguna-s-2.1-free", .include_user_agent = false },
-    };
-
-    for (cases) |case| {
-        const body = try agent_stream_provider.build(alloc, .{
-            .model = case.model,
-            .serialized_tools = "[]",
-            .messages = &messages,
-            .tool_choice = .auto,
-            .capabilities = model_capabilities.capabilitiesForModel(case.model),
-        });
-        defer alloc.free(body);
-
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
-        defer parsed.deinit();
-
-        const headers = parsed.value.object.get("headers");
-        if (!case.include_user_agent) {
-            try std.testing.expect(headers == null);
-            continue;
-        }
-        const user_agent = headers.?.object.get("user-agent") orelse
-            return error.TestExpectedGatewayUserAgent;
-        try std.testing.expect(user_agent == .string);
-        try std.testing.expectEqualStrings(gateway_client.user_agent, user_agent.string);
-    }
-}
-
 test "agent request builder serializes neutral provider search beside local tools" {
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
     const body = try agent_stream_provider.build(std.testing.allocator, .{
-        .model = "anthropic/claude",
-        .serialized_tools = "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]",
+        .tools = &.{.{ .name = "read_file", .description = "Read" }},
         .provider_tools = &.{.{ .tool = .web_search, .local_schema_position = 1 }},
         .messages = &messages,
         .tool_choice = .auto,
@@ -1265,14 +1472,11 @@ test "agent request builder serializes neutral provider search beside local tool
 
 test "agent request builder overlays selected dynamic schemas" {
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
-    const selected_schema = "{\"type\":\"function\",\"name\":\"mcp_fs_read\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}";
     const body = try agent_stream_provider.build(std.testing.allocator, .{
-        .model = "anthropic/claude",
-        .serialized_tools = "[]",
+        .tools = &.{.{ .name = "mcp_fs_read", .description = "Read" }},
         .messages = &messages,
         .tool_choice = .auto,
-        .selected_dynamic_tool_schemas = &.{selected_schema},
-        .capabilities = model_capabilities.capabilitiesForModel("anthropic/claude"),
+        .capabilities = model_descriptor_provider.fallback("anthropic/claude").capabilities,
         .max_output_tokens = 64_000,
     });
     defer std.testing.allocator.free(body);
@@ -1283,19 +1487,15 @@ test "agent request builder overlays selected dynamic schemas" {
 
 test "required vision request contains only the registered vision schema" {
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "inspect image 7" }};
-    const vision_schema = gateway_schema.FunctionSchema{
-        .name = "vision",
-        .description = "registry-owned vision schema sentinel",
-    };
     const body = try agent_stream_provider.build(std.testing.allocator, .{
-        .model = "zai/glm-5.2",
-        .serialized_tools = "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]",
+        .tools = &.{.{
+            .name = "vision",
+            .description = "registry-owned vision schema sentinel",
+        }},
         .messages = &messages,
         .tool_choice = .none,
-        .selected_dynamic_tool_schemas = &.{"{\"type\":\"function\",\"name\":\"mcp_fs_read\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}"},
-        .vision_mode = .required,
-        .vision_tool_schema = vision_schema,
-        .capabilities = model_capabilities.capabilitiesForModel("zai/glm-5.2"),
+        .require_tool_call = true,
+        .capabilities = model_descriptor_provider.fallback("zai/glm-5.2").capabilities,
         .max_output_tokens = 128_000,
     });
     defer std.testing.allocator.free(body);
@@ -2509,6 +2709,7 @@ test "possibly sent web search failure marks billing incomplete" {
 
 test "built-in gateway defaults preserve active provider policy" {
     try std.testing.expectEqualStrings("zai/glm-5.2", default_model);
+    try std.testing.expect(default_fast_mode);
     try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/v3/ai/language-model", default_chat_url);
     try std.testing.expectEqualStrings("/coding-agent/v1/models", models_path);
     try std.testing.expectEqual(@as(usize, 3), retry_count);
@@ -2579,7 +2780,7 @@ test "built-in credits provider names the team query only when valid" {
     const cases = [_]struct { team: ?[]const u8, want: []const u8 }{
         .{ .team = null, .want = "/coding-agent/v1/credits" },
         .{ .team = "team_000000000000000000000000", .want = "/coding-agent/v1/credits?teamId=team_000000000000000000000000" },
-        .{ .team = "example-team", .want = "/coding-agent/v1/credits?teamId=example-team" },
+        .{ .team = "example-projects", .want = "/coding-agent/v1/credits?teamId=example-projects" },
         .{ .team = "team a/../b", .want = "/coding-agent/v1/credits" },
         .{ .team = "", .want = "/coding-agent/v1/credits" },
     };
@@ -2744,6 +2945,7 @@ test "built-in web search provider preserves missing worker configuration error"
     try std.testing.expectError(error.MissingGatewaySearchConfiguration, default_web_search_provider.execute(
         std.testing.allocator,
         .{
+            .connection_id = "vercel",
             .credential = "",
             .model = "",
             .retry_count = retry_count,
@@ -3193,6 +3395,28 @@ fn parsePickerModelCatalog(alloc: std.mem.Allocator, json_text: []const u8) !std
     return parseModelCatalogForView(alloc, json_text, .picker);
 }
 
+test "gateway catalog rejects malformed envelope shapes" {
+    const malformed_envelopes = [_][]const u8{
+        "[]",
+        "{}",
+        "{\"data\":{}}",
+    };
+
+    for (malformed_envelopes) |json_text| {
+        try std.testing.expectError(
+            error.MalformedResponse,
+            parseSortedModelCatalog(std.testing.allocator, json_text),
+        );
+    }
+}
+
+test "gateway catalog accepts an explicit empty data array" {
+    var catalog = try parseSortedModelCatalog(std.testing.allocator, "{\"data\":[]}");
+    defer freeModelCatalog(std.testing.allocator, &catalog);
+
+    try std.testing.expectEqual(@as(usize, 0), catalog.items.len);
+}
+
 fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?ModelCatalogEntry {
     if (entry != .object) return null;
 
@@ -3490,28 +3714,6 @@ test "parsePickerModelIds features Fable as the top highlight" {
     try std.testing.expect(idsContain(ids.items, "anthropic/claude-opus-4.8"));
     try std.testing.expect(idsContain(ids.items, "anthropic/claude-sonnet-4.6"));
     try std.testing.expectEqual(@as(usize, 3), ids.items.len);
-}
-
-test "gateway catalog rejects malformed envelope shapes" {
-    const malformed_envelopes = [_][]const u8{
-        "[]",
-        "{}",
-        "{\"data\":{}}",
-    };
-
-    for (malformed_envelopes) |json_text| {
-        try std.testing.expectError(
-            error.MalformedResponse,
-            parseSortedModelCatalog(std.testing.allocator, json_text),
-        );
-    }
-}
-
-test "gateway catalog accepts an explicit empty data array" {
-    var catalog = try parseSortedModelCatalog(std.testing.allocator, "{\"data\":[]}");
-    defer freeModelCatalog(std.testing.allocator, &catalog);
-
-    try std.testing.expectEqual(@as(usize, 0), catalog.items.len);
 }
 
 test "gateway catalog retains broad capability metadata" {

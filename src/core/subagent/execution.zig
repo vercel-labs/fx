@@ -8501,8 +8501,7 @@ const GatewayExecution = struct {
             .{ .result = .{ .model_output = "fixture match" } },
             .{ .result = .{
                 .model_output = "selected",
-                .selected_dynamic_tool_name = "mcp_fixture_echo",
-                .selected_dynamic_tool_schema_json = "{\"type\":\"function\",\"name\":\"mcp_fixture_echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}",
+                .selected_dynamic_tool = .{ .name = "mcp_fixture_echo", .description = "Echo" },
             } },
             .{ .result = .{ .model_output = "echoed" } },
         };

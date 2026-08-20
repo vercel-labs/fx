@@ -779,7 +779,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .push_context_notice = contextNotice,
             .push_route_recovery_status = routeRecoveryStatus,
             .push_command_output_complete = commandOutputComplete,
-            .push_http_error = httpError,
+            .push_provider_failure = providerFailure,
             .resolve_route_credential = resolveRouteCredential,
             .refresh_gateway_credential = refreshGatewayCredential,
             .request_route_recovery = if (self.enable_route_recovery) requestRouteRecovery else null,
@@ -861,7 +861,7 @@ pub const FakeAgentRuntimeDeps = struct {
         return builtin_gateway.model_descriptor_provider.fallback(model);
     }
 
-    fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: runtime_deps.CredentialRefreshMode) !?[]u8 {
+    fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, _: *const route_snapshot.RouteSnapshot, source: types.CredentialSource, mode: runtime_deps.CredentialRefreshMode) !?[]u8 {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.credential_refresh_sources.append(self.alloc, source);
         try self.credential_refresh_modes.append(self.alloc, mode);
@@ -1783,13 +1783,36 @@ pub const FakeAgentRuntimeDeps = struct {
         }
     }
 
-    fn httpError(raw: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
+    fn providerFailure(raw: *anyopaque, category: agent_stream_provider.StreamFailure.Category, response_code: ?u16, detail: []const u8, credential_source: ?types.CredentialSource) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        self.http_status = status;
+        self.http_status = if (response_code) |code|
+            @enumFromInt(code)
+        else switch (category) {
+            .authentication => .unauthorized,
+            .authorization => .forbidden,
+            .configuration => .bad_request,
+            .invalid_content => .unprocessable_entity,
+            .request_too_large => .payload_too_large,
+            .rate_limited => .too_many_requests,
+            .timeout => .gateway_timeout,
+            .provider_internal => .internal_server_error,
+            .upstream_failure, .protocol => .bad_gateway,
+            .unavailable, .transport, .ambiguous_delivery => .service_unavailable,
+            .other => .internal_server_error,
+        };
         self.http_credential_source = credential_source;
         if (self.http_detail) |value| self.alloc.free(value);
-        self.http_detail = try self.alloc.dupe(u8, detail);
-        try self.record("http_error", .{});
+        var prefix_buf: [32]u8 = undefined;
+        const prefix = if (response_code) |code|
+            std.fmt.bufPrint(&prefix_buf, "HTTP {d}: ", .{code}) catch ""
+        else
+            "";
+        const captured_detail = if (prefix.len > 0 and std.mem.startsWith(u8, detail, prefix))
+            detail[prefix.len..]
+        else
+            detail;
+        self.http_detail = try self.alloc.dupe(u8, captured_detail);
+        try self.record("provider_failure", .{});
     }
 
     fn formatError(_: *anyopaque, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
@@ -1821,7 +1844,7 @@ pub const PromptFixture = struct {
             .gateway_retry_count = 1,
             .max_provider_attempts = model_response_recovery.default_max_provider_attempts,
             .gateway_chat_url = "https://example.invalid",
-            .gateway_tools_json = "[]",
+            .model_tools = &.{},
             .agent_step_limit = 8,
             .cancel_flag = &self.cancel_flag,
             .workspace_root = self.workspace_root,

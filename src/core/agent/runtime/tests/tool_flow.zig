@@ -15,6 +15,7 @@ const diff = @import("../../../output/diff.zig");
 const file_mutation = @import("../../../tooling/file_mutation.zig");
 const command_result_mapping = @import("../../../tooling/command_result_mapping.zig");
 const tool_dispatch = @import("../../../tooling/tool_dispatch.zig");
+const gateway_schema = @import("../../../tooling/gateway_schema.zig");
 const tool_specs = @import("../../../tooling/tool_specs.zig");
 const tool_result_errors = @import("../../../tooling/tool_result_errors.zig");
 const context_contract = @import("../../../workspace/context_contract.zig");
@@ -63,8 +64,10 @@ const toolCall = test_support.toolCall;
 const vision_agent_test_tools = test_support.vision_agent_test_tools;
 const VisionAgentToolRuntime = test_support.VisionAgentToolRuntime;
 
-const fixture_tools_json =
-    "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read a file\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]";
+const fixture_tools = &.{gateway_schema.FunctionSchema{
+    .name = "read_file",
+    .description = "Read a file",
+}};
 
 fn makeOwnedVisionCatalog(
     alloc: std.mem.Allocator,
@@ -1262,8 +1265,7 @@ test "selected dynamic MCP allow returned after cancellation never executes" {
     hooks.exec_plans = &.{
         .{ .result = .{
             .model_output = "selected",
-            .selected_dynamic_tool_name = "mcp_fixture_echo",
-            .selected_dynamic_tool_schema_json = "{\"type\":\"function\",\"name\":\"mcp_fixture_echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}",
+            .selected_dynamic_tool = .{ .name = "mcp_fixture_echo", .description = "Echo" },
         } },
         .{ .result = .{ .model_output = "must not execute" } },
     };
@@ -4546,7 +4548,7 @@ test "three automatic permission blocks route the next action through approval" 
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.agent_step_limit = 5;
-    config.gateway_tools_json = fixture_tools_json;
+    config.model_tools = fixture_tools;
     var job = fixture.job();
     job.permission_mode = .auto;
 

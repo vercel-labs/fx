@@ -9,8 +9,8 @@ pub const LabelArgKind = tool_dispatch.LabelArgKind;
 pub const PermissionTargetKind = tool_dispatch.PermissionTargetKind;
 pub const ToolSpec = tool_dispatch.Tool;
 
-pub fn toolGatewaySchemaJson(alloc: std.mem.Allocator, spec: ToolSpec) ![]u8 {
-    return gateway_schema.builtinFunctionSchemaJsonAlloc(alloc, spec.gateway_schema);
+pub fn toolInputSchemaJson(alloc: std.mem.Allocator, spec: ToolSpec) ![]u8 {
+    return gateway_schema.inputSchemaJsonAlloc(alloc, spec.gateway_schema);
 }
 
 pub fn toolLabelValue(spec: ToolSpec, args: std.json.ObjectMap) ?[]const u8 {

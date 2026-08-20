@@ -3732,7 +3732,7 @@ test "resume projection emits compacted summary before background command contex
 }
 
 test "history projection keeps system role only for leading summaries" {
-    const gateway_json = @import("../gateway/gateway_json.zig");
+    const model_history = @import("../agent/model_history.zig");
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -3777,7 +3777,7 @@ test "history projection keeps system role only for leading summaries" {
     try std.testing.expect(std.mem.find(u8, messages.items[3].content.?.asText(), "nonleading summary marker") != null);
     try std.testing.expectEqual(.user, messages.items[6].role);
     try std.testing.expect(std.mem.find(u8, messages.items[6].content.?.asText(), "<turn_aborted>") != null);
-    try gateway_json.validateToolMessageHistory(alloc, chat_messages.items);
+    try model_history.validate(alloc, chat_messages.items);
 
     var budgeted_messages: std.ArrayList(message.Message) = .empty;
     defer deinitMessages(alloc, &budgeted_messages);
@@ -3816,7 +3816,7 @@ test "history projection keeps system role only for leading summaries" {
     try std.testing.expectEqual(.system, budgeted_messages.items[0].role);
     try std.testing.expect(saw_nonleading_summary);
     try std.testing.expect(saw_interruption_marker);
-    try gateway_json.validateToolMessageHistory(alloc, budgeted_chat_messages.items);
+    try model_history.validate(alloc, budgeted_chat_messages.items);
 }
 
 test "resume projection replays assistant tool execution memory before final answer" {
@@ -3965,7 +3965,7 @@ test "resume projections place permission feedback after its tool result" {
 }
 
 test "resume projections group two tool results before their feedback" {
-    const gateway_json = @import("../gateway/gateway_json.zig");
+    const model_history = @import("../agent/model_history.zig");
     const alloc = std.testing.allocator;
     var first_feedback = [_][]u8{@constCast("first command feedback marker")};
     var second_feedback = [_][]u8{@constCast("second command feedback marker")};
@@ -4020,7 +4020,7 @@ test "resume projections group two tool results before their feedback" {
     try std.testing.expectEqual(core_types.ChatRole.tool, chat_messages.items[3].role);
     try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[4].role);
     try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[5].role);
-    try gateway_json.validateToolMessageHistory(alloc, chat_messages.items);
+    try model_history.validate(alloc, chat_messages.items);
 }
 
 test "execution replay context and token estimate include permission feedback" {
@@ -4927,7 +4927,6 @@ test "compactLineText preserves complete UTF-8 codepoints at the byte cap" {
 }
 
 test "compacted Unicode history serializes system content as a string" {
-    const gateway_json = @import("../gateway/gateway_json.zig");
     const alloc = std.testing.allocator;
     var runtime: SessionRuntime = .{ .max_history_turns = 2 };
     defer runtime.deinit(alloc);
@@ -4951,9 +4950,8 @@ test "compacted Unicode history serializes system content as a string" {
     try appendHistoryChatMessages(arena, &messages, context);
     try messages.append(arena, .{ .role = .user, .content = "current user" });
 
-    const body = try gateway_json.buildGatewayRequestBody(arena, "[]", messages.items);
-    const shape = try gateway_json.formatGatewayRequestShapeSummary(arena, body);
-    try std.testing.expect(std.mem.find(u8, shape, "prompt.0 role=system content=string") != null);
+    try std.testing.expectEqual(core_types.ChatRole.system, messages.items[0].role);
+    try std.testing.expect(messages.items[0].content != null);
     try std.testing.expect(std.unicode.utf8ValidateSlice(context[0].compacted_summary.summary));
     try std.testing.expectEqual(@as(usize, 3), runtime.historyLen());
 }

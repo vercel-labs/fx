@@ -32,8 +32,11 @@ pub const FailureCategory = enum {
     session_changed,
     invalid_selection,
     persistence,
-    cancelled,
 };
+
+test "cancellation is not an ordinary adapter auth failure" {
+    try std.testing.expect(std.meta.stringToEnum(FailureCategory, "cancelled") == null);
+}
 
 pub const Failure = struct {
     category: FailureCategory,
@@ -447,6 +450,7 @@ test "status serialization is redacted" {
 const TestProviderState = struct {
     acquire_calls: usize = 0,
     invalidate_calls: usize = 0,
+    status_calls: usize = 0,
     cancel_during_acquire: ?*std.atomic.Value(bool) = null,
 
     fn acquire(raw: *const anyopaque, alloc: Allocator, _: Request) Allocator.Error!Acquisition {
@@ -464,6 +468,12 @@ const TestProviderState = struct {
         const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
         self.invalidate_calls += 1;
         return .{ .drop_credential = true };
+    }
+
+    fn status(raw: *const anyopaque, _: Allocator, _: connection_registry.Profile, _: AuthHost) Allocator.Error!StatusOutcome {
+        const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+        self.status_calls += 1;
+        return .{ .loaded = .{} };
     }
 };
 
@@ -487,6 +497,7 @@ test "profile mismatch and cancellation precede adapter effects" {
         .context = &state,
         .acquire_fn = TestProviderState.acquire,
         .invalidate_fn = TestProviderState.invalidate,
+        .status_fn = TestProviderState.status,
     };
     const auth_host = AuthHost{ .secret_store = host_contract.unavailable_secret_store };
 
@@ -497,6 +508,12 @@ test "profile mismatch and cancellation precede adapter effects" {
         .source_resolution = .exact,
     }));
     try std.testing.expectEqual(@as(usize, 0), state.acquire_calls);
+
+    try std.testing.expectError(
+        error.AdapterMismatch,
+        provider.status(std.testing.allocator, testProfile("other"), auth_host),
+    );
+    try std.testing.expectEqual(@as(usize, 0), state.status_calls);
 
     var cancelled = std.atomic.Value(bool).init(true);
     const outcome = try provider.acquire(std.testing.allocator, .{

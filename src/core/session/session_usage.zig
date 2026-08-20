@@ -3782,9 +3782,9 @@ const TestGenerationUsageProvider = struct {
 fn resolveTestGenerationCredential(
     _: ?*anyopaque,
     alloc: Allocator,
-    credential_ref: []const u8,
+    reference: generation_usage.CredentialReference,
 ) generation_usage.ResolveCredentialError!generation_usage.ResolvedCredential {
-    return .{ .token = try alloc.dupe(u8, credential_ref) };
+    return .{ .token = try alloc.dupe(u8, reference.credential_ref) };
 }
 
 fn testGenerationDispatch(
@@ -3793,6 +3793,7 @@ fn testGenerationDispatch(
 ) !generation_usage.Dispatch {
     return generation_usage.Dispatch.init(alloc, &.{.{
         .id = "connection-a",
+        .adapter_kind = "test-adapter",
         .credential_ref = "credential",
         .provider = provider,
     }}, .{ .resolve_fn = resolveTestGenerationCredential });
@@ -4884,8 +4885,8 @@ test "terminal generation lookup stays on connection A after selecting B" {
     try std.testing.expect(std.mem.find(u8, encoded.written(), "credential-a") == null);
 
     var dispatch = try generation_usage.Dispatch.init(alloc, &.{
-        .{ .id = "connection-a", .credential_ref = "credential-a", .provider = provider_a.provider() },
-        .{ .id = "connection-b", .credential_ref = "credential-b", .provider = provider_b.provider() },
+        .{ .id = "connection-a", .adapter_kind = "adapter-a", .credential_ref = "credential-a", .provider = provider_a.provider() },
+        .{ .id = "connection-b", .adapter_kind = "adapter-b", .credential_ref = "credential-b", .provider = provider_b.provider() },
     }, .{ .resolve_fn = resolveTestGenerationCredential });
     defer dispatch.deinit(alloc);
     var cancel = std.atomic.Value(bool).init(false);
@@ -4906,6 +4907,7 @@ test "terminal generation lookup stays on connection A after selecting B" {
     );
     var missing_dispatch = try generation_usage.Dispatch.init(alloc, &.{.{
         .id = "connection-b",
+        .adapter_kind = "adapter-b",
         .credential_ref = "credential-b",
         .provider = provider_b.provider(),
     }}, .{ .resolve_fn = resolveTestGenerationCredential });

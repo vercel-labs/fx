@@ -110,11 +110,7 @@ pub const ProviderToolAdvertisement = struct {
 /// Provider-neutral description of one model request. All slices are borrowed
 /// for the duration of `ProviderAdapter.stream`.
 pub const ModelRequest = struct {
-    /// Transitional encoded tool-schema bridge for the existing Vercel
-    /// request builder. G8 removes provider-owned schemas from this field;
-    /// G11 removes the bridge after every caller supplies neutral descriptors.
-    model: []const u8,
-    serialized_tools: []const u8,
+    tools: []const gateway_schema.FunctionSchema,
     provider_tools: []const ProviderToolAdvertisement = &.{},
     messages: []const types.ChatMessage,
     tool_choice: types.ToolChoice,
@@ -122,9 +118,6 @@ pub const ModelRequest = struct {
     /// Identifies the one pending tool call being reviewed. Adapters may use
     /// this semantic fact to preserve provider-specific history ordering.
     required_tool_call_id: ?[]const u8 = null,
-    selected_dynamic_tool_schemas: []const []const u8 = &.{},
-    vision_mode: VisionMode = .unavailable,
-    vision_tool_schema: ?gateway_schema.FunctionSchema = null,
     capabilities: model_capabilities.Capabilities,
     reasoning_effort: types.ReasoningEffort = .auto,
     fast_mode: bool = false,
@@ -136,6 +129,8 @@ pub const ModelRequest = struct {
 
 test "model request exposes only data-only tool and vision metadata" {
     try std.testing.expect(!@hasField(ModelRequest, "tool_registry"));
+    try std.testing.expect(!@hasField(ModelRequest, "serialized_tools"));
+    try std.testing.expect(!@hasField(ModelRequest, "selected_dynamic_tool_schemas"));
     try std.testing.expect(@typeInfo(ProviderTool) == .@"enum");
     try std.testing.expect(!@hasField(gateway_schema.FunctionSchema, "call"));
     try std.testing.expect(!@hasField(gateway_schema.FunctionSchema, "runtime_provider"));
@@ -269,15 +264,24 @@ pub const ProviderToolResult = struct {
 pub const StreamFailure = struct {
     category: Category,
     retryable: bool = false,
-    http_status: ?std.http.Status = null,
+    response_code: ?u16 = null,
     delivery_ambiguous: bool = false,
     detail: ?[]const u8 = null,
     retry_after_seconds: ?u64 = null,
+    transport_cause: ?TransportCause = null,
     diagnostic: ?Diagnostic = null,
 
     pub const Diagnostic = struct {
         summary: []const u8,
         request_shape: ?[]const u8 = null,
+    };
+
+    pub const TransportCause = enum {
+        read_failed,
+        connection_reset,
+        connection_timed_out,
+        connection_closing,
+        system_resumed,
     };
 
     pub const Category = enum {
@@ -619,6 +623,17 @@ test "provider admission is ordered and preflight failure remains effect free" {
     try std.testing.expect(failed.terminal);
 }
 
+test "every normalized failure category is terminal and absorbing" {
+    inline for (std.meta.tags(StreamFailure.Category)) |category| {
+        var state = EventState.init(std.testing.allocator);
+        defer state.deinit();
+        try state.accept(.{ .failure = .{ .category = category } });
+        try std.testing.expectEqual(@as(usize, 1), state.terminal_count);
+        try std.testing.expectError(error.DuplicateTerminalEvent, state.accept(.cancelled));
+        try std.testing.expectError(error.EventAfterTerminal, state.accept(.{ .text_delta = "late" }));
+    }
+}
+
 test "stream event state rejects unsafe references and provider tool identities" {
     var state = EventState.init(std.testing.allocator);
     defer state.deinit();
@@ -718,8 +733,7 @@ test "provider adapter rejects wrong routes before traffic and handles cancellat
     const adapter = ProviderAdapter{ .kind = "fake", .context = &fake, .stream_fn = Fake.stream };
     const request = AdapterRequest{
         .model_request = .{
-            .model = "test/model",
-            .serialized_tools = "[]",
+            .tools = &.{},
             .messages = &.{},
             .tool_choice = .none,
             .capabilities = .{},

@@ -49,6 +49,7 @@ const builtin_context = @import("builtins/context.zig");
 const builtin_devbox = @import("builtins/devbox.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const adapter_registry = @import("core/gateway/adapter_registry.zig");
+const connection_registry = @import("core/gateway/connection_registry.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const output_contracts = @import("core/output/output_contracts.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
@@ -444,20 +445,17 @@ const App = struct {
 
     pub fn fetchAccountUsage(self: *Self) !output_contracts.CreditsSnapshot {
         const profile = try self.auth.selectedConnectionProfile();
-        const adapter = self.providerAdapter();
-        const provider = if (std.mem.eql(u8, profile.adapter_id, adapter.kind))
-            adapter.account_usage
-        else
-            null;
-        const account_usage = provider orelse return .{
+        const account_usage = self.auth.adapter_registry.resolveAccountUsageForProfile(profile) catch return .{
             .err_message = try self.alloc.dupe(
                 u8,
                 "account usage unavailable for selected connection",
             ),
         };
-        var credential = try self.auth.resolveCredentialReference(
+        var credential = try self.auth.resolveProfileCredential(
             self.alloc,
-            profile.credential_ref,
+            profile,
+            .if_needed,
+            null,
         );
         defer credential.deinit(self.alloc);
         return account_usage.fetch(self.alloc, .{
@@ -500,11 +498,27 @@ const App = struct {
         return adapter;
     }
 
+    pub fn providerAdapterForRoute(self: *const Self, route: *const route_snapshot.RouteSnapshot) !agent_stream_provider.ProviderAdapter {
+        var adapter = try self.auth.adapter_registry.resolveRoute(route);
+        if (std.mem.eql(u8, adapter.kind, builtin_gateway.connection_seed.adapter_id)) {
+            adapter.legacy_provider = self.agentStreamProvider();
+        }
+        return adapter;
+    }
+
+    fn selectedProviderAdapter(self: *const Self) !agent_stream_provider.ProviderAdapter {
+        return self.providerAdapterForProfile(try self.auth.selectedConnectionProfile());
+    }
+
+    fn providerAdapterForProfile(
+        self: *const Self,
+        profile: connection_registry.Profile,
+    ) !agent_stream_provider.ProviderAdapter {
+        return self.auth.adapter_registry.resolveProfile(profile);
+    }
+
     fn selectedModelCatalogProvider(self: *const Self) ?model_catalog.Provider {
-        const profile = self.auth.selectedConnectionProfile() catch return null;
-        const adapter = self.providerAdapter();
-        if (!std.mem.eql(u8, profile.adapter_id, adapter.kind)) return null;
-        return adapter.model_catalog;
+        return (self.selectedProviderAdapter() catch return null).model_catalog;
     }
 
     pub fn activeConnectionId(self: *const Self) []const u8 {
@@ -517,27 +531,11 @@ const App = struct {
         alloc: Allocator,
         route: *const route_snapshot.RouteSnapshot,
     ) !agent_runtime.RouteCredential {
+        _ = try self.auth.adapter_registry.resolveRoute(route);
         var profile = try self.auth.connectionProfile(route.connection_id);
         if (!std.mem.eql(u8, profile.adapter_id, route.adapter_kind)) return error.RouteAdapterMismatch;
-        const selected = try self.auth.selectedConnectionProfile();
-        if (std.mem.eql(u8, route.connection_id, selected.id)) {
-            if (self.auth.gatewayCredential()) |credential| {
-                if (!std.mem.eql(u8, route.credential_ref, "automatic") and
-                    !std.mem.eql(u8, route.credential_ref, @tagName(credential.source)))
-                {
-                    return error.RouteCredentialMismatch;
-                }
-                var result = agent_runtime.RouteCredential{
-                    .credential = try alloc.dupe(u8, credential.api_key),
-                    .legacy_source = credential.source,
-                };
-                errdefer result.deinit(alloc);
-                result.tenant = if (credential.gateway_team) |value| try alloc.dupe(u8, value) else null;
-                return result;
-            }
-        }
         profile.credential_ref = @constCast(route.credential_ref);
-        var credential = try self.auth.resolveExactProfileCredential(alloc, profile, .if_needed, null);
+        var credential = try self.auth.resolveAdmittedProfileCredential(alloc, profile, .if_needed, null);
         defer credential.deinit(alloc);
         const tenant = if (credential.gatewayTeam()) |value| try alloc.dupe(u8, value) else null;
         errdefer if (tenant) |value| alloc.free(value);
@@ -553,14 +551,21 @@ const App = struct {
     fn resolveGenerationUsageCredential(
         raw: ?*anyopaque,
         alloc: Allocator,
-        credential_ref: []const u8,
+        reference: generation_usage_provider.CredentialReference,
     ) generation_usage_provider.ResolveCredentialError!generation_usage_provider.ResolvedCredential {
         const self: *App = @ptrCast(@alignCast(raw.?));
-        var credential = self.auth.resolveCredentialReference(
+        var profile = self.auth.connectionProfile(reference.connection_id) catch return error.Unavailable;
+        if (!std.mem.eql(u8, profile.adapter_id, reference.adapter_kind)) return error.Unavailable;
+        _ = self.auth.adapter_registry.resolve(reference.adapter_kind) catch return error.Unavailable;
+        profile.credential_ref = @constCast(reference.credential_ref);
+        var credential = self.auth.resolveExactProfileCredential(
             alloc,
-            credential_ref,
+            profile,
+            .if_needed,
+            null,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.Cancelled => return error.Cancelled,
             else => return error.Unavailable,
         };
         defer credential.deinit(alloc);
@@ -583,15 +588,14 @@ const App = struct {
             profiles.len,
         );
         defer alloc.free(inputs);
-        const adapter = self.providerAdapter();
         for (profiles, 0..) |profile, index| {
+            const durable_profile = self.auth.connectionProfileForRoute(profile.id) catch
+                return error.Unavailable;
             inputs[index] = .{
-                .id = profile.id,
-                .credential_ref = profile.credential_ref,
-                .provider = if (std.mem.eql(u8, profile.adapter_id, adapter.kind))
-                    adapter.generation_usage
-                else
-                    null,
+                .id = durable_profile.id,
+                .adapter_kind = durable_profile.adapter_id,
+                .credential_ref = durable_profile.credential_ref,
+                .provider = self.auth.adapter_registry.resolveGenerationUsageForProfile(durable_profile) catch null,
             };
         }
         return generation_usage_provider.Dispatch.init(alloc, inputs, .{
@@ -616,7 +620,7 @@ const App = struct {
             alloc,
             profile,
             builtin_gateway.connection_seed,
-            self.resolvedModelDescriptor(self.selected_model.items),
+            try self.resolvedModelDescriptorForProfile(profile, self.selected_model.items),
             builtin_gateway.defaultChatUrl(),
         );
     }
@@ -1466,12 +1470,12 @@ const App = struct {
         );
         errdefer types.freeImageAttachmentSlice(std.heap.c_allocator, authorized_image_catalog);
         var descriptor = if (recovery_checkpoint) |checkpoint| recovery_descriptor: {
-            const resolved = self.resolvedModelDescriptor(checkpoint.route_model);
+            const resolved = try self.resolvedModelDescriptorForProfile(profile, checkpoint.route_model);
             break :recovery_descriptor route_snapshot.recoveryDescriptor(
                 checkpoint.route_model,
                 resolved,
             );
-        } else self.resolvedModelDescriptor(self.selected_model.items);
+        } else try self.resolvedModelDescriptorForProfile(profile, self.selected_model.items);
         if (model_capabilities.requiresResolvedRequestCapabilities(
             authorized_image_catalog.len > 0,
             self.effort,
@@ -1482,7 +1486,10 @@ const App = struct {
                 checkpoint.route_model
             else
                 self.selected_model.items;
-            const resolved = try self.resolveModelDescriptorForRequest(model);
+            const resolved = try self.resolveModelDescriptorForProfileRequest(
+                profile,
+                model,
+            );
             descriptor = if (recovery_checkpoint) |checkpoint|
                 route_snapshot.recoveryDescriptor(checkpoint.route_model, resolved)
             else
@@ -1724,12 +1731,27 @@ const App = struct {
         alloc: Allocator,
         permission_mode: types.PermissionMode,
     ) !tool_advertisement.EffectiveToolProjection {
+        const adapter = try self.selectedProviderAdapter();
+        return self.snapshotGatewayToolProjectionForAdapter(
+            alloc,
+            permission_mode,
+            adapter,
+        );
+    }
+
+    pub fn snapshotGatewayToolProjectionForAdapter(
+        self: *App,
+        alloc: Allocator,
+        permission_mode: types.PermissionMode,
+        adapter: agent_stream_provider.ProviderAdapter,
+    ) !tool_advertisement.EffectiveToolProjection {
         self.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
         defer self.permission_state.authority_mutex.unlock(io_mod.getIo());
         return self.snapshotGatewayToolProjectionForRules(
             alloc,
             permission_mode,
             self.permission_engine.rules,
+            adapter,
         );
     }
 
@@ -1739,10 +1761,27 @@ const App = struct {
         permission_mode: types.PermissionMode,
         permission_rules: types.PermissionRuleSet,
     ) !tool_advertisement.EffectiveToolProjection {
+        const adapter = try self.selectedProviderAdapter();
+        return self.snapshotSubagentGatewayToolProjectionForAdapter(
+            alloc,
+            permission_mode,
+            permission_rules,
+            adapter,
+        );
+    }
+
+    pub fn snapshotSubagentGatewayToolProjectionForAdapter(
+        self: *App,
+        alloc: Allocator,
+        permission_mode: types.PermissionMode,
+        permission_rules: types.PermissionRuleSet,
+        adapter: agent_stream_provider.ProviderAdapter,
+    ) !tool_advertisement.EffectiveToolProjection {
         return self.snapshotGatewayToolProjectionForRules(
             alloc,
             permission_mode,
             permission_rules,
+            adapter,
         );
     }
 
@@ -1751,6 +1790,7 @@ const App = struct {
         alloc: Allocator,
         permission_mode: types.PermissionMode,
         permission_rules: types.PermissionRuleSet,
+        adapter: agent_stream_provider.ProviderAdapter,
     ) !tool_advertisement.EffectiveToolProjection {
         return app_mcp_runtime.buildGatewayToolProjection(&self.mcp, alloc, self.toolAdvertisementSet(), .{
             .permission_mode = permission_mode,
@@ -1758,9 +1798,9 @@ const App = struct {
             .subagent_available = self.session_persistence.subagent_host != null,
             .terminal_available = self.session_persistence.subagent_host != null and
                 tool_dispatch.ToolCapabilities.for_host(host.current()).terminalAvailable(),
-            .provider_tools = self.providerAdapter().provider_tools,
+            .provider_tools = adapter.provider_tools,
             .fx_web_search_installed = host_profile.web_search and
-                self.providerAdapter().web_search != null,
+                adapter.web_search != null,
         });
     }
 
@@ -1769,6 +1809,16 @@ const App = struct {
         admission: subagent_domain.AdmissionSnapshot,
     ) tool_runtime.Context {
         return AgentAppRuntime.toolContextForSubagent(self, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl(), admission);
+    }
+
+    pub fn subagentToolContextForAdmissionAndAdapter(
+        self: *App,
+        admission: subagent_domain.AdmissionSnapshot,
+        adapter: agent_stream_provider.ProviderAdapter,
+    ) tool_runtime.Context {
+        var ctx = self.subagentToolContextForAdmission(admission);
+        ctx.provider_adapter = adapter;
+        return ctx;
     }
 
     pub fn runSubagentChild(
@@ -1932,8 +1982,13 @@ const App = struct {
     }
 
     pub fn startModelCacheWarmup(self: *App) void {
-        const provider = self.selectedModelCatalogProvider() orelse {
+        const adapter = self.selectedProviderAdapter() catch {
             debug_trace.logf("gateway", "model_cache_warmup_skipped reason=unsupported_adapter", .{});
+            return;
+        };
+        self.model_cache.selectAdapter(adapter.kind, adapter.model_descriptors);
+        const provider = adapter.model_catalog orelse {
+            debug_trace.logf("gateway", "model_cache_warmup_skipped reason=catalog_unavailable", .{});
             return;
         };
         if (comptime host_profile.cooperative_agent) {
@@ -1974,20 +2029,56 @@ const App = struct {
     }
 
     pub fn resolvedModelDescriptor(self: *App, model: []const u8) model_capabilities.ModelDescriptor {
-        var descriptor = builtin_gateway.model_descriptor_provider.fallback(model);
-        descriptor.capabilities = self.resolvedModelCapabilities(model);
-        return descriptor;
-    }
-
-    pub fn resolveModelCapabilitiesForRequest(self: *App, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
-        return self.model_cache.resolveForRequest(model, &self.worker.worker_cancel_requested);
+        const profile = self.auth.selectedConnectionProfile() catch return model_catalog.configured_model_descriptor_provider.fallback(model);
+        return self.resolvedModelDescriptorForProfile(profile, model) catch
+            model_catalog.configured_model_descriptor_provider.fallback(model);
     }
 
     pub fn resolveModelDescriptorForRequest(self: *App, model: []const u8) model_capabilities.ResolveError!model_capabilities.ModelDescriptor {
-        var descriptor = builtin_gateway.model_descriptor_provider.fallback(model);
-        descriptor.capabilities = try self.resolveModelCapabilitiesForRequest(model);
-        descriptor.source = .catalog;
-        return descriptor;
+        const profile = self.auth.selectedConnectionProfile() catch
+            return model_catalog.configured_model_descriptor_provider.fallback(model);
+        return self.resolveModelDescriptorForProfileRequest(
+            profile,
+            model,
+        ) catch |err| switch (err) {
+            error.Cancelled => error.Cancelled,
+            else => model_catalog.configured_model_descriptor_provider.fallback(model),
+        };
+    }
+
+    fn resolvedModelDescriptorForProfile(
+        self: *App,
+        profile: connection_registry.Profile,
+        model: []const u8,
+    ) !model_capabilities.ModelDescriptor {
+        const adapter = try self.providerAdapterForProfile(profile);
+        const selected = try self.auth.selectedConnectionProfile();
+        if (!std.mem.eql(u8, profile.id, selected.id)) {
+            return adapter.model_descriptors.fallback(model);
+        }
+        return self.model_cache.availableDescriptorWith(
+            adapter.kind,
+            adapter.model_descriptors,
+            model,
+        );
+    }
+
+    fn resolveModelDescriptorForProfileRequest(
+        self: *App,
+        profile: connection_registry.Profile,
+        model: []const u8,
+    ) !model_capabilities.ModelDescriptor {
+        const adapter = try self.providerAdapterForProfile(profile);
+        const selected = try self.auth.selectedConnectionProfile();
+        if (!std.mem.eql(u8, profile.id, selected.id)) {
+            return adapter.model_descriptors.fallback(model);
+        }
+        return self.model_cache.resolveForRequestWith(
+            adapter.kind,
+            adapter.model_descriptors,
+            model,
+            &self.worker.worker_cancel_requested,
+        );
     }
 
     /// Must be called after init() returns so the loader thread captures
@@ -3448,7 +3539,6 @@ test "native app preserves the built-in tool set without workspace metadata" {
 
 test "interactive route credential resolution keeps the admitted source exact" {
     const adapter_auth = @import("core/gateway/adapter_auth.zig");
-    const connection_registry = @import("core/gateway/connection_registry.zig");
     const Probe = struct {
         calls: usize = 0,
         fallback_reads: usize = 0,

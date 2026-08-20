@@ -4,6 +4,7 @@ const agent_runtime = @import("../agent/agent_runtime.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const route_snapshot = @import("../gateway/route_snapshot.zig");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
+const gateway_schema = @import("../tooling/gateway_schema.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const file_mutation = @import("../tooling/file_mutation.zig");
@@ -17,7 +18,6 @@ const model_catalog = @import("../mcp/model_catalog.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
 const execution_memory = @import("../agent/execution_memory.zig");
-const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const io_mod = @import("../shared/io.zig");
 const session_codec = @import("../session/session_codec.zig");
 const types = @import("../shared/types.zig");
@@ -36,7 +36,7 @@ pub const Config = struct {
     model_prompt_overlay: ?[]const u8 = null,
     skills_prompt_section: []const u8 = "",
     explicit_skills_prompt_section: []const u8 = "",
-    gateway_tools_json: []const u8,
+    model_tools: []const gateway_schema.FunctionSchema,
     provider_tools: []const agent_stream_provider.ProviderToolAdvertisement = &.{},
     custom_tool_guidance: []const u8 = "",
     context_registry: context_contract.Registry,
@@ -185,7 +185,7 @@ pub fn run(
             .explicit_skills_prompt_section = config.explicit_skills_prompt_section,
             .gateway_retry_count = config.tool_context.gateway_retry_count,
             .gateway_chat_url = config.tool_context.gateway_chat_url,
-            .gateway_tools_json = config.gateway_tools_json,
+            .model_tools = config.model_tools,
             .provider_tools = config.provider_tools,
             .custom_tool_guidance = config.custom_tool_guidance,
             .agent_step_limit = config.tool_context.agent_step_limit,
@@ -257,7 +257,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .push_system_notice = pushLiveNotice,
         .push_route_recovery_status = pushLiveRouteRecoveryStatus,
         .push_command_output_complete = pushLiveCommandOutputComplete,
-        .push_http_error = captureHttpError,
+        .push_provider_failure = captureProviderFailure,
         .resolve_route_credential = resolveRouteCredential,
         .format_tool_execution_error = formatToolExecutionError,
         .report_usage = reportUsage,
@@ -633,22 +633,19 @@ fn pushLiveRouteRecoveryStatus(
     context.turn.appendLiveEvent(.{ .route_recovery_status = status });
 }
 
-fn captureHttpError(
+fn captureProviderFailure(
     raw: *anyopaque,
-    status: std.http.Status,
+    category: agent_stream_provider.StreamFailure.Category,
+    _: ?u16,
     detail: []const u8,
     _: ?types.CredentialSource,
 ) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
-    const formatted = try gateway_error_format.formatHttpErrorMessage(
-        context.turn.alloc,
-        status,
-        detail,
-    );
+    const formatted = try std.fmt.allocPrint(context.turn.alloc, "{s}: {s}", .{ @tagName(category), detail });
     defer context.turn.alloc.free(formatted);
     const redacted = try execution_memory.redactText(context.turn.alloc, formatted);
     defer context.turn.alloc.free(redacted);
-    try context.turn.setFailureDiagnostic("provider_http_error", redacted);
+    try context.turn.setFailureDiagnostic("provider_failure", redacted);
 }
 
 fn pushLiveEvent(raw: *anyopaque, event: worker_runtime.WorkerEvent) !void {

@@ -8,7 +8,7 @@ const credentials = @import("../auth/credentials.zig");
 const host = @import("../hosts/host.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const stream_provider = if (builtin.is_test) @import("../agent/stream_provider.zig") else struct {};
-const adapter_auth = if (builtin.is_test) @import("../gateway/adapter_auth.zig") else struct {};
+const adapter_auth = @import("../gateway/adapter_auth.zig");
 const adapter_registry = @import("../gateway/adapter_registry.zig");
 const input_appearance = @import("../config/input_appearance.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -432,9 +432,8 @@ pub fn loadCatalogStartupStateWithRegistry(
     return state;
 }
 
-pub fn loadStartupStatus(
+pub fn loadStartupStatusWithoutCredentials(
     alloc: Allocator,
-    secret_store: host.SecretStore,
     default_model: []const u8,
     default_agent_step_limit: usize,
 ) !StartupStatus {
@@ -449,21 +448,16 @@ pub fn loadStartupStatus(
     const selected_model = try loadStartupStatusModel(alloc, default_model, settings.model);
     errdefer if (selected_model.owned) |model| alloc.free(model);
 
-    var auth_status = try auth_runtime.loadStatusSnapshot(alloc, secret_store, settings.credential_source);
-    errdefer auth_status.deinit(alloc);
-
     const result = StartupStatus{
         .workspace_root = workspace_root,
         .selected_model = selected_model.value,
         .owned_selected_model = selected_model.owned,
-        .auth = auth_status,
         .permission_mode = loadPermissionMode(settings.permission_mode),
         .sandbox_backend = sandbox.backendFromConfig(settings.sandbox),
         .agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps),
         .update_channel = settings.update_channel orelse .stable,
         .config_diagnostics = detailed.diagnostics,
     };
-    auth_status.owned_team = null;
     detailed.diagnostics = &.{};
     return result;
 }
@@ -521,6 +515,50 @@ fn credentialSourceFromReference(reference: []const u8) !?credentials.Source {
 
 pub fn resolveConnectionCredential(
     alloc: Allocator,
+    registry: adapter_registry.AdapterRegistry,
+    secret_store: host.SecretStore,
+    profile: connection_registry.Profile,
+    mode: credentials.LoadMode,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) !credentials.Resolution {
+    const auth = try registry.resolveAuthForProfile(profile);
+    const exact_source = !std.mem.eql(u8, profile.credential_ref, "automatic");
+    const acquisition = try auth.acquire(alloc, .{
+        .profile = profile,
+        .host = .{ .secret_store = secret_store },
+        .mode = switch (mode) {
+            .stored => .stored,
+            .refresh_if_needed => .if_needed,
+        },
+        .source_resolution = if (exact_source) .exact else .allow_fallback,
+        .current_source_id = if (exact_source) profile.credential_ref else null,
+        .cancel_flag = cancel_flag,
+    });
+    switch (acquisition) {
+        .acquired => |value| {
+            var normalized = value;
+            defer normalized.deinit(alloc);
+            if (exact_source and !std.mem.eql(u8, normalized.source.id, profile.credential_ref)) {
+                return error.CredentialSourceMismatch;
+            }
+            return .{ .credential = auth_runtime.takeAdapterCredential(&normalized) orelse
+                return error.InvalidCredentialReference };
+        },
+        .missing => |status| return .{ .stored_key_status = switch (status) {
+            .not_attempted => .not_attempted,
+            .not_found => .not_found,
+            .unavailable => .unavailable,
+        } },
+        .failed => |failure| return switch (failure.category) {
+            .configuration => error.InvalidCredentialReference,
+            else => error.CredentialAcquisitionFailed,
+        },
+        .cancelled => return error.Cancelled,
+    }
+}
+
+fn resolveLegacyConnectionCredential(
+    alloc: Allocator,
     transport: oauth_transport.Provider,
     secret_store: host.SecretStore,
     profile: connection_registry.Profile,
@@ -549,7 +587,7 @@ fn loadSelectedConnectionCredential(
     mode: CredentialLoadMode,
 ) !void {
     const connections = &state.connections.?;
-    const resolution = resolveConnectionCredential(
+    const resolution = resolveLegacyConnectionCredential(
         alloc,
         transport,
         secret_store,
@@ -688,7 +726,9 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         cfg.connection_seed,
     );
     errdefer state.deinit(cfg.alloc);
-    try state.normalizeModels(cfg.alloc, cfg.model_descriptors);
+    const profile = state.connections.?.selectedProfile();
+    const adapter = try cfg.adapter_registry.resolveProfile(profile);
+    try state.normalizeModels(cfg.alloc, adapter.model_descriptors);
 
     state.credential_onboarding_skipped = credentialOnboardingDisabled();
 
@@ -2352,6 +2392,121 @@ test "registry startup preserves invalid credential references as configuration 
         connection_registry.DisconnectReason.invalid_credential_reference,
         state.connections.?.selectedProfile().auth.disconnected,
     );
+}
+
+test "connection credential resolution is exact and isolated after profile selection" {
+    const Probe = struct {
+        calls: usize = 0,
+        exact_calls: usize = 0,
+        saw_current_source: bool = false,
+        outcome: enum { acquired, mismatched, missing, failed } = .acquired,
+
+        fn acquire(raw: *const anyopaque, alloc: Allocator, request: adapter_auth.Request) Allocator.Error!adapter_auth.Acquisition {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            self.exact_calls += @intFromBool(request.source_resolution == .exact);
+            self.saw_current_source = std.mem.eql(u8, request.current_source_id orelse "", "fx_login");
+            return switch (self.outcome) {
+                .acquired => .{ .acquired = .{
+                    .secret_bytes = try alloc.dupe(u8, "selected-secret"),
+                    .source = .{ .id = "fx_login", .label = "selected login", .refreshable = true },
+                    .catalog_access = .authenticated,
+                } },
+                .mismatched => .{ .acquired = .{
+                    .secret_bytes = try alloc.dupe(u8, "wrong-source-secret"),
+                    .source = .{ .id = "stored_key", .label = "wrong source", .refreshable = false },
+                    .catalog_access = .authenticated,
+                } },
+                .missing => .{ .missing = .unavailable },
+                .failed => .{ .failed = .{ .category = .unavailable } },
+            };
+        }
+    };
+    var selected: Probe = .{};
+    var peer: Probe = .{};
+    const adapters = [_]stream_provider.ProviderAdapter{
+        .{
+            .kind = "selected",
+            .auth = .{ .kind = "selected", .context = &selected, .acquire_fn = Probe.acquire },
+            .stream_fn = stream_provider.unavailable_adapter.stream_fn,
+        },
+        .{
+            .kind = "peer",
+            .auth = .{ .kind = "peer", .context = &peer, .acquire_fn = Probe.acquire },
+            .stream_fn = stream_provider.unavailable_adapter.stream_fn,
+        },
+    };
+    const registry = try adapter_registry.AdapterRegistry.init(&adapters);
+    const profile = connection_registry.Profile{
+        .id = @constCast("selected"),
+        .display_name = @constCast("Selected"),
+        .adapter_id = @constCast("selected"),
+        .endpoint = null,
+        .protocol = null,
+        .credential_ref = @constCast("fx_login"),
+        .remembered_model = @constCast("model"),
+        .internal_models = .{},
+    };
+
+    var acquired = (try resolveConnectionCredential(
+        std.testing.allocator,
+        registry,
+        host.unavailable_secret_store,
+        profile,
+        .refresh_if_needed,
+        null,
+    )).credential.?;
+    defer acquired.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("selected-secret", acquired.token);
+    try std.testing.expectEqual(@as(usize, 1), selected.calls);
+    try std.testing.expectEqual(selected.calls, selected.exact_calls);
+    try std.testing.expect(selected.saw_current_source);
+    try std.testing.expectEqual(@as(usize, 0), peer.calls);
+
+    selected.outcome = .mismatched;
+    try std.testing.expectError(error.CredentialSourceMismatch, resolveConnectionCredential(
+        std.testing.allocator,
+        registry,
+        host.unavailable_secret_store,
+        profile,
+        .refresh_if_needed,
+        null,
+    ));
+
+    selected.outcome = .missing;
+    const missing = try resolveConnectionCredential(
+        std.testing.allocator,
+        registry,
+        host.unavailable_secret_store,
+        profile,
+        .refresh_if_needed,
+        null,
+    );
+    try std.testing.expect(missing.credential == null);
+    try std.testing.expectEqual(credentials.StoredKeyReadStatus.unavailable, missing.stored_key_status);
+
+    selected.outcome = .failed;
+    try std.testing.expectError(error.CredentialAcquisitionFailed, resolveConnectionCredential(
+        std.testing.allocator,
+        registry,
+        host.unavailable_secret_store,
+        profile,
+        .refresh_if_needed,
+        null,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), peer.calls);
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, resolveConnectionCredential(
+        std.testing.allocator,
+        registry,
+        host.unavailable_secret_store,
+        profile,
+        .refresh_if_needed,
+        &cancelled,
+    ));
+    try std.testing.expectEqual(@as(usize, 4), selected.calls);
+    try std.testing.expectEqual(@as(usize, 0), peer.calls);
 }
 
 test "loadStartupState preserves exact fast model defaults" {

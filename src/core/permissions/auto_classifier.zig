@@ -91,7 +91,7 @@ pub const FileMutationAction = struct {
 pub const ToolAction = struct {
     tool_name: []const u8,
     arguments_json: []const u8,
-    schema_json: ?[]const u8 = null,
+    descriptor: ?gateway_schema.FunctionSchema = null,
     schema_required: bool = false,
 };
 
@@ -361,8 +361,6 @@ fn reviewWithAdapter(
         return constructionFailure(err);
     defer evidence.deinit(alloc);
     if (!evidence.action_complete) return .invalid;
-    const tools_json = toolsJsonAlloc(alloc) catch |err| return constructionFailure(err);
-    defer alloc.free(tools_json);
     const instruction = buildReviewInstruction(
         alloc,
         review_turn,
@@ -398,8 +396,7 @@ fn reviewWithAdapter(
             .tenant = input.tenant,
             .model = reviewer_model,
             .model_request = .{
-                .model = reviewer_model,
-                .serialized_tools = tools_json,
+                .tools = &.{function_schema},
                 .messages = messages,
                 .tool_choice = .auto,
                 .require_tool_call = true,
@@ -548,11 +545,16 @@ fn serializeEvidence(
             try out.writer.writeAll("action: tool\n");
             try writeBoundedField(&out.writer, alloc, "tool", tool.tool_name, max_action_field_bytes, &action_complete);
             try writeBoundedField(&out.writer, alloc, "arguments_json", tool.arguments_json, max_action_field_bytes, &action_complete);
-            if (tool.schema_json) |schema| {
-                try writeBoundedField(&out.writer, alloc, "schema_json", schema, max_action_field_bytes, &action_complete);
+            if (tool.descriptor) |descriptor| {
+                var schema_out: std.Io.Writer.Allocating = .init(alloc);
+                defer schema_out.deinit();
+                try gateway_schema.writeInputSchema(alloc, &schema_out.writer, descriptor);
+                try writeBoundedField(&out.writer, alloc, "schema_name", descriptor.name, max_action_field_bytes, &action_complete);
+                try writeBoundedField(&out.writer, alloc, "schema_description", descriptor.description, max_action_field_bytes, &action_complete);
+                try writeBoundedField(&out.writer, alloc, "input_schema", schema_out.written(), max_action_field_bytes, &action_complete);
             } else if (tool.schema_required) {
                 action_complete = false;
-                try out.writer.writeAll("schema_json: [evidence unavailable]\n");
+                try out.writer.writeAll("input_schema: [evidence unavailable]\n");
             }
         },
         .sandbox_widening => |widening| {
@@ -877,12 +879,6 @@ const function_schema: gateway_schema.FunctionSchema = .{
     },
 };
 
-fn toolsJsonAlloc(alloc: std.mem.Allocator) ![]u8 {
-    const schema_json = try gateway_schema.builtinFunctionSchemaJsonAlloc(alloc, function_schema);
-    defer alloc.free(schema_json);
-    return std.fmt.allocPrint(alloc, "[{s}]", .{schema_json});
-}
-
 fn parseCompletion(alloc: std.mem.Allocator, completion: types.GatewayCompletion) !ParseOutcome {
     if (completion.content) |content| {
         if (std.mem.trim(u8, content, " \t\r\n").len > 0) return .invalid;
@@ -936,16 +932,19 @@ fn parseArguments(alloc: std.mem.Allocator, arguments_json: []const u8) !ParseOu
 }
 
 test "automatic review schema is strict and has no confidence field" {
-    const alloc = std.testing.allocator;
-    const tools_json = try toolsJsonAlloc(alloc);
-    defer alloc.free(tools_json);
-
-    try std.testing.expect(std.mem.find(u8, tools_json, "\"name\":\"permission_decision\"") != null);
-    try std.testing.expect(std.mem.find(u8, tools_json, "\"enum\":[\"allow\",\"ask\"]") != null);
-    try std.testing.expect(std.mem.find(u8, tools_json, "\"risk\"") != null);
-    try std.testing.expect(std.mem.find(u8, tools_json, "\"authorization\"") != null);
-    try std.testing.expect(std.mem.find(u8, tools_json, "confidence") == null);
-    try std.testing.expect(std.mem.find(u8, tools_json, "\"additionalProperties\":false") != null);
+    try function_schema.validate();
+    try std.testing.expectEqualStrings(tool_name, function_schema.name);
+    try std.testing.expectEqual(@as(?bool, false), function_schema.input_schema.additional_properties);
+    try std.testing.expectEqual(@as(usize, 4), function_schema.input_schema.properties.len);
+    const decision_shape = function_schema.input_schema.properties[2].shape.?;
+    switch (decision_shape.*) {
+        .enum_values => |values| try std.testing.expectEqualSlices(
+            []const u8,
+            &.{ "allow", "ask" },
+            values,
+        ),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "automatic reviewer defaults to the tested fifteen second budget" {

@@ -19,7 +19,6 @@ const file_mutation = @import("../tooling/file_mutation.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
-const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const io_mod = @import("../shared/io.zig");
 const session_runtime = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
@@ -265,12 +264,20 @@ test "full diff formatter renders unchanged review elisions" {
 pub fn Bindings(comptime App: type) type {
     return struct {
         pub fn agentRuntimeDeps(app: *App) agent_runtime.AgentRuntimeDeps {
+            const adapter = if (comptime @hasDecl(App, "providerAdapter"))
+                app.providerAdapter()
+            else
+                agent_stream_provider.unavailable_adapter;
+            return agentRuntimeDepsForAdapter(app, adapter);
+        }
+
+        pub fn agentRuntimeDepsForAdapter(
+            app: *App,
+            adapter: agent_stream_provider.ProviderAdapter,
+        ) agent_runtime.AgentRuntimeDeps {
             var deps: agent_runtime.AgentRuntimeDeps = .{
                 .ctx = @ptrCast(app),
-                .provider_adapter = if (comptime @hasDecl(App, "providerAdapter"))
-                    app.providerAdapter()
-                else
-                    agent_stream_provider.unavailable_adapter,
+                .provider_adapter = adapter,
                 .agent_stream_provider = if (comptime @hasDecl(App, "agentStreamProvider"))
                     app.agentStreamProvider()
                 else
@@ -317,7 +324,7 @@ pub fn Bindings(comptime App: type) type {
                 .push_context_notice = agentPushContextNotice,
                 .push_route_recovery_status = agentPushRouteRecoveryStatus,
                 .push_command_output_complete = agentPushCommandOutputComplete,
-                .push_http_error = agentPushHttpError,
+                .push_provider_failure = agentPushProviderFailure,
                 .refresh_gateway_credential = if (comptime @hasField(App, "auth"))
                     refreshGatewayCredential
                 else
@@ -378,15 +385,28 @@ pub fn Bindings(comptime App: type) type {
         fn refreshGatewayCredential(
             raw_ctx: *anyopaque,
             alloc: std.mem.Allocator,
+            route: *const route_snapshot.RouteSnapshot,
             source: credentials.Source,
             mode: auth_runtime.CredentialRefreshMode,
         ) !?[]u8 {
             const app: *App = @ptrCast(@alignCast(raw_ctx));
             if (source != .fx_login) return null;
-            return app.auth.refreshSelectedCredential(alloc, switch (mode) {
+            _ = try app.auth.adapter_registry.resolveRoute(route);
+            var profile = try app.auth.connectionProfile(route.connection_id);
+            if (!std.mem.eql(u8, profile.adapter_id, route.adapter_kind) or
+                !std.mem.eql(u8, route.credential_ref, @tagName(source)))
+            {
+                return error.RouteCredentialMismatch;
+            }
+            profile.credential_ref = @constCast(route.credential_ref);
+            var credential = try app.auth.resolveAdmittedProfileCredential(alloc, profile, switch (mode) {
                 .if_needed => .if_needed,
                 .force => .force,
-            });
+            }, @tagName(source));
+            defer credential.deinit(alloc);
+            const token = credential.token;
+            credential.token = &.{};
+            return token;
         }
 
         pub fn modelCapabilityResolver(app: *App) model_capabilities.Resolver {
@@ -936,16 +956,20 @@ pub fn Bindings(comptime App: type) type {
             try app_worker_runtime.Runtime(App).pushCommandOutputComplete(app, lifecycle_id);
         }
 
-        fn agentPushHttpError(ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
+        fn agentPushProviderFailure(ctx: *anyopaque, category: agent_stream_provider.StreamFailure.Category, _: ?u16, detail: []const u8, credential_source: ?types.CredentialSource) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            const auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
+            const auth_failure = auth_runtime.FailureSnapshot.fromHttp(switch (category) {
+                .authentication => .unauthorized,
+                .authorization => .forbidden,
+                else => .ok,
+            }, credential_source);
             if (auth_failure != null) {
                 try app_worker_runtime.Runtime(App).pushEvent(app, .authentication_failed);
             }
             const message = if (auth_failure) |failure|
                 try failure.renderText(std.heap.c_allocator)
             else
-                try gateway_error_format.formatHttpErrorMessage(std.heap.c_allocator, status, detail);
+                try std.fmt.allocPrint(std.heap.c_allocator, "{s}", .{if (detail.len > 0) detail else @tagName(category)});
             defer std.heap.c_allocator.free(message);
             const label = if (auth_failure != null)
                 try std.fmt.allocPrint(
@@ -1820,14 +1844,15 @@ test "agent deps forward app callbacks through core types" {
     try std.testing.expectEqualStrings("tool:Boom", formatted);
 }
 
-test "unauthorized HTTP errors publish authentication failure before status text" {
+test "authentication failures publish authentication failure before status text" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
     const deps = Bindings(FakeApp).agentRuntimeDeps(&app);
-    try deps.push_http_error(
+    try deps.push_provider_failure(
         deps.ctx,
-        .unauthorized,
+        .authentication,
+        401,
         "invalid credential",
         .ai_gateway_api_key,
     );

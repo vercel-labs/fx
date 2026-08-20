@@ -52,6 +52,42 @@ pub const FunctionSchema = struct {
     name: []const u8,
     description: []const u8,
     input_schema: ObjectSchema = .{},
+    dynamic_input_schema: ?std.json.Value = null,
+
+    pub fn validate(self: FunctionSchema) error{InvalidToolSchema}!void {
+        if (std.mem.trim(u8, self.name, " \t\r\n").len == 0) return error.InvalidToolSchema;
+        if (self.dynamic_input_schema) |value| {
+            if (value != .object) return error.InvalidToolSchema;
+            const schema_type = value.object.get("type") orelse return error.InvalidToolSchema;
+            if (schema_type != .string or !std.mem.eql(u8, schema_type.string, "object")) {
+                return error.InvalidToolSchema;
+            }
+            if (value.object.get("properties")) |properties| {
+                if (properties != .object) return error.InvalidToolSchema;
+            }
+            return;
+        }
+        if (self.input_schema.min_properties != no_u32_bound and
+            self.input_schema.max_properties != no_u32_bound and
+            self.input_schema.min_properties > self.input_schema.max_properties)
+        {
+            return error.InvalidToolSchema;
+        }
+        for (self.input_schema.properties, 0..) |property, index| {
+            if (std.mem.trim(u8, property.name, " \t\r\n").len == 0) return error.InvalidToolSchema;
+            for (self.input_schema.properties[0..index]) |prior| {
+                if (std.mem.eql(u8, prior.name, property.name)) return error.InvalidToolSchema;
+            }
+        }
+        for (self.input_schema.required, 0..) |required, index| {
+            for (self.input_schema.required[0..index]) |prior| {
+                if (std.mem.eql(u8, prior, required)) return error.InvalidToolSchema;
+            }
+            for (self.input_schema.properties) |property| {
+                if (std.mem.eql(u8, property.name, required)) break;
+            } else return error.InvalidToolSchema;
+        }
+    }
 };
 
 test "static property representation stays within the measured size budget" {
@@ -78,52 +114,23 @@ fn writeCappedDescriptionJsonString(
     try std.json.Stringify.value(capped_description, .{}, writer);
 }
 
-/// Opens the gateway's flattened function-tool envelope, up to the
-/// "inputSchema" value. The caller writes the schema and the closing brace.
-fn writeFunctionSchemaOpen(
-    writer: *std.Io.Writer,
-    name: []const u8,
-    description: []const u8,
-) !void {
-    try writer.writeAll("{\"type\":\"function\",\"name\":");
-    try std.json.Stringify.value(name, .{}, writer);
-    try writer.writeAll(",\"description\":");
-    try std.json.Stringify.value(description, .{}, writer);
-    try writer.writeAll(",\"inputSchema\":");
-}
-
-pub fn writeBuiltinFunctionSchema(
+pub fn writeInputSchema(
     alloc: std.mem.Allocator,
     writer: *std.Io.Writer,
-    schema: FunctionSchema,
+    descriptor: FunctionSchema,
 ) !void {
-    const description = try cappedDescriptionAlloc(alloc, schema.description);
-    defer alloc.free(description);
-    try writeFunctionSchemaOpen(writer, schema.name, description);
-    try writeObjectSchema(alloc, writer, schema.input_schema);
-    try writer.writeByte('}');
+    try descriptor.validate();
+    if (descriptor.dynamic_input_schema) |input_schema| {
+        try std.json.Stringify.value(input_schema, .{}, writer);
+    } else {
+        try writeObjectSchema(alloc, writer, descriptor.input_schema);
+    }
 }
 
-pub fn builtinFunctionSchemaJsonAlloc(alloc: std.mem.Allocator, schema: FunctionSchema) ![]u8 {
+pub fn inputSchemaJsonAlloc(alloc: std.mem.Allocator, schema: FunctionSchema) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeBuiltinFunctionSchema(alloc, &out.writer, schema);
-    return try out.toOwnedSlice();
-}
-
-/// Envelope for a dynamic (MCP) tool whose input schema is already rendered
-/// JSON. Caller owns the returned slice.
-pub fn dynamicFunctionSchemaJsonAlloc(
-    alloc: std.mem.Allocator,
-    name: []const u8,
-    description: []const u8,
-    input_schema_json: []const u8,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try writeFunctionSchemaOpen(&out.writer, name, description);
-    try out.writer.writeAll(input_schema_json);
-    try out.writer.writeByte('}');
+    try writeInputSchema(alloc, &out.writer, schema);
     return try out.toOwnedSlice();
 }
 
@@ -289,12 +296,12 @@ test "nullable properties preserve concrete constraints and add one null branch"
         },
     };
 
-    const json = try builtinFunctionSchemaJsonAlloc(alloc, schema);
+    const json = try inputSchemaJsonAlloc(alloc, schema);
     defer alloc.free(json);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
     defer parsed.deinit();
 
-    const properties = parsed.value.object.get("inputSchema").?.object.get("properties").?.object;
+    const properties = parsed.value.object.get("properties").?.object;
     const choice = properties.get("choice").?.object;
     try std.testing.expectEqualStrings(
         "Concrete choice. Set null when unused.",
@@ -330,7 +337,7 @@ test "nested object schema serializes exact property bounds" {
         .input_schema = nested,
     };
 
-    const json = try builtinFunctionSchemaJsonAlloc(alloc, schema);
+    const json = try inputSchemaJsonAlloc(alloc, schema);
     defer alloc.free(json);
 
     try std.testing.expect(std.mem.find(u8, json, "\"minProperties\":1") != null);
@@ -364,12 +371,12 @@ test "object alternatives serialize as exclusive object branches" {
         .input_schema = .{ .one_of = &alternatives },
     };
 
-    const json = try builtinFunctionSchemaJsonAlloc(alloc, schema);
+    const json = try inputSchemaJsonAlloc(alloc, schema);
     defer alloc.free(json);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
     defer parsed.deinit();
 
-    const input_schema = parsed.value.object.get("inputSchema").?.object;
+    const input_schema = parsed.value.object;
     try std.testing.expect(input_schema.get("type") == null);
     try std.testing.expect(input_schema.get("properties") == null);
     const one_of = input_schema.get("oneOf").?.array.items;
@@ -400,7 +407,7 @@ test "object alternatives reject contradictory ordinary object metadata" {
 
     try std.testing.expectError(
         error.InvalidObjectSchema,
-        builtinFunctionSchemaJsonAlloc(std.testing.allocator, schema),
+        inputSchemaJsonAlloc(std.testing.allocator, schema),
     );
 }
 
@@ -415,7 +422,7 @@ test "cappedDescriptionAlloc appends explicit truncation marker" {
     try std.testing.expect(std.mem.endsWith(u8, capped, truncation_marker));
 }
 
-test "builtinFunctionSchemaJsonAlloc serializes strings and object schema" {
+test "inputSchemaJsonAlloc serializes strings and object schema" {
     const alloc = std.testing.allocator;
     const schema = FunctionSchema{
         .name = "read_file",
@@ -428,18 +435,17 @@ test "builtinFunctionSchemaJsonAlloc serializes strings and object schema" {
         },
     };
 
-    const json = try builtinFunctionSchemaJsonAlloc(alloc, schema);
+    const json = try inputSchemaJsonAlloc(alloc, schema);
     defer alloc.free(json);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
     defer parsed.deinit();
 
-    try std.testing.expectEqualStrings("read_file", parsed.value.object.get("name").?.string);
-    try std.testing.expect(std.mem.find(u8, json, "\\\"quoted\\\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "read_file") == null);
     try std.testing.expect(std.mem.find(u8, json, "\\\"with quotes\\\"") != null);
 }
 
-test "builtinFunctionSchemaJsonAlloc serializes every supported property shape" {
+test "inputSchemaJsonAlloc serializes every supported property shape" {
     const alloc = std.testing.allocator;
     const object_value_schema = ObjectSchema{
         .properties = &.{.{ .name = "name", .json_type = .string }},
@@ -483,12 +489,12 @@ test "builtinFunctionSchemaJsonAlloc serializes every supported property shape" 
         },
     };
 
-    const json = try builtinFunctionSchemaJsonAlloc(alloc, schema);
+    const json = try inputSchemaJsonAlloc(alloc, schema);
     defer alloc.free(json);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
     defer parsed.deinit();
 
-    const input_schema = parsed.value.object.get("inputSchema").?.object;
+    const input_schema = parsed.value.object;
     try std.testing.expectEqualStrings("object", input_schema.get("type").?.string);
     try std.testing.expectEqual(false, input_schema.get("additionalProperties").?.bool);
     try std.testing.expectEqual(@as(i64, 6), input_schema.get("minProperties").?.integer);
@@ -532,18 +538,55 @@ test "builtinFunctionSchemaJsonAlloc serializes every supported property shape" 
     );
 }
 
-test "dynamicFunctionSchemaJsonAlloc wraps rendered input schema in the flattened envelope" {
+test "inputSchemaJsonAlloc preserves a valid dynamic schema" {
     const alloc = std.testing.allocator;
-    const description = ("d" ** (description_max_bytes + 1)) ++ "tail";
-    const json = try dynamicFunctionSchemaJsonAlloc(alloc, "mcp_fs_read", description, "{\"type\":\"object\",\"properties\":{}}");
+    var source = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}",
+        .{},
+    );
+    defer source.deinit();
+    const json = try inputSchemaJsonAlloc(alloc, .{
+        .name = "mcp_fs_read",
+        .description = "Read a file",
+        .dynamic_input_schema = source.value,
+    });
     defer alloc.free(json);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
     defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("properties").?.object.get("path") != null);
+}
 
-    try std.testing.expectEqualStrings("function", parsed.value.object.get("type").?.string);
-    try std.testing.expectEqualStrings("mcp_fs_read", parsed.value.object.get("name").?.string);
-    try std.testing.expectEqualStrings(description, parsed.value.object.get("description").?.string);
-    try std.testing.expect(parsed.value.object.get("inputSchema").?.object.get("properties") != null);
-    try std.testing.expect(parsed.value.object.get("function") == null);
+test "function schema rejects invalid fixed and dynamic object contracts" {
+    try std.testing.expectError(error.InvalidToolSchema, (FunctionSchema{
+        .name = "",
+        .description = "empty name",
+    }).validate());
+    try std.testing.expectError(error.InvalidToolSchema, (FunctionSchema{
+        .name = "duplicate",
+        .description = "duplicate property",
+        .input_schema = .{ .properties = &.{
+            .{ .name = "path", .json_type = .string },
+            .{ .name = "path", .json_type = .string },
+        } },
+    }).validate());
+    try std.testing.expectError(error.InvalidToolSchema, (FunctionSchema{
+        .name = "missing_required",
+        .description = "missing required property",
+        .input_schema = .{ .required = &.{"path"} },
+    }).validate());
+    try std.testing.expectError(error.InvalidToolSchema, (FunctionSchema{
+        .name = "bad_bounds",
+        .description = "bad object bounds",
+        .input_schema = .{ .min_properties = 2, .max_properties = 1 },
+    }).validate());
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"type\":\"string\"}", .{});
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidToolSchema, (FunctionSchema{
+        .name = "dynamic",
+        .description = "dynamic schema",
+        .dynamic_input_schema = parsed.value,
+    }).validate());
 }

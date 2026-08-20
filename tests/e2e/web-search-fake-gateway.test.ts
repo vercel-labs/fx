@@ -1170,8 +1170,8 @@ describe("web_search Gateway fixture", () => {
           { cwd: root.workspace, env, timeoutMs: TIMEOUT },
         );
         expect(ask.code).toBe(1);
-        expect(JSON.parse(ask.stdout).error).toBe("MissingCredentials");
-        expect(ask.stderr).toContain("Fx needs access to Vercel AI Gateway");
+        expect(JSON.parse(ask.stdout).error).toBe("MissingAdapter");
+        expect(ask.stderr).toBe("");
 
         const initialized = await client.request(
           "initialize",

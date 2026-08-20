@@ -274,8 +274,15 @@ pub const SearchResult = struct {
 };
 
 pub const ToolSchemaResult = union(enum) {
-    selected: Payload,
+    selected: Selected,
     rejected: Payload,
+
+    pub const Selected = struct {
+        name: []u8,
+        description: []u8,
+        input_schema_json: []u8,
+        notice: ?[]u8 = null,
+    };
 
     pub const Payload = struct {
         model_output: []u8,
@@ -283,12 +290,18 @@ pub const ToolSchemaResult = union(enum) {
     };
 
     pub fn deinit(self: *ToolSchemaResult, alloc: Allocator) void {
-        const payload = switch (self.*) {
-            .selected => |value| value,
-            .rejected => |value| value,
-        };
-        alloc.free(payload.model_output);
-        if (payload.notice) |notice| alloc.free(notice);
+        switch (self.*) {
+            .selected => |payload| {
+                alloc.free(payload.name);
+                alloc.free(payload.description);
+                alloc.free(payload.input_schema_json);
+                if (payload.notice) |notice| alloc.free(notice);
+            },
+            .rejected => |payload| {
+                alloc.free(payload.model_output);
+                if (payload.notice) |notice| alloc.free(notice);
+            },
+        }
         self.* = undefined;
     }
 };

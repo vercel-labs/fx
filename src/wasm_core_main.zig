@@ -1,7 +1,9 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const acp_server = @import("acp/server.zig");
+const agent_stream_provider = @import("core/agent/stream_provider.zig");
 const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
+const js_host_auth = @import("core/auth/js_host_auth.zig");
 const background_process_provider = @import("core/execution/background_process_provider.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
@@ -54,17 +56,23 @@ pub fn main(init: std.process.Init) !void {
 const js_host_gateway_provider = gateway_provider.Provider{
     .connection_seed = builtin_gateway.connection_seed,
     .agent_stream = js_host_stream_provider.provider(),
-    .provider_adapter = .{
-        .kind = builtin_gateway.connection_seed.adapter_id,
-        .account_usage = .{ .fetch_fn = fetchCredits },
-        .model_catalog = js_host_model_catalog.provider,
-        .model_descriptors = builtin_gateway.model_descriptor_provider,
-        .legacy_provider = js_host_stream_provider.provider(),
-        .stream_fn = builtin_gateway.provider_adapter.stream_fn,
-    },
+    .provider_adapter = js_host_provider_adapter,
+    .adapter_registry = .{ .adapters = &js_host_adapters },
     .oauth_transport = oauth_transport.unavailable_provider,
     .chat_url = .{ .resolve_fn = resolveChatUrl },
 };
+
+const js_host_provider_adapter = agent_stream_provider.ProviderAdapter{
+    .kind = builtin_gateway.connection_seed.adapter_id,
+    .auth = builtin_gateway.auth_provider_for_transport(&js_host_auth.oauth_provider),
+    .account_usage = .{ .fetch_fn = fetchCredits },
+    .model_catalog = js_host_model_catalog.provider,
+    .model_descriptors = builtin_gateway.model_descriptor_provider,
+    .legacy_provider = js_host_stream_provider.provider(),
+    .stream_fn = builtin_gateway.streamVercelAdapter,
+};
+
+const js_host_adapters = [_]agent_stream_provider.ProviderAdapter{js_host_provider_adapter};
 
 fn resolveChatUrl(_: ?*anyopaque, fallback: []const u8) []const u8 {
     return fallback;
