@@ -490,6 +490,7 @@ const Runtime = struct {
     fn authProvider(self: *Runtime) adapter_auth.Provider {
         return .{
             .kind = builtin_gateway.connection_seed.adapter_id,
+            .auth_service_label = "Vercel",
             .context = self,
             .acquire_fn = acquireCredential,
             .status_fn = credentialStatus,
@@ -505,10 +506,15 @@ const Runtime = struct {
         if (self.credential.len == 0) return .{ .missing = .not_found };
         const source = builtin_gateway.credentialOverrideSource(request.profile.credential_ref) catch
             return .{ .failed = .{ .category = .configuration } };
+        const credential = try alloc.dupe(u8, self.credential);
         return .{ .acquired = .{
-            .secret_bytes = try alloc.dupe(u8, self.credential),
+            .secret_bytes = credential,
             .source = source,
-            .catalog_access = .authenticated,
+            .catalog_access = .{ .authenticated = .{
+                .source = source,
+                .credential = credential,
+                .team_context = null,
+            } },
         } };
     }
 

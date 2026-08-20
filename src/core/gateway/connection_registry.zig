@@ -203,6 +203,25 @@ pub const Snapshot = struct {
     profiles: []const Profile,
 };
 
+/// Borrowed semantic identity for one in-flight authentication operation.
+/// Display and model fields are intentionally excluded because they cannot
+/// retarget credential persistence.
+pub const AuthIdentity = struct {
+    connection_id: []const u8,
+    adapter_id: []const u8,
+    credential_ref: []const u8,
+    endpoint: ?[]const u8,
+    protocol: ?[]const u8,
+};
+
+pub const CredentialReferenceUpdate = union(enum) {
+    unchanged_same_reference,
+    updated,
+    updated_persistence_indeterminate: anyerror,
+    stale_origin,
+    failed_before_commit: anyerror,
+};
+
 /// Owned persisted representation. It contains references and profile metadata,
 /// never credential bytes or live authentication state.
 pub const Stored = struct {
@@ -473,6 +492,77 @@ pub const Runtime = struct {
         try self.commit(&next);
     }
 
+    /// Compare the complete captured auth identity and update only its exact
+    /// origin profile. Definite pre-publication failure leaves the runtime
+    /// untouched; indeterminate persistence publishes the in-memory update to
+    /// match the registry's existing commit rule.
+    pub fn compareAndRememberCredentialReference(
+        self: *Self,
+        identity: AuthIdentity,
+        credential_ref: []const u8,
+    ) CredentialReferenceUpdate {
+        return self.compareAndPublishCredentialReferenceImpl(
+            identity,
+            credential_ref,
+            false,
+        );
+    }
+
+    /// Publishes the canonical snapshot even when the reference already
+    /// matches, allowing a compatibility field outside the registry to be
+    /// removed by the same persistence transaction.
+    pub fn compareAndPublishCredentialReference(
+        self: *Self,
+        identity: AuthIdentity,
+        credential_ref: []const u8,
+    ) CredentialReferenceUpdate {
+        return self.compareAndPublishCredentialReferenceImpl(
+            identity,
+            credential_ref,
+            true,
+        );
+    }
+
+    fn compareAndPublishCredentialReferenceImpl(
+        self: *Self,
+        identity: AuthIdentity,
+        credential_ref: []const u8,
+        publish_same_reference: bool,
+    ) CredentialReferenceUpdate {
+        validateIdentifier(credential_ref) catch |err| return .{ .failed_before_commit = err };
+        const index = self.indexOf(identity.connection_id) orelse return .stale_origin;
+        const current = self.profiles.items[index];
+        if (!std.mem.eql(u8, current.adapter_id, identity.adapter_id) or
+            !std.mem.eql(u8, current.credential_ref, identity.credential_ref) or
+            !optionalStringsEqual(current.endpoint, identity.endpoint) or
+            !optionalStringsEqual(current.protocol, identity.protocol)) return .stale_origin;
+        const same_reference = std.mem.eql(u8, current.credential_ref, credential_ref);
+        if (same_reference and !publish_same_reference) {
+            return .unchanged_same_reference;
+        }
+
+        var next = self.clone() catch |err| return .{ .failed_before_commit = err };
+        defer next.deinit();
+        if (!same_reference) {
+            const replacement = self.alloc.dupe(u8, credential_ref) catch |err|
+                return .{ .failed_before_commit = err };
+            self.alloc.free(next.profiles.items[index].credential_ref);
+            next.profiles.items[index].credential_ref = replacement;
+        }
+        const outcome = self.persistence.write(self.alloc, next.snapshot()) catch |err|
+            return .{ .failed_before_commit = err };
+
+        for (self.profiles.items) |*profile_value| profile_value.deinit(self.alloc);
+        self.profiles.deinit(self.alloc);
+        self.profiles = next.profiles;
+        self.selected_index = next.selected_index;
+        next.profiles = .empty;
+        return switch (outcome) {
+            .committed => .updated,
+            .replaced_indeterminate => |err| .{ .updated_persistence_indeterminate = err },
+        };
+    }
+
     pub fn markConnected(self: *Self, id: []const u8) error{UnknownConnection}!void {
         const index = self.indexOf(id) orelse return error.UnknownConnection;
         self.profiles.items[index].auth = .connected;
@@ -570,6 +660,10 @@ pub fn parseStored(alloc: Allocator, value: std.json.Value) !Stored {
 
 pub fn validate(snapshot_value: Snapshot) !void {
     try validateSnapshot(snapshot_value);
+}
+
+pub fn validateCredentialReference(value: []const u8) !void {
+    try validateIdentifier(value);
 }
 
 fn validateSnapshot(snapshot: Snapshot) !void {

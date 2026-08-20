@@ -2410,12 +2410,20 @@ test "connection credential resolution is exact and isolated after profile selec
                 .acquired => .{ .acquired = .{
                     .secret_bytes = try alloc.dupe(u8, "selected-secret"),
                     .source = .{ .id = "fx_login", .label = "selected login", .refreshable = true },
-                    .catalog_access = .authenticated,
+                    .catalog_access = .{ .authenticated = .{
+                        .source = .{ .id = "fx_login", .label = "selected login", .refreshable = true },
+                        .credential = "selected-secret",
+                        .team_context = null,
+                    } },
                 } },
                 .mismatched => .{ .acquired = .{
                     .secret_bytes = try alloc.dupe(u8, "wrong-source-secret"),
                     .source = .{ .id = "stored_key", .label = "wrong source", .refreshable = false },
-                    .catalog_access = .authenticated,
+                    .catalog_access = .{ .authenticated = .{
+                        .source = .{ .id = "stored_key", .label = "wrong source", .refreshable = false },
+                        .credential = "wrong-source-secret",
+                        .team_context = null,
+                    } },
                 } },
                 .missing => .{ .missing = .unavailable },
                 .failed => .{ .failed = .{ .category = .unavailable } },

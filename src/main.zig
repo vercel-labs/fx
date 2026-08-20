@@ -3557,7 +3557,11 @@ test "interactive route credential resolution keeps the admitted source exact" {
             return .{ .acquired = .{
                 .secret_bytes = try alloc.dupe(u8, "fallback-secret"),
                 .source = .{ .id = "ai_gateway_api_key", .label = "fallback", .refreshable = false },
-                .catalog_access = .authenticated,
+                .catalog_access = .{ .authenticated = .{
+                    .source = .{ .id = "ai_gateway_api_key", .label = "fallback", .refreshable = false },
+                    .credential = "fallback-secret",
+                    .team_context = null,
+                } },
             } };
         }
     };

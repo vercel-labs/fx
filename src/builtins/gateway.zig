@@ -234,13 +234,30 @@ pub fn credentialOverrideSource(reference: []const u8) !adapter_auth.Source {
 
 fn normalizedCatalogAccess(access: credentials.CatalogAccess) adapter_auth.CatalogAccess {
     return switch (access) {
-        .authenticated => .authenticated,
-        .public_only => |value| .{ .public_only = switch (value) {
-            .no_credential => .no_credential,
-            .fx_login_team_required => .tenant_required,
-            .fx_login_refresh_required => .refresh_required,
-            .credential_refresh_failed => .refresh_failed,
-            .authenticated_credential_rejected => .credential_rejected,
+        .authenticated => |value| .{ .authenticated = .{
+            .source = normalizedSource(switch (value.source) {
+                .vercel_oidc_token => .vercel_oidc_token,
+                .ai_gateway_api_key => .ai_gateway_api_key,
+                .fx_login => .fx_login,
+                .stored_key => .stored_key,
+            }),
+            .credential = value.credential,
+            .team_context = value.team_context,
+        } },
+        .public_only => |value| .{ .public_only = .{
+            .reason = switch (value) {
+                .no_credential => .no_credential,
+                .fx_login_team_required => .tenant_required,
+                .fx_login_refresh_required => .refresh_required,
+                .credential_refresh_failed => .refresh_failed,
+                .authenticated_credential_rejected => .credential_rejected,
+            },
+            .source = switch (value) {
+                .no_credential => null,
+                .fx_login_team_required, .fx_login_refresh_required => normalizedSource(.fx_login),
+                .credential_refresh_failed => |source_value| normalizedSource(source_value),
+                .authenticated_credential_rejected => |source_value| normalizedSource(source_value),
+            },
         } },
     };
 }
@@ -359,6 +376,7 @@ fn logoutVercel(
         return .{ .failed = normalizeAuthFailure(err) };
     };
     return .{ .completed = .{
+        .logged_out_source_id = @tagName(credentials.Source.fx_login),
         .session_deleted = result.session_deleted,
         .local_durability_failed = result.local_durability_failed,
         .remote_revocation_failed = result.remote_revocation_failed,
@@ -381,20 +399,24 @@ fn runVercelTeams(
 
 const VercelTeamSelection = struct {
     selection: login_flow.TeamSelection,
+    origin_profile: adapter_auth.AuthProfileIdentity,
     teams: []adapter_auth.Team,
 };
 
 fn takeVercelTeamSelection(
     alloc: Allocator,
     selection: *login_flow.TeamSelection,
+    profile: connection_registry.Profile,
 ) Allocator.Error!adapter_auth.TeamSelection {
     const team_count = selection.teams.items.len;
     const state = try alloc.create(VercelTeamSelection);
     errdefer alloc.destroy(state);
     state.* = .{
         .selection = selection.take(),
+        .origin_profile = try adapter_auth.AuthProfileIdentity.init(alloc, profile),
         .teams = &.{},
     };
+    errdefer state.origin_profile.deinit(alloc);
     errdefer state.selection.deinit(alloc);
     state.teams = try alloc.alloc(adapter_auth.Team, team_count);
     for (state.selection.teams.items, 0..) |team, index| {
@@ -411,34 +433,48 @@ fn takeVercelTeamSelection(
 
 fn selectVercelTeam(raw: ?*anyopaque, alloc: Allocator, index: usize) Allocator.Error!adapter_auth.SelectOutcome {
     const state: *VercelTeamSelection = @ptrCast(@alignCast(raw.?));
-    const selected = state.selection.select(alloc, index) catch |err| {
+    var selected = state.selection.select(alloc, index) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failed = normalizeAuthFailure(err) };
     };
-    return .{ .selected = .{ .id = selected.id, .slug = selected.slug } };
+    errdefer selected.deinit(alloc);
+    const origin_profile = try state.origin_profile.clone(alloc);
+    return .{ .selected = .{
+        .origin_profile = origin_profile,
+        .source = normalizedSource(.fx_login),
+        .id = selected.id,
+        .slug = selected.slug,
+    } };
 }
 
 fn deinitVercelTeamSelection(raw: ?*anyopaque, alloc: Allocator) void {
     const state: *VercelTeamSelection = @ptrCast(@alignCast(raw.?));
     state.selection.deinit(alloc);
+    state.origin_profile.deinit(alloc);
     alloc.free(state.teams);
     alloc.destroy(state);
 }
 
 const VercelSignIn = struct {
     runtime: login_flow.SignInRuntime = .{},
+    origin_profile: adapter_auth.AuthProfileIdentity,
 };
 
 fn startVercelSignIn(
     raw: *const anyopaque,
     alloc: Allocator,
-    _: connection_registry.Profile,
+    profile: connection_registry.Profile,
     _: adapter_auth.AuthHost,
 ) Allocator.Error!adapter_auth.StartSignInOutcome {
     const state = try alloc.create(VercelSignIn);
-    state.* = .{};
+    const origin_profile = adapter_auth.AuthProfileIdentity.init(alloc, profile) catch |err| {
+        alloc.destroy(state);
+        return err;
+    };
+    state.* = .{ .origin_profile = origin_profile };
     const started = state.runtime.start(alloc, vercelTransport(raw)) catch |err| {
         state.runtime.deinit(alloc);
+        state.origin_profile.deinit(alloc);
         alloc.destroy(state);
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (err == error.Cancelled) return .cancelled;
@@ -446,6 +482,7 @@ fn startVercelSignIn(
     };
     if (!started) {
         state.runtime.deinit(alloc);
+        state.origin_profile.deinit(alloc);
         alloc.destroy(state);
         return .busy;
     }
@@ -494,7 +531,11 @@ fn pollVercelSignIn(raw: ?*anyopaque, alloc: Allocator) Allocator.Error!adapter_
         .succeeded => |value| blk: {
             var selection = value;
             defer selection.deinit(alloc);
-            break :blk .{ .succeeded = try takeVercelTeamSelection(alloc, &selection) };
+            break :blk .{ .succeeded = try takeVercelTeamSelection(
+                alloc,
+                &selection,
+                state.origin_profile.profile(),
+            ) };
         },
     };
 }
@@ -507,13 +548,14 @@ fn cancelVercelSignIn(raw: ?*anyopaque, alloc: Allocator) bool {
 fn deinitVercelSignIn(raw: ?*anyopaque, alloc: Allocator) void {
     const state: *VercelSignIn = @ptrCast(@alignCast(raw.?));
     state.runtime.deinit(alloc);
+    state.origin_profile.deinit(alloc);
     alloc.destroy(state);
 }
 
 fn loadVercelTeams(
     raw: *const anyopaque,
     alloc: Allocator,
-    _: connection_registry.Profile,
+    profile: connection_registry.Profile,
     _: adapter_auth.AuthHost,
 ) Allocator.Error!adapter_auth.TeamsOutcome {
     var selection = login_flow.loadTeamSelection(alloc, vercelTransport(raw)) catch |err| {
@@ -522,7 +564,7 @@ fn loadVercelTeams(
         return .{ .failed = normalizeAuthFailure(err) };
     };
     defer selection.deinit(alloc);
-    return .{ .loaded = try takeVercelTeamSelection(alloc, &selection) };
+    return .{ .loaded = try takeVercelTeamSelection(alloc, &selection, profile) };
 }
 
 fn invalidateVercelCredential(
@@ -3864,7 +3906,11 @@ const PeerAuthProbe = struct {
         return .{ .acquired = .{
             .secret_bytes = value,
             .source = .{ .id = "peer_key", .label = "peer key", .refreshable = false },
-            .catalog_access = .authenticated,
+            .catalog_access = .{ .authenticated = .{
+                .source = .{ .id = "peer_key", .label = "peer key", .refreshable = false },
+                .credential = value,
+                .team_context = null,
+            } },
         } };
     }
 };

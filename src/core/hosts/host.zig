@@ -88,6 +88,21 @@ pub const SecretStoreWriteError = std.mem.Allocator.Error || error{
     StoredKeyWriteFailed,
 };
 
+pub const DurableWriteState = enum {
+    unchanged,
+    replaced,
+    indeterminate,
+};
+
+pub const SecretStoreWriteReport = struct {
+    durable_write: DurableWriteState,
+    failure: ?SecretStoreWriteError = null,
+
+    pub fn valid(self: SecretStoreWriteReport) bool {
+        return self.durable_write == .replaced or self.failure != null;
+    }
+};
+
 pub const SecretStore = struct {
     context: ?*anyopaque = null,
     backend_label: []const u8,
@@ -104,6 +119,11 @@ pub const SecretStore = struct {
     store_interactive_fn: *const fn (
         ?*anyopaque,
     ) SecretStoreWriteError!bool,
+    store_with_disposition_fn: *const fn (
+        ?*anyopaque,
+        std.mem.Allocator,
+        []const u8,
+    ) SecretStoreWriteReport = unavailableSecretStoreWriteWithDisposition,
 
     pub fn isDisabled(self: SecretStore) bool {
         return self.is_disabled_fn(self.context);
@@ -133,6 +153,16 @@ pub const SecretStore = struct {
         self: SecretStore,
     ) SecretStoreWriteError!bool {
         return self.store_interactive_fn(self.context);
+    }
+
+    pub fn storeWithDisposition(
+        self: SecretStore,
+        alloc: std.mem.Allocator,
+        value: []const u8,
+    ) SecretStoreWriteReport {
+        const report = self.store_with_disposition_fn(self.context, alloc, value);
+        std.debug.assert(report.valid());
+        return report;
     }
 };
 
@@ -167,6 +197,14 @@ fn unavailableSecretStoreInteractiveWrite(
     _: ?*anyopaque,
 ) SecretStoreWriteError!bool {
     return false;
+}
+
+fn unavailableSecretStoreWriteWithDisposition(
+    _: ?*anyopaque,
+    _: std.mem.Allocator,
+    _: []const u8,
+) SecretStoreWriteReport {
+    return .{ .durable_write = .unchanged, .failure = error.StoredKeyWriteFailed };
 }
 
 pub const ClipboardError = error{CopyFailed};

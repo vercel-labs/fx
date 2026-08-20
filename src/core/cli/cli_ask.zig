@@ -4007,7 +4007,11 @@ test "ask refresh handles every adapter acquisition outcome without fallback" {
                 .acquired => .{ .acquired = .{
                     .secret_bytes = try alloc.dupe(u8, "refreshed-secret"),
                     .source = .{ .id = "fx_login", .label = "test login", .refreshable = true },
-                    .catalog_access = .authenticated,
+                    .catalog_access = .{ .authenticated = .{
+                        .source = .{ .id = "fx_login", .label = "test login", .refreshable = true },
+                        .credential = "refreshed-secret",
+                        .team_context = null,
+                    } },
                 } },
                 .missing => .{ .missing = .not_attempted },
                 .failed => .{ .failed = .{ .category = .unavailable } },

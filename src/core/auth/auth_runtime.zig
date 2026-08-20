@@ -1827,7 +1827,25 @@ const TestTeamSelectionState = struct {
         const team = self.teams[index];
         const id = try alloc.dupe(u8, team.id);
         errdefer alloc.free(id);
-        return .{ .selected = .{ .id = id, .slug = try alloc.dupe(u8, team.slug) } };
+        const slug = try alloc.dupe(u8, team.slug);
+        errdefer alloc.free(slug);
+        const connection_id = try alloc.dupe(u8, "test");
+        errdefer alloc.free(connection_id);
+        const adapter_id = try alloc.dupe(u8, "test_auth");
+        errdefer alloc.free(adapter_id);
+        const credential_ref = try alloc.dupe(u8, "fx_login");
+        return .{ .selected = .{
+            .origin_profile = .{
+                .connection_id = connection_id,
+                .adapter_id = adapter_id,
+                .credential_ref = credential_ref,
+                .endpoint = null,
+                .protocol = null,
+            },
+            .source = .{ .id = "fx_login", .label = "fx login", .refreshable = true },
+            .id = id,
+            .slug = slug,
+        } };
     }
 
     fn deinit(raw: ?*anyopaque, alloc: Allocator) void {
@@ -2973,7 +2991,11 @@ test "auth runtime preserves every adapter acquisition outcome" {
                 .acquired => .{ .acquired = .{
                     .secret_bytes = try alloc.dupe(u8, "adapter-secret"),
                     .source = .{ .id = "ai_gateway_api_key", .label = "test key", .refreshable = false },
-                    .catalog_access = .authenticated,
+                    .catalog_access = .{ .authenticated = .{
+                        .source = .{ .id = "ai_gateway_api_key", .label = "test key", .refreshable = false },
+                        .credential = "adapter-secret",
+                        .team_context = null,
+                    } },
                 } },
                 .missing => .{ .missing = .unavailable },
                 .configuration => .{ .failed = .{ .category = .configuration } },
