@@ -164,14 +164,13 @@ fn captureDelete(
 ) ?change_tracker.FileOperation {
     if (tracker == null) return null;
     const owned_path = std.heap.c_allocator.dupe(u8, path) catch return null;
+    const preimage = capturePreimage(path);
     return .{
         .kind = .delete,
         .path = owned_path,
-        .previous_content = change_tracker.ChangeTracker.captureFileState(
-            std.heap.c_allocator,
-            path,
-        ),
+        .previous_content = preimage.content,
         .timestamp_ms = 0,
+        .preimage_unavailable = preimage.unavailable,
     };
 }
 
@@ -183,15 +182,14 @@ fn captureRename(
     if (tracker == null) return null;
     const owned_old_path = std.heap.c_allocator.dupe(u8, old_path) catch return null;
     const owned_new_path = std.heap.c_allocator.dupe(u8, new_path) catch null;
+    const preimage = capturePreimage(new_path);
     return .{
         .kind = .rename,
         .path = owned_old_path,
-        .previous_content = change_tracker.ChangeTracker.captureFileState(
-            std.heap.c_allocator,
-            new_path,
-        ),
+        .previous_content = preimage.content,
         .new_path = owned_new_path,
         .timestamp_ms = 0,
+        .preimage_unavailable = preimage.unavailable,
     };
 }
 
@@ -201,14 +199,30 @@ fn captureCopy(
 ) ?change_tracker.FileOperation {
     if (tracker == null) return null;
     const owned_path = std.heap.c_allocator.dupe(u8, destination) catch return null;
+    const preimage = capturePreimage(destination);
     return .{
         .kind = .write,
         .path = owned_path,
-        .previous_content = change_tracker.ChangeTracker.captureFileState(
-            std.heap.c_allocator,
-            destination,
-        ),
+        .previous_content = preimage.content,
         .timestamp_ms = 0,
+        .preimage_unavailable = preimage.unavailable,
+    };
+}
+
+const Preimage = struct {
+    content: ?[]u8 = null,
+    unavailable: bool = false,
+};
+
+/// Resolves the preimage an undo record needs. A file proven absent records no content
+/// and stays undoable, because undo reads that as "the tool created this". A file whose
+/// state could not be read records no content either, but is marked unavailable so undo
+/// refuses it instead of deleting a file the tool never created.
+fn capturePreimage(capture_path: []const u8) Preimage {
+    return switch (change_tracker.ChangeTracker.captureFileState(std.heap.c_allocator, capture_path)) {
+        .captured => |content| .{ .content = content },
+        .absent => .{},
+        .unavailable => .{ .unavailable = true },
     };
 }
 
@@ -745,4 +759,41 @@ fn createSymlinkOrSkip(tmp: *std.testing.TmpDir, target_path: []const u8, link_p
         }
         return err;
     };
+}
+
+test "copy over a destination that cannot be captured refuses to undo it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "workspace/source.txt", "small source");
+    {
+        var destination = try tmp.dir.createFile(std.testing.io, "workspace/dest.bin", .{ .truncate = true });
+        defer destination.close(io_mod.getIo());
+        try destination.setLength(io_mod.getIo(), 10 * 1024 * 1024 + 1);
+    }
+
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    var tracker: change_tracker.ChangeTracker = .{};
+    defer tracker.deinit(std.heap.c_allocator);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const input = testInput(arena_state.allocator(), workspace, &tracker);
+
+    _ = try executeCopy(
+        input,
+        testCall("copy_file", "{\"source\":\"source.txt\",\"destination\":\"dest.bin\",\"overwrite\":true}"),
+    );
+
+    // The destination predates the copy, so undo must never treat it as a file the copy created.
+    try std.testing.expectEqual(@as(usize, 1), tracker.stack.items.len);
+    try std.testing.expect(tracker.stack.items[0].preimage_unavailable);
+
+    const undo = tracker.undoLast(std.heap.c_allocator);
+    switch (undo) {
+        .unavailable => |path| std.heap.c_allocator.free(path),
+        else => return error.ExpectedUnavailable,
+    }
+    try std.testing.expect(pathExists(tmp.dir, "workspace/dest.bin"));
 }
