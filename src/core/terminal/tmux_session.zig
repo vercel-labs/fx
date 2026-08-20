@@ -8,6 +8,7 @@ const process_supervisor = @import("../background/process_supervisor.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
+const shell_resolver = @import("shell_resolver.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -996,7 +997,14 @@ pub fn runLauncher(
     defer parsed.deinit();
     try validateLauncherConfig(parsed.value);
     std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), config_path) catch {};
-    try writePrivateFile(parsed.value.bootstrap_path, parsed.value.bootstrap, true);
+    const bootstrap = try shell_resolver.buildPeerBootstrap(
+        alloc,
+        parsed.value.control_path,
+        parsed.value.control_nonce,
+        parsed.value.command_path,
+    );
+    defer alloc.free(bootstrap);
+    try writePrivateFile(parsed.value.bootstrap_path, bootstrap, true);
     defer std.Io.Dir.deleteFileAbsolute(
         io_mod.getIo(),
         parsed.value.bootstrap_path,

@@ -29,9 +29,10 @@ fn productionPathForReexec(alloc: Allocator) ![]u8 {
 
 /// Path another process can use to exec this still-running fx.
 ///
-/// Tmux bootstraps and similar scripts run later, so `/proc/self/exe`
-/// would be the shell, not fx. `/proc/<pid>/exe` stays on this inode
-/// even after the on-disk binary is replaced.
+/// Valid only while *this* process lives. `/proc/self/exe` in a later
+/// shell would be that shell, so callers bake `/proc/<pid>/exe` instead.
+/// Persist that path only from a process that outlives the consumer
+/// (tmux/native launchers), not from a host that recovery can replace.
 pub fn pathForPeerReexec(alloc: Allocator) ![]u8 {
     if (testProductExe()) |path| return alloc.dupe(u8, path);
     return productionPathForPeerReexec(alloc);
@@ -139,6 +140,41 @@ test "linux re-exec still spawns after the on-disk binary is replaced" {
 
     // And this process can always re-exec itself through /proc/self/exe.
     try std.testing.expect(try pathIsOpenable(linux_self_exe));
+}
+
+test "linux peer re-exec path is gone after that process exits" {
+    if (builtin.os.tag != .linux) return;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    const victim = try std.fs.path.join(alloc, &.{ dir, "self-exe-probe" });
+    defer alloc.free(victim);
+
+    try io_mod.copyFileAtomic(alloc, "/bin/sh", victim);
+    try std.Io.Dir.cwd().setFilePermissions(
+        io_mod.getIo(),
+        victim,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{ .follow_symlinks = false },
+    );
+
+    var held = try spawnHeldOpen(victim);
+    var killed = false;
+    defer if (!killed) held.kill(io_mod.getIo());
+    const child_pid = held.id orelse return error.SkipZigTest;
+    const peer_path = try std.fmt.allocPrint(alloc, "/proc/{d}/exe", .{child_pid});
+    defer alloc.free(peer_path);
+    try std.testing.expect(try pathIsOpenable(peer_path));
+
+    // Host recovery kills the original process. A bootstrap that baked this
+    // path can no longer exec it; the launcher that still owns the pane must
+    // bake its own pid instead.
+    held.kill(io_mod.getIo());
+    killed = true;
+    try std.testing.expect(!try pathIsOpenable(peer_path));
 }
 
 /// Starts `path` so it stays alive while the caller removes the on-disk name,
