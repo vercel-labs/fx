@@ -17,7 +17,7 @@
               install -Dm444 LICENSE "$out/share/licenses/fx/LICENSE"
               install -Dm444 THIRD_PARTY_NOTICES.md "$out/share/licenses/fx/THIRD_PARTY_NOTICES.md"
             '';
-            postFixup = "wrapProgram $out/bin/fx --set FX_AUTO_UPGRADE 0";
+            postFixup = "wrapProgram $out/bin/fx --set-default FX_AUTO_UPGRADE 0";
             meta = {
               license = pkgs.lib.licenses.asl20;
               mainProgram = "fx";
