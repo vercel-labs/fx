@@ -18,7 +18,10 @@ const request_timeout_seconds: i64 = 5;
 const socket_mode = 0o600;
 const directory_mode = 0o700;
 const supervisor_name = "supervisor.json";
+const socket_name = "supervisor.sock";
 const jobs_name = "jobs";
+const transport_hash_bytes: usize = 16;
+const transport_hash_context = "fx.daemon.transport.v1\x00";
 
 pub fn isInternalModeRaw(raw_args: []const [*:0]const u8) bool {
     return raw_args.len == 2 and
@@ -39,7 +42,11 @@ pub const Paths = struct {
         errdefer alloc.free(root);
         const jobs = try std.fs.path.join(alloc, &.{ root, jobs_name });
         errdefer alloc.free(jobs);
-        const socket = try std.fs.path.join(alloc, &.{ root, "supervisor.sock" });
+        const uid = if (comptime builtin.os.tag == .linux or builtin.os.tag == .macos)
+            @as(u64, @intCast(std.c.getuid()))
+        else
+            0;
+        const socket = try socketPathForTarget(alloc, builtin.os.tag, root, uid);
         errdefer alloc.free(socket);
         const identity = try std.fs.path.join(alloc, &.{ root, supervisor_name });
         return .{ .root = root, .jobs = jobs, .socket = socket, .identity = identity };
@@ -64,6 +71,54 @@ pub const Paths = struct {
         return .{ .root = root, .jobs = jobs, .socket = socket, .identity = identity };
     }
 };
+
+fn nativeSocketPathLimit(target: std.Target.Os.Tag) ?usize {
+    return switch (target) {
+        .macos => 104,
+        .linux => 108,
+        else => null,
+    };
+}
+
+fn socketRuntimeBase(target: std.Target.Os.Tag) ?[]const u8 {
+    return switch (target) {
+        .macos => "/private/tmp",
+        .linux => "/tmp",
+        else => null,
+    };
+}
+
+fn socketPathForTarget(
+    alloc: Allocator,
+    target: std.Target.Os.Tag,
+    root: []const u8,
+    uid: u64,
+) ![]u8 {
+    const profile_socket = try std.fs.path.join(alloc, &.{ root, socket_name });
+    const path_limit = nativeSocketPathLimit(target) orelse return profile_socket;
+    if (profile_socket.len < path_limit) return profile_socket;
+    alloc.free(profile_socket);
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(transport_hash_context);
+    hasher.update(root);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const digest_hex = std.fmt.bytesToHex(digest[0..transport_hash_bytes].*, .lower);
+    const runtime_name = try std.fmt.allocPrint(
+        alloc,
+        "fx-daemon-{d}-{s}",
+        .{ uid, digest_hex },
+    );
+    defer alloc.free(runtime_name);
+    const socket = try std.fs.path.join(
+        alloc,
+        &.{ socketRuntimeBase(target).?, runtime_name, socket_name },
+    );
+    errdefer alloc.free(socket);
+    if (socket.len >= path_limit) return error.NameTooLong;
+    return socket;
+}
 
 pub const JobSnapshot = struct {
     id: []u8,
@@ -133,6 +188,8 @@ pub fn prepare(paths: *const Paths) !void {
     try ensurePrivateDir(std.fs.path.dirname(paths.root) orelse return error.InvalidStatePath);
     try ensurePrivateDir(paths.root);
     try ensurePrivateDir(paths.jobs);
+    const socket_dir = std.fs.path.dirname(paths.socket) orelse return error.InvalidStatePath;
+    if (!std.mem.eql(u8, socket_dir, paths.root)) try ensurePrivateDir(socket_dir);
 }
 
 fn openJobsDir(paths: *const Paths) !io_mod.VerifiedDir {
@@ -1287,6 +1344,36 @@ test "daemon paths stay below private profile state" {
         error.InvalidStatePath,
         Paths.init(std.testing.allocator, "relative-home"),
     );
+}
+
+test "daemon socket selection falls back safely for long native paths" {
+    const alloc = std.testing.allocator;
+    const long_root = "/profiles/" ++ "a" ** 160 ++ "/.fx/daemon";
+    const other_root = "/profiles/" ++ "b" ** 160 ++ "/.fx/daemon";
+    const first = try socketPathForTarget(alloc, .macos, long_root, 501);
+    defer alloc.free(first);
+    const reopened = try socketPathForTarget(alloc, .macos, long_root, 501);
+    defer alloc.free(reopened);
+    const second = try socketPathForTarget(alloc, .macos, other_root, 501);
+    defer alloc.free(second);
+    const linux = try socketPathForTarget(alloc, .linux, long_root, 501);
+    defer alloc.free(linux);
+
+    try std.testing.expectEqualStrings(first, reopened);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    try std.testing.expect(std.mem.startsWith(u8, first, "/private/tmp/fx-daemon-501-"));
+    try std.testing.expect(std.mem.startsWith(u8, linux, "/tmp/fx-daemon-501-"));
+    try std.testing.expect(std.mem.find(u8, first, long_root) == null);
+    try std.testing.expect(first.len < nativeSocketPathLimit(.macos).?);
+    try std.testing.expect(linux.len < nativeSocketPathLimit(.linux).?);
+}
+
+test "daemon socket selection preserves short profile paths" {
+    const alloc = std.testing.allocator;
+    const root = "/Users/fx/.fx/daemon";
+    const socket = try socketPathForTarget(alloc, .macos, root, 501);
+    defer alloc.free(socket);
+    try std.testing.expectEqualStrings("/Users/fx/.fx/daemon/supervisor.sock", socket);
 }
 
 test "daemon request frames are versioned JSONL" {

@@ -69,7 +69,8 @@ The daemon and kernel state is profile-owned and should not be committed:
 
 * `~/.fx/kernel-venv/`
 
-* `~/.fx/daemon/supervisor.sock` and `supervisor.json`
+* `~/.fx/daemon/supervisor.sock` and `supervisor.json`; profiles whose socket
+  path exceeds the native limit use a private `/tmp` runtime directory instead
 
 * `~/.fx/daemon/jobs/` job records and `*.log` or `*.stderr.log` files
 

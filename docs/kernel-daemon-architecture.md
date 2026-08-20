@@ -80,8 +80,10 @@ fx daemon shutdown [--json]
 continues after the submitting CLI exits. Job metadata, stdout, and stderr are
 stored below `~/.fx/daemon/jobs/`; `show` reports the metadata and log path.
 `stop` requests termination of one job. `shutdown` stops running jobs and the
-supervisor. The supervisor socket and identity record are under
-`~/.fx/daemon/`.
+supervisor. The identity record remains under `~/.fx/daemon/`; the socket is
+normally `~/.fx/daemon/supervisor.sock`. If that path exceeds the native
+`sockaddr_un` limit, fx places the socket in a private, deterministic runtime
+directory under `/tmp` instead.
 
 The supervisor retains at most 64 job records. Before accepting another job,
 it removes the oldest settled record and its logs; if all 64 retained jobs are
