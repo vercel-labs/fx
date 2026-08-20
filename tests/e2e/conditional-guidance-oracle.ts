@@ -23,6 +23,7 @@ export const CANONICAL_BUILTIN_NAMES = [
   "open_file",
   "web_fetch",
   "web_search",
+  "ipython",
   "read_tool_result",
   "vision",
 ] as const;

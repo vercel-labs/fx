@@ -295,7 +295,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .pr, .usage = "pr [context]" },
         .{ .kind = .issue, .usage = "issue [context]" },
-        .{ .kind = .daemon, .usage = "daemon [start|status|submit|jobs|show|stop|shutdown]" },
+        .{ .kind = .daemon, .usage = "daemon [action]" },
         .{ .kind = .background, .usage = "background [last|<id>]" },
     } },
     .{ .entries = &.{
