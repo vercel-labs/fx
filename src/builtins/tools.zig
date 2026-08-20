@@ -29,6 +29,15 @@ const skill_impl = @import("../tools/skills/skill.zig");
 const capability_search_impl = @import("../tools/capabilities/capability_search.zig");
 const web_fetch_impl = @import("../tools/web/fetch.zig");
 const web_search_impl = @import("../tools/web/search.zig");
+const test_io_mod = if (std_builtin.is_test)
+    @import("../core/shared/io.zig")
+else
+    struct {};
+const test_session_child_store = if (std_builtin.is_test)
+    @import("../core/session/session_child_store.zig")
+else
+    struct {};
+const goal_tools_impl = @import("../tools/agent/goal_tools.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -843,6 +852,9 @@ pub const all = [_]tool_dispatch.Tool{
     ask_user_question,
     vision,
     read_tool_result,
+    goal_tools_impl.get_goal,
+    goal_tools_impl.create_goal,
+    goal_tools_impl.update_goal,
 };
 
 pub const registry = tool_dispatch.Registry{ .tools = all[0..] };
@@ -863,6 +875,9 @@ pub const advertisement_order = [_][]const u8{
     "ask_user_question",
     "web_fetch",
     "web_search",
+    "get_goal",
+    "create_goal",
+    "update_goal",
 };
 
 pub const read_only_tool_names = [_][]const u8{
@@ -989,6 +1004,9 @@ test "built-in tools register exact active local order" {
         "ask_user_question",
         "vision",
         "read_tool_result",
+        "get_goal",
+        "create_goal",
+        "update_goal",
     };
 
     try std.testing.expectEqual(expected_names.len, all.len);
