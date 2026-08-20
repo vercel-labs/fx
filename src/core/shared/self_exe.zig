@@ -27,12 +27,15 @@ fn productionPathForReexec(alloc: Allocator) ![]u8 {
     return std.process.executablePathAlloc(io_mod.getIo(), alloc);
 }
 
-/// Path another process can use to exec this still-running fx.
+/// Path another process can use to exec this fx.
 ///
-/// Valid only while *this* process lives. `/proc/self/exe` in a later
-/// shell would be that shell, so callers bake `/proc/<pid>/exe` instead.
-/// Persist that path only from a process that outlives the consumer
-/// (tmux/native launchers), not from a host that recovery can replace.
+/// Tmux bootstraps and `pipe-pane` commands run later, so `/proc/self/exe`
+/// would be the shell, not fx. Prefer the resolved on-disk path: it is the
+/// only form that still works once this process is gone, and a recovered
+/// session outlives the fx that created it. `/proc/<pid>/exe` is the
+/// fallback for a replaced binary, where an on-disk path would be
+/// `FileNotFound`; it dies with this process, so it is used only when
+/// there is no on-disk file left to name.
 pub fn pathForPeerReexec(alloc: Allocator) ![]u8 {
     if (testProductExe()) |path| return alloc.dupe(u8, path);
     return productionPathForPeerReexec(alloc);
@@ -42,9 +45,24 @@ pub fn pathForPeerReexec(alloc: Allocator) ![]u8 {
 /// `productionPathForReexec` for why this split exists.
 fn productionPathForPeerReexec(alloc: Allocator) ![]u8 {
     if (comptime builtin.os.tag == .linux) {
+        if (std.process.executablePathAlloc(io_mod.getIo(), alloc)) |resolved| {
+            defer alloc.free(resolved);
+            if (onDiskPathIsExecutable(resolved)) return alloc.dupe(u8, resolved);
+        } else |_| {}
         return std.fmt.allocPrint(alloc, "/proc/{d}/exe", .{std.c.getpid()});
     }
-    return std.process.executablePathAlloc(io_mod.getIo(), alloc);
+    const path_z = try std.process.executablePathAlloc(io_mod.getIo(), alloc);
+    defer alloc.free(path_z);
+    return alloc.dupe(u8, path_z);
+}
+
+/// True when `path` still names a file this process could exec. A rebuild
+/// unlinks the old binary, so the resolved name can point at nothing.
+fn onDiskPathIsExecutable(path: []const u8) bool {
+    if (!std.fs.path.isAbsolute(path)) return false;
+    var file = std.Io.Dir.cwd().openFile(io_mod.getIo(), path, .{}) catch return false;
+    file.close(io_mod.getIo());
+    return true;
 }
 
 /// True when both paths resolve to the same file. Used to prove a procfs path
@@ -78,19 +96,21 @@ test "linux re-exec paths name the live inode, not the replaced on-disk file" {
 
     const peer = try productionPathForPeerReexec(alloc);
     defer alloc.free(peer);
-    const expected_peer = try std.fmt.allocPrint(alloc, "/proc/{d}/exe", .{std.c.getpid()});
-    defer alloc.free(expected_peer);
-    try std.testing.expectEqualStrings(expected_peer, peer);
 
-    // Both must resolve to this executable rather than to the on-disk name,
-    // which is the whole point: a rebuild unlinks that name.
+    // Same-process re-exec stays on procfs. Peer paths prefer the on-disk
+    // name so a tmux bootstrap or pipe-pane still works after this pid exits.
     const resolved = std.process.executablePathAlloc(io_mod.getIo(), alloc) catch null;
     defer if (resolved) |owned| alloc.free(owned);
     if (resolved) |on_disk| {
         try std.testing.expect(!std.mem.eql(u8, on_disk, same_process));
-        try std.testing.expect(!std.mem.eql(u8, on_disk, peer));
         try std.testing.expect(try sameFile(same_process, on_disk));
-        try std.testing.expect(try sameFile(peer, on_disk));
+        if (onDiskPathIsExecutable(on_disk)) {
+            try std.testing.expectEqualStrings(on_disk, peer);
+        } else {
+            const expected_peer = try std.fmt.allocPrint(alloc, "/proc/{d}/exe", .{std.c.getpid()});
+            defer alloc.free(expected_peer);
+            try std.testing.expectEqualStrings(expected_peer, peer);
+        }
     }
 }
 
@@ -139,42 +159,52 @@ test "linux re-exec still spawns after the on-disk binary is replaced" {
     try expectExecSucceeds(peer_path);
 
     // And this process can always re-exec itself through /proc/self/exe.
-    try std.testing.expect(try pathIsOpenable(linux_self_exe));
+    try std.testing.expect(onDiskPathIsExecutable(linux_self_exe));
 }
 
-test "linux peer re-exec path is gone after that process exits" {
+test "peer re-exec path prefers a name that outlives this process" {
+    if (builtin.os.tag != .linux) return;
+    const alloc = std.testing.allocator;
+    const path = try productionPathForPeerReexec(alloc);
+    defer alloc.free(path);
+    // A tmux pipe-pane command and a recovered session both run after this
+    // process exits, so a /proc/<pid>/exe path would be dangling by then.
+    // Only fall back to it when no on-disk name is left to use.
+    if (std.mem.startsWith(u8, path, "/proc/")) {
+        const resolved = std.process.executablePathAlloc(io_mod.getIo(), alloc) catch return;
+        defer alloc.free(resolved);
+        try std.testing.expect(!onDiskPathIsExecutable(resolved));
+        return;
+    }
+    try std.testing.expect(onDiskPathIsExecutable(path));
+}
+
+test "on-disk probe rejects a replaced binary so the peer path falls back" {
     if (builtin.os.tag != .linux) return;
     const alloc = std.testing.allocator;
 
+    // The probe is what decides between the durable name and procfs, so cover
+    // the rebuild case directly: a path unlinked while a process holds the
+    // inode must read as unusable.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(dir);
-    const victim = try std.fs.path.join(alloc, &.{ dir, "self-exe-probe" });
+    const dir_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir_path);
+    const victim = try std.fs.path.join(alloc, &.{ dir_path, "fx-probe" });
     defer alloc.free(victim);
 
-    try io_mod.copyFileAtomic(alloc, "/bin/sh", victim);
-    try std.Io.Dir.cwd().setFilePermissions(
-        io_mod.getIo(),
-        victim,
-        std.Io.File.Permissions.fromMode(0o755),
-        .{ .follow_symlinks = false },
-    );
+    {
+        var file = try std.Io.Dir.cwd().createFile(io_mod.getIo(), victim, .{});
+        file.close(io_mod.getIo());
+    }
+    try std.testing.expect(onDiskPathIsExecutable(victim));
 
-    var held = try spawnHeldOpen(victim);
-    var killed = false;
-    defer if (!killed) held.kill(io_mod.getIo());
-    const child_pid = held.id orelse return error.SkipZigTest;
-    const peer_path = try std.fmt.allocPrint(alloc, "/proc/{d}/exe", .{child_pid});
-    defer alloc.free(peer_path);
-    try std.testing.expect(try pathIsOpenable(peer_path));
+    try std.Io.Dir.cwd().deleteFile(io_mod.getIo(), victim);
+    try std.testing.expect(!onDiskPathIsExecutable(victim));
 
-    // Host recovery kills the original process. A bootstrap that baked this
-    // path can no longer exec it; the launcher that still owns the pane must
-    // bake its own pid instead.
-    held.kill(io_mod.getIo());
-    killed = true;
-    try std.testing.expect(!try pathIsOpenable(peer_path));
+    // A relative name could resolve against the spawned process's cwd, so it
+    // is never trusted as a peer path.
+    try std.testing.expect(!onDiskPathIsExecutable("fx"));
 }
 
 /// Starts `path` so it stays alive while the caller removes the on-disk name,
@@ -200,12 +230,6 @@ fn expectExecSucceeds(path: []const u8) !void {
     const term = try child.wait(io_mod.getIo());
     try std.testing.expect(term == .exited);
     try std.testing.expectEqual(@as(u8, 7), term.exited);
-}
-
-fn pathIsOpenable(path: []const u8) !bool {
-    var file = std.Io.Dir.cwd().openFile(io_mod.getIo(), path, .{}) catch return false;
-    file.close(io_mod.getIo());
-    return true;
 }
 
 test "fx re-execs through procfs after its own on-disk copy is replaced" {

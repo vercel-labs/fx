@@ -421,16 +421,9 @@ pub fn runLauncher(alloc: Allocator) !void {
             parsed.value.bootstrap_path,
         ) catch {};
     };
-    const bootstrap = try shell_resolver.buildPeerBootstrap(
-        alloc,
-        parsed.value.control_path,
-        parsed.value.control_nonce,
-        parsed.value.command_path,
-    );
-    defer alloc.free(bootstrap);
     try writePrivateLauncherFile(
         parsed.value.bootstrap_path,
-        bootstrap,
+        parsed.value.bootstrap,
     );
     bootstrap_created = true;
     var command_created = false;

@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
 const command_environment = @import("../execution/command_environment.zig");
-const self_exe = @import("../shared/self_exe.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -248,20 +247,6 @@ pub fn buildBootstrap(
         try output.appendSlice(alloc, " || exit 125\n");
     }
     return output.toOwnedSlice(alloc);
-}
-
-/// Bootstrap sourced later by the pane shell. Bakes *this* process's peer
-/// re-exec path, so markers still exec fx after the host is replaced.
-/// Call from the launcher that outlives host recovery, not from the host.
-pub fn buildPeerBootstrap(
-    alloc: Allocator,
-    control_path: []const u8,
-    nonce: []const u8,
-    command_path: ?[]const u8,
-) ![]u8 {
-    const executable = try self_exe.pathForPeerReexec(alloc);
-    defer alloc.free(executable);
-    return buildBootstrap(alloc, executable, control_path, nonce, command_path);
 }
 
 pub fn buildSourceCommand(
@@ -522,13 +507,6 @@ fn checkBootstrapAllocationFailures(alloc: Allocator) !void {
         "/tmp/command",
     );
     defer alloc.free(bootstrap);
-    const peer = try buildPeerBootstrap(
-        alloc,
-        "/tmp/control",
-        "nonce",
-        "/tmp/command",
-    );
-    defer alloc.free(peer);
     const source = try buildSourceCommand(alloc, "/tmp/bootstrap");
     defer alloc.free(source);
 }
@@ -539,19 +517,4 @@ test "bootstrap construction cleans every allocation failure" {
         checkBootstrapAllocationFailures,
         .{},
     );
-}
-
-test "peer bootstrap bakes this process's re-exec path" {
-    const alloc = std.testing.allocator;
-    const bootstrap = try buildPeerBootstrap(
-        alloc,
-        "/tmp/control",
-        "nonce",
-        null,
-    );
-    defer alloc.free(bootstrap);
-    const executable = try self_exe.pathForPeerReexec(alloc);
-    defer alloc.free(executable);
-    try std.testing.expect(std.mem.find(u8, bootstrap, executable) != null);
-    try std.testing.expect(std.mem.find(u8, bootstrap, "--fx-internal-terminal-control") != null);
 }
