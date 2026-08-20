@@ -446,6 +446,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .notifications, .command = "/sound", .help_entry = "/sound [on|off|max]", .completion_description = "toggle sounds and terminal bells", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .version, .command = "/version", .help_entry = "/version", .completion_description = "show the fx version", .presentation_category = .general },
+    .{ .kind = .goal, .command = "/goal", .help_entry = "/goal [<objective>|clear|pause|resume]", .completion_description = "set, inspect, pause, resume, or clear a persistent goal", .presentation_category = .session, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .quit, .command = "/quit", .aliases = &.{"/exit"}, .help_entry = "/quit", .completion_description = "exit the interactive shell", .presentation_category = .general, .show_in_welcome = true },
 };
 
@@ -553,6 +554,7 @@ test "built-in slash commands register exact active order" {
         "/sound",
         "/workspace",
         "/version",
+        "/goal",
         "/quit",
     };
 
@@ -560,6 +562,19 @@ test "built-in slash commands register exact active order" {
     for (expected_commands, slash_specs) |expected, spec| {
         try std.testing.expectEqualStrings(expected, spec.command);
     }
+}
+
+test "goal slash command appears in completion and registry" {
+    const goal = slash_registry.lookup("/goal") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(SlashKind.goal, goal.kind);
+    try std.testing.expect(goal.has_args);
+    try std.testing.expect(goal.show_in_welcome);
+
+    const completion = firstSlashCompletion("/go") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("/goal", completion);
+
+    const description = nthSlashCompletionDescription("/go", 0) orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, description, "persistent goal") != null);
 }
 
 test "built-in slash registry resolves primary commands and aliases" {
