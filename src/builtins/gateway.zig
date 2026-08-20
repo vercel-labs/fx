@@ -150,6 +150,7 @@ pub const agent_stream_provider = agent_stream_provider_contract.Provider{
 pub fn auth_provider_for_transport(transport: *const oauth_transport.Provider) adapter_auth.Provider {
     return .{
         .kind = connection_seed.adapter_id,
+        .auth_service_label = "Vercel",
         .context = transport,
         .acquire_fn = acquireVercelCredential,
         .logout_fn = logoutVercel,
@@ -157,6 +158,8 @@ pub fn auth_provider_for_transport(transport: *const oauth_transport.Provider) a
         .load_teams_fn = loadVercelTeams,
         .invalidate_fn = invalidateVercelCredential,
         .status_fn = loadVercelStatus,
+        .source_inventory_fn = loadVercelSourceInventory,
+        .submit_entered_secret_fn = submitVercelEnteredSecret,
     };
 }
 
@@ -590,6 +593,10 @@ fn loadVercelStatus(
     var credential = switch (acquisition) {
         .acquired => |value| value,
         .missing => |store_status| return .{ .loaded = .{
+            .missing_help = if (store_status == .unavailable)
+                try alloc.dupe(u8, credentials.unreadable_store_message)
+            else
+                null,
             .store_status = store_status,
         } },
         .failed => |failure| return .{ .failed = failure },
@@ -608,6 +615,224 @@ fn loadVercelStatus(
         .team = owned_team,
         .expired = if (credential.refresh_after_ms) |deadline| deadline <= io_mod.milliTimestamp() else false,
     } };
+}
+
+const vercel_credential_source_order = [_]credentials.Source{
+    .vercel_oidc_token,
+    .ai_gateway_api_key,
+    .fx_login,
+    .stored_key,
+};
+
+fn loadVercelSourceInventory(
+    raw: *const anyopaque,
+    alloc: Allocator,
+    request: *adapter_auth.SourceInventoryRequest,
+) Allocator.Error!adapter_auth.SourceInventoryOutcome {
+    var sources: std.ArrayList(adapter_auth.CredentialSourceDescriptor) = .empty;
+    errdefer {
+        for (sources.items) |*source_value| source_value.deinit(alloc);
+        sources.deinit(alloc);
+    }
+
+    for (vercel_credential_source_order) |source_value| {
+        if (request.cancelled()) return .cancelled;
+        const available = credentials.sourceExists(alloc, request.host.secret_store, source_value) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .failed = normalizeAuthFailure(err) };
+        };
+        const active = if (request.current_source_id) |id|
+            std.mem.eql(u8, id, @tagName(source_value))
+        else
+            false;
+        if (!available and !active and source_value != .stored_key) continue;
+
+        var entered_secret: ?adapter_auth.EnteredSecretPresentation = if (source_value == .stored_key)
+            adapter_auth.EnteredSecretPresentation.init(
+                alloc,
+                "API key",
+                "AI Gateway",
+                request.host.secret_store.backend_label,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return .invalid_configuration,
+            }
+        else
+            null;
+        defer if (entered_secret) |*value| value.deinit(alloc);
+        var descriptor = adapter_auth.CredentialSourceDescriptor.init(
+            alloc,
+            @tagName(source_value),
+            credentials.sourceLabel(source_value),
+            available or active,
+            credentials.sourceRefreshable(source_value),
+            entered_secret,
+            source_value == .fx_login and (available or active),
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .invalid_configuration,
+        };
+        sources.append(alloc, descriptor) catch |err| {
+            descriptor.deinit(alloc);
+            return err;
+        };
+    }
+
+    const owned_sources = try sources.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_sources) |*source_value| source_value.deinit(alloc);
+        alloc.free(owned_sources);
+    }
+    var auth_service = adapter_auth.AuthServicePresentation.init(alloc, "Vercel") catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => unreachable,
+    };
+    errdefer auth_service.deinit(alloc);
+    const origin_profile = try request.profile.clone(alloc);
+    var inventory = adapter_auth.CredentialSourceInventory{
+        .origin_profile = origin_profile,
+        .auth_service = auth_service,
+        .sources = owned_sources,
+    };
+    inventory.validate(request.current_source_id) catch {
+        inventory.deinit(alloc);
+        return .invalid_configuration;
+    };
+    if (request.cancelled()) {
+        inventory.deinit(alloc);
+        return .cancelled;
+    }
+    _ = raw;
+    return .{ .loaded = inventory };
+}
+
+fn submitVercelEnteredSecret(
+    raw: *const anyopaque,
+    alloc: Allocator,
+    submission: *adapter_auth.EnteredSecretSubmission,
+) adapter_auth.EnteredSecretCompletion {
+    return submitVercelEnteredSecretWithValidator(raw, api_key_validator, alloc, submission);
+}
+
+fn submitVercelEnteredSecretWithValidator(
+    raw: *const anyopaque,
+    validator: api_key_validator_contract.Provider,
+    alloc: Allocator,
+    submission: *adapter_auth.EnteredSecretSubmission,
+) adapter_auth.EnteredSecretCompletion {
+    if (!std.mem.eql(u8, submission.source_id, @tagName(credentials.Source.stored_key))) {
+        return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+            .durable_write = .unchanged,
+            .terminal = .{ .missing = .source },
+        });
+    }
+    if (submission.secret_value.bytes.len == 0) {
+        return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+            .durable_write = .unchanged,
+            .terminal = .{ .invalid = .input },
+        });
+    }
+    if (submission.cancelled()) {
+        return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+            .durable_write = .unchanged,
+            .terminal = .cancelled,
+        });
+    }
+
+    switch (validator.validate(alloc, submission.secret_value.bytes)) {
+        .accepted => {},
+        .refused => return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+            .durable_write = .unchanged,
+            .terminal = .{ .failed = .{
+                .stage = .validation,
+                .cause = .{ .adapter = .{ .category = .denied } },
+            } },
+        }),
+        .unavailable => return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+            .durable_write = .unchanged,
+            .terminal = .{ .failed = .{
+                .stage = .validation,
+                .cause = .{ .adapter = .{ .category = .unavailable } },
+            } },
+        }),
+    }
+    if (submission.cancelled()) {
+        return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+            .durable_write = .unchanged,
+            .terminal = .cancelled,
+        });
+    }
+
+    const report = submission.host.secret_store.storeWithDisposition(alloc, submission.secret_value.bytes);
+    if (submission.cancelled()) {
+        return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+            .durable_write = report.durable_write,
+            .terminal = .cancelled,
+        });
+    }
+    if (report.failure != null) {
+        return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+            .durable_write = report.durable_write,
+            .terminal = .{ .failed = .{
+                .stage = .persistence,
+                .cause = .{ .adapter = .{ .category = .persistence } },
+            } },
+        });
+    }
+    if (report.durable_write != .replaced) {
+        return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+            .durable_write = report.durable_write,
+            .terminal = .{ .invalid = .configuration },
+        });
+    }
+
+    const loaded = credentials.resolveExact(
+        alloc,
+        vercelTransport(raw),
+        submission.host.secret_store,
+        .refresh_if_needed,
+        .stored_key,
+    ) catch |err| {
+        return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+            .durable_write = .replaced,
+            .terminal = .{ .failed = .{
+                .stage = .reacquisition,
+                .cause = if (err == error.OutOfMemory)
+                    .allocation
+                else
+                    .{ .adapter = normalizeAuthFailure(err) },
+            } },
+        });
+    };
+    var credential = loaded.credential orelse {
+        return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+            .durable_write = .replaced,
+            .terminal = .{ .failed = .{
+                .stage = .reacquisition,
+                .cause = .{ .adapter = .{ .category = .unavailable } },
+            } },
+        });
+    };
+    defer credential.deinit(alloc);
+    var normalized = takeNormalizedCredential(&credential);
+    if (!std.mem.eql(u8, normalized.source.id, submission.source_id)) {
+        normalized.deinit(alloc);
+        return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+            .durable_write = .replaced,
+            .terminal = .{ .invalid = .configuration },
+        });
+    }
+    if (submission.cancelled()) {
+        normalized.deinit(alloc);
+        return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+            .durable_write = .replaced,
+            .terminal = .cancelled,
+        });
+    }
+    return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+        .durable_write = .replaced,
+        .terminal = .{ .acquired = normalized },
+    });
 }
 
 const AdapterEventBridge = struct {
@@ -3891,6 +4116,258 @@ const AdapterAuthStoreProbe = struct {
     }
 };
 
+const EnteredSecretValidationProbe = struct {
+    result: api_key_validator_contract.Result = .accepted,
+    calls: usize = 0,
+    cancel_after: ?*std.atomic.Value(bool) = null,
+
+    fn provider(self: *@This()) api_key_validator_contract.Provider {
+        return .{ .context = self, .validate_fn = validate };
+    }
+
+    fn validate(
+        raw: ?*anyopaque,
+        _: Allocator,
+        _: []const u8,
+    ) api_key_validator_contract.Result {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.calls += 1;
+        if (self.cancel_after) |flag| flag.store(true, .seq_cst);
+        return self.result;
+    }
+};
+
+const EnteredSecretStoreProbe = struct {
+    const Load = enum { value, missing, unreadable };
+
+    report: host.SecretStoreWriteReport = .{ .durable_write = .replaced },
+    load_result: Load = .value,
+    stored_value: [256]u8 = undefined,
+    stored_value_len: usize = 0,
+    store_calls: usize = 0,
+    load_calls: usize = 0,
+    cancel_after_store: ?*std.atomic.Value(bool) = null,
+    cancel_during_load: ?*std.atomic.Value(bool) = null,
+
+    fn provider(self: *@This()) host.SecretStore {
+        return .{
+            .context = self,
+            .backend_label = "test credential store",
+            .is_disabled_fn = isDisabled,
+            .load_fn = load,
+            .store_fn = store,
+            .store_interactive_fn = storeInteractive,
+            .store_with_disposition_fn = storeWithDisposition,
+        };
+    }
+
+    fn isDisabled(_: ?*anyopaque) bool {
+        return false;
+    }
+
+    fn load(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+    ) host.SecretStoreLoadError!?[]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.load_calls += 1;
+        if (self.cancel_during_load) |flag| flag.store(true, .seq_cst);
+        return switch (self.load_result) {
+            .value => if (self.stored_value_len > 0)
+                try alloc.dupe(u8, self.stored_value[0..self.stored_value_len])
+            else
+                null,
+            .missing => null,
+            .unreadable => error.StoredKeyUnreadable,
+        };
+    }
+
+    fn store(
+        _: ?*anyopaque,
+        _: Allocator,
+        _: []const u8,
+    ) host.SecretStoreWriteError!void {}
+
+    fn storeInteractive(_: ?*anyopaque) host.SecretStoreWriteError!bool {
+        return false;
+    }
+
+    fn storeWithDisposition(
+        raw: ?*anyopaque,
+        _: Allocator,
+        value: []const u8,
+    ) host.SecretStoreWriteReport {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.store_calls += 1;
+        if (self.report.durable_write == .replaced and value.len <= self.stored_value.len) {
+            @memcpy(self.stored_value[0..value.len], value);
+            self.stored_value_len = value.len;
+        }
+        if (self.cancel_after_store) |flag| flag.store(true, .seq_cst);
+        return self.report;
+    }
+};
+
+fn enteredSecretTestSubmission(
+    alloc: Allocator,
+    store: host.SecretStore,
+    cancel_flag: *const std.atomic.Value(bool),
+    source_id_value: []const u8,
+    secret_value: []const u8,
+) !adapter_auth.EnteredSecretSubmission {
+    const profile = adapterAuthTestProfile(connection_seed.adapter_id, "automatic");
+    const identity = try adapter_auth.AuthProfileIdentity.init(alloc, profile);
+    errdefer {
+        var owned = identity;
+        owned.deinit(alloc);
+    }
+    const source_id = try alloc.dupe(u8, source_id_value);
+    errdefer alloc.free(source_id);
+    const presentation = try adapter_auth.EnteredSecretPresentation.init(
+        alloc,
+        "API key",
+        "AI Gateway",
+        store.backend_label,
+    );
+    errdefer {
+        var owned = presentation;
+        owned.deinit(alloc);
+    }
+    return .{
+        .request_id = 42,
+        .profile = identity,
+        .source_id = source_id,
+        .presentation = presentation,
+        .secret_value = .{ .bytes = try alloc.dupe(u8, secret_value) },
+        .host = .{ .secret_store = store },
+        .cancel_flag = cancel_flag,
+    };
+}
+
+test "entered-secret store cancellation and reacquisition matrix preserves durable truth" {
+    const alloc = std.testing.allocator;
+    const transport = oauth_transport.unavailable_provider;
+
+    const Case = struct {
+        name: []const u8,
+        source_id: []const u8 = "stored_key",
+        secret_value: []const u8 = "entered-secret",
+        validation: api_key_validator_contract.Result = .accepted,
+        report: host.SecretStoreWriteReport = .{ .durable_write = .replaced },
+        load_result: EnteredSecretStoreProbe.Load = .value,
+        cancel_before: bool = false,
+        cancel_after_validation: bool = false,
+        cancel_after_store: bool = false,
+        cancel_during_load: bool = false,
+        expected_write: adapter_auth.DurableWriteState,
+        expected_terminal: std.meta.Tag(adapter_auth.EnteredSecretTerminal),
+        expected_stage: ?adapter_auth.EnteredSecretFailureStage = null,
+        expected_validation_calls: usize = 1,
+        expected_store_calls: usize,
+        expected_load_calls: usize,
+    };
+    const cases = [_]Case{
+        .{ .name = "missing exact source", .source_id = "other", .expected_write = .unchanged, .expected_terminal = .missing, .expected_validation_calls = 0, .expected_store_calls = 0, .expected_load_calls = 0 },
+        .{ .name = "empty input", .secret_value = "", .expected_write = .unchanged, .expected_terminal = .invalid, .expected_validation_calls = 0, .expected_store_calls = 0, .expected_load_calls = 0 },
+        .{ .name = "validation refusal", .validation = .refused, .expected_write = .unchanged, .expected_terminal = .failed, .expected_stage = .validation, .expected_store_calls = 0, .expected_load_calls = 0 },
+        .{ .name = "validation unavailable", .validation = .unavailable, .expected_write = .unchanged, .expected_terminal = .failed, .expected_stage = .validation, .expected_store_calls = 0, .expected_load_calls = 0 },
+        .{ .name = "cancel before validation", .cancel_before = true, .expected_write = .unchanged, .expected_terminal = .cancelled, .expected_validation_calls = 0, .expected_store_calls = 0, .expected_load_calls = 0 },
+        .{ .name = "cancel after validation", .cancel_after_validation = true, .expected_write = .unchanged, .expected_terminal = .cancelled, .expected_store_calls = 0, .expected_load_calls = 0 },
+        .{ .name = "pre-publication persistence failure", .report = .{ .durable_write = .unchanged, .failure = error.StoredKeyWriteFailed }, .expected_write = .unchanged, .expected_terminal = .failed, .expected_stage = .persistence, .expected_store_calls = 1, .expected_load_calls = 0 },
+        .{ .name = "indeterminate publication", .report = .{ .durable_write = .indeterminate, .failure = error.StoredKeyWriteFailed }, .expected_write = .indeterminate, .expected_terminal = .failed, .expected_stage = .persistence, .expected_store_calls = 1, .expected_load_calls = 0 },
+        .{ .name = "cancel after replacement", .cancel_after_store = true, .expected_write = .replaced, .expected_terminal = .cancelled, .expected_store_calls = 1, .expected_load_calls = 0 },
+        .{ .name = "reacquisition missing", .load_result = .missing, .expected_write = .replaced, .expected_terminal = .failed, .expected_stage = .reacquisition, .expected_store_calls = 1, .expected_load_calls = 1 },
+        .{ .name = "reacquisition unreadable", .load_result = .unreadable, .expected_write = .replaced, .expected_terminal = .failed, .expected_stage = .reacquisition, .expected_store_calls = 1, .expected_load_calls = 1 },
+        .{ .name = "cancel during reacquisition", .cancel_during_load = true, .expected_write = .replaced, .expected_terminal = .cancelled, .expected_store_calls = 1, .expected_load_calls = 1 },
+        .{ .name = "replacement and exact reacquisition", .expected_write = .replaced, .expected_terminal = .acquired, .expected_store_calls = 1, .expected_load_calls = 1 },
+    };
+
+    for (cases) |case| {
+        var cancel_flag = std.atomic.Value(bool).init(case.cancel_before);
+        var validation = EnteredSecretValidationProbe{
+            .result = case.validation,
+            .cancel_after = if (case.cancel_after_validation) &cancel_flag else null,
+        };
+        var store = EnteredSecretStoreProbe{
+            .report = case.report,
+            .load_result = case.load_result,
+            .cancel_after_store = if (case.cancel_after_store) &cancel_flag else null,
+            .cancel_during_load = if (case.cancel_during_load) &cancel_flag else null,
+        };
+        var submission = try enteredSecretTestSubmission(
+            alloc,
+            store.provider(),
+            &cancel_flag,
+            case.source_id,
+            case.secret_value,
+        );
+        var completion = submitVercelEnteredSecretWithValidator(
+            &transport,
+            validation.provider(),
+            alloc,
+            &submission,
+        );
+        defer completion.deinit(alloc);
+        try std.testing.expectEqual(case.expected_write, completion.outcome.durable_write);
+        try std.testing.expectEqual(case.expected_terminal, std.meta.activeTag(completion.outcome.terminal));
+        if (case.expected_stage) |stage| {
+            try std.testing.expectEqual(stage, completion.outcome.terminal.failed.stage);
+        }
+        try std.testing.expectEqual(case.expected_validation_calls, validation.calls);
+        try std.testing.expectEqual(case.expected_store_calls, store.store_calls);
+        try std.testing.expectEqual(case.expected_load_calls, store.load_calls);
+        if (case.expected_terminal == .acquired) {
+            try std.testing.expectEqualStrings("stored_key", completion.outcome.terminal.acquired.source.id);
+            try std.testing.expectEqualStrings("entered-secret", completion.outcome.terminal.acquired.secret_bytes);
+        }
+        _ = case.name;
+    }
+}
+
+test "post-replacement allocation failure and later exact reacquisition retain the store fact" {
+    const backing = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(backing, .{});
+    const alloc = failing.allocator();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var validation = EnteredSecretValidationProbe{};
+    var store = EnteredSecretStoreProbe{};
+    var submission = try enteredSecretTestSubmission(
+        alloc,
+        store.provider(),
+        &cancel_flag,
+        "stored_key",
+        "post-write-secret",
+    );
+    failing.fail_index = failing.alloc_index;
+    const transport = oauth_transport.unavailable_provider;
+    var completion = submitVercelEnteredSecretWithValidator(
+        &transport,
+        validation.provider(),
+        alloc,
+        &submission,
+    );
+    try std.testing.expectEqual(adapter_auth.DurableWriteState.replaced, completion.outcome.durable_write);
+    try std.testing.expect(completion.outcome.terminal == .failed);
+    try std.testing.expectEqual(adapter_auth.EnteredSecretFailureStage.reacquisition, completion.outcome.terminal.failed.stage);
+    try std.testing.expect(completion.outcome.terminal.failed.cause == .allocation);
+    completion.deinit(alloc);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+
+    cancel_flag.store(false, .seq_cst);
+    const recovered = try credentials.resolveExact(
+        backing,
+        transport,
+        store.provider(),
+        .refresh_if_needed,
+        .stored_key,
+    );
+    var credential = recovered.credential orelse return error.ExpectedRecoveredCredential;
+    defer credential.deinit(backing);
+    try std.testing.expectEqualStrings("post-write-secret", credential.token);
+    try std.testing.expectEqual(credentials.Source.stored_key, credential.source);
+}
+
 const PeerAuthProbe = struct {
     acquire_calls: usize = 0,
     cancel_during_acquire: ?*std.atomic.Value(bool) = null,
@@ -3949,6 +4426,101 @@ fn adapterAuthTestProfile(kind: []const u8, credential_ref: []const u8) connecti
         .remembered_model = @constCast("model"),
         .internal_models = .{},
     };
+}
+
+test "Vercel source inventory preserves exact order labels and entered-secret copy" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const env = try AdapterAuthTestEnv.install(alloc, &.{
+        .{ "HOME", home },
+        .{ "VERCEL_OIDC_TOKEN", "oidc-secret" },
+        .{ "AI_GATEWAY_API_KEY", "gateway-secret" },
+    });
+    defer env.deinit();
+    var session = oauth_session.Session{
+        .issuer = try alloc.dupe(u8, "https://vercel.com"),
+        .client_id = try alloc.dupe(u8, "test-client"),
+        .access_token = try alloc.dupe(u8, "login-secret"),
+        .refresh_token = try alloc.dupe(u8, "refresh-secret"),
+        .expires_at_ms = std.math.maxInt(i64),
+        .scope = try alloc.dupe(u8, "openid offline_access"),
+        .token_type = try alloc.dupe(u8, "Bearer"),
+    };
+    defer session.deinit(alloc);
+    try oauth_session.saveNewSession(alloc, session);
+
+    var store = AdapterAuthStoreProbe{ .value = "stored-secret" };
+    const profile = adapterAuthTestProfile(connection_seed.adapter_id, "fx_login");
+    var request = adapter_auth.SourceInventoryRequest{
+        .profile = try adapter_auth.AuthProfileIdentity.init(alloc, profile),
+        .host = .{ .secret_store = store.store() },
+        .current_source_id = "fx_login",
+    };
+    defer request.deinit(alloc);
+    var outcome = try auth_provider.sourceInventory(alloc, &request);
+    defer outcome.deinit(alloc);
+    const inventory = switch (outcome) {
+        .loaded => |*value| value,
+        else => return error.UnexpectedInventoryOutcome,
+    };
+
+    try std.testing.expectEqualStrings("Vercel", inventory.auth_service.service_label);
+    try std.testing.expectEqual(@as(usize, 4), inventory.sources.len);
+    const expected_sources = [_]credentials.Source{
+        .vercel_oidc_token,
+        .ai_gateway_api_key,
+        .fx_login,
+        .stored_key,
+    };
+    for (inventory.sources, expected_sources) |actual, expected| {
+        try std.testing.expectEqualStrings(@tagName(expected), actual.id);
+        try std.testing.expectEqualStrings(credentials.sourceLabel(expected), actual.presentation_label);
+        try std.testing.expect(actual.available);
+        try std.testing.expectEqual(credentials.sourceRefreshable(expected), actual.refreshable);
+    }
+    const entered = inventory.sources[3].entered_secret.?;
+    try std.testing.expectEqualStrings("API key", entered.secret_kind_label);
+    try std.testing.expectEqualStrings("AI Gateway", entered.verification_service_label);
+    try std.testing.expectEqualStrings("adapter test store", entered.storage_destination_label);
+    try std.testing.expectEqual(@as(usize, 1), store.loads);
+}
+
+test "Vercel source inventory cleans every induced allocation failure" {
+    const backing = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(backing, tmp.dir, ".");
+    defer backing.free(home);
+    const env = try AdapterAuthTestEnv.install(backing, &.{.{ "HOME", home }});
+    defer env.deinit();
+    var store = AdapterAuthStoreProbe{ .value = "stored-secret" };
+    const profile = adapterAuthTestProfile(connection_seed.adapter_id, "automatic");
+    var request = adapter_auth.SourceInventoryRequest{
+        .profile = try adapter_auth.AuthProfileIdentity.init(backing, profile),
+        .host = .{ .secret_store = store.store() },
+    };
+    defer request.deinit(backing);
+
+    var probe = std.testing.FailingAllocator.init(backing, .{});
+    var complete = try loadVercelSourceInventory(&oauth_transport_provider, probe.allocator(), &request);
+    complete.deinit(probe.allocator());
+    try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
+
+    for (0..probe.alloc_index) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(
+            backing,
+            .{ .fail_index = fail_index },
+        );
+        if (loadVercelSourceInventory(&oauth_transport_provider, failing.allocator(), &request)) |outcome_value| {
+            var outcome = outcome_value;
+            outcome.deinit(failing.allocator());
+        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }
 
 test "production registry contains only Vercel" {

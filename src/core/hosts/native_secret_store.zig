@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("host.zig");
 const io_mod = @import("../shared/io.zig");
@@ -11,7 +12,12 @@ const Allocator = std.mem.Allocator;
 
 /// Names the backend that answers on this platform so operators can tell where a
 /// stored key lives without knowing how the backend is selected.
-const backend_label = if (builtin.os.tag == .macos) "macOS Keychain" else "profile file";
+const backend_label = if (build_options.native_auth_e2e)
+    "profile file"
+else if (builtin.os.tag == .macos)
+    "macOS Keychain"
+else
+    "profile file";
 
 const max_key_file_bytes: usize = 8 * 1024;
 
@@ -24,22 +30,26 @@ pub const provider: host.SecretStore = .{
     .load_fn = loadCallback,
     .store_fn = storeCallback,
     .store_interactive_fn = storeInteractiveCallback,
+    .store_with_disposition_fn = storeWithDispositionCallback,
 };
 
 /// The disable switch is named for the macOS backend, so its reader stays there.
 fn isDisabled() bool {
+    if (comptime build_options.native_auth_e2e) return false;
     return keychain.isDisabled();
 }
 
 /// Returns the stored key, or null when no key is stored. An error means the store
 /// could not be read, which callers must keep distinct from absence.
 fn load(alloc: Allocator) LoadError!?[]u8 {
+    if (comptime build_options.native_auth_e2e) return loadFromProfile(alloc);
     if (comptime builtin.os.tag == .macos) return loadFromKeychain(alloc);
     return loadFromProfile(alloc);
 }
 
 fn store(alloc: Allocator, value: []const u8) StoreError!void {
     if (value.len == 0) return error.StoredKeyWriteFailed;
+    if (comptime build_options.native_auth_e2e) return storeInProfile(alloc, value);
     if (comptime builtin.os.tag == .macos) {
         keychain.storeValue(value) catch |err| return writeFailed("keychain", err);
         return;
@@ -50,6 +60,7 @@ fn store(alloc: Allocator, value: []const u8) StoreError!void {
 /// Let the platform credential store own terminal input when it supports a
 /// secure prompt, keeping plaintext out of the fx process.
 fn storeInteractive() StoreError!bool {
+    if (comptime build_options.native_auth_e2e) return false;
     if (comptime builtin.os.tag == .macos) {
         keychain.storeInteractive() catch |err| return writeFailed("keychain_interactive", err);
         return true;
@@ -75,6 +86,134 @@ fn storeCallback(
 
 fn storeInteractiveCallback(_: ?*anyopaque) StoreError!bool {
     return storeInteractive();
+}
+
+fn storeWithDispositionCallback(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    value: []const u8,
+) host.SecretStoreWriteReport {
+    if (value.len == 0) {
+        return .{ .durable_write = .unchanged, .failure = error.StoredKeyWriteFailed };
+    }
+    if (comptime build_options.native_auth_e2e) {
+        return nativeAuthE2eStoreWithDisposition(alloc, value);
+    }
+    if (comptime builtin.os.tag == .macos) {
+        return keychainStoreWriteReport(keychain.storeValueWithDisposition(value));
+    }
+    return storeInProfileWithDisposition(alloc, value);
+}
+
+const NativeAuthE2eMode = enum {
+    replaced,
+    unchanged,
+    indeterminate,
+    cancel_before,
+    cancel_after,
+};
+
+fn nativeAuthE2eControlPath(alloc: Allocator, name: []const u8) ![]u8 {
+    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    return std.fs.path.join(alloc, &.{ home, profile_paths.root_dir_name, name });
+}
+
+fn nativeAuthE2eMode(alloc: Allocator) NativeAuthE2eMode {
+    const path = nativeAuthE2eControlPath(alloc, "native-auth-store-mode") catch return .replaced;
+    defer alloc.free(path);
+    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch return .replaced;
+    defer file.close(io_mod.getIo());
+    const value = io_mod.readFileToEnd(alloc, &file, 64) catch return .replaced;
+    defer alloc.free(value);
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    return std.meta.stringToEnum(NativeAuthE2eMode, trimmed) orelse .unchanged;
+}
+
+fn nativeAuthE2eWriteFact(alloc: Allocator, name: []const u8, value: []const u8) void {
+    const path = nativeAuthE2eControlPath(alloc, name) catch return;
+    defer alloc.free(path);
+    var file = std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{ .truncate = true }) catch return;
+    defer file.close(io_mod.getIo());
+    file.writeStreamingAll(io_mod.getIo(), value) catch {};
+}
+
+fn nativeAuthE2eWriteMarker(alloc: Allocator, name: []const u8) void {
+    nativeAuthE2eWriteFact(alloc, name, "1");
+}
+
+fn nativeAuthE2eWaitForRelease(alloc: Allocator) bool {
+    const path = nativeAuthE2eControlPath(alloc, "native-auth-store-release") catch return false;
+    defer alloc.free(path);
+    for (0..400) |_| {
+        var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch {
+            std.Io.Timeout.sleep(.{
+                .duration = .{ .raw = .{ .nanoseconds = 25 * std.time.ns_per_ms }, .clock = .awake },
+            }, io_mod.getIo()) catch return false;
+            continue;
+        };
+        file.close(io_mod.getIo());
+        return true;
+    }
+    return false;
+}
+
+fn nativeAuthE2eStoreWithDisposition(
+    alloc: Allocator,
+    value: []const u8,
+) host.SecretStoreWriteReport {
+    const mode = nativeAuthE2eMode(alloc);
+    nativeAuthE2eWriteFact(alloc, "native-auth-store-observed", @tagName(mode));
+    return switch (mode) {
+        .replaced => storeInProfileWithDisposition(alloc, value),
+        .unchanged => .{
+            .durable_write = .unchanged,
+            .failure = error.StoredKeyWriteFailed,
+        },
+        .indeterminate => indeterminate: {
+            storeInProfile(alloc, value) catch |err| {
+                nativeAuthE2eWriteFact(alloc, "native-auth-store-error", @errorName(err));
+                break :indeterminate .{
+                    .durable_write = .unchanged,
+                    .failure = error.StoredKeyWriteFailed,
+                };
+            };
+            break :indeterminate .{
+                .durable_write = .indeterminate,
+                .failure = error.StoredKeyWriteFailed,
+            };
+        },
+        .cancel_before => cancel_before: {
+            nativeAuthE2eWriteMarker(alloc, "native-auth-store-entered");
+            if (!nativeAuthE2eWaitForRelease(alloc)) break :cancel_before .{
+                .durable_write = .unchanged,
+                .failure = error.StoredKeyWriteFailed,
+            };
+            break :cancel_before .{
+                .durable_write = .unchanged,
+                .failure = error.StoredKeyWriteFailed,
+            };
+        },
+        .cancel_after => cancel_after: {
+            storeInProfile(alloc, value) catch break :cancel_after .{
+                .durable_write = .unchanged,
+                .failure = error.StoredKeyWriteFailed,
+            };
+            nativeAuthE2eWriteMarker(alloc, "native-auth-store-published");
+            _ = nativeAuthE2eWaitForRelease(alloc);
+            break :cancel_after .{ .durable_write = .replaced };
+        },
+    };
+}
+
+fn keychainStoreWriteReport(report: keychain.StoreReport) host.SecretStoreWriteReport {
+    return .{
+        .durable_write = switch (report.disposition) {
+            .unchanged => .unchanged,
+            .replaced => .replaced,
+            .indeterminate => .indeterminate,
+        },
+        .failure = if (report.failure != null) error.StoredKeyWriteFailed else null,
+    };
 }
 
 fn loadFromKeychain(alloc: Allocator) LoadError!?[]u8 {
@@ -171,6 +310,36 @@ fn storeInProfile(alloc: Allocator, value: []const u8) StoreError!void {
     return storeInDir(alloc, &fx_dir, value);
 }
 
+fn storeInProfileWithDisposition(alloc: Allocator, value: []const u8) host.SecretStoreWriteReport {
+    const home = io_mod.getenv("HOME") orelse {
+        logWriteFailed("home", error.HomeNotSet);
+        return .{ .durable_write = .unchanged, .failure = error.StoredKeyWriteFailed };
+    };
+    var home_dir = io_mod.VerifiedDir{
+        .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
+            logWriteFailed("open_home", err);
+            return .{ .durable_write = .unchanged, .failure = error.StoredKeyWriteFailed };
+        },
+    };
+    defer home_dir.close();
+
+    var fx_dir = io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name) catch |err| {
+        logWriteFailed("open_profile", err);
+        return .{ .durable_write = .unchanged, .failure = error.StoredKeyWriteFailed };
+    };
+    defer fx_dir.close();
+
+    io_mod.durableReplaceVerified(alloc, &fx_dir, profile_paths.api_key_file_name, value) catch |err| {
+        const durable_write: host.DurableWriteState = switch (err) {
+            error.DurableReplacePostRenameFailed => .replaced,
+            else => .unchanged,
+        };
+        logWriteFailed("replace", err);
+        return .{ .durable_write = durable_write, .failure = error.StoredKeyWriteFailed };
+    };
+    return .{ .durable_write = .replaced };
+}
+
 /// `durableReplaceVerified` creates the file at 0600 and re-stats it after the rename,
 /// so the mode this store depends on is enforced rather than assumed.
 fn storeInDir(alloc: Allocator, fx_dir: *io_mod.VerifiedDir, value: []const u8) StoreError!void {
@@ -181,8 +350,12 @@ fn storeInDir(alloc: Allocator, fx_dir: *io_mod.VerifiedDir, value: []const u8) 
 }
 
 fn writeFailed(step: []const u8, err: anyerror) StoreError {
-    debug_trace.logf("stored_key", "store failed step={s} err={s}", .{ step, @errorName(err) });
+    logWriteFailed(step, err);
     return error.StoredKeyWriteFailed;
+}
+
+fn logWriteFailed(step: []const u8, err: anyerror) void {
+    debug_trace.logf("stored_key", "store failed step={s} err={s}", .{ step, @errorName(err) });
 }
 
 test "stored key backend label names the platform store" {
@@ -192,6 +365,26 @@ test "stored key backend label names the platform store" {
         try std.testing.expectEqualStrings("profile file", backend_label);
     }
     try std.testing.expectEqualStrings(backend_label, provider.backend_label);
+}
+
+test "native secret store preserves Keychain publication certainty" {
+    const unchanged = keychainStoreWriteReport(.{
+        .disposition = .unchanged,
+        .failure = error.KeychainWriteFailed,
+    });
+    try std.testing.expectEqual(host.DurableWriteState.unchanged, unchanged.durable_write);
+    try std.testing.expectEqual(error.StoredKeyWriteFailed, unchanged.failure.?);
+
+    const indeterminate = keychainStoreWriteReport(.{
+        .disposition = .indeterminate,
+        .failure = error.KeychainWriteFailed,
+    });
+    try std.testing.expectEqual(host.DurableWriteState.indeterminate, indeterminate.durable_write);
+    try std.testing.expectEqual(error.StoredKeyWriteFailed, indeterminate.failure.?);
+
+    const replaced = keychainStoreWriteReport(.{ .disposition = .replaced });
+    try std.testing.expectEqual(host.DurableWriteState.replaced, replaced.durable_write);
+    try std.testing.expect(replaced.failure == null);
 }
 
 test "stored key file round-trips byte-identically at mode 0600" {

@@ -11,6 +11,7 @@ pub const Result = enum {
 pub const ValidateFn = *const fn (?*anyopaque, Allocator, []const u8) Result;
 
 pub const Provider = struct {
+    /// Vercel adapter validation capability; generic auth sees only normalized outcomes.
     /// When set, context must remain valid until every in-flight validation returns.
     context: ?*anyopaque = null,
     validate_fn: ValidateFn,

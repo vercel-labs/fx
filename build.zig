@@ -48,6 +48,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "app_version", app_version);
     build_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     build_options.addOption(WasmSurface, "wasm_surface", .none);
+    build_options.addOption(bool, "native_auth_e2e", false);
 
     const exe = b.addExecutable(.{
         .name = "fx",
@@ -76,6 +77,38 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run fx");
     run_step.dependOn(&run_cmd.step);
+
+    const native_auth_e2e_options = b.addOptions();
+    native_auth_e2e_options.addOption([]const u8, "git_commit", git_commit);
+    native_auth_e2e_options.addOption([]const u8, "app_version", app_version);
+    native_auth_e2e_options.addOption([]const u8, "update_channel", @tagName(update_channel));
+    native_auth_e2e_options.addOption(WasmSurface, "wasm_surface", .none);
+    native_auth_e2e_options.addOption(bool, "native_auth_e2e", true);
+    const native_auth_e2e = b.addExecutable(.{
+        .name = "fx-native-auth-e2e",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .stack_check = false,
+            .stack_protector = false,
+            .omit_frame_pointer = true,
+            .unwind_tables = .none,
+            .error_tracing = false,
+            .strip = optimize != .Debug,
+        }),
+    });
+    native_auth_e2e.root_module.addImport(
+        "build_options",
+        native_auth_e2e_options.createModule(),
+    );
+    const install_native_auth_e2e = b.addInstallArtifact(native_auth_e2e, .{});
+    const native_auth_e2e_step = b.step(
+        "native-auth-e2e",
+        "Build the isolated native authentication E2E fixture",
+    );
+    native_auth_e2e_step.dependOn(&install_native_auth_e2e.step);
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
@@ -335,6 +368,7 @@ fn addWasmArtifact(
     wasm_options.addOption([]const u8, "app_version", app_version);
     wasm_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     wasm_options.addOption(WasmSurface, "wasm_surface", surface);
+    wasm_options.addOption(bool, "native_auth_e2e", false);
 
     const wasm_root = switch (surface) {
         .core => "src/wasm_core_main.zig",
