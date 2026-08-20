@@ -4042,6 +4042,7 @@ test {
     _ = @import("gateway/web_search_types.zig");
     _ = @import("tools/web/content.zig");
     _ = @import("tools/web/html_to_markdown.zig");
+    _ = @import("tools/agent/goal_tools.zig");
     _ = @import("tools/filesystem/read_file.zig");
     _ = @import("tools/filesystem/semantic_search.zig");
     _ = @import("tools/session/read_tool_result.zig");
@@ -4071,4 +4072,5 @@ test {
     _ = @import("core/agent/worker_runtime.zig");
     _ = @import("gateway/client.zig");
     _ = @import("gateway/host_stream_provider.zig");
+    _ = @import("core/goal/goal.zig");
 }
