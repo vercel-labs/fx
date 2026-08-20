@@ -3,6 +3,7 @@ const std_builtin = @import("builtin");
 const command_admission = @import("../core/permissions/command_admission.zig");
 const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const credentials = @import("../core/auth/credentials.zig");
+const model_provider = @import("../core/config/model_provider.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -204,15 +205,18 @@ const AcpContext = struct {
 
     fn toolContext(self: *AcpContext) tool_runtime.Context {
         const session = if (self.state.active_session) |*active| active else unreachable;
-        self.state.web_search_runtime.configure(.{
-            .api_key = session.api_key,
-            .gateway_team = self.state.gateway_team,
-            .worker_model = session.model,
-            .gateway_retry_count = self.state.cfg.gateway_retry_count,
-            .gateway_chat_url = self.state.cfg.gateway_chat_url,
-            .usage = &session.session_rt.usage,
-            .usage_allocator = self.state.alloc,
-        });
+        const gateway_features_allowed = session.credential_source != .chatgpt_subscription;
+        if (gateway_features_allowed) {
+            self.state.web_search_runtime.configure(.{
+                .api_key = session.api_key,
+                .gateway_team = self.state.gateway_team,
+                .worker_model = session.model,
+                .gateway_retry_count = self.state.cfg.gateway_retry_count,
+                .gateway_chat_url = self.state.cfg.gateway_chat_url,
+                .usage = &session.session_rt.usage,
+                .usage_allocator = self.state.alloc,
+            });
+        }
         var tc: tool_runtime.Context = .{
             .workspace_root = self.state.workspace_root,
             .access_scope = self.state.workspace_access.scope(self.state.workspace_root),
@@ -227,6 +231,7 @@ const AcpContext = struct {
             .agent_stream_provider = self.state.cfg.gateway_provider.agent_stream,
             .credential_source = session.credential_source,
             .oauth_transport = self.state.cfg.gateway_provider.oauth_transport,
+            .secret_store = self.state.cfg.secret_store,
             .gateway_team = self.state.gateway_team,
             .model = session.model,
             .gateway_retry_count = self.state.cfg.gateway_retry_count,
@@ -240,8 +245,8 @@ const AcpContext = struct {
             .permission_grants = session.session_grants,
             .permission_rules = session.permission_rules,
             .tool_registry = self.toolRegistry(),
-            .permission_reviewer_provider = self.state.cfg.permission_reviewer_provider,
-            .auto_classifier = self.auto_classifier,
+            .permission_reviewer_provider = if (gateway_features_allowed) self.state.cfg.permission_reviewer_provider else null,
+            .auto_classifier = if (gateway_features_allowed) self.auto_classifier else permission_auto_classifier.Classifier.disabled(),
             .subagent_host = self.state.subagent_host,
             .subagent_caller_id = session.session_id,
             .worker = &self.state.worker,
@@ -275,7 +280,7 @@ const AcpContext = struct {
             .web_fetch_artifact_store = session.session_rt.webFetchArtifactStore(),
             .web_fetch_artifact_error = session.session_rt.webFetchArtifactError(),
             .web_search_runtime_ready = false,
-            .web_search_backend = self.state.web_search_runtime.dispatchBackend(),
+            .web_search_backend = if (gateway_features_allowed) self.state.web_search_runtime.dispatchBackend() else null,
             .model_capability_resolver = .{
                 .ctx = @ptrCast(self),
                 .resolve_fn = resolveModelCapabilities,
@@ -435,6 +440,15 @@ pub fn handlePrompt(
     const session = if (state.active_session) |*active| active else return .{
         .rpc_error = no_active_session_rpc_error,
     };
+    if (!try server.selectCredentialForModel(state, session.model)) {
+        return .{ .rpc_error = .{
+            .code = ErrorCode.invalid_request,
+            .message = if (model_provider.isChatGptSubscriptionModel(session.model))
+                credentials.missing_chatgpt_credential_message
+            else
+                credentials.missing_credential_message,
+        } };
+    }
 
     const params = msg.params_raw orelse return .{
         .rpc_error = .{
@@ -981,6 +995,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .push_context_notice = pushContextNotice,
         .push_command_output_complete = pushCommandOutputComplete,
         .push_http_error = pushHttpError,
+        .refresh_gateway_credential = refreshGatewayCredential,
         .available_model_capabilities = availableModelCapabilities,
         .resolve_model_capabilities = resolveModelCapabilities,
         .format_tool_execution_error = formatToolExecutionError,
@@ -988,6 +1003,16 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .usage = &session.session_rt.usage,
         .usage_allocator = ctx.state.alloc,
     };
+}
+
+fn refreshGatewayCredential(
+    raw: *anyopaque,
+    alloc: Allocator,
+    source: types.CredentialSource,
+    mode: auth_runtime.CredentialRefreshMode,
+) !?[]u8 {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw));
+    return server.refreshModelCredential(@ptrCast(ctx.state), alloc, source, mode);
 }
 
 fn persistUsageCheckpoint(
@@ -3889,6 +3914,20 @@ test "ACP prompt projection configures web search then blocks native execution" 
     try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, state.web_search_runtime.gateway_chat_url);
     try std.testing.expectEqual(.failure, execution.status);
     try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
+}
+
+test "ACP ChatGPT route removes Gateway-backed auxiliary capabilities" {
+    const alloc = std.testing.allocator;
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .auto);
+    defer state.deinit();
+    state.active_session.?.credential_source = .chatgpt_subscription;
+    state.active_session.?.api_key = "chatgpt-secret";
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
+
+    const tool_ctx = ctx.toolContext();
+    try std.testing.expect(tool_ctx.web_search_backend == null);
+    try std.testing.expect(tool_ctx.permission_reviewer_provider == null);
+    try std.testing.expect(!tool_ctx.auto_classifier.enabled());
 }
 
 test "ACP default user commands require configured authority or review" {

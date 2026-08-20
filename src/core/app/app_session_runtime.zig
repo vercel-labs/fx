@@ -1787,6 +1787,12 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn startResumedSessionReconciliation(app: *App) void {
             if (comptime @hasField(App, "auth")) {
+                if (comptime @hasDecl(@TypeOf(app.auth), "credentialSource")) {
+                    if (app.auth.credentialSource() == .chatgpt_subscription) {
+                        app.session.usage.clearReconciliationCredential();
+                        return;
+                    }
+                }
                 if (app.auth.apiKey()) |api_key| {
                     app.session.usage.startReconciliation(
                         app.alloc,
@@ -9691,6 +9697,53 @@ test "renameActiveSession persists the title to the sidecar and session index" {
     defer display.deinit(alloc);
     try std.testing.expect(display.present);
     try std.testing.expectEqualStrings("deploy pipeline fix", display.title);
+}
+
+const ReconciliationOriginUsage = struct {
+    started: usize = 0,
+    cleared: usize = 0,
+
+    fn startReconciliation(self: *@This(), _: Allocator, _: []const u8) void {
+        self.started += 1;
+    }
+
+    fn clearReconciliationCredential(self: *@This()) void {
+        self.cleared += 1;
+    }
+};
+
+const ReconciliationOriginAuth = struct {
+    source: types.CredentialSource,
+
+    fn credentialSource(self: *const @This()) ?types.CredentialSource {
+        return self.source;
+    }
+
+    fn apiKey(_: *const @This()) ?[]const u8 {
+        return "origin-bound-token";
+    }
+};
+
+const ReconciliationOriginApp = struct {
+    alloc: Allocator = std.testing.allocator,
+    auth: ReconciliationOriginAuth,
+    session: struct { usage: ReconciliationOriginUsage = .{} } = .{},
+};
+
+test "resumed ChatGPT sessions never start Gateway usage reconciliation" {
+    var chatgpt = ReconciliationOriginApp{
+        .auth = .{ .source = .chatgpt_subscription },
+    };
+    Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&chatgpt);
+    try std.testing.expectEqual(@as(usize, 0), chatgpt.session.usage.started);
+    try std.testing.expectEqual(@as(usize, 1), chatgpt.session.usage.cleared);
+
+    var gateway = ReconciliationOriginApp{
+        .auth = .{ .source = .ai_gateway_api_key },
+    };
+    Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&gateway);
+    try std.testing.expectEqual(@as(usize, 1), gateway.session.usage.started);
+    try std.testing.expectEqual(@as(usize, 0), gateway.session.usage.cleared);
 }
 
 test "ensureCachedSessionTitle derives from the first prompt and then freezes" {

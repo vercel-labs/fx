@@ -14,7 +14,7 @@ pub const ParsedCommand = union(enum) {
     rename_session: []const u8,
     help,
     login,
-    logout,
+    logout: []const u8,
     setup,
     status,
     background,
@@ -60,7 +60,7 @@ pub const CommandHandlers = struct {
     continue_recovery: *const fn (ctx: *anyopaque) anyerror!void,
     show_help: *const fn (ctx: *anyopaque) anyerror!void,
     login: *const fn (ctx: *anyopaque) anyerror!void,
-    logout: *const fn (ctx: *anyopaque) anyerror!void,
+    logout: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     setup: *const fn (ctx: *anyopaque) anyerror!void,
     show_status: *const fn (ctx: *anyopaque) anyerror!void,
     show_background: *const fn (ctx: *anyopaque) anyerror!void,
@@ -112,7 +112,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .rename_session => .{ .rename_session = payload },
         .help => .help,
         .login => .login,
-        .logout => .logout,
+        .logout => .{ .logout = payload },
         .setup => .setup,
         .status => .status,
         .background => .background,
@@ -172,7 +172,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .rename_session => |rest| try handlers.rename_session(handlers.ctx, rest),
         .help => try handlers.show_help(handlers.ctx),
         .login => try handlers.login(handlers.ctx),
-        .logout => try handlers.logout(handlers.ctx),
+        .logout => |rest| try handlers.logout(handlers.ctx, rest),
         .setup => try handlers.setup(handlers.ctx),
         .status => try handlers.show_status(handlers.ctx),
         .background => try handlers.show_background(handlers.ctx),
@@ -219,6 +219,13 @@ test "parse extracts model command payload" {
     switch (parsed) {
         .model => |query| try std.testing.expectEqualStrings("claude-opus", query),
         else => return error.TestExpectedEqual,
+    }
+}
+
+test "parse extracts an optional logout provider" {
+    switch (parse(testSlashRegistry(), "/logout chatgpt")) {
+        .logout => |provider| try std.testing.expectEqualStrings("chatgpt", provider),
+        else => return error.TestExpectedLogoutCommand,
     }
 }
 
@@ -554,7 +561,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .continue_recovery = unexpectedNoPayload,
         .show_help = unexpectedNoPayload,
         .login = unexpectedNoPayload,
-        .logout = unexpectedNoPayload,
+        .logout = unexpectedPayload,
         .setup = unexpectedNoPayload,
         .show_status = unexpectedNoPayload,
         .show_background = unexpectedNoPayload,

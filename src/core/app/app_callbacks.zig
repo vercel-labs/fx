@@ -363,7 +363,7 @@ pub fn Bindings(comptime App: type) type {
             mode: auth_runtime.CredentialRefreshMode,
         ) !?[]u8 {
             const app: *App = @ptrCast(@alignCast(raw_ctx));
-            return auth_runtime.refreshFxLoginToken(
+            return auth_runtime.refreshCredentialToken(
                 app.auth.oauthTransport(),
                 alloc,
                 source,

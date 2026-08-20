@@ -49,6 +49,7 @@ const command_specs = @import("core/slash_commands/command_specs.zig");
 const builtin_context = @import("builtins/context.zig");
 const builtin_devbox = @import("builtins/devbox.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
+const builtin_providers = @import("builtins/providers.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
@@ -180,6 +181,11 @@ const idle_wasm_poll_timeout_ms: i32 = 16;
 const resize_debounce_ms: i64 = 100;
 const max_transcript_bytes: usize = 256 * 1024;
 const default_max_agent_steps: usize = agent_steps.default_max_agent_steps;
+const native_gateway_provider: gateway_provider.Provider = provider: {
+    var value = builtin_gateway.provider;
+    value.agent_stream = builtin_providers.agent_stream_provider;
+    break :provider value;
+};
 const max_history_turns: usize = 8;
 const max_list_entries: usize = 100;
 const max_read_file_bytes: usize = 50 * 1024;
@@ -431,7 +437,7 @@ const App = struct {
         return if (comptime host_target.is_wasm)
             js_host_stream_provider.provider()
         else
-            builtin_gateway.agent_stream_provider;
+            builtin_providers.agent_stream_provider;
     }
 
     pub fn cooperativeTransportPulse(self: *Self) !void {
@@ -915,8 +921,8 @@ const App = struct {
         try AuthAppRuntime.runLoginCommand(self);
     }
 
-    pub fn runLogoutCommand(self: *App) !void {
-        try AuthAppRuntime.runLogoutCommand(self);
+    pub fn runLogoutCommand(self: *App, target: []const u8) !void {
+        try AuthAppRuntime.runLogoutCommand(self, target);
     }
 
     pub fn applyAuthPickerChoice(self: *App, choice: auth_runtime.Choice) !void {
@@ -3201,7 +3207,7 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .models_path = builtin_gateway.models_path,
         .gateway_retry_count = builtin_gateway.retry_count,
         .gateway_chat_url = builtin_gateway.default_chat_url,
-        .gateway_provider = builtin_gateway.provider,
+        .gateway_provider = native_gateway_provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3237,7 +3243,7 @@ fn localEntryConfig() app_entry_runtime.Config {
         .models_path = builtin_gateway.models_path,
         .gateway_retry_count = builtin_gateway.retry_count,
         .gateway_chat_url = builtin_gateway.default_chat_url,
-        .gateway_provider = builtin_gateway.provider,
+        .gateway_provider = native_gateway_provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3272,7 +3278,7 @@ fn emptyEntryConfig() app_entry_runtime.Config {
         .models_path = "",
         .gateway_retry_count = 0,
         .gateway_chat_url = "",
-        .gateway_provider = builtin_gateway.provider,
+        .gateway_provider = native_gateway_provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,

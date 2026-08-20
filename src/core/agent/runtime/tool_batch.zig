@@ -46,8 +46,14 @@ pub fn appendAssistantToolCallStep(
     within_turn_suffix: *std.ArrayList(ChatMessage),
     content: ?[]const u8,
     tool_calls: []const ToolCall,
+    provider_state_json: ?[]const u8,
 ) !void {
-    try within_turn_suffix.append(arena, .{ .role = .assistant, .content = content, .tool_calls = tool_calls });
+    try within_turn_suffix.append(arena, .{
+        .role = .assistant,
+        .content = content,
+        .tool_calls = tool_calls,
+        .provider_state_json = provider_state_json,
+    });
 }
 
 pub fn appendToolResultContent(
@@ -549,7 +555,7 @@ test "drained batch feedback follows all tool results and keeps its source call"
         .{ .id = "call_second", .name = "run_command", .arguments_json = "{}" },
     };
 
-    try appendAssistantToolCallStep(alloc, &suffix, null, &calls);
+    try appendAssistantToolCallStep(alloc, &suffix, null, &calls, null);
     try appendToolResultContent(
         alloc,
         &suffix,

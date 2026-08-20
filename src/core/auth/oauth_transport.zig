@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 pub const Method = enum {
     get,
     post_form,
+    post_json,
 };
 
 pub const Request = struct {

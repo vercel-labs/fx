@@ -1,6 +1,9 @@
 const std = @import("std");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
+const auth_runtime = @import("../auth/auth_runtime.zig");
+const credentials = @import("../auth/credentials.zig");
+const model_provider = @import("../config/model_provider.zig");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
@@ -120,8 +123,44 @@ pub fn run(
     var arena_state = std.heap.ArenaAllocator.init(turn.alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var routed_credential: ?credentials.Credential = null;
+    defer if (routed_credential) |*credential| credential.deinit(turn.alloc);
+    var routed_config = config;
+    const chatgpt_model = model_provider.isChatGptSubscriptionModel(admission.model);
+    const chatgpt_credential = config.tool_context.credential_source == .chatgpt_subscription;
+    if (chatgpt_model != chatgpt_credential) {
+        const resolution = credentials.resolveForModel(
+            turn.alloc,
+            config.tool_context.oauth_transport,
+            config.tool_context.secret_store,
+            .refresh_if_needed,
+            admission.model,
+            config.tool_context.credential_source,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            turn.setFailureDiagnostic("model_credential_resolution_failed", @errorName(err)) catch
+                return error.OutOfMemory;
+            return error.ProviderFailed;
+        };
+        routed_credential = resolution.credential;
+        const credential = if (routed_credential) |*value| value else {
+            turn.setFailureDiagnostic("model_credential_missing", admission.model) catch
+                return error.OutOfMemory;
+            return error.ProviderFailed;
+        };
+        routed_config.tool_context.api_key = credential.token;
+        routed_config.tool_context.gateway_team = credential.gatewayTeam();
+        routed_config.tool_context.credential_source = credential.source;
+    }
+    routed_config.tool_context.model = admission.model;
+    if (routed_config.tool_context.credential_source == .chatgpt_subscription) {
+        routed_config.tool_context.permission_reviewer_provider = null;
+        routed_config.tool_context.auto_classifier = auto_classifier.Classifier.disabled();
+        routed_config.tool_context.web_search_backend = null;
+        routed_config.tool_context.web_search_runtime_ready = false;
+    }
     var context = Context{
-        .config = config,
+        .config = routed_config,
         .turn = turn,
         .admission = admission,
         .cancel = cancel,
@@ -248,11 +287,27 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .push_route_recovery_status = pushLiveRouteRecoveryStatus,
         .push_command_output_complete = pushLiveCommandOutputComplete,
         .push_http_error = captureHttpError,
+        .refresh_gateway_credential = refreshGatewayCredential,
         .format_tool_execution_error = formatToolExecutionError,
         .report_usage = reportUsage,
         .usage = &context.turn.sessionRuntime().usage,
         .usage_allocator = context.turn.alloc,
     };
+}
+
+fn refreshGatewayCredential(
+    raw: *anyopaque,
+    alloc: Allocator,
+    source: types.CredentialSource,
+    mode: auth_runtime.CredentialRefreshMode,
+) !?[]u8 {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return auth_runtime.refreshCredentialToken(
+        context.config.tool_context.oauth_transport,
+        alloc,
+        source,
+        mode,
+    );
 }
 
 fn finalizeTurn(

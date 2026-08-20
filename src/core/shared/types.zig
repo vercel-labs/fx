@@ -92,6 +92,7 @@ pub const CredentialSource = enum {
     ai_gateway_api_key,
     fx_login,
     stored_key,
+    chatgpt_subscription,
 };
 
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {
@@ -866,6 +867,9 @@ pub const ChatMessage = struct {
     tool_call_id: ?[]const u8 = null,
     tool_name: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
+    /// Provider-owned opaque response items needed only for stateless within-turn continuation.
+    /// The value is a validated JSON array and is never sent across provider routes.
+    provider_state_json: ?[]const u8 = null,
     tool_result_status: ?PersistedToolStatus = null,
     tool_result_memory: ?ToolResultMemory = null,
     permission_feedback: bool = false,
@@ -959,6 +963,8 @@ pub const GatewayCompletion = struct {
     delivery_ambiguous: bool = false,
     provider_result_identity_failure: ?ProviderResultIdentityFailure = null,
     provider_failure_detail: ?[]const u8 = null,
+    /// Provider-owned opaque response items for the next stateless request in this turn.
+    provider_state_json: ?[]const u8 = null,
     finish_reason: ?ProviderFinishReason = null,
     usage: Usage = .{},
 };

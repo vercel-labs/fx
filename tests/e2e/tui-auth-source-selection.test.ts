@@ -45,6 +45,7 @@ let home: string | null = null;
 let stderrPath: string | null = null;
 let gateway: ReturnType<typeof startFakeGateway> | null = null;
 let oauth: ReturnType<typeof startFakeOAuth> | null = null;
+let chatgptOauth: ReturnType<typeof startFakeChatGptOAuth> | null = null;
 let creditsGateway: ReturnType<typeof startFakeCreditsGateway> | null = null;
 let catcher: ReturnType<typeof startRequestCatcher> | null = null;
 
@@ -55,6 +56,8 @@ afterEach(async () => {
   gateway = null;
   oauth?.stop();
   oauth = null;
+  chatgptOauth?.stop();
+  chatgptOauth = null;
   creditsGateway?.stop();
   creditsGateway = null;
   catcher?.stop();
@@ -63,6 +66,21 @@ afterEach(async () => {
   home = null;
   stderrPath = null;
 });
+
+function writeSeededChatGptLogin(testHome: string, accessToken = chatgptAccessToken()): void {
+  const fxDir = join(testHome, ".fx");
+  mkdirSync(fxDir, { recursive: true, mode: 0o700 });
+  chmodSync(fxDir, 0o700);
+  const authPath = join(fxDir, "chatgpt-auth.json");
+  writeFileSync(authPath, JSON.stringify({
+    version: 1,
+    access_token: accessToken,
+    refresh_token: "chatgpt-refresh",
+    expires_at_ms: Date.now() + 60 * 60 * 1000,
+    account_id: "acct_e2e",
+  }) + "\n", { mode: 0o600 });
+  chmodSync(authPath, 0o600);
+}
 
 function writeSeededFxLogin(
   testHome: string,
@@ -301,6 +319,130 @@ function startFakeOAuth(
   };
 }
 
+function chatgptAccessToken(accountId = "acct_e2e"): string {
+  const payload = Buffer.from(JSON.stringify({
+    "https://api.openai.com/auth": { chatgpt_account_id: accountId },
+  })).toString("base64url");
+  return `header.${payload}.signature`;
+}
+
+function startFakeChatGptOAuth(
+  options: {
+    tokenDelayMs?: number;
+    responseDelayMs?: number;
+    unauthorizedResponses?: number;
+  } = {},
+) {
+  const accessToken = chatgptAccessToken();
+  let responseCount = 0;
+  const requests: Array<{
+    method: string;
+    path: string;
+    authorization: string | null;
+    body: string | null;
+  }> = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      const body = url.pathname === "/chatgpt/responses"
+        ? await request.text()
+        : null;
+      requests.push({
+        method: request.method,
+        path: url.pathname,
+        authorization: request.headers.get("authorization"),
+        body,
+      });
+      if (url.pathname === "/chatgpt/device") {
+        return Response.json({
+          device_auth_id: "chatgpt-device-id",
+          user_code: "CHAT-CODE",
+          interval: 0,
+        });
+      }
+      if (url.pathname === "/chatgpt/poll") {
+        if (options.tokenDelayMs) await Bun.sleep(options.tokenDelayMs);
+        return Response.json({
+          authorization_code: "chatgpt-code",
+          code_verifier: "chatgpt-verifier",
+        });
+      }
+      if (url.pathname === "/chatgpt/token") {
+        return Response.json({
+          access_token: accessToken,
+          refresh_token: "chatgpt-refresh",
+          expires_in: 3600,
+        });
+      }
+      if (url.pathname === "/chatgpt/responses") {
+        responseCount += 1;
+        if (responseCount <= (options.unauthorizedResponses ?? 0)) {
+          return Response.json(
+            { error: { message: "expired ChatGPT token" } },
+            { status: 401 },
+          );
+        }
+        if (options.responseDelayMs) await Bun.sleep(options.responseDelayMs);
+        return new Response(
+          'data: {"type":"response.output_text.delta","delta":"CHATGPT_DIRECT_RESPONSE"}\n\n' +
+            'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":4,"output_tokens":2}}}\n\n',
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+  const baseUrl = `http://127.0.0.1:${server.port}`;
+  return {
+    accessToken,
+    requests,
+    env: {
+      FX_E2E_CHATGPT_DEVICE_USER_CODE_URL: `${baseUrl}/chatgpt/device`,
+      FX_E2E_CHATGPT_DEVICE_TOKEN_URL: `${baseUrl}/chatgpt/poll`,
+      FX_E2E_CHATGPT_TOKEN_URL: `${baseUrl}/chatgpt/token`,
+      FX_E2E_OPENAI_CODEX_RESPONSES_URL: `${baseUrl}/chatgpt/responses`,
+    },
+    stop() {
+      server.stop(true);
+    },
+  };
+}
+
+function startFakeCodexToolLoop() {
+  const bodies: string[] = [];
+  const accessToken = chatgptAccessToken("acct_tool_loop");
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      bodies.push(await request.text());
+      if (bodies.length === 1) {
+        return new Response(
+          'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning"}}\n\n' +
+            'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_tool","type":"reasoning","summary":[],"encrypted_content":"opaque-tool-loop"}}\n\n' +
+            'data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_read","name":"read_file"}}\n\n' +
+            'data: {"type":"response.function_call_arguments.done","output_index":1,"arguments":"{\\"path\\":\\"README.md\\"}"}\n\n' +
+            'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":5,"output_tokens":2}}}\n\n',
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return new Response(
+        'data: {"type":"response.output_text.delta","delta":"CODEX_TOOL_LOOP_OK"}\n\n' +
+          'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":7,"output_tokens":3}}}\n\n',
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
+  return {
+    accessToken,
+    bodies,
+    responsesUrl: `http://127.0.0.1:${server.port}/responses`,
+    stop() { server.stop(true); },
+  };
+}
+
 tmuxTest(
   "inline sign-in renders the device flow and Ctrl+C cancels without a session",
   async () => {
@@ -315,6 +457,8 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/login");
+    await session.waitForText("Sign in with ChatGPT", TIMEOUT);
+    await session.sendKeys("Enter");
     const signInScreen = await session.waitForPane(
       (pane) =>
         pane.includes("Sign in with Vercel") &&
@@ -332,6 +476,197 @@ tmuxTest(
     expect(session.isAlive()).toBe(true);
     expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
     expect(await session.captureFullScrollback()).not.toContain("Signed in to Vercel.");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "ChatGPT sign-in uses the rendered device flow and Ctrl+C cancels without a session",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-chatgpt-cancel-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    chatgptOauth = startFakeChatGptOAuth({ tokenDelayMs: 5_000 });
+
+    session = await startFx(
+      home,
+      stderrPath,
+      gateway,
+      undefined,
+      undefined,
+      chatgptOauth.env,
+    );
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForText("Sign in with ChatGPT", TIMEOUT);
+    await session.sendKeys("Down");
+    await session.sendKeys("Enter");
+    const signInScreen = await session.waitForPane(
+      (pane) =>
+        pane.includes("Sign in with ChatGPT") &&
+        pane.includes("CHAT-CODE") &&
+        pane.includes("auth.openai.com/codex/device") &&
+        pane.includes("Waiting for authorization") &&
+        pane.includes("Enter reopens browser · Esc cancels"),
+      TIMEOUT,
+    );
+    await session.resizeWindow(72, 10);
+    await session.waitForText("CHAT-CODE", TIMEOUT);
+    await session.resizeWindow(100, 30);
+    await session.sendKeys("C-c");
+    await session.waitForComposer(TIMEOUT);
+
+    expect(session.isAlive()).toBe(true);
+    expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
+    expect(await session.captureFullScrollback()).not.toContain("Signed in with ChatGPT.");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "ChatGPT sign-in refreshes the model picker without FX_MODEL",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-chatgpt-success-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([], {
+      models() {
+        return [{ id: "openai/gpt-5.6-sol", type: "language", tags: ["tool-use"] }];
+      },
+    });
+    chatgptOauth = startFakeChatGptOAuth({ tokenDelayMs: 500 });
+
+    session = await startFx(
+      home,
+      stderrPath,
+      gateway,
+      undefined,
+      undefined,
+      {
+        ...chatgptOauth.env,
+        AI_GATEWAY_API_KEY: undefined,
+        FX_MODEL: undefined,
+      },
+    );
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForText("Sign in with ChatGPT", TIMEOUT);
+    await session.sendKeys("Down");
+    await session.sendKeys("Enter");
+    await session.waitForText("CHAT-CODE", TIMEOUT);
+    await session.waitForText("Signed in with ChatGPT.", TIMEOUT);
+
+    const authPath = join(home, ".fx", "chatgpt-auth.json");
+    expect(existsSync(authPath)).toBe(true);
+    expect(statSync(authPath).mode & 0o077).toBe(0);
+
+    await session.sendText("/status");
+    await session.waitForText(
+      "connected_providers=ChatGPT",
+      TIMEOUT,
+    );
+    await session.sendText("/model");
+    const picker = await session.waitForPane(
+      (pane) =>
+        pane.includes("openai-codex/gpt-5.6-sol") &&
+        pane.includes("ChatGPT subscription"),
+      TIMEOUT,
+    );
+    expect(picker).toContain("Vercel AI Gateway");
+    await session.sendKeys("Escape");
+    await session.sendKeys("C-c");
+    await session.waitForComposer(TIMEOUT);
+    await session.sendLiteralText("/model openai-codex/gpt-5.6-sol");
+    await session.sendKeys("Space");
+    await session.sendLiteralText("max");
+    await session.sendKeys("Space");
+    await session.sendLiteralText("fast");
+    await session.sendKeys("Enter");
+    await session.waitForText("Switched to openai-codex/gpt-5.6-sol", TIMEOUT);
+    await session.sendText("/fast");
+    await session.waitForText("Fast: off", TIMEOUT);
+    await session.sendText("/fast");
+    await session.waitForText("Fast: on", TIMEOUT);
+    await session.sendText("Use the ChatGPT subscription directly.");
+    await session.waitForText("CHATGPT_DIRECT_RESPONSE", TIMEOUT);
+    const directRequest = chatgptOauth.requests.find(
+      (request) => request.path === "/chatgpt/responses",
+    );
+    expect(directRequest?.authorization).toBe(`Bearer ${chatgptOauth.accessToken}`);
+    const directBody = JSON.parse(directRequest?.body ?? "{}") as {
+      model?: string;
+      service_tier?: string;
+      max_output_tokens?: number;
+      reasoning?: { effort?: string };
+    };
+    expect(directBody.model).toBe("gpt-5.6-sol");
+    expect(directBody.service_tier).toBe("priority");
+    expect(directBody.max_output_tokens).toBeUndefined();
+    expect(directBody.reasoning?.effort).toBe("max");
+    for (const request of [...gateway.requests, ...gateway.modelRequests]) {
+      expect(request.headers.get("authorization")).not.toBe(
+        `Bearer ${chatgptOauth.accessToken}`,
+      );
+    }
+    await session.sendText("/models");
+    await session.waitForPane(
+      (pane) =>
+        pane.includes("Models") &&
+        pane.includes("openai/gpt-5.6-sol") &&
+        pane.includes("openai-codex/gpt-5.6-sol") &&
+        pane.includes("ChatGPT subscription"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Escape");
+    await session.waitForPane((pane) => !pane.includes("Esc Close"), TIMEOUT);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/logout chatgpt");
+    await session.waitForText("Signed out of ChatGPT.", TIMEOUT);
+    expect(existsSync(authPath)).toBe(false);
+    await session.sendText("/model");
+    const afterLogoutPicker = await session.waitForText("Vercel AI Gateway", TIMEOUT);
+    expect(afterLogoutPicker).not.toMatch(/^\s+openai-codex\//m);
+    await session.sendKeys("C-c");
+
+    expect(session.isAlive()).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "ChatGPT response transport cancels blocked HTTP without stopping the shell",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-chatgpt-response-cancel-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    chatgptOauth = startFakeChatGptOAuth({ responseDelayMs: 10_000 });
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+
+    session = await startFx(
+      home,
+      stderrPath,
+      gateway,
+      undefined,
+      undefined,
+      {
+        ...chatgptOauth.env,
+        FX_MODEL: "openai-codex/gpt-5.4",
+      },
+    );
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Cancel the blocked ChatGPT response.");
+    await Bun.sleep(300);
+    const cancelStarted = Date.now();
+    await session.sendKeys("C-c");
+    await session.waitForText("System: cancelled", TIMEOUT);
+    await session.waitForComposer(TIMEOUT);
+    expect(Date.now() - cancelStarted).toBeLessThan(3_000);
+    expect(session.isAlive()).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -356,6 +691,7 @@ tmuxTest(
       (pane) =>
         pane.includes("Setup") &&
         pane.includes("Sign in with Vercel") &&
+        pane.includes("Sign in with ChatGPT") &&
         pane.includes("API key") &&
         pane.includes("Change team") &&
         pane.includes("Switch credential"),
@@ -369,6 +705,7 @@ tmuxTest(
     await session.sendKeys("Escape");
     await session.waitForText("Switch credential", TIMEOUT);
 
+    await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
     const apiKey = await session.waitForText("Paste your AI Gateway API key", TIMEOUT);
@@ -450,7 +787,7 @@ async function waitForTrace(tracePath: string, needle: string): Promise<void> {
 }
 
 async function enterSwitchCredential(pickerSession: TmuxSession): Promise<void> {
-  for (let index = 0; index < 3; index += 1) {
+  for (let index = 0; index < 4; index += 1) {
     await pickerSession.sendKeys("Down");
   }
   await pickerSession.sendKeys("Enter");
@@ -487,6 +824,7 @@ profileStoredKeyTmuxTest(
 
     await session.sendText("/setup");
     await session.waitForText("API key", TIMEOUT);
+    await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
     await session.waitForText("Paste your AI Gateway API key", TIMEOUT);
@@ -538,6 +876,8 @@ tmuxTest(
     await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
 
     await session.sendText("/login");
+    await session.waitForText("Sign in with ChatGPT", TIMEOUT);
+    await session.sendKeys("Enter");
     await session.waitForText("Signed in to Vercel", TIMEOUT);
     await session.sendText("/status");
     await session.waitForText("auth=fx login", TIMEOUT);
@@ -606,6 +946,7 @@ tmuxTest(
 
     await session.sendText("/setup");
     await session.waitForText("Change team", TIMEOUT);
+    await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
@@ -703,6 +1044,8 @@ tmuxTest(
     expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
 
     await session.sendText("/login");
+    await session.waitForText("Sign in with ChatGPT", TIMEOUT);
+    await session.sendKeys("Enter");
     const loginCompleted = await session.waitForText("Signed in to Vercel", TIMEOUT);
     expect(loginCompleted).not.toContain("Setup");
     expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
@@ -824,6 +1167,8 @@ tmuxTest(
     expect(gateway.modelRequests[0].headers.get("authorization")).toBeNull();
 
     await session.sendText("/login");
+    await session.waitForText("Sign in with ChatGPT", TIMEOUT);
+    await session.sendKeys("Enter");
     await session.waitForText("Choose a Vercel team", TIMEOUT);
     await session.resizeWindow(80, 5);
     await session.sendLiteralText("example");
@@ -986,6 +1331,190 @@ test(
     expect(result.stdout.match(/Code: TEST-CODE/g) ?? []).toHaveLength(1);
     expect(result.stdout).not.toContain(oauth.providerDetail);
     expect(result.stderr).toBe("");
+  },
+  60_000,
+);
+
+test(
+  "ChatGPT CLI login survives restart and exposes sourced models without FX_MODEL",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-chatgpt-cli-login-"));
+    gateway = startFakeGateway([], {
+      models() {
+        return [{ id: "openai/gpt-5.6-sol", type: "language", tags: ["tool-use"] }];
+      },
+    });
+    chatgptOauth = startFakeChatGptOAuth({ unauthorizedResponses: 1 });
+    const env = {
+      HOME: home,
+      AI_GATEWAY_API_KEY: undefined,
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_SKIP_ONBOARDING: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_NO_OPEN_BROWSER: "1",
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      ...chatgptOauth.env,
+    };
+
+    const login = await runFx(["login", "openai-codex"], {
+      env,
+      timeoutMs: TIMEOUT,
+    });
+    expect(login.code, `stdout: ${login.stdout}\nstderr: ${login.stderr}`).toBe(0);
+    expect(login.stdout).toContain("Signed in with ChatGPT.");
+    expect(login.stderr).toBe("");
+
+    const authPath = join(home, ".fx", "chatgpt-auth.json");
+    expect(existsSync(authPath)).toBe(true);
+    expect(statSync(authPath).mode & 0o077).toBe(0);
+
+    const status = await runFx(["status", "--json"], { env, timeoutMs: TIMEOUT });
+    expect(status.code).toBe(0);
+    const statusJson = JSON.parse(status.stdout) as {
+      connected_providers: string[];
+      model_source: string;
+    };
+    expect(statusJson.connected_providers).toContain("chatgpt");
+    expect(statusJson.model_source).toBe("Vercel AI Gateway");
+
+    const models = await runFx(["models", "--json"], { env, timeoutMs: TIMEOUT });
+    expect(models.code, `stdout: ${models.stdout}\nstderr: ${models.stderr}`).toBe(0);
+    const modelsJson = JSON.parse(models.stdout) as {
+      models: Array<{ id: string; source: string }>;
+    };
+    expect(modelsJson.models).toContainEqual({
+      id: "openai/gpt-5.6-sol",
+      source: "Vercel AI Gateway",
+    });
+    expect(modelsJson.models).toContainEqual({
+      id: "openai-codex/gpt-5.6-sol",
+      source: "ChatGPT subscription",
+    });
+
+    const offlineModels = await runFx(["models", "--json"], {
+      env: {
+        ...env,
+        FX_GATEWAY_BASE_URL: "http://127.0.0.1:1",
+        FX_E2E_GATEWAY_MODELS_URL: "http://127.0.0.1:1/coding-agent/v1/models",
+      },
+      timeoutMs: TIMEOUT,
+    });
+    expect(
+      offlineModels.code,
+      `stdout: ${offlineModels.stdout}\nstderr: ${offlineModels.stderr}`,
+    ).toBe(0);
+    expect(
+      (JSON.parse(offlineModels.stdout) as { models: Array<{ id: string }> }).models
+        .some((model) => model.id === "openai-codex/gpt-5.6-sol"),
+    ).toBe(true);
+
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ model: "openai-codex/gpt-5.6-sol" }) + "\n",
+      { mode: 0o600 },
+    );
+    const ask = await runFx(
+      ["ask", "--json", "--auto", "Answer directly."],
+      {
+        env,
+        timeoutMs: TIMEOUT,
+      },
+    );
+    expect(ask.code, `stdout: ${ask.stdout}\nstderr: ${ask.stderr}`).toBe(0);
+    expect(ask.stdout).toContain("CHATGPT_DIRECT_RESPONSE");
+    const responseRequest = chatgptOauth.requests.find(
+      (request) => request.path === "/chatgpt/responses",
+    );
+    expect(responseRequest?.authorization).toBe(`Bearer ${chatgptOauth.accessToken}`);
+    expect(
+      chatgptOauth.requests.filter((request) => request.path === "/chatgpt/responses"),
+    ).toHaveLength(2);
+    expect(
+      chatgptOauth.requests.filter((request) => request.path === "/chatgpt/token"),
+    ).toHaveLength(2);
+    for (const request of [...gateway.requests, ...gateway.modelRequests]) {
+      expect(request.headers.get("authorization")).not.toBe(
+        `Bearer ${chatgptOauth.accessToken}`,
+      );
+    }
+
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ model: "zai/glm-5.2" }) + "\n",
+      { mode: 0o600 },
+    );
+    const resumed = await runFx(
+      ["ask", "--json", "--auto", "--resume", "last", "Continue directly."],
+      {
+        env: {
+          ...env,
+          AI_GATEWAY_API_KEY: "gateway-resume-sentinel",
+          FX_MODEL: undefined,
+        },
+        timeoutMs: TIMEOUT,
+      },
+    );
+    expect(resumed.code, `stdout: ${resumed.stdout}\nstderr: ${resumed.stderr}`).toBe(0);
+    expect(resumed.stdout).toContain("CHATGPT_DIRECT_RESPONSE");
+    expect(
+      chatgptOauth.requests.filter((request) => request.path === "/chatgpt/responses"),
+    ).toHaveLength(3);
+    for (const request of [...gateway.requests, ...gateway.modelRequests]) {
+      expect(request.headers.get("authorization")).not.toBe(
+        `Bearer ${chatgptOauth.accessToken}`,
+      );
+    }
+
+    const logout = await runFx(["logout", "openai-codex"], { env, timeoutMs: TIMEOUT });
+    expect(logout.code).toBe(0);
+    expect(logout.stdout).toContain("Signed out of ChatGPT.");
+    expect(existsSync(authPath)).toBe(false);
+  },
+  60_000,
+);
+
+test(
+  "ChatGPT tool loops round-trip encrypted reasoning without Gateway leakage",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-chatgpt-tool-loop-"));
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexToolLoop();
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ model: "openai-codex/gpt-5.4" }) + "\n",
+        { mode: 0o600 },
+      );
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Read the README, then finish."],
+        {
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "gateway-tool-loop-sentinel",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("CODEX_TOOL_LOOP_OK");
+      expect(codex.bodies).toHaveLength(2);
+      expect(codex.bodies[1]).toContain('"encrypted_content":"opaque-tool-loop"');
+      expect(codex.bodies[1]).toContain('"type":"function_call_output"');
+      for (const request of [...gateway.requests, ...gateway.modelRequests]) {
+        expect(request.headers.get("authorization")).not.toBe(`Bearer ${codex.accessToken}`);
+      }
+    } finally {
+      codex.stop();
+    }
   },
   60_000,
 );

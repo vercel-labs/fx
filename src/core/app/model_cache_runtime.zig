@@ -83,6 +83,7 @@ pub const ModelMenuLoadState = enum {
 
 pub const ModelMenuCatalogState = struct {
     access_level: ?model_catalog.AccessLevel = null,
+    source: ?credentials.Source = null,
     public_only_reason: ?credentials.CatalogPublicOnlyReason = null,
     private_models_hidden: bool = false,
     failure: ?Failure = null,
@@ -244,7 +245,8 @@ fn modelMenuItemMatches(
 fn providerMatchesFilter(provider: []const u8, filter: ModelProviderFilter) bool {
     const known_filter: ?ModelProviderFilter = if (std.ascii.eqlIgnoreCase(provider, "anthropic"))
         .anthropic
-    else if (std.ascii.eqlIgnoreCase(provider, "openai"))
+    else if (std.ascii.eqlIgnoreCase(provider, "openai") or
+        std.ascii.eqlIgnoreCase(provider, "openai-codex"))
         .openai
     else if (std.ascii.eqlIgnoreCase(provider, "xai"))
         .xai
@@ -688,6 +690,7 @@ fn modelMenuCatalogState(outcome: CatalogOutcome) ModelMenuCatalogState {
         null;
     return .{
         .access_level = access.level,
+        .source = access.source,
         .public_only_reason = access.public_only_reason,
         .private_models_hidden = access.private_models_may_be_hidden,
         .failure = if (failure) |failed| .{
@@ -1320,6 +1323,11 @@ test "model menu owns resolved catalog state and filters without changing catalo
     const selected = (try runtime.menu.selectedModelAlloc(alloc)).?;
     defer alloc.free(selected);
     try std.testing.expectEqualStrings("standalone", selected);
+}
+
+test "OpenAI provider tab includes ChatGPT subscription models" {
+    try std.testing.expect(providerMatchesFilter("openai-codex", .openai));
+    try std.testing.expect(!providerMatchesFilter("openai-codex", .others));
 }
 
 test "model menu snapshot construction cleans every allocation failure" {
