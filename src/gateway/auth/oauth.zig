@@ -1,6 +1,6 @@
 const std = @import("std");
 const oauth_transport = @import("oauth_transport.zig");
-const secret = @import("secret.zig");
+const secret = @import("../../core/auth/secret.zig");
 
 const Allocator = std.mem.Allocator;
 

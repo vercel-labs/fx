@@ -1,10 +1,10 @@
 const std = @import("std");
-const model_history = @import("../agent/model_history.zig");
+const model_history = @import("../core/agent/model_history.zig");
 const builtin = @import("builtin");
-const image_attachments = @import("../images/image_attachments.zig");
-const io_mod = @import("../shared/io.zig");
-const model_capabilities = @import("../config/model_capabilities.zig");
-const types = @import("../shared/types.zig");
+const image_attachments = @import("../core/images/image_attachments.zig");
+const io_mod = @import("../core/shared/io.zig");
+const model_capabilities = @import("../core/config/model_capabilities.zig");
+const types = @import("../core/shared/types.zig");
 
 pub const ChatRole = types.ChatRole;
 pub const ChatMessage = types.ChatMessage;

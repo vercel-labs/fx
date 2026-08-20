@@ -1,15 +1,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const credentials = @import("credentials.zig");
-const debug_trace = @import("../shared/debug_trace.zig");
-const host = @import("../hosts/host.zig");
-const host_target = @import("../hosts/target.zig");
-const io_mod = @import("../shared/io.zig");
+const debug_trace = @import("../../core/shared/debug_trace.zig");
+const host = @import("../../core/hosts/host.zig");
+const host_target = @import("../../core/hosts/target.zig");
+const io_mod = @import("../../core/shared/io.zig");
 const js_host_auth = @import("js_host_auth.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
-const secret = @import("secret.zig");
+const secret = @import("../../core/auth/secret.zig");
 const test_builtin_gateway = if (builtin.is_test)
     @import("../../builtins/gateway.zig")
 else

@@ -1,12 +1,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const debug_trace = @import("../shared/debug_trace.zig");
-const host_target = @import("../hosts/target.zig");
-const native_keychain = @import("../hosts/native_keychain.zig");
-const io_mod = @import("../shared/io.zig");
-const profile_paths = @import("../shared/profile_paths.zig");
+const debug_trace = @import("../../core/shared/debug_trace.zig");
+const host_target = @import("../../core/hosts/target.zig");
+const native_keychain = @import("../../core/hosts/native_keychain.zig");
+const io_mod = @import("../../core/shared/io.zig");
+const profile_paths = @import("../../core/shared/profile_paths.zig");
 const js_host_auth = @import("js_host_auth.zig");
-const secret = @import("secret.zig");
+const secret = @import("../../core/auth/secret.zig");
 
 const Allocator = std.mem.Allocator;
 

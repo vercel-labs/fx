@@ -1,5 +1,5 @@
 const std = @import("std");
-const secret = @import("secret.zig");
+const secret = @import("../../core/auth/secret.zig");
 
 const Allocator = std.mem.Allocator;
 

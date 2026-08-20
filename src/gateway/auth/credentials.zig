@@ -1,13 +1,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const debug_trace = @import("../shared/debug_trace.zig");
-const host = @import("../hosts/host.zig");
-const io_mod = @import("../shared/io.zig");
+const debug_trace = @import("../../core/shared/debug_trace.zig");
+const host = @import("../../core/hosts/host.zig");
+const io_mod = @import("../../core/shared/io.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
-const secret = @import("secret.zig");
-const types = @import("../shared/types.zig");
+const secret = @import("../../core/auth/secret.zig");
+const types = @import("../../core/shared/types.zig");
 
 pub const Source = types.CredentialSource;
 

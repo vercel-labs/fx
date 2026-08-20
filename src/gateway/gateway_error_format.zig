@@ -1,6 +1,6 @@
 const std = @import("std");
-const display_width = @import("display_width.zig");
-const text_utils = @import("text_utils.zig");
+const display_width = @import("../core/shared/display_width.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const max_published_error_bytes: usize = 1024;

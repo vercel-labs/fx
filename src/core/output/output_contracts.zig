@@ -1,6 +1,6 @@
 const std = @import("std");
 const auth_runtime = @import("../auth/auth_runtime.zig");
-const credentials = @import("../auth/credentials.zig");
+const credentials = @import("../../gateway/auth/credentials.zig");
 const background_store = @import("../background/background_store.zig");
 const doctor_runtime = @import("../cli/doctor_runtime.zig");
 const permissions = @import("../permissions/permissions.zig");

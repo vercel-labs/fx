@@ -1,8 +1,8 @@
 const std = @import("std");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 pub const account_usage_provider = @import("account_usage_provider.zig");
-const credentials = @import("../auth/credentials.zig");
-const oauth_transport = @import("../auth/oauth_transport.zig");
+const credentials = @import("../../gateway/auth/credentials.zig");
+const oauth_transport = @import("../../gateway/auth/oauth_transport.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const output_contracts = @import("../output/output_contracts.zig");

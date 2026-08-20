@@ -1,6 +1,6 @@
 const std = @import("std");
 const gateway_json = @import("gateway_json.zig");
-const gateway_error_format = @import("../shared/gateway_error_format.zig");
+const gateway_error_format = @import("gateway_error_format.zig");
 
 const Allocator = std.mem.Allocator;
 

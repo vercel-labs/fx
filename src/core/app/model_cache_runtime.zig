@@ -1,5 +1,5 @@
 const std = @import("std");
-const credentials = @import("../auth/credentials.zig");
+const credentials = @import("../../gateway/auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const collections = @import("../shared/collections.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");

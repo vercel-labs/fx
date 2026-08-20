@@ -1,6 +1,6 @@
 const std = @import("std");
 const model_capabilities = @import("../config/model_capabilities.zig");
-const credentials = @import("../auth/credentials.zig");
+const credentials = @import("../../gateway/auth/credentials.zig");
 const collections = @import("../shared/collections.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");

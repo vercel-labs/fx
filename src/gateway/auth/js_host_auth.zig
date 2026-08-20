@@ -1,8 +1,8 @@
 const std = @import("std");
-const host_target = @import("../hosts/target.zig");
-const io_mod = @import("../shared/io.zig");
+const host_target = @import("../../core/hosts/target.zig");
+const io_mod = @import("../../core/shared/io.zig");
 const oauth_transport = @import("oauth_transport.zig");
-const secret = @import("secret.zig");
+const secret = @import("../../core/auth/secret.zig");
 
 const Allocator = std.mem.Allocator;
 const max_response_bytes: usize = 64 * 1024;
