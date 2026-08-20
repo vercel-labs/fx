@@ -162,6 +162,25 @@ async function waitForSettingValue(
   );
 }
 
+async function waitForStatuslineSettingValue(
+  settingsPath: string,
+  key: "sandbox" | "context",
+  expected: boolean,
+): Promise<void> {
+  const deadline = Date.now() + TIMEOUT;
+  let latest: unknown;
+  while (Date.now() < deadline) {
+    if (existsSync(settingsPath)) {
+      latest = JSON.parse(readFileSync(settingsPath, "utf8")).statusLine?.[key];
+      if (latest === expected) return;
+    }
+    await Bun.sleep(100);
+  }
+  throw new Error(
+    `Timed out waiting for statusLine.${key}=${expected}; last=${JSON.stringify(latest)}`,
+  );
+}
+
 async function waitForAppearanceMenu(
   session: TmuxSession,
   expectedSelection?: string,
@@ -1631,7 +1650,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.resizeWindow(60, 12, 500);
       await session.sendText("/appearance");
-      pane = await session.waitForText("Appearance", 5_000);
+      pane = (await waitForAppearanceMenu(session)).join("\n");
       expect(pane).toContain("Input appearance");
       expect(pane).toContain("lines  tint");
       expect(pane).toContain("Maxxing mode");
@@ -1691,12 +1710,14 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("←→ Change");
 
       await session.sendKeys("Right");
+      await waitForStatuslineSettingValue(settingsPath, "sandbox", true);
       grid = await waitForStatuslineMenu(session, "off  on");
       pane = grid.join("\n");
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).statusLine.sandbox).toBe(true);
 
       await session.sendKeys("Down");
       await session.sendKeys("Right");
+      await waitForStatuslineSettingValue(settingsPath, "context", true);
       grid = await waitForStatuslineMenu(session, "Context");
       pane = grid.join("\n");
       expect(pane).not.toContain("saved to user settings");
