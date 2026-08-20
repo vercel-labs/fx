@@ -432,8 +432,13 @@ const Runtime = struct {
     }
 
     fn run(self: *Runtime) void {
+        const agent_stream = host_stream_provider.provider(&self.stream_context);
         const provider = gateway_provider.Provider{
-            .agent_stream = host_stream_provider.provider(&self.stream_context),
+            .agent_stream = agent_stream,
+            .provider_adapter = .{
+                .legacy_provider = agent_stream,
+                .stream_fn = builtin_gateway.provider_adapter.stream_fn,
+            },
             .oauth_transport = oauth_transport.unavailable_provider,
             .chat_url = builtin_gateway.provider.chat_url,
             .cli_model_catalog = builtin_gateway.provider.cli_model_catalog,

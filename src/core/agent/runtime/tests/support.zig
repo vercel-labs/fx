@@ -109,6 +109,8 @@ pub const VisionAgentToolRuntime = struct {
     }
 
     fn context(self: *VisionAgentToolRuntime) tool_runtime.Context {
+        var provider_adapter = builtin_gateway.provider_adapter;
+        provider_adapter.legacy_provider = self.agent_stream_provider;
         return .{
             .workspace_root = self.workspace_root,
             .ignored_list_entries = &.{},
@@ -119,6 +121,7 @@ pub const VisionAgentToolRuntime = struct {
             .max_command_output_bytes = 64 * 1024,
             .max_tool_result_bytes = 64 * 1024,
             .api_key = "key",
+            .provider_adapter = provider_adapter,
             .agent_stream_provider = self.agent_stream_provider,
             .model = "anthropic/claude-opus-4.6",
             .gateway_retry_count = 1,
@@ -696,6 +699,7 @@ pub const FakeAgentRuntimeDeps = struct {
     pub fn deps(self: *FakeAgentRuntimeDeps) AgentRuntimeDeps {
         return .{
             .ctx = self,
+            .provider_adapter = adapterFromLegacy(self.agent_stream_provider),
             .agent_stream_provider = self.agent_stream_provider,
             .tool_registry = self.tool_registry,
             .live_tool_authority = self.live_tool_authority,
@@ -1921,6 +1925,7 @@ pub fn runFakePromptWithLifecycle(
     hooks.workspace_root = config.workspace_root;
     var deps = hooks.deps();
     deps.agent_stream_provider = gateway.provider();
+    deps.provider_adapter = adapterFromLegacy(deps.agent_stream_provider);
     if (hooks.execute_delegate) |delegate| {
         if (delegate.set_agent_stream_provider) |set_provider| {
             set_provider(delegate.ctx, deps.agent_stream_provider);
@@ -1933,6 +1938,12 @@ pub fn runFakePromptWithLifecycle(
         config,
         job,
     );
+}
+
+fn adapterFromLegacy(provider: agent_stream_provider.Provider) agent_stream_provider.ProviderAdapter {
+    var adapter = builtin_gateway.provider_adapter;
+    adapter.legacy_provider = provider;
+    return adapter;
 }
 
 fn syntheticFileMutationTargets(

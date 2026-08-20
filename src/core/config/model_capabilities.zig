@@ -54,6 +54,44 @@ pub const Capabilities = struct {
     max_output_tokens: ?u32 = null,
 };
 
+pub const CapabilitySource = enum {
+    catalog,
+    @"adapter-static",
+    configured,
+};
+
+pub const FastRoute = union(enum) {
+    same_model,
+    suffix: []const u8,
+};
+
+pub const ModelDescriptor = struct {
+    id: []const u8,
+    display_name: []const u8,
+    provider: []const u8 = "",
+    capabilities: Capabilities = .{},
+    source: CapabilitySource,
+    selected_fast_mode: bool = false,
+    fast_route: FastRoute = .same_model,
+
+    pub fn routeModel(self: ModelDescriptor, alloc: std.mem.Allocator, fast_mode: bool) ![]const u8 {
+        if (!fast_mode) return self.id;
+        return switch (self.fast_route) {
+            .same_model => self.id,
+            .suffix => |suffix| try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.id, suffix }),
+        };
+    }
+};
+
+pub fn configuredDescriptor(model: []const u8, capabilities: Capabilities) ModelDescriptor {
+    return .{
+        .id = model,
+        .display_name = model,
+        .capabilities = capabilities,
+        .source = .configured,
+    };
+}
+
 pub const ResolveError = error{Cancelled};
 
 pub const Resolver = struct {

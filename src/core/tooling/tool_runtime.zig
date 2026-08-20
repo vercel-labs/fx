@@ -132,6 +132,7 @@ pub const Context = struct {
     max_command_output_bytes: usize,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     api_key: []const u8,
+    provider_adapter: agent_stream_provider.ProviderAdapter = agent_stream_provider.unavailable_adapter,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     gateway_team: ?[]const u8 = null,
     credential_source: ?types.CredentialSource = null,
@@ -2155,6 +2156,8 @@ const TestRuntime = struct {
     }
 
     fn context(self: *TestRuntime) Context {
+        var provider_adapter = test_builtin_gateway.provider_adapter;
+        provider_adapter.legacy_provider = self.agent_stream_provider;
         return .{
             .workspace_root = self.workspace_root,
             .ignored_list_entries = self.ignored_list_entries,
@@ -2165,6 +2168,7 @@ const TestRuntime = struct {
             .max_command_output_bytes = self.max_command_output_bytes,
             .max_tool_result_bytes = self.max_tool_result_bytes,
             .api_key = self.api_key,
+            .provider_adapter = provider_adapter,
             .agent_stream_provider = self.agent_stream_provider,
             .gateway_team = self.gateway_team,
             .model = self.model,

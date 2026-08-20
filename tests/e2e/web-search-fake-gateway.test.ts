@@ -544,13 +544,25 @@ describe("web_search Gateway fixture", () => {
         expect(json.output).toContain(SOURCE_URL);
         expect(json.tool_calls).toHaveLength(0);
         expect(gateway.requests).toHaveLength(2);
-        expect(gateway.requests[0].headers.get("ai-language-model-id")).toBe(OUTER_MODEL);
+        for (const request of gateway.requests) {
+          expect(request.headers.get("authorization")).toBe("Bearer fake-e2e-key");
+          expect(request.headers.get("ai-gateway-protocol-version")).toBe("0.0.1");
+          expect(request.headers.get("ai-language-model-specification-version")).toBe("4");
+          expect(request.headers.get("ai-language-model-id")).toBe(OUTER_MODEL);
+          expect(request.headers.get("ai-language-model-streaming")).toBe("true");
+          expect(request.headers.get("http-referer")).toBe("https://github.com/vercel-labs/fx");
+          expect(request.headers.get("x-title")).toBe("fx");
+          expect(Object.keys(JSON.parse(request.body)).sort()).toEqual([
+            "prompt",
+            "toolChoice",
+            "tools",
+          ]);
+        }
         expect(gateway.requests[0].body).not.toContain('"name":"web_search"');
         expect(gateway.requests[0].body).toContain("gateway.perplexity_search");
         expect(gateway.requests[0].body).toContain('"name":"perplexity_search"');
         expect(gateway.requests[0].body).not.toContain('"name":"parallel_search"');
         expect(gateway.requests[0].body).not.toContain("google/gemini-3-flash");
-        expect(gateway.requests[1].headers.get("ai-language-model-id")).toBe(OUTER_MODEL);
         expect(gateway.requests[1].body).toContain(SOURCE_URL);
         expect(result.stderr).toContain("Searching web");
         const initial = parseGatewayRequest(gateway.requests[0]!.body);
@@ -564,6 +576,11 @@ describe("web_search Gateway fixture", () => {
         expect(toolShapesWithoutDescriptions(continuing)).toEqual(
           toolShapesWithoutDescriptions(initial),
         );
+        expect(toolByName(initial, "perplexity_search")).toMatchObject({
+          type: "provider",
+          id: "gateway.perplexity_search",
+          name: "perplexity_search",
+        });
         for (const request of [initial, continuing]) {
           expect(findUnavailableCapabilityReferences(request)).toEqual([]);
           expect(customProviderGuidanceState(request)).toEqual({
