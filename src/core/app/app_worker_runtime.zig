@@ -214,6 +214,7 @@ pub fn Runtime(comptime App: type) type {
                 .notification,
                 .question_requested,
                 .clear_route_recovery_status,
+                .authentication_failed,
                 .api_status_text,
                 .finish_prompt,
                 .session_grant,
@@ -249,10 +250,6 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn queuePreview(app: *App) QueuePreview {
             return app.worker.queuePreview();
-        }
-
-        pub fn syncQueuedPromptModel(app: *App, model: []const u8) !void {
-            try app.worker.syncQueuedPromptModel(std.heap.c_allocator, model);
         }
 
         pub fn syncQueuedPromptPermissionSnapshot(app: *App, snapshot: worker_runtime.PermissionSnapshot) void {
@@ -816,6 +813,11 @@ pub fn Runtime(comptime App: type) type {
                             app.shell.render_requests.request(.footer);
                         }
                     },
+                    .authentication_failed => {
+                        if (comptime @hasField(App, "auth")) {
+                            app.auth.recordSelectedAuthenticationFailure(app.alloc);
+                        }
+                    },
                     .api_status_text => |text| {
                         resetStream(app, false);
                         app.shell.worker_status_state().set_api(text, .danger);
@@ -1217,12 +1219,6 @@ const FakeWorker = struct {
         return if (self.pending_question) FakeQuestionSnapshot{
             .source = self.pending_question_source,
         } else null;
-    }
-
-    fn syncQueuedPromptModel(self: *FakeWorker, alloc: std.mem.Allocator, model: []const u8) !void {
-        _ = self;
-        _ = alloc;
-        _ = model;
     }
 
     fn syncQueuedPromptPermissionSnapshot(self: *FakeWorker, snapshot: worker_runtime.PermissionSnapshot) void {

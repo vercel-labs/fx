@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const agent_steps = @import("../../config/agent_steps.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
+const route_snapshot = @import("../../gateway/route_snapshot.zig");
 const types = @import("../../shared/types.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
 const worker_runtime = @import("../worker_runtime.zig");
@@ -1105,10 +1106,19 @@ fn restoredRecoveryStrategy(
         .proven_unexecuted => .regenerate_tool,
         .confirmed => .continue_after_confirmed_tool,
         .uncertain => .reconcile_tool,
-        .none => if (checkpoint.assistant_source.len > 0)
-            .continue_response
-        else
-            .retry_request,
+        .none => switch (checkpoint.action) {
+            .retrying_request => .retry_request,
+            .continuing_response => .continue_response,
+            .regenerating_tool => .regenerate_tool,
+            .continuing_after_tool => .continue_after_confirmed_tool,
+            .reconciling_tool => .reconcile_tool,
+            .waiting_for_connectivity, .paused => if (checkpoint.delivery == .definitely_unsent)
+                .retry_request
+            else if (checkpoint.assistant_source.len > 0)
+                .continue_response
+            else
+                .retry_request,
+        },
     };
 }
 
@@ -1124,14 +1134,21 @@ fn restoredConsumedAttempts(
 
 fn recoverySelectionChanged(
     checkpoint: session_codec.RecoveryCheckpoint,
-    selected_model: []const u8,
-    selected_fast_mode: bool,
+    route: *const route_snapshot.RouteSnapshot,
 ) bool {
-    return !std.mem.eql(
-        u8,
-        checkpoint.route_model,
-        selected_model,
-    ) or checkpoint.requested_fast_mode != selected_fast_mode;
+    const identity = checkpoint.route_identity orelse return true;
+    return !std.mem.eql(u8, route.connection_id, identity.connection_id) or
+        !std.mem.eql(u8, route.adapter_kind, identity.adapter_kind) or
+        !std.mem.eql(u8, route.primary_model_id, checkpoint.route_model) or
+        !optionalStringsEqual(
+            route.permission_review_model_id,
+            identity.permission_review_model_id,
+        );
+}
+
+fn optionalStringsEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
 }
 
 fn checkpointCause(
@@ -1214,6 +1231,7 @@ fn persistRecoveryCheckpoint(
     attempt_limit: usize,
     consumed_attempts: usize,
     outstanding_reservation: bool,
+    delivery: session_codec.RecoveryDelivery,
     cause: model_response_recovery.FailureCause,
     strategy: ?model_response_recovery.Strategy,
     tool_evidence: model_response_recovery.ToolEvidence,
@@ -1225,6 +1243,16 @@ fn persistRecoveryCheckpoint(
         current_turn_messages,
     );
     try effect.set(deps.ctx, .{
+        .version = 2,
+        .route_identity = .{
+            .connection_id = @constCast(job.route.connection_id),
+            .adapter_kind = @constCast(job.route.adapter_kind),
+            .permission_review_model_id = if (job.route.permission_review_model_id) |model|
+                @constCast(model)
+            else
+                null,
+        },
+        .delivery = delivery,
         .turn_id = job.turn_id,
         .user = .{
             .text = @constCast(job.prompt),
@@ -1413,13 +1441,11 @@ fn unsafeNoRetryReason(
 fn refreshGatewayCredentialForJob(
     deps: *const AgentRuntimeDeps,
     alloc: Allocator,
-    job: QueuedPrompt,
+    route_credential: *runtime_deps.RouteCredential,
     mode: CredentialRefreshMode,
-    active_api_key: *[]const u8,
-    owned_api_key: *?[]u8,
     trace_ctx: TraceContext,
 ) !bool {
-    const source = job.credential_source orelse return false;
+    const source = route_credential.legacy_source orelse return false;
     if (source != .fx_login) return false;
     const refresh = deps.refresh_gateway_credential orelse return false;
 
@@ -1434,7 +1460,7 @@ fn refreshGatewayCredentialForJob(
         );
         return false;
     } orelse return false;
-    const previous_api_key = active_api_key.*;
+    const previous_api_key = route_credential.credential;
     if (comptime !host_target.is_wasm) {
         if (deps.usage) |usage| {
             usage.refreshReconciliationCredential(
@@ -1444,9 +1470,8 @@ fn refreshGatewayCredentialForJob(
             );
         }
     }
-    if (owned_api_key.*) |old| secret.zeroAndFree(alloc, old);
-    owned_api_key.* = refreshed;
-    active_api_key.* = refreshed;
+    secret.zeroAndFree(alloc, route_credential.credential);
+    route_credential.credential = refreshed;
     debug_trace.eventf(
         "gateway",
         "credential_refreshed",
@@ -1807,7 +1832,7 @@ fn processQueuedPromptInner(
     defer completed_tool_names.deinit(arena);
     var interrupted_persisted = false;
 
-    debug_trace.eventf("agent", "prompt_start", finish_trace.ctx, "prompt_bytes={d} model={s}", .{ job.prompt.len, job.model });
+    debug_trace.eventf("agent", "prompt_start", finish_trace.ctx, "prompt_bytes={d} model={s}", .{ job.prompt.len, job.route.primary_model_id });
 
     try stable_prefix.append(arena, .{ .role = .system, .content = config.system_prompt });
     if (config.custom_tool_guidance.len > 0) {
@@ -1822,34 +1847,7 @@ fn processQueuedPromptInner(
     if (deps.append_static_context) |append_static_context| {
         try append_static_context(deps.ctx, arena, &stable_prefix);
     }
-    var request_capabilities = deps.available_model_capabilities(deps.ctx, job.model);
-    if (requiresResolvedRequestCapabilities(
-        job.images.len > 0 or job.authorized_image_catalog.len > 0,
-        config.effort,
-        config.fast_mode,
-        request_capabilities,
-    )) {
-        request_capabilities = deps.resolve_model_capabilities(deps.ctx, arena, job.model) catch |err| {
-            if (err != error.Cancelled) return err;
-            runtime_telemetry.traceCancelObserved(finish_trace.ctx, false);
-            var terminal_materializing = false;
-            try runtime_interruption.persistInterruptedTurnOnce(
-                deps,
-                finalization,
-                job,
-                null,
-                null,
-                completed_tool_names.items,
-                &interrupted_persisted,
-                finish_trace.ctx,
-                within_turn_suffix.items,
-                null,
-                &terminal_materializing,
-            );
-            finish_trace.finish("interrupted");
-            return;
-        };
-    }
+    const request_descriptor = job.route.descriptor();
     if (config.cancel_flag.load(.seq_cst)) {
         runtime_telemetry.traceCancelObserved(finish_trace.ctx, false);
         var terminal_materializing = false;
@@ -1884,7 +1882,7 @@ fn processQueuedPromptInner(
         arena,
         &history_messages,
         job.history,
-        .{ .max_tokens = runtime_prompt_context.historyContextBudgetTokensForCapabilities(request_capabilities) },
+        .{ .max_tokens = runtime_prompt_context.historyContextBudgetTokensForCapabilities(request_descriptor.capabilities) },
     );
     const projected_roles = try runtime_telemetry.formatMessageRoles(arena, history_messages.items);
     debug_trace.eventf(
@@ -1907,7 +1905,7 @@ fn processQueuedPromptInner(
         lifecycle,
         config,
         job,
-        request_capabilities,
+        request_descriptor.capabilities,
         finalization,
         arena,
         turn_id,
@@ -2534,9 +2532,13 @@ fn processQueuedPromptLoop(
                 job.history,
             ),
     };
-    var active_api_key: []const u8 = job.api_key;
-    var owned_refreshed_api_key: ?[]u8 = null;
-    defer if (owned_refreshed_api_key) |key| secret.zeroAndFree(std.heap.c_allocator, key);
+    if (!deps.provider_adapter.acceptsRoute(&job.route)) return error.RouteAdapterMismatch;
+    var route_credential = try deps.resolve_route_credential(
+        deps.ctx,
+        std.heap.c_allocator,
+        &job.route,
+    );
+    defer route_credential.deinit(std.heap.c_allocator);
     var summary_accumulator = summary_accumulator_ptr.*;
     defer summary_accumulator_ptr.* = summary_accumulator;
     var finish_trace = finish_trace_ptr.*;
@@ -2565,9 +2567,15 @@ fn processQueuedPromptLoop(
         restoredConsumedAttempts(checkpoint)
     else
         0;
-    const selected_fast_mode = config.fast_mode;
+    const selected_fast_mode = if (job.recovery_checkpoint) |checkpoint|
+        checkpoint.requested_fast_mode
+    else
+        config.fast_mode or job.route.selected_fast_mode;
     const selection_changed = if (job.recovery_checkpoint) |checkpoint|
-        recoverySelectionChanged(checkpoint, job.model, selected_fast_mode)
+        recoverySelectionChanged(
+            checkpoint,
+            &job.route,
+        )
     else
         false;
     const restored_budget_exhausted = if (job.recovery_checkpoint) |checkpoint|
@@ -2604,6 +2612,10 @@ fn processQueuedPromptLoop(
         restoredRecoveryToolEvidence(checkpoint.tool_state)
     else
         .none;
+    var recovery_delivery: session_codec.RecoveryDelivery = if (job.recovery_checkpoint) |checkpoint|
+        checkpoint.delivery
+    else
+        .definitely_unsent;
     var restore_recovery_source = job.recovery_checkpoint != null;
     var step: usize = 0;
     while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
@@ -2668,7 +2680,7 @@ fn processQueuedPromptLoop(
         const advertised_dynamic_tool_names = selected_dynamic_tool_names.items;
         var stream_result: runtime_gateway_step.StreamResult = undefined;
         var stream_result_set = false;
-        var gateway_model: []const u8 = job.model;
+        var gateway_model: []const u8 = job.route.primary_model_id;
         var successful_request_messages: []const ChatMessage = &.{};
         var successful_source_messages: []const ChatMessage = &.{};
         var successful_gateway_model: []const u8 = "";
@@ -2713,7 +2725,7 @@ fn processQueuedPromptLoop(
                 reset_stream_for_next_attempt = false;
             }
 
-            gateway_model = job.model;
+            gateway_model = try job.route.modelFor(arena, route_fast_mode);
             if (recoveryPauseRequested(config)) {
                 recovery_strategy = .pause;
                 try persistRecoveryCheckpoint(
@@ -2732,6 +2744,7 @@ fn processQueuedPromptLoop(
                     semantic_limit,
                     semantic_attempt,
                     false,
+                    recovery_delivery,
                     recovery_cause,
                     recovery_strategy,
                     preserved_tool_evidence,
@@ -2768,6 +2781,7 @@ fn processQueuedPromptLoop(
                     semantic_limit,
                     semantic_attempt,
                     false,
+                    recovery_delivery,
                     recovery_cause,
                     recovery_strategy,
                     preserved_tool_evidence,
@@ -2791,10 +2805,8 @@ fn processQueuedPromptLoop(
                 _ = try refreshGatewayCredentialForJob(
                     deps,
                     std.heap.c_allocator,
-                    job,
+                    &route_credential,
                     .if_needed,
-                    &active_api_key,
-                    &owned_refreshed_api_key,
                     step_ctx,
                 );
             }
@@ -2876,6 +2888,9 @@ fn processQueuedPromptLoop(
             runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, .changed) catch |progress_err| {
                 debug_trace.logf("agent", "token progress publication failed source=gateway_prepare err={s}", .{@errorName(progress_err)});
             };
+            // The reservation is durable before the send. A crash after this
+            // point cannot prove that the provider received nothing.
+            recovery_delivery = .possibly_sent;
             try persistRecoveryCheckpoint(
                 deps,
                 arena,
@@ -2888,6 +2903,7 @@ fn processQueuedPromptLoop(
                 semantic_limit,
                 semantic_attempt,
                 true,
+                recovery_delivery,
                 recovery_cause,
                 recovery_strategy,
                 effectiveRecoveryToolEvidence(
@@ -2904,12 +2920,12 @@ fn processQueuedPromptLoop(
             stream_result = runtime_gateway_step.streamModelRequest(
                 deps.provider_adapter,
                 arena,
-                active_api_key,
-                job.gateway_team,
+                &job.route,
+                route_credential.credential,
+                route_credential.tenant,
                 lifecycle.scope.session_id,
                 gateway_model,
                 config.gateway_retry_count,
-                config.gateway_chat_url,
                 model_request,
                 deps.cooperative_transport_pulse,
                 &gateway_delivery,
@@ -2938,9 +2954,17 @@ fn processQueuedPromptLoop(
                     debug_trace.logf("agent", "token progress publication failed source=gateway_error err={s}", .{@errorName(progress_err)});
                 };
                 const cancel_requested = config.cancel_flag.load(.seq_cst);
+                const network_failure = gateway_attempt_evidence.network_failure;
+                const delivery_state = if (network_failure) |evidence|
+                    evidence.delivery
+                else
+                    gateway_delivery.load();
+                recovery_delivery = if (delivery_state == .possibly_sent)
+                    .possibly_sent
+                else
+                    .definitely_unsent;
                 const consumed_attempts = semantic_attempt +
                     @as(usize, @intFromBool(gateway_attempt_evidence.provider_admitted));
-                const network_failure = gateway_attempt_evidence.network_failure;
                 const failure_cause: model_response_recovery.FailureCause = if (network_failure) |evidence|
                     switch (evidence.cause) {
                         .transport_interrupted => .transport_interrupted,
@@ -2967,6 +2991,7 @@ fn processQueuedPromptLoop(
                         semantic_limit,
                         consumed_attempts,
                         false,
+                        recovery_delivery,
                         failure_cause,
                         .pause,
                         effectiveRecoveryToolEvidence(
@@ -3063,6 +3088,7 @@ fn processQueuedPromptLoop(
                     semantic_limit,
                     consumed_attempts,
                     false,
+                    recovery_delivery,
                     failure_cause,
                     recovery_decision.strategy,
                     effectiveRecoveryToolEvidence(
@@ -3104,6 +3130,7 @@ fn processQueuedPromptLoop(
                         semantic_limit,
                         consumed_attempts,
                         false,
+                        recovery_delivery,
                         failure_cause,
                         .pause,
                         effectiveRecoveryToolEvidence(
@@ -3248,6 +3275,10 @@ fn processQueuedPromptLoop(
                 overlay_arena,
                 gateway_delivery.load(),
             );
+            recovery_delivery = if (gateway_delivery.load() == .possibly_sent)
+                .possibly_sent
+            else
+                .definitely_unsent;
             stream_result_set = true;
             if (recovery_strategy == .reconcile_tool and
                 stream_result.status == .ok and
@@ -3277,6 +3308,7 @@ fn processQueuedPromptLoop(
                     semantic_limit,
                     semantic_attempt + 1,
                     false,
+                    recovery_delivery,
                     recovery_cause,
                     .pause,
                     .uncertain,
@@ -3333,6 +3365,7 @@ fn processQueuedPromptLoop(
                 semantic_limit,
                 settled_attempts,
                 false,
+                recovery_delivery,
                 recovery_cause,
                 recovery_strategy,
                 effectiveRecoveryToolEvidence(
@@ -3352,10 +3385,8 @@ fn processQueuedPromptLoop(
                 if (try refreshGatewayCredentialForJob(
                     deps,
                     std.heap.c_allocator,
-                    job,
+                    &route_credential,
                     .force,
-                    &active_api_key,
-                    &owned_refreshed_api_key,
                     step_ctx,
                 )) {
                     auth_retry_used = true;
@@ -3419,7 +3450,7 @@ fn processQueuedPromptLoop(
                 const route_changed = disableFastRouteAfterFailure(
                     &route_fast_mode,
                     &gateway_model,
-                    job.model,
+                    job.route.primary_model_id,
                     cause,
                     streamReplaySafe(&stream_ctx),
                     step_ctx,
@@ -3455,6 +3486,7 @@ fn processQueuedPromptLoop(
                         semantic_limit,
                         semantic_attempt + 1,
                         false,
+                        recovery_delivery,
                         cause,
                         .pause,
                         effectiveRecoveryToolEvidence(
@@ -3495,6 +3527,7 @@ fn processQueuedPromptLoop(
                             semantic_limit,
                             semantic_attempt + 1,
                             false,
+                            recovery_delivery,
                             cause,
                             decision.strategy,
                             effectiveRecoveryToolEvidence(
@@ -3617,7 +3650,7 @@ fn processQueuedPromptLoop(
                 if (attempt_disposition == .provider_failure) {
                     traceRouteFailure(
                         step_ctx,
-                        job.model,
+                        job.route.primary_model_id,
                         gateway_model,
                         route_fast_mode,
                         semantic_attempt + 1,
@@ -3630,7 +3663,7 @@ fn processQueuedPromptLoop(
                 const route_changed = disableFastRouteAfterFailure(
                     &route_fast_mode,
                     &gateway_model,
-                    job.model,
+                    job.route.primary_model_id,
                     cause,
                     providerFailureReplaySafe(attempt_completion, &stream_ctx),
                     step_ctx,
@@ -3652,6 +3685,7 @@ fn processQueuedPromptLoop(
                         semantic_limit,
                         semantic_attempt + 1,
                         false,
+                        recovery_delivery,
                         cause,
                         .pause,
                         effectiveRecoveryToolEvidence(
@@ -3691,6 +3725,7 @@ fn processQueuedPromptLoop(
                             semantic_limit,
                             semantic_attempt + 1,
                             false,
+                            recovery_delivery,
                             cause,
                             decision.strategy,
                             effectiveRecoveryToolEvidence(
@@ -3782,7 +3817,7 @@ fn processQueuedPromptLoop(
                     );
                     if (deps.request_route_recovery) |recover| {
                         const decision = try recover(deps.ctx, arena, .{
-                            .selected_model = job.model,
+                            .selected_model = job.route.primary_model_id,
                             .route_model = gateway_model,
                             .fast_mode = route_fast_mode,
                             .replay_safe = false,
@@ -3868,10 +3903,10 @@ fn processQueuedPromptLoop(
                 arena,
                 stream_result.status,
                 clipped,
-                job.model,
+                job.route.primary_model_id,
                 request_capabilities,
             );
-            try deps.push_http_error(deps.ctx, stream_result.status, http_detail, job.credential_source);
+            try deps.push_http_error(deps.ctx, stream_result.status, http_detail, route_credential.legacy_source);
             if (stop_state.retained_candidate != null) {
                 stop_state.terminal_materializing = true;
                 const assistant_text = try hooks.prompt.joinVisibleSegments(

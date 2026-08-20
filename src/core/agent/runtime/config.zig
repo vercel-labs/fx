@@ -28,6 +28,8 @@ pub const Config = struct {
     /// Interactive hosts may request a durable "try later" pause separately
     /// from cancellation. Headless hosts leave this null.
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
+    /// Read-only compatibility input for tool and subagent contexts. Root
+    /// model traffic uses `QueuedPrompt.route.endpoint`; G11 removes this field.
     gateway_chat_url: []const u8,
     gateway_tools_json: []const u8,
     custom_tool_guidance: []const u8 = "",

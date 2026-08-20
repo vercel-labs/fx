@@ -1,6 +1,9 @@
 const std = @import("std");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
+const model_capabilities = @import("../config/model_capabilities.zig");
+const connection_registry = @import("../gateway/connection_registry.zig");
+const route_snapshot = @import("../gateway/route_snapshot.zig");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
@@ -129,17 +132,29 @@ pub fn run(
     const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
     const recovery_checkpoint = turn.snapshotRecoveryCheckpoint(arena) catch
         return error.OutOfMemory;
+    const credential_ref = if (config.tool_context.credential_source) |source| @tagName(source) else "automatic";
+    const route = route_snapshot.RouteSnapshot.admit(
+        arena,
+        connection_registry.Profile{
+            .id = @constCast(config.tool_context.provider_adapter.kind),
+            .display_name = @constCast(config.tool_context.provider_adapter.kind),
+            .adapter_id = @constCast(config.tool_context.provider_adapter.kind),
+            .endpoint = @constCast(config.tool_context.gateway_chat_url),
+            .protocol = @constCast(config.tool_context.provider_adapter.kind),
+            .credential_ref = @constCast(credential_ref),
+            .remembered_model = admission.model,
+            .permission_review_model = null,
+        },
+        model_capabilities.configuredDescriptor(admission.model, .{}),
+        config.tool_context.gateway_chat_url,
+    ) catch return error.OutOfMemory;
     const prompt = worker_runtime.QueuedPrompt{
         .turn_id = 1,
         .prompt = arena.dupe(u8, message.content) catch return error.OutOfMemory,
         .images = &.{},
-        .model = arena.dupe(u8, admission.model) catch return error.OutOfMemory,
-        .api_key = arena.dupe(u8, config.tool_context.api_key) catch return error.OutOfMemory,
-        .gateway_team = if (config.tool_context.gateway_team) |team|
-            arena.dupe(u8, team) catch return error.OutOfMemory
-        else
-            null,
-        .credential_source = config.tool_context.credential_source,
+        // G6 replaces this child-local compatibility admission with explicit
+        // root-to-child route inheritance.
+        .route = route,
         .permission_mode = admission.permission_mode,
         .sandbox_backend = admission.sandbox_backend,
         .history = history,
@@ -249,10 +264,30 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .push_route_recovery_status = pushLiveRouteRecoveryStatus,
         .push_command_output_complete = pushLiveCommandOutputComplete,
         .push_http_error = captureHttpError,
+        .resolve_route_credential = resolveRouteCredential,
         .format_tool_execution_error = formatToolExecutionError,
         .report_usage = reportUsage,
         .usage = &context.turn.sessionRuntime().usage,
         .usage_allocator = context.turn.alloc,
+    };
+}
+
+fn resolveRouteCredential(
+    raw: *anyopaque,
+    alloc: Allocator,
+    _: *const route_snapshot.RouteSnapshot,
+) !agent_runtime.RouteCredential {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    const credential = try alloc.dupe(u8, context.config.tool_context.api_key);
+    errdefer alloc.free(credential);
+    const tenant = if (context.config.tool_context.gateway_team) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    return .{
+        .credential = credential,
+        .tenant = tenant,
+        .legacy_source = context.config.tool_context.credential_source,
     };
 }
 

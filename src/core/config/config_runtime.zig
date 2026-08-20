@@ -8,6 +8,7 @@ const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
 const sandbox = @import("../permissions/sandbox.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
+const connection_registry = @import("../gateway/connection_registry.zig");
 const settings_store = @import("settings_store.zig");
 const update_target = @import("../upgrade/update_target.zig");
 pub const context_limits = @import("context_limits.zig");
@@ -37,6 +38,7 @@ pub const Paths = struct {
 
 pub const Settings = struct {
     model: ?[]u8 = null,
+    connections: ?connection_registry.Stored = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     yolo_acknowledged: ?bool = null,
@@ -66,6 +68,7 @@ pub const Settings = struct {
 
     pub fn deinit(self: *Settings, alloc: Allocator) void {
         if (self.model) |value| alloc.free(value);
+        if (self.connections) |*connections| connections.deinit(alloc);
         if (self.input_appearance) |value| alloc.free(value);
         if (self.maxxing_mode) |value| alloc.free(value);
         if (self.sandbox) |value| alloc.free(value);
@@ -557,6 +560,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "update_channel",
         "permission_mode",
         "credential_source",
+        "connections",
         "yolo_acknowledged",
         "permission",
         "additional_directories",
@@ -634,7 +638,11 @@ fn mergeDetailedSettingsLayer(
             .user_workspace => .user_workspace,
             else => .compiled_default,
         });
-        if (source == .user_workspace) incoming.update_channel = null;
+        if (source == .user_workspace) {
+            incoming.update_channel = null;
+            if (incoming.connections) |*connections| connections.deinit(alloc);
+            incoming.connections = null;
+        }
         updateConfigSources(state.sources, incoming, source);
         if (incoming.has_permission_rules) {
             switch (permission_source) {
@@ -797,6 +805,35 @@ pub fn setUserPreferences(
     var store = try settings_store.Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
     return store.applyUserPatch(alloc, patch);
+}
+
+pub fn connectionPersistence() connection_registry.Persistence {
+    return .{ .write_fn = persistConnectionSnapshot };
+}
+
+pub fn setConnectionSnapshot(
+    alloc: Allocator,
+    snapshot: connection_registry.Snapshot,
+) !CommitOutcome {
+    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    var store = try settings_store.Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+    return store.applyConnectionSnapshot(alloc, snapshot);
+}
+
+fn persistConnectionSnapshot(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    snapshot: connection_registry.Snapshot,
+) anyerror!connection_registry.PersistenceOutcome {
+    var outcome = setConnectionSnapshot(alloc, snapshot) catch |err| {
+        if (err == error.SettingsCommitIndeterminate) {
+            return .{ .replaced_indeterminate = err };
+        }
+        return err;
+    };
+    defer outcome.deinit(alloc);
+    return .committed;
 }
 
 pub fn setWorkspacePreferences(
@@ -1321,6 +1358,10 @@ fn parseProfileOnlyFields(
             return error.InvalidCredentialSource;
     }
 
+    if (root.object.get("connections")) |connections_value| {
+        settings.connections = try connection_registry.parseStored(alloc, connections_value);
+    }
+
     if (root.object.get("yolo_acknowledged")) |acknowledged_value| {
         if (acknowledged_value != .bool) return error.InvalidYoloAcknowledgedType;
         settings.yolo_acknowledged = acknowledged_value.bool;
@@ -1488,6 +1529,11 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
         if (target.model) |current| alloc.free(current);
         target.model = value;
         incoming.model = null;
+    }
+    if (incoming.connections) |value| {
+        if (target.connections) |*current| current.deinit(alloc);
+        target.connections = value;
+        incoming.connections = null;
     }
     if (incoming.permission_mode) |value| target.permission_mode = value;
     if (incoming.credential_source) |value| target.credential_source = value;
@@ -3003,7 +3049,7 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try writeFixtureFile(
         tmp.dir,
         "workspace/.fx.json",
-        "{\"model\":\"project/model\",\"permission_mode\":\"ask\",\"permission\":\"deny\",\"prompt_history\":{\"enabled\":false},\"statusLine\":{\"sandbox\":false,\"context\":true},\"skill_match_fuzzy\":true,\"first_call_tool_choice\":\"auto\",\"auto_upgrade\":true,\"update_channel\":\"stable\",\"fast_mode\":true,\"input_appearance\":\"lines\",\"maxxing_mode\":\"normal\",\"slash_menu_categories\":true,\"effort\":\"low\",\"output_level\":\"normal\",\"startup_scrollback\":true,\"max_agent_steps\":17}\n",
+        "{\"model\":\"project/model\",\"permission_mode\":\"ask\",\"permission\":\"deny\",\"prompt_history\":{\"enabled\":false},\"statusLine\":{\"sandbox\":false,\"context\":true},\"skill_match_fuzzy\":true,\"first_call_tool_choice\":\"auto\",\"auto_upgrade\":true,\"update_channel\":\"stable\",\"fast_mode\":true,\"input_appearance\":\"lines\",\"maxxing_mode\":\"normal\",\"slash_menu_categories\":true,\"effort\":\"low\",\"output_level\":\"normal\",\"startup_scrollback\":true,\"connections\":{\"selected\":\"vercel\",\"profiles\":[{\"id\":\"vercel\",\"api_key\":\"project-secret\"}]},\"max_agent_steps\":17}\n",
     );
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -3032,7 +3078,7 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try std.testing.expectEqual(@as(usize, 1), result.settings.permission_rules.rules.len);
     try expectPermissionRule(result.settings.permission_rules.rules[0], "bash", "profile *", .allow);
 
-    try std.testing.expectEqual(@as(usize, 15), result.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 16), result.diagnostics.len);
     inline for (&.{
         "model",
         "permission_mode",
@@ -3049,9 +3095,40 @@ test "project profile-only settings are ignored and diagnosed by key" {
         "slash_menu_categories",
         "effort",
         "startup_scrollback",
+        "connections",
     }) |key| {
         try expectIgnoredProjectKey(result.diagnostics, key);
     }
+}
+
+test "profile connection registry loads only from user settings" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"connections\":{\"selected\":\"vercel\",\"profiles\":[{\"id\":\"vercel\",\"display_name\":\"Vercel AI Gateway\",\"adapter_id\":\"vercel_ai_gateway\",\"endpoint\":\"https://ai-gateway.vercel.sh/v3/ai/language-model\",\"protocol\":\"vercel_ai_gateway\",\"credential_ref\":\"automatic\",\"remembered_model\":\"openai/gpt-5.4\",\"permission_review_model\":\"openai/gpt-5.4\"}]}}\n",
+    );
+    try writeFixtureFile(
+        tmp.dir,
+        "workspace/.fx.json",
+        "{\"connections\":{\"selected\":\"project\",\"profiles\":[{\"id\":\"project\",\"api_key\":\"secret\"}]}}\n",
+    );
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+
+    const stored = &result.settings.connections.?;
+    try std.testing.expectEqualStrings("vercel", stored.selected_id);
+    try std.testing.expectEqual(@as(usize, 1), stored.profiles.len);
+    try std.testing.expectEqualStrings("automatic", stored.profiles[0].credential_ref);
+    try expectIgnoredProjectKey(result.diagnostics, "connections");
 }
 
 test "malformed project profile-only settings are ignored before value parsing" {

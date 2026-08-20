@@ -340,6 +340,36 @@ fn catalogSelection(
     return resolved;
 }
 
+fn configuredModelDescriptor(_: ?*anyopaque, model: []const u8) model_capabilities.ModelDescriptor {
+    return model_capabilities.configuredDescriptor(model, .{});
+}
+
+fn configuredCatalogDescriptor(_: ?*anyopaque, entry: ModelCatalogEntry) model_capabilities.ModelDescriptor {
+    return .{
+        .id = entry.id,
+        .display_name = entry.id,
+        .capabilities = .{
+            .supports_reasoning = entry.has_reasoning or entry.reasoning_efforts.items.len > 0,
+            .reasoning_efforts = .fromSlice(entry.reasoning_efforts.items),
+            .supports_fast_mode = entry.supports_fast_mode,
+            .supports_tool_use = entry.has_tool_use,
+            .supports_vision = entry.has_vision,
+            .supports_file_input = entry.has_file_input,
+            .supports_web_search = entry.has_web_search,
+            .supports_explicit_caching = entry.has_explicit_caching,
+            .supports_implicit_caching = entry.has_implicit_caching,
+            .context_window = if (entry.context_window == 0) null else entry.context_window,
+            .max_output_tokens = if (entry.max_tokens == 0) null else entry.max_tokens,
+        },
+        .source = .catalog,
+    };
+}
+
+pub const configured_model_descriptor_provider = ModelDescriptorProvider{
+    .fallback_fn = configuredModelDescriptor,
+    .catalog_fn = configuredCatalogDescriptor,
+};
+
 pub fn freeModelCatalog(alloc: std.mem.Allocator, entries: *std.ArrayList(ModelCatalogEntry)) void {
     for (entries.items) |entry| freeModelCatalogEntry(alloc, entry);
     entries.deinit(alloc);

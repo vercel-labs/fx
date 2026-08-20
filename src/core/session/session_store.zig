@@ -1059,19 +1059,24 @@ pub const Store = struct {
         defer alloc.free(session_dir);
         const snapshot_dir = try std.fs.path.join(alloc, &.{ session_dir, "images" });
         defer alloc.free(snapshot_dir);
-        const needs_migration_commit = try session.repair_legacy_images_transactionally(
+        const repaired_images = try session.repair_legacy_images_transactionally(
             alloc,
             migration_state.history,
             snapshot_dir,
         );
+        var migration_committed = false;
+        errdefer if (!migration_committed and repaired_images) {
+            deleteSnapshotFilesAddedByMigration(
+                migration_state.history,
+                loaded.state.history,
+            );
+        };
+        const migrated_route = if (options.legacy_route_defaults) |defaults|
+            try session_codec.migrateLegacyRouteState(alloc, &migration_state, defaults)
+        else
+            false;
+        const needs_migration_commit = repaired_images or migrated_route;
         if (needs_migration_commit) {
-            var migration_committed = false;
-            errdefer if (!migration_committed) {
-                deleteSnapshotFilesAddedByMigration(
-                    migration_state.history,
-                    loaded.state.history,
-                );
-            };
             _ = try loaded.commitStateReplacement(
                 alloc,
                 migration_state,
@@ -5771,6 +5776,244 @@ fn readFixtureFile(
     return io_mod.readFileToEnd(alloc, &file, max_bytes);
 }
 
+fn replaceFixtureBytesPreservingLength(
+    alloc: Allocator,
+    source: []const u8,
+    current: []const u8,
+    legacy: []const u8,
+) ![]u8 {
+    if (legacy.len > current.len) return error.TestUnexpectedResult;
+    const start = std.mem.indexOf(u8, source, current) orelse
+        return error.TestUnexpectedResult;
+    if (std.mem.indexOf(u8, source[start + current.len ..], current) != null) {
+        return error.TestUnexpectedResult;
+    }
+    const result = try alloc.dupe(u8, source);
+    @memcpy(result[start .. start + legacy.len], legacy);
+    @memset(result[start + legacy.len .. start + current.len], ' ');
+    return result;
+}
+
+fn writeLegacyRouteFixture(
+    alloc: Allocator,
+    store: Store,
+    id: []const u8,
+    workspace_root: []const u8,
+) !void {
+    var state = try testDurableState(alloc, id, workspace_root);
+    defer state.deinit(alloc);
+    state.preferences.connection_id = try alloc.dupe(u8, "vercel");
+    const checkpoint = session_codec.RecoveryCheckpoint{
+        .version = 2,
+        .route_identity = .{
+            .connection_id = @constCast("vercel"),
+            .adapter_kind = @constCast("vercel_ai_gateway"),
+            .permission_review_model_id = @constCast("reviewer/model"),
+        },
+        .delivery = .possibly_sent,
+        .turn_id = 7,
+        .user = .{ .text = @constCast("resume legacy route") },
+        .assistant_source = @constCast("partial answer"),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .route_model = @constCast("test/model"),
+        .requested_fast_mode = true,
+        .fast_mode = false,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 3,
+        .outstanding_reservation = false,
+    };
+    {
+        var writable = try store.startWritableSession(alloc, state);
+        defer writable.deinit(alloc);
+        _ = try writable.appendEvent(
+            alloc,
+            .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
+            20,
+            .retry_expected_tail,
+            .{},
+        );
+    }
+
+    const current_events = try readFixtureFile(
+        alloc,
+        store,
+        id,
+        "events.jsonl",
+        1024 * 1024,
+    );
+    defer alloc.free(current_events);
+    const legacy_preferences = try replaceFixtureBytesPreservingLength(
+        alloc,
+        current_events,
+        "{\"connection_id\":\"vercel\",\"model_id\":\"test/model\",\"effort\":\"high\",\"fast_mode\":false}",
+        "{\"model\":\"test/model\",\"effort\":\"high\",\"fast_mode\":false}",
+    );
+    defer alloc.free(legacy_preferences);
+    const legacy_events = try replaceFixtureBytesPreservingLength(
+        alloc,
+        legacy_preferences,
+        "{\"version\":2,\"route_identity\":{\"connection_id\":\"vercel\",\"adapter_kind\":\"vercel_ai_gateway\",\"permission_review_model_id\":\"reviewer/model\"},\"delivery\":\"possibly_sent\",",
+        "{\"version\":1,",
+    );
+    defer alloc.free(legacy_events);
+    try writeFixtureEntry(alloc, store, id, "events.jsonl", legacy_events);
+
+    var session_dir = try store.openSessionDir(id);
+    defer session_dir.close();
+    try deleteSessionEntry(&session_dir, "session.json");
+}
+
+test "writable resume transactionally migrates legacy route state" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    const defaults = session_codec.LegacyRouteDefaults{
+        .connection_id = "vercel",
+        .adapter_kind = "vercel_ai_gateway",
+        .permission_review_model_id = "reviewer/model",
+    };
+
+    try writeLegacyRouteFixture(
+        alloc,
+        ctx.store,
+        "legacy-route-definite",
+        ctx.workspace,
+    );
+    {
+        var legacy = try ctx.store.loadReadOnly(alloc, "legacy-route-definite");
+        defer legacy.deinit(alloc);
+        try std.testing.expectEqual(@as(?[]u8, null), legacy.preferences.connection_id);
+        const checkpoint = legacy.recovery_checkpoint orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u8, 1), checkpoint.version);
+        try std.testing.expectEqual(@as(?session_codec.RecoveryRouteIdentity, null), checkpoint.route_identity);
+    }
+
+    var definite_failure = MigrationBoundaryFailure{ .target = .after_event_sync };
+    var definite_options = definite_failure.options();
+    definite_options.legacy_route_defaults = defaults;
+    try std.testing.expectError(
+        error.SessionPersistenceDegraded,
+        ctx.store.resumeTargetForWrite(
+            alloc,
+            .{ .id = "legacy-route-definite" },
+            ctx.workspace,
+            definite_options,
+        ),
+    );
+    {
+        var rollback = try ctx.store.loadReadOnly(alloc, "legacy-route-definite");
+        defer rollback.deinit(alloc);
+        try std.testing.expectEqual(@as(?[]u8, null), rollback.preferences.connection_id);
+        try std.testing.expectEqual(
+            @as(u8, 1),
+            rollback.recovery_checkpoint.?.version,
+        );
+    }
+
+    {
+        var migrated = try ctx.store.resumeTargetForWrite(
+            alloc,
+            .{ .id = "legacy-route-definite" },
+            ctx.workspace,
+            .{ .legacy_route_defaults = defaults },
+        );
+        defer migrated.deinit(alloc);
+        try std.testing.expectEqualStrings("vercel", migrated.state.preferences.connection_id.?);
+        const migrated_checkpoint = migrated.state.recovery_checkpoint orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u8, 2), migrated_checkpoint.version);
+        try std.testing.expectEqualStrings(
+            "vercel_ai_gateway",
+            migrated_checkpoint.route_identity.?.adapter_kind,
+        );
+        try std.testing.expectEqualStrings(
+            "reviewer/model",
+            migrated_checkpoint.route_identity.?.permission_review_model_id.?,
+        );
+        try std.testing.expectEqual(session_codec.RecoveryDelivery.possibly_sent, migrated_checkpoint.delivery);
+        try std.testing.expectEqual(@as(usize, 3), migrated_checkpoint.consumed_provider_attempts);
+    }
+
+    const events_after_migration = try readFixtureFile(
+        alloc,
+        ctx.store,
+        "legacy-route-definite",
+        "events.jsonl",
+        1024 * 1024,
+    );
+    defer alloc.free(events_after_migration);
+    var idempotent = try ctx.store.resumeTargetForWrite(
+        alloc,
+        .{ .id = "legacy-route-definite" },
+        ctx.workspace,
+        .{ .legacy_route_defaults = defaults },
+    );
+    idempotent.deinit(alloc);
+    const events_after_second_resume = try readFixtureFile(
+        alloc,
+        ctx.store,
+        "legacy-route-definite",
+        "events.jsonl",
+        1024 * 1024,
+    );
+    defer alloc.free(events_after_second_resume);
+    try std.testing.expectEqualSlices(
+        u8,
+        events_after_migration,
+        events_after_second_resume,
+    );
+    {
+        var current = try ctx.store.loadReadOnly(alloc, "legacy-route-definite");
+        defer current.deinit(alloc);
+        try std.testing.expectEqualStrings("vercel", current.preferences.connection_id.?);
+        try std.testing.expectEqual(@as(u8, 2), current.recovery_checkpoint.?.version);
+    }
+
+    try writeLegacyRouteFixture(
+        alloc,
+        ctx.store,
+        "legacy-route-indeterminate",
+        ctx.workspace,
+    );
+    var indeterminate_failure = MigrationBoundaryFailure{
+        .target = .after_target_namespace_sync,
+    };
+    var indeterminate_options = indeterminate_failure.options();
+    indeterminate_options.legacy_route_defaults = defaults;
+    try std.testing.expectError(
+        error.SessionCommitIndeterminate,
+        ctx.store.resumeTargetForWrite(
+            alloc,
+            .{ .id = "legacy-route-indeterminate" },
+            ctx.workspace,
+            indeterminate_options,
+        ),
+    );
+    try std.testing.expectError(
+        error.SessionCommitBoundaryUnavailable,
+        ctx.store.loadReadOnly(alloc, "legacy-route-indeterminate"),
+    );
+    {
+        var resolved = try ctx.store.resumeTargetForWrite(
+            alloc,
+            .{ .id = "legacy-route-indeterminate" },
+            ctx.workspace,
+            .{ .legacy_route_defaults = defaults },
+        );
+        defer resolved.deinit(alloc);
+        try std.testing.expectEqualStrings("vercel", resolved.state.preferences.connection_id.?);
+        try std.testing.expectEqual(@as(u8, 2), resolved.state.recovery_checkpoint.?.version);
+    }
+    var readable = try ctx.store.loadReadOnly(alloc, "legacy-route-indeterminate");
+    defer readable.deinit(alloc);
+    try std.testing.expectEqualStrings("vercel", readable.preferences.connection_id.?);
+    try std.testing.expectEqual(@as(u8, 2), readable.recovery_checkpoint.?.version);
+}
+
 fn writeFixtureEntry(
     alloc: Allocator,
     store: Store,
@@ -6235,6 +6478,12 @@ test "pristine discard retains active recovery and permits cleared recovery" {
     defer ctx.deinit(alloc);
 
     const checkpoint = session_codec.RecoveryCheckpoint{
+        .version = 2,
+        .route_identity = .{
+            .connection_id = @constCast("vercel"),
+            .adapter_kind = @constCast("vercel_ai_gateway"),
+            .permission_review_model_id = null,
+        },
         .turn_id = 1,
         .user = .{ .text = @constCast("prompt") },
         .assistant_source = @constCast(""),
@@ -6249,6 +6498,7 @@ test "pristine discard retains active recovery and permits cleared recovery" {
 
     var active_state = try testDurableState(alloc, "active-recovery", ctx.workspace);
     defer active_state.deinit(alloc);
+    active_state.preferences.connection_id = try alloc.dupe(u8, "vercel");
     var active = try ctx.store.startWritableSession(alloc, active_state);
     _ = try active.appendEvent(
         alloc,
@@ -6264,6 +6514,7 @@ test "pristine discard retains active recovery and permits cleared recovery" {
 
     var cleared_state = try testDurableState(alloc, "cleared-recovery", ctx.workspace);
     defer cleared_state.deinit(alloc);
+    cleared_state.preferences.connection_id = try alloc.dupe(u8, "vercel");
     var cleared = try ctx.store.startWritableSession(alloc, cleared_state);
     _ = try cleared.appendEvent(
         alloc,

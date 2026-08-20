@@ -11,8 +11,11 @@ const session_codec = @import("../core/session/session_codec.zig");
 const session_store = @import("../core/session/session_store.zig");
 const js_host_session_store = @import("../core/session/js_host_session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
+const credentials = @import("../core/auth/credentials.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
+const connection_registry = @import("../core/gateway/connection_registry.zig");
+const route_snapshot = @import("../core/gateway/route_snapshot.zig");
 const host = @import("../core/hosts/host.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
 const subagent_resume_admission = @import("../core/subagent/resume_admission.zig");
@@ -29,7 +32,15 @@ const ErrorCode = jsonrpc.ErrorCode;
 const writeJsonStr = jsonrpc.writeJsonStr;
 
 pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
-    try server.releaseActiveSession(state);
+    const profile = state.connections.?.selectedProfile();
+    var route_credential = server.prepareConnectionCredential(
+        state,
+        alloc,
+        profile,
+        state.selected_model,
+    ) catch |err| return handleCredentialFailure(state, alloc, msg, err);
+    var credential_owned = true;
+    defer if (credential_owned) route_credential.deinit(alloc);
 
     var durable = try freshAcpState(state, alloc);
     var durable_owned = true;
@@ -54,6 +65,9 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
     var revision_owned = true;
     defer if (revision_owned) alloc.free(revision);
 
+    try server.releaseActiveSession(state);
+    server.adoptConnectionCredential(state, profile.id, route_credential);
+    credential_owned = false;
     state.active_session = .{
         .session_id = session_id,
         .wasm_state = durable,
@@ -158,6 +172,16 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         }
     };
 
+    const profile = state.connections.?.selectedProfile();
+    var route_credential = server.prepareConnectionCredential(
+        state,
+        alloc,
+        profile,
+        state.selected_model,
+    ) catch |err| return handleCredentialFailure(state, alloc, msg, err);
+    var credential_owned = true;
+    defer if (credential_owned) route_credential.deinit(alloc);
+
     var store = (if (state.cfg.home_override) |home|
         session_store.Store.initFromHome(alloc, home, state.workspace_root)
     else
@@ -216,6 +240,8 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         .effort = state.effort,
         .session_rt = session_rt,
         .mcp = session_mcp,
+        .connection_id = profile.id,
+        .credential = route_credential,
     }) catch {
         _ = store.discardPristineStartedSession(alloc, &writable);
         writable_owned = false;
@@ -230,6 +256,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     model_owned = false;
     session_rt_owned = false;
     session_mcp_owned = false;
+    credential_owned = false;
 
     try writeNewSessionResponse(state, alloc, msg, session_id);
 }
@@ -298,6 +325,32 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Session not found" });
     var loaded_owned = true;
     defer if (loaded_owned) loaded.deinit(alloc);
+    _ = session_codec.migrateLegacyRouteState(alloc, &loaded.state, .{
+        .connection_id = state.cfg.gateway_provider.connection_seed.id,
+        .adapter_kind = state.cfg.gateway_provider.connection_seed.adapter_id,
+        .permission_review_model_id = state.cfg.gateway_provider.connection_seed.permission_review_model,
+    }) catch return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.internal_error,
+        .message = "Session could not be loaded",
+    });
+    const loaded_connection = loaded.state.preferences.connection_id orelse
+        session_codec.legacy_connection_id;
+    const profile = state.connections.?.profile(loaded_connection) catch
+        return handleLoadFailure(state, alloc, msg, error.MissingSessionConnection);
+    if (loaded.state.recovery_checkpoint) |checkpoint| {
+        route_snapshot.validateRecoveryProfile(
+            profile,
+            checkpoint.route_identity.?.adapter_kind,
+        ) catch |err| return handleLoadFailure(state, alloc, msg, err);
+    }
+    var route_credential = server.prepareConnectionCredential(
+        state,
+        alloc,
+        profile,
+        loaded.state.preferences.model,
+    ) catch |err| return handleCredentialFailure(state, alloc, msg, err);
+    var credential_owned = true;
+    defer if (credential_owned) route_credential.deinit(alloc);
     const sid_copy = try alloc.dupe(u8, loaded.state.id);
     var sid_owned = true;
     defer if (sid_owned) alloc.free(sid_copy);
@@ -317,6 +370,8 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     if (loaded.state.usage) |usage| try session_rt.usage.restore(alloc, usage, loaded.state.created_at_ms);
 
     try server.releaseActiveSession(state);
+    server.adoptConnectionCredential(state, profile.id, route_credential);
+    credential_owned = false;
     state.active_session = .{
         .session_id = sid_copy,
         .wasm_state = loaded.state,
@@ -513,6 +568,7 @@ fn handleRestoreSession(
     defer if (store_owned) store.deinit(alloc);
 
     const seed_preferences = session_codec.DurableSessionPreferences{
+        .connection_id = state.connections.?.selectedProfile().id,
         .model = state.configured_model,
         .effort = state.effort,
         .fast_mode = state.fast_mode,
@@ -524,11 +580,24 @@ fn handleRestoreSession(
         state.workspace_root,
         .{
             .seed_preferences = seed_preferences,
+            .legacy_route_defaults = .{
+                .connection_id = state.cfg.gateway_provider.connection_seed.id,
+                .adapter_kind = state.cfg.gateway_provider.connection_seed.adapter_id,
+                .permission_review_model_id = state.cfg.gateway_provider.connection_seed.permission_review_model,
+            },
             .log = session_test_controls.logOptions(),
         },
     ) catch |err| return handleLoadFailure(state, alloc, msg, err);
     var writable_owned = true;
     defer if (writable_owned) writable.deinit(alloc);
+    const profile = state.connections.?.profile(writable.state.preferences.connection_id.?) catch
+        return handleLoadFailure(state, alloc, msg, error.MissingSessionConnection);
+    if (writable.state.recovery_checkpoint) |checkpoint| {
+        route_snapshot.validateRecoveryProfile(
+            profile,
+            checkpoint.route_identity.?.adapter_kind,
+        ) catch |err| return handleLoadFailure(state, alloc, msg, err);
+    }
 
     const sid_copy = try alloc.dupe(u8, writable.state.id);
     var sid_owned = true;
@@ -537,6 +606,14 @@ fn handleRestoreSession(
         state.selected_model
     else
         writable.state.preferences.model;
+    var route_credential = server.prepareConnectionCredential(
+        state,
+        alloc,
+        profile,
+        effective_model,
+    ) catch |err| return handleCredentialFailure(state, alloc, msg, err);
+    var credential_owned = true;
+    defer if (credential_owned) route_credential.deinit(alloc);
     const model_copy = try alloc.dupe(u8, effective_model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model_copy);
@@ -579,6 +656,8 @@ fn handleRestoreSession(
         .effort = writable.state.preferences.effort,
         .session_rt = session_rt,
         .mcp = session_mcp,
+        .connection_id = profile.id,
+        .credential = route_credential,
     }) catch
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
@@ -590,6 +669,7 @@ fn handleRestoreSession(
     model_owned = false;
     session_rt_owned = false;
     session_mcp_owned = false;
+    credential_owned = false;
     if (kind.replaysHistory()) {
         for (state.active_session.?.writable.?.state.history) |turn| {
             try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
@@ -694,6 +774,8 @@ fn freshAcpState(
     errdefer alloc.free(workspace);
     const model = try alloc.dupe(u8, state.configured_model);
     errdefer alloc.free(model);
+    const connection_id = try alloc.dupe(u8, state.connections.?.selectedProfile().id);
+    errdefer alloc.free(connection_id);
     const history = try alloc.alloc(types.HistoryTurn, 0);
     errdefer alloc.free(history);
     return .{
@@ -704,6 +786,7 @@ fn freshAcpState(
         .updated_at_ms = now,
         .conversation_language = session_runtime.ConversationLanguage.default(),
         .preferences = .{
+            .connection_id = connection_id,
             .model = model,
             .effort = state.effort,
             .fast_mode = state.fast_mode,
@@ -722,6 +805,8 @@ const SessionActivation = struct {
     effort: types.ReasoningEffort,
     session_rt: session_runtime.SessionRuntime,
     mcp: ?*mcp_runtime.McpRuntime,
+    connection_id: []const u8,
+    credential: credentials.Credential,
 };
 
 fn activateSession(
@@ -730,6 +815,11 @@ fn activateSession(
     activation: SessionActivation,
 ) !void {
     try server.releaseActiveSession(state);
+    server.adoptConnectionCredential(
+        state,
+        activation.connection_id,
+        activation.credential,
+    );
     state.active_session = .{
         .session_id = activation.session_id,
         .store = store,
@@ -824,6 +914,18 @@ fn handleLoadFailure(
             .message = "One-off child sessions cannot accept additional prompts",
         });
     }
+    if (err == error.MissingSessionConnection) {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Saved connection is unavailable; select or restore that connection before resuming",
+        });
+    }
+    if (err == error.RecoveryRouteAdapterChanged) {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Saved connection adapter changed; restore the original adapter before resuming",
+        });
+    }
     if (err == error.InvalidSessionFormat or
         err == error.UnsupportedSessionSchema or
         err == error.LegacySessionTooLarge or
@@ -841,6 +943,24 @@ fn handleLoadFailure(
     return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
         .message = "Session not found",
+    });
+}
+
+fn handleCredentialFailure(
+    state: *server.ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    err: anyerror,
+) !void {
+    if (err == error.MissingCredential) {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = credentials.missing_credential_message,
+        });
+    }
+    return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.internal_error,
+        .message = "Failed to prepare session connection",
     });
 }
 
@@ -1421,15 +1541,24 @@ fn initAcpSessionTestState(
     errdefer alloc.free(selected_model);
     const configured_model = try alloc.dupe(u8, "test/model");
     errdefer alloc.free(configured_model);
+    const cfg = acpSessionTestConfig();
+    const connections = try connection_registry.Runtime.init(
+        alloc,
+        cfg.gateway_provider.connection_seed.profile("test/model", null),
+        null,
+        .unavailable,
+    );
 
     return .{
         .alloc = alloc,
-        .cfg = acpSessionTestConfig(),
+        .cfg = cfg,
         .writer = .{ .stdout = capture },
         .workspace_root = workspace,
         .api_key = api_key,
+        .credential_connection_id = cfg.gateway_provider.connection_seed.id,
         .selected_model = selected_model,
         .configured_model = configured_model,
+        .connections = connections,
         .agent_step_limit = 8,
         .max_tool_result_bytes = 64 * 1024,
     };

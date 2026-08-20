@@ -12,6 +12,8 @@ const permission_request = @import("../permissions/permission_request.zig");
 const notification_contract = @import("../notifications/notification_contract.zig");
 const session_runtime = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
+const route_snapshot_mod = @import("../gateway/route_snapshot.zig");
+const route_snapshot_test_support = @import("../gateway/route_snapshot_test_support.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
@@ -59,10 +61,7 @@ pub const QueuedPrompt = struct {
     prompt: []u8,
     images: []types.ImageAttachment,
     authorized_image_catalog: []types.ImageAttachment = &.{},
-    model: []u8,
-    api_key: []u8,
-    gateway_team: ?[]u8 = null,
-    credential_source: ?types.CredentialSource = null,
+    route: route_snapshot_mod.RouteSnapshot,
     permission_mode: types.PermissionMode,
     sandbox_backend: sandbox.BackendKind = .none,
     history: []types.HistoryTurn,
@@ -460,6 +459,7 @@ pub const WorkerEvent = union(enum) {
     semantic_notice: types.SemanticNotice,
     route_recovery_status: types.RouteRecoveryStatus,
     clear_route_recovery_status,
+    authentication_failed,
     api_status_text: []u8,
     command_output: CommandOutputChunk,
     command_output_complete: ?types.ToolLifecycleId,
@@ -1156,16 +1156,6 @@ pub const WorkerRuntime = struct {
         var events = self.takeEvents();
         defer events.deinit(alloc);
         for (events.items) |event| freeWorkerEvent(alloc, event);
-    }
-
-    pub fn syncQueuedPromptModel(self: *WorkerRuntime, alloc: std.mem.Allocator, model: []const u8) !void {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        for (self.queued_prompts.items) |*prompt| {
-            const next_model = try alloc.dupe(u8, model);
-            alloc.free(prompt.model);
-            prompt.model = next_model;
-        }
     }
 
     pub fn syncQueuedPromptPermissionSnapshot(self: *WorkerRuntime, snapshot: PermissionSnapshot) void {
@@ -1954,9 +1944,8 @@ pub fn freeQueuedPrompt(alloc: std.mem.Allocator, prompt: QueuedPrompt) void {
     alloc.free(prompt.prompt);
     types.freeImageAttachmentSlice(alloc, prompt.images);
     types.freeImageAttachmentSlice(alloc, prompt.authorized_image_catalog);
-    alloc.free(prompt.model);
-    secret.zeroAndFree(alloc, prompt.api_key);
-    if (prompt.gateway_team) |team| alloc.free(team);
+    var route = prompt.route;
+    route.deinit(alloc);
     types.freeHistoryTurnSlice(alloc, prompt.history);
     if (prompt.root_user_intent_context.len > 0) alloc.free(prompt.root_user_intent_context);
     types.freePermissionGrantSlice(alloc, prompt.grants);
@@ -2522,6 +2511,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
         .semantic_notice => |notice| .{ .semantic_notice = try types.dupeSemanticNotice(alloc, notice) },
         .route_recovery_status => |status| .{ .route_recovery_status = status },
         .clear_route_recovery_status => .clear_route_recovery_status,
+        .authentication_failed => .authentication_failed,
         .api_status_text => |text| .{ .api_status_text = try alloc.dupe(u8, text) },
         .command_output => |chunk| .{ .command_output = .{
             .lifecycle_id = if (chunk.lifecycle_id) |id| .{
@@ -2776,14 +2766,20 @@ fn freeToolResultMemory(
 }
 
 fn makePrompt(alloc: std.mem.Allocator, text: []const u8, model: []const u8) !QueuedPrompt {
+    const prompt = try alloc.dupe(u8, text);
+    errdefer alloc.free(prompt);
+    var route = try route_snapshot_test_support.owned(alloc, model);
+    errdefer route.deinit(alloc);
+    const history = try alloc.alloc(types.HistoryTurn, 0);
+    errdefer alloc.free(history);
+    const grants = try alloc.alloc(types.PermissionGrant, 0);
     return .{
-        .prompt = try alloc.dupe(u8, text),
+        .prompt = prompt,
         .images = &.{},
-        .model = try alloc.dupe(u8, model),
-        .api_key = try alloc.dupe(u8, "key"),
+        .route = route,
         .permission_mode = .auto,
-        .history = try alloc.alloc(types.HistoryTurn, 0),
-        .grants = try alloc.alloc(types.PermissionGrant, 0),
+        .history = history,
+        .grants = grants,
     };
 }
 
@@ -2950,7 +2946,7 @@ test "dedicated turn finalizer queues before optional finish payload" {
     try std.testing.expect(events.items[1] == .finish_prompt);
 }
 
-test "queue, event, snapshot, sync, history, and grant behavior" {
+test "queue preserves admitted routes while syncing mutable turn policy" {
     const alloc = std.testing.allocator;
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
@@ -2979,8 +2975,9 @@ test "queue, event, snapshot, sync, history, and grant behavior" {
     try std.testing.expectEqualStrings("first", events.items[0].begin_prompt.text);
     try std.testing.expect(events.items[0].begin_prompt.text.ptr != job.prompt.ptr);
 
-    try runtime.syncQueuedPromptModel(alloc, "next");
-    try std.testing.expectEqualStrings("next", runtime.queued_prompts.items[0].model);
+    try std.testing.expect(!@hasDecl(WorkerRuntime, "syncQueuedPromptModel"));
+    try std.testing.expectEqualStrings("old", job.route.primary_model_id);
+    try std.testing.expectEqualStrings("old", runtime.queued_prompts.items[0].route.primary_model_id);
     runtime.syncQueuedPromptPermissionSnapshot(.{
         .mode = .ask,
         .sandbox_backend = .none,

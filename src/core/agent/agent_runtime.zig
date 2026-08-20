@@ -27,6 +27,7 @@ pub const PreparedParentTurnContext = runtime_deps.PreparedParentTurnContext;
 pub const RouteRecoveryDecision = runtime_deps.RouteRecoveryDecision;
 pub const RouteRecoveryRequest = runtime_deps.RouteRecoveryRequest;
 pub const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
+pub const RouteCredential = runtime_deps.RouteCredential;
 pub const SemanticPresentationSink = runtime_assistant_stream.SemanticPresentationSink;
 pub const LifecycleContext = runtime_lifecycle.LifecycleContext;
 pub const PreparedToolBlockKind = runtime_lifecycle.PreparedToolBlockKind;

@@ -19,6 +19,7 @@ const gateway_json = @import("../../../gateway/gateway_json.zig");
 const gateway_failure_diagnostics = @import("../../../gateway/gateway_failure_diagnostics.zig");
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const model_capabilities = @import("../../../config/model_capabilities.zig");
+const route_snapshot = @import("../../../gateway/route_snapshot.zig");
 const file_mutation = @import("../../../tooling/file_mutation.zig");
 const file_mutation_contract = @import("../../../tooling/file_mutation_contract.zig");
 const context_contract = @import("../../../workspace/context_contract.zig");
@@ -60,6 +61,39 @@ const SandboxScopeRequired = runtime_tool_contracts.SandboxScopeRequired;
 const ToolCallValidationResult = runtime_tool_contracts.ToolCallValidationResult;
 const DiffEntryPayload = runtime_tool_contracts.DiffEntryPayload;
 const SecondaryPublicationReport = runtime_tool_contracts.SecondaryPublicationReport;
+
+pub fn testRouteForModel(model: []const u8) route_snapshot.RouteSnapshot {
+    return testRouteForDescriptor(builtin_gateway.model_descriptor_provider.fallback(model));
+}
+
+pub fn testRouteForCapabilities(
+    model: []const u8,
+    capabilities: model_capabilities.Capabilities,
+) route_snapshot.RouteSnapshot {
+    var descriptor = builtin_gateway.model_descriptor_provider.fallback(model);
+    descriptor.capabilities = capabilities;
+    descriptor.source = .configured;
+    return testRouteForDescriptor(descriptor);
+}
+
+fn testRouteForDescriptor(descriptor: model_capabilities.ModelDescriptor) route_snapshot.RouteSnapshot {
+    return .{
+        .connection_id = @constCast("vercel"),
+        .adapter_kind = @constCast(builtin_gateway.connection_seed.adapter_id),
+        .endpoint = @constCast("https://example.invalid"),
+        .protocol = @constCast("vercel_ai_gateway"),
+        .credential_ref = @constCast("automatic"),
+        .primary_model_id = @constCast(descriptor.id),
+        .permission_review_model_id = null,
+        .capabilities = descriptor.capabilities,
+        .capability_source = descriptor.source,
+        .selected_fast_mode = descriptor.selected_fast_mode,
+        .fast_model_suffix = switch (descriptor.fast_route) {
+            .same_model => null,
+            .suffix => |suffix| @constCast(suffix),
+        },
+    };
+}
 
 pub const vision_agent_test_tools = [_]tool_dispatch.Tool{builtin_tools.vision};
 
@@ -378,6 +412,11 @@ pub const ModelCapabilityOverride = struct {
     capabilities: model_capabilities.Capabilities,
 };
 
+pub const RouteCredentialOverride = struct {
+    credential_ref: []const u8,
+    credential: []const u8,
+};
+
 fn fakeGatewayStream(
     context: ?*anyopaque,
     alloc: Allocator,
@@ -625,6 +664,9 @@ pub const FakeAgentRuntimeDeps = struct {
     credential_refresh_sources: std.ArrayList(types.CredentialSource) = .empty,
     credential_refresh_modes: std.ArrayList(runtime_deps.CredentialRefreshMode) = .empty,
     credential_refresh_error: ?anyerror = null,
+    route_credential: []const u8 = "key",
+    route_credential_overrides: []const RouteCredentialOverride = &.{},
+    route_credential_source: ?types.CredentialSource = null,
     enable_interactive_notices: bool = false,
     enable_recovery_checkpoint: bool = false,
     recovery_checkpoints: std.ArrayList(session_codec.RecoveryCheckpoint) = .empty,
@@ -736,13 +778,30 @@ pub const FakeAgentRuntimeDeps = struct {
             .push_route_recovery_status = routeRecoveryStatus,
             .push_command_output_complete = commandOutputComplete,
             .push_http_error = httpError,
+            .resolve_route_credential = resolveRouteCredential,
             .refresh_gateway_credential = refreshGatewayCredential,
             .request_route_recovery = if (self.enable_route_recovery) requestRouteRecovery else null,
-            .available_model_capabilities = availableModelCapabilities,
-            .resolve_model_capabilities = resolveModelCapabilities,
+            .available_model_descriptor = availableModelDescriptor,
+            .resolve_model_descriptor = resolveModelDescriptor,
             .format_tool_execution_error = formatError,
             .record_tool_call_rejected = recordRejected,
             .report_inner_tool_usage = reportCapturedInnerToolUsage,
+        };
+    }
+
+    fn resolveRouteCredential(
+        raw: *anyopaque,
+        alloc: Allocator,
+        route: *const route_snapshot.RouteSnapshot,
+    ) !runtime_deps.RouteCredential {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        const credential = for (self.route_credential_overrides) |override| {
+            if (std.mem.eql(u8, override.credential_ref, route.credential_ref))
+                break override.credential;
+        } else self.route_credential;
+        return .{
+            .credential = try alloc.dupe(u8, credential),
+            .legacy_source = self.route_credential_source,
         };
     }
 
@@ -763,31 +822,41 @@ pub const FakeAgentRuntimeDeps = struct {
         }
     }
 
-    fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) !model_capabilities.Capabilities {
+    fn resolveModelDescriptor(raw: *anyopaque, _: Allocator, model: []const u8) !model_capabilities.ModelDescriptor {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.capability_queries.append(self.alloc, try self.alloc.dupe(u8, model));
         if (self.cancel_on_capability_resolution) |cancel_flag| {
             cancel_flag.store(true, .seq_cst);
             return error.Cancelled;
         }
-        const capabilities = blk: {
+        const descriptor = blk: {
             for (self.capability_overrides) |override| {
-                if (std.mem.eql(u8, override.model, model)) break :blk override.capabilities;
+                if (std.mem.eql(u8, override.model, model)) {
+                    var value = builtin_gateway.model_descriptor_provider.fallback(model);
+                    value.capabilities = override.capabilities;
+                    value.source = .configured;
+                    break :blk value;
+                }
             }
-            break :blk model_capabilities.capabilitiesForModel(model);
+            break :blk builtin_gateway.model_descriptor_provider.fallback(model);
         };
         if (self.cancel_after_capability_resolution) |cancel_flag| {
             cancel_flag.store(true, .seq_cst);
         }
-        return capabilities;
+        return descriptor;
     }
 
-    fn availableModelCapabilities(raw: *anyopaque, model: []const u8) model_capabilities.Capabilities {
+    fn availableModelDescriptor(raw: *anyopaque, model: []const u8) model_capabilities.ModelDescriptor {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         for (self.available_capability_overrides) |override| {
-            if (std.mem.eql(u8, override.model, model)) return override.capabilities;
+            if (std.mem.eql(u8, override.model, model)) {
+                var descriptor = builtin_gateway.model_descriptor_provider.fallback(model);
+                descriptor.capabilities = override.capabilities;
+                descriptor.source = .configured;
+                return descriptor;
+            }
         }
-        return model_capabilities.capabilitiesForModel(model);
+        return builtin_gateway.model_descriptor_provider.fallback(model);
     }
 
     fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: runtime_deps.CredentialRefreshMode) !?[]u8 {
@@ -1737,8 +1806,7 @@ pub const PromptFixture = struct {
         return .{
             .prompt = @constCast("user prompt"),
             .images = self.images[0..],
-            .model = @constCast("anthropic/claude-opus-4.6"),
-            .api_key = @constCast("key"),
+            .route = testRouteForModel("anthropic/claude-opus-4.6"),
             .permission_mode = .ask,
             .history = self.history[0..],
             .grants = self.grants[0..],
@@ -1919,7 +1987,7 @@ pub fn runFakePromptWithLifecycle(
     gateway: *FakeGateway,
     hooks: *FakeAgentRuntimeDeps,
     config: Config,
-    job: QueuedPrompt,
+    queued_job: QueuedPrompt,
     lifecycle: runtime_lifecycle.LifecycleContext,
 ) !void {
     hooks.workspace_root = config.workspace_root;
@@ -1936,7 +2004,7 @@ pub fn runFakePromptWithLifecycle(
         null,
         lifecycle,
         config,
-        job,
+        queued_job,
     );
 }
 

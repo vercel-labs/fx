@@ -448,6 +448,7 @@ fn composeSelectionFailureRow(
     const message = switch (failure) {
         .open_elsewhere => "This session is open in another Fx. Close it there, then press Enter to retry.",
         .being_updated => "This session is being updated. Wait a moment, then press Enter to retry.",
+        .select_connection => "Restore or select this session's saved connection, then press Enter to retry.",
         .unavailable => "Unable to resume this session.",
     };
     try row_text.appendSingleLineEllipsized(

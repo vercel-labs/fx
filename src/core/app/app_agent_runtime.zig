@@ -9,6 +9,8 @@ const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
+const route_snapshot_test_support = @import("../gateway/route_snapshot_test_support.zig");
+const route_snapshot = @import("../gateway/route_snapshot.zig");
 const credentials = @import("../auth/credentials.zig");
 const background_runtime = @import("../background/background_runtime.zig");
 const change_tracker = @import("../workspace/change_tracker.zig");
@@ -35,6 +37,7 @@ const tool_advertisement = @import("../tooling/tool_advertisement.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const context_contract = @import("../workspace/context_contract.zig");
+const model_capabilities = @import("../config/model_capabilities.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const test_builtin_gateway = if (@import("builtin").is_test)
     @import("../../builtins/gateway.zig")
@@ -1089,7 +1092,7 @@ pub fn Runtime(comptime App: type) type {
             const prompt_policy = app.promptPolicy();
             return .{
                 .system_prompt = prompt_policy.system_prompt,
-                .model_prompt_overlay = prompt_policy.modelPromptOverlay(job.model),
+                .model_prompt_overlay = prompt_policy.modelPromptOverlay(job.route.primary_model_id),
                 .skills_prompt_section = skills_section,
                 .explicit_skills_prompt_section = explicit_skills_section,
                 .gateway_retry_count = gateway_retry_count,
@@ -1416,6 +1419,7 @@ const ProjectionBarrier = struct {
 const FakeApp = struct {
     alloc: Allocator,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
+    provider_adapter_override: ?agent_stream_provider.ProviderAdapter = null,
     workspace_root: []const u8 = "/tmp/workspace",
     auth: auth_runtime.Runtime = .{},
     selected_model: std.ArrayList(u8) = .empty,
@@ -1503,9 +1507,21 @@ const FakeApp = struct {
     }
 
     pub fn providerAdapter(self: *const FakeApp) agent_stream_provider.ProviderAdapter {
+        if (self.provider_adapter_override) |adapter| return adapter;
         var adapter = test_builtin_gateway.provider_adapter;
         adapter.legacy_provider = self.agent_stream_provider;
         return adapter;
+    }
+
+    pub fn resolveRouteCredential(
+        self: *FakeApp,
+        alloc: Allocator,
+        _: *const route_snapshot.RouteSnapshot,
+    ) !agent_runtime.RouteCredential {
+        return .{
+            .credential = try alloc.dupe(u8, self.auth.apiKey() orelse return error.MissingCredential),
+            .legacy_source = self.auth.credentialSource(),
+        };
     }
 
     fn deinit(self: *FakeApp) void {
@@ -2402,15 +2418,104 @@ test "app agent runtime prefers active queued project context snapshot" {
 }
 
 fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {
+    const prompt = try alloc.dupe(u8, "draft an issue");
+    errdefer alloc.free(prompt);
+    var route = try route_snapshot_test_support.owned(alloc, "test-model");
+    errdefer route.deinit(alloc);
+    const history = try alloc.alloc(types.HistoryTurn, 0);
+    errdefer alloc.free(history);
     return .{
-        .prompt = try alloc.dupe(u8, "draft an issue"),
+        .prompt = prompt,
         .images = &.{},
-        .model = try alloc.dupe(u8, "test-model"),
-        .api_key = try alloc.dupe(u8, "api-key"),
+        .route = route,
         .permission_mode = .auto,
-        .history = try alloc.alloc(types.HistoryTurn, 0),
+        .history = history,
         .grants = try alloc.alloc(types.PermissionGrant, 0),
     };
+}
+
+fn makeNonVercelQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {
+    const prompt = try alloc.dupe(u8, "draft an issue");
+    errdefer alloc.free(prompt);
+    var route = try route_snapshot.RouteSnapshot.admitSelected(
+        alloc,
+        .{
+            .id = @constCast("fake"),
+            .display_name = @constCast("Fake"),
+            .adapter_id = @constCast("test_non_vercel"),
+            .endpoint = @constCast("fake://tui"),
+            .protocol = @constCast("fake-protocol"),
+            .credential_ref = @constCast("fake-ref"),
+            .remembered_model = @constCast("test-model"),
+            .permission_review_model = null,
+        },
+        test_builtin_gateway.connection_seed,
+        model_capabilities.configuredDescriptor("test-model", .{}),
+        "https://unused-seed.invalid",
+    );
+    errdefer route.deinit(alloc);
+    const history = try alloc.alloc(types.HistoryTurn, 0);
+    errdefer alloc.free(history);
+    return .{
+        .prompt = prompt,
+        .images = &.{},
+        .route = route,
+        .permission_mode = .auto,
+        .history = history,
+        .grants = try alloc.alloc(types.PermissionGrant, 0),
+    };
+}
+
+test "fake non-Vercel adapter completes a TUI-admitted queued root turn" {
+    const Fake = struct {
+        calls: usize = 0,
+
+        fn stream(
+            adapter: *const agent_stream_provider.ProviderAdapter,
+            _: Allocator,
+            request: agent_stream_provider.AdapterRequest,
+            events: agent_stream_provider.EventSink,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(adapter.context.?));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("test_non_vercel", request.route.adapter_kind);
+            try std.testing.expectEqualStrings("fake-protocol", request.route.protocol);
+            try std.testing.expectEqualStrings("fake://tui", request.route.endpoint);
+            try std.testing.expectEqualStrings("fake-ref", request.route.credential_ref);
+            try std.testing.expectEqualStrings("api-key", request.credential);
+            try events.emit(.provider_admitted);
+            try events.emit(.{ .text_delta = "tui complete" });
+            try events.emit(.{ .finish = .{ .reason = .stop } });
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    var fake = Fake{};
+    app.provider_adapter_override = .{
+        .kind = "test_non_vercel",
+        .context = &fake,
+        .stream_fn = Fake.stream,
+    };
+    const pending_job = try makeNonVercelQueuedPrompt(alloc);
+    app.worker.enqueuePrompt(std.heap.c_allocator, pending_job) catch |err| {
+        worker_runtime.freeQueuedPrompt(alloc, pending_job);
+        return err;
+    };
+    const job = (try app.worker.tryTakeNextPrompt(std.heap.c_allocator)) orelse
+        return error.TestExpectedQueuedPrompt;
+    defer worker_runtime.freeQueuedPrompt(alloc, job);
+
+    try Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url);
+
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    var events = app.worker.takeEvents();
+    defer events.deinit(std.heap.c_allocator);
+    defer for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+    try std.testing.expect(events.items[events.items.len - 1] == .finish_prompt);
+    try std.testing.expect(events.items[events.items.len - 1].finish_prompt.turn == .assistant);
+    try std.testing.expectEqualStrings("tui complete", events.items[events.items.len - 1].finish_prompt.turn.assistant.assistant);
 }
 
 test "app agent runtime processes a cancelled queued prompt" {

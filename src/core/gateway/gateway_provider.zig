@@ -7,6 +7,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const generation_usage_provider = @import("../session/generation_usage_provider.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const web_search_provider = @import("../tooling/web_search_provider.zig");
+const connection_registry = @import("connection_registry.zig");
 const model_catalog = @import("model_catalog.zig");
 const model_catalog_metadata = @import("model_catalog_metadata.zig");
 
@@ -87,6 +88,7 @@ pub const CreditsProvider = struct {
 };
 
 pub const Provider = struct {
+    connection_seed: connection_registry.Seed,
     agent_stream: agent_stream_provider.Provider,
     provider_adapter: agent_stream_provider.ProviderAdapter,
     oauth_transport: oauth_transport.Provider,

@@ -3,11 +3,13 @@ const api_key_validator = @import("api_key_validator.zig");
 const credentials = @import("credentials.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("login_flow.zig");
+const connection_registry = @import("../gateway/connection_registry.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -585,7 +587,10 @@ pub const Runtime = struct {
     api_key_validator: api_key_validator.Provider = api_key_validator.unavailable_provider,
     oauth_transport: oauth_transport.Provider = oauth_transport.unavailable_provider,
     secret_store: host.SecretStore = host.unavailable_secret_store,
+    connections: ?connection_registry.Runtime = null,
     selected_credential: ?credentials.Credential = null,
+    credential_connection_id: [connection_registry.max_connection_id_bytes]u8 = undefined,
+    credential_connection_id_len: usize = 0,
     credential_refresh_failure_source: ?credentials.Source = null,
     source_inventory: SourceSet = .empty,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
@@ -621,8 +626,97 @@ pub const Runtime = struct {
         self.exitApiKeyStage(alloc, .runtime_deinit);
         self.clearTeamSelection(alloc);
         self.team_query.deinit(alloc);
-        if (self.selected_credential) |*credential| credential.deinit(alloc);
+        self.clearCredential(alloc);
+        if (self.connections) |*connections| connections.deinit();
         self.* = .{};
+    }
+
+    pub fn adoptConnections(
+        self: *Self,
+        alloc: Allocator,
+        connections: *connection_registry.Runtime,
+    ) void {
+        self.clearCredential(alloc);
+        if (self.connections) |*current| current.deinit();
+        self.connections = connections.*;
+        connections.* = undefined;
+    }
+
+    pub fn connectionList(self: *const Self) []const connection_registry.Profile {
+        const connections = if (self.connections) |*value| value else return &.{};
+        return connections.list();
+    }
+
+    pub fn selectedConnectionProfile(self: *const Self) !connection_registry.Profile {
+        const connections = if (self.connections) |*value| value else return error.ConnectionRegistryUnavailable;
+        return connections.selectedProfile();
+    }
+
+    pub fn connectionProfile(self: *const Self, id: []const u8) !connection_registry.Profile {
+        const connections = if (self.connections) |*value| value else return error.ConnectionRegistryUnavailable;
+        return connections.profile(id);
+    }
+
+    /// Resolves one owned credential from an admitted reference without
+    /// consulting the currently selected connection.
+    pub fn resolveCredentialReference(
+        self: *const Self,
+        alloc: Allocator,
+        reference: []const u8,
+    ) !credentials.Credential {
+        const preferred = if (std.mem.eql(u8, reference, "automatic"))
+            null
+        else
+            types.parseCredentialSource(reference) orelse return error.InvalidCredentialReference;
+        const resolution = try credentials.resolvePreferring(
+            alloc,
+            self.oauth_transport,
+            self.secret_store,
+            .refresh_if_needed,
+            preferred,
+        );
+        return resolution.credential orelse error.MissingCredential;
+    }
+
+    pub fn addConnection(self: *Self, input: connection_registry.ProfileInput) !void {
+        const connections = if (self.connections) |*value| value else return error.ConnectionRegistryUnavailable;
+        try connections.add(input);
+    }
+
+    pub fn selectConnection(self: *Self, alloc: Allocator, id: []const u8) !bool {
+        const connections = if (self.connections) |*value| value else return error.ConnectionRegistryUnavailable;
+        const changed = connections.select(id) catch |err| {
+            if (std.mem.eql(u8, connections.selectedProfile().id, id)) {
+                self.clearCredential(alloc);
+                connections.markSelectedDisconnected(.not_checked);
+            }
+            return err;
+        };
+        if (!changed) return false;
+        self.clearCredential(alloc);
+        connections.markSelectedDisconnected(.not_checked);
+        return true;
+    }
+
+    pub fn connectionStatus(self: *const Self, id: []const u8) !connection_registry.Status {
+        const connections = if (self.connections) |*value| value else return error.ConnectionRegistryUnavailable;
+        return connections.status(id);
+    }
+
+    pub fn rememberSelectedConnectionModel(self: *Self, model: []const u8) !void {
+        const connections = if (self.connections) |*value| value else return error.ConnectionRegistryUnavailable;
+        try connections.rememberSelectedModel(model);
+    }
+
+    pub fn rememberSelectedCredentialReference(self: *Self, reference: []const u8) !void {
+        const connections = if (self.connections) |*value| value else return error.ConnectionRegistryUnavailable;
+        try connections.rememberSelectedCredentialReference(reference);
+    }
+
+    pub fn recordSelectedAuthenticationFailure(self: *Self, alloc: Allocator) void {
+        self.clearCredential(alloc);
+        const connections = if (self.connections) |*value| value else return;
+        connections.markSelectedDisconnected(.authentication_failed);
     }
 
     /// Borrows the current credential until this runtime replaces or releases it.
@@ -631,6 +725,7 @@ pub const Runtime = struct {
     }
 
     fn gatewayCredentialAt(self: *const Self, now_ms: i64) ?GatewayCredential {
+        if (!self.credentialMatchesSelectedConnection()) return null;
         const credential = self.selected_credential orelse return null;
         if (credential.needsRefreshAt(now_ms)) return null;
         return .{
@@ -650,6 +745,9 @@ pub const Runtime = struct {
     }
 
     pub fn modelCatalogAccess(self: *const Self) credentials.CatalogAccess {
+        if (!self.credentialMatchesSelectedConnection()) {
+            return credentials.catalogAccessAt(null, io_mod.milliTimestamp());
+        }
         if (self.credential_refresh_failure_source) |source| {
             return credentials.catalogAccessAfterRefreshFailure(source);
         }
@@ -662,6 +760,7 @@ pub const Runtime = struct {
     }
 
     pub fn credentialSource(self: *const Self) ?credentials.Source {
+        if (!self.credentialMatchesSelectedConnection()) return null;
         const credential = self.selected_credential orelse return null;
         return credential.source;
     }
@@ -676,6 +775,7 @@ pub const Runtime = struct {
     }
 
     fn credentialNeedsRefreshAt(self: *const Self, now_ms: i64) bool {
+        if (!self.credentialMatchesSelectedConnection()) return false;
         const credential = self.selected_credential orelse return false;
         return credential.needsRefreshAt(now_ms);
     }
@@ -685,6 +785,7 @@ pub const Runtime = struct {
     }
 
     fn statusSnapshotAt(self: *const Self, now_ms: i64) StatusSnapshot {
+        if (!self.credentialMatchesSelectedConnection()) return .{};
         const credential = self.selected_credential orelse return .{};
         return .{
             .active_source = credential.source,
@@ -701,7 +802,7 @@ pub const Runtime = struct {
         return .{
             .active_source = active_source,
             .available_inactive_sources = available_inactive_sources,
-            .selected_team = if (self.selected_credential) |credential| credential.gatewayTeam() else null,
+            .selected_team = self.selectedConnectionTeam(),
             .refreshable = if (active_source) |source| credentials.sourceRefreshable(source) else false,
             .stored_key_status = self.stored_key_status,
             .onboarding_skipped = self.onboarding_skipped,
@@ -1080,12 +1181,48 @@ pub const Runtime = struct {
 
         self.selected_credential = credential.*;
         self.credential_refresh_failure_source = null;
+        self.bindCredentialToSelectedConnection();
         credential.token = &.{};
         credential.team_id = null;
         credential.team_slug = null;
         self.source_inventory.insert(source);
         if (source == .stored_key) self.stored_key_status = .not_attempted;
         return changed;
+    }
+
+    fn bindCredentialToSelectedConnection(self: *Self) void {
+        const connections = if (self.connections) |*value| value else {
+            self.credential_connection_id_len = 0;
+            return;
+        };
+        const id = connections.selectedProfile().id;
+        std.debug.assert(id.len <= self.credential_connection_id.len);
+        @memcpy(self.credential_connection_id[0..id.len], id);
+        self.credential_connection_id_len = id.len;
+        connections.markSelectedConnected();
+    }
+
+    fn credentialMatchesSelectedConnection(self: *const Self) bool {
+        const connections = if (self.connections) |*value| value else return true;
+        if (self.credential_connection_id_len == 0) return false;
+        return std.mem.eql(
+            u8,
+            self.credential_connection_id[0..self.credential_connection_id_len],
+            connections.selectedProfile().id,
+        );
+    }
+
+    fn selectedConnectionTeam(self: *const Self) ?[]const u8 {
+        if (!self.credentialMatchesSelectedConnection()) return null;
+        const credential = self.selected_credential orelse return null;
+        return credential.gatewayTeam();
+    }
+
+    fn clearCredential(self: *Self, alloc: Allocator) void {
+        if (self.selected_credential) |*credential| credential.deinit(alloc);
+        self.selected_credential = null;
+        self.credential_refresh_failure_source = null;
+        self.credential_connection_id_len = 0;
     }
 
     pub fn adoptSelectedTeam(self: *Self, alloc: Allocator, selected_team: *login_flow.SelectedTeam) bool {
@@ -1147,9 +1284,7 @@ pub const Runtime = struct {
         loader: CredentialLoaderFn,
     ) !bool {
         const previous = self.credentialSource();
-        if (self.selected_credential) |*credential| credential.deinit(alloc);
-        self.selected_credential = null;
-        self.credential_refresh_failure_source = null;
+        self.clearCredential(alloc);
 
         try self.refreshSourceInventoryWithProbe(alloc, ctx, probe);
         for (credential_source_order) |source| {
@@ -1181,9 +1316,7 @@ pub const Runtime = struct {
     ) !bool {
         const login_was_active = self.credentialSource() == .fx_login;
         if (login_was_active) {
-            if (self.selected_credential) |*credential| credential.deinit(alloc);
-            self.selected_credential = null;
-            self.credential_refresh_failure_source = null;
+            self.clearCredential(alloc);
         }
 
         try self.refreshSourceInventoryWithProbe(alloc, ctx, probe);
@@ -2473,4 +2606,148 @@ test "api key stage zeroes its allocation on every exit path" {
         runtime.deinit(alloc);
         try expectApiKeyAllocationCleared(&runtime, &backing, sentinel);
     }
+}
+
+fn discardConnectionSnapshot(
+    _: ?*anyopaque,
+    _: Allocator,
+    _: connection_registry.Snapshot,
+) anyerror!connection_registry.PersistenceOutcome {
+    return .committed;
+}
+
+const ConnectionSelectionPersistence = struct {
+    failure: enum { definite, indeterminate } = .definite,
+
+    fn write(
+        raw: ?*anyopaque,
+        _: Allocator,
+        _: connection_registry.Snapshot,
+    ) anyerror!connection_registry.PersistenceOutcome {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        return switch (self.failure) {
+            .definite => error.ConnectionWriteFailed,
+            .indeterminate => .{ .replaced_indeterminate = error.SettingsCommitIndeterminate },
+        };
+    }
+};
+
+fn initTestConnectionRegistry(alloc: Allocator) !connection_registry.Runtime {
+    return connection_registry.Runtime.init(
+        alloc,
+        .{
+            .id = "vercel",
+            .display_name = "Vercel AI Gateway",
+            .adapter_id = "vercel_ai_gateway",
+            .credential_ref = "automatic",
+            .remembered_model = "model/vercel",
+        },
+        null,
+        .{ .write_fn = discardConnectionSnapshot },
+    );
+}
+
+test "credentials are bound to the selected connection and invalid auth disconnects it" {
+    const alloc = std.testing.allocator;
+    var connections = try connection_registry.Runtime.init(
+        alloc,
+        .{
+            .id = "vercel",
+            .display_name = "Vercel AI Gateway",
+            .adapter_id = "vercel_ai_gateway",
+            .credential_ref = "automatic",
+            .remembered_model = "model/vercel",
+        },
+        null,
+        .{ .write_fn = discardConnectionSnapshot },
+    );
+    try connections.add(.{
+        .id = "local",
+        .display_name = "Local",
+        .adapter_id = "local",
+        .credential_ref = "local_key",
+        .remembered_model = "model/local",
+    });
+
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.adoptConnections(alloc, &connections);
+    var credential = credentials.Credential{
+        .token = try alloc.dupe(u8, "vercel-secret"),
+        .source = .ai_gateway_api_key,
+    };
+    defer credential.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &credential);
+    try std.testing.expectEqualStrings("vercel-secret", runtime.apiKey().?);
+
+    try std.testing.expect(try runtime.selectConnection(alloc, "local"));
+    try std.testing.expect(runtime.apiKey() == null);
+    try std.testing.expectEqual(
+        connection_registry.DisconnectReason.not_checked,
+        (try runtime.connectionStatus("local")).auth.disconnected,
+    );
+
+    try std.testing.expect(try runtime.selectConnection(alloc, "vercel"));
+    var replacement = credentials.Credential{
+        .token = try alloc.dupe(u8, "invalid-secret"),
+        .source = .ai_gateway_api_key,
+    };
+    defer replacement.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &replacement);
+    runtime.recordSelectedAuthenticationFailure(alloc);
+    try std.testing.expect(runtime.apiKey() == null);
+    try std.testing.expectEqual(
+        connection_registry.DisconnectReason.authentication_failed,
+        (try runtime.connectionStatus("vercel")).auth.disconnected,
+    );
+}
+
+test "connection selection failure preserves or completes the credential transition" {
+    const credential_bytes = "bound-vercel-credential";
+    var backing: [32768]u8 = [_]u8{0xa5} ** 32768;
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    const alloc = fixed.allocator();
+    var persistence: ConnectionSelectionPersistence = .{};
+    var connections = try initTestConnectionRegistry(alloc);
+
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.adoptConnections(alloc, &connections);
+    try runtime.addConnection(.{
+        .id = "local",
+        .display_name = "Local",
+        .adapter_id = "local",
+        .credential_ref = "local_key",
+        .remembered_model = "model/local",
+    });
+    runtime.connections.?.persistence = .{
+        .context = &persistence,
+        .write_fn = ConnectionSelectionPersistence.write,
+    };
+    var credential = credentials.Credential{
+        .token = try alloc.dupe(u8, credential_bytes),
+        .source = .ai_gateway_api_key,
+    };
+    defer credential.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &credential);
+
+    try std.testing.expectError(
+        error.ConnectionWriteFailed,
+        runtime.selectConnection(alloc, "local"),
+    );
+    try std.testing.expectEqualStrings("vercel", runtime.connections.?.selectedProfile().id);
+    try std.testing.expectEqualStrings(credential_bytes, runtime.apiKey().?);
+
+    persistence.failure = .indeterminate;
+    try std.testing.expectError(
+        error.SettingsCommitIndeterminate,
+        runtime.selectConnection(alloc, "local"),
+    );
+    try std.testing.expectEqualStrings("local", runtime.connections.?.selectedProfile().id);
+    try std.testing.expect(runtime.gatewayCredential() == null);
+    try std.testing.expect(std.mem.find(u8, &backing, credential_bytes) == null);
+    try std.testing.expectEqual(
+        connection_registry.DisconnectReason.not_checked,
+        (try runtime.connectionStatus("local")).auth.disconnected,
+    );
 }

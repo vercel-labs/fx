@@ -83,6 +83,7 @@ fn classifyResumeFailure(err: anyerror) session_catalog.ResumeFailure {
         error.SessionAuthorityBoundaryUnavailable,
         error.SessionCommitBoundaryUnavailable,
         => .being_updated,
+        error.MissingSessionConnection => .select_connection,
         else => .unavailable,
     };
 }
@@ -3063,8 +3064,6 @@ const RoutingWorker = struct {
     pub fn pendingQuestionBatchSource(self: *RoutingWorker) worker_runtime.QuestionPromptSource {
         return self.question_source;
     }
-
-    pub fn syncQueuedPromptModel(_: *RoutingWorker, _: std.mem.Allocator, _: []const u8) !void {}
 
     pub fn syncQueuedPromptPermissionSnapshot(self: *RoutingWorker, snapshot: worker_runtime.PermissionSnapshot) void {
         self.synced_permission_mode = snapshot.mode;

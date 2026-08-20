@@ -327,6 +327,18 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn forgetCredentialSource(app: *App) void {
+            if (comptime @hasDecl(@TypeOf(app.auth), "rememberSelectedCredentialReference")) {
+                app.auth.rememberSelectedCredentialReference("automatic") catch |err| {
+                    debug_trace.logf(
+                        "auth",
+                        "connection credential choice not cleared err={s}",
+                        .{@errorName(err)},
+                    );
+                    return;
+                };
+            }
+            // G11 removes this compatibility projection once status readers
+            // consume the selected connection as their authority.
             var attempt = config_runtime.attemptUserPreferences(
                 app.alloc,
                 .{ .clear_credential_source = true },
@@ -371,11 +383,22 @@ pub fn Runtime(comptime App: type) type {
         /// leaves the source active for this run rather than refusing a working
         /// credential the user already selected.
         fn rememberCredentialSource(app: *App, source: credentials.Source) void {
+            if (comptime @hasDecl(@TypeOf(app.auth), "rememberSelectedCredentialReference")) {
+                app.auth.rememberSelectedCredentialReference(@tagName(source)) catch |err| {
+                    debug_trace.logf(
+                        "auth",
+                        "connection credential choice not persisted source={t} err={s}",
+                        .{ source, @errorName(err) },
+                    );
+                    return;
+                };
+            }
+            // G11 removes this compatibility projection once status readers
+            // consume the selected connection as their authority.
             if (comptime @hasDecl(App, "persistCredentialSourcePreference")) {
                 app.persistCredentialSourcePreference(source);
                 return;
             }
-
             var attempt = config_runtime.attemptUserPreferences(
                 app.alloc,
                 .{ .credential_source = source },

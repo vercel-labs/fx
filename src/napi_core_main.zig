@@ -434,8 +434,10 @@ const Runtime = struct {
     fn run(self: *Runtime) void {
         const agent_stream = host_stream_provider.provider(&self.stream_context);
         const provider = gateway_provider.Provider{
+            .connection_seed = builtin_gateway.connection_seed,
             .agent_stream = agent_stream,
             .provider_adapter = .{
+                .kind = builtin_gateway.connection_seed.adapter_id,
                 .legacy_provider = agent_stream,
                 .stream_fn = builtin_gateway.provider_adapter.stream_fn,
             },

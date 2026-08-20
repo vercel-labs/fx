@@ -17,6 +17,8 @@ const gateway_failure_diagnostics = @import("../core/gateway/gateway_failure_dia
 const gateway_json = @import("../core/gateway/gateway_json.zig");
 const io_mod = @import("../core/shared/io.zig");
 const gateway_generation_usage = @import("../gateway/generation_usage.zig");
+const connection_registry = @import("../core/gateway/connection_registry.zig");
+const route_snapshot_contract = @import("../core/gateway/route_snapshot.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
@@ -50,6 +52,16 @@ const base_url_env = "FX_GATEWAY_BASE_URL";
 const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
 const oauth_request_timeout_ms: i64 = 15_000;
 const oauth_response_max_bytes: usize = 64 * 1024;
+
+pub const connection_seed = connection_registry.Seed{
+    .id = "vercel",
+    .display_name = "Vercel AI Gateway",
+    .adapter_id = "vercel_ai_gateway",
+    .endpoint = default_chat_url,
+    .protocol = "vercel_ai_gateway",
+    .credential_ref = "automatic",
+    .permission_review_model = "openai/gpt-5.4",
+};
 
 const web_search_system_prompt = "Research the user's query with the web_search tool and preserve sources for citation.";
 const perplexity_search_backend_id = web_search_contract.SearchBackendId{ .value = "ai_gateway_perplexity_search" };
@@ -132,10 +144,12 @@ pub const agent_stream_provider = agent_stream_provider_contract.Provider{
 };
 
 pub const provider_adapter = agent_stream_provider_contract.ProviderAdapter{
+    .kind = connection_seed.adapter_id,
     .stream_fn = streamVercelAdapter,
 };
 
 pub const provider = gateway_provider.Provider{
+    .connection_seed = connection_seed,
     .agent_stream = agent_stream_provider,
     .provider_adapter = provider_adapter,
     .oauth_transport = oauth_transport_provider,
@@ -186,7 +200,7 @@ const AdapterEventBridge = struct {
     }
 };
 
-fn streamVercelAdapter(
+pub fn streamVercelAdapter(
     adapter: *const agent_stream_provider_contract.ProviderAdapter,
     alloc: Allocator,
     request: agent_stream_provider_contract.AdapterRequest,
@@ -225,7 +239,7 @@ fn streamVercelAdapter(
         .session_id = request.session_id,
         .model = request.model_id,
         .retry_count = request.retry_count,
-        .chat_url = request.endpoint,
+        .chat_url = request.route.endpoint,
         .payload = payload,
         .trace_ctx = request.trace_ctx,
         .content_capture_limit = request.content_capture_limit,
@@ -355,6 +369,19 @@ test "Vercel adapter sink failure does not mutate user cancellation" {
     defer state.deinit();
     var sink_error: ?anyerror = null;
     var sink_context: u8 = 0;
+    var route = route_snapshot_contract.RouteSnapshot{
+        .connection_id = @constCast("vercel"),
+        .adapter_kind = @constCast(connection_seed.adapter_id),
+        .endpoint = @constCast("provider:endpoint"),
+        .protocol = @constCast("vercel_ai_gateway"),
+        .credential_ref = @constCast("automatic"),
+        .primary_model_id = @constCast("test/model"),
+        .permission_review_model_id = null,
+        .capabilities = .{},
+        .capability_source = .configured,
+        .selected_fast_mode = false,
+        .fast_model_suffix = null,
+    };
     try std.testing.expectError(error.TestSinkFailure, adapter.stream(std.testing.allocator, .{
         .model_request = .{
             .model = "test/model",
@@ -363,11 +390,11 @@ test "Vercel adapter sink failure does not mutate user cancellation" {
             .tool_choice = .none,
             .capabilities = .{},
         },
+        .route = &route,
         .credential = "credential",
         .tenant = null,
         .model_id = "test/model",
         .retry_count = 1,
-        .endpoint = "provider:endpoint",
         .trace_ctx = .{},
         .content_capture_limit = null,
         .delivery = &delivery,
@@ -432,6 +459,19 @@ test "Vercel adapter enforces serialized request limit before admission" {
     defer state.deinit();
     var sink_error: ?anyerror = null;
     var capture: Capture = .{};
+    var route = route_snapshot_contract.RouteSnapshot{
+        .connection_id = @constCast("vercel"),
+        .adapter_kind = @constCast(connection_seed.adapter_id),
+        .endpoint = @constCast("provider:endpoint"),
+        .protocol = @constCast("vercel_ai_gateway"),
+        .credential_ref = @constCast("automatic"),
+        .primary_model_id = @constCast("test/model"),
+        .permission_review_model_id = null,
+        .capabilities = .{},
+        .capability_source = .configured,
+        .selected_fast_mode = false,
+        .fast_model_suffix = null,
+    };
     var request = agent_stream_provider_contract.AdapterRequest{
         .model_request = .{
             .model = "test/model",
@@ -441,11 +481,11 @@ test "Vercel adapter enforces serialized request limit before admission" {
             .capabilities = .{},
         },
         .serialized_request_limit_bytes = 16 * 1024,
+        .route = &route,
         .credential = "credential",
         .tenant = null,
         .model_id = "test/model",
         .retry_count = 1,
-        .endpoint = "provider:endpoint",
         .trace_ctx = .{},
         .content_capture_limit = null,
         .delivery = &delivery,

@@ -16,6 +16,7 @@ const builtin_tools = @import("../builtins/tools.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
+const connection_registry = @import("../core/gateway/connection_registry.zig");
 const hooks = @import("../core/hooks/hooks.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
@@ -214,7 +215,9 @@ pub const ServerState = struct {
     workspace_access: workspace_access.WorkspaceAccess = .{},
     api_key: []u8 = &.{},
     credential_source: ?types.CredentialSource = null,
+    credential_connection_id: ?[]const u8 = null,
     gateway_team: ?[]u8 = null,
+    connections: ?connection_registry.Runtime = null,
     selected_model: []u8 = &.{},
     configured_model: []u8 = &.{},
     process_model_override: bool = false,
@@ -267,6 +270,7 @@ pub const ServerState = struct {
         if (self.gateway_team) |team| self.alloc.free(team);
         if (self.selected_model.len > 0) self.alloc.free(self.selected_model);
         if (self.configured_model.len > 0) self.alloc.free(self.configured_model);
+        if (self.connections) |*connections| connections.deinit();
         self.permission_rules.deinit(self.alloc);
         self.background.deinit(std.heap.c_allocator);
         self.skills.deinit(self.alloc);
@@ -304,6 +308,67 @@ pub fn releaseActiveSession(state: *ServerState) !void {
         active.session_rt.usage.configureCheckpointSink(null);
     }
     destroyActiveSession(state);
+}
+
+pub fn prepareConnectionCredential(
+    state: *ServerState,
+    alloc: Allocator,
+    profile: connection_registry.Profile,
+    model: []const u8,
+) !credentials.Credential {
+    if (state.credential_connection_id) |connection_id| {
+        if (state.api_key.len > 0 and std.mem.eql(u8, connection_id, profile.id)) {
+            return .{
+                .token = try alloc.dupe(u8, state.api_key),
+                .source = state.credential_source orelse .ai_gateway_api_key,
+                .team_id = if (state.gateway_team) |team| try alloc.dupe(u8, team) else null,
+            };
+        }
+    }
+    const resolution = try app_lifecycle.resolveConnectionCredential(
+        alloc,
+        state.cfg.gateway_provider.oauth_transport,
+        state.cfg.secret_store,
+        profile,
+        state.cfg.gateway_provider.connection_seed,
+        .refresh_if_needed,
+    );
+    var credential = resolution.credential orelse return error.MissingCredential;
+    errdefer credential.deinit(alloc);
+    var catalog_cancel_flag = std.atomic.Value(bool).init(false);
+    _ = try state.capability_resolver.resolve(
+        state.alloc,
+        state.cfg.gateway_provider.model_catalog,
+        .{
+            .access = credentials.catalogAccessForCredential(
+                credential.source,
+                credential.token,
+                credential.gatewayTeam(),
+            ),
+            .endpoint = state.cfg.gateway_models_path,
+            .cancel_flag = &catalog_cancel_flag,
+        },
+        model,
+    );
+    return credential;
+}
+
+pub fn adoptConnectionCredential(
+    state: *ServerState,
+    connection_id: []const u8,
+    credential: credentials.Credential,
+) void {
+    if (state.api_key.len > 0) state.alloc.free(state.api_key);
+    if (state.gateway_team) |team| state.alloc.free(team);
+    state.credential_source = credential.source;
+    state.credential_connection_id = connection_id;
+    state.api_key = credential.token;
+    if (credential.team_id) |team| {
+        state.gateway_team = team;
+        if (credential.team_slug) |unused| state.alloc.free(unused);
+    } else {
+        state.gateway_team = credential.team_slug;
+    }
 }
 
 fn closeActiveSession(state: *ServerState) !void {
@@ -1137,16 +1202,18 @@ fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_
                 home_dir,
                 workspace_root,
                 state.cfg.default_model,
+                false,
                 state.cfg.default_agent_step_limit,
+                state.cfg.gateway_provider.connection_seed,
             );
         }
     }
-    return app_lifecycle.loadStartupState(
+    return app_lifecycle.loadStartupStateWithoutCredentials(
         alloc,
-        state.cfg.gateway_provider.oauth_transport,
-        state.cfg.secret_store,
         state.cfg.default_model,
+        false,
         state.cfg.default_agent_step_limit,
+        state.cfg.gateway_provider.connection_seed,
     );
 }
 
@@ -1194,31 +1261,13 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
 
     state.workspace_root = startup.takeWorkspaceRoot();
     state.workspace_access = startup.takeWorkspaceAccess();
-    var credential = if (state.cfg.credential_override) |override| credentials.Credential{
-        .token = try alloc.dupe(u8, override),
-        .source = .ai_gateway_api_key,
-    } else startup.takeCredential() orelse {
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_request,
-            .message = credentials.missing_credential_message,
-        });
-    };
-    defer credential.deinit(alloc);
-    if (credential.token.len == 0) {
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_request,
-            .message = credentials.missing_credential_message,
-        });
-    }
-    state.credential_source = credential.source;
-    state.api_key = credential.token;
-    credential.token = &.{};
-    if (credential.team_id) |team| {
-        state.gateway_team = team;
-        credential.team_id = null;
-    } else if (credential.team_slug) |team| {
-        state.gateway_team = team;
-        credential.team_slug = null;
+    state.connections = startup.takeConnections();
+    if (state.cfg.credential_override) |override| {
+        if (override.len > 0) {
+            state.api_key = try alloc.dupe(u8, override);
+            state.credential_source = .ai_gateway_api_key;
+            state.credential_connection_id = state.connections.?.selectedProfile().id;
+        }
     }
 
     if (state.cfg.model_override) |override| {
@@ -1248,18 +1297,6 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         skill_runtime.traceDiagnostics("acp_startup", loaded_skills.diagnostics);
         state.skills.replaceLoaded(alloc, loaded_skills.dir, loaded_skills.skills, loaded_skills.diagnostics);
     }
-
-    var catalog_cancel_flag = std.atomic.Value(bool).init(false);
-    _ = try state.capability_resolver.resolve(
-        state.alloc,
-        state.cfg.gateway_provider.model_catalog,
-        .{
-            .access = credentials.catalogAccessForCredential(state.credential_source, state.api_key, state.gateway_team),
-            .endpoint = state.cfg.gateway_models_path,
-            .cancel_flag = &catalog_cancel_flag,
-        },
-        state.selected_model,
-    );
 
     state.client_fs_read = request.client_fs_read;
     state.client_fs_write = request.client_fs_write;

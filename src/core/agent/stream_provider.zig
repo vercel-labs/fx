@@ -1,6 +1,7 @@
 const std = @import("std");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const image_attachments = @import("../images/image_attachments.zig");
+const route_snapshot = @import("../gateway/route_snapshot.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
 const gateway_schema = @import("../tooling/gateway_schema.zig");
@@ -248,6 +249,8 @@ pub const ProviderToolResult = struct {
 
 pub const StreamFailure = struct {
     category: Category,
+    http_status: ?std.http.Status = null,
+    delivery_ambiguous: bool = false,
     detail: ?[]const u8 = null,
     retry_after_seconds: ?u64 = null,
     diagnostic: ?Diagnostic = null,
@@ -442,12 +445,12 @@ pub const EventSink = struct {
 pub const AdapterRequest = struct {
     model_request: ModelRequest,
     serialized_request_limit_bytes: ?usize = null,
+    route: *const route_snapshot.RouteSnapshot,
     credential: []const u8,
     tenant: ?[]const u8,
     session_id: ?[]const u8 = null,
     model_id: []const u8,
     retry_count: usize,
-    endpoint: []const u8,
     trace_ctx: debug_trace.TraceContext,
     content_capture_limit: ?usize,
     cooperative_pulse: ?CooperativePulse = null,
@@ -465,12 +468,17 @@ pub const AdapterStreamFn = *const fn (
 ) anyerror!void;
 
 pub const ProviderAdapter = struct {
+    kind: []const u8,
     /// When set, context must remain valid until every in-flight stream returns.
     context: ?*anyopaque = null,
     /// Bounded G1 bridge for existing injected Vercel stream providers. G11
     /// removes this field after the old seam has no callers.
     legacy_provider: ?Provider = null,
     stream_fn: AdapterStreamFn,
+
+    pub fn acceptsRoute(self: ProviderAdapter, route: *const route_snapshot.RouteSnapshot) bool {
+        return std.mem.eql(u8, self.kind, route.adapter_kind);
+    }
 
     pub fn stream(
         self: ProviderAdapter,
@@ -481,6 +489,20 @@ pub const ProviderAdapter = struct {
         if (request.cancel_flag.load(.seq_cst)) {
             try events.emit(.cancelled);
             return error.Cancelled;
+        }
+        if (!self.acceptsRoute(request.route)) {
+            try events.emit(.{ .failure = .{
+                .category = .configuration,
+                .detail = "admitted route does not match provider adapter",
+            } });
+            return error.RouteAdapterMismatch;
+        }
+        if (!request.route.containsModel(request.model_id)) {
+            try events.emit(.{ .failure = .{
+                .category = .configuration,
+                .detail = "model is not part of the admitted route",
+            } });
+            return error.RouteModelMismatch;
         }
 
         try self.stream_fn(&self, alloc, request, events);
@@ -500,6 +522,7 @@ fn unavailableAdapterStream(
 }
 
 pub const unavailable_adapter = ProviderAdapter{
+    .kind = "unavailable",
     .stream_fn = unavailableAdapterStream,
 };
 
@@ -610,7 +633,7 @@ test "stream event state rejects unsafe references and provider tool identities"
     try std.testing.expectError(error.DuplicateProviderToolResult, state.accept(result_event));
 }
 
-test "provider adapter handles cancellation and missing terminal without exposing credential" {
+test "provider adapter rejects wrong routes before traffic and handles cancellation and missing terminal" {
     const Fake = struct {
         calls: usize = 0,
 
@@ -626,13 +649,17 @@ test "provider adapter handles cancellation and missing terminal without exposin
     };
     const Capture = struct {
         cancelled: bool = false,
+        failures: usize = 0,
         failure_detail: ?[]const u8 = null,
 
         fn emit(raw: *anyopaque, event: StreamEvent) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             switch (event) {
                 .cancelled => self.cancelled = true,
-                .failure => |failure| self.failure_detail = failure.detail,
+                .failure => |failure| {
+                    self.failures += 1;
+                    self.failure_detail = failure.detail;
+                },
                 else => {},
             }
         }
@@ -646,7 +673,20 @@ test "provider adapter handles cancellation and missing terminal without exposin
     var cancelled = std.atomic.Value(bool).init(true);
     var delivery = DeliveryCertainty.init();
     var attempt_evidence: AttemptEvidence = .{};
-    const adapter = ProviderAdapter{ .context = &fake, .stream_fn = Fake.stream };
+    var route = route_snapshot.RouteSnapshot{
+        .connection_id = @constCast("fake"),
+        .adapter_kind = @constCast("fake"),
+        .endpoint = @constCast("https://example.invalid"),
+        .protocol = @constCast("fake"),
+        .credential_ref = @constCast("fake_ref"),
+        .primary_model_id = @constCast("test/model"),
+        .permission_review_model_id = null,
+        .capabilities = .{},
+        .capability_source = .configured,
+        .selected_fast_mode = false,
+        .fast_model_suffix = null,
+    };
+    const adapter = ProviderAdapter{ .kind = "fake", .context = &fake, .stream_fn = Fake.stream };
     const request = AdapterRequest{
         .model_request = .{
             .model = "test/model",
@@ -655,11 +695,11 @@ test "provider adapter handles cancellation and missing terminal without exposin
             .tool_choice = .none,
             .capabilities = .{},
         },
+        .route = &route,
         .credential = "must-not-be-emitted",
         .tenant = null,
         .model_id = "test/model",
         .retry_count = 0,
-        .endpoint = "https://example.invalid",
         .trace_ctx = .{},
         .content_capture_limit = null,
         .delivery = &delivery,
@@ -681,6 +721,40 @@ test "provider adapter handles cancellation and missing terminal without exposin
     state.deinit();
     state = EventState.init(std.testing.allocator);
     sink_error = null;
+    const wrong_adapter = ProviderAdapter{ .kind = "other", .context = &fake, .stream_fn = Fake.stream };
+    try std.testing.expectError(error.RouteAdapterMismatch, wrong_adapter.stream(std.testing.allocator, request, .{
+        .context = &capture,
+        .state = &state,
+        .sink_error = &sink_error,
+        .emit_fn = Capture.emit,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), capture.failures);
+    try std.testing.expectEqualStrings("admitted route does not match provider adapter", capture.failure_detail.?);
+    try std.testing.expectEqual(@as(usize, 1), state.terminal_count);
+
+    capture = .{};
+    state.deinit();
+    state = EventState.init(std.testing.allocator);
+    sink_error = null;
+    var wrong_model = request;
+    wrong_model.model_id = "outside/route";
+    try std.testing.expectError(error.RouteModelMismatch, adapter.stream(std.testing.allocator, wrong_model, .{
+        .context = &capture,
+        .state = &state,
+        .sink_error = &sink_error,
+        .emit_fn = Capture.emit,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), capture.failures);
+    try std.testing.expectEqualStrings("model is not part of the admitted route", capture.failure_detail.?);
+    try std.testing.expectEqual(@as(usize, 1), state.terminal_count);
+    try std.testing.expect(std.mem.find(u8, capture.failure_detail.?, request.credential) == null);
+
+    capture = .{};
+    state.deinit();
+    state = EventState.init(std.testing.allocator);
+    sink_error = null;
     try adapter.stream(std.testing.allocator, request, .{
         .context = &capture,
         .state = &state,
@@ -688,6 +762,7 @@ test "provider adapter handles cancellation and missing terminal without exposin
         .emit_fn = Capture.emit,
     });
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), capture.failures);
     try std.testing.expectEqual(@as(usize, 1), state.terminal_count);
     try std.testing.expect(std.mem.find(u8, capture.failure_detail.?, request.credential) == null);
 }

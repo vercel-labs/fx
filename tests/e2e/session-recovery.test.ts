@@ -118,7 +118,335 @@ function sessionIdsFromHome(home: string): string[] {
     .map((entry) => entry.name);
 }
 
+function writeConnectionSettings(
+  home: string,
+  selected: "connection-a" | "connection-b",
+  endpointA: string,
+  endpointB: string,
+  includeA = true,
+  credentialRefB = "ai_gateway_api_key",
+): void {
+  const profiles = [
+    ...(includeA
+      ? [{
+        id: "connection-a",
+        display_name: "Connection A",
+        adapter_id: "vercel_ai_gateway",
+        endpoint: endpointA,
+        protocol: "vercel_ai_gateway",
+        credential_ref: "ai_gateway_api_key",
+        remembered_model: "model-a",
+        permission_review_model: "reviewer-a",
+      }]
+      : []),
+    {
+      id: "connection-b",
+      display_name: "Connection B",
+      adapter_id: "vercel_ai_gateway",
+      endpoint: endpointB,
+      protocol: "vercel_ai_gateway",
+      credential_ref: credentialRefB,
+      remembered_model: "model-b",
+      permission_review_model: "reviewer-b",
+    },
+  ];
+  writeFileSync(
+    join(home, ".fx", "settings.json"),
+    JSON.stringify({
+      permission_mode: "auto",
+      connections: { selected, profiles },
+    }) + "\n",
+    { mode: 0o600 },
+  );
+}
+
+function unavailableResponse(): Response {
+  return new Response(
+    JSON.stringify({ error: { message: "provider temporarily unavailable" } }),
+    {
+      status: 503,
+      headers: {
+        "content-type": "application/json",
+        "retry-after": "0",
+      },
+    },
+  );
+}
+
+function startRejectingOAuth() {
+  const requests: string[] = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      requests.push(`${request.method} ${new URL(request.url).pathname}`);
+      return new Response("selected connection must not refresh", { status: 500 });
+    },
+  });
+  return {
+    issuerUrl: `http://127.0.0.1:${server.port}`,
+    requests,
+    stop() {
+      server.stop(true);
+    },
+  };
+}
+
+function writeExpiredFxLogin(home: string, issuer: string): void {
+  writeFileSync(
+    join(home, ".fx", "auth.json"),
+    JSON.stringify({
+      version: 1,
+      issuer,
+      client_id: "test-client",
+      access_token: "expired-access-token",
+      refresh_token: "seeded-refresh-token",
+      expires_at_ms: Date.now() - 60_000,
+      scope: "openid offline_access use:ai-gateway",
+      token_type: "Bearer",
+    }) + "\n",
+    { mode: 0o600 },
+  );
+}
+
+function gatewayTrafficCount(gateway: ReturnType<typeof startFakeGateway>): number {
+  return gateway.requests.length +
+    gateway.classifierRequests.length +
+    gateway.generationRequests.length +
+    gateway.modelRequests.length;
+}
+
 describe("session recovery", () => {
+  test(
+    "fresh binary continues a persisted checkpoint without touching the new default connection",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-session-route-restart-"));
+      const gatewayA = startFakeGateway([
+        ...Array.from({ length: 10 }, () => unavailableResponse()),
+        fakeGatewayFinalText("resumed on A"),
+      ], {
+        models: [{ id: "model-a", type: "language", tags: ["tool-use"] }],
+      });
+      const gatewayB = startFakeGateway([
+        fakeGatewayFinalText("must not use B"),
+      ], {
+        models: [{ id: "model-b", type: "language", tags: ["tool-use"] }],
+      });
+      const oauthB = startRejectingOAuth();
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(join(home, ".fx"), { recursive: true });
+        mkdirSync(workspace);
+        const workspaceRoot = realpathSync(workspace);
+        writeConnectionSettings(
+          home,
+          "connection-a",
+          gatewayA.chatUrl,
+          gatewayB.chatUrl,
+        );
+        const env = {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "route-only-secret",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_MODEL: undefined,
+          FX_GATEWAY_BASE_URL: gatewayA.baseUrl,
+          FX_GATEWAY_CHAT_URL: undefined,
+          FX_AUTO_UPGRADE: "0",
+          NO_COLOR: "1",
+        };
+
+        const first = await runFx(
+          ["ask", "--auto", "--json", "Pause this turn on connection A."],
+          { cwd: workspaceRoot, env },
+        );
+        expect(first.code).toBe(1);
+        const firstResult = JSON.parse(first.stdout.trim());
+        expect(firstResult.recovery).toEqual(expect.objectContaining({
+          state: "paused",
+          cause: "provider_unavailable",
+          attempt: 10,
+          attempt_limit: 10,
+          durable: true,
+        }));
+        const sessionId = firstResult.session_id as string;
+        expect(sessionId.length).toBeGreaterThan(0);
+        expect(gatewayA.requests).toHaveLength(10);
+        expect(gatewayTrafficCount(gatewayB)).toBe(0);
+
+        const sessionDir = join(home, ".fx", "sessions", sessionId);
+        const pausedDurableText = readdirSync(sessionDir)
+          .filter((name) => name.endsWith(".json") || name.endsWith(".jsonl"))
+          .map((name) => readFileSync(join(sessionDir, name), "utf8"))
+          .join("\n");
+        expect(pausedDurableText).toContain('"connection_id":"connection-a"');
+        expect(pausedDurableText).toContain('"adapter_kind":"vercel_ai_gateway"');
+        expect(pausedDurableText).toContain('"permission_review_model_id":"reviewer-a"');
+        expect(pausedDurableText).toContain('"route_model":"model-a"');
+        expect(pausedDurableText).toMatch(
+          /"delivery":"possibly_sent"[^\n]*"consumed_provider_attempts":10,"outstanding_reservation":false/,
+        );
+        expect(pausedDurableText).not.toContain("route-only-secret");
+
+        writeConnectionSettings(
+          home,
+          "connection-b",
+          gatewayA.chatUrl,
+          gatewayB.chatUrl,
+          true,
+          "fx_login",
+        );
+        writeExpiredFxLogin(home, oauthB.issuerUrl);
+        const resumed = await runFx(
+          [
+            "ask",
+            "--auto",
+            "--json",
+            "--resume-id",
+            sessionId,
+            "--continue-recovery",
+          ],
+          {
+            cwd: workspaceRoot,
+            env: {
+              ...env,
+              FX_E2E_OAUTH_ISSUER_URL: oauthB.issuerUrl,
+            },
+          },
+        );
+        expect(resumed.code).toBe(0);
+        expect(JSON.parse(resumed.stdout.trim()).output).toContain("resumed on A");
+        expect(gatewayA.requests).toHaveLength(11);
+        expect(gatewayTrafficCount(gatewayB)).toBe(0);
+        expect(oauthB.requests).toEqual([]);
+        expect(gatewayA.requests[0]!.headers.get("ai-language-model-id")).toBe(
+          "model-a",
+        );
+        expect(gatewayA.requests[10]!.headers.get("ai-language-model-id")).toBe(
+          "model-a",
+        );
+
+        const durableText = readdirSync(sessionDir)
+          .filter((name) => name.endsWith(".json") || name.endsWith(".jsonl"))
+          .map((name) => readFileSync(join(sessionDir, name), "utf8"))
+          .join("\n");
+        expect(durableText).toContain('"connection_id":"connection-a"');
+        expect(durableText).toContain('"model_id":"model-a"');
+        expect(durableText).not.toContain("route-only-secret");
+
+        writeConnectionSettings(
+          home,
+          "connection-b",
+          gatewayA.chatUrl,
+          gatewayB.chatUrl,
+          false,
+        );
+        const beforeMissingA = gatewayTrafficCount(gatewayA);
+        const beforeMissingB = gatewayTrafficCount(gatewayB);
+        const missing = await runFx(
+          [
+            "ask",
+            "--auto",
+            "--json",
+            "--resume-id",
+            sessionId,
+            "This must not reach a provider.",
+          ],
+          { cwd: workspaceRoot, env },
+        );
+        expect(missing.code).not.toBe(0);
+        expect(`${missing.stdout}\n${missing.stderr}`).toContain(
+          "saved connection is unavailable; select or restore that connection",
+        );
+        expect(gatewayTrafficCount(gatewayA)).toBe(beforeMissingA);
+        expect(gatewayTrafficCount(gatewayB)).toBe(beforeMissingB);
+      } finally {
+        gatewayA.stop();
+        gatewayB.stop();
+        oauthB.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  test(
+    "ACP load resolves the saved connection before selected connection auth",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-acp-session-route-restart-"));
+      const gatewayA = startFakeGateway([], {
+        models: [{ id: "model-a", type: "language", tags: ["tool-use"] }],
+      });
+      const gatewayB = startFakeGateway([], {
+        models: [{ id: "model-b", type: "language", tags: ["tool-use"] }],
+      });
+      const oauthB = startRejectingOAuth();
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(join(home, ".fx"), { recursive: true });
+        mkdirSync(workspace);
+        const workspaceRoot = realpathSync(workspace);
+        const env = {
+          AI_GATEWAY_API_KEY: "route-only-secret",
+          FX_GATEWAY_BASE_URL: gatewayA.baseUrl,
+          FX_AUTO_UPGRADE: "0",
+        };
+        writeConnectionSettings(
+          home,
+          "connection-a",
+          gatewayA.chatUrl,
+          gatewayB.chatUrl,
+        );
+
+        const creator = startAcp(workspaceRoot, home, env);
+        creator.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
+        expect((await creator.read()).result).toBeDefined();
+        creator.send({ jsonrpc: "2.0", id: 2, method: "session/new", params: { mcpServers: [] } });
+        const created = await creator.read();
+        const sessionId = created.result?.sessionId as string;
+        expect(sessionId.length).toBeGreaterThan(0);
+        creator.kill();
+
+        writeConnectionSettings(
+          home,
+          "connection-b",
+          gatewayA.chatUrl,
+          gatewayB.chatUrl,
+          true,
+          "fx_login",
+        );
+        writeExpiredFxLogin(home, oauthB.issuerUrl);
+        const loader = startAcp(workspaceRoot, home, {
+          ...env,
+          FX_E2E_OAUTH_ISSUER_URL: oauthB.issuerUrl,
+        });
+        try {
+          loader.send({ jsonrpc: "2.0", id: 3, method: "initialize", params: { protocolVersion: 1 } });
+          expect((await loader.read()).result).toBeDefined();
+          expect(oauthB.requests).toEqual([]);
+          loader.send({
+            jsonrpc: "2.0",
+            id: 4,
+            method: "session/load",
+            params: { sessionId, mcpServers: [] },
+          });
+          expect((await loader.read()).result).toBeDefined();
+          expect(oauthB.requests).toEqual([]);
+          expect(gatewayTrafficCount(gatewayB)).toBe(0);
+        } finally {
+          loader.kill();
+        }
+      } finally {
+        gatewayA.stop();
+        gatewayB.stop();
+        oauthB.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
   for (const boundary of [
     "after_event_append",
     "after_event_sync",

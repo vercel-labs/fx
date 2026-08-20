@@ -234,6 +234,10 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 writeStderr(deps, "fx: saved session not found.\n");
                 return .{ .exit = 1 };
             },
+            error.MissingSessionConnection => {
+                writeStderr(deps, "fx: saved connection is unavailable; select or restore that connection before resuming.\n");
+                return .{ .exit = 1 };
+            },
             error.SessionBusy => {
                 writeStderr(deps, "fx: another Fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n");
                 return .{ .exit = 1 };

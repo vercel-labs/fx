@@ -5,6 +5,7 @@ const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const task_helpers = @import("../tasks/task_helpers.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
+const route_snapshot_test_support = @import("../gateway/route_snapshot_test_support.zig");
 
 pub fn Runtime(comptime App: type) type {
     return struct {
@@ -253,13 +254,18 @@ const TestWorkerApp = struct {
 };
 
 fn makeQueuedPrompt(alloc: std.mem.Allocator, text: []const u8) !worker_runtime.QueuedPrompt {
+    const prompt = try alloc.dupe(u8, text);
+    errdefer alloc.free(prompt);
+    var route = try route_snapshot_test_support.owned(alloc, "test-model");
+    errdefer route.deinit(alloc);
+    const history = try alloc.alloc(types.HistoryTurn, 0);
+    errdefer alloc.free(history);
     return .{
-        .prompt = try alloc.dupe(u8, text),
+        .prompt = prompt,
         .images = &.{},
-        .model = try alloc.dupe(u8, "test-model"),
-        .api_key = try alloc.dupe(u8, "test-key"),
+        .route = route,
         .permission_mode = .ask,
-        .history = try alloc.alloc(types.HistoryTurn, 0),
+        .history = history,
         .grants = try alloc.alloc(types.PermissionGrant, 0),
     };
 }

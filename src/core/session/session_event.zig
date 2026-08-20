@@ -1061,6 +1061,10 @@ fn validateEnvelope(envelope: Envelope) !void {
                 .updated_at_ms = 0,
                 .conversation_language = session.ConversationLanguage.literal("en"),
                 .preferences = .{
+                    .connection_id = if (payload.checkpoint.route_identity) |identity|
+                        identity.connection_id
+                    else
+                        null,
                     .model = @constCast("test/model"),
                     .effort = .auto,
                     .fast_mode = false,
@@ -1117,7 +1121,7 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
             try writer.writeByte('{');
             var wrote = false;
             if (payload.model) |model| {
-                try writer.writeAll("\"model\":");
+                try writer.writeAll("\"model_id\":");
                 try writeJsonString(writer, model);
                 wrote = true;
             }
@@ -1256,8 +1260,17 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
         .preferences_changed => blk: {
             const object = try requireObject(value);
             if (object.count() == 0 or object.count() > 3) return error.InvalidEventFrame;
-            try rejectUnknownKeys(object, &.{ "model", "effort", "fast_mode" });
-            const model = if (object.get("model")) |_| try dupeString(alloc, object, "model") else null;
+            try rejectUnknownKeys(object, &.{ "model_id", "model", "effort", "fast_mode" });
+            if (object.get("model_id") != null and object.get("model") != null) {
+                return error.InvalidEventFrame;
+            }
+            const model_key: ?[]const u8 = if (object.get("model_id") != null)
+                "model_id"
+            else if (object.get("model") != null)
+                "model"
+            else
+                null;
+            const model = if (model_key) |key| try dupeString(alloc, object, key) else null;
             errdefer if (model) |owned| alloc.free(owned);
             const effort = if (object.get("effort")) |_|
                 types.ReasoningEffort.parse(try requireString(object, "effort")) orelse
@@ -1428,10 +1441,21 @@ fn readFrameLine(alloc: Allocator, source: *std.Io.Reader) ![]u8 {
 }
 
 fn parsePreferences(alloc: Allocator, value: std.json.Value) !session_codec.DurableSessionPreferences {
-    const object = try exactObject(value, &.{ "model", "effort", "fast_mode" });
-    const model = try dupeString(alloc, object, "model");
+    const source = try requireObject(value);
+    const is_current = source.get("connection_id") != null;
+    const object = if (is_current)
+        try exactObject(value, &.{ "connection_id", "model_id", "effort", "fast_mode" })
+    else
+        try exactObject(value, &.{ "model", "effort", "fast_mode" });
+    const connection_id = if (is_current)
+        try dupeString(alloc, object, "connection_id")
+    else
+        null;
+    errdefer if (connection_id) |owned| alloc.free(owned);
+    const model = try dupeString(alloc, object, if (is_current) "model_id" else "model");
     errdefer alloc.free(model);
     return .{
+        .connection_id = connection_id,
         .model = model,
         .effort = types.ReasoningEffort.parse(
             try requireString(object, "effort"),
@@ -1444,7 +1468,9 @@ fn writePreferences(
     writer: *std.Io.Writer,
     preferences: session_codec.DurableSessionPreferences,
 ) !void {
-    try writer.writeAll("{\"model\":");
+    try writer.writeAll("{\"connection_id\":");
+    try writeJsonString(writer, preferences.connection_id orelse session_codec.legacy_connection_id);
+    try writer.writeAll(",\"model_id\":");
     try writeJsonString(writer, preferences.model);
     try writer.writeAll(",\"effort\":");
     try writeJsonString(writer, preferences.effort.label());

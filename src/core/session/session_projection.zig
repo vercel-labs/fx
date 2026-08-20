@@ -282,7 +282,10 @@ fn durablePreferencesEqual(
     left: session_codec.DurableSessionPreferences,
     right: session_codec.DurableSessionPreferences,
 ) bool {
-    return std.mem.eql(u8, left.model, right.model) and
+    const left_connection = left.connection_id orelse session_codec.legacy_connection_id;
+    const right_connection = right.connection_id orelse session_codec.legacy_connection_id;
+    return std.mem.eql(u8, left_connection, right_connection) and
+        std.mem.eql(u8, left.model, right.model) and
         left.effort.eql(right.effort) and
         left.fast_mode == right.fast_mode;
 }
@@ -452,7 +455,9 @@ fn writePreferences(
     writer: *std.Io.Writer,
     preferences: session_codec.DurableSessionPreferences,
 ) !void {
-    try writer.writeAll("{\"model\":");
+    try writer.writeAll("{\"connection_id\":");
+    try writeJsonString(writer, preferences.connection_id orelse session_codec.legacy_connection_id);
+    try writer.writeAll(",\"model_id\":");
     try writeJsonString(writer, preferences.model);
     try writer.writeAll(",\"effort\":");
     try writeJsonString(writer, preferences.effort.label());
@@ -462,10 +467,21 @@ fn writePreferences(
 }
 
 fn parsePreferences(alloc: Allocator, value: std.json.Value) !session_codec.DurableSessionPreferences {
-    const object = try exactObject(value, &.{ "model", "effort", "fast_mode" });
-    const model = try dupeString(alloc, object, "model");
+    if (value != .object) return error.InvalidManifest;
+    const is_current = value.object.get("connection_id") != null;
+    const object = if (is_current)
+        try exactObject(value, &.{ "connection_id", "model_id", "effort", "fast_mode" })
+    else
+        try exactObject(value, &.{ "model", "effort", "fast_mode" });
+    const connection_id = if (is_current)
+        try dupeString(alloc, object, "connection_id")
+    else
+        null;
+    errdefer if (connection_id) |owned| alloc.free(owned);
+    const model = try dupeString(alloc, object, if (is_current) "model_id" else "model");
     errdefer alloc.free(model);
     return .{
+        .connection_id = connection_id,
         .model = model,
         .effort = types.ReasoningEffort.parse(try requireString(object, "effort")) orelse
             return error.InvalidManifest,
