@@ -52,9 +52,19 @@ pub const NetworkFailureCause = enum {
 
 /// Stable native transport evidence consumed by model recovery policy.
 /// Providers that cannot distinguish failure stages leave this unset.
+pub const NetworkFailureStage = enum {
+    connection_setup,
+    request_send,
+    response_head,
+    response_body,
+    unknown,
+};
+
 pub const NetworkFailureEvidence = struct {
     cause: NetworkFailureCause,
     delivery: DeliveryCertainty.State,
+    stage: NetworkFailureStage = .unknown,
+    error_name: []const u8 = "",
 };
 
 pub const AttemptEvidence = struct {

@@ -16,6 +16,7 @@ pub fn isRetryableGatewayError(err: anyerror) bool {
 pub fn networkFailureEvidence(
     err: anyerror,
     delivery: DeliveryCertainty.State,
+    stage: agent_stream_provider.NetworkFailureStage,
 ) ?agent_stream_provider.NetworkFailureEvidence {
     const cause: agent_stream_provider.NetworkFailureCause = if (err == error.SystemResumed)
         .system_resumed
@@ -23,7 +24,12 @@ pub fn networkFailureEvidence(
         .transport_interrupted
     else
         return null;
-    return .{ .cause = cause, .delivery = delivery };
+    return .{
+        .cause = cause,
+        .delivery = delivery,
+        .stage = stage,
+        .error_name = @errorName(err),
+    };
 }
 
 fn isRetryableAgentNetworkError(err: anyerror) bool {
@@ -110,17 +116,21 @@ test "native network failure evidence covers setup send read and resume failures
         const evidence = networkFailureEvidence(
             case.err,
             .possibly_sent,
+            .response_body,
         ) orelse return error.TestExpectedNetworkFailureEvidence;
         try std.testing.expectEqual(case.cause, evidence.cause);
         try std.testing.expectEqual(
             DeliveryCertainty.State.possibly_sent,
             evidence.delivery,
         );
+        try std.testing.expectEqual(agent_stream_provider.NetworkFailureStage.response_body, evidence.stage);
+        try std.testing.expectEqualStrings(@errorName(case.err), evidence.error_name);
     }
 
     const pre_send = networkFailureEvidence(
         error.ConnectionRefused,
         .definitely_unsent,
+        .connection_setup,
     ).?;
     try std.testing.expectEqual(
         DeliveryCertainty.State.definitely_unsent,
@@ -142,7 +152,7 @@ test "native network failure evidence excludes opaque and configuration failures
     for (excluded) |err| {
         try std.testing.expectEqual(
             @as(?agent_stream_provider.NetworkFailureEvidence, null),
-            networkFailureEvidence(err, .definitely_unsent),
+            networkFailureEvidence(err, .definitely_unsent, .unknown),
         );
     }
 }
@@ -176,6 +186,26 @@ pub const GatewayJsonResult = union(enum) {
 
 pub const StreamCallback = agent_stream_provider.StreamCallback;
 pub const ToolStartCallback = agent_stream_provider.ToolStartCallback;
+
+/// Owns the persistent native AI Gateway HTTP transport. The allocator must
+/// remain valid for the runtime lifetime and support concurrent callers.
+pub const Runtime = struct {
+    http_client: std.http.Client,
+
+    pub fn init(alloc: std.mem.Allocator) Runtime {
+        return .{
+            .http_client = .{
+                .allocator = alloc,
+                .io = io_mod.getIo(),
+            },
+        };
+    }
+
+    pub fn deinit(self: *Runtime) void {
+        self.http_client.deinit();
+        self.* = undefined;
+    }
+};
 
 const gateway_retry_base_delay_ns: u64 = 150 * std.time.ns_per_ms;
 const gateway_connection_setup_timeout_ms: i64 = 30_000;
@@ -763,6 +793,7 @@ const RequestOpenOverride = struct {
 const StreamCoreOptions = struct {
     setup_timing: ConnectionSetupTiming = .{},
     request_open_override: ?RequestOpenOverride = null,
+    http_client: ?*std.http.Client = null,
 };
 
 const RequestOpenOperation = struct {
@@ -1000,12 +1031,14 @@ pub const StreamRequest = struct {
     trace_ctx: debug_trace.TraceContext = .{},
     content_capture_limit: ?usize = null,
     delivery: ?*DeliveryCertainty = null,
+    failure_stage: ?*agent_stream_provider.NetworkFailureStage = null,
     on_reasoning_chunk: ?StreamCallback = null,
     on_tool_input_chunk: ?StreamCallback = null,
     provider_attempt_owner: ProviderAttemptOwner = .transport,
 };
 
 pub fn streamGatewayCompletion(
+    runtime: *Runtime,
     alloc: std.mem.Allocator,
     request: StreamRequest,
     callback_ctx: *anyopaque,
@@ -1015,7 +1048,7 @@ pub fn streamGatewayCompletion(
 ) !StreamResult {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const expected_provider_tool_name = try expectedProviderToolName(alloc, request.payload);
-    return streamGatewayCompletionCore(
+    return streamGatewayCompletionCoreWithOptions(
         alloc,
         request,
         callback_ctx,
@@ -1024,6 +1057,7 @@ pub fn streamGatewayCompletion(
         cancel_flag,
         expected_provider_tool_name,
         true,
+        .{ .http_client = &runtime.http_client },
     );
 }
 
@@ -1171,6 +1205,7 @@ fn streamGatewayCompletionCoreWithOptions(
         .transport => request.retry_count,
     };
     const trace_ctx = request.trace_ctx;
+    if (request.failure_stage) |stage| stage.* = .connection_setup;
     const request_url = try resolveE2eGatewayUrl(e2e_gateway_chat_url_env, request.chat_url);
     const uri = try std.Uri.parse(request_url);
 
@@ -1185,14 +1220,16 @@ fn streamGatewayCompletionCoreWithOptions(
         request.session_id,
     );
 
+    var local_client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+    defer if (core_options.http_client == null) local_client.deinit();
+    const http_client = core_options.http_client orelse &local_client;
+
     var attempt: usize = 0;
     var delivery_ambiguous = false;
     var request_body_possibly_sent = false;
     var setup_epoch: ?ConnectionSetupEpoch = null;
     while (attempt < retry_count) : (attempt += 1) {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-        var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-        defer client.deinit();
 
         if (setup_epoch == null) {
             setup_epoch = ConnectionSetupEpoch.init(core_options.setup_timing);
@@ -1207,7 +1244,7 @@ fn streamGatewayCompletionCoreWithOptions(
 
         debug_trace.eventf("gateway", "before_http_open_connect", trace_ctx, "attempt={d} retry_count={d}", .{ attempt + 1, retry_count });
         debug_trace.eventf("gateway", "before_request_open", trace_ctx, "attempt={d} retry_count={d} payload_bytes={d}", .{ attempt + 1, retry_count, payload.len });
-        var req = openGatewayRequestBounded(&client, uri, .{
+        var req = openGatewayRequestBounded(http_client, uri, .{
             .headers = .{
                 .content_type = .{ .override = "application/json" },
                 .authorization = .{ .override = auth_header },
@@ -1215,7 +1252,7 @@ fn streamGatewayCompletionCoreWithOptions(
                 .user_agent = .{ .override = user_agent },
             },
             .extra_headers = extra_headers,
-            .keep_alive = false,
+            .keep_alive = true,
             .redirect_behavior = .unhandled,
         }, core_options.request_open_override, epoch, cancel_flag) catch |err| {
             debug_trace.eventf("gateway", "http_open_connect_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
@@ -1265,6 +1302,13 @@ fn streamGatewayCompletionCoreWithOptions(
         }
         setup_epoch = null;
         defer req.deinit();
+        // A connected error may leave the request reader in `.ready`, which
+        // std.http otherwise treats as reusable even when cancellation shut
+        // down the socket or a request write failed. Never return such a
+        // connection to the long-lived runtime pool.
+        errdefer {
+            if (req.connection) |conn| conn.closing = true;
+        }
         debug_trace.eventf("gateway", "after_http_open_connect", trace_ctx, "attempt={d}", .{attempt + 1});
         debug_trace.eventf("gateway", "after_request_open", trace_ctx, "attempt={d}", .{attempt + 1});
 
@@ -1286,6 +1330,7 @@ fn streamGatewayCompletionCoreWithOptions(
         }
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
+        if (request.failure_stage) |stage| stage.* = .request_send;
         req.transfer_encoding = .{ .content_length = payload.len };
         var send_buf: [8192]u8 = undefined;
         debug_trace.eventf("gateway", "before_request_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
@@ -1326,6 +1371,7 @@ fn streamGatewayCompletionCoreWithOptions(
         debug_trace.eventf("gateway", "after_request_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
         debug_trace.eventf("gateway", "after_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
 
+        if (request.failure_stage) |stage| stage.* = .response_head;
         debug_trace.eventf("gateway", "before_receive_head", trace_ctx, "attempt={d}", .{attempt + 1});
         var response = req.receiveHead(&.{}) catch |err| {
             debug_trace.eventf("gateway", "receive_head_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
@@ -1384,6 +1430,7 @@ fn streamGatewayCompletionCoreWithOptions(
             };
         }
 
+        if (request.failure_stage) |stage| stage.* = .response_body;
         var transfer_buf: [gateway_transfer_buffer_bytes]u8 = undefined;
         const body_reader = response.reader(&transfer_buf);
         debug_trace.eventf("gateway", "before_sse_consume", trace_ctx, "attempt={d}", .{attempt + 1});
@@ -5465,6 +5512,8 @@ const LoopbackGatewayMode = enum {
     success_capture,
     model_catalog_success,
     private_model_catalog_success,
+    persistent_success_twice,
+    cancelled_stream_then_success,
 };
 
 const LoopbackGatewayFixture = struct {
@@ -5746,6 +5795,51 @@ const LoopbackGatewayFixture = struct {
                         "Content-Type: application/json\r\n" ++
                         "Connection: close\r\n\r\n" ++
                         loopback_private_model_catalog_json,
+                );
+            },
+            .persistent_success_twice => {
+                for (0..2) |_| {
+                    try readLoopbackGatewayRequest(zio, stream, self);
+                    try writeLoopbackGatewayBytes(
+                        zio,
+                        stream,
+                        "HTTP/1.1 200 OK\r\n" ++
+                            "Content-Type: text/event-stream\r\n" ++
+                            "Content-Length: 115\r\n" ++
+                            "Connection: keep-alive\r\n\r\n" ++
+                            "data: {\"type\":\"text-delta\",\"id\":\"answer\",\"delta\":\"ok\"}\n\n" ++
+                            "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n",
+                    );
+                }
+                self.markStage();
+            },
+            .cancelled_stream_then_success => {
+                try readLoopbackGatewayRequest(zio, stream, self);
+                try writeLoopbackGatewayBytes(
+                    zio,
+                    stream,
+                    "HTTP/1.1 200 OK\r\n" ++
+                        "Content-Type: text/event-stream\r\n" ++
+                        "Connection: keep-alive\r\n\r\n" ++
+                        "data: {\"type\":\"text-delta\",\"id\":\"partial\",\"delta\":\"partial\"}\n\n",
+                );
+                self.markStage();
+                var byte: [1]u8 = undefined;
+                var reader = stream.reader(zio, &byte);
+                _ = reader.interface.takeByte() catch {};
+
+                var recovered_stream = try self.server.accept(zio);
+                defer recovered_stream.close(zio);
+                try readLoopbackGatewayRequest(zio, recovered_stream, self);
+                try writeLoopbackGatewayBytes(
+                    zio,
+                    recovered_stream,
+                    "HTTP/1.1 200 OK\r\n" ++
+                        "Content-Type: text/event-stream\r\n" ++
+                        "Content-Length: 115\r\n" ++
+                        "Connection: keep-alive\r\n\r\n" ++
+                        "data: {\"type\":\"text-delta\",\"id\":\"answer\",\"delta\":\"ok\"}\n\n" ++
+                        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n",
                 );
             },
         }
@@ -6284,6 +6378,7 @@ test "agent-owned provider attempts return immediate peer resets without transpo
         const evidence = networkFailureEvidence(
             err,
             delivery.load(),
+            .connection_setup,
         ) orelse return error.TestExpectedNetworkFailureEvidence;
         try std.testing.expectEqual(
             agent_stream_provider.NetworkFailureCause.transport_interrupted,
@@ -6370,6 +6465,124 @@ test "TLS setup does not retry after delivery when no certainty sink is provided
     if (harness.fixture.failure) |err| return err;
 }
 
+test "gateway runtime reuses one connection for sequential successful streams" {
+    var fixture = try LoopbackGatewayFixture.init(.persistent_success_twice, 0);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+
+    const chat_url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/v1/chat/completions",
+        .{fixture.port()},
+    );
+    defer std.testing.allocator.free(chat_url);
+
+    var runtime = Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    for (0..2) |_| {
+        var result = try streamGatewayCompletion(
+            &runtime,
+            std.testing.allocator,
+            .{
+                .api_key = "test-key",
+                .model = "provider/test-model",
+                .retry_count = 1,
+                .chat_url = chat_url,
+                .payload = "{}",
+            },
+            @ptrCast(&bounded_stream_discard_ctx),
+            discardBoundedContent,
+            null,
+            &cancel_flag,
+        );
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("ok", result.completion.content.?);
+    }
+
+    try std.testing.expect(fixture.waitForSignal(&fixture.reached_stage, 5000));
+    fixture.deinit();
+    if (fixture.failure) |err| return err;
+}
+
+test "gateway runtime evicts a cancelled stream before the next request" {
+    var fixture = try LoopbackGatewayFixture.init(.cancelled_stream_then_success, 0);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+
+    const chat_url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/v1/chat/completions",
+        .{fixture.port()},
+    );
+    defer std.testing.allocator.free(chat_url);
+
+    var runtime = Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request_done = std.atomic.Value(bool).init(false);
+    const Cancel = struct {
+        fn run(
+            server_fixture: *LoopbackGatewayFixture,
+            flag: *std.atomic.Value(bool),
+            done: *std.atomic.Value(bool),
+        ) void {
+            if (!server_fixture.waitForStageOrDone(done)) return;
+            flag.store(true, .seq_cst);
+        }
+    };
+    const cancel_thread = try std.Thread.spawn(.{}, Cancel.run, .{
+        &fixture,
+        &cancel_flag,
+        &request_done,
+    });
+
+    try std.testing.expectError(
+        error.Cancelled,
+        streamGatewayCompletion(
+            &runtime,
+            std.testing.allocator,
+            .{
+                .api_key = "test-key",
+                .model = "provider/test-model",
+                .retry_count = 1,
+                .chat_url = chat_url,
+                .payload = "{}",
+            },
+            @ptrCast(&bounded_stream_discard_ctx),
+            discardBoundedContent,
+            null,
+            &cancel_flag,
+        ),
+    );
+    request_done.store(true, .seq_cst);
+    cancel_thread.join();
+
+    cancel_flag.store(false, .seq_cst);
+    var recovered = try streamGatewayCompletion(
+        &runtime,
+        std.testing.allocator,
+        .{
+            .api_key = "test-key",
+            .model = "provider/test-model",
+            .retry_count = 1,
+            .chat_url = chat_url,
+            .payload = "{}",
+        },
+        @ptrCast(&bounded_stream_discard_ctx),
+        discardBoundedContent,
+        null,
+        &cancel_flag,
+    );
+    defer recovered.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ok", recovered.completion.content.?);
+
+    fixture.deinit();
+    if (fixture.failure) |err| return err;
+}
+
 test "direct gateway cancellation before admission opens no connection" {
     var fixture = try LoopbackGatewayFixture.init(.success, 0);
     defer fixture.deinit();
@@ -6383,10 +6596,13 @@ test "direct gateway cancellation before admission opens no connection" {
     );
     defer std.testing.allocator.free(chat_url);
 
+    var runtime = Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
     var cancel_flag = std.atomic.Value(bool).init(true);
     try std.testing.expectError(
         error.Cancelled,
         streamGatewayCompletion(
+            &runtime,
             std.testing.allocator,
             .{
                 .api_key = "test-key",
@@ -6912,9 +7128,12 @@ test "bounded gateway progress does not extend the absolute deadline" {
 }
 
 test "delivery certainty stays definitely unsent when request setup fails" {
+    var runtime = Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
     var delivery = DeliveryCertainty.init();
     var cancel_flag = std.atomic.Value(bool).init(false);
     const result = streamGatewayCompletion(
+        &runtime,
         std.testing.allocator,
         .{
             .api_key = "test-key",

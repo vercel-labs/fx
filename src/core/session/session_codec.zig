@@ -34,8 +34,21 @@ pub const RecoveryToolState = enum {
     uncertain,
 };
 
+pub const RecoveryNetworkFailureStage = enum {
+    connection_setup,
+    request_send,
+    response_head,
+    response_body,
+    unknown,
+};
+
+pub const RecoveryDelivery = enum {
+    definitely_unsent,
+    possibly_sent,
+};
+
 pub const RecoveryCheckpoint = struct {
-    version: u8 = 1,
+    version: u8 = 2,
     turn_id: u64,
     user: session.UserTurn,
     assistant_source: []u8,
@@ -49,12 +62,16 @@ pub const RecoveryCheckpoint = struct {
     max_provider_attempts: usize,
     consumed_provider_attempts: usize,
     outstanding_reservation: bool = false,
+    network_error_name: ?[]u8 = null,
+    network_failure_stage: ?RecoveryNetworkFailureStage = null,
+    delivery: ?RecoveryDelivery = null,
 
     pub fn deinit(self: *RecoveryCheckpoint, alloc: Allocator) void {
         session.freeUserTurn(alloc, self.user);
         alloc.free(self.assistant_source);
         session.freeExecutionMemory(alloc, self.execution);
         alloc.free(self.route_model);
+        if (self.network_error_name) |error_name| alloc.free(error_name);
         self.* = undefined;
     }
 
@@ -66,6 +83,12 @@ pub const RecoveryCheckpoint = struct {
         const execution = try types.dupeExecutionMemory(alloc, self.execution);
         errdefer session.freeExecutionMemory(alloc, execution);
         const route_model = try alloc.dupe(u8, self.route_model);
+        errdefer alloc.free(route_model);
+        const network_error_name = if (self.network_error_name) |error_name|
+            try alloc.dupe(u8, error_name)
+        else
+            null;
+        errdefer if (network_error_name) |error_name| alloc.free(error_name);
         return .{
             .version = self.version,
             .turn_id = self.turn_id,
@@ -81,6 +104,9 @@ pub const RecoveryCheckpoint = struct {
             .max_provider_attempts = self.max_provider_attempts,
             .consumed_provider_attempts = self.consumed_provider_attempts,
             .outstanding_reservation = self.outstanding_reservation,
+            .network_error_name = network_error_name,
+            .network_failure_stage = self.network_failure_stage,
+            .delivery = self.delivery,
         };
     }
 };
@@ -529,7 +555,7 @@ pub fn validateState(state: DurableSessionState) !void {
     session_permission_state.validate(state.permission_state) catch
         return error.InvalidDurableField;
     if (state.recovery_checkpoint) |checkpoint| {
-        if (checkpoint.version != 1 or
+        if ((checkpoint.version != 1 and checkpoint.version != 2) or
             checkpoint.turn_id == 0 or
             checkpoint.max_provider_attempts == 0 or
             checkpoint.consumed_provider_attempts > checkpoint.max_provider_attempts or
@@ -713,13 +739,28 @@ pub fn writeRecoveryCheckpoint(writer: *std.Io.Writer, checkpoint: RecoveryCheck
     try writeJsonString(writer, @tagName(checkpoint.tool_state));
     try writer.writeAll(",\"route_model\":");
     try writeDurableBytes(writer, checkpoint.route_model);
-    try writer.print(",\"requested_fast_mode\":{s},\"fast_mode\":{s},\"max_provider_attempts\":{d},\"consumed_provider_attempts\":{d},\"outstanding_reservation\":{s}}}", .{
+    try writer.print(",\"requested_fast_mode\":{s},\"fast_mode\":{s},\"max_provider_attempts\":{d},\"consumed_provider_attempts\":{d},\"outstanding_reservation\":{s}", .{
         if (checkpoint.requested_fast_mode) "true" else "false",
         if (checkpoint.fast_mode) "true" else "false",
         checkpoint.max_provider_attempts,
         checkpoint.consumed_provider_attempts,
         if (checkpoint.outstanding_reservation) "true" else "false",
     });
+    if (checkpoint.version >= 2) {
+        try writer.writeAll(",\"network_error_name\":");
+        try writeOptionalDurableBytes(writer, checkpoint.network_error_name);
+        try writer.writeAll(",\"network_failure_stage\":");
+        if (checkpoint.network_failure_stage) |stage|
+            try writeJsonString(writer, @tagName(stage))
+        else
+            try writer.writeAll("null");
+        try writer.writeAll(",\"delivery\":");
+        if (checkpoint.delivery) |delivery|
+            try writeJsonString(writer, @tagName(delivery))
+        else
+            try writer.writeAll("null");
+    }
+    try writer.writeByte('}');
 }
 
 fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits) !DurableSessionState {
@@ -883,24 +924,46 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
 }
 
 pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !RecoveryCheckpoint {
-    const object = try exactObject(value, &.{
-        "version",
-        "turn_id",
-        "user",
-        "assistant_source",
-        "execution",
-        "cause",
-        "action",
-        "tool_state",
-        "route_model",
-        "requested_fast_mode",
-        "fast_mode",
-        "max_provider_attempts",
-        "consumed_provider_attempts",
-        "outstanding_reservation",
-    });
-    const version = try requireU64(object, "version");
-    if (version != 1) return error.InvalidDurableField;
+    const raw_object = try requireObject(value);
+    const version = try requireU64(raw_object, "version");
+    const object = switch (version) {
+        1 => try exactObject(value, &.{
+            "version",
+            "turn_id",
+            "user",
+            "assistant_source",
+            "execution",
+            "cause",
+            "action",
+            "tool_state",
+            "route_model",
+            "requested_fast_mode",
+            "fast_mode",
+            "max_provider_attempts",
+            "consumed_provider_attempts",
+            "outstanding_reservation",
+        }),
+        2 => try exactObject(value, &.{
+            "version",
+            "turn_id",
+            "user",
+            "assistant_source",
+            "execution",
+            "cause",
+            "action",
+            "tool_state",
+            "route_model",
+            "requested_fast_mode",
+            "fast_mode",
+            "max_provider_attempts",
+            "consumed_provider_attempts",
+            "outstanding_reservation",
+            "network_error_name",
+            "network_failure_stage",
+            "delivery",
+        }),
+        else => return error.InvalidDurableField,
+    };
     const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
     errdefer session.freeUserTurn(alloc, user);
     const assistant_source = try parseDurableBytes(alloc, object.get("assistant_source") orelse return error.InvalidSessionFormat);
@@ -913,8 +976,24 @@ pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !Recover
         return error.InvalidDurableField;
     const consumed_provider_attempts = std.math.cast(usize, try requireU64(object, "consumed_provider_attempts")) orelse
         return error.InvalidDurableField;
+    const network_error_name = if (version >= 2)
+        try parseOptionalDurableBytes(alloc, object.get("network_error_name") orelse return error.InvalidSessionFormat)
+    else
+        null;
+    errdefer if (network_error_name) |error_name| alloc.free(error_name);
+    if (network_error_name) |error_name| {
+        if (error_name.len > types.ModelFailureDiagnostic.max_bytes) return error.InvalidDurableField;
+    }
+    const network_failure_stage = if (version >= 2)
+        try parseOptionalRecoveryEnum(RecoveryNetworkFailureStage, object.get("network_failure_stage") orelse return error.InvalidSessionFormat)
+    else
+        null;
+    const delivery = if (version >= 2)
+        try parseOptionalRecoveryEnum(RecoveryDelivery, object.get("delivery") orelse return error.InvalidSessionFormat)
+    else
+        null;
     return .{
-        .version = 1,
+        .version = @intCast(version),
         .turn_id = try requireU64(object, "turn_id"),
         .user = user,
         .assistant_source = assistant_source,
@@ -931,6 +1010,17 @@ pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !Recover
         .max_provider_attempts = max_provider_attempts,
         .consumed_provider_attempts = consumed_provider_attempts,
         .outstanding_reservation = try requireBool(object, "outstanding_reservation"),
+        .network_error_name = network_error_name,
+        .network_failure_stage = network_failure_stage,
+        .delivery = delivery,
+    };
+}
+
+fn parseOptionalRecoveryEnum(comptime T: type, value: std.json.Value) !?T {
+    return switch (value) {
+        .null => null,
+        .string => |name| std.meta.stringToEnum(T, name) orelse error.InvalidDurableField,
+        else => error.InvalidSessionFormat,
     };
 }
 
@@ -3217,6 +3307,9 @@ test "recovery checkpoint round trips while legacy state stays absent" {
         .max_provider_attempts = 10,
         .consumed_provider_attempts = 4,
         .outstanding_reservation = true,
+        .network_error_name = @constCast("ConnectionResetByPeer"),
+        .network_failure_stage = .response_head,
+        .delivery = .possibly_sent,
     };
     const state = DurableSessionState{
         .id = @constCast("session-recovery"),
@@ -3254,6 +3347,13 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     try std.testing.expect(restored.fast_mode);
     try std.testing.expectEqual(@as(usize, 4), restored.consumed_provider_attempts);
     try std.testing.expect(restored.outstanding_reservation);
+    try std.testing.expectEqualStrings("ConnectionResetByPeer", restored.network_error_name.?);
+    try std.testing.expectEqual(RecoveryNetworkFailureStage.response_head, restored.network_failure_stage.?);
+    try std.testing.expectEqual(RecoveryDelivery.possibly_sent, restored.delivery.?);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "keep working") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "ConnectionResetByPeer") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "Bearer ") == null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "https://") == null);
 
     const legacy =
         "{\"id\":\"legacy\",\"origin_workspace_root\":\"/tmp/origin\",\"workspace_root\":\"/tmp/current\",\"created_at_ms\":1,\"updated_at_ms\":2,\"conversation_language\":\"en\",\"preferences\":{\"model\":\"openai/gpt-test\",\"effort\":\"auto\",\"fast_mode\":false},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0}";
@@ -3261,6 +3361,54 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     var legacy_state = try decodeState(alloc, &legacy_source, .{});
     defer legacy_state.deinit(alloc);
     try std.testing.expectEqual(@as(?RecoveryCheckpoint, null), legacy_state.recovery_checkpoint);
+}
+
+test "recovery checkpoint version one remains compatible without network diagnostics" {
+    const alloc = std.testing.allocator;
+    const checkpoint = RecoveryCheckpoint{
+        .version = 1,
+        .turn_id = 7,
+        .user = .{ .text = @constCast("prompt") },
+        .assistant_source = @constCast("partial"),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .route_model = @constCast("openai/gpt-test"),
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 1,
+    };
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writeRecoveryCheckpoint(&encoded.writer, checkpoint);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "network_error_name") == null);
+
+    var parsed_json = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+    defer parsed_json.deinit();
+    var restored = try parseRecoveryCheckpoint(alloc, parsed_json.value);
+    defer restored.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u8, 1), restored.version);
+    try std.testing.expectEqual(@as(?[]u8, null), restored.network_error_name);
+    try std.testing.expectEqual(@as(?RecoveryNetworkFailureStage, null), restored.network_failure_stage);
+    try std.testing.expectEqual(@as(?RecoveryDelivery, null), restored.delivery);
+}
+
+test "recovery checkpoint rejects oversized network error names" {
+    const alloc = std.testing.allocator;
+    const oversized = "x" ** (types.ModelFailureDiagnostic.max_bytes + 1);
+    const encoded = try std.fmt.allocPrint(
+        alloc,
+        "{{\"version\":2,\"turn_id\":1,\"user\":{{\"text\":\"prompt\",\"images\":[]}},\"assistant_source\":\"\",\"execution\":{{\"schema_version\":3,\"tool_steps\":[],\"files\":[]}},\"cause\":\"network_interrupted\",\"action\":\"retrying_request\",\"tool_state\":\"none\",\"route_model\":\"model\",\"requested_fast_mode\":false,\"fast_mode\":false,\"max_provider_attempts\":10,\"consumed_provider_attempts\":1,\"outstanding_reservation\":false,\"network_error_name\":\"{s}\",\"network_failure_stage\":\"connection_setup\",\"delivery\":\"definitely_unsent\"}}",
+        .{oversized},
+    );
+    defer alloc.free(encoded);
+    var parsed_json = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer parsed_json.deinit();
+    try std.testing.expectError(
+        error.InvalidDurableField,
+        parseRecoveryCheckpoint(alloc, parsed_json.value),
+    );
 }
 
 test "session permission state round trips while legacy state stays empty" {

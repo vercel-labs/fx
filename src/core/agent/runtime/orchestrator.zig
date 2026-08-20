@@ -1216,6 +1216,7 @@ fn persistRecoveryCheckpoint(
     cause: model_response_recovery.FailureCause,
     strategy: ?model_response_recovery.Strategy,
     tool_evidence: model_response_recovery.ToolEvidence,
+    network_failure: ?runtime_gateway_step.AttemptEvidence,
     trace_ctx: TraceContext,
 ) !void {
     const effect = deps.recovery_checkpoint orelse return;
@@ -1240,6 +1241,27 @@ fn persistRecoveryCheckpoint(
         .max_provider_attempts = attempt_limit,
         .consumed_provider_attempts = consumed_attempts,
         .outstanding_reservation = outstanding_reservation,
+        .network_error_name = if (network_failure) |attempt|
+            if (attempt.network_failure) |failure| @constCast(failure.error_name) else null
+        else
+            null,
+        .network_failure_stage = if (network_failure) |attempt|
+            if (attempt.network_failure) |failure| switch (failure.stage) {
+                .connection_setup => .connection_setup,
+                .request_send => .request_send,
+                .response_head => .response_head,
+                .response_body => .response_body,
+                .unknown => .unknown,
+            } else null
+        else
+            null,
+        .delivery = if (network_failure) |attempt|
+            if (attempt.network_failure) |failure| switch (failure.delivery) {
+                .definitely_unsent => .definitely_unsent,
+                .possibly_sent => .possibly_sent,
+            } else null
+        else
+            null,
     });
     debug_trace.eventf(
         "agent",
@@ -2627,6 +2649,7 @@ fn processQueuedPromptLoop(
     else
         .transport_interrupted;
     var latest_recovery_diagnostic: ?types.ModelFailureDiagnostic = null;
+    var latest_network_failure: ?runtime_gateway_step.AttemptEvidence = null;
     var preserved_tool_evidence: model_response_recovery.ToolEvidence = if (job.recovery_checkpoint) |checkpoint|
         restoredRecoveryToolEvidence(checkpoint.tool_state)
     else
@@ -2777,6 +2800,7 @@ fn processQueuedPromptLoop(
                     recovery_cause,
                     recovery_strategy,
                     preserved_tool_evidence,
+                    latest_network_failure,
                     step_ctx,
                 );
                 try finishRecoveryPaused(
@@ -2813,6 +2837,7 @@ fn processQueuedPromptLoop(
                     recovery_cause,
                     recovery_strategy,
                     preserved_tool_evidence,
+                    latest_network_failure,
                     step_ctx,
                 );
                 try finishRecoveryPaused(
@@ -2964,6 +2989,7 @@ fn processQueuedPromptLoop(
                     null,
                     &stream_ctx,
                 ),
+                latest_network_failure,
                 step_ctx,
             );
 
@@ -3010,6 +3036,7 @@ fn processQueuedPromptLoop(
                 const consumed_attempts = semantic_attempt +
                     @as(usize, @intFromBool(gateway_attempt_evidence.provider_admitted));
                 const network_failure = gateway_attempt_evidence.network_failure;
+                latest_network_failure = if (network_failure != null) gateway_attempt_evidence else null;
                 const failure_cause: model_response_recovery.FailureCause = if (network_failure) |evidence|
                     switch (evidence.cause) {
                         .transport_interrupted => .transport_interrupted,
@@ -3043,6 +3070,7 @@ fn processQueuedPromptLoop(
                             null,
                             &stream_ctx,
                         ),
+                        latest_network_failure,
                         step_ctx,
                     );
                     try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
@@ -3139,6 +3167,7 @@ fn processQueuedPromptLoop(
                         null,
                         &stream_ctx,
                     ),
+                    latest_network_failure,
                     step_ctx,
                 );
                 const auto_retry_status_published = will_auto_retry;
@@ -3180,6 +3209,7 @@ fn processQueuedPromptLoop(
                             null,
                             &stream_ctx,
                         ),
+                        latest_network_failure,
                         step_ctx,
                     );
                     try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
@@ -3349,6 +3379,7 @@ fn processQueuedPromptLoop(
                     recovery_cause,
                     .pause,
                     .uncertain,
+                    latest_network_failure,
                     step_ctx,
                 );
                 try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
@@ -3409,6 +3440,7 @@ fn processQueuedPromptLoop(
                     stream_result.completion,
                     &stream_ctx,
                 ),
+                latest_network_failure,
                 step_ctx,
             );
             runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, summary_accumulator.reconcileTokenRequest(stream_result.completion.usage, stream_result.completion.delivery_ambiguous)) catch |progress_err| {
@@ -3531,6 +3563,7 @@ fn processQueuedPromptLoop(
                             stream_result.completion,
                             &stream_ctx,
                         ),
+                        latest_network_failure,
                         step_ctx,
                     );
                     try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
@@ -3571,6 +3604,7 @@ fn processQueuedPromptLoop(
                                 stream_result.completion,
                                 &stream_ctx,
                             ),
+                            latest_network_failure,
                             step_ctx,
                         );
                     }
@@ -3728,6 +3762,7 @@ fn processQueuedPromptLoop(
                             attempt_completion,
                             &stream_ctx,
                         ),
+                        latest_network_failure,
                         step_ctx,
                     );
                     try finishRecoveryPaused(
@@ -3767,6 +3802,7 @@ fn processQueuedPromptLoop(
                                 attempt_completion,
                                 &stream_ctx,
                             ),
+                            latest_network_failure,
                             step_ctx,
                         );
                     }

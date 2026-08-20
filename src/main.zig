@@ -427,11 +427,10 @@ const App = struct {
         return builtin_gateway.credits_provider;
     }
 
-    pub fn agentStreamProvider(_: *const Self) agent_stream_provider.Provider {
-        return if (comptime host_target.is_wasm)
-            js_host_stream_provider.provider()
-        else
-            builtin_gateway.agent_stream_provider;
+    pub fn agentStreamProvider(self: *const Self) agent_stream_provider.Provider {
+        if (comptime host_target.is_wasm) return js_host_stream_provider.provider();
+        const runtime = if (self.gateway_client_runtime) |*value| value else unreachable;
+        return builtin_gateway.agentStreamProvider(@constCast(runtime));
     }
 
     pub fn cooperativeTransportPulse(self: *Self) !void {
@@ -466,6 +465,7 @@ const App = struct {
 
     alloc: Allocator,
     terminal: TerminalState = .{},
+    gateway_client_runtime: ?gateway_client.Runtime = null,
 
     auth: auth_runtime.Runtime = auth_runtime.Runtime.init(
         if (host_target.is_wasm) api_key_validator.unavailable_provider else builtin_gateway.api_key_validator,
@@ -562,6 +562,10 @@ const App = struct {
     pub fn init(alloc: Allocator, launch: *cli_surface.InteractiveLaunch) !Self {
         var app = Self{
             .alloc = alloc,
+            .gateway_client_runtime = if (comptime host_target.is_wasm)
+                null
+            else
+                gateway_client.Runtime.init(std.heap.c_allocator),
             .subagents = ui_subagents.Controller.init(),
             .lifecycle_runtime = hooks.Runtime.init(alloc),
             .background = BackgroundRuntime.init(if (comptime host_target.is_wasm)
@@ -848,6 +852,7 @@ const App = struct {
         WorkspaceAppRuntime.deinit(self);
         self.workspace_identity.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
+        if (self.gateway_client_runtime) |*runtime| runtime.deinit();
         return resume_handoff;
     }
 
@@ -2875,12 +2880,6 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
     io_mod.setRawEnviron(raw_env);
 
     const alloc = processAllocator();
-    const cfg = if (cli_args.len == 0)
-        emptyEntryConfig()
-    else if (needsFullEntryConfig(cli_args))
-        fullEntryConfig()
-    else
-        localEntryConfig();
 
     var early_threaded: ?std.Io.Threaded = null;
     defer if (early_threaded) |*threaded| threaded.deinit();
@@ -2893,6 +2892,15 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
         });
         if (early_threaded) |*threaded| io_mod.setIo(threaded.io());
     }
+
+    var gateway_runtime = gateway_client.Runtime.init(alloc);
+    defer gateway_runtime.deinit();
+    const cfg = if (cli_args.len == 0)
+        emptyEntryConfig()
+    else if (needsFullEntryConfig(cli_args))
+        fullEntryConfig(&gateway_runtime)
+    else
+        localEntryConfig();
 
     const before = try app_entry_runtime.runBeforeInteractive(alloc, cli_args, cfg);
     switch (before) {
@@ -3190,7 +3198,7 @@ test "native app preserves the built-in tool set without workspace metadata" {
     try std.testing.expectEqual(builtin_tools.advertisement_set.order.len, advertised.order.len);
 }
 
-fn fullEntryConfig() app_entry_runtime.Config {
+fn fullEntryConfig(runtime: *gateway_client.Runtime) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
@@ -3201,7 +3209,7 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .models_path = builtin_gateway.models_path,
         .gateway_retry_count = builtin_gateway.retry_count,
         .gateway_chat_url = builtin_gateway.default_chat_url,
-        .gateway_provider = builtin_gateway.provider,
+        .gateway_provider = builtin_gateway.providerWithRuntime(runtime),
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,

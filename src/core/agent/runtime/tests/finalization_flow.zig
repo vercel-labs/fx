@@ -5,6 +5,7 @@ const io_mod = @import("../../../shared/io.zig");
 const tool_result_errors = @import("../../../tooling/tool_result_errors.zig");
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const session_runtime = @import("../../../session/session.zig");
+const session_codec = @import("../../../session/session_codec.zig");
 
 const test_support = @import("support.zig");
 const runtime_finalization = @import("../finalization.zig");
@@ -92,6 +93,81 @@ test "processQueuedPrompt normal final completion propagates normalized history 
     const finish_idx = logIndex(&hooks, "event:finish_prompt").?;
     try std.testing.expect(newline_idx < finish_idx);
     try expectBodyNotContains(&gateway, 0, "<turn_aborted>");
+}
+
+test "network recovery checkpoint persists exact transport diagnostic" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{
+        .{
+            .pre_send_error = error.ConnectionRefused,
+            .network_failure_stage = .connection_setup,
+        },
+        .{ .content = "Recovered" },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    var diagnostic_checkpoint: ?*const session_codec.RecoveryCheckpoint = null;
+    for (hooks.recovery_checkpoints.items) |*checkpoint| {
+        if (checkpoint.network_error_name != null) {
+            diagnostic_checkpoint = checkpoint;
+            break;
+        }
+    }
+    const checkpoint = diagnostic_checkpoint orelse return error.TestExpectedNetworkDiagnosticCheckpoint;
+    try std.testing.expectEqualStrings("ConnectionRefused", checkpoint.network_error_name.?);
+    try std.testing.expectEqual(
+        session_codec.RecoveryNetworkFailureStage.connection_setup,
+        checkpoint.network_failure_stage.?,
+    );
+    try std.testing.expectEqual(
+        session_codec.RecoveryDelivery.definitely_unsent,
+        checkpoint.delivery.?,
+    );
+    try std.testing.expectEqualStrings("Recovered", hooks.history_assistant_text.?);
+}
+
+test "network recovery checkpoint preserves response body and partial output evidence" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{
+        .{
+            .chunks = &.{"Partial"},
+            .stream_error_after_chunks = error.ReadFailed,
+            .network_failure_stage = .response_body,
+        },
+        .{ .content = "Partial complete" },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    var diagnostic_checkpoint: ?*const session_codec.RecoveryCheckpoint = null;
+    for (hooks.recovery_checkpoints.items) |*checkpoint| {
+        if (checkpoint.network_error_name != null) {
+            diagnostic_checkpoint = checkpoint;
+            break;
+        }
+    }
+    const checkpoint = diagnostic_checkpoint orelse return error.TestExpectedNetworkDiagnosticCheckpoint;
+    try std.testing.expectEqualStrings("ReadFailed", checkpoint.network_error_name.?);
+    try std.testing.expectEqual(
+        session_codec.RecoveryNetworkFailureStage.response_body,
+        checkpoint.network_failure_stage.?,
+    );
+    try std.testing.expectEqual(
+        session_codec.RecoveryDelivery.possibly_sent,
+        checkpoint.delivery.?,
+    );
+    try std.testing.expect(std.mem.find(u8, checkpoint.assistant_source, "Partial") != null);
 }
 
 test "processQueuedPrompt pauses missing finish without synthesizing output" {

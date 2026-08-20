@@ -215,6 +215,7 @@ pub const FakeCompletion = struct {
     retry_after_seconds: ?u64 = null,
     pre_send_error: ?anyerror = null,
     stream_error: ?anyerror = null,
+    network_failure_stage: agent_stream_provider.NetworkFailureStage = .unknown,
     stream_error_after_chunks: ?anyerror = null,
     stream_error_after_tool_starts: ?anyerror = null,
     chunks: []const []const u8 = &.{},
@@ -284,13 +285,13 @@ pub const FakeGateway = struct {
         self.index += 1;
 
         if (completion.pre_send_error) |err| {
-            recordNetworkFailureEvidence(request, err);
+            recordNetworkFailureEvidence(request, err, completion.network_failure_stage);
             return err;
         }
         request.delivery.markPossiblySent();
 
         if (completion.stream_error) |err| {
-            recordNetworkFailureEvidence(request, err);
+            recordNetworkFailureEvidence(request, err, completion.network_failure_stage);
             return err;
         }
 
@@ -312,7 +313,7 @@ pub const FakeGateway = struct {
         }
         if (completion.cancel_after_chunks) request.cancel_flag.store(true, .seq_cst);
         if (completion.stream_error_after_chunks) |err| {
-            recordNetworkFailureEvidence(request, err);
+            recordNetworkFailureEvidence(request, err, completion.network_failure_stage);
             return err;
         }
         if (request.on_tool_start) |start| {
@@ -321,7 +322,7 @@ pub const FakeGateway = struct {
             }
         }
         if (completion.stream_error_after_tool_starts) |err| {
-            recordNetworkFailureEvidence(request, err);
+            recordNetworkFailureEvidence(request, err, completion.network_failure_stage);
             return err;
         }
         if (completion.cancel_during_tool_stream) {
@@ -362,10 +363,12 @@ pub const FakeGateway = struct {
     fn recordNetworkFailureEvidence(
         request: agent_stream_provider.Request,
         err: anyerror,
+        stage: agent_stream_provider.NetworkFailureStage,
     ) void {
         request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
             err,
             request.delivery.load(),
+            stage,
         );
     }
 };
