@@ -888,7 +888,7 @@ pub fn enforceStructuredRetentionAndReport(
         self.pruneToolDetailsForRetainedEntries(alloc, &entry_ids);
     }
     try self.refreshFoldedCommandSummaryIndices(alloc);
-    try rebuildTranscriptCacheFromEntries(self, alloc, "structured retention");
+    try rebuildTranscriptCacheAfterStructuredRewrite(self, alloc, "structured retention");
     requestTranscriptPaint(self);
     return true;
 }
@@ -1043,7 +1043,7 @@ pub fn appendPinnedToolStatusAtomic(
     const entry_index = rawEntryIndex(&shadow, entry_id) orelse
         return error.MissingLifecycleTranscriptEntry;
     shadow.entries.items[entry_index].raw_bytes.lifecycle_pinned = true;
-    const retention_changed = try enforceStructuredRetentionAndReport(
+    try enforceStructuredRetention(
         &shadow,
         alloc,
         entry_id,
@@ -1061,7 +1061,7 @@ pub fn appendPinnedToolStatusAtomic(
         &shadow,
         alloc,
         "atomic_pinned_tool_status_append",
-        if (retention_changed) .strict else .preserve_same_epoch,
+        .preserve_same_epoch,
     );
     return entry_id;
 }
@@ -1127,7 +1127,7 @@ fn appendSemanticNoticeAtomicPinned(
         notice,
         pending_replacement,
     );
-    const retention_changed = try enforceStructuredRetentionAndReport(
+    try enforceStructuredRetention(
         &shadow,
         alloc,
         entry_id,
@@ -1145,7 +1145,7 @@ fn appendSemanticNoticeAtomicPinned(
         &shadow,
         alloc,
         "atomic_semantic_notice_append",
-        if (retention_changed) .strict else .preserve_same_epoch,
+        .preserve_same_epoch,
     );
     return entry_id;
 }
@@ -1192,7 +1192,7 @@ pub fn replaceSemanticNoticeAtomic(
     handed_off = true;
     previous.deinit(alloc);
 
-    const retention_changed = try enforceStructuredRetentionAndReport(
+    try enforceStructuredRetention(
         &shadow,
         alloc,
         entry_id,
@@ -1209,7 +1209,7 @@ pub fn replaceSemanticNoticeAtomic(
         &shadow,
         alloc,
         "atomic_semantic_notice_replacement",
-        if (retention_changed) .strict else .preserve_same_epoch,
+        .preserve_same_epoch,
     );
     return true;
 }
@@ -1238,7 +1238,7 @@ pub fn writeRecordedTranscriptClassifiedAtomic(
         class,
     );
     handed_off = true;
-    const retention_changed = try enforceStructuredRetentionAndReport(
+    try enforceStructuredRetention(
         &shadow,
         alloc,
         entry_id,
@@ -1249,7 +1249,7 @@ pub fn writeRecordedTranscriptClassifiedAtomic(
         &shadow,
         alloc,
         "atomic_recorded_transcript_append",
-        if (retention_changed) .strict else .preserve_same_epoch,
+        .preserve_same_epoch,
     );
     return entry_id;
 }
@@ -1329,7 +1329,7 @@ pub fn writeRecordedCommandOutputChunkAtomic(
         &shadow,
         alloc,
         "atomic_recorded_command_output_append",
-        if (retention_changed) .strict else .preserve_same_epoch,
+        .preserve_same_epoch,
         if (retention_changed) null else dirty_entry_id,
     );
     return entry_id;
@@ -1380,7 +1380,7 @@ pub fn flushRecordedCommandOutputSummaryAtomic(
         &shadow,
         alloc,
         "command output consolidation",
-        if (retention_changed) .strict else .preserve_same_epoch,
+        .preserve_same_epoch,
         if (retention_changed) null else dirty_entry_id,
     );
 }
@@ -1524,7 +1524,7 @@ fn replacePinnedToolStatusAtomicInternal(
         &shadow,
         alloc,
         if (reposition) "lifecycle_status_reposition" else "lifecycle_status_replacement",
-        if (retention_changed) .strict else rewrite_mode,
+        rewrite_mode,
         if (retention_changed or reposition) null else entry_id,
     );
     return true;
@@ -1615,7 +1615,7 @@ fn replacePinnedToolStatusesAtomicWithRewriteMode(
         &shadow,
         alloc,
         "lifecycle_statuses_replacement",
-        if (retention_changed) .strict else rewrite_mode,
+        rewrite_mode,
         if (retention_changed) null else dirty_entry_id,
     );
 }
@@ -1666,7 +1666,7 @@ pub fn clearLifecyclePinsAtomic(
         &shadow,
         alloc,
         "lifecycle_pin_cleanup",
-        if (retention_changed) .strict else .preserve_same_epoch,
+        .preserve_same_epoch,
         if (retention_changed) null else dirty_entry_id,
     );
 }
@@ -2480,7 +2480,7 @@ pub fn writeUserPromptCard(
         &shadow,
         alloc,
         "atomic_user_prompt_append",
-        if (admission.retention_changed) .strict else .preserve_same_epoch,
+        .preserve_same_epoch,
         if (admission.retention_changed) null else admission.entry_id,
     );
     self.forgetShimmer();
@@ -2800,7 +2800,7 @@ pub fn streamAssistantChunk(
             &shadow,
             alloc,
             "atomic_assistant_stream_append",
-            .strict,
+            .preserve_same_epoch,
             if (staged.retention_changed) null else staged.entry_id,
         );
         self.forgetShimmer();
@@ -2848,7 +2848,7 @@ pub fn retintEntriesForTheme(
         }
     }
 
-    const retention_changed = try enforceStructuredRetentionAndReport(
+    try enforceStructuredRetention(
         &shadow,
         alloc,
         null,
@@ -2861,7 +2861,7 @@ pub fn retintEntriesForTheme(
         &shadow,
         alloc,
         "theme retint",
-        if (retention_changed) .strict else .preserve_same_epoch,
+        .preserve_same_epoch,
     );
 }
 

@@ -26,6 +26,7 @@ REQUIRED_DIRECT_COMMANDS = (
     ("doctor", "--json"),
     ("sessions", "--json"),
 )
+MAX_PROFILE_RUNS = 100
 
 REQUIRED_EXCLUSIONS = (
     "notifications.test.ts",
@@ -56,6 +57,7 @@ class Scenario:
     requires_tmux: bool
     allow_keychain: bool
     test_file: str | None
+    profile_runs: int = 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -224,6 +226,16 @@ def _parse_scenario(
     allow_keychain = values.get("allow_keychain", False)
     if not isinstance(allow_keychain, bool):
         raise PgsoError(f"scenario {name} allow_keychain must be a boolean")
+    profile_runs = values.get("profile_runs", 1)
+    if (
+        isinstance(profile_runs, bool)
+        or not isinstance(profile_runs, int)
+        or not 1 <= profile_runs <= MAX_PROFILE_RUNS
+    ):
+        raise PgsoError(
+            f"scenario {name} profile_runs must be an integer from 1 to "
+            f"{MAX_PROFILE_RUNS}"
+        )
 
     test_file = values.get("test_file")
     if test_file is not None:
@@ -243,6 +255,16 @@ def _parse_scenario(
         expected_test = repo_root / "tests" / "e2e" / test_file
         if not expected_test.is_file():
             raise PgsoError(f"test file does not exist: {test_file}")
+    if profile_runs != 1 and (
+        argv[0] != "{binary}"
+        or test_file is not None
+        or requires_tmux
+        or allow_keychain
+    ):
+        raise PgsoError(
+            f"scenario {name} profile_runs is only supported for "
+            "noninteractive direct training commands without Keychain access"
+        )
 
     if "skip_reason" in defaults or "skip_reason" in scenario_raw:
         raise PgsoError(f"scenario {name} cannot be skipped")
@@ -257,6 +279,7 @@ def _parse_scenario(
         requires_tmux=requires_tmux,
         allow_keychain=allow_keychain,
         test_file=test_file,
+        profile_runs=profile_runs,
     )
 
 
@@ -527,6 +550,8 @@ def _execute_scenario(
     log_dir: pathlib.Path,
     environment: dict[str, str],
     command_runner: Callable[..., CommandResult],
+    run_index: int = 0,
+    run_count: int = 1,
 ) -> CommandResult:
     scenario_home = runtime_home / scenario.name
     _prepare_runtime_home(scenario_home, allow_keychain=scenario.allow_keychain)
@@ -543,12 +568,17 @@ def _execute_scenario(
 
     primary_error: BaseException | None = None
     try:
+        log_name = (
+            scenario.name
+            if run_count == 1
+            else f"{scenario.name}-run-{run_index + 1:03d}"
+        )
         return command_runner(
             _scenario_argv(scenario, canonical, bun),
             cwd=_resolve_cwd(corpus.repo_root, scenario.cwd),
             env=environment,
             timeout_s=scenario.timeout_seconds,
-            log_path=log_dir / f"{scenario.name}.json",
+            log_path=log_dir / f"{log_name}.json",
         )
     except BaseException as error:
         primary_error = error
@@ -574,25 +604,33 @@ def _run_scenarios(
     finish: Callable[[Scenario, CommandResult, object], int],
     failure_label: str,
     command_runner: Callable[..., CommandResult],
+    repeat_profile_runs: bool = False,
 ) -> CorpusResult:
     results: list[ScenarioResult] = []
     merged_raw_profiles = 0
     with _installed_training_binary(corpus, binary) as canonical:
         for scenario in scenarios:
             command_result: CommandResult | None = None
+            elapsed_seconds = 0.0
             try:
                 environment: dict[str, str] = {}
                 state = prepare(scenario, environment)
-                command_result = _execute_scenario(
-                    corpus,
-                    scenario,
-                    canonical,
-                    bun,
-                    runtime_home,
-                    log_dir,
-                    environment,
-                    command_runner,
-                )
+                run_count = scenario.profile_runs if repeat_profile_runs else 1
+                for run_index in range(run_count):
+                    command_result = _execute_scenario(
+                        corpus,
+                        scenario,
+                        canonical,
+                        bun,
+                        runtime_home,
+                        log_dir,
+                        environment,
+                        command_runner,
+                        run_index,
+                        run_count,
+                    )
+                    elapsed_seconds += command_result.elapsed_seconds
+                assert command_result is not None
                 raw_profiles = finish(scenario, command_result, state)
                 merged_raw_profiles += raw_profiles
             except Exception as error:
@@ -601,7 +639,7 @@ def _run_scenarios(
                         name=scenario.name,
                         status="failed",
                         elapsed_seconds=(
-                            0 if command_result is None else command_result.elapsed_seconds
+                            elapsed_seconds
                         ),
                         raw_profiles=0,
                         error=str(error),
@@ -617,7 +655,7 @@ def _run_scenarios(
                 ScenarioResult(
                     name=scenario.name,
                     status="passed",
-                    elapsed_seconds=command_result.elapsed_seconds,
+                    elapsed_seconds=elapsed_seconds,
                     raw_profiles=raw_profiles,
                 )
             )
@@ -681,6 +719,7 @@ def run_corpus(
         finish=finish,
         failure_label="training corpus",
         command_runner=command_runner,
+        repeat_profile_runs=True,
     )
 
 

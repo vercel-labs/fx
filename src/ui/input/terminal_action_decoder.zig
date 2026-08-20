@@ -104,7 +104,7 @@ pub const Decoder = struct {
 
             if (prior_stage == 1 and
                 self.stage == 0 and
-                action == null and
+                (action == null or action.? == .ignore) and
                 shouldReplayControlAfterBareEscape(byte))
             {
                 const was_cancel_pending = self.takeCancelPending();
@@ -121,9 +121,8 @@ pub const Decoder = struct {
 
             if (self.stage != 0 or prior_stage != 0) {
                 if (self.stage == 0) {
-                    ingress.setEvent(.{ .unrecognized_escape = .{
-                        .cancel_pending = self.takeCancelPending(),
-                    } });
+                    _ = self.takeCancelPending();
+                    appendAction(&ingress, .ignore, false);
                 }
                 return ingress;
             }
@@ -157,8 +156,8 @@ pub const Decoder = struct {
             return ingress;
         }
 
-        if (escape_parser.isPrivateCsiPayloadStage(self.stage)) {
-            debug_trace.logf("input", "discard pending private csi reason=quiet_expiry", .{});
+        if (escape_parser.isControlSequenceDiscardStage(self.stage)) {
+            debug_trace.logf("input", "discard pending control sequence reason=quiet_expiry", .{});
             self.reset();
             return ingress;
         }
@@ -182,6 +181,12 @@ pub const Decoder = struct {
             } else {
                 self.started_ms = now_ms;
             }
+            return ingress;
+        }
+
+        if (!escape_parser.isBareEscapeStage(self.stage)) {
+            debug_trace.logf("input", "discard pending control sequence reason=quiet_expiry", .{});
+            self.reset();
             return ingress;
         }
 
@@ -334,7 +339,7 @@ test "active paste bypasses decoding and preserves pending text ownership" {
     try std.testing.expect(!decoder.hasPending());
 }
 
-test "unknown escape requests only the captured cancellation" {
+test "unknown escape resolves to ignore instead of Escape" {
     var decoder = Decoder{};
     _ = decoder.feed(0x1b, .{
         .now_ms = 1,
@@ -349,6 +354,44 @@ test "unknown escape requests only the captured cancellation" {
         .child_route_active = false,
     });
 
-    try std.testing.expect(ingress.event.?.unrecognized_escape.cancel_pending);
+    try std.testing.expectEqual(input_action.Action.ignore, ingress.event.?.action.action);
+    try std.testing.expect(ingress.event.?.action.cancel_pending);
+    try std.testing.expect(!decoder.hasPending());
+}
+
+test "unknown complete CSI stays pending until its final byte and resolves to ignore" {
+    var decoder = Decoder{};
+    const context: input_action.TerminalDecodeContext = .{
+        .now_ms = 1,
+        .paste_active = false,
+        .cancel_pending = true,
+        .child_route_active = false,
+    };
+
+    _ = decoder.feed(0x1b, context);
+    for ("[>0") |byte| {
+        const ingress = decoder.feed(byte, context);
+        try std.testing.expect(ingress.event == null);
+        try std.testing.expect(decoder.hasPending());
+    }
+    const ingress = decoder.feed('q', context);
+    try std.testing.expectEqual(input_action.Action.ignore, ingress.event.?.action.action);
+    try std.testing.expect(ingress.event.?.action.cancel_pending);
+    try std.testing.expect(!decoder.hasPending());
+}
+
+test "incomplete CSI expires without producing Escape" {
+    var decoder = Decoder{};
+    const context: input_action.TerminalDecodeContext = .{
+        .now_ms = 1,
+        .paste_active = false,
+        .cancel_pending = true,
+        .child_route_active = false,
+    };
+
+    _ = decoder.feed(0x1b, context);
+    _ = decoder.feed('[', context);
+    const ingress = decoder.flush(31, 30, false);
+    try std.testing.expect(ingress.event == null);
     try std.testing.expect(!decoder.hasPending());
 }

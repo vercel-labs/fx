@@ -3699,7 +3699,7 @@ describe("modern MCP stdio compatibility", () => {
 
       writeFileSync(join(root.home, ".fx", "mcp.json"), "{not valid json");
       await tui.sendText("/mcp reload");
-      await tui.waitForText("MCP reload rejected; the existing runtime was retained", 5_000);
+      await tui.waitForText("MCP configuration could not be reloaded", 5_000);
       expect(isProcessAlive(originalPid!)).toBe(true);
 
       await tui.sendText(afterPrompt);
@@ -3749,7 +3749,7 @@ describe("modern MCP stdio compatibility", () => {
       writeFileSync(profilePath, JSON.stringify(profile));
       const supersedeStarted = Date.now();
       await tui.sendText("/mcp reload");
-      await tui.waitForText("MCP profile reloaded (ready, runtime ", 1_000);
+      await tui.waitForText("MCP configuration reloaded successfully.", 1_000);
       expect(Date.now() - supersedeStarted).toBeLessThan(1_000);
 
       await tui.kill();
@@ -3790,12 +3790,12 @@ describe("modern MCP stdio compatibility", () => {
 
       await tui.sendText("/mcp add extra /definitely/missing-optional-mcp-command");
       const pane = await tui.waitForText(
-        "MCP reload rejected; the existing runtime was retained",
+        "MCP configuration could not be reloaded",
         10_000,
       );
       expect(pane).toContain("Saved MCP server 'extra'.");
       expect(pane).toContain("MCP reconnection started");
-      expect(pane).toContain("Required MCP server 'fixture' is failed");
+      expect(pane).toContain("Required MCP server 'fixture' failed to start");
       expect(isProcessAlive(originalPid)).toBe(true);
 
       await tui.sendText(prompt);
@@ -3856,7 +3856,7 @@ describe("modern MCP stdio compatibility", () => {
       await tui.sendText(beforePrompt);
       await tui.waitForText("PRE_RELOAD_CALL_READY", 15_000);
       await tui.sendText("/mcp reload");
-      await tui.waitForText("MCP profile reloaded", 15_000);
+      await tui.waitForText("MCP configuration reloaded successfully.", 15_000);
       await tui.sendText(afterPrompt);
       await tui.waitForText("POST_RELOAD_GUIDANCE_READY", 15_000);
 
@@ -3924,6 +3924,7 @@ describe("modern MCP stdio compatibility", () => {
         "retry_attempt=0",
         "discovery=completed",
       ]) expect(pane).toContain(expected);
+      expect(pane).toContain(root.workspace);
       for (const forbidden of [
         "captured_at_ms=",
         "runtime_generation=",
@@ -3932,7 +3933,6 @@ describe("modern MCP stdio compatibility", () => {
         "HEALTH_SECRET_SENTINEL",
         "S11_SECRET_ENV",
         MODERN_FIXTURE,
-        root.root,
         "fake-mcp-stdio-key",
       ]) expect(pane).not.toContain(forbidden);
       expect(activeGateway.requests).toHaveLength(0);
@@ -4257,7 +4257,7 @@ describe("modern MCP stdio compatibility", () => {
 
       const reloadStarted = Date.now();
       await tui.sendText("/mcp reload");
-      await tui.waitForText("MCP profile reloaded (ready, runtime ", 5_000);
+      await tui.waitForText("MCP configuration reloaded successfully.", 5_000);
       while (isProcessAlive(retiredPid) && Date.now() - reloadStarted < 5_000) {
         await Bun.sleep(25);
       }

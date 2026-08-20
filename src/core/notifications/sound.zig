@@ -159,14 +159,23 @@ pub const Player = struct {
 
     pub fn play(self: *Player, cue: Cue) void {
         switch (self.dependencies.platform) {
-            .macos => self.playMacos(cue),
+            .macos => self.playMacos(cue, true),
             .linux, .unsupported => self.emitBell(),
         }
     }
 
-    fn playMacos(self: *Player, cue: Cue) void {
+    // Attention notifications always include a terminal BEL so multiplexers
+    // can mark the pane, even when macOS also plays the configured chime.
+    pub fn playAttention(self: *Player, cue: Cue) void {
+        self.emitBell();
+        if (self.dependencies.platform == .macos) {
+            self.playMacos(cue, false);
+        }
+    }
+
+    fn playMacos(self: *Player, cue: Cue, bell_on_failure: bool) void {
         const sound_path = self.dependencies.sound_path(self.dependencies.ctx, cue) orelse {
-            self.emitBell();
+            if (bell_on_failure) self.emitBell();
             return;
         };
         const argv = [_][]const u8{ macos_player_path, sound_path };
@@ -174,12 +183,20 @@ pub const Player = struct {
             self.dependencies.ctx,
             &argv,
         ) catch |err| {
-            debug_trace.logf(
-                "notifications",
-                "sound spawn failed err={s}; using terminal bell",
-                .{@errorName(err)},
-            );
-            self.emitBell();
+            if (bell_on_failure) {
+                debug_trace.logf(
+                    "notifications",
+                    "sound spawn failed err={s}; using terminal bell",
+                    .{@errorName(err)},
+                );
+                self.emitBell();
+            } else {
+                debug_trace.logf(
+                    "notifications",
+                    "sound spawn failed err={s}; terminal bell already emitted",
+                    .{@errorName(err)},
+                );
+            }
             return;
         };
         self.dependencies.start_waiter(self.dependencies.ctx, process) catch |err| {
@@ -448,6 +465,45 @@ test "Linux sound emits one bell without spawning" {
     var player = testPlayer(&state, .linux);
     player.play(.success);
 
+    try std.testing.expectEqual(@as(usize, 0), state.spawn_count);
+    try std.testing.expectEqual(@as(usize, 1), state.bell_count);
+}
+
+test "macOS attention emits one terminal bell and plays the chime" {
+    var state = TestState{};
+    var player = testPlayer(&state, .macos);
+    player.playAttention(.success);
+
+    try std.testing.expectEqual(@as(usize, 1), state.sound_path_count);
+    try std.testing.expectEqual(@as(usize, 1), state.spawn_count);
+    try std.testing.expectEqual(@as(usize, 1), state.waiter_count);
+    try std.testing.expectEqual(@as(usize, 1), state.reap_count);
+    try std.testing.expectEqual(@as(usize, 1), state.bell_count);
+}
+
+test "macOS attention emits only one bell when the chime is unavailable" {
+    var missing_state = TestState{ .no_sound_path = true };
+    var missing_player = testPlayer(&missing_state, .macos);
+    missing_player.playAttention(.success);
+
+    try std.testing.expectEqual(@as(usize, 0), missing_state.spawn_count);
+    try std.testing.expectEqual(@as(usize, 1), missing_state.bell_count);
+
+    var failed_state = TestState{ .fail_spawn = true };
+    var failed_player = testPlayer(&failed_state, .macos);
+    failed_player.playAttention(.success);
+
+    try std.testing.expectEqual(@as(usize, 1), failed_state.spawn_count);
+    try std.testing.expectEqual(@as(usize, 0), failed_state.waiter_count);
+    try std.testing.expectEqual(@as(usize, 1), failed_state.bell_count);
+}
+
+test "Linux attention emits exactly one bell without spawning" {
+    var state = TestState{};
+    var player = testPlayer(&state, .linux);
+    player.playAttention(.success);
+
+    try std.testing.expectEqual(@as(usize, 0), state.sound_path_count);
     try std.testing.expectEqual(@as(usize, 0), state.spawn_count);
     try std.testing.expectEqual(@as(usize, 1), state.bell_count);
 }

@@ -210,6 +210,33 @@ fn expectGatewayPromptRoles(gateway: *const FakeGateway, index: usize, expected_
     }
 }
 
+fn expectGatewayPromptTailText(
+    gateway: *const FakeGateway,
+    index: usize,
+    expected_role: types.ChatRole,
+    expected_text: []const u8,
+) !void {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(index < gateway.request_bodies.items.len);
+
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        gateway.request_bodies.items[index],
+        .{},
+    );
+    defer parsed.deinit();
+
+    const prompt = parsed.value.object.get("prompt").?.array.items;
+    try std.testing.expect(prompt.len > 0);
+    const tail = prompt[prompt.len - 1];
+    try expectPromptEntryRole(tail, expected_role);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countPromptEntryText(tail, expected_text),
+    );
+}
+
 fn expectRootFieldAbsent(gateway: *const FakeGateway, index: usize, field: []const u8) !void {
     const alloc = std.testing.allocator;
     try std.testing.expect(index < gateway.request_bodies.items.len);
@@ -524,6 +551,64 @@ test "processQueuedPrompt gates text-only images through the real Vision runtime
     try expectBodyContains(&gateway, 2, "FX LOGO");
     try expectBodyNotContains(&gateway, 2, image_path);
     try std.testing.expectEqualStrings("Final selected-model answer", hooks.finish_assistant_text.?);
+}
+
+test "processQueuedPrompt recovers when a model rejects post-Vision assistant prefill" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const image_path = try writeTestImagePath(alloc, &tmp);
+    defer alloc.free(image_path);
+    const image = try testCapturedImage(alloc, &tmp, image_path, 1);
+    defer types.freeImageAttachment(alloc, image);
+    var images = [_]types.ImageAttachment{image};
+
+    const calls = [_]ToolCall{toolCall(
+        "call_vision_prefill_recovery",
+        "vision",
+        "{\"image_ids\":[1],\"focus\":\"describe the image\"}",
+    )};
+    const prefill_rejection =
+        "{\"error\":{\"message\":\"AI_APICallError: This model does not support " ++
+        "assistant message prefill. The conversation must end with a user message.\"}}";
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "{\"images\":[{\"image_id\":1,\"status\":\"ok\",\"summary\":\"FX logo\",\"visible_text\":[],\"details\":[]}] }" },
+        .{ .status = .bad_request, .err_body = prefill_rejection },
+        .{ .content = "Recovered final answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.tool_registry = .{ .tools = test_support.vision_agent_test_tools[0..] };
+    defer hooks.deinit();
+    var vision_runtime = VisionAgentToolRuntime{ .alloc = alloc };
+    defer vision_runtime.deinit();
+    hooks.execute_delegate = vision_runtime.delegate();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast("anthropic/claude-fable-5");
+    job.prompt = @constCast("Describe the attached image.");
+    job.images = &images;
+    job.authorized_image_catalog = &images;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    try expectGatewayPromptTailText(
+        &gateway,
+        2,
+        .tool,
+        "FX logo",
+    );
+    try expectGatewayPromptTailText(
+        &gateway,
+        3,
+        .user,
+        "Continue from the preceding tool result.",
+    );
+    try std.testing.expectEqual(@as(?std.http.Status, null), hooks.http_status);
+    try std.testing.expectEqualStrings("Recovered final answer", hooks.finish_assistant_text.?);
 }
 
 test "text-only Vision keeps later permission restriction trusted across model steps" {

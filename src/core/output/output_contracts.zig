@@ -695,10 +695,14 @@ pub const SessionListSnapshot = struct {
         } else {
             try out.writer.print("[sessions] {d} saved\n", .{self.sessions.len});
             for (self.sessions) |entry| {
-                try out.writer.print(
-                    " - {s} turns={d} language={s} updated_at_ms={d}\n",
-                    .{ entry.id, entry.history_len, entry.conversation_language.view(), entry.updated_at_ms },
+                try out.writer.writeAll(" - ");
+                try writeTerminalSafe(
+                    &out.writer,
+                    alloc,
+                    entry.title orelse session_display_metadata.fallback_title,
                 );
+                try out.writer.writeByte('\n');
+                try writeSessionListDetails(&out.writer, alloc, entry);
             }
         }
         if (self.has_more) {
@@ -748,6 +752,85 @@ pub const SessionListSnapshot = struct {
         return try out.toOwnedSlice();
     }
 };
+
+fn writeSessionListDetails(
+    writer: *std.Io.Writer,
+    alloc: Allocator,
+    entry: session_store.SessionSummary,
+) !void {
+    try writer.print(
+        "   id={s} | {d} turn{s}",
+        .{ entry.id, entry.history_len, if (entry.history_len == 1) "" else "s" },
+    );
+    if (sessionLanguageLabel(entry.conversation_language.view())) |label| {
+        try writer.writeAll(" | ");
+        try writeTerminalSafe(writer, alloc, label);
+    }
+    try writer.writeAll(" | updated ");
+    try writeUtcTimestamp(writer, entry.updated_at_ms);
+    try writer.writeByte('\n');
+}
+
+fn sessionLanguageLabel(tag: []const u8) ?[]const u8 {
+    if (std.ascii.eqlIgnoreCase(tag, "und")) return null;
+
+    if (tag.len > 4 and std.ascii.eqlIgnoreCase(tag[0..4], "und-")) {
+        const script = tag[4..];
+        if (std.ascii.eqlIgnoreCase(script, "Latn")) return "Latin script";
+        if (std.ascii.eqlIgnoreCase(script, "Hani")) return "Han script";
+        if (std.ascii.eqlIgnoreCase(script, "Arab")) return "Arabic script";
+        if (std.ascii.eqlIgnoreCase(script, "Hebr")) return "Hebrew script";
+        if (std.ascii.eqlIgnoreCase(script, "Cyrl")) return "Cyrillic script";
+        if (std.ascii.eqlIgnoreCase(script, "Grek")) return "Greek script";
+        if (std.ascii.eqlIgnoreCase(script, "Deva")) return "Devanagari script";
+        if (std.ascii.eqlIgnoreCase(script, "Thai")) return "Thai script";
+        return tag;
+    }
+
+    const separator = std.mem.findScalar(u8, tag, '-') orelse tag.len;
+    const primary = tag[0..separator];
+    if (std.ascii.eqlIgnoreCase(primary, "en")) return "English";
+    if (std.ascii.eqlIgnoreCase(primary, "es")) return "Spanish";
+    if (std.ascii.eqlIgnoreCase(primary, "fr")) return "French";
+    if (std.ascii.eqlIgnoreCase(primary, "de")) return "German";
+    if (std.ascii.eqlIgnoreCase(primary, "it")) return "Italian";
+    if (std.ascii.eqlIgnoreCase(primary, "pt")) return "Portuguese";
+    if (std.ascii.eqlIgnoreCase(primary, "ja")) return "Japanese";
+    if (std.ascii.eqlIgnoreCase(primary, "ko")) return "Korean";
+    if (std.ascii.eqlIgnoreCase(primary, "zh")) return "Chinese";
+    if (std.ascii.eqlIgnoreCase(primary, "ar")) return "Arabic";
+    if (std.ascii.eqlIgnoreCase(primary, "he")) return "Hebrew";
+    if (std.ascii.eqlIgnoreCase(primary, "ru")) return "Russian";
+    if (std.ascii.eqlIgnoreCase(primary, "el")) return "Greek";
+    if (std.ascii.eqlIgnoreCase(primary, "hi")) return "Hindi";
+    if (std.ascii.eqlIgnoreCase(primary, "th")) return "Thai";
+    return tag;
+}
+
+fn writeUtcTimestamp(writer: *std.Io.Writer, timestamp_ms: i64) !void {
+    const max_supported_timestamp_ms: i64 = 253_402_300_799_999;
+    if (timestamp_ms < 0 or timestamp_ms > max_supported_timestamp_ms) {
+        try writer.writeAll("unknown");
+        return;
+    }
+
+    const epoch_secs: u64 = @intCast(@divTrunc(timestamp_ms, std.time.ms_per_s));
+    const milliseconds: u16 = @intCast(@mod(timestamp_ms, std.time.ms_per_s));
+    const epoch = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
+    const day = epoch.getDaySeconds();
+    const year_day = epoch.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+
+    try writer.print("{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3} UTC", .{
+        year_day.year,
+        @intFromEnum(month_day.month),
+        month_day.day_index + 1,
+        day.getHoursIntoDay(),
+        day.getMinutesIntoHour(),
+        day.getSecondsIntoMinute(),
+        milliseconds,
+    });
+}
 
 pub const SessionSummarySnapshot = struct {
     summary: session_store.SessionSummary,
@@ -1992,7 +2075,7 @@ test "core session list snapshot text and json stay stable" {
     const text = try (SessionListSnapshot{ .sessions = &sessions }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[sessions] 1 saved\n - abc turns=3 language=es updated_at_ms=2\n",
+        "[sessions] 1 saved\n - Session title\n   id=abc | 3 turns | Spanish | updated 1970-01-01 00:00:00.002 UTC\n",
         text,
     );
 
@@ -2010,7 +2093,7 @@ test "core session list snapshot text and json stay stable" {
     }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(paged_text);
     try std.testing.expectEqualStrings(
-        "[sessions] 1 saved\n - abc turns=3 language=es updated_at_ms=2\n" ++
+        "[sessions] 1 saved\n - Session title\n   id=abc | 3 turns | Spanish | updated 1970-01-01 00:00:00.002 UTC\n" ++
             "[sessions] more saved sessions; continue with `fx sessions --cursor v1:2:abc`\n",
         paged_text,
     );
@@ -2025,6 +2108,40 @@ test "core session list snapshot text and json stay stable" {
         "{\"kind\":\"sessions\",\"count\":1,\"has_more\":true,\"next_cursor\":\"v1:2:abc\",\"sessions\":[{\"id\":\"abc\",\"title\":\"Session title\",\"preview\":\"Session title\\npreview line\",\"workspace_root\":\"/tmp/workspace\",\"origin_workspace_root\":\"/tmp/origin\",\"created_at_ms\":1,\"updated_at_ms\":2,\"history_len\":3,\"conversation_language\":\"es\"}]}",
         paged_json,
     );
+
+    const fallback_sessions = [_]session_store.SessionSummary{
+        .{
+            .id = @constCast("legacy"),
+            .created_at_ms = 1,
+            .updated_at_ms = 2,
+            .conversation_language = types.ConversationLanguage.default(),
+            .history_len = 0,
+        },
+    };
+    const fallback_text = try (SessionListSnapshot{ .sessions = &fallback_sessions }).renderText(std.testing.allocator);
+    defer std.testing.allocator.free(fallback_text);
+    try std.testing.expectEqualStrings(
+        "[sessions] 1 saved\n - Untitled session\n   id=legacy | 0 turns | updated 1970-01-01 00:00:00.002 UTC\n",
+        fallback_text,
+    );
+
+    var script_session = fallback_sessions[0];
+    script_session.conversation_language = types.ConversationLanguage.literal("und-Latn");
+    script_session.history_len = 1;
+    const script_text = try (SessionListSnapshot{ .sessions = @as(*const [1]session_store.SessionSummary, &script_session) }).renderText(std.testing.allocator);
+    defer std.testing.allocator.free(script_text);
+    try std.testing.expectEqualStrings(
+        "[sessions] 1 saved\n - Untitled session\n   id=legacy | 1 turn | Latin script | updated 1970-01-01 00:00:00.002 UTC\n",
+        script_text,
+    );
+
+    const long_title = "a" ** session_display_metadata.max_title_bytes;
+    var long_session = sessions[0];
+    long_session.title = @constCast(long_title);
+    const long_text = try (SessionListSnapshot{ .sessions = @as(*const [1]session_store.SessionSummary, &long_session) }).renderText(std.testing.allocator);
+    defer std.testing.allocator.free(long_text);
+    try std.testing.expect(std.mem.startsWith(u8, long_text, "[sessions] 1 saved\n - " ++ long_title ++ "\n"));
+    try std.testing.expect(std.mem.find(u8, long_text, "\n   id=abc | 3 turns") != null);
 
     const warning_text = try (SessionListSnapshot{
         .sessions = &sessions,
@@ -2041,6 +2158,47 @@ test "core session list snapshot text and json stay stable" {
     try std.testing.expectEqualStrings(
         "{\"kind\":\"sessions\",\"count\":0,\"skipped_invalid\":2,\"sessions\":[]}",
         warning_json,
+    );
+}
+
+test "core session list text visibly escapes terminal controls in titles" {
+    const sessions = [_]session_store.SessionSummary{
+        .{
+            .id = @constCast("hostile-title"),
+            .title = @constCast("\x1b[2Jbreak\nnext"),
+            .created_at_ms = 1,
+            .updated_at_ms = 2,
+            .conversation_language = types.ConversationLanguage.default(),
+            .history_len = 0,
+        },
+    };
+
+    const text = try (SessionListSnapshot{ .sessions = &sessions }).renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings(
+        "[sessions] 1 saved\n - \\x1b[2Jbreak\\x0anext\n" ++
+            "   id=hostile-title | 0 turns | updated 1970-01-01 00:00:00.002 UTC\n",
+        text,
+    );
+}
+
+test "core session list text visibly escapes terminal controls in unknown language tags" {
+    const sessions = [_]session_store.SessionSummary{
+        .{
+            .id = @constCast("hostile-language"),
+            .created_at_ms = 1,
+            .updated_at_ms = 2,
+            .conversation_language = try types.ConversationLanguage.fromSlice("\x1b[2J"),
+            .history_len = 0,
+        },
+    };
+
+    const text = try (SessionListSnapshot{ .sessions = &sessions }).renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings(
+        "[sessions] 1 saved\n - Untitled session\n" ++
+            "   id=hostile-language | 0 turns | \\x1b[2J | updated 1970-01-01 00:00:00.002 UTC\n",
+        text,
     );
 }
 

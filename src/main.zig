@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
 
-pub const version = "0.0.3";
+pub const version = "0.0.4";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");
@@ -37,6 +37,7 @@ const app_callbacks = @import("core/app/app_callbacks.zig");
 const app_commands = @import("core/app/app_commands.zig");
 const change_tracker_mod = @import("core/workspace/change_tracker.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
+const statusline_identity = @import("core/workspace/statusline_identity.zig");
 const collections = @import("core/shared/collections.zig");
 const agent_steps = @import("core/config/agent_steps.zig");
 const config_runtime = @import("core/config/config_runtime.zig");
@@ -459,8 +460,8 @@ const App = struct {
         return if (comptime host_profile.clipboard) native_host.clipboard else host.unavailable_clipboard;
     }
 
-    pub fn terminalTitle(_: *const Self) host.TerminalTitle {
-        return ui_render.terminal_title;
+    pub fn terminalTitle(self: *const Self) host.TerminalTitle {
+        return ui_render.terminalTitleFor(&self.shell.stdout_file);
     }
 
     alloc: Allocator,
@@ -479,6 +480,7 @@ const App = struct {
     selected_model: std.ArrayList(u8) = .empty,
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
     workspace_root: []u8 = &.{},
+    workspace_identity: statusline_identity.Runtime = .{},
     workspace_host: WorkspaceHostRuntime = .{},
     workspace: app_workspace_runtime.State = .{},
     permission_engine: PermissionEngine = .{},
@@ -602,7 +604,7 @@ const App = struct {
             .{
                 .load_mcp_runtime = if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
                 .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
-                .terminal_title = ui_render.terminal_title,
+                .terminal_title = app.terminalTitle(),
             },
         );
         errdefer app.deinit();
@@ -622,7 +624,7 @@ const App = struct {
                 } else {
                     try SessionAppRuntime.resumeRequestedSession(&app);
                 }
-                app.terminalTitle().setModel(app.selected_model.items);
+                SessionAppRuntime.syncTerminalTitle(&app);
             }
         }
         if (comptime host_profile.durable_sessions) {
@@ -637,6 +639,7 @@ const App = struct {
         }
         if (comptime !host_profile.auto_upgrade) app.auto_upgrade_enabled = false;
         try HostConfigAppRuntime.restore(&app, builtin_modes.registry);
+        SessionAppRuntime.syncTerminalTitle(&app);
         return app;
     }
 
@@ -842,6 +845,7 @@ const App = struct {
 
         self.auth.deinit(self.alloc);
         WorkspaceAppRuntime.deinit(self);
+        self.workspace_identity.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
         return resume_handoff;
     }
@@ -966,6 +970,7 @@ const App = struct {
             app_callbacks.Bindings(App).workerEventHandlers(self),
             flushRequestedFrame,
         );
+        try SessionAppRuntime.settlePendingLiveSessionTransition(self);
     }
 
     fn flushRequestedFrame(self: *App) !void {

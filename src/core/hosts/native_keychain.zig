@@ -6,12 +6,14 @@ const secret = @import("../auth/secret.zig");
 
 pub const service_name = "FX_AI_GATEWAY_API_KEY";
 const mcp_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V1";
+pub const oauth_session_service_name = "FX_OAUTH_SESSION_V1";
 
 /// Backing store for a resolved account name. Must outlive any argv built from it.
 pub const AccountBuffer = [256]u8;
 
 const passwd_scratch_bytes = 2048;
 const max_mcp_credentials_bytes: usize = 1024 * 1024;
+const max_oauth_session_bytes: usize = 64 * 1024;
 const keychain_process_timeout: std.Io.Timeout = .{
     .duration = .{
         .raw = .{ .nanoseconds = 10 * std.time.ns_per_s },
@@ -82,6 +84,10 @@ pub fn load(alloc: std.mem.Allocator) !?[]u8 {
 
 pub fn loadMcpCredentials(alloc: std.mem.Allocator) !?[]u8 {
     return loadMcpValueMacControlled(alloc, mcp_credentials_service_name, null);
+}
+
+pub fn loadOAuthSession(alloc: std.mem.Allocator) !?[]u8 {
+    return loadMcpValueMacControlled(alloc, oauth_session_service_name, null);
 }
 
 pub fn loadMcpCredentialsCancellable(
@@ -259,6 +265,14 @@ pub fn storeMcpCredentials(value: []const u8) Error!void {
     return storeMcpCredentialsControlled(value, null);
 }
 
+pub fn storeOAuthSession(value: []const u8) Error!void {
+    if (!isAvailable()) return error.UnsupportedPlatform;
+    if (value.len == 0 or value.len > max_oauth_session_bytes) {
+        return error.KeychainWriteFailed;
+    }
+    return storeMcpValueMac(oauth_session_service_name, value);
+}
+
 pub fn storeMcpCredentialsCancellable(
     value: []const u8,
     cancel_flag: *const std.atomic.Value(bool),
@@ -287,6 +301,10 @@ fn storeMcpCredentialsControlled(
 
 pub fn deleteMcpCredentials(alloc: std.mem.Allocator) Error!bool {
     return deleteMcpValueMac(alloc, mcp_credentials_service_name);
+}
+
+pub fn deleteOAuthSession(alloc: std.mem.Allocator) Error!bool {
+    return deleteMcpValueMac(alloc, oauth_session_service_name);
 }
 
 fn writeFailed(step: []const u8, err: anyerror) Error {

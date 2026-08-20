@@ -285,7 +285,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.sendText("/fast");
         await session.waitForText("● Fast: on", TIMEOUT);
         await session.sendText("/sandbox none");
-        await session.waitForText("● Sandbox: already set to none", TIMEOUT);
+        await session.waitForText("● Sandbox: switched to none", TIMEOUT);
         await session.sendText("/statusline sandbox");
         await session.waitForText("● Statusline: sandbox:", TIMEOUT);
         await session.sendText("/statusline context");
@@ -441,7 +441,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         });
         await session.waitForText("Run /help", TIMEOUT);
         await session.sendText("/sandbox none");
-        await session.waitForText("● Sandbox: already set to none", TIMEOUT);
+        await session.waitForText("● Sandbox: switched to none", TIMEOUT);
         await session.sendText('/allowlist add command "local-a *"');
         await session.waitForText("(scope=local)", TIMEOUT);
         await session.sendText('/allowlist user add command "user *"');
@@ -741,6 +741,78 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
       }
     },
     30_000,
+  );
+
+  test(
+    "settings reasoning effort changes without mutating the selected model",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-settings-effort-"));
+      const gateway = startFakeGateway([], {
+        models: [{
+          id: "zai/glm-5.2",
+          type: "language",
+          released: 1,
+          tags: ["reasoning", "tool-use"],
+          reasoning_options: [{ type: "effort", values: ["low", "medium"] }],
+        }],
+      });
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        const stderrPath = join(root, "stderr.log");
+        const settingsPath = join(home, ".fx", "settings.json");
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        writeFileSync(
+          settingsPath,
+          JSON.stringify({ model: "zai/glm-5.2", effort: "low" }) + "\n",
+          { mode: 0o600 },
+        );
+
+        session = await TmuxSession.create({
+          cwd: realpathSync(workspace),
+          env: {
+            ...NO_AUTH,
+            HOME: home,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          },
+          stderrPath,
+        });
+        await session.waitForText("Run /help", TIMEOUT);
+        await session.sendText("/settings");
+        await session.waitForText("←→ Change", TIMEOUT);
+        await session.sendLiteral("reason");
+        const effortSetting = await session.waitForText("Reasoning effort", TIMEOUT);
+        expect(effortSetting).toContain("low");
+        await session.sendKeys("Right");
+
+        let stored = JSON.parse(readFileSync(settingsPath, "utf8"));
+        const persistenceDeadline = Date.now() + TIMEOUT;
+        while (stored.effort !== "medium" && Date.now() < persistenceDeadline) {
+          await Bun.sleep(25);
+          stored = JSON.parse(readFileSync(settingsPath, "utf8"));
+        }
+        expect(stored).toMatchObject({
+          model: "zai/glm-5.2",
+          effort: "medium",
+        });
+        expect(session.paneStatus()).toEqual({ dead: false, status: null });
+        expect(await session.capturePane()).toContain("medium");
+
+        await session.sendKeys("Escape");
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("/quit");
+        await session.waitForSessionEnd(TIMEOUT);
+        session = null;
+
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        expect(gateway.requests).toHaveLength(0);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    60_000,
   );
 
   test(

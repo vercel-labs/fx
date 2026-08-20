@@ -1,8 +1,38 @@
 # fx
 
-## 0.0.3
+## 0.0.4
 
 <!-- release:start -->
+
+### New Features
+
+- **Session resume command:** Resume the latest workspace session or an exact session ID with `fx session resume`
+- **Headless permission prompts:** Add `--prompt-permissions` so JSON and quiet `fx ask` runs can request Y/N approval on a TTY while keeping stdout clean
+
+### Improvements
+
+- **Auto mode permissions:** Run routine reversible development commands and new-file creation directly, then ask for human approval after repeated automatic review denials
+- **Command discovery:** Rank exact, prefix, and substring slash-command matches and highlight the selected help description
+- **Terminal attention bells:** Emit one terminal bell when fx pauses for permission or other input so terminal multiplexers can flag waiting panes
+- **Transcript scrollback:** Preserve retained transcript rows in native scrollback across pruning, resize, and reflow
+
+### Bug Fixes
+
+- **Session cache contention:** Continue same-workspace session writes and keep listing and resume results current while another process holds the latest-session cache lock
+- **Reasoning effort settings:** Change reasoning effort without crashing or replacing the selected model
+- **Web redirects:** Follow HTTP 303 redirects in `web_fetch`
+- **Command output separation:** End command output that lacks a trailing newline before rendering the next `fx ask` tool header
+- **Skill discovery:** Show one entry for skills reached through symlinked compatibility roots while preserving distinct same-name skills
+- **libfx session transitions:** Cancel active cooperative turns before starting a fresh session so the terminal remains responsive
+- **Memory activity:** Present `memory list` as a read instead of a write
+- **Unsupported login shells:** Fall back to zsh on macOS or Bash elsewhere when the configured login shell is unsupported
+- **Process cleanup:** Cancel and reap headless terminal commands on SIGTERM, preserve signal status, and tolerate short-lived Linux processes disappearing during cleanup
+- **Model output limits:** Omit invalid limits that consume a model's full context window
+- **Terminal lease transitions:** Reject write payloads on lease acquisition, release, and revocation before session state changes
+
+<!-- release:end -->
+
+## 0.0.3
 
 ### Improvements
 
@@ -16,8 +46,6 @@
 - **Model catalogs:** Reject malformed catalog responses with a nonzero exit instead of treating them as an empty model list
 - **Skill creation:** Show invalid `/skills create` names inline and keep the current session, transcript, and composer usable
 - **GLM 5.2 responses:** Restore responses for fx login sessions without changing requests for other models
-
-<!-- release:end -->
 
 ## 0.0.2
 

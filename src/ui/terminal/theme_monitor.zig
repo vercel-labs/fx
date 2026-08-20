@@ -6,8 +6,6 @@ const theme_protocol = @import("theme_protocol.zig");
 // the cursor probe's full 100 ms delay on a standalone Escape key.
 pub const response_idle_timeout_ms: i64 = 75;
 pub const background_response_timeout_ms: i64 = 200;
-const background_sample_interval_ms: i64 = 1000;
-const query_retry_delay_ms: i64 = 1000;
 
 const max_candidate_bytes = 64;
 
@@ -59,8 +57,7 @@ pub const Monitor = struct {
     deferred_input_in_flight: bool = false,
     query_state: QueryState = .idle,
     theme_dirty: bool = false,
-    retry_after_ms: i64 = 0,
-    next_sample_ms: ?i64 = null,
+    notification_light: ?bool = null,
     settled_update: ?ThemeUpdate = null,
 
     pub fn start(self: *Monitor) void {
@@ -98,12 +95,12 @@ pub const Monitor = struct {
         const candidate = self.candidate[0..self.candidate_len];
         if (std.mem.eql(u8, candidate, dark_response)) {
             self.candidate_len = 0;
-            self.queueRefresh();
+            self.queueRefresh(false);
             return .consumed;
         }
         if (std.mem.eql(u8, candidate, light_response)) {
             self.candidate_len = 0;
-            self.queueRefresh();
+            self.queueRefresh(true);
             return .consumed;
         }
         if (std.mem.startsWith(u8, dark_response, candidate) or
@@ -172,24 +169,14 @@ pub const Monitor = struct {
         };
         if (now_ms >= query_deadline) {
             debug_trace.logf("theme", "theme_query_timeout phase={s}", .{@tagName(self.query_state)});
-            self.query_state = .idle;
-            self.theme_dirty = true;
-            self.retry_after_ms = addMillis(now_ms, query_retry_delay_ms);
+            self.settleNotificationFallback();
         }
     }
 
     pub fn takeQueryRequest(self: *Monitor, now_ms: i64) ?QueryRequest {
         switch (self.query_state) {
             .idle => {
-                if (now_ms < self.retry_after_ms) return null;
-                if (!self.theme_dirty) {
-                    const next_sample_ms = self.next_sample_ms orelse {
-                        self.next_sample_ms = addMillis(now_ms, background_sample_interval_ms);
-                        return null;
-                    };
-                    if (now_ms < next_sample_ms) return null;
-                }
-                self.next_sample_ms = addMillis(now_ms, background_sample_interval_ms);
+                if (!self.theme_dirty) return null;
                 self.query_state = .{
                     .awaiting_response_fence = addMillis(now_ms, background_response_timeout_ms),
                 };
@@ -207,10 +194,9 @@ pub const Monitor = struct {
     }
 
     pub fn failQuery(self: *Monitor, now_ms: i64) void {
+        _ = now_ms;
         if (self.query_state == .idle) return;
-        self.query_state = .idle;
-        self.theme_dirty = true;
-        self.retry_after_ms = addMillis(now_ms, query_retry_delay_ms);
+        self.settleNotificationFallback();
     }
 
     pub fn takeSettledUpdate(self: *Monitor) ?ThemeUpdate {
@@ -238,13 +224,13 @@ pub const Monitor = struct {
         return in_flight;
     }
 
-    fn queueRefresh(self: *Monitor) void {
+    fn queueRefresh(self: *Monitor, light: bool) void {
         if (self.settled_update != null) {
             debug_trace.logf("theme", "theme_update_dropped reason=newer_notification", .{});
             self.settled_update = null;
         }
+        self.notification_light = light;
         self.theme_dirty = true;
-        self.retry_after_ms = 0;
     }
 
     fn finishResponseFence(self: *Monitor) void {
@@ -253,15 +239,23 @@ pub const Monitor = struct {
             .awaiting_background => |query| {
                 const update = query.background orelse return;
                 self.query_state = .idle;
-                self.retry_after_ms = 0;
                 if (self.theme_dirty) {
                     debug_trace.logf("theme", "theme_sample_dropped reason=newer_notification", .{});
                     return;
                 }
+                self.notification_light = null;
                 self.settled_update = update;
             },
             .idle, .background_ready => {},
         }
+    }
+
+    fn settleNotificationFallback(self: *Monitor) void {
+        self.query_state = .idle;
+        self.theme_dirty = false;
+        const light = self.notification_light orelse return;
+        self.notification_light = null;
+        self.settled_update = .{ .light = light };
     }
 
     fn deferCandidate(self: *Monitor) void {
@@ -421,7 +415,7 @@ test "theme monitor drains stale backgrounds before sampling" {
     try std.testing.expectEqual(@as(u8, 0xff), update.rgb.?.r);
 }
 
-test "theme monitor retries after a background query timeout" {
+test "theme monitor settles the notification after a background query timeout" {
     var monitor = Monitor{};
     monitor.start();
     for (light_response) |byte| _ = monitor.feed(byte, 0);
@@ -429,7 +423,9 @@ test "theme monitor retries after a background query timeout" {
 
     const timed_out_ms = background_response_timeout_ms + 2;
     monitor.poll(timed_out_ms);
-    try std.testing.expect(monitor.takeSettledUpdate() == null);
+    const fallback = monitor.takeSettledUpdate().?;
+    try std.testing.expect(fallback.light);
+    try std.testing.expect(fallback.rgb == null);
 
     for ("\x1b]11;rgb:ffff/ffff/ffff\x1b\\") |byte| {
         try std.testing.expect(switch (monitor.feed(byte, background_response_timeout_ms + 1)) {
@@ -439,21 +435,20 @@ test "theme monitor retries after a background query timeout" {
     }
     try std.testing.expect(monitor.takeSettledUpdate() == null);
     try std.testing.expect(monitor.takeQueryRequest(timed_out_ms) == null);
-    try std.testing.expectEqual(
-        QueryRequest.response_fence,
-        monitor.takeQueryRequest(timed_out_ms + 1000).?,
-    );
+    try std.testing.expect(monitor.takeQueryRequest(timed_out_ms + 10_000) == null);
 }
 
-test "theme monitor backs off after a query write failure" {
+test "theme monitor settles the notification after a query write failure" {
     var monitor = Monitor{};
     monitor.start();
     for (light_response) |byte| _ = monitor.feed(byte, 0);
     _ = monitor.takeQueryRequest(0).?;
 
     monitor.failQuery(1);
-    try std.testing.expect(monitor.takeQueryRequest(1000) == null);
-    try std.testing.expectEqual(QueryRequest.response_fence, monitor.takeQueryRequest(1001).?);
+    const fallback = monitor.takeSettledUpdate().?;
+    try std.testing.expect(fallback.light);
+    try std.testing.expect(fallback.rgb == null);
+    try std.testing.expect(monitor.takeQueryRequest(10_000) == null);
 }
 
 test "theme monitor consumes OSC 11 long after query timeout without forwarding" {
@@ -463,7 +458,7 @@ test "theme monitor consumes OSC 11 long after query timeout without forwarding"
     try beginBackgroundSampleForTest(&monitor, 0);
 
     monitor.poll(background_response_timeout_ms + 2);
-    try std.testing.expect(monitor.takeSettledUpdate() == null);
+    try std.testing.expect(!monitor.takeSettledUpdate().?.light);
 
     // Far past any former late-ownership window; still must not forward.
     const late_ms = background_response_timeout_ms * 5;
@@ -618,23 +613,13 @@ test "theme monitor coalesces a notification during a background sample" {
     try std.testing.expect(monitor.takeSettledUpdate().?.light);
 }
 
-test "theme monitor periodically samples without a theme notification" {
+test "theme monitor remains idle without a theme notification" {
     var monitor = Monitor{};
     monitor.start();
 
     try std.testing.expect(monitor.takeQueryRequest(0) == null);
-    try std.testing.expect(monitor.takeQueryRequest(999) == null);
-    const request = monitor.takeQueryRequest(1000);
-    try std.testing.expect(request != null);
-    try std.testing.expectEqual(QueryRequest.response_fence, request.?);
-    for (response_fence) |byte| _ = monitor.feed(byte, 1001);
-    try std.testing.expectEqual(QueryRequest.background, monitor.takeQueryRequest(1002).?);
-    for ("\x1b]11;rgb:0000/0000/0000\x07") |byte| _ = monitor.feed(byte, 1003);
-    for (response_fence) |byte| _ = monitor.feed(byte, 1004);
-    _ = monitor.takeSettledUpdate().?;
-
-    try std.testing.expect(monitor.takeQueryRequest(1999) == null);
-    try std.testing.expectEqual(QueryRequest.response_fence, monitor.takeQueryRequest(2000).?);
+    try std.testing.expect(monitor.takeQueryRequest(1000) == null);
+    try std.testing.expect(monitor.takeQueryRequest(60_000) == null);
 }
 
 test "theme monitor forwards a full malformed OSC candidate without dropping its next byte" {

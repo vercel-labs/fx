@@ -751,6 +751,10 @@ describe("filesystem path handling", () => {
     async () => {
       const root = createIsolatedRoot();
       try {
+        writeFileSync(
+          join(root.home, ".fx", "settings.json"),
+          JSON.stringify({ sandbox: "none" }),
+        );
         const cases = [
           { id: "cwd_absolute", cwd: root.external, canonical: root.external },
           { id: "cwd_relative", cwd: "../external", canonical: root.external },
@@ -801,13 +805,23 @@ describe("filesystem path handling", () => {
   );
 
   test(
-    "trusted prepared writes bypass review while untrusted external writes use exact review",
+    "trusted new writes bypass review while external overwrites use exact review",
     async () => {
       const root = createIsolatedRoot();
       try {
         const allowedParent = join(root.external, "missing", "nested");
         const allowedTarget = join(allowedParent, "created.txt");
         const allowedRelativePath = "../external/missing/nested/created.txt";
+        const classifiedExternalTarget = join(
+          root.external,
+          "classified",
+          "nested",
+          "created.txt",
+        );
+        mkdirSync(join(root.external, "classified", "nested"), {
+          recursive: true,
+        });
+        writeFileSync(classifiedExternalTarget, "BEFORE_CLASSIFIED_CONTENT");
 
         const classifiedScenarios = [
           {
@@ -817,6 +831,7 @@ describe("filesystem path handling", () => {
             resultPath: "trusted-local.txt",
             addDir: false,
             expectedReview: false,
+            preexisting: false,
           },
           {
             id: "write_trusted_added",
@@ -825,14 +840,16 @@ describe("filesystem path handling", () => {
             resultPath: join(root.external, "trusted", "nested", "created.txt"),
             addDir: true,
             expectedReview: false,
+            preexisting: false,
           },
           {
             id: "write_classified_external",
             path: "../external/classified/nested/created.txt",
-            target: join(root.external, "classified", "nested", "created.txt"),
-            resultPath: join(root.external, "classified", "nested", "created.txt"),
+            target: classifiedExternalTarget,
+            resultPath: classifiedExternalTarget,
             addDir: false,
             expectedReview: true,
+            preexisting: true,
           },
         ];
         for (const scenario of classifiedScenarios) {
@@ -843,7 +860,14 @@ describe("filesystem path handling", () => {
             expectedResultRequest: [scenario.path],
             expectedResultOutput: [scenario.resultPath],
             finalMessage: "classified write complete",
-            beforeToolCall: () => expect(existsSync(scenario.target)).toBe(false),
+            beforeToolCall: () => {
+              expect(existsSync(scenario.target)).toBe(scenario.preexisting);
+              if (scenario.preexisting) {
+                expect(readFileSync(scenario.target, "utf8")).toBe(
+                  "BEFORE_CLASSIFIED_CONTENT",
+                );
+              }
+            },
           }));
           try {
             const classified = await runFx(
@@ -875,8 +899,9 @@ describe("filesystem path handling", () => {
               expect(reviewBody).not.toContain("external_file_mutation");
               expect(reviewBody).toContain(`target[target]: ${scenario.target}`);
               expect(reviewBody).toContain("action: prepared_file_mutation");
-              expect(reviewBody).toContain("preimage: absent");
+              expect(reviewBody).toContain("preimage: present");
               expect(reviewBody).toContain("additions: 1");
+              expect(reviewBody).toContain("deletions: 1");
               expect(reviewBody).toContain("CLASSIFIED_CONTENT");
             }
             expect(classifiedJson.tool_calls).toEqual([
@@ -923,7 +948,7 @@ describe("filesystem path handling", () => {
   );
 
   test(
-    "automatic review rejects an oversized prepared write before transport or execution",
+    "automatic review receives a large prepared overwrite before blocking on ask",
     async () => {
       const root = createIsolatedRoot();
       const target = join(root.external, "large-review.txt");
@@ -936,6 +961,7 @@ describe("filesystem path handling", () => {
             ? longReviewRow
             : `review row ${String(index + 1).padStart(3, "0")}: deterministic permission evidence`,
       ).join("\n") + "\n";
+      writeFileSync(target, "before\n");
       const gateway = startFakeGateway([
         toolCall("write_large_review", "write_file", {
           path: "../external/large-review.txt",
@@ -945,9 +971,9 @@ describe("filesystem path handling", () => {
           const resultOutput = toolResultOutput(body, "write_large_review");
           expect(resultOutput).toContain('"reason":"auto_denied"');
           expect(resultOutput).toContain("Permission denied by auto mode classifier");
-          return finalText("oversized reviewed write rejected");
+          return finalText("large reviewed write blocked");
         },
-      ]);
+      ], { classifierDecision: "ask" });
       try {
         const result = await runFx(
           [
@@ -969,20 +995,25 @@ describe("filesystem path handling", () => {
         const json = parseFxJson(result);
 
         expect(gateway.requests).toHaveLength(2);
-        expect(gateway.classifierRequests).toHaveLength(0);
+        expect(gateway.classifierRequests).toHaveLength(1);
+        expect(
+          Buffer.byteLength(gateway.classifierRequests[0]!.body),
+        ).toBeGreaterThan(16 * 1024);
         expect(gateway.remainingResponseCount()).toBe(0);
         expect(json.tool_calls).toEqual([
           { name: "write_file", status: "error" },
         ]);
-        expect(json.output).toContain("oversized reviewed write rejected");
+        expect(json.output).toContain("large reviewed write blocked");
         expect(result.stderr).not.toContain("Auto agent approved this request");
-        expect(existsSync(target)).toBe(false);
+        expect(readFileSync(target, "utf8")).toBe("before\n");
         const trace = readFileSync(tracePath, "utf8");
         expect(trace).toContain(
-          "event=auto_review_compose_result result=required_packet_too_large",
+          "event=auto_review_compose_result result=ready",
         );
-        expect(trace).not.toContain("event=auto_review_transport_start");
-        expect(trace).toContain("fallback_reason=invalid_or_unavailable");
+        expect(trace).toContain("event=auto_review_transport_start");
+        expect(trace).toContain(
+          "event=auto_review_result tool_name=write_file decision=ask",
+        );
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -996,6 +1027,7 @@ describe("filesystem path handling", () => {
     async () => {
       const root = createIsolatedRoot();
       const target = join(root.external, "review-required.txt");
+      writeFileSync(target, "before");
       const gateway = startFakeGateway([
         toolCall("write_review_required", "write_file", {
           path: target,
@@ -1039,7 +1071,7 @@ describe("filesystem path handling", () => {
         ]);
         expect(result.stdout).not.toContain("NonInteractivePermissionRequired");
         expect(result.stderr).not.toContain("permission required");
-        expect(existsSync(target)).toBe(false);
+        expect(readFileSync(target, "utf8")).toBe("before");
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });

@@ -1395,7 +1395,7 @@ describe("modern MCP Streamable HTTP", () => {
 
       const reloadStarted = Date.now();
       await tui.sendText("/mcp reload");
-      await tui.waitForText("MCP profile reloaded (ready, runtime ", 5_000);
+      await tui.waitForText("MCP configuration reloaded successfully.", 5_000);
       const cancelDeadline = Date.now() + 5_000;
       while (fixture.cancelledCalls === 0 && Date.now() < cancelDeadline) {
         await Bun.sleep(25);

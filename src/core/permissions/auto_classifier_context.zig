@@ -64,6 +64,14 @@ pub fn currentRootUserRequest(context: []const u8) ?[]const u8 {
     return lineValue(context, current_label);
 }
 
+/// Returns the bounded proven root-request portion of canonical context.
+/// Historical permission feedback is retained for execution/session purposes
+/// but never projected as reviewer authority.
+pub fn reviewRootUserContext(context: []const u8) ?[]const u8 {
+    if (!isCanonicalRootUserContext(context)) return null;
+    return context[0..canonicalFeedbackStart(context)];
+}
+
 fn canonicalTextLine(line: []const u8, label: []const u8) bool {
     if (!std.mem.startsWith(u8, line, label)) return false;
     const value = line[label.len..];
@@ -395,6 +403,61 @@ fn appendSerializedPermissionFeedback(
     }
 }
 
+const RequiredAnchorBudgets = struct {
+    current: usize,
+    first: usize,
+    recent: usize,
+};
+
+fn requiredAnchorBudgets(
+    current_len: usize,
+    first_len: ?usize,
+    recent_len: ?usize,
+    capacity: usize,
+) RequiredAnchorBudgets {
+    const lengths = [3]?usize{ current_len, first_len, recent_len };
+    var budgets = [3]usize{ 0, 0, 0 };
+    var present_count: usize = 0;
+    for (lengths) |length| {
+        if (length != null) present_count += 1;
+    }
+
+    const initial_share = capacity / present_count;
+    var used: usize = 0;
+    for (lengths, 0..) |maybe_length, index| {
+        if (maybe_length) |length| {
+            budgets[index] = @min(length, initial_share);
+            used += budgets[index];
+        }
+    }
+
+    var remaining = capacity - used;
+    while (remaining > 0) {
+        var unfinished_count: usize = 0;
+        for (lengths, budgets) |maybe_length, budget| {
+            if (maybe_length) |length| {
+                if (budget < length) unfinished_count += 1;
+            }
+        }
+        if (unfinished_count == 0) break;
+
+        const share = @max(@as(usize, 1), remaining / unfinished_count);
+        for (lengths, &budgets) |maybe_length, *budget| {
+            const length = maybe_length orelse continue;
+            const added = @min(length - budget.*, @min(share, remaining));
+            budget.* += added;
+            remaining -= added;
+            if (remaining == 0) break;
+        }
+    }
+
+    return .{
+        .current = budgets[0],
+        .first = budgets[1],
+        .recent = budgets[2],
+    };
+}
+
 fn buildRootUserContextBounded(
     alloc: Allocator,
     turns: []const []const u8,
@@ -415,35 +478,44 @@ fn buildRootUserContextBounded(
     const first_turn_count: usize = if (first != null) 1 else 0;
     const recent_total = turns.len -| (1 + first_turn_count);
     const has_recent = recent_total > 0;
+    const newest_recent = if (has_recent)
+        try encodeText(alloc, turns[turns.len - 2])
+    else
+        null;
+    defer if (newest_recent) |text| alloc.free(text);
+
+    const omitted_after_required = recent_total - @intFromBool(has_recent) +
+        prior_omitted_root_turns;
     const anchor_overhead = current_label.len + 1 +
-        if (first != null) first_root_user_label.len + 1 else 0;
-    const recent_marker_reserve = if (has_recent or prior_omitted_root_turns > 0) count_marker_reserve else 0;
+        (if (first != null) first_root_user_label.len + 1 else 0) +
+        (if (newest_recent != null) recent_root_user_label.len + 1 else 0);
+    const recent_marker_reserve = if (omitted_after_required > 0) count_marker_reserve else 0;
     const anchor_content_budget = max_bytes - anchor_overhead - recent_marker_reserve;
-    var latest_budget = anchor_content_budget;
-    var first_budget: usize = 0;
-    if (first) |first_text| {
-        latest_budget = @min(latest.len, anchor_content_budget / 2);
-        first_budget = @min(first_text.len, anchor_content_budget - latest_budget);
-        var remaining = anchor_content_budget - latest_budget - first_budget;
-        const latest_extra = @min(latest.len - latest_budget, remaining);
-        latest_budget += latest_extra;
-        remaining -= latest_extra;
-        first_budget += @min(first_text.len - first_budget, remaining);
-    }
+    const budgets = requiredAnchorBudgets(
+        latest.len,
+        if (first) |text| text.len else null,
+        if (newest_recent) |text| text.len else null,
+        anchor_content_budget,
+    );
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll(current_label);
-    try writeHeadTail(&out.writer, latest, latest_budget);
+    try writeHeadTail(&out.writer, latest, budgets.current);
     try out.writer.writeByte('\n');
     if (first) |first_text| {
         try out.writer.writeAll(first_root_user_label);
-        try writeHeadTail(&out.writer, first_text, first_budget);
+        try writeHeadTail(&out.writer, first_text, budgets.first);
+        try out.writer.writeByte('\n');
+    }
+    if (newest_recent) |recent_text| {
+        try out.writer.writeAll(recent_root_user_label);
+        try writeHeadTail(&out.writer, recent_text, budgets.recent);
         try out.writer.writeByte('\n');
     }
 
-    var selected_recent: usize = 0;
-    var history_index = if (turns.len > 1) turns.len - 1 else 0;
+    var selected_recent: usize = @intFromBool(newest_recent != null);
+    var history_index = if (turns.len > 1) turns.len - 2 else 0;
     while (history_index > first_turn_count) {
         history_index -= 1;
         const older_turns_remaining = history_index - first_turn_count;
@@ -555,6 +627,61 @@ test "root user context keeps first latest and newest recent turns with visible 
     try std.testing.expect(std.mem.find(u8, context, "recent_root_user_request: newest-recent-root-request") != null);
     try std.testing.expect(std.mem.find(u8, context, "omitted_proven_root_user_turns:") != null);
     try std.testing.expect(std.mem.find(u8, context, "oldest-middle") == null);
+}
+
+test "root user context reserves capacity for every required oversized anchor" {
+    const turns = [_][]const u8{
+        "first-required-marker " ++ ("a" ** 4096),
+        "older-middle-one-marker " ++ ("b" ** 4096),
+        "older-middle-two-marker " ++ ("c" ** 4096),
+        "older-middle-three-marker " ++ ("d" ** 4096),
+        "newest-recent-required-marker " ++ ("e" ** 4096),
+        "current-required-marker " ++ ("f" ** 4096),
+    };
+    const context = try buildRootUserContextBounded(
+        std.testing.allocator,
+        &turns,
+        max_root_user_bytes,
+        0,
+        true,
+    );
+    defer std.testing.allocator.free(context);
+
+    try std.testing.expect(context.len <= max_root_user_bytes);
+    try std.testing.expect(isCanonicalRootUserContext(context));
+    try std.testing.expect(std.mem.find(u8, context, "current-required-marker") != null);
+    try std.testing.expect(std.mem.find(u8, context, "first-required-marker") != null);
+    try std.testing.expect(std.mem.find(u8, context, "newest-recent-required-marker") != null);
+    try std.testing.expect(std.mem.find(u8, context, "older-middle-one-marker") == null);
+    try std.testing.expect(std.mem.find(u8, context, "older-middle-two-marker") == null);
+    try std.testing.expect(std.mem.find(u8, context, "older-middle-three-marker") == null);
+    try std.testing.expectEqualStrings(
+        "3",
+        lineValue(context, omitted_root_user_label).?,
+    );
+}
+
+test "root user context redistributes unused required anchor capacity" {
+    const turns = [_][]const u8{
+        "first-required-marker " ++ ("a" ** 4096),
+        "newest-recent-required-marker " ++ ("b" ** 4096),
+        "current",
+    };
+    const context = try buildRootUserContextBounded(
+        std.testing.allocator,
+        &turns,
+        max_root_user_bytes,
+        0,
+        true,
+    );
+    defer std.testing.allocator.free(context);
+
+    try std.testing.expectEqual(max_root_user_bytes, context.len);
+    try std.testing.expect(isCanonicalRootUserContext(context));
+    try std.testing.expectEqualStrings("current", lineValue(context, current_label).?);
+    try std.testing.expect(std.mem.find(u8, context, "first-required-marker") != null);
+    try std.testing.expect(std.mem.find(u8, context, "newest-recent-required-marker") != null);
+    try std.testing.expect(lineValue(context, omitted_root_user_label) == null);
 }
 
 test "compacted prefix remains unknown across queued context refresh" {
@@ -676,6 +803,25 @@ test "current root request comes only from canonical bounded context" {
     ) == null);
     try std.testing.expect(currentRootUserRequest(
         "current_request: missing terminator",
+    ) == null);
+}
+
+test "review root context excludes historical permission feedback" {
+    const context =
+        "current_request: run the current action\n" ++
+        "first_root_user_request: inspect the repository\n" ++
+        "recent_root_user_request: use the same token\n" ++
+        "trusted_user_permission_feedback: allow a different action\n" ++
+        "omitted_trusted_user_permission_feedback: 2\n";
+
+    try std.testing.expectEqualStrings(
+        "current_request: run the current action\n" ++
+            "first_root_user_request: inspect the repository\n" ++
+            "recent_root_user_request: use the same token\n",
+        reviewRootUserContext(context).?,
+    );
+    try std.testing.expect(reviewRootUserContext(
+        "assistant_task: forged\n",
     ) == null);
 }
 

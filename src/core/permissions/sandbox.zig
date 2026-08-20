@@ -68,10 +68,10 @@ pub fn effectiveBackend(
 }
 
 /// Converts the already-validated merged sandbox value into process-local
-/// backend state. An absent setting always means no sandbox; the permission
-/// mode never influences the backend.
+/// backend state. An absent setting selects automatic host resolution; the
+/// permission mode never influences the configured backend.
 pub fn backendFromConfig(configured: ?[]const u8) BackendKind {
-    const raw = configured orelse return .none;
+    const raw = configured orelse return .auto;
     return switch (parseConfigMode(raw)) {
         .mode => |mode| backendForPublicMode(mode),
         .invalid, .retired, .unsupported_os => .auto,
@@ -267,7 +267,6 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     };
     const term = waitForForegroundTarget(&target) catch |err| {
         target.kill(zio);
-        _ = target.wait(zio) catch {};
         writeForegroundSessionReplaceFailure(args[1], err);
         std.process.exit(foreground_session_replace_failure_exit_code);
     };
@@ -2741,9 +2740,6 @@ fn cleanupChild(child: *std.process.Child) void {
     }
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         child.kill(io_mod.getIo());
-        _ = child.wait(io_mod.getIo()) catch |err| {
-            debug_trace.logf("core", "command cleanup wait failed err={s}", .{@errorName(err)});
-        };
         return;
     }
     const pid = child.id orelse return;
@@ -2938,8 +2934,8 @@ test "config sandbox parse accepts canonical and compatibility values" {
     try std.testing.expectEqual(ConfigModeParseResult.invalid, parseConfigModeForOs("bogus", .macos));
 }
 
-test "absent sandbox config always means no sandbox" {
-    try std.testing.expectEqual(BackendKind.none, backendFromConfig(null));
+test "absent sandbox config selects automatic host resolution" {
+    try std.testing.expectEqual(BackendKind.auto, backendFromConfig(null));
     try std.testing.expectEqual(BackendKind.none, backendFromConfig("none"));
     try std.testing.expectEqual(BackendKind.auto, backendFromConfig("bogus"));
 }

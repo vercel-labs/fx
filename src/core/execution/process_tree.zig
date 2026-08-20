@@ -312,14 +312,7 @@ pub const Tracker = struct {
             .{parent.pid},
         );
         defer self.alloc.free(task_path);
-        var task_dir = std.Io.Dir.openDirAbsolute(
-            io_mod.getIo(),
-            task_path,
-            .{ .iterate = true },
-        ) catch |err| switch (err) {
-            error.FileNotFound => return,
-            else => return err,
-        };
+        var task_dir = (try openLinuxProcDir(task_path)) orelse return;
         defer task_dir.close(io_mod.getIo());
         var tasks = task_dir.iterate();
         while (try tasks.next(io_mod.getIo())) |entry| {
@@ -344,10 +337,7 @@ pub const Tracker = struct {
             .{ parent.pid, tid },
         );
         defer self.alloc.free(path);
-        var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return,
-            else => return err,
-        };
+        var file = (try openLinuxProcFile(path)) orelse return;
         defer file.close(io_mod.getIo());
         var buffer: [64 * 1024]u8 = undefined;
         const read_len = readLinuxChildrenFile(file, &buffer) catch |err| switch (err) {
@@ -501,6 +491,49 @@ fn readLinuxChildrenFile(file: std.Io.File, buffer: []u8) !usize {
     }
 }
 
+fn openLinuxProcDir(path: []const u8) !?std.Io.Dir {
+    if (comptime builtin.os.tag != .linux) return error.ProcessTreeUnsupported;
+    // A process can disappear between identity validation and opening its
+    // procfs entry. The POSIX wrapper maps Linux's ESRCH to FileNotFound;
+    // std.Io currently treats ESRCH from directory opens as unexpected.
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{
+        .ACCMODE = .RDONLY,
+        .NOFOLLOW = true,
+        .DIRECTORY = true,
+        .CLOEXEC = true,
+    }, 0) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    return .{ .handle = fd };
+}
+
+fn openLinuxProcFile(path: []const u8) !?std.Io.File {
+    if (comptime builtin.os.tag != .linux) return error.ProcessTreeUnsupported;
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{
+        .ACCMODE = .RDONLY,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    }, 0) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    return .{
+        .handle = fd,
+        .flags = .{ .nonblocking = false },
+    };
+}
+
+test "Linux proc helpers treat missing process data as vanished" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try std.testing.expect(
+        (try openLinuxProcDir("/proc/self/fx-process-tree-missing")) == null,
+    );
+    try std.testing.expect(
+        (try openLinuxProcFile("/proc/self/fx-process-tree-missing")) == null,
+    );
+}
+
 test "process-group exclusion preserves the captured command grace" {
     try std.testing.expect(shouldSignalProcess(41, null));
     try std.testing.expect(!shouldSignalProcess(41, 41));
@@ -652,10 +685,7 @@ fn captureLinuxSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot
     if (comptime builtin.os.tag != .linux) return error.ProcessTreeUnsupported;
     const path = try std.fmt.allocPrint(alloc, "/proc/{d}/stat", .{pid});
     defer alloc.free(path);
-    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return error.ProcessNotFound,
-        else => return err,
-    };
+    var file = (try openLinuxProcFile(path)) orelse return error.ProcessNotFound;
     defer file.close(io_mod.getIo());
     var buffer: [4096]u8 = undefined;
     const read_len = try readLinuxProcFile(file, &buffer);

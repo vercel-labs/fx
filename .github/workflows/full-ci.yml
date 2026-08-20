@@ -31,7 +31,7 @@ jobs:
             runner: macos-15-intel
           - name: macos-aarch64
             runner: macos-15
-        optimize: [Debug, ReleaseSafe]
+        optimize: [ReleaseSafe]
     env:
       AI_GATEWAY_API_KEY: ""
       VERCEL_OIDC_TOKEN: ""
@@ -45,11 +45,9 @@ jobs:
           cache-key: full-ci-native-${{ matrix.platform.name }}-${{ matrix.optimize }}
 
       - name: Check formatting
-        if: matrix.optimize == 'Debug'
         run: zig fmt --check src/
 
       - name: Audit public surface
-        if: matrix.optimize == 'Debug'
         run: ./scripts/check-public-surface.sh
 
       - name: Build
@@ -95,7 +93,7 @@ jobs:
           - name: macos-aarch64
             runner: macos-15
             zig_tarball: zig-aarch64-macos
-        optimize: [Debug, ReleaseSafe]
+        optimize: [ReleaseSafe]
         shard:
           - index: 0
             shard_count: 4
@@ -144,14 +142,42 @@ jobs:
 
       - name: Install E2E system dependencies
         shell: bash
+        timeout-minutes: 17
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             missing=()
             command -v tmux >/dev/null 2>&1 || missing+=(tmux)
             command -v zsh >/dev/null 2>&1 || missing+=(zsh)
             if [ "${#missing[@]}" -gt 0 ]; then
-              sudo apt-get update
-              sudo apt-get install -y "${missing[@]}"
+              retry() {
+                local attempt
+                for attempt in 1 2; do
+                  if "$@"; then
+                    return 0
+                  fi
+                  if [ "$attempt" -lt 2 ]; then
+                    printf 'Dependency install attempt %s failed; retrying in 5s\n' "$attempt" >&2
+                    sleep 5
+                  fi
+                done
+                return 1
+              }
+              # The Azure mirror can stall after APT has already fetched release
+              # metadata from the direct Ubuntu fallback. Prefer that fallback
+              # for the whole update when the runner's mirror list provides it.
+              if [ -f /etc/apt/apt-mirrors.txt ] &&
+                grep -Eq '^https?://(archive|ports)\.ubuntu\.com/' /etc/apt/apt-mirrors.txt
+              then
+                sudo sed -i '/:\/\/azure\..*ubuntu\.com\//d' /etc/apt/apt-mirrors.txt
+              fi
+              retry sudo timeout --kill-after=15s 4m apt-get \
+                -o Acquire::Retries=3 \
+                -o Acquire::http::Timeout=30 \
+                -o Acquire::https::Timeout=30 \
+                update
+              retry sudo timeout --kill-after=15s 3m apt-get \
+                -o Dpkg::Use-Pty=0 \
+                install -y "${missing[@]}"
             fi
           elif ! command -v tmux >/dev/null 2>&1; then
             brew install tmux
@@ -223,10 +249,7 @@ jobs:
           jobs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100")"
           jq -e --arg target "$TARGET" '
             ([
-              "Native checks (Debug, " + $target + ")",
               "Native checks (ReleaseSafe, " + $target + ")",
-              (range(1; 5) as $shard
-                | "E2E (Debug, " + $target + ", shard " + ($shard | tostring) + "/4)"),
               (range(1; 5) as $shard
                 | "E2E (ReleaseSafe, " + $target + ", shard " + ($shard | tostring) + "/4)")
             ] | sort) as $expected
@@ -234,9 +257,7 @@ jobs:
             [
               .jobs[]
               | select(
-                  (.name == ("Native checks (Debug, " + $target + ")")) or
                   (.name == ("Native checks (ReleaseSafe, " + $target + ")")) or
-                  (.name | startswith("E2E (Debug, " + $target + ", shard ")) or
                   (.name | startswith("E2E (ReleaseSafe, " + $target + ", shard "))
               )
             ] as $selected

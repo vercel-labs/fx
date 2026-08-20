@@ -4198,8 +4198,9 @@ describe("acp: model-independent", () => {
       const blockedRoot = createIsolatedRoot("fx-acp-auto-file-check-");
       try {
         const acceptedTarget = join(acceptedRoot.external, "accepted.txt");
+        writeFileSync(acceptedTarget, "before");
         const acceptedPrompt =
-          `Use only the write_file tool to create ${acceptedTarget}.`;
+          `Use only the write_file tool to overwrite ${acceptedTarget}.`;
         const acceptedGateway = startFakeGateway([
           fileToolCall("write_external_accepted", acceptedTarget, "FX_ACP_AUTO_ACCEPTED"),
           finalText("ACP external write accepted"),
@@ -4244,8 +4245,9 @@ describe("acp: model-independent", () => {
         }
 
         const blockedTarget = join(blockedRoot.external, "blocked.txt");
+        writeFileSync(blockedTarget, "before");
         const blockedPrompt =
-          `Use only the write_file tool to create ${blockedTarget}.`;
+          `Use only the write_file tool to overwrite ${blockedTarget}.`;
         const blockedGateway = startFakeGateway([
           fileToolCall("write_external_blocked", blockedTarget, "FX_ACP_AUTO_BLOCKED"),
           finalText("ACP external write blocked"),
@@ -4271,7 +4273,7 @@ describe("acp: model-independent", () => {
             message.params.update.status === "failed"
           );
           expect(failedUpdateIndex).toBeGreaterThanOrEqual(0);
-          expect(existsSync(blockedTarget)).toBe(false);
+          expect(readFileSync(blockedTarget, "utf-8")).toBe("before");
           expect(blockedGateway.classifierRequests).toHaveLength(1);
           expect(blockedGateway.classifierRequests[0]!.body).toContain(
             blockedPrompt,
@@ -4283,6 +4285,93 @@ describe("acp: model-independent", () => {
         await client?.close();
         rmSync(acceptedRoot.root, { recursive: true, force: true });
         rmSync(blockedRoot.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP routes the post-threshold action through session/request_permission",
+    async () => {
+      const cases = [
+        { suffix: "allow", optionId: "allow_once" as const, executes: true },
+        { suffix: "reject", optionId: "reject_once" as const, executes: false },
+      ];
+
+      for (const testCase of cases) {
+        const root = createIsolatedRoot(`fx-acp-auto-threshold-${testCase.suffix}-`);
+        const target = join(root.external, `threshold-${testCase.suffix}.txt`);
+        writeFileSync(target, "before");
+        const fourthCallId = `${testCase.suffix}_threshold_call_4`;
+        const postRejectCallId = "reject_after_human_denial";
+        const postDecisionResponses = testCase.executes
+          ? []
+          : [(body: string) => {
+            expect(acpToolResultText(body, fourthCallId)).toContain("user_denied");
+            return fileToolCall(
+              postRejectCallId,
+              target,
+              "ACP_THRESHOLD_REJECTED_RETRY",
+            );
+          }];
+        const gateway = startFakeGateway([
+          ...Array.from({ length: 4 }, (_, index) => (body: string) => {
+            if (index > 0) expect(body).toContain("auto_denied");
+            if (index === 3) {
+              expect(body).not.toContain('"tools":[]');
+              expect(body).not.toContain('"toolChoice":{"type":"none"}');
+            }
+            return fileToolCall(
+              index === 3 ? fourthCallId : `${testCase.suffix}_threshold_call_${index + 1}`,
+              target,
+              `ACP_THRESHOLD_${testCase.suffix.toUpperCase()}`,
+            );
+          }),
+          ...postDecisionResponses,
+          finalText(`ACP threshold ${testCase.suffix} complete`),
+        ], { classifierDecision: "ask" });
+
+        try {
+          client = await AcpClient.create({
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway),
+          });
+          client.setPermissionOption(testCase.optionId);
+          await startCodeSession(client);
+          const result = await runPrompt(
+            client,
+            `Write the ACP threshold ${testCase.suffix} fixture.`,
+            TIMEOUT,
+          );
+
+          const permissions = result.messages.filter(
+            (message: any) => message.method === "session/request_permission",
+          );
+          expect(permissions).toHaveLength(1);
+          expect(permissions[0]!.params.toolCall.toolCallId).toBe(fourthCallId);
+          expect(gateway.classifierRequests).toHaveLength(testCase.executes ? 1 : 2);
+          expect(gateway.requests).toHaveLength(testCase.executes ? 5 : 6);
+          expect(existsSync(target)).toBe(true);
+          if (testCase.executes) {
+            expect(readFileSync(target, "utf8")).toBe("ACP_THRESHOLD_ALLOW");
+            expect(acpToolResultText(gateway.requests[4]!.body, fourthCallId)).not.toContain(
+              "tool_permission_denied",
+            );
+          } else {
+            expect(readFileSync(target, "utf8")).toBe("before");
+            expect(acpToolResultText(gateway.requests[4]!.body, fourthCallId)).toContain(
+              "user_denied",
+            );
+            expect(acpToolResultText(gateway.requests[5]!.body, postRejectCallId)).toContain(
+              "auto_denied",
+            );
+          }
+          expect(client.stderr).toBe("");
+        } finally {
+          await client?.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
       }
     },
     TIMEOUT,
@@ -4692,6 +4781,11 @@ describe("acp: model-independent", () => {
         expect(JSON.stringify(result.messages)).toContain("ACP needs one detail.");
         expect(JSON.stringify(result.messages)).toContain("ACP recovered normally.");
         expect(JSON.stringify(result.messages)).not.toContain("internal_error");
+        expect(
+          result.messages.some(
+            (message: any) => message.method === "session/request_permission",
+          ),
+        ).toBe(false);
         expect(gateway.requests).toHaveLength(2);
         expect(gateway.requests[1].body).toContain(`"toolCallId":"${malformedCallId}"`);
         expect(gateway.requests[1].body).toContain('"input":{}');

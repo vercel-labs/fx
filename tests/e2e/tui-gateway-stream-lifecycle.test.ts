@@ -5576,7 +5576,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/mcp reload");
-      await session.waitForText("MCP profile reloaded (ready, runtime ", TIMEOUT);
+      await session.waitForText("MCP configuration reloaded successfully.", TIMEOUT);
       const readyDeadline = Date.now() + TIMEOUT;
       let mcpStatus = "";
       const readyStatus = "fixture source=profile scope=profile policy=optional transport=stdio state=ready";
@@ -5768,7 +5768,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "minimal command summaries abbreviate the active workspace path",
+    "minimal command summaries hide no-op cwd prefixes and abbreviate the active workspace path",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-command-summary-")));
       const home = join(root, "home");
@@ -5804,7 +5804,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         JSON.stringify({ maxxing_mode: "minimal" }),
       );
 
-      const firstCommand = "printf TOOL_SUMMARY_FIRST_COMMAND";
+      const firstCommand = "cd . && printf TOOL_SUMMARY_FIRST_COMMAND";
+      const firstDisplayCommand = "printf TOOL_SUMMARY_FIRST_COMMAND";
       const nestedCommand = `cd ${nested} && pwd`;
       const thirdCommand = "printf TOOL_SUMMARY_THIRD_COMMAND";
       const finalText = "TOOL_SUMMARY_FINAL";
@@ -5850,6 +5851,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_TRACE_LOG: tracePath,
         FX_TRACE_SCOPES: "tool",
       };
+      const withoutWorkspaceStatusline = (text: string): string =>
+        text.split("\n").filter((line) =>
+          !(line.includes(workspace) && line.includes(" · "))
+        ).join("\n");
 
       session = await TmuxSession.create({
         cwd: workspace,
@@ -5868,8 +5873,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(compact).toContain(
         "Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink && pwd",
       );
-      expect(compact).not.toContain(workspace);
-      expect(countOccurrences(compact, `Ran ${firstCommand}`)).toBe(1);
+      expect(withoutWorkspaceStatusline(compact)).not.toContain(workspace);
+      expect(countOccurrences(compact, `Ran ${firstDisplayCommand}`)).toBe(1);
+      expect(compact).not.toContain(`Ran ${firstCommand}`);
       expect(countOccurrences(compact, `Ran ${thirdCommand}`)).toBe(1);
 
       await session.resizeWindow(80, 24);
@@ -5879,8 +5885,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(review).toContain(
         "├ Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
       );
+      expect(review).toContain(`├ Ran ${firstDisplayCommand}`);
+      expect(review).not.toContain(`Ran ${firstCommand}`);
       expect(review).toContain("● 3 tool calls · 3 commands");
-      expect(review).not.toContain(workspace);
+      expect(withoutWorkspaceStatusline(review)).not.toContain(workspace);
 
       await session.sendKeys("Right");
       const full = await session.waitForText("Full detail · ←/→ switch · ctrl o close", TIMEOUT);
@@ -5888,7 +5896,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.sendKeys("PPage");
       const fullAtSummary = await session.waitForText("● 3 tool calls · 3 commands", TIMEOUT);
       expect(fullAtSummary).toContain("● 3 tool calls · 3 commands");
-      expect(fullAtSummary).not.toContain(workspace);
+      expect(withoutWorkspaceStatusline(fullAtSummary)).not.toContain(workspace);
 
       const trace = readFileSync(tracePath, "utf8");
       for (const callId of [
@@ -5927,7 +5935,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(resumed).toContain(
         "Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink && pwd",
       );
-      expect(resumed).not.toContain(workspace);
+      expect(resumed).toContain(`Ran ${firstDisplayCommand}`);
+      expect(resumed).not.toContain(`Ran ${firstCommand}`);
+      expect(withoutWorkspaceStatusline(resumed)).not.toContain(workspace);
       expect(summaryGateway.requests).toHaveLength(2);
       expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
     },

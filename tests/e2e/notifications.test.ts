@@ -84,6 +84,22 @@ async function waitForTrace(
   throw new Error(`Timed out waiting for notification trace.\n${trace}`);
 }
 
+function bellCount(path: string) {
+  if (!existsSync(path)) return 0;
+  return [...readFileSync(path)].filter((byte) => byte === 0x07).length;
+}
+
+async function waitForBellCount(path: string, expected: number) {
+  const started = Date.now();
+  while (Date.now() - started < TIMEOUT) {
+    if (bellCount(path) === expected) return;
+    await Bun.sleep(50);
+  }
+  throw new Error(
+    `Timed out waiting for ${expected} terminal bell(s); received ${bellCount(path)}.`,
+  );
+}
+
 function handlerStartCount(trace: string, lifecycleEvent: string) {
   return trace
     .split("\n")
@@ -304,7 +320,12 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "notifications sound handler runs once when a real permission blocks",
   async () => {
-    const fixture = createNotificationRoot();
+    // Keep direct interaction sounds off so the raw pane capture isolates the
+    // attention-required transition.
+    const fixture = createNotificationRoot({
+      turn_end: false,
+      attention_required: true,
+    });
     const marker = join(fixture.workspace, "permission-marker.txt");
     const gateway = startFakeGateway([
       fakeGatewayToolCall("permission_1", "terminal", {
@@ -315,7 +336,9 @@ test.skipIf(!tmuxAvailable())(
     ]);
     const tracePath = join(fixture.root, "trace.log");
     const stderrPath = join(fixture.root, "stderr.log");
+    const paneOutputPath = join(fixture.root, "pane-output.bin");
     writeFileSync(stderrPath, "");
+    writeFileSync(paneOutputPath, "");
     let session: TmuxSession | null = null;
     try {
       session = await TmuxSession.create({
@@ -325,6 +348,7 @@ test.skipIf(!tmuxAvailable())(
         stderrPath,
       });
       await session.waitForComposer(TIMEOUT);
+      session.startPaneOutputCapture(paneOutputPath);
       await session.sendText("Try the prepared command.");
       await session.waitForText(COMMAND_APPROVAL_PROMPT, TIMEOUT);
       const waitingTrace = await waitForTrace(
@@ -335,6 +359,9 @@ test.skipIf(!tmuxAvailable())(
       expect(handlerStartCount(waitingTrace, "AttentionRequired")).toBe(1);
       expect(waitingTrace).toContain("handler=fx.sound.attention_required");
       expect(existsSync(marker)).toBe(false);
+      await waitForBellCount(paneOutputPath, 1);
+      await Bun.sleep(250);
+      expect(bellCount(paneOutputPath)).toBe(1);
 
       await session.sendKeys("3");
       await session.waitForText("NOTIFICATION_PERMISSION_COMPLETE", TIMEOUT);

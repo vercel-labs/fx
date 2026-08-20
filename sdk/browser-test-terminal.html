@@ -36,13 +36,46 @@
     let runtime;
     let inputTaskRan = false;
     let inputTaskChunkCount;
+    let fetchCount = 0;
+    let activeClearFetchAborted = false;
+    let activeClearSessionRendered = false;
+    let activeClearFollowupFresh = false;
     let signalFetchStarted;
     let releaseBufferedStream;
     let finishBufferedStream;
     const fetchStarted = new Promise((resolve) => { signalFetchStarted = resolve; });
     const bufferedStreamReleased = new Promise((resolve) => { releaseBufferedStream = resolve; });
     const bufferedStreamFinished = new Promise((resolve) => { finishBufferedStream = resolve; });
-    const mockFetch = async () => {
+    const completedResponse = (text) => {
+      let sent = false;
+      return new Response(new ReadableStream({
+        pull(controller) {
+          if (sent) return;
+          sent = true;
+          controller.enqueue(encoded.encode(`data: ${JSON.stringify({ type: "text-delta", id: "browser_followup_1", delta: text })}\n\n`));
+          controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":1}}}\n\n'));
+          controller.enqueue(encoded.encode("data: [DONE]\n\n"));
+          controller.close();
+        },
+      }), { status: 200, headers: { "content-type": "text/event-stream" } });
+    };
+    const mockFetch = async (_url, init) => {
+      fetchCount += 1;
+      const requestBody = new TextDecoder().decode(init.body);
+      if (fetchCount === 2) {
+        return new Promise((_, reject) => {
+          init.signal.addEventListener("abort", () => {
+            activeClearFetchAborted = true;
+            reject(new DOMException("aborted", "AbortError"));
+          }, { once: true });
+        });
+      }
+      if (fetchCount > 2) {
+        activeClearFollowupFresh = requestBody.includes("follow-up prompt") &&
+          !requestBody.includes("clear active turn") &&
+          !requestBody.includes("STREAM_STARTED");
+        return completedResponse("BROWSER_FOLLOWUP_OK");
+      }
       signalFetchStarted();
       return new Response(new ReadableStream({
         async pull(controller) {
@@ -106,6 +139,31 @@
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     runtime.write("\x7f".repeat(liveDraft.length));
+    const freshWelcomeOffset = output.length;
+    testState.stage = "starting-active-clear";
+    runtime.write("clear active turn\r");
+    const activeDeadline = performance.now() + 10000;
+    while (fetchCount < 2 || !output.includes("Thinking")) {
+      if (performance.now() >= activeDeadline) throw new Error("active clear prompt did not start");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    testState.stage = "clearing-active-turn";
+    runtime.write("/clear\r");
+    while (!activeClearFetchAborted) {
+      if (performance.now() >= activeDeadline) throw new Error("active clear did not abort browser fetch");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    while (!output.slice(freshWelcomeOffset).includes("Run /help for commands")) {
+      if (performance.now() >= activeDeadline) throw new Error("active clear did not render a fresh session");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    activeClearSessionRendered = true;
+    testState.stage = "running-followup";
+    runtime.write("follow-up prompt\r");
+    while (fetchCount < 3 || !activeClearFollowupFresh) {
+      if (performance.now() >= activeDeadline) throw new Error("browser follow-up did not start with fresh session history");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     runtime.write("/exit\r");
     const code = await runtime.exited;
     window.__fxBrowserTerminalTest = {
@@ -114,6 +172,9 @@
       output,
       inputTaskRanDuringStream,
       draftRenderedDuringStream,
+      activeClearFetchAborted,
+      activeClearSessionRendered,
+      activeClearFollowupFresh,
       dataListeners: dataListeners.size,
       resizeListeners: resizeListeners.size,
     };

@@ -707,6 +707,70 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
+    "fx ask recovers when the model rejects the post-Vision prompt as assistant prefill",
+    async () => {
+      const root = createIsolatedRoot();
+      const fixture = createScopedImageFixture(root);
+      const prefillRejection = new Response(
+        JSON.stringify({
+          error: {
+            message:
+              "AI_APICallError: This model does not support assistant message prefill. " +
+              "The conversation must end with a user message.",
+          },
+        }),
+        { status: 400, headers: { "content-type": "application/json" } },
+      );
+      const gateway = startImageGateway([
+        sseToolCall(
+          "vision",
+          { image_ids: [1], focus: "describe the image" },
+          "vision_prefill_recovery",
+        ),
+        sseText(VISION_RESULT),
+        prefillRejection,
+        sseText("Recovered final image answer"),
+      ]);
+      try {
+        const result = await runFx(
+          [
+            "ask",
+            "--json",
+            "--no-save",
+            "--no-color",
+            "--image",
+            fixture.imagePath,
+            "Describe the attached image.",
+          ],
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway, GLM_MODEL),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        const json = parseFxJson(result);
+        expect(json.exit_code).toBe(0);
+        expect(json.output).toContain("Recovered final image answer");
+        expect(gateway.chatRequests).toHaveLength(4);
+
+        const rejectedPrompt = JSON.parse(gateway.chatRequests[2].body).prompt;
+        expect(rejectedPrompt.at(-1)).toMatchObject({ role: "tool" });
+        const retryPrompt = JSON.parse(gateway.chatRequests[3].body).prompt;
+        expect(retryPrompt.at(-1)).toMatchObject({ role: "user" });
+        expect(JSON.stringify(retryPrompt.at(-1))).toContain(
+          "Continue from the preceding tool result.",
+        );
+        expect(result.stderr).toBe("Inspecting images\n");
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "fx ask executes path-source Vision and cleans transient snapshots without failure telemetry",
     async () => {
       const root = createIsolatedRoot();

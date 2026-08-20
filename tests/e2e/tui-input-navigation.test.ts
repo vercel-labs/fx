@@ -69,7 +69,7 @@ async function startFx(
   mkdirSync(join(testHome, ".fx"), { recursive: true });
   writeFileSync(
     join(testHome, ".fx", "settings.json"),
-    JSON.stringify({ maxxing_mode: "legacy" }),
+    JSON.stringify({ maxxing_mode: "legacy", sandbox: "none" }),
   );
   if (withGateway) {
     gateway = startFakeGateway(
@@ -323,6 +323,33 @@ tmuxTest(
 
     await active.sendKeys("Enter");
     await active.waitForText("Commands 39", READY_TIMEOUT);
+    await active.sendKeys("Escape");
+    await active.waitForText("Run /help for commands", READY_TIMEOUT);
+    expect(active.isAlive()).toBe(true);
+    expectCleanStderr();
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "unknown terminal escape sequences leave the command catalog open",
+  async () => {
+    const active = await startFx(80, 24);
+    await active.sendText("/help");
+    await active.waitForPane(
+      (pane) =>
+        pane.includes("/help") &&
+        pane.includes("/quit") &&
+        !pane.includes("Run /help for commands"),
+      READY_TIMEOUT,
+    );
+
+    await active.sendHexBytes(hexSeq("\x1b[>0q"));
+    const afterUnknown = await active.capturePane();
+    expect(afterUnknown).toContain("/help");
+    expect(afterUnknown).toContain("/quit");
+    expect(afterUnknown).not.toContain("Run /help for commands");
+
     await active.sendKeys("Escape");
     await active.waitForText("Run /help for commands", READY_TIMEOUT);
     expect(active.isAlive()).toBe(true);

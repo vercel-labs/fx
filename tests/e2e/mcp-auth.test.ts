@@ -1790,7 +1790,10 @@ describe("MCP remote authentication lifecycle", () => {
       profile.mcp.fixture.oauth.issuer = origin;
       writeFileSync(profilePath, JSON.stringify(profile));
       await tui.sendText("/mcp reload");
-      await tui.waitForText("MCP profile reloaded", 15_000);
+      await tui.waitForText(
+        "MCP configuration reloaded, but server 'fixture' is unavailable.",
+        15_000,
+      );
       await tui.sendText("/mcp auth fixture --open");
       await tui.waitForText("Authenticated MCP server 'fixture'.", 15_000);
       expect(auth.authorizationRequests).toBe(1);

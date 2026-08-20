@@ -13,7 +13,7 @@ const validateSessionId = paths.validateSessionId;
 const SessionSummary = store_types.SessionSummary;
 const summaryFromState = discovery.summaryFromState;
 const freeSummaries = summary_codec.freeSummaries;
-const readSessionIndex = summary_codec.readSessionIndex;
+const readSessionIndexForRepair = summary_codec.readSessionIndexForRepair;
 const removeSessionIndexMarker = summary_codec.removeSessionIndexMarker;
 const replaceIndexedSummary = summary_codec.replaceIndexedSummary;
 const writeSessionIndex = summary_codec.writeSessionIndex;
@@ -128,7 +128,8 @@ pub const LatestCache = struct {
                 latest_sessions_lock_file,
                 commit_lock_deadline_ms,
             ) catch |err| return switch (err) {
-                error.LockBusy, error.LockUnsupported => error.SessionCommitBoundaryUnavailable,
+                error.LockBusy => error.LatestCacheLockBusy,
+                error.LockUnsupported => error.SessionCommitBoundaryUnavailable,
                 else => err,
             };
         }
@@ -165,7 +166,7 @@ pub const LatestCache = struct {
             .preserve => {},
             .maintain, .replace_latest_if_current => {
                 if (self.prior_index == null) {
-                    self.prior_index = readSessionIndex(alloc, &self.sessions) catch |err| switch (err) {
+                    self.prior_index = readSessionIndexForRepair(alloc, &self.sessions) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => null,
                     };
@@ -181,10 +182,45 @@ pub const LatestCache = struct {
         try self.test_controls.boundary(.after_latest_cache_pending);
     }
 
+    pub fn writeDeferredToken(
+        self: *LatestCache,
+        alloc: Allocator,
+        session_id: []const u8,
+        workspace_root: []const u8,
+        position: session_log.CommitPosition,
+    ) !void {
+        try validateSessionId(session_id);
+        const encoded = try summary_codec.encodeDeferredCacheToken(
+            alloc,
+            session_id,
+            workspace_root,
+            position,
+        );
+        defer alloc.free(encoded);
+
+        var latest = try io_mod.openOrCreateVerifiedPrivateDir(
+            &self.sessions,
+            latest_sessions_dir,
+        );
+        defer latest.close();
+        var deferred = try io_mod.openOrCreateVerifiedPrivateDir(
+            &latest,
+            deferred_cache_dir,
+        );
+        defer deferred.close();
+        try io_mod.durableReplaceVerified(
+            alloc,
+            &deferred,
+            session_id,
+            encoded,
+        );
+    }
+
     pub fn publish(
         self: *LatestCache,
         alloc: Allocator,
         state: session_codec.DurableSessionState,
+        position: session_log.CommitPosition,
     ) !void {
         defer self.releaseLock();
         defer self.clearPreparedState(alloc);
@@ -261,6 +297,27 @@ pub const LatestCache = struct {
             try writeSessionIndex(alloc, &self.sessions, index.items);
             try removeSessionIndexMarker(&self.sessions);
         }
+        try self.clearDeferredTokenIfCovered(
+            alloc,
+            state.id,
+            position,
+        );
+    }
+
+    fn clearDeferredTokenIfCovered(
+        self: *LatestCache,
+        alloc: Allocator,
+        session_id: []const u8,
+        position: session_log.CommitPosition,
+    ) !void {
+        var token = (try summary_codec.readDeferredCacheToken(
+            alloc,
+            &self.sessions,
+            session_id,
+        )) orelse return;
+        defer token.deinit(alloc);
+        if (!commitPositionCovers(position, token.position)) return;
+        try removeDeferredToken(&self.sessions, session_id);
     }
 
     fn abort(self: *LatestCache) void {
@@ -313,6 +370,8 @@ pub const LatestCache = struct {
 };
 
 pub const latest_sessions_dir = "latest";
+
+pub const deferred_cache_dir = summary_codec.deferred_cache_dir;
 
 pub const latest_sessions_lock_file = "latest.lock";
 
@@ -384,6 +443,105 @@ fn latestCandidateNewer(
     return std.mem.order(u8, left.session_id, right.session_id) == .gt;
 }
 
+pub fn commitPositionCovers(
+    current: session_log.CommitPosition,
+    target: session_log.CommitPosition,
+) bool {
+    if (!std.mem.eql(u8, &current.log_generation, &target.log_generation)) {
+        return true;
+    }
+    if (current.through_seq != target.through_seq) {
+        return current.through_seq > target.through_seq;
+    }
+    return std.mem.eql(
+        u8,
+        &current.through_event_id,
+        &target.through_event_id,
+    ) and current.through_event_log_bytes >= target.through_event_log_bytes;
+}
+
+fn deferredTokensEqual(
+    left: summary_codec.DeferredCacheToken,
+    right: summary_codec.DeferredCacheToken,
+) bool {
+    return std.mem.eql(u8, left.session_id, right.session_id) and
+        std.mem.eql(u8, left.workspace_root, right.workspace_root) and
+        std.meta.eql(left.position, right.position);
+}
+
+pub fn removeDeferredToken(
+    sessions: *const io_mod.VerifiedDir,
+    session_id: []const u8,
+) !void {
+    try validateSessionId(session_id);
+    var latest = sessions.dir.openDir(io_mod.getIo(), latest_sessions_dir, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        error.NotDir, error.SymLinkLoop => return error.InvalidSessionIndex,
+        else => return err,
+    };
+    defer latest.close(io_mod.getIo());
+    var deferred = latest.openDir(io_mod.getIo(), deferred_cache_dir, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        error.NotDir, error.SymLinkLoop => return error.InvalidSessionIndex,
+        else => return err,
+    };
+    defer deferred.close(io_mod.getIo());
+    deferred.deleteFile(io_mod.getIo(), session_id) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    try io_mod.syncVerifiedDir(deferred);
+}
+
+pub fn clearObservedDeferredToken(
+    alloc: Allocator,
+    sessions: *const io_mod.VerifiedDir,
+    expected: summary_codec.DeferredCacheToken,
+) !void {
+    var session_dir = sessions.dir.openDir(io_mod.getIo(), expected.session_id, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => {
+            var current = (try summary_codec.readDeferredCacheToken(
+                alloc,
+                sessions,
+                expected.session_id,
+            )) orelse return;
+            defer current.deinit(alloc);
+            if (deferredTokensEqual(expected, current)) {
+                try removeDeferredToken(sessions, expected.session_id);
+            }
+            return;
+        },
+        error.NotDir, error.SymLinkLoop => return,
+        else => return err,
+    };
+    defer session_dir.close(io_mod.getIo());
+    var verified = io_mod.VerifiedDir{ .dir = session_dir };
+    var session_lock = io_mod.acquireTimedAdvisoryLock(
+        &verified,
+        "session.lock",
+        0,
+    ) catch return;
+    defer session_lock.release();
+
+    var current = (try summary_codec.readDeferredCacheToken(
+        alloc,
+        sessions,
+        expected.session_id,
+    )) orelse return;
+    defer current.deinit(alloc);
+    if (!deferredTokensEqual(expected, current)) return;
+    try removeDeferredToken(sessions, expected.session_id);
+}
+
 /// Commit-lifecycle `prepare` thunk: recovers the `LatestCache` from the opaque
 /// context and begins the pending phase for the previous/next workspace roots.
 pub fn latestCachePrepare(
@@ -404,14 +562,33 @@ pub fn latestCachePrepare(
     );
 }
 
+/// Commit-lifecycle deferred-publication thunk: persists the proposed
+/// canonical boundary before the watermark can advance.
+pub fn latestCacheWriteDeferred(
+    raw: ?*anyopaque,
+    alloc: Allocator,
+    session_id: []const u8,
+    workspace_root: []const u8,
+    position: session_log.CommitPosition,
+) !void {
+    const cache: *LatestCache = @ptrCast(@alignCast(raw orelse return error.SessionStoreUnavailable));
+    try cache.writeDeferredToken(
+        alloc,
+        session_id,
+        workspace_root,
+        position,
+    );
+}
+
 /// Commit-lifecycle `publish` thunk: writes the ready pointer for the committed state.
 pub fn latestCachePublish(
     raw: ?*anyopaque,
     alloc: Allocator,
     state: session_codec.DurableSessionState,
+    position: session_log.CommitPosition,
 ) !void {
     const cache: *LatestCache = @ptrCast(@alignCast(raw orelse return error.SessionStoreUnavailable));
-    try cache.publish(alloc, state);
+    try cache.publish(alloc, state, position);
 }
 
 /// Commit-lifecycle `abort` thunk: releases the cache lock without publishing.

@@ -638,16 +638,6 @@ pub fn Runtime(comptime App: type) type {
                             },
                         }
                     },
-                    .unrecognized_escape => |unrecognized| {
-                        if (unrecognized.cancel_pending) {
-                            // Dismiss approval with cancellation to avoid duplicate notices.
-                            if (app.approval_prompt.isActive()) {
-                                try approval_rt.cancelApprovalOperation(app);
-                            } else {
-                                try interrupt_rt.cancelActiveOperation(app);
-                            }
-                        }
-                    },
                 }
             }
             return replay_byte;
@@ -668,7 +658,7 @@ pub fn Runtime(comptime App: type) type {
                         disarmCtrlCExit(app, "semantic_action");
                         try resolveEscape(app, decoded.cancel_pending, now);
                     },
-                    .paste_byte, .raw, .unrecognized_escape => unreachable,
+                    .paste_byte, .raw => unreachable,
                 }
             }
         }
@@ -6676,6 +6666,33 @@ test "app_input_runtime model picker commits a model without options directly" {
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
 }
 
+test "app_input_runtime model picker skips effort stage for reasoning model without tiers" {
+    const alloc = std.testing.allocator;
+    const model = "deepseek/deepseek-v4-pro-0813";
+    const completions = [_][]const u8{model};
+
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.model_completion_values = &completions;
+    app.gateway_metadata_model = model;
+    app.gateway_metadata = .{ .supports_reasoning = true };
+    try app.input_runtime.textReplacementState().replace(alloc, "/model ");
+
+    const capabilities = app.resolvedModelCapabilities(model);
+    try std.testing.expect(capabilities.supports_reasoning);
+    try std.testing.expectEqual(@as(usize, 0), capabilities.reasoning_efforts.len);
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    try std.testing.expectEqualStrings(model, app.selected_model.items);
+    try std.testing.expectEqual(ModelPickerStage.model, app.input_runtime.picker.model_picker_stage);
+    try std.testing.expect(!app.input_runtime.picker.hasPendingModelPickerSelection());
+    try std.testing.expect(app.last_preference_effort == null);
+    try std.testing.expect(app.last_preference_fast_mode == null);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+}
+
 test "app_input_runtime model picker exposes opaque Gateway reasoning effort" {
     const alloc = std.testing.allocator;
     const completions = [_][]const u8{"provider/new-reasoning-model"};
@@ -9867,7 +9884,7 @@ test "app_input_runtime pending Ctrl-C exits before repeating active cancellatio
     try std.testing.expectEqualStrings("", app.transcript.items);
 }
 
-test "app_input_runtime expired incomplete escape keeps approval cancellation behavior" {
+test "app_input_runtime expired incomplete control sequence preserves approval" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -9881,9 +9898,23 @@ test "app_input_runtime expired incomplete escape keeps approval cancellation be
     try Runtime(RoutingFakeApp).flushPendingEscape(&app, 0);
 
     try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
-    try std.testing.expect(!app.approval_prompt.isActive());
-    try std.testing.expect(app.worker.cancel_requested);
+    try std.testing.expect(app.approval_prompt.isActive());
+    try std.testing.expect(!app.worker.cancel_requested);
     try std.testing.expect(app.worker.submitted_permission == null);
+}
+
+test "app_input_runtime complete unknown control sequence preserves active operation" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.stream.active = true;
+
+    try feedRoutingBytes(&app, "\x1b[>0q");
+
+    try std.testing.expect(app.stream.active);
+    try std.testing.expect(!app.worker.cancel_requested);
+    try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
 }
 
 test "app_input_runtime refreshes the pending escape deadline on decoder progress" {

@@ -271,6 +271,34 @@ const SkillEntry = struct {
     linked: bool,
 };
 
+/// Deduplicates filesystem aliases without collapsing distinct skills that
+/// share metadata names. Ordered discovery makes the first logical root the
+/// stable source and display path for each canonical candidate directory.
+const CanonicalSkillPaths = struct {
+    paths: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn deinit(self: *CanonicalSkillPaths, alloc: Allocator) void {
+        var keys = self.paths.keyIterator();
+        while (keys.next()) |path| alloc.free(@constCast(path.*));
+        self.paths.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn remember(self: *CanonicalSkillPaths, alloc: Allocator, logical_path: []const u8) !bool {
+        const canonical_path = io_mod.realpathAlloc(alloc, logical_path) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return true;
+        };
+        if (self.paths.contains(canonical_path)) {
+            alloc.free(canonical_path);
+            return false;
+        }
+        errdefer alloc.free(canonical_path);
+        try self.paths.put(alloc, canonical_path, {});
+        return true;
+    }
+};
+
 pub fn loadVisibleSkills(
     alloc: Allocator,
     workspace_root: ?[]const u8,
@@ -288,6 +316,8 @@ pub fn loadVisibleSkills(
         for (diagnostics.items) |diagnostic| alloc.free(diagnostic.path);
         diagnostics.deinit(alloc);
     }
+    var canonical_skill_paths: CanonicalSkillPaths = .{};
+    defer canonical_skill_paths.deinit(alloc);
 
     var roots: std.ArrayList(SkillRoot) = .empty;
     defer {
@@ -310,7 +340,7 @@ pub fn loadVisibleSkills(
     }
 
     for (roots.items) |root| {
-        try appendSkillsFromDir(alloc, &skills, &diagnostics, root);
+        try appendSkillsFromDir(alloc, &skills, &diagnostics, &canonical_skill_paths, root);
     }
 
     const owned_skills = try skills.toOwnedSlice(alloc);
@@ -394,6 +424,7 @@ fn appendSkillsFromDir(
     alloc: Allocator,
     skills: *std.ArrayList(Skill),
     diagnostics: ?*std.ArrayList(SkillDiagnostic),
+    canonical_skill_paths: *CanonicalSkillPaths,
     root: SkillRoot,
 ) !void {
     var dir = (if (root.read_authority) |read_authority|
@@ -437,7 +468,7 @@ fn appendSkillsFromDir(
     }.lessThan);
 
     for (entries.items) |entry| {
-        try appendSkillCandidate(alloc, skills, diagnostics, root, &dir, entry.name, entry.linked);
+        try appendSkillCandidate(alloc, skills, diagnostics, canonical_skill_paths, root, &dir, entry.name, entry.linked);
     }
 }
 
@@ -467,6 +498,7 @@ fn appendSkillCandidate(
     alloc: Allocator,
     skills: *std.ArrayList(Skill),
     diagnostics: ?*std.ArrayList(SkillDiagnostic),
+    canonical_skill_paths: *CanonicalSkillPaths,
     root: SkillRoot,
     root_dir: *std.Io.Dir,
     entry_name: []const u8,
@@ -511,6 +543,8 @@ fn appendSkillCandidate(
         return;
     };
     defer file.close(io_mod.getIo());
+
+    if (!try canonical_skill_paths.remember(alloc, candidate_path)) return;
 
     const inspection = try inspectSkillCandidateFile(alloc, &file, entry_name);
     const candidate = switch (inspection) {
@@ -2439,6 +2473,89 @@ test "loadVisibleSkills preserves root-distinct duplicate skill names" {
     try std.testing.expectEqual(SkillSource.global_agents, skills[3].source);
     try std.testing.expectEqual(@as(usize, 4), skillMenuFilterQueryCount(skills, .all, "review"));
     try std.testing.expectEqual(@as(usize, 3), skillMenuFilterQueryCount(skills, .agents, "review"));
+}
+
+test "loadVisibleSkills deduplicates symlinked workspace and global roots while preserving physical same-name candidates" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(
+        &tmp,
+        "home/workspace/.agents/skills/alpha/SKILL.md",
+        "---\nname: review\ndescription: alpha workflow\n---\n\nalpha body\n",
+    );
+    try writeTempFile(
+        &tmp,
+        "home/workspace/.agents/skills/beta/SKILL.md",
+        "---\nname: review\ndescription: beta workflow\n---\n\nbeta body\n",
+    );
+    try writeTempFile(
+        &tmp,
+        "home/.agents/skills/global/SKILL.md",
+        "---\nname: review\ndescription: global workflow\n---\n\nglobal body\n",
+    );
+    try createTempSymlinkOrSkip(
+        &tmp,
+        "../.agents/skills",
+        "home/workspace/.claude/skills",
+    );
+    try createTempSymlinkOrSkip(
+        &tmp,
+        "../.agents/skills",
+        "home/.claude/skills",
+    );
+
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+    defer alloc.free(workspace_root);
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const unused_managed_root = try std.fs.path.join(alloc, &.{ home_root, ".fx/skills" });
+    defer alloc.free(unused_managed_root);
+
+    const workspace_roots = [_]skill_contract.RootSpec{
+        .{ .source = .workspace_claude, .path = ".claude/skills" },
+        .{ .source = .workspace_agents, .path = ".agents/skills" },
+    };
+    const global_roots = [_]skill_contract.RootSpec{
+        .{ .source = .global_claude, .path = ".claude/skills" },
+        .{ .source = .global_agents, .path = ".agents/skills" },
+    };
+    const root_policy: skill_contract.RootPolicy = .{
+        .workspace_roots = &workspace_roots,
+        .managed_root_source = null,
+        .global_roots = &global_roots,
+    };
+
+    var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, unused_managed_root, root_policy);
+    defer discovery.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), discovery.skills.len);
+    try std.testing.expectEqualStrings("review", discovery.skills[0].name);
+    try std.testing.expectEqualStrings("alpha workflow", discovery.skills[0].description);
+    try std.testing.expectEqual(SkillSource.workspace_claude, discovery.skills[0].source);
+    try std.testing.expectEqualStrings("review", discovery.skills[1].name);
+    try std.testing.expectEqualStrings("beta workflow", discovery.skills[1].description);
+    try std.testing.expectEqual(SkillSource.workspace_claude, discovery.skills[1].source);
+    try std.testing.expectEqualStrings("review", discovery.skills[2].name);
+    try std.testing.expectEqualStrings("global workflow", discovery.skills[2].description);
+    try std.testing.expectEqual(SkillSource.global_claude, discovery.skills[2].source);
+
+    const alpha_alias = try std.fs.path.join(alloc, &.{ workspace_root, ".claude/skills/alpha" });
+    defer alloc.free(alpha_alias);
+    const beta_alias = try std.fs.path.join(alloc, &.{ workspace_root, ".claude/skills/beta" });
+    defer alloc.free(beta_alias);
+    const global_alias = try std.fs.path.join(alloc, &.{ home_root, ".claude/skills/global" });
+    defer alloc.free(global_alias);
+    try std.testing.expectEqualStrings(alpha_alias, discovery.skills[0].path);
+    try std.testing.expectEqualStrings(beta_alias, discovery.skills[1].path);
+    try std.testing.expectEqualStrings(global_alias, discovery.skills[2].path);
+    try std.testing.expectEqual(SkillResolution.ambiguous_name, resolveSkill(discovery.skills, "review", null));
+    switch (resolveSkill(discovery.skills, "review", beta_alias)) {
+        .found => |skill| try std.testing.expectEqualStrings("beta workflow", skill.description),
+        else => return error.TestExpectedExactSkill,
+    }
+    try std.testing.expectEqual(@as(usize, 0), discovery.diagnostics.len);
 }
 
 test "loadVisibleSkills stops ancestor walking before home and keeps home agents global" {

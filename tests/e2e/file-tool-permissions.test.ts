@@ -157,6 +157,7 @@ describe("external file permissions", () => {
         const allowedTarget = join(root.external, "allowed-write.txt");
         const tracePath = join(root.root, "permission-trace.log");
         writeFileSync(readTarget, "FX_E2E_EXTERNAL_READ\n");
+        writeFileSync(classifiedTarget, "before");
         writeFileSync(join(root.home, ".fx", "settings.json"), "{}");
 
         const { result: readResult } = await runWithFakeGateway(
@@ -185,7 +186,7 @@ describe("external file permissions", () => {
               "--json",
               "--no-save",
               "--auto",
-              `Use only the write_file tool to create ${classifiedTarget} with exactly this content: FX_E2E_EXTERNAL_CLASSIFIED.`,
+              `Use only the write_file tool to overwrite ${classifiedTarget} with exactly this content: FX_E2E_EXTERNAL_CLASSIFIED.`,
             ],
             [
               fakeGatewayToolCall("classified_write_1", "write_file", {

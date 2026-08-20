@@ -1979,7 +1979,7 @@ test "loadStartupState applies core env overrides" {
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, state.credential.?.source);
     try std.testing.expectEqual(PermissionMode.auto, state.permission_mode);
     try std.testing.expectEqual(@as(usize, 37), state.agent_step_limit);
-    try std.testing.expectEqual(sandbox.BackendKind.none, state.sandbox_backend);
+    try std.testing.expectEqual(sandbox.BackendKind.auto, state.sandbox_backend);
 }
 
 test "loadStartupState defaults fast mode off and preserves explicit preferences" {

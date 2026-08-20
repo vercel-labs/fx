@@ -54,6 +54,7 @@ TRAINING_E2E_TESTS = (
 
 VERIFICATION_E2E_TESTS = (
     "auto-mode-reliability.test.ts",
+    "oauth-keychain-migration.test.ts",
     "tui-auth-source-selection.test.ts",
     "tui-composer-edit-contracts.test.ts",
     "tui-cost.test.ts",
@@ -275,6 +276,29 @@ class PgsoCorpusTests(unittest.TestCase):
                 with self.assertRaises(PgsoError):
                     load_corpus(self.write_manifest(payload), repo_root=self.root)
 
+    def test_load_rejects_invalid_profile_runs(self) -> None:
+        for value in (True, 0, 101, 1.5):
+            with self.subTest(value=value):
+                payload = self.manifest()
+                scenarios = payload["scenarios"]
+                assert isinstance(scenarios, list)
+                scenarios[-1]["profile_runs"] = value
+                with self.assertRaisesRegex(PgsoError, "profile_runs"):
+                    load_corpus(self.write_manifest(payload), repo_root=self.root)
+
+    def test_load_rejects_profile_runs_for_e2e_scenarios(self) -> None:
+        test_file = "profile-repeat.test.ts"
+        (self.root / "tests" / "e2e" / test_file).write_text("test")
+        payload = self.manifest()
+        scenarios = payload["scenarios"]
+        assert isinstance(scenarios, list)
+        scenario = self.e2e_scenario(test_file)
+        scenario["profile_runs"] = 2
+        scenarios.append(scenario)
+
+        with self.assertRaisesRegex(PgsoError, "profile_runs"):
+            load_corpus(self.write_manifest(payload), repo_root=self.root)
+
     def test_load_rejects_sound_and_nondeterministic_test_files(self) -> None:
         for test_file in (
             "notifications.test.ts",
@@ -341,12 +365,28 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(36, len(corpus.scenarios))
-        self.assertEqual(52, len(corpus.candidate_scenarios))
+        self.assertEqual(53, len(corpus.candidate_scenarios))
+        self.assertEqual(
+            100,
+            next(
+                scenario.profile_runs
+                for scenario in corpus.scenarios
+                if scenario.name == "direct-sessions"
+            ),
+        )
         self.assertEqual(
             ("e2e-cli", "e2e-mcp-auth"),
             tuple(
                 scenario.name
                 for scenario in corpus.scenarios
+                if scenario.allow_keychain
+            ),
+        )
+        self.assertEqual(
+            ("verify-oauth-keychain-migration",),
+            tuple(
+                scenario.name
+                for scenario in corpus.verification_scenarios
                 if scenario.allow_keychain
             ),
         )
@@ -485,7 +525,7 @@ class PgsoCorpusTests(unittest.TestCase):
                 pattern = environment["LLVM_PROFILE_FILE"]
                 raw = pathlib.Path(
                     pattern.replace("%m", "module")
-                    .replace("%p", "123")
+                    .replace("%p", str(len(calls)))
                     .replace("%c", "")
                 )
                 raw.write_bytes(scenario_name.encode())
@@ -567,8 +607,62 @@ class PgsoCorpusTests(unittest.TestCase):
         patterns = [call["env"]["LLVM_PROFILE_FILE"] for call in calls]
         self.assertNotEqual(patterns[0], patterns[1])
         self.assertTrue(all("%m-%p-%c.profraw" in pattern for pattern in patterns))
-        self.assertEqual(("first-module-123-.profraw",), merges[0])
-        self.assertEqual(("second-module-123-.profraw",), merges[1])
+        self.assertEqual(("first-module-1-.profraw",), merges[0])
+        self.assertEqual(("second-module-2-.profraw",), merges[1])
+
+    def test_training_profile_runs_repeat_one_direct_scenario(self) -> None:
+        payload = self.manifest()
+        scenarios = payload["scenarios"]
+        assert isinstance(scenarios, list)
+        scenarios[-1]["profile_runs"] = 3
+        loaded = load_corpus(self.write_manifest(payload), repo_root=self.root)
+        corpus = self.make_corpus(loaded.scenarios[-1])
+
+        result, calls, merges, _, _ = self.run_fixture(corpus)
+
+        self.assertEqual(1, result.passed)
+        self.assertEqual(0.75, result.results[0].elapsed_seconds)
+        self.assertEqual(3, result.merged_raw_profiles)
+        self.assertEqual(3, len(calls))
+        self.assertEqual(
+            (
+                "direct-sessions-module-1-.profraw",
+                "direct-sessions-module-2-.profraw",
+                "direct-sessions-module-3-.profraw",
+            ),
+            merges[0],
+        )
+
+    def test_behavior_corpus_ignores_training_profile_runs(self) -> None:
+        payload = self.manifest()
+        scenarios = payload["scenarios"]
+        assert isinstance(scenarios, list)
+        scenarios[-1]["profile_runs"] = 3
+        loaded = load_corpus(self.write_manifest(payload), repo_root=self.root)
+        corpus = self.make_corpus(loaded.scenarios[-1])
+        binary = self.root / "candidate-fx"
+        binary.write_bytes(b"candidate")
+        calls: list[tuple[str, ...]] = []
+
+        def command_runner(argv, **kwargs):
+            calls.append(tuple(argv))
+            return CommandResult(
+                argv=tuple(argv),
+                returncode=0,
+                stdout="ok\n",
+                stderr="",
+                elapsed_seconds=0.2,
+            )
+
+        result = run_behavior_corpus(
+            corpus,
+            binary,
+            self.root / "behavior-output",
+            command_runner=command_runner,
+        )
+
+        self.assertEqual(1, result.passed)
+        self.assertEqual(1, len(calls))
 
     def test_run_cleans_the_isolated_tmux_server(self) -> None:
         marker = self.root / "tmux-cleaned"

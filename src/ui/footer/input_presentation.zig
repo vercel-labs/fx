@@ -350,13 +350,7 @@ pub fn composeHintRow(
     else
         base_hint_line;
 
-    var row: std.ArrayList(u8) = .empty;
-    try row.appendSlice(alloc, if (question_hint != null) ui_render.dim_style else ui_render.statusline_style);
-    try row_text.appendClipped(alloc, &row, hint_line, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-
     const width_usize: usize = width;
-    const hint_width = display_width.visibleWidthIgnoringAnsi(hint_line);
     const danger_text = dangerStatusText(approval_active, ctx, width);
     // The armed clear indicator outranks the question suppression: a
     // freeform draft mid-question uses the same double-Esc contract as the
@@ -371,6 +365,20 @@ pub fn composeHintRow(
         ctx.upgrade_status;
     const right_width = display_width.visibleWidth(right_text);
     const danger_visible = danger_text.len > 0 and right_text.ptr == danger_text.ptr;
+    const left_width: u16 = if (!danger_visible and right_width > 0 and width_usize > right_width)
+        @intCast(width_usize - right_width - 1)
+    else
+        width;
+
+    var row: std.ArrayList(u8) = .empty;
+    try row.appendSlice(alloc, if (question_hint != null) ui_render.dim_style else ui_render.statusline_style);
+    try row_text.appendClipped(alloc, &row, hint_line, left_width);
+    try row.appendSlice(alloc, ui_render.reset_style);
+
+    const hint_width = @min(
+        display_width.visibleWidthIgnoringAnsi(hint_line),
+        @as(usize, left_width),
+    );
     if (right_text.len > 0 and right_width > 0 and
         ((danger_visible and width_usize >= right_width) or
             (!danger_visible and width_usize > hint_width + right_width)))
@@ -1607,6 +1615,9 @@ test "compose hint row right-aligns upgrade status" {
         .selected_subagent_label = null,
         .selected_subagent_status = null,
         .upgrade_status = "Update installed: ctrl+g to reload",
+        .statusline = .{
+            .workspace_label = "/a/long/workspace/path/that/uses/the/statusline-tail",
+        },
         .input = &input,
     };
 

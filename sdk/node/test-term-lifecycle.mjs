@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,6 +34,14 @@ function terminalGrid(terminal) {
     lines.push(terminal.buffer.active.getLine(row)?.translateToString(true) ?? "");
   }
   return lines.join("\n");
+}
+
+const activeTransitionChildIndex = process.argv.indexOf("--active-transition-child");
+if (activeTransitionChildIndex >= 0) {
+  const scenario = process.argv[activeTransitionChildIndex + 1];
+  const command = process.argv[activeTransitionChildIndex + 2];
+  await runActiveTransitionChild(scenario, command);
+  process.exit(0);
 }
 
 const terminal = new Terminal({ cols: 80, rows: 24, allowProposedApi: true, scrollback: 1000 });
@@ -157,4 +166,164 @@ if (await abortRuntime.exited !== 130) throw new Error("aborted terminal did not
 if (abortDisposals.data !== 1 || abortDisposals.resize !== 1) {
   throw new Error(`aborted terminal subscriptions were not released exactly once: data=${abortDisposals.data}, resize=${abortDisposals.resize}`);
 }
-console.log("headless lifecycle passed: theme retinted, resize propagated, and Ctrl-C cancelled stalled fetch");
+
+await runActiveTransitionScenario("stalled", "/clear");
+await runActiveTransitionScenario("streaming", "/clear");
+await runActiveTransitionScenario("stalled", "/new");
+await runActiveTransitionScenario("stalled", "/reset");
+
+console.log("headless lifecycle passed: active session transitions recovered and Ctrl-C cancelled stalled fetch");
+
+async function runActiveTransitionScenario(scenario, command) {
+  const child = spawn(process.execPath, [
+    "--experimental-wasm-jspi",
+    fileURLToPath(import.meta.url),
+    wasmPath,
+    "--active-transition-child",
+    scenario,
+    command,
+  ], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+
+  const result = await new Promise((resolveResult) => {
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, 15000);
+    child.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      resolveResult({ code, signal, timedOut });
+    });
+  });
+
+  if (result.timedOut) {
+    throw new Error(`active ${command} timed out during ${scenario}; child output:\n${stdout}`);
+  }
+  if (result.code !== 0) {
+    throw new Error(`active ${command} failed during ${scenario}: code=${result.code} signal=${result.signal}\n${stderr}\n${stdout}`);
+  }
+  if (!stdout.includes("followup_completed")) {
+    throw new Error(`active ${command} did not complete a follow-up prompt during ${scenario}:\n${stdout}`);
+  }
+  if (stderr !== "") throw new Error(`active ${command} wrote stderr during ${scenario}:\n${stderr}`);
+}
+
+async function runActiveTransitionChild(scenario, command) {
+  if (!scenario || !command) throw new Error("active transition child requires scenario and command");
+
+  const childTerminal = new Terminal({ cols: 80, rows: 24, allowProposedApi: true, scrollback: 1000 });
+  const childDisposals = { data: 0, resize: 0 };
+  let childOutput = "";
+  let fetchCount = 0;
+  const requestBodies = [];
+  let firstFetchAborted = false;
+  let streamStarted = false;
+  const childDecoder = new TextDecoder();
+  const childHost = instrumentTerminal(childTerminal, childDisposals, (bytes) => {
+    childOutput += childDecoder.decode(bytes, { stream: true });
+  });
+  const encoder = new TextEncoder();
+
+  const completedResponse = (text) => new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "text-delta", id: "followup_1", delta: text })}\n\n`));
+      controller.enqueue(encoder.encode('data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":1}}}\n\n'));
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  }), { status: 200, headers: { "content-type": "text/event-stream" } });
+
+  const childFetch = async (_url, init) => {
+    fetchCount += 1;
+    requestBodies.push(new TextDecoder().decode(init.body));
+    process.stdout.write(`fetch_started:${fetchCount}\n`);
+    if (fetchCount > 1) return completedResponse("FOLLOWUP_OK");
+    if (scenario === "stalled") {
+      return new Promise((_, reject) => {
+        init.signal.addEventListener("abort", () => {
+          firstFetchAborted = true;
+          process.stdout.write("fetch_aborted\n");
+          reject(new DOMException("aborted", "AbortError"));
+        }, { once: true });
+      });
+    }
+    let sent = false;
+    return new Response(new ReadableStream({
+      pull(controller) {
+        if (sent) return;
+        sent = true;
+        controller.enqueue(encoder.encode('data: {"type":"text-delta","id":"stream_1","delta":"STREAM_STARTED"}\n\n'));
+        streamStarted = true;
+        init.signal.addEventListener("abort", () => {
+          firstFetchAborted = true;
+          process.stdout.write("fetch_aborted\n");
+          controller.error(new DOMException("aborted", "AbortError"));
+        }, { once: true });
+      },
+    }), { status: 200, headers: { "content-type": "text/event-stream" } });
+  };
+
+  const childRuntime = await createFxTerminal({
+    backend: "wasm",
+    wasm: await readFile(wasmPath),
+    terminal: childHost,
+    env: { AI_GATEWAY_API_KEY: "term-active-transition-key" },
+    fetch: childFetch,
+  });
+  const childFlush = () => new Promise((resolveFlush) => childTerminal.write("", resolveFlush));
+  const waitForChild = async (predicate, label, timeoutMs = 5000) => {
+    const deadline = performance.now() + timeoutMs;
+    while (!predicate()) {
+      await childFlush();
+      if (performance.now() >= deadline) {
+        throw new Error(`timed out waiting for ${label}; output:\n${childOutput}`);
+      }
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+  };
+
+  await childRuntime.interactive;
+  await waitForChild(() => childOutput.includes("Run /help for commands"), "child startup");
+  process.stdout.write("runtime_interactive\n");
+  childRuntime.write("first prompt\r");
+  await waitForChild(() => fetchCount === 1, "first fetch");
+  if (scenario === "streaming") {
+    await waitForChild(() => streamStarted, "stream start");
+  } else {
+    await waitForChild(() => childOutput.includes("Thinking"), "thinking state");
+  }
+
+  process.stdout.write("transition_write\n");
+  childRuntime.write(`${command}\r`);
+  process.stdout.write("transition_returned\n");
+  await waitForChild(() => firstFetchAborted, "first fetch abort");
+  process.stdout.write("transition_settled\n");
+  childRuntime.write("second prompt\r");
+  await waitForChild(
+    () => fetchCount === 2 && terminalGrid(childTerminal).includes("FOLLOWUP_OK"),
+    "follow-up completion",
+  );
+  const followupRequest = requestBodies[1] ?? "";
+  if (!followupRequest.includes("second prompt")) {
+    throw new Error(`follow-up request omitted the new prompt: ${followupRequest}`);
+  }
+  if (followupRequest.includes("first prompt") || followupRequest.includes("STREAM_STARTED")) {
+    throw new Error(`follow-up request retained cancelled session history: ${followupRequest}`);
+  }
+  process.stdout.write("followup_completed\n");
+  childRuntime.write("/exit\r");
+  const childExit = await childRuntime.exited;
+  if (childExit !== 0) throw new Error(`child runtime exited with ${childExit}`);
+  if (childDisposals.data !== 1 || childDisposals.resize !== 1) {
+    throw new Error(`child subscriptions were not released exactly once: data=${childDisposals.data}, resize=${childDisposals.resize}`);
+  }
+}

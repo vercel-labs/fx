@@ -328,6 +328,7 @@ fn hostForHeader(alloc: Allocator, canonical_host: []const u8) ![]u8 {
 fn isRedirectStatus(status: std.http.Status) bool {
     return status == .moved_permanently or
         status == .found or
+        status == .see_other or
         status == .temporary_redirect or
         status == .permanent_redirect;
 }
@@ -3116,6 +3117,34 @@ test "web_fetch safe redirect repeats hostname policy dns admission and pinned d
     try std.testing.expectEqual(@as(usize, 2), connector.calls);
     try std.testing.expectEqualStrings("www.example.com", resolver.last_host.?);
     try std.testing.expectEqualStrings("https://www.example.com/next", result.success.final_url);
+}
+
+test "web_fetch follows HTTP 303 See Other redirects" {
+    const alloc = std.testing.allocator;
+
+    var resolver = FakeResolver{ .addresses = &.{try ip("93.184.216.34", 443)} };
+    defer resolver.deinit(alloc);
+    var connector = FakeConnector{ .responses = &.{
+        .{ .status = .see_other, .body = "", .location = "/next" },
+        .{ .status = .ok, .body = "next" },
+    } };
+    defer connector.deinit(alloc);
+
+    var target = try url_policy.normalize(alloc, "https://example.com/start");
+    defer target.deinit(alloc);
+
+    var result = try fetch(alloc, target, .{}, .{
+        .resolver = resolver.resolver(),
+        .connector = connector.connector(),
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result == .success);
+    try std.testing.expectEqual(@as(usize, 2), resolver.calls);
+    try std.testing.expectEqual(@as(usize, 2), connector.calls);
+    try std.testing.expectEqualStrings("/next", connector.last_path_query.?);
+    try std.testing.expectEqualStrings("https://example.com/next", result.success.final_url);
+    try std.testing.expectEqualStrings("next", result.success.body);
 }
 
 test "web_fetch cross host redirect returns reinvocation result without following" {

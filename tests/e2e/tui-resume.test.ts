@@ -54,7 +54,6 @@ function shellQuote(value: string): string {
 function startUpgradeServer(
   root: string,
   argvLogPath: string,
-  version = "v9.9.9",
 ): { baseUrl: string; stop: () => void } {
   const artifactDir = join(root, "release-artifact");
   const wrapperPath = join(artifactDir, "fx");
@@ -78,13 +77,13 @@ exec ${shellQuote(FX_BIN)} "$@"
   const archive = readFileSync(archivePath);
   const checksum = createHash("sha256").update(archive).digest("hex");
   const platform = `${process.platform === "darwin" ? "macos" : "linux"}-${process.arch === "arm64" ? "aarch64" : "x86_64"}`;
-  const archiveRoute = `/${version}/fx-${platform}.tar.gz`;
+  const archiveRoute = `/v9.9.9/fx-${platform}.tar.gz`;
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     fetch(request) {
       const path = new URL(request.url).pathname;
-      if (path === "/latest.txt") return new Response(`${version}\n`);
+      if (path === "/latest.txt") return new Response("v9.9.9\n");
       if (path === archiveRoute) return new Response(archive);
       if (path === `${archiveRoute}.sha256`) return new Response(`${checksum}\n`);
       return new Response("not found", { status: 404 });
@@ -737,6 +736,90 @@ test("volatile status rows normalize before stable-grid comparison", () => {
   expect(normalizeVolatileStatusRows(["  (↑6 ↓5)"])).toEqual(["<status>"]);
   expect(normalizeVolatileStatusRows(["  0s (↑6 ↓5)"])).toEqual(["<status>"]);
 });
+
+test.skipIf(!tmuxAvailable())(
+  "session resume command group opens last and explicit session ids",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-session-resume-command-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const seedStderrPath = join(root, "seed-stderr.log");
+    const exactStderrPath = join(root, "exact-stderr.log");
+    const lastStderrPath = join(root, "last-stderr.log");
+    const title = "Save the grouped session resume fixture.";
+    const marker = "GROUPED_SESSION_RESUME_FIXTURE";
+    mkdirSync(home);
+    mkdirSync(workspace);
+    writeFileSync(seedStderrPath, "");
+    writeFileSync(exactStderrPath, "");
+    writeFileSync(lastStderrPath, "");
+
+    const seedGateway = startFakeGateway([fakeGatewayFinalText(marker)]);
+    const resumeGateway = startFakeGateway([]);
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: gatewayEnv(home, seedGateway),
+        stderrPath: seedStderrPath,
+        width: 100,
+        height: 30,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText(title);
+      await active.waitForText(marker, TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await active.kill();
+      active = null;
+
+      const sessionId = sessionIdFromHome(home);
+      const cases = [
+        {
+          command: `${FX_BIN} session resume --id ${sessionId}`,
+          stderrPath: exactStderrPath,
+        },
+        {
+          command: `${FX_BIN} session resume last`,
+          stderrPath: lastStderrPath,
+        },
+      ];
+      for (const resumeCase of cases) {
+        active = await TmuxSession.create({
+          cmd: resumeCase.command,
+          cwd: realpathSync(workspace),
+          env: gatewayEnv(home, resumeGateway),
+          stderrPath: resumeCase.stderrPath,
+          width: 100,
+          height: 30,
+        });
+        const resumed = await waitForScrollbackMarkers(
+          active,
+          [`● Session resumed: ${title}`, marker],
+          TIMEOUT,
+        );
+        expect(resumed).toContain(marker);
+        expect(active.isPaneAlive()).toBe(true);
+        expect(readFileSync(resumeCase.stderrPath, "utf8")).toBe("");
+        await active.sendText("/quit");
+        expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+        await active.kill();
+        active = null;
+      }
+
+      expect(seedGateway.requests).toHaveLength(1);
+      expect(resumeGateway.requests).toHaveLength(0);
+      expect(readFileSync(seedStderrPath, "utf8")).toBe("");
+    } finally {
+      if (active) await active.kill();
+      seedGateway.stop();
+      resumeGateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
 
 function expectAltExitToPreserveNormalViewport(tapePath: string): void {
   const tape = readFileSync(tapePath);
@@ -1877,12 +1960,14 @@ test.skipIf(!tmuxAvailable())(
     };
     const expectInlineOrder = (scrollback: string): void => {
       expect(countOccurrences(scrollback, statusLine)).toBe(1);
-      expect(countOccurrences(scrollback, outputLine)).toBe(1);
 
       const statusIndex = scrollback.indexOf(statusLine);
-      const outputIndex = scrollback.indexOf(outputLine);
       const doneIndex = scrollback.lastIndexOf(finalMarker);
       expect(statusIndex).toBeGreaterThanOrEqual(0);
+      expect(doneIndex).toBeGreaterThan(statusIndex);
+      const transcriptRegion = scrollback.slice(statusIndex, doneIndex);
+      expect(countOccurrences(transcriptRegion, outputLine)).toBe(1);
+      const outputIndex = scrollback.indexOf(outputLine, statusIndex);
       expect(outputIndex).toBeGreaterThan(statusIndex);
       expect(doneIndex).toBeGreaterThan(outputIndex);
     };

@@ -137,6 +137,48 @@ function fakeGatewayStreamingText(lines: string[], delayMs: number) {
 }
 
 describe("fx ask presentation", () => {
+  test("redirected command output separates the next tool header", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewaySse([
+        {
+          type: "tool-call",
+          toolCallId: "no-final-newline",
+          toolName: "terminal",
+          input: { action: "exec", command: "printf no-final-newline" },
+        },
+        {
+          type: "tool-call",
+          toolCallId: "next-command",
+          toolName: "terminal",
+          input: { action: "exec", command: "printf 'next-output\\n'" },
+        },
+        {
+          type: "finish",
+          finishReason: { unified: "tool-calls", raw: "tool-calls" },
+        },
+      ]),
+      fakeGatewayFinalText("Commands complete.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", "--no-color", "Run both commands."],
+      {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toContain(
+      "no-final-newline\nRunning printf 'next-output\\n'\nnext-output\n",
+    );
+    expect(result.stderr).not.toContain("no-final-newlineRunning printf");
+    expect(JSON.parse(result.stdout).output).toBe("Commands complete.\n");
+  }, TIMEOUT);
+
   test("fresh binary defaults terminal exec and start to the user profile", async () => {
     const configuredShell = userInfo().shell;
     if (!configuredShell.endsWith("/bash") && !configuredShell.endsWith("/zsh")) return;

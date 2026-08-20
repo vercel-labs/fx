@@ -25,21 +25,64 @@ pub const Lease = struct {
     }
 };
 
-pub const ReloadOutcome = union(enum) {
-    published: struct {
+pub const PublishedReload = struct {
+    generation: ?u64,
+    health: mcp_health.StartupDecision,
+    configured_server_count: usize,
+    unavailable_server_names: [][]u8,
+
+    fn init(
+        alloc: Allocator,
         generation: ?u64,
-        health: mcp_health.StartupDecision,
-    },
+        servers: []const mcp_health.ServerSnapshot,
+    ) !PublishedReload {
+        var unavailable_count: usize = 0;
+        for (servers) |server| {
+            if (isUnavailableForReload(server)) unavailable_count += 1;
+        }
+
+        const names = try alloc.alloc([]u8, unavailable_count);
+        errdefer alloc.free(names);
+        var initialized: usize = 0;
+        errdefer for (names[0..initialized]) |name| alloc.free(name);
+        for (servers) |server| {
+            if (!isUnavailableForReload(server)) continue;
+            names[initialized] = try alloc.dupe(u8, server.configured_name);
+            initialized += 1;
+        }
+
+        return .{
+            .generation = generation,
+            .health = mcp_health.startupDecision(servers),
+            .configured_server_count = servers.len,
+            .unavailable_server_names = names,
+        };
+    }
+
+    pub fn deinit(self: *PublishedReload, alloc: Allocator) void {
+        for (self.unavailable_server_names) |name| alloc.free(name);
+        alloc.free(self.unavailable_server_names);
+        self.* = undefined;
+    }
+};
+
+pub const ReloadOutcome = union(enum) {
+    published: PublishedReload,
     retained_required_failure: []u8,
 
     pub fn deinit(self: *ReloadOutcome, alloc: Allocator) void {
         switch (self.*) {
-            .published => {},
+            .published => |*published| published.deinit(alloc),
             .retained_required_failure => |message| alloc.free(message),
         }
         self.* = undefined;
     }
 };
+
+fn isUnavailableForReload(server: mcp_health.ServerSnapshot) bool {
+    return server.connection != .ready and
+        (server.connection != .disabled or server.required);
+}
 
 pub const ReloadCompletion = union(enum) {
     outcome: ReloadOutcome,
@@ -405,10 +448,12 @@ pub const State = struct {
         errdefer if (candidate_owned) destroyRuntime(alloc, candidate.?);
         if (cancel_requested.load(.acquire)) return error.Cancelled;
 
-        const decision: mcp_health.StartupDecision = if (candidate) |runtime| decision: {
+        var published = if (candidate) |runtime| published: {
             runtime.connectAllCancellable(registry, cancel_requested);
             if (cancel_requested.load(.acquire)) return error.Cancelled;
-            const value = try runtime.startupDecision(alloc, captured_at_ms);
+            var snapshot = try runtime.snapshotHealth(alloc, captured_at_ms);
+            defer snapshot.deinit(alloc);
+            const value = mcp_health.startupDecision(snapshot.servers);
             if (!mcp_health.publishCandidateForDecision(value)) {
                 const failure = (try runtime.requiredStartupFailure(alloc, captured_at_ms)) orelse
                     try alloc.dupe(u8, "A required MCP server is unavailable.");
@@ -416,8 +461,13 @@ pub const State = struct {
                 candidate_owned = false;
                 return .{ .retained_required_failure = failure };
             }
-            break :decision value;
-        } else .ready;
+            break :published try PublishedReload.init(
+                alloc,
+                runtime.generation,
+                snapshot.servers,
+            );
+        } else try PublishedReload.init(alloc, null, &.{});
+        errdefer published.deinit(alloc);
 
         self.lock.lockUncancelable(io_mod.getIo());
         if (cancel_requested.load(.acquire) or
@@ -432,10 +482,7 @@ pub const State = struct {
         candidate_owned = false;
 
         if (previous) |runtime| destroyRuntime(alloc, runtime);
-        return .{ .published = .{
-            .generation = if (candidate) |runtime| runtime.generation else null,
-            .health = decision,
-        } };
+        return .{ .published = published };
     }
 
     pub fn deinit(self: *State, alloc: Allocator) void {
@@ -580,6 +627,9 @@ test "transactional reload retains old runtime and publishes only accepted candi
         .published => |published| {
             try std.testing.expectEqual(mcp_health.StartupDecision.degraded, published.health);
             try std.testing.expect(published.generation.? != original_generation);
+            try std.testing.expectEqual(@as(usize, 1), published.configured_server_count);
+            try std.testing.expectEqual(@as(usize, 1), published.unavailable_server_names.len);
+            try std.testing.expectEqualStrings("candidate", published.unavailable_server_names[0]);
         },
         .retained_required_failure => return error.TestUnexpectedResult,
     }
@@ -591,6 +641,8 @@ test "transactional reload retains old runtime and publishes only accepted candi
         .published => |published| {
             try std.testing.expectEqual(mcp_health.StartupDecision.ready, published.health);
             try std.testing.expect(published.generation == null);
+            try std.testing.expectEqual(@as(usize, 0), published.configured_server_count);
+            try std.testing.expectEqual(@as(usize, 0), published.unavailable_server_names.len);
         },
         .retained_required_failure => return error.TestUnexpectedResult,
     }
@@ -630,6 +682,8 @@ test "pending reload returns immediately and publishes one completion" {
             .published => |published| {
                 try std.testing.expectEqual(mcp_health.StartupDecision.ready, published.health);
                 try std.testing.expect(published.generation == null);
+                try std.testing.expectEqual(@as(usize, 0), published.configured_server_count);
+                try std.testing.expectEqual(@as(usize, 0), published.unavailable_server_names.len);
             },
             .retained_required_failure => return error.TestUnexpectedResult,
         },

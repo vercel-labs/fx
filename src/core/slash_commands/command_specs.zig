@@ -460,12 +460,61 @@ pub fn firstSlashCompletion(registry: SlashRegistry, prefix: []const u8) ?[]cons
     return null;
 }
 
-pub fn matchedCompletionCommand(spec: SlashSpec, prefix: []const u8) ?[]const u8 {
-    if (prefix.len <= 1) return spec.command;
-    if (std.mem.startsWith(u8, spec.command, prefix)) return spec.command;
+const slash_completion_match_rank_count: usize = 3;
+
+const SlashCompletionCommandMatch = struct {
+    command: []const u8,
+    rank: usize,
+};
+
+const SlashCompletionMatch = struct {
+    spec: *const SlashSpec,
+    command: []const u8,
+};
+
+fn completionCommandMatchRank(command: []const u8, prefix: []const u8) ?usize {
+    if (std.mem.eql(u8, command, prefix)) return 0;
+    if (std.mem.startsWith(u8, command, prefix)) return 1;
+    if (prefix.len <= 1 or command.len <= 1) return null;
+    if (std.mem.find(u8, command[1..], prefix[1..]) != null) return 2;
+    return null;
+}
+
+fn bestCompletionCommandMatch(spec: SlashSpec, prefix: []const u8) ?SlashCompletionCommandMatch {
+    var best: ?SlashCompletionCommandMatch = if (completionCommandMatchRank(spec.command, prefix)) |rank|
+        .{ .command = spec.command, .rank = rank }
+    else
+        null;
+
     if (spec.show_aliases_in_completion) {
         for (spec.aliases) |alias| {
-            if (std.mem.startsWith(u8, alias, prefix)) return alias;
+            const rank = completionCommandMatchRank(alias, prefix) orelse continue;
+            if (best == null or rank < best.?.rank) {
+                best = .{ .command = alias, .rank = rank };
+            }
+        }
+    }
+    return best;
+}
+
+pub fn matchedCompletionCommand(spec: SlashSpec, prefix: []const u8) ?[]const u8 {
+    return (bestCompletionCommandMatch(spec, prefix) orelse return null).command;
+}
+
+fn nthSlashCommandCompletionMatch(registry: SlashRegistry, prefix: []const u8, n: usize) ?SlashCompletionMatch {
+    var idx: usize = 0;
+    for (0..slash_completion_match_rank_count) |rank| {
+        for (registry.commands) |*spec| {
+            if (spec.help_entry == null) continue;
+            const match = bestCompletionCommandMatch(spec.*, prefix) orelse continue;
+            if (match.rank != rank) continue;
+            if (idx == n) {
+                return .{
+                    .spec = spec,
+                    .command = match.command,
+                };
+            }
+            idx += 1;
         }
     }
     return null;
@@ -547,15 +596,7 @@ pub fn nthSlashCompletion(registry: SlashRegistry, prefix: []const u8, n: usize)
         return nthWorkspaceArgCompletion(query, n);
     }
     if (prefix.len == 0 or prefix[0] != '/') return null;
-    var idx: usize = 0;
-    for (registry.commands) |spec| {
-        if (spec.help_entry == null) continue;
-        if (matchedCompletionCommand(spec, prefix)) |cmd| {
-            if (idx == n) return cmd;
-            idx += 1;
-        }
-    }
-    return null;
+    return (nthSlashCommandCompletionMatch(registry, prefix, n) orelse return null).command;
 }
 
 /// Returns the byte offset where the argument portion begins for
@@ -620,31 +661,13 @@ pub fn nthSlashCompletionDescription(registry: SlashRegistry, prefix: []const u8
     if (maxxingArgCompletionPrefix(prefix) != null) return null;
     if (workspaceArgCompletionPrefix(prefix) != null) return null;
     if (prefix.len == 0 or prefix[0] != '/') return null;
-
-    var idx: usize = 0;
-    for (registry.commands) |spec| {
-        if (spec.help_entry == null) continue;
-        if (matchedCompletionCommand(spec, prefix) != null) {
-            if (idx == n) return spec.completion_description;
-            idx += 1;
-        }
-    }
-    return null;
+    return (nthSlashCommandCompletionMatch(registry, prefix, n) orelse return null).spec.completion_description;
 }
 
 pub fn nthSlashCompletionCategory(registry: SlashRegistry, prefix: []const u8, n: usize) ?SlashPresentationCategory {
     if (argCompletionAnchor(prefix) != 0) return null;
     if (prefix.len == 0 or prefix[0] != '/') return null;
-
-    var idx: usize = 0;
-    for (registry.commands) |spec| {
-        if (spec.help_entry == null) continue;
-        if (matchedCompletionCommand(spec, prefix) != null) {
-            if (idx == n) return spec.presentation_category;
-            idx += 1;
-        }
-    }
-    return null;
+    return (nthSlashCommandCompletionMatch(registry, prefix, n) orelse return null).spec.presentation_category;
 }
 
 pub fn slashCompletionHasArgs(registry: SlashRegistry, command: []const u8) bool {
@@ -1695,7 +1718,8 @@ test "rendered top-level help is a complete CLI navigation page" {
     try std.testing.expect(std.mem.find(u8, text, "Supported for interactive, resume, ask, ACP, PR, and issue launches") == null);
     try std.testing.expect(std.mem.find(u8, text, "Examples:") != null);
     try std.testing.expect(std.mem.find(u8, text, "fx ask \"Explain the changes in this repository\"") != null);
-    try std.testing.expect(std.mem.find(u8, text, "fx --resume last") != null);
+    try std.testing.expect(std.mem.find(u8, text, "fx session resume last") != null);
+    try std.testing.expect(std.mem.find(u8, text, "session resume [last|id]") != null);
     try std.testing.expect(std.mem.find(u8, text, "fx status --json") != null);
     try std.testing.expect(std.mem.find(u8, text, "Run `/help` inside an interactive session for slash commands.") != null);
     try std.testing.expect(std.mem.find(u8, text, "Learn more about 𝒇x:  https://fx.sh/docs") != null);
@@ -1780,7 +1804,7 @@ test "per-command help preserves long resume usage outside top-level index" {
     const text = try renderTopLevelCommandHelp(std.testing.allocator, testTopLevelRegistry(), .@"resume");
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx --resume [last|<id>] [--record] | resume [last|<id>] [--record] | resume --id <id> [--record] | --resume-last | --continue | -c | -r | --resume-<id>") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx session resume [last|<id>] [--record] | session resume --id <id> [--record] | --resume [last|<id>] [--record] | resume [last|<id>] [--record] | resume --id <id> [--record] | --resume-last | --continue | -c | -r | --resume-<id>") != null);
     try std.testing.expect(std.mem.find(u8, text, "Options:") != null);
     try std.testing.expect(std.mem.find(u8, text, "--record") != null);
 }
@@ -1819,6 +1843,31 @@ test "slash completion matches prefix and aliases" {
     try std.testing.expect(firstSlashCompletion(testSlashRegistry(), "/help") == null);
     try std.testing.expect(firstSlashCompletion(testSlashRegistry(), "hello") == null);
     try std.testing.expect(firstSlashCompletion(testSlashRegistry(), "") == null);
+}
+
+test "slash completion ranks exact prefix and substring command matches" {
+    const specs = [_]SlashSpec{
+        .{ .kind = .models, .command = "/models", .help_entry = "/models", .completion_description = "browse models", .presentation_category = .model },
+        .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename session", .presentation_category = .session },
+        .{ .kind = .model, .command = "/model", .help_entry = "/model <id>", .completion_description = "choose model", .presentation_category = .model },
+    };
+    const registry = SlashRegistry{ .commands = specs[0..] };
+
+    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(registry, "/model"));
+    try std.testing.expectEqualStrings("/model", nthSlashCompletion(registry, "/model", 0).?);
+    try std.testing.expectEqualStrings("choose model", nthSlashCompletionDescription(registry, "/model", 0).?);
+    try std.testing.expectEqualStrings("/models", nthSlashCompletion(registry, "/model", 1).?);
+
+    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(registry, "/mo"));
+    try std.testing.expectEqualStrings("/models", nthSlashCompletion(registry, "/mo", 0).?);
+    try std.testing.expectEqualStrings("/model", nthSlashCompletion(registry, "/mo", 1).?);
+
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(registry, "/name"));
+    try std.testing.expectEqualStrings("/rename", nthSlashCompletion(registry, "/name", 0).?);
+    try std.testing.expectEqual(SlashPresentationCategory.session, nthSlashCompletionCategory(registry, "/name", 0).?);
+
+    try std.testing.expectEqual(@as(usize, 0), slashCompletionCount(registry, "/missing"));
+    try std.testing.expect(nthSlashCompletion(registry, "/missing", 0) == null);
 }
 
 test "slash completion exposes interactive resume" {
@@ -2220,11 +2269,12 @@ test "slash completion descriptions follow completion matches" {
     try std.testing.expectEqualStrings("toggle Fast mode when supported", nthSlashCompletionDescription(testSlashRegistry(), "/fa", 0).?);
 }
 
-test "slash completion aliases participate in registry order" {
+test "slash completion aliases participate in ranked order" {
     try std.testing.expectEqualStrings("/background", firstSlashCompletion(testSlashRegistry(), "/ba").?);
-    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(testSlashRegistry(), "/ba"));
+    try std.testing.expectEqual(@as(usize, 3), slashCompletionCount(testSlashRegistry(), "/ba"));
     try std.testing.expectEqualStrings("/background", nthSlashCompletion(testSlashRegistry(), "/ba", 0).?);
     try std.testing.expectEqualStrings("/balance", nthSlashCompletion(testSlashRegistry(), "/ba", 1).?);
+    try std.testing.expectEqualStrings("/feedback", nthSlashCompletion(testSlashRegistry(), "/ba", 2).?);
     try std.testing.expectEqualStrings("/balance", firstSlashCompletion(testSlashRegistry(), "/bal").?);
 }
 

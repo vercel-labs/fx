@@ -1196,6 +1196,27 @@ test "mixed slash completion uses skill relevance order" {
     );
 }
 
+test "mixed slash completion ranks substring commands before skill metadata" {
+    const specs = [_]command_specs.SlashSpec{
+        .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename session", .presentation_category = .session },
+    };
+    const registry = command_specs.SlashRegistry{ .commands = specs[0..] };
+    const skills = [_]skill_runtime.Skill{.{
+        .name = "workflow-helper",
+        .description = "manage named workflows",
+        .path = "/tmp/.codex/skills/workflow-helper",
+        .source = .global_codex,
+    }};
+
+    try std.testing.expectEqual(@as(usize, 2), mixedSlashCompletionCount(registry, "/name", &skills));
+    try std.testing.expectEqualStrings("/rename", nthMixedSlashCompletionText(registry, "/name", &skills, 0).?);
+    try std.testing.expect(nthMixedSlashCompletionSkill(registry, "/name", &skills, 0) == null);
+    try std.testing.expectEqualStrings(
+        "workflow-helper",
+        nthMixedSlashCompletionSkill(registry, "/name", &skills, 1).?.name,
+    );
+}
+
 test "registry-aware mixed slash completion maps skills after injected commands" {
     const specs = [_]command_specs.SlashSpec{
         .{ .kind = .help, .command = "/alpha", .help_entry = "/alpha" },

@@ -1,6 +1,7 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const session = @import("session.zig");
+const session_replay = @import("session_replay.zig");
 const Allocator = std.mem.Allocator;
 
 const paths = @import("session_store_paths.zig");
@@ -45,10 +46,263 @@ const session_index_marker_contents = "pending\n";
 const relationship_migration_snapshot_file = "relationship-migration-index.json";
 pub const max_session_index_bytes: usize = 16 * 1024 * 1024;
 const session_index_schema_version: i64 = 3;
+const deferred_cache_token_schema_version: i64 = 1;
+pub const max_deferred_cache_token_bytes: usize = 4 * 1024;
+const max_deferred_cache_token_count: usize = 4096;
+pub const deferred_cache_dir = "deferred";
 pub const relationship_migration_candidate_limit: usize = 16;
 const relationship_migration_read_bytes: usize = 64 * 1024;
 const relationship_migration_overlap_bytes: u64 = 512;
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
+
+const DeferredCachePositionJson = struct {
+    log_generation: []const u8,
+    through_seq: u64,
+    through_event_id: []const u8,
+    through_event_log_bytes: u64,
+};
+
+const DeferredCacheTokenJson = struct {
+    schema_version: i64,
+    session_id: []const u8,
+    workspace_root: []const u8,
+    position: DeferredCachePositionJson,
+};
+
+pub const DeferredCacheToken = struct {
+    session_id: []u8,
+    workspace_root: []u8,
+    position: session_replay.CommitPosition,
+
+    pub fn deinit(self: *DeferredCacheToken, alloc: Allocator) void {
+        alloc.free(self.session_id);
+        alloc.free(self.workspace_root);
+        self.* = undefined;
+    }
+};
+
+pub fn encodeDeferredCacheToken(
+    alloc: Allocator,
+    session_id: []const u8,
+    workspace_root: []const u8,
+    position: session_replay.CommitPosition,
+) ![]u8 {
+    try validateSessionId(session_id);
+    try paths.validateWorkspaceRoot(workspace_root);
+
+    const generation = std.fmt.bytesToHex(position.log_generation, .lower);
+    const event_id = std.fmt.bytesToHex(position.through_event_id, .lower);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.print("{{\"schema_version\":{d},\"session_id\":", .{deferred_cache_token_schema_version});
+    try std.json.Stringify.value(session_id, .{}, &out.writer);
+    try out.writer.writeAll(",\"workspace_root\":");
+    try std.json.Stringify.value(workspace_root, .{}, &out.writer);
+    try out.writer.writeAll(",\"position\":{\"log_generation\":");
+    try std.json.Stringify.value(&generation, .{}, &out.writer);
+    try out.writer.print(",\"through_seq\":{d},\"through_event_id\":", .{position.through_seq});
+    try std.json.Stringify.value(&event_id, .{}, &out.writer);
+    try out.writer.print(",\"through_event_log_bytes\":{d}}}}}", .{position.through_event_log_bytes});
+    const encoded = try out.toOwnedSlice();
+    if (encoded.len > max_deferred_cache_token_bytes) {
+        alloc.free(encoded);
+        return error.InvalidSessionIndex;
+    }
+    return encoded;
+}
+
+pub fn decodeDeferredCacheToken(
+    alloc: Allocator,
+    bytes: []const u8,
+) !DeferredCacheToken {
+    if (bytes.len == 0 or bytes.len > max_deferred_cache_token_bytes) {
+        return error.InvalidSessionIndex;
+    }
+    var parsed = std.json.parseFromSlice(
+        DeferredCacheTokenJson,
+        alloc,
+        bytes,
+        .{ .allocate = .alloc_always },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSessionIndex,
+    };
+    defer parsed.deinit();
+
+    if (parsed.value.schema_version != deferred_cache_token_schema_version) {
+        return error.InvalidSessionIndex;
+    }
+    validateSessionId(parsed.value.session_id) catch
+        return error.InvalidSessionIndex;
+    paths.validateWorkspaceRoot(parsed.value.workspace_root) catch
+        return error.InvalidSessionIndex;
+
+    const session_id = try alloc.dupe(u8, parsed.value.session_id);
+    errdefer alloc.free(session_id);
+    const workspace_root = try alloc.dupe(u8, parsed.value.workspace_root);
+    errdefer alloc.free(workspace_root);
+    return .{
+        .session_id = session_id,
+        .workspace_root = workspace_root,
+        .position = .{
+            .log_generation = try parseDeferredTokenIdentifier(
+                parsed.value.position.log_generation,
+            ),
+            .through_seq = parsed.value.position.through_seq,
+            .through_event_id = try parseDeferredTokenIdentifier(
+                parsed.value.position.through_event_id,
+            ),
+            .through_event_log_bytes = parsed.value.position.through_event_log_bytes,
+        },
+    };
+}
+
+fn parseDeferredTokenIdentifier(raw: []const u8) ![16]u8 {
+    if (raw.len != 32) return error.InvalidSessionIndex;
+    var result: [16]u8 = undefined;
+    _ = std.fmt.hexToBytes(&result, raw) catch return error.InvalidSessionIndex;
+    const canonical = std.fmt.bytesToHex(result, .lower);
+    if (!std.mem.eql(u8, &canonical, raw)) return error.InvalidSessionIndex;
+    return result;
+}
+
+pub fn deferredCachePresent(
+    sessions: *const io_mod.VerifiedDir,
+) !bool {
+    var deferred = (try openDeferredCacheDirectory(sessions)) orelse return false;
+    defer deferred.close();
+    var iter = deferred.dir.iterate();
+    return (try iter.next(io_mod.getIo())) != null;
+}
+
+fn openDeferredCacheDirectory(
+    sessions: *const io_mod.VerifiedDir,
+) !?io_mod.VerifiedDir {
+    var latest = sessions.dir.openDir(io_mod.getIo(), "latest", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        error.NotDir, error.SymLinkLoop => return error.InvalidSessionIndex,
+        else => return err,
+    };
+    defer latest.close(io_mod.getIo());
+
+    var deferred = latest.openDir(io_mod.getIo(), deferred_cache_dir, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        error.NotDir, error.SymLinkLoop => return error.InvalidSessionIndex,
+        else => return err,
+    };
+    errdefer deferred.close(io_mod.getIo());
+    try requirePrivateCacheDirectory(latest);
+    try requirePrivateCacheDirectory(deferred);
+    return .{ .dir = deferred };
+}
+
+fn requirePrivateCacheDirectory(dir: std.Io.Dir) !void {
+    const stat = try dir.stat(io_mod.getIo());
+    if (stat.kind != .directory or
+        stat.permissions.toMode() & 0o777 != private_dir_permissions.toMode())
+    {
+        return error.InvalidSessionIndex;
+    }
+}
+
+pub fn readDeferredCacheTokens(
+    alloc: Allocator,
+    sessions: *const io_mod.VerifiedDir,
+) !std.ArrayList(DeferredCacheToken) {
+    var tokens: std.ArrayList(DeferredCacheToken) = .empty;
+    errdefer freeDeferredCacheTokens(alloc, &tokens);
+    var deferred = (try openDeferredCacheDirectory(sessions)) orelse return tokens;
+    defer deferred.close();
+
+    var iter = deferred.dir.iterate();
+    while (try iter.next(io_mod.getIo())) |entry| {
+        if (tokens.items.len >= max_deferred_cache_token_count) {
+            return error.InvalidSessionIndex;
+        }
+        if (entry.kind != .file) return error.InvalidSessionIndex;
+        try validateSessionId(entry.name);
+        var token = try readDeferredCacheTokenFromDirectory(
+            alloc,
+            &deferred,
+            entry.name,
+        );
+        errdefer token.deinit(alloc);
+        if (!std.mem.eql(u8, entry.name, token.session_id)) {
+            return error.InvalidSessionIndex;
+        }
+        try tokens.append(alloc, token);
+    }
+    return tokens;
+}
+
+pub fn readDeferredCacheToken(
+    alloc: Allocator,
+    sessions: *const io_mod.VerifiedDir,
+    session_id: []const u8,
+) !?DeferredCacheToken {
+    try validateSessionId(session_id);
+    var deferred = (try openDeferredCacheDirectory(sessions)) orelse return null;
+    defer deferred.close();
+    return readDeferredCacheTokenFromDirectory(
+        alloc,
+        &deferred,
+        session_id,
+    ) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+}
+
+fn readDeferredCacheTokenFromDirectory(
+    alloc: Allocator,
+    deferred: *const io_mod.VerifiedDir,
+    session_id: []const u8,
+) !DeferredCacheToken {
+    var file = deferred.dir.openFile(io_mod.getIo(), session_id, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    }) catch |err| switch (err) {
+        error.NotDir, error.SymLinkLoop, error.IsDir => {
+            return error.InvalidSessionIndex;
+        },
+        else => return err,
+    };
+    defer file.close(io_mod.getIo());
+    const stat = try file.stat(io_mod.getIo());
+    if (stat.kind != .file or stat.nlink != 1 or
+        stat.permissions.toMode() & 0o777 != private_file_permissions.toMode() or
+        stat.size == 0 or stat.size > max_deferred_cache_token_bytes)
+    {
+        return error.InvalidSessionIndex;
+    }
+    const bytes = io_mod.readFileToEnd(
+        alloc,
+        &file,
+        max_deferred_cache_token_bytes + 1,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSessionIndex,
+    };
+    defer alloc.free(bytes);
+    return decodeDeferredCacheToken(alloc, bytes);
+}
+
+pub fn freeDeferredCacheTokens(
+    alloc: Allocator,
+    tokens: *std.ArrayList(DeferredCacheToken),
+) void {
+    for (tokens.items) |*token| token.deinit(alloc);
+    tokens.deinit(alloc);
+}
 
 pub const RelationshipMigrationCursor = struct {
     inode: u64 = 0,
@@ -1060,6 +1314,14 @@ pub fn readSessionIndex(
     alloc: Allocator,
     sessions: *const io_mod.VerifiedDir,
 ) !std.ArrayList(SessionSummary) {
+    if (try deferredCachePresent(sessions)) return error.InvalidSessionIndex;
+    return readSessionIndexForRepair(alloc, sessions);
+}
+
+pub fn readSessionIndexForRepair(
+    alloc: Allocator,
+    sessions: *const io_mod.VerifiedDir,
+) !std.ArrayList(SessionSummary) {
     if (try sessionIndexMarkerPresent(sessions)) return error.InvalidSessionIndex;
     var file = try openVerifiedSessionIndexFile(sessions, session_index_file);
     defer file.close(io_mod.getIo());
@@ -1076,6 +1338,7 @@ pub fn readSessionIndexPage(
     sessions: *const io_mod.VerifiedDir,
     options: SessionIndexPageOptions,
 ) !ResumableSessionPage {
+    if (try deferredCachePresent(sessions)) return error.InvalidSessionIndex;
     if (try sessionIndexMarkerPresent(sessions)) return error.InvalidSessionIndex;
     var file = try openVerifiedSessionIndexFile(sessions, session_index_file);
     defer file.close(io_mod.getIo());
@@ -1098,6 +1361,7 @@ pub fn readSessionIndexWorkspaceCandidates(
     sessions: *const io_mod.VerifiedDir,
     workspace_root: []const u8,
 ) !std.ArrayList(SessionSummary) {
+    if (try deferredCachePresent(sessions)) return error.InvalidSessionIndex;
     var file = try openVerifiedSessionIndexFile(sessions, session_index_file);
     defer file.close(io_mod.getIo());
     const bytes = io_mod.readFileToEnd(
@@ -1120,6 +1384,7 @@ pub fn readRelationshipMigrationCandidatePage(
     sessions: *const io_mod.VerifiedDir,
     continuation: RelationshipMigrationCursor,
 ) !RelationshipMigrationCandidatePage {
+    if (try deferredCachePresent(sessions)) return error.InvalidSessionIndex;
     var file = try openVerifiedSessionIndexFile(
         sessions,
         relationship_migration_snapshot_file,
@@ -1949,4 +2214,128 @@ test "state summary fast parser reads generated cache shape" {
 
     try std.testing.expectEqual(@as(usize, 2), summary.count);
     try std.testing.expectEqualStrings("session-2", summary.latest_id.?);
+}
+
+test "deferred cache token round trips an exact commit position" {
+    const alloc = std.testing.allocator;
+    const position = session_replay.CommitPosition{
+        .log_generation = [_]u8{0x12} ** 16,
+        .through_seq = 42,
+        .through_event_id = [_]u8{0xab} ** 16,
+        .through_event_log_bytes = 4096,
+    };
+    const encoded = try encodeDeferredCacheToken(
+        alloc,
+        "deferred-token-round-trip",
+        "/tmp/workspace",
+        position,
+    );
+    defer alloc.free(encoded);
+
+    var decoded = try decodeDeferredCacheToken(alloc, encoded);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualStrings("deferred-token-round-trip", decoded.session_id);
+    try std.testing.expectEqualStrings("/tmp/workspace", decoded.workspace_root);
+    try std.testing.expectEqualDeep(position, decoded.position);
+}
+
+test "deferred cache token rejects malformed and noncanonical input" {
+    const invalid = [_][]const u8{
+        "",
+        "{}",
+        "{\"schema_version\":2,\"session_id\":\"session\",\"workspace_root\":\"/tmp/workspace\",\"position\":{\"log_generation\":\"12121212121212121212121212121212\",\"through_seq\":1,\"through_event_id\":\"abababababababababababababababab\",\"through_event_log_bytes\":1}}",
+        "{\"schema_version\":1,\"session_id\":\"../session\",\"workspace_root\":\"/tmp/workspace\",\"position\":{\"log_generation\":\"12121212121212121212121212121212\",\"through_seq\":1,\"through_event_id\":\"abababababababababababababababab\",\"through_event_log_bytes\":1}}",
+        "{\"schema_version\":1,\"session_id\":\"session\",\"workspace_root\":\"relative\",\"position\":{\"log_generation\":\"12121212121212121212121212121212\",\"through_seq\":1,\"through_event_id\":\"abababababababababababababababab\",\"through_event_log_bytes\":1}}",
+        "{\"schema_version\":1,\"session_id\":\"session\",\"workspace_root\":\"/tmp/workspace\",\"position\":{\"log_generation\":\"1212121212121212121212121212121A\",\"through_seq\":1,\"through_event_id\":\"abababababababababababababababab\",\"through_event_log_bytes\":1}}",
+    };
+    for (invalid) |bytes| {
+        try std.testing.expectError(
+            error.InvalidSessionIndex,
+            decodeDeferredCacheToken(std.testing.allocator, bytes),
+        );
+    }
+
+    var oversized: [max_deferred_cache_token_bytes + 1]u8 = undefined;
+    @memset(&oversized, 'x');
+    try std.testing.expectError(
+        error.InvalidSessionIndex,
+        decodeDeferredCacheToken(std.testing.allocator, &oversized),
+    );
+}
+
+test "deferred cache token reader rejects non-private files" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        std.testing.io,
+        "sessions",
+        private_dir_permissions,
+    );
+    var sessions_dir = try tmp.dir.openDir(std.testing.io, "sessions", .{
+        .iterate = true,
+    });
+    defer sessions_dir.close(std.testing.io);
+    var sessions = io_mod.VerifiedDir{ .dir = sessions_dir };
+    var latest = try io_mod.openOrCreateVerifiedPrivateDir(&sessions, "latest");
+    defer latest.close();
+    var deferred = try io_mod.openOrCreateVerifiedPrivateDir(
+        &latest,
+        deferred_cache_dir,
+    );
+    defer deferred.close();
+    const encoded = try encodeDeferredCacheToken(
+        alloc,
+        "non-private-token",
+        "/tmp/workspace",
+        .{
+            .log_generation = [_]u8{0x12} ** 16,
+            .through_seq = 1,
+            .through_event_id = [_]u8{0xab} ** 16,
+            .through_event_log_bytes = 100,
+        },
+    );
+    defer alloc.free(encoded);
+    try io_mod.durableReplaceVerified(
+        alloc,
+        &deferred,
+        "non-private-token",
+        encoded,
+    );
+    var file = try deferred.dir.openFile(std.testing.io, "non-private-token", .{
+        .mode = .read_write,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    });
+    try file.setPermissions(
+        std.testing.io,
+        std.Io.File.Permissions.fromMode(0o644),
+    );
+    file.close(std.testing.io);
+
+    try std.testing.expect(try deferredCachePresent(&sessions));
+    try std.testing.expectError(
+        error.InvalidSessionIndex,
+        readDeferredCacheTokens(alloc, &sessions),
+    );
+}
+
+test "deferred cache token parser handles fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzDeferredCacheToken, .{
+        .corpus = &.{
+            "",
+            "{}",
+            "{\"schema_version\":1}",
+        },
+    });
+}
+
+fn fuzzDeferredCacheToken(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [max_deferred_cache_token_bytes + 1]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    var decoded = decodeDeferredCacheToken(
+        std.testing.allocator,
+        buffer[0..len],
+    ) catch return;
+    decoded.deinit(std.testing.allocator);
 }

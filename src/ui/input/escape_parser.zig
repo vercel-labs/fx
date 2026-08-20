@@ -31,9 +31,9 @@ const legacy_x10_column_stage: u8 = 11;
 const legacy_x10_row_stage: u8 = 12;
 const discarded_sgr_mouse_stage: u8 = 13;
 const discarded_x10_mouse_stage: u8 = 14;
-const csi_private_stage: u8 = 15;
+const control_sequence_discard_stage: u8 = 15;
 const sgr_mouse_max_bytes: u8 = 18;
-const csi_private_max_bytes: u16 = 32;
+const control_sequence_discard_max_bytes: u16 = 32;
 const kitty_up_key: u16 = 57352;
 const kitty_down_key: u16 = 57353;
 const shift_modifier: u16 = 0x01;
@@ -213,8 +213,12 @@ pub fn isMouseReportDiscardStage(stage: u8) bool {
     };
 }
 
-pub fn isPrivateCsiPayloadStage(stage: u8) bool {
-    return baseEscapeStage(stage) == csi_private_stage;
+pub fn isBareEscapeStage(stage: u8) bool {
+    return baseEscapeStage(stage) == 1;
+}
+
+pub fn isControlSequenceDiscardStage(stage: u8) bool {
+    return baseEscapeStage(stage) == control_sequence_discard_stage;
 }
 
 fn resetMouseEscapeDecode(stage: *u8, param: *u16, param2: *u16, mouse: *MouseInput) void {
@@ -222,6 +226,52 @@ fn resetMouseEscapeDecode(stage: *u8, param: *u16, param2: *u16, mouse: *MouseIn
     param.* = 0;
     param2.* = 0;
     mouse.reset();
+}
+
+fn beginControlSequenceDiscard(
+    stage: *u8,
+    param: *u16,
+    param2: *u16,
+    mouse: *MouseInput,
+    byte: u8,
+) ?InputEscapeAction {
+    if (byte >= 0x40 and byte <= 0x7e) {
+        resetMouseEscapeDecode(stage, param, param2, mouse);
+        return .ignore;
+    }
+    if (byte >= 0x20 and byte <= 0x3f) {
+        setBaseEscapeStage(stage, control_sequence_discard_stage);
+        param.* = 1;
+        param2.* = 0;
+        mouse.reset();
+        return null;
+    }
+    resetMouseEscapeDecode(stage, param, param2, mouse);
+    return .ignore;
+}
+
+fn consumeControlSequenceDiscardByte(
+    stage: *u8,
+    param: *u16,
+    param2: *u16,
+    mouse: *MouseInput,
+    byte: u8,
+) ?InputEscapeAction {
+    if (byte >= 0x40 and byte <= 0x7e) {
+        resetMouseEscapeDecode(stage, param, param2, mouse);
+        return .ignore;
+    }
+    if (byte < 0x20 or byte > 0x3f) {
+        resetMouseEscapeDecode(stage, param, param2, mouse);
+        return .ignore;
+    }
+
+    param.* = std.math.add(u16, param.*, 1) catch std.math.maxInt(u16);
+    if (param.* >= control_sequence_discard_max_bytes) {
+        resetMouseEscapeDecode(stage, param, param2, mouse);
+        return .ignore;
+    }
+    return null;
 }
 
 pub fn beginMouseReportDiscard(stage: *u8, param: *u16, param2: *u16, mouse: *MouseInput) bool {
@@ -395,7 +445,7 @@ pub fn consumeInputEscapeByteWithMouse(
             stage.* = 0;
             param.* = 0;
             param2.* = 0;
-            return null;
+            return .ignore;
         },
         2 => {
             const meta_prefixed = hasMetaPrefix(stage.*);
@@ -423,11 +473,7 @@ pub fn consumeInputEscapeByteWithMouse(
                     return null;
                 },
                 '?' => {
-                    param.* = 0;
-                    param2.* = 0;
-                    mouse.reset();
-                    setBaseEscapeStage(stage, csi_private_stage);
-                    return null;
+                    return beginControlSequenceDiscard(stage, param, param2, mouse, byte);
                 },
                 '0'...'9' => {
                     param.* = byte - '0';
@@ -435,29 +481,15 @@ pub fn consumeInputEscapeByteWithMouse(
                     setBaseEscapeStage(stage, 3);
                     return null;
                 },
-                else => null,
+                else => return beginControlSequenceDiscard(stage, param, param2, mouse, byte),
             };
             stage.* = 0;
             param.* = 0;
             param2.* = 0;
             return action;
         },
-        csi_private_stage => {
-            if (byte >= 0x40 and byte <= 0x7e) {
-                stage.* = 0;
-                param.* = 0;
-                param2.* = 0;
-                return .ignore;
-            }
-
-            param.* = std.math.add(u16, param.*, 1) catch std.math.maxInt(u16);
-            if (param.* >= csi_private_max_bytes) {
-                stage.* = 0;
-                param.* = 0;
-                param2.* = 0;
-                return .ignore;
-            }
-            return null;
+        control_sequence_discard_stage => {
+            return consumeControlSequenceDiscardByte(stage, param, param2, mouse, byte);
         },
         3 => {
             if (byte >= '0' and byte <= '9') {
@@ -473,18 +505,18 @@ pub fn consumeInputEscapeByteWithMouse(
                 return null;
             }
 
-            const meta_prefixed = hasMetaPrefix(stage.*);
-            const value = param.*;
-            const digit_count = param2.*;
-            stage.* = 0;
-            param.* = 0;
-            param2.* = 0;
             if (byte == 'u') {
+                const meta_prefixed = hasMetaPrefix(stage.*);
+                const value = param.*;
+                resetMouseEscapeDecode(stage, param, param2, mouse);
                 // Single-parameter CSI u: no `;`, so modifiers == 0.
                 return kittyUnicodeKeyAction(value, 0, meta_prefixed);
             }
-            if (byte != '~') return null;
+            if (byte != '~') return beginControlSequenceDiscard(stage, param, param2, mouse, byte);
 
+            const value = param.*;
+            const digit_count = param2.*;
+            resetMouseEscapeDecode(stage, param, param2, mouse);
             if (digit_count == 3 and value == 200) return .paste_start;
             if (digit_count == 3 and value == 201) return .paste_end;
 
@@ -499,12 +531,9 @@ pub fn consumeInputEscapeByteWithMouse(
         },
         4 => {
             const meta_prefixed = hasMetaPrefix(stage.*);
-            stage.* = 0;
-            param.* = 0;
-            param2.* = 0;
-            return switch (byte) {
+            const action: InputEscapeAction = switch (byte) {
                 'A', 'B', 'C', 'D' => if (meta_prefixed)
-                    modifiedArrowAction(byte, 0, true)
+                    modifiedArrowAction(byte, 0, true) orelse .ignore
                 else switch (byte) {
                     'A' => .cursor_up,
                     'B' => .cursor_down,
@@ -514,8 +543,10 @@ pub fn consumeInputEscapeByteWithMouse(
                 },
                 'H' => .home,
                 'F' => .end,
-                else => null,
+                else => return beginControlSequenceDiscard(stage, param, param2, mouse, byte),
             };
+            resetMouseEscapeDecode(stage, param, param2, mouse);
+            return action;
         },
         5 => {
             if (byte >= '0' and byte <= '9') {
@@ -531,18 +562,18 @@ pub fn consumeInputEscapeByteWithMouse(
                 return null;
             }
 
-            const meta_prefixed = hasMetaPrefix(stage.*);
-            const keycode = param2.*;
-            const modifiers = if (param.* > 0) param.* - 1 else 0;
-            stage.* = 0;
-            param.* = 0;
-            param2.* = 0;
-
             if (byte == 'u') {
+                const meta_prefixed = hasMetaPrefix(stage.*);
+                const keycode = param2.*;
+                const modifiers = if (param.* > 0) param.* - 1 else 0;
+                resetMouseEscapeDecode(stage, param, param2, mouse);
                 return kittyUnicodeKeyAction(keycode, modifiers, meta_prefixed);
             }
 
             if (byte == '~') {
+                const keycode = param2.*;
+                const modifiers = if (param.* > 0) param.* - 1 else 0;
+                resetMouseEscapeDecode(stage, param, param2, mouse);
                 if (keycode == 3 and (modifiers & 0x08) != 0) {
                     return .delete_to_line_end;
                 }
@@ -572,18 +603,28 @@ pub fn consumeInputEscapeByteWithMouse(
                 };
             }
 
-            if (byte == 'Z' and modifiers != 0) return .toggle_permission_mode;
-            if (modifiedArrowAction(byte, modifiers, meta_prefixed)) |action| return action;
+            const meta_prefixed = hasMetaPrefix(stage.*);
+            const modifiers = if (param.* > 0) param.* - 1 else 0;
+            if (byte == 'Z' and modifiers != 0) {
+                resetMouseEscapeDecode(stage, param, param2, mouse);
+                return .toggle_permission_mode;
+            }
+            if (modifiedArrowAction(byte, modifiers, meta_prefixed)) |action| {
+                resetMouseEscapeDecode(stage, param, param2, mouse);
+                return action;
+            }
 
-            return switch (byte) {
+            const action: InputEscapeAction = switch (byte) {
                 'A' => .cursor_up,
                 'B' => .cursor_down,
                 'C' => .cursor_right,
                 'D' => .cursor_left,
                 'H' => .home,
                 'F' => .end,
-                else => null,
+                else => return beginControlSequenceDiscard(stage, param, param2, mouse, byte),
             };
+            resetMouseEscapeDecode(stage, param, param2, mouse);
+            return action;
         },
         // Stage 6: third parameter (e.g. modifyOtherKeys: ESC[27;modifier;keycode~)
         6 => {
@@ -592,18 +633,15 @@ pub fn consumeInputEscapeByteWithMouse(
                 return null;
             }
 
-            const meta_prefixed = hasMetaPrefix(stage.*);
-            const keycode = param.*;
-            const modifiers = if (param2.* > 0) param2.* - 1 else 0;
-            stage.* = 0;
-            param.* = 0;
-            param2.* = 0;
-
             if (byte == '~') {
+                const meta_prefixed = hasMetaPrefix(stage.*);
+                const keycode = param.*;
+                const modifiers = if (param2.* > 0) param2.* - 1 else 0;
+                resetMouseEscapeDecode(stage, param, param2, mouse);
                 return kittyUnicodeKeyAction(keycode, modifiers, meta_prefixed);
             }
 
-            return null;
+            return beginControlSequenceDiscard(stage, param, param2, mouse, byte);
         },
         // SGR mouse: ESC [ < button ; column ; row M/m.
         sgr_mouse_stage => {

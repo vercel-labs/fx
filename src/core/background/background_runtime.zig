@@ -2758,7 +2758,6 @@ fn spawnBlockedBackgroundHandshakeForTest(
         child.stdin = null;
         child.stderr = null;
         child.kill(io_mod.getIo());
-        _ = child.wait(io_mod.getIo()) catch {};
     }
 
     var ready: [1]u8 = undefined;

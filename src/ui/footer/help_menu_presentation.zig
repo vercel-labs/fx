@@ -9,6 +9,8 @@ const Allocator = std.mem.Allocator;
 const HelpMenuProjection = render_input.HelpMenuProjection;
 
 const roomy_header_rows: u16 = 2;
+// Keep command names and descriptions visually associated on wide terminals.
+const maximum_description_column: usize = 48;
 
 fn commandRowCount(_: u16) u16 {
     return 1;
@@ -64,7 +66,7 @@ pub fn composeHelpMenuRow(
     }
     if (layout.match_count == 0) return composeEmptyRow(alloc, width);
 
-    const description_col = centeredDescriptionColumn(projection, width);
+    const description_col = descriptionColumn(projection, width);
     return switch (bodyRowAt(projection, width, layout, row_index - layout.body_start_row)) {
         .none => empty,
         .category => |category| composeCategoryRow(alloc, category, width),
@@ -238,7 +240,7 @@ fn composeCommandRow(
     try row.appendSlice(alloc, ui_render.reset_style);
     try row_text.appendSpacesToColumn(alloc, &row, description_col);
 
-    try row.appendSlice(alloc, ui_render.dim_style);
+    try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
     try row_text.appendSingleLineEllipsized(
         alloc,
         &row,
@@ -249,7 +251,7 @@ fn composeCommandRow(
     return row;
 }
 
-fn centeredDescriptionColumn(projection: HelpMenuProjection, width: u16) usize {
+fn descriptionColumn(projection: HelpMenuProjection, width: u16) usize {
     const total_width: usize = width;
     const right_column_start = total_width * 2 / 3;
     const right_column_width = total_width - right_column_start;
@@ -262,7 +264,8 @@ fn centeredDescriptionColumn(projection: HelpMenuProjection, width: u16) usize {
         );
     }
     const description_block_width = @min(widest_description_width, right_column_width);
-    return right_column_start + (right_column_width - description_block_width) / 2;
+    const centered_column = right_column_start + (right_column_width - description_block_width) / 2;
+    return @min(centered_column, maximum_description_column);
 }
 
 fn composeEmptyRow(alloc: Allocator, width: u16) !std.ArrayList(u8) {
@@ -281,34 +284,43 @@ const help_menu_test_specs = [_]command_specs.SlashSpec{
 };
 const help_menu_test_registry = command_specs.SlashRegistry{ .commands = help_menu_test_specs[0..] };
 
-test "help menu renders each command on one linear row at wide and narrow widths" {
+test "help menu keeps descriptions close at wide widths without changing narrow layout" {
     const alloc = std.testing.allocator;
     const projection: render_input.HelpMenuProjection = .{
         .active = true,
         .registry = help_menu_test_registry,
         .selected_index = 0,
     };
-    const rows = menuRowCount(projection, 100, 20);
+    const rows = menuRowCount(projection, 160, 20);
 
-    var header = try composeHelpMenuRow(alloc, projection, 0, 100, rows);
+    var header = try composeHelpMenuRow(alloc, projection, 0, 160, rows);
     defer header.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, header.items, "Commands 3") != null);
 
-    var category = try composeHelpMenuRow(alloc, projection, 2, 100, rows);
+    var category = try composeHelpMenuRow(alloc, projection, 2, 160, rows);
     defer category.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, category.items, "General") != null);
 
-    var selected = try composeHelpMenuRow(alloc, projection, 3, 100, rows);
+    var selected = try composeHelpMenuRow(alloc, projection, 3, 160, rows);
     defer selected.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, selected.items, "/help") != null);
     try std.testing.expect(std.mem.find(u8, selected.items, "●") == null);
     try std.testing.expect(std.mem.find(u8, selected.items, "show available slash commands") != null);
     try std.testing.expectEqual(@as(?usize, null), std.mem.findScalar(u8, selected.items, '\n'));
     const description_start = std.mem.find(u8, selected.items, "show available slash commands").?;
-    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(selected.items[0..description_start]) >= 100 * 2 / 3);
+    const selected_style_start = description_start - ui_render.selected_completion_style.len;
+    try std.testing.expectEqualStrings(
+        ui_render.selected_completion_style,
+        selected.items[selected_style_start..description_start],
+    );
+    try std.testing.expectEqual(
+        maximum_description_column,
+        display_width.visibleWidthIgnoringAnsi(selected.items[0..description_start]),
+    );
 
     const narrow_rows = menuRowCount(projection, 22, 20);
     try std.testing.expectEqual(rows, narrow_rows);
+    try std.testing.expectEqual(@as(usize, 14), descriptionColumn(projection, 22));
     var narrow = try composeHelpMenuRow(alloc, projection, 3, 22, narrow_rows);
     defer narrow.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, narrow.items, "/help") != null);
@@ -325,13 +337,13 @@ test "help menu keeps a gutter between long commands and descriptions" {
         .active = true,
         .registry = .{ .commands = long_specs[0..] },
     };
-    const rows = menuRowCount(projection, 100, 12);
-    var item = try composeHelpMenuRow(alloc, projection, 3, 100, rows);
+    const rows = menuRowCount(projection, 160, 12);
+    var item = try composeHelpMenuRow(alloc, projection, 3, 160, rows);
     defer item.deinit(alloc);
 
     const description_start = std.mem.find(u8, item.items, "choose presentation").?;
     const description_col = display_width.visibleWidthIgnoringAnsi(item.items[0..description_start]);
-    try std.testing.expect(description_col >= 100 * 2 / 3);
+    try std.testing.expectEqual(maximum_description_column, description_col);
     try std.testing.expect(std.mem.find(u8, item.items[0..description_start], "…") != null);
 }
 

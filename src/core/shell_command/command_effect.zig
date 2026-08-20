@@ -9,6 +9,180 @@ const max_line_count = 10_000;
 const max_git_log_count = 1_000;
 pub const max_direct_pipeline_stages = 8;
 
+/// Returns true only for a small parsed set of ordinary development commands
+/// whose effects are expected and recoverable in auto mode. Unknown syntax,
+/// dynamic shell expansion, publication, deletion, and wrappers remain on the
+/// normal review path.
+pub fn knownReversibleAutoCommand(
+    alloc: std.mem.Allocator,
+    command: []const u8,
+    background: bool,
+) std.mem.Allocator.Error!bool {
+    if (background) return false;
+    const trimmed = std.mem.trim(u8, command, " \t");
+    if (trimmed.len == 0 or trimmed.len > max_command_bytes or
+        std.mem.findScalar(u8, trimmed, '\n') != null or
+        std.mem.findScalar(u8, trimmed, '\r') != null)
+    {
+        return false;
+    }
+
+    var argv = command_lex.tokenize_argv(alloc, trimmed) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    defer argv.deinit(alloc);
+    if (argv.tokens.len == 0) return false;
+
+    var stage_start: usize = 0;
+    var index: usize = 0;
+    while (index <= argv.tokens.len) : (index += 1) {
+        const at_end = index == argv.tokens.len;
+        if (!at_end and !std.mem.eql(u8, argv.tokens[index].value, "&&")) {
+            if (isUnsupportedAutoControlOperator(argv.tokens[index])) return false;
+            continue;
+        }
+        if (!reversibleAutoStage(argv.tokens[stage_start..index])) return false;
+        stage_start = index + 1;
+    }
+    return true;
+}
+
+fn isUnsupportedAutoOperator(token: command_lex.ArgvToken) bool {
+    return isUnsupportedAutoControlOperator(token) or
+        (!token.quoted and command_lex.redirection_kind(token.value) != null);
+}
+
+fn isUnsupportedAutoControlOperator(token: command_lex.ArgvToken) bool {
+    if (token.quoted) return false;
+    if (std.mem.eql(u8, token.value, "&&")) return false;
+    return std.mem.eql(u8, token.value, "|") or
+        std.mem.eql(u8, token.value, "||") or
+        std.mem.eql(u8, token.value, "&") or
+        std.mem.eql(u8, token.value, ";") or
+        std.mem.eql(u8, token.value, "(") or
+        std.mem.eql(u8, token.value, ")") or
+        std.mem.eql(u8, token.value, "{") or
+        std.mem.eql(u8, token.value, "}");
+}
+
+fn reversibleAutoStage(raw_tokens: []const command_lex.ArgvToken) bool {
+    var tokens = raw_tokens;
+    if (tokens.len >= 3 and
+        !tokens[tokens.len - 3].quoted and
+        !tokens[tokens.len - 2].quoted and
+        !tokens[tokens.len - 1].quoted and
+        std.mem.eql(u8, tokens[tokens.len - 3].value, "2") and
+        std.mem.eql(u8, tokens[tokens.len - 2].value, ">&") and
+        std.mem.eql(u8, tokens[tokens.len - 1].value, "1"))
+    {
+        tokens = tokens[0 .. tokens.len - 3];
+    }
+    if (tokens.len == 0) return false;
+    for (tokens) |token| {
+        if (isUnsupportedAutoOperator(token) or tokenHasDynamicShellSyntax(token.raw)) {
+            return false;
+        }
+    }
+
+    const executable = tokens[0].value;
+    const words = tokens[1..];
+    if (std.mem.eql(u8, executable, "node")) {
+        return words.len == 1 and isVersionFlag(words[0].value);
+    }
+    if (std.mem.eql(u8, executable, "which")) {
+        return words.len > 0 and allOperands(words);
+    }
+    if (std.mem.eql(u8, executable, "git")) return reversibleGit(words);
+    if (std.mem.eql(u8, executable, "npm")) return reversibleNpm(words);
+    if (std.mem.eql(u8, executable, "bun")) return reversiblePackageRunner(words);
+    if (std.mem.eql(u8, executable, "pnpm")) return reversiblePackageRunner(words);
+    if (std.mem.eql(u8, executable, "yarn")) return reversiblePackageRunner(words);
+    if (std.mem.eql(u8, executable, "zig")) {
+        return words.len > 0 and std.mem.eql(u8, words[0].value, "build");
+    }
+    return false;
+}
+
+fn tokenHasDynamicShellSyntax(raw: []const u8) bool {
+    for (raw) |byte| switch (byte) {
+        '$', '`', '*', '?', '[', '~', '\n', '\r', ';', '(', ')', '{', '}' => return true,
+        else => {},
+    };
+    return false;
+}
+
+fn isVersionFlag(value: []const u8) bool {
+    return std.mem.eql(u8, value, "-v") or
+        std.mem.eql(u8, value, "--version");
+}
+
+fn allOperands(tokens: []const command_lex.ArgvToken) bool {
+    for (tokens) |token| {
+        if (token.value.len == 0 or token.value[0] == '-') return false;
+    }
+    return true;
+}
+
+fn reversibleGit(words: []const command_lex.ArgvToken) bool {
+    if (words.len == 0) return false;
+    const subcommand = words[0].value;
+    if (std.mem.eql(u8, subcommand, "status")) return true;
+    if (std.mem.eql(u8, subcommand, "remote")) {
+        return words.len == 2 and std.mem.eql(u8, words[1].value, "-v");
+    }
+    if (std.mem.eql(u8, subcommand, "worktree")) {
+        return words.len >= 2 and std.mem.eql(u8, words[1].value, "list");
+    }
+    if (std.mem.eql(u8, subcommand, "fetch")) {
+        for (words[1..]) |word| {
+            if (std.mem.eql(u8, word.value, "--prune") or
+                std.mem.eql(u8, word.value, "-p") or
+                std.mem.eql(u8, word.value, "--prune-tags")) return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn reversibleNpm(words: []const command_lex.ArgvToken) bool {
+    if (words.len == 1 and isVersionFlag(words[0].value)) return true;
+    if (words.len == 0) return false;
+    const subcommand = words[0].value;
+    if (std.mem.eql(u8, subcommand, "install") or
+        std.mem.eql(u8, subcommand, "i") or
+        std.mem.eql(u8, subcommand, "ci") or
+        std.mem.eql(u8, subcommand, "test"))
+    {
+        return !hasGlobalPackageFlag(words[1..]);
+    }
+    return std.mem.eql(u8, subcommand, "run") and words.len >= 2;
+}
+
+fn reversiblePackageRunner(words: []const command_lex.ArgvToken) bool {
+    if (words.len == 1 and isVersionFlag(words[0].value)) return true;
+    if (words.len == 0) return false;
+    const subcommand = words[0].value;
+    if (std.mem.eql(u8, subcommand, "install") or
+        std.mem.eql(u8, subcommand, "test"))
+    {
+        return !hasGlobalPackageFlag(words[1..]);
+    }
+    return std.mem.eql(u8, subcommand, "run") and words.len >= 2;
+}
+
+fn hasGlobalPackageFlag(words: []const command_lex.ArgvToken) bool {
+    for (words) |word| {
+        if (std.mem.eql(u8, word.value, "-g") or
+            std.mem.eql(u8, word.value, "--global") or
+            std.mem.eql(u8, word.value, "--location") or
+            std.mem.eql(u8, word.value, "--location=global") or
+            std.mem.eql(u8, word.value, "--prefix") or
+            std.mem.startsWith(u8, word.value, "--prefix=")) return true;
+    }
+    return false;
+}
+
 const PrintfFormatLanguage = enum {
     portable_literal_newline_percent_string,
 };
@@ -17,6 +191,50 @@ const PrintfPolicy = struct {
     executable: []const u8,
     format_language: PrintfFormatLanguage = .portable_literal_newline_percent_string,
 };
+
+test "known reversible auto commands exclude destructive and hidden effects" {
+    for ([_][]const u8{
+        "node -v",
+        "node -v && npm -v",
+        "which node npm && node -v",
+        "git status --short --branch",
+        "git remote -v",
+        "git worktree list --porcelain",
+        "git fetch origin main",
+        "npm install 2>&1",
+        "npm run dev",
+        "zig build test",
+        "bun test",
+    }) |command| {
+        try std.testing.expect(try knownReversibleAutoCommand(
+            std.testing.allocator,
+            command,
+            false,
+        ));
+    }
+    for ([_][]const u8{
+        "rm -rf .",
+        "git rm -r netlify",
+        "git push origin HEAD",
+        "cat ~/.ssh/id_rsa",
+        "sh -c 'npm install'",
+        "npm exec -- rm -rf .",
+        "npm install --prefix=/tmp/global",
+        "npm install --location global",
+        "git fetch --prune origin",
+    }) |command| {
+        try std.testing.expect(!try knownReversibleAutoCommand(
+            std.testing.allocator,
+            command,
+            false,
+        ));
+    }
+    try std.testing.expect(!try knownReversibleAutoCommand(
+        std.testing.allocator,
+        "npm run dev",
+        true,
+    ));
+}
 
 const LsSymlinkSemantics = enum {
     platform_default,

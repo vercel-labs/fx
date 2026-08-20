@@ -63,6 +63,9 @@ const toolCall = test_support.toolCall;
 const vision_agent_test_tools = test_support.vision_agent_test_tools;
 const VisionAgentToolRuntime = test_support.VisionAgentToolRuntime;
 
+const fixture_tools_json =
+    "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read a file\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]";
+
 fn makeOwnedVisionCatalog(
     alloc: std.mem.Allocator,
     dir: std.Io.Dir,
@@ -4520,7 +4523,53 @@ test "processQueuedPrompt auto permission denial labels lifecycle source" {
     try expectPermissionDeniedToolResult(&gateway, 1, "write_file", .auto_denied);
 }
 
-test "three permission blocks use one tools-disabled final model step when budget remains" {
+test "three automatic permission blocks route the next action through approval" {
+    const alloc = std.testing.allocator;
+    const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch one\"}")};
+    const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch two\"}")};
+    const third = [_]ToolCall{toolCall("blocked-3", "run_command", "{\"command\":\"touch three\"}")};
+    const approved = [_]ToolCall{toolCall("approved-4", "run_command", "{\"command\":\"touch approved\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &first },
+        .{ .tool_calls = &second },
+        .{ .tool_calls = &third },
+        .{ .tool_calls = &approved },
+        .{ .content = "Approved action completed." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{ .deny, .deny, .deny, .once };
+    hooks.permission_denial_reasons = &.{ .auto_denied, .auto_denied, .auto_denied };
+    hooks.permission_human_approvals = &.{ .none, .none, .none, .once };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.agent_step_limit = 5;
+    config.gateway_tools_json = fixture_tools_json;
+    var job = fixture.job();
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 5), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 3, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyNotContains(&gateway, 3, "\"tools\":[]");
+    try std.testing.expectEqualStrings(
+        "Approved action completed.",
+        hooks.history_assistant_text.?,
+    );
+    try std.testing.expectEqual(@as(usize, 4), hooks.permission_names.items.len);
+    try std.testing.expectEqualSlices(
+        permission_auto_classifier.AutoPermissionPhase,
+        &.{ .automatic_review, .automatic_review, .automatic_review, .human_approval },
+        hooks.permission_review_phases.items,
+    );
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("run_command", hooks.executed_names.items[0]);
+}
+
+test "human approval phase permits a normal text completion" {
     const alloc = std.testing.allocator;
     const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch one\"}")};
     const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch two\"}")};
@@ -4529,7 +4578,7 @@ test "three permission blocks use one tools-disabled final model step when budge
         .{ .tool_calls = &first },
         .{ .tool_calls = &second },
         .{ .tool_calls = &third },
-        .{ .content = "Which safe alternative should I use?" },
+        .{ .content = "No further action is needed." },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
@@ -4540,20 +4589,67 @@ test "three permission blocks use one tools-disabled final model step when budge
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.agent_step_limit = 4;
+    var job = fixture.job();
+    job.permission_mode = .auto;
 
-    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
-    try expectBodyContains(&gateway, 3, "\"toolChoice\":{\"type\":\"none\"}");
-    try expectBodyContains(&gateway, 3, "\"tools\":[]");
+    try std.testing.expectEqual(@as(usize, 3), hooks.permission_names.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqualStrings(
-        "Which safe alternative should I use?",
+        "No further action is needed.",
         hooks.history_assistant_text.?,
     );
-    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
 }
 
-test "three permission blocks use local fallback when step budget is exhausted" {
+test "human approval phase reaches every call in a parallel response group" {
+    const alloc = std.testing.allocator;
+    const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch one\"}")};
+    const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch two\"}")};
+    const third = [_]ToolCall{toolCall("blocked-3", "run_command", "{\"command\":\"touch three\"}")};
+    const parallel = [_]ToolCall{
+        toolCall("approved-4a", "run_command", "{\"command\":\"touch approved-a\"}"),
+        toolCall("approved-4b", "run_command", "{\"command\":\"touch approved-b\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &first },
+        .{ .tool_calls = &second },
+        .{ .tool_calls = &third },
+        .{ .tool_calls = &parallel },
+        .{ .content = "Parallel approved actions completed." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{ .deny, .deny, .deny, .once, .once };
+    hooks.permission_denial_reasons = &.{ .auto_denied, .auto_denied, .auto_denied };
+    hooks.permission_human_approvals = &.{ .none, .none, .none, .once, .once };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.agent_step_limit = 5;
+    var job = fixture.job();
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 5), hooks.permission_names.items.len);
+    try std.testing.expectEqualSlices(
+        permission_auto_classifier.AutoPermissionPhase,
+        &.{
+            .automatic_review,
+            .automatic_review,
+            .automatic_review,
+            .human_approval,
+            .human_approval,
+        },
+        hooks.permission_review_phases.items,
+    );
+    try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
+}
+
+test "three automatic permission blocks preserve an exhausted positive step cap" {
     const alloc = std.testing.allocator;
     const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch one\"}")};
     const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch two\"}")};
@@ -4578,13 +4674,13 @@ test "three permission blocks use local fallback when step budget is exhausted" 
 
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
     try std.testing.expectEqualStrings(
-        "The blocked action was not run. No safe alternative completed within the configured agent step limit. Provide direction to continue.",
+        runtime_config.Config.default_step_limit_notice,
         hooks.history_assistant_text.?,
     );
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
 }
 
-test "permission review receives only the active root request" {
+test "permission review receives bounded proven root request context" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
     const completions = [_]FakeCompletion{
@@ -4646,9 +4742,9 @@ test "permission review receives only the active root request" {
     try std.testing.expectEqual(@as(usize, 1), hooks.permission_user_intent_contexts.items.len);
     const context = hooks.permission_user_intent_contexts.items[0];
     try std.testing.expect(std.mem.find(u8, context, "Go ahead.") != null);
-    try std.testing.expect(std.mem.find(u8, context, "Inspect the final state before continuing.") == null);
-    try std.testing.expect(std.mem.find(u8, context, "true first root request") == null);
-    try std.testing.expect(std.mem.find(u8, context, "Create a.txt in the workspace.") == null);
+    try std.testing.expect(std.mem.find(u8, context, "Inspect the final state before continuing.") != null);
+    try std.testing.expect(std.mem.find(u8, context, "true first root request") != null);
+    try std.testing.expect(std.mem.find(u8, context, "Create a.txt in the workspace.") != null);
     try std.testing.expect(std.mem.find(u8, context, "surviving recent assistant") == null);
     try std.testing.expect(std.mem.find(u8, context, "excluded older assistant") == null);
     try std.testing.expect(std.mem.find(u8, context, "Do not make any more file changes.") == null);

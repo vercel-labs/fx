@@ -129,9 +129,6 @@ pub const TerminalInputEvent = union(enum) {
     paste_byte: u8,
     raw: RawTerminalInput,
     action: DecodedTerminalAction,
-    unrecognized_escape: struct {
-        cancel_pending: bool,
-    },
 };
 
 /// Core-owned facts sampled before UI advances its terminal decoder.

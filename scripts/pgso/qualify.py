@@ -37,7 +37,8 @@ from scripts.pgso.toolchain import Toolchain
 MINIMUM_SAMPLES = 50
 STARTUP_MINIMUM_SAMPLES = 100
 STARTUP_WARMUP_RUNS = 10
-STARTUP_ROUNDS = 10
+STARTUP_MINIMUM_ROUNDS = 10
+STARTUP_MAX_RUNS_PER_ROUND = 10
 MAXIMUM_REGRESSION = 0.10
 REQUIRED_EVIDENCE = (
     "identity",
@@ -876,10 +877,14 @@ def measure_startup(
     logs.mkdir(parents=True, exist_ok=True)
     results: list[MeasurementResult] = []
     startup_samples = max(samples, STARTUP_MINIMUM_SAMPLES)
-    samples_per_round, extra_samples = divmod(startup_samples, STARTUP_ROUNDS)
+    startup_rounds = max(
+        STARTUP_MINIMUM_ROUNDS,
+        math.ceil(startup_samples / STARTUP_MAX_RUNS_PER_ROUND),
+    )
+    samples_per_round, extra_samples = divmod(startup_samples, startup_rounds)
     round_samples = tuple(
         samples_per_round + (round_index < extra_samples)
-        for round_index in range(STARTUP_ROUNDS)
+        for round_index in range(startup_rounds)
     )
 
     for command_name, command_argv in select_startup_commands(command_names):

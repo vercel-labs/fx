@@ -441,7 +441,7 @@ const specs = [_]Spec{
     .{ .id = .effort, .category = .agent, .label = "Reasoning effort", .description = "Control how much reasoning the model applies" },
     .{ .id = .fast_mode, .category = .agent, .label = "Fast mode", .description = "Use faster inference when the model supports it" },
     .{ .id = .permission_mode, .category = .agent, .label = "Permission mode", .description = "Choose when Fx asks before taking actions" },
-    .{ .id = .sound_level, .category = .notifications, .label = "Sound level", .description = "Choose off, on, or max interface sounds" },
+    .{ .id = .sound_level, .category = .notifications, .label = "Sound level", .description = "Choose off, on, or max sounds and terminal bells" },
     .{ .id = .sandbox, .category = .advanced, .label = "Command sandbox", .description = "Choose command process isolation for this workspace" },
     .{ .id = .startup_scrollback, .category = .advanced, .label = "Startup scrollback", .description = "Restore terminal output when Fx starts" },
     .{ .id = .prompt_history, .category = .advanced, .label = "Prompt history", .description = "Save accepted prompts and slash commands for composer history" },

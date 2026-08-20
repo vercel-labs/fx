@@ -174,6 +174,9 @@ function outerCommandCall() {
 
 const PROJECTION_READY = ".projection-change-ready";
 const PROJECTION_RELEASE = ".projection-change-release";
+const PROJECTION_CHANGING_COMMAND =
+  `i=1; while [ "$i" -le 5000 ]; do printf 'PROJECTION_FIXTURE_%04d\\n' "$i"; i=$((i + 1)); done; ` +
+  `: > ${PROJECTION_READY}; while [ ! -e ${PROJECTION_RELEASE} ]; do sleep 0.01; done`;
 
 function outerProjectionChangingCommandCall() {
   return outerToolCalls([
@@ -182,9 +185,7 @@ function outerProjectionChangingCommandCall() {
       name: "terminal",
       input: {
         action: "exec",
-        command:
-          `i=1; while [ "$i" -le 5000 ]; do printf 'PROJECTION_FIXTURE_%04d\\n' "$i"; i=$((i + 1)); done; ` +
-          `: > ${PROJECTION_READY}; while [ ! -e ${PROJECTION_RELEASE} ]; do sleep 0.01; done`,
+        command: PROJECTION_CHANGING_COMMAND,
       },
     },
   ]);
@@ -1496,7 +1497,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         },
         "ask",
         () => "allow",
-        { bash: { "i=1; while *": "allow" } },
+        { bash: { [PROJECTION_CHANGING_COMMAND]: "allow" } },
       );
       await ctx.session.resizeWindow(120, 36);
 

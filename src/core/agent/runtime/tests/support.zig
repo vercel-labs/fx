@@ -467,6 +467,7 @@ pub const FakeAgentRuntimeDeps = struct {
     permission_review_models: std.ArrayList([]u8) = .empty,
     permission_review_target_call_ids: std.ArrayList([]u8) = .empty,
     permission_review_origins: std.ArrayList(permission_auto_classifier.ReviewOrigin) = .empty,
+    permission_review_phases: std.ArrayList(permission_auto_classifier.AutoPermissionPhase) = .empty,
     permission_review_root_authority_counts: std.ArrayList(usize) = .empty,
     permission_review_feedback_counts: std.ArrayList(usize) = .empty,
     permission_review_pending_call_counts: std.ArrayList(usize) = .empty,
@@ -647,6 +648,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.permission_review_models);
         freeStringList(self.alloc, &self.permission_review_target_call_ids);
         self.permission_review_origins.deinit(self.alloc);
+        self.permission_review_phases.deinit(self.alloc);
         self.permission_review_root_authority_counts.deinit(self.alloc);
         self.permission_review_feedback_counts.deinit(self.alloc);
         self.permission_review_pending_call_counts.deinit(self.alloc);
@@ -982,6 +984,10 @@ pub const FakeAgentRuntimeDeps = struct {
             try self.alloc.dupe(u8, review_turn.target_call_id),
         );
         try self.permission_review_origins.append(self.alloc, review_turn.origin);
+        try self.permission_review_phases.append(
+            self.alloc,
+            review_turn.auto_permission_phase,
+        );
         try self.permission_review_root_authority_counts.append(
             self.alloc,
             @intFromBool(review_turn.current_root_request.len > 0),

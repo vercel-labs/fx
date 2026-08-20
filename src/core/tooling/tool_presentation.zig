@@ -40,19 +40,20 @@ fn projectRunCommandActivitySource(
     workspace_root_input: []const u8,
     storage: *[max_run_command_activity_bytes + 1]u8,
 ) []const u8 {
+    const display_command = stripNoopCurrentDirectoryPrefix(command);
     var workspace_root_end = workspace_root_input.len;
     while (workspace_root_end > 1 and workspace_root_input[workspace_root_end - 1] == '/') {
         workspace_root_end -= 1;
     }
     const workspace_root = workspace_root_input[0..workspace_root_end];
     const can_abbreviate_workspace = workspace_root.len > 1 and workspace_root[0] == '/';
-    const source_limit = @min(command.len, max_run_command_activity_source_bytes);
+    const source_limit = @min(display_command.len, max_run_command_activity_source_bytes);
     var source_index: usize = 0;
     var projected_len: usize = 0;
     var line_boundary_pending = false;
 
     while (source_index < source_limit) {
-        const byte = command[source_index];
+        const byte = display_command[source_index];
         if (byte == '\r' or byte == '\n') {
             line_boundary_pending = true;
             source_index += 1;
@@ -73,7 +74,7 @@ fn projectRunCommandActivitySource(
 
         if (can_abbreviate_workspace and
             workspace_root.len <= source_limit - source_index and
-            workspaceRootMatchesAt(command, workspace_root, source_index))
+            workspaceRootMatchesAt(display_command, workspace_root, source_index))
         {
             storage[projected_len] = '.';
             projected_len += 1;
@@ -89,6 +90,15 @@ fn projectRunCommandActivitySource(
     }
 
     return storage[0..projected_len];
+}
+
+fn stripNoopCurrentDirectoryPrefix(command: []const u8) []const u8 {
+    const prefix = "cd . &&";
+    if (!std.mem.startsWith(u8, command, prefix)) return command;
+    if (command.len == prefix.len or !std.ascii.isWhitespace(command[prefix.len])) return command;
+
+    const remainder = std.mem.trimStart(u8, command[prefix.len..], " \t\r\n");
+    return if (remainder.len > 0) remainder else command;
 }
 
 fn workspaceRootMatchesAt(command: []const u8, workspace_root: []const u8, index: usize) bool {
@@ -638,6 +648,43 @@ test "run command activity abbreviates only active workspace paths" {
         "terminal.exec cd /Users/example/workspace/packages/cli && pwd",
         permission,
     );
+}
+
+test "run command activity hides only a leading no-op current directory prefix" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        command: []const u8,
+        expected: []const u8,
+    }{
+        .{ .command = "cd . && zig build", .expected = "zig build" },
+        .{ .command = "cd . &&\n  zig build test", .expected = "zig build test" },
+        .{ .command = "cd ./packages && pwd", .expected = "cd ./packages && pwd" },
+        .{ .command = "cd .. && pwd", .expected = "cd .. && pwd" },
+        .{ .command = "cd . || pwd", .expected = "cd . || pwd" },
+        .{ .command = "printf 'cd . && pwd'", .expected = "printf 'cd . && pwd'" },
+        .{ .command = "cd . &&", .expected = "cd . &&" },
+    };
+
+    for (cases) |case| {
+        const arguments_json = try std.fmt.allocPrint(alloc, "{{\"command\":{f}}}", .{std.json.fmt(case.command, .{})});
+        defer alloc.free(arguments_json);
+        const activity = (try formatRunCommandActivity(alloc, test_tool_registry, "", .{
+            .id = "current_directory_command",
+            .name = "run_command",
+            .arguments_json = arguments_json,
+        })) orelse return error.TestExpectedEqual;
+        defer alloc.free(activity.detail);
+
+        try std.testing.expectEqualStrings(case.expected, activity.detail);
+    }
+
+    const permission = try formatPermissionLabel(alloc, test_tool_registry, .{
+        .id = "raw_current_directory_command",
+        .name = "run_command",
+        .arguments_json = "{\"command\":\"cd . && zig build\"}",
+    });
+    defer alloc.free(permission);
+    try std.testing.expectEqualStrings("terminal.exec cd . && zig build", permission);
 }
 
 test "tool presentation formats bounded web search action detail" {

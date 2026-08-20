@@ -332,6 +332,56 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertTrue(all(len(result.control_samples) == 100 for result in results))
         self.assertTrue(all(len(result.candidate_samples) == 100 for result in results))
 
+    def test_startup_measurement_caps_large_campaign_blocks_at_ten_runs(self) -> None:
+        control = self.root / "control" / "fx"
+        candidate = self.root / "candidate" / "fx"
+        hyperfine = self.root / "tools" / "hyperfine"
+        for path in (control, candidate, hyperfine):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+
+        calls, fake_run = self.fake_startup_runner(
+            hyperfine=hyperfine,
+            control=control,
+            candidate=candidate,
+        )
+        with mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run):
+            results = measure_startup(
+                repo_root=self.root,
+                control_binary=control,
+                candidate_binary=candidate,
+                hyperfine_binary=hyperfine,
+                output_dir=self.root / "measurements",
+                samples=1_000,
+                timeout_s=10,
+                command_names=("status",),
+            )
+
+        hyperfine_calls = [
+            command for command in calls if command[0] == str(hyperfine)
+        ]
+        self.assertEqual(100, len(hyperfine_calls))
+        self.assertTrue(
+            all(command[command.index("--runs") + 1] == "10" for command in hyperfine_calls)
+        )
+        for round_index, command in enumerate(hyperfine_calls):
+            expected_order = (
+                ["control", "candidate"]
+                if round_index % 2 == 0
+                else ["candidate", "control"]
+            )
+            self.assertEqual(
+                expected_order,
+                [
+                    command[index + 1]
+                    for index, value in enumerate(command)
+                    if value == "--command-name"
+                ],
+            )
+        self.assertEqual((1_000,), tuple(result.requested_samples for result in results))
+        self.assertEqual((1_000,), tuple(len(result.control_samples) for result in results))
+        self.assertEqual((1_000,), tuple(len(result.candidate_samples) for result in results))
+
     def test_startup_measurement_disables_external_keychain_reads(self) -> None:
         control = self.root / "control" / "fx"
         candidate = self.root / "candidate" / "fx"

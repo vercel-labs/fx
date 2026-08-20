@@ -1275,7 +1275,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "logout keeps the active fx login when its saved session cannot be deleted",
+  "logout recalculates auth when local cleanup cannot be completed",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-logout-delete-failure-"));
     stderrPath = join(home, "stderr.log");
@@ -1295,18 +1295,18 @@ tmuxTest(
 
     await session.sendText("/logout");
     const failed = await session.waitForText(
-      "Could not complete fx logout. The current source is unchanged.",
+      "Could not confirm durable fx logout. The active source was recalculated.",
       TIMEOUT,
     );
     expect(failed).not.toContain("Signed out of fx.");
+    expect(failed).toContain(
+      "Warning: signed out locally, but the remote session could not be revoked.",
+    );
     expect(existsSync(authPath)).toBe(true);
 
     await session.sendText("/status");
-    await session.waitForText("auth=fx login", TIMEOUT);
-    await session.sendText("prove fx login remains active");
-    await session.waitForText(LOGIN_RESPONSE, TIMEOUT);
-    expect(gateway.requests).toHaveLength(1);
-    expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
+    await session.waitForText("auth=missing", TIMEOUT);
+    expect(gateway.requests).toHaveLength(0);
     expect(oauth.requests).toEqual([]);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },

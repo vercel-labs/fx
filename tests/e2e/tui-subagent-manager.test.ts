@@ -6982,8 +6982,12 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForText("MANAGER_HUMAN_TWO_LIVE_", TIMEOUT);
         await Bun.sleep(1_500);
         const idleReopenFrames = stdoutFrames(tapePath).slice(idleReopenFrameStart);
+        const identityFrameAllowance = Buffer.byteLength(fixture.workspace) +
+          Buffer.byteLength(" · ");
         expect(
-          idleReopenFrames.filter((frame) => frame.payload.length >= 1_024),
+          idleReopenFrames.filter(
+            (frame) => frame.payload.length >= 1_024 + identityFrameAllowance,
+          ),
         ).toHaveLength(0);
         expect(
           idleReopenFrames.reduce((total, frame) => total + frame.payload.length, 0),

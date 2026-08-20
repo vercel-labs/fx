@@ -2683,6 +2683,7 @@ test "gateway catalog retains broad capability metadata" {
     try std.testing.expectEqualStrings("language", catalog.items[0].model_type);
     try std.testing.expect(catalog.items[0].has_tool_use);
     try std.testing.expect(catalog.items[0].has_reasoning);
+    try std.testing.expectEqual(@as(usize, 0), catalog.items[0].reasoning_efforts.items.len);
     try std.testing.expect(catalog.items[0].has_vision);
     try std.testing.expect(catalog.items[0].has_file_input);
     try std.testing.expect(catalog.items[0].has_web_search);

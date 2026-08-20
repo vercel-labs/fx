@@ -4953,10 +4953,9 @@ pub const McpRuntime = struct {
             if (!server.required or server.connection == .ready) continue;
             const message = try std.fmt.allocPrint(
                 alloc,
-                "Required MCP server '{s}' is {s}: {s}",
+                "Required MCP server '{s}' failed to start: {s}",
                 .{
                     server.configured_name,
-                    @tagName(server.connection),
                     server.failure orelse "Check the trusted profile configuration and retry.",
                 },
             );

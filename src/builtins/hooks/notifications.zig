@@ -273,7 +273,10 @@ fn Runtime(comptime App: type) type {
                     "sound play kind={s} cue={s}",
                     .{ @tagName(kind), @tagName(cue) },
                 );
-                player.play(cue);
+                switch (kind) {
+                    .attention_required => player.playAttention(cue),
+                    .turn_end => player.play(cue),
+                }
             }
         }
 

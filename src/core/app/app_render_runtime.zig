@@ -25,6 +25,7 @@ const types = @import("../shared/types.zig");
 const subagent_domain = @import("../subagent/domain.zig");
 const subagent_projection = @import("../subagent/ui_projection.zig");
 const file_index = @import("../workspace/file_index.zig");
+const statusline_identity = @import("../workspace/statusline_identity.zig");
 const activity_runtime = @import("../output/activity_runtime.zig");
 const transcript_presentation = @import("../output/transcript_presentation.zig");
 const event_loop = @import("../../ui/event_loop.zig");
@@ -1129,6 +1130,8 @@ pub fn Runtime(comptime App: type) type {
             ctx.esc_clear_armed = view.editor.gestures.escapeClearArmed();
             ctx.question = null;
             ctx.statusline = .{
+                .workspace_label = base.statusline.workspace_label,
+                .git_branch = base.statusline.git_branch,
                 .sandbox_label = base.statusline.sandbox_label,
             };
             const worker_status_projection = if (app.subagents.childConversationRuntime()) |child_runtime|
@@ -1215,6 +1218,16 @@ pub fn Runtime(comptime App: type) type {
             visible_model: []const u8,
         ) ui_render.StatuslineItems {
             var items: ui_render.StatuslineItems = .{};
+            if (comptime @hasField(App, "workspace_identity") and
+                @hasField(App, "workspace_root"))
+            {
+                const identity = app.workspace_identity.refresh(
+                    app.alloc,
+                    app.workspace_root,
+                ) catch app.workspace_identity.snapshot();
+                items.workspace_label = identity.workspace_label;
+                items.git_branch = identity.git_branch;
+            }
             if (app.statusline_sandbox) {
                 const permission_mode: types.PermissionMode = if (comptime @hasField(App, "permission_engine"))
                     app.permission_engine.mode
@@ -4516,6 +4529,8 @@ const CoordinatorTestApp = struct {
     worker: CoordinatorTestWorker = .{},
     subagents: ui_subagents.Controller = .{},
     selected_model: std.ArrayList(u8) = .empty,
+    workspace_root: []const u8 = "",
+    workspace_identity: statusline_identity.Runtime = .{},
     pacer: CoordinatorTestPacer = .{},
     auth: auth_runtime.Runtime = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
@@ -4545,6 +4560,7 @@ const CoordinatorTestApp = struct {
         self.question_prompt.deinit(self.alloc);
         self.subagents.deinit(self.alloc);
         self.selected_model.deinit(self.alloc);
+        self.workspace_identity.deinit(self.alloc);
         self.pending_images.deinit(self.alloc);
         self.model_cache.deinit();
     }

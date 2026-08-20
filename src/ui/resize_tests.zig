@@ -3331,12 +3331,11 @@ test "structured command-output rewrite materializes committed transcript scroll
         .images = &.{},
     });
 
-    var live_entry_ids: [18]u32 = undefined;
     for (0..18) |index| {
         var line: [48]u8 = undefined;
         const text = try std.fmt.bufPrint(&line, "SYSTEM OUTPUT {d:0>2}\\n", .{index + 1});
         const bytes = try h.alloc.dupe(u8, text);
-        live_entry_ids[index] = try h.shell.appendRawBytesEntryClassified(
+        _ = try h.shell.appendRawBytesEntryClassified(
             h.alloc,
             bytes,
             .unknown_raw,
@@ -3359,43 +3358,63 @@ test "structured command-output rewrite materializes committed transcript scroll
     try h.flush();
     try std.testing.expectEqual(transcript_runtime.TranscriptCommitDiagnosticState.stable, h.shell.transcriptCommitDiagnostic().state);
 
-    try removeRawEntriesForResizeTest(&h.shell, h.alloc, &live_entry_ids);
-    const compact_bytes = try h.alloc.dupe(
-        u8,
-        "SYSTEM OUTPUT 01\n... 16 command lines folded\nSYSTEM OUTPUT 18\n",
-    );
-    _ = try h.shell.appendRawBytesEntryClassified(
-        h.alloc,
-        compact_bytes,
-        .unknown_raw,
-    );
-    try h.shell.rebuildTranscriptCacheAfterStructuredRewrite(
-        h.alloc,
-        "command output consolidation",
-    );
-
-    const second_assistant_id = try h.shell.appendAssistantTurnEntry(h.alloc);
-    const second_assistant = h.shell.lookupAssistantSegments(second_assistant_id) orelse
-        return error.TestExpectedAssistantSegments;
+    var follow_up: std.Io.Writer.Allocating = .init(h.alloc);
+    defer follow_up.deinit();
     for (0..60) |index| {
-        var line: [40]u8 = undefined;
-        const text = try std.fmt.bufPrint(&line, "follow-up table row {d}\n", .{index + 1});
-        try second_assistant.text.appendSlice(h.alloc, text);
+        try follow_up.writer.print("follow-up retained row {d}\n", .{index + 1});
     }
+    const retained_before = h.shell.retainedStructuredBytesForCommandOutput();
+    h.shell.max_retained_transcript_bytes = retained_before + follow_up.written().len / 2;
+    {
+        var block = assistant_presentation.CodeBlockPayload{
+            .language = try h.alloc.dupe(u8, "zig"),
+            .code = try h.alloc.dupe(u8, "const retained_boundary = true;\n"),
+        };
+        errdefer block.deinit(h.alloc);
+        _ = try h.shell.appendAssistantCodeBlockOwned(h.alloc, block);
+    }
+    _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, follow_up.written());
+    try std.testing.expect(
+        h.shell.retainedStructuredBytesForCommandOutput() <=
+            h.shell.max_retained_transcript_bytes,
+    );
+    var retained_source = try h.shell.prepareTranscriptSource(h.alloc, null);
+    defer retained_source.deinit(h.alloc);
+    try std.testing.expect(std.mem.find(
+        u8,
+        retained_source.bytes,
+        "SYSTEM OUTPUT 02",
+    ) == null);
 
     try h.renderTranscriptFrame();
     try h.flush();
-    // The structured rewrite is byte-incompatible with the committed
-    // anchor: this frame re-anchors in place with zero release.
+    // The retention rewrite is byte-incompatible with the committed anchor.
+    // This frame re-anchors in place and records same-epoch recovery debt.
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
+    const held_diagnostic = h.shell.transcriptCommitDiagnostic();
+    try std.testing.expectEqual(
+        transcript_runtime.TranscriptCommitDiagnosticState.stable,
+        held_diagnostic.state,
+    );
+    switch (h.shell.transcript_commit_state) {
+        .stable => |anchor| try std.testing.expect(anchor.normal_buffer_recovery_pending),
+        .invalid, .recovering => return error.TestExpectedStableTranscript,
+    }
 
     // The following compatible frame settles the held rows with final bytes.
     try h.renderTranscriptFrame();
     try h.flush();
     try std.testing.expect(h.last_frame.planned_scroll_rows > 0);
-    try std.testing.expect(h.last_frame.committed_scroll_rows > 0);
-    try expectGridContains(&h, "follow-up table row 60");
+    try std.testing.expectEqual(
+        h.last_frame.planned_scroll_rows,
+        h.last_frame.committed_scroll_rows,
+    );
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
+    switch (h.shell.transcript_commit_state) {
+        .stable => |anchor| try std.testing.expect(!anchor.normal_buffer_recovery_pending),
+        .invalid, .recovering => return error.TestExpectedStableTranscript,
+    }
 }
 
 fn applyCompletedReadForGroupFinalityResizeTest(
@@ -7592,24 +7611,6 @@ fn commandOutputAnsiStyles() transcript_runtime.Styles {
         .dim_style = "\x1b[2m",
         .red_style = "\x1b[31m",
     };
-}
-
-fn removeRawEntriesForResizeTest(
-    runtime: *TranscriptRuntime,
-    alloc: Allocator,
-    ids: []const u32,
-) !void {
-    for (ids) |id| {
-        var index: usize = 0;
-        while (index < runtime.entries.items.len) : (index += 1) {
-            const entry = runtime.entries.items[index];
-            if (entry == .raw_bytes and entry.raw_bytes.id == id) {
-                var removed = runtime.entries.orderedRemove(index);
-                removed.deinit(alloc);
-                break;
-            }
-        } else return error.TestExpectedRawEntry;
-    }
 }
 
 fn expectGridOccurrenceCount(h: *Harness, needle: []const u8, expected: usize) !void {

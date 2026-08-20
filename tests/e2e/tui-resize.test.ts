@@ -20,6 +20,7 @@ import { FX_BIN } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewaySse,
   fakeGatewayToolCall,
   hasEmptyComposer,
   paneExitMatches,
@@ -1707,6 +1708,137 @@ describe.skipIf(SKIP)("tui: resize", () => {
   );
 
   test(
+    "structured retention keeps native scrollback complete before resize",
+    async () => {
+      const root = realpathSync(
+        mkdtempSync(join(tmpdir(), "fx-retention-native-scrollback-")),
+      );
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      tempDirs.push(root);
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      );
+      writeFileSync(stderrPath, "");
+
+      const begin = "RETENTION_SCROLLBACK_BEGIN";
+      const end = "RETENTION_SCROLLBACK_END";
+      const beforeMarkers = Array.from(
+        { length: 120 },
+        (_, index) => `RETENTION_A_${String(index).padStart(3, "0")}`,
+      );
+      const afterMarkers = Array.from(
+        { length: 120 },
+        (_, index) => `RETENTION_B_${String(index).padStart(3, "0")}`,
+      );
+      const markers = [
+        begin,
+        ...beforeMarkers,
+        ...afterMarkers,
+        end,
+      ];
+      const response = fakeGatewaySse([
+        {
+          type: "text-delta",
+          id: "retention-text-a",
+          delta: `${begin}\n${beforeMarkers.map((marker) =>
+            `${marker} retained before semantic code block`
+          ).join("\n")}\n`,
+        },
+        {
+          type: "text-delta",
+          id: "retention-code",
+          delta: "```zig\nconst retained_scrollback = true;\n```\n",
+        },
+        {
+          type: "text-delta",
+          id: "retention-text-b",
+          delta: `${afterMarkers.map((marker) =>
+            `${marker} retained after semantic code block`
+          ).join("\n")}\n`,
+        },
+        {
+          type: "text-delta",
+          id: "retention-tail",
+          delta:
+            "| phase | state |\n| --- | --- |\n| middle | retained |\n\n---\n" +
+            `${end}\n`,
+        },
+        {
+          type: "finish",
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: {
+            inputTokens: { total: 3 },
+            outputTokens: { total: 5_000 },
+          },
+        },
+      ]);
+      const command =
+        `awk 'BEGIN { for (i = 0; i < 13500; i++) printf "RETENTION_SEED_%05d alpha beta gamma delta epsilon zeta eta theta iota kappa lambda\\n", i }'`;
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("retention-seed", "terminal", { action: "exec", command }),
+        response,
+      ]);
+      gateways.push(gateway);
+
+      session = await createResizeSession({
+        cmd: FX_BIN,
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-retention-scrollback-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_MAX_AGENT_STEPS: "4",
+          FX_AUTO_UPGRADE: "0",
+          NO_COLOR: "1",
+        },
+        width: 120,
+        height: 40,
+        stderrPath,
+        minimumHistoryLines: MINIMUM_RESIZE_HISTORY_LINES,
+      });
+      await session.waitForComposer(10_000);
+      await session.sendText("exercise structured retention scrollback");
+      await waitForLiveScrollbackText(session, end, 60_000);
+      await waitForGatewayRequestCount(gateway, 2, 60_000);
+      await session.waitForPane(
+        (pane) => pane.includes(end) && hasEmptyComposer(pane),
+        60_000,
+      );
+
+      const assertMarkersExactlyOnce = (scrollback: string) => {
+        for (const marker of markers) {
+          expect(countOccurrences(scrollback, marker)).toBe(1);
+        }
+      };
+      const beforeResize = await session.captureFullScrollback();
+      assertMarkersExactlyOnce(beforeResize);
+
+      await session.resizeWindow(72, 24, 700);
+      await waitForSettledFooter(session);
+      assertMarkersExactlyOnce(await session.captureFullScrollback());
+
+      await session.resizeWindow(120, 40, 700);
+      const grid = await waitForSettledFooter(session);
+      assertMarkersExactlyOnce(await session.captureFullScrollback());
+      expect(grid.filter(isInputRow)).toHaveLength(1);
+      expect(findFooter(grid)).not.toBeNull();
+      expect(gateway.requests).toHaveLength(2);
+      expect(session.isPaneAlive()).toBe(true);
+      expectEmptyStderr(stderrPath);
+    },
+    LARGE_SKILL_TIMEOUT,
+  );
+
+  test(
     "cancelling a resized command approval keeps one startup banner",
     async () => {
       const testDeadline = Date.now() + TIMEOUT - TEST_TEARDOWN_HEADROOM_MS;
@@ -2476,7 +2608,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
         await active.sendText("/statusline");
         await active.waitForText("Status line", TIMEOUT);
         await active.sendKeys("Right");
-        await active.waitForText("sandbox:none", TIMEOUT);
+        await active.waitForText(
+          process.platform === "darwin" ? "sandbox:os" : "sandbox:none",
+          TIMEOUT,
+        );
         await active.sendKeys("Down");
         await active.sendKeys("Right");
       },
@@ -3923,7 +4058,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
   );
 
   test(
-    "silent and notified terminal theme changes retint the retained transcript once",
+    "idle theme monitoring stays silent and notifications retint the transcript once",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-theme-reset-replay-"));
       const home = join(root, "home");
@@ -3982,6 +4117,36 @@ describe.skipIf(SKIP)("tui: resize", () => {
       let trace = readFileSync(tracePath, "utf8");
       let fenceRequests = countOccurrences(trace, "theme_query_requested kind=response_fence");
       let backgroundRequests = countOccurrences(trace, "theme_query_requested kind=background");
+      const stdoutBeforeIdle = Buffer.concat(
+        stdoutFrames(tapePath).map((frame) => frame.payload),
+      ).toString();
+      const rawFenceRequests = countOccurrences(stdoutBeforeIdle, "\x1b[c");
+      const rawBackgroundRequests = countOccurrences(
+        stdoutBeforeIdle,
+        "\x1b]11;?\x1b\\",
+      );
+
+      await new Promise((resolve) => setTimeout(resolve, 1_300));
+      trace = readFileSync(tracePath, "utf8");
+      expect(countOccurrences(trace, "theme_query_requested kind=response_fence")).toBe(
+        fenceRequests,
+      );
+      expect(countOccurrences(trace, "theme_query_requested kind=background")).toBe(
+        backgroundRequests,
+      );
+      const stdoutAfterIdle = Buffer.concat(
+        stdoutFrames(tapePath).map((frame) => frame.payload),
+      ).toString();
+      expect(countOccurrences(stdoutAfterIdle, "\x1b[c")).toBe(rawFenceRequests);
+      expect(countOccurrences(stdoutAfterIdle, "\x1b]11;?\x1b\\")).toBe(
+        rawBackgroundRequests,
+      );
+
+      sendRawTmuxBytes(
+        session,
+        "initial-theme-notification",
+        Buffer.from("\x1b[?997;2n"),
+      );
       await waitForTraceCount(
         tracePath,
         "theme_query_requested kind=response_fence",

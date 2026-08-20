@@ -30,13 +30,15 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .ask,
         .token = "ask",
-        .usage = "ask [--auto|--yolo] [--image PATH] [--json] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
+        .usage = "ask [--auto|--yolo] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
         .summary = "Run one noninteractive request",
         .options = &.{
             .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
             .{ .flag = "--yolo", .description = "Disable permission checks and command sandboxing" },
             .{ .flag = "--image PATH", .description = "Attach an image file; repeat for multiple images" },
             json_option,
+            .{ .flag = "--quiet", .description = "Suppress assistant output" },
+            .{ .flag = "--prompt-permissions", .description = "Prompt for Y/N permission approval when stdin is a TTY" },
             .{ .flag = "--no-save", .description = "Do not save the session; incompatible with --resume and --resume-id" },
             .{ .flag = "--no-color", .description = "Render TTY output without colors or hyperlinks" },
             .{ .flag = "--resume <last|id>", .description = "Continue the last session or a session by id" },
@@ -48,6 +50,7 @@ pub const top_level_specs = [_]TopLevelSpec{
             "The prompt may be passed as arguments or piped on stdin when no prompt args are given.",
             "TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.",
             "Operational progress and diagnostics are written to stderr. JSON output keeps raw Markdown in `output`.",
+            "With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.",
         },
     },
     .{
@@ -161,11 +164,12 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .session,
         .token = "session",
-        .usage = "session <last|id>|--id <id> [--json] | session migrate <id>|--id <id> [--allow-large] [--json] | session recover <id>|--id <id> [--json]",
-        .summary = "Inspect one saved session",
+        .usage = "session <last|id>|--id <id> [--json] | session resume [last|<id>] [--record] | session resume --id <id> [--record] | session migrate <id>|--id <id> [--allow-large] [--json] | session recover <id>|--id <id> [--json]",
+        .summary = "Inspect, resume, migrate, or recover saved sessions",
         .options = &.{
             .{ .flag = "last", .description = "Inspect the current workspace session" },
             .{ .flag = "--id <id>", .description = "Inspect a saved session by exact id" },
+            .{ .flag = "resume [last|<id>]", .description = "Resume the latest workspace session or a session by id" },
             .{ .flag = "migrate <id>", .description = "Migrate a saved session to the current format" },
             .{ .flag = "recover <id>", .description = "Copy a recoverable corrupt session into a new session" },
             .{ .flag = "--allow-large", .description = "Permit migrating an oversized session" },
@@ -189,7 +193,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .token = "resume",
         .aliases = &.{ "--resume", "--resume-last", "--continue", "-c", "-r" },
         .hidden_from_top_level_help = true,
-        .usage = "--resume [last|<id>] [--record] | resume [last|<id>] [--record] | resume --id <id> [--record] | --resume-last | --continue | -c | -r | --resume-<id>",
+        .usage = "session resume [last|<id>] [--record] | session resume --id <id> [--record] | --resume [last|<id>] [--record] | resume [last|<id>] [--record] | resume --id <id> [--record] | --resume-last | --continue | -c | -r | --resume-<id>",
         .summary = "Continue a saved interactive session",
         .options = &.{
             .{ .flag = "-r", .description = "Choose the session to resume from a picker" },
@@ -276,6 +280,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .sessions, .usage = "sessions" },
         .{ .kind = .session, .usage = "session <last|id>" },
+        .{ .usage = "session resume [last|id]", .summary = "Resume the latest workspace session or a session by id" },
         .{ .usage = "session migrate <id>", .summary = "Migrate a saved session to the current format" },
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
         .{ .kind = .replay, .usage = "replay <tape>" },
@@ -350,7 +355,7 @@ pub const top_level_flags = [_]TopLevelFlag{
 pub const top_level_examples = [_]TopLevelExample{
     .{ .command = "fx", .description = "Start a fresh interactive session" },
     .{ .command = "fx ask \"Explain the changes in this repository\"", .description = "Run one request and exit" },
-    .{ .command = "fx --resume last", .description = "Continue the latest session for this workspace" },
+    .{ .command = "fx session resume last", .description = "Continue the latest session for this workspace" },
     .{ .command = "fx status --json", .description = "Inspect the current configuration as JSON" },
 };
 
@@ -438,7 +443,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .appearance, .command = "/appearance", .aliases = &.{ "/input", "/maxxing" }, .show_aliases_in_completion = false, .help_entry = "/appearance [input lines|tint|presentation normal|minimal]", .completion_description = "choose input and transcript presentation", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .sandbox, .command = "/sandbox", .help_entry = "/sandbox [os|none]", .completion_description = "choose command sandbox behavior", .presentation_category = .security, .has_args = true, .accepts_payload = true },
     .{ .kind = .statusline, .command = "/statusline", .help_entry = "/statusline [sandbox|context|session]", .completion_description = "toggle status line segments", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
-    .{ .kind = .notifications, .command = "/sound", .help_entry = "/sound [on|off|max]", .completion_description = "toggle notification sounds", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
+    .{ .kind = .notifications, .command = "/sound", .help_entry = "/sound [on|off|max]", .completion_description = "toggle sounds and terminal bells", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .version, .command = "/version", .help_entry = "/version", .completion_description = "show the fx version", .presentation_category = .general },
     .{ .kind = .quit, .command = "/quit", .aliases = &.{"/exit"}, .help_entry = "/quit", .completion_description = "exit the interactive shell", .presentation_category = .general, .show_in_welcome = true },

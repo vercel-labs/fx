@@ -234,6 +234,64 @@ describe.skipIf(!tmuxAvailable() || CLIPBOARD_PROGRAM === null)("tui: clipboard 
   );
 });
 
+describe.skipIf(!tmuxAvailable())("tui: active session transitions", () => {
+  test(
+    "active /clear cancels a fake Gateway turn and accepts a follow-up prompt",
+    async () => {
+      const workDir = mkdtempSync(join(tmpdir(), "fx-active-clear-"));
+      const homeDir = mkdtempSync(join(tmpdir(), "fx-active-clear-home-"));
+      const stderrPath = join(workDir, "stderr.log");
+      let requestCount = 0;
+      const gateway = startDynamicFakeGateway(() => {
+        requestCount += 1;
+        if (requestCount > 1) return fakeGatewayFinalText("NATIVE_FOLLOWUP_OK");
+        return new Promise<Response>(() => {});
+      });
+
+      try {
+        session = await TmuxSession.create({
+          cwd: workDir,
+          stderrPath,
+          env: {
+            HOME: homeDir,
+            AI_GATEWAY_API_KEY: "active-clear-fake-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+          },
+          width: 120,
+          height: 40,
+        });
+        await session.waitForComposer(10_000);
+
+        await session.sendText("start an active turn");
+        await session.waitForText("Thinking", 10_000);
+        await session.sendText("/clear");
+        await session.waitForComposer(10_000);
+
+        await session.sendText("complete the follow-up");
+        await session.waitForText("NATIVE_FOLLOWUP_OK", 10_000);
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[1].body).toContain("complete the follow-up");
+        expect(gateway.requests[1].body).not.toContain("start an active turn");
+        expect(session.isAlive()).toBe(true);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        gateway.stop();
+        rmSync(workDir, { recursive: true, force: true });
+        rmSync(homeDir, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+});
+
 describe.skipIf(SKIP)("tui: extra slash commands", () => {
   test(
     "/clear clears the screen",

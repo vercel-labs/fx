@@ -142,7 +142,7 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
         "Run /help for commands",
         "auth_refreshable=",
         "permission_mode=auto",
-        "sandbox=none",
+        process.platform === "darwin" ? "sandbox=os" : "sandbox=none",
       ]) {
         expect(scrollback.split(field)).toHaveLength(2);
       }

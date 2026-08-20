@@ -217,6 +217,29 @@ fn installStableAnchorForTest(
     );
 }
 
+fn stableHistoryVisualOffsetForTest(runtime: *const TranscriptRuntime) !u32 {
+    return switch (runtime.transcript_commit_state) {
+        .stable => |anchor| anchor.history_visual_offset,
+        .invalid, .recovering => error.TestExpectedStableTranscript,
+    };
+}
+
+fn expectStableNormalBufferRecoveryForTest(
+    runtime: *const TranscriptRuntime,
+    expected_history_visual_offset: u32,
+) !void {
+    switch (runtime.transcript_commit_state) {
+        .stable => |anchor| {
+            try std.testing.expect(anchor.normal_buffer_recovery_pending);
+            try std.testing.expectEqual(
+                expected_history_visual_offset,
+                anchor.history_visual_offset,
+            );
+        },
+        .invalid, .recovering => return error.TestExpectedStableTranscript,
+    }
+}
+
 fn testPaintPlan(
     runtime: *const TranscriptRuntime,
     selection: viewport_selection.ViewportSelection,
@@ -10305,7 +10328,7 @@ test "streamAssistantChunk extends the trailing assistant_turn on subsequent chu
     try std.testing.expectEqualStrings("alpha beta", runtime.entries.items[0].assistant_turn.segments.text.items);
 }
 
-test "recorded assistant stream slow path preserves a capped canonical anchor without pruning" {
+test "recorded assistant stream slow path preserves a canonical anchor when retention rewrites its source" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
         .layout = transcriptTestLayout(48, 12, 8),
@@ -10315,6 +10338,12 @@ test "recorded assistant stream slow path preserves a capped canonical anchor wi
     defer runtime.deinit(alloc);
     try runtime.enableShadowVt(alloc);
 
+    const old_prefix = "old retained prefix\n";
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        old_prefix,
+        .subagent_status,
+    );
     const long_prompt = try makeLongPastePrompt(alloc, 40);
     defer alloc.free(long_prompt);
     var metrics: Metrics = .{};
@@ -10346,35 +10375,38 @@ test "recorded assistant stream slow path preserves a capped canonical anchor wi
         committed_prepared.cursor.cursor_col,
         1,
     );
-    const committed_diagnostic = runtime.transcriptCommitDiagnostic();
+    const committed_history_visual_offset = try stableHistoryVisualOffsetForTest(&runtime);
 
     const chunk = "trimmed assistant tail";
-    const retained_before = transcript_store.retainedStructuredBytes(&runtime);
-    runtime.max_retained_transcript_bytes = retained_before + chunk.len - 1;
-    try std.testing.expect(
-        chunk.len > runtime.max_retained_transcript_bytes - retained_before,
-    );
+    runtime.max_retained_transcript_bytes =
+        transcript_store.retainedStructuredBytes(&runtime) + chunk.len - old_prefix.len;
     const assistant_id = try runtime.streamAssistantChunk(alloc, &metrics, chunk);
 
-    try std.testing.expectEqualDeep(
-        committed_diagnostic,
-        runtime.transcriptCommitDiagnostic(),
+    try expectStableNormalBufferRecoveryForTest(
+        &runtime,
+        committed_history_visual_offset,
     );
-    try std.testing.expectEqual(@as(usize, 2), runtime.entries.items.len);
-    try std.testing.expectEqual(user_id, runtime.entries.items[0].id());
-    try std.testing.expect(runtime.entries.items[0] == .user_turn);
-    try std.testing.expectEqual(assistant_id, runtime.entries.items[1].id());
-    try std.testing.expectEqualStrings(
-        chunk[1..],
-        runtime.lookupAssistantSegments(assistant_id).?.text.items,
+    try std.testing.expect(
+        transcript_store.retainedStructuredBytes(&runtime) <=
+            runtime.max_retained_transcript_bytes,
     );
+    try std.testing.expect(runtime.lookupAssistantSegments(assistant_id) != null);
     var appended_source = try runtime.prepareTranscriptSource(alloc, null);
     defer appended_source.deinit(alloc);
-    try std.testing.expect(std.mem.startsWith(
+    try std.testing.expect(!std.mem.startsWith(
         u8,
         appended_source.bytes,
         committed_source.bytes,
     ));
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        std.mem.count(u8, appended_source.bytes, old_prefix),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, appended_source.bytes, "LONG_PASTE_LAST_MARKER"),
+    );
+    try std.testing.expect(runtime.entries.items[0].id() == user_id);
 }
 
 const AssistantStreamFastPathCase = enum {
@@ -11158,7 +11190,7 @@ test "recorded user prompt card preserves a committed anchor after a non-prefix 
     );
 }
 
-test "recorded user prompt card invalidates an anchor when retention prunes its source" {
+test "recorded user prompt card preserves an anchor when retention prunes its source" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
         .layout = transcriptTestLayout(40, 8, 4),
@@ -11184,6 +11216,7 @@ test "recorded user prompt card invalidates an anchor when retention prunes its 
         1,
         1,
     );
+    const committed_history_visual_offset = try stableHistoryVisualOffsetForTest(&runtime);
 
     const prompt = "retained prompt";
     runtime.max_retained_transcript_bytes = prompt.len;
@@ -11196,9 +11229,9 @@ test "recorded user prompt card invalidates an anchor when retention prunes its 
         &.{},
     );
 
-    try std.testing.expectEqual(
-        transcript_runtime.TranscriptCommitDiagnosticState.invalid,
-        runtime.transcriptCommitDiagnostic().state,
+    try expectStableNormalBufferRecoveryForTest(
+        &runtime,
+        committed_history_visual_offset,
     );
     var retained_source = try runtime.prepareTranscriptSource(alloc, null);
     defer retained_source.deinit(alloc);
@@ -11558,7 +11591,7 @@ test "theme retint is atomic across allocation failures" {
     );
 }
 
-test "recorded transcript append invalidates an anchor when retention prunes its source" {
+test "recorded transcript append preserves an anchor when retention prunes its source" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
         .layout = transcriptTestLayout(40, 8, 4),
@@ -11584,6 +11617,7 @@ test "recorded transcript append invalidates an anchor when retention prunes its
         1,
         1,
     );
+    const committed_history_visual_offset = try stableHistoryVisualOffsetForTest(&runtime);
 
     const notice = "permission accepted\n";
     runtime.max_retained_transcript_bytes = notice.len;
@@ -11596,9 +11630,9 @@ test "recorded transcript append invalidates an anchor when retention prunes its
         .subagent_status,
     );
 
-    try std.testing.expectEqual(
-        transcript_runtime.TranscriptCommitDiagnosticState.invalid,
-        runtime.transcriptCommitDiagnostic().state,
+    try expectStableNormalBufferRecoveryForTest(
+        &runtime,
+        committed_history_visual_offset,
     );
     var retained_source = try runtime.prepareTranscriptSource(alloc, null);
     defer retained_source.deinit(alloc);
@@ -13006,7 +13040,7 @@ test "recorded command output completion does not allocate without a matching bl
     try std.testing.expectEqual(display_before.open_command_block, runtime.command_output_display.open_command_block);
 }
 
-test "recorded command output consolidation uses strict anchor mode when retention changes" {
+test "recorded command output consolidation preserves its anchor when retention changes" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(80, 12, 8) };
     defer runtime.deinit(alloc);
@@ -13049,6 +13083,7 @@ test "recorded command output consolidation uses strict anchor mode when retenti
         transcript_runtime.TranscriptCommitDiagnosticState.stable,
         runtime.transcriptCommitDiagnostic().state,
     );
+    const committed_history_visual_offset = try stableHistoryVisualOffsetForTest(&runtime);
 
     try runtime.flushCommandOutputSummaryForLifecycle(
         alloc,
@@ -13060,9 +13095,9 @@ test "recorded command output consolidation uses strict anchor mode when retenti
 
     try std.testing.expect(transcript_store.retainedStructuredBytes(&runtime) <= runtime.max_retained_transcript_bytes);
     try std.testing.expect(runtime.command_output_blocks.items[0].lines.items.len < 2);
-    try std.testing.expectEqual(
-        transcript_runtime.TranscriptCommitDiagnosticState.invalid,
-        runtime.transcriptCommitDiagnostic().state,
+    try expectStableNormalBufferRecoveryForTest(
+        &runtime,
+        committed_history_visual_offset,
     );
 }
 
@@ -13715,27 +13750,30 @@ test "preserving batch lifecycle rewrite keeps a capped canonical anchor" {
     ) != null);
 }
 
-test "turn finished anchor preservation falls back for retention strict mode and geometry blockers" {
+test "turn finished anchor preservation keeps a same-epoch retention rewrite" {
     const alloc = std.testing.allocator;
 
-    {
-        var runtime = TranscriptRuntime{
-            .layout = transcriptTestLayout(40, 8, 4),
-            .owned_top_row = 1,
-        };
-        defer runtime.deinit(alloc);
-        try prepareTurnFinishedAnchor(&runtime, alloc);
-        runtime.max_retained_transcript_bytes = 0;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(40, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try prepareTurnFinishedAnchor(&runtime, alloc);
+    const committed_history_visual_offset = try stableHistoryVisualOffsetForTest(&runtime);
+    runtime.max_retained_transcript_bytes = 0;
 
-        _ = try runtime.applyToolLifecyclePreservingNormalBufferAnchor(alloc, .{
-            .turn_finished = .{ .turn_id = 1, .outcome = .interrupted },
-        });
+    _ = try runtime.applyToolLifecyclePreservingNormalBufferAnchor(alloc, .{
+        .turn_finished = .{ .turn_id = 1, .outcome = .interrupted },
+    });
 
-        try std.testing.expectEqual(
-            transcript_runtime.TranscriptCommitDiagnosticState.invalid,
-            runtime.transcriptCommitDiagnostic().state,
-        );
-    }
+    try expectStableNormalBufferRecoveryForTest(
+        &runtime,
+        committed_history_visual_offset,
+    );
+}
+
+test "turn finished anchor preservation falls back for strict mode or geometry blocker" {
+    const alloc = std.testing.allocator;
 
     {
         var runtime = TranscriptRuntime{
@@ -13998,7 +14036,7 @@ test "pinned status admission preserves an authoritative committed anchor" {
     );
 }
 
-test "pinned status admission invalidates an anchor when retention prunes its source" {
+test "pinned status admission preserves an anchor when retention prunes its source" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
         .layout = transcriptTestLayout(40, 8, 4),
@@ -14025,6 +14063,7 @@ test "pinned status admission invalidates an anchor when retention prunes its so
         1,
         1,
     );
+    const committed_history_visual_offset = try stableHistoryVisualOffsetForTest(&runtime);
     runtime.max_retained_transcript_bytes = "pending\n".len;
 
     _ = try transcript_store.appendPinnedToolStatusAtomic(
@@ -14033,9 +14072,9 @@ test "pinned status admission invalidates an anchor when retention prunes its so
         "pending\n",
     );
 
-    try std.testing.expectEqual(
-        transcript_runtime.TranscriptCommitDiagnosticState.invalid,
-        runtime.transcriptCommitDiagnostic().state,
+    try expectStableNormalBufferRecoveryForTest(
+        &runtime,
+        committed_history_visual_offset,
     );
     var retained_source = try runtime.prepareTranscriptSource(alloc, null);
     defer retained_source.deinit(alloc);
@@ -14479,7 +14518,7 @@ test "coalesced approval lifecycle reposition preserves an authoritative committ
     try std.testing.expectEqual(committed_offset, facts.source_visual_offset);
 }
 
-test "coalesced approval lifecycle reposition invalidates when retention prunes its source" {
+test "coalesced approval lifecycle reposition preserves its anchor when retention prunes its source" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
         .layout = transcriptTestLayout(48, 12, 8),
@@ -14507,6 +14546,7 @@ test "coalesced approval lifecycle reposition invalidates when retention prunes 
         1,
         1,
     );
+    const committed_history_visual_offset = try stableHistoryVisualOffsetForTest(&runtime);
 
     const id = lifecycleId(92, "retained-command");
     _ = try runtime.applyToolLifecycle(alloc, .{ .provisional = .{
@@ -14532,9 +14572,9 @@ test "coalesced approval lifecycle reposition invalidates when retention prunes 
         .place_after_current_transcript = true,
     } });
 
-    try std.testing.expectEqual(
-        transcript_runtime.TranscriptCommitDiagnosticState.invalid,
-        runtime.transcriptCommitDiagnostic().state,
+    try expectStableNormalBufferRecoveryForTest(
+        &runtime,
+        committed_history_visual_offset,
     );
     var retained_source = try runtime.prepareTranscriptSource(alloc, null);
     defer retained_source.deinit(alloc);
@@ -14962,7 +15002,7 @@ test "lifecycle pin cleanup preserves a capped canonical anchor without pruning"
     try std.testing.expectEqualStrings(committed_source.bytes, cleaned_source.bytes);
 }
 
-test "lifecycle pin cleanup invalidates a canonical anchor when retention prunes" {
+test "lifecycle pin cleanup preserves a canonical anchor when retention prunes" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
         .layout = transcriptTestLayout(48, 12, 8),
@@ -15000,14 +15040,15 @@ test "lifecycle pin cleanup invalidates a canonical anchor when retention prunes
         1,
         1,
     );
+    const committed_history_visual_offset = try stableHistoryVisualOffsetForTest(&runtime);
     runtime.max_retained_transcript_bytes =
         transcript_store.retainedStructuredBytes(&runtime) - anchored.len;
 
     try runtime.finishLifecycleBatch(alloc);
 
-    try std.testing.expectEqual(
-        transcript_runtime.TranscriptCommitDiagnosticState.invalid,
-        runtime.transcriptCommitDiagnostic().state,
+    try expectStableNormalBufferRecoveryForTest(
+        &runtime,
+        committed_history_visual_offset,
     );
     try std.testing.expectEqual(@as(usize, 0), runtime.lifecyclePinCount());
     try std.testing.expectEqual(@as(usize, 0), runtime.toolActivityRecordCount());

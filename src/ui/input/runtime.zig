@@ -132,7 +132,7 @@ fn withApprovalInput(
                 null,
             .cancel_pending = decoded.cancel_pending,
         } },
-        .paste_byte, .unrecognized_escape => event,
+        .paste_byte => event,
     };
     return typed;
 }
@@ -258,7 +258,7 @@ fn withQuestionInput(
             ),
             .cancel_pending = decoded.cancel_pending,
         } },
-        .paste_byte, .unrecognized_escape => event,
+        .paste_byte => event,
     };
     return typed;
 }
@@ -374,7 +374,7 @@ fn withSubagentInput(
             .subagent_action = subagentActionFromDecoded(decoded.action),
             .cancel_pending = decoded.cancel_pending,
         } },
-        .paste_byte, .unrecognized_escape => event,
+        .paste_byte => event,
     };
     return typed;
 }
@@ -535,6 +535,7 @@ test "Fx terminal reply ownership survives takeover transition" {
     monitor.start();
 
     try std.testing.expect(monitor.takeQueryRequest(0) == null);
+    for ("\x1b[?997;1n") |byte| _ = monitor.feed(byte, 1);
     try std.testing.expectEqual(
         theme_monitor.QueryRequest.response_fence,
         monitor.takeQueryRequest(1000).?,
@@ -622,6 +623,7 @@ test "terminal reply ownership precedes active paste transport" {
     monitor.start();
 
     try std.testing.expect(monitor.takeQueryRequest(0) == null);
+    for ("\x1b[?997;1n") |byte| _ = monitor.feed(byte, 1);
     try std.testing.expectEqual(
         theme_monitor.QueryRequest.response_fence,
         monitor.takeQueryRequest(1000).?,
@@ -1063,7 +1065,7 @@ pub const MouseReportDiscardResult = escape_parser.MouseReportDiscardResult;
 pub const isLegacyX10PayloadStage = escape_parser.isLegacyX10PayloadStage;
 pub const isMouseReportPayloadStage = escape_parser.isMouseReportPayloadStage;
 pub const isMouseReportDiscardStage = escape_parser.isMouseReportDiscardStage;
-pub const isPrivateCsiPayloadStage = escape_parser.isPrivateCsiPayloadStage;
+pub const isControlSequenceDiscardStage = escape_parser.isControlSequenceDiscardStage;
 pub const beginMouseReportDiscard = escape_parser.beginMouseReportDiscard;
 pub const consumeMouseReportDiscardByte = escape_parser.consumeMouseReportDiscardByte;
 pub const consumeInputEscapeByte = escape_parser.consumeInputEscapeByte;
@@ -2882,8 +2884,33 @@ test "input escape parser keeps private CSI digits in the escape sequence" {
     for ("[?12") |byte| {
         try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, byte));
     }
-    try std.testing.expect(isPrivateCsiPayloadStage(stage));
+    try std.testing.expect(isControlSequenceDiscardStage(stage));
     try std.testing.expectEqual(@as(?InputEscapeAction, .ignore), consumeInputEscapeByte(&stage, &param, &param2, 'h'));
+    try std.testing.expectEqual(@as(u8, 0), stage);
+}
+
+test "input escape parser ignores complete unknown CSI and SS3 sequences" {
+    try expectEscapeAction("[I", .ignore);
+    try expectEscapeAction("[1;2R", .ignore);
+    try expectEscapeAction("[>0q", .ignore);
+    try expectEscapeAction("O1;2P", .ignore);
+}
+
+test "input escape parser keeps an unknown control sequence pending until its final byte" {
+    var stage: u8 = 1;
+    var param: u16 = 0;
+    var param2: u16 = 0;
+    for ("[>0") |byte| {
+        try std.testing.expectEqual(
+            @as(?InputEscapeAction, null),
+            consumeInputEscapeByte(&stage, &param, &param2, byte),
+        );
+    }
+    try std.testing.expect(isControlSequenceDiscardStage(stage));
+    try std.testing.expectEqual(
+        @as(?InputEscapeAction, .ignore),
+        consumeInputEscapeByte(&stage, &param, &param2, 'q'),
+    );
     try std.testing.expectEqual(@as(u8, 0), stage);
 }
 
