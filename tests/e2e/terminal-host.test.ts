@@ -7,6 +7,7 @@ import {
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   lstatSync,
   mkdtempSync,
@@ -16,6 +17,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { createConnection, type Socket } from "node:net";
@@ -2891,6 +2893,55 @@ test.skipIf(!tmuxAvailable())("revision four client cannot opt into Part 8 tmux 
   host.kill("SIGKILL");
   await waitForExit(host);
 }, 15_000);
+
+test.skipIf(!tmuxAvailable() || process.platform !== "linux")(
+  "terminal helpers keep running after the on-disk fx binary is replaced",
+  async () => {
+    if (!existsSync("/bin/zsh")) return;
+    const home = makeHome();
+    const paths = hostPaths(home);
+    const liveBin = join(home, "fx");
+    copyFileSync(FX_BIN, liveBin);
+    chmodSync(liveBin, 0o755);
+
+    const host = startHost(home, undefined, 30_000, {}, liveBin);
+    await waitFor(() => existsSync(paths.socket));
+    const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
+
+    // Same sequence as `zig build`: unlink the running name, then put a
+    // different executable in its place. Realpath-based spawn would now hit
+    // /bin/sh or FileNotFound; helpers must keep the live inode.
+    unlinkSync(liveBin);
+    copyFileSync("/bin/sh", liveBin);
+    chmodSync(liveBin, 0o755);
+
+    const tmux = await startCommand(connected.client, connected.revision!, 510, {
+      cwd: home,
+      command: "printf 'rebuild-tmux-ok\\n'; exit 0",
+      shell: { executable: { path: "/bin/zsh", clean_start: true } },
+      backend: "tmux",
+      returnWhen: { match: "rebuild-tmux-ok" },
+      waitMs: 15_000,
+    });
+    expect(tmux.outcome, "tmux").toEqual({ condition_met: {} });
+
+    const native = await startCommand(connected.client, connected.revision!, 511, {
+      cwd: home,
+      command: "printf 'rebuild-native-ok\\n'; exit 0",
+      shell: { executable: { path: "/bin/zsh", clean_start: true } },
+      backend: "native",
+      returnWhen: { match: "rebuild-native-ok" },
+      waitMs: 15_000,
+    });
+    expect(native.outcome, "native").toEqual({ condition_met: {} });
+
+    connected.client.close();
+    host.kill("SIGKILL");
+    await waitForExit(host);
+  },
+  TMUX_COMMAND_STARTUP_OBSERVATION_BUDGET_MS +
+    NATIVE_STARTUP_OBSERVATION_BUDGET_MS,
+);
 
 test.skipIf(!tmuxAvailable())("tmux recovers every durable starting boundary", async () => {
   if (!existsSync("/bin/zsh")) return;
