@@ -40,7 +40,7 @@ const marker_ack_timeout_ms: i64 = tmux_session.marker_acknowledgement_timeout_m
 const command_release_byte: u8 = 2;
 const control_nonce_len: usize = 32;
 const marker_frame_len: usize = control_nonce_len + 1;
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_file_permissions = (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else std.Io.File.Permissions.fromMode(0o600)));
 const default_dimensions: contracts.Dimensions = .{
     .rows = 24,
     .columns = 80,
@@ -3115,22 +3115,26 @@ fn httpReady(alloc: Allocator, url: []const u8) bool {
 }
 
 fn applyMonitorSocketTimeout(stream: std.Io.net.Stream, timeout_ms: i64) void {
-    const timeout = std.posix.timeval{
-        .sec = @intCast(@divTrunc(timeout_ms, 1000)),
-        .usec = @intCast(@mod(timeout_ms, 1000) * 1000),
-    };
-    std.posix.setsockopt(
-        stream.socket.handle,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.RCVTIMEO,
-        std.mem.asBytes(&timeout),
-    ) catch {};
-    std.posix.setsockopt(
-        stream.socket.handle,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.SNDTIMEO,
-        std.mem.asBytes(&timeout),
-    ) catch {};
+    if (comptime builtin.os.tag == .windows) {
+        return;
+    } else {
+        const timeout = std.posix.timeval{
+            .sec = @intCast(@divTrunc(timeout_ms, 1000)),
+            .usec = @intCast(@mod(timeout_ms, 1000) * 1000),
+        };
+        std.posix.setsockopt(
+            stream.socket.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            std.mem.asBytes(&timeout),
+        ) catch {};
+        std.posix.setsockopt(
+            stream.socket.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.SNDTIMEO,
+            std.mem.asBytes(&timeout),
+        ) catch {};
+    }
 }
 
 const SignalTarget = struct {
@@ -3297,7 +3301,10 @@ const Session = struct {
             else => return err,
         };
         const child_pid = if (durable.record.pid) |value|
-            std.fmt.parseInt(std.posix.pid_t, value, 10) catch null
+            if (comptime builtin.os.tag == .windows) blk: {
+                const n = std.fmt.parseInt(usize, value, 10) catch break :blk null;
+                break :blk @as(std.posix.pid_t, @ptrFromInt(n));
+            } else std.fmt.parseInt(std.posix.pid_t, value, 10) catch null
         else
             null;
         const child_token = if (durable.record.process_token) |value|

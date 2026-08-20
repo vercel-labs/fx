@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
 const monitor_core = @import("monitor.zig");
 const operation = @import("operation.zig");
@@ -460,8 +461,13 @@ pub const Record = struct {
             return error.InvalidTerminalRecord;
         }
         if (self.takeover_owner_pid) |pid| {
-            _ = std.fmt.parseInt(std.posix.pid_t, pid, 10) catch
-                return error.InvalidTerminalRecord;
+            if (comptime builtin.os.tag == .windows) {
+                _ = std.fmt.parseInt(usize, pid, 10) catch
+                    return error.InvalidTerminalRecord;
+            } else {
+                _ = std.fmt.parseInt(std.posix.pid_t, pid, 10) catch
+                    return error.InvalidTerminalRecord;
+            }
             _ = process_supervisor.ProcessInstanceToken.parse(
                 self.takeover_owner_process_token.?,
             ) catch return error.InvalidTerminalRecord;
@@ -8097,7 +8103,7 @@ test "tmux recovery propagates proof capability failure without durable loss" {
     );
     try proof_file.setPermissions(
         std.testing.io,
-        std.Io.File.Permissions.fromMode(0o640),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else std.Io.File.Permissions.fromMode(0o640))),
     );
     proof_file.close(std.testing.io);
 
@@ -8120,7 +8126,7 @@ test "tmux recovery propagates proof capability failure without durable loss" {
     defer proof_file.close(std.testing.io);
     try proof_file.setPermissions(
         std.testing.io,
-        std.Io.File.Permissions.fromMode(0o600),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else std.Io.File.Permissions.fromMode(0o600))),
     );
 
     {

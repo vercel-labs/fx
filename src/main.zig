@@ -2917,16 +2917,23 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
 }
 
 fn rawArgs(c_argc: c_int, c_argv: [*][*:0]c_char) []const [*:0]const u8 {
+    if (c_argc <= 0) return &.{};
     const argc: usize = @intCast(c_argc);
     const argv: [*][*:0]const u8 = @ptrCast(c_argv);
     return argv[0..argc];
 }
 
 fn argsFromRaw(raw_args: []const [*:0]const u8) std.process.Args {
+    if (comptime builtin.os.tag == .windows) {
+        return .{ .vector = &[_]u16{} };
+    }
     return .{ .vector = raw_args };
 }
 
 fn environBlockFromRaw(raw_env: RawEnviron) std.process.Environ.Block {
+    if (comptime builtin.os.tag == .windows) {
+        return .{ .use_global = false };
+    }
     var count: usize = 0;
     while (raw_env[count] != null) : (count += 1) {}
     return .{ .slice = raw_env[0..count :null] };
@@ -3067,7 +3074,8 @@ fn exitFast(code: u8) noreturn {
 
 fn hasPosixArgVector() bool {
     return switch (builtin.os.tag) {
-        .windows, .freestanding, .other => false,
+        .windows => builtin.link_libc,
+        .freestanding, .other => false,
         .wasi => builtin.link_libc,
         else => true,
     };
@@ -3295,6 +3303,10 @@ fn runAcpServer(_: ?*anyopaque, alloc: Allocator, cfg: acp_runner.Config) anyerr
     return acp_server.run(alloc, cfg);
 }
 
+fn handleSigWinchNativeWindows() callconv(.c) void {
+    resize_interlock.noteResizeSignal();
+}
+
 fn handleSigWinchNative(_: std.posix.SIG) callconv(.c) void {
     resize_interlock.noteResizeSignal();
 }
@@ -3305,6 +3317,8 @@ fn handleSigWinchWeb() callconv(.c) void {
 
 const handle_sigwinch: app_lifecycle.ResizeHandler = if (host_target.is_wasm)
     handleSigWinchWeb
+else if (@import("builtin").os.tag == .windows)
+    handleSigWinchNativeWindows
 else
     handleSigWinchNative;
 

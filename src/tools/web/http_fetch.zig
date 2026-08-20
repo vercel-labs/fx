@@ -6,6 +6,25 @@ const url_policy = @import("url_policy.zig");
 const Allocator = std.mem.Allocator;
 const IpAddress = std.Io.net.IpAddress;
 const posix = std.posix;
+const PollFd = if (@import("builtin").os.tag == .windows)
+    struct {
+        fd: posix.fd_t,
+        events: i16 = 0,
+        revents: i16 = 0,
+    }
+else
+    posix.pollfd;
+const Poll = if (@import("builtin").os.tag == .windows)
+    struct {
+        pub const IN: i16 = 0x0001;
+        pub const PRI: i16 = 0x0002;
+        pub const OUT: i16 = 0x0004;
+        pub const ERR: i16 = 0x0008;
+        pub const HUP: i16 = 0x0010;
+        pub const NVAL: i16 = 0x0020;
+    }
+else
+    posix.POLL;
 
 pub const max_body_bytes: usize = 10 * 1024 * 1024;
 const max_redirect_hops: usize = 10;
@@ -1222,29 +1241,33 @@ fn readChunkedTrailers(reader: *BodyReader, alloc: Allocator) !void {
 }
 
 fn connectPinned(address: IpAddress, options: FetchOptions) !posix.fd_t {
-    try checkControl(options);
-    const family: posix.sa_family_t = switch (address) {
-        .ip4 => posix.AF.INET,
-        .ip6 => posix.AF.INET6,
-    };
-    const fd = try openSocket(family);
-    errdefer closeFd(fd);
+    if (comptime @import("builtin").os.tag == .windows) {
+        return error.SocketOptionFailed;
+    } else {
+        try checkControl(options);
+        const family: posix.sa_family_t = switch (address) {
+            .ip4 => posix.AF.INET,
+            .ip6 => posix.AF.INET6,
+        };
+        const fd = try openSocket(family);
+        errdefer closeFd(fd);
 
-    var storage: PosixAddress = undefined;
-    const len = addressToPosix(address, &storage);
-    while (true) switch (posix.errno(posix.system.connect(fd, &storage.any, len))) {
-        .SUCCESS => return fd,
-        .INTR => {
-            try checkControl(options);
-            continue;
-        },
-        .INPROGRESS, .AGAIN, .ALREADY => {
-            try pollFd(fd, posix.POLL.OUT, options);
-            try checkSocketError(fd);
-            return fd;
-        },
-        else => |err| return classifyConnectErrno(err),
-    };
+        var storage: PosixAddress = undefined;
+        const len = addressToPosix(address, &storage);
+        while (true) switch (posix.errno(posix.system.connect(fd, &storage.any, len))) {
+            .SUCCESS => return fd,
+            .INTR => {
+                try checkControl(options);
+                continue;
+            },
+            .INPROGRESS, .AGAIN, .ALREADY => {
+                try pollFd(fd, Poll.OUT, options);
+                try checkSocketError(fd);
+                return fd;
+            },
+            else => |err| return classifyConnectErrno(err),
+        };
+    }
 }
 
 fn classifyConnectErrno(err: posix.E) anyerror {
@@ -1291,6 +1314,7 @@ fn addressToPosix(address: IpAddress, storage: *PosixAddress) posix.socklen_t {
 }
 
 fn openSocket(family: posix.sa_family_t) !posix.fd_t {
+    if (comptime @import("builtin").os.tag == .windows) return error.SocketOpenFailed;
     const fd = while (true) {
         const rc = posix.system.socket(family, posix.SOCK.STREAM, 0);
         switch (posix.errno(rc)) {
@@ -1493,21 +1517,25 @@ const PollError = posix.PollError || error{Interrupted};
 
 const Poller = struct {
     ctx: ?*anyopaque,
-    poll_fn: *const fn (?*anyopaque, []posix.pollfd, i32) PollError!usize,
+    poll_fn: *const fn (?*anyopaque, []PollFd, i32) PollError!usize,
 };
 
-fn pollDefault(_: ?*anyopaque, fds: []posix.pollfd, timeout_ms: i32) PollError!usize {
-    const fds_count = std.math.cast(posix.nfds_t, fds.len) orelse
-        return error.SystemResources;
-    const rc = posix.system.poll(fds.ptr, fds_count, timeout_ms);
-    return switch (posix.errno(rc)) {
-        .SUCCESS => @intCast(rc),
-        .INTR => error.Interrupted,
-        .NOMEM => error.SystemResources,
-        .NETDOWN => error.NetworkDown,
-        .FAULT, .INVAL => unreachable,
-        else => |err| posix.unexpectedErrno(err),
-    };
+fn pollDefault(_: ?*anyopaque, fds: []PollFd, timeout_ms: i32) PollError!usize {
+    if (comptime @import("builtin").os.tag == .windows) {
+        return error.NetworkDown;
+    } else {
+        const fds_count = std.math.cast(posix.nfds_t, fds.len) orelse
+            return error.SystemResources;
+        const rc = posix.system.poll(fds.ptr, fds_count, timeout_ms);
+        return switch (posix.errno(rc)) {
+            .SUCCESS => @intCast(rc),
+            .INTR => error.Interrupted,
+            .NOMEM => error.SystemResources,
+            .NETDOWN => error.NetworkDown,
+            .FAULT, .INVAL => unreachable,
+            else => |err| posix.unexpectedErrno(err),
+        };
+    }
 }
 
 const default_poller: Poller = .{
@@ -1587,7 +1615,7 @@ fn rawReadWith(
     syscall: ReadSyscall,
 ) !usize {
     while (true) {
-        try pollFdWith(fd, posix.POLL.IN, options, poller);
+        try pollFdWith(fd, Poll.IN, options, poller);
         switch (syscall.read_fn(syscall.ctx, fd, buf)) {
             .count => |count| return count,
             .failure => |err| switch (classifyReadErrno(err)) {
@@ -1606,62 +1634,74 @@ fn rawWriteAll(fd: posix.fd_t, bytes: []const u8, options: FetchOptions) !void {
 }
 
 fn rawWriteAllWith(fd: posix.fd_t, bytes: []const u8, options: FetchOptions, poller: Poller) !void {
-    var written: usize = 0;
-    while (written < bytes.len) {
-        try pollFdWith(fd, posix.POLL.OUT, options, poller);
-        const rc = std.c.send(
-            fd,
-            bytes[written..].ptr,
-            bytes.len - written,
-            @intCast(posix.MSG.NOSIGNAL),
-        );
-        const errno = posix.errno(rc);
-        if (errno != .SUCCESS) switch (classifyWriteErrno(errno)) {
-            .retry => {
-                if (errno == .INTR) try checkControl(options);
-                continue;
-            },
-            .failure => |root| return root,
-        };
-        const n: usize = @intCast(rc);
-        if (n == 0) return error.UnexpectedClose;
-        written += n;
+    if (comptime @import("builtin").os.tag == .windows) {
+        return error.SocketOptionFailed;
+    } else {
+        var written: usize = 0;
+        while (written < bytes.len) {
+            try pollFdWith(fd, Poll.OUT, options, poller);
+            const rc = std.c.send(
+                fd,
+                bytes[written..].ptr,
+                bytes.len - written,
+                @intCast(posix.MSG.NOSIGNAL),
+            );
+            const errno = posix.errno(rc);
+            if (errno != .SUCCESS) switch (classifyWriteErrno(errno)) {
+                .retry => {
+                    if (errno == .INTR) try checkControl(options);
+                    continue;
+                },
+                .failure => |root| return root,
+            };
+            const n: usize = @intCast(rc);
+            if (n == 0) return error.UnexpectedClose;
+            written += n;
+        }
     }
 }
 
 fn pollFd(fd: posix.fd_t, events: i16, options: FetchOptions) !void {
-    return pollFdWith(fd, events, options, default_poller);
+    if (comptime @import("builtin").os.tag == .windows) {
+        return error.SocketOptionFailed;
+    } else {
+        return pollFdWith(fd, events, options, default_poller);
+    }
 }
 
 fn pollFdWith(fd: posix.fd_t, events: i16, options: FetchOptions, poller: Poller) !void {
-    while (true) {
-        var fds = [_]posix.pollfd{.{
-            .fd = fd,
-            .events = events,
-            .revents = 0,
-        }};
-        const ready = poller.poll_fn(
-            poller.ctx,
-            &fds,
-            try pollTimeoutMs(options),
-        ) catch |err| switch (err) {
-            error.Interrupted => {
-                try checkControl(options);
-                continue;
-            },
-            else => return err,
-        };
-        if (ready == 0) continue;
-        return classifyPollEvents(fd, events, fds[0].revents);
+    if (comptime @import("builtin").os.tag == .windows) {
+        return error.SocketOptionFailed;
+    } else {
+        while (true) {
+            var fds = [_]PollFd{.{
+                .fd = fd,
+                .events = events,
+                .revents = 0,
+            }};
+            const ready = poller.poll_fn(
+                poller.ctx,
+                &fds,
+                try pollTimeoutMs(options),
+            ) catch |err| switch (err) {
+                error.Interrupted => {
+                    try checkControl(options);
+                    continue;
+                },
+                else => return err,
+            };
+            if (ready == 0) continue;
+            return classifyPollEvents(fd, events, fds[0].revents);
+        }
     }
 }
 
 fn classifyPollEvents(fd: posix.fd_t, events: i16, revents: i16) !void {
-    if ((revents & posix.POLL.NVAL) != 0) return error.InvalidDescriptor;
+    if ((revents & Poll.NVAL) != 0) return error.InvalidDescriptor;
     if ((revents & events) != 0) return;
-    if (events == posix.POLL.IN and (revents & posix.POLL.HUP) != 0) return;
-    if ((revents & posix.POLL.ERR) != 0) return pollSocketError(fd);
-    if ((revents & posix.POLL.HUP) != 0) return error.UnexpectedClose;
+    if (events == Poll.IN and (revents & Poll.HUP) != 0) return;
+    if ((revents & Poll.ERR) != 0) return pollSocketError(fd);
+    if ((revents & Poll.HUP) != 0) return error.UnexpectedClose;
     return error.UnexpectedClose;
 }
 
@@ -3601,7 +3641,7 @@ const ScriptedPoller = struct {
         return .{ .ctx = @ptrCast(self), .poll_fn = poll };
     }
 
-    fn poll(raw: ?*anyopaque, fds: []posix.pollfd, timeout_ms: i32) PollError!usize {
+    fn poll(raw: ?*anyopaque, fds: []PollFd, timeout_ms: i32) PollError!usize {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
         self.calls += 1;
         self.observed_events = fds[0].events;
@@ -3624,17 +3664,17 @@ const ScriptedPoller = struct {
 };
 
 test "web_fetch poll events preserve requested readiness and hangup semantics" {
-    try classifyPollEvents(-1, posix.POLL.IN, posix.POLL.IN | posix.POLL.HUP);
-    try classifyPollEvents(-1, posix.POLL.IN, posix.POLL.IN | posix.POLL.ERR);
-    try classifyPollEvents(-1, posix.POLL.OUT, posix.POLL.OUT | posix.POLL.HUP);
-    try classifyPollEvents(-1, posix.POLL.IN, posix.POLL.HUP);
+    try classifyPollEvents(-1, Poll.IN, Poll.IN | Poll.HUP);
+    try classifyPollEvents(-1, Poll.IN, Poll.IN | Poll.ERR);
+    try classifyPollEvents(-1, Poll.OUT, Poll.OUT | Poll.HUP);
+    try classifyPollEvents(-1, Poll.IN, Poll.HUP);
     try std.testing.expectError(
         error.UnexpectedClose,
-        classifyPollEvents(-1, posix.POLL.OUT, posix.POLL.HUP),
+        classifyPollEvents(-1, Poll.OUT, Poll.HUP),
     );
     try std.testing.expectError(
         error.InvalidDescriptor,
-        classifyPollEvents(-1, posix.POLL.IN, posix.POLL.NVAL),
+        classifyPollEvents(-1, Poll.IN, Poll.NVAL),
     );
 
     var sockets: [2]std.c.fd_t = undefined;
@@ -3644,44 +3684,44 @@ test "web_fetch poll events preserve requested readiness and hangup semantics" {
     defer closeFd(sockets[1]);
     try std.testing.expectError(
         error.UnexpectedClose,
-        classifyPollEvents(sockets[0], posix.POLL.IN, posix.POLL.ERR),
+        classifyPollEvents(sockets[0], Poll.IN, Poll.ERR),
     );
 }
 
 test "web_fetch injected poll failures and arguments remain exact" {
     var interrupted = ScriptedPoller{
         .result = .interrupted_once,
-        .revents = posix.POLL.IN,
+        .revents = Poll.IN,
     };
     try pollFdWith(
         42,
-        posix.POLL.IN,
+        Poll.IN,
         .{ .deadline = .{ .deadline_ms = monotonicMillis() + 1000 } },
         interrupted.poller(),
     );
     try std.testing.expectEqual(@as(usize, 2), interrupted.calls);
-    try std.testing.expectEqual(posix.POLL.IN, interrupted.observed_events);
+    try std.testing.expectEqual(Poll.IN, interrupted.observed_events);
 
     var resources = ScriptedPoller{ .result = .system_resources };
     try std.testing.expectError(error.SystemResources, pollFdWith(
         42,
-        posix.POLL.IN,
+        Poll.IN,
         .{},
         resources.poller(),
     ));
     try std.testing.expectEqual(@as(usize, 1), resources.calls);
-    try std.testing.expectEqual(posix.POLL.IN, resources.observed_events);
+    try std.testing.expectEqual(Poll.IN, resources.observed_events);
     try std.testing.expectEqual(@as(i32, 1000), resources.observed_timeout_ms);
 
     var network_down = ScriptedPoller{ .result = .network_down };
     try std.testing.expectError(error.NetworkDown, pollFdWith(
         42,
-        posix.POLL.OUT,
+        Poll.OUT,
         .{},
         network_down.poller(),
     ));
     try std.testing.expectEqual(@as(usize, 1), network_down.calls);
-    try std.testing.expectEqual(posix.POLL.OUT, network_down.observed_events);
+    try std.testing.expectEqual(Poll.OUT, network_down.observed_events);
 }
 
 fn noOpSignalHandler(_: posix.SIG) callconv(.c) void {}
@@ -3732,7 +3772,7 @@ test "web_fetch poll deadline is not extended by interrupted syscalls" {
 
     try std.testing.expectError(error.Timeout, pollFd(
         fds[0],
-        posix.POLL.IN,
+        Poll.IN,
         .{ .deadline = .{ .deadline_ms = deadline_ms } },
     ));
     const elapsed_ms = monotonicMillis() - started_ms;
@@ -3794,7 +3834,7 @@ const InterruptingRead = struct {
 
 test "web_fetch interrupted socket read rechecks cancellation before retry" {
     var cancel_flag: std.atomic.Value(bool) = .init(false);
-    var poller = ScriptedPoller{ .revents = posix.POLL.IN };
+    var poller = ScriptedPoller{ .revents = Poll.IN };
     var read = InterruptingRead{ .cancel_flag = &cancel_flag };
     var buf: [1]u8 = undefined;
 
@@ -3869,7 +3909,7 @@ test "web_fetch closed peer write returns a cause without terminating process" {
         return error.SocketShutdownFailed;
     closeFd(sockets[1]);
 
-    var poller = ScriptedPoller{ .revents = posix.POLL.OUT | posix.POLL.HUP };
+    var poller = ScriptedPoller{ .revents = Poll.OUT | Poll.HUP };
     rawWriteAllWith(
         sockets[0],
         "x",

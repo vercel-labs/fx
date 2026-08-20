@@ -130,7 +130,7 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) LoadError!?[]u8 {
         debug_trace.logf("stored_key", "load failed step=stat err={s}", .{@errorName(err)});
         return error.StoredKeyUnreadable;
     };
-    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) {
+    if (comptime builtin.os.tag != .windows and (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0)) {
         debug_trace.logf("stored_key", "load failed step=permissions err=StoredKeyInsecure", .{});
         return error.StoredKeyInsecure;
     }
@@ -206,7 +206,7 @@ test "stored key file round-trips byte-identically at mode 0600" {
     try storeInDir(std.testing.allocator, &fx_dir, written);
 
     const stat = try tmp.dir.statFile(std.testing.io, profile_paths.api_key_file_name, .{});
-    try std.testing.expect(stat.permissions.toMode() & 0o777 == 0o600);
+    try std.testing.expect((if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else stat.permissions.toMode()) & 0o777 == 0o600);
 
     const read_back = (try loadFromDir(std.testing.allocator, &fx_dir.dir)) orelse
         return error.TestUnexpectedMissingStoredKey;

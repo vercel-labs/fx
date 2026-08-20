@@ -13,9 +13,13 @@ const Channel = update_target.Channel;
 const Target = update_target.Target;
 
 fn setRecvTimeout(conn: *std.http.Client.Connection) void {
-    const sock = conn.stream_writer.stream.socket.handle;
-    const timeout = std.posix.timeval{ .sec = recv_timeout_sec, .usec = 0 };
-    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+    if (comptime builtin.os.tag == .windows) {
+        return;
+    } else {
+        const sock = conn.stream_writer.stream.socket.handle;
+        const timeout = std.posix.timeval{ .sec = recv_timeout_sec, .usec = 0 };
+        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+    }
 }
 
 pub const cdn_base = "https://releases.fx.sh";
@@ -46,13 +50,13 @@ fn isLoopbackE2eUpgradeBase(url: []const u8) bool {
     return std.mem.eql(u8, host, "127.0.0.1");
 }
 
-pub const platform = platformFromTarget() orelse
-    @compileError("unsupported platform for auto-upgrade (requires macOS or Linux, x86_64 or aarch64)");
+pub const platform = platformFromTarget() orelse if (builtin.os.tag == .windows) "windows-x86_64" else @compileError("unsupported platform for auto-upgrade (requires macOS or Linux, x86_64 or aarch64)");
 
 fn platformFromTarget() ?[]const u8 {
     const os: ?[]const u8 = switch (builtin.os.tag) {
         .macos => "macos",
         .linux => "linux",
+        .windows => "windows",
         else => null,
     };
     const arch: ?[]const u8 = switch (builtin.cpu.arch) {

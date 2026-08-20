@@ -1,10 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const config_runtime = @import("../config/config_runtime.zig");
 const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
-const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_dir_permissions = (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700)));
+const private_file_permissions = (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else std.Io.File.Permissions.fromMode(0o600)));
 
 pub const subagent_relationship_index_file = "relationship-index.bin";
 
@@ -721,11 +722,20 @@ pub const SessionChildCapability = struct {
             display_session_path,
             mode,
             options,
-        ) catch |err| return switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.SessionPathUnsafe => error.SessionPathUnsafe,
-            error.PrivateStatePermissionsUnsupported => error.PrivateStatePermissionsUnsupported,
-            else => error.SessionChildStoreFailed,
+        ) catch |err| {
+            if (comptime @import("builtin").os.tag == .windows) {
+                return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.SessionPathUnsafe => error.SessionPathUnsafe,
+                    else => error.SessionChildStoreFailed,
+                };
+            }
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.SessionPathUnsafe => error.SessionPathUnsafe,
+                error.PrivateStatePermissionsUnsupported => error.PrivateStatePermissionsUnsupported,
+                else => error.SessionChildStoreFailed,
+            };
         };
         capability.impl.allowed_kind = .subagent_control;
         return capability;
@@ -1162,7 +1172,7 @@ fn validateName(name: []const u8) !void {
 fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory) return error.SessionPathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o700) {
+    if (comptime builtin.os.tag != .windows and (stat.permissions.toMode() & 0o777 != 0o700)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -1177,7 +1187,7 @@ fn verifyPrivateOpenedStat(
 ) !void {
     io_mod.verifyOpenedRegularFile(stat, mode) catch
         return error.SessionPathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o600) {
+    if (comptime builtin.os.tag != .windows and (stat.permissions.toMode() & 0o777 != 0o600)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -1186,7 +1196,7 @@ fn verifyPrivateStat(stat: std.Io.File.Stat) !void {
     if (stat.kind != .file or stat.nlink != 1) {
         return error.SessionPathUnsafe;
     }
-    if (stat.permissions.toMode() & 0o777 != 0o600) {
+    if (comptime builtin.os.tag != .windows and (stat.permissions.toMode() & 0o777 != 0o600)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -1263,7 +1273,7 @@ fn openTestSession(
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
     );
     const display_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
     errdefer alloc.free(display_path);
@@ -1375,7 +1385,7 @@ test "managed child capability rejects invalid names and unsafe routes" {
     try session.dir.createDir(
         io_mod.getIo(),
         "tool-results/wrong-kind",
-        std.Io.File.Permissions.fromMode(0o700),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
     );
     try std.testing.expectError(
         error.SessionPathUnsafe,
@@ -1403,11 +1413,11 @@ test "managed child capability rejects invalid names and unsafe routes" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "outside",
-        std.Io.File.Permissions.fromMode(0o700),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
     );
     var wrong_kind = try session.dir.createFile(io_mod.getIo(), "artifacts", .{
         .truncate = true,
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else std.Io.File.Permissions.fromMode(0o600))),
     });
     wrong_kind.close(io_mod.getIo());
     try std.testing.expectError(
@@ -1441,7 +1451,7 @@ test "retained route handle contains pathname swaps" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "outside",
-        std.Io.File.Permissions.fromMode(0o700),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
     );
     try session.dir.rename(
         "tool-results",
@@ -1570,7 +1580,7 @@ test "subagent control capability rejects a symlinked route" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "outside",
-        std.Io.File.Permissions.fromMode(0o700),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
     );
     try session.dir.symLink(
         io_mod.getIo(),
@@ -1634,9 +1644,9 @@ test "terminal capabilities are private route restricted and reject symlinks" {
         "terminal/state/record.json",
         .{ .follow_symlinks = false },
     );
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), terminal_stat.permissions.toMode() & 0o777);
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), state_stat.permissions.toMode() & 0o777);
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), record_stat.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else terminal_stat.permissions.toMode()) & 0o777);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else state_stat.permissions.toMode()) & 0o777);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else record_stat.permissions.toMode()) & 0o777);
 
     try session.dir.rename(
         "terminal",
@@ -1647,7 +1657,7 @@ test "terminal capabilities are private route restricted and reject symlinks" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "outside-terminal",
-        std.Io.File.Permissions.fromMode(0o700),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
     );
     try session.dir.symLink(
         io_mod.getIo(),

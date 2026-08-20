@@ -43,14 +43,18 @@ pub fn executeVercel(
 }
 
 fn setVercelHttpTimeout(conn: *std.http.Client.Connection) void {
-    const sock = conn.stream_writer.stream.socket.handle;
-    const timeout = std.posix.timeval{ .sec = vercel_http_timeout_sec, .usec = 0 };
-    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch |err| {
-        debug_trace.logf("core", "vercel sandbox receive timeout setup failed err={s}", .{@errorName(err)});
-    };
-    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch |err| {
-        debug_trace.logf("core", "vercel sandbox send timeout setup failed err={s}", .{@errorName(err)});
-    };
+    if (comptime @import("builtin").os.tag == .windows) {
+        return;
+    } else {
+        const sock = conn.stream_writer.stream.socket.handle;
+        const timeout = std.posix.timeval{ .sec = vercel_http_timeout_sec, .usec = 0 };
+        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch |err| {
+            debug_trace.logf("core", "vercel sandbox receive timeout setup failed err={s}", .{@errorName(err)});
+        };
+        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch |err| {
+            debug_trace.logf("core", "vercel sandbox send timeout setup failed err={s}", .{@errorName(err)});
+        };
+    }
 }
 
 fn executeVercelHttp(alloc: Allocator, scratch: Allocator, token: []const u8, command: []const u8, cwd: []const u8) !CommandResult {

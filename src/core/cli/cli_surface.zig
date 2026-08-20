@@ -1522,6 +1522,7 @@ fn runPasteSetup(
 }
 
 fn setupTerminalAvailableDefault(_: ?*anyopaque) bool {
+    if (comptime @import("builtin").os.tag == .windows) return true;
     return std.c.isatty(std.posix.STDIN_FILENO) != 0 and
         std.c.isatty(std.posix.STDERR_FILENO) != 0;
 }
@@ -1532,89 +1533,102 @@ fn readMaskedKeyDefault(
     write_mask: WriteFn,
     write_ctx: ?*anyopaque,
 ) ![]u8 {
-    var raw = try MaskedKeyRawMode.enable();
-    defer raw.disable();
+    if (comptime @import("builtin").os.tag == .windows) {
+        return error.NotATerminal;
+    } else {
+        var raw = try MaskedKeyRawMode.enable();
+        defer raw.disable();
 
-    var input: std.ArrayList(u8) = .empty;
-    errdefer {
-        if (input.capacity > 0) secret.zeroAndFree(alloc, input.allocatedSlice());
-    }
-
-    while (input.items.len < 8 * 1024) {
-        var byte: [1]u8 = undefined;
-        if (try std.posix.read(std.posix.STDIN_FILENO, &byte) == 0) return error.SetupCancelled;
-        switch (byte[0]) {
-            '\r', '\n' => {
-                if (input.items.len == 0) continue;
-                // toOwnedSlice shrinks through realloc, which may move the buffer
-                // and free the original without zeroing it. Copy out and wipe the
-                // source so no unzeroed key is left behind in freed memory.
-                const owned = try alloc.dupe(u8, input.items);
-                secret.zeroAndFree(alloc, input.allocatedSlice());
-                input = .empty;
-                return owned;
-            },
-            3, 4, 0x1b => return error.SetupCancelled,
-            8, 127 => if (input.items.len > 0) {
-                _ = input.pop();
-                try write_mask(write_ctx, "\x08 \x08");
-            },
-            0x20...0x7e => {
-                try input.append(alloc, byte[0]);
-                try write_mask(write_ctx, "•");
-            },
-            else => {},
+        var input: std.ArrayList(u8) = .empty;
+        errdefer {
+            if (input.capacity > 0) secret.zeroAndFree(alloc, input.allocatedSlice());
         }
+
+        while (input.items.len < 8 * 1024) {
+            var byte: [1]u8 = undefined;
+            if (try std.posix.read(std.posix.STDIN_FILENO, &byte) == 0) return error.SetupCancelled;
+            switch (byte[0]) {
+                '\r', '\n' => {
+                    if (input.items.len == 0) continue;
+                    // toOwnedSlice shrinks through realloc, which may move the buffer
+                    // and free the original without zeroing it. Copy out and wipe the
+                    // source so no unzeroed key is left behind in freed memory.
+                    const owned = try alloc.dupe(u8, input.items);
+                    secret.zeroAndFree(alloc, input.allocatedSlice());
+                    input = .empty;
+                    return owned;
+                },
+                3, 4, 0x1b => return error.SetupCancelled,
+                8, 127 => if (input.items.len > 0) {
+                    _ = input.pop();
+                    try write_mask(write_ctx, "\x08 \x08");
+                },
+                0x20...0x7e => {
+                    try input.append(alloc, byte[0]);
+                    try write_mask(write_ctx, "•");
+                },
+                else => {},
+            }
+        }
+        return error.SetupKeyTooLong;
     }
-    return error.SetupKeyTooLong;
 }
 
 const MaskedKeyRawMode = struct {
-    original: std.posix.termios = undefined,
+    original: if (@import("builtin").os.tag == .windows) u8 else std.posix.termios = undefined,
     active: bool = false,
 
     fn enable() !MaskedKeyRawMode {
-        if (std.c.isatty(std.posix.STDIN_FILENO) == 0 or
-            std.c.isatty(std.posix.STDERR_FILENO) == 0)
-        {
+        if (comptime @import("builtin").os.tag == .windows) {
             return error.NotATerminal;
-        }
+        } else {
+            if (std.c.isatty(std.posix.STDIN_FILENO) == 0 or
+                std.c.isatty(std.posix.STDERR_FILENO) == 0)
+            {
+                return error.NotATerminal;
+            }
 
-        var self: MaskedKeyRawMode = .{};
-        self.original = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
-        var raw = self.original;
-        raw.iflag.BRKINT = false;
-        raw.iflag.ICRNL = false;
-        raw.iflag.INPCK = false;
-        raw.iflag.ISTRIP = false;
-        raw.iflag.IXON = false;
-        raw.iflag.IXOFF = false;
-        raw.cflag.CSIZE = .CS8;
-        raw.lflag.ECHO = false;
-        raw.lflag.ICANON = false;
-        raw.lflag.IEXTEN = false;
-        raw.lflag.ISIG = false;
-        const vmin_idx = switch (builtin.os.tag) {
-            .linux => 6,
-            else => 16,
-        };
-        const vtime_idx = switch (builtin.os.tag) {
-            .linux => 5,
-            else => 17,
-        };
-        if (vmin_idx < raw.cc.len and vtime_idx < raw.cc.len) {
-            raw.cc[vmin_idx] = 1;
-            raw.cc[vtime_idx] = 0;
+            var self: MaskedKeyRawMode = .{};
+            self.original = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
+            var raw = self.original;
+            raw.iflag.BRKINT = false;
+            raw.iflag.ICRNL = false;
+            raw.iflag.INPCK = false;
+            raw.iflag.ISTRIP = false;
+            raw.iflag.IXON = false;
+            raw.iflag.IXOFF = false;
+            raw.cflag.CSIZE = .CS8;
+            raw.lflag.ECHO = false;
+            raw.lflag.ICANON = false;
+            raw.lflag.IEXTEN = false;
+            raw.lflag.ISIG = false;
+            const vmin_idx = switch (builtin.os.tag) {
+                .linux => 6,
+                else => 16,
+            };
+            const vtime_idx = switch (builtin.os.tag) {
+                .linux => 5,
+                else => 17,
+            };
+            if (vmin_idx < raw.cc.len and vtime_idx < raw.cc.len) {
+                raw.cc[vmin_idx] = 1;
+                raw.cc[vtime_idx] = 0;
+            }
+            try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
+            self.active = true;
+            return self;
         }
-        try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
-        self.active = true;
-        return self;
     }
 
     fn disable(self: *MaskedKeyRawMode) void {
         if (!self.active) return;
-        std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
-        self.active = false;
+        if (comptime @import("builtin").os.tag == .windows) {
+            self.active = false;
+            return;
+        } else {
+            std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+            self.active = false;
+        }
     }
 };
 

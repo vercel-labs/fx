@@ -181,12 +181,16 @@ pub const Client = struct {
 };
 
 fn applyResponseTimeout(stream: std.Io.net.Stream) void {
-    std.posix.setsockopt(
-        stream.socket.handle,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.RCVTIMEO,
-        std.mem.asBytes(&response_timeout),
-    ) catch {};
+    if (comptime @import("builtin").os.tag == .windows) {
+        return;
+    } else {
+        std.posix.setsockopt(
+            stream.socket.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            std.mem.asBytes(&response_timeout),
+        ) catch {};
+    }
 }
 
 fn clampStatus(custom_status: ?[]const u8) ?[]const u8 {

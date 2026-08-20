@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
@@ -131,7 +132,7 @@ pub fn prepareExternal(alloc: Allocator) !Output {
                 .read = true,
                 .truncate = false,
                 .exclusive = true,
-                .permissions = std.Io.File.Permissions.fromMode(0o600),
+                .permissions = (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else std.Io.File.Permissions.fromMode(0o600))),
             },
         ) catch |err| switch (err) {
             error.PathAlreadyExists => {
@@ -185,7 +186,7 @@ test "background launch output removes managed log on cancellation" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
     );
     const display_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
     defer alloc.free(display_path);

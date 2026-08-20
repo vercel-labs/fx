@@ -105,23 +105,24 @@ pub fn resolve(
 pub fn configuredLoginShellInto(buffer: []u8) ?[]const u8 {
     if (comptime !builtin.link_libc or builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return null;
+    } else {
+        var entry: std.c.passwd = undefined;
+        var scratch: [4096]u8 = undefined;
+        var found: ?*std.c.passwd = null;
+        if (std.c.getpwuid_r(
+            std.c.getuid(),
+            &entry,
+            &scratch,
+            scratch.len,
+            &found,
+        ) != 0) return null;
+        const record = found orelse return null;
+        const shell_ptr = record.shell orelse return null;
+        const shell = std.mem.span(shell_ptr);
+        if (shell.len == 0 or shell.len > buffer.len) return null;
+        @memcpy(buffer[0..shell.len], shell);
+        return buffer[0..shell.len];
     }
-    var entry: std.c.passwd = undefined;
-    var scratch: [4096]u8 = undefined;
-    var found: ?*std.c.passwd = null;
-    if (std.c.getpwuid_r(
-        std.c.getuid(),
-        &entry,
-        &scratch,
-        scratch.len,
-        &found,
-    ) != 0) return null;
-    const record = found orelse return null;
-    const shell_ptr = record.shell orelse return null;
-    const shell = std.mem.span(shell_ptr);
-    if (shell.len == 0 or shell.len > buffer.len) return null;
-    @memcpy(buffer[0..shell.len], shell);
-    return buffer[0..shell.len];
 }
 
 pub fn environment(

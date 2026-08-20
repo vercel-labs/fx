@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session_usage = @import("session_usage.zig");
@@ -96,7 +97,7 @@ pub fn capture(
         return .{ .invalid = @errorName(err) };
     };
     if (initial.kind != .file or initial.nlink != 1 or
-        initial.permissions.toMode() & 0o777 != 0o600)
+        (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else initial.permissions.toMode()) & 0o777 != 0o600)
     {
         return .{ .invalid = "unsafe_initial_shape" };
     }

@@ -394,7 +394,7 @@ fn openUsageRecoveryProfileRoot(
     errdefer profile.close(zio);
     const stat = try profile.stat(zio);
     if (stat.kind != .directory or
-        stat.permissions.toMode() & 0o777 != 0o700)
+        (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else stat.permissions.toMode()) & 0o777 != 0o700)
     {
         return error.InvalidUsageRecoveryIndex;
     }
@@ -417,7 +417,7 @@ fn openUsageRecoveryDir(
     errdefer dir.close(io_mod.getIo());
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory or
-        stat.permissions.toMode() & 0o777 != 0o700)
+        (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else stat.permissions.toMode()) & 0o777 != 0o700)
     {
         return error.InvalidUsageRecoveryIndex;
     }
@@ -443,7 +443,7 @@ fn validateUsageRecoveryMarker(
         stat.nlink != 1 or
         stat.size == 0 or
         stat.size > max_usage_recovery_marker_bytes or
-        stat.permissions.toMode() & 0o777 != 0o600)
+        (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else stat.permissions.toMode()) & 0o777 != 0o600)
     {
         return error.InvalidUsageRecoveryIndex;
     }
@@ -4571,14 +4571,14 @@ test "session snapshot locator resolver rejects symlink leaves and directories" 
         try tmp.dir.createDir(
             std.testing.io,
             sessions_name,
-            std.Io.File.Permissions.fromMode(0o700),
+            (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
         );
         var sessions = try tmp.dir.openDir(std.testing.io, sessions_name, .{});
         defer sessions.close(std.testing.io);
         try sessions.createDir(
             std.testing.io,
             "session",
-            std.Io.File.Permissions.fromMode(0o700),
+            (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
         );
         var session_dir = try sessions.openDir(std.testing.io, "session", .{});
         defer session_dir.close(std.testing.io);
@@ -4587,7 +4587,7 @@ test "session snapshot locator resolver rejects symlink leaves and directories" 
             try tmp.dir.createDir(
                 std.testing.io,
                 "outside-images",
-                std.Io.File.Permissions.fromMode(0o700),
+                (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
             );
             var outside_images = try tmp.dir.openDir(std.testing.io, "outside-images", .{});
             defer outside_images.close(std.testing.io);
@@ -4619,7 +4619,7 @@ test "session snapshot locator resolver rejects symlink leaves and directories" 
             try session_dir.createDir(
                 std.testing.io,
                 "images",
-                std.Io.File.Permissions.fromMode(0o700),
+                (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
             );
             var images_dir = try session_dir.openDir(std.testing.io, "images", .{});
             defer images_dir.close(std.testing.io);
@@ -4720,12 +4720,12 @@ fn loadedWriterBelongsToRoot(
 }
 
 fn prepareWritableSessionDir(dir: std.Io.Dir) !void {
-    const permissions = std.Io.File.Permissions.fromMode(0o700);
+    const permissions = (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700)));
     dir.setPermissions(io_mod.getIo(), permissions) catch
         return error.PrivateStatePermissionsUnsupported;
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory) return error.SessionPathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o700) {
+    if (comptime builtin.os.tag != .windows and (stat.permissions.toMode() & 0o777 != 0o700)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -4916,7 +4916,7 @@ fn makeRawSessionsEntry(store: Store, name: []const u8) !void {
     sessions.dir.createDir(
         io_mod.getIo(),
         name,
-        std.Io.File.Permissions.fromMode(0o700),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
     ) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
@@ -7313,7 +7313,7 @@ test "same-workspace append defers latest cache contention and marks cache dirty
     defer token.close(io_mod.getIo());
     const token_stat = try token.stat(io_mod.getIo());
     try std.testing.expectEqual(std.Io.File.Kind.file, token_stat.kind);
-    try std.testing.expectEqual(@as(u32, 0o600), token_stat.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(u32, 0o600), (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else token_stat.permissions.toMode()) & 0o777);
     const token_bytes = try io_mod.readFileToEnd(
         alloc,
         &token,
@@ -7348,7 +7348,7 @@ test "deferred token failure prevents a same-workspace canonical commit" {
         .read = true,
         .truncate = false,
         .exclusive = true,
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else std.Io.File.Permissions.fromMode(0o600))),
         .resolve_beneath = true,
     });
     obstacle.close(io_mod.getIo());
@@ -8424,7 +8424,7 @@ test "doctor reports unsafe managed child artifacts" {
     try session_dir.createDir(
         io_mod.getIo(),
         "tool-results",
-        std.Io.File.Permissions.fromMode(0o755),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else std.Io.File.Permissions.fromMode(0o755))),
     );
     var managed_dir = try session_dir.openDir(
         io_mod.getIo(),
@@ -8432,7 +8432,7 @@ test "doctor reports unsafe managed child artifacts" {
         .{ .iterate = true, .follow_symlinks = false },
     );
     defer managed_dir.close(io_mod.getIo());
-    try managed_dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o755));
+    try managed_dir.setPermissions(io_mod.getIo(), (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else std.Io.File.Permissions.fromMode(0o755))));
 
     var diagnostics = try ctx.store.inspectForDoctor(alloc);
     defer freeDoctorDiagnostics(alloc, &diagnostics);
@@ -8515,12 +8515,12 @@ test "doctor ignores legacy task records" {
     defer session_dir.close(io_mod.getIo());
     try session_dir.setPermissions(
         io_mod.getIo(),
-        std.Io.File.Permissions.fromMode(0o700),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
     );
     try session_dir.createDir(
         io_mod.getIo(),
         "tasks",
-        std.Io.File.Permissions.fromMode(0o700),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
     );
     const corrupt_path = try std.fs.path.join(alloc, &.{
         session_path,
@@ -9653,7 +9653,7 @@ test "recovery verifies and copies persisted image snapshots into the new sessio
     try std.Io.Dir.createDirAbsolute(
         io_mod.getIo(),
         source_images,
-        std.Io.File.Permissions.fromMode(0o700),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
     );
     const image_bytes = "\x89PNG\r\n\x1a\nrecovery-image";
     var digest_bytes: [32]u8 = undefined;
@@ -9676,7 +9676,7 @@ test "recovery verifies and copies persisted image snapshots into the new sessio
         .{
             .truncate = false,
             .exclusive = true,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
+            .permissions = (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else std.Io.File.Permissions.fromMode(0o600))),
         },
     );
     try image_file.writeStreamingAll(io_mod.getIo(), image_bytes);
@@ -11272,7 +11272,7 @@ test "summary index marker preparation rejects an uncommitted session" {
     try sessions.dir.createDir(
         io_mod.getIo(),
         "index.pending",
-        std.Io.File.Permissions.fromMode(0o700),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
     );
 
     var state = try testDurableState(alloc, "marker-prepare-failure", ctx.workspace);
@@ -12002,7 +12002,7 @@ test "missing home is empty for reads and bootstrapped privately for writes" {
     defer home_dir.close(io_mod.getIo());
     const home_stat = try home_dir.stat(io_mod.getIo());
     try std.testing.expectEqual(std.Io.File.Kind.directory, home_stat.kind);
-    try std.testing.expectEqual(@as(u32, 0o700), home_stat.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(u32, 0o700), (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else home_stat.permissions.toMode()) & 0o777);
     const sessions_path = try std.fs.path.join(alloc, &.{ missing_home, ".fx", "sessions" });
     defer alloc.free(sessions_path);
     try std.Io.Dir.accessAbsolute(io_mod.getIo(), sessions_path, .{});
@@ -12097,7 +12097,7 @@ test "first write creates only the private session layout" {
     const durable_stat = try durable_dir.stat(io_mod.getIo());
     try std.testing.expectEqual(
         @as(u64, 0o700),
-        durable_stat.permissions.toMode() & 0o777,
+        (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else durable_stat.permissions.toMode()) & 0o777,
     );
     var durable_iter = durable_dir.iterate();
     const sessions_entry = (try durable_iter.next(io_mod.getIo())) orelse
@@ -12114,7 +12114,7 @@ test "first write creates only the private session layout" {
     const sessions_stat = try sessions_dir.stat(io_mod.getIo());
     try std.testing.expectEqual(
         @as(u64, 0o700),
-        sessions_stat.permissions.toMode() & 0o777,
+        (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else sessions_stat.permissions.toMode()) & 0o777,
     );
     var sessions_iter = sessions_dir.iterate();
     var saw_session = false;

@@ -1187,27 +1187,31 @@ fn waitForInteractiveCallback(
     listener: *std.Io.net.Server,
     lifecycle_cancel_flag: ?*const std.atomic.Value(bool),
 ) !void {
-    var fds = [_]std.posix.pollfd{.{
-        .fd = listener.socket.handle,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
-    var remaining_ms = interactive_callback_timeout_ms;
-    while (remaining_ms > 0) {
-        try checkAuthorizationCancellation(lifecycle_cancel_flag);
-        fds[0].revents = 0;
-        const wait_ms = @min(remaining_ms, interactive_callback_poll_ms);
-        const ready = try std.posix.poll(&fds, wait_ms);
-        if (ready > 0) {
-            if ((fds[0].revents & std.posix.POLL.IN) == 0) {
-                return error.McpAuthorizationCallbackTimedOut;
-            }
+    if (comptime @import("builtin").os.tag == .windows) {
+        return error.McpAuthorizationCallbackTimedOut;
+    } else {
+        var fds = [_]std.posix.pollfd{.{
+            .fd = listener.socket.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        var remaining_ms = interactive_callback_timeout_ms;
+        while (remaining_ms > 0) {
             try checkAuthorizationCancellation(lifecycle_cancel_flag);
-            return;
+            fds[0].revents = 0;
+            const wait_ms = @min(remaining_ms, interactive_callback_poll_ms);
+            const ready = try std.posix.poll(&fds, wait_ms);
+            if (ready > 0) {
+                if ((fds[0].revents & std.posix.POLL.IN) == 0) {
+                    return error.McpAuthorizationCallbackTimedOut;
+                }
+                try checkAuthorizationCancellation(lifecycle_cancel_flag);
+                return;
+            }
+            remaining_ms -= wait_ms;
         }
-        remaining_ms -= wait_ms;
+        return error.McpAuthorizationCallbackTimedOut;
     }
-    return error.McpAuthorizationCallbackTimedOut;
 }
 
 fn requestInteractiveAuthorization(
@@ -1794,29 +1798,32 @@ fn validateJsonContentType(content_type: ?[]const u8) !void {
 }
 
 fn setSocketTimeouts(socket: std.posix.socket_t, seconds: i64) void {
-    if (comptime host_target.is_wasm) return;
-    const timeout = std.posix.timeval{ .sec = seconds, .usec = 0 };
-    const bytes = std.mem.asBytes(&timeout);
-    std.posix.setsockopt(
-        socket,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.RCVTIMEO,
-        bytes,
-    ) catch |err| debug_trace.logf(
-        "mcp",
-        "OAuth receive timeout setup failed err={s}",
-        .{@errorName(err)},
-    );
-    std.posix.setsockopt(
-        socket,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.SNDTIMEO,
-        bytes,
-    ) catch |err| debug_trace.logf(
-        "mcp",
-        "OAuth send timeout setup failed err={s}",
-        .{@errorName(err)},
-    );
+    if (comptime host_target.is_wasm or @import("builtin").os.tag == .windows) {
+        return;
+    } else {
+        const timeout = std.posix.timeval{ .sec = @as(std.c.long, @intCast(seconds)), .usec = 0 };
+        const bytes = std.mem.asBytes(&timeout);
+        std.posix.setsockopt(
+            socket,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            bytes,
+        ) catch |err| debug_trace.logf(
+            "mcp",
+            "OAuth receive timeout setup failed err={s}",
+            .{@errorName(err)},
+        );
+        std.posix.setsockopt(
+            socket,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.SNDTIMEO,
+            bytes,
+        ) catch |err| debug_trace.logf(
+            "mcp",
+            "OAuth send timeout setup failed err={s}",
+            .{@errorName(err)},
+        );
+    }
 }
 
 fn dupeRequiredSecret(

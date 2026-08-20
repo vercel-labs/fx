@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const result_store = @import("../../core/session/result_store.zig");
 const session_child_store = @import("../../core/session/session_child_store.zig");
 const io_mod = @import("../../core/shared/io.zig");
@@ -154,7 +155,7 @@ test "unknown read_tool_result handle returns failure for legacy and managed sto
     try tmp.dir.createDir(
         io_mod.getIo(),
         "legacy",
-        std.Io.File.Permissions.fromMode(0o700),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
     );
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "legacy");
     defer alloc.free(dir);
@@ -175,7 +176,7 @@ test "unknown read_tool_result handle returns failure for legacy and managed sto
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,
