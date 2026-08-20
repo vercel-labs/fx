@@ -1,10 +1,11 @@
 {
-  "name": "fx-ws-bridge",
-  "version": "0.0.0",
+  "name": "acp-ws-bridge",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "WebSocket transport bridge for fx acp stdio JSON-RPC",
+  "description": "Universal ACP WebSocket bridge — stdio-to-WS daemon for fx, pi, omp, opencode",
   "bin": {
+    "acp-ws-bridge": "bridge.mjs",
     "fx-ws-bridge": "bridge.mjs"
   },
   "scripts": {
@@ -15,8 +16,7 @@
     "node": ">=20"
   },
   "license": "Apache-2.0",
-  "main": "index.js",
-  "keywords": [],
+  "keywords": ["acp", "agent-client-protocol", "websocket", "fx", "omp", "pi", "opencode"],
   "dependencies": {
     "ws": "^8.21.3"
   }

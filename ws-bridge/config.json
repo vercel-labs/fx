@@ -1,0 +1,28 @@
+{
+  "defaultAgent": "fx",
+  "allowCwdRoots": [],
+  "agents": {
+    "fx": {
+      "command": "fx",
+      "args": ["acp"],
+      "env": {}
+    },
+    "omp": {
+      "command": "omp",
+      "args": ["acp"],
+      "env": {}
+    },
+    "pi": {
+      "command": "npx",
+      "args": ["-y", "pi-acp"],
+      "env": {
+        "PI_ACP_ENABLE_EMBEDDED_CONTEXT": "true"
+      }
+    },
+    "opencode": {
+      "command": "opencode",
+      "args": ["acp"],
+      "env": {}
+    }
+  }
+}

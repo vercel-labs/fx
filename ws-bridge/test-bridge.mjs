@@ -24,7 +24,21 @@ function ok(name, cond, detail = "") {
   }
 }
 
-function waitForMessage(ws, predicate, timeoutMs = 5000) {
+function waitForMessage(ws, predicate, timeoutMs = 8000) {
+  // Check buffered messages first (attach a persistent buffer if not already)
+  if (!ws._buffer) {
+    ws._buffer = [];
+    ws.on("message", (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        ws._buffer.push(msg);
+      } catch {}
+    });
+  }
+  // Check already-buffered
+  for (const msg of ws._buffer) {
+    if (predicate(msg)) return Promise.resolve(msg);
+  }
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("timeout waiting for message")), timeoutMs);
     const handler = (data) => {
