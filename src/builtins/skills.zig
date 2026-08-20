@@ -10,9 +10,10 @@ const Allocator = std.mem.Allocator;
 const RootSpec = skill_contract.RootSpec;
 
 /// Roots scanned at the workspace root and each ancestor directory below
-/// home, in precedence order. `skills/` belongs to the product; the rest are
-/// compatibility roots for other agent installs.
+/// home, in precedence order. `.fx/skills` and `skills/` belong to the product;
+/// the rest are compatibility roots for other agent installs.
 const workspace_roots = [_]RootSpec{
+    .{ .source = .workspace_fx, .path = ".fx/skills" },
     .{ .source = .workspace_shared, .path = "skills" },
     .{ .source = .workspace_opencode, .path = ".opencode/skills" },
     .{ .source = .workspace_codex, .path = ".codex/skills" },
@@ -1142,6 +1143,7 @@ test "copySkillDir preserves the installed skill across allocation failures" {
 
 test "workspace skill roots scan the product root before compatibility roots" {
     const expected = [_]RootSpec{
+        .{ .source = .workspace_fx, .path = ".fx/skills" },
         .{ .source = .workspace_shared, .path = "skills" },
         .{ .source = .workspace_opencode, .path = ".opencode/skills" },
         .{ .source = .workspace_codex, .path = ".codex/skills" },

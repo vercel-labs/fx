@@ -331,6 +331,7 @@ fn composeEmptyRow(
 fn skillSourceScopeLabel(source: skill_runtime.SkillSource) []const u8 {
     return switch (source) {
         .global_fx => "Fx · Global",
+        .workspace_fx => "Fx · Workspace",
         .workspace_shared => "Fx · Workspace",
         .workspace_opencode => "OpenCode · Workspace",
         .global_opencode => "OpenCode · Global",
