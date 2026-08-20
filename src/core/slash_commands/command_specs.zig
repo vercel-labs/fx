@@ -18,6 +18,7 @@ pub const TopLevelKind = enum {
     permissions,
     models,
     doctor,
+    daemon,
     background,
     teams,
     session,

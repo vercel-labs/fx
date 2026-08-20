@@ -73,6 +73,49 @@ JSON and quiet requests stay noninteractive by default. Add `--prompt-permission
 
 Inside a saved session, `/permissions remember <allow|deny> <tool-name> <arguments-json>` stores an exact confirmed rule without running the action. `/permissions` lists stable rule IDs, and `/permissions revoke <rule-id>` removes a stored rule even when its original workspace or file state has changed.
 
+## Persistent IPython and background agents
+
+The `ipython` tool runs code in one persistent IPython namespace for each root
+agent runtime. This includes the interactive app, headless `ask`, and ACP
+hosts where IPython is available. Child agents in that root runtime share the
+same namespace. Unrelated root sessions are isolated, and the worker stops
+when its owning runtime ends.
+
+The tool is available on Linux and macOS. Code execution still uses the normal
+fx permission policy and the user's operating-system permissions. Approval is
+tool-level, not a filesystem boundary, and IPython is not a sandbox.
+
+The first IPython call bootstraps a managed environment at
+`~/.fx/kernel-venv/bin/python` with `ipython==9.16.1`. To use an existing
+interpreter, set `FX_IPYTHON_PYTHON` to its path. That interpreter must be able
+to import IPython.
+
+The local background-agent supervisor can be controlled with:
+
+```bash
+fx daemon start
+fx daemon status [--json]
+fx daemon submit [--cwd PATH] -- "run the checks and summarize failures"
+fx daemon jobs [--json]
+fx daemon show <job-id> [--json]
+fx daemon stop <job-id> [--json]
+fx daemon shutdown [--json]
+```
+
+`daemon submit` returns a job ID and runs a detached one-shot `fx ask --json`
+job after the submitting CLI exits. Job metadata and private stdout and stderr
+logs are kept under `~/.fx/daemon/jobs/`; each captured stream retains at most
+4 MiB. The newest 64 job records are retained, with the oldest settled record
+pruned before a new submission. `daemon show` reports metadata including the
+log path.
+
+The detached job retains the usual permission policy and uses the supervisor's
+exact fx executable path. Restart the daemon after switching fx builds.
+
+The daemon currently does not attach to or reconnect a resident interactive
+worker, stream prompts, or replay an active session. Those capabilities are
+planned for a later stage.
+
 ## Embed fx
 
 fx builds as a native binary or WebAssembly. Applications embedding fx can provide network transport, session storage, configuration, permission handling, and terminal I/O.

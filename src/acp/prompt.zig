@@ -287,6 +287,8 @@ const AcpContext = struct {
                 .workspace_root = session.workspace_root,
                 .session_id = session.session_id,
             },
+            .ipython_runtime = if (self.state.ipython_kernel) |*kernel| kernel else null,
+            .ipython_root_session_id = session.session_id,
         };
         if (comptime !host_target.is_wasm) {
             if (session.mcp != null) {
@@ -516,6 +518,7 @@ pub fn handlePrompt(
         .permission_rules = session.permission_rules,
         .mcp_runtime = session.mcp,
         .subagent_available = state.subagent_host != null,
+        .ipython_available = state.ipython_kernel != null,
     });
     defer tool_projection.deinit(alloc);
 
@@ -659,6 +662,7 @@ pub fn runSubagentChild(
             .permission_rules = admission.rules,
             .mcp_runtime = mcp,
             .subagent_available = true,
+            .ipython_available = state.ipython_kernel != null,
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(alloc);

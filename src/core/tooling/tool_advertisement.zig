@@ -13,6 +13,7 @@ pub const Options = struct {
     permission_rules: types.PermissionRuleSet = .{},
     mcp_runtime: ?*mcp_runtime.McpRuntime = null,
     subagent_available: bool = false,
+    ipython_available: bool = false,
 };
 
 const BuildKind = enum { full, read_only };
@@ -872,6 +873,7 @@ fn writeBuiltinTool(
 ) !void {
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
+    if (std.mem.eql(u8, tool.name, "ipython") and !options.ipython_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
     if (options.permission_mode != .yolo) {
         if (tool.provider_executed and !providerExecutionIsAllowed(tool.name, options.permission_rules)) return;
@@ -1394,6 +1396,29 @@ test "subagent advertisement follows writable host capability and task never app
     defer freeNames(std.testing.allocator, &available_names);
     try expectContainsName(available_names.items, "subagent");
     try expectNotContainsName(available_names.items, "task");
+}
+
+test "IPython advertisement follows kernel host capability" {
+    var ipython = test_tool_seed;
+    ipython.name = "ipython";
+    ipython.gateway_schema = .{
+        .name = "ipython",
+        .description = ipython.description,
+    };
+    const tools = [_]tool_dispatch.Tool{ipython};
+    var unavailable = try buildTestGatewayToolProjectionForRegistry(std.testing.allocator, &tools, .{});
+    defer unavailable.deinit(std.testing.allocator);
+    var unavailable_names = try collectToolNames(std.testing.allocator, unavailable.tools_json);
+    defer freeNames(std.testing.allocator, &unavailable_names);
+    try expectNotContainsName(unavailable_names.items, "ipython");
+
+    var available = try buildTestGatewayToolProjectionForRegistry(std.testing.allocator, &tools, .{
+        .ipython_available = true,
+    });
+    defer available.deinit(std.testing.allocator);
+    var available_names = try collectToolNames(std.testing.allocator, available.tools_json);
+    defer freeNames(std.testing.allocator, &available_names);
+    try expectContainsName(available_names.items, "ipython");
 }
 
 test "terminal advertisement remains available for captured execution" {

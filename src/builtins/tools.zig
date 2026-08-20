@@ -15,6 +15,7 @@ const types = @import("../core/shared/types.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
 const ask_user_question_impl = @import("../tools/agent/ask_user_question.zig");
 const subagent_impl = @import("../tools/agent/subagent.zig");
+const ipython_impl = @import("../tools/agent/ipython.zig");
 const vision_impl = @import("../tools/agent/vision.zig");
 const create_folder_impl = @import("../tools/filesystem/create_folder.zig");
 const delete_file_impl = @import("../tools/filesystem/delete_file.zig");
@@ -398,6 +399,8 @@ const subagent_command_schema = gateway_schema.ObjectSchema{
 };
 const vision_description =
     "Inspect authorized images attached by the user or local image paths supplied in the conversation, and return structured factual evidence. Pass exactly one source: image_ids for attached images, or paths for local images. When to use: read visible text, UI state, objects, layout, or other visual details needed for the task. When NOT to use: inspect paths the user did not supply, infer details not visible in an image, or repeat evidence already available in the conversation.";
+const ipython_description =
+    "Execute Python in one persistent IPython-compatible namespace for the current root session. The process is serialized and shared with child agents; arbitrary Python can read, write, or execute operating-system resources, so approval is required. Return bounded stdout, stderr, final expression result, status, and duration.";
 const read_tool_result_description =
     "Read a prior large tool result by stable handle from the active session, using a bounded byte range or literal query. When to use: inspect more of a tool result after a preview said the full redacted result was stored. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session.";
 
@@ -1193,6 +1196,34 @@ pub const vision = ToolSpec{
     .irreversible_fn = vision_impl.isIrreversible,
 };
 
+pub const ipython = ToolSpec{
+    .name = "ipython",
+    .description = ipython_description,
+    .gateway_schema = .{
+        .name = "ipython",
+        .description = ipython_description,
+        .input_schema = .{
+            .properties = &.{.{ .name = "code", .json_type = .string, .min_length = 1, .max_length = 256 * 1024 }},
+            .required = &.{"code"},
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .ipython,
+    .activity_kind = .command,
+    .requires_approval = true,
+    .action_label = "Executing Python",
+    .completed_action_label = "Executed Python",
+    .label_arg_kind = .none,
+    .label_arg_default = "cell",
+    .cancel_if_requested_after_call = true,
+    .permission_target_kind = .none,
+    .decode = ipython_impl.decode,
+    .validate = ipython_impl.validate,
+    .call = ipython_impl.call,
+    .reads_only_fn = ipython_impl.readsOnly,
+    .irreversible_fn = ipython_impl.isIrreversible,
+};
+
 pub const read_tool_result = ToolSpec{
     .name = "read_tool_result",
     .description = read_tool_result_description,
@@ -1250,6 +1281,7 @@ pub const all = [_]tool_dispatch.Tool{
     mcp_features,
     ask_user_question,
     vision,
+    ipython,
     read_tool_result,
 };
 
@@ -1575,6 +1607,7 @@ pub const advertisement_order = [_][]const u8{
     "open_file",
     "web_fetch",
     "web_search",
+    "ipython",
 };
 
 pub const read_only_tool_names = [_][]const u8{
@@ -1645,6 +1678,7 @@ test "built-in tools register exact active local order" {
         "mcp_features",
         "ask_user_question",
         "vision",
+        "ipython",
         "read_tool_result",
     };
 
@@ -1662,6 +1696,15 @@ test "built-in tool lookup and metadata use registered defaults" {
     try std.testing.expect(toolHasPermissionContract("terminal"));
     try std.testing.expect(lookup("run_command") == null);
     try std.testing.expect(lookup("missing_tool") == null);
+
+    const ipython_spec = lookup("ipython") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("Executing Python", ipython_spec.action_label);
+    try std.testing.expectEqualStrings("Executed Python", ipython_spec.completed_action_label);
+    try std.testing.expectEqualStrings("cell", ipython_spec.label_arg_default);
+    try std.testing.expectEqual(
+        tool_dispatch.ProgressLabelKind.started,
+        tool_dispatch.classifyProgressLabel(registry, "Executing Python cell"),
+    );
 }
 
 test "built-in list_files owns product metadata schema and callbacks" {

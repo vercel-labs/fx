@@ -274,6 +274,11 @@ pub fn Runtime(comptime App: type) type {
                 .on_mcp_progress = app_callbacks.Bindings(App).onMcpProgress,
                 .lifecycle_view = app.lifecycle_view,
                 .lifecycle_scope = lifecycleContext(app).scope,
+                .ipython_runtime = if (comptime @hasField(App, "ipython_kernel"))
+                    if (app.ipython_kernel) |*kernel| kernel else null
+                else
+                    null,
+                .ipython_root_session_id = lifecycleContext(app).scope.session_id,
             };
             if (comptime @hasField(App, "web_fetch_runtime")) {
                 ctx.web_fetch_runtime = &app.web_fetch_runtime;

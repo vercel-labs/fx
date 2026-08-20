@@ -112,6 +112,7 @@ const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const host_capabilities = @import("../hosts/host.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
+const kernel_runtime = @import("../kernel/runtime.zig");
 
 test {
     _ = tool_admission;
@@ -222,6 +223,8 @@ pub const Context = struct {
         .kind = .interactive,
         .workspace_root = "",
     },
+    ipython_runtime: ?*kernel_runtime.Runtime = null,
+    ipython_root_session_id: ?[]const u8 = null,
 
     /// Projects only the borrowed capabilities consumed by admission.
     pub fn admissionInput(self: Context) tool_admission.Input {
@@ -899,6 +902,8 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
             .{}
         else
             ctx.permission_rules,
+        .ipython_runtime = ctx.ipython_runtime,
+        .ipython_root_session_id = ctx.ipython_root_session_id orelse ctx.lifecycle_scope.session_id,
     };
 }
 

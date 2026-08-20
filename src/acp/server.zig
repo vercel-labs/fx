@@ -3,6 +3,7 @@ const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const io_mod = @import("../core/shared/io.zig");
 const host_target = @import("../core/hosts/target.zig");
+const kernel_runtime = @import("../core/kernel/runtime.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const sessions = @import("sessions.zig");
@@ -236,6 +237,7 @@ pub const ServerState = struct {
     worker: worker_runtime.WorkerRuntime = .{},
     background: background_runtime.BackgroundRuntime = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
+    ipython_kernel: ?kernel_runtime.Runtime = null,
     subagent_store: ?session_store.Store = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
@@ -261,6 +263,8 @@ pub const ServerState = struct {
                 .{@errorName(err)},
             );
         };
+        if (self.ipython_kernel) |*kernel| kernel.deinit();
+        self.ipython_kernel = null;
         self.workspace_access.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
         if (self.api_key.len > 0) self.alloc.free(self.api_key);
@@ -324,6 +328,9 @@ fn closeActiveSession(state: *ServerState) !void {
 
 fn destroyActiveSession(state: *ServerState) void {
     const active = if (state.active_session) |*session| session else return;
+    if (comptime !host_target.is_wasm) {
+        if (state.ipython_kernel) |*kernel| kernel.resetSession();
+    }
     state.background.detachManagedPersistence(
         std.heap.c_allocator,
         active.session_id,
@@ -520,6 +527,10 @@ pub fn runWithTransport(
         .terminal_client = terminal_client_runtime.Runtime.init(
             cfg.background_process_provider,
         ),
+        .ipython_kernel = if (comptime !host_target.supports_ipython)
+            null
+        else
+            kernel_runtime.Runtime.init(alloc, .{}),
         .lifecycle_runtime = lifecycle_runtime,
         .lifecycle_view = lifecycle_view,
     };

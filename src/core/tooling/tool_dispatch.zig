@@ -30,6 +30,7 @@ const workspace_access = @import("../workspace/workspace_access.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
 const terminal_contracts = @import("../terminal/contracts.zig");
 const tool_args = @import("tool_args.zig");
+const kernel_runtime = @import("../kernel/runtime.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -262,6 +263,8 @@ pub const DispatchContext = struct {
     web_search_completion_sink: ?*?core_types.WebSearchCompletion = null,
     web_fetch_completion_sink: ?*?core_types.WebFetchCompletion = null,
     tool_result_memory_sink: ?*?core_types.ToolResultMemory = null,
+    ipython_runtime: ?*kernel_runtime.Runtime = null,
+    ipython_root_session_id: ?[]const u8 = null,
 };
 
 /// Function pointer used by ask_user_question to request live user answers.
@@ -390,6 +393,7 @@ pub const ExecutorKind = enum {
     mcp_features,
     ask_user_question,
     vision,
+    ipython,
 };
 
 pub const ApprovalPolicy = enum {
@@ -941,6 +945,10 @@ pub fn localToolAvailabilityFailure(
             null
         else
             try ctx.allocator.dupe(u8, terminal_unavailable_message),
+        .ipython => if (ctx.ipython_runtime != null)
+            null
+        else
+            try ctx.allocator.dupe(u8, "IPython is unavailable in this host"),
         else => null,
     };
 }

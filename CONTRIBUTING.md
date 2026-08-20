@@ -35,6 +35,56 @@ zig build test
 zig build run
 ```
 
+## Persistent IPython and daemon boundaries
+
+The persistent language runtime belongs in `src/core/kernel/`, with the
+model-facing tool in `src/tools/agent/ipython.zig`. Each root agent runtime
+owns one IPython runtime: the interactive `App`, a headless `ask` context, or
+an ACP server state where that host supports IPython. Child agents share the
+root namespace. Do not create a kernel per child agent or make the namespace
+global across unrelated root sessions. Kernel code runs with the user's
+operating-system permissions and must continue through the existing permission
+admission path.
+
+The default interpreter is bootstrapped at `~/.fx/kernel-venv/` with
+`ipython==9.16.1`. `FX_IPYTHON_PYTHON` overrides that interpreter for local
+development and tests. Keep code, output, and worker frames bounded when
+changing this boundary.
+
+The local agent supervisor belongs in `src/core/daemon/`. Its public contract
+is the `daemon` command group: `start`, `status`, `submit`, `jobs`, `show`,
+`stop`, and `shutdown`. `submit` launches a detached one-shot `fx ask --json`
+job using the supervisor's exact executable path and persists job metadata under
+`~/.fx/daemon/`. Logs are private, drained while the worker runs, and retain a
+bounded tail for each output stream. Text and `--json` output must be rendered
+from the same output snapshot. The daemon currently has no resident
+interactive worker, attach, reconnect, prompt streaming, or event replay.
+Treat those as a future stage with separate lifecycle and recovery contracts.
+Keep this supervisor separate from `src/core/background/`, which tracks shell
+background processes.
+Public daemon snapshots must omit process-instance tokens; private job records
+retain them only for PID-reuse fencing.
+
+The daemon and kernel state is profile-owned and should not be committed:
+
+* `~/.fx/kernel-venv/`
+
+* `~/.fx/daemon/supervisor.sock` and `supervisor.json`
+
+* `~/.fx/daemon/jobs/` job records and `*.log` or `*.stderr.log` files
+
+The benchmark harness is `benchmarks/kernel_runtime.py`. The current recorded
+Linux run used twenty startup runs, five hundred warm cells, and one hundred
+workload runs. It measured IPython 9.16.1 at 350.2 ms first usable median,
+408.8 ms p95, 514.2 microseconds warm cells with 777.9 microseconds p95,
+7.4 ms first workload, 7852.9 microseconds warm numeric, 45.3 MiB RSS, and
+22.8 ms for 1 MiB output. Julia 1.12.7 measured 744.1 ms, 880.9 ms, 473.7
+microseconds, 738.7 microseconds, 49.0 ms, 324.9 microseconds, 296.6 MiB,
+and 159.1 ms respectively. Julia wins the warmed numeric loop; IPython wins
+startup, first use, memory, and output transfer, so Julia is not a second
+backend. RSS comes from Linux `/proc` and is reported as unavailable on other
+hosts. These are host observations, not latency budgets.
+
 ## Verification Workflow
 
 Keep the local development loop focused: run the narrowest test that covers the changed path, build fx, and exercise the change using `./zig-out/bin/fx`. The installed `fx` on `PATH` is not valid development evidence.

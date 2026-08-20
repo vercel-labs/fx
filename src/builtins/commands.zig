@@ -142,6 +142,26 @@ pub const top_level_specs = [_]TopLevelSpec{
         .options = &.{json_option},
     },
     .{
+        .kind = .daemon,
+        .token = "daemon",
+        .usage = "daemon [start|status|submit [--cwd PATH] -- <prompt>|jobs|show <job-id>|stop <job-id>|shutdown] [--json]",
+        .summary = "Run and inspect background agents",
+        .options = &.{
+            .{ .flag = "start", .description = "Start the local background-agent supervisor" },
+            .{ .flag = "status", .description = "Show supervisor and job state (default)" },
+            .{ .flag = "submit [--cwd PATH] -- <prompt>", .description = "Run an agent with the supervisor's fx binary after this client exits" },
+            .{ .flag = "jobs", .description = "List background-agent jobs" },
+            .{ .flag = "show <job-id>", .description = "Show one background-agent job" },
+            .{ .flag = "stop <job-id>", .description = "Stop one background-agent job" },
+            .{ .flag = "shutdown", .description = "Stop every job and the supervisor" },
+            json_option,
+        },
+        .details = &.{
+            "Daemon state is private to the current profile under ~/.fx/daemon.",
+            "Workers reuse the supervisor's exact fx executable and retain their normal permission policy.",
+        },
+    },
+    .{
         .kind = .background,
         .token = "background",
         .usage = "background [last|<id>] [--json]",
@@ -275,6 +295,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .pr, .usage = "pr [context]" },
         .{ .kind = .issue, .usage = "issue [context]" },
+        .{ .kind = .daemon, .usage = "daemon [start|status|submit|jobs|show|stop|shutdown]" },
         .{ .kind = .background, .usage = "background [last|<id>]" },
     } },
     .{ .entries = &.{

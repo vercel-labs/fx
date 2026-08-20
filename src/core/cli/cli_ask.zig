@@ -18,6 +18,8 @@ const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
 const host = @import("../hosts/host.zig");
+const host_target = @import("../hosts/target.zig");
+const kernel_runtime = @import("../kernel/runtime.zig");
 const pathing = @import("../workspace/pathing.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -260,6 +262,7 @@ fn runAskChild(
             .permission_rules = admission.rules,
             .mcp_runtime = ctx.mcp,
             .subagent_available = true,
+            .ipython_available = ctx.ipython_kernel != null,
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
@@ -473,6 +476,7 @@ const AskContext = struct {
     use_process_interrupt_flag: bool = false,
     background: BackgroundRuntime = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
+    ipython_kernel: ?kernel_runtime.Runtime = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
     subagent_skills_prompt: []u8 = &.{},
     subagent_explicit_skills_prompt: []u8 = &.{},
@@ -540,6 +544,10 @@ const AskContext = struct {
             .terminal_client = terminal_client_runtime.Runtime.init(
                 cfg.background_process_provider,
             ),
+            .ipython_kernel = if (comptime !host_target.supports_ipython)
+                null
+            else
+                kernel_runtime.Runtime.init(alloc, .{}),
             .lifecycle_runtime = lifecycle_runtime,
             .lifecycle_view = hooks.RuntimeView.empty(),
         };
@@ -627,6 +635,8 @@ const AskContext = struct {
         if (self.subagent_host) |subagent_host| subagent_host.deinit();
         self.subagent_host = null;
         self.terminal_client.deinit();
+        if (self.ipython_kernel) |*kernel| kernel.deinit();
+        self.ipython_kernel = null;
         self.workspace_access.deinit(self.alloc);
         self.background.deinit(std.heap.c_allocator);
         self.worker.deinit(std.heap.c_allocator);
@@ -948,6 +958,11 @@ const AskContext = struct {
             .interactive = false,
             .lifecycle_view = self.lifecycle_view,
             .lifecycle_scope = self.lifecycleContext().scope,
+            .ipython_runtime = if (self.ipython_kernel) |*kernel| kernel else null,
+            .ipython_root_session_id = if (self.writable) |*writable|
+                writable.active_id
+            else
+                null,
         };
         if (self.mcp != null) {
             tc.mcp_ctx = @ptrCast(self);
@@ -1509,6 +1524,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .permission_rules = ctx.permission_rules,
         .mcp_runtime = ctx.mcp,
         .subagent_available = ctx.subagent_host != null,
+        .ipython_available = ctx.ipython_kernel != null,
     });
     defer tool_projection.deinit(alloc);
 

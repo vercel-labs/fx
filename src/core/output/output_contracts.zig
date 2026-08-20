@@ -2,6 +2,7 @@ const std = @import("std");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const background_store = @import("../background/background_store.zig");
+const daemon = @import("../daemon/daemon.zig");
 const doctor_runtime = @import("../cli/doctor_runtime.zig");
 const permissions = @import("../permissions/permissions.zig");
 const sandbox = @import("../permissions/sandbox.zig");
@@ -24,6 +25,139 @@ pub const OutputFormat = enum {
     text,
     json,
 };
+
+pub const DaemonSnapshot = struct {
+    value: *const daemon.Snapshot,
+
+    pub fn render(self: DaemonSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    pub fn renderText(self: DaemonSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        if (self.value.running) {
+            try out.writer.writeAll("Daemon: running");
+            if (self.value.pid) |pid| try out.writer.print(" (pid {d})", .{pid});
+            try out.writer.writeByte('\n');
+        } else {
+            try out.writer.writeAll("Daemon: stopped\n");
+        }
+        if (self.value.jobs.len == 0) {
+            try out.writer.writeAll("Background agents: none\n");
+            return out.toOwnedSlice();
+        }
+        try out.writer.writeAll("Background agents:\n");
+        for (self.value.jobs) |job| {
+            try out.writer.writeAll("- ");
+            try writeTerminalSafe(&out.writer, alloc, job.id);
+            try out.writer.print("  {s}", .{@tagName(job.state)});
+            if (job.pid) |pid| try out.writer.print("  pid {d}", .{pid});
+            try out.writer.writeAll("  ");
+            try writeTerminalSafe(&out.writer, alloc, job.cwd);
+            try out.writer.writeByte('\n');
+            try out.writer.writeAll("  log: ");
+            try writeTerminalSafe(&out.writer, alloc, job.log_path);
+            try out.writer.writeByte('\n');
+        }
+        return out.toOwnedSlice();
+    }
+
+    pub fn renderJson(self: DaemonSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"kind\":\"daemon\",\"schema_version\":1,\"running\":");
+        try out.writer.print("{}", .{self.value.running});
+        try out.writer.writeAll(",\"pid\":");
+        if (self.value.pid) |pid| try out.writer.print("{d}", .{pid}) else try out.writer.writeAll("null");
+        try out.writer.writeAll(",\"jobs\":[");
+        for (self.value.jobs, 0..) |job, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("{\"id\":");
+            try std.json.Stringify.value(job.id, .{}, &out.writer);
+            try out.writer.writeAll(",\"state\":");
+            try std.json.Stringify.value(@tagName(job.state), .{}, &out.writer);
+            try out.writer.writeAll(",\"pid\":");
+            if (job.pid) |pid| try out.writer.print("{d}", .{pid}) else try out.writer.writeAll("null");
+            try out.writer.writeAll(",\"cwd\":");
+            try std.json.Stringify.value(job.cwd, .{}, &out.writer);
+            try out.writer.writeAll(",\"prompt\":");
+            try std.json.Stringify.value(job.prompt, .{}, &out.writer);
+            try out.writer.writeAll(",\"log_path\":");
+            try std.json.Stringify.value(job.log_path, .{}, &out.writer);
+            try out.writer.writeAll(",\"exit_code\":");
+            if (job.exit_code) |code| try out.writer.print("{d}", .{code}) else try out.writer.writeAll("null");
+            try out.writer.writeByte('}');
+        }
+        try out.writer.writeAll("]}");
+        return out.toOwnedSlice();
+    }
+};
+
+pub const DaemonCommandSnapshot = struct {
+    action: []const u8,
+    message: ?[]const u8 = null,
+    job_id: ?[]const u8 = null,
+
+    pub fn render(self: DaemonCommandSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        switch (format) {
+            .text => {
+                if (self.job_id) |job_id| {
+                    try out.writer.writeAll("Background agent submitted: ");
+                    try writeTerminalSafe(&out.writer, alloc, job_id);
+                    try out.writer.writeByte('\n');
+                } else if (self.message) |message| {
+                    try writeTerminalSafe(&out.writer, alloc, message);
+                    try out.writer.writeByte('\n');
+                } else {
+                    try writeTerminalSafe(&out.writer, alloc, self.action);
+                    try out.writer.writeByte('\n');
+                }
+            },
+            .json => {
+                try out.writer.writeAll("{\"kind\":\"daemon_command\",\"schema_version\":1,\"action\":");
+                try std.json.Stringify.value(self.action, .{}, &out.writer);
+                try out.writer.writeAll(",\"message\":");
+                if (self.message) |message| try std.json.Stringify.value(message, .{}, &out.writer) else try out.writer.writeAll("null");
+                try out.writer.writeAll(",\"job_id\":");
+                if (self.job_id) |job_id| try std.json.Stringify.value(job_id, .{}, &out.writer) else try out.writer.writeAll("null");
+                try out.writer.writeByte('}');
+            },
+        }
+        return out.toOwnedSlice();
+    }
+};
+
+test "daemon snapshots render the same public fields without process tokens" {
+    const alloc = std.testing.allocator;
+    var jobs = [_]daemon.JobSnapshot{.{
+        .id = @constCast("job-1234-abcd"),
+        .state = .running,
+        .pid = 42,
+        .cwd = @constCast("/tmp/workspace"),
+        .prompt = @constCast("inspect"),
+        .log_path = @constCast("/tmp/job.log"),
+        .process_token = null,
+        .exit_code = null,
+    }};
+    const snapshot = daemon.Snapshot{ .running = true, .pid = 7, .jobs = &jobs };
+
+    const text_output = try (DaemonSnapshot{ .value = &snapshot }).render(alloc, .text);
+    defer alloc.free(text_output);
+    try std.testing.expect(std.mem.find(u8, text_output, "job-1234-abcd  running  pid 42") != null);
+    try std.testing.expect(std.mem.find(u8, text_output, "/tmp/job.log") != null);
+
+    const json_output = try (DaemonSnapshot{ .value = &snapshot }).render(alloc, .json);
+    defer alloc.free(json_output);
+    try std.testing.expect(std.mem.find(u8, json_output, "\"kind\":\"daemon\"") != null);
+    try std.testing.expect(std.mem.find(u8, json_output, "\"id\":\"job-1234-abcd\"") != null);
+    try std.testing.expect(std.mem.find(u8, json_output, "process_token") == null);
+}
 
 pub const CommandFailureSnapshot = struct {
     kind: []const u8,

@@ -90,6 +90,10 @@ const Context = struct {
             .workspace_root = result.workspace_root,
             .session_id = self.turn.child_id,
         };
+        result.ipython_root_session_id = inheritedIpythonRootSessionId(
+            result.ipython_root_session_id,
+            self.config.tool_context.lifecycle_scope.session_id,
+        );
         return result;
     }
 
@@ -109,6 +113,24 @@ const Context = struct {
         };
     }
 };
+
+fn inheritedIpythonRootSessionId(
+    explicit_root: ?[]const u8,
+    parent_session_id: ?[]const u8,
+) ?[]const u8 {
+    return explicit_root orelse parent_session_id;
+}
+
+test "subagents retain the root IPython namespace identity" {
+    try std.testing.expectEqualStrings(
+        "root-session",
+        inheritedIpythonRootSessionId("root-session", "child-session").?,
+    );
+    try std.testing.expectEqualStrings(
+        "parent-session",
+        inheritedIpythonRootSessionId(null, "parent-session").?,
+    );
+}
 
 pub fn run(
     config: Config,

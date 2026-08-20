@@ -97,6 +97,8 @@ const background_process_provider = @import(
 );
 const background_process = @import("tools/shell/background_process.zig");
 const process_supervisor = @import("core/background/process_supervisor.zig");
+const daemon_runtime = @import("core/daemon/daemon.zig");
+const kernel_runtime = @import("core/kernel/runtime.zig");
 const terminal_client_runtime = @import("core/terminal/client.zig");
 const terminal_direct_runtime = @import("core/terminal/direct_runtime.zig");
 const app_terminal_runtime = @import("core/app/app_terminal_runtime.zig");
@@ -522,6 +524,7 @@ const App = struct {
     worker_thread: ?std.Thread = null,
     worker: WorkerRuntime = .{},
     background: BackgroundRuntime = .{},
+    ipython_kernel: ?kernel_runtime.Runtime = null,
     terminal_client: terminal_client_runtime.Runtime = .{},
     terminal_direct: terminal_direct_runtime.Runtime = .{},
     terminal_takeover: app_terminal_takeover_runtime.Controller = .{},
@@ -563,6 +566,10 @@ const App = struct {
         var app = Self{
             .alloc = alloc,
             .lifecycle_runtime = hooks.Runtime.init(alloc),
+            .ipython_kernel = if (comptime !host_target.supports_ipython)
+                null
+            else
+                kernel_runtime.Runtime.init(alloc, .{}),
             .background = BackgroundRuntime.init(if (comptime host_target.is_wasm)
                 background_process_provider.unavailable_provider
             else
@@ -825,6 +832,8 @@ const App = struct {
         self.selected_model.deinit(self.alloc);
         self.session_title.deinit(self.alloc);
         SessionAppRuntime.deinitPersistence(self);
+        if (self.ipython_kernel) |*kernel| kernel.deinit();
+        self.ipython_kernel = null;
         if (self.requested_resume) |*target| {
             target.deinit(self.alloc);
             self.requested_resume = null;
@@ -1518,6 +1527,7 @@ const App = struct {
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = self.session_persistence.subagent_host != null,
+            .ipython_available = self.ipython_kernel != null,
         });
     }
 
@@ -2749,6 +2759,26 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
     const raw_args = rawArgs(c_argc, c_argv);
     const raw_env: RawEnviron = @ptrCast(c_envp);
 
+    if (daemon_runtime.isInternalModeRaw(raw_args)) {
+        io_mod.setRawEnviron(raw_env);
+        const process_args = argsFromRaw(raw_args);
+        var threaded = std.Io.Threaded.init(processAllocator(), .{
+            .argv0 = .init(process_args),
+            .environ = .{ .block = environBlockFromRaw(raw_env) },
+        });
+        defer threaded.deinit();
+        io_mod.setIo(threaded.io());
+        const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+        var paths = try daemon_runtime.Paths.init(processAllocator(), home);
+        defer paths.deinit(processAllocator());
+        try daemon_runtime.runSupervisor(
+            processAllocator(),
+            &paths,
+            background_process.provider,
+        );
+        return;
+    }
+
     if (comptime terminal_host.isSupported()) {
         if (terminal_tmux_session.isCaptureModeRaw(raw_args)) {
             io_mod.setRawEnviron(raw_env);
@@ -3092,6 +3122,7 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "logout") or
         std.mem.eql(u8, command, "teams") or
         std.mem.eql(u8, command, "setup") or
+        std.mem.eql(u8, command, "daemon") or
         std.mem.eql(u8, command, "upgrade") or
         // Resolve a stored credential, which reads the platform key store out of process.
         std.mem.eql(u8, command, "status") or
@@ -3108,6 +3139,7 @@ test "auth and upgrade commands use early threaded io without full entry config"
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "logout")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "teams")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "setup")}));
+    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "daemon")}));
 }
 
 test "credential-reading commands use early threaded io without full entry config" {
@@ -3749,6 +3781,8 @@ test {
     _ = @import("core/background/background.zig");
     _ = @import("core/background/background_commands.zig");
     _ = @import("core/background/background_runtime.zig");
+    _ = @import("core/daemon/daemon.zig");
+    _ = @import("core/kernel/runtime.zig");
     _ = @import("core/background/background_store.zig");
     _ = @import("core/cli/cli_ask.zig");
     _ = @import("core/cli/cli_replay.zig");

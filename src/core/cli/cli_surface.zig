@@ -11,6 +11,7 @@ const command_specs = @import("../slash_commands/command_specs.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const devbox_executor = @import("../execution/devbox_executor.zig");
+const daemon_runtime = @import("../daemon/daemon.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
@@ -63,6 +64,7 @@ pub const Command = union(enum) {
     permissions: []const [:0]const u8,
     models: []const [:0]const u8,
     doctor: []const [:0]const u8,
+    daemon: []const [:0]const u8,
     background: []const [:0]const u8,
     teams: []const [:0]const u8,
     session: []const [:0]const u8,
@@ -197,6 +199,29 @@ pub const Config = struct {
 
 const LocalSurfaceOptions = struct {
     format: output_contracts.OutputFormat = .text,
+};
+
+const DaemonAction = enum {
+    start,
+    status,
+    submit,
+    jobs,
+    show,
+    stop,
+    shutdown,
+};
+
+const DaemonOptions = struct {
+    action: DaemonAction = .status,
+    format: output_contracts.OutputFormat = .text,
+    cwd: ?[]const u8 = null,
+    target: ?[]const u8 = null,
+    prompt: []u8 = &.{},
+
+    fn deinit(self: *DaemonOptions, alloc: Allocator) void {
+        if (self.prompt.len > 0) alloc.free(self.prompt);
+        self.* = undefined;
+    }
 };
 
 const UpgradeOptions = struct {
@@ -440,6 +465,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             if (command_specs.matchesTopLevel(command_catalog, command, .credits)) return .{ .credits = args[1..] };
         },
         'd' => {
+            if (command_specs.matchesTopLevel(command_catalog, command, .daemon)) return .{ .daemon = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .doctor)) return .{ .doctor = args[1..] };
         },
         'i' => {
@@ -929,6 +955,170 @@ fn runNonInteractiveWithDeps(
             defer alloc.free(text);
             try writeFormattedOutput(deps, text, opts.format);
             return .handled_success;
+        },
+        .daemon => |rest| {
+            var opts = parseDaemonArgs(alloc, rest) catch |err| {
+                try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .daemon, "daemon", err, rest);
+                return .handled_failure;
+            };
+            defer opts.deinit(alloc);
+            const home = io_mod.getenv("HOME") orelse {
+                try writeDaemonFailure(alloc, deps, opts.format, error.HomeNotSet);
+                return .handled_failure;
+            };
+            var paths = daemon_runtime.Paths.init(alloc, home) catch |err| {
+                try writeDaemonFailure(alloc, deps, opts.format, err);
+                return .handled_failure;
+            };
+            defer paths.deinit(alloc);
+
+            switch (opts.action) {
+                .start => {
+                    daemon_runtime.ensureStarted(alloc, &paths, cfg.background_process_provider) catch |err| {
+                        try writeDaemonFailure(alloc, deps, opts.format, err);
+                        return .handled_failure;
+                    };
+                    const text = try (output_contracts.DaemonCommandSnapshot{
+                        .action = "start",
+                        .message = "Daemon started.",
+                    }).render(alloc, opts.format);
+                    defer alloc.free(text);
+                    try writeFormattedOutput(deps, text, opts.format);
+                    return .handled_success;
+                },
+                .status, .jobs, .show => {
+                    if (opts.action == .show) {
+                        var selected = daemon_runtime.snapshotJob(
+                            alloc,
+                            &paths,
+                            cfg.background_process_provider,
+                            opts.target.?,
+                        ) catch |err| {
+                            try writeDaemonFailure(alloc, deps, opts.format, err);
+                            return .handled_failure;
+                        };
+                        defer selected.deinit(alloc);
+                        const text = try (output_contracts.DaemonSnapshot{ .value = &selected }).render(alloc, opts.format);
+                        defer alloc.free(text);
+                        try writeFormattedOutput(deps, text, opts.format);
+                        return .handled_success;
+                    }
+                    var current = daemon_runtime.snapshot(
+                        alloc,
+                        &paths,
+                        cfg.background_process_provider,
+                    ) catch |err| {
+                        try writeDaemonFailure(alloc, deps, opts.format, err);
+                        return .handled_failure;
+                    };
+                    defer current.deinit(alloc);
+                    const text = try (output_contracts.DaemonSnapshot{ .value = &current }).render(alloc, opts.format);
+                    defer alloc.free(text);
+                    try writeFormattedOutput(deps, text, opts.format);
+                    return .handled_success;
+                },
+                .submit => {
+                    const cwd_input = opts.cwd orelse ".";
+                    const cwd = io_mod.realpathAlloc(alloc, cwd_input) catch |err| {
+                        try writeDaemonFailure(alloc, deps, opts.format, err);
+                        return .handled_failure;
+                    };
+                    defer alloc.free(cwd);
+                    daemon_runtime.ensureStarted(alloc, &paths, cfg.background_process_provider) catch |err| {
+                        try writeDaemonFailure(alloc, deps, opts.format, err);
+                        return .handled_failure;
+                    };
+                    var response = daemon_runtime.request(alloc, &paths, .{ .submit = .{
+                        .cwd = cwd,
+                        .prompt = opts.prompt,
+                    } }) catch |err| {
+                        try writeDaemonFailure(alloc, deps, opts.format, err);
+                        return .handled_failure;
+                    };
+                    defer response.deinit(alloc);
+                    if (!response.ok) {
+                        try writeDaemonProtocolFailure(alloc, deps, opts.format, response.message);
+                        return .handled_failure;
+                    }
+                    const text = try (output_contracts.DaemonCommandSnapshot{
+                        .action = "submit",
+                        .message = response.message,
+                        .job_id = response.job_id,
+                    }).render(alloc, opts.format);
+                    defer alloc.free(text);
+                    try writeFormattedOutput(deps, text, opts.format);
+                    return .handled_success;
+                },
+                .stop => {
+                    var response = daemon_runtime.request(alloc, &paths, .{ .stop = opts.target.? }) catch |err| {
+                        try writeDaemonFailure(alloc, deps, opts.format, err);
+                        return .handled_failure;
+                    };
+                    defer response.deinit(alloc);
+                    if (!response.ok) {
+                        try writeDaemonProtocolFailure(alloc, deps, opts.format, response.message);
+                        return .handled_failure;
+                    }
+                    const text = try (output_contracts.DaemonCommandSnapshot{
+                        .action = "stop",
+                        .message = "Background agent stopped.",
+                    }).render(alloc, opts.format);
+                    defer alloc.free(text);
+                    try writeFormattedOutput(deps, text, opts.format);
+                    return .handled_success;
+                },
+                .shutdown => {
+                    var current = daemon_runtime.snapshot(alloc, &paths, cfg.background_process_provider) catch |err| {
+                        try writeDaemonFailure(alloc, deps, opts.format, err);
+                        return .handled_failure;
+                    };
+                    defer current.deinit(alloc);
+                    var should_request = current.running;
+                    if (!should_request) {
+                        for (current.jobs) |job| {
+                            if (job.state == .running or job.state == .queued) {
+                                daemon_runtime.ensureStarted(
+                                    alloc,
+                                    &paths,
+                                    cfg.background_process_provider,
+                                ) catch |err| {
+                                    try writeDaemonFailure(alloc, deps, opts.format, err);
+                                    return .handled_failure;
+                                };
+                                should_request = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (should_request) {
+                        var response = daemon_runtime.request(alloc, &paths, .shutdown) catch |err| {
+                            try writeDaemonFailure(alloc, deps, opts.format, err);
+                            return .handled_failure;
+                        };
+                        defer response.deinit(alloc);
+                        if (!response.ok) {
+                            try writeDaemonProtocolFailure(alloc, deps, opts.format, response.message);
+                            return .handled_failure;
+                        }
+                        if (!daemon_runtime.waitUntilStopped(
+                            alloc,
+                            &paths,
+                            cfg.background_process_provider,
+                            daemon_runtime.shutdown_timeout_ms,
+                        )) {
+                            try writeDaemonFailure(alloc, deps, opts.format, error.DaemonStopTimeout);
+                            return .handled_failure;
+                        }
+                    }
+                    const text = try (output_contracts.DaemonCommandSnapshot{
+                        .action = "shutdown",
+                        .message = "Daemon stopped.",
+                    }).render(alloc, opts.format);
+                    defer alloc.free(text);
+                    try writeFormattedOutput(deps, text, opts.format);
+                    return .handled_success;
+                },
+            }
         },
         .background => |rest| {
             const opts = parsePersistedRecordArgs(rest) catch |err| {
@@ -2320,6 +2510,52 @@ fn writeJsonCommandFailureCode(
     try writeJsonLine(deps, json);
 }
 
+fn writeDaemonFailure(
+    alloc: Allocator,
+    deps: RunDeps,
+    format: output_contracts.OutputFormat,
+    err: anyerror,
+) !void {
+    var buffer: [192]u8 = undefined;
+    const message = switch (err) {
+        error.HomeNotSet => "HOME is not set",
+        error.DaemonJobNotFound, error.FileNotFound => "background agent not found or daemon is not running",
+        error.ConnectionRefused => "daemon is not running",
+        error.DaemonStartTimeout => "daemon did not become ready before the startup deadline",
+        error.DaemonStopTimeout => "daemon did not stop before the shutdown deadline",
+        error.TooManyDaemonJobs => "all retained background-agent slots are still running",
+        error.FrameTooLarge => "daemon request or response exceeded its size limit",
+        error.Timeout => "daemon request timed out",
+        error.BackgroundProcessIdentityIndeterminate,
+        error.BackgroundProcessIdentityUnavailable,
+        error.ProcessIdentityUnavailable,
+        error.ProcessIdentityUnsupported,
+        => "the operating system could not verify the daemon process identity",
+        else => std.fmt.bufPrint(&buffer, "operation failed: {s}", .{@errorName(err)}) catch "operation failed",
+    };
+    if (format == .json) {
+        return writeJsonCommandFailureCode(alloc, deps, "daemon", @errorName(err), message);
+    }
+    try writeStderr(deps, "fx daemon: ");
+    try writeStderr(deps, message);
+    try writeStderr(deps, "\n");
+}
+
+fn writeDaemonProtocolFailure(
+    alloc: Allocator,
+    deps: RunDeps,
+    format: output_contracts.OutputFormat,
+    maybe_message: ?[]const u8,
+) !void {
+    const message = maybe_message orelse "daemon request failed";
+    if (format == .json) {
+        return writeJsonCommandFailureCode(alloc, deps, "daemon", "DaemonRequestFailed", message);
+    }
+    try writeStderr(deps, "fx daemon: ");
+    try writeStderr(deps, message);
+    try writeStderr(deps, "\n");
+}
+
 fn writeLookupFailure(
     alloc: Allocator,
     deps: RunDeps,
@@ -2751,6 +2987,77 @@ fn parseLocalSurfaceArgs(args: []const [:0]const u8) !LocalSurfaceOptions {
             continue;
         }
         return error.InvalidLocalSurfaceArgs;
+    }
+    return options;
+}
+
+fn parseDaemonArgs(alloc: Allocator, args: []const [:0]const u8) !DaemonOptions {
+    var options = DaemonOptions{};
+    var index: usize = 0;
+    if (args.len > 0 and !std.mem.startsWith(u8, args[0], "--")) {
+        options.action = std.meta.stringToEnum(DaemonAction, args[0]) orelse
+            return error.InvalidDaemonArgs;
+        index = 1;
+    }
+
+    var json_seen = false;
+    if (options.action == .submit) {
+        var prompt_parts: std.ArrayList([:0]const u8) = .empty;
+        defer prompt_parts.deinit(alloc);
+        var cwd_seen = false;
+        while (index < args.len) : (index += 1) {
+            const arg = args[index];
+            if (std.mem.eql(u8, arg, "--")) {
+                index += 1;
+                try prompt_parts.appendSlice(alloc, args[index..]);
+                break;
+            }
+            if (std.mem.eql(u8, arg, "--json")) {
+                if (json_seen) return error.InvalidDaemonArgs;
+                json_seen = true;
+                options.format = .json;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--cwd")) {
+                if (cwd_seen or index + 1 >= args.len) return error.InvalidDaemonArgs;
+                cwd_seen = true;
+                index += 1;
+                options.cwd = args[index];
+                continue;
+            }
+            if (std.mem.startsWith(u8, arg, "--")) return error.InvalidDaemonArgs;
+            try prompt_parts.append(alloc, arg);
+        }
+        if (prompt_parts.items.len == 0) return error.InvalidDaemonArgs;
+        options.prompt = try joinArgs(alloc, prompt_parts.items);
+        errdefer alloc.free(options.prompt);
+        if (std.mem.trim(u8, options.prompt, " \t\r\n").len == 0 or
+            options.prompt.len > daemon_runtime.max_prompt_bytes)
+        {
+            return error.InvalidDaemonArgs;
+        }
+        if (options.cwd) |cwd| if (std.mem.trim(u8, cwd, " \t\r\n").len == 0) {
+            return error.InvalidDaemonArgs;
+        };
+        return options;
+    }
+
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--json")) {
+            if (json_seen) return error.InvalidDaemonArgs;
+            json_seen = true;
+            options.format = .json;
+            continue;
+        }
+        if (options.action != .show and options.action != .stop) {
+            return error.InvalidDaemonArgs;
+        }
+        if (options.target != null) return error.InvalidDaemonArgs;
+        options.target = arg;
+    }
+    if ((options.action == .show or options.action == .stop) and options.target == null) {
+        return error.InvalidDaemonArgs;
     }
     return options;
 }
@@ -3463,6 +3770,34 @@ test "parse local surface args accepts only json" {
     try std.testing.expectEqual(output_contracts.OutputFormat.json, opts.format);
 
     try std.testing.expectError(error.InvalidLocalSurfaceArgs, parseLocalSurfaceArgs(&.{@constCast("--wat")}));
+}
+
+test "parse daemon args owns a bounded submit prompt and validates targets" {
+    const alloc = std.testing.allocator;
+    var submit = try parseDaemonArgs(alloc, &.{
+        @constCast("submit"),
+        @constCast("--json"),
+        @constCast("--cwd"),
+        @constCast("/tmp/workspace"),
+        @constCast("--"),
+        @constCast("inspect"),
+        @constCast("the failure"),
+    });
+    defer submit.deinit(alloc);
+    try std.testing.expectEqual(DaemonAction.submit, submit.action);
+    try std.testing.expectEqual(output_contracts.OutputFormat.json, submit.format);
+    try std.testing.expectEqualStrings("/tmp/workspace", submit.cwd.?);
+    try std.testing.expectEqualStrings("inspect the failure", submit.prompt);
+
+    var show = try parseDaemonArgs(alloc, &.{ @constCast("show"), @constCast("job-1234-abcd"), @constCast("--json") });
+    defer show.deinit(alloc);
+    try std.testing.expectEqual(DaemonAction.show, show.action);
+    try std.testing.expectEqualStrings("job-1234-abcd", show.target.?);
+    try std.testing.expectEqual(output_contracts.OutputFormat.json, show.format);
+
+    try std.testing.expectError(error.InvalidDaemonArgs, parseDaemonArgs(alloc, &.{@constCast("submit")}));
+    try std.testing.expectError(error.InvalidDaemonArgs, parseDaemonArgs(alloc, &.{@constCast("stop")}));
+    try std.testing.expectError(error.InvalidDaemonArgs, parseDaemonArgs(alloc, &.{ @constCast("jobs"), @constCast("extra") }));
 }
 
 test "parse upgrade args accepts a remembered release channel" {
