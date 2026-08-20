@@ -379,8 +379,62 @@ fn openContainedDir(
 ) !std.Io.Dir {
     const canonical_path = try io_mod.realpathAlloc(alloc, logical_path);
     defer alloc.free(canonical_path);
-    if (!pathing.pathInside(read_authority, canonical_path)) return error.PathOutsideReadAuthority;
-    return io_mod.openDirAbsoluteNoFollow(canonical_path, options);
+    if (pathing.pathInside(read_authority, canonical_path))
+        return io_mod.openDirAbsoluteNoFollow(canonical_path, options);
+
+    const extra_authorities = externalSymlinkAuthorities(alloc) catch return error.PathOutsideReadAuthority;
+    if (extra_authorities.len == 0) return error.PathOutsideReadAuthority;
+    defer freeExternalAuthorities(alloc, extra_authorities);
+
+    for (extra_authorities) |authority| {
+        if (pathing.pathInside(authority, canonical_path))
+            return io_mod.openDirAbsoluteNoFollow(canonical_path, options);
+    }
+    return error.PathOutsideReadAuthority;
+}
+
+/// Parses FX_SKILL_SYMLINK_AUTHORITIES (colon-separated absolute paths) into
+/// owned duplicates. Returns an empty slice when the variable is unset or
+/// contains no valid absolute paths. Relative entries and entries containing
+/// `..` components are silently skipped. The caller must free each entry and
+/// the slice itself via `freeExternalAuthorities`.
+fn externalSymlinkAuthorities(alloc: Allocator) ![][]const u8 {
+    const raw = io_mod.getenv("FX_SKILL_SYMLINK_AUTHORITIES") orelse return &.{};
+    if (raw.len == 0) return &.{};
+
+    var authorities: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (authorities.items) |item| alloc.free(item);
+        authorities.deinit(alloc);
+    }
+
+    var it = std.mem.tokenizeScalar(u8, raw, ':');
+    while (it.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t");
+        if (trimmed.len == 0) continue;
+        if (!std.fs.path.isAbsolute(trimmed)) continue;
+        if (pathContainsDotDot(trimmed)) continue;
+        const owned = try alloc.dupe(u8, trimmed);
+        errdefer alloc.free(owned);
+        authorities.append(alloc, owned) catch |err| {
+            alloc.free(owned);
+            return err;
+        };
+    }
+    return try authorities.toOwnedSlice(alloc);
+}
+
+fn pathContainsDotDot(path: []const u8) bool {
+    var it = std.fs.path.componentIterator(path);
+    while (it.next()) |component| {
+        if (std.mem.eql(u8, component.name, "..")) return true;
+    }
+    return false;
+}
+
+fn freeExternalAuthorities(alloc: Allocator, authorities: [][]const u8) void {
+    for (authorities) |authority| alloc.free(authority);
+    if (authorities.len > 0) alloc.free(authorities);
 }
 
 fn containsRootPath(roots: []const SkillRoot, path: []const u8) bool {
@@ -2967,4 +3021,159 @@ test "loadVisibleSkills cleans every partial allocation failure" {
 
 test "freeSkills accepts static empty slice" {
     freeSkills(std.testing.allocator, &.{});
+}
+
+var stable_test_environ: ?*std.process.Environ.Map = null;
+
+fn stableEmptyTestEnviron() !*const std.process.Environ.Map {
+    if (stable_test_environ) |map| return map;
+
+    const alloc = std.heap.page_allocator;
+    const map = try alloc.create(std.process.Environ.Map);
+    map.* = std.process.Environ.Map.init(alloc);
+    stable_test_environ = map;
+    return map;
+}
+
+const TestEnviron = struct {
+    alloc: Allocator,
+    map: std.process.Environ.Map,
+
+    fn install(alloc: Allocator) !*TestEnviron {
+        _ = try stableEmptyTestEnviron();
+
+        const self = try alloc.create(TestEnviron);
+        errdefer alloc.destroy(self);
+
+        self.* = .{
+            .alloc = alloc,
+            .map = std.process.Environ.Map.init(alloc),
+        };
+        errdefer self.map.deinit();
+
+        io_mod.setEnvironMap(&self.map);
+        return self;
+    }
+
+    fn put(self: *TestEnviron, key: []const u8, value: []const u8) !void {
+        try self.map.put(key, value);
+    }
+
+    fn deinit(self: *TestEnviron) void {
+        if (stable_test_environ) |map| {
+            io_mod.setEnvironMap(map);
+        }
+        self.map.deinit();
+        const alloc = self.alloc;
+        alloc.destroy(self);
+    }
+};
+
+test "externalSymlinkAuthorities parses colon-separated absolute paths" {
+    const alloc = std.testing.allocator;
+
+    const env = try TestEnviron.install(alloc);
+    defer env.deinit();
+    try env.put("FX_SKILL_SYMLINK_AUTHORITIES", "/nix/store:/opt/skills: relative :/bad/../path");
+
+    const authorities = try externalSymlinkAuthorities(alloc);
+    defer freeExternalAuthorities(alloc, authorities);
+    try std.testing.expectEqual(@as(usize, 2), authorities.len);
+    try std.testing.expectEqualStrings("/nix/store", authorities[0]);
+    try std.testing.expectEqualStrings("/opt/skills", authorities[1]);
+}
+
+test "externalSymlinkAuthorities returns empty when unset" {
+    const alloc = std.testing.allocator;
+
+    const env = try TestEnviron.install(alloc);
+    defer env.deinit();
+
+    const authorities = try externalSymlinkAuthorities(alloc);
+    try std.testing.expectEqual(@as(usize, 0), authorities.len);
+}
+
+test "loadVisibleSkills discovers a linked candidate resolved via external symlink authority" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The skill source lives outside the home/workspace, simulating a Nix
+    // store path. The symlink in the skills directory points to it.
+    try writeTempFile(
+        &tmp,
+        "external-store/linked-skill/SKILL.md",
+        "---\nname: linked-skill\ndescription: external link\n---\n\nEXTERNAL_BODY\n",
+    );
+    try createTempSymlinkOrSkip(
+        &tmp,
+        "../../../../external-store/linked-skill",
+        "home/workspace/.codex/skills/linked-skill",
+    );
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+    defer alloc.free(workspace_root);
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(managed_root);
+    const external_authority = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external-store");
+    defer alloc.free(external_authority);
+
+    const env = try TestEnviron.install(alloc);
+    defer env.deinit();
+    try env.put("FX_SKILL_SYMLINK_AUTHORITIES", external_authority);
+
+    var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+    defer discovery.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), discovery.skills.len);
+    try std.testing.expectEqualStrings("linked-skill", discovery.skills[0].name);
+    try std.testing.expectEqual(@as(usize, 0), discovery.diagnostics.len);
+
+    var candidate = switch (try openValidatedSkillCandidate(alloc, discovery.skills[0])) {
+        .current => |current| current,
+        .missing, .name_mismatch, .skipped => return error.TestExpectedCurrentSkill,
+    };
+    candidate.deinit();
+}
+
+test "loadVisibleSkills still rejects external symlinks without an authority" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(
+        &tmp,
+        "external-store/escaping-skill/SKILL.md",
+        "---\nname: escaping-skill\ndescription: outside\n---\n\nOUTSIDE_BODY_MUST_NOT_LOAD\n",
+    );
+    try createTempSymlinkOrSkip(
+        &tmp,
+        "../../../../external-store/escaping-skill",
+        "home/workspace/.codex/skills/escaping-skill",
+    );
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+    defer alloc.free(workspace_root);
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(managed_root);
+    const logical_path = try std.fs.path.join(alloc, &.{ workspace_root, ".codex/skills/escaping-skill" });
+    defer alloc.free(logical_path);
+
+    const env = try TestEnviron.install(alloc);
+    defer env.deinit();
+
+    var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+    defer discovery.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), discovery.skills.len);
+    try std.testing.expectEqual(@as(usize, 1), discovery.diagnostics.len);
+    try std.testing.expectEqualStrings(logical_path, discovery.diagnostics[0].path);
+    try std.testing.expectEqual(SkillDiagnosticScope.candidate, discovery.diagnostics[0].scope);
+    try std.testing.expectEqual(SkillDiagnosticCause.unreadable, discovery.diagnostics[0].cause);
 }
