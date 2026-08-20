@@ -1,6 +1,7 @@
 const std = @import("std");
 const mcp_access = @import("../mcp/access_policy.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
+const route_snapshot = @import("../gateway/route_snapshot.zig");
 const session_layout = @import("../session/session_layout.zig");
 const types = @import("../shared/types.zig");
 
@@ -339,6 +340,7 @@ pub const AdmissionSnapshot = struct {
     parent_id: []u8,
     source_id: []u8,
     model: []u8,
+    route: ?route_snapshot.RouteSnapshot = null,
     effort: types.ReasoningEffort,
     permission_mode: types.PermissionMode = .yolo,
     sandbox_backend: types.BackendKind,
@@ -354,6 +356,7 @@ pub const AdmissionSnapshot = struct {
         alloc.free(self.parent_id);
         alloc.free(self.source_id);
         alloc.free(self.model);
+        if (self.route) |*route| route.deinit(alloc);
         freeStrings(alloc, self.tool_names);
         self.rules.deinit(alloc);
         types.freePermissionGrantSlice(alloc, self.grants);
@@ -371,6 +374,11 @@ pub const AdmissionSnapshot = struct {
         errdefer alloc.free(source_id);
         const model = try alloc.dupe(u8, self.model);
         errdefer alloc.free(model);
+        const route = if (self.route) |*value| try value.clone(alloc) else null;
+        errdefer if (route) |route_value| {
+            var owned = route_value;
+            owned.deinit(alloc);
+        };
         const tool_names = try cloneStrings(alloc, self.tool_names);
         errdefer freeStrings(alloc, tool_names);
         var rules = try types.dupePermissionRuleSet(alloc, self.rules);
@@ -392,6 +400,7 @@ pub const AdmissionSnapshot = struct {
             .parent_id = parent_id,
             .source_id = source_id,
             .model = model,
+            .route = route,
             .effort = self.effort,
             .permission_mode = self.permission_mode,
             .sandbox_backend = self.sandbox_backend,
@@ -410,6 +419,7 @@ pub const AdmissionInput = struct {
     parent_id: []const u8,
     source_id: []const u8,
     model: []const u8,
+    route: ?*const route_snapshot.RouteSnapshot = null,
     effort: types.ReasoningEffort,
     permission_mode: types.PermissionMode = .yolo,
     sandbox_backend: types.BackendKind,
@@ -464,6 +474,16 @@ pub fn captureAdmission(
     errdefer alloc.free(source_id);
     const model = try alloc.dupe(u8, input.model);
     errdefer alloc.free(model);
+    if (input.route) |value| {
+        if (!std.mem.eql(u8, value.primary_model_id, input.model)) {
+            return error.InvalidModel;
+        }
+    }
+    const route = if (input.route) |value| try value.clone(alloc) else null;
+    errdefer if (route) |route_value| {
+        var owned = route_value;
+        owned.deinit(alloc);
+    };
     const tool_names = try cloneStrings(alloc, input.tool_names);
     errdefer freeStrings(alloc, tool_names);
     var rules = try types.dupePermissionRuleSet(alloc, input.rules);
@@ -488,6 +508,7 @@ pub fn captureAdmission(
         .parent_id = parent_id,
         .source_id = source_id,
         .model = model,
+        .route = route,
         .effort = input.effort,
         .permission_mode = input.permission_mode,
         .sandbox_backend = input.sandbox_backend,
@@ -517,6 +538,7 @@ pub const QueuedMessage = struct {
     root_user_intent_context: []u8 = &.{},
     root_user_messages: [][]u8 = &.{},
     root_user_evidence_complete: bool = false,
+    route: ?route_snapshot.RouteSnapshot = null,
     status: QueueStatus = .pending,
     cancellation_reason: ?[]u8 = null,
     created_at_ms: i64,
@@ -529,6 +551,7 @@ pub const QueuedMessage = struct {
             alloc.free(self.root_user_intent_context);
         }
         freeStrings(alloc, self.root_user_messages);
+        if (self.route) |*route| route.deinit(alloc);
         if (self.cancellation_reason) |reason| alloc.free(reason);
         self.* = undefined;
     }
@@ -552,6 +575,11 @@ pub const QueuedMessage = struct {
             try alloc.dupe(u8, value)
         else
             null;
+        const route = if (self.route) |*value| try value.clone(alloc) else null;
+        errdefer if (route) |route_value| {
+            var owned = route_value;
+            owned.deinit(alloc);
+        };
         return .{
             .id = id,
             .source_id = source_id,
@@ -559,10 +587,30 @@ pub const QueuedMessage = struct {
             .root_user_intent_context = root_user_intent_context,
             .root_user_messages = root_user_messages,
             .root_user_evidence_complete = self.root_user_evidence_complete,
+            .route = route,
             .status = self.status,
             .cancellation_reason = reason,
             .created_at_ms = self.created_at_ms,
         };
+    }
+
+    pub fn jsonStringify(self: QueuedMessage, writer: anytype) !void {
+        try writer.beginObject();
+        try writer.objectField("id");
+        try writer.write(self.id);
+        try writer.objectField("source_id");
+        try writer.write(self.source_id);
+        try writer.objectField("content");
+        try writer.write(self.content);
+        try writer.objectField("root_user_intent_context");
+        try writer.write(self.root_user_intent_context);
+        try writer.objectField("status");
+        try writer.write(self.status);
+        try writer.objectField("cancellation_reason");
+        try writer.write(self.cancellation_reason);
+        try writer.objectField("created_at_ms");
+        try writer.write(self.created_at_ms);
+        try writer.endObject();
     }
 };
 
@@ -1431,6 +1479,52 @@ fn freeStrings(alloc: Allocator, values: [][]u8) void {
     alloc.free(values);
 }
 
+test "child admission retains the exact durable work route" {
+    const route = route_snapshot.RouteSnapshot{
+        .connection_id = "connection-a",
+        .adapter_kind = "loopback",
+        .endpoint = "http://127.0.0.1/a",
+        .protocol = "loopback",
+        .credential_ref = "key-a",
+        .primary_model_id = "child-override-a",
+        .permission_review_model_id = "reviewer-a",
+        .vision_model_id = "vision-a",
+        .subagent_model_id = "child-default-a",
+        .capabilities = .{ .supports_tool_use = true },
+        .capability_source = .configured,
+        .selected_fast_mode = false,
+        .fast_model_suffix = null,
+    };
+    var admission = try captureAdmission(std.testing.allocator, .{
+        .parent_id = "parent",
+        .source_id = "parent",
+        .model = "child-override-a",
+        .route = &route,
+        .effort = .auto,
+        .sandbox_backend = .none,
+    });
+    defer admission.deinit(std.testing.allocator);
+
+    const child_route = admission.route.?;
+    try std.testing.expectEqualStrings("child-override-a", child_route.primary_model_id);
+    try std.testing.expectEqualStrings("connection-a", child_route.connection_id);
+    try std.testing.expectEqualStrings("loopback", child_route.adapter_kind);
+    try std.testing.expectEqualStrings("http://127.0.0.1/a", child_route.endpoint);
+    try std.testing.expectEqualStrings("key-a", child_route.credential_ref);
+    try std.testing.expectEqualStrings("reviewer-a", child_route.permission_review_model_id.?);
+    try std.testing.expectEqualStrings("vision-a", child_route.vision_model_id.?);
+    try std.testing.expectEqualStrings("child-default-a", child_route.subagent_model_id);
+
+    try std.testing.expectError(error.InvalidModel, captureAdmission(std.testing.allocator, .{
+        .parent_id = "parent",
+        .source_id = "parent",
+        .model = "",
+        .route = &route,
+        .effort = .auto,
+        .sandbox_backend = .none,
+    }));
+}
+
 test "validation preserves six branches and nested message variants" {
     const alloc = std.testing.allocator;
 
@@ -1949,5 +2043,47 @@ test "queued message clone owns inherited root user context" {
     try std.testing.expectEqualStrings(
         "Inspect storage only.",
         cloned.root_user_messages[1],
+    );
+}
+
+test "queued message inspection JSON keeps durable route internal" {
+    const alloc = std.testing.allocator;
+    const route = route_snapshot.RouteSnapshot{
+        .connection_id = "connection-a",
+        .adapter_kind = "loopback",
+        .endpoint = "http://127.0.0.1/a",
+        .protocol = "loopback",
+        .credential_ref = "key-a",
+        .primary_model_id = "child-a",
+        .permission_review_model_id = "reviewer-a",
+        .vision_model_id = "vision-a",
+        .subagent_model_id = "child-a",
+        .capabilities = .{
+            .supports_reasoning = true,
+            .reasoning_efforts = .fromSlice(&.{types.ReasoningEffort.literal("high")}),
+        },
+        .capability_source = .configured,
+        .selected_fast_mode = false,
+        .fast_model_suffix = null,
+    };
+    const source = QueuedMessage{
+        .id = @constCast("work-1"),
+        .source_id = @constCast("root-session"),
+        .content = @constCast("inspect the requested file"),
+        .root_user_intent_context = @constCast("current request"),
+        .route = route,
+        .status = .interrupted,
+        .cancellation_reason = @constCast("resume this subagent"),
+        .created_at_ms = 7,
+    };
+    var message = try source.clone(alloc);
+    defer message.deinit(alloc);
+
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try std.json.Stringify.value(message, .{}, &encoded.writer);
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"work-1\",\"source_id\":\"root-session\",\"content\":\"inspect the requested file\",\"root_user_intent_context\":\"current request\",\"status\":\"interrupted\",\"cancellation_reason\":\"resume this subagent\",\"created_at_ms\":7}",
+        encoded.writer.buffered(),
     );
 }

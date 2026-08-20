@@ -3428,8 +3428,18 @@ test "ACP command routes parsed options and launch config through the injected r
         }
     };
 
+    const ReviewProvider = struct {
+        fn review(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: permission_auto_classifier.ProviderInput,
+            _: permission_auto_classifier.ReviewRequest,
+        ) anyerror!permission_auto_classifier.ParseOutcome {
+            return .invalid;
+        }
+    };
     var cfg = testConfig();
-    cfg.permission_reviewer_provider = test_builtin_gateway.permission_reviewer.provider;
+    cfg.permission_reviewer_provider = .{ .review_fn = ReviewProvider.review };
     var capture = Capture{ .expected = cfg };
     cfg.acp_runner = .{ .context = &capture, .run_fn = Capture.run };
     const result = try runIfRequestedWithDeps(

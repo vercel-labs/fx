@@ -279,7 +279,7 @@ export function heldFakeGatewayFinalText() {
 
 export type FakeGatewayResponse =
   | Response
-  | ((body: string) => Response | Promise<Response>);
+  | ((body: string, request: Request) => Response | Promise<Response>);
 
 export type FakeGatewayModel = {
   id: string;
@@ -322,7 +322,7 @@ export type FakeGatewayOptions = {
 };
 
 function serveFakeGateway(
-  nextCompletion: (body: string) => Response | Promise<Response>,
+  nextCompletion: (body: string, request: Request) => Response | Promise<Response>,
   options: FakeGatewayOptions,
 ) {
   const requests: Array<{ body: string; headers: Headers }> = [];
@@ -362,11 +362,11 @@ function serveFakeGateway(
       if (body.includes("\"permission_decision\"")) {
         classifierRequests.push({ body, headers });
         const next = classifierResponses.shift();
-        if (next) return typeof next === "function" ? await next(body) : next;
+        if (next) return typeof next === "function" ? await next(body, req) : next;
         return fakeGatewayPermissionDecision(options.classifierDecision ?? "allow");
       }
       requests.push({ body, headers });
-      return nextCompletion(body);
+      return nextCompletion(body, req);
     },
   });
   return {
@@ -403,7 +403,7 @@ export function startFakeGateway(
 // finite queue. For suites that replay one response indefinitely or switch
 // on their own state.
 export function startDynamicFakeGateway(
-  response: (body: string) => Response | Promise<Response>,
+  response: (body: string, request: Request) => Response | Promise<Response>,
   options: FakeGatewayOptions = {},
 ) {
   return serveFakeGateway(response, options);

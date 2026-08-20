@@ -1,24 +1,22 @@
 const std = @import("std");
 const agent_stream_provider = @import("../stream_provider.zig");
+const route_snapshot = @import("../../gateway/route_snapshot.zig");
 const image_attachments = @import("../../images/image_attachments.zig");
-const model_capabilities = @import("../../config/model_capabilities.zig");
+const session_usage = @import("../../session/session_usage.zig");
 const types = @import("../../shared/types.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
-const session_usage = @import("../../session/session_usage.zig");
 const runtime_gateway_step = @import("gateway_step.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 
-const model = "google/gemini-2.5-flash";
-
 pub const Request = struct {
-    stream_provider: agent_stream_provider.Provider,
-    api_key: []const u8,
-    gateway_team: ?[]const u8,
+    adapter: agent_stream_provider.ProviderAdapter,
+    route: *const route_snapshot.RouteSnapshot,
+    credential: []const u8,
+    tenant: ?[]const u8,
     session_id: ?[]const u8 = null,
     retry_count: usize,
-    chat_url: []const u8,
     cancel_flag: *std.atomic.Value(bool),
     usage: ?*session_usage.Usage = null,
     usage_allocator: Allocator = std.heap.c_allocator,
@@ -49,21 +47,8 @@ pub fn inspect(
         .{ .role = .system, .content = system_prompt },
         .{ .role = .user, .content = user_prompt },
     };
-    const payload = try request.stream_provider.build(
-        alloc,
-        .{
-            .model = model,
-            .serialized_tools = "[]",
-            .messages = &messages,
-            .tool_choice = .none,
-            .capabilities = model_capabilities.capabilitiesForModel(model),
-            .budget = .{ .cancel_flag = request.cancel_flag },
-            .verified_images = images,
-            .response_format = request.response_format,
-        },
-    );
-    defer alloc.free(payload);
-
+    const descriptor = request.route.visionDescriptor() orelse
+        return error.VisionUnavailable;
     var capture = StreamCapture{
         .alloc = alloc,
         .max_bytes = request.capture_limit_bytes,
@@ -71,16 +56,25 @@ pub fn inspect(
     defer capture.deinit();
     var delivery = runtime_gateway_step.DeliveryCertainty.init();
     var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
-    const streamed = try runtime_gateway_step.streamGatewayCompletion(
-        request.stream_provider,
+    var streamed = try runtime_gateway_step.streamModelRequest(
+        request.adapter,
         alloc,
-        request.api_key,
-        request.gateway_team,
+        request.route,
+        request.credential,
+        request.tenant,
         request.session_id,
-        model,
+        descriptor.id,
         request.retry_count,
-        request.chat_url,
-        payload,
+        .{
+            .model = descriptor.id,
+            .serialized_tools = "[]",
+            .messages = &messages,
+            .tool_choice = .none,
+            .capabilities = descriptor.capabilities,
+            .budget = .{ .cancel_flag = request.cancel_flag },
+            .verified_images = images,
+            .response_format = request.response_format,
+        },
         null,
         &delivery,
         &attempt_evidence,
@@ -93,23 +87,24 @@ pub fn inspect(
         request.usage,
         request.usage_allocator,
         request.trace_ctx,
+        null,
         request.capture_limit_bytes,
+        null,
         .transport,
     );
+    defer streamed.deinit(alloc);
 
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     if (streamed.status != .ok) return error.ImageProviderUnavailable;
     if (capture.failed) return error.OutOfMemory;
-
-    const tool_usage = types.ToolUsage{
-        .input_tokens = streamed.completion.usage.input_tokens orelse 0,
-        .output_tokens = streamed.completion.usage.output_tokens orelse 0,
-    };
     if (capture.saw_content) {
         return .{
             .text = try capture.takeText(),
             .observed_bytes = capture.observed_bytes,
-            .usage = tool_usage,
+            .usage = .{
+                .input_tokens = streamed.completion.usage.input_tokens orelse 0,
+                .output_tokens = streamed.completion.usage.output_tokens orelse 0,
+            },
         };
     }
     if (streamed.completion.content) |content| {
@@ -117,10 +112,18 @@ pub fn inspect(
         return .{
             .text = try alloc.dupe(u8, content[0..retained_len]),
             .observed_bytes = content.len,
-            .usage = tool_usage,
+            .usage = .{
+                .input_tokens = streamed.completion.usage.input_tokens orelse 0,
+                .output_tokens = streamed.completion.usage.output_tokens orelse 0,
+            },
         };
     }
     return error.InvalidProviderResponse;
+}
+
+fn onContentChunk(raw: *anyopaque, chunk: []const u8) void {
+    const capture: *StreamCapture = @ptrCast(@alignCast(raw));
+    capture.appendContent(chunk);
 }
 
 const StreamCapture = struct {
@@ -139,17 +142,16 @@ const StreamCapture = struct {
     fn takeText(self: *StreamCapture) ![]u8 {
         return self.text.toOwnedSlice(self.alloc);
     }
-};
 
-fn onContentChunk(raw: *anyopaque, chunk: []const u8) void {
-    const capture: *StreamCapture = @ptrCast(@alignCast(raw));
-    capture.saw_content = capture.saw_content or chunk.len > 0;
-    capture.observed_bytes +|= chunk.len;
-    const remaining = capture.max_bytes -| capture.text.items.len;
-    capture.text.appendSlice(capture.alloc, chunk[0..@min(chunk.len, remaining)]) catch {
-        capture.failed = true;
-    };
-}
+    fn appendContent(self: *StreamCapture, chunk: []const u8) void {
+        self.saw_content = self.saw_content or chunk.len > 0;
+        self.observed_bytes +|= chunk.len;
+        const remaining = self.max_bytes -| self.text.items.len;
+        self.text.appendSlice(self.alloc, chunk[0..@min(chunk.len, remaining)]) catch {
+            self.failed = true;
+        };
+    }
+};
 
 test "shared image provider capture counts all streamed bytes while retaining its bound" {
     var capture = StreamCapture{
@@ -158,8 +160,8 @@ test "shared image provider capture counts all streamed bytes while retaining it
     };
     defer capture.deinit();
 
-    onContentChunk(@ptrCast(&capture), "abc");
-    onContentChunk(@ptrCast(&capture), "二xyz");
+    capture.appendContent("abc");
+    capture.appendContent("二xyz");
 
     try std.testing.expectEqual(@as(usize, "abc二xyz".len), capture.observed_bytes);
     try std.testing.expectEqualStrings("abc\xe4", capture.text.items);

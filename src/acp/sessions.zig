@@ -328,7 +328,8 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     _ = session_codec.migrateLegacyRouteState(alloc, &loaded.state, .{
         .connection_id = state.cfg.gateway_provider.connection_seed.id,
         .adapter_kind = state.cfg.gateway_provider.connection_seed.adapter_id,
-        .permission_review_model_id = state.cfg.gateway_provider.connection_seed.permission_review_model,
+        .permission_review_model_id = state.cfg.gateway_provider.connection_seed.internal_models.permission_review,
+        .vision_model_id = state.cfg.gateway_provider.connection_seed.internal_models.vision,
     }) catch return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.internal_error,
         .message = "Session could not be loaded",
@@ -583,7 +584,8 @@ fn handleRestoreSession(
             .legacy_route_defaults = .{
                 .connection_id = state.cfg.gateway_provider.connection_seed.id,
                 .adapter_kind = state.cfg.gateway_provider.connection_seed.adapter_id,
-                .permission_review_model_id = state.cfg.gateway_provider.connection_seed.permission_review_model,
+                .permission_review_model_id = state.cfg.gateway_provider.connection_seed.internal_models.permission_review,
+                .vision_model_id = state.cfg.gateway_provider.connection_seed.internal_models.vision,
             },
             .log = session_test_controls.logOptions(),
         },

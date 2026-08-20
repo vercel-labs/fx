@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createServer, type Socket } from "node:net";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -14,7 +15,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import {
   AMBIGUOUS_CAPABILITY_CLAUSES,
   AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
@@ -600,6 +601,407 @@ async function waitForMcpServerReady(
 }
 
 describe("gateway stream lifecycle", () => {
+  test("reviewer Vision and subagent stay on the parent connection", async () => {
+    const root = createFixtureRoot("pinned-internal-workloads");
+    const tracePath = join(root.root, "trace.log");
+    const imagePath = join(root.workspace, "fixture.png");
+    const commandPath = join(root.workspace, "reviewed.txt");
+    copyFileSync(
+      join(REPO_ROOT, "tests/e2e/fixtures/placeholder-logo.png"),
+      imagePath,
+    );
+    const parentModel = "primary-a";
+    const reviewerModel = "reviewer-a";
+    const visionModel = "vision-a";
+    const childModel = "child-a";
+    const childPrompt = "Return the pinned child route proof.";
+    let childId = "";
+    let releaseParent!: (response: Response) => void;
+    const parentCompletion = new Promise<Response>((resolve) => {
+      releaseParent = resolve;
+    });
+    const gatewayB = startDynamicFakeGateway(() =>
+      fakeGatewayFinalText("WRONG_CONNECTION")
+    );
+    const gatewayA = startDynamicFakeGateway((body, request) => {
+      const model = request.headers.get("ai-language-model-id");
+      if (model === visionModel) {
+        return fakeGatewayFinalText(JSON.stringify({
+          images: [{
+            image_id: 1,
+            status: "ok",
+            summary: "connection A image evidence",
+            visible_text: ["FX"],
+            details: ["deterministic fixture"],
+          }],
+        }));
+      }
+      if (model === childModel) {
+        releaseParent(fakeGatewayFinalText("Parent observed child on connection A."));
+        return fakeGatewayFinalText("Child completed on connection A.");
+      }
+      if (hasCurrentToolResult(body, "route_child_1")) {
+        const outcome = subagentOutcome(body, "route_child_1");
+        childId = outcome.child_id ?? "";
+        return parentCompletion;
+      }
+      if (hasCurrentToolResult(body, "route_vision_1")) {
+        return fakeGatewayToolCall("route_command_1", "terminal", {
+          action: "exec",
+          command: `printf 'reviewed\\n' > ${JSON.stringify(commandPath)}`,
+        });
+      }
+      if (hasCurrentToolResult(body, "route_command_1")) {
+        return fakeGatewayToolCall("route_child_1", "subagent", {
+          command: {
+            create: {
+              name: "route-child",
+              mode: "one_off",
+              prompt: childPrompt,
+            },
+          },
+        });
+      }
+      return fakeGatewayToolCall("route_vision_1", "vision", {
+        image_ids: [1],
+        focus: "identify the deterministic fixture",
+      });
+    }, {
+      classifierDecision: "allow",
+      models: [
+        { id: parentModel, type: "language", tags: ["tool-use"] },
+        { id: reviewerModel, type: "language", tags: ["tool-use"] },
+        { id: visionModel, type: "language", tags: ["vision", "file-input", "tool-use"] },
+        { id: childModel, type: "language", tags: ["tool-use"] },
+      ],
+    });
+    writeFileSync(
+      join(root.home, ".fx", "settings.json"),
+      JSON.stringify({
+        permission_mode: "auto",
+        sandbox: "none",
+        connections: {
+          selected: "connection-a",
+          profiles: [
+            {
+              id: "connection-a",
+              display_name: "Connection A",
+              adapter_id: "vercel_ai_gateway",
+              endpoint: gatewayA.chatUrl,
+              protocol: "vercel_ai_gateway",
+              credential_ref: "ai_gateway_api_key",
+              remembered_model: parentModel,
+              internal_models: {
+                permission_review: reviewerModel,
+                vision: visionModel,
+                subagent: childModel,
+              },
+            },
+            {
+              id: "connection-b",
+              display_name: "Connection B",
+              adapter_id: "vercel_ai_gateway",
+              endpoint: gatewayB.chatUrl,
+              protocol: "vercel_ai_gateway",
+              credential_ref: "vercel_oidc_token",
+              remembered_model: "primary-b",
+              internal_models: {
+                permission_review: "reviewer-b",
+                vision: "vision-b",
+                subagent: "child-b",
+              },
+            },
+          ],
+        },
+      }),
+    );
+
+    try {
+      const result = await runFx(
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "--image",
+          imagePath,
+          "Review one command, inspect the image, then delegate once.",
+        ],
+        {
+          cwd: root.workspace,
+          env: {
+            HOME: root.home,
+            AI_GATEWAY_API_KEY: "credential-a",
+            VERCEL_OIDC_TOKEN: "credential-b",
+            FX_MODEL: parentModel,
+            FX_GATEWAY_BASE_URL: gatewayA.baseUrl,
+            FX_GATEWAY_CHAT_URL: gatewayA.chatUrl,
+            FX_E2E_GATEWAY_MODELS_URL:
+              `${gatewayA.baseUrl}/coding-agent/v1/models`,
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "agent,permission,subagent,tool",
+          },
+          timeoutMs: 30_000,
+        },
+      );
+      if (result.code !== 0) {
+        throw new Error(
+          `pinned workload flow failed: code=${result.code}\nstdout=${result.stdout}\nstderr=${result.stderr}\ntrace=${existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "<none>"}`,
+        );
+      }
+
+      expect(parseAskJson(result.stdout).output).toContain(
+        "Parent observed child on connection A.",
+      );
+      expect(readFileSync(commandPath, "utf8")).toBe("reviewed\n");
+      expect(gatewayA.classifierRequests.length).toBeGreaterThan(0);
+      for (const request of gatewayA.classifierRequests) {
+        expect(request.headers.get("ai-language-model-id")).toBe(reviewerModel);
+        expect(request.headers.get("authorization")).toBe("Bearer credential-a");
+      }
+      const completionModels = gatewayA.requests.map((request) =>
+        request.headers.get("ai-language-model-id")
+      );
+      expect(completionModels).toContain(parentModel);
+      expect(completionModels).toContain(visionModel);
+      expect(completionModels).toContain(childModel);
+      expect(completionModels).not.toContain("primary-b");
+      expect(completionModels).not.toContain("reviewer-b");
+      expect(completionModels).not.toContain("vision-b");
+      expect(completionModels).not.toContain("child-b");
+      for (const request of gatewayA.requests) {
+        expect(request.headers.get("authorization")).toBe("Bearer credential-a");
+      }
+      expect(gatewayA.modelRequests.length).toBeGreaterThan(0);
+      for (const request of gatewayA.modelRequests) {
+        expect(request.headers.get("authorization")).toBe("Bearer credential-a");
+      }
+      expect(gatewayB.requests).toHaveLength(0);
+      expect(gatewayB.classifierRequests).toHaveLength(0);
+      expect(gatewayB.modelRequests).toHaveLength(0);
+      expect(gatewayB.generationRequests).toHaveLength(0);
+      expect(childId.length).toBeGreaterThan(0);
+      const childSession = JSON.parse(readFileSync(
+        join(root.home, ".fx", "sessions", childId, "session.json"),
+        "utf8",
+      ));
+      expect(childSession.preferences.connection_id).toBe("connection-a");
+      expect(childSession.preferences.model_id).toBe(childModel);
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        `reviewer_model=${reviewerModel} connection_id=connection-a`,
+      );
+    } finally {
+      gatewayA.stop();
+      gatewayB.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 35_000);
+
+  test("paused child resumes after restart on its durable connection", async () => {
+    const root = createFixtureRoot("pinned-child-restart");
+    const parentModel = "primary-a";
+    const reviewerModel = "reviewer-a";
+    const childModel = "child-a";
+    const childPrompt = "Pause and resume this child on connection A.";
+    let phase: "admit" | "resume" = "admit";
+    let childId = "";
+    let childAttempts = 0;
+    let resumeStarted = false;
+    const gatewayB = startDynamicFakeGateway(() =>
+      fakeGatewayFinalText("WRONG_CONNECTION")
+    );
+    const gatewayA = startDynamicFakeGateway(async (body, request) => {
+      const model = request.headers.get("ai-language-model-id");
+      if (model === childModel) {
+        childAttempts += 1;
+        if (phase === "resume") {
+          return fakeGatewayFinalText("child resumed on connection A");
+        }
+        return new Response(JSON.stringify({
+          error: { message: "deterministic child provider pause" },
+        }), {
+          status: 502,
+          headers: {
+            "content-type": "application/json",
+            "retry-after": "0",
+          },
+        });
+      }
+      if (hasCurrentToolResult(body, "restart_inspect_1")) {
+        const outcome = subagentOutcome(body, "restart_inspect_1");
+        expect(outcome.status).toBe("idle");
+        return fakeGatewayFinalText("parent observed restarted child on A");
+      }
+      if (hasCurrentToolResult(body, "restart_resume_1")) {
+        const deadline = Date.now() + 20_000;
+        while (Date.now() < deadline) {
+          if (subagentControl(root, childId).queue[0]?.status === "completed") {
+            return fakeGatewayToolCall("restart_inspect_1", "subagent", {
+              command: {
+                inspect: {
+                  id: childId,
+                  sections: ["status", "messages"],
+                  limit: 20,
+                },
+              },
+            });
+          }
+          await Bun.sleep(20);
+        }
+        throw new Error(
+          `Timed out waiting for restarted child ${childId}: ${JSON.stringify(subagentControl(root, childId))}`,
+        );
+      }
+      if (phase === "resume" && !resumeStarted) {
+        resumeStarted = true;
+        return fakeGatewayToolCall("restart_resume_1", "subagent", {
+          command: {
+            lifecycle: { id: childId, action: "resume" },
+          },
+        });
+      }
+      if (hasCurrentToolResult(body, "restart_create_1")) {
+        childId = subagentOutcome(body, "restart_create_1").child_id ?? "";
+        const deadline = Date.now() + 20_000;
+        while (Date.now() < deadline) {
+          if (subagentControl(root, childId).state === "interrupted") {
+            return fakeGatewayFinalText("parent persisted paused child on A");
+          }
+          await Bun.sleep(20);
+        }
+        throw new Error(`Timed out waiting for paused child ${childId}`);
+      }
+      return fakeGatewayToolCall("restart_create_1", "subagent", {
+        command: {
+          create: {
+            name: "restart-route-child",
+            mode: "persistent",
+            prompt: childPrompt,
+          },
+        },
+      });
+    }, {
+      classifierDecision: "allow",
+      models: [
+        { id: parentModel, type: "language", tags: ["tool-use"] },
+        { id: reviewerModel, type: "language", tags: ["tool-use"] },
+        { id: childModel, type: "language", tags: ["tool-use"] },
+      ],
+    });
+    const settings = (selected: "connection-a" | "connection-b") => ({
+      permission_mode: "auto",
+      sandbox: "none",
+      connections: {
+        selected,
+        profiles: [
+          {
+            id: "connection-a",
+            display_name: "Connection A",
+            adapter_id: "vercel_ai_gateway",
+            endpoint: gatewayA.chatUrl,
+            protocol: "vercel_ai_gateway",
+            credential_ref: "ai_gateway_api_key",
+            remembered_model: parentModel,
+            internal_models: {
+              permission_review: reviewerModel,
+              vision: null,
+              subagent: childModel,
+            },
+          },
+          {
+            id: "connection-b",
+            display_name: "Connection B",
+            adapter_id: "vercel_ai_gateway",
+            endpoint: gatewayB.chatUrl,
+            protocol: "vercel_ai_gateway",
+            credential_ref: "vercel_oidc_token",
+            remembered_model: "primary-b",
+            internal_models: {
+              permission_review: "reviewer-b",
+              vision: null,
+              subagent: "child-b",
+            },
+          },
+        ],
+      },
+    });
+    const env = {
+      HOME: root.home,
+      AI_GATEWAY_API_KEY: "credential-a",
+      VERCEL_OIDC_TOKEN: "credential-b",
+      FX_MODEL: undefined,
+      FX_GATEWAY_BASE_URL: gatewayA.baseUrl,
+      FX_GATEWAY_CHAT_URL: undefined,
+      FX_E2E_GATEWAY_MODELS_URL:
+        `${gatewayA.baseUrl}/coding-agent/v1/models`,
+      FX_AUTO_UPGRADE: "0",
+      NO_COLOR: "1",
+    };
+
+    try {
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify(settings("connection-a")),
+      );
+      const admitted = await runFx(
+        ["ask", "--json", "--auto", "Admit one persistent child on A."],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(admitted.code).toBe(0);
+      const admittedResult = parseAskJson(admitted.stdout);
+      expect(admittedResult.output).toContain("persisted paused child on A");
+      expect(childId.length).toBeGreaterThan(0);
+      const paused = subagentControl(root, childId);
+      expect(paused.state).toBe("interrupted");
+      expect(paused.queue[0].route).toMatchObject({
+        connection_id: "connection-a",
+        endpoint: gatewayA.chatUrl,
+        credential_ref: "ai_gateway_api_key",
+        primary_model_id: childModel,
+      });
+      expect(JSON.stringify(paused)).not.toContain("credential-a");
+
+      phase = "resume";
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify(settings("connection-b")),
+      );
+      const resumed = await runFx(
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "--resume-id",
+          admittedResult.session_id,
+          "Resume the persisted child and inspect it.",
+        ],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(resumed.code).toBe(0);
+      expect(parseAskJson(resumed.stdout).output).toContain(
+        "parent observed restarted child on A",
+      );
+      expect(childAttempts).toBeGreaterThan(1);
+      const childRequests = gatewayA.requests.filter((request) =>
+        request.headers.get("ai-language-model-id") === childModel
+      );
+      expect(childRequests.length).toBeGreaterThan(1);
+      for (const request of childRequests) {
+        expect(request.headers.get("authorization")).toBe("Bearer credential-a");
+      }
+      expect(gatewayB.requests).toHaveLength(0);
+      expect(gatewayB.classifierRequests).toHaveLength(0);
+      expect(gatewayB.modelRequests).toHaveLength(0);
+      expect(gatewayB.generationRequests).toHaveLength(0);
+      const completed = subagentControl(root, childId);
+      expect(completed.state).toBe("idle");
+      expect(completed.queue[0].route).toBeNull();
+    } finally {
+      gatewayA.stop();
+      gatewayB.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
   test("bounded conditional guidance oracle distinguishes capabilities from ordinary prose", () => {
     const fixture = (
       systemText: string,

@@ -136,7 +136,11 @@ function writeConnectionSettings(
         protocol: "vercel_ai_gateway",
         credential_ref: "ai_gateway_api_key",
         remembered_model: "model-a",
-        permission_review_model: "reviewer-a",
+        internal_models: {
+          permission_review: "reviewer-a",
+          vision: "vision-a",
+          subagent: "subagent-a",
+        },
       }]
       : []),
     {
@@ -147,7 +151,11 @@ function writeConnectionSettings(
       protocol: "vercel_ai_gateway",
       credential_ref: credentialRefB,
       remembered_model: "model-b",
-      permission_review_model: "reviewer-b",
+      internal_models: {
+        permission_review: "reviewer-b",
+        vision: "vision-b",
+        subagent: "subagent-b",
+      },
     },
   ];
   writeFileSync(
@@ -282,6 +290,8 @@ describe("session recovery", () => {
         expect(pausedDurableText).toContain('"connection_id":"connection-a"');
         expect(pausedDurableText).toContain('"adapter_kind":"vercel_ai_gateway"');
         expect(pausedDurableText).toContain('"permission_review_model_id":"reviewer-a"');
+        expect(pausedDurableText).toContain('"vision_model_id":"vision-a"');
+        expect(pausedDurableText).toContain('"subagent_model_id":"subagent-a"');
         expect(pausedDurableText).toContain('"route_model":"model-a"');
         expect(pausedDurableText).toMatch(
           /"delivery":"possibly_sent"[^\n]*"consumed_provider_attempts":10,"outstanding_reservation":false/,

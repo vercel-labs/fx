@@ -23,6 +23,7 @@ const mcp_access = @import("../mcp/access_policy.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
+const route_snapshot = @import("../gateway/route_snapshot.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const types = @import("../shared/types.zig");
@@ -104,6 +105,7 @@ pub const BackgroundRecoveryError = error{ThreadSpawnFailed};
 
 pub const Defaults = struct {
     model: []const u8,
+    route: ?*const route_snapshot.RouteSnapshot = null,
     effort: types.ReasoningEffort,
     fast_mode: bool = false,
     conversation_language: session.ConversationLanguage,
@@ -149,6 +151,7 @@ pub const MessageSendOptions = struct {
     invocation_id: []const u8,
     child_id: []const u8,
     content: []const u8,
+    route: ?*const route_snapshot.RouteSnapshot = null,
     timestamp_ms: i64,
     identity_epoch: u64 = 0,
 };
@@ -591,6 +594,7 @@ pub const Runtime = struct {
                 .model,
                 identity_epoch,
                 identity_admitted,
+                options.defaults.route,
             );
             normalizeRetiredResult(identity_admitted, &result);
             return .{ .result = result };
@@ -824,6 +828,7 @@ pub const Runtime = struct {
                 .human,
                 identity_epoch,
                 identity_admitted,
+                options.defaults.route,
             );
         }
 
@@ -1358,6 +1363,7 @@ pub const Runtime = struct {
             .human,
             identity_epoch,
             identity_admitted,
+            options.route,
         );
         normalizeRetiredResult(identity_admitted, &result);
         self.finishOperationResult(alloc, operation_id, &result);
@@ -1377,8 +1383,12 @@ pub const Runtime = struct {
         identity_source: domain.OperationIdentitySource,
         identity_epoch: u64,
         identity_admitted: bool,
+        route: ?*const route_snapshot.RouteSnapshot,
     ) !manager_mod.Result {
         std.debug.assert(command == .message and command.message == .send);
+        if (route == null) {
+            return .{ .failure = .{ .code = .invalid_state } };
+        }
         const send = command.message.send;
         if (identity_admitted and
             !std.mem.eql(u8, caller_id, self.root_id) and
@@ -1403,6 +1413,7 @@ pub const Runtime = struct {
             .operation_identity_source = identity_source,
             .operation_identity_epoch = identity_epoch,
             .operation_identity_admitted = identity_admitted,
+            .work_route = route,
             .timestamp_ms = timestamp_ms,
         };
         if (identity_admitted and
@@ -1424,6 +1435,18 @@ pub const Runtime = struct {
         defaults: Defaults,
     ) !manager_mod.Result {
         var mutable_context = context;
+        switch (command) {
+            .create => |create_request| if (create_request.prompt != null) {
+                mutable_context.work_route = defaults.route;
+            },
+            .message => |message| if (message == .send) {
+                mutable_context.work_route = defaults.route;
+            },
+            .inspect, .relationship, .configure, .lifecycle => {},
+        }
+        if (commandPublishesWork(command) and mutable_context.work_route == null) {
+            return .{ .failure = .{ .code = .invalid_state } };
+        }
         if (mutable_context.operation_identity_admitted and
             (command == .configure or command == .lifecycle))
         {
@@ -1466,6 +1489,14 @@ pub const Runtime = struct {
             .inspect, .relationship, .configure => {},
         };
         return result;
+    }
+
+    fn commandPublishesWork(command: domain.Command) bool {
+        return switch (command) {
+            .create => |create_request| create_request.prompt != null,
+            .message => |message| message == .send,
+            .inspect, .relationship, .configure, .lifecycle => false,
+        };
     }
 
     fn recoverIfNeeded(self: *Runtime, timestamp_ms: i64) void {
@@ -2175,6 +2206,10 @@ fn freshChildState(
         .updated_at_ms = now,
         .conversation_language = defaults.conversation_language,
         .preferences = .{
+            .connection_id = if (defaults.route) |route|
+                try alloc.dupe(u8, route.connection_id)
+            else
+                null,
             .model = model,
             .effort = create.configuration.effort orelse defaults.effort,
             .fast_mode = defaults.fast_mode,
@@ -2315,10 +2350,17 @@ fn captureAdmission(
     var snapshot = self.authority_resolver.resolve(alloc, request.child_id) catch
         return error.AdmissionFailed;
     defer snapshot.deinit(alloc);
+    const route = request.route orelse return error.AdmissionFailed;
+    if (request.preferences.connection_id) |connection_id| {
+        if (!std.mem.eql(u8, route.connection_id, connection_id)) {
+            return error.AdmissionFailed;
+        }
+    }
     return domain.captureAdmission(alloc, .{
         .parent_id = request.parent_id,
         .source_id = request.source_id,
         .model = request.preferences.model,
+        .route = route,
         .effort = request.preferences.effort,
         .permission_mode = snapshot.permission_mode,
         .sandbox_backend = snapshot.sandbox_backend,
@@ -2895,6 +2937,7 @@ test "older runtime and lower-clock restart cross the durable replay horizon" {
         .invocation_id = "older-runtime-delivery",
         .child_id = child_id,
         .content = "cross-horizon delivery",
+        .route = &test_route,
         .timestamp_ms = -700,
     };
     send_options.identity_epoch = try older_host.issueOperationIdentity(
@@ -2909,12 +2952,29 @@ test "older runtime and lower-clock restart cross the durable replay horizon" {
     try std.testing.expectEqual(domain.OutcomeCode.message_queued, sent.receipt.code);
 }
 
+const test_route = route_snapshot.RouteSnapshot{
+    .connection_id = "test-connection",
+    .adapter_kind = "test-adapter",
+    .endpoint = "http://127.0.0.1/test",
+    .protocol = "test-protocol",
+    .credential_ref = "automatic",
+    .primary_model_id = "test/model",
+    .permission_review_model_id = null,
+    .vision_model_id = null,
+    .subagent_model_id = "test/model",
+    .capabilities = .{},
+    .capability_source = .configured,
+    .selected_fast_mode = false,
+    .fast_model_suffix = null,
+};
+
 fn testOptions(caller_id: []const u8, invocation_id: []const u8) ExecuteOptions {
     return .{
         .caller_id = caller_id,
         .invocation_id = invocation_id,
         .defaults = .{
             .model = "test/model",
+            .route = &test_route,
             .effort = types.ReasoningEffort.literal("high"),
             .conversation_language = session.ConversationLanguage.literal("en"),
         },
@@ -2928,11 +2988,91 @@ fn testHumanOptions(invocation_id: []const u8) HumanCommandOptions {
         .invocation_id = invocation_id,
         .defaults = .{
             .model = "test/model",
+            .route = &test_route,
             .effort = types.ReasoningEffort.literal("high"),
             .conversation_language = session.ConversationLanguage.literal("en"),
         },
         .timestamp_ms = 10,
     };
+}
+
+test "production child work rejects admission before receipt without a durable route" {
+    const alloc = std.testing.allocator;
+    const root_id = "01J00000000000000000000000";
+    var env = try TestEnvironment.init(alloc);
+    defer env.deinit(alloc);
+    try env.createSession(alloc, root_id);
+    var test_authority = TestAuthority{ .root_id = root_id };
+    const host = try Runtime.create(
+        alloc,
+        &env.store,
+        root_id,
+        test_authority.resolver(),
+        .{},
+    );
+    defer host.deinit();
+
+    var create_work = try domain.validateCommand(alloc, .{ .create = .{
+        .name = "missing-route-work",
+        .mode = .persistent,
+        .prompt = "must not be admitted",
+    } });
+    defer create_work.deinit(alloc);
+    var create_options = testHumanOptions("missing-route-create");
+    create_options.defaults.route = null;
+    var create_result = try host.executeHumanCommand(
+        alloc,
+        &create_work,
+        create_options,
+    );
+    defer create_result.deinit(alloc);
+    try std.testing.expect(create_result == .failure);
+    try std.testing.expectEqual(
+        manager_mod.FailureCode.invalid_state,
+        create_result.failure.code,
+    );
+
+    var create_idle = try domain.validateCommand(alloc, .{ .create = .{
+        .name = "idle-child",
+        .mode = .persistent,
+    } });
+    defer create_idle.deinit(alloc);
+    var idle_result = try host.executeHumanCommand(
+        alloc,
+        &create_idle,
+        testHumanOptions("create-idle-child"),
+    );
+    defer idle_result.deinit(alloc);
+    try std.testing.expect(idle_result == .receipt);
+
+    var send_result = try host.sendMessage(alloc, .{
+        .caller_id = root_id,
+        .invocation_id = "missing-route-send",
+        .child_id = idle_result.receipt.target_id,
+        .content = "must not be admitted",
+        .timestamp_ms = 20,
+    });
+    defer send_result.deinit(alloc);
+    try std.testing.expect(send_result == .failure);
+    try std.testing.expectEqual(
+        manager_mod.FailureCode.invalid_state,
+        send_result.failure.code,
+    );
+
+    var capability = try env.store.openSubagentControlCapabilityReadOnly(
+        alloc,
+        idle_result.receipt.target_id,
+        .{},
+    );
+    defer capability.deinit();
+    const store = control_store.Store{
+        .capability = &capability,
+        .expected_child_id = idle_result.receipt.target_id,
+    };
+    var control = try store.load(alloc);
+    defer control.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), control.queue.len);
+    try std.testing.expectEqual(domain.State.idle, control.state);
 }
 
 test "model child permissions inherit and reject elevation before persistence" {
@@ -4982,6 +5122,7 @@ test "manager refresh reconciles restart once without replaying unfinished work"
         .operation_identity_source = .model,
         .operation_identity_epoch = 1,
         .operation_identity_admitted = true,
+        .work_route = &test_route,
         .timestamp_ms = 20,
     });
     defer admitted.deinit(alloc);
@@ -4994,6 +5135,10 @@ test "manager refresh reconciles restart once without replaying unfinished work"
     };
     var lock = try store.acquireLock();
     var record = try store.load(alloc);
+    try std.testing.expectEqualStrings(
+        test_route.connection_id,
+        record.queue[0].route.?.connection_id,
+    );
     try execution.admitWork(alloc, &record, 0, 21);
     try store.save(alloc, record);
     record.deinit(alloc);
@@ -5022,8 +5167,92 @@ test "manager refresh reconciles restart once without replaying unfinished work"
     try std.testing.expectEqual(domain.State.interrupted, interrupted.state);
     try std.testing.expectEqual(domain.QueueStatus.interrupted, interrupted.queue[0].status);
     try std.testing.expectEqualStrings(
+        test_route.connection_id,
+        interrupted.queue[0].route.?.connection_id,
+    );
+    try std.testing.expectEqualStrings(
+        test_route.endpoint,
+        interrupted.queue[0].route.?.endpoint,
+    );
+    try std.testing.expectEqualStrings(
         "interrupted by process restart",
         interrupted.queue[0].cancellation_reason.?,
+    );
+}
+
+test "pending child work restores its pinned route after host restart" {
+    const alloc = std.testing.allocator;
+    const root_id = "01J00000000000000000000000";
+    var env = try TestEnvironment.init(alloc);
+    defer env.deinit(alloc);
+    try env.createSession(alloc, root_id);
+    var test_authority = TestAuthority{ .root_id = root_id };
+    const initial = try Runtime.create(
+        alloc,
+        &env.store,
+        root_id,
+        test_authority.resolver(),
+        .{},
+    );
+
+    var create = try domain.validateCommand(alloc, .{ .create = .{
+        .name = "pending-route-worker",
+        .mode = .persistent,
+    } });
+    defer create.deinit(alloc);
+    const created = try initial.execute(alloc, &create, testOptions(root_id, "create-pending-route"));
+    defer alloc.free(created);
+    const child_id = try resultChildIdAlloc(alloc, created);
+    defer alloc.free(child_id);
+    var send = try domain.validateCommand(alloc, .{ .message = .{ .send = .{
+        .id = child_id,
+        .content = "pending across restart",
+    } } });
+    defer send.deinit(alloc);
+    const operation_id = try tool_result.boundOperationIdAlloc(
+        alloc,
+        "pending-route-work",
+        .model,
+        1,
+    );
+    defer alloc.free(operation_id);
+    var queued = try initial.manager.execute(alloc, send, .{
+        .actor_id = root_id,
+        .operation_id = operation_id,
+        .operation_identity_source = .model,
+        .operation_identity_epoch = 1,
+        .operation_identity_admitted = true,
+        .work_route = &test_route,
+        .timestamp_ms = 20,
+    });
+    defer queued.deinit(alloc);
+    try std.testing.expect(queued == .receipt);
+    initial.deinit();
+
+    const recovered = try Runtime.create(
+        alloc,
+        &env.store,
+        root_id,
+        test_authority.resolver(),
+        .{},
+    );
+    defer recovered.deinit();
+    var capability = try env.store.openSubagentControlCapabilityWritable(alloc, child_id, .{});
+    defer capability.deinit();
+    const store = control_store.Store{
+        .capability = &capability,
+        .expected_child_id = child_id,
+    };
+    var record = try store.load(alloc);
+    defer record.deinit(alloc);
+    try std.testing.expectEqual(domain.QueueStatus.pending, record.queue[0].status);
+    try std.testing.expectEqualStrings(
+        test_route.connection_id,
+        record.queue[0].route.?.connection_id,
+    );
+    try std.testing.expectEqualStrings(
+        test_route.credential_ref,
+        record.queue[0].route.?.credential_ref,
     );
 }
 
@@ -5585,6 +5814,7 @@ test "human resume retries a lock-blocked durable enqueue exactly once" {
         .invocation_id = "enqueue-under-direct-resume",
         .child_id = child_id,
         .content = "queued while direct resume owns transcript",
+        .route = &test_route,
         .timestamp_ms = 40,
     });
     defer admitted.deinit(alloc);
@@ -6952,6 +7182,7 @@ test "typed message send queues a busy child without steering active work" {
         .invocation_id = "human-send-retry-stable",
         .child_id = child_id,
         .content = "second queued turn",
+        .route = &test_route,
         .timestamp_ms = 20,
     };
     send_options.identity_epoch = try host.issueOperationIdentity(

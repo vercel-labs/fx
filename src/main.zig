@@ -493,6 +493,27 @@ const App = struct {
         };
     }
 
+    pub fn admitSubagentWorkRoute(
+        self: *App,
+        alloc: Allocator,
+    ) !route_snapshot.RouteSnapshot {
+        const connection_id = if (self.session_persistence.session_preferences) |preferences|
+            preferences.connection_id orelse session_codec.legacy_connection_id
+        else
+            (try self.auth.selectedConnectionProfile()).id;
+        const profile = self.auth.connectionProfile(connection_id) catch |err| switch (err) {
+            error.UnknownConnection => return error.MissingSessionConnection,
+            else => return err,
+        };
+        return route_snapshot.RouteSnapshot.admitSelected(
+            alloc,
+            profile,
+            builtin_gateway.connection_seed,
+            self.resolvedModelDescriptor(self.selected_model.items),
+            builtin_gateway.defaultChatUrl(),
+        );
+    }
+
     pub fn secretStore(self: *const Self) host.SecretStore {
         return self.auth.secret_store;
     }
@@ -1267,7 +1288,8 @@ const App = struct {
         return .{
             .connection_id = builtin_gateway.connection_seed.id,
             .adapter_kind = builtin_gateway.connection_seed.adapter_id,
-            .permission_review_model_id = builtin_gateway.connection_seed.permission_review_model,
+            .permission_review_model_id = builtin_gateway.connection_seed.internal_models.permission_review,
+            .vision_model_id = builtin_gateway.connection_seed.internal_models.vision,
         };
     }
 
@@ -1368,6 +1390,8 @@ const App = struct {
                 builtin_gateway.connection_seed,
                 checkpoint.route_identity.?.adapter_kind,
                 checkpoint.route_identity.?.permission_review_model_id,
+                checkpoint.route_identity.?.vision_model_id,
+                checkpoint.route_identity.?.subagent_model_id,
                 descriptor,
                 builtin_gateway.defaultChatUrl(),
             )
@@ -1657,10 +1681,6 @@ const App = struct {
         self.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
         defer self.permission_state.authority_mutex.unlock(io_mod.getIo());
         try self.permission_engine.allow(self.alloc, tool_name, target_path);
-    }
-
-    pub fn permissionReviewerProvider(_: *const App) ?permission_auto_classifier.Provider {
-        return if (comptime host_profile.tools) builtin_gateway.permission_reviewer.provider else null;
     }
 
     pub fn describeToolAction(self: *App, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
@@ -3343,7 +3363,6 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .load_mcp_runtime = builtin_mcp.loadRuntime,
         .acp_runner = .{ .run_fn = runAcpServer },
         .devbox_provider = builtin_devbox.provider,
-        .permission_reviewer_provider = builtin_gateway.permission_reviewer.provider,
     };
 }
 

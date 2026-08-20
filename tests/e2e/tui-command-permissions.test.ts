@@ -3544,7 +3544,11 @@ describe("effect-aware command permissions", () => {
         timeoutMs: TIMEOUT,
       });
 
-      expect(result.code).toBe(0);
+      if (result.code !== 0) {
+        throw new Error(
+          `child recovery process failed code=${result.code} signal=${result.signal} timed_out=${result.timedOut}\n${result.stderr}`,
+        );
+      }
       expect(result.stdout).toContain(
         "parent resumed the paused child recovery",
       );
@@ -6067,7 +6071,7 @@ describe("effect-aware command permissions", () => {
       expect(gateway.requests).toHaveLength(3);
       expect(gateway.classifierRequests).toHaveLength(1);
       const trace = readFileSync(tracePath, "utf8");
-      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(1);
+      expect(trace.match(/event=auto_review_send/g)).toHaveLength(1);
       expect(trace.match(/event=auto_review_result/g)).toHaveLength(1);
       expect(trace).toContain("denial_reason=auto_denied");
       expect(result.stderr).not.toContain("Auto agent approved this request:");
@@ -6111,7 +6115,7 @@ describe("effect-aware command permissions", () => {
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(1);
       const trace = readFileSync(tracePath, "utf8");
-      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(1);
+      expect(trace.match(/event=auto_review_send/g)).toHaveLength(1);
       expect(trace.match(/event=auto_review_result/g)).toHaveLength(1);
       expect(trace).toContain("denial_reason=auto_denied");
       expect(result.stderr).not.toContain(COMMAND_APPROVAL_PROMPT);
@@ -6160,7 +6164,7 @@ describe("effect-aware command permissions", () => {
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(1);
       const trace = readFileSync(tracePath, "utf8");
-      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(1);
+      expect(trace.match(/event=auto_review_send/g)).toHaveLength(1);
       expect(trace.match(/event=auto_review_result/g)).toHaveLength(1);
       expect(trace).toContain("denial_reason=auto_denied");
     },
@@ -6505,7 +6509,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "fx ask and ACP send large automatic review packets before execution",
+    "fx ask and ACP reject oversized automatic review packets before execution",
     async () => {
       const cliRoot = createIsolatedRoot();
       const cliMarker = "large-cli-marker";
@@ -6530,20 +6534,17 @@ describe("effect-aware command permissions", () => {
       expect(cliJson.output).toContain("large CLI complete");
       expect(cliJson.tool_calls).toHaveLength(1);
       expect(cliJson.tool_calls).toContainEqual(
-        expect.objectContaining({ name: "terminal", status: "success" }),
+        expect.objectContaining({ name: "terminal", status: "error" }),
       );
-      expect(existsSync(join(cliRoot.workspace, cliMarker))).toBe(true);
+      expect(existsSync(join(cliRoot.workspace, cliMarker))).toBe(false);
       expect(cliGateway.requests).toHaveLength(2);
-      expect(cliGateway.classifierRequests).toHaveLength(1);
-      expect(
-        Buffer.byteLength(cliGateway.classifierRequests[0]!.body),
-      ).toBeGreaterThan(16 * 1024);
+      expect(cliGateway.classifierRequests).toHaveLength(0);
       await expectSavedTerminalExec(
         cliRoot,
         cliJson.session_id,
         cliCommand,
         false,
-        "success",
+        "failure",
       );
 
       const acpRoot = createIsolatedRoot();
@@ -6563,20 +6564,17 @@ describe("effect-aware command permissions", () => {
       expect(serialized).toContain("large ACP complete");
       expect(serialized).not.toContain("permission_required");
       expect(serialized).not.toContain("integer does not fit in destination type");
-      expect((serialized.match(/\"status\":\"failed\"/g) ?? [])).toHaveLength(0);
-      expect((serialized.match(/\"status\":\"completed\"/g) ?? [])).toHaveLength(1);
-      expect(existsSync(join(acpRoot.workspace, acpMarker))).toBe(true);
+      expect((serialized.match(/\"status\":\"failed\"/g) ?? [])).toHaveLength(1);
+      expect((serialized.match(/\"status\":\"completed\"/g) ?? [])).toHaveLength(0);
+      expect(existsSync(join(acpRoot.workspace, acpMarker))).toBe(false);
       expect(acpGateway.requests).toHaveLength(2);
-      expect(acpGateway.classifierRequests).toHaveLength(1);
-      expect(
-        Buffer.byteLength(acpGateway.classifierRequests[0]!.body),
-      ).toBeGreaterThan(16 * 1024);
+      expect(acpGateway.classifierRequests).toHaveLength(0);
       await expectSavedTerminalExec(
         acpRoot,
         sessionIdFromHome(acpRoot),
         acpCommand,
         false,
-        "success",
+        "failure",
       );
     },
     90_000,

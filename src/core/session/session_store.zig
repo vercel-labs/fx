@@ -5804,11 +5804,13 @@ fn writeLegacyRouteFixture(
     defer state.deinit(alloc);
     state.preferences.connection_id = try alloc.dupe(u8, "vercel");
     const checkpoint = session_codec.RecoveryCheckpoint{
-        .version = 2,
+        .version = 3,
         .route_identity = .{
             .connection_id = @constCast("vercel"),
             .adapter_kind = @constCast("vercel_ai_gateway"),
             .permission_review_model_id = @constCast("reviewer/model"),
+            .vision_model_id = @constCast("google/gemini-2.5-flash"),
+            .subagent_model_id = @constCast("test/model"),
         },
         .delivery = .possibly_sent,
         .turn_id = 7,
@@ -5853,7 +5855,7 @@ fn writeLegacyRouteFixture(
     const legacy_events = try replaceFixtureBytesPreservingLength(
         alloc,
         legacy_preferences,
-        "{\"version\":2,\"route_identity\":{\"connection_id\":\"vercel\",\"adapter_kind\":\"vercel_ai_gateway\",\"permission_review_model_id\":\"reviewer/model\"},\"delivery\":\"possibly_sent\",",
+        "{\"version\":3,\"route_identity\":{\"connection_id\":\"vercel\",\"adapter_kind\":\"vercel_ai_gateway\",\"permission_review_model_id\":\"reviewer/model\",\"vision_model_id\":\"google/gemini-2.5-flash\",\"subagent_model_id\":\"test/model\"},\"delivery\":\"possibly_sent\",",
         "{\"version\":1,",
     );
     defer alloc.free(legacy_events);
@@ -5925,7 +5927,7 @@ test "writable resume transactionally migrates legacy route state" {
         try std.testing.expectEqualStrings("vercel", migrated.state.preferences.connection_id.?);
         const migrated_checkpoint = migrated.state.recovery_checkpoint orelse
             return error.TestUnexpectedResult;
-        try std.testing.expectEqual(@as(u8, 2), migrated_checkpoint.version);
+        try std.testing.expectEqual(@as(u8, 3), migrated_checkpoint.version);
         try std.testing.expectEqualStrings(
             "vercel_ai_gateway",
             migrated_checkpoint.route_identity.?.adapter_kind,
@@ -5933,6 +5935,14 @@ test "writable resume transactionally migrates legacy route state" {
         try std.testing.expectEqualStrings(
             "reviewer/model",
             migrated_checkpoint.route_identity.?.permission_review_model_id.?,
+        );
+        try std.testing.expectEqualStrings(
+            "google/gemini-2.5-flash",
+            migrated_checkpoint.route_identity.?.vision_model_id.?,
+        );
+        try std.testing.expectEqualStrings(
+            "test/model",
+            migrated_checkpoint.route_identity.?.subagent_model_id,
         );
         try std.testing.expectEqual(session_codec.RecoveryDelivery.possibly_sent, migrated_checkpoint.delivery);
         try std.testing.expectEqual(@as(usize, 3), migrated_checkpoint.consumed_provider_attempts);
@@ -5970,7 +5980,7 @@ test "writable resume transactionally migrates legacy route state" {
         var current = try ctx.store.loadReadOnly(alloc, "legacy-route-definite");
         defer current.deinit(alloc);
         try std.testing.expectEqualStrings("vercel", current.preferences.connection_id.?);
-        try std.testing.expectEqual(@as(u8, 2), current.recovery_checkpoint.?.version);
+        try std.testing.expectEqual(@as(u8, 3), current.recovery_checkpoint.?.version);
     }
 
     try writeLegacyRouteFixture(
@@ -6006,12 +6016,12 @@ test "writable resume transactionally migrates legacy route state" {
         );
         defer resolved.deinit(alloc);
         try std.testing.expectEqualStrings("vercel", resolved.state.preferences.connection_id.?);
-        try std.testing.expectEqual(@as(u8, 2), resolved.state.recovery_checkpoint.?.version);
+        try std.testing.expectEqual(@as(u8, 3), resolved.state.recovery_checkpoint.?.version);
     }
     var readable = try ctx.store.loadReadOnly(alloc, "legacy-route-indeterminate");
     defer readable.deinit(alloc);
     try std.testing.expectEqualStrings("vercel", readable.preferences.connection_id.?);
-    try std.testing.expectEqual(@as(u8, 2), readable.recovery_checkpoint.?.version);
+    try std.testing.expectEqual(@as(u8, 3), readable.recovery_checkpoint.?.version);
 }
 
 fn writeFixtureEntry(
@@ -6478,11 +6488,13 @@ test "pristine discard retains active recovery and permits cleared recovery" {
     defer ctx.deinit(alloc);
 
     const checkpoint = session_codec.RecoveryCheckpoint{
-        .version = 2,
+        .version = 3,
         .route_identity = .{
             .connection_id = @constCast("vercel"),
             .adapter_kind = @constCast("vercel_ai_gateway"),
             .permission_review_model_id = null,
+            .vision_model_id = null,
+            .subagent_model_id = @constCast("test/model"),
         },
         .turn_id = 1,
         .user = .{ .text = @constCast("prompt") },

@@ -434,12 +434,33 @@ fn runScriptedVision(
     var provider = @import("../../../../builtins/gateway.zig").agent_stream_provider;
     provider.context = script;
     provider.stream_fn = VisionProviderScript.stream;
+    var adapter = @import("../../../../builtins/gateway.zig").provider_adapter;
+    adapter.legacy_provider = provider;
+    const route: route_snapshot.RouteSnapshot = .{
+        .connection_id = "connection-a",
+        .adapter_kind = "vercel_ai_gateway",
+        .endpoint = "https://example.invalid",
+        .protocol = "vercel_ai_gateway",
+        .credential_ref = "test",
+        .primary_model_id = "google/gemini-2.5-flash",
+        .permission_review_model_id = "openai/gpt-5.4",
+        .vision_model_id = "google/gemini-2.5-flash",
+        .subagent_model_id = "google/gemini-2.5-flash",
+        .capabilities = .{
+            .supports_tool_use = true,
+            .supports_vision = true,
+            .supports_file_input = true,
+        },
+        .capability_source = .configured,
+        .selected_fast_mode = false,
+        .fast_model_suffix = null,
+    };
     return vision_executor.execute(alloc, args_json, catalog, .{
-        .stream_provider = provider,
-        .api_key = "key",
-        .gateway_team = null,
+        .adapter = adapter,
+        .route = &route,
+        .credential = "key",
+        .tenant = null,
         .retry_count = 1,
-        .chat_url = "https://example.invalid",
         .cancel_flag = null,
         .usage = null,
         .usage_allocator = alloc,
@@ -4465,6 +4486,8 @@ test "processQueuedPrompt preserves fallback route and budget until selection ch
             .connection_id = @constCast("vercel"),
             .adapter_kind = @constCast("vercel_ai_gateway"),
             .permission_review_model_id = null,
+            .vision_model_id = @constCast("google/gemini-2.5-flash"),
+            .subagent_model_id = @constCast("zai/glm-5.2"),
         },
         .turn_id = 44,
         .user = .{ .text = @constCast("user prompt") },
@@ -4535,6 +4558,8 @@ test "processQueuedPrompt restores connectivity checkpoints through evidence" {
             .connection_id = @constCast("vercel"),
             .adapter_kind = @constCast("vercel_ai_gateway"),
             .permission_review_model_id = null,
+            .vision_model_id = @constCast("google/gemini-2.5-flash"),
+            .subagent_model_id = @constCast("zai/glm-5.2"),
         },
         .turn_id = 45,
         .user = .{ .text = @constCast("user prompt") },
