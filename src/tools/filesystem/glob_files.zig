@@ -439,7 +439,7 @@ fn noopInputDeinit(_: *anyopaque, _: Allocator) void {}
 const glob_files_dispatch_tool = tool_dispatch.Tool{
     .name = "glob_files",
     .description = "Glob files dispatch test fixture.",
-    .gateway_schema = .{
+    .descriptor = .{
         .name = "glob_files",
         .description = "Glob files dispatch test fixture.",
     },

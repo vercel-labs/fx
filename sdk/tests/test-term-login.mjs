@@ -25,6 +25,8 @@ const placeholder = "term-login-placeholder";
 const gatewayRequests = [];
 const openedUrls = [];
 let tokenPolls = 0;
+let cancellationPolls = 0;
+let cancellationSchedule = false;
 
 const json = (body, status = 200) => new Response(JSON.stringify(body), {
   status,
@@ -70,6 +72,10 @@ const stubFetch = async (input, init = {}) => {
   }
   if (url.href === "https://api.vercel.com/login/oauth/token") {
     tokenPolls += 1;
+    if (cancellationSchedule) {
+      cancellationPolls += 1;
+      return json({ error: "authorization_pending" }, 400);
+    }
     if (tokenPolls <= 2) return json({ error: "authorization_pending" }, 400);
     return json({
       access_token: accessToken,
@@ -200,10 +206,40 @@ async function exit(runtime, label) {
 
 function assertNoSecretLeaks(capture, label) {
   const exposed = `${capture.transcript()}\n${capture.trace()}\n${JSON.stringify(capture.events)}`;
-  for (const secret of [accessToken, refreshToken]) {
+  for (const secret of [accessToken, refreshToken, placeholder]) {
     if (exposed.includes(secret)) throw new Error(`${label} exposed OAuth secret material`);
   }
 }
+
+const capability = await start();
+await waitFor(
+  () => capability.capture.transcript().includes("Sign in with Vercel") &&
+    capability.capture.transcript().includes("Add an API key"),
+  "neutral auth source inventory",
+  () => JSON.stringify(capability.capture.transcript().slice(-1500)),
+);
+capability.runtime.write("\x1b[27u");
+await new Promise((resolve) => setTimeout(resolve, 50));
+const capabilityEffects = {
+  tokenPolls,
+  commits: storeFacts.commits.length,
+  removes: storeFacts.removes.length,
+  gatewayRequests: gatewayRequests.length,
+};
+capability.runtime.write("/setup\r");
+await waitFor(
+  () => capability.capture.transcript().includes("API key setup is unavailable in this WASM session."),
+  "missing entered-secret host capability",
+  () => JSON.stringify(capability.capture.transcript().slice(-1500)),
+);
+if (tokenPolls !== capabilityEffects.tokenPolls ||
+  storeFacts.commits.length !== capabilityEffects.commits ||
+  storeFacts.removes.length !== capabilityEffects.removes ||
+  gatewayRequests.length !== capabilityEffects.gatewayRequests) {
+  throw new Error("missing entered-secret capability performed an auth, store, or model fallback effect");
+}
+assertNoSecretLeaks(capability.capture, "capability terminal");
+await exit(capability.runtime, "capability terminal");
 
 const first = await start({ AI_GATEWAY_API_KEY: placeholder });
 first.runtime.write("/login\r");
@@ -269,4 +305,33 @@ if (storeFacts.removes[0].expectedRevision !== storeFacts.commits[0].revision) {
 assertNoSecretLeaks(second.capture, "restored terminal");
 await exit(second.runtime, "second terminal");
 
-console.log(`term login passed: open_url=true, transcript_url=true, transcript_code=true, signed_in=true, polls=${tokenPolls}, oauth_bearer=true, opaque_commit=true, restored=true, logout_removed=true, leaks=0`);
+cancellationSchedule = true;
+const commitsBeforeCancellation = storeFacts.commits.length;
+const removesBeforeCancellation = storeFacts.removes.length;
+const requestsBeforeCancellation = gatewayRequests.length;
+const cancelled = await start({ AI_GATEWAY_API_KEY: placeholder });
+cancelled.runtime.write("/login\r");
+await waitFor(
+  () => openedUrls.length === 2 && cancellationPolls === 1,
+  "completed pending callback before cancellation",
+  () => JSON.stringify(cancelled.capture.transcript().slice(-1500)),
+);
+const transcriptBytesBeforeCancellation = cancelled.capture.transcript().length;
+cancelled.runtime.write("\x1b[27u");
+await waitFor(
+  () => cancelled.capture.transcript().length > transcriptBytesBeforeCancellation,
+  "terminal cancellation render",
+  () => JSON.stringify(cancelled.capture.transcript().slice(-1500)),
+);
+await new Promise((resolve) => setTimeout(resolve, 1200));
+if (storedRecord !== null ||
+  cancellationPolls !== 1 ||
+  storeFacts.commits.length !== commitsBeforeCancellation ||
+  storeFacts.removes.length !== removesBeforeCancellation ||
+  gatewayRequests.length !== requestsBeforeCancellation) {
+  throw new Error(`cancelled login polled again, adopted, persisted, or fell back: polls=${cancellationPolls}, stored=${storedRecord !== null}, commits=${storeFacts.commits.length - commitsBeforeCancellation}, removes=${storeFacts.removes.length - removesBeforeCancellation}, requests=${gatewayRequests.length - requestsBeforeCancellation}`);
+}
+assertNoSecretLeaks(cancelled.capture, "cancelled terminal");
+await exit(cancelled.runtime, "cancelled terminal");
+
+console.log(`term login passed: source_inventory=true, missing_capability=true, no_fallback=true, open_url=true, transcript_url=true, transcript_code=true, signed_in=true, polls=${tokenPolls}, oauth_bearer=true, opaque_commit=true, restored=true, logout_removed=true, callback_boundary_cancel=true, leaks=0`);

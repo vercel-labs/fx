@@ -1,5 +1,6 @@
 const std = @import("std");
 const model_cache_runtime = @import("../core/app/model_cache_runtime.zig");
+const model_capabilities = @import("../core/config/model_capabilities.zig");
 const types = @import("../core/shared/types.zig");
 const catalog_screen_layout = @import("catalog_screen_layout.zig");
 const paste_blocks = @import("../core/input/pasted_blocks.zig");
@@ -131,7 +132,10 @@ test "models screen places composer catalog and controls without transcript chro
     const items = [_]model_cache_runtime.ModelMenuItem{.{
         .id = @constCast("anthropic/claude-opus-4.8"),
         .provider = "anthropic",
-        .capabilities = .{ .supports_reasoning = true, .context_window = 1_000_000 },
+        .descriptor = model_capabilities.configuredDescriptor(
+            "anthropic/claude-opus-4.8",
+            .{ .supports_reasoning = true, .context_window = 1_000_000 },
+        ),
     }};
     const projection: render_input.ModelMenuProjection = .{
         .active = true,

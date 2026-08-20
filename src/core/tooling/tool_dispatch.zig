@@ -20,7 +20,7 @@ const subagent_tool_provider = @import("../subagent/tool_provider.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const web_fetch_runtime = @import("web_fetch_runtime.zig");
 const web_fetch_artifacts = @import("../session/web_fetch_artifacts.zig");
-const gateway_schema = @import("gateway_schema.zig");
+const tool_descriptor = @import("tool_descriptor.zig");
 const host = @import("../hosts/host.zig");
 const tool_result_errors = @import("tool_result_errors.zig");
 const tool_result_limits = @import("tool_result_limits.zig");
@@ -50,7 +50,7 @@ pub const default_max_read_file_bytes: usize = 50 * 1024;
 pub const default_max_read_file_lines: usize = 400;
 pub const default_max_read_file_line_len: usize = 2000;
 
-pub const web_search_unavailable_message = "web_search is unavailable: Fx search is not installed for this surface or selected connection";
+pub const web_search_unavailable_message = "web_search is unavailable: fx search is not installed for this surface or selected connection";
 pub const web_fetch_unavailable_message = "web_fetch is unavailable: no local WebFetch runtime is installed";
 pub const terminal_unavailable_message =
     "{\"error\":{\"tool\":\"terminal\",\"code\":\"unsupported_host\",\"retryable\":false}}";
@@ -421,7 +421,7 @@ pub const PresentationFn = *const fn (std.json.ObjectMap) ?CallPresentation;
 pub const Tool = struct {
     name: []const u8,
     description: []const u8,
-    gateway_schema: gateway_schema.FunctionSchema,
+    descriptor: tool_descriptor.Descriptor,
     provider_tool: ?agent_stream_provider.ProviderTool = null,
     /// A provider tool never reaches local dispatch or a call-time permission
     /// check, so advertisement is its only
@@ -1065,7 +1065,7 @@ fn countWebSearchExecution(ctx: DispatchContext, _: ToolInput) DispatchError!Too
 const mock_tool = Tool{
     .name = "mock_tool",
     .description = "Mock tool used by dispatch tests.",
-    .gateway_schema = .{
+    .descriptor = .{
         .name = "mock_tool",
         .description = "Mock tool used by dispatch tests.",
     },
@@ -1148,7 +1148,7 @@ test "toolLabelValue reads the label field named by registered metadata" {
     const labeled_tool = Tool{
         .name = "labeled_tool",
         .description = "Labeled mock tool.",
-        .gateway_schema = .{
+        .descriptor = .{
             .name = "labeled_tool",
             .description = "Labeled mock tool.",
         },
@@ -1169,7 +1169,7 @@ test "validateRegisteredToolCall distinguishes unregistered valid and rejected c
     const rejecting_tool = Tool{
         .name = "rejecting_tool",
         .description = "Rejecting mock tool.",
-        .gateway_schema = .{
+        .descriptor = .{
             .name = "rejecting_tool",
             .description = "Rejecting mock tool.",
         },
@@ -1242,7 +1242,7 @@ test "dispatchToolCall materializes validate failure" {
     const rejecting_tool = Tool{
         .name = "rejecting_tool",
         .description = "Rejecting mock tool.",
-        .gateway_schema = .{
+        .descriptor = .{
             .name = "rejecting_tool",
             .description = "Rejecting mock tool.",
         },
@@ -1340,7 +1340,7 @@ test "dispatchToolCall rejects unavailable web_search before permission or execu
     const web_search = Tool{
         .name = "web_search",
         .description = "Web search dispatch fixture.",
-        .gateway_schema = .{
+        .descriptor = .{
             .name = "web_search",
             .description = "Web search dispatch fixture.",
         },
@@ -1386,7 +1386,7 @@ test "dispatchToolCall traces denied web_search query without secrets or executi
     const web_search = Tool{
         .name = "web_search",
         .description = "Web search dispatch fixture.",
-        .gateway_schema = .{
+        .descriptor = .{
             .name = "web_search",
             .description = "Web search dispatch fixture.",
         },

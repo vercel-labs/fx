@@ -6730,7 +6730,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "explicit TUI Fx search worker uses the admitted adapter",
+    "explicit TUI fx search worker uses the admitted adapter",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-local-search-")));
       const home = join(root, "home");
@@ -6744,7 +6744,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       const searchGateway = startFakeGateway([
         fakeGatewayToolCall("fx_search_1", "web_search", {
-          query: "Fx local search fixture",
+          query: "fx local search fixture",
         }),
         fakeGatewaySse([
           {
@@ -6757,7 +6757,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             type: "tool-result",
             toolCallId: "worker_provider_search_1",
             result: {
-              results: [{ title: "Fx local source", url: sourceUrl }],
+              results: [{ title: "fx local source", url: sourceUrl }],
             },
           },
           {
@@ -6788,11 +6788,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       });
 
       await session.waitForComposer(TIMEOUT);
-      await session.sendText("Use the installed Fx search worker.");
+      await session.sendText("Use the installed fx search worker.");
       await session.waitForText(finalText, TIMEOUT);
       await waitForCondition(
         () => searchGateway.requests.length === 3,
-        "Fx search worker completion",
+        "fx search worker completion",
       );
 
       expect(searchGateway.requests.map((request) =>
@@ -6812,7 +6812,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(searchGateway.requests[1]!.body).not.toContain('"name":"web_search"');
       expect(searchGateway.requests[2]!.body).toContain(sourceUrl);
       const scrollback = await session.captureFullScrollback();
-      expect(scrollback).toContain("└ Searched Fx local search fixture");
+      expect(scrollback).toContain("└ Searched fx local search fixture");
       expect(scrollback).not.toContain("Would you like to allow this action?");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },

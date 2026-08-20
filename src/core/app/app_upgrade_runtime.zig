@@ -117,9 +117,9 @@ pub fn Runtime(comptime App: type) type {
                 if (app.approval_prompt.isActive()) return "upgrade is unavailable while an approval is open";
             }
             if (comptime @hasField(App, "auth") and
-                @hasDecl(@TypeOf(app.auth), "apiKeyEntryActive"))
+                @hasDecl(@TypeOf(app.auth), "enteredSecretEntryActive"))
             {
-                if (app.auth.apiKeyEntryActive()) return "upgrade is unavailable during API key entry";
+                if (app.auth.enteredSecretEntryActive()) return "upgrade is unavailable during API key entry";
             }
             if (comptime @hasField(App, "subagents")) {
                 if (app.subagents.isViewActive()) return "close the subagent view before upgrading";

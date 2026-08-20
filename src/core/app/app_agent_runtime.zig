@@ -11,7 +11,8 @@ const app_worker_runtime = @import("app_worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const route_snapshot_test_support = @import("../gateway/route_snapshot_test_support.zig");
 const route_snapshot = @import("../gateway/route_snapshot.zig");
-const credentials = @import("../../gateway/auth/credentials.zig");
+const adapter_auth = @import("../gateway/adapter_auth.zig");
+const adapter_registry = @import("../gateway/adapter_registry.zig");
 const background_runtime = @import("../background/background_runtime.zig");
 const change_tracker = @import("../workspace/change_tracker.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
@@ -34,14 +35,14 @@ const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("../tooling/tool_args.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
 const tool_advertisement = @import("../tooling/tool_advertisement.zig");
-const gateway_schema = @import("../tooling/gateway_schema.zig");
+const tool_descriptor = @import("../tooling/tool_descriptor.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const test_builtin_gateway = if (@import("builtin").is_test)
-    @import("../../builtins/gateway.zig")
+    @import("../gateway/test_adapter.zig")
 else
     struct {};
 const test_builtin_tools = if (@import("builtin").is_test)
@@ -111,7 +112,6 @@ pub fn Runtime(comptime App: type) type {
             max_read_file_line_len: usize,
             max_command_output_bytes: usize,
             gateway_retry_count: usize,
-            gateway_chat_url: []const u8,
         ) tool_runtime.Context {
             return toolContextWithAuthority(
                 app,
@@ -122,7 +122,6 @@ pub fn Runtime(comptime App: type) type {
                 max_read_file_line_len,
                 max_command_output_bytes,
                 gateway_retry_count,
-                gateway_chat_url,
                 null,
             );
         }
@@ -136,7 +135,6 @@ pub fn Runtime(comptime App: type) type {
             max_read_file_line_len: usize,
             max_command_output_bytes: usize,
             gateway_retry_count: usize,
-            gateway_chat_url: []const u8,
             admission: subagent_domain.AdmissionSnapshot,
         ) tool_runtime.Context {
             return toolContextWithAuthority(
@@ -148,7 +146,6 @@ pub fn Runtime(comptime App: type) type {
                 max_read_file_line_len,
                 max_command_output_bytes,
                 gateway_retry_count,
-                gateway_chat_url,
                 .{
                     .mode = admission.permission_mode,
                     .sandbox_backend = admission.sandbox_backend,
@@ -167,7 +164,6 @@ pub fn Runtime(comptime App: type) type {
             max_read_file_line_len: usize,
             max_command_output_bytes: usize,
             gateway_retry_count: usize,
-            gateway_chat_url: []const u8,
             authority: ?ToolAuthorityView,
         ) tool_runtime.Context {
             const host_workspace = appHostWorkspaceInfo(app);
@@ -211,22 +207,9 @@ pub fn Runtime(comptime App: type) type {
                 .max_read_file_line_len = max_read_file_line_len,
                 .max_command_output_bytes = max_command_output_bytes,
                 .max_tool_result_bytes = agent_settings.max_tool_result_bytes,
-                .api_key = app.auth.apiKey() orelse "",
-                .provider_adapter = if (comptime @hasDecl(App, "providerAdapter"))
-                    app.providerAdapter()
-                else
-                    agent_stream_provider.unavailable_adapter,
-                .agent_stream_provider = if (comptime @hasDecl(App, "agentStreamProvider"))
-                    app.agentStreamProvider()
-                else
-                    agent_stream_provider.unavailable_provider,
-                .gateway_team = app.auth.gatewayTeam(),
-                .credential_source = app.auth.credentialSource(),
-                .oauth_transport = app.auth.oauthTransport(),
+                .adapter_registry = app.adapterRegistry(),
                 .model = app.selected_model.items,
                 .gateway_retry_count = gateway_retry_count,
-                .gateway_chat_url = gateway_chat_url,
-                .gateway_models_path = if (comptime @hasField(App, "web_search_models_path")) app.web_search_models_path else "/v1/models",
                 .agent_step_limit = app.agent_step_limit,
                 .fast_mode = agent_settings.fast_mode,
                 .effort = agent_settings.effort,
@@ -269,7 +252,6 @@ pub fn Runtime(comptime App: type) type {
                     .allow_sandboxed => .allow_sandboxed,
                     .prompt => .prompt,
                 } else .none,
-                .permission_reviewer_provider = if (comptime @hasDecl(App, "permissionReviewerProvider")) app.permissionReviewerProvider() else null,
                 .tracker = &app.change_tracker,
                 .mcp_ctx = @ptrCast(app),
                 .mcp_has_tool = if (comptime runtime_profile.allows(App, .mcp)) mcpHasTool else null,
@@ -307,7 +289,7 @@ pub fn Runtime(comptime App: type) type {
                     .callback = respondToMcpInput,
                 };
             }
-            ctx.model_capability_resolver = app_callbacks.Bindings(App).modelCapabilityResolver(app);
+            ctx.model_descriptor_resolver = app_callbacks.Bindings(App).modelDescriptorResolver(app);
             return ctx;
         }
 
@@ -470,9 +452,8 @@ pub fn Runtime(comptime App: type) type {
             max_read_file_line_len: usize,
             max_command_output_bytes: usize,
             gateway_retry_count: usize,
-            gateway_chat_url: []const u8,
         ) ![]const u8 {
-            const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
+            const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count), advertised_dynamic_tool_names);
             return formatToolAction(ctx, arena, call, file_display_path, .active, null);
         }
 
@@ -489,9 +470,8 @@ pub fn Runtime(comptime App: type) type {
             max_read_file_line_len: usize,
             max_command_output_bytes: usize,
             gateway_retry_count: usize,
-            gateway_chat_url: []const u8,
         ) ![]const u8 {
-            const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
+            const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count), advertised_dynamic_tool_names);
             return formatToolAction(ctx, arena, call, file_display_path, .completed, null);
         }
 
@@ -509,9 +489,8 @@ pub fn Runtime(comptime App: type) type {
             max_read_file_line_len: usize,
             max_command_output_bytes: usize,
             gateway_retry_count: usize,
-            gateway_chat_url: []const u8,
         ) ![]const u8 {
-            const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
+            const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count), advertised_dynamic_tool_names);
             return formatToolAction(ctx, arena, call, file_display_path, .denied, label);
         }
 
@@ -532,9 +511,8 @@ pub fn Runtime(comptime App: type) type {
             max_read_file_line_len: usize,
             max_command_output_bytes: usize,
             gateway_retry_count: usize,
-            gateway_chat_url: []const u8,
         ) !command_admission.PermissionOutcome {
-            var ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
+            var ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count), advertised_dynamic_tool_names);
             ctx.permission_review_turn = review_turn;
             const admission = ctx.admissionInputWithLiveAuthority(live_authority);
             return if (revalidation) |request| switch (request) {
@@ -583,7 +561,6 @@ pub fn Runtime(comptime App: type) type {
             max_read_file_line_len: usize,
             max_command_output_bytes: usize,
             gateway_retry_count: usize,
-            gateway_chat_url: []const u8,
         ) !command_admission.PermissionOutcome {
             var ctx = tool_runtime.withAdvertisedDynamicToolNames(
                 toolContext(
@@ -595,7 +572,6 @@ pub fn Runtime(comptime App: type) type {
                     max_read_file_line_len,
                     max_command_output_bytes,
                     gateway_retry_count,
-                    gateway_chat_url,
                 ),
                 advertised_dynamic_tool_names,
             );
@@ -628,7 +604,6 @@ pub fn Runtime(comptime App: type) type {
             max_read_file_line_len: usize,
             max_command_output_bytes: usize,
             gateway_retry_count: usize,
-            gateway_chat_url: []const u8,
         ) !command_admission.PermissionOutcome {
             var ctx = tool_runtime.withAdvertisedDynamicToolNames(
                 toolContext(
@@ -640,7 +615,6 @@ pub fn Runtime(comptime App: type) type {
                     max_read_file_line_len,
                     max_command_output_bytes,
                     gateway_retry_count,
-                    gateway_chat_url,
                 ),
                 advertised_dynamic_tool_names,
             );
@@ -666,9 +640,8 @@ pub fn Runtime(comptime App: type) type {
             max_read_file_line_len: usize,
             max_command_output_bytes: usize,
             gateway_retry_count: usize,
-            gateway_chat_url: []const u8,
         ) !agent_runtime.ToolCallValidationResult {
-            return tool_runtime.validateToolCall(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), arena, call);
+            return tool_runtime.validateToolCall(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count), arena, call);
         }
 
         pub fn checkToolAvailability(
@@ -682,9 +655,8 @@ pub fn Runtime(comptime App: type) type {
             max_read_file_line_len: usize,
             max_command_output_bytes: usize,
             gateway_retry_count: usize,
-            gateway_chat_url: []const u8,
         ) !?[]const u8 {
-            return tool_runtime.checkToolAvailability(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), arena, call);
+            return tool_runtime.checkToolAvailability(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count), arena, call);
         }
 
         pub fn permissionTargetForCall(
@@ -699,9 +671,8 @@ pub fn Runtime(comptime App: type) type {
             max_read_file_line_len: usize,
             max_command_output_bytes: usize,
             gateway_retry_count: usize,
-            gateway_chat_url: []const u8,
         ) ![]const u8 {
-            const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
+            const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count), advertised_dynamic_tool_names);
             return tool_admission.permissionTargetForCall(ctx.admissionInput(), arena, call);
         }
 
@@ -715,9 +686,8 @@ pub fn Runtime(comptime App: type) type {
             max_read_file_line_len: usize,
             max_command_output_bytes: usize,
             gateway_retry_count: usize,
-            gateway_chat_url: []const u8,
         ) !agent_runtime.ToolExecutionResult {
-            var ctx = toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url);
+            var ctx = toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count);
             ctx.root_user_intent_context = request.root_user_intent_context;
             ctx.root_user_messages = request.root_user_messages;
             ctx.root_user_evidence_complete = request.root_user_evidence_complete;
@@ -738,7 +708,6 @@ pub fn Runtime(comptime App: type) type {
             max_read_file_line_len: usize,
             max_command_output_bytes: usize,
             gateway_retry_count: usize,
-            gateway_chat_url: []const u8,
         ) !void {
             _ = ignored_list_entries;
             _ = max_list_entries;
@@ -747,7 +716,6 @@ pub fn Runtime(comptime App: type) type {
             _ = max_read_file_line_len;
             _ = max_command_output_bytes;
             _ = gateway_retry_count;
-            _ = gateway_chat_url;
             try app.contextRegistry().appendDefaultStatic(.{
                 .project_context = modelVisibleProjectContext(app),
             }, arena, messages);
@@ -792,7 +760,6 @@ pub fn Runtime(comptime App: type) type {
             max_read_file_line_len: usize,
             max_command_output_bytes: usize,
             gateway_retry_count: usize,
-            gateway_chat_url: []const u8,
         ) !void {
             _ = ignored_list_entries;
             _ = max_list_entries;
@@ -801,7 +768,6 @@ pub fn Runtime(comptime App: type) type {
             _ = max_read_file_line_len;
             _ = max_command_output_bytes;
             _ = gateway_retry_count;
-            _ = gateway_chat_url;
             const permission_snapshot = app.worker.effectivePermissionSnapshot(
                 app_permission_runtime.Runtime(App).livePermissionSnapshot(app),
             );
@@ -866,11 +832,9 @@ pub fn Runtime(comptime App: type) type {
         pub fn fetchModelIds(
             app: *App,
             provider: model_catalog.Provider,
-            catalog_endpoint: []const u8,
         ) !std.ArrayList([]u8) {
             const result = model_catalog.fetchWithPublicFallback(provider, app.alloc, .{
                 .access = app.auth.modelCatalogAccess(),
-                .endpoint = catalog_endpoint,
             });
             var catalog = switch (result) {
                 .loaded => |loaded| loaded.catalog,
@@ -884,7 +848,6 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             job: worker_runtime.QueuedPrompt,
             gateway_retry_count: usize,
-            gateway_chat_url: []const u8,
         ) !void {
             var snapshot_ownership = worker_runtime.ActivePromptSnapshotOwnership.init(job.images);
             app.worker.beginActivePromptSnapshots(&snapshot_ownership);
@@ -960,24 +923,12 @@ pub fn Runtime(comptime App: type) type {
                     return error.McpRequiredServerUnavailable;
                 }
             }
-            const provider_adapter = if (comptime @hasDecl(App, "providerAdapterForRoute"))
-                try app.providerAdapterForRoute(&job.route)
-            else adapter: {
-                const value = app.providerAdapter();
-                if (!value.acceptsRoute(&job.route)) return error.RouteAdapterMismatch;
-                break :adapter value;
-            };
-            var tool_projection = if (comptime @hasDecl(App, "snapshotGatewayToolProjectionForAdapter"))
-                try app.snapshotGatewayToolProjectionForAdapter(
-                    std.heap.c_allocator,
-                    job.permission_mode,
-                    provider_adapter,
-                )
-            else
-                try app.snapshotGatewayToolProjection(
-                    std.heap.c_allocator,
-                    job.permission_mode,
-                );
+            const route_adapter = try app.adapterForRoute(&job.route);
+            var tool_projection = try app.snapshotModelToolProjectionForAdapter(
+                std.heap.c_allocator,
+                job.permission_mode,
+                route_adapter,
+            );
             defer tool_projection.deinit(std.heap.c_allocator);
             const session_child_capability =
                 if (comptime @hasField(App, "session_persistence"))
@@ -985,9 +936,9 @@ pub fn Runtime(comptime App: type) type {
                 else
                     null;
 
-            const deps = app_callbacks.Bindings(App).agentRuntimeDepsForAdapter(
+            const deps = app_callbacks.Bindings(App).agentRuntimeDepsForRegistry(
                 app,
-                provider_adapter,
+                app.adapterRegistry(),
             );
             const semantic_presentation = app_callbacks.Bindings(App).semanticPresentationSink(app);
             const config = buildQueuedPromptConfig(
@@ -996,7 +947,6 @@ pub fn Runtime(comptime App: type) type {
                 skills_section,
                 explicit_skills.text,
                 gateway_retry_count,
-                gateway_chat_url,
                 &tool_projection,
                 session_child_capability,
             );
@@ -1037,26 +987,13 @@ pub fn Runtime(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(raw.?));
             const alloc = std.heap.c_allocator;
             const route = admission.route orelse return error.AdmissionFailed;
-            const provider_adapter = if (comptime @hasDecl(App, "providerAdapterForRoute"))
-                app.providerAdapterForRoute(&route) catch return error.ProviderFailed
-            else adapter: {
-                const value = app.providerAdapter();
-                if (!value.acceptsRoute(&route)) return error.AdmissionFailed;
-                break :adapter value;
-            };
-            var child_projection = (if (comptime @hasDecl(App, "snapshotSubagentGatewayToolProjectionForAdapter"))
-                app.snapshotSubagentGatewayToolProjectionForAdapter(
-                    alloc,
-                    admission.permission_mode,
-                    admission.rules,
-                    provider_adapter,
-                )
-            else
-                app.snapshotSubagentGatewayToolProjection(
-                    alloc,
-                    admission.permission_mode,
-                    admission.rules,
-                )) catch
+            const route_adapter = app.adapterForRoute(&route) catch return error.ProviderFailed;
+            var child_projection = app.snapshotSubagentModelToolProjectionForAdapter(
+                alloc,
+                admission.permission_mode,
+                admission.rules,
+                route_adapter,
+            ) catch
                 return error.OutOfMemory;
             defer child_projection.deinit(alloc);
             var bounded_skills = app.skills.buildBoundedSystemPromptSection(
@@ -1076,10 +1013,10 @@ pub fn Runtime(comptime App: type) type {
             return subagent_agent_adapter.run(.{
                 .host = app_session_runtime.Runtime(App).subagentHost(app) orelse
                     return error.ProviderFailed,
-                .tool_context = childToolContext(if (comptime @hasDecl(App, "subagentToolContextForAdmissionAndAdapter"))
-                    app.subagentToolContextForAdmissionAndAdapter(admission, provider_adapter)
-                else
-                    app.subagentToolContextForAdmission(admission)),
+                .tool_context = childToolContext(app.subagentToolContextForAdmissionAndAdapter(
+                    admission,
+                    route_adapter,
+                )),
                 .system_prompt = prompt_policy.system_prompt,
                 .model_prompt_overlay = prompt_policy.modelPromptOverlay(admission.model),
                 .skills_prompt_section = bounded_skills.text,
@@ -1100,9 +1037,10 @@ pub fn Runtime(comptime App: type) type {
             raw: *anyopaque,
             alloc: Allocator,
             route: *const route_snapshot.RouteSnapshot,
+            mode: adapter_auth.RefreshMode,
         ) !agent_runtime.RouteCredential {
             const app: *App = @ptrCast(@alignCast(raw));
-            return app.resolveRouteCredential(alloc, route);
+            return app.resolveRouteCredential(alloc, route, mode);
         }
 
         fn appendClaimedContextNotice(app: *App, writer: *std.Io.Writer, notice: []const u8) !void {
@@ -1125,7 +1063,6 @@ pub fn Runtime(comptime App: type) type {
             skills_section: []const u8,
             explicit_skills_section: []const u8,
             gateway_retry_count: usize,
-            gateway_chat_url: []const u8,
             tool_projection: *const tool_advertisement.EffectiveToolProjection,
             session_child_capability: ?*session_child_store.SessionChildCapability,
         ) agent_runtime.Config {
@@ -1140,7 +1077,6 @@ pub fn Runtime(comptime App: type) type {
                     &app.worker.worker_recovery_pause_requested
                 else
                     null,
-                .gateway_chat_url = gateway_chat_url,
                 .model_tools = tool_projection.tools,
                 .provider_tools = tool_projection.provider_tools,
                 .custom_tool_guidance = tool_projection.custom_guidance,
@@ -1300,7 +1236,6 @@ fn mcpToolAvailable(ctx: tool_runtime.Context, name: []const u8) bool {
 }
 
 const test_ignored_list_entries = [_][]const u8{ ".git", "zig-out" };
-const test_gateway_chat_url = "https://gateway.test/chat";
 const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.web_search,
     test_builtin_tools.terminal,
@@ -1314,7 +1249,7 @@ const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 const custom_label_tool = tool_dispatch.Tool{
     .name = "custom_registered_tool",
     .description = "Custom registered test tool.",
-    .gateway_schema = .{
+    .descriptor = .{
         .name = "custom_registered_tool",
         .description = "Custom registered test tool.",
     },
@@ -1444,7 +1379,7 @@ fn makeTestContextSnapshot(alloc: Allocator, provider_id: []const u8, content: [
 }
 
 fn testToolContext(app: *FakeApp) tool_runtime.Context {
-    return Runtime(FakeApp).toolContext(app, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    return Runtime(FakeApp).toolContext(app, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
 }
 
 const ProjectionBarrier = struct {
@@ -1459,8 +1394,7 @@ const ProjectionBarrier = struct {
 
 const FakeApp = struct {
     alloc: Allocator,
-    agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
-    provider_adapter_override: ?agent_stream_provider.ProviderAdapter = null,
+    route_adapter_override: ?agent_stream_provider.ProviderAdapter = null,
     workspace_root: []const u8 = "/tmp/workspace",
     auth: auth_runtime.Runtime = .{},
     selected_model: std.ArrayList(u8) = .empty,
@@ -1493,11 +1427,11 @@ const FakeApp = struct {
     diff_blocks: usize = 0,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{}),
-    web_search_models_path: []const u8 = "/models",
     lifecycle_runtime: hooks.Runtime,
     lifecycle_view: hooks.RuntimeView,
     tool_registry: tool_dispatch.Registry = test_tool_registry,
     context_registry: context_contract.Registry = test_context_registry,
+    adapter_manifest: [1]agent_stream_provider.ProviderAdapter = .{agent_stream_provider.unavailable_adapter},
 
     fn init(alloc: Allocator) !FakeApp {
         var lifecycle_runtime = hooks.Runtime.init(alloc);
@@ -1509,9 +1443,15 @@ const FakeApp = struct {
             .context_snapshot = try makeTestContextSnapshot(alloc, "test.default_context", "project context"),
         };
         errdefer app.context_snapshot.deinit(alloc);
-        var credential = credentials.Credential{
-            .token = try alloc.dupe(u8, "api-key"),
-            .source = .ai_gateway_api_key,
+        const token = try alloc.dupe(u8, "api-key");
+        var credential = adapter_auth.Credential{
+            .secret_bytes = token,
+            .source = .{ .id = "test_key", .label = "test key", .refreshable = false },
+            .catalog_access = .{ .authenticated = .{
+                .source = .{ .id = "test_key", .label = "test key", .refreshable = false },
+                .credential = token,
+                .team_context = null,
+            } },
         };
         defer credential.deinit(alloc);
         _ = app.auth.adoptCredential(alloc, &credential);
@@ -1541,25 +1481,33 @@ const FakeApp = struct {
         return test_prompt_policy;
     }
 
-    pub fn agentStreamProvider(self: *const FakeApp) agent_stream_provider.Provider {
-        return self.agent_stream_provider;
+    fn testRouteAdapter(self: *const FakeApp) agent_stream_provider.ProviderAdapter {
+        if (self.route_adapter_override) |adapter| return adapter;
+        return test_builtin_gateway.provider_adapter;
     }
 
-    pub fn providerAdapter(self: *const FakeApp) agent_stream_provider.ProviderAdapter {
-        if (self.provider_adapter_override) |adapter| return adapter;
-        var adapter = test_builtin_gateway.provider_adapter;
-        adapter.legacy_provider = self.agent_stream_provider;
-        return adapter;
+    pub fn adapterForRoute(self: *FakeApp, route: *const route_snapshot.RouteSnapshot) !agent_stream_provider.ProviderAdapter {
+        return self.adapterRegistry().resolveRoute(route);
+    }
+
+    pub fn adapterRegistry(self: *FakeApp) adapter_registry.AdapterRegistry {
+        self.adapter_manifest[0] = self.testRouteAdapter();
+        return .{ .adapters = &self.adapter_manifest };
     }
 
     pub fn resolveRouteCredential(
         self: *FakeApp,
         alloc: Allocator,
         _: *const route_snapshot.RouteSnapshot,
+        _: adapter_auth.RefreshMode,
     ) !agent_runtime.RouteCredential {
         return .{
-            .credential = try alloc.dupe(u8, self.auth.apiKey() orelse return error.MissingCredential),
-            .legacy_source = self.auth.credentialSource(),
+            .credential = try alloc.dupe(u8, self.auth.credentialSecret() orelse return error.MissingCredential),
+            .source = self.auth.credentialSource() orelse .{
+                .id = "test",
+                .label = "test",
+                .refreshable = false,
+            },
         };
     }
 
@@ -1588,9 +1536,10 @@ const FakeApp = struct {
         return .{ .model_output = try arena.dupe(u8, self.mcp_result) };
     }
 
-    fn subagentToolContextForAdmission(
+    fn subagentToolContextForAdmissionAndAdapter(
         self: *FakeApp,
         admission: subagent_domain.AdmissionSnapshot,
+        _: agent_stream_provider.ProviderAdapter,
     ) tool_runtime.Context {
         return Runtime(FakeApp).toolContextForSubagent(
             self,
@@ -1601,15 +1550,15 @@ const FakeApp = struct {
             120,
             2048,
             2,
-            test_gateway_chat_url,
             admission,
         );
     }
 
-    fn snapshotGatewayToolProjection(
+    fn snapshotModelToolProjectionForAdapter(
         self: *FakeApp,
         alloc: Allocator,
         permission_mode: PermissionMode,
+        _: agent_stream_provider.ProviderAdapter,
     ) !tool_advertisement.EffectiveToolProjection {
         self.snapshot_tools_count += 1;
         self.snapshot_permission_mode = permission_mode;
@@ -1619,7 +1568,7 @@ const FakeApp = struct {
         else
             null;
         if (self.snapshot_tools_error) |err| return err;
-        const tools = try alloc.alloc(gateway_schema.FunctionSchema, 0);
+        const tools = try alloc.alloc(tool_descriptor.Descriptor, 0);
         errdefer alloc.free(tools);
         const provider_tools = try alloc.alloc(agent_stream_provider.ProviderToolAdvertisement, 0);
         errdefer alloc.free(provider_tools);
@@ -1630,11 +1579,12 @@ const FakeApp = struct {
         };
     }
 
-    fn snapshotSubagentGatewayToolProjection(
+    fn snapshotSubagentModelToolProjectionForAdapter(
         self: *FakeApp,
         alloc: Allocator,
         permission_mode: PermissionMode,
         permission_rules: types.PermissionRuleSet,
+        _: agent_stream_provider.ProviderAdapter,
     ) !tool_advertisement.EffectiveToolProjection {
         self.snapshot_tools_count += 1;
         self.snapshot_permission_mode = permission_mode;
@@ -1644,7 +1594,7 @@ const FakeApp = struct {
         else
             null;
         if (self.snapshot_tools_error) |err| return err;
-        const tools = try alloc.alloc(gateway_schema.FunctionSchema, 0);
+        const tools = try alloc.alloc(tool_descriptor.Descriptor, 0);
         errdefer alloc.free(tools);
         const provider_tools = try alloc.alloc(agent_stream_provider.ProviderToolAdvertisement, 0);
         errdefer alloc.free(provider_tools);
@@ -1657,63 +1607,63 @@ const FakeApp = struct {
 
     pub fn appendRuntimeContextMessage(self: *FakeApp, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
         self.append_context_count += 1;
-        try Runtime(FakeApp).appendTransientRuntimeContextMessage(self, arena, messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+        try Runtime(FakeApp).appendTransientRuntimeContextMessage(self, arena, messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     }
 
     pub fn requestToolPermissionSync(self: *FakeApp, arena: Allocator, call: ToolCall, permission_mode: PermissionMode, local_grants: []const PermissionGrant) !command_admission.PermissionOutcome {
-        return Runtime(FakeApp).requestToolPermissionSync(self, arena, call, "", permission_mode, local_grants, null, null, &.{}, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+        return Runtime(FakeApp).requestToolPermissionSync(self, arena, call, "", permission_mode, local_grants, null, null, &.{}, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     }
 
     pub fn requestToolPermissionSyncWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
-        return Runtime(FakeApp).requestToolPermissionSync(self, arena, call, review_turn, permission_mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+        return Runtime(FakeApp).requestToolPermissionSync(self, arena, call, review_turn, permission_mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     }
 
     pub fn requestPreparedFileMutationPermissionSyncWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
-        return Runtime(FakeApp).requestPreparedFileMutationPermissionSync(self, arena, call, prepared, review_turn, permission_mode, local_grants, live_authority, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+        return Runtime(FakeApp).requestPreparedFileMutationPermissionSync(self, arena, call, prepared, review_turn, permission_mode, local_grants, live_authority, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     }
 
     pub fn validateToolCall(self: *FakeApp, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
-        return Runtime(FakeApp).validateToolCall(self, arena, call, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+        return Runtime(FakeApp).validateToolCall(self, arena, call, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     }
 
     pub fn checkToolAvailability(self: *FakeApp, arena: Allocator, call: ToolCall) !?[]const u8 {
-        return Runtime(FakeApp).checkToolAvailability(self, arena, call, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+        return Runtime(FakeApp).checkToolAvailability(self, arena, call, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     }
 
     pub fn describeToolAction(self: *FakeApp, arena: Allocator, call: ToolCall) ![]const u8 {
-        return Runtime(FakeApp).describeToolAction(self, arena, call, null, &.{}, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+        return Runtime(FakeApp).describeToolAction(self, arena, call, null, &.{}, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     }
 
     pub fn describeToolActionWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return Runtime(FakeApp).describeToolAction(self, arena, call, file_display_path, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+        return Runtime(FakeApp).describeToolAction(self, arena, call, file_display_path, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     }
 
     pub fn describeToolActionCompleted(self: *FakeApp, arena: Allocator, call: ToolCall) ![]const u8 {
-        return Runtime(FakeApp).describeToolActionCompleted(self, arena, call, null, &.{}, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+        return Runtime(FakeApp).describeToolActionCompleted(self, arena, call, null, &.{}, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     }
 
     pub fn describeToolActionCompletedWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return Runtime(FakeApp).describeToolActionCompleted(self, arena, call, file_display_path, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+        return Runtime(FakeApp).describeToolActionCompleted(self, arena, call, file_display_path, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     }
 
     pub fn describeToolActionDenied(self: *FakeApp, arena: Allocator, call: ToolCall, label: []const u8) ![]const u8 {
-        return Runtime(FakeApp).describeToolActionDenied(self, arena, call, null, label, &.{}, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+        return Runtime(FakeApp).describeToolActionDenied(self, arena, call, null, label, &.{}, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     }
 
     pub fn describeToolActionDeniedWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return Runtime(FakeApp).describeToolActionDenied(self, arena, call, file_display_path, label, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+        return Runtime(FakeApp).describeToolActionDenied(self, arena, call, file_display_path, label, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     }
 
     pub fn permissionTargetForCall(self: *FakeApp, arena: Allocator, call: ToolCall) ![]const u8 {
-        return Runtime(FakeApp).permissionTargetForCall(self, arena, call, &.{}, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+        return Runtime(FakeApp).permissionTargetForCall(self, arena, call, &.{}, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     }
 
     pub fn permissionTargetForCallWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return Runtime(FakeApp).permissionTargetForCall(self, arena, call, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+        return Runtime(FakeApp).permissionTargetForCall(self, arena, call, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     }
 
     pub fn executeToolCall(self: *FakeApp, request: agent_runtime.ToolExecutionRequest) !agent_runtime.ToolExecutionResult {
-        return Runtime(FakeApp).executeToolCall(self, request, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+        return Runtime(FakeApp).executeToolCall(self, request, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     }
 
     pub fn executeToolCallWithAdvertised(self: *FakeApp, request: agent_runtime.ToolExecutionRequest) !agent_runtime.ToolExecutionResult {
@@ -1730,12 +1680,6 @@ const FakeApp = struct {
         return std.fmt.allocPrint(arena, "Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
     }
 };
-
-fn testAgentStreamProvider(stream_fn: agent_stream_provider.StreamFn) agent_stream_provider.Provider {
-    var provider = test_builtin_gateway.agent_stream_provider;
-    provider.stream_fn = stream_fn;
-    return provider;
-}
 
 const TestCatalogProvider = struct {
     saw_expected_input: bool = false,
@@ -1761,8 +1705,7 @@ const TestCatalogProvider = struct {
         self.saw_expected_input =
             std.mem.eql(u8, input.access.authorizationCredential() orelse "", "api-key") and
             input.access.teamContext() == null and
-            input.access.credentialSource() == .ai_gateway_api_key and
-            std.mem.eql(u8, input.endpoint, "/catalog") and
+            std.mem.eql(u8, (input.access.credentialSource() orelse return .{ .failure = .{ .category = .runtime } }).id, "test_key") and
             input.cancel_flag == null and
             input.view == .full;
 
@@ -1786,7 +1729,6 @@ test "app model id loading uses the injected catalog provider" {
             .context = @ptrCast(&test_provider),
             .fetch_fn = TestCatalogProvider.fetch,
         },
-        "/catalog",
     );
     defer {
         for (ids.items) |id| alloc.free(id);
@@ -1815,7 +1757,7 @@ test "app agent runtime builds tool context from app state and MCP callbacks" {
 
     const ctx = testToolContext(&app);
     try std.testing.expectEqualStrings("/tmp/workspace", ctx.workspace_root);
-    try std.testing.expectEqualStrings("api-key", ctx.api_key);
+    try std.testing.expectEqualStrings("", ctx.route_credential);
     try std.testing.expectEqualStrings("test-model", ctx.model);
     try std.testing.expect(ctx.tool_registry.lookup("web_search") != null);
     try std.testing.expectEqual(PermissionMode.auto, ctx.permission_mode);
@@ -1827,8 +1769,7 @@ test "app agent runtime builds tool context from app state and MCP callbacks" {
     try std.testing.expect(ctx.web_fetch_runtime.? == &app.web_fetch_runtime);
     try std.testing.expect(ctx.web_fetch_progress_ctx != null);
     try std.testing.expect(ctx.on_web_fetch_progress != null);
-    try std.testing.expect(ctx.provider_adapter.web_search != null);
-    try std.testing.expectEqualStrings("/models", ctx.gateway_models_path);
+    try std.testing.expect(ctx.route_adapter.web_search == null);
     try std.testing.expectEqual(@as(usize, 4096), ctx.max_tool_result_bytes);
     try std.testing.expectEqual(types.ToolChoice.none, ctx.first_call_tool_choice);
     try std.testing.expectEqual(sandbox.BackendKind.none, ctx.sandbox_backend);
@@ -1949,14 +1890,14 @@ test "app search requires a pinned route before invoking its adapter" {
     provider.execute_fn = FailingWebSearchProvider.execute;
     var adapter = test_builtin_gateway.provider_adapter;
     adapter.web_search = provider;
-    app.provider_adapter_override = adapter;
+    app.route_adapter_override = adapter;
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var messages: std.ArrayList(ChatMessage) = .empty;
     defer messages.deinit(arena);
-    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     try app.appendRuntimeContextMessage(arena, &messages);
 
     const validation = try app.validateToolCall(arena, .{
@@ -2062,18 +2003,18 @@ test "app agent runtime formats active completed denied and MCP tool actions" {
     try std.testing.expect(std.mem.find(u8, mcp_action, "mcp_lookup") != null);
 
     const advertised = [_][]const u8{"mcp_lookup"};
-    const advertised_mcp_active = try Runtime(FakeApp).describeToolAction(&app, arena, mcp_call, null, &advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    const advertised_mcp_active = try Runtime(FakeApp).describeToolAction(&app, arena, mcp_call, null, &advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     try std.testing.expectEqualStrings(
         "● Running MCP\x1b[0m \x1b[38;5;245mmcp_lookup\x1b[0m",
         advertised_mcp_active,
     );
-    const advertised_mcp_action = try Runtime(FakeApp).describeToolActionCompleted(&app, arena, mcp_call, null, &advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    const advertised_mcp_action = try Runtime(FakeApp).describeToolActionCompleted(&app, arena, mcp_call, null, &advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     try std.testing.expectEqualStrings(
         "● Ran MCP\x1b[0m \x1b[38;5;245mmcp_lookup\x1b[0m",
         advertised_mcp_action,
     );
     app.mcp_has_tool_calls = 0;
-    const advertised_mcp_denied = try Runtime(FakeApp).describeToolActionDenied(&app, arena, mcp_call, null, "Denied", &advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    const advertised_mcp_denied = try Runtime(FakeApp).describeToolActionDenied(&app, arena, mcp_call, null, "Denied", &advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     try std.testing.expectEqualStrings(
         "● Denied\x1b[0m \x1b[38;5;245mmcp_lookup\x1b[0m",
         advertised_mcp_denied,
@@ -2082,13 +2023,13 @@ test "app agent runtime formats active completed denied and MCP tool actions" {
 
     app.mcp_name = "mcp_other";
     app.mcp_has_tool_calls = 0;
-    const unavailable_mcp_action = try Runtime(FakeApp).describeToolActionCompleted(&app, arena, mcp_call, null, &advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    const unavailable_mcp_action = try Runtime(FakeApp).describeToolActionCompleted(&app, arena, mcp_call, null, &advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     try std.testing.expect(std.mem.find(u8, unavailable_mcp_action, "MCP") == null);
     try std.testing.expectEqual(@as(usize, 1), app.mcp_has_tool_calls);
 
     app.mcp_has_tool_calls = 0;
     const builtin_advertised = [_][]const u8{"terminal"};
-    _ = try Runtime(FakeApp).describeToolActionCompleted(&app, arena, run_call, null, &builtin_advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    _ = try Runtime(FakeApp).describeToolActionCompleted(&app, arena, run_call, null, &builtin_advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
     try std.testing.expectEqual(@as(usize, 0), app.mcp_has_tool_calls);
 }
 
@@ -2408,8 +2349,8 @@ test "app agent runtime appends static and transient context through configured 
     });
     defer app.worker.clearActivePermissionSnapshot();
 
-    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
-    try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
+    try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
 
     try std.testing.expectEqual(@as(usize, 3), messages.items.len);
     try std.testing.expectEqual(types.ChatRole.system, messages.items[0].role);
@@ -2433,7 +2374,7 @@ test "app agent runtime prefers active queued project context snapshot" {
     var messages: std.ArrayList(ChatMessage) = .empty;
     defer messages.deinit(arena);
 
-    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2);
 
     try std.testing.expectEqual(@as(usize, 2), messages.items.len);
     try std.testing.expectEqualStrings("provider static:queued project context", messages.items[0].content.?);
@@ -2476,7 +2417,6 @@ fn makeNonVercelQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {
         },
         test_builtin_gateway.connection_seed,
         model_capabilities.configuredDescriptor("test-model", .{}),
-        "https://unused-seed.invalid",
     );
     errdefer route.deinit(alloc);
     const history = try alloc.alloc(types.HistoryTurn, 0);
@@ -2518,8 +2458,9 @@ test "fake non-Vercel adapter completes a TUI-admitted queued root turn" {
     var app = try FakeApp.init(alloc);
     defer app.deinit();
     var fake = Fake{};
-    app.provider_adapter_override = .{
+    app.route_adapter_override = .{
         .kind = "test_non_vercel",
+        .supported_protocol = "fake-protocol",
         .context = &fake,
         .stream_fn = Fake.stream,
     };
@@ -2532,7 +2473,7 @@ test "fake non-Vercel adapter completes a TUI-admitted queued root turn" {
         return error.TestExpectedQueuedPrompt;
     defer worker_runtime.freeQueuedPrompt(alloc, job);
 
-    try Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url);
+    try Runtime(FakeApp).processQueuedPrompt(&app, job, 1);
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     var events = app.worker.takeEvents();
@@ -2553,7 +2494,7 @@ test "app agent runtime processes a cancelled queued prompt" {
     const job = try makeQueuedPrompt(alloc);
     defer worker_runtime.freeQueuedPrompt(alloc, job);
 
-    try Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url);
+    try Runtime(FakeApp).processQueuedPrompt(&app, job, 1);
 
     try std.testing.expectEqual(@as(usize, 0), app.append_context_count);
     try std.testing.expectEqual(@as(usize, 1), app.snapshot_tools_count);
@@ -2576,23 +2517,22 @@ test "app agent runtime processes a cancelled queued prompt" {
 test "app direct ask delivers semantic presentation through the runtime sink" {
     const Gateway = struct {
         fn stream(
-            _: ?*anyopaque,
+            _: *const agent_stream_provider.ProviderAdapter,
             _: Allocator,
-            request: agent_stream_provider.Request,
-        ) !agent_stream_provider.Result {
-            request.on_content_chunk(
-                request.callback_ctx,
-                "Before table.\n" ++
-                    "| Name | Count |\n" ++
-                    "|------|------:|\n" ++
-                    "| api | 7 |\n" ++
-                    "After table.\n\n" ++
-                    "```zig\n" ++
-                    "const ready = true;\n" ++
-                    "```\n\n" ++
-                    "---\n",
-            );
-            return .{ .status = .ok, .completion = .{ .content = "", .finish_reason = .stop } };
+            _: agent_stream_provider.AdapterRequest,
+            events: agent_stream_provider.EventSink,
+        ) !void {
+            try events.emit(.provider_admitted);
+            try events.emit(.{ .text_delta = "Before table.\n" ++
+                "| Name | Count |\n" ++
+                "|------|------:|\n" ++
+                "| api | 7 |\n" ++
+                "After table.\n\n" ++
+                "```zig\n" ++
+                "const ready = true;\n" ++
+                "```\n\n" ++
+                "---\n" });
+            try events.emit(.{ .finish = .{ .reason = .stop } });
         }
     };
 
@@ -2602,9 +2542,13 @@ test "app direct ask delivers semantic presentation through the runtime sink" {
     const job = try makeQueuedPrompt(alloc);
     defer worker_runtime.freeQueuedPrompt(alloc, job);
 
-    app.agent_stream_provider = testAgentStreamProvider(Gateway.stream);
+    app.route_adapter_override = .{
+        .kind = test_builtin_gateway.connection_seed.adapter_id,
+        .supported_protocol = test_builtin_gateway.connection_seed.protocol.?,
+        .stream_fn = Gateway.stream,
+    };
 
-    try Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url);
+    try Runtime(FakeApp).processQueuedPrompt(&app, job, 1);
 
     var events = app.worker.takeEvents();
     defer events.deinit(std.heap.c_allocator);
@@ -2673,7 +2617,7 @@ test "app agent runtime clears active turn settings when queued prompt setup fai
     job.permission_mode = .yolo;
     job.sandbox_backend = .macos;
 
-    try std.testing.expectError(error.TestExpectedEqual, Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url));
+    try std.testing.expectError(error.TestExpectedEqual, Runtime(FakeApp).processQueuedPrompt(&app, job, 1));
     try std.testing.expectEqual(
         @as(?PermissionMode, .yolo),
         app.snapshot_permission_mode,
@@ -2835,7 +2779,7 @@ test "subagent tool context uses immutable admission authority" {
     });
     defer admission.deinit(alloc);
 
-    const ctx = app.subagentToolContextForAdmission(admission);
+    const ctx = app.subagentToolContextForAdmissionAndAdapter(admission, app.testRouteAdapter());
     try std.testing.expectEqual(PermissionMode.auto, ctx.permission_mode);
     try std.testing.expectEqual(sandbox.BackendKind.macos, ctx.sandbox_backend);
     try std.testing.expectEqual(@as(usize, 1), ctx.permission_rules.rules.len);
@@ -2878,7 +2822,7 @@ test "app agent runtime discards queued snapshots when tool projection preflight
 
     try std.testing.expectError(
         error.TestExpectedEqual,
-        Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url),
+        Runtime(FakeApp).processQueuedPrompt(&app, job, 1),
     );
     try std.testing.expectError(
         error.FileNotFound,
@@ -2929,7 +2873,7 @@ test "app agent runtime discards every snapshot in a failed multi-image prefligh
 
     try std.testing.expectError(
         error.TestExpectedEqual,
-        Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url),
+        Runtime(FakeApp).processQueuedPrompt(&app, job, 1),
     );
     try std.testing.expectError(
         error.FileNotFound,
@@ -2963,7 +2907,7 @@ test "app agent runtime queued prompt config uses captured job settings over sta
         .fast_mode = true,
         .effort = types.ReasoningEffort.literal("high"),
     };
-    const tools = try alloc.alloc(gateway_schema.FunctionSchema, 0);
+    const tools = try alloc.alloc(tool_descriptor.Descriptor, 0);
     errdefer alloc.free(tools);
     const custom_guidance = try alloc.dupe(u8, "app custom tool guidance");
     const provider_tools = try alloc.alloc(agent_stream_provider.ProviderToolAdvertisement, 0);
@@ -2973,7 +2917,7 @@ test "app agent runtime queued prompt config uses captured job settings over sta
         .custom_guidance = custom_guidance,
     };
     defer tool_projection.deinit(alloc);
-    const config = Runtime(FakeApp).buildQueuedPromptConfig(&app, job, "", "", 1, test_gateway_chat_url, &tool_projection, null);
+    const config = Runtime(FakeApp).buildQueuedPromptConfig(&app, job, "", "", 1, &tool_projection, null);
 
     try std.testing.expect(config.fast_mode);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), config.effort);

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -15,9 +15,27 @@ const runtimeWorkspace = await mkdtemp(join(tmpdir(), "libfx-runtime-workspace-"
 await writeFile(join(processWorkspace, ".fx.json"), `${JSON.stringify({ context: false })}\n`);
 await writeFile(join(runtimeWorkspace, ".fx.json"), `${JSON.stringify({ context: true })}\n`);
 await writeFile(join(runtimeWorkspace, "AGENTS.md"), `# Context\n\n${marker}\n`);
+await mkdir(join(runtimeHome, ".fx"));
+await writeFile(join(runtimeHome, ".fx", "settings.json"), `${JSON.stringify({
+  connections: {
+    selected: "vercel",
+    profiles: [{
+      id: "vercel",
+      display_name: "Vercel AI Gateway",
+      adapter_id: "vercel_ai_gateway",
+      endpoint: "https://ai-gateway.vercel.sh/v3/ai/language-model",
+      protocol: "vercel_ai_gateway",
+      credential_ref: "fx_login",
+      remembered_model: "native/test-model",
+      internal_models: {},
+    }],
+  },
+})}\n`);
 
 let requestBody = "";
+let requestAuthorization = "";
 const server = createServer((request, response) => {
+  requestAuthorization = request.headers.authorization ?? "";
   request.setEncoding("utf8");
   request.on("data", (chunk) => { requestBody += chunk; });
   request.on("end", () => {
@@ -49,6 +67,7 @@ try {
   const turn = session.prompt("read the explicit workspace context");
   await turn.result;
   assert.match(requestBody, new RegExp(marker), "native startup must load context policy from workspaceRoot, not process.cwd()" );
+  assert.equal(requestAuthorization, "Bearer native-core-config-key", "native adapter auth must prefer the injected credential over the saved source backend");
   await session.close();
   assert.equal(await agent.close(), 0);
   console.log("native config isolation passed: explicit home and workspace own startup state");

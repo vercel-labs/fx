@@ -4396,14 +4396,6 @@ describe("gateway stream lifecycle", () => {
           timeoutMs: 15_000,
         },
       );
-      if (first.code !== 0) {
-        const trace = existsSync(tracePath)
-          ? readFileSync(tracePath, "utf8")
-          : "<no trace>";
-        throw new Error(
-          `subagent host exit failed: code=${first.code} signal=${first.signal} timed_out=${first.timedOut} kill_sent=${first.killSent}\nstdout=${first.stdout}\nstderr=${first.stderr}\nprocess_at_timeout=${first.processStateAtTimeout}\nprocess_after_close=${first.processStateAfterClose}\ntrace=${trace}`,
-        );
-      }
       expect(first.code).toBe(0);
       const firstJson = parseAskJson(first.stdout);
       expect(firstJson.output).toContain("Parent exits while child is active.");

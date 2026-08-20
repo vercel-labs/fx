@@ -1,5 +1,7 @@
 const std = @import("std");
 const auth_runtime = @import("../auth/auth_runtime.zig");
+const adapter_auth = @import("../gateway/adapter_auth.zig");
+const connection_registry = @import("../gateway/connection_registry.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
@@ -57,6 +59,8 @@ const ResolvedModel = struct {
 
 pub fn collect(
     alloc: Allocator,
+    auth: adapter_auth.Provider,
+    profile: connection_registry.Profile,
     secret_store: host.SecretStore,
     default_model: []const u8,
     default_agent_step_limit: usize,
@@ -95,7 +99,7 @@ pub fn collect(
 
     var detailed = config_runtime.loadMergedSettingsDetailed(alloc, snapshot.workspace_root) catch |err| {
         // Settings are unreadable, so no remembered choice is available to honour.
-        snapshot.auth = try auth_runtime.loadStatusSnapshot(alloc, secret_store, null);
+        snapshot.auth = try auth_runtime.loadStatusSnapshot(alloc, auth, profile, secret_store);
         try appendConfigLoadFailureCheck(&checks, alloc, "config", "failed to load config", err);
         try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
         try appendAuthCheck(&checks, alloc, snapshot.auth);
@@ -111,8 +115,9 @@ pub fn collect(
 
     snapshot.auth = try auth_runtime.loadStatusSnapshot(
         alloc,
+        auth,
+        profile,
         secret_store,
-        detailed.settings.credential_source,
     );
 
     try appendConfigCheck(&checks, alloc, paths, detailed.diagnostics);
@@ -198,8 +203,8 @@ fn configLayerRejected(
 }
 
 fn appendAuthCheck(checks: *std.ArrayList(Check), alloc: Allocator, auth: auth_runtime.StatusSnapshot) !void {
-    if (auth.missingHelp(.cli)) |help| {
-        try appendCheck(checks, alloc, "auth", .fail, help);
+    if (try auth.missingHelpAlloc(alloc, .cli)) |help| {
+        try appendCheckOwned(checks, alloc, "auth", .fail, help);
         return;
     }
 

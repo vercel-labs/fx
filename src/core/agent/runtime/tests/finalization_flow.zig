@@ -442,7 +442,7 @@ test "processQueuedPrompt terminal outcomes finalize exactly once before optiona
     }{
         .{ .completion = .{ .content = "Final" }, .outcome = .completed, .finish_count = 1 },
         .{ .completion = .{ .cancel_before_output = true }, .outcome = .interrupted, .finish_count = 1 },
-        .{ .completion = .{ .status = .bad_request, .err_body = "bad" }, .outcome = .failed, .finish_count = 0 },
+        .{ .completion = .{ .failure_category = .configuration, .failure_detail = "bad" }, .outcome = .failed, .finish_count = 0 },
         .{ .completion = .{ .stream_error = error.TestProviderFailure }, .outcome = .failed, .finish_count = 0, .propagates_error = true },
     };
     for (cases) |case| {
@@ -535,7 +535,7 @@ test "processQueuedPrompt emits exactly one structured prompt finish per termina
     }
 
     {
-        const completions = [_]FakeCompletion{.{ .status = .bad_request, .err_body = "bad" }};
+        const completions = [_]FakeCompletion{.{ .failure_category = .configuration, .failure_detail = "bad" }};
         var gateway = FakeGateway.init(alloc, &completions);
         defer gateway.deinit();
         var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -598,8 +598,8 @@ test "processQueuedPrompt step limit writes active debug trace" {
 
     try std.testing.expect(std.mem.find(u8, trace, "[agent] step start step=1 limit=1") != null);
     try std.testing.expect(std.mem.find(u8, trace, "[agent] step completion step=1") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "[agent] step limit reached turn_id=1 step_id=1 step_index=1 step_limit=1 gateway_messages=2 completed_tool_count=1 completed_tool_names=read_file last_tool_call_name=read_file last_tool_call_id=call_1 outcome_kind=step_limit") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "event=step_limit_reached turn_id=1 step_id=1 step_index=1 step_limit=1 gateway_messages=2 completed_tool_count=1 completed_tool_names=read_file last_tool_call_name=read_file last_tool_call_id=call_1 outcome_kind=step_limit") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "[agent] step limit reached turn_id=1 step_id=1 step_index=1 step_limit=1 model_messages=2 completed_tool_count=1 completed_tool_names=read_file last_tool_call_name=read_file last_tool_call_id=call_1 outcome_kind=step_limit") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=step_limit_reached turn_id=1 step_id=1 step_index=1 step_limit=1 model_messages=2 completed_tool_count=1 completed_tool_names=read_file last_tool_call_name=read_file last_tool_call_id=call_1 outcome_kind=step_limit") != null);
     try std.testing.expect(std.mem.find(u8, trace, "{\"path\":\"a\"}") == null);
 }
 
@@ -1116,19 +1116,21 @@ test "common Stop does not run for silent-tool auto-continuation" {
     try expectBodyContains(&gateway, 3, "Summarize what you just did.");
 }
 
-test "common Stop HTTP failure pauses with candidate and partial still visible" {
+test "common Stop retryable adapter failure pauses with candidate and partial still visible" {
     const alloc = std.testing.allocator;
     const chunks = [_][]const u8{"later partial"};
     var gateway = FakeGateway.init(alloc, &.{
         .{ .chunks = &.{"candidate"}, .content = "candidate" },
         .{
-            .status = .bad_gateway,
-            .err_body = "gateway unavailable",
+            .failure_category = .upstream_failure,
+            .failure_retryable = true,
+            .failure_detail = "adapter unavailable",
             .chunks = &chunks,
         },
         .{
-            .status = .bad_gateway,
-            .err_body = "gateway unavailable",
+            .failure_category = .upstream_failure,
+            .failure_retryable = true,
+            .failure_detail = "adapter unavailable",
         },
     });
     defer gateway.deinit();
@@ -1158,7 +1160,7 @@ test "common Stop HTTP failure pauses with candidate and partial still visible" 
     try std.testing.expect(textContains(&deps, "candidate"));
     try std.testing.expect(textContains(&deps, "later partial"));
     try std.testing.expectEqual(@as(usize, 0), deps.history_turns.items.len);
-    try std.testing.expectEqual(@as(?std.http.Status, null), deps.http_status);
+    try std.testing.expect(deps.provider_failure_category == null);
     try std.testing.expectEqual(
         types.TurnPresentationOutcome.paused,
         deps.finalized_outcome.?,

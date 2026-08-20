@@ -496,7 +496,7 @@ pub const State = struct {
     }
 };
 
-pub fn buildGatewayToolProjection(
+pub fn buildModelToolProjection(
     state: *State,
     alloc: Allocator,
     advertisement_set: tool_set.ToolSet,
@@ -506,7 +506,7 @@ pub fn buildGatewayToolProjection(
     defer if (lease) |*active| active.deinit();
     var effective = options;
     effective.mcp_runtime = if (lease) |active| active.runtime else null;
-    return tool_advertisement.buildGatewayToolProjectionForSet(
+    return tool_advertisement.buildModelToolProjectionForSet(
         alloc,
         advertisement_set,
         effective,

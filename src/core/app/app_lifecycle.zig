@@ -4,18 +4,15 @@ const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
-const credentials = @import("../../gateway/auth/credentials.zig");
 const host = @import("../hosts/host.zig");
-const oauth_transport = @import("../../gateway/auth/oauth_transport.zig");
 const stream_provider = if (builtin.is_test) @import("../agent/stream_provider.zig") else struct {};
 const adapter_auth = @import("../gateway/adapter_auth.zig");
 const adapter_registry = @import("../gateway/adapter_registry.zig");
 const input_appearance = @import("../config/input_appearance.zig");
-const model_capabilities = @import("../config/model_capabilities.zig");
 const connection_registry = @import("../gateway/connection_registry.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
-const test_model_descriptors = if (builtin.is_test)
-    @import("../../builtins/gateway/model_descriptors.zig")
+const test_model_descriptor_provider = if (builtin.is_test)
+    @import("../gateway/test_adapter.zig").model_descriptor_provider
 else
     struct {};
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -42,6 +39,13 @@ const TerminalState = shell_runtime.TerminalState;
 const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 pub const ResizeHandler = shell_runtime.ResizeHandler;
 pub const default_permission_mode = config_runtime.default_permission_mode;
+
+pub const CredentialLoadMode = enum { stored, refresh_if_needed };
+
+pub const CredentialResolution = struct {
+    credential: ?adapter_auth.Credential = null,
+    store_status: adapter_auth.StoreStatus = .not_attempted,
+};
 
 /// Compile-time terminal restoration for one async-signal-safe `write(2)` call.
 /// Resets terminal modes and ends with a newline before the next shell prompt.
@@ -128,10 +132,13 @@ pub fn uninstallAbnormalExitHandlers() void {
 pub const StartupState = struct {
     workspace_root: []u8 = &.{},
     workspace_access: workspace_access.WorkspaceAccess = .{},
-    credential: ?credentials.Credential = null,
+    /// Bounded compatibility input retained verbatim until the selected
+    /// adapter accepts it as an exact credential source.
+    legacy_credential_ref: ?[]u8 = null,
+    credential: ?adapter_auth.Credential = null,
     connections: ?connection_registry.Runtime = null,
     credential_onboarding_skipped: bool = false,
-    stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
+    stored_key_status: adapter_auth.StoreStatus = .not_attempted,
     selected_model: []u8 = &.{},
     configured_model: []u8 = &.{},
     model_source: config_runtime.ModelSource = .compiled_default,
@@ -166,6 +173,7 @@ pub const StartupState = struct {
     pub fn deinit(self: *StartupState, alloc: Allocator) void {
         self.workspace_access.deinit(alloc);
         if (self.workspace_root.len > 0) alloc.free(self.workspace_root);
+        if (self.legacy_credential_ref) |value| alloc.free(value);
         if (self.credential) |*credential| credential.deinit(alloc);
         if (self.connections) |*connections| connections.deinit();
         if (self.selected_model.len > 0) alloc.free(self.selected_model);
@@ -190,23 +198,28 @@ pub const StartupState = struct {
         return value;
     }
 
-    pub fn apiKey(self: *const StartupState) ?[]const u8 {
+    pub fn credentialSecret(self: *const StartupState) ?[]const u8 {
         const credential = self.credential orelse return null;
         if (credential.needsRefreshAt(io_mod.milliTimestamp())) return null;
-        return credential.token;
+        return credential.secret_bytes;
     }
 
-    pub fn modelCatalogAccess(self: *const StartupState) credentials.CatalogAccess {
-        return credentials.catalogAccessAt(self.credential, io_mod.milliTimestamp());
+    pub fn modelCatalogAccess(self: *const StartupState) adapter_auth.CatalogAccess {
+        const credential = self.credential orelse return .{ .public_only = .{ .reason = .no_credential } };
+        if (credential.needsRefreshAt(io_mod.milliTimestamp())) return .{ .public_only = .{
+            .reason = .refresh_required,
+            .source = credential.source,
+        } };
+        return credential.catalog_access;
     }
 
-    pub fn gatewayTeam(self: *const StartupState) ?[]const u8 {
+    pub fn tenantContext(self: *const StartupState) ?[]const u8 {
         const credential = self.credential orelse return null;
         if (credential.needsRefreshAt(io_mod.milliTimestamp())) return null;
-        return credential.gatewayTeam();
+        return credential.tenantContext();
     }
 
-    pub fn takeCredential(self: *StartupState) ?credentials.Credential {
+    pub fn takeCredential(self: *StartupState) ?adapter_auth.Credential {
         const value = self.credential;
         self.credential = null;
         return value;
@@ -309,19 +322,6 @@ pub const BootstrapConfig = struct {
     record_requested: bool = false,
 };
 
-pub fn loadStartupState(
-    alloc: Allocator,
-    transport: oauth_transport.Provider,
-    secret_store: host.SecretStore,
-    default_model: []const u8,
-    default_fast_mode: bool,
-    default_agent_step_limit: usize,
-    connection_seed: connection_registry.Seed,
-) !StartupState {
-    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_fast_mode, default_agent_step_limit, connection_seed, null, .refresh_if_needed);
-}
-
 pub fn loadStartupStateWithoutCredentials(
     alloc: Allocator,
     default_model: []const u8,
@@ -330,7 +330,15 @@ pub fn loadStartupStateWithoutCredentials(
     connection_seed: connection_registry.Seed,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_fast_mode, default_agent_step_limit, connection_seed, null, null);
+    return loadStartupStateFromOwnedWorkspace(
+        alloc,
+        workspace_root,
+        default_model,
+        default_fast_mode,
+        default_agent_step_limit,
+        connection_seed,
+        null,
+    );
 }
 
 pub fn loadEmbeddedStartupState(
@@ -345,28 +353,13 @@ pub fn loadEmbeddedStartupState(
     const owned_workspace_root = try io_mod.realpathAlloc(alloc, workspace_root);
     return loadStartupStateFromOwnedWorkspace(
         alloc,
-        oauth_transport.unavailable_provider,
-        host.unavailable_secret_store,
         owned_workspace_root,
         default_model,
         default_fast_mode,
         default_agent_step_limit,
         connection_seed,
         home_dir,
-        null,
     );
-}
-
-pub fn loadCatalogStartupState(
-    alloc: Allocator,
-    secret_store: host.SecretStore,
-    default_model: []const u8,
-    default_fast_mode: bool,
-    default_agent_step_limit: usize,
-    connection_seed: connection_registry.Seed,
-) !StartupState {
-    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_fast_mode, default_agent_step_limit, connection_seed, null, .stored);
 }
 
 pub fn loadCatalogStartupStateWithRegistry(
@@ -381,17 +374,25 @@ pub fn loadCatalogStartupStateWithRegistry(
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     var state = try loadStartupStateFromOwnedWorkspace(
         alloc,
-        oauth_transport.unavailable_provider,
-        host.unavailable_secret_store,
         workspace_root,
         default_model,
         default_fast_mode,
         default_agent_step_limit,
         connection_seed,
         null,
-        null,
     );
     errdefer state.deinit(alloc);
+    if (try migrateLegacyCredentialReference(
+        &state,
+        alloc,
+        registry,
+        secret_store,
+        .stored,
+        null,
+    )) {
+        state.connections.?.markSelectedConnected();
+        return state;
+    }
     const connections = &state.connections.?;
     const profile = connections.selectedProfile();
     const auth = registry.resolveAuthForProfile(profile) catch {
@@ -402,16 +403,23 @@ pub fn loadCatalogStartupStateWithRegistry(
         .profile = profile,
         .host = .{ .secret_store = secret_store },
         .mode = .stored,
-        .source_resolution = .allow_fallback,
+        .source_resolution = if (std.mem.eql(u8, profile.credential_ref, "automatic"))
+            .allow_fallback
+        else
+            .exact,
+        .current_source_id = if (std.mem.eql(u8, profile.credential_ref, "automatic"))
+            null
+        else
+            profile.credential_ref,
     });
     switch (acquisition) {
         .acquired => |value| {
             var normalized = value;
             defer normalized.deinit(alloc);
-            state.credential = auth_runtime.takeAdapterCredential(&normalized) orelse {
-                connections.markSelectedDisconnected(.invalid_credential_reference);
-                return state;
-            };
+            state.credential = normalized;
+            normalized.secret_bytes = &.{};
+            normalized.tenant_id = null;
+            normalized.tenant_slug = null;
             connections.markSelectedConnected();
         },
         .missing => |store_status| {
@@ -478,49 +486,30 @@ pub fn applyWorkspaceLaunch(
 
 fn loadStartupStateForWorkspace(alloc: Allocator, workspace_root: []const u8, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const owned_workspace_root = try alloc.dupe(u8, workspace_root);
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, false, default_agent_step_limit, test_connection_seed, null, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, owned_workspace_root, default_model, false, default_agent_step_limit, test_connection_seed, null);
 }
 
 fn loadStartupStateForWorkspaceWithFastDefault(alloc: Allocator, workspace_root: []const u8, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const owned_workspace_root = try alloc.dupe(u8, workspace_root);
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, true, default_agent_step_limit, test_connection_seed, null, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, owned_workspace_root, default_model, true, default_agent_step_limit, test_connection_seed, null);
 }
-
-const CredentialLoadMode = credentials.LoadMode;
 
 const test_connection_seed = connection_registry.Seed{
     .id = "test",
     .display_name = "Test Gateway",
     .adapter_id = "test_gateway",
+    .protocol = "test_gateway",
     .credential_ref = "automatic",
 };
-
-fn connectionUsesSeedAdapter(
-    profile: connection_registry.Profile,
-    seed: connection_registry.Seed,
-) bool {
-    return std.mem.eql(u8, profile.adapter_id, seed.adapter_id) and
-        optionalStringEqual(profile.protocol, seed.protocol);
-}
-
-fn optionalStringEqual(left: ?[]const u8, right: ?[]const u8) bool {
-    if (left == null or right == null) return left == null and right == null;
-    return std.mem.eql(u8, left.?, right.?);
-}
-
-fn credentialSourceFromReference(reference: []const u8) !?credentials.Source {
-    if (std.mem.eql(u8, reference, "automatic")) return null;
-    return types.parseCredentialSource(reference) orelse error.InvalidCredentialReference;
-}
 
 pub fn resolveConnectionCredential(
     alloc: Allocator,
     registry: adapter_registry.AdapterRegistry,
     secret_store: host.SecretStore,
     profile: connection_registry.Profile,
-    mode: credentials.LoadMode,
+    mode: CredentialLoadMode,
     cancel_flag: ?*const std.atomic.Value(bool),
-) !credentials.Resolution {
+) !CredentialResolution {
     const auth = try registry.resolveAuthForProfile(profile);
     const exact_source = !std.mem.eql(u8, profile.credential_ref, "automatic");
     const acquisition = try auth.acquire(alloc, .{
@@ -541,14 +530,13 @@ pub fn resolveConnectionCredential(
             if (exact_source and !std.mem.eql(u8, normalized.source.id, profile.credential_ref)) {
                 return error.CredentialSourceMismatch;
             }
-            return .{ .credential = auth_runtime.takeAdapterCredential(&normalized) orelse
-                return error.InvalidCredentialReference };
+            const credential = normalized;
+            normalized.secret_bytes = &.{};
+            normalized.tenant_id = null;
+            normalized.tenant_slug = null;
+            return .{ .credential = credential };
         },
-        .missing => |status| return .{ .stored_key_status = switch (status) {
-            .not_attempted => .not_attempted,
-            .not_found => .not_found,
-            .unavailable => .unavailable,
-        } },
+        .missing => |status| return .{ .store_status = status },
         .failed => |failure| return switch (failure.category) {
             .configuration => error.InvalidCredentialReference,
             else => error.CredentialAcquisitionFailed,
@@ -557,74 +545,97 @@ pub fn resolveConnectionCredential(
     }
 }
 
-fn resolveLegacyConnectionCredential(
-    alloc: Allocator,
-    transport: oauth_transport.Provider,
-    secret_store: host.SecretStore,
-    profile: connection_registry.Profile,
-    seed: connection_registry.Seed,
-    mode: credentials.LoadMode,
-) !credentials.Resolution {
-    if (!connectionUsesSeedAdapter(profile, seed)) {
-        return error.UnsupportedConnectionAdapter;
-    }
-    return credentials.resolvePreferring(
-        alloc,
-        transport,
-        secret_store,
-        mode,
-        try credentialSourceFromReference(profile.credential_ref),
-    );
-}
-
-fn loadSelectedConnectionCredential(
+/// Validates and acquires the bounded legacy reference through the selected
+/// adapter before one transaction publishes the canonical connection and
+/// removes the compatibility field. No automatic source precedence is used.
+pub fn migrateLegacyCredentialReference(
     state: *StartupState,
     alloc: Allocator,
-    transport: oauth_transport.Provider,
+    registry: adapter_registry.AdapterRegistry,
     secret_store: host.SecretStore,
-    profile: connection_registry.Profile,
-    seed: connection_registry.Seed,
     mode: CredentialLoadMode,
-) !void {
+    cancel_flag: ?*const std.atomic.Value(bool),
+) !bool {
+    const legacy_ref = state.legacy_credential_ref orelse return false;
+    if (state.credential != null) return error.LegacyCredentialMigrationStateConflict;
     const connections = &state.connections.?;
-    const resolution = resolveLegacyConnectionCredential(
+    const selected = connections.selectedProfile();
+    var candidate = selected;
+    candidate.credential_ref = legacy_ref;
+
+    var resolution = try resolveConnectionCredential(
         alloc,
-        transport,
+        registry,
         secret_store,
-        profile,
-        seed,
+        candidate,
         mode,
-    ) catch |err| switch (err) {
-        error.UnsupportedConnectionAdapter => {
-            connections.markSelectedDisconnected(.unsupported_adapter);
-            return;
-        },
-        error.InvalidCredentialReference => {
-            connections.markSelectedDisconnected(.invalid_credential_reference);
-            return;
-        },
-        else => return err,
-    };
-    state.credential = resolution.credential;
-    state.stored_key_status = resolution.stored_key_status;
-    if (state.credential != null) {
-        connections.markSelectedConnected();
-    } else {
-        connections.markSelectedDisconnected(.missing_credential);
+        cancel_flag,
+    );
+    var credential = resolution.credential orelse
+        return error.LegacyCredentialSourceUnavailable;
+    errdefer credential.deinit(alloc);
+    resolution.credential = null;
+    if (credential.needsRefreshAt(io_mod.milliTimestamp())) {
+        return error.LegacyCredentialSourceExpired;
     }
+
+    const update = connections.compareAndPublishCredentialReference(.{
+        .connection_id = selected.id,
+        .adapter_id = selected.adapter_id,
+        .credential_ref = selected.credential_ref,
+        .endpoint = selected.endpoint,
+        .protocol = selected.protocol,
+    }, legacy_ref);
+    switch (update) {
+        .updated, .unchanged_same_reference => {},
+        .updated_persistence_indeterminate => {
+            state.credential = credential;
+            credential.secret_bytes = &.{};
+            credential.tenant_id = null;
+            credential.tenant_slug = null;
+            alloc.free(state.legacy_credential_ref.?);
+            state.legacy_credential_ref = null;
+            return error.CredentialReferencePersistenceIndeterminate;
+        },
+        .stale_origin => return error.LegacyCredentialReferenceStale,
+        .failed_before_commit => |err| return err,
+    }
+
+    state.credential = credential;
+    credential.secret_bytes = &.{};
+    credential.tenant_id = null;
+    credential.tenant_slug = null;
+    alloc.free(state.legacy_credential_ref.?);
+    state.legacy_credential_ref = null;
+    return true;
+}
+
+pub fn legacyCredentialMigrationErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.InvalidCredentialReference => "saved credential source is invalid for the selected connection",
+        error.LegacyCredentialSourceUnavailable => "saved credential source is unavailable; restore it or choose another source",
+        error.LegacyCredentialSourceExpired => "saved credential source requires renewal; authenticate again or choose another source",
+        error.CredentialAcquisitionFailed => "saved credential source could not be loaded",
+        error.Cancelled => "saved credential source loading was cancelled",
+        error.CredentialReferencePersistenceIndeterminate => "saved credential source was published, but its durability could not be confirmed; restart fx before continuing",
+        error.LegacyCredentialReferenceStale => "saved credential source changed during migration; restart fx before continuing",
+        error.LegacyCredentialMigrationStateConflict => "saved credential source migration encountered conflicting live state; restart fx before continuing",
+        error.ConnectionWriteFailed,
+        error.ConnectionPersistenceUnavailable,
+        error.DurablePathUnsafe,
+        => "validated credential source could not be saved; the prior setting was preserved",
+        else => "saved credential source migration failed; the prior setting was preserved",
+    };
 }
 
 fn loadStartupStateFromOwnedWorkspace(
     alloc: Allocator,
-    transport: oauth_transport.Provider,
-    secret_store: host.SecretStore,
     owned_workspace_root: []u8,
     default_model: []const u8,
     default_fast_mode: bool,
     default_agent_step_limit: usize,
     connection_seed: connection_registry.Seed,
     profile_home: ?[]const u8,
-    credential_mode: ?CredentialLoadMode,
 ) !StartupState {
     var state = StartupState{ .agent_step_limit = default_agent_step_limit };
     errdefer state.deinit(alloc);
@@ -646,13 +657,24 @@ fn loadStartupStateFromOwnedWorkspace(
         false,
     );
 
-    const legacy_credential_ref: ?[]const u8 = if (settings.credential_source) |source| @tagName(source) else null;
     state.connections = try connection_registry.Runtime.init(
         alloc,
-        connection_seed.profile(settings.model orelse default_model, legacy_credential_ref),
+        connection_seed.profile(
+            settings.model orelse default_model,
+            null,
+        ),
         if (settings.connections) |*connections| connections else null,
         config_runtime.connectionPersistence(),
     );
+    if (settings.legacy_credential_ref) |legacy_credential_ref| {
+        const selected = state.connections.?.selectedProfile();
+        if (settings.connections != null and
+            !std.mem.eql(u8, selected.credential_ref, legacy_credential_ref))
+        {
+            return error.LegacyCredentialReferenceConflict;
+        }
+        state.legacy_credential_ref = try alloc.dupe(u8, legacy_credential_ref);
+    }
     const selected_connection = state.connections.?.selectedProfile();
     state.configured_model = try alloc.dupe(u8, selected_connection.remembered_model);
     state.model_source = if (settings.connections != null)
@@ -665,17 +687,6 @@ fn loadStartupStateFromOwnedWorkspace(
     detailed.diagnostics = &.{};
     state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
-    if (credential_mode) |mode| {
-        try loadSelectedConnectionCredential(
-            &state,
-            alloc,
-            transport,
-            secret_store,
-            selected_connection,
-            connection_seed,
-            mode,
-        );
-    }
     state.permission_mode = loadPermissionMode(settings.permission_mode);
     state.yolo_acknowledged = settings.yolo_acknowledged orelse false;
     state.permission_rules = try types.dupePermissionRuleSet(alloc, settings.permission_rules);
@@ -716,7 +727,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     cfg.shell.layout = minimalLayout();
     try cfg.shell.initBacking(cfg.alloc);
 
-    var state = try loadCatalogStartupStateWithRegistry(
+    var state = loadCatalogStartupStateWithRegistry(
         cfg.alloc,
         cfg.adapter_registry,
         cfg.secret_store,
@@ -724,7 +735,16 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         cfg.default_fast_mode,
         cfg.default_agent_step_limit,
         cfg.connection_seed,
-    );
+    ) catch |err| {
+        var message_buf: [256]u8 = undefined;
+        const message = std.fmt.bufPrint(
+            &message_buf,
+            "fx: {s}\n",
+            .{legacyCredentialMigrationErrorMessage(err)},
+        ) catch "fx: credential source migration failed\n";
+        std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), message) catch {};
+        return err;
+    };
     errdefer state.deinit(cfg.alloc);
     const profile = state.connections.?.selectedProfile();
     const adapter = try cfg.adapter_registry.resolveProfile(profile);
@@ -2232,19 +2252,16 @@ test "startup credential modes select a refresh policy, never a narrower source 
     try std.testing.expectEqualStrings("refresh_if_needed", modes[1].name);
 }
 
-test "loadStartupState applies core env overrides" {
+test "startup loading without credentials applies core environment overrides" {
     var env = try TestEnv.install(std.testing.allocator, &.{
         .{ .key = "FX_MODEL", .value = "  env-model  " },
-        .{ .key = "AI_GATEWAY_API_KEY", .value = "gateway-key" },
         .{ .key = "FX_PERMISSION_MODE", .value = "auto" },
         .{ .key = "FX_MAX_AGENT_STEPS", .value = "37" },
     });
     defer env.deinit();
 
-    var state = try loadStartupState(
+    var state = try loadStartupStateWithoutCredentials(
         std.testing.allocator,
-        oauth_transport.unavailable_provider,
-        host.unavailable_secret_store,
         "default-model",
         false,
         12,
@@ -2256,96 +2273,11 @@ test "loadStartupState applies core env overrides" {
     try std.testing.expectEqualStrings("env-model", state.selected_model);
     try std.testing.expectEqualStrings("default-model", state.configured_model);
     try std.testing.expectEqual(config_runtime.ModelSource.process_override, state.model_source);
+    try std.testing.expect(state.credential == null);
     try std.testing.expect(!state.fast_mode);
-    try std.testing.expectEqualStrings("gateway-key", state.apiKey().?);
-    try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, state.credential.?.source);
     try std.testing.expectEqual(PermissionMode.auto, state.permission_mode);
     try std.testing.expectEqual(@as(usize, 37), state.agent_step_limit);
     try std.testing.expectEqual(sandbox.BackendKind.auto, state.sandbox_backend);
-}
-
-test "loadStartupState defaults fast mode off and preserves explicit preferences" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
-    defer std.testing.allocator.free(home);
-
-    var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home }});
-    defer env.deinit();
-
-    var state = try loadStartupState(
-        std.testing.allocator,
-        oauth_transport.unavailable_provider,
-        host.unavailable_secret_store,
-        "zai/glm-5.2-fast",
-        true,
-        12,
-        .{
-            .id = "vercel",
-            .display_name = "Vercel AI Gateway",
-            .adapter_id = "vercel_ai_gateway",
-            .endpoint = "https://ai-gateway.vercel.sh/v3/ai/language-model",
-            .protocol = "vercel_ai_gateway",
-            .credential_ref = "automatic",
-            .internal_models = .{ .permission_review = "openai/gpt-5.4" },
-        },
-    );
-    defer state.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings("zai/glm-5.2-fast", state.selected_model);
-}
-
-test "built-in Vercel connection reuses credential resolution and CatalogAccess ownership" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try writeFixtureFile(
-        tmp.dir,
-        "home/.fx/settings.json",
-        "{\"connections\":{\"selected\":\"vercel\",\"profiles\":[{\"id\":\"vercel\",\"display_name\":\"Vercel AI Gateway\",\"adapter_id\":\"vercel_ai_gateway\",\"endpoint\":\"https://ai-gateway.vercel.sh/v3/ai/language-model\",\"protocol\":\"vercel_ai_gateway\",\"credential_ref\":\"ai_gateway_api_key\",\"remembered_model\":\"openai/gpt-5.4\",\"permission_review_model\":\"openai/gpt-5.4\"}]}}\n",
-    );
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-    var env = try TestEnv.install(alloc, &.{
-        .{ .key = "HOME", .value = home },
-        .{ .key = "AI_GATEWAY_API_KEY", .value = "gateway-key" },
-    });
-    defer env.deinit();
-
-    var state = try loadStartupState(
-        alloc,
-        oauth_transport.unavailable_provider,
-        host.unavailable_secret_store,
-        "default-model",
-        false,
-        12,
-        .{
-            .id = "vercel",
-            .display_name = "Vercel AI Gateway",
-            .adapter_id = "vercel_ai_gateway",
-            .endpoint = "https://ai-gateway.vercel.sh/v3/ai/language-model",
-            .protocol = "vercel_ai_gateway",
-            .credential_ref = "automatic",
-            .internal_models = .{
-                .permission_review = "openai/gpt-5.4",
-                .vision = "google/gemini-2.5-flash",
-            },
-        },
-    );
-    defer state.deinit(alloc);
-
-    const selected = state.connections.?.selectedProfile();
-    try std.testing.expectEqualStrings("vercel", selected.id);
-    try std.testing.expectEqualStrings("openai/gpt-5.4", state.selected_model);
-    try std.testing.expectEqual(connection_registry.AuthStateTag.connected, std.meta.activeTag(selected.auth));
-    try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, state.credential.?.source);
-    const access = state.modelCatalogAccess();
-    try std.testing.expectEqualStrings("gateway-key", access.authorizationCredential().?);
-    try std.testing.expectEqual(state.credential.?.token.ptr, access.authorizationCredential().?.ptr);
-    try std.testing.expect(!@hasField(connection_registry.Profile, "api_key"));
 }
 
 test "registry startup preserves invalid credential references as configuration failures" {
@@ -2368,6 +2300,7 @@ test "registry startup preserves invalid credential references as configuration 
     };
     const adapters = [_]stream_provider.ProviderAdapter{.{
         .kind = test_connection_seed.adapter_id,
+        .supported_protocol = test_connection_seed.protocol.?,
         .auth = auth,
         .stream_fn = stream_provider.unavailable_adapter.stream_fn,
     }};
@@ -2435,11 +2368,13 @@ test "connection credential resolution is exact and isolated after profile selec
     const adapters = [_]stream_provider.ProviderAdapter{
         .{
             .kind = "selected",
+            .supported_protocol = "selected",
             .auth = .{ .kind = "selected", .context = &selected, .acquire_fn = Probe.acquire },
             .stream_fn = stream_provider.unavailable_adapter.stream_fn,
         },
         .{
             .kind = "peer",
+            .supported_protocol = "peer",
             .auth = .{ .kind = "peer", .context = &peer, .acquire_fn = Probe.acquire },
             .stream_fn = stream_provider.unavailable_adapter.stream_fn,
         },
@@ -2450,7 +2385,7 @@ test "connection credential resolution is exact and isolated after profile selec
         .display_name = @constCast("Selected"),
         .adapter_id = @constCast("selected"),
         .endpoint = null,
-        .protocol = null,
+        .protocol = @constCast("selected"),
         .credential_ref = @constCast("fx_login"),
         .remembered_model = @constCast("model"),
         .internal_models = .{},
@@ -2465,7 +2400,7 @@ test "connection credential resolution is exact and isolated after profile selec
         null,
     )).credential.?;
     defer acquired.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("selected-secret", acquired.token);
+    try std.testing.expectEqualStrings("selected-secret", acquired.secret_bytes);
     try std.testing.expectEqual(@as(usize, 1), selected.calls);
     try std.testing.expectEqual(selected.calls, selected.exact_calls);
     try std.testing.expect(selected.saw_current_source);
@@ -2491,7 +2426,7 @@ test "connection credential resolution is exact and isolated after profile selec
         null,
     );
     try std.testing.expect(missing.credential == null);
-    try std.testing.expectEqual(credentials.StoredKeyReadStatus.unavailable, missing.stored_key_status);
+    try std.testing.expectEqual(adapter_auth.StoreStatus.unavailable, missing.store_status);
 
     selected.outcome = .failed;
     try std.testing.expectError(error.CredentialAcquisitionFailed, resolveConnectionCredential(
@@ -2517,7 +2452,7 @@ test "connection credential resolution is exact and isolated after profile selec
     try std.testing.expectEqual(@as(usize, 0), peer.calls);
 }
 
-test "loadStartupState preserves exact fast model defaults" {
+test "loadStartupState enables fast mode only for the compiled model default" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2548,12 +2483,14 @@ test "loadStartupState preserves exact fast model defaults" {
 
     var absent = try loadStartupStateForWorkspace(std.testing.allocator, absent_root, "zai/glm-5.2", 25);
     defer absent.deinit(std.testing.allocator);
+    try absent.normalizeModels(std.testing.allocator, test_model_descriptor_provider);
     try std.testing.expectEqualStrings("zai/glm-5.2", absent.selected_model);
     try std.testing.expectEqualStrings("zai/glm-5.2", absent.configured_model);
     try std.testing.expect(!absent.fast_mode);
 
     var configured = try loadStartupStateForWorkspace(std.testing.allocator, configured_root, "zai/glm-5.2", 25);
     defer configured.deinit(std.testing.allocator);
+    try configured.normalizeModels(std.testing.allocator, test_model_descriptor_provider);
     try std.testing.expectEqualStrings("openai/gpt-5", configured.selected_model);
     try std.testing.expectEqualStrings("openai/gpt-5", configured.configured_model);
     try std.testing.expect(!configured.fast_mode);
@@ -2758,6 +2695,463 @@ test "loadStartupState diagnoses the retired fuzzy skill setting" {
     defer state.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), state.config_diagnostics.len);
     try std.testing.expectEqual(config_runtime.ConfigDiagnosticCause.retired_skill_match_fuzzy, state.config_diagnostics[0].cause);
+}
+
+test "legacy credential migration requires exact adapter acceptance before publication" {
+    const Probe = struct {
+        calls: usize = 0,
+        exact_calls: usize = 0,
+        fallback_calls: usize = 0,
+
+        fn acquire(
+            raw: *const anyopaque,
+            _: Allocator,
+            request: adapter_auth.Request,
+        ) Allocator.Error!adapter_auth.Acquisition {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            self.exact_calls += @intFromBool(request.source_resolution == .exact);
+            self.fallback_calls += @intFromBool(request.source_resolution == .allow_fallback);
+            return .{ .failed = .{ .category = .configuration } };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"credential_source\":\"not_a_credential_source\",\"future\":true}\n",
+    );
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    var env = try TestEnv.install(alloc, &.{.{ .key = "HOME", .value = home_root }});
+    defer env.deinit();
+
+    var selected: Probe = .{};
+    var peer: Probe = .{};
+    const adapters = [_]stream_provider.ProviderAdapter{
+        .{
+            .kind = test_connection_seed.adapter_id,
+            .supported_protocol = test_connection_seed.protocol.?,
+            .auth = .{
+                .kind = test_connection_seed.adapter_id,
+                .context = &selected,
+                .acquire_fn = Probe.acquire,
+            },
+            .stream_fn = stream_provider.unavailable_adapter.stream_fn,
+        },
+        .{
+            .kind = "peer",
+            .supported_protocol = "peer",
+            .auth = .{ .kind = "peer", .context = &peer, .acquire_fn = Probe.acquire },
+            .stream_fn = stream_provider.unavailable_adapter.stream_fn,
+        },
+    };
+    const registry = try adapter_registry.AdapterRegistry.init(&adapters);
+
+    try std.testing.expectError(error.InvalidCredentialReference, loadCatalogStartupStateWithRegistry(
+        alloc,
+        registry,
+        host.unavailable_secret_store,
+        "default-model",
+        false,
+        25,
+        test_connection_seed,
+    ));
+
+    try std.testing.expectEqual(@as(usize, 1), selected.calls);
+    try std.testing.expectEqual(selected.calls, selected.exact_calls);
+    try std.testing.expectEqual(@as(usize, 0), selected.fallback_calls);
+    try std.testing.expectEqual(@as(usize, 0), peer.calls);
+
+    var settings_file = try tmp.dir.openFile(io_mod.getIo(), "home/.fx/settings.json", .{});
+    defer settings_file.close(io_mod.getIo());
+    const settings = try io_mod.readFileToEnd(alloc, &settings_file, 4096);
+    defer alloc.free(settings);
+    try std.testing.expect(std.mem.find(u8, settings, "credential_source") != null);
+    try std.testing.expect(std.mem.find(u8, settings, "credential_ref") == null);
+}
+
+test "legacy credential migration exact failures preserve rollback state and isolate traffic" {
+    const Outcome = enum { invalid, unavailable, failed, cancelled, expired };
+    const Probe = struct {
+        outcome: Outcome,
+        calls: usize = 0,
+        exact_calls: usize = 0,
+        fallback_calls: usize = 0,
+
+        fn acquire(
+            raw: *const anyopaque,
+            alloc: Allocator,
+            request: adapter_auth.Request,
+        ) Allocator.Error!adapter_auth.Acquisition {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            self.exact_calls += @intFromBool(request.source_resolution == .exact and
+                std.mem.eql(u8, request.current_source_id orelse "", "fx_login"));
+            self.fallback_calls += @intFromBool(request.source_resolution == .allow_fallback);
+            return switch (self.outcome) {
+                .invalid => .{ .failed = .{ .category = .configuration } },
+                .unavailable => .{ .missing = .not_found },
+                .failed => .{ .failed = .{ .category = .unavailable } },
+                .cancelled => .cancelled,
+                .expired => expired: {
+                    const secret_bytes = try alloc.dupe(u8, "expired-secret");
+                    break :expired .{ .acquired = .{
+                        .secret_bytes = secret_bytes,
+                        .source = .{ .id = "fx_login", .label = "fx login", .refreshable = true },
+                        .refresh_after_ms = 0,
+                        .catalog_access = .{ .authenticated = .{
+                            .source = .{ .id = "fx_login", .label = "fx login", .refreshable = true },
+                            .credential = secret_bytes,
+                            .team_context = null,
+                        } },
+                    } };
+                },
+            };
+        }
+    };
+    const StoreProbe = struct {
+        loads: usize = 0,
+        writes: usize = 0,
+
+        fn store(self: *@This()) host.SecretStore {
+            return .{
+                .context = self,
+                .backend_label = "migration test store",
+                .is_disabled_fn = disabled,
+                .load_fn = load,
+                .store_fn = write,
+                .store_interactive_fn = interactive,
+            };
+        }
+
+        fn disabled(_: ?*anyopaque) bool {
+            return false;
+        }
+
+        fn load(raw: ?*anyopaque, _: Allocator) host.SecretStoreLoadError!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.loads += 1;
+            return null;
+        }
+
+        fn write(raw: ?*anyopaque, _: Allocator, _: []const u8) host.SecretStoreWriteError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.writes += 1;
+        }
+
+        fn interactive(_: ?*anyopaque) host.SecretStoreWriteError!bool {
+            return false;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"credential_source\":\"fx_login\"}\n");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    var env = try TestEnv.install(alloc, &.{
+        .{ .key = "HOME", .value = home_root },
+        .{ .key = "AI_GATEWAY_API_KEY", .value = "must-not-be-read" },
+    });
+    defer env.deinit();
+
+    const cases = [_]struct { outcome: Outcome, expected: anyerror }{
+        .{ .outcome = .invalid, .expected = error.InvalidCredentialReference },
+        .{ .outcome = .unavailable, .expected = error.LegacyCredentialSourceUnavailable },
+        .{ .outcome = .failed, .expected = error.CredentialAcquisitionFailed },
+        .{ .outcome = .cancelled, .expected = error.Cancelled },
+        .{ .outcome = .expired, .expected = error.LegacyCredentialSourceExpired },
+    };
+    for (cases) |case| {
+        var selected = Probe{ .outcome = case.outcome };
+        var peer = Probe{ .outcome = .invalid };
+        var store: StoreProbe = .{};
+        const adapters = [_]stream_provider.ProviderAdapter{
+            .{
+                .kind = test_connection_seed.adapter_id,
+                .supported_protocol = test_connection_seed.protocol.?,
+                .auth = .{
+                    .kind = test_connection_seed.adapter_id,
+                    .context = &selected,
+                    .acquire_fn = Probe.acquire,
+                },
+                .stream_fn = stream_provider.unavailable_adapter.stream_fn,
+            },
+            .{
+                .kind = "peer",
+                .supported_protocol = "peer",
+                .auth = .{ .kind = "peer", .context = &peer, .acquire_fn = Probe.acquire },
+                .stream_fn = stream_provider.unavailable_adapter.stream_fn,
+            },
+        };
+        const registry = try adapter_registry.AdapterRegistry.init(&adapters);
+        try std.testing.expectError(case.expected, loadCatalogStartupStateWithRegistry(
+            alloc,
+            registry,
+            store.store(),
+            "default-model",
+            false,
+            25,
+            test_connection_seed,
+        ));
+        try std.testing.expectEqual(@as(usize, 1), selected.calls);
+        try std.testing.expectEqual(selected.calls, selected.exact_calls);
+        try std.testing.expectEqual(@as(usize, 0), selected.fallback_calls);
+        try std.testing.expectEqual(@as(usize, 0), peer.calls);
+        try std.testing.expectEqual(@as(usize, 0), store.loads);
+        try std.testing.expectEqual(@as(usize, 0), store.writes);
+
+        var settings_file = try tmp.dir.openFile(io_mod.getIo(), "home/.fx/settings.json", .{});
+        defer settings_file.close(io_mod.getIo());
+        const settings = try io_mod.readFileToEnd(alloc, &settings_file, 4096);
+        defer alloc.free(settings);
+        try std.testing.expect(std.mem.find(u8, settings, "credential_source") != null);
+        try std.testing.expect(std.mem.find(u8, settings, "credential_ref") == null);
+    }
+}
+
+test "legacy credential migration distinguishes definite and indeterminate publication" {
+    const AuthProbe = struct {
+        fn acquire(
+            _: *const anyopaque,
+            alloc: Allocator,
+            _: adapter_auth.Request,
+        ) Allocator.Error!adapter_auth.Acquisition {
+            const secret_bytes = try alloc.dupe(u8, "migration-secret");
+            return .{ .acquired = .{
+                .secret_bytes = secret_bytes,
+                .source = .{ .id = "fx_login", .label = "fx login", .refreshable = true },
+                .catalog_access = .{ .authenticated = .{
+                    .source = .{ .id = "fx_login", .label = "fx login", .refreshable = true },
+                    .credential = secret_bytes,
+                    .team_context = null,
+                } },
+            } };
+        }
+    };
+    const PersistenceProbe = struct {
+        mode: enum { reject, indeterminate },
+        writes: usize = 0,
+        saw_exact: bool = false,
+
+        fn persistence(self: *@This()) connection_registry.Persistence {
+            return .{ .context = self, .write_fn = write };
+        }
+
+        fn write(
+            raw: ?*anyopaque,
+            _: Allocator,
+            snapshot: connection_registry.Snapshot,
+        ) !connection_registry.PersistenceOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.writes += 1;
+            self.saw_exact = std.mem.eql(u8, snapshot.profiles[0].credential_ref, "fx_login");
+            return switch (self.mode) {
+                .reject => error.ConnectionWriteFailed,
+                .indeterminate => .{ .replaced_indeterminate = error.SettingsCommitIndeterminate },
+            };
+        }
+    };
+
+    const adapters = [_]stream_provider.ProviderAdapter{.{
+        .kind = test_connection_seed.adapter_id,
+        .supported_protocol = test_connection_seed.protocol.?,
+        .auth = .{ .kind = test_connection_seed.adapter_id, .acquire_fn = AuthProbe.acquire },
+        .stream_fn = stream_provider.unavailable_adapter.stream_fn,
+    }};
+    const registry = try adapter_registry.AdapterRegistry.init(&adapters);
+    const alloc = std.testing.allocator;
+
+    var rejected: PersistenceProbe = .{ .mode = .reject };
+    var rejected_state = StartupState{ .agent_step_limit = 1 };
+    defer rejected_state.deinit(alloc);
+    rejected_state.connections = try connection_registry.Runtime.init(
+        alloc,
+        test_connection_seed.profile("model", null),
+        null,
+        rejected.persistence(),
+    );
+    rejected_state.legacy_credential_ref = try alloc.dupe(u8, "fx_login");
+    try std.testing.expectError(error.ConnectionWriteFailed, migrateLegacyCredentialReference(
+        &rejected_state,
+        alloc,
+        registry,
+        host.unavailable_secret_store,
+        .stored,
+        null,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), rejected.writes);
+    try std.testing.expect(rejected.saw_exact);
+    try std.testing.expectEqualStrings("automatic", rejected_state.connections.?.selectedProfile().credential_ref);
+    try std.testing.expectEqualStrings("fx_login", rejected_state.legacy_credential_ref.?);
+    try std.testing.expect(rejected_state.credential == null);
+
+    var indeterminate: PersistenceProbe = .{ .mode = .indeterminate };
+    var indeterminate_state = StartupState{ .agent_step_limit = 1 };
+    defer indeterminate_state.deinit(alloc);
+    indeterminate_state.connections = try connection_registry.Runtime.init(
+        alloc,
+        test_connection_seed.profile("model", null),
+        null,
+        indeterminate.persistence(),
+    );
+    indeterminate_state.legacy_credential_ref = try alloc.dupe(u8, "fx_login");
+    try std.testing.expectError(error.CredentialReferencePersistenceIndeterminate, migrateLegacyCredentialReference(
+        &indeterminate_state,
+        alloc,
+        registry,
+        host.unavailable_secret_store,
+        .stored,
+        null,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), indeterminate.writes);
+    try std.testing.expect(indeterminate.saw_exact);
+    try std.testing.expectEqualStrings("fx_login", indeterminate_state.connections.?.selectedProfile().credential_ref);
+    try std.testing.expect(indeterminate_state.legacy_credential_ref == null);
+    try std.testing.expect(indeterminate_state.credential != null);
+}
+
+test "startup migrates reloads and idempotently preserves exact credential source" {
+    const Probe = struct {
+        calls: usize = 0,
+
+        fn acquire(
+            raw: *const anyopaque,
+            alloc: Allocator,
+            request: adapter_auth.Request,
+        ) Allocator.Error!adapter_auth.Acquisition {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (request.source_resolution != .exact or
+                !std.mem.eql(u8, request.current_source_id orelse "", "fx_login"))
+            {
+                return .{ .failed = .{ .category = .configuration } };
+            }
+            const secret_bytes = try alloc.dupe(u8, "migration-secret");
+            return .{ .acquired = .{
+                .secret_bytes = secret_bytes,
+                .source = .{ .id = "fx_login", .label = "fx login", .refreshable = true },
+                .catalog_access = .{ .authenticated = .{
+                    .source = .{ .id = "fx_login", .label = "fx login", .refreshable = true },
+                    .credential = secret_bytes,
+                    .team_context = null,
+                } },
+            } };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"credential_source\":\"fx_login\",\"future\":true}\n",
+    );
+
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    var env = try TestEnv.install(alloc, &.{.{ .key = "HOME", .value = home_root }});
+    defer env.deinit();
+
+    var probe: Probe = .{};
+    const adapters = [_]stream_provider.ProviderAdapter{.{
+        .kind = test_connection_seed.adapter_id,
+        .supported_protocol = test_connection_seed.protocol.?,
+        .auth = .{
+            .kind = test_connection_seed.adapter_id,
+            .context = &probe,
+            .acquire_fn = Probe.acquire,
+        },
+        .stream_fn = stream_provider.unavailable_adapter.stream_fn,
+    }};
+    const registry = try adapter_registry.AdapterRegistry.init(&adapters);
+
+    var initial = try loadStartupStateForWorkspace(alloc, workspace_root, "default-model", 25);
+    defer initial.deinit(alloc);
+    try std.testing.expectEqualStrings("automatic", initial.connections.?.selectedProfile().credential_ref);
+    try std.testing.expectEqualStrings("fx_login", initial.legacy_credential_ref.?);
+    try std.testing.expect(try migrateLegacyCredentialReference(
+        &initial,
+        alloc,
+        registry,
+        host.unavailable_secret_store,
+        .stored,
+        null,
+    ));
+    try std.testing.expectEqualStrings("fx_login", initial.connections.?.selectedProfile().credential_ref);
+    try std.testing.expect(initial.legacy_credential_ref == null);
+    try std.testing.expect(initial.credential != null);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+
+    var settings_file = try tmp.dir.openFile(io_mod.getIo(), "home/.fx/settings.json", .{});
+    defer settings_file.close(io_mod.getIo());
+    const migrated = try io_mod.readFileToEnd(alloc, &settings_file, 4096);
+    defer alloc.free(migrated);
+    try std.testing.expect(std.mem.find(u8, migrated, "credential_source") == null);
+    try std.testing.expect(std.mem.find(u8, migrated, "\"credential_ref\":\"fx_login\"") != null);
+    try std.testing.expect(std.mem.find(u8, migrated, "\"future\":true") != null);
+
+    var reloaded = try loadStartupStateForWorkspace(alloc, workspace_root, "default-model", 25);
+    defer reloaded.deinit(alloc);
+    try std.testing.expectEqualStrings("fx_login", reloaded.connections.?.selectedProfile().credential_ref);
+    try std.testing.expect(reloaded.legacy_credential_ref == null);
+    try std.testing.expect(!(try migrateLegacyCredentialReference(
+        &reloaded,
+        alloc,
+        registry,
+        host.unavailable_secret_store,
+        .stored,
+        null,
+    )));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+
+    var reloaded_file = try tmp.dir.openFile(io_mod.getIo(), "home/.fx/settings.json", .{});
+    defer reloaded_file.close(io_mod.getIo());
+    const after_reload = try io_mod.readFileToEnd(alloc, &reloaded_file, 4096);
+    defer alloc.free(after_reload);
+    try std.testing.expectEqualStrings(migrated, after_reload);
+}
+
+test "startup rejects conflicting legacy and canonical credential references" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"credential_source\":\"fx_login\",\"connections\":{" ++
+            "\"selected\":\"test\",\"profiles\":[{" ++
+            "\"id\":\"test\",\"display_name\":\"Test Gateway\"," ++
+            "\"adapter_id\":\"test_gateway\",\"credential_ref\":\"automatic\"," ++
+            "\"remembered_model\":\"default-model\",\"internal_models\":{" ++
+            "\"permission_review\":null,\"vision\":null,\"subagent\":null}}]}}\n",
+    );
+
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    var env = try TestEnv.install(alloc, &.{.{ .key = "HOME", .value = home_root }});
+    defer env.deinit();
+
+    try std.testing.expectError(
+        error.LegacyCredentialReferenceConflict,
+        loadStartupStateForWorkspace(alloc, workspace_root, "default-model", 25),
+    );
 }
 
 test "credential onboarding can be skipped independently from Keychain" {

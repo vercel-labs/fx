@@ -107,7 +107,7 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
         });
         await session.waitForText("Run /help", TIMEOUT);
         await session.sendText("PLAN10_PROMPT_HISTORY_SENTINEL");
-        await session.waitForText("HTTP 401", TIMEOUT);
+        await session.waitForText("authentication failed", TIMEOUT);
         await session.sendText("/help");
         await session.waitForText("Commands 39", TIMEOUT);
         await session.sendKeys("Escape");
@@ -213,7 +213,7 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
           });
           await session.waitForText("Run /help", TIMEOUT);
           await session.sendText(prompt);
-          await session.waitForText("HTTP 401", TIMEOUT);
+          await session.waitForText("authentication failed", TIMEOUT);
           await session.sendText("/quit");
           await session.waitForSessionEnd(TIMEOUT);
           session = null;
@@ -234,7 +234,7 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
         await session.waitForText("Run /help", TIMEOUT);
         await disablePromptHistory(session, join(home, ".fx", "settings.json"));
         await session.sendText("PLAN10_HISTORY_DISABLED");
-        await session.waitForText("HTTP 401", TIMEOUT);
+        await session.waitForText("authentication failed", TIMEOUT);
         await session.waitForPane(hasEmptyComposer, TIMEOUT);
         await session.sendKeys("Up");
         let recalled = await session.waitForPane(

@@ -1,6 +1,7 @@
 const std = @import("std");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
+const builtin_gateway = @import("../builtins/gateway.zig");
 const gateway_client = @import("client.zig");
 
 const Allocator = std.mem.Allocator;
@@ -32,31 +33,29 @@ pub const Transport = struct {
 };
 
 pub const ProviderContext = struct {
-    build_fn: stream_provider.BuildFn,
     transport: Transport,
+    endpoint_override: ?[]const u8 = null,
 };
 
-pub fn provider(context: *ProviderContext) stream_provider.Provider {
+pub fn vercelTransport(context: *ProviderContext) builtin_gateway.VercelTransport {
     return .{
         .context = context,
-        .build_fn = build,
         .stream_fn = stream,
     };
 }
 
-pub fn initContext(build_fn: stream_provider.BuildFn, transport: Transport) ProviderContext {
-    return .{ .build_fn = build_fn, .transport = transport };
+pub fn initContext(transport: Transport, endpoint_override: ?[]const u8) ProviderContext {
+    return .{ .transport = transport, .endpoint_override = endpoint_override };
 }
 
-fn build(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.BuildRequest) anyerror![]u8 {
-    const context: *ProviderContext = @ptrCast(@alignCast(raw.?));
-    return context.build_fn(null, alloc, request);
-}
-
-fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.Request) anyerror!stream_provider.Result {
+fn stream(
+    raw: ?*anyopaque,
+    alloc: Allocator,
+    request: builtin_gateway.VercelTransportRequest,
+) anyerror!builtin_gateway.VercelTransportResponse {
     const context: *ProviderContext = @ptrCast(@alignCast(raw.?));
     const transport = context.transport;
-    const auth = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});
+    const auth = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.credential});
     defer alloc.free(auth);
 
     const Header = struct { name: []const u8, value: []const u8 };
@@ -69,10 +68,10 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.Request) 
         .{ .name = "X-Title", .value = "fx" },
         .{ .name = "ai-gateway-protocol-version", .value = "0.0.1" },
         .{ .name = "ai-language-model-specification-version", .value = "4" },
-        .{ .name = "ai-language-model-id", .value = request.model },
+        .{ .name = "ai-language-model-id", .value = request.model_id },
         .{ .name = "ai-language-model-streaming", .value = "true" },
     });
-    if (request.team) |team| if (team.len > 0) try headers.append(alloc, .{ .name = "x-vercel-ai-gateway-team", .value = team });
+    if (request.tenant) |team| if (team.len > 0) try headers.append(alloc, .{ .name = "x-vercel-ai-gateway-team", .value = team });
     if (request.session_id) |session_id| if (session_id.len > 0) try headers.appendSlice(alloc, &.{
         .{ .name = "x-session-id", .value = session_id },
         .{ .name = "x-session-affinity", .value = session_id },
@@ -83,7 +82,8 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.Request) 
     try std.json.Stringify.value(headers.items, .{}, &headers_json.writer);
 
     request.delivery.markPossiblySent();
-    const handle = try transport.open("POST", request.chat_url, headers_json.writer.buffered(), request.payload);
+    const endpoint = context.endpoint_override orelse request.endpoint;
+    const handle = try transport.open("POST", endpoint, headers_json.writer.buffered(), request.payload);
     if (handle < 0) return error.HostStreamFailed;
     defer transport.close(handle);
 
@@ -101,7 +101,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.Request) 
     if (status != .ok) return .{
         .status = status,
         .err_body = try readBody(alloc, transport, handle, request.cancel_flag, request.cooperative_pulse),
-        .ownership = .owned,
+        .owned = true,
     };
 
     var reader: HostStreamReader = undefined;
@@ -119,7 +119,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.Request) 
         error.ReadFailed => return if (request.cancel_flag.load(.seq_cst) or reader.aborted) error.Cancelled else error.HostStreamFailed,
         else => return err,
     };
-    return .{ .status = .ok, .completion = completion, .ownership = .owned };
+    return .{ .status = .ok, .completion = completion, .owned = true };
 }
 
 fn pulse(value: ?stream_provider.CooperativePulse) !void {

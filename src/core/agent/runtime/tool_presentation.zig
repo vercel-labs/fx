@@ -1,6 +1,7 @@
 const std = @import("std");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
+const adapter_auth = @import("../../gateway/adapter_auth.zig");
 const types = @import("../../shared/types.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
@@ -1297,7 +1298,7 @@ const ProvisionalStatusTestCapture = struct {
     fn noopPushDiffBlock(_: *anyopaque, _: DiffEntryPayload) !void {}
     fn noopPushSystemNotice(_: *anyopaque, _: []const u8) !void {}
     fn noopPushCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
-    fn noopPushProviderFailure(_: *anyopaque, _: agent_stream_provider.StreamFailure.Category, _: ?u16, _: []const u8, _: ?types.CredentialSource) !void {}
+    fn noopPushProviderFailure(_: *anyopaque, _: agent_stream_provider.StreamFailure.Category, _: []const u8, _: ?adapter_auth.Source) !void {}
     fn noopFormatToolExecutionError(_: *anyopaque, arena: Allocator, _: []const u8, err: anyerror) ![]const u8 {
         return std.fmt.allocPrint(arena, "{s}", .{@errorName(err)});
     }

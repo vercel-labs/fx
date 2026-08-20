@@ -119,6 +119,7 @@ pub const TopLevelResource = struct {
 
 pub const TopLevelRegistry = struct {
     specs: []const TopLevelSpec = &.{},
+    auth_service_label: []const u8 = "",
     description: []const u8,
     interactive_hint: []const u8,
     help_groups: []const TopLevelHelpGroup = &.{},
@@ -237,6 +238,7 @@ pub const HelpMenu = struct {
 };
 
 pub const top_level_help_default_width: usize = 80;
+pub const provider_command_presentation_buffer_bytes: usize = 384;
 
 pub const HelpStyle = enum {
     plain,
@@ -328,13 +330,15 @@ pub fn renderTopLevelHelpWithStyle(alloc: Allocator, registry: TopLevelRegistry,
 
 pub fn renderTopLevelCommandHelp(alloc: Allocator, registry: TopLevelRegistry, kind: TopLevelKind) ![]u8 {
     const spec = topLevelSpec(registry, kind);
+    var summary_buf: [provider_command_presentation_buffer_bytes]u8 = undefined;
+    const summary = try topLevelSummary(&summary_buf, registry, spec);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
     try out.writer.writeAll("fx ");
     try out.writer.writeAll(spec.token);
     try out.writer.writeAll("\n\n");
-    try out.writer.writeAll(spec.summary);
+    try out.writer.writeAll(summary);
     try out.writer.writeAll("\n\nUsage:\n");
     try out.writer.writeAll("  fx ");
     try out.writer.writeAll(spec.usage);
@@ -415,9 +419,8 @@ fn helpCatalogSpecMatches(spec: SlashSpec, query: []const u8) bool {
     var tokens = std.mem.tokenizeAny(u8, query, " \t\r\n");
     while (tokens.next()) |token| {
         if (containsIgnoreCase(spec.command, token) or
-            containsIgnoreCase(spec.help_entry.?, token) or
-            containsIgnoreCase(spec.completion_description.?, token) or
-            containsIgnoreCase(spec.presentation_category.?.label(), token))
+            containsIgnoreCase(@tagName(spec.kind), token) or
+            containsIgnoreCase(@tagName(spec.presentation_category.?), token))
         {
             continue;
         }
@@ -651,17 +654,29 @@ pub fn nthSlashCompletionLabel(registry: SlashRegistry, prefix: []const u8, n: u
 }
 
 pub fn nthSlashCompletionDescription(registry: SlashRegistry, prefix: []const u8, n: usize) ?[]const u8 {
-    if (allowlistArgCompletionPrefix(prefix) != null) return null;
-    if (sandboxArgCompletionPrefix(prefix) != null) return null;
-    if (statuslineArgCompletionPrefix(prefix) != null) return null;
-    if (notificationsArgCompletionPrefix(prefix) != null) return null;
-    if (permissionsArgCompletionPrefix(prefix) != null) return null;
-    if (appearanceArgCompletionPrefix(prefix) != null) return null;
-    if (inputArgCompletionPrefix(prefix) != null) return null;
-    if (maxxingArgCompletionPrefix(prefix) != null) return null;
-    if (workspaceArgCompletionPrefix(prefix) != null) return null;
-    if (prefix.len == 0 or prefix[0] != '/') return null;
-    return (nthSlashCommandCompletionMatch(registry, prefix, n) orelse return null).spec.completion_description;
+    return (slashCompletionDescriptionSpec(registry, prefix, n) orelse return null).completion_description;
+}
+
+pub fn formatSlashCompletionDescription(
+    registry: SlashRegistry,
+    prefix: []const u8,
+    n: usize,
+    auth_service_label: []const u8,
+    buffer: []u8,
+) !?[]const u8 {
+    const spec = slashCompletionDescriptionSpec(registry, prefix, n) orelse return null;
+    return try formatSlashSpecDescription(spec, auth_service_label, buffer);
+}
+
+pub fn formatSlashSpecDescription(
+    spec: SlashSpec,
+    auth_service_label: []const u8,
+    buffer: []u8,
+) ![]const u8 {
+    if (spec.kind == .login and auth_service_label.len > 0) {
+        return try std.fmt.bufPrint(buffer, "sign in with {s}", .{auth_service_label});
+    }
+    return spec.completion_description orelse "";
 }
 
 pub fn nthSlashCompletionCategory(registry: SlashRegistry, prefix: []const u8, n: usize) ?SlashPresentationCategory {
@@ -1393,6 +1408,35 @@ fn topLevelSpec(registry: TopLevelRegistry, kind: TopLevelKind) TopLevelSpec {
     unreachable;
 }
 
+fn nthSlashCompletionSpec(registry: SlashRegistry, prefix: []const u8, n: usize) ?SlashSpec {
+    return (nthSlashCommandCompletionMatch(registry, prefix, n) orelse return null).spec.*;
+}
+
+fn slashCompletionDescriptionSpec(registry: SlashRegistry, prefix: []const u8, n: usize) ?SlashSpec {
+    if (allowlistArgCompletionPrefix(prefix) != null or
+        sandboxArgCompletionPrefix(prefix) != null or
+        statuslineArgCompletionPrefix(prefix) != null or
+        notificationsArgCompletionPrefix(prefix) != null or
+        permissionsArgCompletionPrefix(prefix) != null or
+        appearanceArgCompletionPrefix(prefix) != null or
+        inputArgCompletionPrefix(prefix) != null or
+        maxxingArgCompletionPrefix(prefix) != null or
+        workspaceArgCompletionPrefix(prefix) != null or
+        prefix.len == 0 or
+        prefix[0] != '/') return null;
+    return nthSlashCompletionSpec(registry, prefix, n);
+}
+
+fn topLevelSummary(buffer: []u8, registry: TopLevelRegistry, spec: TopLevelSpec) ![]const u8 {
+    if (registry.auth_service_label.len == 0) return spec.summary;
+    return switch (spec.kind) {
+        .login => std.fmt.bufPrint(buffer, "Sign in with {s}", .{registry.auth_service_label}),
+        .logout => std.fmt.bufPrint(buffer, "Sign out of the current {s} session", .{registry.auth_service_label}),
+        .teams => std.fmt.bufPrint(buffer, "Choose the {s} team used by AI Gateway", .{registry.auth_service_label}),
+        else => spec.summary,
+    };
+}
+
 fn slashSpec(registry: SlashRegistry, kind: SlashKind) SlashSpec {
     return slashSpecPtr(registry, kind).*;
 }
@@ -1457,7 +1501,12 @@ fn maxTopLevelResourceLabelWidth(registry: TopLevelRegistry) usize {
 
 fn writeTopLevelHelpEntry(writer: *std.Io.Writer, registry: TopLevelRegistry, entry: TopLevelHelpEntry, usage_width: usize, columns: usize, style: HelpStyle) !void {
     const spaces = "                                                                ";
-    const summary = entry.summary orelse topLevelSpec(registry, entry.kind.?).summary;
+    var summary_buf: [provider_command_presentation_buffer_bytes]u8 = undefined;
+    const summary = entry.summary orelse try topLevelSummary(
+        &summary_buf,
+        registry,
+        topLevelSpec(registry, entry.kind.?),
+    );
     if (entry.kind) |kind| {
         if (topLevelSpec(registry, kind).hidden_from_top_level_help) return;
     }
@@ -1638,17 +1687,17 @@ fn expectAllLinesFit(text: []const u8, columns: usize) !void {
 
 fn testSlashRegistry() SlashRegistry {
     const builtin_commands = @import("../../builtins/commands.zig");
-    return builtin_commands.slash_registry;
+    return builtin_commands.testSlashRegistry();
 }
 
 fn testTopLevelRegistry() TopLevelRegistry {
     const builtin_commands = @import("../../builtins/commands.zig");
-    return builtin_commands.top_level_registry;
+    return builtin_commands.testTopLevelRegistry();
 }
 
 fn testTopLevelHelpText(alloc: Allocator) ![]u8 {
     const builtin_commands = @import("../../builtins/commands.zig");
-    return builtin_commands.renderTopLevelHelp(alloc, top_level_help_default_width, "9.8.7");
+    return renderTopLevelHelp(alloc, builtin_commands.testTopLevelRegistry(), top_level_help_default_width, "9.8.7");
 }
 
 fn stripAnsiForTest(alloc: Allocator, text: []const u8) ![]u8 {
@@ -1892,14 +1941,24 @@ test "slash completion categories follow canonical entries" {
     try std.testing.expect(nthSlashCompletionCategory(registry, "/permissions ", 0) == null);
 }
 
-test "help catalog groups visible commands and searches all command metadata" {
+test "help catalog groups visible commands and searches normalized identifiers" {
     const registry = testSlashRegistry();
 
     try std.testing.expectEqual(@as(usize, 39), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
     try std.testing.expectEqual(@as(usize, 4), helpCatalogCount(registry, "appearance"));
-    try std.testing.expectEqualStrings("/paste", helpCatalogSpecAt(registry, "clipboard", 0).?.command);
+    try std.testing.expectEqualStrings("/paste", helpCatalogSpecAt(registry, "paste", 0).?.command);
+}
+
+test "help catalog ignores render-only command wording" {
+    var spec = slashSpec(testSlashRegistry(), .login);
+    spec.help_entry = "/login differently worded peer";
+    spec.completion_description = "authenticate with Example Cloud";
+
+    try std.testing.expect(helpCatalogSpecMatches(spec, "login"));
+    try std.testing.expect(!helpCatalogSpecMatches(spec, "Example Cloud"));
+    try std.testing.expect(!helpCatalogSpecMatches(spec, "differently worded"));
 }
 
 test "help menu selection follows the filtered catalog without executing commands" {

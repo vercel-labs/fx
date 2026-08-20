@@ -5,7 +5,7 @@ const route_snapshot = @import("../../gateway/route_snapshot.zig");
 const types = @import("../../shared/types.zig");
 const session_usage = @import("../../session/session_usage.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
-const gateway_schema = @import("../../tooling/gateway_schema.zig");
+const tool_descriptor = @import("../../tooling/tool_descriptor.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const io_mod = @import("../../shared/io.zig");
 const runtime_telemetry = @import("telemetry.zig");
@@ -21,30 +21,31 @@ pub const AttemptEvidence = agent_stream_provider.AttemptEvidence;
 pub const StreamFailureFacts = struct {
     category: agent_stream_provider.StreamFailure.Category,
     retryable: bool,
-    response_code: ?u16,
     delivery_ambiguous: bool,
     retry_after_seconds: ?u64,
     transport_cause: ?agent_stream_provider.StreamFailure.TransportCause,
 };
 
 pub const StreamResult = struct {
-    completion: types.GatewayCompletion = .{},
+    completion: types.ModelCompletion = .{},
     failure: ?Failure = null,
 
     pub const Failure = struct {
         category: agent_stream_provider.StreamFailure.Category,
+        response_status: u16 = 0,
         retryable: bool,
-        response_code: ?u16 = null,
         delivery_ambiguous: bool,
         detail: ?[]u8 = null,
         retry_after_seconds: ?u64 = null,
         transport_cause: ?agent_stream_provider.StreamFailure.TransportCause = null,
         diagnostic_summary: ?[]u8 = null,
+        tool_descriptor: ?[]u8 = null,
         request_shape: ?[]u8 = null,
 
         pub fn deinit(self: *Failure, alloc: Allocator) void {
             if (self.detail) |value| alloc.free(value);
             if (self.diagnostic_summary) |value| alloc.free(value);
+            if (self.tool_descriptor) |value| alloc.free(value);
             if (self.request_shape) |value| alloc.free(value);
             self.* = undefined;
         }
@@ -57,7 +58,7 @@ pub const StreamResult = struct {
     /// Transfers the owned completion into the caller's lifetime. The caller
     /// must eventually release it with `deinitCollectedCompletion` or an arena
     /// reset that owns every nested allocation.
-    pub fn takeCompletion(self: *StreamResult) types.GatewayCompletion {
+    pub fn takeCompletion(self: *StreamResult) types.ModelCompletion {
         const completion = self.completion;
         self.completion = .{};
         return completion;
@@ -75,8 +76,8 @@ const CollectedTerminal = union(enum) {
     finish,
     failure: struct {
         category: agent_stream_provider.StreamFailure.Category,
+        response_status: u16,
         retryable: bool,
-        response_code: ?u16,
         delivery_ambiguous: bool,
         retry_after_seconds: ?u64,
         transport_cause: ?agent_stream_provider.StreamFailure.TransportCause,
@@ -96,12 +97,13 @@ const AdapterEventCollector = struct {
     on_tool_input_chunk: ?agent_stream_provider.StreamCallback,
     content: std.ArrayList(u8) = .empty,
     tool_calls: std.ArrayList(types.ToolCall) = .empty,
-    completion: types.GatewayCompletion = .{},
+    completion: types.ModelCompletion = .{},
     generation_origin: ?[]u8 = null,
     failure_detail: ?[]u8 = null,
     failure_diagnostic_summary: ?[]u8 = null,
+    failure_tool_descriptor: ?[]u8 = null,
     failure_request_shape: ?[]u8 = null,
-    usage_observation: ?session_usage.GatewayObservation = null,
+    usage_observation: ?session_usage.ModelInvocationObservation = null,
     terminal: CollectedTerminal = .none,
 
     fn deinit(self: *AdapterEventCollector) void {
@@ -115,6 +117,7 @@ const AdapterEventCollector = struct {
         if (self.generation_origin) |origin| self.alloc.free(origin);
         if (self.failure_detail) |detail| self.alloc.free(detail);
         if (self.failure_diagnostic_summary) |summary| self.alloc.free(summary);
+        if (self.failure_tool_descriptor) |descriptor| self.alloc.free(descriptor);
         if (self.failure_request_shape) |shape| self.alloc.free(shape);
     }
 
@@ -122,7 +125,7 @@ const AdapterEventCollector = struct {
         const self: *AdapterEventCollector = @ptrCast(@alignCast(raw));
         switch (event) {
             .provider_admitted => {
-                self.usage_observation = try session_usage.GatewayObservation.begin(self.usage);
+                self.usage_observation = try session_usage.ModelInvocationObservation.begin(self.usage);
                 self.attempt_evidence.provider_admitted = true;
             },
             .text_delta => |chunk| {
@@ -199,8 +202,8 @@ const AdapterEventCollector = struct {
                 self.completion.delivery_ambiguous = delivery_ambiguous;
                 self.terminal = .{ .failure = .{
                     .category = failure.category,
+                    .response_status = failure.response_status,
                     .retryable = failure.retryable,
-                    .response_code = failure.response_code,
                     .delivery_ambiguous = delivery_ambiguous,
                     .retry_after_seconds = failure.retry_after_seconds,
                     .transport_cause = failure.transport_cause,
@@ -208,6 +211,9 @@ const AdapterEventCollector = struct {
                 if (failure.detail) |detail| self.failure_detail = try self.alloc.dupe(u8, detail);
                 if (failure.diagnostic) |diagnostic| {
                     self.failure_diagnostic_summary = try self.alloc.dupe(u8, diagnostic.summary);
+                    if (diagnostic.tool_descriptor) |descriptor| {
+                        self.failure_tool_descriptor = try self.alloc.dupe(u8, descriptor);
+                    }
                     if (diagnostic.request_shape) |shape| {
                         self.failure_request_shape = try self.alloc.dupe(u8, shape);
                     }
@@ -217,7 +223,7 @@ const AdapterEventCollector = struct {
         }
     }
 
-    fn takeCompletion(self: *AdapterEventCollector) !types.GatewayCompletion {
+    fn takeCompletion(self: *AdapterEventCollector) !types.ModelCompletion {
         if (self.content.items.len > 0) self.completion.content = try self.content.toOwnedSlice(self.alloc);
         self.completion.tool_calls = try self.tool_calls.toOwnedSlice(self.alloc);
         const completion = self.completion;
@@ -225,7 +231,7 @@ const AdapterEventCollector = struct {
         return completion;
     }
 
-    fn takeUsageObservation(self: *AdapterEventCollector) ?session_usage.GatewayObservation {
+    fn takeUsageObservation(self: *AdapterEventCollector) ?session_usage.ModelInvocationObservation {
         const observation = self.usage_observation;
         self.usage_observation = null;
         return observation;
@@ -238,17 +244,19 @@ const AdapterEventCollector = struct {
         };
         const failure = StreamResult.Failure{
             .category = terminal.category,
+            .response_status = terminal.response_status,
             .retryable = terminal.retryable,
-            .response_code = terminal.response_code,
             .delivery_ambiguous = terminal.delivery_ambiguous,
             .detail = self.failure_detail,
             .retry_after_seconds = terminal.retry_after_seconds,
             .transport_cause = terminal.transport_cause,
             .diagnostic_summary = self.failure_diagnostic_summary,
+            .tool_descriptor = self.failure_tool_descriptor,
             .request_shape = self.failure_request_shape,
         };
         self.failure_detail = null;
         self.failure_diagnostic_summary = null;
+        self.failure_tool_descriptor = null;
         self.failure_request_shape = null;
         return failure;
     }
@@ -261,7 +269,6 @@ const AdapterEventCollector = struct {
         return .{
             .category = failure.category,
             .retryable = failure.retryable,
-            .response_code = failure.response_code,
             .delivery_ambiguous = failure.delivery_ambiguous,
             .retry_after_seconds = failure.retry_after_seconds,
             .transport_cause = failure.transport_cause,
@@ -337,7 +344,7 @@ pub fn streamModelRequest(
         .emit_fn = AdapterEventCollector.emit,
     }) catch |err| {
         if (failure_facts) |output| output.* = collector.failureFacts();
-        runtime_telemetry.recordGatewayCallMetric(model, started_at_ms, 0, 0, 0, 0, trace_ctx.turn_id, trace_ctx.step_id, trace_ctx.subagent_id, @errorName(err), "");
+        runtime_telemetry.recordModelCallMetric(model, started_at_ms, 0, 0, 0, trace_ctx.turn_id, trace_ctx.step_id, trace_ctx.subagent_id, @errorName(err), "");
         if (collector.takeUsageObservation()) |observation| {
             try observation.fail(failedDeliveryOutcome(&collector, delivery));
         }
@@ -347,7 +354,7 @@ pub fn streamModelRequest(
     switch (collector.terminal) {
         .none => return error.MissingTerminalEvent,
         .cancelled => {
-            runtime_telemetry.recordGatewayCallMetric(model, started_at_ms, 0, 0, 0, 0, trace_ctx.turn_id, trace_ctx.step_id, trace_ctx.subagent_id, "Cancelled", "");
+            runtime_telemetry.recordModelCallMetric(model, started_at_ms, 0, 0, 0, trace_ctx.turn_id, trace_ctx.step_id, trace_ctx.subagent_id, "Cancelled", "");
             if (collector.takeUsageObservation()) |observation| {
                 try observation.fail(failedDeliveryOutcome(&collector, delivery));
             }
@@ -362,14 +369,14 @@ pub fn streamModelRequest(
     if (collector.terminal == .failure) {
         var failure = collector.takeFailure();
         errdefer failure.deinit(alloc);
-        recordGatewayResultMetric(
+        recordModelResultMetric(
             model,
             started_at_ms,
             false,
             completion,
-            failure.response_code,
             failure.detail,
-            failure.diagnostic_summary,
+            failure.response_status,
+            failure.tool_descriptor,
             failure.request_shape,
             trace_ctx,
         );
@@ -378,13 +385,13 @@ pub fn streamModelRequest(
         }
         return .{ .completion = completion, .failure = failure };
     }
-    recordGatewayResultMetric(
+    recordModelResultMetric(
         model,
         started_at_ms,
         true,
         completion,
         null,
-        null,
+        0,
         null,
         null,
         trace_ctx,
@@ -392,7 +399,6 @@ pub fn streamModelRequest(
     if (collector.takeUsageObservation()) |observation| {
         try observation.complete(
             usage_allocator,
-            .ok,
             completion,
             route.connection_id,
             collector.generation_origin,
@@ -419,7 +425,7 @@ fn failedDeliveryOutcome(
     return if (delivery.load() == .possibly_sent) .ambiguous_delivery else .unbilled;
 }
 
-fn deinitCollectedCompletion(alloc: Allocator, completion: types.GatewayCompletion) void {
+fn deinitCollectedCompletion(alloc: Allocator, completion: types.ModelCompletion) void {
     if (completion.content) |content| alloc.free(@constCast(content));
     if (completion.generation_id) |id| alloc.free(@constCast(id));
     if (completion.billing) |billing| alloc.free(@constCast(billing.model));
@@ -427,14 +433,14 @@ fn deinitCollectedCompletion(alloc: Allocator, completion: types.GatewayCompleti
     if (completion.provider_failure_detail) |detail| alloc.free(@constCast(detail));
 }
 
-fn recordGatewayResultMetric(
+fn recordModelResultMetric(
     model: []const u8,
     started_at_ms: i64,
     succeeded: bool,
-    completion: types.GatewayCompletion,
-    response_code: ?u16,
+    completion: types.ModelCompletion,
     err_body: ?[]const u8,
-    failure_schema: ?[]const u8,
+    response_status: u16,
+    failure_tool_descriptor: ?[]const u8,
     failure_request_shape: ?[]const u8,
     trace_ctx: TraceContext,
 ) void {
@@ -453,10 +459,10 @@ fn recordGatewayResultMetric(
     else
         "";
 
-    runtime_telemetry.recordGatewayCallMetricWithDiagnostics(
+    runtime_telemetry.recordModelCallMetricWithDiagnostics(
         model,
         started_at_ms,
-        if (succeeded) 200 else response_code orelse 0,
+        response_status,
         truncated_bytes,
         input_tokens,
         output_tokens,
@@ -466,7 +472,7 @@ fn recordGatewayResultMetric(
         "",
         terminal_stop_reason,
         .{
-            .schema = failure_schema orelse "",
+            .tool_descriptor = failure_tool_descriptor orelse "",
             .request_shape = failure_request_shape orelse "",
         },
     );
@@ -584,10 +590,12 @@ test "neutral adapter events materialize owned completion state" {
     const Fake = struct {
         fn stream(
             _: *const agent_stream_provider.ProviderAdapter,
-            _: Allocator,
+            alloc: Allocator,
             _: agent_stream_provider.AdapterRequest,
             events: agent_stream_provider.EventSink,
         ) anyerror!void {
+            const lookup_scope = try alloc.dupe(u8, "https://example.invalid/generation");
+            defer alloc.free(lookup_scope);
             try events.emit(.provider_admitted);
             var generation = [_]u8{ 'r', 'e', 'q', 'u', 'e', 's', 't', '-', '4', '2' };
             const local_call = types.ToolCall{
@@ -613,9 +621,11 @@ test "neutral adapter events materialize owned completion state" {
                 .reason = .tool_calls,
                 .generation_reference = .{
                     .id = &generation,
+                    .lookup_scope = lookup_scope,
                 },
             } });
             @memset(&generation, 'x');
+            @memset(lookup_scope, 'x');
         }
     };
     const Callbacks = struct {
@@ -624,13 +634,13 @@ test "neutral adapter events materialize owned completion state" {
 
     var cancel_flag = std.atomic.Value(bool).init(false);
     var delivery = DeliveryCertainty.init();
-    var attempt_evidence: AttemptEvidence = .{};
+    var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
     var callback_ctx: u8 = 0;
     var route = testingRoute("https://example.invalid");
     var usage = session_usage.Usage.initFresh();
     defer usage.deinit(std.testing.allocator);
     var result = try streamModelRequest(
-        .{ .kind = "test", .stream_fn = Fake.stream },
+        .{ .kind = "test", .supported_protocol = "test", .stream_fn = Fake.stream },
         std.testing.allocator,
         &route,
         "credential",
@@ -676,7 +686,10 @@ test "neutral adapter events materialize owned completion state" {
     try std.testing.expectEqual(session_usage.Availability.pending, usage_snapshot.billing);
     try std.testing.expectEqual(@as(usize, 1), usage_snapshot.pending.len);
     try std.testing.expectEqualStrings("request-42", usage_snapshot.pending[0].id);
-    try std.testing.expect(usage_snapshot.pending[0].lookup_scope == null);
+    try std.testing.expectEqualStrings(
+        "https://example.invalid/generation",
+        usage_snapshot.pending[0].lookup_scope.?,
+    );
 }
 
 test "normalized adapter failure retains semantic recovery facts" {
@@ -706,7 +719,7 @@ test "normalized adapter failure retains semantic recovery facts" {
     var callback_ctx: u8 = 0;
     var route = testingRoute("provider:endpoint");
     var result = try streamModelRequest(
-        .{ .kind = "test", .stream_fn = Fake.stream },
+        .{ .kind = "test", .supported_protocol = "test", .stream_fn = Fake.stream },
         std.testing.allocator,
         &route,
         "credential",
@@ -769,11 +782,11 @@ test "normalized delivery-ambiguous failure keeps usage incomplete" {
     defer usage.deinit(alloc);
     var cancel_flag = std.atomic.Value(bool).init(false);
     var delivery = DeliveryCertainty.init();
-    var attempt_evidence: AttemptEvidence = .{};
+    var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
     var callback_ctx: u8 = 0;
     var route = testingRoute("provider:endpoint");
     const result = try streamModelRequest(
-        .{ .kind = "test", .stream_fn = Fake.stream },
+        .{ .kind = "test", .supported_protocol = "test", .stream_fn = Fake.stream },
         alloc,
         &route,
         "credential",
@@ -836,7 +849,7 @@ test "ambiguous-delivery category implies ambiguous delivery evidence" {
     var callback_ctx: u8 = 0;
     var route = testingRoute("provider:endpoint");
     var result = try streamModelRequest(
-        .{ .kind = "test", .stream_fn = Fake.stream },
+        .{ .kind = "test", .supported_protocol = "test", .stream_fn = Fake.stream },
         alloc,
         &route,
         "credential",
@@ -872,7 +885,7 @@ pub const VisionToolMode = agent_stream_provider.VisionMode;
 pub fn recordSelectedDynamicTool(
     alloc: Allocator,
     names: *std.ArrayList([]const u8),
-    descriptors: *std.ArrayList(gateway_schema.FunctionSchema),
+    descriptors: *std.ArrayList(tool_descriptor.Descriptor),
     execution: ToolExecutionResult,
 ) !void {
     const descriptor = execution.selected_dynamic_tool orelse return;
@@ -887,30 +900,16 @@ pub fn recordSelectedDynamicTool(
 pub fn providerFailureDetail(
     alloc: Allocator,
     category: agent_stream_provider.StreamFailure.Category,
-    response_code: ?u16,
     detail: []const u8,
     model: []const u8,
     capabilities: model_capabilities.Capabilities,
 ) ![]const u8 {
-    var response_label_buf: [32]u8 = undefined;
-    const response_label = if (response_code) |code|
-        std.fmt.bufPrint(&response_label_buf, "HTTP {d}", .{code}) catch ""
-    else
-        "";
     if (category != .request_too_large) {
-        if (response_label.len == 0 or std.mem.find(u8, detail, response_label) != null) return detail;
-        return if (detail.len > 0)
-            std.fmt.allocPrint(alloc, "{s}: {s}", .{ response_label, detail })
-        else
-            alloc.dupe(u8, response_label);
+        return detail;
     }
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    if (response_label.len > 0) {
-        try out.writer.writeAll(response_label);
-        if (detail.len > 0) try out.writer.print(": {s}", .{detail});
-        try out.writer.writeAll("\n\n");
-    } else if (detail.len > 0) {
+    if (detail.len > 0) {
         try out.writer.print("{s}\n\n", .{detail});
     }
     try out.writer.print("prompt_too_long=true\nmodel={s}\n", .{model});
@@ -929,7 +928,6 @@ test "request-too-large detail reports selected model and only known limits" {
     const known = try providerFailureDetail(
         alloc,
         .request_too_large,
-        413,
         "provider detail",
         "provider/large-model",
         .{ .context_window = 1_000_000, .max_output_tokens = 128_000 },
@@ -945,7 +943,6 @@ test "request-too-large detail reports selected model and only known limits" {
     const unknown = try providerFailureDetail(
         alloc,
         .request_too_large,
-        413,
         "",
         "provider/private-model",
         .{},

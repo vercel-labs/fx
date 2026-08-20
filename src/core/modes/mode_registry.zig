@@ -19,7 +19,7 @@ pub const Registry = struct {
         return null;
     }
 
-    pub fn buildGatewayToolProjection(
+    pub fn buildModelToolProjection(
         self: Registry,
         alloc: std.mem.Allocator,
         tool_set: tool_set_contract.ToolSet,
@@ -27,10 +27,10 @@ pub const Registry = struct {
         options: tool_advertisement.Options,
     ) !tool_advertisement.EffectiveToolProjection {
         const mode = self.lookup(id) orelse
-            return tool_advertisement.buildGatewayToolProjectionForSet(alloc, tool_set, options);
+            return tool_advertisement.buildModelToolProjectionForSet(alloc, tool_set, options);
         return switch (mode.tool_policy) {
-            .full => tool_advertisement.buildGatewayToolProjectionForSet(alloc, tool_set, options),
-            .read_only => tool_advertisement.buildReadOnlyGatewayToolProjectionForSet(alloc, tool_set, options),
+            .full => tool_advertisement.buildModelToolProjectionForSet(alloc, tool_set, options),
+            .read_only => tool_advertisement.buildReadOnlyModelToolProjectionForSet(alloc, tool_set, options),
         };
     }
 
@@ -106,7 +106,7 @@ test "mode registry applies tool policy to the supplied tool set" {
             .{
                 .name = "inspect",
                 .description = "Inspect",
-                .gateway_schema = .{
+                .descriptor = .{
                     .name = "inspect",
                     .description = "Inspect",
                     .input_schema = .{},
@@ -119,7 +119,7 @@ test "mode registry applies tool policy to the supplied tool set" {
             .{
                 .name = "mutate",
                 .description = "Mutate",
-                .gateway_schema = .{
+                .descriptor = .{
                     .name = "mutate",
                     .description = "Mutate",
                     .input_schema = .{},

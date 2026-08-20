@@ -12,8 +12,8 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const route_snapshot = @import("../gateway/route_snapshot.zig");
-const test_model_descriptors = if (builtin.is_test)
-    @import("../../builtins/gateway/model_descriptors.zig")
+const test_model_descriptor_provider = if (builtin.is_test)
+    @import("../gateway/test_adapter.zig").model_descriptor_provider
 else
     struct {};
 const picker_state = @import("../input/picker_state.zig");
@@ -423,7 +423,7 @@ pub fn Runtime(comptime App: type) type {
                     },
                     .effort => {
                         const target = if (app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else app.selected_model.items;
-                        const capabilities = model_capabilities.resolveForApp(App, app, target);
+                        const capabilities = model_capabilities.resolveForApp(App, app, target).capabilities;
                         const effort_count = model_capabilities.reasoningEffortOptionCount(capabilities);
                         for (0..effort_count) |i| {
                             effort_picker_values_buf[i] = model_capabilities.reasoningEffortAtIndex(capabilities, i);
@@ -461,7 +461,7 @@ pub fn Runtime(comptime App: type) type {
                 input_completion_runtime.CompletionRuntime(App).visibleInlineCompletion(app);
 
             const visible_model = pending_model orelse app.selected_model.items;
-            const visible_capabilities = model_capabilities.resolveForApp(App, app, visible_model);
+            const visible_capabilities = model_capabilities.resolveForApp(App, app, visible_model).capabilities;
             const model_supports_fast = visible_capabilities.supports_fast_mode;
             const model_supports_effort = visible_capabilities.reasoning_efforts.len > 0;
             const visible_effort = if (pending_model != null and model_supports_effort)
@@ -496,7 +496,7 @@ pub fn Runtime(comptime App: type) type {
                 .stream = visible_stream,
                 .completed_assistant_presentation_tail = app.pacer.hasCompletedAssistantPresentationTail(),
                 .writing_response = app.pacer.hasPending(),
-                .has_api_key = app.auth.credentialSource() != null,
+                .has_credential = app.auth.credentialSource() != null,
                 .model = visible_model,
                 .pending_images = app.pending_images.items,
                 .input_appearance = app.input_runtime.input_appearance,
@@ -566,7 +566,10 @@ pub fn Runtime(comptime App: type) type {
                 else
                     .{},
                 .model_menu = if (comptime @hasField(App, "model_cache"))
-                    render_input.modelMenuProjection(&app.model_cache)
+                    render_input.modelMenuProjectionWithAuth(
+                        &app.model_cache,
+                        if (comptime @hasField(App, "auth")) app.auth.authServiceLabel() else "",
+                    )
                 else
                     .{},
                 .session_menu = if (comptime @hasField(App, "session_persistence")) .{
@@ -1087,7 +1090,7 @@ pub fn Runtime(comptime App: type) type {
         ) render_input.RenderContext {
             const chat = view.chat;
             const visible_model = chat.configuration.model orelse app.selected_model.items;
-            const capabilities = model_capabilities.resolveForApp(App, app, visible_model);
+            const capabilities = model_capabilities.resolveForApp(App, app, visible_model).capabilities;
             var ctx = base;
             ctx.slash_registry = slash_registry;
             ctx.stream = .{};
@@ -1122,7 +1125,10 @@ pub fn Runtime(comptime App: type) type {
             ctx.auth_picker.active = false;
             ctx.skills_menu = .{};
             ctx.model_menu = if (comptime @hasField(App, "model_cache"))
-                render_input.modelMenuProjection(&app.model_cache)
+                render_input.modelMenuProjectionWithAuth(
+                    &app.model_cache,
+                    if (comptime @hasField(App, "auth")) app.auth.authServiceLabel() else "",
+                )
             else
                 .{};
             ctx.session_menu = .{};
@@ -1208,7 +1214,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn pendingPickerEffort(app: *App, model: []const u8, query: ?picker_state.ModelPickerQuery, effort_index: usize) types.ReasoningEffort {
-            const capabilities = model_capabilities.resolveForApp(App, app, model);
+            const capabilities = model_capabilities.resolveForApp(App, app, model).capabilities;
             if (query) |picker_query| {
                 if (picker_query.stage == .effort) {
                     const typed = std.mem.trim(u8, picker_query.query, " \t");
@@ -1247,7 +1253,7 @@ pub fn Runtime(comptime App: type) type {
             }
             if (app.statusline_context) {
                 items.context_used = app.total_input_tokens;
-                items.context_total = model_capabilities.resolveForApp(App, app, visible_model).context_window;
+                items.context_total = model_capabilities.resolveForApp(App, app, visible_model).capabilities.context_window;
             }
             if (comptime @hasField(App, "statusline_session")) {
                 if (app.statusline_session) {
@@ -2536,6 +2542,7 @@ pub fn Runtime(comptime App: type) type {
                 .help = render_input.helpMenuProjection(
                     &app.input_runtime.help_menu,
                     app.slashRegistry(),
+                    ctx.auth_picker.auth_service_label,
                     ctx.input.edit_state.input.items,
                 ),
                 .composer = .{
@@ -2582,7 +2589,10 @@ pub fn Runtime(comptime App: type) type {
                         ctx.input.edit_state.input.items,
                     );
                     if (comptime @hasField(App, "model_cache")) {
-                        projection.models = render_input.modelMenuProjection(&app.model_cache);
+                        projection.models = render_input.modelMenuProjectionWithAuth(
+                            &app.model_cache,
+                            if (comptime @hasField(App, "auth")) app.auth.authServiceLabel() else "",
+                        );
                     }
                     break :blk projection;
                 },
@@ -4575,15 +4585,15 @@ const CoordinatorTestApp = struct {
     auth: auth_runtime.Runtime = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     skills: skill_runtime.Runtime = .{},
-    model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.testing.allocator, "/v1/models"),
+    model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.testing.allocator),
     stream: types.StreamState = .{},
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
     statusline_sandbox: bool = false,
     statusline_context: bool = false,
     total_input_tokens: u64 = 0,
-    gateway_metadata_model: ?[]const u8 = null,
-    gateway_metadata: model_capabilities.GatewayMetadata = .{},
+    descriptor_override_model: ?[]const u8 = null,
+    descriptor_override_capabilities: model_capabilities.Capabilities = .{},
     permission_state: app_permission_runtime.State = .{},
     upgrader: CoordinatorTestUpgrader = .{},
     terminal_client: CoordinatorTestTerminalClient = .{},
@@ -4627,13 +4637,13 @@ const CoordinatorTestApp = struct {
         return false;
     }
 
-    pub fn resolvedModelCapabilities(self: *CoordinatorTestApp, model: []const u8) model_capabilities.Capabilities {
-        if (self.gateway_metadata_model) |metadata_model| {
-            if (std.mem.eql(u8, metadata_model, model)) {
-                return model_capabilities.resolveCapabilities(model, self.gateway_metadata);
+    pub fn resolvedModelDescriptor(self: *CoordinatorTestApp, model: []const u8) model_capabilities.ModelDescriptor {
+        if (self.descriptor_override_model) |override_model| {
+            if (std.mem.eql(u8, override_model, model)) {
+                return model_capabilities.configuredDescriptor(model, self.descriptor_override_capabilities);
             }
         }
-        return model_capabilities.capabilitiesForModel(model);
+        return test_model_descriptor_provider.fallback(model);
     }
 
     fn isFileIndexLoading(_: *CoordinatorTestApp) bool {
@@ -4772,19 +4782,22 @@ test "core.app_render_runtime projects an inline slash completion suffix after t
     try std.testing.expectEqualStrings("explain /he", ctx.input.edit_state.input.items);
 }
 
-test "core.app_render_runtime projects Opus 4.8 one million token context to footer" {
+test "core.app_render_runtime projects resolved model context to footer" {
     const alloc = std.testing.allocator;
+    const model = "example/large-context";
     var app = CoordinatorTestApp{
         .alloc = alloc,
         .shell = .{},
         .statusline_context = true,
         .total_input_tokens = 43_000,
+        .descriptor_override_model = model,
+        .descriptor_override_capabilities = .{ .context_window = 1_000_000 },
     };
     defer app.deinit();
 
     const statusline = Runtime(CoordinatorTestApp).buildStatuslineItems(
         &app,
-        "anthropic/claude-opus-4.8",
+        model,
     );
     try std.testing.expectEqual(@as(u64, 43_000), statusline.context_used);
     try std.testing.expectEqual(@as(?u32, 1_000_000), statusline.context_total);
@@ -4794,7 +4807,7 @@ test "core.app_render_runtime projects Opus 4.8 one million token context to foo
         false,
         false,
         true,
-        "anthropic/claude-opus-4.8",
+        model,
         .ask,
         0,
         null,
@@ -4806,7 +4819,7 @@ test "core.app_render_runtime projects Opus 4.8 one million token context to foo
         100,
         &buf,
     );
-    try std.testing.expectEqualStrings("ask · opus 4.8 · Context: 43k/1000k 4%", line);
+    try std.testing.expect(std.mem.find(u8, line, "Context: 43k/1000k 4%") != null);
 }
 
 test "core.app_render_runtime uses Gateway context window from resolved capabilities" {
@@ -4816,8 +4829,8 @@ test "core.app_render_runtime uses Gateway context window from resolved capabili
         .shell = .{},
         .statusline_context = true,
         .total_input_tokens = 12_000,
-        .gateway_metadata_model = "provider/new-long-context",
-        .gateway_metadata = .{ .context_window = 750_000 },
+        .descriptor_override_model = "provider/new-long-context",
+        .descriptor_override_capabilities = .{ .context_window = 750_000 },
     };
     defer app.deinit();
 

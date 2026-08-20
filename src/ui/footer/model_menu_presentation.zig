@@ -85,7 +85,12 @@ pub fn composeModelMenuRow(
 
     const layout = ModelMenuLayout.build(projection, row_count);
     if (projection.load_state == .ready and row_index == header_rows and row_index < layout.row_count - 1) {
-        const text = loadedCatalogStatusText(projection.catalog_state) orelse return row;
+        const text = try loadedCatalogStatusTextAlloc(
+            alloc,
+            projection.catalog_state,
+            projection.auth_service_label,
+        ) orelse return row;
+        defer alloc.free(text);
         return composeDimmedRow(alloc, text, width);
     }
     if (projection.load_state != .ready or layout.match_count == 0) {
@@ -231,7 +236,7 @@ fn modelFactsColumn(projection: ModelMenuProjection, width: u16) ?usize {
     const content_width: usize = width;
     var facts_width: usize = 0;
     for (projection.items) |item| {
-        facts_width = @max(facts_width, compactFactsWidth(item.capabilities));
+        facts_width = @max(facts_width, compactFactsWidth(item.descriptor.capabilities));
     }
     if (facts_width == 0 or content_width < indent_width + 8 + 2 + facts_width) return null;
     return content_width - facts_width;
@@ -252,7 +257,7 @@ fn composeTitleRow(
 
     var facts: std.ArrayList(u8) = .empty;
     defer facts.deinit(alloc);
-    try appendCompactFacts(alloc, &facts, item.capabilities);
+    try appendCompactFacts(alloc, &facts, item.descriptor.capabilities);
 
     const prefix_width = display_width.visibleWidthIgnoringAnsi(row.items);
     const content_width = @as(usize, width);
@@ -331,16 +336,36 @@ fn composeStateRow(alloc: Allocator, projection: ModelMenuProjection, width: u16
     return composeDimmedRow(alloc, text, width);
 }
 
-fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]const u8 {
-    if (retryableFailureText(state.failure)) |text| return text;
+fn loadedCatalogStatusTextAlloc(
+    alloc: Allocator,
+    state: model_cache_runtime.ModelMenuCatalogState,
+    auth_service_label: []const u8,
+) !?[]u8 {
+    if (retryableFailureText(state.failure)) |text| return try alloc.dupe(u8, text);
     if (state.private_models_hidden) {
-        const reason = state.public_only_reason orelse return "Using the public model catalog.";
+        const reason = state.public_only_reason orelse return try alloc.dupe(u8, "Using the public model catalog.");
         return switch (reason) {
-            .no_credential => "Using the public model catalog; sign in or use an API key for team-private models.",
-            .fx_login_team_required => "Choose a Vercel team to load its private models.",
-            .fx_login_refresh_required => "Vercel sign-in must refresh before team-private models can load.",
-            .credential_refresh_failed => "Vercel sign-in refresh failed; using the public model catalog.",
-            .authenticated_credential_rejected => "Your Gateway credential was rejected; using the public model catalog.",
+            .no_credential => if (auth_service_label.len == 0)
+                error.MissingAuthPresentation
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "Using the public model catalog; sign in with {s} or use an AI Gateway API key for team-private models.",
+                    .{auth_service_label},
+                ),
+            .tenant_required => if (auth_service_label.len == 0)
+                error.MissingAuthPresentation
+            else
+                try std.fmt.allocPrint(alloc, "Choose a {s} team to load its private models.", .{auth_service_label}),
+            .refresh_required => if (auth_service_label.len == 0)
+                error.MissingAuthPresentation
+            else
+                try std.fmt.allocPrint(alloc, "{s} sign-in must refresh before team-private models can load.", .{auth_service_label}),
+            .refresh_failed => if (auth_service_label.len == 0)
+                error.MissingAuthPresentation
+            else
+                try std.fmt.allocPrint(alloc, "{s} sign-in refresh failed; using the public model catalog.", .{auth_service_label}),
+            .credential_rejected => try alloc.dupe(u8, "Your Gateway credential was rejected; using the public model catalog."),
         };
     }
     return null;
@@ -350,8 +375,8 @@ fn retryableFailureText(failure: ?model_cache_runtime.ModelMenuCatalogState.Fail
     const value = failure orelse return null;
     if (!value.retryable) return null;
     return switch (value.category) {
-        .rate_limited => "AI Gateway rate limited model discovery; retry /models.",
-        .transport, .gateway_unavailable => "Could not reach AI Gateway; retry /models.",
+        .rate_limited => "The model service rate limited discovery; retry /models.",
+        .transport, .unavailable => "Could not reach the model service; retry /models.",
         else => "Could not refresh model catalog; retry /models.",
     };
 }
@@ -373,13 +398,17 @@ fn cloneClippedRow(alloc: Allocator, text: []const u8, width: u16) !std.ArrayLis
     return row;
 }
 
+fn testDescriptor(id: []const u8, capabilities: model_capabilities.Capabilities) model_capabilities.ModelDescriptor {
+    return model_capabilities.configuredDescriptor(id, capabilities);
+}
+
 test "model menu renders provider tabs and compact model facts" {
     const alloc = std.testing.allocator;
     const items = [_]model_cache_runtime.ModelMenuItem{
         .{
             .id = @constCast("anthropic/claude-opus-4.8"),
             .provider = "anthropic",
-            .capabilities = .{
+            .descriptor = testDescriptor("anthropic/claude-opus-4.8", .{
                 .supports_reasoning = true,
                 .supports_tool_use = true,
                 .supports_vision = true,
@@ -388,12 +417,12 @@ test "model menu renders provider tabs and compact model facts" {
                 .supports_fast_mode = true,
                 .context_window = 1_000_000,
                 .max_output_tokens = 128_000,
-            },
+            }),
         },
         .{
             .id = @constCast("openai/gpt-5"),
             .provider = "openai",
-            .capabilities = .{},
+            .descriptor = testDescriptor("openai/gpt-5", .{}),
         },
     };
     const projection: ModelMenuProjection = .{
@@ -430,7 +459,7 @@ test "model menu keeps active provider visible and omits unknown metadata" {
     const items = [_]model_cache_runtime.ModelMenuItem{.{
         .id = @constCast("private-team-provider/model-with-a-very-long-name"),
         .provider = "private-team-provider",
-        .capabilities = .{},
+        .descriptor = testDescriptor("private-team-provider/model-with-a-very-long-name", .{}),
     }};
     const projection: ModelMenuProjection = .{
         .active = true,
@@ -456,12 +485,12 @@ test "model menu keeps shared-prefix model ids distinguishable when narrow" {
     const alpha: model_cache_runtime.ModelMenuItem = .{
         .id = @constCast("provider/very-long-shared-family-production-reasoning-alpha"),
         .provider = "provider",
-        .capabilities = .{},
+        .descriptor = testDescriptor("provider/very-long-shared-family-production-reasoning-alpha", .{}),
     };
     const beta: model_cache_runtime.ModelMenuItem = .{
         .id = @constCast("provider/very-long-shared-family-production-reasoning-beta"),
         .provider = "provider",
-        .capabilities = .{},
+        .descriptor = testDescriptor("provider/very-long-shared-family-production-reasoning-beta", .{}),
     };
 
     var alpha_row = try composeTitleRow(alloc, alpha, true, null, 40);
@@ -494,37 +523,52 @@ test "model menu states and navigation budget stay bounded" {
     const failed: ModelMenuProjection = .{ .active = true, .load_state = .failed, .catalog_state = .{ .failure = .{ .category = .transport, .retryable = true } } };
     var failed_state = try composeModelMenuRow(alloc, failed, 2, 80, menuRowCount(failed, 80, 10));
     defer failed_state.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, failed_state.items, "Could not reach AI Gateway; retry /models.") != null);
+    try std.testing.expect(std.mem.find(u8, failed_state.items, "Could not reach the model service; retry /models.") != null);
 
     const items = [_]model_cache_runtime.ModelMenuItem{
-        .{ .id = @constCast("a/one"), .provider = "a", .capabilities = .{} },
-        .{ .id = @constCast("a/two"), .provider = "a", .capabilities = .{} },
-        .{ .id = @constCast("a/three"), .provider = "a", .capabilities = .{} },
+        .{ .id = @constCast("a/one"), .provider = "a", .descriptor = testDescriptor("a/one", .{}) },
+        .{ .id = @constCast("a/two"), .provider = "a", .descriptor = testDescriptor("a/two", .{}) },
+        .{ .id = @constCast("a/three"), .provider = "a", .descriptor = testDescriptor("a/three", .{}) },
     };
     const ready: ModelMenuProjection = .{ .active = true, .load_state = .ready, .items = &items };
     try std.testing.expectEqual(@as(u16, 3), visibleNavigationItemsForBudget(ready, 7));
 }
 
 test "model menu status follows provenance and retryable failure precedence" {
-    try std.testing.expect(loadedCatalogStatusText(.{ .access_level = .authenticated }) == null);
+    try std.testing.expect(try loadedCatalogStatusTextAlloc(
+        std.testing.allocator,
+        .{ .access_level = .authenticated },
+        "Vercel",
+    ) == null);
 
     const cases = [_]struct {
         state: model_cache_runtime.ModelMenuCatalogState,
+        auth_service_label: []const u8 = "Vercel",
         expected: []const u8,
     }{
-        .{ .state = .{ .public_only_reason = .no_credential, .private_models_hidden = true }, .expected = "Using the public model catalog; sign in or use an API key for team-private models." },
-        .{ .state = .{ .public_only_reason = .fx_login_team_required, .private_models_hidden = true }, .expected = "Choose a Vercel team to load its private models." },
-        .{ .state = .{ .public_only_reason = .fx_login_refresh_required, .private_models_hidden = true }, .expected = "Vercel sign-in must refresh before team-private models can load." },
-        .{ .state = .{ .public_only_reason = .credential_refresh_failed, .private_models_hidden = true }, .expected = "Vercel sign-in refresh failed; using the public model catalog." },
-        .{ .state = .{ .public_only_reason = .authenticated_credential_rejected, .private_models_hidden = true }, .expected = "Your Gateway credential was rejected; using the public model catalog." },
-        .{ .state = .{ .failure = .{ .category = .transport, .retryable = true } }, .expected = "Could not reach AI Gateway; retry /models." },
-        .{ .state = .{ .access_level = .public_only, .public_only_reason = .no_credential, .private_models_hidden = true, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI Gateway rate limited model discovery; retry /models." },
-        .{ .state = .{ .access_level = .authenticated, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI Gateway rate limited model discovery; retry /models." },
+        .{ .state = .{ .public_only_reason = .no_credential, .private_models_hidden = true }, .expected = "Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models." },
+        .{ .state = .{ .public_only_reason = .tenant_required, .private_models_hidden = true }, .expected = "Choose a Vercel team to load its private models." },
+        .{ .state = .{ .public_only_reason = .refresh_required, .private_models_hidden = true }, .expected = "Vercel sign-in must refresh before team-private models can load." },
+        .{ .state = .{ .public_only_reason = .refresh_failed, .private_models_hidden = true }, .expected = "Vercel sign-in refresh failed; using the public model catalog." },
+        .{ .state = .{ .public_only_reason = .credential_rejected, .private_models_hidden = true }, .expected = "Your Gateway credential was rejected; using the public model catalog." },
+        .{ .state = .{ .public_only_reason = .no_credential, .private_models_hidden = true }, .auth_service_label = "Example Cloud", .expected = "Using the public model catalog; sign in with Example Cloud or use an AI Gateway API key for team-private models." },
+        .{ .state = .{ .public_only_reason = .tenant_required, .private_models_hidden = true }, .auth_service_label = "Example Cloud", .expected = "Choose a Example Cloud team to load its private models." },
+        .{ .state = .{ .public_only_reason = .refresh_required, .private_models_hidden = true }, .auth_service_label = "Example Cloud", .expected = "Example Cloud sign-in must refresh before team-private models can load." },
+        .{ .state = .{ .public_only_reason = .refresh_failed, .private_models_hidden = true }, .auth_service_label = "Example Cloud", .expected = "Example Cloud sign-in refresh failed; using the public model catalog." },
+        .{ .state = .{ .failure = .{ .category = .transport, .retryable = true } }, .expected = "Could not reach the model service; retry /models." },
+        .{ .state = .{ .access_level = .public_only, .public_only_reason = .no_credential, .private_models_hidden = true, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "The model service rate limited discovery; retry /models." },
+        .{ .state = .{ .access_level = .authenticated, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "The model service rate limited discovery; retry /models." },
         .{ .state = .{ .access_level = .authenticated, .failure = .{ .category = .runtime, .retryable = true } }, .expected = "Could not refresh model catalog; retry /models." },
     };
 
     for (cases) |case| {
-        try std.testing.expectEqualStrings(case.expected, loadedCatalogStatusText(case.state).?);
+        const actual = (try loadedCatalogStatusTextAlloc(
+            std.testing.allocator,
+            case.state,
+            case.auth_service_label,
+        )).?;
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualStrings(case.expected, actual);
     }
 }
 
@@ -575,12 +619,12 @@ test "model menu facts share a left-aligned column" {
         .{
             .id = @constCast("tiny-provider/model"),
             .provider = "tiny-provider",
-            .capabilities = .{ .context_window = 1_000_000 },
+            .descriptor = testDescriptor("tiny-provider/model", .{ .context_window = 1_000_000 }),
         },
         .{
             .id = @constCast("much-longer-provider/model"),
             .provider = "much-longer-provider",
-            .capabilities = .{ .context_window = 256_000, .max_output_tokens = 128_000 },
+            .descriptor = testDescriptor("much-longer-provider/model", .{ .context_window = 256_000, .max_output_tokens = 128_000 }),
         },
     };
     const projection: ModelMenuProjection = .{
@@ -608,14 +652,14 @@ test "model menu keeps only compact facts beside the model" {
     const items = [_]model_cache_runtime.ModelMenuItem{.{
         .id = @constCast("anthropic/claude-opus-4.8"),
         .provider = "anthropic",
-        .capabilities = .{
+        .descriptor = testDescriptor("anthropic/claude-opus-4.8", .{
             .context_window = 1_000_000,
             .max_output_tokens = 128_000,
             .supports_reasoning = true,
             .supports_fast_mode = true,
             .supports_vision = true,
             .supports_tool_use = true,
-        },
+        }),
     }};
     const projection: ModelMenuProjection = .{
         .active = true,

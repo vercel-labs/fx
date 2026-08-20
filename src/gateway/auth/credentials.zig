@@ -7,9 +7,14 @@ const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("../../core/auth/secret.zig");
-const types = @import("../../core/shared/types.zig");
+const protocol_validation = @import("../protocol_validation.zig");
 
-pub const Source = types.CredentialSource;
+pub const Source = enum {
+    vercel_oidc_token,
+    ai_gateway_api_key,
+    fx_login,
+    stored_key,
+};
 
 pub const CatalogPublicOnly = union(enum) {
     no_credential,
@@ -136,7 +141,7 @@ pub fn catalogAccessForCredential(
         .fx_login => blk: {
             const team = team_context orelse
                 return .{ .public_only = .fx_login_team_required };
-            if (!types.validGatewayTeam(team))
+            if (!protocol_validation.validTeam(team))
                 return .{ .public_only = .fx_login_team_required };
             break :blk .fx_login;
         },

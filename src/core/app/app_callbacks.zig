@@ -4,9 +4,10 @@ const agent_stream_provider = @import("../agent/stream_provider.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
-const credentials = @import("../../gateway/auth/credentials.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const route_snapshot = @import("../gateway/route_snapshot.zig");
+const adapter_auth = @import("../gateway/adapter_auth.zig");
+const adapter_registry = @import("../gateway/adapter_registry.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
@@ -264,24 +265,16 @@ test "full diff formatter renders unchanged review elisions" {
 pub fn Bindings(comptime App: type) type {
     return struct {
         pub fn agentRuntimeDeps(app: *App) agent_runtime.AgentRuntimeDeps {
-            const adapter = if (comptime @hasDecl(App, "providerAdapter"))
-                app.providerAdapter()
-            else
-                agent_stream_provider.unavailable_adapter;
-            return agentRuntimeDepsForAdapter(app, adapter);
+            return agentRuntimeDepsForRegistry(app, app.adapterRegistry());
         }
 
-        pub fn agentRuntimeDepsForAdapter(
+        pub fn agentRuntimeDepsForRegistry(
             app: *App,
-            adapter: agent_stream_provider.ProviderAdapter,
+            registry: adapter_registry.AdapterRegistry,
         ) agent_runtime.AgentRuntimeDeps {
             var deps: agent_runtime.AgentRuntimeDeps = .{
                 .ctx = @ptrCast(app),
-                .provider_adapter = adapter,
-                .agent_stream_provider = if (comptime @hasDecl(App, "agentStreamProvider"))
-                    app.agentStreamProvider()
-                else
-                    agent_stream_provider.unavailable_provider,
+                .adapter_registry = registry,
                 .cooperative_transport_pulse = if (comptime @hasDecl(App, "cooperativeTransportPulse")) .{
                     .ctx = @ptrCast(app),
                     .run = cooperativeTransportPulse,
@@ -325,18 +318,10 @@ pub fn Bindings(comptime App: type) type {
                 .push_route_recovery_status = agentPushRouteRecoveryStatus,
                 .push_command_output_complete = agentPushCommandOutputComplete,
                 .push_provider_failure = agentPushProviderFailure,
-                .refresh_gateway_credential = if (comptime @hasField(App, "auth"))
-                    refreshGatewayCredential
-                else
-                    null,
                 .request_route_recovery = if (comptime @hasDecl(@TypeOf(app.worker), "requestRouteRecoveryAnswerBlocking"))
                     agentRequestRouteRecovery
                 else
                     null,
-                .available_model_descriptor = agentAvailableModelDescriptor,
-                .resolve_model_descriptor = agentResolveModelDescriptor,
-                .available_model_capabilities = agentAvailableModelCapabilities,
-                .resolve_model_capabilities = agentResolveModelCapabilities,
                 .format_tool_execution_error = agentFormatToolExecutionError,
                 .record_tool_call_rejected = agentRecordToolCallRejected,
                 .report_usage = agentReportUsage,
@@ -377,42 +362,16 @@ pub fn Bindings(comptime App: type) type {
             raw_ctx: *anyopaque,
             alloc: std.mem.Allocator,
             route: *const route_snapshot.RouteSnapshot,
+            mode: adapter_auth.RefreshMode,
         ) !agent_runtime.RouteCredential {
             const app: *App = @ptrCast(@alignCast(raw_ctx));
-            return app.resolveRouteCredential(alloc, route);
+            return app.resolveRouteCredential(alloc, route, mode);
         }
 
-        fn refreshGatewayCredential(
-            raw_ctx: *anyopaque,
-            alloc: std.mem.Allocator,
-            route: *const route_snapshot.RouteSnapshot,
-            source: credentials.Source,
-            mode: auth_runtime.CredentialRefreshMode,
-        ) !?[]u8 {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            if (source != .fx_login) return null;
-            _ = try app.auth.adapter_registry.resolveRoute(route);
-            var profile = try app.auth.connectionProfile(route.connection_id);
-            if (!std.mem.eql(u8, profile.adapter_id, route.adapter_kind) or
-                !std.mem.eql(u8, route.credential_ref, @tagName(source)))
-            {
-                return error.RouteCredentialMismatch;
-            }
-            profile.credential_ref = @constCast(route.credential_ref);
-            var credential = try app.auth.resolveAdmittedProfileCredential(alloc, profile, switch (mode) {
-                .if_needed => .if_needed,
-                .force => .force,
-            }, @tagName(source));
-            defer credential.deinit(alloc);
-            const token = credential.token;
-            credential.token = &.{};
-            return token;
-        }
-
-        pub fn modelCapabilityResolver(app: *App) model_capabilities.Resolver {
+        pub fn modelDescriptorResolver(app: *App) model_capabilities.Resolver {
             return .{
                 .ctx = @ptrCast(app),
-                .resolve_fn = agentResolveModelCapabilities,
+                .resolve_fn = agentResolveModelDescriptor,
             };
         }
 
@@ -634,30 +593,7 @@ pub fn Bindings(comptime App: type) type {
             if (comptime @hasDecl(App, "resolvedModelDescriptor")) {
                 return app.resolvedModelDescriptor(model);
             }
-            if (comptime @hasDecl(App, "resolveModelCapabilitiesForRequest")) {
-                return model_capabilities.configuredDescriptor(
-                    model,
-                    try app.resolveModelCapabilitiesForRequest(model),
-                );
-            }
             return model_capabilities.configuredDescriptor(model, .{});
-        }
-
-        fn agentResolveModelCapabilities(ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
-            const descriptor = try agentResolveModelDescriptor(ctx, std.heap.c_allocator, model);
-            return descriptor.capabilities;
-        }
-
-        fn agentAvailableModelDescriptor(ctx: *anyopaque, model: []const u8) model_capabilities.ModelDescriptor {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime @hasDecl(App, "resolvedModelDescriptor")) {
-                return app.resolvedModelDescriptor(model);
-            }
-            return model_capabilities.configuredDescriptor(model, .{});
-        }
-
-        fn agentAvailableModelCapabilities(ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities {
-            return agentAvailableModelDescriptor(ctx, model).capabilities;
         }
 
         fn agentRequestToolPermission(ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
@@ -956,13 +892,12 @@ pub fn Bindings(comptime App: type) type {
             try app_worker_runtime.Runtime(App).pushCommandOutputComplete(app, lifecycle_id);
         }
 
-        fn agentPushProviderFailure(ctx: *anyopaque, category: agent_stream_provider.StreamFailure.Category, _: ?u16, detail: []const u8, credential_source: ?types.CredentialSource) !void {
+        fn agentPushProviderFailure(ctx: *anyopaque, category: agent_stream_provider.StreamFailure.Category, detail: []const u8, source: ?adapter_auth.Source) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            const auth_failure = auth_runtime.FailureSnapshot.fromHttp(switch (category) {
-                .authentication => .unauthorized,
-                .authorization => .forbidden,
-                else => .ok,
-            }, credential_source);
+            const auth_failure = if (category == .authentication)
+                auth_runtime.FailureSnapshot.fromAuthenticationFailure(source)
+            else
+                null;
             if (auth_failure != null) {
                 try app_worker_runtime.Runtime(App).pushEvent(app, .authentication_failed);
             }
@@ -1452,10 +1387,13 @@ const FakeApp = struct {
     last_notice_tone: types.NoticeTone = .information,
     last_notice_visibility: types.NoticeVisibility = .compact_and_full,
     last_notice_record: bool = false,
-    capability_request_count: usize = 0,
 
     fn init(alloc: std.mem.Allocator) FakeApp {
         return .{ .alloc = alloc };
+    }
+
+    fn adapterRegistry(_: *FakeApp) adapter_registry.AdapterRegistry {
+        return .{ .adapters = &.{agent_stream_provider.unavailable_adapter} };
     }
 
     fn deinit(self: *FakeApp) void {
@@ -1477,16 +1415,14 @@ const FakeApp = struct {
         return count;
     }
 
-    pub fn resolveModelCapabilitiesForRequest(
-        self: *FakeApp,
+    pub fn resolveModelDescriptorForRequest(
+        _: *FakeApp,
         model: []const u8,
-    ) !model_capabilities.Capabilities {
-        self.capability_request_count += 1;
-        const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("future-tier")};
-        return model_capabilities.resolveCapabilities(
-            model,
-            .{ .reasoning_efforts = .fromSlice(&efforts) },
-        );
+    ) !model_capabilities.ModelDescriptor {
+        return model_capabilities.configuredDescriptor(model, .{
+            .supports_reasoning = true,
+            .reasoning_efforts = .fromSlice(&.{types.ReasoningEffort.literal("future-tier")}),
+        });
     }
 
     fn storeLifecycleId(
@@ -1852,29 +1788,13 @@ test "authentication failures publish authentication failure before status text"
     try deps.push_provider_failure(
         deps.ctx,
         .authentication,
-        401,
         "invalid credential",
-        .ai_gateway_api_key,
+        .{ .id = "test_key", .label = "test key", .refreshable = false },
     );
 
     try std.testing.expectEqual(@as(usize, 2), app.worker.events.items.len);
     try std.testing.expect(app.worker.events.items[0] == .authentication_failed);
     try std.testing.expect(app.worker.events.items[1] == .api_status_text);
-}
-
-test "agent deps use request-time model capability resolution when available" {
-    var app = FakeApp.init(std.testing.allocator);
-    defer app.deinit();
-
-    const deps = Bindings(FakeApp).agentRuntimeDeps(&app);
-    const capabilities = try deps.resolve_model_capabilities(
-        deps.ctx,
-        std.testing.allocator,
-        "provider/new-reasoning-model",
-    );
-
-    try std.testing.expectEqual(@as(usize, 1), app.capability_request_count);
-    try std.testing.expect(model_capabilities.reasoningEffortSupported(capabilities, types.ReasoningEffort.literal("future-tier")));
 }
 
 test "agent deps record rejected tool calls in feedback diagnostics" {

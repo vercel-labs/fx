@@ -366,7 +366,7 @@ fn appendWorkspaceIdentity(
 pub fn buildHintLine(
     stream_active: bool,
     awaiting_permission: bool,
-    has_api_key: bool,
+    has_credential: bool,
     model: []const u8,
     permission_mode: types.PermissionMode,
     queued_count: usize,
@@ -388,7 +388,7 @@ pub fn buildHintLine(
     const permission_label = permissionModeStatusLabel(permission_mode, &permission_buf);
 
     var end: usize = 0;
-    if (!awaiting_permission and !has_api_key) {
+    if (!awaiting_permission and !has_credential) {
         appendStatusSegment(out, &end, "run /login");
     }
     if (!awaiting_permission and queued_count > 0) {

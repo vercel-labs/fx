@@ -1950,7 +1950,7 @@ test "host authority capture applies explicit mode and permission capability pol
         const seed = tool_dispatch.Tool{
             .name = "inspect",
             .description = "Inspect",
-            .gateway_schema = .{
+            .descriptor = .{
                 .name = "inspect",
                 .description = "Inspect",
                 .input_schema = .{},
@@ -1970,7 +1970,7 @@ test "host authority capture applies explicit mode and permission capability pol
         fn renamed(tool: tool_dispatch.Tool, name: []const u8) tool_dispatch.Tool {
             var result = tool;
             result.name = name;
-            result.gateway_schema.name = name;
+            result.descriptor.name = name;
             return result;
         }
     };

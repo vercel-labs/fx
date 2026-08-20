@@ -1,12 +1,12 @@
 const std = @import("std");
+const adapter_auth = @import("../gateway/adapter_auth.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const io_mod = @import("../shared/io.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
-const credentials = @import("../../gateway/auth/credentials.zig");
 const background_commands = @import("../background/background_commands.zig");
-const gateway_provider = @import("../gateway/gateway_provider.zig");
+const gateway_system = @import("../gateway/gateway_system.zig");
 const route_snapshot_test_support = @import("../gateway/route_snapshot_test_support.zig");
 const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
@@ -2064,11 +2064,11 @@ fn writeAuthStateSummary(writer: *std.Io.Writer, app: anytype) !void {
 
     const auth_view = app.auth.view();
     try writer.print(
-        "auth: source={s} refreshable={s} gateway_team={s}\n",
+        "auth: source={s} refreshable={s} tenant={s}\n",
         .{
             auth_view.activeSourceLabel(),
             boolLabel(auth_view.refreshable),
-            auth_view.gatewayTeamStatus().label(),
+            auth_view.tenantStatus().label(),
         },
     );
 }
@@ -2306,7 +2306,7 @@ fn networkCallIsError(call: diagnostics.NetworkCall) bool {
 fn writeNetworkCallCompact(writer: *std.Io.Writer, call: diagnostics.NetworkCall) !void {
     try writeTraceTimestampUtc(writer, call.started_at_ms);
     try writer.print(" model={s}", .{call.model()});
-    if (call.kind != .gateway) try writer.print(" kind={s}", .{@tagName(call.kind)});
+    if (call.kind != .model) try writer.print(" kind={s}", .{@tagName(call.kind)});
     if (call.subagent_id != 0) try writer.print(" source=subagent#{d}", .{call.subagent_id}) else try writer.writeAll(" source=parent");
     if (call.errorName().len > 0) {
         try writer.print(" err={s}", .{call.errorName()});
@@ -2319,8 +2319,8 @@ fn writeNetworkCallCompact(writer: *std.Io.Writer, call: diagnostics.NetworkCall
     if (call.terminalStopReason().len > 0) try writer.print(" stop_reason={s}", .{call.terminalStopReason()});
     if (call.turn_id != 0) try writer.print(" turn={d}", .{call.turn_id});
     if (call.step_id != 0) try writer.print(" step={d}", .{call.step_id});
-    if (call.gatewaySchemaDiagnostic().len > 0) try writer.print(" gateway_schema=\"{s}\"", .{call.gatewaySchemaDiagnostic()});
-    if (call.gatewayRequestShape().len > 0) try writer.print(" request_shape=\"{s}\"", .{call.gatewayRequestShape()});
+    if (call.toolDescriptorDiagnostic().len > 0) try writer.print(" tool_descriptor=\"{s}\"", .{call.toolDescriptorDiagnostic()});
+    if (call.modelRequestShape().len > 0) try writer.print(" request_shape=\"{s}\"", .{call.modelRequestShape()});
     try writer.writeByte('\n');
 }
 
@@ -3332,8 +3332,8 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     if (comptime @hasField(App, "selected_model")) snapshot.model = app.selected_model.items;
     if (comptime @hasField(App, "effort")) snapshot.effort = app.effort.displayLabel();
     if (comptime @hasField(App, "fast_mode")) snapshot.fast_mode = app.fast_mode;
-    if (comptime @hasDecl(App, "resolvedModelCapabilities") and @hasField(App, "selected_model")) {
-        const capabilities = app.resolvedModelCapabilities(app.selected_model.items);
+    if (comptime @hasDecl(App, "resolvedModelDescriptor") and @hasField(App, "selected_model")) {
+        const capabilities = app.resolvedModelDescriptor(app.selected_model.items).capabilities;
         snapshot.reasoning_efforts = capabilities.reasoning_efforts;
         snapshot.supports_fast_mode = capabilities.supports_fast_mode;
     }
@@ -3504,7 +3504,7 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
         .effort => {
             const effort = types.ReasoningEffort.parseDisplayLabel(change.value) orelse
                 return error.InvalidSettingsCatalogValue;
-            const capabilities = app.resolvedModelCapabilities(app.selected_model.items);
+            const capabilities = app.resolvedModelDescriptor(app.selected_model.items).capabilities;
             if (!model_capabilities.reasoningEffortSupported(capabilities, effort)) {
                 const message = try std.fmt.allocPrint(
                     app.alloc,
@@ -3999,7 +3999,7 @@ const ModelCatalogCommandFakeApp = struct {
     fn init(alloc: std.mem.Allocator) !ModelCatalogCommandFakeApp {
         return ModelCatalogCommandFakeApp{
             .alloc = alloc,
-            .model_cache = model_cache_runtime.Runtime.init(alloc, "/v1/models"),
+            .model_cache = model_cache_runtime.Runtime.init(alloc),
         };
     }
 
@@ -4142,13 +4142,19 @@ test "trace auth summary preserves missing and loaded status text" {
     defer missing.deinit();
     try writeAuthStateSummary(&missing.writer, &app);
     try std.testing.expectEqualStrings(
-        "auth: source=missing refreshable=false gateway_team=unknown\n",
+        "auth: source=missing refreshable=false tenant=unknown\n",
         missing.written(),
     );
 
-    var credential = credentials.Credential{
-        .token = try alloc.dupe(u8, "token"),
-        .source = .fx_login,
+    const token = try alloc.dupe(u8, "token");
+    var credential = adapter_auth.Credential{
+        .secret_bytes = token,
+        .source = .{ .id = "session", .label = "fx login", .refreshable = true },
+        .catalog_access = .{ .authenticated = .{
+            .source = .{ .id = "session", .label = "fx login", .refreshable = true },
+            .credential = token,
+            .team_context = null,
+        } },
     };
     defer credential.deinit(alloc);
     _ = app.auth.adoptCredential(alloc, &credential);
@@ -4156,7 +4162,7 @@ test "trace auth summary preserves missing and loaded status text" {
     defer loaded.deinit();
     try writeAuthStateSummary(&loaded.writer, &app);
     try std.testing.expectEqualStrings(
-        "auth: source=fx login refreshable=true gateway_team=unset\n",
+        "auth: source=fx login refreshable=true tenant=unset\n",
         loaded.written(),
     );
 }
@@ -4268,7 +4274,7 @@ test "trace renders web search request count without content" {
     try std.testing.expect(std.mem.find(u8, text, "raw result content") == null);
 }
 
-test "trace renders gateway schema diagnostics without raw payload content" {
+test "trace renders adapter diagnostics without raw payload content" {
     const alloc = std.testing.allocator;
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
@@ -4282,8 +4288,8 @@ test "trace renders gateway schema diagnostics without raw payload content" {
         .step_id = 34,
     };
     call.setModel("zai/glm-5.2-fast");
-    call.setGatewaySchemaDiagnostic("path=prompt.0.content expected=string received=array");
-    call.setGatewayRequestShape("bytes=123 prompt_count=1 prompt.0 role=system content=array tools=array tools_count=0 toolChoice=auto");
+    call.setToolDescriptorDiagnostic("path=prompt.0.content expected=string received=array");
+    call.setModelRequestShape("bytes=123 prompt_count=1 prompt.0 role=system content=array tools=array tools_count=0 toolChoice=auto");
     diagnostics.recordNetworkCall(call);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -4294,7 +4300,7 @@ test "trace renders gateway schema diagnostics without raw payload content" {
     try std.testing.expect(std.mem.find(u8, text, "status=400") != null);
     try std.testing.expect(std.mem.find(u8, text, "turn=12") != null);
     try std.testing.expect(std.mem.find(u8, text, "step=34") != null);
-    try std.testing.expect(std.mem.find(u8, text, "gateway_schema=\"path=prompt.0.content expected=string received=array\"") != null);
+    try std.testing.expect(std.mem.find(u8, text, "tool_descriptor=\"path=prompt.0.content expected=string received=array\"") != null);
     try std.testing.expect(std.mem.find(u8, text, "request_shape=\"bytes=123 prompt_count=1 prompt.0 role=system content=array") != null);
     try std.testing.expect(std.mem.find(u8, text, "SECRET_RAW_PROMPT") == null);
 }

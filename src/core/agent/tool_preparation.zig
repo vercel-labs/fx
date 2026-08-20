@@ -647,7 +647,7 @@ test "classifiers are ordered" {
     };
     var test_web_search = builtin_tools.read_file;
     test_web_search.name = "web_search";
-    test_web_search.gateway_schema.name = "web_search";
+    test_web_search.descriptor.name = "web_search";
     const tools = [_]tool_dispatch.Tool{
         builtin_tools.skill,
         test_web_search,

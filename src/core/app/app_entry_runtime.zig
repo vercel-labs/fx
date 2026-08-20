@@ -9,7 +9,7 @@ const devbox_executor = @import("../execution/devbox_executor.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
-const gateway_provider = @import("../gateway/gateway_provider.zig");
+const gateway_system = @import("../gateway/gateway_system.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
@@ -25,7 +25,7 @@ const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const test_builtin_gateway = if (builtin.is_test)
-    @import("../../builtins/gateway.zig")
+    @import("../gateway/test_adapter.zig")
 else
     struct {};
 const test_builtin_commands = if (builtin.is_test)
@@ -42,10 +42,8 @@ pub const Config = struct {
     command_catalog: command_specs.TopLevelRegistry,
     default_model: []const u8,
     default_agent_step_limit: usize,
-    models_path: []const u8,
     gateway_retry_count: usize,
-    gateway_chat_url: []const u8,
-    gateway_provider: gateway_provider.Provider,
+    gateway_system: gateway_system.System,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     url_opener: host.UrlOpener,
@@ -67,7 +65,6 @@ pub const Config = struct {
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     acp_runner: acp_runner.Runner,
     devbox_provider: ?devbox_executor.Provider = null,
-    permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
 };
 
 pub fn run(comptime App: type, alloc: Allocator, args: []const [:0]const u8, cfg: Config) !void {
@@ -238,6 +235,14 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 writeStderr(deps, "fx: saved connection is unavailable; select or restore that connection before resuming.\n");
                 return .{ .exit = 1 };
             },
+            error.RecoveryRouteAuthorityChanged => {
+                writeStderr(deps, "fx: saved connection routing authority changed; restore the original connection before resuming.\n");
+                return .{ .exit = 1 };
+            },
+            error.RecoveryRouteAuthorityUnavailable => {
+                writeStderr(deps, "fx: saved recovery route lacks pinned authority and cannot be resumed.\n");
+                return .{ .exit = 1 };
+            },
             error.SessionBusy => {
                 writeStderr(deps, "fx: another Fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n");
                 return .{ .exit = 1 };
@@ -393,10 +398,8 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .command_catalog = cfg.command_catalog,
         .default_model = cfg.default_model,
         .default_agent_step_limit = cfg.default_agent_step_limit,
-        .models_path = cfg.models_path,
         .gateway_retry_count = cfg.gateway_retry_count,
-        .gateway_chat_url = cfg.gateway_chat_url,
-        .gateway_provider = cfg.gateway_provider,
+        .gateway_system = cfg.gateway_system,
         .background_process_provider = cfg.background_process_provider,
         .url_opener = cfg.url_opener,
         .secret_store = cfg.secret_store,
@@ -417,7 +420,6 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .load_mcp_runtime = cfg.load_mcp_runtime,
         .acp_runner = cfg.acp_runner,
         .devbox_provider = cfg.devbox_provider,
-        .permission_reviewer_provider = cfg.permission_reviewer_provider,
     };
 }
 
@@ -525,13 +527,11 @@ fn unexpectedAcpRunForTest(_: ?*anyopaque, _: Allocator, _: acp_runner.Config) a
 fn testConfig() Config {
     return .{
         .version = "0.2.10",
-        .command_catalog = test_builtin_commands.top_level_registry,
+        .command_catalog = test_builtin_commands.testTopLevelRegistry(),
         .default_model = "model",
         .default_agent_step_limit = 12,
-        .models_path = "/models",
         .gateway_retry_count = 2,
-        .gateway_chat_url = "https://gateway/chat",
-        .gateway_provider = test_builtin_gateway.provider,
+        .gateway_system = test_builtin_gateway.system,
         .url_opener = host.unavailable_url_opener,
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{ .system_prompt = "system" },
@@ -819,9 +819,11 @@ test "app entry returns after handled CLI success without initializing app" {
     try std.testing.expectEqualStrings("entry", capture.seen_config.?.mode_registry.default_mode_id);
     try std.testing.expectEqualStrings("entry_test_tool", capture.seen_config.?.tool_set.order[0]);
     try std.testing.expectEqualStrings("skills", capture.seen_config.?.skill_root_policy.workspace_roots[0].path);
-    try std.testing.expect(capture.seen_config.?.gateway_provider.chat_url.resolve_fn == test_builtin_gateway.chat_url_provider.resolve_fn);
-    try std.testing.expect(capture.seen_config.?.gateway_provider.provider_adapter.web_search.?.execute_fn == test_builtin_gateway.default_web_search_provider.execute_fn);
-    try std.testing.expect(capture.seen_config.?.gateway_provider.provider_adapter.model_catalog.?.fetch_fn == test_builtin_gateway.model_catalog_provider.fetch_fn);
+    const route_adapter = try capture.seen_config.?.gateway_system.adapter_registry.resolve(
+        test_builtin_gateway.connection_seed.adapter_id,
+    );
+    try std.testing.expect(route_adapter.web_search.?.execute_fn == test_builtin_gateway.default_web_search_provider.execute_fn);
+    try std.testing.expect(route_adapter.model_catalog.?.fetch_fn == test_builtin_gateway.model_catalog_provider.fetch_fn);
     try std.testing.expect(
         capture.seen_config.?.background_process_provider.spawn_prepared_fn ==
             cfg.background_process_provider.spawn_prepared_fn,

@@ -1300,7 +1300,7 @@ fn surfaceTestContext(input: *InputRuntime) RenderContext {
     return .{
         .slash_registry = surface_test_slash_registry,
         .stream = .{},
-        .has_api_key = true,
+        .has_credential = true,
         .model = "gpt-5.1",
         .queued_count = 0,
         .subagent_count = 0,
@@ -1406,7 +1406,7 @@ test "surface footer measurement preserves the narrow tool activity projection" 
     const approval = ApprovalPrompt{};
     const ctx: RenderContext = .{
         .stream = .{ .active = true, .last_activity_kind = .read, .read_count = 1 },
-        .has_api_key = true,
+        .has_credential = true,
         .model = "gpt-5.1",
         .queued_count = 0,
         .subagent_count = 0,
@@ -1447,7 +1447,7 @@ test "surface footer measurement preserves route recovery status tone" {
     const approval = ApprovalPrompt{};
     const ctx = RenderContext{
         .stream = .{},
-        .has_api_key = true,
+        .has_credential = true,
         .model = "gpt-5.1",
         .queued_count = 0,
         .subagent_count = 0,
@@ -1516,7 +1516,7 @@ test "surface footer measurement keeps clipped command status transcript-owned" 
             .last_activity_kind = .command,
             .token_progress = .{ .input_tokens = 10, .output_tokens = 20 },
         },
-        .has_api_key = true,
+        .has_credential = true,
         .model = "gpt-5.1",
         .queued_count = 0,
         .subagent_count = 0,
@@ -1691,6 +1691,7 @@ test "queued editor exposes only its file picker while a response streams" {
 
 test "surface footer measurement reserves only the compact auth picker rows" {
     const auth_runtime = @import("../../core/auth/auth_runtime.zig");
+    const adapter_auth = @import("../../core/gateway/adapter_auth.zig");
     const alloc = std.testing.allocator;
     var approval = ApprovalPrompt{};
     defer approval.deinit(alloc);
@@ -1699,11 +1700,16 @@ test "surface footer measurement reserves only the compact auth picker rows" {
     var shell = surfaceTestShell(24, 80);
     defer shell.deinit(alloc);
     var ctx = surfaceTestContext(&input);
+    const sources = [_]adapter_auth.CredentialSourceDescriptor{
+        .{ .id = @constCast("ai_gateway_api_key"), .presentation_label = @constCast("AI_GATEWAY_API_KEY"), .available = true, .refreshable = false, .supports_team_selection = false },
+        .{ .id = @constCast("fx_login"), .presentation_label = @constCast("fx login"), .available = true, .refreshable = true, .supports_team_selection = true },
+    };
     ctx.auth_picker = auth_runtime.PickerView{
         .active = true,
-        .available_sources = auth_runtime.SourceSet.initMany(&.{ .ai_gateway_api_key, .fx_login }),
-        .selected_choice = .{ .source = .fx_login },
-        .active_source = .fx_login,
+        .sources = &sources,
+        .selected_choice = .{ .source = "fx_login" },
+        .active_source = .{ .id = "fx_login", .label = "fx login", .refreshable = true },
+        .auth_service_label = "Vercel",
         .include_skip = false,
     };
 
@@ -1736,14 +1742,22 @@ test "surface footer places the cursor after the Vercel team query" {
         .name = &team_name,
     }};
     var ctx = surfaceTestContext(&input);
+    const sources = [_]adapter_auth.CredentialSourceDescriptor{.{
+        .id = @constCast("fx_login"),
+        .presentation_label = @constCast("fx login"),
+        .available = true,
+        .refreshable = true,
+        .supports_team_selection = true,
+    }};
     ctx.auth_picker = auth_runtime.PickerView{
         .active = true,
-        .available_sources = auth_runtime.SourceSet.initOne(.fx_login),
+        .sources = &sources,
         .selected_choice = .{ .team = 0 },
-        .active_source = .fx_login,
+        .active_source = .{ .id = "fx_login", .label = "fx login", .refreshable = true },
+        .auth_service_label = "Vercel",
         .include_skip = false,
         .stage = .change_team,
-        .fx_login_session_available = true,
+        .team_selection_available = true,
         .teams = &teams,
         .team_query = "play",
     };
@@ -1779,12 +1793,13 @@ test "surface footer keeps the Vercel team query and cursor visible at minimum h
     var ctx = surfaceTestContext(&input);
     ctx.auth_picker = auth_runtime.PickerView{
         .active = true,
-        .available_sources = .empty,
+        .sources = &.{},
         .selected_choice = null,
-        .active_source = .fx_login,
+        .active_source = .{ .id = "fx_login", .label = "fx login", .refreshable = true },
+        .auth_service_label = "Vercel",
         .include_skip = false,
         .stage = .change_team,
-        .fx_login_session_available = true,
+        .team_selection_available = true,
         .team_query = "play",
     };
 
@@ -1829,17 +1844,23 @@ test "surface footer keeps the Vercel team query and cursor visible at minimum h
 
 test "surface footer keeps the selected auth source visible at minimum height" {
     const auth_runtime = @import("../../core/auth/auth_runtime.zig");
+    const adapter_auth = @import("../../core/gateway/adapter_auth.zig");
     const alloc = std.testing.allocator;
     var approval = ApprovalPrompt{};
     defer approval.deinit(alloc);
     var input = InputRuntime{};
     defer input.deinit(alloc);
     var ctx = surfaceTestContext(&input);
+    const sources = [_]adapter_auth.CredentialSourceDescriptor{
+        .{ .id = @constCast("ai_gateway_api_key"), .presentation_label = @constCast("AI_GATEWAY_API_KEY"), .available = true, .refreshable = false, .supports_team_selection = false },
+        .{ .id = @constCast("fx_login"), .presentation_label = @constCast("fx login"), .available = true, .refreshable = true, .supports_team_selection = true },
+    };
     ctx.auth_picker = auth_runtime.PickerView{
         .active = true,
-        .available_sources = auth_runtime.SourceSet.initMany(&.{ .ai_gateway_api_key, .fx_login }),
-        .selected_choice = .{ .source = .fx_login },
-        .active_source = .ai_gateway_api_key,
+        .sources = &sources,
+        .selected_choice = .{ .source = "fx_login" },
+        .active_source = .{ .id = "ai_gateway_api_key", .label = "AI_GATEWAY_API_KEY", .refreshable = false },
+        .auth_service_label = "Vercel",
         .include_skip = false,
     };
 

@@ -12,7 +12,7 @@ const terminal = buildTerminalSpec();
 fn buildTerminalSpec() tool_dispatch.Tool {
     var spec = builtin_tools.terminal;
     spec.description = terminal_description;
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "terminal",
         .description = terminal_description,
         .input_schema = .{
@@ -57,7 +57,7 @@ test "browser workspace projects exactly one command-only terminal" {
     try std.testing.expectEqualStrings("terminal", advertisement_set.order[0]);
     try std.testing.expectEqual(@as(usize, 0), advertisement_set.read_only_tool_names.len);
 
-    const schema = registry.tools[0].gateway_schema;
+    const schema = registry.tools[0].descriptor;
     try std.testing.expectEqual(@as(usize, 2), schema.input_schema.properties.len);
     try std.testing.expectEqualStrings("action", schema.input_schema.properties[0].name);
     try std.testing.expectEqualStrings("command", schema.input_schema.properties[1].name);

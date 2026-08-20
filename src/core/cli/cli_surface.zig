@@ -4,7 +4,6 @@ const io_mod = @import("../shared/io.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const adapter_auth = @import("../gateway/adapter_auth.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
-const credentials = @import("../../gateway/auth/credentials.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const background_record_liveness = @import("../background/background_record_liveness.zig");
 const background_store = @import("../background/background_store.zig");
@@ -16,7 +15,7 @@ const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const devbox_executor = @import("../execution/devbox_executor.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
-const gateway_provider = @import("../gateway/gateway_provider.zig");
+const gateway_system = @import("../gateway/gateway_system.zig");
 const adapter_registry = @import("../gateway/adapter_registry.zig");
 const connection_registry = @import("../gateway/connection_registry.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
@@ -26,7 +25,6 @@ const background_process_provider = @import(
 const github_publish = @import("../github/github_publish.zig");
 const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
-const oauth_transport = @import("../../gateway/auth/oauth_transport.zig");
 const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
@@ -38,7 +36,7 @@ const skill_contract = @import("../skills/skill_contract.zig");
 const types = @import("../shared/types.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const test_builtin_gateway = if (builtin.is_test)
-    @import("../../builtins/gateway.zig")
+    @import("../gateway/test_adapter.zig")
 else
     struct {};
 const context_contract = @import("../workspace/context_contract.zig");
@@ -129,6 +127,7 @@ pub const InteractiveLaunch = struct {
     upgrade_relaunch: bool = false,
     record_requested: bool = false,
     modifiers: LaunchModifiers = .{},
+    slash_registry: command_specs.SlashRegistry = .{ .commands = &.{} },
 
     pub fn deinit(self: *InteractiveLaunch, alloc: Allocator) void {
         if (self.requested_resume) |*target| target.deinit(alloc);
@@ -173,10 +172,8 @@ pub const Config = struct {
     default_model: []const u8,
     default_fast_mode: bool = false,
     default_agent_step_limit: usize,
-    models_path: []const u8,
     gateway_retry_count: usize,
-    gateway_chat_url: []const u8,
-    gateway_provider: gateway_provider.Provider,
+    gateway_system: gateway_system.System,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     url_opener: host.UrlOpener,
@@ -198,7 +195,6 @@ pub const Config = struct {
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     acp_runner: acp_runner.Runner,
     devbox_provider: ?devbox_executor.Provider = null,
-    permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
 };
 
 const LocalSurfaceOptions = struct {
@@ -299,8 +295,6 @@ const WorkflowOptions = struct {
 };
 
 const WriteFn = *const fn (?*anyopaque, []const u8) anyerror!void;
-const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, bool, usize, connection_registry.Seed) anyerror!app_lifecycle.StartupState;
-const LoadCatalogStartupStateFn = *const fn (Allocator, host.SecretStore, []const u8, bool, usize, connection_registry.Seed) anyerror!app_lifecycle.StartupState;
 const LoadStartupStateWithoutCredentialsFn = *const fn (Allocator, []const u8, bool, usize, connection_registry.Seed) anyerror!app_lifecycle.StartupState;
 const LoadStartupStatusWithoutCredentialsFn = *const fn (Allocator, []const u8, usize) anyerror!app_lifecycle.StartupStatus;
 const ResolveConnectionCredentialFn = *const fn (
@@ -308,9 +302,9 @@ const ResolveConnectionCredentialFn = *const fn (
     adapter_registry.AdapterRegistry,
     host.SecretStore,
     connection_registry.Profile,
-    credentials.LoadMode,
+    app_lifecycle.CredentialLoadMode,
     ?*const std.atomic.Value(bool),
-) anyerror!credentials.Resolution;
+) anyerror!app_lifecycle.CredentialResolution;
 const GetenvFn = *const fn (?*anyopaque, []const u8) ?[]const u8;
 const EnvironMapFn = *const fn (?*anyopaque) ?*const std.process.Environ.Map;
 const SelfExePathFn = *const fn (?*anyopaque, Allocator) anyerror![]u8;
@@ -324,8 +318,6 @@ const RunDeps = struct {
     setup_ctx: ?*anyopaque = null,
     write_stdout: WriteFn = writeRealStdout,
     write_stderr: WriteFn = writeRealStderr,
-    load_startup_state: LoadStartupStateFn = app_lifecycle.loadStartupState,
-    load_catalog_startup_state: LoadCatalogStartupStateFn = app_lifecycle.loadCatalogStartupState,
     load_startup_state_without_credentials: LoadStartupStateWithoutCredentialsFn = app_lifecycle.loadStartupStateWithoutCredentials,
     load_startup_status_without_credentials: LoadStartupStatusWithoutCredentialsFn = app_lifecycle.loadStartupStatusWithoutCredentials,
     resolve_connection_credential: ResolveConnectionCredentialFn = app_lifecycle.resolveConnectionCredential,
@@ -341,9 +333,11 @@ const TopLevelAuthBinding = struct {
     profile: connection_registry.Profile,
     adapter: agent_stream_provider.ProviderAdapter,
     auth: adapter_auth.Provider,
+    auth_service: adapter_auth.AuthServicePresentation,
     host: adapter_auth.AuthHost,
 
     fn deinit(self: *TopLevelAuthBinding, alloc: Allocator) void {
+        self.auth_service.deinit(alloc);
         self.startup.deinit(alloc);
         self.* = undefined;
     }
@@ -355,17 +349,22 @@ fn resolveTopLevelAuth(alloc: Allocator, cfg: Config, deps: RunDeps) !TopLevelAu
         cfg.default_model,
         cfg.default_fast_mode,
         cfg.default_agent_step_limit,
-        cfg.gateway_provider.connection_seed,
+        cfg.gateway_system.connection_seed,
     );
     errdefer startup.deinit(alloc);
+    _ = try migrateLegacyCredentialReference(alloc, cfg, deps, &startup);
     const connections = if (startup.connections) |*value| value else return error.ConnectionRegistryUnavailable;
     const profile = connections.selectedProfile();
-    const adapter = try cfg.gateway_provider.adapter_registry.resolveProfile(profile);
+    const adapter = try cfg.gateway_system.adapter_registry.resolveProfile(profile);
+    const auth = adapter.auth orelse return error.MissingAuthCapability;
+    var auth_service = try auth.authServicePresentation(alloc);
+    errdefer auth_service.deinit(alloc);
     return .{
         .startup = startup,
         .profile = profile,
         .adapter = adapter,
-        .auth = adapter.auth orelse return error.MissingAuthCapability,
+        .auth = auth,
+        .auth_service = auth_service,
         .host = .{ .secret_store = cfg.secret_store, .url_opener = cfg.url_opener },
     };
 }
@@ -375,11 +374,32 @@ fn selectedStartupProfile(startup: *app_lifecycle.StartupState) !connection_regi
     return connections.selectedProfile();
 }
 
+fn migrateLegacyCredentialReference(
+    alloc: Allocator,
+    cfg: Config,
+    deps: RunDeps,
+    startup: *app_lifecycle.StartupState,
+) !bool {
+    return app_lifecycle.migrateLegacyCredentialReference(
+        startup,
+        alloc,
+        cfg.gateway_system.adapter_registry,
+        cfg.secret_store,
+        .stored,
+        null,
+    ) catch |err| {
+        try writeStderr(deps, "fx: ");
+        try writeStderr(deps, app_lifecycle.legacyCredentialMigrationErrorMessage(err));
+        try writeStderr(deps, "\n");
+        return err;
+    };
+}
+
 fn resolveStartupAdapter(
     cfg: Config,
     startup: *app_lifecycle.StartupState,
 ) !agent_stream_provider.ProviderAdapter {
-    return cfg.gateway_provider.adapter_registry.resolveProfile(
+    return cfg.gateway_system.adapter_registry.resolveProfile(
         try selectedStartupProfile(startup),
     );
 }
@@ -757,9 +777,7 @@ fn runNonInteractiveWithDeps(
                 .default_model = cfg.default_model,
                 .default_agent_step_limit = cfg.default_agent_step_limit,
                 .gateway_retry_count = cfg.gateway_retry_count,
-                .gateway_chat_url = cfg.gateway_provider.chat_url.resolve(cfg.gateway_chat_url),
-                .gateway_models_path = cfg.models_path,
-                .gateway_provider = cfg.gateway_provider,
+                .gateway_system = cfg.gateway_system,
                 .background_process_provider = cfg.background_process_provider,
                 .secret_store = cfg.secret_store,
                 .prompt_policy = cfg.prompt_policy,
@@ -774,7 +792,6 @@ fn runNonInteractiveWithDeps(
                 .context_registry = cfg.context_registry,
                 .mode_registry = cfg.mode_registry,
                 .devbox_provider = cfg.devbox_provider,
-                .permission_reviewer_provider = cfg.permission_reviewer_provider,
                 .context_limit_overrides = global_args.modifiers.context_limit_overrides,
                 .additional_directories = global_args.modifiers.additional_directories,
                 .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
@@ -791,7 +808,7 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             }
             var binding = resolveTopLevelAuth(alloc, cfg, deps) catch |err| switch (err) {
-                error.MissingAdapter, error.MissingAuthCapability => {
+                error.MissingAdapter, error.MissingAuthCapability, error.UnsupportedProtocol => {
                     try writeStderr(deps, "fx login: unsupported connection adapter\n");
                     return .handled_failure;
                 },
@@ -806,8 +823,17 @@ fn runNonInteractiveWithDeps(
                     return .handled_failure;
                 },
                 .failed => |failure| {
-                    const message = switch (failure.category) {
-                        .configuration => "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first\n",
+                    var owned_message: ?[]u8 = null;
+                    defer if (owned_message) |message| alloc.free(message);
+                    const message: []const u8 = switch (failure.category) {
+                        .configuration => configured: {
+                            owned_message = try std.fmt.allocPrint(
+                                alloc,
+                                "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx {s} App client id first\n",
+                                .{binding.auth_service.service_label},
+                            );
+                            break :configured owned_message.?;
+                        },
                         .denied => "fx login: authorization denied\n",
                         .expired => "fx login: authorization expired; run fx login again\n",
                         else => "fx login: failed to sign in\n",
@@ -823,7 +849,7 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             }
             var binding = resolveTopLevelAuth(alloc, cfg, deps) catch |err| switch (err) {
-                error.MissingAdapter, error.MissingAuthCapability => {
+                error.MissingAdapter, error.MissingAuthCapability, error.UnsupportedProtocol => {
                     try writeStderr(deps, "fx logout: unsupported connection adapter\n");
                     return .handled_failure;
                 },
@@ -834,7 +860,7 @@ fn runNonInteractiveWithDeps(
             const result = switch (outcome) {
                 .completed => |value| value,
                 .failed => {
-                    try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
+                    try writeStderr(deps, "fx logout: failed to durably remove saved fx login\n");
                     return .handled_failure;
                 },
                 .cancelled => {
@@ -862,7 +888,7 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             }
             var binding = resolveTopLevelAuth(alloc, cfg, deps) catch |err| switch (err) {
-                error.MissingAdapter, error.MissingAuthCapability => {
+                error.MissingAdapter, error.MissingAuthCapability, error.UnsupportedProtocol => {
                     try writeStderr(deps, "fx teams: unsupported connection adapter\n");
                     return .handled_failure;
                 },
@@ -894,7 +920,7 @@ fn runNonInteractiveWithDeps(
                 try writeTopLevelUsage(cfg.command_catalog, deps, .setup);
                 return .handled_failure;
             }
-            return if (try runPasteSetup(alloc, cfg.secret_store, deps)) .handled_success else .handled_failure;
+            return if (try runEnteredSecretSetup(alloc, cfg, deps)) .handled_success else .handled_failure;
         },
         .status => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
@@ -902,7 +928,7 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             };
             var binding = resolveTopLevelAuth(alloc, cfg, deps) catch |err| switch (err) {
-                error.MissingAdapter, error.MissingAuthCapability => {
+                error.MissingAdapter, error.MissingAuthCapability, error.UnsupportedProtocol => {
                     try writeStderr(deps, "fx status: unsupported connection adapter\n");
                     return .handled_failure;
                 },
@@ -919,7 +945,7 @@ fn runNonInteractiveWithDeps(
                 .loaded => |value| status: {
                     var adapter_status = value;
                     defer adapter_status.deinit(alloc);
-                    break :status try auth_runtime.takeAdapterStatus(&adapter_status);
+                    break :status auth_runtime.takeAdapterStatus(&adapter_status, binding.profile.display_name);
                 },
                 .failed => |failure| .{ .failure = failure.category },
                 .cancelled => {
@@ -931,11 +957,13 @@ fn runNonInteractiveWithDeps(
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
             const mcp_config_diagnostic = try cfg.inspect_mcp_profile_config(alloc);
 
+            const auth_help = try startup.auth.missingHelpAlloc(alloc, .cli);
+            defer if (auth_help) |value| alloc.free(value);
             const snapshot = statusSnapshotFromStartupWithBuild(startup, .{
                 .channel = cfg.build_channel,
                 .version = cfg.version,
                 .revision = cfg.revision,
-            }, mcp_config_diagnostic);
+            }, auth_help, mcp_config_diagnostic);
             if (opts.format == .json) {
                 try writeStatusJsonLine(alloc, deps, snapshot);
                 return .handled_success;
@@ -956,7 +984,7 @@ fn runNonInteractiveWithDeps(
                 cfg.default_model,
                 cfg.default_fast_mode,
                 cfg.default_agent_step_limit,
-                cfg.gateway_provider.connection_seed,
+                cfg.gateway_system.connection_seed,
             );
             defer startup.deinit(alloc);
             const adapter = try resolveStartupAdapter(cfg, &startup);
@@ -987,11 +1015,17 @@ fn runNonInteractiveWithDeps(
                 cfg.default_model,
                 cfg.default_fast_mode,
                 cfg.default_agent_step_limit,
-                cfg.gateway_provider.connection_seed,
+                cfg.gateway_system.connection_seed,
             );
             defer startup.deinit(alloc);
+            const legacy_credential_migrated = try migrateLegacyCredentialReference(
+                alloc,
+                cfg,
+                deps,
+                &startup,
+            );
             const profile = try selectedStartupProfile(&startup);
-            const adapter = cfg.gateway_provider.adapter_registry.resolveProfile(profile) catch {
+            const adapter = cfg.gateway_system.adapter_registry.resolveProfile(profile) catch {
                 try writeStderr(deps, "fx models: unsupported connection adapter\n");
                 return .handled_failure;
             };
@@ -999,17 +1033,24 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, "fx models: model catalog unavailable for selected connection\n");
                 return .handled_failure;
             };
-            var credential_resolution = try deps.resolve_connection_credential(
-                alloc,
-                cfg.gateway_provider.adapter_registry,
-                cfg.secret_store,
-                profile,
-                .stored,
-                null,
-            );
-            if (credential_resolution.credential) |credential| {
-                startup.credential = credential;
-                credential_resolution.credential = null;
+            var auth_service: ?adapter_auth.AuthServicePresentation = if (adapter.auth) |auth|
+                try auth.authServicePresentation(alloc)
+            else
+                null;
+            defer if (auth_service) |*presentation| presentation.deinit(alloc);
+            if (!legacy_credential_migrated) {
+                var credential_resolution = try deps.resolve_connection_credential(
+                    alloc,
+                    cfg.gateway_system.adapter_registry,
+                    cfg.secret_store,
+                    profile,
+                    .stored,
+                    null,
+                );
+                if (credential_resolution.credential) |credential| {
+                    startup.credential = credential;
+                    credential_resolution.credential = null;
+                }
             }
             try startup.normalizeModels(alloc, adapter.model_descriptors);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
@@ -1017,12 +1058,14 @@ fn runNonInteractiveWithDeps(
             const catalog_access = startup.modelCatalogAccess();
             const result = model_catalog.fetchWithPublicFallback(catalog_provider, alloc, .{
                 .access = catalog_access,
-                .endpoint = cfg.models_path,
             });
             const loaded = switch (result) {
                 .loaded => |loaded| loaded,
                 .failed => |failure| {
-                    const error_name = @errorName(failure.failure.asError());
+                    const error_name = if (failure.failure.category == .unavailable)
+                        "GatewayUnavailable"
+                    else
+                        @errorName(failure.failure.asError());
                     const message = try std.fmt.allocPrint(
                         alloc,
                         "could not list models: {s}",
@@ -1054,6 +1097,7 @@ fn runNonInteractiveWithDeps(
                 .ids = ids.items,
                 .private_models_hidden = loaded.provenance.access.private_models_may_be_hidden,
                 .public_only_reason = loaded.provenance.access.public_only_reason,
+                .auth_service_label = if (auth_service) |presentation| presentation.service_label else "",
             }).render(alloc, opts.format);
             defer alloc.free(text);
             try writeFormattedOutput(deps, text, opts.format);
@@ -1065,9 +1109,19 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             };
 
+            var binding = resolveTopLevelAuth(alloc, cfg, deps) catch |err| switch (err) {
+                error.MissingAdapter, error.MissingAuthCapability, error.UnsupportedProtocol => {
+                    try writeStderr(deps, "fx doctor: unsupported connection adapter\n");
+                    return .handled_failure;
+                },
+                else => return err,
+            };
+            defer binding.deinit(alloc);
             const mcp_config_diagnostic = try cfg.inspect_mcp_profile_config(alloc);
             var snapshot = try doctor_runtime.collect(
                 alloc,
+                binding.auth,
+                binding.profile,
                 cfg.secret_store,
                 cfg.default_model,
                 cfg.default_agent_step_limit,
@@ -1360,7 +1414,7 @@ fn runNonInteractiveWithDeps(
                 cfg.default_model,
                 cfg.default_fast_mode,
                 cfg.default_agent_step_limit,
-                cfg.gateway_provider.connection_seed,
+                cfg.gateway_system.connection_seed,
             ) catch |err| {
                 try writeWorkspaceCommandError(alloc, cfg.command_catalog, deps, rest, err);
                 return .handled_failure;
@@ -1419,11 +1473,17 @@ fn runNonInteractiveWithDeps(
                 cfg.default_model,
                 cfg.default_fast_mode,
                 cfg.default_agent_step_limit,
-                cfg.gateway_provider.connection_seed,
+                cfg.gateway_system.connection_seed,
             );
             defer startup.deinit(alloc);
+            const legacy_credential_migrated = try migrateLegacyCredentialReference(
+                alloc,
+                cfg,
+                deps,
+                &startup,
+            );
             const profile = try selectedStartupProfile(&startup);
-            const adapter = cfg.gateway_provider.adapter_registry.resolveProfile(profile) catch {
+            const adapter = cfg.gateway_system.adapter_registry.resolveProfile(profile) catch {
                 return writeUnavailableCredits(
                     alloc,
                     deps,
@@ -1437,24 +1497,26 @@ fn runNonInteractiveWithDeps(
                     opts.format,
                 );
             };
-            var credential_resolution = try deps.resolve_connection_credential(
-                alloc,
-                cfg.gateway_provider.adapter_registry,
-                cfg.secret_store,
-                profile,
-                .stored,
-                null,
-            );
-            if (credential_resolution.credential) |credential| {
-                startup.credential = credential;
-                credential_resolution.credential = null;
+            if (!legacy_credential_migrated) {
+                var credential_resolution = try deps.resolve_connection_credential(
+                    alloc,
+                    cfg.gateway_system.adapter_registry,
+                    cfg.secret_store,
+                    profile,
+                    .stored,
+                    null,
+                );
+                if (credential_resolution.credential) |credential| {
+                    startup.credential = credential;
+                    credential_resolution.credential = null;
+                }
             }
             try startup.normalizeModels(alloc, adapter.model_descriptors);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
             var snapshot = account_usage.fetch(alloc, .{
-                .credential = startup.apiKey(),
-                .tenant = startup.gatewayTeam(),
+                .credential = startup.credentialSecret(),
+                .tenant = startup.tenantContext(),
             });
             defer snapshot.deinit(alloc);
             const text = try snapshot.render(alloc, opts.format);
@@ -1513,7 +1575,7 @@ fn runNonInteractiveWithDeps(
                 cfg.default_model,
                 cfg.default_fast_mode,
                 cfg.default_agent_step_limit,
-                cfg.gateway_provider.connection_seed,
+                cfg.gateway_system.connection_seed,
             ) catch |err| {
                 if (opts.format == .json) {
                     try writeJsonCommandFailure(alloc, deps, "upgrade", err, "failed to load update settings");
@@ -1666,12 +1728,12 @@ fn writeStderr(deps: RunDeps, text: []const u8) !void {
     try deps.write_stderr(deps.stderr_ctx, text);
 }
 
-fn runPasteSetup(
+fn runEnteredSecretSetup(
     alloc: Allocator,
-    secret_store: host.SecretStore,
+    cfg: Config,
     deps: RunDeps,
 ) !bool {
-    if (secret_store.isDisabled()) {
+    if (cfg.secret_store.isDisabled()) {
         try writeStderr(deps, "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n");
         return false;
     }
@@ -1680,37 +1742,169 @@ fn runPasteSetup(
         return false;
     }
 
-    try writeStderr(deps, "Paste AI Gateway API key (input hidden): ");
-    const stored_interactively = secret_store.storeInteractive() catch {
+    var binding = resolveTopLevelAuth(alloc, cfg, deps) catch |err| switch (err) {
+        error.MissingAdapter, error.MissingAuthCapability, error.UnsupportedProtocol => {
+            try writeStderr(deps, "fx setup: unsupported connection adapter\n");
+            return false;
+        },
+        else => return err,
+    };
+    defer binding.deinit(alloc);
+
+    var inventory_request = adapter_auth.SourceInventoryRequest{
+        .profile = try adapter_auth.AuthProfileIdentity.init(alloc, binding.profile),
+        .host = binding.host,
+    };
+    defer inventory_request.deinit(alloc);
+    var inventory = switch (try binding.auth.sourceInventory(alloc, &inventory_request)) {
+        .loaded => |value| value,
+        .invalid_configuration => {
+            try writeStderr(deps, "fx setup: invalid authentication configuration\n");
+            return false;
+        },
+        .missing_capability => {
+            try writeStderr(deps, "fx setup: API key setup is unavailable for this connection\n");
+            return false;
+        },
+        .failed => {
+            try writeStderr(deps, "fx setup: could not load available credential sources\n");
+            return false;
+        },
+        .cancelled => {
+            try writeStderr(deps, "fx setup: API key setup was cancelled\n");
+            return false;
+        },
+    };
+    defer inventory.deinit(alloc);
+
+    const source = for (inventory.sources) |*value| {
+        if (value.entered_secret != null) break value;
+    } else {
+        try writeStderr(deps, "fx setup: API key setup is unavailable for this connection\n");
+        return false;
+    };
+    const source_presentation = source.entered_secret.?;
+    const prompt = try std.fmt.allocPrint(
+        alloc,
+        "Paste {s} {s} (input hidden): ",
+        .{ source_presentation.verification_service_label, source_presentation.secret_kind_label },
+    );
+    defer alloc.free(prompt);
+    try writeStderr(deps, prompt);
+
+    const entered_secret = deps.read_masked_key(
+        deps.setup_ctx,
+        alloc,
+        deps.write_stderr,
+        deps.stderr_ctx,
+    ) catch {
         try writeStderr(deps, "\nfx setup: API key was not saved\n");
         return false;
     };
-    if (!stored_interactively) {
-        const key = deps.read_masked_key(
-            deps.setup_ctx,
-            alloc,
-            deps.write_stderr,
-            deps.stderr_ctx,
-        ) catch {
-            try writeStderr(deps, "\nfx setup: API key was not saved\n");
-            return false;
-        };
-        defer secret.zeroAndFree(alloc, key);
-        try writeStderr(deps, "\n");
-        secret_store.store(alloc, key) catch {
-            try writeStderr(deps, "fx setup: API key was not saved\n");
-            return false;
-        };
-    }
+    var entered_secret_owned = true;
+    defer if (entered_secret_owned) secret.zeroAndFree(alloc, entered_secret);
+    try writeStderr(deps, "\n");
 
+    var submission = init_submission: {
+        var profile_identity = try inventory.origin_profile.clone(alloc);
+        errdefer profile_identity.deinit(alloc);
+        const source_id = try alloc.dupe(u8, source.id);
+        errdefer alloc.free(source_id);
+        var presentation = try source_presentation.clone(alloc);
+        errdefer presentation.deinit(alloc);
+        break :init_submission adapter_auth.EnteredSecretSubmission{
+            .request_id = 1,
+            .profile = profile_identity,
+            .source_id = source_id,
+            .presentation = presentation,
+            .secret_value = .{ .bytes = entered_secret },
+            .host = binding.host,
+        };
+    };
+    entered_secret_owned = false;
+    var completion = binding.auth.submitEnteredSecret(alloc, &submission);
+    defer completion.deinit(alloc);
+
+    const secret_label = completion.presentation.secret_kind_label;
+    const verification_service = completion.presentation.verification_service_label;
+    const destination = completion.presentation.storage_destination_label;
+    switch (completion.outcome.terminal) {
+        .acquired => {
+            const message = try std.fmt.allocPrint(alloc, "Saved {s} to {s}.\n", .{ secret_label, destination });
+            defer alloc.free(message);
+            try writeStdout(deps, message);
+            return true;
+        },
+        .failed => |failure| switch (failure.stage) {
+            .validation => {
+                const denied = failure.cause == .adapter and failure.cause.adapter.category == .denied;
+                const message = if (denied)
+                    try std.fmt.allocPrint(
+                        alloc,
+                        "The {s} refused that {s}. Nothing was stored.\n",
+                        .{ verification_service, secret_label },
+                    )
+                else
+                    try std.fmt.allocPrint(
+                        alloc,
+                        "Could not verify that {s} with {s}. Nothing was stored.\n",
+                        .{ secret_label, verification_service },
+                    );
+                defer alloc.free(message);
+                try writeStderr(deps, message);
+            },
+            .persistence => try writeTopLevelEnteredSecretPersistenceFailure(
+                alloc,
+                deps,
+                secret_label,
+                destination,
+                completion.outcome.durable_write,
+            ),
+            .reacquisition => try writeTopLevelEnteredSecretNotActive(alloc, deps, secret_label, destination),
+        },
+        .cancelled => try writeStderr(deps, "fx setup: API key setup was cancelled\n"),
+        .invalid, .missing => try writeStderr(deps, "fx setup: API key setup is unavailable for this connection\n"),
+    }
+    return false;
+}
+
+fn writeTopLevelEnteredSecretPersistenceFailure(
+    alloc: Allocator,
+    deps: RunDeps,
+    secret_label: []const u8,
+    destination: []const u8,
+    durable_write: adapter_auth.DurableWriteState,
+) !void {
+    if (durable_write == .replaced) return writeTopLevelEnteredSecretNotActive(alloc, deps, secret_label, destination);
+    const message = if (durable_write == .unchanged)
+        try std.fmt.allocPrint(
+            alloc,
+            "Could not save the {s} to {s}. Nothing was stored.\n",
+            .{ secret_label, destination },
+        )
+    else
+        try std.fmt.allocPrint(
+            alloc,
+            "Could not confirm whether the {s} was saved to {s}. It was not made active.\n",
+            .{ secret_label, destination },
+        );
+    defer alloc.free(message);
+    try writeStderr(deps, message);
+}
+
+fn writeTopLevelEnteredSecretNotActive(
+    alloc: Allocator,
+    deps: RunDeps,
+    secret_label: []const u8,
+    destination: []const u8,
+) !void {
     const message = try std.fmt.allocPrint(
         alloc,
-        "Saved API key to {s}.\n",
-        .{secret_store.backend_label},
+        "Saved the {s} to {s}, but could not make it active.\n",
+        .{ secret_label, destination },
     );
     defer alloc.free(message);
-    try writeStdout(deps, message);
-    return true;
+    try writeStderr(deps, message);
 }
 
 fn setupTerminalAvailableDefault(_: ?*anyopaque) bool {
@@ -1903,23 +2097,27 @@ fn writeStatusJsonLine(alloc: Allocator, deps: RunDeps, snapshot: output_contrac
     try writeRenderedJsonLine(alloc, deps, buf[0..], .{ .status = snapshot });
 }
 
-fn statusSnapshotFromStartup(startup: app_lifecycle.StartupStatus) output_contracts.StatusSnapshot {
+fn statusSnapshotFromStartup(
+    startup: app_lifecycle.StartupStatus,
+    auth_help: ?[]const u8,
+) output_contracts.StatusSnapshot {
     return statusSnapshotFromStartupWithBuild(startup, .{
         .channel = .stable,
         .version = "",
         .revision = "",
-    }, .clear);
+    }, auth_help, .clear);
 }
 
 fn statusSnapshotFromStartupWithBuild(
     startup: app_lifecycle.StartupStatus,
     build: update_target.CurrentBuild,
+    auth_help: ?[]const u8,
     mcp_config_diagnostic: mcp_contract.ProfileConfigDiagnostic,
 ) output_contracts.StatusSnapshot {
     return .{
         .model = startup.selected_model,
         .auth = startup.auth,
-        .auth_help = startup.auth.missingHelp(.cli),
+        .auth_help = auth_help,
         .permission_mode = permissionModeForSnapshot(startup.permission_mode),
         .sandbox_backend = sandbox.effectiveBackend(
             startup.permission_mode,
@@ -2484,9 +2682,9 @@ fn catalogFailureDetail(failure: model_catalog.Failure) []const u8 {
     return switch (failure.category) {
         .authentication => "AuthenticationRejected",
         .cancellation => "the request was cancelled",
-        .malformed_response => "MalformedResponse",
+        .invalid_content => "MalformedResponse",
         .resource_exhausted => "OutOfMemory",
-        .rate_limited, .gateway_unavailable, .transport, .http_status, .runtime => "Unavailable",
+        .rate_limited, .unavailable, .transport, .protocol, .runtime => "Unavailable",
     };
 }
 
@@ -2883,9 +3081,7 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .default_model = cfg.default_model,
         .default_agent_step_limit = cfg.default_agent_step_limit,
         .gateway_retry_count = cfg.gateway_retry_count,
-        .gateway_chat_url = cfg.gateway_provider.chat_url.resolve(cfg.gateway_chat_url),
-        .gateway_models_path = cfg.models_path,
-        .gateway_provider = cfg.gateway_provider,
+        .gateway_system = cfg.gateway_system,
         .background_process_provider = cfg.background_process_provider,
         .secret_store = cfg.secret_store,
         .prompt_policy = cfg.prompt_policy,
@@ -2901,7 +3097,6 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .mode_registry = cfg.mode_registry,
         .load_mcp_runtime = cfg.load_mcp_runtime,
         .devbox_provider = cfg.devbox_provider,
-        .permission_reviewer_provider = cfg.permission_reviewer_provider,
     };
 }
 
@@ -3359,7 +3554,7 @@ fn isVersionFlag(arg: []const u8) bool {
 
 fn testCommandCatalog() CommandCatalog {
     const builtin_commands = @import("../../builtins/commands.zig");
-    return builtin_commands.top_level_registry;
+    return builtin_commands.testTopLevelRegistry();
 }
 
 test "parse recognizes every top-level command and preserves unknown commands" {
@@ -3585,13 +3780,6 @@ test "ACP command routes parsed options and launch config through the injected r
                 std.mem.eql(u8, cfg.default_model, expected.default_model) and
                 cfg.default_agent_step_limit == expected.default_agent_step_limit and
                 cfg.gateway_retry_count == expected.gateway_retry_count and
-                std.mem.eql(
-                    u8,
-                    cfg.gateway_chat_url,
-                    expected.gateway_provider.chat_url.resolve(expected.gateway_chat_url),
-                ) and
-                std.mem.eql(u8, cfg.gateway_models_path, expected.models_path) and
-                cfg.gateway_provider.chat_url.resolve_fn == expected.gateway_provider.chat_url.resolve_fn and
                 std.mem.eql(u8, cfg.prompt_policy.system_prompt, expected.prompt_policy.system_prompt) and
                 cfg.ignored_list_entries.len == expected.ignored_list_entries.len and
                 cfg.max_list_entries == expected.max_list_entries and
@@ -3607,8 +3795,7 @@ test "ACP command routes parsed options and launch config through the injected r
                     expected.context_registry.defaultProvider().id,
                 ) and
                 std.mem.eql(u8, cfg.mode_registry.default_mode_id, expected.mode_registry.default_mode_id) and
-                cfg.devbox_provider.?.execute_fn == expected.devbox_provider.?.execute_fn and
-                cfg.permission_reviewer_provider.?.review_fn == expected.permission_reviewer_provider.?.review_fn;
+                cfg.devbox_provider.?.execute_fn == expected.devbox_provider.?.execute_fn;
 
             const limit_matches = cfg.context_limit_overrides.len == 1 and
                 cfg.context_limit_overrides[0].name == .project_instructions_total_bytes and
@@ -3626,18 +3813,7 @@ test "ACP command routes parsed options and launch config through the injected r
         }
     };
 
-    const ReviewProvider = struct {
-        fn review(
-            _: ?*anyopaque,
-            _: Allocator,
-            _: permission_auto_classifier.ProviderInput,
-            _: permission_auto_classifier.ReviewRequest,
-        ) anyerror!permission_auto_classifier.ParseOutcome {
-            return .invalid;
-        }
-    };
     var cfg = testConfig();
-    cfg.permission_reviewer_provider = .{ .review_fn = ReviewProvider.review };
     var capture = Capture{ .expected = cfg };
     cfg.acp_runner = .{ .context = &capture, .run_fn = Capture.run };
     const result = try runIfRequestedWithDeps(
@@ -4173,12 +4349,19 @@ test "setup is a paste-only stored-key adapter" {
     defer capture.deinit();
     var cfg = testConfig();
     cfg.secret_store = capture.secretStore();
+    var adapter = setupTestAdapter(
+        cfg.gateway_system.connection_seed.adapter_id,
+        cfg.gateway_system.connection_seed.protocol.?,
+    );
+    selectConfiguredTestAdapter(&cfg, &adapter);
+    var deps = capture.deps();
+    deps.load_startup_state_without_credentials = stubLoadStatusBindingState;
 
     const result = try runIfRequestedWithDeps(
         std.testing.allocator,
         &.{@constCast("setup")},
         cfg,
-        capture.deps(),
+        deps,
     );
 
     try std.testing.expectEqual(RunResult.handled_success, result);
@@ -4190,24 +4373,32 @@ test "setup is a paste-only stored-key adapter" {
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), cfg.secret_store.backend_label) != null);
 }
 
-test "setup delegates secure input to an interactive host store" {
+test "setup never bypasses adapter validation through an interactive host store" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
     capture.setup_interactive_store = true;
     var cfg = testConfig();
     cfg.secret_store = capture.secretStore();
+    var adapter = setupTestAdapter(
+        cfg.gateway_system.connection_seed.adapter_id,
+        cfg.gateway_system.connection_seed.protocol.?,
+    );
+    selectConfiguredTestAdapter(&cfg, &adapter);
+    var deps = capture.deps();
+    deps.load_startup_state_without_credentials = stubLoadStatusBindingState;
 
     const result = try runIfRequestedWithDeps(
         std.testing.allocator,
         &.{@constCast("setup")},
         cfg,
-        capture.deps(),
+        deps,
     );
 
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqual(@as(usize, 1), capture.setup_store_calls);
-    try std.testing.expectEqual(@as(usize, 0), capture.setup_read_calls);
-    try std.testing.expect(!capture.setup_value_matched);
+    try std.testing.expectEqual(@as(usize, 1), capture.setup_read_calls);
+    try std.testing.expectEqual(@as(usize, 0), capture.setup_interactive_calls);
+    try std.testing.expect(capture.setup_value_matched);
 }
 
 test "setup preserves the disabled secret-store failure" {
@@ -4473,20 +4664,16 @@ test "CLI surface uses the supplied command catalog for parsing usage and help" 
     try std.testing.expectEqualStrings("usage: fx start\n", usage_capture.stderr.written());
 }
 
-test "workflow config does not carry placeholder gateway tools" {
+test "workflow config does not carry placeholder model tools" {
     const skill_roots = [_]skill_contract.RootSpec{
         .{ .source = .workspace_shared, .path = "skills" },
     };
-    var chat_url_probe = ChatUrlProbe{};
     var surface_cfg = testConfig();
     surface_cfg.skill_root_policy.workspace_roots = &skill_roots;
-    surface_cfg.gateway_provider.chat_url = chat_url_probe.provider();
     const cfg = workflowConfig(surface_cfg);
     try std.testing.expect(!@hasField(@TypeOf(cfg), "gateway_tools_json"));
     try std.testing.expect(!@hasField(@TypeOf(cfg), "context_registry"));
     try std.testing.expectEqualStrings("test-model", cfg.default_model);
-    try std.testing.expectEqualStrings("http://127.0.0.1:43123/chat", cfg.gateway_chat_url);
-    try std.testing.expect(chat_url_probe.called);
     try std.testing.expectEqualStrings("surface", cfg.mode_registry.default_mode_id);
     try std.testing.expectEqualStrings("skills", cfg.skill_root_policy.workspace_roots[0].path);
     try std.testing.expect(cfg.load_mcp_runtime == noMcpRuntimeForTest);
@@ -4529,23 +4716,31 @@ test "top-level auth does not relabel startup failures as unsupported adapters" 
 test "top-level status resolves one selected adapter before credential effects" {
     try std.testing.expect(!@hasField(RunDeps, "load_startup_status"));
 
-    var vercel = StatusCapabilityProbe{ .expected_kind = test_builtin_gateway.connection_seed.adapter_id };
-    var peer = StatusCapabilityProbe{ .expected_kind = "test_peer" };
+    var vercel = StatusCapabilityProbe{
+        .expected_kind = test_builtin_gateway.connection_seed.adapter_id,
+        .service_label = "Vercel",
+    };
+    var peer = StatusCapabilityProbe{
+        .expected_kind = "test_peer",
+        .service_label = "Example Cloud",
+    };
     const adapters = [_]@TypeOf(test_builtin_gateway.provider_adapter){
         .{
             .kind = test_builtin_gateway.connection_seed.adapter_id,
+            .supported_protocol = test_builtin_gateway.connection_seed.protocol.?,
             .auth = vercel.provider(),
             .stream_fn = test_builtin_gateway.provider_adapter.stream_fn,
         },
         .{
             .kind = "test_peer",
+            .supported_protocol = test_builtin_gateway.connection_seed.protocol.?,
             .auth = peer.provider(),
             .stream_fn = test_builtin_gateway.provider_adapter.stream_fn,
         },
     };
     var store = StatusStoreProbe{};
     var cfg = testConfig();
-    cfg.gateway_provider.adapter_registry = .{ .adapters = &adapters };
+    cfg.gateway_system.adapter_registry = .{ .adapters = &adapters };
     cfg.secret_store = store.provider();
 
     var missing_capture = CaptureOutput.init(std.testing.allocator);
@@ -4553,7 +4748,7 @@ test "top-level status resolves one selected adapter before credential effects" 
     var missing_deps = missing_capture.deps();
     missing_deps.load_startup_state_without_credentials = stubLoadStatusBindingState;
     missing_deps.load_startup_status_without_credentials = failingStartupStatusWithoutCredentials;
-    cfg.gateway_provider.connection_seed.adapter_id = "missing";
+    cfg.gateway_system.connection_seed.adapter_id = "missing";
     const missing = try runIfRequestedWithDeps(
         std.testing.allocator,
         &.{@constCast("status")},
@@ -4571,7 +4766,7 @@ test "top-level status resolves one selected adapter before credential effects" 
     var vercel_deps = vercel_capture.deps();
     vercel_deps.load_startup_state_without_credentials = stubLoadStatusBindingState;
     vercel_deps.load_startup_status_without_credentials = stubLoadStartupStatusWithoutCredentials;
-    cfg.gateway_provider.connection_seed.adapter_id = test_builtin_gateway.connection_seed.adapter_id;
+    cfg.gateway_system.connection_seed.adapter_id = test_builtin_gateway.connection_seed.adapter_id;
     const vercel_result = try runIfRequestedWithDeps(
         std.testing.allocator,
         &.{ @constCast("status"), @constCast("--json") },
@@ -4590,7 +4785,7 @@ test "top-level status resolves one selected adapter before credential effects" 
     var peer_deps = peer_capture.deps();
     peer_deps.load_startup_state_without_credentials = stubLoadStatusBindingState;
     peer_deps.load_startup_status_without_credentials = stubLoadStartupStatusWithoutCredentials;
-    cfg.gateway_provider.connection_seed.adapter_id = "test_peer";
+    cfg.gateway_system.connection_seed.adapter_id = "test_peer";
     const peer_result = try runIfRequestedWithDeps(
         std.testing.allocator,
         &.{ @constCast("status"), @constCast("--json") },
@@ -4807,8 +5002,9 @@ test "runIfRequested model fetch failure is handled" {
     defer capture.deinit();
     var probe = ModelFetchProbe{ .outcome = .failure };
     var cfg = testConfig();
-    cfg.gateway_provider.provider_adapter.model_catalog = probe.provider();
-    selectConfiguredTestAdapter(&cfg);
+    var adapter = test_builtin_gateway.provider_adapter;
+    adapter.model_catalog = probe.provider();
+    selectConfiguredTestAdapter(&cfg, &adapter);
 
     var deps = capture.deps();
     deps.load_startup_state_without_credentials = stubLoadSelectedStartupState;
@@ -4827,8 +5023,9 @@ test "runIfRequested model fetch failure preserves json output" {
     defer capture.deinit();
     var probe = ModelFetchProbe{ .outcome = .failure };
     var cfg = testConfig();
-    cfg.gateway_provider.provider_adapter.model_catalog = probe.provider();
-    selectConfiguredTestAdapter(&cfg);
+    var adapter = test_builtin_gateway.provider_adapter;
+    adapter.model_catalog = probe.provider();
+    selectConfiguredTestAdapter(&cfg, &adapter);
 
     var deps = capture.deps();
     deps.load_startup_state_without_credentials = stubLoadSelectedStartupState;
@@ -4853,8 +5050,9 @@ test "runIfRequested model provider cancellation is handled" {
     defer capture.deinit();
     var probe = ModelFetchProbe{ .outcome = .cancelled };
     var cfg = testConfig();
-    cfg.gateway_provider.provider_adapter.model_catalog = probe.provider();
-    selectConfiguredTestAdapter(&cfg);
+    var adapter = test_builtin_gateway.provider_adapter;
+    adapter.model_catalog = probe.provider();
+    selectConfiguredTestAdapter(&cfg, &adapter);
 
     var deps = capture.deps();
     deps.load_startup_state_without_credentials = stubLoadSelectedStartupState;
@@ -4873,8 +5071,9 @@ test "runIfRequested models passes startup team to fetch seam" {
     defer capture.deinit();
     var probe = ModelFetchProbe{};
     var cfg = testConfig();
-    cfg.gateway_provider.provider_adapter.model_catalog = probe.provider();
-    selectConfiguredTestAdapter(&cfg);
+    var adapter = test_builtin_gateway.provider_adapter;
+    adapter.model_catalog = probe.provider();
+    selectConfiguredTestAdapter(&cfg, &adapter);
 
     var deps = capture.deps();
     deps.load_startup_state_without_credentials = stubLoadSelectedStartupState;
@@ -4894,9 +5093,10 @@ test "model catalog does not fall back across adapter kinds" {
     defer capture.deinit();
     var probe = ModelFetchProbe{};
     var cfg = testConfig();
-    cfg.gateway_provider.provider_adapter.kind = "other-adapter";
-    cfg.gateway_provider.provider_adapter.model_catalog = probe.provider();
-    selectConfiguredTestAdapter(&cfg);
+    var adapter = test_builtin_gateway.provider_adapter;
+    adapter.kind = "other-adapter";
+    adapter.model_catalog = probe.provider();
+    selectConfiguredTestAdapter(&cfg, &adapter);
 
     var deps = capture.deps();
     deps.load_startup_state_without_credentials = stubLoadSelectedStartupState;
@@ -4917,8 +5117,9 @@ test "runIfRequested credits renders through the configured provider" {
     defer capture.deinit();
     var probe = CreditsProviderProbe{ .outcome = .success };
     var cfg = testConfig();
-    cfg.gateway_provider.provider_adapter.account_usage = probe.provider();
-    selectConfiguredTestAdapter(&cfg);
+    var adapter = test_builtin_gateway.provider_adapter;
+    adapter.account_usage = probe.provider();
+    selectConfiguredTestAdapter(&cfg, &adapter);
 
     var deps = capture.deps();
     deps.load_startup_state_without_credentials = stubLoadSelectedStartupState;
@@ -4939,9 +5140,10 @@ test "account usage does not fall back across adapter kinds" {
     defer capture.deinit();
     var probe = CreditsProviderProbe{ .outcome = .success };
     var cfg = testConfig();
-    cfg.gateway_provider.provider_adapter.kind = "other";
-    cfg.gateway_provider.provider_adapter.account_usage = probe.provider();
-    selectConfiguredTestAdapter(&cfg);
+    var adapter = test_builtin_gateway.provider_adapter;
+    adapter.kind = "other";
+    adapter.account_usage = probe.provider();
+    selectConfiguredTestAdapter(&cfg, &adapter);
     var deps = capture.deps();
     deps.load_startup_state_without_credentials = stubLoadSelectedStartupState;
     deps.resolve_connection_credential = stubResolveConnectionCredential;
@@ -4965,8 +5167,9 @@ test "runIfRequested credits failures use nonzero text and json contracts" {
     defer text_capture.deinit();
     var text_probe = CreditsProviderProbe{ .outcome = .failure };
     var text_cfg = testConfig();
-    text_cfg.gateway_provider.provider_adapter.account_usage = text_probe.provider();
-    selectConfiguredTestAdapter(&text_cfg);
+    var text_adapter = test_builtin_gateway.provider_adapter;
+    text_adapter.account_usage = text_probe.provider();
+    selectConfiguredTestAdapter(&text_cfg, &text_adapter);
     var text_deps = text_capture.deps();
     text_deps.load_startup_state_without_credentials = stubLoadSelectedStartupState;
     text_deps.resolve_connection_credential = stubResolveConnectionCredential;
@@ -4988,8 +5191,9 @@ test "runIfRequested credits failures use nonzero text and json contracts" {
     defer json_capture.deinit();
     var json_probe = CreditsProviderProbe{ .outcome = .failure };
     var json_cfg = testConfig();
-    json_cfg.gateway_provider.provider_adapter.account_usage = json_probe.provider();
-    selectConfiguredTestAdapter(&json_cfg);
+    var json_adapter = test_builtin_gateway.provider_adapter;
+    json_adapter.account_usage = json_probe.provider();
+    selectConfiguredTestAdapter(&json_cfg, &json_adapter);
     var json_deps = json_capture.deps();
     json_deps.load_startup_state_without_credentials = stubLoadSelectedStartupState;
     json_deps.resolve_connection_credential = stubResolveConnectionCredential;
@@ -5018,7 +5222,7 @@ test "runIfRequested local json success appends exactly one newline" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json") }, testConfig(), deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"sandbox\":\"none\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Example Cloud. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"sandbox\":\"none\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
         capture.stdout.written(),
     );
     try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
@@ -5099,19 +5303,22 @@ test "writeRenderedJsonLine falls back to heap and appends exactly one newline" 
     const startup = app_lifecycle.StartupStatus{
         .workspace_root = @constCast("/tmp/fx"),
         .selected_model = "test-model",
+        .auth = .{ .connection_display_name = "Vercel AI Gateway" },
         .permission_mode = .ask,
         .agent_step_limit = 42,
     };
 
+    const auth_help = try startup.auth.missingHelpAlloc(std.testing.allocator, .cli);
+    defer if (auth_help) |value| std.testing.allocator.free(value);
     try writeRenderedJsonLine(
         std.testing.allocator,
         capture.deps(),
         tiny_buf[0..],
-        .{ .status = statusSnapshotFromStartup(startup) },
+        .{ .status = statusSnapshotFromStartup(startup, auth_help) },
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"sandbox\":\"none\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"sandbox\":\"none\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
         capture.stdout.written(),
     );
 }
@@ -5125,7 +5332,9 @@ test "status snapshot reports yolo effective sandbox without mutating startup" {
         .agent_step_limit = 42,
     };
 
-    const snapshot = statusSnapshotFromStartup(startup);
+    const auth_help = try startup.auth.missingHelpAlloc(std.testing.allocator, .cli);
+    defer if (auth_help) |value| std.testing.allocator.free(value);
+    const snapshot = statusSnapshotFromStartup(startup, auth_help);
     try std.testing.expectEqual(types.PermissionMode.yolo, snapshot.permission_mode);
     try std.testing.expectEqual(sandbox.BackendKind.none, snapshot.sandbox_backend);
     try std.testing.expectEqual(sandbox.BackendKind.macos, startup.sandbox_backend);
@@ -5142,7 +5351,7 @@ test "writeRenderedJsonLine renders doctor json through output contract" {
     const snapshot = doctor_runtime.Snapshot{
         .workspace_root = @constCast("/tmp/fx"),
         .model = "test-model",
-        .auth = .{ .active_source = .ai_gateway_api_key },
+        .auth = .{ .active_source = .{ .id = "ai_gateway_api_key", .label = "AI_GATEWAY_API_KEY", .refreshable = false } },
         .permission_mode = .auto,
         .agent_step_limit = 42,
         .checks = checks[0..],
@@ -5169,6 +5378,7 @@ const CaptureOutput = struct {
     setup_read_calls: usize = 0,
     setup_value_matched: bool = false,
     setup_interactive_store: bool = false,
+    setup_interactive_calls: usize = 0,
     setup_store_disabled: bool = false,
 
     fn init(alloc: Allocator) CaptureOutput {
@@ -5203,6 +5413,7 @@ const CaptureOutput = struct {
             .load_fn = captureSecretStoreLoad,
             .store_fn = captureSecretStoreWrite,
             .store_interactive_fn = captureSecretStoreInteractiveWrite,
+            .store_with_disposition_fn = captureSecretStoreWriteWithDisposition,
         };
     }
 };
@@ -5258,9 +5469,122 @@ fn captureSecretStoreInteractiveWrite(
     ctx: ?*anyopaque,
 ) host.SecretStoreWriteError!bool {
     const capture: *CaptureOutput = @ptrCast(@alignCast(ctx.?));
+    capture.setup_interactive_calls += 1;
     if (!capture.setup_interactive_store) return false;
     capture.setup_store_calls += 1;
     return true;
+}
+
+fn captureSecretStoreWriteWithDisposition(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    value: []const u8,
+) host.SecretStoreWriteReport {
+    captureSecretStoreWrite(ctx, alloc, value) catch return .{
+        .durable_write = .unchanged,
+        .failure = error.StoredKeyWriteFailed,
+    };
+    return .{ .durable_write = .replaced };
+}
+
+fn setupTestAdapter(
+    kind: []const u8,
+    protocol: []const u8,
+) agent_stream_provider.ProviderAdapter {
+    return .{
+        .kind = kind,
+        .supported_protocol = protocol,
+        .auth = .{
+            .kind = kind,
+            .auth_service_label = "Example Cloud",
+            .source_inventory_fn = setupTestSourceInventory,
+            .submit_entered_secret_fn = setupTestSubmitEnteredSecret,
+        },
+        .stream_fn = agent_stream_provider.unavailable_adapter.stream_fn,
+    };
+}
+
+fn setupTestSourceInventory(
+    _: *const anyopaque,
+    alloc: Allocator,
+    request: *adapter_auth.SourceInventoryRequest,
+) Allocator.Error!adapter_auth.SourceInventoryOutcome {
+    var presentation = adapter_auth.EnteredSecretPresentation.init(
+        alloc,
+        "API key",
+        "AI Gateway",
+        request.host.secret_store.backend_label,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .invalid_configuration,
+    };
+    defer presentation.deinit(alloc);
+    const sources = try alloc.alloc(adapter_auth.CredentialSourceDescriptor, 1);
+    errdefer alloc.free(sources);
+    sources[0] = adapter_auth.CredentialSourceDescriptor.init(
+        alloc,
+        "stored_secret",
+        "stored API key",
+        true,
+        false,
+        presentation,
+        false,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .invalid_configuration,
+    };
+    errdefer sources[0].deinit(alloc);
+    var auth_service = adapter_auth.AuthServicePresentation.init(alloc, "Example Cloud") catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .invalid_configuration,
+    };
+    errdefer auth_service.deinit(alloc);
+    return .{ .loaded = .{
+        .origin_profile = try request.profile.clone(alloc),
+        .auth_service = auth_service,
+        .sources = sources,
+    } };
+}
+
+fn setupTestSubmitEnteredSecret(
+    _: *const anyopaque,
+    alloc: Allocator,
+    submission: *adapter_auth.EnteredSecretSubmission,
+) adapter_auth.EnteredSecretCompletion {
+    if (!std.mem.eql(u8, submission.secret_value.bytes, "paste-only-test-key")) {
+        return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+            .durable_write = .unchanged,
+            .terminal = .{ .invalid = .input },
+        });
+    }
+    const report = submission.host.secret_store.storeWithDisposition(alloc, submission.secret_value.bytes);
+    if (report.failure != null or report.durable_write != .replaced) {
+        return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+            .durable_write = report.durable_write,
+            .terminal = .{ .failed = .{
+                .stage = .persistence,
+                .cause = .{ .adapter = .{ .category = .persistence } },
+            } },
+        });
+    }
+    const credential_bytes = alloc.dupe(u8, "acquired-test-secret") catch {
+        return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+            .durable_write = .replaced,
+            .terminal = .{ .failed = .{ .stage = .reacquisition, .cause = .allocation } },
+        });
+    };
+    return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+        .durable_write = .replaced,
+        .terminal = .{ .acquired = .{
+            .secret_bytes = credential_bytes,
+            .source = .{ .id = "stored_secret", .label = "stored API key", .refreshable = false },
+            .catalog_access = .{ .authenticated = .{
+                .source = .{ .id = "stored_secret", .label = "stored API key", .refreshable = false },
+                .credential = credential_bytes,
+                .team_context = null,
+            } },
+        } },
+    });
 }
 
 fn gatherNoopContextForTest(_: Allocator, _: context_contract.InitialContextInput) context_contract.ProviderError!context_contract.ProviderContext {
@@ -5339,10 +5663,8 @@ fn testConfig() Config {
         .command_catalog = testCommandCatalog(),
         .default_model = "test-model",
         .default_agent_step_limit = 42,
-        .models_path = "/v1/models",
         .gateway_retry_count = 1,
-        .gateway_chat_url = "https://example.test/chat",
-        .gateway_provider = test_builtin_gateway.provider,
+        .gateway_system = test_builtin_gateway.system,
         .url_opener = host.unavailable_url_opener,
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{ .system_prompt = "system" },
@@ -5369,43 +5691,8 @@ fn testConfig() Config {
     };
 }
 
-fn selectConfiguredTestAdapter(cfg: *Config) void {
-    const adapters: *const [1]agent_stream_provider.ProviderAdapter =
-        @ptrCast(&cfg.gateway_provider.provider_adapter);
-    cfg.gateway_provider.adapter_registry = .{ .adapters = adapters };
-}
-
-fn stubLoadStartupState(
-    alloc: Allocator,
-    _: oauth_transport.Provider,
-    _: host.SecretStore,
-    default_model: []const u8,
-    default_fast_mode: bool,
-    default_agent_step_limit: usize,
-    _: connection_registry.Seed,
-) !app_lifecycle.StartupState {
-    var state = app_lifecycle.StartupState{ .agent_step_limit = default_agent_step_limit };
-    errdefer state.deinit(alloc);
-    state.workspace_root = try alloc.dupe(u8, "/tmp/fx");
-    state.selected_model = try alloc.dupe(u8, default_model);
-    state.fast_mode = default_fast_mode;
-    state.credential = .{
-        .token = try alloc.dupe(u8, "test-key"),
-        .source = .ai_gateway_api_key,
-    };
-    state.credential.?.team_id = try alloc.dupe(u8, "team_123");
-    return state;
-}
-
-fn stubLoadCatalogStartupState(
-    alloc: Allocator,
-    secret_store: host.SecretStore,
-    default_model: []const u8,
-    default_fast_mode: bool,
-    default_agent_step_limit: usize,
-    connection_seed: connection_registry.Seed,
-) !app_lifecycle.StartupState {
-    return stubLoadStartupState(alloc, oauth_transport.unavailable_provider, secret_store, default_model, default_fast_mode, default_agent_step_limit, connection_seed);
+fn selectConfiguredTestAdapter(cfg: *Config, adapter: *const agent_stream_provider.ProviderAdapter) void {
+    cfg.gateway_system.adapter_registry = .{ .adapters = adapter[0..1] };
 }
 
 fn stubLoadSelectedStartupState(
@@ -5426,6 +5713,7 @@ fn stubLoadSelectedStartupState(
     state.workspace_root = try alloc.dupe(u8, "/tmp/fx");
     state.selected_model = try alloc.dupe(u8, default_model);
     state.configured_model = try alloc.dupe(u8, default_model);
+    state.fast_mode = default_fast_mode;
     return state;
 }
 
@@ -5434,16 +5722,21 @@ fn stubResolveConnectionCredential(
     _: adapter_registry.AdapterRegistry,
     _: host.SecretStore,
     _: connection_registry.Profile,
-    _: credentials.LoadMode,
+    _: app_lifecycle.CredentialLoadMode,
     _: ?*const std.atomic.Value(bool),
-) !credentials.Resolution {
+) !app_lifecycle.CredentialResolution {
     const token = try alloc.dupe(u8, "test-key");
     errdefer alloc.free(token);
     const team = try alloc.dupe(u8, "team_123");
     return .{ .credential = .{
-        .token = token,
-        .source = .ai_gateway_api_key,
-        .team_id = team,
+        .secret_bytes = token,
+        .source = .{ .id = "test_key", .label = "test key", .refreshable = false },
+        .tenant_id = team,
+        .catalog_access = .{ .authenticated = .{
+            .source = .{ .id = "test_key", .label = "test key", .refreshable = false },
+            .credential = token,
+            .team_context = team,
+        } },
     } };
 }
 
@@ -5527,12 +5820,14 @@ const StatusStoreProbe = struct {
 
 const StatusCapabilityProbe = struct {
     expected_kind: []const u8,
+    service_label: []const u8,
     calls: usize = 0,
     matched_profile: bool = false,
 
     fn provider(self: *@This()) adapter_auth.Provider {
         return .{
             .kind = self.expected_kind,
+            .auth_service_label = self.service_label,
             .context = self,
             .status_fn = status,
         };
@@ -5557,18 +5852,6 @@ const StatusCapabilityProbe = struct {
         } };
     }
 };
-
-fn failingStartupState(
-    _: Allocator,
-    _: oauth_transport.Provider,
-    _: host.SecretStore,
-    _: []const u8,
-    _: bool,
-    _: usize,
-    _: connection_registry.Seed,
-) !app_lifecycle.StartupState {
-    return error.StartupShouldNotRun;
-}
 
 fn failingStartupStateWithoutCredentials(
     _: Allocator,
@@ -5612,8 +5895,7 @@ const ModelFetchProbe = struct {
         self.called = true;
         if (!std.mem.eql(u8, input.access.authorizationCredential() orelse "", "test-key") or
             !std.mem.eql(u8, input.access.teamContext() orelse "", "team_123") or
-            input.access.credentialSource() != .ai_gateway_api_key or
-            !std.mem.eql(u8, input.endpoint, "/v1/models") or
+            !std.mem.eql(u8, (input.access.credentialSource() orelse return failure(.runtime)).id, "test_key") or
             input.cancel_flag != null)
         {
             return failure(.runtime);
@@ -5636,29 +5918,12 @@ const ModelFetchProbe = struct {
     }
 };
 
-const ChatUrlProbe = struct {
-    called: bool = false,
-
-    fn provider(self: *ChatUrlProbe) gateway_provider.ChatUrlProvider {
-        return .{
-            .context = self,
-            .resolve_fn = resolve,
-        };
-    }
-
-    fn resolve(raw: ?*anyopaque, fallback: []const u8) []const u8 {
-        const self: *ChatUrlProbe = @ptrCast(@alignCast(raw.?));
-        self.called = std.mem.eql(u8, fallback, "https://example.test/chat");
-        return "http://127.0.0.1:43123/chat";
-    }
-};
-
 const CreditsProviderProbe = struct {
     outcome: enum { success, failure },
     calls: usize = 0,
     saw_expected_input: bool = false,
 
-    fn provider(self: *CreditsProviderProbe) gateway_provider.account_usage_provider.Provider {
+    fn provider(self: *CreditsProviderProbe) gateway_system.account_usage_provider.Provider {
         return .{
             .context = self,
             .fetch_fn = fetch,
@@ -5668,7 +5933,7 @@ const CreditsProviderProbe = struct {
     fn fetch(
         raw: ?*anyopaque,
         alloc: Allocator,
-        input: gateway_provider.account_usage_provider.Input,
+        input: gateway_system.account_usage_provider.Input,
     ) output_contracts.CreditsSnapshot {
         const self: *CreditsProviderProbe = @ptrCast(@alignCast(raw.?));
         self.calls += 1;

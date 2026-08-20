@@ -66,14 +66,21 @@ pub fn composeHelpMenuRow(
     }
     if (layout.match_count == 0) return composeEmptyRow(alloc, width);
 
-    const description_col = descriptionColumn(projection, width);
+    const description_col = try descriptionColumn(projection, width);
     return switch (bodyRowAt(projection, width, layout, row_index - layout.body_start_row)) {
         .none => empty,
         .category => |category| composeCategoryRow(alloc, category, width),
         .item => |item| if (item.description)
             empty
         else
-            composeCommandRow(alloc, item.spec.*, item.selected, width, description_col),
+            composeCommandRow(
+                alloc,
+                item.spec.*,
+                projection.auth_service_label,
+                item.selected,
+                width,
+                description_col,
+            ),
     };
 }
 
@@ -225,6 +232,7 @@ fn composeCategoryRow(
 fn composeCommandRow(
     alloc: Allocator,
     spec: command_specs.SlashSpec,
+    auth_service_label: []const u8,
     selected: bool,
     width: u16,
     description_col: usize,
@@ -240,27 +248,39 @@ fn composeCommandRow(
     try row.appendSlice(alloc, ui_render.reset_style);
     try row_text.appendSpacesToColumn(alloc, &row, description_col);
 
+    var description_buffer: [command_specs.provider_command_presentation_buffer_bytes]u8 = undefined;
+    const description = try command_specs.formatSlashSpecDescription(
+        spec,
+        auth_service_label,
+        &description_buffer,
+    );
     try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
     try row_text.appendSingleLineEllipsized(
         alloc,
         &row,
-        spec.completion_description.?,
+        description,
         @as(usize, width) -| description_col,
     );
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
 }
 
-fn descriptionColumn(projection: HelpMenuProjection, width: u16) usize {
+fn descriptionColumn(projection: HelpMenuProjection, width: u16) !usize {
     const total_width: usize = width;
     const right_column_start = total_width * 2 / 3;
     const right_column_width = total_width - right_column_start;
     var widest_description_width: usize = 0;
     var display_index: usize = 0;
     while (projection.itemAt(display_index)) |spec| : (display_index += 1) {
+        var description_buffer: [command_specs.provider_command_presentation_buffer_bytes]u8 = undefined;
+        const description = try command_specs.formatSlashSpecDescription(
+            spec.*,
+            projection.auth_service_label,
+            &description_buffer,
+        );
         widest_description_width = @max(
             widest_description_width,
-            display_width.visibleWidth(spec.completion_description.?),
+            display_width.visibleWidth(description),
         );
     }
     const description_block_width = @min(widest_description_width, right_column_width);
@@ -283,6 +303,25 @@ const help_menu_test_specs = [_]command_specs.SlashSpec{
     .{ .kind = .paste, .command = "/paste", .help_entry = "/paste", .completion_description = "attach an image from the clipboard when supported", .presentation_category = .media },
 };
 const help_menu_test_registry = command_specs.SlashRegistry{ .commands = help_menu_test_specs[0..] };
+
+test "help menu formats the provider-labelled login description" {
+    const specs = [_]command_specs.SlashSpec{.{
+        .kind = .login,
+        .command = "/login",
+        .help_entry = "/login",
+        .completion_description = "sign in",
+        .presentation_category = .account,
+    }};
+    const projection: render_input.HelpMenuProjection = .{
+        .active = true,
+        .registry = .{ .commands = specs[0..] },
+        .auth_service_label = "Example Cloud",
+    };
+    const rows = menuRowCount(projection, 100, 10);
+    var row = try composeHelpMenuRow(std.testing.allocator, projection, 3, 100, rows);
+    defer row.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, row.items, "sign in with Example Cloud") != null);
+}
 
 test "help menu keeps descriptions close at wide widths without changing narrow layout" {
     const alloc = std.testing.allocator;
@@ -320,7 +359,7 @@ test "help menu keeps descriptions close at wide widths without changing narrow 
 
     const narrow_rows = menuRowCount(projection, 22, 20);
     try std.testing.expectEqual(rows, narrow_rows);
-    try std.testing.expectEqual(@as(usize, 14), descriptionColumn(projection, 22));
+    try std.testing.expectEqual(@as(usize, 14), try descriptionColumn(projection, 22));
     var narrow = try composeHelpMenuRow(alloc, projection, 3, 22, narrow_rows);
     defer narrow.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, narrow.items, "/help") != null);
@@ -352,7 +391,7 @@ test "help menu search keeps headings non-selectable and reports empty results" 
     const projection: render_input.HelpMenuProjection = .{
         .active = true,
         .registry = help_menu_test_registry,
-        .query = "clipboard",
+        .query = "paste",
     };
     const rows = menuRowCount(projection, 80, 12);
     try std.testing.expectEqual(@as(u16, 4), rows);

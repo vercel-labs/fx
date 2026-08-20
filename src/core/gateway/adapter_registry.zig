@@ -4,6 +4,7 @@ const account_usage = @import("account_usage_provider.zig");
 const adapter_auth = @import("adapter_auth.zig");
 const connection_registry = @import("connection_registry.zig");
 const generation_usage = @import("../session/generation_usage_provider.zig");
+const host = @import("../hosts/host.zig");
 const model_catalog = @import("model_catalog.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const route_snapshot = @import("route_snapshot.zig");
@@ -16,16 +17,17 @@ pub const InitError = error{
     EmptyRegistry,
     TooManyAdapters,
     EmptyAdapterKind,
+    EmptySupportedProtocol,
     DuplicateAdapterKind,
     AuthAdapterKindMismatch,
 };
 
 pub const ResolveError = error{
     MissingAdapter,
+    UnsupportedProtocol,
     MissingAuthCapability,
     MissingAccountUsageCapability,
     MissingGenerationUsageCapability,
-    MissingModelCatalogCapability,
 };
 
 /// A bounded, borrowed registry assembled once by composition. It owns no
@@ -38,6 +40,7 @@ pub const AdapterRegistry = struct {
         if (adapters.len > max_adapters) return error.TooManyAdapters;
         for (adapters, 0..) |adapter, index| {
             if (adapter.kind.len == 0) return error.EmptyAdapterKind;
+            if (adapter.supported_protocol.len == 0) return error.EmptySupportedProtocol;
             if (adapter.auth) |auth| {
                 if (!std.mem.eql(u8, adapter.kind, auth.kind)) return error.AuthAdapterKindMismatch;
             }
@@ -56,11 +59,20 @@ pub const AdapterRegistry = struct {
     }
 
     pub fn resolveRoute(self: AdapterRegistry, route: *const route_snapshot.RouteSnapshot) ResolveError!stream_provider.ProviderAdapter {
-        return self.resolve(route.adapter_kind);
+        const adapter = try self.resolve(route.adapter_kind);
+        if (!std.mem.eql(u8, adapter.supported_protocol, route.protocol)) {
+            return error.UnsupportedProtocol;
+        }
+        return adapter;
     }
 
     pub fn resolveProfile(self: AdapterRegistry, profile: connection_registry.Profile) ResolveError!stream_provider.ProviderAdapter {
-        return self.resolve(profile.adapter_id);
+        const adapter = try self.resolve(profile.adapter_id);
+        const protocol = profile.protocol orelse return error.UnsupportedProtocol;
+        if (!std.mem.eql(u8, adapter.supported_protocol, protocol)) {
+            return error.UnsupportedProtocol;
+        }
+        return adapter;
     }
 
     pub fn resolveAuthForProfile(self: AdapterRegistry, profile: connection_registry.Profile) ResolveError!@import("adapter_auth.zig").Provider {
@@ -77,11 +89,6 @@ pub const AdapterRegistry = struct {
         const adapter = try self.resolveProfile(profile);
         return adapter.generation_usage orelse error.MissingGenerationUsageCapability;
     }
-
-    pub fn resolveModelCatalogForProfile(self: AdapterRegistry, profile: connection_registry.Profile) ResolveError!model_catalog.Provider {
-        const adapter = try self.resolveProfile(profile);
-        return adapter.model_catalog orelse error.MissingModelCatalogCapability;
-    }
 };
 
 fn unavailableStream(
@@ -92,12 +99,26 @@ fn unavailableStream(
 ) anyerror!void {}
 
 test "adapter registry rejects invalid manifests and missing kinds" {
-    const adapter = stream_provider.ProviderAdapter{ .kind = "one", .stream_fn = unavailableStream };
+    const adapter = stream_provider.ProviderAdapter{
+        .kind = "one",
+        .supported_protocol = "one",
+        .stream_fn = unavailableStream,
+    };
     try std.testing.expectError(error.EmptyRegistry, AdapterRegistry.init(&.{}));
-    try std.testing.expectError(error.EmptyAdapterKind, AdapterRegistry.init(&.{.{ .kind = "", .stream_fn = unavailableStream }}));
+    try std.testing.expectError(error.EmptyAdapterKind, AdapterRegistry.init(&.{.{
+        .kind = "",
+        .supported_protocol = "one",
+        .stream_fn = unavailableStream,
+    }}));
+    try std.testing.expectError(error.EmptySupportedProtocol, AdapterRegistry.init(&.{.{
+        .kind = "one",
+        .supported_protocol = "",
+        .stream_fn = unavailableStream,
+    }}));
     try std.testing.expectError(error.DuplicateAdapterKind, AdapterRegistry.init(&.{ adapter, adapter }));
     try std.testing.expectError(error.AuthAdapterKindMismatch, AdapterRegistry.init(&.{.{
         .kind = "one",
+        .supported_protocol = "one",
         .auth = .{ .kind = "two" },
         .stream_fn = unavailableStream,
     }}));
@@ -125,7 +146,7 @@ test "adapter registry rejects invalid manifests and missing kinds" {
         .display_name = @constCast("One"),
         .adapter_id = @constCast("one"),
         .endpoint = null,
-        .protocol = null,
+        .protocol = @constCast("one"),
         .credential_ref = @constCast("automatic"),
         .remembered_model = @constCast("model"),
         .internal_models = .{},
@@ -135,14 +156,49 @@ test "adapter registry rejects invalid manifests and missing kinds" {
         .display_name = @constCast("One"),
         .adapter_id = @constCast("one"),
         .endpoint = null,
-        .protocol = null,
+        .protocol = @constCast("one"),
         .credential_ref = @constCast("automatic"),
         .remembered_model = @constCast("model"),
         .internal_models = .{},
     };
     try std.testing.expectError(error.MissingAccountUsageCapability, registry.resolveAccountUsageForProfile(profile));
     try std.testing.expectError(error.MissingGenerationUsageCapability, registry.resolveGenerationUsageForProfile(profile));
-    try std.testing.expectError(error.MissingModelCatalogCapability, registry.resolveModelCatalogForProfile(profile));
+}
+
+test "adapter registry rejects profile and admitted route protocol mismatches" {
+    const registry = try AdapterRegistry.init(&.{.{
+        .kind = "one",
+        .supported_protocol = "one",
+        .stream_fn = unavailableStream,
+    }});
+    const profile = connection_registry.Profile{
+        .id = @constCast("one"),
+        .display_name = @constCast("One"),
+        .adapter_id = @constCast("one"),
+        .endpoint = @constCast("https://example.invalid"),
+        .protocol = @constCast("unexpected-protocol"),
+        .credential_ref = @constCast("automatic"),
+        .remembered_model = @constCast("model"),
+        .internal_models = .{},
+    };
+    try std.testing.expectError(error.UnsupportedProtocol, registry.resolveProfile(profile));
+
+    const route = route_snapshot.RouteSnapshot{
+        .connection_id = @constCast("one"),
+        .adapter_kind = @constCast("one"),
+        .endpoint = @constCast("https://example.invalid"),
+        .protocol = @constCast("unexpected-protocol"),
+        .credential_ref = @constCast("automatic"),
+        .primary_model_id = @constCast("model"),
+        .permission_review_model_id = null,
+        .vision_model_id = null,
+        .subagent_model_id = @constCast("model"),
+        .capabilities = .{},
+        .capability_source = .configured,
+        .selected_fast_mode = false,
+        .fast_model_suffix = null,
+    };
+    try std.testing.expectError(error.UnsupportedProtocol, registry.resolveRoute(&route));
 }
 
 test "adapter registry accepts sixteen adapters and rejects seventeen" {
@@ -151,6 +207,7 @@ test "adapter registry accepts sixteen adapters and rejects seventeen" {
         for (&values, 0..) |*adapter, index| {
             adapter.* = .{
                 .kind = std.fmt.comptimePrint("adapter-{d}", .{index}),
+                .supported_protocol = std.fmt.comptimePrint("adapter-{d}", .{index}),
                 .stream_fn = unavailableStream,
             };
         }
@@ -160,9 +217,17 @@ test "adapter registry accepts sixteen adapters and rejects seventeen" {
     try std.testing.expectError(error.TooManyAdapters, AdapterRegistry.init(&adapters));
 }
 
-test "Vercel and test peer traffic follows profile route and prepared dispatch authorities" {
+test "Vercel and Example Cloud keep every non-selected effect at zero" {
     const Traffic = struct {
+        service_label: []const u8 = "",
         auth: usize = 0,
+        environment: usize = 0,
+        inventory: usize = 0,
+        entry: usize = 0,
+        validation: usize = 0,
+        persistence: usize = 0,
+        reacquisition: usize = 0,
+        secret_store: usize = 0,
         catalog: usize = 0,
         account: usize = 0,
         root: usize = 0,
@@ -180,7 +245,123 @@ test "Vercel and test peer traffic follows profile route and prepared dispatch a
         ) std.mem.Allocator.Error!adapter_auth.Acquisition {
             const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
             self.auth += 1;
+            self.environment += 1;
             return .{ .missing = .not_found };
+        }
+
+        fn sourceInventory(
+            raw: *const anyopaque,
+            alloc: std.mem.Allocator,
+            request: *adapter_auth.SourceInventoryRequest,
+        ) std.mem.Allocator.Error!adapter_auth.SourceInventoryOutcome {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.inventory += 1;
+            const sources = try alloc.alloc(adapter_auth.CredentialSourceDescriptor, 0);
+            errdefer alloc.free(sources);
+            var origin_profile = try request.profile.clone(alloc);
+            errdefer origin_profile.deinit(alloc);
+            var presentation = adapter_auth.AuthServicePresentation.init(
+                alloc,
+                self.service_label,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => unreachable,
+            };
+            errdefer presentation.deinit(alloc);
+            return .{ .loaded = .{
+                .origin_profile = origin_profile,
+                .auth_service = presentation,
+                .sources = sources,
+            } };
+        }
+
+        fn submitEnteredSecret(
+            raw: *const anyopaque,
+            alloc: std.mem.Allocator,
+            submission: *adapter_auth.EnteredSecretSubmission,
+        ) adapter_auth.EnteredSecretCompletion {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.entry += 1;
+            self.validation += 1;
+            const report = submission.host.secret_store.storeWithDisposition(
+                alloc,
+                submission.secret_value.bytes,
+            );
+            self.persistence += 1;
+            if (report.durable_write != .replaced) {
+                return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+                    .durable_write = report.durable_write,
+                    .terminal = .{ .failed = .{
+                        .stage = .persistence,
+                        .cause = .{ .adapter = .{ .category = .persistence } },
+                    } },
+                });
+            }
+            self.reacquisition += 1;
+            const token = alloc.dupe(u8, "selected-secret") catch
+                return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+                    .durable_write = .replaced,
+                    .terminal = .{ .failed = .{
+                        .stage = .reacquisition,
+                        .cause = .allocation,
+                    } },
+                });
+            const source_value = adapter_auth.Source{
+                .id = "entered_key",
+                .label = "entered key",
+                .refreshable = false,
+            };
+            return adapter_auth.takeEnteredSecretCompletion(alloc, submission, .{
+                .durable_write = .replaced,
+                .terminal = .{ .acquired = .{
+                    .secret_bytes = token,
+                    .source = source_value,
+                    .catalog_access = .{ .authenticated = .{
+                        .source = source_value,
+                        .credential = token,
+                        .team_context = null,
+                    } },
+                } },
+            });
+        }
+
+        fn storeIsDisabled(_: ?*anyopaque) bool {
+            return false;
+        }
+
+        fn loadSecret(_: ?*anyopaque, _: std.mem.Allocator) host.SecretStoreLoadError!?[]u8 {
+            return null;
+        }
+
+        fn storeSecret(raw: ?*anyopaque, _: std.mem.Allocator, _: []const u8) host.SecretStoreWriteError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.secret_store += 1;
+        }
+
+        fn storeInteractive(_: ?*anyopaque) host.SecretStoreWriteError!bool {
+            return false;
+        }
+
+        fn storeSecretWithDisposition(
+            raw: ?*anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+        ) host.SecretStoreWriteReport {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.secret_store += 1;
+            return .{ .durable_write = .replaced };
+        }
+
+        fn secretStore(self: *@This()) host.SecretStore {
+            return .{
+                .context = self,
+                .backend_label = "test store",
+                .is_disabled_fn = storeIsDisabled,
+                .load_fn = loadSecret,
+                .store_fn = storeSecret,
+                .store_interactive_fn = storeInteractive,
+                .store_with_disposition_fn = storeSecretWithDisposition,
+            };
         }
 
         fn fetchCatalog(
@@ -204,12 +385,12 @@ test "Vercel and test peer traffic follows profile route and prepared dispatch a
         }
 
         fn stream(
-            provider_adapter: *const stream_provider.ProviderAdapter,
+            route_adapter: *const stream_provider.ProviderAdapter,
             _: std.mem.Allocator,
             request: stream_provider.AdapterRequest,
             events: stream_provider.EventSink,
         ) !void {
-            const self: *@This() = @ptrCast(@alignCast(provider_adapter.context.?));
+            const self: *@This() = @ptrCast(@alignCast(route_adapter.context.?));
             if (std.mem.eql(u8, request.model_id, "root")) self.root += 1 else if (std.mem.eql(u8, request.model_id, "reviewer")) self.reviewer += 1 else if (std.mem.eql(u8, request.model_id, "vision")) self.vision += 1 else if (std.mem.eql(u8, request.model_id, "subagent")) self.subagent += 1 else return error.TestUnexpectedModel;
             try events.emit(.provider_admitted);
             try events.emit(.{ .finish = .{ .reason = .stop } });
@@ -258,7 +439,15 @@ test "Vercel and test peer traffic follows profile route and prepared dispatch a
         fn adapter(self: *@This(), kind: []const u8) stream_provider.ProviderAdapter {
             return .{
                 .kind = kind,
-                .auth = .{ .kind = kind, .context = self, .acquire_fn = acquire },
+                .supported_protocol = kind,
+                .auth = .{
+                    .kind = kind,
+                    .auth_service_label = self.service_label,
+                    .context = self,
+                    .acquire_fn = acquire,
+                    .source_inventory_fn = sourceInventory,
+                    .submit_entered_secret_fn = submitEnteredSecret,
+                },
                 .context = self,
                 .account_usage = .{ .context = self, .fetch_fn = fetchAccount },
                 .generation_usage = .{ .context = self, .lookup_fn = lookupGeneration },
@@ -276,6 +465,13 @@ test "Vercel and test peer traffic follows profile route and prepared dispatch a
         fn expectSelected(self: @This()) !void {
             inline for (.{
                 self.auth,
+                self.environment,
+                self.inventory,
+                self.entry,
+                self.validation,
+                self.persistence,
+                self.reacquisition,
+                self.secret_store,
                 self.catalog,
                 self.account,
                 self.root,
@@ -289,7 +485,25 @@ test "Vercel and test peer traffic follows profile route and prepared dispatch a
         }
 
         fn expectIdle(self: @This()) !void {
-            try std.testing.expectEqual(@as(@TypeOf(self), .{}), self);
+            inline for (.{
+                self.auth,
+                self.environment,
+                self.inventory,
+                self.entry,
+                self.validation,
+                self.persistence,
+                self.reacquisition,
+                self.secret_store,
+                self.catalog,
+                self.account,
+                self.root,
+                self.reviewer,
+                self.vision,
+                self.subagent,
+                self.search_calls,
+                self.generation_credential,
+                self.generation_usage,
+            }) |calls| try std.testing.expectEqual(@as(usize, 0), calls);
         }
     };
 
@@ -369,10 +583,47 @@ test "Vercel and test peer traffic follows profile route and prepared dispatch a
                 .missing => {},
                 .failed, .cancelled => return error.TestUnexpectedAuthOutcome,
             }
-            var catalog_result = try (try registry.resolveModelCatalogForProfile(profile)).fetch(
+            var inventory_request = adapter_auth.SourceInventoryRequest{
+                .profile = try adapter_auth.AuthProfileIdentity.init(alloc, profile),
+                .host = .{ .secret_store = selected.secretStore() },
+            };
+            defer inventory_request.deinit(alloc);
+            var inventory_outcome = try (try registry.resolveAuthForProfile(profile)).sourceInventory(
                 alloc,
-                .{ .endpoint = "/models" },
+                &inventory_request,
             );
+            defer inventory_outcome.deinit(alloc);
+            switch (inventory_outcome) {
+                .loaded => |inventory| try std.testing.expectEqualStrings(
+                    selected.service_label,
+                    inventory.auth_service.service_label,
+                ),
+                else => return error.TestUnexpectedInventoryOutcome,
+            }
+            var entered_presentation = try adapter_auth.EnteredSecretPresentation.init(
+                alloc,
+                "API key",
+                "Gateway",
+                "test store",
+            );
+            defer entered_presentation.deinit(alloc);
+            var submission = adapter_auth.EnteredSecretSubmission{
+                .request_id = 1,
+                .profile = try adapter_auth.AuthProfileIdentity.init(alloc, profile),
+                .source_id = try alloc.dupe(u8, "entered_key"),
+                .presentation = try entered_presentation.clone(alloc),
+                .secret_value = .{ .bytes = try alloc.dupe(u8, "submitted-secret") },
+                .host = .{ .secret_store = selected.secretStore() },
+            };
+            var completion = (try registry.resolveAuthForProfile(profile)).submitEnteredSecret(
+                alloc,
+                &submission,
+            );
+            defer completion.deinit(alloc);
+            try std.testing.expect(completion.outcome.terminal == .acquired);
+            try std.testing.expectEqualStrings("entered_key", completion.outcome.terminal.acquired.source.id);
+            const selected_adapter = try registry.resolveProfile(profile);
+            var catalog_result = try selected_adapter.model_catalog.?.fetch(alloc, .{});
             switch (catalog_result) {
                 .catalog => |*catalog| model_catalog.freeModelCatalog(alloc, catalog),
                 .failure => return error.TestUnexpectedCatalogFailure,
@@ -441,15 +692,48 @@ test "Vercel and test peer traffic follows profile route and prepared dispatch a
         }
     };
 
-    var vercel: Traffic = .{};
-    var peer: Traffic = .{};
+    var vercel = Traffic{ .service_label = "Vercel" };
+    var peer = Traffic{ .service_label = "Example Cloud" };
     const adapters = [_]stream_provider.ProviderAdapter{
         vercel.adapter("vercel_ai_gateway"),
         peer.adapter("test_peer"),
     };
     const registry = try AdapterRegistry.init(&adapters);
+    const mismatch_profile = connection_registry.Profile{
+        .id = @constCast("vercel_ai_gateway"),
+        .display_name = @constCast("Vercel"),
+        .adapter_id = @constCast("vercel_ai_gateway"),
+        .endpoint = @constCast("https://example.invalid"),
+        .protocol = @constCast("test_peer"),
+        .credential_ref = @constCast("credential_ref"),
+        .remembered_model = @constCast("root"),
+        .internal_models = .{},
+    };
+    try std.testing.expectError(error.UnsupportedProtocol, registry.resolveProfile(mismatch_profile));
+    try std.testing.expectError(error.UnsupportedProtocol, registry.resolveAuthForProfile(mismatch_profile));
+    try std.testing.expectError(error.UnsupportedProtocol, registry.resolveAccountUsageForProfile(mismatch_profile));
+    try std.testing.expectError(error.UnsupportedProtocol, registry.resolveGenerationUsageForProfile(mismatch_profile));
+    const mismatch_route = route_snapshot.RouteSnapshot{
+        .connection_id = @constCast("vercel_ai_gateway"),
+        .adapter_kind = @constCast("vercel_ai_gateway"),
+        .endpoint = @constCast("https://example.invalid"),
+        .protocol = @constCast("test_peer"),
+        .credential_ref = @constCast("credential_ref"),
+        .primary_model_id = @constCast("root"),
+        .permission_review_model_id = null,
+        .vision_model_id = null,
+        .subagent_model_id = @constCast("root"),
+        .capabilities = .{},
+        .capability_source = .configured,
+        .selected_fast_mode = false,
+        .fast_model_suffix = null,
+    };
+    try std.testing.expectError(error.UnsupportedProtocol, registry.resolveRoute(&mismatch_route));
+    try vercel.expectIdle();
+    try peer.expectIdle();
+
     try Harness.run(std.testing.allocator, registry, "vercel_ai_gateway", &vercel, &peer);
-    vercel = .{};
-    peer = .{};
+    vercel = .{ .service_label = "Vercel" };
+    peer = .{ .service_label = "Example Cloud" };
     try Harness.run(std.testing.allocator, registry, "test_peer", &peer, &vercel);
 }

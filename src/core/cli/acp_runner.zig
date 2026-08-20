@@ -4,7 +4,7 @@ const devbox_executor = @import("../execution/devbox_executor.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
-const gateway_provider = @import("../gateway/gateway_provider.zig");
+const gateway_system = @import("../gateway/gateway_system.zig");
 const host = @import("../hosts/host.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
@@ -17,9 +17,7 @@ pub const Config = struct {
     default_model: []const u8,
     default_agent_step_limit: usize,
     gateway_retry_count: usize,
-    gateway_chat_url: []const u8,
-    gateway_models_path: []const u8,
-    gateway_provider: gateway_provider.Provider,
+    gateway_system: gateway_system.System,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     secret_store: host.SecretStore,
@@ -35,9 +33,7 @@ pub const Config = struct {
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
     devbox_provider: ?devbox_executor.Provider = null,
-    permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     model_override: ?[]const u8 = null,
-    credential_override: ?[]const u8 = null,
     home_override: ?[]const u8 = null,
     workspace_root_override: ?[]const u8 = null,
     log_file: ?[]const u8 = null,

@@ -40,7 +40,7 @@ fn dynamicTool(name: []const u8) tool_dispatch.Tool {
     return .{
         .name = name,
         .description = "Selected dynamic MCP tool.",
-        .gateway_schema = .{
+        .descriptor = .{
             .name = name,
             .description = "Selected dynamic MCP tool.",
         },

@@ -9,7 +9,7 @@ const session_permission_state = @import("../../permissions/session_permission_s
 const command_replay_store = @import("../../session/command_replay_store.zig");
 const route_snapshot = @import("../../gateway/route_snapshot.zig");
 const stream_provider = @import("../stream_provider.zig");
-const gateway_schema = @import("../../tooling/gateway_schema.zig");
+const tool_descriptor = @import("../../tooling/tool_descriptor.zig");
 
 pub const vision = @import("vision_contracts.zig");
 
@@ -130,7 +130,7 @@ pub const ToolExecutionResult = struct {
     web_search_completion: ?types.WebSearchCompletion = null,
     web_fetch_completion: ?types.WebFetchCompletion = null,
     inner_usage: ?types.ToolUsage = null,
-    selected_dynamic_tool: ?gateway_schema.FunctionSchema = null,
+    selected_dynamic_tool: ?tool_descriptor.Descriptor = null,
     tool_result_memory: ?types.ToolResultMemory = null,
     prepared_result_memory: ?types.ToolResultMemory = null,
     committed_file_handoff: ?file_mutation.CommittedFileHandoff = null,
@@ -154,7 +154,7 @@ pub const ToolExecutionRequest = struct {
     /// Borrowed provider authority already admitted and resolved by the
     /// owning turn. Tool implementations may consume it but never retain it.
     route: ?*const route_snapshot.RouteSnapshot = null,
-    provider_adapter: ?stream_provider.ProviderAdapter = null,
+    route_adapter: ?stream_provider.ProviderAdapter = null,
     route_credential: []const u8 = "",
     route_tenant: ?[]const u8 = null,
     /// Borrowed root-user evidence for subagent execution. This is never

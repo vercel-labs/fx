@@ -8,7 +8,7 @@ const route_snapshot = @import("../gateway/route_snapshot.zig");
 const generation_usage_provider = @import("../session/generation_usage_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
-const gateway_schema = @import("../tooling/gateway_schema.zig");
+const tool_descriptor = @import("../tooling/tool_descriptor.zig");
 const web_search_provider = @import("../tooling/web_search_provider.zig");
 
 const Allocator = std.mem.Allocator;
@@ -110,7 +110,7 @@ pub const ProviderToolAdvertisement = struct {
 /// Provider-neutral description of one model request. All slices are borrowed
 /// for the duration of `ProviderAdapter.stream`.
 pub const ModelRequest = struct {
-    tools: []const gateway_schema.FunctionSchema,
+    tools: []const tool_descriptor.Descriptor,
     provider_tools: []const ProviderToolAdvertisement = &.{},
     messages: []const types.ChatMessage,
     tool_choice: types.ToolChoice,
@@ -132,109 +132,9 @@ test "model request exposes only data-only tool and vision metadata" {
     try std.testing.expect(!@hasField(ModelRequest, "serialized_tools"));
     try std.testing.expect(!@hasField(ModelRequest, "selected_dynamic_tool_schemas"));
     try std.testing.expect(@typeInfo(ProviderTool) == .@"enum");
-    try std.testing.expect(!@hasField(gateway_schema.FunctionSchema, "call"));
-    try std.testing.expect(!@hasField(gateway_schema.FunctionSchema, "runtime_provider"));
+    try std.testing.expect(!@hasField(tool_descriptor.Descriptor, "call"));
+    try std.testing.expect(!@hasField(tool_descriptor.Descriptor, "runtime_provider"));
 }
-
-pub const BuildRequest = ModelRequest;
-
-pub const Request = struct {
-    api_key: []const u8,
-    team: ?[]const u8,
-    /// Borrowed for the duration of `Provider.stream`.
-    session_id: ?[]const u8 = null,
-    model: []const u8,
-    retry_count: usize,
-    chat_url: []const u8,
-    payload: []const u8,
-    trace_ctx: debug_trace.TraceContext,
-    content_capture_limit: ?usize,
-    cooperative_pulse: ?CooperativePulse = null,
-    delivery: *DeliveryCertainty,
-    attempt_evidence: *AttemptEvidence,
-    callback_ctx: *anyopaque,
-    on_content_chunk: StreamCallback,
-    on_tool_start: ?ToolStartCallback,
-    on_reasoning_chunk: ?StreamCallback,
-    on_tool_input_chunk: ?StreamCallback = null,
-    cancel_flag: *std.atomic.Value(bool),
-    provider_attempt_owner: ProviderAttemptOwner = .transport,
-};
-
-pub const ResultOwnership = enum {
-    borrowed,
-    owned,
-};
-
-pub const Result = struct {
-    status: std.http.Status,
-    completion: types.GatewayCompletion = .{},
-    err_body: ?[]u8 = null,
-    /// Borrowed base URL used to reconcile generation usage for this result.
-    generation_origin: []const u8 = "",
-    reconcile_generation_usage: bool = false,
-    failure_schema: ?[]u8 = null,
-    failure_request_shape: ?[]u8 = null,
-    retry_after_seconds: ?u64 = null,
-    ownership: ResultOwnership = .borrowed,
-
-    /// Providers mark allocated response fields as `owned`; test and embedded
-    /// providers may return stable borrowed fields instead.
-    pub fn deinit(self: *Result, alloc: Allocator) void {
-        if (self.ownership == .owned) {
-            if (self.err_body) |body| alloc.free(body);
-            if (self.completion.content) |content| alloc.free(@constCast(content));
-            if (self.completion.generation_id) |id| alloc.free(@constCast(id));
-            if (self.completion.billing) |billing| alloc.free(@constCast(billing.model));
-            types.freeToolCallSlice(alloc, @constCast(self.completion.tool_calls));
-            if (self.completion.provider_failure_detail) |detail| alloc.free(@constCast(detail));
-            if (self.failure_schema) |schema| alloc.free(schema);
-            if (self.failure_request_shape) |shape| alloc.free(shape);
-        }
-        const status = self.status;
-        self.* = .{ .status = status };
-    }
-};
-
-pub const StreamFn = *const fn (
-    context: ?*anyopaque,
-    alloc: Allocator,
-    request: Request,
-) anyerror!Result;
-
-pub const BuildFn = *const fn (
-    context: ?*anyopaque,
-    alloc: Allocator,
-    request: BuildRequest,
-) anyerror![]u8;
-
-pub const Provider = struct {
-    /// When set, context must remain valid until every in-flight `stream` returns.
-    context: ?*anyopaque = null,
-    build_fn: BuildFn = unavailableBuild,
-    stream_fn: StreamFn,
-
-    /// The returned request bytes are owned by `alloc`.
-    pub fn build(self: Provider, alloc: Allocator, request: BuildRequest) ![]u8 {
-        return self.build_fn(self.context, alloc, request);
-    }
-
-    pub fn stream(self: Provider, alloc: Allocator, request: Request) !Result {
-        return self.stream_fn(self.context, alloc, request);
-    }
-};
-
-fn unavailableBuild(_: ?*anyopaque, _: Allocator, _: BuildRequest) anyerror![]u8 {
-    return error.AgentStreamProviderUnavailable;
-}
-
-fn unavailableStream(_: ?*anyopaque, _: Allocator, _: Request) anyerror!Result {
-    return error.AgentStreamProviderUnavailable;
-}
-
-pub const unavailable_provider = Provider{
-    .stream_fn = unavailableStream,
-};
 
 pub const GenerationReference = struct {
     pub const max_bytes: usize = 512;
@@ -263,8 +163,8 @@ pub const ProviderToolResult = struct {
 
 pub const StreamFailure = struct {
     category: Category,
+    response_status: u16 = 0,
     retryable: bool = false,
-    response_code: ?u16 = null,
     delivery_ambiguous: bool = false,
     detail: ?[]const u8 = null,
     retry_after_seconds: ?u64 = null,
@@ -273,6 +173,7 @@ pub const StreamFailure = struct {
 
     pub const Diagnostic = struct {
         summary: []const u8,
+        tool_descriptor: ?[]const u8 = null,
         request_shape: ?[]const u8 = null,
     };
 
@@ -472,6 +373,7 @@ pub const AdapterRequest = struct {
     route: *const route_snapshot.RouteSnapshot,
     credential: []const u8,
     tenant: ?[]const u8,
+    /// Borrowed for the duration of `ProviderAdapter.stream`.
     session_id: ?[]const u8 = null,
     model_id: []const u8,
     retry_count: usize,
@@ -493,12 +395,10 @@ pub const AdapterStreamFn = *const fn (
 
 pub const ProviderAdapter = struct {
     kind: []const u8,
+    supported_protocol: []const u8,
     auth: ?adapter_auth.Provider = null,
     /// When set, context must remain valid until every in-flight stream returns.
     context: ?*anyopaque = null,
-    /// Bounded G1 bridge for existing injected Vercel stream providers. G11
-    /// removes this field after the old seam has no callers.
-    legacy_provider: ?Provider = null,
     account_usage: ?account_usage_provider.Provider = null,
     generation_usage: ?generation_usage_provider.Provider = null,
     model_catalog: ?model_catalog.Provider = null,
@@ -508,7 +408,8 @@ pub const ProviderAdapter = struct {
     stream_fn: AdapterStreamFn,
 
     pub fn acceptsRoute(self: ProviderAdapter, route: *const route_snapshot.RouteSnapshot) bool {
-        return std.mem.eql(u8, self.kind, route.adapter_kind);
+        return std.mem.eql(u8, self.kind, route.adapter_kind) and
+            std.mem.eql(u8, self.supported_protocol, route.protocol);
     }
 
     pub fn stream(
@@ -554,6 +455,7 @@ fn unavailableAdapterStream(
 
 pub const unavailable_adapter = ProviderAdapter{
     .kind = "unavailable",
+    .supported_protocol = "unavailable",
     .stream_fn = unavailableAdapterStream,
 };
 
@@ -730,7 +632,12 @@ test "provider adapter rejects wrong routes before traffic and handles cancellat
         .selected_fast_mode = false,
         .fast_model_suffix = null,
     };
-    const adapter = ProviderAdapter{ .kind = "fake", .context = &fake, .stream_fn = Fake.stream };
+    const adapter = ProviderAdapter{
+        .kind = "fake",
+        .supported_protocol = "fake",
+        .context = &fake,
+        .stream_fn = Fake.stream,
+    };
     const request = AdapterRequest{
         .model_request = .{
             .tools = &.{},
@@ -764,7 +671,12 @@ test "provider adapter rejects wrong routes before traffic and handles cancellat
     state.deinit();
     state = EventState.init(std.testing.allocator);
     sink_error = null;
-    const wrong_adapter = ProviderAdapter{ .kind = "other", .context = &fake, .stream_fn = Fake.stream };
+    const wrong_adapter = ProviderAdapter{
+        .kind = "other",
+        .supported_protocol = "other",
+        .context = &fake,
+        .stream_fn = Fake.stream,
+    };
     try std.testing.expectError(error.RouteAdapterMismatch, wrong_adapter.stream(std.testing.allocator, request, .{
         .context = &capture,
         .state = &state,
@@ -775,6 +687,23 @@ test "provider adapter rejects wrong routes before traffic and handles cancellat
     try std.testing.expectEqual(@as(usize, 1), capture.failures);
     try std.testing.expectEqualStrings("admitted route does not match provider adapter", capture.failure_detail.?);
     try std.testing.expectEqual(@as(usize, 1), state.terminal_count);
+
+    capture = .{};
+    state.deinit();
+    state = EventState.init(std.testing.allocator);
+    sink_error = null;
+    route.protocol = @constCast("unexpected-protocol");
+    try std.testing.expectError(error.RouteAdapterMismatch, adapter.stream(std.testing.allocator, request, .{
+        .context = &capture,
+        .state = &state,
+        .sink_error = &sink_error,
+        .emit_fn = Capture.emit,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), capture.failures);
+    try std.testing.expectEqualStrings("admitted route does not match provider adapter", capture.failure_detail.?);
+    try std.testing.expectEqual(@as(usize, 1), state.terminal_count);
+    route.protocol = @constCast("fake");
 
     capture = .{};
     state.deinit();
@@ -808,71 +737,4 @@ test "provider adapter rejects wrong routes before traffic and handles cancellat
     try std.testing.expectEqual(@as(usize, 1), capture.failures);
     try std.testing.expectEqual(@as(usize, 1), state.terminal_count);
     try std.testing.expect(std.mem.find(u8, capture.failure_detail.?, request.credential) == null);
-}
-
-test "stream provider dispatches request and preserves ordered callbacks" {
-    const Fake = struct {
-        calls: usize = 0,
-        attempt_owner: ?ProviderAttemptOwner = null,
-
-        fn stream(raw: ?*anyopaque, _: Allocator, request: Request) anyerror!Result {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.calls += 1;
-            self.attempt_owner = request.provider_attempt_owner;
-            request.on_content_chunk(request.callback_ctx, "first");
-            request.on_reasoning_chunk.?(request.callback_ctx, "second");
-            return .{
-                .status = .ok,
-                .completion = .{ .content = "done" },
-                .retry_after_seconds = 17,
-            };
-        }
-    };
-    const Capture = struct {
-        chunks: std.ArrayList(u8) = .empty,
-        failed: bool = false,
-
-        fn append(raw: *anyopaque, chunk: []const u8) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.chunks.appendSlice(std.testing.allocator, chunk) catch {
-                self.failed = true;
-            };
-        }
-    };
-
-    var fake: Fake = .{};
-    var capture: Capture = .{};
-    defer capture.chunks.deinit(std.testing.allocator);
-    var delivery = DeliveryCertainty.init();
-    var attempt_evidence: AttemptEvidence = .{};
-    var cancelled = std.atomic.Value(bool).init(false);
-    var result = try (Provider{
-        .context = &fake,
-        .stream_fn = Fake.stream,
-    }).stream(std.testing.allocator, .{
-        .api_key = "key",
-        .team = null,
-        .model = "model",
-        .retry_count = 1,
-        .chat_url = "https://example.test/chat",
-        .payload = "{}",
-        .trace_ctx = .{},
-        .content_capture_limit = null,
-        .delivery = &delivery,
-        .attempt_evidence = &attempt_evidence,
-        .callback_ctx = &capture,
-        .on_content_chunk = Capture.append,
-        .on_tool_start = null,
-        .on_reasoning_chunk = Capture.append,
-        .cancel_flag = &cancelled,
-        .provider_attempt_owner = .agent,
-    });
-    defer result.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqual(ProviderAttemptOwner.agent, fake.attempt_owner.?);
-    try std.testing.expect(!capture.failed);
-    try std.testing.expectEqualStrings("firstsecond", capture.chunks.items);
-    try std.testing.expectEqualStrings("done", result.completion.content.?);
-    try std.testing.expectEqual(@as(?u64, 17), result.retry_after_seconds);
 }

@@ -1975,7 +1975,7 @@ describe("effect-aware command permissions", () => {
       expect(report).toContain("## Problems");
       expect(report).toContain("## Network Calls");
       expect(report).toContain("status=400");
-      expect(report).toContain('gateway_schema="path=prompt.0.content expected=string received=array"');
+      expect(report).toContain('tool_descriptor="path=prompt.0.content expected=string received=array"');
       expect(report).toContain("request_shape=");
       expect(report).toContain("prompt.0 role=system content=string");
       expect(report).toContain("role=user content=array");
@@ -5108,6 +5108,10 @@ describe("effect-aware command permissions", () => {
         TIMEOUT,
       );
       expect(approvalPane).toContain("touch");
+      const approvalDeadline = Date.now() + TIMEOUT;
+      while (approval === null && Date.now() < approvalDeadline) {
+        await Bun.sleep(20);
+      }
       expect(approval).not.toBeNull();
       expect(subagentState(root, childId)).toBe("awaiting_approval");
       expect(gateway.classifierRequests).toHaveLength(0);

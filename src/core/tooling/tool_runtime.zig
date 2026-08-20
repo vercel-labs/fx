@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
-const oauth_transport = @import("../../gateway/auth/oauth_transport.zig");
 const command_contract = @import("../execution/command_contract.zig");
 const command_environment = @import("../execution/command_environment.zig");
 const background_process_provider = @import(
@@ -21,7 +20,7 @@ const change_tracker = @import("../workspace/change_tracker.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation = @import("file_mutation.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
-const gateway_schema = @import("gateway_schema.zig");
+const tool_descriptor = @import("tool_descriptor.zig");
 const hooks = @import("../hooks/hooks.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const glob_pattern = @import("../workspace/glob_pattern.zig");
@@ -51,6 +50,7 @@ const session_store = @import("../session/session_store.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const route_snapshot = @import("../gateway/route_snapshot.zig");
+const adapter_registry = @import("../gateway/adapter_registry.zig");
 const mcp_access_policy = @import("../mcp/access_policy.zig");
 const tool_admission = @import("tool_admission.zig");
 const tool_args = @import("tool_args.zig");
@@ -74,8 +74,8 @@ const test_builtin_tools = if (builtin.is_test)
     @import("../../builtins/tools.zig")
 else
     struct {};
-const test_builtin_gateway = if (builtin.is_test)
-    @import("../../builtins/gateway.zig")
+const test_adapter = if (builtin.is_test)
+    @import("../gateway/test_adapter.zig")
 else
     struct {};
 const test_browser_workspace_tools = if (builtin.is_test)
@@ -133,13 +133,11 @@ pub const Context = struct {
     max_read_file_line_len: usize,
     max_command_output_bytes: usize,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
-    api_key: []const u8,
-    provider_adapter: agent_stream_provider.ProviderAdapter = agent_stream_provider.unavailable_adapter,
+    adapter_registry: adapter_registry.AdapterRegistry = .{ .adapters = &.{} },
+    route_adapter: agent_stream_provider.ProviderAdapter = agent_stream_provider.unavailable_adapter,
     route: ?*const route_snapshot.RouteSnapshot = null,
-    agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
-    gateway_team: ?[]const u8 = null,
-    credential_source: ?types.CredentialSource = null,
-    oauth_transport: oauth_transport.Provider = oauth_transport.unavailable_provider,
+    route_credential: []const u8 = "",
+    route_tenant: ?[]const u8 = null,
     model: []const u8,
     permission_review_turn: ?permission_auto_classifier.ReviewTurnContext = null,
     root_user_intent_context: []const u8 = "",
@@ -147,8 +145,6 @@ pub const Context = struct {
     root_user_evidence_complete: bool = false,
     current_turn_messages: []const ChatMessage = &.{},
     gateway_retry_count: usize,
-    gateway_chat_url: []const u8,
-    gateway_models_path: []const u8 = "/v1/models",
     agent_step_limit: usize,
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
@@ -202,7 +198,6 @@ pub const Context = struct {
     mcp_progress_ctx: ?*anyopaque = null,
     on_mcp_progress: ?*const fn (*anyopaque, types.ToolLifecycleId, []const u8) void = null,
     advertised_dynamic_tool_names: []const []const u8 = &.{},
-    permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     auto_classifier: permission_auto_classifier.Classifier =
         permission_auto_classifier.Classifier.disabled(),
     web_fetch_runtime: ?*web_fetch_runtime.Runtime = null,
@@ -214,10 +209,9 @@ pub const Context = struct {
     on_web_search_progress: ?tool_dispatch.WebSearchProgressFn = null,
     web_fetch_progress_ctx: ?*anyopaque = null,
     on_web_fetch_progress: ?tool_dispatch.WebFetchProgressFn = null,
+    model_descriptor_resolver: ?model_capabilities.Resolver = null,
     workspace_executor: ?js_host_workspace.Executor = null,
     host_sandbox_default: tool_admission.HostSandboxDefault = .none,
-    model_capability_resolver: ?model_capabilities.Resolver = null,
-    model_descriptor_resolver: ?model_capabilities.Resolver = null,
     /// False when running outside an interactive TUI (e.g. ACP). Tools
     /// that require a live user (like `ask_user_question`) short-circuit
     /// in that case.
@@ -283,16 +277,7 @@ pub const Context = struct {
                 return permission_auto_classifier.Classifier.withAdapter(input);
             }
         }
-        const provider = self.permission_reviewer_provider orelse
-            return permission_auto_classifier.Classifier.disabled();
-        return permission_auto_classifier.Classifier.withProvider(provider, .{
-            .credential = self.api_key,
-            .tenant = self.gateway_team,
-            .endpoint = self.gateway_chat_url,
-            .cancel_flag = self.cancel_flag,
-            .usage = &self.session.usage,
-            .usage_allocator = self.session_allocator,
-        });
+        return permission_auto_classifier.Classifier.disabled();
     }
 };
 
@@ -378,11 +363,10 @@ pub fn executeToolCallAuthorized(
     execution_ctx.max_tool_result_bytes = request.max_tool_result_bytes;
     if (request.route) |route| {
         execution_ctx.route = route;
-        execution_ctx.provider_adapter = request.provider_adapter orelse
+        execution_ctx.route_adapter = request.route_adapter orelse
             return error.MissingRouteAdapter;
-        execution_ctx.api_key = request.route_credential;
-        execution_ctx.gateway_team = request.route_tenant;
-        execution_ctx.gateway_chat_url = route.endpoint;
+        execution_ctx.route_credential = request.route_credential;
+        execution_ctx.route_tenant = request.route_tenant;
         execution_ctx.model = route.primary_model_id;
     }
     execution_ctx.current_turn_messages = request.current_turn_messages;
@@ -814,7 +798,7 @@ fn toolExecutionResultFromDispatch(result: tool_dispatch.DispatchResult) ToolExe
 
 const SelectedDynamicToolSinkState = struct {
     allocator: Allocator,
-    descriptor: ?gateway_schema.FunctionSchema = null,
+    descriptor: ?tool_descriptor.Descriptor = null,
 };
 
 const ContextNoticeSinkState = struct {
@@ -862,35 +846,29 @@ fn recordSelectedDynamicToolForDispatch(
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidToolArguments,
     };
-    const descriptor: gateway_schema.FunctionSchema = .{
+    const descriptor: tool_descriptor.Descriptor = .{
         .name = owned_name,
         .description = owned_description,
-        .dynamic_input_schema = input_schema,
+        .input_schema = .{ .document = input_schema },
     };
     descriptor.validate() catch return error.InvalidToolArguments;
     state.descriptor = descriptor;
 }
 
 fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchContext {
-    var capabilities = tool_dispatch.ToolCapabilities.for_host(
-        host_capabilities.current(),
-    );
-    capabilities.web_search_runtime_ready =
-        ctx.web_search_runtime_ready and ctx.web_search_backend != null and
-        ctx.provider_adapter.web_search != null;
     // Availability preflight has no route; invocation still requires an exact match.
     const web_search_route_compatible = if (ctx.route) |route|
-        ctx.provider_adapter.acceptsRoute(route)
+        ctx.route_adapter.acceptsRoute(route)
     else
         true;
     const web_search_invocation: ?tool_dispatch.WebSearchInvocation = if (ctx.route) |route|
-        if (ctx.provider_adapter.acceptsRoute(route))
-            if (ctx.provider_adapter.web_search) |provider| .{
+        if (ctx.route_adapter.acceptsRoute(route))
+            if (ctx.route_adapter.web_search) |provider| .{
                 .provider = provider,
                 .inputs = .{
                     .connection_id = route.connection_id,
-                    .credential = ctx.api_key,
-                    .tenant = ctx.gateway_team,
+                    .credential = ctx.route_credential,
+                    .tenant = ctx.route_tenant,
                     .model = route.primary_model_id,
                     .retry_count = ctx.gateway_retry_count,
                     .endpoint = route.endpoint,
@@ -902,8 +880,14 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
             null
     else
         null;
+    var capabilities = tool_dispatch.ToolCapabilities.for_host(
+        host_capabilities.current(),
+    );
     capabilities.web_search_runtime_ready =
-        capabilities.web_search_runtime_ready and web_search_route_compatible;
+        ctx.web_search_runtime_ready and
+        ctx.web_search_backend != null and
+        (ctx.route == null or
+            (ctx.route_adapter.web_search != null and web_search_route_compatible));
     return .{
         .allocator = arena,
         .permission_mode = ctx.permission_mode,
@@ -1053,10 +1037,10 @@ fn executeVisionRequest(
 ) !ToolExecutionResult {
     const route = state.runtime.route orelse return visionRouteUnavailable(alloc);
     const config: vision_executor.Config = .{
-        .adapter = state.runtime.provider_adapter,
+        .adapter = state.runtime.route_adapter,
         .route = route,
-        .credential = state.runtime.api_key,
-        .tenant = state.runtime.gateway_team,
+        .credential = state.runtime.route_credential,
+        .tenant = state.runtime.route_tenant,
         .session_id = state.runtime.lifecycle_scope.session_id,
         .retry_count = state.runtime.gateway_retry_count,
         .cancel_flag = state.runtime.cancel_flag,
@@ -2174,7 +2158,7 @@ fn testReviewTurn() permission_auto_classifier.ReviewTurnContext {
 }
 
 const TestRuntime = struct {
-    agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
+    route_adapter: agent_stream_provider.ProviderAdapter = test_adapter.provider_adapter,
     tool_registry: tool_dispatch.Registry = test_tool_registry,
     worker: WorkerRuntime = .{},
     background: BackgroundRuntime = .{},
@@ -2195,20 +2179,19 @@ const TestRuntime = struct {
     permission_mode: PermissionMode = .ask,
     max_command_output_bytes: usize = 64 * 1024,
     max_tool_result_bytes: usize = 64 * 1024,
-    api_key: []const u8 = "",
-    gateway_team: ?[]const u8 = null,
+    route_credential: []const u8 = "",
+    route_tenant: ?[]const u8 = null,
     gateway_retry_count: usize = 0,
-    gateway_chat_url: []const u8 = "",
     route: route_snapshot.RouteSnapshot = .{
         .connection_id = "test-connection",
-        .adapter_kind = "vercel_ai_gateway",
-        .endpoint = "https://gateway.invalid/chat",
-        .protocol = "vercel_ai_gateway",
+        .adapter_kind = "test-adapter",
+        .endpoint = "https://example.invalid/model",
+        .protocol = "test-model-stream",
         .credential_ref = "test",
-        .primary_model_id = "google/gemini-2.5-flash",
-        .permission_review_model_id = "openai/gpt-5.4",
-        .vision_model_id = "google/gemini-2.5-flash",
-        .subagent_model_id = "google/gemini-2.5-flash",
+        .primary_model_id = "test/model",
+        .permission_review_model_id = "test/reviewer",
+        .vision_model_id = "test/vision",
+        .subagent_model_id = "test/subagent",
         .capabilities = .{
             .supports_tool_use = true,
             .supports_vision = true,
@@ -2244,6 +2227,7 @@ const TestRuntime = struct {
     on_web_fetch_progress: ?tool_dispatch.WebFetchProgressFn = null,
     workspace_executor: ?js_host_workspace.Executor = null,
     host_sandbox_default: tool_admission.HostSandboxDefault = .none,
+    adapter_manifest: [1]agent_stream_provider.ProviderAdapter = .{agent_stream_provider.unavailable_adapter},
 
     fn deinit(self: *TestRuntime, alloc: Allocator) void {
         self.worker.deinit(alloc);
@@ -2252,8 +2236,8 @@ const TestRuntime = struct {
     }
 
     fn context(self: *TestRuntime) Context {
-        var provider_adapter = test_builtin_gateway.provider_adapter;
-        provider_adapter.legacy_provider = self.agent_stream_provider;
+        const route_adapter = self.route_adapter;
+        self.adapter_manifest[0] = route_adapter;
         return .{
             .workspace_root = self.workspace_root,
             .ignored_list_entries = self.ignored_list_entries,
@@ -2263,14 +2247,13 @@ const TestRuntime = struct {
             .max_read_file_line_len = 2000,
             .max_command_output_bytes = self.max_command_output_bytes,
             .max_tool_result_bytes = self.max_tool_result_bytes,
-            .api_key = self.api_key,
-            .provider_adapter = provider_adapter,
+            .adapter_registry = .{ .adapters = &self.adapter_manifest },
+            .route_adapter = route_adapter,
             .route = &self.route,
-            .agent_stream_provider = self.agent_stream_provider,
-            .gateway_team = self.gateway_team,
+            .route_credential = self.route_credential,
+            .route_tenant = self.route_tenant,
             .model = self.model,
             .gateway_retry_count = self.gateway_retry_count,
-            .gateway_chat_url = self.gateway_chat_url,
             .agent_step_limit = 0,
             .permission_mode = self.permission_mode,
             .permission_grants = self.permission_grants,
@@ -4564,8 +4547,8 @@ test "web search invocation projects the pinned route after another route is sel
     const alloc = std.testing.allocator;
     var backend = WebSearchBackendFixture{};
     var connection_a = TestRuntime{
-        .api_key = "credential-a",
-        .gateway_team = "tenant-a",
+        .route_credential = "credential-a",
+        .route_tenant = "tenant-a",
         .gateway_retry_count = 2,
         .web_search_runtime_ready = true,
         .web_search_backend = .{
@@ -4578,7 +4561,7 @@ test "web search invocation projects the pinned route after another route is sel
     connection_a.route.endpoint = "https://connection-a.invalid/chat";
     connection_a.route.primary_model_id = "provider/model-a";
 
-    var connection_b = TestRuntime{ .api_key = "credential-b" };
+    var connection_b = TestRuntime{ .route_credential = "credential-b" };
     defer connection_b.deinit(alloc);
     connection_b.route.connection_id = "connection-b";
     _ = connection_b.context();
@@ -4596,7 +4579,7 @@ test "web search invocation projects the pinned route after another route is sel
     try std.testing.expect(invocation.inputs.usage == &connection_a.session.usage);
 }
 
-test "unsupported route blocks Fx search while route-free preflight stays available" {
+test "unsupported route blocks fx search while route-free preflight stays available" {
     const alloc = std.testing.allocator;
     var backend = WebSearchBackendFixture{};
     var rt = TestRuntime{
@@ -4617,6 +4600,7 @@ test "unsupported route blocks Fx search while route-free preflight stays availa
 
     var no_route = rt.context();
     no_route.route = null;
+    no_route.route_adapter = agent_stream_provider.unavailable_adapter;
     const missing = typedDispatchContext(no_route, arena_state.allocator());
     try std.testing.expect(missing.web_search_invocation == null);
     try std.testing.expect(missing.tool_capabilities.web_search_runtime_ready);
@@ -6348,7 +6332,6 @@ test "run_command timeout returns model-visible failure" {
     const config = runtime_config.Config{
         .system_prompt = "",
         .gateway_retry_count = 0,
-        .gateway_chat_url = "",
         .model_tools = &.{},
         .agent_step_limit = 1,
         .cancel_flag = &cancel,
@@ -7706,7 +7689,7 @@ test "MCP select does not authorize same-response dynamic execution" {
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, selected.status);
     try std.testing.expectEqualStrings("mcp_fs_read", selected.selected_dynamic_tool.?.name);
     try expectContains(selected.selected_dynamic_tool.?.description, "<context_limit action='literal' />");
-    try std.testing.expect(selected.selected_dynamic_tool.?.dynamic_input_schema != null);
+    try std.testing.expect(selected.selected_dynamic_tool.?.input_schema.document != null);
 
     const result = try executeToolCall(rt.context(), arena, .{
         .id = "dynamic",
@@ -8472,70 +8455,87 @@ test "skill tool reports missing skill" {
 
 const vision_test_registry_tools = [_]tool_dispatch.Tool{test_builtin_tools.vision};
 
-const VisionGatewayResponse = struct {
-    status: std.http.Status = .ok,
+const VisionAdapterResponse = struct {
     content: ?[]const u8 = null,
     usage: types.Usage = .{},
     generation_id: ?[]const u8 = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    failure: ?agent_stream_provider.StreamFailure = null,
 };
 
-const VisionGatewayFixture = struct {
+const VisionAdapterFixture = struct {
     alloc: Allocator,
-    responses: []const VisionGatewayResponse,
+    responses: []const VisionAdapterResponse,
     allocation_probe: ?*std.testing.FailingAllocator = null,
     allocation_index_at_stream: ?usize = null,
-    payloads: std.ArrayList([]u8) = .empty,
+    image_counts: std.ArrayList(usize) = .empty,
+    prompts: std.ArrayList([]u8) = .empty,
+    all_media_types_png: bool = true,
     call_count: usize = 0,
     cancel_after_call: ?usize = null,
-    last_api_key: []const u8 = "",
-    last_team: ?[]const u8 = null,
+    last_credential: []const u8 = "",
+    last_tenant: ?[]const u8 = null,
     last_model: []const u8 = "",
     last_retry_count: usize = 0,
-    last_chat_url: []const u8 = "",
+    last_endpoint: []const u8 = "",
 
-    fn deinit(self: *VisionGatewayFixture) void {
-        for (self.payloads.items) |payload| self.alloc.free(payload);
-        self.payloads.deinit(self.alloc);
+    fn deinit(self: *VisionAdapterFixture) void {
+        self.image_counts.deinit(self.alloc);
+        for (self.prompts.items) |prompt| self.alloc.free(prompt);
+        self.prompts.deinit(self.alloc);
     }
 
-    fn provider(self: *VisionGatewayFixture) agent_stream_provider.Provider {
-        var result = test_builtin_gateway.agent_stream_provider;
+    fn adapter(self: *VisionAdapterFixture) agent_stream_provider.ProviderAdapter {
+        var result = test_adapter.provider_adapter;
         result.context = self;
         result.stream_fn = stream;
         return result;
     }
 
     fn stream(
-        context: ?*anyopaque,
+        route_adapter: *const agent_stream_provider.ProviderAdapter,
         _: Allocator,
-        request: agent_stream_provider.Request,
-    ) anyerror!agent_stream_provider.Result {
-        const self: *VisionGatewayFixture = @ptrCast(@alignCast(context.?));
+        request: agent_stream_provider.AdapterRequest,
+        events: agent_stream_provider.EventSink,
+    ) anyerror!void {
+        const self: *VisionAdapterFixture = @ptrCast(@alignCast(route_adapter.context.?));
         if (self.allocation_probe) |probe| {
             self.allocation_index_at_stream = probe.alloc_index;
         }
         const response_index = self.call_count;
         self.call_count += 1;
-        try self.payloads.append(self.alloc, try self.alloc.dupe(u8, request.payload));
-        self.last_api_key = request.api_key;
-        self.last_team = request.team;
-        self.last_model = request.model;
+        const images = request.model_request.verified_images orelse &.{};
+        try self.image_counts.append(self.alloc, images.len);
+        for (images) |image| {
+            self.all_media_types_png = self.all_media_types_png and std.mem.eql(u8, image.media_type, "image/png");
+        }
+        const user_prompt = if (request.model_request.messages.len > 1)
+            request.model_request.messages[1].content orelse ""
+        else
+            "";
+        try self.prompts.append(self.alloc, try self.alloc.dupe(u8, user_prompt));
+        self.last_credential = request.credential;
+        self.last_tenant = request.tenant;
+        self.last_model = request.model_id;
         self.last_retry_count = request.retry_count;
-        self.last_chat_url = request.chat_url;
+        self.last_endpoint = request.route.endpoint;
         if (self.cancel_after_call == self.call_count) request.cancel_flag.store(true, .seq_cst);
-        if (response_index >= self.responses.len) return error.UnexpectedVisionGatewayCall;
+        if (response_index >= self.responses.len) return error.UnexpectedVisionAdapterCall;
         const response = self.responses[response_index];
+        try events.emit(.provider_admitted);
         request.delivery.markPossiblySent();
-        return .{
-            .status = response.status,
-            .completion = .{
-                .content = response.content,
-                .generation_id = response.generation_id,
-                .finish_reason = .stop,
-                .usage = response.usage,
-            },
-            .generation_origin = "https://ai-gateway.vercel.sh",
-        };
+        if (response.failure) |failure| {
+            try events.emit(.{ .failure = failure });
+            return;
+        }
+        if (response.content) |content| try events.emit(.{ .text_delta = content });
+        try events.emit(.{ .usage = .{ .tokens = response.usage } });
+        try events.emit(.{ .finish = .{
+            .reason = .stop,
+            .generation_reference = if (response.generation_id) |id| .{
+                .id = id,
+                .lookup_scope = "https://example.invalid",
+            } else null,
+        } });
     }
 };
 
@@ -8718,7 +8718,7 @@ fn visionProviderParseAllocationCount(provider_json: []const u8) !usize {
     return probe.alloc_index;
 }
 
-fn visionAllocationIndexAtGateway(
+fn visionAllocationIndexAtAdapter(
     catalog: []const types.ImageAttachment,
     args_json: []const u8,
     provider_json: []const u8,
@@ -8728,15 +8728,15 @@ fn visionAllocationIndexAtGateway(
         base,
         .{ .resize_fail_index = 0 },
     );
-    const responses = [_]VisionGatewayResponse{.{ .content = provider_json }};
-    var fixture = VisionGatewayFixture{
+    const responses = [_]VisionAdapterResponse{.{ .content = provider_json }};
+    var fixture = VisionAdapterFixture{
         .alloc = base,
         .responses = &responses,
         .allocation_probe = &probe,
     };
     defer fixture.deinit();
     var rt = TestRuntime{
-        .agent_stream_provider = fixture.provider(),
+        .route_adapter = fixture.adapter(),
         .tool_registry = .{ .tools = vision_test_registry_tools[0..] },
         .session_allocator = base,
         .context_limits = .{ .image_adapter_output_bytes = .{
@@ -8836,18 +8836,18 @@ const OneShotFailingAllocator = struct {
 
 fn expectVisionOutOfMemoryAt(
     fail_index: usize,
-    expected_gateway_calls: usize,
+    expected_adapter_calls: usize,
     catalog: []const types.ImageAttachment,
     args_json: []const u8,
     provider_json: []const u8,
 ) !void {
     const base = std.testing.allocator;
     var failing = OneShotFailingAllocator.init(base, fail_index);
-    const responses = [_]VisionGatewayResponse{.{ .content = provider_json }};
-    var fixture = VisionGatewayFixture{ .alloc = base, .responses = &responses };
+    const responses = [_]VisionAdapterResponse{.{ .content = provider_json }};
+    var fixture = VisionAdapterFixture{ .alloc = base, .responses = &responses };
     defer fixture.deinit();
     var rt = TestRuntime{
-        .agent_stream_provider = fixture.provider(),
+        .route_adapter = fixture.adapter(),
         .tool_registry = .{ .tools = vision_test_registry_tools[0..] },
         .session_allocator = base,
         .context_limits = .{ .image_adapter_output_bytes = .{
@@ -8868,7 +8868,7 @@ fn expectVisionOutOfMemoryAt(
         try std.testing.expectEqual(error.OutOfMemory, err);
     }
     try std.testing.expect(failing.failing.has_induced_failure);
-    try std.testing.expectEqual(expected_gateway_calls, fixture.call_count);
+    try std.testing.expectEqual(expected_adapter_calls, fixture.call_count);
     try std.testing.expectEqual(
         failing.failing.allocated_bytes,
         failing.failing.freed_bytes,
@@ -8902,7 +8902,7 @@ test "vision runtime propagates provider and parser allocation failures without 
     defer types.freeImageAttachmentSlice(alloc, catalog);
     const args_json = "{\"image_ids\":[1],\"focus\":\"inspect\"}";
     const provider_json = "{\"images\":[{\"image_id\":1,\"status\":\"ok\",\"summary\":\"read\",\"visible_text\":[],\"details\":[]}]}";
-    const stream_alloc_index = try visionAllocationIndexAtGateway(
+    const stream_alloc_index = try visionAllocationIndexAtAdapter(
         catalog,
         args_json,
         provider_json,
@@ -8933,7 +8933,7 @@ test "vision parsed record transfer allocation failure releases the parsed owner
     const args_json = "{\"image_ids\":[1],\"focus\":\"inspect\"}";
     const provider_json = "{\"images\":[{\"image_id\":1,\"status\":\"ok\",\"summary\":\"read\",\"visible_text\":[],\"details\":[]}]}";
     const transfer_capacity_fail_index =
-        try visionAllocationIndexAtGateway(catalog, args_json, provider_json) +
+        try visionAllocationIndexAtAdapter(catalog, args_json, provider_json) +
         1 +
         try visionProviderParseAllocationCount(provider_json);
 
@@ -8980,11 +8980,11 @@ test "vision authorized catalog retains historical access outside budgeted model
 
     const provider_json = try visionProviderSuccess(alloc, &.{41});
     defer alloc.free(provider_json);
-    const responses = [_]VisionGatewayResponse{.{ .content = provider_json }};
-    var fixture = VisionGatewayFixture{ .alloc = alloc, .responses = &responses };
+    const responses = [_]VisionAdapterResponse{.{ .content = provider_json }};
+    var fixture = VisionAdapterFixture{ .alloc = alloc, .responses = &responses };
     defer fixture.deinit();
     var rt = TestRuntime{
-        .agent_stream_provider = fixture.provider(),
+        .route_adapter = fixture.adapter(),
         .tool_registry = .{ .tools = vision_test_registry_tools[0..] },
         .session_allocator = alloc,
     };
@@ -9016,7 +9016,7 @@ test "vision runtime resolves historical authorized images and batches twenty as
     defer alloc.free(second);
     const third = try visionProviderSuccessReversed(alloc, requested[16..20]);
     defer alloc.free(third);
-    const responses = [_]VisionGatewayResponse{
+    const responses = [_]VisionAdapterResponse{
         .{ .content = first, .usage = .{ .input_tokens = 2, .output_tokens = 3 } },
         .{
             .content = second,
@@ -9029,15 +9029,14 @@ test "vision runtime resolves historical authorized images and batches twenty as
             .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAX",
         },
     };
-    var fixture = VisionGatewayFixture{ .alloc = alloc, .responses = &responses };
+    var fixture = VisionAdapterFixture{ .alloc = alloc, .responses = &responses };
     defer fixture.deinit();
     var rt = TestRuntime{
-        .agent_stream_provider = fixture.provider(),
+        .route_adapter = fixture.adapter(),
         .tool_registry = .{ .tools = vision_test_registry_tools[0..] },
-        .api_key = "gateway-key",
-        .gateway_team = "team_vision",
+        .route_credential = "gateway-key",
+        .route_tenant = "team_vision",
         .gateway_retry_count = 2,
-        .gateway_chat_url = "https://gateway.invalid/chat",
         .session_allocator = alloc,
         .context_limits = .{ .image_adapter_output_bytes = .{
             .value = .{ .bytes = 64 * 1024 },
@@ -9053,19 +9052,15 @@ test "vision runtime resolves historical authorized images and batches twenty as
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
     try std.testing.expectEqual(@as(usize, 3), fixture.call_count);
-    try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, fixture.payloads.items[0], "\"type\":\"file\""));
-    try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, fixture.payloads.items[1], "\"type\":\"file\""));
-    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, fixture.payloads.items[2], "\"type\":\"file\""));
-    try std.testing.expectEqualStrings("google/gemini-2.5-flash", fixture.last_model);
-    try std.testing.expectEqualStrings("gateway-key", fixture.last_api_key);
-    try std.testing.expectEqualStrings("team_vision", fixture.last_team.?);
+    try std.testing.expectEqualSlices(usize, &.{ 8, 8, 4 }, fixture.image_counts.items);
+    try std.testing.expect(fixture.all_media_types_png);
+    try std.testing.expectEqualStrings("test/vision", fixture.last_model);
+    try std.testing.expectEqualStrings("gateway-key", fixture.last_credential);
+    try std.testing.expectEqualStrings("team_vision", fixture.last_tenant.?);
     try std.testing.expectEqual(@as(usize, 2), fixture.last_retry_count);
-    try std.testing.expectEqualStrings("https://gateway.invalid/chat", fixture.last_chat_url);
-    try expectContains(fixture.payloads.items[0], "Read the build state");
-    try expectContains(fixture.payloads.items[0], "\"mediaType\":\"image/png\"");
-    for (fixture.payloads.items) |payload| {
-        for (catalog) |image| try expectNotContains(payload, image.path);
-    }
+    try std.testing.expectEqualStrings("https://example.invalid/model", fixture.last_endpoint);
+    try expectContains(fixture.prompts.items[0], "Read the build state");
+    try std.testing.expect(!@hasField(image_attachments.VerifiedSnapshot, "path"));
     var previous_offset: usize = 0;
     for (requested) |image_id| {
         const needle = try std.fmt.allocPrint(alloc, "\"image_id\":{d}", .{image_id});
@@ -9082,10 +9077,10 @@ test "vision runtime resolves historical authorized images and batches twenty as
 
 test "vision runtime rejects unauthorized ids before filesystem or provider access" {
     const alloc = std.testing.allocator;
-    var fixture = VisionGatewayFixture{ .alloc = alloc, .responses = &.{} };
+    var fixture = VisionAdapterFixture{ .alloc = alloc, .responses = &.{} };
     defer fixture.deinit();
     var rt = TestRuntime{
-        .agent_stream_provider = fixture.provider(),
+        .route_adapter = fixture.adapter(),
         .tool_registry = .{ .tools = vision_test_registry_tools[0..] },
     };
     defer rt.deinit(alloc);
@@ -9100,10 +9095,10 @@ test "vision runtime rejects unauthorized ids before filesystem or provider acce
 
 test "vision runtime rejects a path source without canonical path authority" {
     const alloc = std.testing.allocator;
-    var fixture = VisionGatewayFixture{ .alloc = alloc, .responses = &.{} };
+    var fixture = VisionAdapterFixture{ .alloc = alloc, .responses = &.{} };
     defer fixture.deinit();
     var rt = TestRuntime{
-        .agent_stream_provider = fixture.provider(),
+        .route_adapter = fixture.adapter(),
         .tool_registry = .{ .tools = vision_test_registry_tools[0..] },
         .workspace_root = "/tmp",
     };
@@ -9135,11 +9130,11 @@ test "vision runtime loads approved paths into a transient authorized catalog" {
     defer alloc.free(source_path);
     const provider_json = try visionProviderSuccess(alloc, &.{1});
     defer alloc.free(provider_json);
-    const responses = [_]VisionGatewayResponse{.{ .content = provider_json }};
-    var fixture = VisionGatewayFixture{ .alloc = alloc, .responses = &responses };
+    const responses = [_]VisionAdapterResponse{.{ .content = provider_json }};
+    var fixture = VisionAdapterFixture{ .alloc = alloc, .responses = &responses };
     defer fixture.deinit();
     var rt = TestRuntime{
-        .agent_stream_provider = fixture.provider(),
+        .route_adapter = fixture.adapter(),
         .tool_registry = .{ .tools = vision_test_registry_tools[0..] },
         .workspace_root = workspace,
         .session_allocator = alloc,
@@ -9161,8 +9156,8 @@ test "vision runtime loads approved paths into a transient authorized catalog" {
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
     try expectContains(result.model_output, "\"image_id\":1");
     try std.testing.expectEqual(@as(usize, 1), fixture.call_count);
-    try expectContains(fixture.payloads.items[0], "\"type\":\"file\"");
-    try expectNotContains(fixture.payloads.items[0], source_path);
+    try std.testing.expectEqualSlices(usize, &.{1}, fixture.image_counts.items);
+    try std.testing.expect(fixture.all_media_types_png);
 }
 
 test "vision runtime returns bounded failures for unavailable approved paths" {
@@ -9191,10 +9186,10 @@ test "vision runtime returns bounded failures for unavailable approved paths" {
     file.close(io_mod.getIo());
     try tmp.dir.deleteFile(io_mod.getIo(), "removed.png");
 
-    var fixture = VisionGatewayFixture{ .alloc = alloc, .responses = &.{} };
+    var fixture = VisionAdapterFixture{ .alloc = alloc, .responses = &.{} };
     defer fixture.deinit();
     var rt = TestRuntime{
-        .agent_stream_provider = fixture.provider(),
+        .route_adapter = fixture.adapter(),
         .tool_registry = .{ .tools = vision_test_registry_tools[0..] },
         .workspace_root = workspace,
     };
@@ -9225,11 +9220,11 @@ test "vision runtime propagates cancellation while preparing approved paths" {
     defer alloc.free(workspace);
     const source_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "photo.png");
     defer alloc.free(source_path);
-    var fixture = VisionGatewayFixture{ .alloc = alloc, .responses = &.{} };
+    var fixture = VisionAdapterFixture{ .alloc = alloc, .responses = &.{} };
     defer fixture.deinit();
     var cancel_flag = std.atomic.Value(bool).init(true);
     var rt = TestRuntime{
-        .agent_stream_provider = fixture.provider(),
+        .route_adapter = fixture.adapter(),
         .tool_registry = .{ .tools = vision_test_registry_tools[0..] },
         .workspace_root = workspace,
         .cancel_flag = &cancel_flag,
@@ -9259,16 +9254,16 @@ test "vision runtime preserves partial success and exact total outage notices" {
         "{\"image_id\":1,\"status\":\"ok\",\"summary\":\"read\",\"visible_text\":[],\"details\":[]}]}";
     // The malformed response is scripted twice because a structurally invalid
     // successful response is retried once. The outage before it is not retried.
-    const responses = [_]VisionGatewayResponse{
+    const responses = [_]VisionAdapterResponse{
         .{ .content = partial_json },
-        .{ .status = .service_unavailable },
+        .{ .failure = .{ .category = .unavailable } },
         .{ .content = "not-json" },
         .{ .content = "not-json" },
     };
-    var fixture = VisionGatewayFixture{ .alloc = alloc, .responses = &responses };
+    var fixture = VisionAdapterFixture{ .alloc = alloc, .responses = &responses };
     defer fixture.deinit();
     var rt = TestRuntime{
-        .agent_stream_provider = fixture.provider(),
+        .route_adapter = fixture.adapter(),
         .tool_registry = .{ .tools = vision_test_registry_tools[0..] },
         .session_allocator = alloc,
     };
@@ -9314,14 +9309,14 @@ test "vision runtime classifies an empty successful provider result as invalid" 
     defer tmp.cleanup();
     const catalog = try makeVisionCatalog(alloc, tmp.dir, 1);
     defer types.freeImageAttachmentSlice(alloc, catalog);
-    const responses = [_]VisionGatewayResponse{
+    const responses = [_]VisionAdapterResponse{
         .{ .content = "{\"images\":[]}" },
         .{ .content = "{\"images\":[]}" },
     };
-    var fixture = VisionGatewayFixture{ .alloc = alloc, .responses = &responses };
+    var fixture = VisionAdapterFixture{ .alloc = alloc, .responses = &responses };
     defer fixture.deinit();
     var rt = TestRuntime{
-        .agent_stream_provider = fixture.provider(),
+        .route_adapter = fixture.adapter(),
         .tool_registry = .{ .tools = vision_test_registry_tools[0..] },
         .session_allocator = alloc,
     };
@@ -9365,15 +9360,15 @@ test "vision runtime honors configured provider bounds without a hidden twenty K
     const large_json = try large_out.toOwnedSlice();
     defer alloc.free(large_json);
     try std.testing.expect(large_json.len > 20 * 1024);
-    const responses = [_]VisionGatewayResponse{
+    const responses = [_]VisionAdapterResponse{
         .{ .content = large_json },
         .{ .content = large_json },
         .{ .content = large_json },
     };
-    var fixture = VisionGatewayFixture{ .alloc = alloc, .responses = &responses };
+    var fixture = VisionAdapterFixture{ .alloc = alloc, .responses = &responses };
     defer fixture.deinit();
     var rt = TestRuntime{
-        .agent_stream_provider = fixture.provider(),
+        .route_adapter = fixture.adapter(),
         .tool_registry = .{ .tools = vision_test_registry_tools[0..] },
         .session_allocator = alloc,
         .context_limits = .{ .image_adapter_output_bytes = .{
@@ -9410,8 +9405,8 @@ test "vision cancellation stops later batches and does not surface the outage ti
     defer types.freeImageAttachmentSlice(alloc, catalog);
     const first = try visionProviderSuccess(alloc, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
     defer alloc.free(first);
-    const responses = [_]VisionGatewayResponse{.{ .content = first }};
-    var fixture = VisionGatewayFixture{
+    const responses = [_]VisionAdapterResponse{.{ .content = first }};
+    var fixture = VisionAdapterFixture{
         .alloc = alloc,
         .responses = &responses,
         .cancel_after_call = 1,
@@ -9419,7 +9414,7 @@ test "vision cancellation stops later batches and does not surface the outage ti
     defer fixture.deinit();
     var cancel_flag = std.atomic.Value(bool).init(false);
     var rt = TestRuntime{
-        .agent_stream_provider = fixture.provider(),
+        .route_adapter = fixture.adapter(),
         .tool_registry = .{ .tools = vision_test_registry_tools[0..] },
         .cancel_flag = &cancel_flag,
         .session_allocator = alloc,

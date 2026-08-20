@@ -486,7 +486,7 @@ describe("web_search Gateway fixture", () => {
         expect(gateway.requests).toHaveLength(2);
         expect(gateway.requests[0].body).toContain("gateway.perplexity_search");
         expect(gateway.requests[1].body).toContain(
-          "web_search is unavailable: Fx search is not installed for this surface or selected connection",
+          "web_search is unavailable: fx search is not installed for this surface or selected connection",
         );
       } finally {
         gateway.stop();
@@ -518,7 +518,7 @@ describe("web_search Gateway fixture", () => {
         expect(result.stdout).toContain("native search call was rejected");
         expect(gateway.requests).toHaveLength(2);
         expect(gateway.requests[1].body).toContain(
-          "web_search is unavailable: Fx search is not installed for this surface or selected connection",
+          "web_search is unavailable: fx search is not installed for this surface or selected connection",
         );
       } finally {
         gateway.stop();

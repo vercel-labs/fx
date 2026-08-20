@@ -129,7 +129,7 @@ fn noopInputDeinit(_: *anyopaque, _: Allocator) void {}
 const list_files_dispatch_tool = tool_dispatch.Tool{
     .name = "list_files",
     .description = "List files dispatch test fixture.",
-    .gateway_schema = .{
+    .descriptor = .{
         .name = "list_files",
         .description = "List files dispatch test fixture.",
     },

@@ -22,6 +22,11 @@ const catalogModels = [
   { id: "sdk/catalog-beta", type: "language", released: 1, tags: ["reasoning"] },
 ];
 let fetchCalls = 0;
+const generationIds = [];
+const responseGenerationIds = [
+  "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+];
 let requestedModel;
 let requestedSessionId;
 let requestedSessionAffinity;
@@ -48,12 +53,15 @@ const mockFetch = async (url, init) => {
   if (!Array.isArray(requestBody.prompt) && !Array.isArray(requestBody.messages)) {
     throw new Error("gateway request did not contain prompt messages");
   }
+  const generationId = responseGenerationIds[fetchCalls - 1];
+  if (!generationId) throw new Error(`missing generation ID for response ${fetchCalls}`);
+  generationIds.push(generationId);
   return new Response(new ReadableStream({
     async start(controller) {
       controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"hello"}\n'));
       await new Promise((resolve) => setTimeout(resolve, 10));
       controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":" world"}\n'));
-      controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":3},"outputTokens":{"total":2}}}\n'));
+      controller.enqueue(encoded.encode(`data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":3},"outputTokens":{"total":2}},"providerMetadata":{"gateway":{"generationId":"${generationId}"}}}\n`));
       controller.enqueue(encoded.encode("data: [DONE]\n"));
       controller.close();
     },
@@ -183,6 +191,8 @@ try { await restored.remove(); } catch { removeRejected = true; }
 if (!removeRejected) throw new Error("host session remove failure was accepted");
 const retryTurn = restored.prompt("continue after failed removal");
 if ((await retryTurn.result).stopReason !== "end_turn") throw new Error("session did not remain active after failed removal");
+if (fetchCalls !== 2) throw new Error(`expected one Gateway request per turn, got ${fetchCalls}`);
+if (new Set(generationIds).size !== generationIds.length) throw new Error("Gateway responses reused a generation ID");
 await restored.remove();
 if ((await agent.listSessions()).some((entry) => entry.sessionId === session.id)) throw new Error("removed session was still listed");
 const exitCode = await agent.close();

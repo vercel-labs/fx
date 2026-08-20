@@ -31,13 +31,13 @@ const server = createServer((request, response) => {
         firstConnectionClosedResolve();
       });
       response.write('data: {"type":"text-delta","delta":"native one"}\n\n');
-      response.write('data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n\n');
+      response.write('data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}},"providerMetadata":{"gateway":{"generationId":"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"}}}\n\n');
       events.push("first-finish-sent");
       return;
     }
     assert.equal(requestCount, 2, "only two Gateway requests are expected");
     response.write('data: {"type":"text-delta","delta":"native two"}\n\n');
-    response.write('data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n\n');
+    response.write('data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}},"providerMetadata":{"gateway":{"generationId":"gen_01ARZ3NDEKTSV4RRFFQ69G5FAW"}}}\n\n');
     response.end("data: [DONE]\n\n");
   });
 });

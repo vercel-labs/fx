@@ -312,7 +312,7 @@ pub fn composeHintRow(
     const base_hint_line = ui_render.buildHintLine(
         ctx.stream.active,
         approval_active,
-        ctx.has_api_key or (ctx.auth_picker.active and ctx.auth_picker.include_skip),
+        ctx.has_credential or (ctx.auth_picker.active and ctx.auth_picker.include_skip),
         ctx.model,
         ctx.permission_mode,
         ctx.queued_count,
@@ -962,7 +962,7 @@ fn testRenderContext(input: *const InputRuntime) RenderContext {
     return .{
         .slash_registry = input_test_slash_registry,
         .stream = .{},
-        .has_api_key = true,
+        .has_credential = true,
         .model = "gpt-5.1",
         .queued_count = 0,
         .subagent_count = 0,
@@ -1500,7 +1500,7 @@ test "compose hint row keeps model in left hint text" {
 
     const ctx: RenderContext = .{
         .stream = .{},
-        .has_api_key = true,
+        .has_credential = true,
         .model = "gpt-5.1",
         .queued_count = 0,
         .subagent_count = 0,
@@ -1527,7 +1527,7 @@ test "compose hint row uses dots in subagent view" {
 
     const ctx: RenderContext = .{
         .stream = .{},
-        .has_api_key = true,
+        .has_credential = true,
         .model = "gpt-5.1",
         .queued_count = 0,
         .subagent_count = 2,
@@ -1565,7 +1565,7 @@ test "compose hint row omits the inactive subagent manager marker" {
 
     const ctx: RenderContext = .{
         .stream = .{},
-        .has_api_key = true,
+        .has_credential = true,
         .model = "gpt-5.1",
         .queued_count = 0,
         .subagent_count = 2,
@@ -1606,7 +1606,7 @@ test "compose hint row right-aligns upgrade status" {
 
     const ctx: RenderContext = .{
         .stream = .{},
-        .has_api_key = true,
+        .has_credential = true,
         .model = "gpt-5.1",
         .queued_count = 0,
         .subagent_count = 0,
@@ -1635,7 +1635,7 @@ test "compose hint row right-aligns upgrade status after styled auto mode" {
 
     const ctx: RenderContext = .{
         .stream = .{},
-        .has_api_key = true,
+        .has_credential = true,
         .model = "openai/gpt-4o",
         .permission_mode = .auto,
         .queued_count = 0,

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const question_prompt = @import("../agent/question_prompt.zig");
 const app_auth_runtime = @import("app_auth_runtime.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
@@ -8,6 +9,8 @@ const app_commands = @import("app_commands.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
+const adapter_auth = @import("../gateway/adapter_auth.zig");
+const connection_registry = @import("../gateway/connection_registry.zig");
 const host = @import("../hosts/host.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const composer_insertion = @import("../input/composer_insertion.zig");
@@ -26,6 +29,10 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_commands = @import("../images/image_commands.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const test_model_descriptor_provider = if (builtin.is_test)
+    @import("../gateway/test_adapter.zig").model_descriptor_provider
+else
+    struct {};
 const model_cache_runtime = @import("model_cache_runtime.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const approval_decision = @import("../permissions/approval_decision.zig");
@@ -2227,7 +2234,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn resolveExplicitModelSelection(app: *App, input: []const u8) ExplicitModelSelectionParse {
             return switch (parseExplicitModelSelection(input)) {
-                .selection => |selection| validateExplicitModelSelection(selection, model_capabilities.resolveForApp(App, app, selection.model)),
+                .selection => |selection| validateExplicitModelSelection(selection, model_capabilities.resolveForApp(App, app, selection.model).capabilities),
                 .none => .none,
                 .invalid => .invalid,
             };
@@ -3192,8 +3199,8 @@ const RoutingFakeApp = struct {
     permission_mode_preference_commit_count: usize = 0,
     last_preference_permission_mode: ?types.PermissionMode = null,
     model_completion_values: []const []const u8 = &.{},
-    gateway_metadata_model: ?[]const u8 = null,
-    gateway_metadata: model_capabilities.GatewayMetadata = .{},
+    descriptor_override_model: ?[]const u8 = null,
+    descriptor_override_capabilities: model_capabilities.Capabilities = .{},
     model_cache_loading: bool = false,
     model_cache: model_cache_runtime.Runtime,
     file_completion_values: []const file_index.Candidate = &.{},
@@ -3216,7 +3223,7 @@ const RoutingFakeApp = struct {
     resume_selected_error: anyerror = error.SessionStoreUnavailable,
     resume_selected_closes_picker: bool = false,
     load_more_session_count: usize = 0,
-    selected_credential_source: ?types.CredentialSource = null,
+    selected_credential_source_id: ?[]const u8 = null,
     selected_auth_action: ?auth_runtime.AcquisitionAction = null,
     selected_auth_team: ?usize = null,
     upgrade_apply_count: usize = 0,
@@ -3235,7 +3242,7 @@ const RoutingFakeApp = struct {
     fn init(alloc: std.mem.Allocator) !RoutingFakeApp {
         var app = RoutingFakeApp{
             .alloc = alloc,
-            .model_cache = model_cache_runtime.Runtime.init(alloc, "/v1/models"),
+            .model_cache = model_cache_runtime.Runtime.init(alloc),
         };
         try app.selected_model.appendSlice(alloc, "test/model");
         app.shell.layout = .{
@@ -3349,13 +3356,13 @@ const RoutingFakeApp = struct {
         return false;
     }
 
-    pub fn resolvedModelCapabilities(self: *RoutingFakeApp, model: []const u8) model_capabilities.Capabilities {
-        if (self.gateway_metadata_model) |metadata_model| {
-            if (std.mem.eql(u8, metadata_model, model)) {
-                return model_capabilities.resolveCapabilities(model, self.gateway_metadata);
+    pub fn resolvedModelDescriptor(self: *RoutingFakeApp, model: []const u8) model_capabilities.ModelDescriptor {
+        if (self.descriptor_override_model) |override_model| {
+            if (std.mem.eql(u8, override_model, model)) {
+                return model_capabilities.configuredDescriptor(model, self.descriptor_override_capabilities);
             }
         }
-        return model_capabilities.capabilitiesForModel(model);
+        return test_model_descriptor_provider.fallback(model);
     }
 
     fn setGatewayControls(
@@ -3364,8 +3371,9 @@ const RoutingFakeApp = struct {
         efforts: []const types.ReasoningEffort,
         supports_fast_mode: bool,
     ) void {
-        self.gateway_metadata_model = model;
-        self.gateway_metadata = .{
+        self.descriptor_override_model = model;
+        self.descriptor_override_capabilities = .{
+            .supports_reasoning = efforts.len > 0,
             .reasoning_efforts = .fromSlice(efforts),
             .supports_fast_mode = supports_fast_mode,
         };
@@ -3461,8 +3469,8 @@ const RoutingFakeApp = struct {
         }
     }
 
-    pub fn selectCredentialSource(self: *RoutingFakeApp, source: types.CredentialSource) !bool {
-        self.selected_credential_source = source;
+    pub fn selectCredentialSource(self: *RoutingFakeApp, source_id: []const u8) !bool {
+        self.selected_credential_source_id = source_id;
         return true;
     }
 
@@ -3755,7 +3763,7 @@ test "app_input_runtime help menu inserts argument commands with a trailing spac
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try app.input_runtime.textReplacementState().replace(alloc, "additional directories");
+    try app.input_runtime.textReplacementState().replace(alloc, "workspace");
     app.input_runtime.help_menu.open();
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', RoutingFakeApp.input_byte_limit, 100);
@@ -3859,7 +3867,7 @@ test "app_input_runtime routes auth picker navigation before composer history" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    app.auth.source_inventory = auth_runtime.SourceSet.initMany(&.{ .ai_gateway_api_key, .fx_login });
+    try installRoutingSourceInventory(&app.auth, &.{ "ai_gateway_api_key", "fx_login" });
     app.auth.openPicker(alloc);
 
     try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .down, 1);
@@ -3872,7 +3880,7 @@ test "app_input_runtime Tab cycles the active auth picker" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    app.auth.source_inventory = auth_runtime.SourceSet.initMany(&.{ .ai_gateway_api_key, .fx_login });
+    try installRoutingSourceInventory(&app.auth, &.{ "ai_gateway_api_key", "fx_login" });
     app.auth.openPicker(alloc);
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
@@ -3916,7 +3924,7 @@ test "help menu whole replacement preserves the prior draft when staging fails" 
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(
         alloc,
-        "additional directories",
+        "workspace",
     );
     app.input_runtime.help_menu.open();
     failing.fail_index = failing.alloc_index;
@@ -3928,7 +3936,7 @@ test "help menu whole replacement preserves the prior draft when staging fails" 
 
     try std.testing.expect(app.input_runtime.help_menu.active);
     try std.testing.expectEqualStrings(
-        "additional directories",
+        "workspace",
         app.input_runtime.edit_state.input.items,
     );
 }
@@ -3959,7 +3967,7 @@ test "app_input_runtime auth picker enter closes before selecting a switched sou
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    app.auth.source_inventory = auth_runtime.SourceSet.initMany(&.{ .ai_gateway_api_key, .fx_login });
+    try installRoutingSourceInventory(&app.auth, &.{ "ai_gateway_api_key", "fx_login" });
     app.auth.openPicker(alloc);
     app.auth.openSwitchCredentialPicker(alloc);
     _ = app.auth.movePicker(1);
@@ -3967,14 +3975,14 @@ test "app_input_runtime auth picker enter closes before selecting a switched sou
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
     try std.testing.expect(!app.auth.pickerView().active);
-    try std.testing.expectEqual(types.CredentialSource.fx_login, app.selected_credential_source.?);
+    try std.testing.expectEqualStrings("fx_login", app.selected_credential_source_id.?);
 }
 
 test "app_input_runtime auth picker delegates typed acquisition actions" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    app.auth.source_inventory = auth_runtime.SourceSet.initMany(&.{ .ai_gateway_api_key, .fx_login });
+    try installRoutingSourceInventory(&app.auth, &.{ "ai_gateway_api_key", "fx_login" });
     app.auth.openPicker(alloc);
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
@@ -3987,7 +3995,7 @@ test "app_input_runtime Escape closes auth picker without arming composer clear"
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    app.auth.source_inventory = auth_runtime.SourceSet.initOne(.ai_gateway_api_key);
+    try installRoutingSourceInventory(&app.auth, &.{"ai_gateway_api_key"});
     app.auth.openPicker(alloc);
 
     try Runtime(RoutingFakeApp).resolveEscape(&app, false, 1);
@@ -4013,7 +4021,7 @@ test "app_input_runtime auth stage Escape pops before closing the picker" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    app.auth.source_inventory = auth_runtime.SourceSet.initOne(.stored_key);
+    try installRoutingSourceInventory(&app.auth, &.{"stored_key"});
     app.auth.openPicker(alloc);
 
     for (0..3) |_| _ = app.auth.movePicker(1);
@@ -4041,7 +4049,7 @@ test "app_input_runtime disabled change team action stays silent" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    app.auth.source_inventory = auth_runtime.SourceSet.initOne(.stored_key);
+    try installRoutingSourceInventory(&app.auth, &.{"stored_key"});
     app.auth.openPicker(alloc);
 
     for (0..2) |_| _ = app.auth.movePicker(1);
@@ -4193,7 +4201,7 @@ test "app_input_runtime composer editing dismisses auth picker before inserting"
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    app.auth.source_inventory = auth_runtime.SourceSet.initOne(.ai_gateway_api_key);
+    try installRoutingSourceInventory(&app.auth, &.{"ai_gateway_api_key"});
     app.auth.openPicker(alloc);
 
     try Runtime(RoutingFakeApp).handleByte(&app, 'x', 4096, 100);
@@ -4293,22 +4301,22 @@ test "api key entry bypasses composer paste and zeroes on cancellation" {
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     const sentinel = "FX_API_KEY_HISTORY_SENTINEL";
-    app.auth.openApiKeyPicker(alloc);
+    app.auth.openEnteredSecretPicker(alloc);
 
     try feedRoutingBytes(&app, "\x1b[200~");
     try feedRoutingBytes(&app, sentinel);
     try feedRoutingBytes(&app, "\x1b[201~");
 
-    try std.testing.expect(app.auth.apiKeyEntryActive());
-    try std.testing.expectEqual(sentinel.len, app.auth.pickerView().api_key_mask_count);
+    try std.testing.expect(app.auth.enteredSecretEntryActive());
+    try std.testing.expectEqual(sentinel.len, app.auth.pickerView().entered_secret_mask_count);
     try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.paste.buffer.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.composer_history.count());
 
     try Runtime(RoutingFakeApp).resolveEscape(&app, false, 1);
-    try std.testing.expect(!app.auth.apiKeyEntryActive());
-    try std.testing.expectEqual(@as(usize, 0), app.auth.pickerView().api_key_mask_count);
+    try std.testing.expect(!app.auth.enteredSecretEntryActive());
+    try std.testing.expectEqual(@as(usize, 0), app.auth.pickerView().entered_secret_mask_count);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
 }
 
@@ -5658,7 +5666,7 @@ test "explicit model selection semantic validation uses resolved capabilities" {
     };
     try std.testing.expect(validateExplicitModelSelection(
         unsupported_fast,
-        model_capabilities.capabilitiesForModel(unsupported_fast.model),
+        test_model_descriptor_provider.fallback(unsupported_fast.model).capabilities,
     ) == .invalid);
 
     const gateway_reasoning_only = switch (parseExplicitModelSelection(
@@ -5669,7 +5677,10 @@ test "explicit model selection semantic validation uses resolved capabilities" {
     };
     try std.testing.expect(validateExplicitModelSelection(
         gateway_reasoning_only,
-        model_capabilities.resolveCapabilities(gateway_reasoning_only.model, .{ .reasoning_efforts = .fromSlice(&high_efforts) }),
+        model_capabilities.configuredDescriptor(gateway_reasoning_only.model, .{
+            .supports_reasoning = true,
+            .reasoning_efforts = .fromSlice(&high_efforts),
+        }).capabilities,
     ) != .invalid);
 
     const unsupported_portable = switch (parseExplicitModelSelection(
@@ -5680,7 +5691,10 @@ test "explicit model selection semantic validation uses resolved capabilities" {
     };
     try std.testing.expect(validateExplicitModelSelection(
         unsupported_portable,
-        model_capabilities.resolveCapabilities(unsupported_portable.model, .{ .reasoning_efforts = .fromSlice(&high_efforts) }),
+        model_capabilities.configuredDescriptor(unsupported_portable.model, .{
+            .supports_reasoning = true,
+            .reasoning_efforts = .fromSlice(&high_efforts),
+        }).capabilities,
     ) == .invalid);
 
     const verified = switch (parseExplicitModelSelection(
@@ -5691,11 +5705,34 @@ test "explicit model selection semantic validation uses resolved capabilities" {
     };
     try std.testing.expect(validateExplicitModelSelection(
         verified,
-        model_capabilities.resolveCapabilities(verified.model, .{
+        model_capabilities.configuredDescriptor(verified.model, .{
+            .supports_reasoning = true,
             .reasoning_efforts = .fromSlice(&xhigh_efforts),
             .supports_fast_mode = true,
-        }),
+        }).capabilities,
     ) != .invalid);
+}
+
+test "model picker derives effort and fast mode from normalized descriptor" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.descriptor_override_model = "opaque-model";
+    app.descriptor_override_capabilities = .{
+        .supports_reasoning = true,
+        .reasoning_efforts = .fromSlice(&.{
+            types.ReasoningEffort.literal("low"),
+            types.ReasoningEffort.literal("high"),
+        }),
+        .supports_fast_mode = true,
+    };
+
+    try input_completion_runtime.CompletionRuntime(RoutingFakeApp).beginExactModelSelection(&app, "opaque-model");
+
+    try std.testing.expectEqual(picker_state.ModelPickerStage.effort, app.input_runtime.picker.model_picker_stage);
+    try std.testing.expectEqualStrings("opaque-model", app.input_runtime.picker.model_picker_pending_model.items);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.picker.model_picker_effort_index);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.picker.model_picker_fast_index);
 }
 
 test "model picker spaces do not commit before enter" {
@@ -6638,6 +6675,7 @@ test "app_input_runtime model picker preserves staged selections and backs out s
     try std.testing.expect(app.input_runtime.picker.selectedModelPickerFast());
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.7", app.selected_model.items);
     try std.testing.expectEqual(types.ReasoningEffort.literal("medium"), app.effort);
@@ -6645,6 +6683,23 @@ test "app_input_runtime model picker preserves staged selections and backs out s
     try std.testing.expectEqual(types.ReasoningEffort.literal("medium"), app.last_preference_effort.?);
     try std.testing.expectEqual(true, app.last_preference_fast_mode.?);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+}
+
+test "app_input_runtime preserves exact model ids before picker commit" {
+    const alloc = std.testing.allocator;
+    const completions = [_][]const u8{"zai/glm-5.2-fast"};
+
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.model_completion_values = &completions;
+    try app.input_runtime.textReplacementState().replace(alloc, "/model ");
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    try std.testing.expectEqualStrings("zai/glm-5.2-fast", app.selected_model.items);
+    try std.testing.expectEqualStrings("zai/glm-5.2-fast", app.last_preference_model.items);
+    try std.testing.expect(app.last_preference_fast_mode == null);
 }
 
 test "app_input_runtime model picker commits a model without options directly" {
@@ -6673,11 +6728,11 @@ test "app_input_runtime model picker skips effort stage for reasoning model with
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     app.model_completion_values = &completions;
-    app.gateway_metadata_model = model;
-    app.gateway_metadata = .{ .supports_reasoning = true };
+    app.descriptor_override_model = model;
+    app.descriptor_override_capabilities = .{ .supports_reasoning = true };
     try app.input_runtime.textReplacementState().replace(alloc, "/model ");
 
-    const capabilities = app.resolvedModelCapabilities(model);
+    const capabilities = app.resolvedModelDescriptor(model).capabilities;
     try std.testing.expect(capabilities.supports_reasoning);
     try std.testing.expectEqual(@as(usize, 0), capabilities.reasoning_efforts.len);
 
@@ -7663,24 +7718,75 @@ fn openRoutingModelMenu(app: *RoutingFakeApp, model_ids: []const []const u8) !vo
         const owned_id = try app.alloc.dupe(u8, model_id);
         var item_owns_id = false;
         errdefer if (!item_owns_id) app.alloc.free(owned_id);
-        const provider_end = std.mem.indexOfScalar(u8, owned_id, '/') orelse owned_id.len;
-        const provider = owned_id[0..provider_end];
+        const descriptor = app.resolvedModelDescriptor(owned_id);
         try menu.items.append(app.alloc, .{
             .id = owned_id,
-            .provider = provider,
-            .capabilities = app.resolvedModelCapabilities(owned_id),
+            .provider = descriptor.provider,
+            .descriptor = descriptor,
         });
         item_owns_id = true;
     }
 }
 
 fn openRoutingAuthPicker(app: *RoutingFakeApp) !void {
-    app.auth.source_inventory.insert(.vercel_oidc_token);
-    app.auth.source_inventory.insert(.ai_gateway_api_key);
+    try installRoutingSourceInventory(&app.auth, &.{ "test_session", "test_api_key" });
     app.auth.openPicker(app.alloc);
     try std.testing.expect(app.auth.movePicker(1));
     try std.testing.expectEqual(@as(usize, 4), app.auth.pickerView().choiceCount());
     try std.testing.expectEqual(@as(usize, 1), app.auth.pickerView().selectedIndex());
+}
+
+fn installRoutingSourceInventory(
+    auth: *auth_runtime.Runtime,
+    source_ids: []const []const u8,
+) !void {
+    const alloc = std.testing.allocator;
+    if (auth.connections == null) {
+        var connections = try connection_registry.Runtime.init(
+            alloc,
+            .{
+                .id = "test-connection",
+                .display_name = "Example Cloud",
+                .adapter_id = "test-adapter",
+                .credential_ref = if (source_ids.len > 0) source_ids[0] else "test_api_key",
+                .remembered_model = "test/model",
+            },
+            null,
+            connection_registry.Persistence.unavailable,
+        );
+        auth.adoptConnections(alloc, &connections);
+    }
+    const profile = try auth.selectedConnectionProfile();
+    var sources = try alloc.alloc(adapter_auth.CredentialSourceDescriptor, source_ids.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (sources[0..initialized]) |*source_value| source_value.deinit(alloc);
+        alloc.free(sources);
+    }
+    for (source_ids, 0..) |source_id, index| {
+        const is_session = std.mem.eql(u8, source_id, "test_session");
+        const is_entered = std.mem.eql(u8, source_id, "test_api_key") or
+            std.mem.eql(u8, source_id, "stored_key");
+        sources[index] = try adapter_auth.CredentialSourceDescriptor.init(
+            alloc,
+            source_id,
+            source_id,
+            true,
+            is_session,
+            if (is_entered) .{
+                .secret_kind_label = @constCast("API key"),
+                .verification_service_label = @constCast("Example Cloud"),
+                .storage_destination_label = @constCast("test store"),
+            } else null,
+            is_session,
+        );
+        initialized += 1;
+    }
+    auth.source_inventory = .{
+        .origin_profile = try adapter_auth.AuthProfileIdentity.init(alloc, profile),
+        .auth_service = try adapter_auth.AuthServicePresentation.init(alloc, "Example Cloud"),
+        .sources = sources,
+    };
 }
 
 const RoutingDecisionKind = enum { question, approval };

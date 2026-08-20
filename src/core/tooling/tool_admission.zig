@@ -8,7 +8,7 @@ const command_environment = @import("../execution/command_environment.zig");
 const command_effect = @import("../shell_command/command_effect.zig");
 const file_mutation = @import("file_mutation.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
-const gateway_schema = @import("gateway_schema.zig");
+const tool_descriptor = @import("tool_descriptor.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -742,7 +742,7 @@ fn schemaForReview(
     arena: Allocator,
     call: ToolCall,
     is_dynamic_tool: bool,
-) !?gateway_schema.FunctionSchema {
+) !?tool_descriptor.Descriptor {
     if (is_dynamic_tool) {
         const context = input.mcp_runtime.context orelse return null;
         const tool_schema = input.mcp_runtime.tool_schema orelse return null;
@@ -758,7 +758,7 @@ fn schemaForReview(
             .selected => |payload| .{
                 .name = payload.name,
                 .description = payload.description,
-                .dynamic_input_schema = std.json.parseFromSliceLeaky(
+                .input_schema = .{ .document = std.json.parseFromSliceLeaky(
                     std.json.Value,
                     arena,
                     payload.input_schema_json,
@@ -766,7 +766,7 @@ fn schemaForReview(
                 ) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return null,
-                },
+                } },
             },
             .rejected => null,
         };
@@ -4153,7 +4153,7 @@ test "automatic non-allow is recoverable regardless tool approval policy" {
     );
     var auto_deny_tool = test_builtin_tools.read_file;
     auto_deny_tool.name = "test_auto_deny_on_ask";
-    auto_deny_tool.gateway_schema.name = auto_deny_tool.name;
+    auto_deny_tool.descriptor.name = auto_deny_tool.name;
     auto_deny_tool.requires_approval = true;
     auto_deny_tool.approval_policy = .auto_deny_on_ask;
     auto_deny_tool.label_arg_kind = .none;
@@ -4319,7 +4319,7 @@ test "ask-only policy bypasses prompt and reviewer in auto and uses the ordinary
     );
     var ask_only_tool = test_builtin_tools.read_file;
     ask_only_tool.name = "test_ask_only";
-    ask_only_tool.gateway_schema.name = ask_only_tool.name;
+    ask_only_tool.descriptor.name = ask_only_tool.name;
     ask_only_tool.requires_approval = true;
     ask_only_tool.approval_policy = .ask_only;
     ask_only_tool.label_arg_kind = .none;
@@ -4721,7 +4721,7 @@ test "registered subagent commands do not require generic tool approval" {
     );
     var subagent = test_builtin_tools.read_file;
     subagent.name = "subagent";
-    subagent.gateway_schema.name = "subagent";
+    subagent.descriptor.name = "subagent";
     subagent.executor_kind = .subagent;
     subagent.activity_kind = .subagent;
     subagent.label_arg_kind = .none;
@@ -4752,7 +4752,7 @@ test "web search permission target follows registered tool metadata" {
 
     var provider_search = test_builtin_tools.read_file;
     provider_search.name = "provider_search";
-    provider_search.gateway_schema.name = "provider_search";
+    provider_search.descriptor.name = "provider_search";
     provider_search.executor_kind = .web_search;
     provider_search.permission_target_kind = .none;
     const tools = [_]tool_dispatch.Tool{provider_search};
@@ -4919,7 +4919,7 @@ test "permission rule display follows supplied registry metadata" {
 
     var provider_list = test_builtin_tools.list_files;
     provider_list.name = "provider_list";
-    provider_list.gateway_schema.name = "provider_list";
+    provider_list.descriptor.name = "provider_list";
     const tools = [_]tool_dispatch.Tool{provider_list};
     input.tool_registry = .{ .tools = tools[0..] };
     var rules = [_]types.PermissionRule{.{

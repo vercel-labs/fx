@@ -1,7 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const command_specs = @import("../core/slash_commands/command_specs.zig");
-
-const Allocator = std.mem.Allocator;
 
 pub const TopLevelKind = command_specs.TopLevelKind;
 pub const TopLevelSpec = command_specs.TopLevelSpec;
@@ -19,7 +18,7 @@ pub const SlashRegistry = command_specs.SlashRegistry;
 
 const json_option = command_specs.OptionDoc{ .flag = "--json", .description = "Emit machine-readable JSON instead of text" };
 
-pub const top_level_specs = [_]TopLevelSpec{
+const top_level_blueprint = [_]TopLevelSpec{
     .{
         .kind = .help,
         .token = "help",
@@ -90,13 +89,13 @@ pub const top_level_specs = [_]TopLevelSpec{
         .kind = .login,
         .token = "login",
         .usage = "login",
-        .summary = "Sign in with Vercel",
+        .summary = "Sign in",
     },
     .{
         .kind = .logout,
         .token = "logout",
         .usage = "logout",
-        .summary = "Sign out of the current Vercel session",
+        .summary = "Sign out",
     },
     .{
         .kind = .setup,
@@ -159,7 +158,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .kind = .teams,
         .token = "teams",
         .usage = "teams",
-        .summary = "Choose the Vercel team used by AI Gateway",
+        .summary = "Choose a team",
     },
     .{
         .kind = .session,
@@ -369,42 +368,7 @@ pub const top_level_resources = [_]TopLevelResource{
     .{ .label = "Report a problem:", .value = "run `/feedback` inside 𝒇x" },
 };
 
-pub const top_level_registry = TopLevelRegistry{
-    .specs = top_level_specs[0..],
-    .description = "Fast, native coding agent for the terminal.",
-    .interactive_hint = "𝒇x starts an interactive session by default. Use `fx ask` to run one noninteractive request.",
-    .help_groups = top_level_help_groups[0..],
-    .flags = top_level_flags[0..],
-    .examples = top_level_examples[0..],
-    .notes = top_level_notes[0..],
-    .resources = top_level_resources[0..],
-};
-
-pub fn matchesTopLevel(token: []const u8, kind: TopLevelKind) bool {
-    return command_specs.matchesTopLevel(top_level_registry, token, kind);
-}
-
-pub fn renderTopLevelHelp(alloc: Allocator, columns: usize, version: []const u8) ![]u8 {
-    return command_specs.renderTopLevelHelp(alloc, top_level_registry, columns, version);
-}
-
-pub fn renderTopLevelHelpWithStyle(alloc: Allocator, columns: usize, version: []const u8, style: HelpStyle) ![]u8 {
-    return command_specs.renderTopLevelHelpWithStyle(alloc, top_level_registry, columns, version, style);
-}
-
-pub fn renderTopLevelCommandHelp(alloc: Allocator, kind: TopLevelKind) ![]u8 {
-    return command_specs.renderTopLevelCommandHelp(alloc, top_level_registry, kind);
-}
-
-pub fn topLevelKindFromToken(token: []const u8) ?TopLevelKind {
-    return command_specs.topLevelKindFromToken(top_level_registry, token);
-}
-
-pub fn topLevelUsage(kind: TopLevelKind) []const u8 {
-    return command_specs.topLevelUsage(top_level_registry, kind);
-}
-
-pub const slash_specs = [_]SlashSpec{
+const slash_blueprint = [_]SlashSpec{
     .{ .kind = .help, .command = "/help", .help_entry = "/help", .completion_description = "show available slash commands", .presentation_category = .general, .show_in_welcome = true },
     .{ .kind = .clear_screen, .command = "/clear", .help_entry = "/clear", .completion_description = "start a fresh session and keep background processes", .presentation_category = .general, .show_in_welcome = true },
     .{ .kind = .new_session, .command = "/new", .help_entry = "/new", .completion_description = "start a fresh session", .presentation_category = .session, .show_in_welcome = true },
@@ -412,7 +376,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .resume_session, .command = "/resume", .help_entry = "/resume", .completion_description = "resume a saved session", .presentation_category = .session },
     .{ .kind = .continue_recovery, .command = "/continue", .help_entry = "/continue", .completion_description = "continue a paused model response", .presentation_category = .session, .requires_prompt_credential = true },
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
-    .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "sign in with Vercel", .presentation_category = .account },
+    .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "sign in", .presentation_category = .account },
     .{ .kind = .logout, .command = "/logout", .help_entry = "/logout", .completion_description = "sign out of fx login", .presentation_category = .account },
     .{ .kind = .setup, .command = "/setup", .help_entry = "/setup", .completion_description = "set up AI Gateway access", .presentation_category = .account },
     .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show token and turn statistics", .presentation_category = .account },
@@ -449,54 +413,32 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .quit, .command = "/quit", .aliases = &.{"/exit"}, .help_entry = "/quit", .completion_description = "exit the interactive shell", .presentation_category = .general, .show_in_welcome = true },
 };
 
-pub const slash_registry = SlashRegistry{ .commands = slash_specs[0..] };
-
-pub fn matchesSlashExact(cmd: []const u8, kind: SlashKind) bool {
-    return command_specs.matchesSlashExact(slash_registry, cmd, kind);
+pub fn topLevelRegistry(auth_service_label: []const u8) TopLevelRegistry {
+    return .{
+        .specs = top_level_blueprint[0..],
+        .auth_service_label = auth_service_label,
+        .description = "Fast, native coding agent for the terminal.",
+        .interactive_hint = "𝒇x starts an interactive session by default. Use `fx ask` to run one noninteractive request.",
+        .help_groups = top_level_help_groups[0..],
+        .flags = top_level_flags[0..],
+        .examples = top_level_examples[0..],
+        .notes = top_level_notes[0..],
+        .resources = top_level_resources[0..],
+    };
 }
 
-pub fn isExactSlashCommand(cmd: []const u8) bool {
-    return slash_registry.matchExact(cmd) != null;
+pub fn slashRegistry() SlashRegistry {
+    return .{ .commands = slash_blueprint[0..] };
 }
 
-pub fn matchedSlashPrefix(cmd: []const u8, kind: SlashKind) ?[]const u8 {
-    return command_specs.matchedSlashPrefix(slash_registry, cmd, kind);
+pub fn testTopLevelRegistry() TopLevelRegistry {
+    if (!builtin.is_test) @compileError("test catalog is test-only");
+    return topLevelRegistry("test service");
 }
 
-pub fn renderSlashHelp(alloc: Allocator) ![]u8 {
-    return command_specs.renderSlashHelp(alloc, slash_registry);
-}
-
-pub fn renderSlashWelcome(alloc: Allocator) ![]u8 {
-    return command_specs.renderSlashWelcome(alloc, slash_registry);
-}
-
-pub fn firstSlashCompletion(prefix: []const u8) ?[]const u8 {
-    return command_specs.firstSlashCompletion(slash_registry, prefix);
-}
-
-pub fn slashCompletionCount(prefix: []const u8) usize {
-    return command_specs.slashCompletionCount(slash_registry, prefix);
-}
-
-pub fn nthSlashCompletion(prefix: []const u8, n: usize) ?[]const u8 {
-    return command_specs.nthSlashCompletion(slash_registry, prefix, n);
-}
-
-pub fn nthSlashCompletionLabel(prefix: []const u8, n: usize) ?[]const u8 {
-    return command_specs.nthSlashCompletionLabel(slash_registry, prefix, n);
-}
-
-pub fn nthSlashCompletionDescription(prefix: []const u8, n: usize) ?[]const u8 {
-    return command_specs.nthSlashCompletionDescription(slash_registry, prefix, n);
-}
-
-pub fn nthSlashCompletionCategory(prefix: []const u8, n: usize) ?SlashPresentationCategory {
-    return command_specs.nthSlashCompletionCategory(slash_registry, prefix, n);
-}
-
-pub fn slashCompletionHasArgs(command: []const u8) bool {
-    return command_specs.slashCompletionHasArgs(slash_registry, command);
+pub fn testSlashRegistry() SlashRegistry {
+    if (!builtin.is_test) @compileError("test catalog is test-only");
+    return slashRegistry();
 }
 
 pub const argCompletionAnchor = command_specs.argCompletionAnchor;
@@ -556,13 +498,14 @@ test "built-in slash commands register exact active order" {
         "/quit",
     };
 
-    try std.testing.expectEqual(expected_commands.len, slash_specs.len);
-    for (expected_commands, slash_specs) |expected, spec| {
+    try std.testing.expectEqual(expected_commands.len, slash_blueprint.len);
+    for (expected_commands, slash_blueprint) |expected, spec| {
         try std.testing.expectEqualStrings(expected, spec.command);
     }
 }
 
 test "built-in slash registry resolves primary commands and aliases" {
+    const slash_registry = testSlashRegistry();
     const image = slash_registry.lookup("/img") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(SlashKind.image, image.kind);
 
@@ -588,17 +531,69 @@ test "built-in slash registry resolves primary commands and aliases" {
 }
 
 test "exact slash command matching includes hidden completion aliases" {
-    try std.testing.expect(isExactSlashCommand("/appearance"));
-    try std.testing.expect(isExactSlashCommand("/input"));
-    try std.testing.expect(isExactSlashCommand("/maxxing\t"));
-    try std.testing.expect(!isExactSlashCommand("/input lines"));
-    try std.testing.expect(!isExactSlashCommand("/unknown"));
+    const slash_registry = testSlashRegistry();
+    try std.testing.expect(slash_registry.matchExact("/appearance") != null);
+    try std.testing.expect(slash_registry.matchExact("/input") != null);
+    try std.testing.expect(slash_registry.matchExact("/maxxing\t") != null);
+    try std.testing.expect(slash_registry.matchExact("/input lines") == null);
+    try std.testing.expect(slash_registry.matchExact("/unknown") == null);
 }
 
 test "built-in paste completion describes clipboard image attachment" {
-    const completion = nthSlashCompletion("/pas", 0) orelse return error.TestExpectedEqual;
+    const slash_registry = testSlashRegistry();
+    const completion = command_specs.nthSlashCompletion(slash_registry, "/pas", 0) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("/paste", completion);
 
-    const description = nthSlashCompletionDescription("/pas", 0) orelse return error.TestExpectedEqual;
+    const description = command_specs.nthSlashCompletionDescription(slash_registry, "/pas", 0) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("attach an image from the clipboard when supported", description);
+}
+
+test "provider-labelled command copy is formatted without owned catalog state" {
+    const cases = [_]struct {
+        service_label: []const u8,
+        login: []const u8,
+        logout: []const u8,
+        teams: []const u8,
+        completion: []const u8,
+    }{
+        .{
+            .service_label = "Vercel",
+            .login = "Sign in with Vercel",
+            .logout = "Sign out of the current Vercel session",
+            .teams = "Choose the Vercel team used by AI Gateway",
+            .completion = "sign in with Vercel",
+        },
+        .{
+            .service_label = "Example Cloud",
+            .login = "Sign in with Example Cloud",
+            .logout = "Sign out of the current Example Cloud session",
+            .teams = "Choose the Example Cloud team used by AI Gateway",
+            .completion = "sign in with Example Cloud",
+        },
+    };
+
+    for (cases) |case| {
+        const registry = topLevelRegistry(case.service_label);
+        const kinds = [_]TopLevelKind{ .login, .logout, .teams };
+        const summaries = [_][]const u8{ case.login, case.logout, case.teams };
+        for (kinds, summaries) |kind, summary| {
+            const help = try command_specs.renderTopLevelCommandHelp(
+                std.testing.allocator,
+                registry,
+                kind,
+            );
+            defer std.testing.allocator.free(help);
+            try std.testing.expect(std.mem.find(u8, help, summary) != null);
+        }
+
+        var buffer: [command_specs.provider_command_presentation_buffer_bytes]u8 = undefined;
+        const completion = try command_specs.formatSlashCompletionDescription(
+            slashRegistry(),
+            "/log",
+            0,
+            case.service_label,
+            &buffer,
+        ) orelse return error.TestExpectedEqual;
+        try std.testing.expectEqualStrings(case.completion, completion);
+    }
 }

@@ -9,7 +9,7 @@ const mcp_contract = @import("mcp_contract.zig");
 const mcp_auth = @import("mcp_auth.zig");
 const mcp_auth_store = @import("mcp_auth_store.zig");
 const text_utils = @import("../shared/text_utils.zig");
-const gateway_schema = @import("../tooling/gateway_schema.zig");
+const tool_descriptor = @import("../tooling/tool_descriptor.zig");
 const permissions = @import("../permissions/permissions.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
@@ -18178,7 +18178,7 @@ test "MCP exact selection returns one executable schema by prefixed name" {
     try std.testing.expectEqualStrings("mcp_fs_read", selected.name);
     try std.testing.expect(std.mem.find(u8, selected.input_schema_json, "\"path\"") != null);
     try std.testing.expect(std.mem.find(u8, selected.description, "instruction tail") != null);
-    try std.testing.expect(std.mem.find(u8, selected.description, gateway_schema.truncation_marker) == null);
+    try std.testing.expect(std.mem.find(u8, selected.description, tool_descriptor.truncation_marker) == null);
     try std.testing.expect((try runtime.toolSchemaJsonByName(alloc, "mcp_missing", .{}, .{})) == null);
 }
 

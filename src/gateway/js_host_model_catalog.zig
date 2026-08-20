@@ -1,6 +1,7 @@
 const std = @import("std");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const builtin_gateway = @import("../builtins/gateway.zig");
+const model_catalog_failure = @import("model_catalog_failure.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -31,7 +32,7 @@ fn fetch(
 
     const url = try std.fmt.allocPrint(alloc, "{s}{s}", .{
         builtin_gateway.default_model_catalog_base_url,
-        input.endpoint,
+        builtin_gateway.models_path,
     });
     defer alloc.free(url);
 
@@ -75,7 +76,7 @@ fn fetch(
     if (response_len < 0) return .{ .failure = .{ .category = .transport, .retryable = true } };
     if (response_len > response.len) return .{ .failure = .{ .category = .resource_exhausted } };
     if (status != 200) {
-        return .{ .failure = model_catalog.failureForHttpStatus(@enumFromInt(status)) };
+        return .{ .failure = model_catalog_failure.fromHttpStatus(@enumFromInt(status)) };
     }
 
     const catalog = builtin_gateway.parseModelCatalogForView(
@@ -83,8 +84,7 @@ fn fetch(
         response[0..@intCast(response_len)],
         input.view,
     ) catch |err| return .{ .failure = .{
-        .category = if (err == error.OutOfMemory) .resource_exhausted else .malformed_response,
-        .http_status = .ok,
+        .category = if (err == error.OutOfMemory) .resource_exhausted else .invalid_content,
     } };
     return .{ .catalog = catalog };
 }

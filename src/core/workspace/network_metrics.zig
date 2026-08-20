@@ -1,4 +1,4 @@
-// In-memory ring buffer of recent gateway HTTP calls. Used by /trace
+// In-memory ring buffer of recent model and tool network calls. Used by /trace
 // to surface latency / error patterns without forcing a persistent trace
 // log. Process-wide and lock-protected: callers do not need to plumb the
 // buffer through their context.
@@ -9,18 +9,18 @@ const io_mod = @import("../shared/io.zig");
 pub const max_model_len: usize = 64;
 pub const max_error_len: usize = 48;
 pub const max_stop_reason_len: usize = 48;
-pub const max_gateway_schema_diagnostic_len: usize = 160;
-pub const max_gateway_request_shape_len: usize = 512;
+pub const max_tool_descriptor_diagnostic_len: usize = 160;
+pub const max_model_request_shape_len: usize = 512;
 pub const ring_capacity: usize = 32;
 
 pub const NetworkCallKind = enum {
-    gateway,
+    model,
     web_search,
     web_fetch_target,
 };
 
 pub const NetworkCall = struct {
-    kind: NetworkCallKind = .gateway,
+    kind: NetworkCallKind = .model,
     started_at_ms: i64 = 0,
     duration_ms: u32 = 0,
     status: u16 = 0,
@@ -38,10 +38,10 @@ pub const NetworkCall = struct {
     error_len: u8 = 0,
     stop_reason_buf: [max_stop_reason_len]u8 = [_]u8{0} ** max_stop_reason_len,
     stop_reason_len: u8 = 0,
-    gateway_schema_diagnostic_buf: [max_gateway_schema_diagnostic_len]u8 = [_]u8{0} ** max_gateway_schema_diagnostic_len,
-    gateway_schema_diagnostic_len: u16 = 0,
-    gateway_request_shape_buf: [max_gateway_request_shape_len]u8 = [_]u8{0} ** max_gateway_request_shape_len,
-    gateway_request_shape_len: u16 = 0,
+    tool_descriptor_diagnostic_buf: [max_tool_descriptor_diagnostic_len]u8 = [_]u8{0} ** max_tool_descriptor_diagnostic_len,
+    tool_descriptor_diagnostic_len: u16 = 0,
+    model_request_shape_buf: [max_model_request_shape_len]u8 = [_]u8{0} ** max_model_request_shape_len,
+    model_request_shape_len: u16 = 0,
 
     pub fn model(self: *const NetworkCall) []const u8 {
         return self.model_buf[0..self.model_len];
@@ -55,12 +55,12 @@ pub const NetworkCall = struct {
         return self.stop_reason_buf[0..self.stop_reason_len];
     }
 
-    pub fn gatewaySchemaDiagnostic(self: *const NetworkCall) []const u8 {
-        return self.gateway_schema_diagnostic_buf[0..self.gateway_schema_diagnostic_len];
+    pub fn toolDescriptorDiagnostic(self: *const NetworkCall) []const u8 {
+        return self.tool_descriptor_diagnostic_buf[0..self.tool_descriptor_diagnostic_len];
     }
 
-    pub fn gatewayRequestShape(self: *const NetworkCall) []const u8 {
-        return self.gateway_request_shape_buf[0..self.gateway_request_shape_len];
+    pub fn modelRequestShape(self: *const NetworkCall) []const u8 {
+        return self.model_request_shape_buf[0..self.model_request_shape_len];
     }
 
     pub fn setModel(self: *NetworkCall, name: []const u8) void {
@@ -81,16 +81,16 @@ pub const NetworkCall = struct {
         self.stop_reason_len = @intCast(n);
     }
 
-    pub fn setGatewaySchemaDiagnostic(self: *NetworkCall, diagnostic: []const u8) void {
-        const n = @min(diagnostic.len, max_gateway_schema_diagnostic_len);
-        @memcpy(self.gateway_schema_diagnostic_buf[0..n], diagnostic[0..n]);
-        self.gateway_schema_diagnostic_len = @intCast(n);
+    pub fn setToolDescriptorDiagnostic(self: *NetworkCall, diagnostic: []const u8) void {
+        const n = @min(diagnostic.len, max_tool_descriptor_diagnostic_len);
+        @memcpy(self.tool_descriptor_diagnostic_buf[0..n], diagnostic[0..n]);
+        self.tool_descriptor_diagnostic_len = @intCast(n);
     }
 
-    pub fn setGatewayRequestShape(self: *NetworkCall, shape: []const u8) void {
-        const n = @min(shape.len, max_gateway_request_shape_len);
-        @memcpy(self.gateway_request_shape_buf[0..n], shape[0..n]);
-        self.gateway_request_shape_len = @intCast(n);
+    pub fn setModelRequestShape(self: *NetworkCall, shape: []const u8) void {
+        const n = @min(shape.len, max_model_request_shape_len);
+        @memcpy(self.model_request_shape_buf[0..n], shape[0..n]);
+        self.model_request_shape_len = @intCast(n);
     }
 };
 
@@ -172,24 +172,24 @@ test "gateway diagnostics default empty truncate and survive snapshot" {
     defer resetForTest();
 
     var empty: NetworkCall = .{};
-    try std.testing.expectEqualStrings("", empty.gatewaySchemaDiagnostic());
-    try std.testing.expectEqualStrings("", empty.gatewayRequestShape());
+    try std.testing.expectEqualStrings("", empty.toolDescriptorDiagnostic());
+    try std.testing.expectEqualStrings("", empty.modelRequestShape());
 
-    var long_schema: [max_gateway_schema_diagnostic_len + 8]u8 = undefined;
+    var long_schema: [max_tool_descriptor_diagnostic_len + 8]u8 = undefined;
     @memset(long_schema[0..], 's');
-    var long_shape: [max_gateway_request_shape_len + 8]u8 = undefined;
+    var long_shape: [max_model_request_shape_len + 8]u8 = undefined;
     @memset(long_shape[0..], 'r');
 
     var call: NetworkCall = .{ .status = 400 };
-    call.setGatewaySchemaDiagnostic(&long_schema);
-    call.setGatewayRequestShape(&long_shape);
+    call.setToolDescriptorDiagnostic(&long_schema);
+    call.setModelRequestShape(&long_shape);
     record(call);
 
     var buf: [1]NetworkCall = undefined;
     const n = snapshot(&buf);
     try std.testing.expectEqual(@as(usize, 1), n);
-    try std.testing.expectEqual(max_gateway_schema_diagnostic_len, buf[0].gatewaySchemaDiagnostic().len);
-    try std.testing.expectEqual(max_gateway_request_shape_len, buf[0].gatewayRequestShape().len);
-    try std.testing.expectEqual(@as(u8, 's'), buf[0].gatewaySchemaDiagnostic()[0]);
-    try std.testing.expectEqual(@as(u8, 'r'), buf[0].gatewayRequestShape()[0]);
+    try std.testing.expectEqual(max_tool_descriptor_diagnostic_len, buf[0].toolDescriptorDiagnostic().len);
+    try std.testing.expectEqual(max_model_request_shape_len, buf[0].modelRequestShape().len);
+    try std.testing.expectEqual(@as(u8, 's'), buf[0].toolDescriptorDiagnostic()[0]);
+    try std.testing.expectEqual(@as(u8, 'r'), buf[0].modelRequestShape()[0]);
 }

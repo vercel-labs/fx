@@ -551,7 +551,7 @@ fn noopInputDeinit(_: *anyopaque, _: Allocator) void {}
 const grep_files_dispatch_tool = tool_dispatch.Tool{
     .name = "grep_files",
     .description = "Grep files dispatch test fixture.",
-    .gateway_schema = .{
+    .descriptor = .{
         .name = "grep_files",
         .description = "Grep files dispatch test fixture.",
     },

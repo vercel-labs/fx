@@ -1,7 +1,7 @@
 const std = @import("std");
 const agent_stream_provider = @import("../stream_provider.zig");
 const types = @import("../../shared/types.zig");
-const gateway_schema = @import("../../tooling/gateway_schema.zig");
+const tool_descriptor = @import("../../tooling/tool_descriptor.zig");
 const tool_result_limits = @import("../../tooling/tool_result_limits.zig");
 const session_child_store = @import("../../session/session_child_store.zig");
 const context_limits = @import("../../config/context_limits.zig");
@@ -32,8 +32,7 @@ pub const Config = struct {
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
     /// Read-only compatibility input for tool and subagent contexts. Root
     /// model traffic uses `QueuedPrompt.route.endpoint`; G11 removes this field.
-    gateway_chat_url: []const u8,
-    model_tools: []const gateway_schema.FunctionSchema,
+    model_tools: []const tool_descriptor.Descriptor,
     provider_tools: []const agent_stream_provider.ProviderToolAdvertisement = &.{},
     custom_tool_guidance: []const u8 = "",
     agent_step_limit: usize,

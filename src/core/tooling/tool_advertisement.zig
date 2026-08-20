@@ -1,6 +1,6 @@
 const std = @import("std");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
-const gateway_schema = @import("gateway_schema.zig");
+const tool_descriptor = @import("tool_descriptor.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const permissions = @import("../permissions/permissions.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
@@ -14,9 +14,9 @@ pub const Options = struct {
     permission_rules: types.PermissionRuleSet = .{},
     mcp_runtime: ?*mcp_runtime.McpRuntime = null,
     subagent_available: bool = false,
-    terminal_available: bool = false,
     provider_tools: []const agent_stream_provider.ProviderTool = &.{},
     fx_web_search_installed: bool = false,
+    terminal_available: bool = false,
 };
 
 const BuildKind = enum { full, read_only };
@@ -48,7 +48,7 @@ fn testToolIsIrreversible(_: tool_dispatch.ToolInput) bool {
 const test_tool_seed = tool_dispatch.Tool{
     .name = "test_tool",
     .description = "Test registered tool.",
-    .gateway_schema = .{
+    .descriptor = .{
         .name = "test_tool",
         .description = "Test registered tool.",
     },
@@ -62,7 +62,7 @@ const test_read_file = blk: {
     var spec = test_tool_seed;
     spec.name = "read_file";
     spec.description = "Test file read. When to use: exercise registered read projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "read_file",
         .description = spec.description,
         .input_schema = .{
@@ -87,7 +87,7 @@ const test_file_info = blk: {
     var spec = test_read_file;
     spec.name = "file_info";
     spec.description = "Test file metadata. When to use: exercise registered metadata projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "file_info",
         .description = spec.description,
         .input_schema = .{
@@ -112,7 +112,7 @@ const test_open_file = blk: {
     var spec = test_read_file;
     spec.name = "open_file";
     spec.description = "Test file open. When to use: exercise registered launcher projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "open_file",
         .description = spec.description,
         .input_schema = .{
@@ -137,7 +137,7 @@ const test_memory = blk: {
     var spec = test_read_file;
     spec.name = "memory";
     spec.description = "Test durable memory. When to use: exercise registered memory projection. When NOT to use: assert product-specific persistence behavior.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "memory",
         .description = spec.description,
         .input_schema = .{
@@ -163,7 +163,7 @@ const test_semantic_search = blk: {
     var spec = test_read_file;
     spec.name = "semantic_search";
     spec.description = "Test lexical search. When to use: exercise registered search projection. When NOT to use: assert product-specific search behavior.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "semantic_search",
         .description = spec.description,
         .input_schema = .{
@@ -189,7 +189,7 @@ const test_write_file = blk: {
     var spec = test_read_file;
     spec.name = "write_file";
     spec.description = "Test file write. When to use: exercise registered mutation projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "write_file",
         .description = spec.description,
         .input_schema = .{
@@ -215,7 +215,7 @@ const test_edit_file = blk: {
     var spec = test_read_file;
     spec.name = "edit_file";
     spec.description = "Test file editing. When to use: exercise registered edit projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "edit_file",
         .description = spec.description,
         .input_schema = .{
@@ -242,7 +242,7 @@ const test_delete_file = blk: {
     var spec = test_read_file;
     spec.name = "delete_file";
     spec.description = "Test file deletion. When to use: exercise registered delete projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "delete_file",
         .description = spec.description,
         .input_schema = .{
@@ -267,7 +267,7 @@ const test_rename_file = blk: {
     var spec = test_read_file;
     spec.name = "rename_file";
     spec.description = "Test file rename. When to use: exercise registered rename projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "rename_file",
         .description = spec.description,
         .input_schema = .{
@@ -293,7 +293,7 @@ const test_copy_file = blk: {
     var spec = test_read_file;
     spec.name = "copy_file";
     spec.description = "Test file copying. When to use: exercise registered copy projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "copy_file",
         .description = spec.description,
         .input_schema = .{
@@ -319,7 +319,7 @@ const test_create_folder = blk: {
     var spec = test_read_file;
     spec.name = "create_folder";
     spec.description = "Test folder creation. When to use: exercise registered creation projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "create_folder",
         .description = spec.description,
         .input_schema = .{
@@ -344,7 +344,7 @@ const test_list_files = blk: {
     var spec = test_read_file;
     spec.name = "list_files";
     spec.description = "Test directory listing. When to use: exercise registered list projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "list_files",
         .description = spec.description,
         .input_schema = .{ .properties = &.{
@@ -366,7 +366,7 @@ const test_glob_files = blk: {
     var spec = test_list_files;
     spec.name = "glob_files";
     spec.description = "Test filename matching. When to use: exercise registered search projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "glob_files",
         .description = spec.description,
         .input_schema = .{
@@ -389,7 +389,7 @@ const test_grep_files = blk: {
     var spec = test_read_file;
     spec.name = "grep_files";
     spec.description = "Test text search. When to use: exercise registered search projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "grep_files",
         .description = spec.description,
         .input_schema = .{
@@ -413,7 +413,7 @@ const test_grep_files = blk: {
 const test_web_fetch = blk: {
     var spec = test_read_file;
     spec.name = "web_fetch";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "web_fetch",
         .description = spec.description,
     };
@@ -428,7 +428,7 @@ const test_web_search_base = blk: {
     var spec = test_web_fetch;
     spec.name = "web_search";
     spec.description = "Test web search guidance.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "web_search",
         .description = spec.description,
     };
@@ -448,7 +448,7 @@ const test_terminal = blk: {
     var spec = test_read_file;
     spec.name = "terminal";
     spec.description = "Test terminal. When to use: exercise registered terminal projection. When NOT to use: assert product-specific terminal behavior.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "terminal",
         .description = spec.description,
         .input_schema = .{
@@ -475,7 +475,7 @@ const test_skill = blk: {
     var spec = test_read_file;
     spec.name = "skill";
     spec.description = "Test skill. When to use: exercise registered skill projection. When NOT to use: assert product-specific skill loading.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "skill",
         .description = spec.description,
     };
@@ -494,7 +494,7 @@ const test_install_skill = blk: {
     var spec = test_skill;
     spec.name = "install_skill";
     spec.description = "Test install skill. When to use: exercise registered write-tool projection. When NOT to use: assert product-specific installation behavior.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "install_skill",
         .description = spec.description,
     };
@@ -511,7 +511,7 @@ const test_subagent = blk: {
     var spec = test_skill;
     spec.name = "subagent";
     spec.description = "Test subagent. When to use: exercise registered subagent projection. When NOT to use: assert product-specific child management.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "subagent",
         .description = spec.description,
     };
@@ -528,7 +528,7 @@ const test_mcp_select_tool = blk: {
     var spec = test_skill;
     spec.name = "mcp_select_tool";
     spec.description = "Test MCP selection. When to use: exercise deferred MCP projection. When NOT to use: assert product-specific MCP guidance.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "mcp_select_tool",
         .description = spec.description,
         .input_schema = .{
@@ -553,7 +553,7 @@ const test_ask_user_question = blk: {
     var spec = test_subagent;
     spec.name = "ask_user_question";
     spec.description = "Test user question. When to use: exercise registered interactive projection. When NOT to use: assert product-specific question behavior.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "ask_user_question",
         .description = spec.description,
     };
@@ -572,7 +572,7 @@ const test_vision = blk: {
     var spec = test_read_file;
     spec.name = "vision";
     spec.description = "Test route-filtered vision capability.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "vision",
         .description = spec.description,
     };
@@ -592,7 +592,7 @@ const test_read_tool_result = blk: {
     var spec = test_read_file;
     spec.name = "read_tool_result";
     spec.description = "Test tool result lookup. When to use: exercise registry projection. When NOT to use: assert product-specific session behavior.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "read_tool_result",
         .description = spec.description,
     };
@@ -611,7 +611,7 @@ const test_mcp_search_tools = blk: {
     var spec = test_mcp_select_tool;
     spec.name = "mcp_search_tools";
     spec.description = "Test MCP tool search. When to use: exercise deferred dynamic-tool discovery. When NOT to use: assert product-specific search guidance.";
-    spec.gateway_schema = .{
+    spec.descriptor = .{
         .name = "mcp_search_tools",
         .description = spec.description,
         .input_schema = .{
@@ -644,7 +644,7 @@ const test_mirror_provider_tool = blk: {
 /// included custom advertisements. Descriptor contents remain borrowed from
 /// the immutable tool registry.
 pub const EffectiveToolProjection = struct {
-    tools: []gateway_schema.FunctionSchema,
+    tools: []tool_descriptor.Descriptor,
     provider_tools: []agent_stream_provider.ProviderToolAdvertisement,
     custom_guidance: []u8,
 
@@ -661,7 +661,7 @@ pub const EffectiveToolProjection = struct {
 };
 
 pub fn containsDescriptor(
-    descriptors: []const gateway_schema.FunctionSchema,
+    descriptors: []const tool_descriptor.Descriptor,
     name: []const u8,
 ) bool {
     for (descriptors) |descriptor| {
@@ -745,42 +745,38 @@ fn testToolSetForRegistry(tools: []const tool_dispatch.Tool) tool_set_contract.T
     };
 }
 
-fn buildTestGatewayToolProjection(alloc: Allocator, options: Options) !EffectiveToolProjection {
-    return buildGatewayToolProjectionForSet(alloc, test_tool_set, options);
+fn buildTestModelToolProjection(alloc: Allocator, options: Options) !EffectiveToolProjection {
+    return buildModelToolProjectionForSet(alloc, test_tool_set, options);
 }
 
-fn buildTestGatewayToolProjectionForRegistry(alloc: Allocator, tools: []const tool_dispatch.Tool, options: Options) !EffectiveToolProjection {
-    return buildGatewayToolProjectionForSet(alloc, testToolSetForRegistry(tools), options);
+fn buildTestModelToolProjectionForRegistry(alloc: Allocator, tools: []const tool_dispatch.Tool, options: Options) !EffectiveToolProjection {
+    return buildModelToolProjectionForSet(alloc, testToolSetForRegistry(tools), options);
 }
 
-fn buildTestReadOnlyGatewayToolProjection(alloc: Allocator, options: Options) !EffectiveToolProjection {
-    return buildReadOnlyGatewayToolProjectionForSet(alloc, test_tool_set, options);
-}
-
-pub fn buildGatewayToolProjectionForSet(alloc: Allocator, tool_set: tool_set_contract.ToolSet, options: Options) !EffectiveToolProjection {
+pub fn buildModelToolProjectionForSet(alloc: Allocator, tool_set: tool_set_contract.ToolSet, options: Options) !EffectiveToolProjection {
     return buildToolProjection(alloc, tool_set, .full, options);
 }
 
-pub fn buildReadOnlyGatewayToolProjectionForSet(alloc: Allocator, tool_set: tool_set_contract.ToolSet, options: Options) !EffectiveToolProjection {
+pub fn buildReadOnlyModelToolProjectionForSet(alloc: Allocator, tool_set: tool_set_contract.ToolSet, options: Options) !EffectiveToolProjection {
     return buildToolProjection(alloc, tool_set, .read_only, options);
 }
 
 pub fn buildModelTools(
     alloc: Allocator,
-    base: []const gateway_schema.FunctionSchema,
-    selected_dynamic: []const gateway_schema.FunctionSchema,
+    base: []const tool_descriptor.Descriptor,
+    selected_dynamic: []const tool_descriptor.Descriptor,
     vision_mode: agent_stream_provider.VisionMode,
-    vision: ?gateway_schema.FunctionSchema,
-) ![]gateway_schema.FunctionSchema {
+    vision: ?tool_descriptor.Descriptor,
+) ![]tool_descriptor.Descriptor {
     if (vision_mode == .required) {
         const descriptor = vision orelse return error.VisionToolNotRegistered;
         try descriptor.validate();
-        const tools = try alloc.alloc(gateway_schema.FunctionSchema, 1);
+        const tools = try alloc.alloc(tool_descriptor.Descriptor, 1);
         tools[0] = descriptor;
         return tools;
     }
 
-    var tools: std.ArrayList(gateway_schema.FunctionSchema) = .empty;
+    var tools: std.ArrayList(tool_descriptor.Descriptor) = .empty;
     errdefer tools.deinit(alloc);
     for (base) |descriptor| try appendUniqueDescriptor(alloc, &tools, descriptor);
     for (selected_dynamic) |descriptor| try appendUniqueDescriptor(alloc, &tools, descriptor);
@@ -796,8 +792,8 @@ pub fn buildModelTools(
 
 fn appendUniqueDescriptor(
     alloc: Allocator,
-    tools: *std.ArrayList(gateway_schema.FunctionSchema),
-    descriptor: gateway_schema.FunctionSchema,
+    tools: *std.ArrayList(tool_descriptor.Descriptor),
+    descriptor: tool_descriptor.Descriptor,
 ) !void {
     try descriptor.validate();
     for (tools.items) |existing| {
@@ -807,7 +803,7 @@ fn appendUniqueDescriptor(
 }
 
 fn buildToolProjection(alloc: Allocator, tool_set: tool_set_contract.ToolSet, kind: BuildKind, options: Options) !EffectiveToolProjection {
-    var tools: std.ArrayList(gateway_schema.FunctionSchema) = .empty;
+    var tools: std.ArrayList(tool_descriptor.Descriptor) = .empty;
     errdefer tools.deinit(alloc);
     var guidance_out: std.Io.Writer.Allocating = .init(alloc);
     errdefer guidance_out.deinit();
@@ -842,7 +838,7 @@ fn buildToolProjection(alloc: Allocator, tool_set: tool_set_contract.ToolSet, ki
 
 fn appendBuiltinTool(
     alloc: Allocator,
-    tools: *std.ArrayList(gateway_schema.FunctionSchema),
+    tools: *std.ArrayList(tool_descriptor.Descriptor),
     guidance_writer: *std.Io.Writer,
     provider_tools: *std.ArrayList(agent_stream_provider.ProviderToolAdvertisement),
     first_custom_guidance: *bool,
@@ -875,8 +871,8 @@ fn appendBuiltinTool(
     }
     if (options.permission_mode != .yolo and
         permissions.rulesDenyAllTargetsForTool(options.permission_rules, tool.name)) return;
-    try tool.gateway_schema.validate();
-    try tools.append(alloc, tool.gateway_schema);
+    try tool.descriptor.validate();
+    try tools.append(alloc, tool.descriptor);
 }
 
 fn providerToolIsSupported(
@@ -934,7 +930,7 @@ fn isCanonicalToolName(tool_set: tool_set_contract.ToolSet, name: []const u8) bo
 
 fn collectDescriptorNames(
     alloc: Allocator,
-    descriptors: []const gateway_schema.FunctionSchema,
+    descriptors: []const tool_descriptor.Descriptor,
 ) !std.ArrayList([]const u8) {
     var names: std.ArrayList([]const u8) = .empty;
     errdefer freeNames(alloc, &names);
@@ -1019,9 +1015,9 @@ test "full routes project neutral provider search separately from local schemas"
         .permission_rules = .{ .rules = &rules },
         .provider_tools = &.{.web_search},
     };
-    var default_projection = try buildTestGatewayToolProjection(std.testing.allocator, options);
+    var default_projection = try buildTestModelToolProjection(std.testing.allocator, options);
     defer default_projection.deinit(std.testing.allocator);
-    var registry_projection = try buildTestGatewayToolProjectionForRegistry(std.testing.allocator, test_all_tools[0..], options);
+    var registry_projection = try buildTestModelToolProjectionForRegistry(std.testing.allocator, test_all_tools[0..], options);
     defer registry_projection.deinit(std.testing.allocator);
 
     inline for (&.{ &default_projection, &registry_projection }) |projection| {
@@ -1035,8 +1031,8 @@ test "full routes project neutral provider search separately from local schemas"
     }
 }
 
-test "explicit Fx search install keeps local and provider authorities separate" {
-    var projection = try buildTestGatewayToolProjection(std.testing.allocator, .{
+test "explicit fx search install keeps local and provider authorities separate" {
+    var projection = try buildTestModelToolProjection(std.testing.allocator, .{
         .provider_tools = &.{.web_search},
         .fx_web_search_installed = true,
     });
@@ -1056,7 +1052,7 @@ test "explicit Fx search install keeps local and provider authorities separate" 
 }
 
 test "unsupported provider search advertises neither authority" {
-    var projection = try buildTestGatewayToolProjection(std.testing.allocator, .{});
+    var projection = try buildTestModelToolProjection(std.testing.allocator, .{});
     defer projection.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 0), projection.provider_tools.len);
@@ -1086,7 +1082,7 @@ test "provider search advertisement respects no-rule allow ask and deny" {
             .provider_tools = &.{.web_search},
         } else .{ .provider_tools = &.{.web_search} };
 
-        var full_projection = try buildTestGatewayToolProjection(std.testing.allocator, options);
+        var full_projection = try buildTestModelToolProjection(std.testing.allocator, options);
         defer full_projection.deinit(std.testing.allocator);
 
         inline for (&.{&full_projection}) |projection| {
@@ -1118,7 +1114,7 @@ test "provider execution gate follows the registry declaration, not the tool nam
         var rules = [_]types.PermissionRule{
             .{ .permission = @constCast("mirror_search"), .pattern = @constCast("*"), .action = case.action },
         };
-        var projection = try buildTestGatewayToolProjectionForRegistry(
+        var projection = try buildTestModelToolProjectionForRegistry(
             std.testing.allocator,
             tools[0..],
             .{
@@ -1141,7 +1137,7 @@ test "ask keeps advertising a tool the provider does not execute" {
     var rules = [_]types.PermissionRule{
         .{ .permission = @constCast("web_search"), .pattern = @constCast("*"), .action = .ask },
     };
-    var projection = try buildTestGatewayToolProjectionForRegistry(
+    var projection = try buildTestModelToolProjectionForRegistry(
         std.testing.allocator,
         tools[0..],
         .{ .permission_rules = .{ .rules = &rules } },
@@ -1162,7 +1158,7 @@ test "yolo advertisement ignores permission filtering" {
     var rules = [_]types.PermissionRule{
         .{ .permission = @constCast("*"), .pattern = @constCast("*"), .action = .deny },
     };
-    var projection = try buildTestGatewayToolProjection(std.testing.allocator, .{
+    var projection = try buildTestModelToolProjection(std.testing.allocator, .{
         .permission_mode = .yolo,
         .permission_rules = .{ .rules = &rules },
         .provider_tools = &.{.web_search},
@@ -1181,7 +1177,7 @@ test "edit category-wide deny strips aliased write tools" {
     var rules = [_]types.PermissionRule{
         .{ .permission = @constCast("edit"), .pattern = @constCast("*"), .action = .deny },
     };
-    var projection = try buildTestGatewayToolProjection(std.testing.allocator, .{ .permission_rules = .{ .rules = &rules } });
+    var projection = try buildTestModelToolProjection(std.testing.allocator, .{ .permission_rules = .{ .rules = &rules } });
     defer projection.deinit(std.testing.allocator);
     var names = try collectDescriptorNames(std.testing.allocator, projection.tools);
     defer freeNames(std.testing.allocator, &names);
@@ -1197,7 +1193,7 @@ test "later allow or ask after category deny keeps tools advertised" {
         .{ .permission = @constCast("bash"), .pattern = @constCast("*"), .action = .deny },
         .{ .permission = @constCast("bash"), .pattern = @constCast("git *"), .action = .allow },
     };
-    var projection = try buildTestGatewayToolProjection(std.testing.allocator, .{ .permission_rules = .{ .rules = &rules } });
+    var projection = try buildTestModelToolProjection(std.testing.allocator, .{ .permission_rules = .{ .rules = &rules } });
     defer projection.deinit(std.testing.allocator);
     var names = try collectDescriptorNames(std.testing.allocator, projection.tools);
     defer freeNames(std.testing.allocator, &names);
@@ -1212,7 +1208,7 @@ test "later category deny hides earlier target-specific overrides" {
         .{ .permission = @constCast("edit"), .pattern = @constCast("src/*"), .action = .allow },
         .{ .permission = @constCast("edit"), .pattern = @constCast("*"), .action = .deny },
     };
-    var projection = try buildTestGatewayToolProjection(std.testing.allocator, .{ .permission_rules = .{ .rules = &rules } });
+    var projection = try buildTestModelToolProjection(std.testing.allocator, .{ .permission_rules = .{ .rules = &rules } });
     defer projection.deinit(std.testing.allocator);
     var names = try collectDescriptorNames(std.testing.allocator, projection.tools);
     defer freeNames(std.testing.allocator, &names);
@@ -1227,7 +1223,7 @@ test "target-specific later deny overrides target-specific allow" {
         .{ .permission = @constCast("edit"), .pattern = @constCast("src/*"), .action = .allow },
         .{ .permission = @constCast("edit"), .pattern = @constCast("src/*"), .action = .deny },
     };
-    var projection = try buildTestGatewayToolProjection(std.testing.allocator, .{ .permission_rules = .{ .rules = &rules } });
+    var projection = try buildTestModelToolProjection(std.testing.allocator, .{ .permission_rules = .{ .rules = &rules } });
     defer projection.deinit(std.testing.allocator);
     var names = try collectDescriptorNames(std.testing.allocator, projection.tools);
     defer freeNames(std.testing.allocator, &names);
@@ -1241,7 +1237,7 @@ test "target-specific edit and bash denies keep tools advertised" {
         .{ .permission = @constCast("edit"), .pattern = @constCast("/etc/**"), .action = .deny },
         .{ .permission = @constCast("bash"), .pattern = @constCast("rm -rf*"), .action = .deny },
     };
-    var projection = try buildTestGatewayToolProjection(std.testing.allocator, .{ .permission_rules = .{ .rules = &rules } });
+    var projection = try buildTestModelToolProjection(std.testing.allocator, .{ .permission_rules = .{ .rules = &rules } });
     defer projection.deinit(std.testing.allocator);
     var names = try collectDescriptorNames(std.testing.allocator, projection.tools);
     defer freeNames(std.testing.allocator, &names);
@@ -1252,7 +1248,7 @@ test "target-specific edit and bash denies keep tools advertised" {
 }
 
 fn checkEffectiveToolProjectionAllocationFailures(alloc: Allocator) !void {
-    var projection = buildTestGatewayToolProjection(alloc, .{ .provider_tools = &.{.web_search} }) catch |err|
+    var projection = buildTestModelToolProjection(alloc, .{ .provider_tools = &.{.web_search} }) catch |err|
         return switch (err) {
             error.WriteFailed => error.OutOfMemory,
             else => err,
@@ -1271,7 +1267,7 @@ test "effective tool projection cleans up every partial allocation failure" {
 }
 
 test "full advertisement uses active structured builtin schemas" {
-    var projection = try buildTestGatewayToolProjection(std.testing.allocator, .{
+    var projection = try buildTestModelToolProjection(std.testing.allocator, .{
         .subagent_available = true,
     });
     defer projection.deinit(std.testing.allocator);
@@ -1279,7 +1275,7 @@ test "full advertisement uses active structured builtin schemas" {
     for (projection.tools) |descriptor| {
         try descriptor.validate();
         const description = descriptor.description;
-        try std.testing.expect(description.len <= gateway_schema.description_max_bytes);
+        try std.testing.expect(description.len <= tool_descriptor.description_max_bytes);
         try std.testing.expect(std.mem.find(u8, description, "When to use") != null);
         try std.testing.expect(std.mem.find(u8, description, "When NOT to use") != null);
         builtin_count += 1;
@@ -1296,7 +1292,7 @@ test "MCP dynamic tools are deferred from the base gateway advertisement" {
     try appendTestMcpTool(&runtime, fs_index, "mcp_fs_read");
     try appendTestMcpTool(&runtime, fs_index, "mcp_fs_write");
 
-    var projection = try buildTestGatewayToolProjection(alloc, .{ .mcp_runtime = &runtime });
+    var projection = try buildTestModelToolProjection(alloc, .{ .mcp_runtime = &runtime });
     defer projection.deinit(alloc);
     var names = try collectDescriptorNames(alloc, projection.tools);
     defer freeNames(alloc, &names);
@@ -1320,9 +1316,9 @@ test "deferred MCP base advertisement is stable across schema churn" {
     try appendTestMcpTool(&second_runtime, second_server, "mcp_second_a");
     try appendTestMcpTool(&second_runtime, second_server, "mcp_second_b");
 
-    var first_projection = try buildTestGatewayToolProjection(alloc, .{ .mcp_runtime = &first_runtime });
+    var first_projection = try buildTestModelToolProjection(alloc, .{ .mcp_runtime = &first_runtime });
     defer first_projection.deinit(alloc);
-    var second_projection = try buildTestGatewayToolProjection(alloc, .{ .mcp_runtime = &second_runtime });
+    var second_projection = try buildTestModelToolProjection(alloc, .{ .mcp_runtime = &second_runtime });
     defer second_projection.deinit(alloc);
 
     try std.testing.expectEqual(first_projection.tools.len, second_projection.tools.len);
@@ -1341,7 +1337,7 @@ test "selected MCP schemas are appended after deferred discovery" {
 
 test "selected MCP schemas cannot duplicate builtin tool names in gateway advertisement" {
     const alloc = std.testing.allocator;
-    var projection = try buildTestGatewayToolProjection(alloc, .{});
+    var projection = try buildTestModelToolProjection(alloc, .{});
     defer projection.deinit(alloc);
     const tools = try buildModelTools(alloc, projection.tools, &.{.{
         .name = "mcp_search_tools",
@@ -1356,11 +1352,11 @@ test "selected MCP schemas cannot duplicate builtin tool names in gateway advert
 }
 
 test "model tools preserve base dynamic vision order and first-name ownership" {
-    const base = [_]gateway_schema.FunctionSchema{
+    const base = [_]tool_descriptor.Descriptor{
         .{ .name = "read_file", .description = "base" },
         .{ .name = "shared", .description = "base wins" },
     };
-    const selected = [_]gateway_schema.FunctionSchema{
+    const selected = [_]tool_descriptor.Descriptor{
         .{ .name = "shared", .description = "dynamic loses" },
         .{ .name = "mcp_read", .description = "dynamic" },
     };
@@ -1413,14 +1409,14 @@ test "model tool composition cleans up every partial allocation failure" {
 }
 
 test "subagent advertisement follows writable host capability and task never appears" {
-    var unavailable = try buildTestGatewayToolProjection(std.testing.allocator, .{});
+    var unavailable = try buildTestModelToolProjection(std.testing.allocator, .{});
     defer unavailable.deinit(std.testing.allocator);
     var unavailable_names = try collectDescriptorNames(std.testing.allocator, unavailable.tools);
     defer freeNames(std.testing.allocator, &unavailable_names);
     try expectNotContainsName(unavailable_names.items, "subagent");
     try expectNotContainsName(unavailable_names.items, "task");
 
-    var available = try buildTestGatewayToolProjection(std.testing.allocator, .{
+    var available = try buildTestModelToolProjection(std.testing.allocator, .{
         .subagent_available = true,
     });
     defer available.deinit(std.testing.allocator);
@@ -1431,13 +1427,13 @@ test "subagent advertisement follows writable host capability and task never app
 }
 
 test "terminal advertisement remains available for captured execution" {
-    var unavailable = try buildTestGatewayToolProjection(std.testing.allocator, .{});
+    var unavailable = try buildTestModelToolProjection(std.testing.allocator, .{});
     defer unavailable.deinit(std.testing.allocator);
     var unavailable_names = try collectDescriptorNames(std.testing.allocator, unavailable.tools);
     defer freeNames(std.testing.allocator, &unavailable_names);
     try expectContainsName(unavailable_names.items, "terminal");
 
-    var available = try buildTestGatewayToolProjection(std.testing.allocator, .{});
+    var available = try buildTestModelToolProjection(std.testing.allocator, .{});
     defer available.deinit(std.testing.allocator);
     var available_names = try collectDescriptorNames(std.testing.allocator, available.tools);
     defer freeNames(std.testing.allocator, &available_names);

@@ -119,7 +119,7 @@ fn noopInputDeinit(_: *anyopaque, _: Allocator) void {}
 const rename_file_dispatch_tool = tool_dispatch.Tool{
     .name = "rename_file",
     .description = "Rename file dispatch test fixture.",
-    .gateway_schema = .{
+    .descriptor = .{
         .name = "rename_file",
         .description = "Rename file dispatch test fixture.",
     },

@@ -361,7 +361,7 @@ fn modelPickerTokenStart(trimmed: []const u8, model: []const u8, stage: ModelPic
     if (stage == .effort) return skipPickerSpaces(trimmed, after_model);
 
     const effort_start = skipPickerSpaces(trimmed, after_model);
-    if (effort_start >= trimmed.len) return null;
+    if (effort_start >= trimmed.len) return effort_start;
 
     var effort_end = effort_start;
     while (effort_end < trimmed.len and trimmed[effort_end] != ' ' and trimmed[effort_end] != '\t') : (effort_end += 1) {}
@@ -481,6 +481,20 @@ test "model picker flow accepts aliased pending model input" {
     try std.testing.expectEqualStrings("openai/gpt-5", state.model_picker_pending_model.items);
     try std.testing.expectEqual(@as(usize, 3), state.selectedModelPickerEffortIndex());
     try std.testing.expect(state.selectedModelPickerFast());
+}
+
+test "model picker fast stage accepts a model without an effort token" {
+    const alloc = std.testing.allocator;
+    var editor: editor_state.State = .{};
+    defer editor.deinit(alloc);
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    try state.beginModelPickerFlow(alloc, "zai/glm-5.2", 0, true, .fast);
+    try editor.setText(alloc, "/model zai/glm-5.2 ");
+    const query = state.activeModelPickerQuery(&editor).?;
+    try std.testing.expectEqual(ModelPickerStage.fast, query.stage);
+    try std.testing.expectEqualStrings("", query.query);
 }
 
 test "model picker flow preserves state when allocation fails" {

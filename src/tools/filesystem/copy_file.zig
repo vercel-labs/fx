@@ -117,7 +117,7 @@ fn noopInputDeinit(_: *anyopaque, _: Allocator) void {}
 const copy_file_dispatch_tool = tool_dispatch.Tool{
     .name = "copy_file",
     .description = "Copy file dispatch test fixture.",
-    .gateway_schema = .{
+    .descriptor = .{
         .name = "copy_file",
         .description = "Copy file dispatch test fixture.",
     },

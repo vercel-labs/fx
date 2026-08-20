@@ -1,6 +1,6 @@
 const std = @import("std");
 const auth_runtime = @import("../auth/auth_runtime.zig");
-const credentials = @import("../../gateway/auth/credentials.zig");
+const adapter_auth = @import("../gateway/adapter_auth.zig");
 const background_store = @import("../background/background_store.zig");
 const doctor_runtime = @import("../cli/doctor_runtime.zig");
 const permissions = @import("../permissions/permissions.zig");
@@ -582,7 +582,8 @@ pub const ModelListSnapshot = struct {
     ids: []const []const u8,
     limit: ?usize = null,
     private_models_hidden: bool = false,
-    public_only_reason: ?credentials.CatalogPublicOnlyReason = null,
+    public_only_reason: ?adapter_auth.CatalogPublicOnlyReason = null,
+    auth_service_label: []const u8 = "",
 
     pub fn render(self: ModelListSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
         return switch (format) {
@@ -593,7 +594,8 @@ pub const ModelListSnapshot = struct {
 
     pub fn renderText(self: ModelListSnapshot, alloc: Allocator) ![]u8 {
         if (self.ids.len == 0) {
-            if (self.catalogExplanation()) |explanation| {
+            if (try self.catalogExplanationAlloc(alloc)) |explanation| {
+                defer alloc.free(explanation);
                 return std.fmt.allocPrint(alloc, "[models] no models returned by gateway\n[models] {s}\n", .{explanation});
             }
             return std.fmt.allocPrint(alloc, "[models] no models returned by gateway\n", .{});
@@ -611,14 +613,18 @@ pub const ModelListSnapshot = struct {
         if (self.ids.len > shown) {
             try out.writer.print(" ... and {d} more\n", .{self.ids.len - shown});
         }
-        if (self.catalogExplanation()) |explanation| try out.writer.print("[models] {s}\n", .{explanation});
+        if (try self.catalogExplanationAlloc(alloc)) |explanation| {
+            defer alloc.free(explanation);
+            try out.writer.print("[models] {s}\n", .{explanation});
+        }
 
         return try out.toOwnedSlice();
     }
 
     pub fn renderInteractiveBody(self: ModelListSnapshot, alloc: Allocator) ![]u8 {
         if (self.ids.len == 0) {
-            if (self.catalogExplanation()) |explanation| {
+            if (try self.catalogExplanationAlloc(alloc)) |explanation| {
+                defer alloc.free(explanation);
                 return std.fmt.allocPrint(alloc, "no models returned by gateway\n{s}", .{explanation});
             }
             return alloc.dupe(u8, "no models returned by gateway");
@@ -630,7 +636,10 @@ pub const ModelListSnapshot = struct {
         const shown = self.shownCount();
         for (self.ids[0..shown]) |id| try out.writer.print("\n - {s}", .{id});
         if (self.ids.len > shown) try out.writer.print("\n ... and {d} more", .{self.ids.len - shown});
-        if (self.catalogExplanation()) |explanation| try out.writer.print("\n{s}", .{explanation});
+        if (try self.catalogExplanationAlloc(alloc)) |explanation| {
+            defer alloc.free(explanation);
+            try out.writer.print("\n{s}", .{explanation});
+        }
         return try out.toOwnedSlice();
     }
 
@@ -655,15 +664,43 @@ pub const ModelListSnapshot = struct {
         return if (self.limit) |value| @min(self.ids.len, value) else self.ids.len;
     }
 
-    fn catalogExplanation(self: ModelListSnapshot) ?[]const u8 {
+    fn catalogExplanationAlloc(self: ModelListSnapshot, alloc: Allocator) !?[]u8 {
         if (!self.private_models_hidden) return null;
-        const reason = self.public_only_reason orelse return "Using the public model catalog.";
+        const reason = self.public_only_reason orelse return try alloc.dupe(u8, "Using the public model catalog.");
         return switch (reason) {
-            .no_credential => "Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.",
-            .fx_login_team_required => "Choose a Vercel team to load its private models.",
-            .fx_login_refresh_required => "Vercel sign-in must refresh before team-private models can load.",
-            .credential_refresh_failed => "Vercel sign-in refresh failed; using the public model catalog.",
-            .authenticated_credential_rejected => "Your Gateway credential was rejected; using the public model catalog.",
+            .no_credential => {
+                if (self.auth_service_label.len == 0) return error.MissingAuthPresentation;
+                return try std.fmt.allocPrint(
+                    alloc,
+                    "Using the public model catalog; sign in with {s} or use an AI Gateway API key for team-private models.",
+                    .{self.auth_service_label},
+                );
+            },
+            .tenant_required => {
+                if (self.auth_service_label.len == 0) return error.MissingAuthPresentation;
+                return try std.fmt.allocPrint(
+                    alloc,
+                    "Choose a {s} team to load its private models.",
+                    .{self.auth_service_label},
+                );
+            },
+            .refresh_required => {
+                if (self.auth_service_label.len == 0) return error.MissingAuthPresentation;
+                return try std.fmt.allocPrint(
+                    alloc,
+                    "{s} sign-in must refresh before team-private models can load.",
+                    .{self.auth_service_label},
+                );
+            },
+            .refresh_failed => {
+                if (self.auth_service_label.len == 0) return error.MissingAuthPresentation;
+                return try std.fmt.allocPrint(
+                    alloc,
+                    "{s} sign-in refresh failed; using the public model catalog.",
+                    .{self.auth_service_label},
+                );
+            },
+            .credential_rejected => try alloc.dupe(u8, "Your Gateway credential was rejected; using the public model catalog."),
         };
     }
 };
@@ -1876,7 +1913,7 @@ test "core status snapshot text and json stay stable" {
 test "core status snapshot includes selected team when present" {
     const snapshot = StatusSnapshot{
         .model = "alpha",
-        .auth = .{ .active_source = .fx_login, .team = "example-team" },
+        .auth = .{ .active_source = .{ .id = "fx_login", .label = "fx login", .refreshable = true }, .team = "example-team" },
         .permission_mode = .ask,
         .workspace_root = "/tmp/fx",
         .history_turns = 0,
@@ -1962,10 +1999,10 @@ test "core permissions snapshot text and json stay stable" {
     );
 }
 
-test "model list explains public-only and rejected-credential catalogs" {
+test "model list preserves exact Vercel and peer public catalog copy" {
     const alloc = std.testing.allocator;
     const ids = [_][]const u8{"alpha"};
-    const rejected = ModelListSnapshot{ .ids = &ids, .private_models_hidden = true, .public_only_reason = .authenticated_credential_rejected };
+    const rejected = ModelListSnapshot{ .ids = &ids, .private_models_hidden = true, .public_only_reason = .credential_rejected };
     const shown = ModelListSnapshot{ .ids = &ids };
     const cases = [_]struct {
         snapshot: ModelListSnapshot,
@@ -1973,9 +2010,9 @@ test "model list explains public-only and rejected-credential catalogs" {
         body: []const u8,
     }{
         .{
-            .snapshot = .{ .ids = &ids, .private_models_hidden = true, .public_only_reason = .no_credential },
-            .text = "[models] 1 available\n - alpha\n[models] Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.\n",
-            .body = "1 available\n - alpha\nUsing the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.",
+            .snapshot = .{ .ids = &ids, .private_models_hidden = true, .public_only_reason = .no_credential, .auth_service_label = "Example Cloud" },
+            .text = "[models] 1 available\n - alpha\n[models] Using the public model catalog; sign in with Example Cloud or use an AI Gateway API key for team-private models.\n",
+            .body = "1 available\n - alpha\nUsing the public model catalog; sign in with Example Cloud or use an AI Gateway API key for team-private models.",
         },
         .{
             .snapshot = rejected,
@@ -1983,14 +2020,34 @@ test "model list explains public-only and rejected-credential catalogs" {
             .body = "1 available\n - alpha\nYour Gateway credential was rejected; using the public model catalog.",
         },
         .{
-            .snapshot = .{ .ids = &.{}, .private_models_hidden = true, .public_only_reason = .no_credential },
-            .text = "[models] no models returned by gateway\n[models] Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.\n",
-            .body = "no models returned by gateway\nUsing the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.",
+            .snapshot = .{ .ids = &.{}, .private_models_hidden = true, .public_only_reason = .no_credential, .auth_service_label = "Example Cloud" },
+            .text = "[models] no models returned by gateway\n[models] Using the public model catalog; sign in with Example Cloud or use an AI Gateway API key for team-private models.\n",
+            .body = "no models returned by gateway\nUsing the public model catalog; sign in with Example Cloud or use an AI Gateway API key for team-private models.",
         },
         .{
-            .snapshot = .{ .ids = &.{}, .private_models_hidden = true, .public_only_reason = .authenticated_credential_rejected },
+            .snapshot = .{ .ids = &.{}, .private_models_hidden = true, .public_only_reason = .credential_rejected },
             .text = "[models] no models returned by gateway\n[models] Your Gateway credential was rejected; using the public model catalog.\n",
             .body = "no models returned by gateway\nYour Gateway credential was rejected; using the public model catalog.",
+        },
+        .{
+            .snapshot = .{ .ids = &ids, .private_models_hidden = true, .public_only_reason = .no_credential, .auth_service_label = "Vercel" },
+            .text = "[models] 1 available\n - alpha\n[models] Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.\n",
+            .body = "1 available\n - alpha\nUsing the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.",
+        },
+        .{
+            .snapshot = .{ .ids = &ids, .private_models_hidden = true, .public_only_reason = .tenant_required, .auth_service_label = "Vercel" },
+            .text = "[models] 1 available\n - alpha\n[models] Choose a Vercel team to load its private models.\n",
+            .body = "1 available\n - alpha\nChoose a Vercel team to load its private models.",
+        },
+        .{
+            .snapshot = .{ .ids = &ids, .private_models_hidden = true, .public_only_reason = .refresh_required, .auth_service_label = "Vercel" },
+            .text = "[models] 1 available\n - alpha\n[models] Vercel sign-in must refresh before team-private models can load.\n",
+            .body = "1 available\n - alpha\nVercel sign-in must refresh before team-private models can load.",
+        },
+        .{
+            .snapshot = .{ .ids = &ids, .private_models_hidden = true, .public_only_reason = .refresh_failed, .auth_service_label = "Vercel" },
+            .text = "[models] 1 available\n - alpha\n[models] Vercel sign-in refresh failed; using the public model catalog.\n",
+            .body = "1 available\n - alpha\nVercel sign-in refresh failed; using the public model catalog.",
         },
     };
 
@@ -2550,7 +2607,7 @@ test "core doctor snapshot text and json stay stable" {
     const snapshot = DoctorSnapshot{
         .workspace_root = "/tmp/fx",
         .model = "alpha",
-        .auth = .{ .active_source = .ai_gateway_api_key },
+        .auth = .{ .active_source = .{ .id = "ai_gateway_api_key", .label = "AI_GATEWAY_API_KEY", .refreshable = false } },
         .permission_mode = .ask,
         .agent_step_limit = 24,
         .checks = &checks,

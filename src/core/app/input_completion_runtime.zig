@@ -424,6 +424,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             const projection = render_input.helpMenuProjection(
                 &app.input_runtime.help_menu,
                 app.slashRegistry(),
+                if (comptime @hasField(App, "auth")) app.auth.authServiceLabel() else "",
                 app.input_runtime.edit_state.input.items,
             );
             const scan = ui_input.scanInputCursorVertical(
@@ -1005,7 +1006,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                     const model = try app.alloc.dupe(u8, app.input_runtime.picker.model_picker_pending_model.items);
                     defer app.alloc.free(model);
                     const effort = selectedEffortCompletion(app) orelse return;
-                    const capabilities = model_capabilities.resolveForApp(App, app, model);
+                    const capabilities = model_capabilities.resolveForApp(App, app, model).capabilities;
                     try setModelComposerText(app, "/model {s} {s}", .{ model, effort.label() });
                     try app.input_runtime.picker.beginModelPickerFlow(
                         app.alloc,
@@ -1018,7 +1019,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                 .fast => {
                     const model = try app.alloc.dupe(u8, app.input_runtime.picker.model_picker_pending_model.items);
                     defer app.alloc.free(model);
-                    const capabilities = model_capabilities.resolveForApp(App, app, model);
+                    const capabilities = model_capabilities.resolveForApp(App, app, model).capabilities;
                     const effort = model_capabilities.reasoningEffortAtIndex(capabilities, app.input_runtime.picker.model_picker_effort_index);
                     const effort_index = model_capabilities.reasoningEffortIndex(capabilities, effort);
                     const fast_mode = selectedFastCompletion(app) orelse return;
@@ -1045,7 +1046,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                     const model = try app.alloc.dupe(u8, app.input_runtime.picker.model_picker_pending_model.items);
                     defer app.alloc.free(model);
                     const effort = exactEffortCompletion(app, query.query) orelse return false;
-                    const capabilities = model_capabilities.resolveForApp(App, app, model);
+                    const capabilities = model_capabilities.resolveForApp(App, app, model).capabilities;
                     if (!capabilities.supports_fast_mode) return false;
 
                     try setModelComposerText(app, "/model {s} {s} ", .{ model, effort.label() });
@@ -1089,7 +1090,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                         return true;
                     };
-                    const capabilities = model_capabilities.resolveForApp(App, app, model);
+                    const capabilities = model_capabilities.resolveForApp(App, app, model).capabilities;
                     if (capabilities.supports_fast_mode) {
                         try setModelComposerText(app, "/model {s} {s} ", .{ model, effort.label() });
                         try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, model_capabilities.reasoningEffortIndex(capabilities, effort), true, .fast);
@@ -1108,7 +1109,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                         return true;
                     };
-                    const effort = model_capabilities.reasoningEffortAtIndex(model_capabilities.resolveForApp(App, app, model), app.input_runtime.picker.model_picker_effort_index);
+                    const effort = model_capabilities.reasoningEffortAtIndex(model_capabilities.resolveForApp(App, app, model).capabilities, app.input_runtime.picker.model_picker_effort_index);
                     try session_commands.Commands(App).selectModelFromPicker(app, model, effort, fast_mode);
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
                     app.shell.render_requests.request(.footer);
@@ -1135,23 +1136,25 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         fn beginModelPickerOptions(app: *App, model: []const u8) !void {
-            const capabilities = model_capabilities.resolveForApp(App, app, model);
+            const descriptor = model_capabilities.resolveForApp(App, app, model);
+            const canonical_model = descriptor.id;
+            const capabilities = descriptor.capabilities;
             const supports_effort = capabilities.reasoning_efforts.len > 0;
             const supports_fast = capabilities.supports_fast_mode;
 
             if (!supports_effort and !supports_fast) {
-                try session_commands.Commands(App).selectModelFromPicker(app, model, app.effort, app.fast_mode);
+                try session_commands.Commands(App).selectModelFromPicker(app, canonical_model, app.effort, app.fast_mode);
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 app.shell.render_requests.request(.footer);
                 return;
             }
 
             const stage: ModelPickerStage = if (supports_effort) .effort else .fast;
-            try setModelComposerText(app, "/model {s} ", .{model});
+            try setModelComposerText(app, "/model {s} ", .{canonical_model});
             // Preselect the product effort default and enable Fast mode when supported.
             try app.input_runtime.picker.beginModelPickerFlow(
                 app.alloc,
-                model,
+                canonical_model,
                 model_capabilities.reasoningEffortIndex(capabilities, .auto),
                 supports_fast,
                 stage,
@@ -1177,7 +1180,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                     return true;
                 },
                 .fast => {
-                    const capabilities = model_capabilities.resolveForApp(App, app, model);
+                    const capabilities = model_capabilities.resolveForApp(App, app, model).capabilities;
                     if (capabilities.reasoning_efforts.len > 0) {
                         const effort_index = model_capabilities.reasoningEffortIndex(capabilities, model_capabilities.reasoningEffortAtIndex(capabilities, app.input_runtime.picker.model_picker_effort_index));
                         try setModelComposerText(app, "/model {s} ", .{model});
@@ -1235,7 +1238,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             out: *[types.ReasoningEffort.max_options + 1]types.ReasoningEffort,
         ) usize {
             if (!app.input_runtime.picker.hasPendingModelPickerSelection()) return 0;
-            const capabilities = model_capabilities.resolveForApp(App, app, app.input_runtime.picker.model_picker_pending_model.items);
+            const capabilities = model_capabilities.resolveForApp(App, app, app.input_runtime.picker.model_picker_pending_model.items).capabilities;
             const count = model_capabilities.reasoningEffortOptionCount(capabilities);
             if (count == 0) return 0;
 
@@ -1254,7 +1257,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (!app.input_runtime.picker.hasPendingModelPickerSelection()) return null;
             const query = std.mem.trim(u8, raw_query, " \t");
             const effort = types.ReasoningEffort.parseDisplayLabel(query) orelse return null;
-            if (!model_capabilities.reasoningEffortSupported(model_capabilities.resolveForApp(App, app, app.input_runtime.picker.model_picker_pending_model.items), effort)) return null;
+            if (!model_capabilities.reasoningEffortSupported(model_capabilities.resolveForApp(App, app, app.input_runtime.picker.model_picker_pending_model.items).capabilities, effort)) return null;
             return effort;
         }
 
@@ -1463,13 +1466,13 @@ const ModelPickerCompletionTestApp = struct {
         self.input_runtime.deinit(self.alloc);
     }
 
-    pub fn resolvedModelCapabilities(_: *const ModelPickerCompletionTestApp, _: []const u8) model_capabilities.Capabilities {
-        return .{
+    pub fn resolvedModelDescriptor(_: *const ModelPickerCompletionTestApp, model: []const u8) model_capabilities.ModelDescriptor {
+        return model_capabilities.configuredDescriptor(model, .{
             .reasoning_efforts = .fromSlice(&.{
                 types.ReasoningEffort.literal("future-tier"),
                 types.ReasoningEffort.literal("high"),
             }),
-        };
+        });
     }
 };
 

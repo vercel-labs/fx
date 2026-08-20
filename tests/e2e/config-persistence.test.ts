@@ -34,29 +34,6 @@ const NO_AUTH = {
 };
 
 const serialTest = test.serial;
-const SELECTED_COMPLETION_SGR = "\x1b[1m\x1b[38;5;255m";
-
-function selectedModelStageRow(paneEscapes: string, label: string): string | null {
-  return paneEscapes.split("\n").find((line) => {
-    const visible = line.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").trim();
-    return line.includes(SELECTED_COMPLETION_SGR) && visible === label;
-  }) ?? null;
-}
-
-async function waitForSelectedModelStage(
-  active: TmuxSession,
-  label: string,
-  timeoutMs: number,
-): Promise<string> {
-  const deadline = Date.now() + timeoutMs;
-  let last: string | null = null;
-  while (Date.now() < deadline) {
-    last = selectedModelStageRow(await active.capturePaneEscapes(), label);
-    if (last !== null) return last;
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  throw new Error(`Timed out waiting for selected model option ${label}; last=${last}`);
-}
 
 async function disablePromptHistory(
   session: TmuxSession,
@@ -577,7 +554,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         });
         await session.waitForText("Run /help", TIMEOUT);
         await session.sendText("/output quiet");
-        await session.waitForText("Fx needs access to Vercel AI Gateway", TIMEOUT);
+        await session.waitForText("fx needs access to Vercel AI Gateway", TIMEOUT);
         expect(composerContains(await session.capturePane(), "/output quiet")).toBe(
           true,
         );
@@ -894,6 +871,12 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           stderrPath,
         });
         await session.waitForText("Run /help", TIMEOUT);
+        const migratedSettings = readFileSync(settingsPath, "utf8");
+        const migratedDocument = JSON.parse(migratedSettings);
+        expect(migratedDocument).not.toHaveProperty("credential_source");
+        expect(migratedDocument.connections.profiles).toContainEqual(
+          expect.objectContaining({ credential_ref: "fx_login" }),
+        );
         await session.sendLiteral("/model openai");
         await session.waitForText("openai/gpt-5", TIMEOUT);
         await session.sendKeys("C-u");
@@ -906,7 +889,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.sendLiteral("/model");
         await session.sendKeys("Enter");
         await session.waitForText("anthropic/claude-opus-4.8", TIMEOUT);
-        expect(readFileSync(settingsPath, "utf8")).toBe(initialSettings);
+        expect(readFileSync(settingsPath, "utf8")).toBe(migratedSettings);
         await session.sendKeys("Enter");
         // Gateway order is preserved after fx's default sentinel.
         await session.waitForText("default", TIMEOUT);

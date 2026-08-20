@@ -3,29 +3,30 @@ const builtin = @import("builtin");
 const agent_stream_provider = @import("../../stream_provider.zig");
 const command_admission = @import("../../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../../permissions/auto_classifier.zig");
+const adapter_auth = @import("../../../gateway/adapter_auth.zig");
+const adapter_registry = @import("../../../gateway/adapter_registry.zig");
+const test_adapter = @import("../../../gateway/test_adapter.zig");
 const types = @import("../../../shared/types.zig");
 const permissions = @import("../../../permissions/permissions.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
 const background_runtime = @import("../../../background/background_runtime.zig");
 const builtin_context = @import("../../../../builtins/context.zig");
-const builtin_gateway = @import("../../../../builtins/gateway.zig");
-const gateway_client = @import("../../../../gateway/client.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
 const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
 const command_replay_store = @import("../../../session/command_replay_store.zig");
 const session_child_store = @import("../../../session/session_child_store.zig");
-const gateway_json = @import("../../../../gateway/gateway_json.zig");
-const gateway_failure_diagnostics = @import("../../../../gateway/gateway_failure_diagnostics.zig");
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const model_capabilities = @import("../../../config/model_capabilities.zig");
 const route_snapshot = @import("../../../gateway/route_snapshot.zig");
+const image_attachments = @import("../../../images/image_attachments.zig");
 const file_mutation = @import("../../../tooling/file_mutation.zig");
 const file_mutation_contract = @import("../../../tooling/file_mutation_contract.zig");
 const context_contract = @import("../../../workspace/context_contract.zig");
 const io_mod = @import("../../../shared/io.zig");
 const pathing = @import("../../../workspace/pathing.zig");
 const tool_dispatch = @import("../../../tooling/tool_dispatch.zig");
+const tool_descriptor = @import("../../../tooling/tool_descriptor.zig");
 const tool_runtime = @import("../../../tooling/tool_runtime.zig");
 const command_output_content = @import("../../../tooling/command_output_content.zig");
 const testing_write_file = if (builtin.is_test)
@@ -63,14 +64,14 @@ const DiffEntryPayload = runtime_tool_contracts.DiffEntryPayload;
 const SecondaryPublicationReport = runtime_tool_contracts.SecondaryPublicationReport;
 
 pub fn testRouteForModel(model: []const u8) route_snapshot.RouteSnapshot {
-    return testRouteForDescriptor(builtin_gateway.model_descriptor_provider.fallback(model));
+    return testRouteForDescriptor(test_adapter.model_descriptor_provider.fallback(model));
 }
 
 pub fn testRouteForCapabilities(
     model: []const u8,
     capabilities: model_capabilities.Capabilities,
 ) route_snapshot.RouteSnapshot {
-    var descriptor = builtin_gateway.model_descriptor_provider.fallback(model);
+    var descriptor = test_adapter.model_descriptor_provider.fallback(model);
     descriptor.capabilities = capabilities;
     descriptor.source = .configured;
     return testRouteForDescriptor(descriptor);
@@ -78,11 +79,11 @@ pub fn testRouteForCapabilities(
 
 fn testRouteForDescriptor(descriptor: model_capabilities.ModelDescriptor) route_snapshot.RouteSnapshot {
     return .{
-        .connection_id = @constCast("vercel"),
-        .adapter_kind = @constCast(builtin_gateway.connection_seed.adapter_id),
+        .connection_id = @constCast(test_adapter.connection_seed.id),
+        .adapter_kind = @constCast(test_adapter.connection_seed.adapter_id),
         .endpoint = @constCast("https://example.invalid"),
-        .protocol = @constCast("vercel_ai_gateway"),
-        .credential_ref = @constCast("automatic"),
+        .protocol = @constCast(test_adapter.connection_seed.protocol.?),
+        .credential_ref = @constCast(test_adapter.connection_seed.credential_ref),
         .primary_model_id = @constCast(descriptor.id),
         .permission_review_model_id = null,
         .vision_model_id = @constCast("google/gemini-2.5-flash"),
@@ -103,7 +104,7 @@ pub const VisionAgentToolRuntime = struct {
     alloc: Allocator,
     workspace_root: []const u8 = "/tmp/workspace",
     session_id: ?[]const u8 = null,
-    agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
+    adapter_manifest: [1]agent_stream_provider.ProviderAdapter = .{agent_stream_provider.unavailable_adapter},
     result_allocator_override: ?Allocator = null,
     execution_count: usize = 0,
     result_count: usize = 0,
@@ -121,13 +122,13 @@ pub const VisionAgentToolRuntime = struct {
         return .{
             .ctx = self,
             .run = execute,
-            .set_agent_stream_provider = setAgentStreamProvider,
+            .set_route_adapter = setRouteAdapter,
         };
     }
 
-    fn setAgentStreamProvider(raw: *anyopaque, provider: agent_stream_provider.Provider) void {
+    fn setRouteAdapter(raw: *anyopaque, adapter: agent_stream_provider.ProviderAdapter) void {
         const self: *VisionAgentToolRuntime = @ptrCast(@alignCast(raw));
-        self.agent_stream_provider = provider;
+        self.adapter_manifest[0] = adapter;
     }
 
     fn execute(raw: *anyopaque, request: ToolExecutionRequest) !ToolExecutionResult {
@@ -145,8 +146,7 @@ pub const VisionAgentToolRuntime = struct {
     }
 
     fn context(self: *VisionAgentToolRuntime) tool_runtime.Context {
-        var provider_adapter = builtin_gateway.provider_adapter;
-        provider_adapter.legacy_provider = self.agent_stream_provider;
+        const provider_adapter = self.adapter_manifest[0];
         return .{
             .workspace_root = self.workspace_root,
             .ignored_list_entries = &.{},
@@ -156,12 +156,11 @@ pub const VisionAgentToolRuntime = struct {
             .max_read_file_line_len = 2000,
             .max_command_output_bytes = 64 * 1024,
             .max_tool_result_bytes = 64 * 1024,
-            .api_key = "key",
-            .provider_adapter = provider_adapter,
-            .agent_stream_provider = self.agent_stream_provider,
+            .adapter_registry = .{ .adapters = &self.adapter_manifest },
+            .route_adapter = provider_adapter,
+            .route_credential = "key",
             .model = "anthropic/claude-opus-4.6",
             .gateway_retry_count = 1,
-            .gateway_chat_url = "https://example.invalid",
             .agent_step_limit = 8,
             .tool_registry = .{ .tools = vision_agent_test_tools[0..] },
             .permission_mode = .ask,
@@ -249,8 +248,10 @@ fn testExecutionAuthorityWithScope(
 }
 
 pub const FakeCompletion = struct {
-    status: std.http.Status = .ok,
-    err_body: ?[]const u8 = null,
+    failure_category: ?agent_stream_provider.StreamFailure.Category = null,
+    failure_response_status: u16 = 0,
+    failure_retryable: bool = false,
+    failure_detail: ?[]const u8 = null,
     retry_after_seconds: ?u64 = null,
     pre_send_error: ?anyerror = null,
     stream_error: ?anyerror = null,
@@ -263,6 +264,9 @@ pub const FakeCompletion = struct {
     streamed_tool_starts: []const ToolCall = &.{},
     provider_result_identity_failure: ?types.ProviderResultIdentityFailure = null,
     provider_failure_detail: ?[]const u8 = null,
+    failure_diagnostic_summary: ?[]const u8 = null,
+    failure_tool_descriptor: ?[]const u8 = null,
+    failure_request_shape: ?[]const u8 = null,
     finish_reason: ?types.ProviderFinishReason = null,
     omit_finish: bool = false,
     usage: types.Usage = .{},
@@ -272,6 +276,182 @@ pub const FakeCompletion = struct {
     cancel_after_chunks: bool = false,
     cancel_during_tool_stream: bool = false,
 };
+
+fn roleName(role: types.ChatRole) []const u8 {
+    return @tagName(role);
+}
+
+fn cacheBreakpoint(messages: []const ChatMessage) ?usize {
+    if (messages.len < 3) return null;
+    var index = messages.len - 2;
+    while (index > 0) : (index -= 1) {
+        const role = messages[index].role;
+        if (role == .user or role == .assistant) return index;
+    }
+    return null;
+}
+
+fn writeSnapshotImage(writer: *std.Io.Writer, snapshot: image_attachments.VerifiedSnapshot) !void {
+    try writer.writeAll("{\"type\":\"file\",\"mediaType\":");
+    try std.json.Stringify.value(snapshot.media_type, .{}, writer);
+    try writer.writeAll(",\"data\":\"");
+    try std.base64.standard.Encoder.encodeWriter(writer, snapshot.bytes);
+    try writer.writeAll("\"}");
+}
+
+fn writeSnapshotMessage(
+    alloc: Allocator,
+    writer: *std.Io.Writer,
+    message: ChatMessage,
+    cached: bool,
+    verified_images: ?[]const image_attachments.VerifiedSnapshot,
+) !void {
+    try writer.writeAll("{\"role\":");
+    try std.json.Stringify.value(roleName(message.role), .{}, writer);
+    switch (message.role) {
+        .system => {
+            try writer.writeAll(",\"content\":");
+            try std.json.Stringify.value(message.content orelse "", .{}, writer);
+        },
+        .user => {
+            try writer.writeAll(",\"content\":[");
+            var wrote_part = false;
+            if (message.content) |content| {
+                if (content.len > 0) {
+                    try writer.writeAll("{\"type\":\"text\",\"text\":");
+                    try std.json.Stringify.value(content, .{}, writer);
+                    try writer.writeByte('}');
+                    wrote_part = true;
+                }
+            }
+            if (verified_images) |snapshots| {
+                for (snapshots) |snapshot| {
+                    if (wrote_part) try writer.writeByte(',');
+                    try writeSnapshotImage(writer, snapshot);
+                    wrote_part = true;
+                }
+            } else {
+                for (message.images) |image| {
+                    var snapshot = try image_attachments.loadVerifiedSnapshot(alloc, image, .{});
+                    defer snapshot.deinit(alloc);
+                    if (wrote_part) try writer.writeByte(',');
+                    try writeSnapshotImage(writer, snapshot);
+                    wrote_part = true;
+                }
+            }
+            try writer.writeByte(']');
+        },
+        .assistant => {
+            try writer.writeAll(",\"content\":[");
+            var wrote_part = false;
+            if (message.content) |content| {
+                if (content.len > 0) {
+                    try writer.writeAll("{\"type\":\"text\",\"text\":");
+                    try std.json.Stringify.value(content, .{}, writer);
+                    try writer.writeByte('}');
+                    wrote_part = true;
+                }
+            }
+            for (message.tool_calls) |call| {
+                if (wrote_part) try writer.writeByte(',');
+                try writer.writeAll("{\"type\":\"tool-call\",\"toolCallId\":");
+                try std.json.Stringify.value(call.id, .{}, writer);
+                try writer.writeAll(",\"toolName\":");
+                try std.json.Stringify.value(call.name, .{}, writer);
+                try writer.writeAll(",\"input\":");
+                try writer.writeAll(call.arguments_json);
+                try writer.writeByte('}');
+                wrote_part = true;
+            }
+            try writer.writeByte(']');
+        },
+        .tool => {
+            try writer.writeAll(",\"content\":[{\"type\":\"tool-result\",\"toolCallId\":");
+            try std.json.Stringify.value(message.tool_call_id orelse "", .{}, writer);
+            try writer.writeAll(",\"toolName\":");
+            try std.json.Stringify.value(message.tool_name orelse "unknown", .{}, writer);
+            try writer.writeAll(",\"output\":{\"type\":\"text\",\"value\":");
+            try std.json.Stringify.value(message.content orelse "", .{}, writer);
+            try writer.writeAll("}}]");
+        },
+    }
+    if (cached) {
+        try writer.writeAll(",\"providerOptions\":{\"anthropic\":{\"cacheControl\":{\"type\":\"ephemeral\"}}}");
+    }
+    try writer.writeByte('}');
+}
+
+fn writeSnapshotTool(alloc: Allocator, writer: *std.Io.Writer, descriptor: tool_descriptor.Descriptor) !void {
+    try writer.writeAll("{\"type\":\"function\",\"name\":");
+    try std.json.Stringify.value(descriptor.name, .{}, writer);
+    try writer.writeAll(",\"description\":");
+    try std.json.Stringify.value(descriptor.description, .{}, writer);
+    try writer.writeAll(",\"inputSchema\":");
+    try tool_descriptor.writeInputSchema(alloc, writer, descriptor);
+    try writer.writeByte('}');
+}
+
+/// Test-only, provider-neutral request observation. The JSON is diagnostic
+/// storage for existing order/count assertions; it is never sent by an adapter.
+fn writeRequestSnapshot(alloc: Allocator, request: agent_stream_provider.ModelRequest) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const options = model_capabilities.resolveProviderOptionsForCapabilities(
+        request.capabilities,
+        request.reasoning_effort,
+        request.fast_mode,
+    );
+    const breakpoint = if (options.prompt_caching) cacheBreakpoint(request.messages) else null;
+    var prefix_cacheable = true;
+
+    try out.writer.writeAll("{\"prompt\":[");
+    for (request.messages, 0..) |message, index| {
+        if (index > 0) try out.writer.writeByte(',');
+        const cached = options.prompt_caching and
+            prefix_cacheable and
+            message.cache_policy != .no_cache and
+            (message.role == .system or breakpoint == index);
+        const verified_images = if (request.verified_images != null and index + 1 == request.messages.len)
+            request.verified_images
+        else
+            null;
+        try writeSnapshotMessage(alloc, &out.writer, message, cached, verified_images);
+        if (message.cache_policy == .no_cache) prefix_cacheable = false;
+    }
+    try out.writer.writeAll("],\"tools\":[");
+    for (request.tools, 0..) |descriptor, index| {
+        if (index > 0) try out.writer.writeByte(',');
+        try writeSnapshotTool(alloc, &out.writer, descriptor);
+    }
+    try out.writer.writeAll("],\"toolChoice\":{\"type\":");
+    try std.json.Stringify.value(
+        if (request.require_tool_call) "required" else request.tool_choice.label(),
+        .{},
+        &out.writer,
+    );
+    try out.writer.writeByte('}');
+    if (request.max_output_tokens) |value| try out.writer.print(",\"maxOutputTokens\":{d}", .{value});
+    if (options.reasoning) |*reasoning| {
+        try out.writer.writeAll(",\"reasoning\":");
+        try std.json.Stringify.value(reasoning.label(), .{}, &out.writer);
+    }
+    if (options.fast or options.parallel_tool_calls != null) {
+        try out.writer.writeAll(",\"providerOptions\":{");
+        var wrote_option = false;
+        if (options.fast) {
+            try out.writer.writeAll("\"gateway\":{\"speed\":\"fast\"}");
+            wrote_option = true;
+        }
+        if (options.parallel_tool_calls) |parallel| {
+            if (wrote_option) try out.writer.writeByte(',');
+            try out.writer.writeAll("\"xai\":{\"parallelToolCalls\":");
+            try out.writer.writeAll(if (parallel) "true}" else "false}");
+        }
+        try out.writer.writeByte('}');
+    }
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
+}
 
 pub const FakeGateway = struct {
     alloc: Allocator,
@@ -300,8 +480,8 @@ pub const FakeGateway = struct {
         self.request_session_ids.deinit(self.alloc);
     }
 
-    pub fn provider(self: *FakeGateway) agent_stream_provider.Provider {
-        var result = builtin_gateway.agent_stream_provider;
+    pub fn adapter(self: *FakeGateway) agent_stream_provider.ProviderAdapter {
+        var result = test_adapter.provider_adapter;
         result.context = self;
         result.stream_fn = fakeGatewayStream;
         return result;
@@ -309,103 +489,163 @@ pub const FakeGateway = struct {
 
     fn stream(
         self: *FakeGateway,
-        alloc: Allocator,
-        request: agent_stream_provider.Request,
-    ) !agent_stream_provider.Result {
-        try self.request_bodies.append(self.alloc, try self.alloc.dupe(u8, request.payload));
-        try self.request_models.append(self.alloc, try self.alloc.dupe(u8, request.model));
-        try self.request_api_keys.append(self.alloc, try self.alloc.dupe(u8, request.api_key));
+        _: Allocator,
+        request: agent_stream_provider.AdapterRequest,
+        events: agent_stream_provider.EventSink,
+    ) !void {
+        try self.request_bodies.append(self.alloc, try writeRequestSnapshot(self.alloc, request.model_request));
+        try self.request_models.append(self.alloc, try self.alloc.dupe(u8, request.model_id));
+        try self.request_api_keys.append(self.alloc, try self.alloc.dupe(u8, request.credential));
         const session_id = if (request.session_id) |id| try self.alloc.dupe(u8, id) else null;
         errdefer if (session_id) |id| self.alloc.free(id);
         try self.request_session_ids.append(self.alloc, session_id);
-        if (self.index >= self.completions.len) return error.TestUnexpectedGatewayRequest;
+        if (self.index >= self.completions.len) return error.TestUnexpectedAdapterRequest;
         const completion = self.completions[self.index];
         self.index += 1;
 
+        try events.emit(.provider_admitted);
         if (completion.pre_send_error) |err| {
-            recordNetworkFailureEvidence(request, err);
+            if (try emitNetworkFailure(request, err, events)) return;
             return err;
         }
         request.delivery.markPossiblySent();
 
         if (completion.stream_error) |err| {
-            recordNetworkFailureEvidence(request, err);
+            if (try emitNetworkFailure(request, err, events)) return;
             return err;
         }
 
         if (completion.pause_before_output) {
             if (self.recovery_pause_flag) |flag| flag.store(true, .seq_cst);
             request.cancel_flag.store(true, .seq_cst);
-            return error.Cancelled;
+            try events.emit(.cancelled);
+            return;
         }
         if (completion.cancel_before_output) {
             request.cancel_flag.store(true, .seq_cst);
-            return .{ .status = .ok };
+            try events.emit(.cancelled);
+            return;
         }
 
-        if (request.on_reasoning_chunk) |reasoning| {
-            for (completion.reasoning_chunks) |chunk| reasoning(request.callback_ctx, chunk);
-        }
-        for (completion.chunks) |chunk| {
-            request.on_content_chunk(request.callback_ctx, chunk);
+        for (completion.reasoning_chunks) |chunk| try events.emit(.{ .reasoning_delta = chunk });
+        for (completion.chunks) |chunk| try events.emit(.{ .text_delta = chunk });
+        if (completion.chunks.len == 0) {
+            if (completion.content) |content| try events.emit(.{ .text_delta = content });
         }
         if (completion.cancel_after_chunks) request.cancel_flag.store(true, .seq_cst);
         if (completion.stream_error_after_chunks) |err| {
-            recordNetworkFailureEvidence(request, err);
+            if (try emitNetworkFailure(request, err, events)) return;
             return err;
         }
-        if (request.on_tool_start) |start| {
-            for (completion.streamed_tool_starts) |call| {
-                start(request.callback_ctx, call.id, call.name, null);
-            }
+        for (completion.streamed_tool_starts) |call| {
+            try events.emit(.{ .tool_input_started = .{ .id = call.id, .name = call.name } });
         }
         if (completion.stream_error_after_tool_starts) |err| {
-            recordNetworkFailureEvidence(request, err);
+            if (try emitNetworkFailure(request, err, events)) return;
             return err;
         }
         if (completion.cancel_during_tool_stream) {
             request.cancel_flag.store(true, .seq_cst);
-            return error.Cancelled;
+            try events.emit(.cancelled);
+            return;
         }
-        if (completion.status != .ok) {
-            const err_body = if (completion.err_body) |body| try alloc.dupe(u8, body) else null;
-            const diagnostics = gateway_failure_diagnostics.collect(alloc, request.payload, err_body);
-            return .{
-                .status = completion.status,
-                .err_body = err_body,
+        if (completion.failure_category) |category| {
+            const detail_source = std.mem.trim(u8, completion.failure_detail orelse @tagName(category), " \t\r\n");
+            const detail = detail_source[0..@min(detail_source.len, 4096)];
+            try events.emit(.{ .failure = .{
+                .category = category,
+                .response_status = completion.failure_response_status,
+                .retryable = completion.failure_retryable,
+                .delivery_ambiguous = completion.delivery_ambiguous,
+                .detail = detail,
                 .retry_after_seconds = completion.retry_after_seconds,
-                .failure_schema = diagnostics.schema,
-                .failure_request_shape = diagnostics.request_shape,
-                .ownership = .owned,
-            };
+                .diagnostic = if (completion.failure_diagnostic_summary) |summary| .{
+                    .summary = summary,
+                    .tool_descriptor = completion.failure_tool_descriptor,
+                    .request_shape = completion.failure_request_shape,
+                } else null,
+            } });
+            return;
         }
 
-        return .{
-            .status = .ok,
-            .completion = .{
-                .content = completion.content,
-                .tool_calls = completion.tool_calls,
-                .provider_result_identity_failure = completion.provider_result_identity_failure,
-                .provider_failure_detail = completion.provider_failure_detail,
-                .delivery_ambiguous = completion.delivery_ambiguous,
-                .finish_reason = if (completion.omit_finish)
-                    null
-                else
-                    completion.finish_reason orelse if (completion.tool_calls.len > 0) .tool_calls else .stop,
-                .usage = completion.usage,
+        for (completion.tool_calls) |call| switch (call.provenance) {
+            .fx_local => try events.emit(.{ .fx_tool_call = call }),
+            .provider_executed => {
+                var started = call;
+                started.provider_result = null;
+                events.emit(.{ .provider_tool_started = started }) catch |err| {
+                    if (err == error.DuplicateProviderToolStart) {
+                        return error.MalformedAuthoritativeToolIdentity;
+                    }
+                    return err;
+                };
+                if (call.provider_result) |result| try events.emit(.{ .provider_tool_result = .{
+                    .call_id = call.id,
+                    .result = result,
+                } });
             },
-            .generation_origin = "https://ai-gateway.vercel.sh",
         };
+        try events.emit(.{ .usage = .{ .tokens = completion.usage } });
+        try events.emit(.{ .finish = .{
+            .reason = if (completion.omit_finish)
+                null
+            else
+                completion.finish_reason orelse if (completion.tool_calls.len > 0) .tool_calls else .stop,
+            .provider_result_identity_failure = completion.provider_result_identity_failure,
+            .provider_failure_detail = completion.provider_failure_detail,
+            .delivery_ambiguous = completion.delivery_ambiguous,
+        } });
     }
 
-    fn recordNetworkFailureEvidence(
-        request: agent_stream_provider.Request,
+    fn emitNetworkFailure(
+        request: agent_stream_provider.AdapterRequest,
         err: anyerror,
-    ) void {
-        request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
-            err,
-            request.delivery.load(),
-        );
+        events: agent_stream_provider.EventSink,
+    ) !bool {
+        const cause: agent_stream_provider.NetworkFailureCause = if (err == error.SystemResumed)
+            .system_resumed
+        else if (err == error.TlsInitializationFailed or
+            err == error.ConnectionSetupTimedOut or
+            err == error.UnknownHostName or
+            err == error.NameServerFailure or
+            err == error.NoAddressReturned or
+            err == error.DetectingNetworkConfigurationFailed or
+            err == error.AddressUnavailable or
+            err == error.ConnectionPending or
+            err == error.ConnectionRefused or
+            err == error.HostUnreachable or
+            err == error.NetworkUnreachable or
+            err == error.NetworkDown or
+            err == error.Timeout or
+            err == error.WouldBlock or
+            err == error.WriteFailed or
+            err == error.ReadFailed or
+            err == error.ConnectionResetByPeer or
+            err == error.ConnectionTimedOut or
+            err == error.HttpConnectionClosing)
+            .transport_interrupted
+        else
+            return false;
+        const evidence: agent_stream_provider.NetworkFailureEvidence = .{
+            .cause = cause,
+            .delivery = request.delivery.load(),
+        };
+        request.attempt_evidence.network_failure = evidence;
+        try events.emit(.{ .failure = .{
+            .category = .transport,
+            .retryable = true,
+            .delivery_ambiguous = evidence.delivery == .possibly_sent,
+            .detail = @errorName(err),
+            .transport_cause = switch (err) {
+                error.ReadFailed => .read_failed,
+                error.ConnectionResetByPeer => .connection_reset,
+                error.ConnectionTimedOut => .connection_timed_out,
+                error.HttpConnectionClosing => .connection_closing,
+                error.SystemResumed => .system_resumed,
+                else => null,
+            },
+        } });
+        return true;
     }
 };
 
@@ -420,12 +660,13 @@ pub const RouteCredentialOverride = struct {
 };
 
 fn fakeGatewayStream(
-    context: ?*anyopaque,
+    adapter: *const agent_stream_provider.ProviderAdapter,
     alloc: Allocator,
-    request: agent_stream_provider.Request,
-) !agent_stream_provider.Result {
-    const gateway: *FakeGateway = @ptrCast(@alignCast(context.?));
-    return gateway.stream(alloc, request);
+    request: agent_stream_provider.AdapterRequest,
+    events: agent_stream_provider.EventSink,
+) !void {
+    const gateway: *FakeGateway = @ptrCast(@alignCast(adapter.context.?));
+    return gateway.stream(alloc, request, events);
 }
 
 pub const FakeExecPlan = union(enum) {
@@ -436,7 +677,7 @@ pub const FakeExecPlan = union(enum) {
 pub const ExecuteDelegate = struct {
     ctx: *anyopaque,
     run: *const fn (*anyopaque, ToolExecutionRequest) anyerror!ToolExecutionResult,
-    set_agent_stream_provider: ?*const fn (*anyopaque, agent_stream_provider.Provider) void = null,
+    set_route_adapter: ?*const fn (*anyopaque, agent_stream_provider.ProviderAdapter) void = null,
 };
 
 pub const PermissionRequestOverride = struct {
@@ -492,7 +733,6 @@ fn captureReviewAuthority(
 
 pub const FakeAgentRuntimeDeps = struct {
     alloc: Allocator,
-    agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     live_tool_authority: ?runtime_deps.LiveToolAuthorityProvider = null,
     tool_activity_recorder: ?runtime_deps.ToolActivityRecorder = null,
     tool_registry: tool_dispatch.Registry = test_tool_registry,
@@ -613,9 +853,9 @@ pub const FakeAgentRuntimeDeps = struct {
     interrupted_history_count: usize = 0,
     interrupted_event_count: usize = 0,
     interrupted_tool_name: ?[]u8 = null,
-    http_status: ?std.http.Status = null,
-    http_detail: ?[]u8 = null,
-    http_credential_source: ?types.CredentialSource = null,
+    provider_failure_category: ?agent_stream_provider.StreamFailure.Category = null,
+    provider_failure_detail: ?[]u8 = null,
+    provider_failure_source: ?adapter_auth.Source = null,
     diff_count: usize = 0,
     diff_preview: ?[]u8 = null,
     token_updates: std.ArrayList(types.TurnTokenProgress) = .empty,
@@ -656,19 +896,14 @@ pub const FakeAgentRuntimeDeps = struct {
     last_route_recovery_fast_mode: bool = false,
     last_route_recovery_finish_reason: ?types.ProviderFinishReason = null,
     last_route_recovery_unsafe_reason: ?types.RouteRecoveryUnsafeReason = null,
-    capability_overrides: []const ModelCapabilityOverride = &.{},
-    available_capability_overrides: []const ModelCapabilityOverride = &.{},
-    capability_queries: std.ArrayList([]u8) = .empty,
-    cancel_on_capability_resolution: ?*std.atomic.Value(bool) = null,
-    cancel_after_capability_resolution: ?*std.atomic.Value(bool) = null,
     credential_refresh_tokens: []const []const u8 = &.{},
     credential_refresh_index: usize = 0,
-    credential_refresh_sources: std.ArrayList(types.CredentialSource) = .empty,
-    credential_refresh_modes: std.ArrayList(runtime_deps.CredentialRefreshMode) = .empty,
+    credential_refresh_sources: std.ArrayList(adapter_auth.Source) = .empty,
+    credential_refresh_modes: std.ArrayList(adapter_auth.RefreshMode) = .empty,
     credential_refresh_error: ?anyerror = null,
     route_credential: []const u8 = "key",
     route_credential_overrides: []const RouteCredentialOverride = &.{},
-    route_credential_source: ?types.CredentialSource = null,
+    route_credential_source: ?adapter_auth.Source = null,
     enable_interactive_notices: bool = false,
     enable_recovery_checkpoint: bool = false,
     recovery_checkpoints: std.ArrayList(session_codec.RecoveryCheckpoint) = .empty,
@@ -676,6 +911,7 @@ pub const FakeAgentRuntimeDeps = struct {
     cancel_on_recovery_reservation: ?*std.atomic.Value(bool) = null,
     pause_on_auto_retry_status: bool = false,
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
+    adapter_manifest: [1]agent_stream_provider.ProviderAdapter = .{agent_stream_provider.unavailable_adapter},
 
     pub fn init(alloc: Allocator) FakeAgentRuntimeDeps {
         return .{ .alloc = alloc };
@@ -726,14 +962,13 @@ pub const FakeAgentRuntimeDeps = struct {
         for (self.history_turns.items) |turn| types.freeHistoryTurn(self.alloc, turn);
         self.history_turns.deinit(self.alloc);
         if (self.interrupted_tool_name) |value| self.alloc.free(value);
-        if (self.http_detail) |value| self.alloc.free(value);
+        if (self.provider_failure_detail) |value| self.alloc.free(value);
         if (self.diff_preview) |value| self.alloc.free(value);
         self.token_updates.deinit(self.alloc);
         for (self.lifecycle_events.items) |event| {
             worker_runtime.freeToolLifecycleEvent(self.alloc, event);
         }
         self.lifecycle_events.deinit(self.alloc);
-        freeStringList(self.alloc, &self.capability_queries);
         self.credential_refresh_sources.deinit(self.alloc);
         self.credential_refresh_modes.deinit(self.alloc);
         for (self.recovery_checkpoints.items) |*checkpoint| checkpoint.deinit(self.alloc);
@@ -743,8 +978,7 @@ pub const FakeAgentRuntimeDeps = struct {
     pub fn deps(self: *FakeAgentRuntimeDeps) AgentRuntimeDeps {
         return .{
             .ctx = self,
-            .provider_adapter = adapterFromLegacy(self.agent_stream_provider),
-            .agent_stream_provider = self.agent_stream_provider,
+            .adapter_registry = adapter_registry.AdapterRegistry{ .adapters = &self.adapter_manifest },
             .tool_registry = self.tool_registry,
             .live_tool_authority = self.live_tool_authority,
             .tool_activity_recorder = self.tool_activity_recorder,
@@ -781,10 +1015,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .push_command_output_complete = commandOutputComplete,
             .push_provider_failure = providerFailure,
             .resolve_route_credential = resolveRouteCredential,
-            .refresh_gateway_credential = refreshGatewayCredential,
             .request_route_recovery = if (self.enable_route_recovery) requestRouteRecovery else null,
-            .available_model_descriptor = availableModelDescriptor,
-            .resolve_model_descriptor = resolveModelDescriptor,
             .format_tool_execution_error = formatError,
             .record_tool_call_rejected = recordRejected,
             .report_inner_tool_usage = reportCapturedInnerToolUsage,
@@ -795,15 +1026,34 @@ pub const FakeAgentRuntimeDeps = struct {
         raw: *anyopaque,
         alloc: Allocator,
         route: *const route_snapshot.RouteSnapshot,
+        mode: adapter_auth.RefreshMode,
     ) !runtime_deps.RouteCredential {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         const credential = for (self.route_credential_overrides) |override| {
             if (std.mem.eql(u8, override.credential_ref, route.credential_ref))
                 break override.credential;
         } else self.route_credential;
+        const source = self.route_credential_source;
+        if (source) |value| {
+            if (value.refreshable) {
+                try self.credential_refresh_sources.append(self.alloc, value);
+                try self.credential_refresh_modes.append(self.alloc, mode);
+                if (self.credential_refresh_error) |err| return err;
+            }
+        }
+        const resolved = if (source != null and source.?.refreshable and
+            self.credential_refresh_index < self.credential_refresh_tokens.len)
+        blk: {
+            const token = self.credential_refresh_tokens[self.credential_refresh_index];
+            self.credential_refresh_index += 1;
+            break :blk token;
+        } else if (source != null and source.?.refreshable and mode == .force)
+            return error.MissingCredential
+        else
+            credential;
         return .{
-            .credential = try alloc.dupe(u8, credential),
-            .legacy_source = self.route_credential_source,
+            .credential = try alloc.dupe(u8, resolved),
+            .source = source orelse .{ .id = "test", .label = "test", .refreshable = false },
         };
     }
 
@@ -822,54 +1072,6 @@ pub const FakeAgentRuntimeDeps = struct {
                 cancel_flag.store(true, .seq_cst);
             }
         }
-    }
-
-    fn resolveModelDescriptor(raw: *anyopaque, _: Allocator, model: []const u8) !model_capabilities.ModelDescriptor {
-        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        try self.capability_queries.append(self.alloc, try self.alloc.dupe(u8, model));
-        if (self.cancel_on_capability_resolution) |cancel_flag| {
-            cancel_flag.store(true, .seq_cst);
-            return error.Cancelled;
-        }
-        const descriptor = blk: {
-            for (self.capability_overrides) |override| {
-                if (std.mem.eql(u8, override.model, model)) {
-                    var value = builtin_gateway.model_descriptor_provider.fallback(model);
-                    value.capabilities = override.capabilities;
-                    value.source = .configured;
-                    break :blk value;
-                }
-            }
-            break :blk builtin_gateway.model_descriptor_provider.fallback(model);
-        };
-        if (self.cancel_after_capability_resolution) |cancel_flag| {
-            cancel_flag.store(true, .seq_cst);
-        }
-        return descriptor;
-    }
-
-    fn availableModelDescriptor(raw: *anyopaque, model: []const u8) model_capabilities.ModelDescriptor {
-        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        for (self.available_capability_overrides) |override| {
-            if (std.mem.eql(u8, override.model, model)) {
-                var descriptor = builtin_gateway.model_descriptor_provider.fallback(model);
-                descriptor.capabilities = override.capabilities;
-                descriptor.source = .configured;
-                return descriptor;
-            }
-        }
-        return builtin_gateway.model_descriptor_provider.fallback(model);
-    }
-
-    fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, _: *const route_snapshot.RouteSnapshot, source: types.CredentialSource, mode: runtime_deps.CredentialRefreshMode) !?[]u8 {
-        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        try self.credential_refresh_sources.append(self.alloc, source);
-        try self.credential_refresh_modes.append(self.alloc, mode);
-        if (self.credential_refresh_error) |err| return err;
-        if (self.credential_refresh_index >= self.credential_refresh_tokens.len) return null;
-        const token = self.credential_refresh_tokens[self.credential_refresh_index];
-        self.credential_refresh_index += 1;
-        return try alloc.dupe(u8, token);
     }
 
     fn requestRouteRecovery(raw: *anyopaque, _: Allocator, request: runtime_deps.RouteRecoveryRequest) !runtime_deps.RouteRecoveryDecision {
@@ -1783,35 +1985,12 @@ pub const FakeAgentRuntimeDeps = struct {
         }
     }
 
-    fn providerFailure(raw: *anyopaque, category: agent_stream_provider.StreamFailure.Category, response_code: ?u16, detail: []const u8, credential_source: ?types.CredentialSource) !void {
+    fn providerFailure(raw: *anyopaque, category: agent_stream_provider.StreamFailure.Category, detail: []const u8, source: ?adapter_auth.Source) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        self.http_status = if (response_code) |code|
-            @enumFromInt(code)
-        else switch (category) {
-            .authentication => .unauthorized,
-            .authorization => .forbidden,
-            .configuration => .bad_request,
-            .invalid_content => .unprocessable_entity,
-            .request_too_large => .payload_too_large,
-            .rate_limited => .too_many_requests,
-            .timeout => .gateway_timeout,
-            .provider_internal => .internal_server_error,
-            .upstream_failure, .protocol => .bad_gateway,
-            .unavailable, .transport, .ambiguous_delivery => .service_unavailable,
-            .other => .internal_server_error,
-        };
-        self.http_credential_source = credential_source;
-        if (self.http_detail) |value| self.alloc.free(value);
-        var prefix_buf: [32]u8 = undefined;
-        const prefix = if (response_code) |code|
-            std.fmt.bufPrint(&prefix_buf, "HTTP {d}: ", .{code}) catch ""
-        else
-            "";
-        const captured_detail = if (prefix.len > 0 and std.mem.startsWith(u8, detail, prefix))
-            detail[prefix.len..]
-        else
-            detail;
-        self.http_detail = try self.alloc.dupe(u8, captured_detail);
+        self.provider_failure_category = category;
+        self.provider_failure_source = source;
+        if (self.provider_failure_detail) |value| self.alloc.free(value);
+        self.provider_failure_detail = try self.alloc.dupe(u8, detail);
         try self.record("provider_failure", .{});
     }
 
@@ -1843,7 +2022,6 @@ pub const PromptFixture = struct {
             .system_prompt = "system",
             .gateway_retry_count = 1,
             .max_provider_attempts = model_response_recovery.default_max_provider_attempts,
-            .gateway_chat_url = "https://example.invalid",
             .model_tools = &.{},
             .agent_step_limit = 8,
             .cancel_flag = &self.cancel_flag,
@@ -2016,12 +2194,11 @@ pub fn runFakePromptWithLifecycle(
     lifecycle: runtime_lifecycle.LifecycleContext,
 ) !void {
     hooks.workspace_root = config.workspace_root;
-    var deps = hooks.deps();
-    deps.agent_stream_provider = gateway.provider();
-    deps.provider_adapter = adapterFromLegacy(deps.agent_stream_provider);
+    hooks.adapter_manifest[0] = gateway.adapter();
+    const deps = hooks.deps();
     if (hooks.execute_delegate) |delegate| {
-        if (delegate.set_agent_stream_provider) |set_provider| {
-            set_provider(delegate.ctx, deps.agent_stream_provider);
+        if (delegate.set_route_adapter) |set_adapter| {
+            set_adapter(delegate.ctx, hooks.adapter_manifest[0]);
         }
     }
     try runtime_orchestrator.processQueuedPrompt(
@@ -2031,12 +2208,6 @@ pub fn runFakePromptWithLifecycle(
         config,
         queued_job,
     );
-}
-
-fn adapterFromLegacy(provider: agent_stream_provider.Provider) agent_stream_provider.ProviderAdapter {
-    var adapter = builtin_gateway.provider_adapter;
-    adapter.legacy_provider = provider;
-    return adapter;
 }
 
 fn syntheticFileMutationTargets(
@@ -2154,7 +2325,7 @@ pub fn expectGatewayPromptFinalUserText(gateway: *const FakeGateway, index: usiz
         const entry = prompt[i];
         if (entry != .object) continue;
         const role = entry.object.get("role") orelse continue;
-        if (role != .string or !std.mem.eql(u8, role.string, gateway_json.roleName(.user))) continue;
+        if (role != .string or !std.mem.eql(u8, role.string, roleName(.user))) continue;
         try std.testing.expectEqual(@as(usize, 1), countPromptEntryText(entry, expected_text));
         return;
     }

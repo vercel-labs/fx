@@ -81,14 +81,14 @@ const ProfilePublicationBatch = struct {
     }
 };
 
-/// One Gateway invocation. `begin` durably reserves it before network I/O;
+/// One model invocation. `begin` durably reserves it before network I/O;
 /// every successful reservation must terminate through `fail` or `complete`.
-pub const GatewayObservation = struct {
+pub const ModelInvocationObservation = struct {
     usage: ?*Usage,
     sequence: u64 = 0,
     started_at_ms: i64,
 
-    pub fn begin(usage: ?*Usage) !GatewayObservation {
+    pub fn begin(usage: ?*Usage) !ModelInvocationObservation {
         return .{
             .usage = usage,
             .sequence = if (usage) |ledger| try ledger.reserveInvocationDurably() else 0,
@@ -96,16 +96,15 @@ pub const GatewayObservation = struct {
         };
     }
 
-    pub fn fail(self: GatewayObservation, outcome: DeliveryOutcome) !void {
+    pub fn fail(self: ModelInvocationObservation, outcome: DeliveryOutcome) !void {
         const ledger = self.usage orelse return;
         try ledger.finishInvocationDurably(self.sequence, self.elapsedMs(), outcome);
     }
 
     pub fn complete(
-        self: GatewayObservation,
+        self: ModelInvocationObservation,
         alloc: Allocator,
-        status: std.http.Status,
-        completion: types.GatewayCompletion,
+        completion: types.ModelCompletion,
         connection_id: []const u8,
         lookup_scope: ?[]const u8,
     ) !void {
@@ -113,13 +112,10 @@ pub const GatewayObservation = struct {
         const generation_id = completion.generation_id;
         const delivery: DeliveryOutcome = if (completion.delivery_ambiguous)
             .ambiguous_delivery
-        else if (status == .ok)
-            if (!completion.generation_metadata_invalid and generation_id != null)
-                .observed_generation
-            else
-                .possibly_billed_without_identity
+        else if (!completion.generation_metadata_invalid and generation_id != null)
+            .observed_generation
         else
-            .unbilled;
+            .possibly_billed_without_identity;
         const id = generation_id orelse {
             try ledger.finishInvocationDurably(self.sequence, self.elapsedMs(), delivery);
             if (delivery == .possibly_billed_without_identity) {
@@ -131,14 +127,13 @@ pub const GatewayObservation = struct {
             }
             return;
         };
-        if (completion.generation_metadata_invalid or status != .ok) {
+        if (completion.generation_metadata_invalid) {
             try ledger.finishInvocationDurably(self.sequence, self.elapsedMs(), delivery);
             debug_trace.logf(
                 "session",
-                "usage generation ignored sequence={d} status={d} metadata_invalid={s}",
+                "usage generation ignored sequence={d} metadata_invalid={s}",
                 .{
                     self.sequence,
-                    @intFromEnum(status),
                     if (completion.generation_metadata_invalid) "true" else "false",
                 },
             );
@@ -159,7 +154,7 @@ pub const GatewayObservation = struct {
             .{ self.sequence, id },
         );
         if (completion.billing) |billing| {
-            ledger.applyGatewayBilling(alloc, id, billing) catch |err| {
+            ledger.applyGenerationBilling(alloc, id, billing) catch |err| {
                 debug_trace.logf(
                     "session",
                     "usage stream billing apply failed id={s} reason={s}",
@@ -178,7 +173,7 @@ pub const GatewayObservation = struct {
         }
     }
 
-    fn elapsedMs(self: GatewayObservation) u64 {
+    fn elapsedMs(self: ModelInvocationObservation) u64 {
         const ended_at_ms = io_mod.milliTimestamp();
         if (ended_at_ms <= self.started_at_ms) return 0;
         return std.math.cast(u64, ended_at_ms - self.started_at_ms) orelse
@@ -731,11 +726,11 @@ pub const Usage = struct {
         if (publication == .failed) self.flushProfilePublications();
     }
 
-    fn applyGatewayBilling(
+    fn applyGenerationBilling(
         self: *Usage,
         alloc: Allocator,
         generation_id: []const u8,
-        billing: types.GatewayBilling,
+        billing: types.GenerationBilling,
     ) !void {
         try self.applyGeneration(alloc, .{
             .id = generation_id,
@@ -1370,9 +1365,7 @@ pub const Usage = struct {
     pub fn startReconciliation(self: *Usage, alloc: Allocator) void {
         self.reconciliation_mutex.lockUncancelable(io_mod.getIo());
         defer self.reconciliation_mutex.unlock(io_mod.getIo());
-        if (comptime builtin.os.tag != .wasi) {
-            _ = self.reconciliation_work_epoch.fetchAdd(1, .seq_cst);
-        }
+        _ = self.reconciliation_work_epoch.fetchAdd(1, .seq_cst);
         if (self.reconciliation_thread) |thread| {
             if (!self.reconciliation_done.load(.seq_cst)) return;
             self.reconciliation_cancel.store(true, .seq_cst);
@@ -1382,7 +1375,6 @@ pub const Usage = struct {
             self.reconciliation_cancel.store(false, .seq_cst);
         }
         if (builtin.is_test) return;
-        if (comptime builtin.os.tag == .wasi) return;
 
         self.mutex.lockUncancelable(io_mod.getIo());
         const still_has_pending = self.pending.items.len > 0;
@@ -3578,14 +3570,14 @@ test "active invocation capacity fails before Gateway admission" {
     const alloc = std.testing.allocator;
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
-    var observations: [max_active_invocations]GatewayObservation = undefined;
+    var observations: [max_active_invocations]ModelInvocationObservation = undefined;
 
     for (&observations) |*observation| {
-        observation.* = try GatewayObservation.begin(&usage);
+        observation.* = try ModelInvocationObservation.begin(&usage);
     }
     try std.testing.expectError(
         error.UsageCapacityExceeded,
-        GatewayObservation.begin(&usage),
+        ModelInvocationObservation.begin(&usage),
     );
 
     for (observations) |observation| try observation.fail(.unbilled);
@@ -3707,10 +3699,9 @@ test "successful response without generation identity marks billing incomplete" 
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
 
-    const observation = try GatewayObservation.begin(&usage);
+    const observation = try ModelInvocationObservation.begin(&usage);
     try observation.complete(
         alloc,
-        .ok,
         .{},
         "vercel",
         "https://ai-gateway.vercel.sh",
@@ -3837,14 +3828,13 @@ test "reconciliation settles usage through the originating connection" {
     try std.testing.expectEqual(@as(u64, 2), snapshot.output_tokens);
 }
 
-test "terminal Gateway billing settles the durable observation immediately" {
+test "terminal generation billing settles the durable observation immediately" {
     const alloc = std.testing.allocator;
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
-    const observation = try GatewayObservation.begin(&usage);
+    const observation = try ModelInvocationObservation.begin(&usage);
     try observation.complete(
         alloc,
-        .ok,
         .{
             .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
             .billing = .{
@@ -3877,10 +3867,9 @@ test "successful retry after ambiguous delivery retains known generation" {
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
 
-    const observation = try GatewayObservation.begin(&usage);
+    const observation = try ModelInvocationObservation.begin(&usage);
     try observation.complete(
         alloc,
-        .ok,
         .{
             .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
             .delivery_ambiguous = true,
@@ -4661,7 +4650,7 @@ test "gateway observation checkpoints active and terminal usage states" {
         .persist = Capture.persist,
     });
 
-    const observation = try GatewayObservation.begin(&usage);
+    const observation = try ModelInvocationObservation.begin(&usage);
     try std.testing.expectEqual(@as(usize, 1), capture.calls);
     try std.testing.expectEqual(Availability.incomplete, capture.billing[0]);
     try std.testing.expect(!capture.api_duration_complete[0]);
@@ -4669,7 +4658,6 @@ test "gateway observation checkpoints active and terminal usage states" {
 
     try observation.complete(
         alloc,
-        .ok,
         .{ .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV" },
         "vercel",
         "https://ai-gateway.vercel.sh",
@@ -4703,7 +4691,7 @@ test "gateway observation does not proceed when active checkpoint fails" {
 
     try std.testing.expectError(
         error.CheckpointRejected,
-        GatewayObservation.begin(&usage),
+        ModelInvocationObservation.begin(&usage),
     );
     try std.testing.expectEqual(@as(usize, 1), reject.calls);
     var snapshot = try usage.snapshot(alloc);
@@ -4734,7 +4722,7 @@ test "terminal checkpoint failure preserves request progress as incomplete" {
         .persist = Reject.persist,
     });
 
-    const observation = try GatewayObservation.begin(&usage);
+    const observation = try ModelInvocationObservation.begin(&usage);
     try observation.fail(.unbilled);
     try std.testing.expectEqual(@as(usize, 2), reject.calls);
     var snapshot = try usage.snapshot(alloc);
@@ -4867,10 +4855,9 @@ test "terminal generation lookup stays on connection A after selecting B" {
 
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
-    const observation = try GatewayObservation.begin(&usage);
+    const observation = try ModelInvocationObservation.begin(&usage);
     try observation.complete(
         alloc,
-        .ok,
         .{ .generation_id = "request-42" },
         "connection-a",
         null,
@@ -4897,10 +4884,9 @@ test "terminal generation lookup stays on connection A after selecting B" {
 
     var missing_usage = Usage.initFresh();
     defer missing_usage.deinit(alloc);
-    const missing_observation = try GatewayObservation.begin(&missing_usage);
+    const missing_observation = try ModelInvocationObservation.begin(&missing_usage);
     try missing_observation.complete(
         alloc,
-        .ok,
         .{ .generation_id = "request-missing" },
         "connection-a",
         null,

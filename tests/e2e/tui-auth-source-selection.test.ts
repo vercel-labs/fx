@@ -4,13 +4,14 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
@@ -26,7 +27,11 @@ if (process.env.FX_REQUIRE_TMUX === "1" && !HAS_TMUX) {
 }
 
 const tmuxTest = test.skipIf(!HAS_TMUX);
-const profileStoredKeyTmuxTest = test.skipIf(!HAS_TMUX || process.platform === "darwin");
+const nativeAuthTmuxTest = test.skipIf(!HAS_TMUX);
+const NATIVE_AUTH_BIN = join(dirname(FX_BIN), "fx-native-auth-e2e");
+const NATIVE_AUTH_SOURCE_LABEL = process.platform === "darwin"
+  ? "stored API key (macOS Keychain)"
+  : "stored API key (profile file)";
 const TIMEOUT = 30_000;
 const ENV_TOKEN = "env-api-key-token";
 const LOGIN_TOKEN = "fx-login-token";
@@ -39,6 +44,7 @@ const DIRECT_LOGIN_RESPONSE = "DIRECT_LOGIN_RESPONSE";
 const LOGOUT_FALLBACK_RESPONSE = "LOGOUT_FALLBACK_RESPONSE";
 const REFRESH_RECOVERY_RESPONSE = "REFRESH_RECOVERY_RESPONSE";
 const ACQUIRED_LOGIN_TOKEN = "acquired-login-token";
+const MIGRATED_EXACT_RESPONSE = "MIGRATED_EXACT_RESPONSE";
 
 let session: TmuxSession | null = null;
 let home: string | null = null;
@@ -100,9 +106,10 @@ async function startFx(
   tracePath?: string,
   envOverrides: Record<string, string | undefined> = {},
   cwd?: string,
+  binary = FX_BIN,
 ): Promise<TmuxSession> {
   return TmuxSession.create({
-    cmd: FX_BIN,
+    cmd: binary,
     cwd,
     env: {
       HOME: testHome,
@@ -532,13 +539,66 @@ async function openSwitchCredential(pickerSession: TmuxSession): Promise<void> {
 function savedCredentialSource(testHome: string): string | undefined {
   const settingsPath = join(testHome, ".fx", "settings.json");
   if (!existsSync(settingsPath)) return undefined;
-  return (JSON.parse(readFileSync(settingsPath, "utf8")) as { credential_source?: string })
-    .credential_source;
+  const settings = JSON.parse(readFileSync(settingsPath, "utf8")) as {
+    connections?: {
+      selected?: string;
+      profiles?: Array<{ id?: string; credential_ref?: string }>;
+    };
+  };
+  const selected = settings.connections?.selected;
+  const reference = settings.connections?.profiles?.find((profile) => profile.id === selected)
+    ?.credential_ref;
+  return reference === "automatic" ? undefined : reference;
 }
 
-profileStoredKeyTmuxTest(
+function setNativeAuthStoreMode(testHome: string, mode: string): void {
+  const fxDir = join(testHome, ".fx");
+  mkdirSync(fxDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(fxDir, "native-auth-store-mode"), `${mode}\n`, { mode: 0o600 });
+  rmSync(join(fxDir, "native-auth-store-entered"), { force: true });
+  rmSync(join(fxDir, "native-auth-store-published"), { force: true });
+  rmSync(join(fxDir, "native-auth-store-release"), { force: true });
+  rmSync(join(fxDir, "native-auth-store-observed"), { force: true });
+  rmSync(join(fxDir, "native-auth-store-error"), { force: true });
+}
+
+async function waitForFile(path: string): Promise<void> {
+  const started = Date.now();
+  while (!existsSync(path)) {
+    if (Date.now() - started >= TIMEOUT) throw new Error(`Timed out waiting for ${path}`);
+    await Bun.sleep(25);
+  }
+}
+
+async function submitEnteredSecret(target: TmuxSession, value: string): Promise<void> {
+  await target.sendText("/setup");
+  await target.waitForText("API key", TIMEOUT);
+  await target.sendKeys("Down");
+  await target.sendKeys("Enter");
+  await target.waitForText("Paste your AI Gateway API key", TIMEOUT);
+  await target.sendLiteralText(value);
+  await target.sendKeys("Enter");
+}
+
+function readNonSecretNativeFixtureFiles(testHome: string): string {
+  const root = join(testHome, ".fx");
+  if (!existsSync(root)) return "";
+  const values: string[] = [];
+  const visit = (path: string): void => {
+    for (const entry of readdirSync(path, { withFileTypes: true })) {
+      const child = join(path, entry.name);
+      if (entry.isDirectory()) visit(child);
+      else if (entry.isFile() && entry.name !== "api-key") values.push(readFileSync(child, "utf8"));
+    }
+  };
+  visit(root);
+  return values.join("\n");
+}
+
+nativeAuthTmuxTest(
   "stored-key setup persists ahead of the environment",
   async () => {
+    expect(existsSync(NATIVE_AUTH_BIN)).toBe(true);
     home = mkdtempSync(join(tmpdir(), "fx-tui-stored-key-preference-"));
     stderrPath = join(home, "stderr.log");
     writeFileSync(stderrPath, "");
@@ -546,7 +606,7 @@ profileStoredKeyTmuxTest(
 
     session = await startFx(home, stderrPath, gateway, undefined, undefined, {
       FX_DISABLE_KEYCHAIN: undefined,
-    });
+    }, undefined, NATIVE_AUTH_BIN);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/status");
     await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
@@ -560,7 +620,7 @@ profileStoredKeyTmuxTest(
     await session.sendKeys("Enter");
     await session.waitForText("Saved the API key to profile file and made it active", TIMEOUT);
     await session.sendText("/status");
-    await session.waitForText("auth=stored API key (profile file)", TIMEOUT);
+    await session.waitForText(`auth=${NATIVE_AUTH_SOURCE_LABEL}`, TIMEOUT);
     expect(savedCredentialSource(home)).toBe("stored_key");
 
     const keyPath = join(home, ".fx", "api-key");
@@ -570,10 +630,10 @@ profileStoredKeyTmuxTest(
     await session.kill();
     session = await startFx(home, stderrPath, gateway, undefined, undefined, {
       FX_DISABLE_KEYCHAIN: undefined,
-    });
+    }, undefined, NATIVE_AUTH_BIN);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/status");
-    await session.waitForText("auth=stored API key (profile file)", TIMEOUT);
+    await session.waitForText(`auth=${NATIVE_AUTH_SOURCE_LABEL}`, TIMEOUT);
     await session.sendText("use the stored key after restart");
     await session.waitForText(STORED_RESPONSE, TIMEOUT);
     expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${STORED_TOKEN}`);
@@ -583,6 +643,180 @@ profileStoredKeyTmuxTest(
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
+);
+
+tmuxTest(
+  "legacy credential source publishes only after exact native acquisition and reloads exactly",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-exact-migration-"));
+    stderrPath = join(home, "stderr.log");
+    const tracePath = join(home, "trace.log");
+    const fxDir = join(home, ".fx");
+    mkdirSync(fxDir, { recursive: true, mode: 0o700 });
+    writeFileSync(stderrPath, "");
+    writeFileSync(
+      join(fxDir, "settings.json"),
+      JSON.stringify({ credential_source: "ai_gateway_api_key", future: true }) + "\n",
+      { mode: 0o600 },
+    );
+    const alternateSecret = "migration-alternate-stored-secret";
+    writeFileSync(join(fxDir, "api-key"), alternateSecret, { mode: 0o600 });
+    writeSeededFxLogin(home);
+    gateway = startFakeGateway([fakeGatewayFinalText(MIGRATED_EXACT_RESPONSE)]);
+
+    session = await startFx(home, stderrPath, gateway, undefined, tracePath);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/status");
+    await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
+    expect(savedCredentialSource(home)).toBe("ai_gateway_api_key");
+    const migrated = readFileSync(join(fxDir, "settings.json"), "utf8");
+    expect(migrated).not.toContain("credential_source");
+    expect(migrated).toContain('"credential_ref":"ai_gateway_api_key"');
+    expect(migrated).toContain('"future":true');
+
+    await session.kill();
+    session = await startFx(home, stderrPath, gateway, undefined, tracePath);
+    await session.waitForComposer(TIMEOUT);
+    expect(readFileSync(join(fxDir, "settings.json"), "utf8")).toBe(migrated);
+    await session.sendText("use the migrated exact source after restart");
+    await session.waitForText(MIGRATED_EXACT_RESPONSE, TIMEOUT);
+    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
+
+    const output = await session.captureFullScrollback();
+    const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+    for (const secret of [ENV_TOKEN, alternateSecret, LOGIN_TOKEN, "seeded-refresh-token"]) {
+      expect(output).not.toContain(secret);
+      expect(trace).not.toContain(secret);
+      expect(migrated).not.toContain(secret);
+    }
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+nativeAuthTmuxTest(
+  "native entered-secret outcomes preserve publication truth without Keychain access",
+  async () => {
+    expect(existsSync(NATIVE_AUTH_BIN)).toBe(true);
+    home = mkdtempSync(join(tmpdir(), "fx-native-auth-lifecycle-"));
+    stderrPath = join(home, "stderr.log");
+    const tracePath = join(home, "trace.log");
+    writeFileSync(stderrPath, "");
+    const invalidSecret = `invalid-${Date.now()}-${Math.random()}`;
+    const controlSecret = `control-${Date.now()}\t${Math.random()}`;
+    const indeterminateSecret = `indeterminate-${Date.now()}-${Math.random()}`;
+    const cancelBeforeSecret = `cancel-before-${Date.now()}-${Math.random()}`;
+    const cancelAfterSecret = `cancel-after-${Date.now()}-${Math.random()}`;
+    const secrets = [
+      invalidSecret,
+      controlSecret,
+      indeterminateSecret,
+      cancelBeforeSecret,
+      cancelAfterSecret,
+    ];
+    gateway = startFakeGateway([], {
+      models(request) {
+        if (request.headers.get("authorization") === `Bearer ${invalidSecret}`) {
+          return new Response("refused", { status: 401 });
+        }
+        return [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }];
+      },
+    });
+
+    setNativeAuthStoreMode(home, "replaced");
+    session = await startFx(home, stderrPath, gateway, undefined, tracePath, {
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_TRACE_SCOPES: "auth,prompt,stored_key",
+    }, undefined, NATIVE_AUTH_BIN);
+    await session.waitForComposer(TIMEOUT);
+
+    await submitEnteredSecret(session, invalidSecret);
+    await session.waitForText("The AI Gateway refused that API key. Nothing was stored.", TIMEOUT);
+    expect(existsSync(join(home, ".fx", "api-key"))).toBe(false);
+    expect(savedCredentialSource(home)).toBeUndefined();
+
+    const validationRequests = gateway.modelRequests.length;
+    setNativeAuthStoreMode(home, "replaced");
+    await submitEnteredSecret(session, controlSecret);
+    await session.waitForText(
+      "API keys cannot contain control bytes. Nothing was stored.",
+      TIMEOUT,
+    );
+    expect(gateway.modelRequests).toHaveLength(validationRequests);
+    expect(gateway.requests).toHaveLength(0);
+    expect(existsSync(join(home, ".fx", "native-auth-store-observed"))).toBe(false);
+    expect(existsSync(join(home, ".fx", "api-key"))).toBe(false);
+    expect(savedCredentialSource(home)).toBeUndefined();
+
+    setNativeAuthStoreMode(home, "indeterminate");
+    await submitEnteredSecret(session, indeterminateSecret);
+    await waitForFile(join(home, ".fx", "native-auth-store-observed"));
+    expect(readFileSync(join(home, ".fx", "native-auth-store-observed"), "utf8")).toBe(
+      "indeterminate",
+    );
+    const storeErrorPath = join(home, ".fx", "native-auth-store-error");
+    expect(existsSync(storeErrorPath) ? readFileSync(storeErrorPath, "utf8") : "").toBe("");
+    const indeterminatePane = await session.waitForText(
+      "Could not confirm whether the API key was saved to profile file. It was not made active.",
+      TIMEOUT,
+    );
+    expect(readFileSync(join(home, ".fx", "api-key"), "utf8")).toBe(indeterminateSecret);
+    expect(savedCredentialSource(home)).toBeUndefined();
+    expect(indeterminatePane).toContain(
+      "Could not confirm whether the API key was saved to profile file. It was not made active.",
+    );
+
+    await session.kill();
+    session = await startFx(home, stderrPath, gateway, undefined, tracePath, {
+      FX_DISABLE_KEYCHAIN: "1",
+    }, undefined, NATIVE_AUTH_BIN);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/status");
+    await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
+    expect(savedCredentialSource(home)).toBeUndefined();
+
+    rmSync(join(home, ".fx", "api-key"), { force: true });
+    setNativeAuthStoreMode(home, "cancel_before");
+    await submitEnteredSecret(session, cancelBeforeSecret);
+    await waitForFile(join(home, ".fx", "native-auth-store-entered"));
+    await session.sendKeys("Escape");
+    await session.waitForPane((pane) => !pane.includes("Switch credential"), TIMEOUT);
+    writeFileSync(join(home, ".fx", "native-auth-store-release"), "1", { mode: 0o600 });
+    await session.waitForText("API key setup was cancelled. Nothing was stored.", TIMEOUT);
+    expect(existsSync(join(home, ".fx", "api-key"))).toBe(false);
+    expect(savedCredentialSource(home)).toBeUndefined();
+
+    setNativeAuthStoreMode(home, "cancel_after");
+    await submitEnteredSecret(session, cancelAfterSecret);
+    await waitForFile(join(home, ".fx", "native-auth-store-published"));
+    await session.sendKeys("Escape");
+    await session.waitForPane((pane) => !pane.includes("Switch credential"), TIMEOUT);
+    writeFileSync(join(home, ".fx", "native-auth-store-release"), "1", { mode: 0o600 });
+    await session.waitForText(
+      "API key setup was cancelled after the key was saved to profile file; it was not made active.",
+      TIMEOUT,
+    );
+    expect(readFileSync(join(home, ".fx", "api-key"), "utf8")).toBe(cancelAfterSecret);
+    expect(savedCredentialSource(home)).toBeUndefined();
+
+    const output = await session.captureFullScrollback();
+    const stderr = readFileSync(stderrPath, "utf8");
+    const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+    const nonSecretFiles = readNonSecretNativeFixtureFiles(home);
+    for (const value of secrets) {
+      expect(output).not.toContain(value);
+      expect(stderr).not.toContain(value);
+      expect(trace).not.toContain(value);
+      expect(nonSecretFiles).not.toContain(value);
+    }
+    expect(stderr).toBe("");
+    expect(nonSecretFiles).not.toContain("/usr/bin/security");
+    expect(nonSecretFiles).not.toContain("keychain");
+    expect(trace).not.toContain("/usr/bin/security");
+    expect(trace).not.toContain("keychain");
+  },
+  120_000,
 );
 
 tmuxTest(
@@ -677,10 +911,10 @@ tmuxTest(
     await session.sendKeys("Enter");
     await session.waitForText("Choose a Vercel team", TIMEOUT);
     await session.sendKeys("Enter");
-    await session.waitForText("Changed Vercel team to Vercel Labs", TIMEOUT);
+    await session.waitForText("Changed the Vercel team to Vercel Labs", TIMEOUT);
+    expect(savedCredentialSource(home)).toBe("fx_login");
     await session.sendText("/status");
     await session.waitForText("auth=fx login", TIMEOUT);
-    expect(savedCredentialSource(home)).toBe("fx_login");
 
     const savedAuth = JSON.parse(readFileSync(join(home, ".fx", "auth.json"), "utf8")) as {
       team_id?: string;
@@ -1180,7 +1414,7 @@ tmuxTest(
     await session.sendText(" preserve this exact prompt");
     const blocked = await session.waitForPane(
       (pane) =>
-        pane.includes("Fx needs access to Vercel AI Gateway") &&
+        pane.includes("fx needs access to Vercel AI Gateway") &&
         pane.includes("preserve this exact prompt") &&
         pane.includes("Image 1"),
       TIMEOUT,
@@ -1437,7 +1671,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "HTTP auth failure names the selected source and suppresses provider detail",
+  "normalized auth failure names the selected source and suppresses provider detail",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-http-failure-"));
     stderrPath = join(home, "stderr.log");
@@ -1455,7 +1689,7 @@ tmuxTest(
     await session.sendText("exercise interactive auth failure");
     const failed = await session.waitForPane(
       (pane) =>
-        pane.includes("AI_GATEWAY_API_KEY authentication failed · HTTP 401") &&
+        pane.includes("AI_GATEWAY_API_KEY authentication failed") &&
         pane.includes("Run /setup to choose another source."),
       TIMEOUT,
     );
@@ -1542,7 +1776,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "initial expired login refresh failure is visible before any model request",
+  "expired migrated login stops visibly before alternate or provider traffic",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-initial-refresh-failure-"));
     stderrPath = join(home, "stderr.log");
@@ -1558,35 +1792,25 @@ tmuxTest(
     );
 
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, tracePath);
-    await session.waitForComposer(TIMEOUT);
-    const prompt = "stop before the initial model request";
-    await session.sendText(prompt);
-    const failed = await session.waitForPane(
-      (pane) =>
-        pane.includes(prompt) &&
-        pane.includes("fx login credential refresh failed.") &&
-        pane.includes("Choose another source below"),
-      TIMEOUT,
-    );
+    expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+    session = null;
 
     expect(gateway.requests).toHaveLength(0);
     expect(gateway.classifierRequests).toHaveLength(0);
-    expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
-      "GET /.well-known/openid-configuration",
-      "POST /oauth/token",
-    ]);
-    const trace = readFileSync(tracePath, "utf8");
+    expect(gateway.modelRequests).toHaveLength(0);
+    expect(oauth.requests).toEqual([]);
+    const visible = readFileSync(stderrPath, "utf8");
+    expect(visible).toContain(
+      "fx: saved credential source requires renewal; authenticate again or choose another source",
+    );
+    const settings = readFileSync(join(home, ".fx", "settings.json"), "utf8");
+    expect(settings).toContain('"credential_source":"fx_login"');
+    expect(settings).not.toContain("credential_ref");
+    const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
     for (const secret of [LOGIN_TOKEN, ENV_TOKEN, "seeded-refresh-token", oauth.providerDetail]) {
-      expect(failed).not.toContain(secret);
+      expect(visible).not.toContain(secret);
       expect(trace).not.toContain(secret);
     }
-    expect(readFileSync(stderrPath, "utf8")).toBe("");
-
-    await session.sendKeys("Escape");
-    await session.sendKeys("C-u");
-    await session.waitForComposer(TIMEOUT);
-    await session.sendText("/quit");
-    expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
   },
   60_000,
 );
@@ -2050,15 +2274,16 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     await waitForModelRequestCount(gateway, 1);
 
+    await session.resizeWindow(140, 30);
     await session.sendText("/models");
     const pane = await session.waitForPane(
       (text) =>
         text.includes(FAKE_GATEWAY_MODEL) &&
-        text.includes("Using the public model catalog; sign in or use an API key for team-private models."),
+        text.includes("Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models."),
       TIMEOUT,
     );
     expect(pane).toContain(FAKE_GATEWAY_MODEL);
-    expect(pane).toContain("Using the public model catalog; sign in or use an API key for team-private models.");
+    expect(pane).toContain("Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.");
 
     expect(gateway.requests).toHaveLength(0);
     expect(gateway.modelRequests).toHaveLength(1);
@@ -2112,7 +2337,7 @@ for (const scenario of [
   {
     name: "ordinary public empty catalog",
     authenticated: false,
-    status: "Using the public model catalog; sign in or use an API key for team-private models.",
+    status: "Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.",
   },
   {
     name: "rejected credential empty fallback catalog",
@@ -2146,6 +2371,7 @@ for (const scenario of [
       await session.waitForComposer(TIMEOUT);
       await waitForModelRequestCount(gateway, scenario.authenticated ? 2 : 1);
 
+      await session.resizeWindow(140, 30);
       await session.sendText("/models");
       const pane = await session.waitForPane(
         (text) => text.includes("No models available.") && text.includes(scenario.status),

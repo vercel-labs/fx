@@ -39,8 +39,8 @@ pub const Paths = struct {
 pub const Settings = struct {
     model: ?[]u8 = null,
     connections: ?connection_registry.Stored = null,
+    legacy_credential_ref: ?[]u8 = null,
     permission_mode: ?types.PermissionMode = null,
-    credential_source: ?types.CredentialSource = null,
     yolo_acknowledged: ?bool = null,
     max_agent_steps: ?usize = null,
     max_tool_result_bytes: ?usize = null,
@@ -69,6 +69,7 @@ pub const Settings = struct {
     pub fn deinit(self: *Settings, alloc: Allocator) void {
         if (self.model) |value| alloc.free(value);
         if (self.connections) |*connections| connections.deinit(alloc);
+        if (self.legacy_credential_ref) |value| alloc.free(value);
         if (self.input_appearance) |value| alloc.free(value);
         if (self.maxxing_mode) |value| alloc.free(value);
         if (self.sandbox) |value| alloc.free(value);
@@ -522,6 +523,7 @@ fn hasLegacyWorkspacePreferences(root: std.json.Value) bool {
             "maxxing_mode",
             "slash_menu_categories",
             "startup_scrollback",
+            "credential_source",
         }) |key| {
             if (workspace.contains(key)) return true;
         }
@@ -559,8 +561,8 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "auto_upgrade",
         "update_channel",
         "permission_mode",
-        "credential_source",
         "connections",
+        "credential_source",
         "yolo_acknowledged",
         "permission",
         "additional_directories",
@@ -661,6 +663,11 @@ fn mergeDetailedSettingsLayer(
         mergeSettings(state.settings, &incoming, alloc);
     } else |err| {
         if (err == error.OutOfMemory) return err;
+        if (err == error.InvalidLegacyCredentialSourceType or
+            err == error.InvalidLegacyCredentialSource)
+        {
+            return err;
+        }
         if (diagnostic_layer == .user and err == error.InvalidModelValue) state.prompt_history_store_allowed.* = false;
         try state.diagnostics.append(alloc, .{
             .layer = diagnostic_layer,
@@ -811,29 +818,15 @@ pub fn connectionPersistence() connection_registry.Persistence {
     return .{ .write_fn = persistConnectionSnapshot };
 }
 
-pub fn setConnectionSnapshot(
-    alloc: Allocator,
-    snapshot: connection_registry.Snapshot,
-) !CommitOutcome {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-    var store = try settings_store.Store.initFromHome(alloc, home, .writable);
-    defer store.deinit(alloc);
-    return store.applyConnectionSnapshot(alloc, snapshot);
-}
-
 fn persistConnectionSnapshot(
     _: ?*anyopaque,
     alloc: Allocator,
     snapshot: connection_registry.Snapshot,
 ) anyerror!connection_registry.PersistenceOutcome {
-    var outcome = setConnectionSnapshot(alloc, snapshot) catch |err| {
-        if (err == error.SettingsCommitIndeterminate) {
-            return .{ .replaced_indeterminate = err };
-        }
-        return err;
-    };
-    defer outcome.deinit(alloc);
-    return .committed;
+    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    var store = try settings_store.Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+    return store.persistConnectionSnapshot(alloc, snapshot);
 }
 
 pub fn setWorkspacePreferences(
@@ -1352,14 +1345,15 @@ fn parseProfileOnlyFields(
         settings.permission_mode = parsePermissionMode(value.string) orelse return error.InvalidPermissionMode;
     }
 
-    if (root.object.get("credential_source")) |credential_source_value| {
-        if (credential_source_value != .string) return error.InvalidCredentialSourceType;
-        settings.credential_source = types.parseCredentialSource(credential_source_value.string) orelse
-            return error.InvalidCredentialSource;
-    }
-
     if (root.object.get("connections")) |connections_value| {
         settings.connections = try connection_registry.parseStored(alloc, connections_value);
+    }
+
+    if (root.object.get("credential_source")) |credential_source_value| {
+        if (credential_source_value != .string) return error.InvalidLegacyCredentialSourceType;
+        connection_registry.validateCredentialReference(credential_source_value.string) catch
+            return error.InvalidLegacyCredentialSource;
+        settings.legacy_credential_ref = try alloc.dupe(u8, credential_source_value.string);
     }
 
     if (root.object.get("yolo_acknowledged")) |acknowledged_value| {
@@ -1535,8 +1529,12 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
         target.connections = value;
         incoming.connections = null;
     }
+    if (incoming.legacy_credential_ref) |value| {
+        if (target.legacy_credential_ref) |current| alloc.free(current);
+        target.legacy_credential_ref = value;
+        incoming.legacy_credential_ref = null;
+    }
     if (incoming.permission_mode) |value| target.permission_mode = value;
-    if (incoming.credential_source) |value| target.credential_source = value;
     if (incoming.yolo_acknowledged) |value| target.yolo_acknowledged = value;
     if (incoming.max_agent_steps) |value| target.max_agent_steps = value;
     if (incoming.max_tool_result_bytes) |value| target.max_tool_result_bytes = value;
@@ -1789,6 +1787,34 @@ fn expectOneTrailingNewline(bytes: []const u8) !void {
     if (bytes.len > 1) {
         try std.testing.expect(bytes[bytes.len - 2] != '\n');
     }
+}
+
+test "legacy credential source reader preserves only bounded neutral references" {
+    const alloc = std.testing.allocator;
+    var settings = try parseSettingsJson(alloc, "{\"credential_source\":\"fx_login\"}");
+    defer settings.deinit(alloc);
+    try std.testing.expectEqualStrings("fx_login", settings.legacy_credential_ref.?);
+
+    try std.testing.expectError(
+        error.InvalidLegacyCredentialSourceType,
+        parseSettingsJson(alloc, "{\"credential_source\":null}"),
+    );
+    try std.testing.expectError(
+        error.InvalidLegacyCredentialSource,
+        parseSettingsJson(alloc, "{\"credential_source\":\"\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidLegacyCredentialSource,
+        parseSettingsJson(alloc, "{\"credential_source\":\"contains whitespace\"}"),
+    );
+
+    const oversized = "a" ** (connection_registry.max_connection_id_bytes + 1);
+    const json_text = try std.fmt.allocPrint(alloc, "{{\"credential_source\":\"{s}\"}}", .{oversized});
+    defer alloc.free(json_text);
+    try std.testing.expectError(
+        error.InvalidLegacyCredentialSource,
+        parseSettingsJson(alloc, json_text),
+    );
 }
 
 fn workspaceOverrideObject(root: *std.json.Value, workspace_root: []const u8) !*std.json.ObjectMap {

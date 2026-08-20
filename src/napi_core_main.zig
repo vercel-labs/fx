@@ -2,11 +2,11 @@ const std = @import("std");
 const build_options = @import("build_options");
 const acp_server = @import("acp/server.zig");
 const jsonrpc = @import("acp/jsonrpc.zig");
-const agent_stream_provider = @import("core/agent/stream_provider.zig");
+const stream_provider = @import("core/agent/stream_provider.zig");
 const background_process_provider = @import("core/execution/background_process_provider.zig");
 const adapter_auth = @import("core/gateway/adapter_auth.zig");
 const connection_registry = @import("core/gateway/connection_registry.zig");
-const gateway_provider = @import("core/gateway/gateway_provider.zig");
+const gateway_system = @import("core/gateway/gateway_system.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
 const host = @import("core/hosts/host.zig");
 const debug_trace = @import("core/shared/debug_trace.zig");
@@ -14,7 +14,6 @@ const io_mod = @import("core/shared/io.zig");
 const fetch_state = @import("napi_fetch_state.zig");
 const streamable_http = @import("core/mcp/streamable_http.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
-const oauth_transport = @import("gateway/auth/oauth_transport.zig");
 const builtin_context = @import("builtins/context.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_modes = @import("builtins/modes.zig");
@@ -435,19 +434,17 @@ const Runtime = struct {
     }
 
     fn run(self: *Runtime) void {
-        const agent_stream = host_stream_provider.provider(&self.stream_context);
+        var transport = host_stream_provider.vercelTransport(&self.stream_context);
         var provider_adapter = builtin_gateway.provider_adapter;
         provider_adapter.auth = self.authProvider();
-        provider_adapter.legacy_provider = agent_stream;
+        provider_adapter.context = &transport;
         provider_adapter.generation_usage = generation_usage_provider.unavailable_provider;
-        const adapters = [_]agent_stream_provider.ProviderAdapter{provider_adapter};
-        const provider = gateway_provider.Provider{
-            .connection_seed = builtin_gateway.connection_seed,
-            .agent_stream = agent_stream,
-            .provider_adapter = provider_adapter,
+        const adapters = [_]stream_provider.ProviderAdapter{provider_adapter};
+        var connection_seed = builtin_gateway.connection_seed;
+        connection_seed.endpoint = self.gateway_chat_url;
+        const system = gateway_system.System{
+            .connection_seed = connection_seed,
             .adapter_registry = .{ .adapters = &adapters },
-            .oauth_transport = oauth_transport.unavailable_provider,
-            .chat_url = builtin_gateway.provider.chat_url,
         };
         acp_server.runWithTransport(
             self.alloc,
@@ -455,9 +452,7 @@ const Runtime = struct {
                 .default_model = builtin_gateway.default_model,
                 .default_agent_step_limit = 64,
                 .gateway_retry_count = 0,
-                .gateway_chat_url = self.gateway_chat_url,
-                .gateway_models_path = builtin_gateway.models_path,
-                .gateway_provider = provider,
+                .gateway_system = system,
                 .background_process_provider = background_process_provider.unavailable_provider,
                 .secret_store = host.unavailable_secret_store,
                 .prompt_policy = builtin_context.prompt_policy,
@@ -471,7 +466,6 @@ const Runtime = struct {
                 .max_history_turns = 100,
                 .context_registry = .{ .default_provider = builtin_context.provider },
                 .mode_registry = builtin_modes.registry,
-                .credential_override = self.credential,
                 .model_override = self.model,
                 .home_override = self.home,
                 .workspace_root_override = self.workspace_root,
@@ -503,7 +497,6 @@ const Runtime = struct {
         request: adapter_auth.Request,
     ) Allocator.Error!adapter_auth.Acquisition {
         const self: *const Runtime = @ptrCast(@alignCast(raw));
-        if (self.credential.len == 0) return .{ .missing = .not_found };
         const source = builtin_gateway.credentialOverrideSource(request.profile.credential_ref) catch
             return .{ .failed = .{ .category = .configuration } };
         const credential = try alloc.dupe(u8, self.credential);
@@ -710,13 +703,16 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         .gateway_chat_url = gateway_chat_url,
         .thread = undefined,
     };
-    runtime.stream_context = host_stream_provider.initContext(builtin_gateway.buildAgentRequest, .{
-        .context = &runtime.fetch,
-        .open_fn = FetchBridge.open,
-        .status_fn = FetchBridge.statusFn,
-        .next_fn = FetchBridge.next,
-        .close_fn = FetchBridge.close,
-    });
+    runtime.stream_context = host_stream_provider.initContext(
+        .{
+            .context = &runtime.fetch,
+            .open_fn = FetchBridge.open,
+            .status_fn = FetchBridge.statusFn,
+            .next_fn = FetchBridge.next,
+            .close_fn = FetchBridge.close,
+        },
+        runtime.gateway_chat_url,
+    );
     runtime.thread = std.Thread.spawn(.{}, Runtime.run, .{runtime}) catch return error.ThreadFailed;
     return runtime;
 }

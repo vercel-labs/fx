@@ -1,37 +1,20 @@
+//! Provider-neutral adapter registry and connection seed composition.
+
 const std = @import("std");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 pub const account_usage_provider = @import("account_usage_provider.zig");
-const credentials = @import("../../gateway/auth/credentials.zig");
-const oauth_transport = @import("../../gateway/auth/oauth_transport.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const connection_registry = @import("connection_registry.zig");
 const adapter_registry = @import("adapter_registry.zig");
 const model_catalog = @import("model_catalog.zig");
-const model_catalog_metadata = @import("model_catalog_metadata.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const ResolveChatUrlFn = *const fn (?*anyopaque, []const u8) []const u8;
-
-pub const ChatUrlProvider = struct {
-    /// When set, context must remain valid until every in-flight `resolve` returns.
-    context: ?*anyopaque = null,
-    resolve_fn: ResolveChatUrlFn,
-
-    pub fn resolve(self: ChatUrlProvider, fallback: []const u8) []const u8 {
-        return self.resolve_fn(self.context, fallback);
-    }
-};
-
-pub const Provider = struct {
+pub const System = struct {
     connection_seed: connection_registry.Seed,
-    agent_stream: agent_stream_provider.Provider,
-    provider_adapter: agent_stream_provider.ProviderAdapter,
     adapter_registry: adapter_registry.AdapterRegistry = .{ .adapters = &.{} },
-    oauth_transport: oauth_transport.Provider,
-    chat_url: ChatUrlProvider,
 };
 
 test "account usage lookup dispatches through the injected provider" {
@@ -77,14 +60,6 @@ const CapabilityResolverState = enum {
     failed,
 };
 
-pub fn modelCatalogForAdapter(
-    admitted_adapter_kind: []const u8,
-    adapter: agent_stream_provider.ProviderAdapter,
-) ?model_catalog.Provider {
-    if (!std.mem.eql(u8, admitted_adapter_kind, adapter.kind)) return null;
-    return adapter.model_catalog;
-}
-
 pub const CapabilityResolver = struct {
     catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty,
     state: CapabilityResolverState = .idle,
@@ -97,9 +72,11 @@ pub const CapabilityResolver = struct {
         self: *CapabilityResolver,
         alloc: Allocator,
         provider: model_catalog.Provider,
+        descriptors: model_catalog.ModelDescriptorProvider,
         input: model_catalog.FetchInput,
         model: []const u8,
-    ) model_capabilities.ResolveError!model_capabilities.Capabilities {
+    ) model_capabilities.ResolveError!model_capabilities.ModelDescriptor {
+        const fallback = descriptors.fallback(model);
         if (self.state == .idle) {
             const result = model_catalog.fetchWithPublicFallback(provider, alloc, input);
             const loaded = switch (result) {
@@ -120,7 +97,7 @@ pub const CapabilityResolver = struct {
                         "model catalog lookup outcome=fetch_failed model={s} category={t}",
                         .{ model, failure.category },
                     );
-                    return model_capabilities.capabilitiesForModel(model);
+                    return fallback;
                 },
             };
             self.catalog = loaded.catalog;
@@ -133,41 +110,24 @@ pub const CapabilityResolver = struct {
                 "model catalog lookup outcome=cache_failed model={s}",
                 .{model},
             );
-            return model_capabilities.capabilitiesForModel(model);
+            return fallback;
         }
-        for (self.catalog.items) |entry| {
-            if (std.mem.eql(u8, entry.id, model)) {
-                debug_trace.logf(
-                    "gateway",
-                    "model catalog lookup outcome=ready_hit model={s}",
-                    .{model},
-                );
-                return model_capabilities.resolveCapabilities(
-                    model,
-                    model_catalog_metadata.fromCatalogEntry(entry),
-                );
-            }
-        }
+        const descriptor = descriptors.resolve(self.catalog.items, model);
         debug_trace.logf(
             "gateway",
-            "model catalog lookup outcome=missing_entry model={s}",
-            .{model},
+            "model catalog lookup outcome={s} model={s}",
+            .{ if (descriptor.source == .catalog) "ready_hit" else "missing_entry", model },
         );
-        return model_capabilities.capabilitiesForModel(model);
+        return descriptor;
     }
 
-    pub fn available(self: *const CapabilityResolver, model: []const u8) model_capabilities.Capabilities {
-        if (self.state == .ready) {
-            for (self.catalog.items) |entry| {
-                if (std.mem.eql(u8, entry.id, model)) {
-                    return model_capabilities.resolveCapabilities(
-                        model,
-                        model_catalog_metadata.fromCatalogEntry(entry),
-                    );
-                }
-            }
-        }
-        return model_capabilities.capabilitiesForModel(model);
+    pub fn available(
+        self: *const CapabilityResolver,
+        descriptors: model_catalog.ModelDescriptorProvider,
+        model: []const u8,
+    ) model_capabilities.ModelDescriptor {
+        if (self.state == .ready) return descriptors.resolve(self.catalog.items, model);
+        return descriptors.fallback(model);
     }
 
     pub fn catalogEntries(self: *const CapabilityResolver) ?[]const model_catalog.ModelCatalogEntry {
@@ -199,12 +159,12 @@ const FakeCatalog = struct {
                 self.saw_authenticated_access =
                     std.mem.eql(u8, input.access.authorizationCredential() orelse "", "test-key") and
                     std.mem.eql(u8, input.access.teamContext() orelse "", "team_123");
-                return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
+                return .{ .failure = .{ .category = .authentication } };
             }
             self.saw_public_retry =
                 input.access.authorizationCredential() == null and
                 input.access.teamContext() == null and
-                input.access.publicOnlyReason() == .authenticated_credential_rejected;
+                input.access.publicOnlyReason() == .credential_rejected;
             self.outcome = .ready;
         }
         switch (self.outcome) {
@@ -240,23 +200,33 @@ const FakeCatalog = struct {
     }
 };
 
-test "model catalog selection requires the admitted adapter kind" {
-    var fake = FakeCatalog{ .outcome = .ready };
-    const adapter = agent_stream_provider.ProviderAdapter{
-        .kind = "matching-adapter",
-        .model_catalog = fake.provider(),
-        .stream_fn = agent_stream_provider.unavailable_adapter.stream_fn,
+fn fakeFallbackDescriptor(_: ?*anyopaque, selected_model: []const u8) model_capabilities.ModelDescriptor {
+    return .{
+        .id = selected_model,
+        .display_name = selected_model,
+        .capabilities = .{},
+        .source = .@"adapter-static",
     };
-
-    const matching = modelCatalogForAdapter("matching-adapter", adapter).?;
-    try std.testing.expect(matching.context.? == @as(*anyopaque, @ptrCast(&fake)));
-    try std.testing.expect(modelCatalogForAdapter("other-adapter", adapter) == null);
-    try std.testing.expectEqual(@as(usize, 0), fake.calls);
-
-    var without_catalog = adapter;
-    without_catalog.model_catalog = null;
-    try std.testing.expect(modelCatalogForAdapter("matching-adapter", without_catalog) == null);
 }
+
+fn fakeCatalogDescriptor(_: ?*anyopaque, entry: model_catalog.ModelCatalogEntry) model_capabilities.ModelDescriptor {
+    var descriptor = fakeFallbackDescriptor(null, entry.id);
+    descriptor.capabilities.supports_reasoning = entry.has_reasoning or entry.reasoning_efforts.items.len > 0;
+    descriptor.capabilities.reasoning_efforts = .fromSlice(entry.reasoning_efforts.items);
+    descriptor.capabilities.supports_fast_mode = entry.supports_fast_mode;
+    descriptor.capabilities.supports_tool_use = entry.has_tool_use;
+    descriptor.capabilities.supports_vision = entry.has_vision;
+    descriptor.capabilities.supports_file_input = entry.has_file_input;
+    descriptor.capabilities.context_window = if (entry.context_window == 0) null else entry.context_window;
+    descriptor.capabilities.max_output_tokens = if (entry.max_tokens == 0) null else entry.max_tokens;
+    descriptor.source = .catalog;
+    return descriptor;
+}
+
+const fake_descriptor_provider = model_catalog.ModelDescriptorProvider{
+    .fallback_fn = fakeFallbackDescriptor,
+    .catalog_fn = fakeCatalogDescriptor,
+};
 
 test "available capabilities never fetch and use a completed catalog snapshot" {
     const alloc = std.testing.allocator;
@@ -265,44 +235,64 @@ test "available capabilities never fetch and use a completed catalog snapshot" {
     var resolver: CapabilityResolver = .{};
     defer resolver.deinit(alloc);
 
-    const cold = resolver.available("provider/model");
+    const cold = resolver.available(fake_descriptor_provider, "provider/model");
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
-    try std.testing.expectEqual(@as(?u32, null), cold.context_window);
-    try std.testing.expectEqual(@as(?u32, null), cold.max_output_tokens);
+    try std.testing.expectEqual(model_capabilities.CapabilitySource.@"adapter-static", cold.source);
+    try std.testing.expectEqual(@as(?u32, null), cold.capabilities.context_window);
+    try std.testing.expectEqual(@as(?u32, null), cold.capabilities.max_output_tokens);
 
     _ = try resolver.resolve(
         alloc,
         provider,
-        .{ .endpoint = "https://example.invalid" },
+        fake_descriptor_provider,
+        .{},
         "provider/model",
     );
-    const warm = resolver.available("provider/model");
+    const warm = resolver.available(fake_descriptor_provider, "provider/model");
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqual(@as(?u32, 256_000), warm.context_window);
-    try std.testing.expectEqual(@as(?u32, 32_000), warm.max_output_tokens);
+    try std.testing.expectEqual(model_capabilities.CapabilitySource.catalog, warm.source);
+    try std.testing.expectEqual(@as(?u32, 256_000), warm.capabilities.context_window);
+    try std.testing.expectEqual(@as(?u32, 32_000), warm.capabilities.max_output_tokens);
 }
 
-const FakeChatUrl = struct {
-    resolved: []const u8,
+test "capability resolver keeps exact alias catalog identity" {
+    const alloc = std.testing.allocator;
+    var resolver: CapabilityResolver = .{ .state = .ready };
+    defer resolver.deinit(alloc);
+    try model_catalog.appendClonedModelCatalogEntry(alloc, &resolver.catalog, .{
+        .id = @constCast("zai/glm-4.6-fast"),
+        .model_type = @constCast("language"),
+        .has_reasoning = true,
+        .has_tool_use = true,
+        .has_vision = true,
+        .has_file_input = true,
+        .context_window = 262_144,
+        .max_tokens = 65_536,
+    });
 
-    fn resolve(raw: ?*anyopaque, fallback: []const u8) []const u8 {
-        const self: *FakeChatUrl = @ptrCast(@alignCast(raw.?));
-        _ = fallback;
-        return self.resolved;
-    }
-};
-
-test "gateway provider resolves chat url through the injected policy" {
-    var fake = FakeChatUrl{ .resolved = "http://127.0.0.1:43123/chat" };
-    const provider = ChatUrlProvider{
-        .context = &fake,
-        .resolve_fn = FakeChatUrl.resolve,
-    };
-
-    try std.testing.expectEqualStrings(
-        fake.resolved,
-        provider.resolve("https://fallback.test/chat"),
+    const fast = resolver.available(fake_descriptor_provider, "zai/glm-4.6-fast");
+    var fake = FakeCatalog{ .outcome = .ready };
+    const normal = try resolver.resolve(
+        alloc,
+        fake.provider(),
+        fake_descriptor_provider,
+        .{},
+        "zai/glm-4.6",
     );
+
+    try std.testing.expectEqualStrings("zai/glm-4.6-fast", fast.id);
+    try std.testing.expectEqual(model_capabilities.CapabilitySource.catalog, fast.source);
+    try std.testing.expect(!fast.selected_fast_mode);
+    try std.testing.expect(fast.capabilities.supports_reasoning);
+    try std.testing.expect(fast.capabilities.supports_tool_use);
+    try std.testing.expect(fast.capabilities.supports_vision);
+    try std.testing.expect(fast.capabilities.supports_file_input);
+    try std.testing.expectEqual(@as(?u32, 262_144), fast.capabilities.context_window);
+    try std.testing.expectEqual(@as(?u32, 65_536), fast.capabilities.max_output_tokens);
+
+    try std.testing.expectEqualStrings("zai/glm-4.6", normal.id);
+    try std.testing.expectEqual(model_capabilities.CapabilitySource.@"adapter-static", normal.source);
+    try std.testing.expect(!normal.capabilities.supports_reasoning);
 }
 
 test "capability resolver leaves a cancelled catalog fetch retryable" {
@@ -316,8 +306,8 @@ test "capability resolver leaves a cancelled catalog fetch retryable" {
         resolver.resolve(
             std.testing.allocator,
             fake.provider(),
+            fake_descriptor_provider,
             .{
-                .endpoint = "http://127.0.0.1:1/v1/models",
                 .cancel_flag = &cancel_flag,
             },
             "provider/model",
@@ -327,16 +317,17 @@ test "capability resolver leaves a cancelled catalog fetch retryable" {
 
     fake.outcome = .ready;
     cancel_flag.store(false, .seq_cst);
-    const capabilities = try resolver.resolve(
+    const descriptor = try resolver.resolve(
         std.testing.allocator,
         fake.provider(),
+        fake_descriptor_provider,
         .{
-            .endpoint = "http://127.0.0.1:1/v1/models",
             .cancel_flag = &cancel_flag,
         },
         "provider/model",
     );
-    try std.testing.expect(capabilities.supports_vision);
+    try std.testing.expectEqual(model_capabilities.CapabilitySource.catalog, descriptor.source);
+    try std.testing.expect(descriptor.capabilities.supports_vision);
 }
 
 test "capability resolver uses provider catalog metadata" {
@@ -345,33 +336,53 @@ test "capability resolver uses provider catalog metadata" {
     var fake = FakeCatalog{ .outcome = .ready };
     var cancel_flag = std.atomic.Value(bool).init(false);
 
-    const capabilities = try resolver.resolve(
+    const descriptor = try resolver.resolve(
         std.testing.allocator,
         fake.provider(),
+        fake_descriptor_provider,
         .{
-            .access = credentials.catalogAccessForCredential(.ai_gateway_api_key, "test-key", "team_123"),
-            .endpoint = "/v1/models",
+            .access = .{ .authenticated = .{
+                .source = .{ .id = "test_key", .label = "test key", .refreshable = false },
+                .credential = "test-key",
+                .team_context = "team_123",
+            } },
             .cancel_flag = &cancel_flag,
         },
         "provider/model",
     );
 
-    try std.testing.expect(capabilities.supports_vision);
-    try std.testing.expect(capabilities.supports_file_input);
-    try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
-    try std.testing.expectEqual(@as(?u32, 32_000), capabilities.max_output_tokens);
+    try std.testing.expectEqual(model_capabilities.CapabilitySource.catalog, descriptor.source);
+    try std.testing.expect(descriptor.capabilities.supports_vision);
+    try std.testing.expect(descriptor.capabilities.supports_file_input);
+    try std.testing.expectEqual(@as(?u32, 256_000), descriptor.capabilities.context_window);
+    try std.testing.expectEqual(@as(?u32, 32_000), descriptor.capabilities.max_output_tokens);
 
     const missing = try resolver.resolve(
         std.testing.allocator,
         fake.provider(),
+        fake_descriptor_provider,
         .{
-            .endpoint = "/v1/models",
             .cancel_flag = &cancel_flag,
         },
         "zai/glm-4.6",
     );
-    try std.testing.expect(!missing.supports_fast_mode);
-    try std.testing.expect(!missing.supports_vision);
+    try std.testing.expectEqual(model_capabilities.CapabilitySource.@"adapter-static", missing.source);
+    try std.testing.expect(!missing.capabilities.supports_fast_mode);
+    try std.testing.expect(!missing.capabilities.supports_vision);
+
+    const unknown = try resolver.resolve(
+        std.testing.allocator,
+        fake.provider(),
+        fake_descriptor_provider,
+        .{
+            .cancel_flag = &cancel_flag,
+        },
+        "unknown/model",
+    );
+    try std.testing.expectEqual(model_capabilities.CapabilitySource.@"adapter-static", unknown.source);
+    try std.testing.expect(!unknown.capabilities.supports_reasoning);
+    try std.testing.expect(!unknown.capabilities.supports_fast_mode);
+    try std.testing.expect(!unknown.capabilities.supports_vision);
 }
 
 test "capability resolver retries rejected authenticated catalog access anonymously" {
@@ -379,12 +390,16 @@ test "capability resolver retries rejected authenticated catalog access anonymou
     defer resolver.deinit(std.testing.allocator);
     var fake = FakeCatalog{ .outcome = .authenticated_rejected_then_ready };
 
-    const capabilities = try resolver.resolve(
+    const descriptor = try resolver.resolve(
         std.testing.allocator,
         fake.provider(),
+        fake_descriptor_provider,
         .{
-            .access = credentials.catalogAccessForCredential(.ai_gateway_api_key, "test-key", "team_123"),
-            .endpoint = "/v1/models",
+            .access = .{ .authenticated = .{
+                .source = .{ .id = "test_key", .label = "test key", .refreshable = false },
+                .credential = "test-key",
+                .team_context = "team_123",
+            } },
         },
         "provider/model",
     );
@@ -392,7 +407,8 @@ test "capability resolver retries rejected authenticated catalog access anonymou
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expect(fake.saw_authenticated_access);
     try std.testing.expect(fake.saw_public_retry);
-    try std.testing.expect(capabilities.supports_vision);
+    try std.testing.expectEqual(model_capabilities.CapabilitySource.catalog, descriptor.source);
+    try std.testing.expect(descriptor.capabilities.supports_vision);
 }
 
 test "capability resolver degrades terminal catalog failures to local capabilities" {
@@ -401,27 +417,29 @@ test "capability resolver degrades terminal catalog failures to local capabiliti
     var fake = FakeCatalog{ .outcome = .unavailable };
     var cancel_flag = std.atomic.Value(bool).init(false);
 
-    const capabilities = try resolver.resolve(
+    const descriptor = try resolver.resolve(
         std.testing.allocator,
         fake.provider(),
+        fake_descriptor_provider,
         .{
-            .endpoint = "/v1/models",
             .cancel_flag = &cancel_flag,
         },
         "zai/glm-4.6",
     );
-    try std.testing.expect(!capabilities.supports_fast_mode);
+    try std.testing.expectEqual(model_capabilities.CapabilitySource.@"adapter-static", descriptor.source);
+    try std.testing.expect(!descriptor.capabilities.supports_fast_mode);
 
     fake.outcome = .ready;
     const cached_failure = try resolver.resolve(
         std.testing.allocator,
         fake.provider(),
+        fake_descriptor_provider,
         .{
-            .endpoint = "/v1/models",
             .cancel_flag = &cancel_flag,
         },
         "provider/model",
     );
-    try std.testing.expect(!cached_failure.supports_vision);
+    try std.testing.expectEqual(model_capabilities.CapabilitySource.@"adapter-static", cached_failure.source);
+    try std.testing.expect(!cached_failure.capabilities.supports_vision);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }

@@ -2,7 +2,6 @@ const std = @import("std");
 const std_builtin = @import("builtin");
 const command_admission = @import("../core/permissions/command_admission.zig");
 const auth_runtime = @import("../core/auth/auth_runtime.zig");
-const credentials = @import("../gateway/auth/credentials.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -12,7 +11,8 @@ const server = @import("server.zig");
 const sessions = @import("sessions.zig");
 const agent_runtime = @import("../core/agent/agent_runtime.zig");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
-const gateway_schema = @import("../core/tooling/gateway_schema.zig");
+const adapter_auth = @import("../core/gateway/adapter_auth.zig");
+const tool_descriptor = @import("../core/tooling/tool_descriptor.zig");
 const diff_mod = @import("../core/output/diff.zig");
 const file_mutation = @import("../core/tooling/file_mutation.zig");
 const file_mutation_contract = @import("../core/tooling/file_mutation_contract.zig");
@@ -42,7 +42,7 @@ const context_contract = @import("../core/workspace/context_contract.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const route_snapshot = @import("../core/gateway/route_snapshot.zig");
-const gateway_provider = @import("../core/gateway/gateway_provider.zig");
+const gateway_system = @import("../core/gateway/gateway_system.zig");
 const connection_registry = @import("../core/gateway/connection_registry.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
@@ -62,7 +62,7 @@ const tool_runtime = @import("../core/tooling/tool_runtime.zig");
 const command_output_content = @import("../core/tooling/command_output_content.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const test_builtin_gateway = if (std_builtin.is_test)
-    @import("../builtins/gateway.zig")
+    @import("../core/gateway/test_adapter.zig")
 else
     struct {};
 const types = @import("../core/shared/types.zig");
@@ -93,7 +93,7 @@ const AcpContext = struct {
     alloc: Allocator,
     state: *server.ServerState,
     session_id: []const u8,
-    provider_adapter: agent_stream_provider.ProviderAdapter = agent_stream_provider.unavailable_adapter,
+    route_adapter: agent_stream_provider.ProviderAdapter = agent_stream_provider.unavailable_adapter,
     /// Tool-call IDs already announced with a pending update. Keys are owned
     /// copies of provider call ids so the ID stays stable from permission
     /// review through execution.
@@ -221,16 +221,12 @@ const AcpContext = struct {
             .max_read_file_line_len = self.state.cfg.max_read_file_line_len,
             .max_command_output_bytes = self.state.cfg.max_command_output_bytes,
             .max_tool_result_bytes = session.max_tool_result_bytes,
-            .api_key = session.api_key,
-            .provider_adapter = self.provider_adapter,
-            .agent_stream_provider = self.state.cfg.gateway_provider.agent_stream,
-            .credential_source = session.credential_source,
-            .oauth_transport = self.state.cfg.gateway_provider.oauth_transport,
-            .gateway_team = self.state.gateway_team,
+            .adapter_registry = self.state.cfg.gateway_system.adapter_registry,
+            .route_adapter = self.route_adapter,
+            .route_credential = session.route_credential,
+            .route_tenant = self.state.route_tenant,
             .model = session.model,
             .gateway_retry_count = self.state.cfg.gateway_retry_count,
-            .gateway_chat_url = self.state.cfg.gateway_chat_url,
-            .gateway_models_path = self.state.cfg.gateway_models_path,
             .agent_step_limit = session.agent_step_limit,
             .fast_mode = session.fast_mode,
             .effort = session.effort,
@@ -239,7 +235,6 @@ const AcpContext = struct {
             .permission_grants = session.session_grants,
             .permission_rules = session.permission_rules,
             .tool_registry = self.toolRegistry(),
-            .permission_reviewer_provider = self.state.cfg.permission_reviewer_provider,
             .auto_classifier = self.auto_classifier,
             .subagent_host = self.state.subagent_host,
             .subagent_caller_id = session.session_id,
@@ -275,9 +270,9 @@ const AcpContext = struct {
             .web_fetch_artifact_error = session.session_rt.webFetchArtifactError(),
             .web_search_runtime_ready = false,
             .web_search_backend = self.state.web_search_runtime.dispatchBackend(),
-            .model_capability_resolver = .{
+            .model_descriptor_resolver = .{
                 .ctx = @ptrCast(self),
-                .resolve_fn = resolveModelCapabilities,
+                .resolve_fn = resolveModelDescriptor,
             },
             .interactive = false,
             .lifecycle_view = self.state.lifecycle_view,
@@ -520,26 +515,34 @@ pub fn handlePrompt(
         state.connections.?.selectedProfile().id;
     var profile = state.connections.?.profile(connection_id) catch
         return error.MissingSessionConnection;
-    const credential_source = session.credential_source orelse return error.MissingCredential;
+    if (recovery_checkpoint) |checkpoint| {
+        try route_snapshot.validateRecoveryProfile(
+            profile,
+            state.cfg.gateway_system.connection_seed,
+            checkpoint.route_identity.?,
+        );
+    }
+    const route_source = session.route_source orelse return error.MissingCredential;
     const credential_adapter_kind = state.credential_adapter_kind orelse
         return error.RouteCredentialMismatch;
     if (!std.mem.eql(u8, profile.adapter_id, credential_adapter_kind) or
         (!std.mem.eql(u8, profile.credential_ref, "automatic") and
-            !std.mem.eql(u8, profile.credential_ref, @tagName(credential_source))))
+            !std.mem.eql(u8, profile.credential_ref, route_source.id)))
     {
         return error.RouteCredentialMismatch;
     }
-    profile.credential_ref = @constCast(@tagName(credential_source));
-    const profile_adapter = try state.cfg.gateway_provider.adapter_registry.resolveProfile(profile);
-    ctx.provider_adapter = profile_adapter;
     if (recovery_checkpoint) |checkpoint| {
-        try route_snapshot.validateRecoveryProfile(
-            profile,
-            checkpoint.route_identity.?.adapter_kind,
-        );
+        const expected_credential_ref = checkpoint.route_identity.?.credential_ref orelse
+            return error.RecoveryRouteAuthorityUnavailable;
+        if (!std.mem.eql(u8, route_source.id, expected_credential_ref)) {
+            return error.RecoveryRouteAuthorityChanged;
+        }
     }
+    profile.credential_ref = @constCast(route_source.id);
+    const profile_adapter = try state.cfg.gateway_system.adapter_registry.resolveProfile(profile);
+    ctx.route_adapter = profile_adapter;
 
-    var tool_projection = try state.cfg.mode_registry.buildGatewayToolProjection(alloc, activeToolSet(state), captured_mode, .{
+    var tool_projection = try state.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(state), captured_mode, .{
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
         .mcp_runtime = session.mcp,
@@ -612,24 +615,19 @@ pub fn handlePrompt(
         try route_snapshot.RouteSnapshot.admitSelectedRecovery(
             alloc,
             profile,
-            state.cfg.gateway_provider.connection_seed,
-            checkpoint.route_identity.?.adapter_kind,
-            checkpoint.route_identity.?.permission_review_model_id,
-            checkpoint.route_identity.?.vision_model_id,
-            checkpoint.route_identity.?.subagent_model_id,
+            state.cfg.gateway_system.connection_seed,
+            checkpoint.route_identity.?,
             descriptor,
-            state.cfg.gateway_chat_url,
         )
     else
         try route_snapshot.RouteSnapshot.admitSelected(
             alloc,
             profile,
-            state.cfg.gateway_provider.connection_seed,
+            state.cfg.gateway_system.connection_seed,
             descriptor,
-            state.cfg.gateway_chat_url,
         );
     defer route.deinit(alloc);
-    ctx.provider_adapter = try state.cfg.gateway_provider.adapter_registry.resolveRoute(&route);
+    ctx.route_adapter = try state.cfg.gateway_system.adapter_registry.resolveRoute(&route);
 
     const job: worker_runtime.QueuedPrompt = .{
         .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
@@ -722,10 +720,10 @@ pub fn runSubagentChild(
     };
     defer ctx.deinitPublishedToolCalls();
     const route = admission.route orelse return error.AdmissionFailed;
-    const provider_adapter = state.cfg.gateway_provider.adapter_registry.resolveRoute(&route) catch
+    const route_adapter = state.cfg.gateway_system.adapter_registry.resolveRoute(&route) catch
         return error.ProviderFailed;
-    ctx.provider_adapter = provider_adapter;
-    var child_projection = state.cfg.mode_registry.buildGatewayToolProjection(
+    ctx.route_adapter = route_adapter;
+    var child_projection = state.cfg.mode_registry.buildModelToolProjection(
         alloc,
         builtin_tools.advertisement_set,
         captured_mode,
@@ -734,7 +732,7 @@ pub fn runSubagentChild(
             .permission_rules = admission.rules,
             .mcp_runtime = mcp,
             .subagent_available = true,
-            .provider_tools = provider_adapter.provider_tools,
+            .provider_tools = route_adapter.provider_tools,
             .terminal_available = tool_dispatch.ToolCapabilities.for_host(host.current()).terminalAvailable(),
         },
     ) catch return error.OutOfMemory;
@@ -797,7 +795,7 @@ fn refreshProjectContext(
 const AgentConfigSections = struct {
     skills_prompt_section: []const u8,
     explicit_skills_prompt_section: []const u8,
-    model_tools: []const gateway_schema.FunctionSchema,
+    model_tools: []const tool_descriptor.Descriptor,
     provider_tools: []const agent_stream_provider.ProviderToolAdvertisement = &.{},
     custom_tool_guidance: []const u8,
 };
@@ -809,7 +807,6 @@ fn buildAgentConfig(state: *server.ServerState, session: *server.ActiveSessionSt
         .skills_prompt_section = sections.skills_prompt_section,
         .explicit_skills_prompt_section = sections.explicit_skills_prompt_section,
         .gateway_retry_count = state.cfg.gateway_retry_count,
-        .gateway_chat_url = state.cfg.gateway_chat_url,
         .model_tools = sections.model_tools,
         .provider_tools = sections.provider_tools,
         .custom_tool_guidance = sections.custom_tool_guidance,
@@ -1024,8 +1021,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
     const session = if (ctx.state.active_session) |*active| active else unreachable;
     return .{
         .ctx = @ptrCast(ctx),
-        .provider_adapter = ctx.provider_adapter,
-        .agent_stream_provider = ctx.state.cfg.gateway_provider.agent_stream,
+        .adapter_registry = ctx.state.cfg.gateway_system.adapter_registry,
         .flush_assistant_stream_per_content_chunk = host_target.is_wasm,
         .tool_registry = ctx.toolRegistry(),
         .context_registry = ctx.state.cfg.context_registry,
@@ -1065,8 +1061,6 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .push_command_output_complete = pushCommandOutputComplete,
         .push_provider_failure = pushProviderFailure,
         .resolve_route_credential = resolveRouteCredential,
-        .available_model_descriptor = availableModelDescriptor,
-        .resolve_model_descriptor = resolveModelDescriptor,
         .format_tool_execution_error = formatToolExecutionError,
         .record_tool_call_rejected = recordToolCallRejected,
         .usage = &session.session_rt.usage,
@@ -1078,25 +1072,56 @@ fn resolveRouteCredential(
     raw_ctx: *anyopaque,
     alloc: Allocator,
     route: *const route_snapshot.RouteSnapshot,
+    mode: adapter_auth.RefreshMode,
 ) !agent_runtime.RouteCredential {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const session = if (ctx.state.active_session) |*active| active else return error.NoActiveSession;
-    const source = session.credential_source orelse return error.RouteCredentialMismatch;
-    const connection_id = ctx.state.credential_connection_id orelse return error.RouteCredentialMismatch;
-    const adapter_kind = ctx.state.credential_adapter_kind orelse return error.RouteCredentialMismatch;
-    if (!std.mem.eql(u8, route.connection_id, connection_id) or
-        !std.mem.eql(u8, route.adapter_kind, adapter_kind) or
-        !std.mem.eql(u8, route.credential_ref, @tagName(source)))
-    {
+    var profile = ctx.state.connections.?.profile(route.connection_id) catch
         return error.RouteCredentialMismatch;
+    if (!std.mem.eql(u8, profile.adapter_id, route.adapter_kind)) return error.RouteCredentialMismatch;
+    if (ctx.state.credential_connection_id) |connection_id| {
+        if (std.mem.eql(u8, connection_id, route.connection_id) and
+            ctx.state.route_source != null and
+            !std.mem.eql(u8, ctx.state.route_source.?.id, route.credential_ref))
+        {
+            return error.RouteCredentialMismatch;
+        }
     }
-    var result = agent_runtime.RouteCredential{
-        .credential = try alloc.dupe(u8, session.api_key),
-        .legacy_source = session.credential_source,
+    profile.credential_ref = @constCast(route.credential_ref);
+    const auth = try ctx.state.cfg.gateway_system.adapter_registry.resolveAuthForProfile(profile);
+    if (mode != .force and
+        ctx.state.route_credential.len > 0 and
+        ctx.state.route_source != null and
+        ctx.state.credential_connection_id != null and
+        ctx.state.credential_adapter_kind != null and
+        std.mem.eql(u8, ctx.state.credential_connection_id.?, route.connection_id) and
+        std.mem.eql(u8, ctx.state.credential_adapter_kind.?, route.adapter_kind) and
+        std.mem.eql(u8, ctx.state.route_source.?.id, route.credential_ref))
+    {
+        return agent_runtime.RouteCredential.initCopy(
+            alloc,
+            ctx.state.route_credential,
+            ctx.state.route_tenant,
+            ctx.state.route_source.?,
+        );
+    }
+    const acquisition = try auth.acquire(alloc, .{
+        .profile = profile,
+        .host = .{ .secret_store = ctx.state.cfg.secret_store },
+        .mode = mode,
+        .source_resolution = .exact,
+        .current_source_id = route.credential_ref,
+    });
+    var credential = switch (acquisition) {
+        .acquired => |value| value,
+        .missing => return error.MissingCredential,
+        .failed => return error.CredentialAcquisitionFailed,
+        .cancelled => return error.Cancelled,
     };
-    errdefer result.deinit(alloc);
-    result.tenant = if (ctx.state.gateway_team) |value| try alloc.dupe(u8, value) else null;
-    return result;
+    defer credential.deinit(alloc);
+    const token = credential.secret_bytes;
+    credential.secret_bytes = &.{};
+    const tenant = credential.takeTenantContext();
+    return .{ .credential = token, .tenant = tenant, .source = credential.source };
 }
 
 fn persistUsageCheckpoint(
@@ -1153,51 +1178,43 @@ fn persistUsageCheckpoint(
     );
 }
 
-fn resolveModelCapabilities(
+fn resolveModelDescriptor(
     raw_ctx: *anyopaque,
     _: Allocator,
     model: []const u8,
-) model_capabilities.ResolveError!model_capabilities.Capabilities {
+) model_capabilities.ResolveError!model_capabilities.ModelDescriptor {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const adapter = ctx.provider_adapter;
+    const adapter = ctx.route_adapter;
     const descriptors = adapter.model_descriptors;
-    const session = if (ctx.state.active_session) |*active| active else return descriptors.fallback(model).capabilities;
-    const catalog = adapter.model_catalog orelse return descriptors.fallback(model).capabilities;
+    const session = if (ctx.state.active_session) |*active| active else return descriptors.fallback(model);
+    const catalog = adapter.model_catalog orelse return descriptors.fallback(model);
     return ctx.state.capability_resolver.resolve(
         ctx.state.alloc,
         catalog,
+        descriptors,
         .{
-            .access = credentials.catalogAccessForCredential(session.credential_source, session.api_key, ctx.state.gateway_team),
-            .endpoint = ctx.state.cfg.gateway_models_path,
+            .access = if (session.route_source) |source_value| .{ .authenticated = .{
+                .source = source_value,
+                .credential = session.route_credential,
+                .team_context = ctx.state.route_tenant,
+            } } else .{ .public_only = .{ .reason = .no_credential } },
             .cancel_flag = &session.cancel_flag,
         },
         model,
     );
 }
 
-fn availableModelCapabilities(
+fn availableModelDescriptor(
     raw_ctx: *anyopaque,
     model: []const u8,
-) model_capabilities.Capabilities {
+) model_capabilities.ModelDescriptor {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const adapter = ctx.provider_adapter;
-    if (adapter.model_catalog == null) return adapter.model_descriptors.fallback(model).capabilities;
-    return ctx.state.capability_resolver.available(model);
-}
-
-fn resolveModelDescriptor(raw_ctx: *anyopaque, alloc: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.ModelDescriptor {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    var descriptor = ctx.provider_adapter.model_descriptors.fallback(model);
-    descriptor.capabilities = try resolveModelCapabilities(raw_ctx, alloc, model);
-    descriptor.source = .catalog;
-    return descriptor;
-}
-
-fn availableModelDescriptor(raw_ctx: *anyopaque, model: []const u8) model_capabilities.ModelDescriptor {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    var descriptor = ctx.provider_adapter.model_descriptors.fallback(model);
-    descriptor.capabilities = availableModelCapabilities(raw_ctx, model);
-    return descriptor;
+    const adapter = ctx.route_adapter;
+    if (adapter.model_catalog == null) return adapter.model_descriptors.fallback(model);
+    return ctx.state.capability_resolver.available(
+        adapter.model_descriptors,
+        model,
+    );
 }
 
 fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) !void {
@@ -1826,7 +1843,7 @@ test "ACP degraded history repair commits the finished turn once" {
         .model = try alloc.dupe(u8, state.preferences.model),
         .mode = "code",
         .workspace_root = workspace,
-        .api_key = "",
+        .route_credential = "",
         .agent_step_limit = 1,
         .max_tool_result_bytes = 1024,
         .fast_mode = false,
@@ -2029,14 +2046,13 @@ fn pushDiffBlock(raw_ctx: *anyopaque, payload: agent_runtime.DiffEntryPayload) !
 
 fn pushCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
 
-fn pushProviderFailure(raw_ctx: *anyopaque, category: agent_stream_provider.StreamFailure.Category, _: ?u16, detail: []const u8, credential_source: ?types.CredentialSource) !void {
+fn pushProviderFailure(raw_ctx: *anyopaque, category: agent_stream_provider.StreamFailure.Category, detail: []const u8, source: ?adapter_auth.Source) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     var buf: [1024]u8 = undefined;
-    const auth_failure = auth_runtime.FailureSnapshot.fromHttp(switch (category) {
-        .authentication => .unauthorized,
-        .authorization => .forbidden,
-        else => .ok,
-    }, credential_source);
+    const auth_failure = if (category == .authentication)
+        auth_runtime.FailureSnapshot.fromAuthenticationFailure(source)
+    else
+        null;
     const owned_message = if (auth_failure) |failure|
         try failure.renderText(ctx.alloc)
     else
@@ -3254,24 +3270,23 @@ test "ACP auth failure emits a valid detail-free JSON-RPC notification" {
     var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     state.writer = .{ .stdout = capture };
-    state.active_session.?.credential_source = .vercel_oidc_token;
+    state.active_session.?.route_source = .{ .id = "vercel_oidc_token", .label = "VERCEL_OIDC_TOKEN", .refreshable = false };
     var ctx = AcpContext{
         .alloc = alloc,
         .state = &state,
         .session_id = "session_1",
     };
-    try std.testing.expectEqual(
-        types.CredentialSource.vercel_oidc_token,
-        ctx.toolContext().credential_source.?,
+    try std.testing.expectEqualStrings(
+        "unavailable",
+        ctx.toolContext().route_adapter.kind,
     );
 
     const deps = agentRuntimeDeps(&ctx);
     try deps.push_provider_failure(
         deps.ctx,
         .authentication,
-        401,
         "provider rejected access-token-secret",
-        state.active_session.?.credential_source,
+        state.active_session.?.route_source,
     );
     try capture.sync(io_mod.getIo());
 
@@ -3287,7 +3302,7 @@ test "ACP auth failure emits a valid detail-free JSON-RPC notification" {
     const update = parsed.value.object.get("params").?.object.get("update").?.object;
     const content = update.get("content").?.object;
     try std.testing.expectEqualStrings(
-        "VERCEL_OIDC_TOKEN authentication failed · HTTP 401",
+        "VERCEL_OIDC_TOKEN authentication failed",
         content.get("text").?.string,
     );
     try std.testing.expect(std.mem.find(u8, captured, "access-token-secret") == null);
@@ -3430,9 +3445,7 @@ fn testServerConfig() server.Config {
         .default_model = "test-model",
         .default_agent_step_limit = 4,
         .gateway_retry_count = 0,
-        .gateway_chat_url = "http://127.0.0.1",
-        .gateway_models_path = "/models",
-        .gateway_provider = test_builtin_gateway.provider,
+        .gateway_system = test_builtin_gateway.system,
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{
             .system_prompt = "test",
@@ -3464,7 +3477,7 @@ fn initTestAcpState(alloc: Allocator, workspace_root: []const u8, mode: Permissi
     const cfg = testServerConfig();
     const connections = try connection_registry.Runtime.init(
         alloc,
-        cfg.gateway_provider.connection_seed.profile("test-model", null),
+        cfg.gateway_system.connection_seed.profile("test-model", null),
         null,
         .unavailable,
     );
@@ -3481,7 +3494,7 @@ fn initTestAcpState(alloc: Allocator, workspace_root: []const u8, mode: Permissi
             .model = model,
             .mode = "normal",
             .workspace_root = owned_workspace,
-            .api_key = "",
+            .route_credential = "",
             .agent_step_limit = 4,
             .max_tool_result_bytes = 1024 * 1024,
             .fast_mode = false,
@@ -3528,16 +3541,15 @@ test "fake non-Vercel adapter completes an ACP root turn on its admitted route" 
     defer state.deinit();
     state.writer = .{ .stdout = output };
     var fake = Fake{};
-    state.cfg.gateway_chat_url = "fake://acp";
-    state.cfg.gateway_provider.provider_adapter = .{
+    const route_adapter = agent_stream_provider.ProviderAdapter{
         .kind = "test_non_vercel",
+        .supported_protocol = "fake-protocol",
+        .auth = .{ .kind = "test_non_vercel", .auth_service_label = "Test Cloud" },
         .context = &fake,
         .stream_fn = Fake.stream,
     };
-    const adapters = [_]agent_stream_provider.ProviderAdapter{
-        state.cfg.gateway_provider.provider_adapter,
-    };
-    state.cfg.gateway_provider.adapter_registry = .{ .adapters = &adapters };
+    const adapters = [_]agent_stream_provider.ProviderAdapter{route_adapter};
+    state.cfg.gateway_system.adapter_registry = .{ .adapters = &adapters };
     state.connections.?.deinit();
     state.connections = try connection_registry.Runtime.init(
         alloc,
@@ -3553,12 +3565,12 @@ test "fake non-Vercel adapter completes an ACP root turn on its admitted route" 
         null,
         .unavailable,
     );
-    state.api_key = try alloc.dupe(u8, "fake-key");
-    state.credential_source = .ai_gateway_api_key;
+    state.route_credential = try alloc.dupe(u8, "fake-key");
+    state.route_source = .{ .id = "ai_gateway_api_key", .label = "AI_GATEWAY_API_KEY", .refreshable = false };
     state.credential_connection_id = "fake";
     state.credential_adapter_kind = "test_non_vercel";
-    state.active_session.?.api_key = state.api_key;
-    state.active_session.?.credential_source = state.credential_source;
+    state.active_session.?.route_credential = state.route_credential;
+    state.active_session.?.route_source = state.route_source;
     var msg = jsonrpc.Message{
         .id = .{ .integer = 1 },
         .method = "session/prompt",
@@ -3575,14 +3587,14 @@ test "ACP root and child credentials require the exact admitted route" {
     const alloc = std.testing.allocator;
     var state = try initTestAcpState(alloc, "/tmp/workspace", .auto);
     defer state.deinit();
-    const seed = state.cfg.gateway_provider.connection_seed;
-    state.api_key = try alloc.dupe(u8, "admitted-secret");
-    state.gateway_team = try alloc.dupe(u8, "team");
-    state.credential_source = .fx_login;
+    const seed = state.cfg.gateway_system.connection_seed;
+    state.route_credential = try alloc.dupe(u8, "admitted-secret");
+    state.route_tenant = try alloc.dupe(u8, "team");
+    state.route_source = .{ .id = "fx_login", .label = "fx login", .refreshable = true };
     state.credential_connection_id = seed.id;
     state.credential_adapter_kind = seed.adapter_id;
-    state.active_session.?.api_key = state.api_key;
-    state.active_session.?.credential_source = state.credential_source;
+    state.active_session.?.route_credential = state.route_credential;
+    state.active_session.?.route_source = state.route_source;
     const profile = connection_registry.Profile{
         .id = @constCast(seed.id),
         .display_name = @constCast(seed.display_name),
@@ -3598,7 +3610,6 @@ test "ACP root and child credentials require the exact admitted route" {
         profile,
         seed,
         model_capabilities.configuredDescriptor("model", .{}),
-        state.cfg.gateway_chat_url,
     );
     defer route.deinit(alloc);
     var ctx = AcpContext{
@@ -3607,23 +3618,110 @@ test "ACP root and child credentials require the exact admitted route" {
         .session_id = state.active_session.?.session_id,
     };
 
-    var root = try resolveRouteCredential(&ctx, alloc, &route);
+    var root = try resolveRouteCredential(&ctx, alloc, &route, .if_needed);
     defer root.deinit(alloc);
     try std.testing.expectEqualStrings("admitted-secret", root.credential);
     try std.testing.expectEqualStrings("team", root.tenant.?);
 
     var mismatched = route;
     mismatched.credential_ref = "stored_key";
-    try std.testing.expectError(error.RouteCredentialMismatch, resolveRouteCredential(&ctx, alloc, &mismatched));
+    try std.testing.expectError(error.RouteCredentialMismatch, resolveRouteCredential(&ctx, alloc, &mismatched, .if_needed));
     mismatched = route;
     mismatched.adapter_kind = "peer";
-    try std.testing.expectError(error.RouteCredentialMismatch, resolveRouteCredential(&ctx, alloc, &mismatched));
+    try std.testing.expectError(error.RouteCredentialMismatch, resolveRouteCredential(&ctx, alloc, &mismatched, .if_needed));
     mismatched = route;
     mismatched.connection_id = "other";
-    try std.testing.expectError(error.RouteCredentialMismatch, resolveRouteCredential(&ctx, alloc, &mismatched));
+    try std.testing.expectError(error.RouteCredentialMismatch, resolveRouteCredential(&ctx, alloc, &mismatched, .if_needed));
 }
 
-test "mismatched ACP adapter forces static capabilities without provider traffic" {
+test "ACP repeated refresh frees the unused owned tenant slug" {
+    const RefreshProbe = struct {
+        calls: usize = 0,
+        force_calls: usize = 0,
+        exact_calls: usize = 0,
+
+        fn acquire(
+            raw: *const anyopaque,
+            alloc: Allocator,
+            request: adapter_auth.Request,
+        ) Allocator.Error!adapter_auth.Acquisition {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            self.force_calls += @intFromBool(request.mode == .force);
+            self.exact_calls += @intFromBool(request.source_resolution == .exact);
+            const token = try alloc.dupe(u8, "refreshed-secret");
+            errdefer alloc.free(token);
+            const tenant_id = try alloc.dupe(u8, "team-id");
+            errdefer alloc.free(tenant_id);
+            const tenant_slug = try alloc.dupe(u8, "team-slug");
+            const source_value = adapter_auth.Source{
+                .id = "fx_login",
+                .label = "fx login",
+                .refreshable = true,
+            };
+            return .{ .acquired = .{
+                .secret_bytes = token,
+                .source = source_value,
+                .tenant_id = tenant_id,
+                .tenant_slug = tenant_slug,
+                .catalog_access = .{ .authenticated = .{
+                    .source = source_value,
+                    .credential = token,
+                    .team_context = tenant_id,
+                } },
+            } };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .auto);
+    defer state.deinit();
+    const seed = state.cfg.gateway_system.connection_seed;
+    var probe = RefreshProbe{};
+    const adapters = [_]agent_stream_provider.ProviderAdapter{.{
+        .kind = seed.adapter_id,
+        .supported_protocol = seed.protocol.?,
+        .auth = .{
+            .kind = seed.adapter_id,
+            .context = &probe,
+            .acquire_fn = RefreshProbe.acquire,
+        },
+        .stream_fn = agent_stream_provider.unavailable_adapter.stream_fn,
+    }};
+    state.cfg.gateway_system.adapter_registry = .{ .adapters = &adapters };
+    state.connections.?.deinit();
+    state.connections = try connection_registry.Runtime.init(
+        alloc,
+        seed.profile("test-model", "fx_login"),
+        null,
+        .unavailable,
+    );
+    const profile = state.connections.?.selectedProfile();
+    var route = try route_snapshot.RouteSnapshot.admitSelected(
+        alloc,
+        profile,
+        seed,
+        model_capabilities.configuredDescriptor("test-model", .{}),
+    );
+    defer route.deinit(alloc);
+    var ctx = AcpContext{
+        .alloc = alloc,
+        .state = &state,
+        .session_id = state.active_session.?.session_id,
+    };
+
+    for (0..32) |_| {
+        var refreshed = try resolveRouteCredential(&ctx, alloc, &route, .force);
+        try std.testing.expectEqualStrings("refreshed-secret", refreshed.credential);
+        try std.testing.expectEqualStrings("team-id", refreshed.tenant.?);
+        refreshed.deinit(alloc);
+    }
+    try std.testing.expectEqual(@as(usize, 32), probe.calls);
+    try std.testing.expectEqual(probe.calls, probe.force_calls);
+    try std.testing.expectEqual(probe.calls, probe.exact_calls);
+}
+
+test "mismatched ACP protocol fails before catalog search or model traffic" {
     const web_search_contract = @import("../core/tooling/web_search_contract.zig");
     const web_search_runtime = @import("../core/tooling/web_search_runtime.zig");
     const Traffic = struct {
@@ -3683,43 +3781,43 @@ test "mismatched ACP adapter forces static capabilities without provider traffic
     defer state.deinit();
     state.writer = .{ .stdout = output };
     var traffic = Traffic{};
-    state.cfg.gateway_provider.connection_seed = .{
+    const adapters = [_]agent_stream_provider.ProviderAdapter{.{
+        .kind = "protocol_adapter",
+        .supported_protocol = "expected_protocol",
+        .context = &traffic,
+        .model_catalog = .{ .context = &traffic, .fetch_fn = Traffic.fetchCatalog },
+        .web_search = .{
+            .context = &traffic,
+            .policy = .{},
+            .preferred_backends_fn = Traffic.preferredSearchBackends,
+            .execute_fn = Traffic.search,
+        },
+        .stream_fn = Traffic.stream,
+    }};
+    state.cfg.gateway_system.adapter_registry = .{ .adapters = &adapters };
+    state.cfg.gateway_system.connection_seed = .{
         .id = "mismatched",
         .display_name = "Mismatched",
-        .adapter_id = "unavailable_adapter",
+        .adapter_id = "protocol_adapter",
         .endpoint = "fake://acp-mismatch",
-        .protocol = "unavailable_adapter",
+        .protocol = "unexpected_protocol",
         .credential_ref = "stored_key",
     };
     state.connections.?.deinit();
     state.connections = try connection_registry.Runtime.init(
         alloc,
-        state.cfg.gateway_provider.connection_seed.profile("test-model", null),
+        state.cfg.gateway_system.connection_seed.profile("test-model", null),
         null,
         .unavailable,
     );
-    var adapter = test_builtin_gateway.provider_adapter;
-    adapter.kind = "provider_adapter";
-    adapter.context = &traffic;
-    adapter.model_catalog = .{
-        .context = &traffic,
-        .fetch_fn = Traffic.fetchCatalog,
-    };
-    var search = test_builtin_gateway.default_web_search_provider;
-    search.context = &traffic;
-    search.preferred_backends_fn = Traffic.preferredSearchBackends;
-    search.execute_fn = Traffic.search;
-    adapter.web_search = search;
-    adapter.stream_fn = Traffic.stream;
-    state.cfg.gateway_provider.provider_adapter = adapter;
     state.active_session.?.effort = types.ReasoningEffort.literal("high");
     const profile = state.connections.?.selectedProfile();
-    state.api_key = try alloc.dupe(u8, "fake-key");
-    state.credential_source = .stored_key;
+    state.route_credential = try alloc.dupe(u8, "fake-key");
+    state.route_source = .{ .id = "stored_key", .label = "stored API key", .refreshable = false };
     state.credential_connection_id = profile.id;
     state.credential_adapter_kind = profile.adapter_id;
-    state.active_session.?.api_key = state.api_key;
-    state.active_session.?.credential_source = state.credential_source;
+    state.active_session.?.route_credential = state.route_credential;
+    state.active_session.?.route_source = state.route_source;
     var msg = jsonrpc.Message{
         .id = .{ .integer = 1 },
         .method = "session/prompt",
@@ -3727,7 +3825,7 @@ test "mismatched ACP adapter forces static capabilities without provider traffic
     };
 
     try std.testing.expectError(
-        error.MissingAdapter,
+        error.UnsupportedProtocol,
         handlePrompt(&state, alloc, &msg, "normal", .auto, .none),
     );
     try std.testing.expectEqual(@as(usize, 0), traffic.catalog_calls);
@@ -4177,7 +4275,7 @@ test "ACP deps reject malformed native web_search calls" {
     try std.testing.expectEqualStrings("web_search field \"query\" must contain at least two characters", result.failure);
 }
 
-test "ACP prompt projection leaves Fx search uninstalled" {
+test "ACP prompt projection leaves fx search uninstalled" {
     const alloc = std.testing.allocator;
     const web_search_contract = @import("../core/tooling/web_search_contract.zig");
     const web_search_runtime = @import("../core/tooling/web_search_runtime.zig");
@@ -4213,7 +4311,12 @@ test "ACP prompt projection leaves Fx search uninstalled" {
     var provider = test_builtin_gateway.default_web_search_provider;
     provider.context = @ptrCast(&provider_state);
     provider.execute_fn = FailingWebSearchProvider.execute;
-    state.cfg.gateway_provider.provider_adapter.web_search = provider;
+    var route_adapter = try state.cfg.gateway_system.adapter_registry.resolve(
+        state.cfg.gateway_system.connection_seed.adapter_id,
+    );
+    route_adapter.web_search = provider;
+    const adapters = [_]agent_stream_provider.ProviderAdapter{route_adapter};
+    state.cfg.gateway_system.adapter_registry = .{ .adapters = &adapters };
 
     var messages: std.ArrayList(ChatMessage) = .empty;
     defer messages.deinit(arena);
@@ -4640,7 +4743,7 @@ test "ACP full advertisement includes direct provider search with explicit permi
     var rules = [_]types.PermissionRule{
         .{ .permission = @constCast("web_search"), .pattern = @constCast("*"), .action = .allow },
     };
-    var projection = try tool_advertisement.buildGatewayToolProjectionForSet(std.testing.allocator, builtin_tools.advertisement_set, .{
+    var projection = try tool_advertisement.buildModelToolProjectionForSet(std.testing.allocator, builtin_tools.advertisement_set, .{
         .permission_rules = .{ .rules = &rules },
         .provider_tools = &.{.web_search},
     });
@@ -4661,7 +4764,7 @@ test "ACP prompt agent config carries request options from active session" {
 
     var state = try initTestAcpState(alloc, workspace, .auto);
     defer state.deinit();
-    state.gateway_team = try alloc.dupe(u8, "team_123");
+    state.route_tenant = try alloc.dupe(u8, "team_123");
     state.context_limits.project_instruction_file_bytes = .{
         .value = .{ .bytes = 17 },
         .source = .command_line,
@@ -4688,9 +4791,8 @@ test "ACP prompt agent config carries request options from active session" {
     const tool_ctx = ctx.toolContext();
     try std.testing.expect(!tool_ctx.web_search_runtime_ready);
     try std.testing.expect(tool_ctx.web_search_backend != null);
-    try std.testing.expect(state.cfg.gateway_provider.provider_adapter.web_search != null);
+    try std.testing.expect(tool_ctx.route_adapter.web_search == null);
     try std.testing.expect(tool_ctx.web_fetch_runtime.? == &state.web_fetch_runtime);
-    try std.testing.expectEqualStrings("team_123", tool_ctx.gateway_team.?);
-    try std.testing.expectEqualStrings("/models", tool_ctx.gateway_models_path);
+    try std.testing.expectEqualStrings("team_123", tool_ctx.route_tenant.?);
     try std.testing.expect(tool_ctx.devbox_provider.?.execute_fn == unavailableDevboxForTest);
 }

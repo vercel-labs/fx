@@ -15,7 +15,7 @@ const diff = @import("../../../output/diff.zig");
 const file_mutation = @import("../../../tooling/file_mutation.zig");
 const command_result_mapping = @import("../../../tooling/command_result_mapping.zig");
 const tool_dispatch = @import("../../../tooling/tool_dispatch.zig");
-const gateway_schema = @import("../../../tooling/gateway_schema.zig");
+const tool_descriptor = @import("../../../tooling/tool_descriptor.zig");
 const tool_specs = @import("../../../tooling/tool_specs.zig");
 const tool_result_errors = @import("../../../tooling/tool_result_errors.zig");
 const context_contract = @import("../../../workspace/context_contract.zig");
@@ -64,7 +64,7 @@ const toolCall = test_support.toolCall;
 const vision_agent_test_tools = test_support.vision_agent_test_tools;
 const VisionAgentToolRuntime = test_support.VisionAgentToolRuntime;
 
-const fixture_tools = &.{gateway_schema.FunctionSchema{
+const fixture_tools = &.{tool_descriptor.Descriptor{
     .name = "read_file",
     .description = "Read a file",
 }};
@@ -4861,7 +4861,7 @@ test "permission feedback follows the matching tool result" {
     });
 }
 
-test "batched permission feedback follows every tool result before the next gateway request" {
+test "batched permission feedback follows every tool result before the next model request" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
         toolCall("call_first", "terminal", "{\"action\":\"exec\",\"command\":\"printf first\"}"),
@@ -4959,7 +4959,7 @@ test "initial session grants follow active registry metadata" {
 
     var provider_list = builtin_tools.list_files;
     provider_list.name = "provider_list";
-    provider_list.gateway_schema.name = "provider_list";
+    provider_list.descriptor.name = "provider_list";
     const tools = [_]tool_dispatch.Tool{provider_list};
 
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -6199,8 +6199,9 @@ test "processQueuedPrompt pauses retryable failures and preserves execution on t
     const cases = [_]Case{
         .{
             .completion = .{
-                .status = .bad_gateway,
-                .err_body = "gateway unavailable",
+                .failure_category = .upstream_failure,
+                .failure_retryable = true,
+                .failure_detail = "adapter unavailable",
             },
             .expected = .paused,
         },

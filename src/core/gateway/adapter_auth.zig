@@ -819,8 +819,14 @@ pub const Provider = struct {
     }
 
     pub fn authServicePresentation(self: Provider, alloc: Allocator) !AuthServicePresentation {
+        return AuthServicePresentation.init(alloc, try self.authServiceLabel());
+    }
+
+    /// Borrowed from the immutable adapter registration for its full lifetime.
+    pub fn authServiceLabel(self: Provider) ![]const u8 {
         const label = self.auth_service_label orelse return error.MissingAuthPresentation;
-        return AuthServicePresentation.init(alloc, label);
+        try validatePresentation(label, max_auth_service_label_bytes);
+        return label;
     }
 
     pub fn sourceInventory(

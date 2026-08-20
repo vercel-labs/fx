@@ -400,7 +400,7 @@ pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
 const read_file_dispatch_tool = tool_dispatch.Tool{
     .name = "read_file",
     .description = "Read file dispatch test fixture.",
-    .gateway_schema = .{
+    .descriptor = .{
         .name = "read_file",
         .description = "Read file dispatch test fixture.",
     },
@@ -417,7 +417,7 @@ const read_file_dispatch_tool = tool_dispatch.Tool{
 const write_file_dispatch_tool = tool_dispatch.Tool{
     .name = "write_file",
     .description = "Write file dispatch test fixture.",
-    .gateway_schema = .{
+    .descriptor = .{
         .name = "write_file",
         .description = "Write file dispatch test fixture.",
     },

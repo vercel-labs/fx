@@ -330,11 +330,9 @@ function startAuthFixture(
         const target = transport === "sse" && url.pathname === "/messages"
           ? `${new URL(upstreamUrl).origin}/messages`
           : upstreamUrl;
-        const upstreamHeaders = new Headers(request.headers);
-        upstreamHeaders.set("connection", "close");
         const upstreamResponse = await fetch(target, {
           method: request.method,
-          headers: upstreamHeaders,
+          headers: request.headers,
           ...(body === "" ? {} : { body }),
         });
         if (

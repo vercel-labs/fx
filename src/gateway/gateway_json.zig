@@ -1,6 +1,5 @@
 const std = @import("std");
 const model_history = @import("../core/agent/model_history.zig");
-const builtin = @import("builtin");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const io_mod = @import("../core/shared/io.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
@@ -8,7 +7,7 @@ const types = @import("../core/shared/types.zig");
 
 pub const ChatRole = types.ChatRole;
 pub const ChatMessage = types.ChatMessage;
-pub const GatewayCompletion = types.GatewayCompletion;
+pub const ModelCompletion = types.ModelCompletion;
 pub const ToolCall = types.ToolCall;
 
 pub const StructuredResponseFormat = struct {
@@ -463,6 +462,42 @@ pub fn shouldCacheMessage(message: ChatMessage, index: usize, cache_breakpoint_i
 const anthropic_cache_meta = ",\"providerOptions\":{\"anthropic\":{\"cacheControl\":{\"type\":\"ephemeral\"}}}";
 const max_prompt_shape_entries: usize = 12;
 
+fn writeVercelVerifiedImagePart(
+    writer: *std.Io.Writer,
+    snapshot: image_attachments.VerifiedSnapshot,
+    budget: ?BuildBudget,
+) !void {
+    if (budget) |active| try active.check();
+    try writer.writeAll("{\"type\":\"file\",\"mediaType\":\"");
+    try writer.writeAll(snapshot.media_type);
+    try writer.writeAll("\",\"data\":\"");
+
+    var offset: usize = 0;
+    while (offset < snapshot.bytes.len) {
+        if (budget) |active| try active.check();
+        const end = @min(offset + 3 * 1024, snapshot.bytes.len);
+        try std.base64.standard.Encoder.encodeWriter(writer, snapshot.bytes[offset..end]);
+        offset = end;
+    }
+
+    try writer.writeAll("\"}");
+    if (budget) |active| try active.check();
+}
+
+fn writeVercelImagePart(
+    scratch_alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    image: types.ImageAttachment,
+    budget: ?BuildBudget,
+) !void {
+    var snapshot = try image_attachments.loadVerifiedSnapshot(scratch_alloc, image, .{
+        .deadline = if (budget) |active| active.deadline else null,
+        .cancel_flag = if (budget) |active| active.cancel_flag else null,
+    });
+    defer snapshot.deinit(scratch_alloc);
+    try writeVercelVerifiedImagePart(writer, snapshot, budget);
+}
+
 fn writeChatMessageJsonInner(
     scratch_alloc: std.mem.Allocator,
     writer: *std.Io.Writer,
@@ -497,32 +532,13 @@ fn writeChatMessageJsonInner(
             if (verified_images) |snapshots| {
                 for (snapshots) |snapshot| {
                     if (wrote_part) try writer.writeByte(',');
-                    try image_attachments.writeVerifiedImageFilePartJsonWithBudget(
-                        writer,
-                        snapshot,
-                        .{
-                            .deadline = if (budget) |active| active.deadline else null,
-                            .cancel_flag = if (budget) |active| active.cancel_flag else null,
-                        },
-                    );
+                    try writeVercelVerifiedImagePart(writer, snapshot, budget);
                     wrote_part = true;
                 }
             } else {
                 for (message.images) |image| {
                     if (wrote_part) try writer.writeByte(',');
-                    if (budget) |active| {
-                        try image_attachments.writeImageFilePartJsonWithBudget(
-                            scratch_alloc,
-                            writer,
-                            image,
-                            .{
-                                .deadline = active.deadline,
-                                .cancel_flag = active.cancel_flag,
-                            },
-                        );
-                    } else {
-                        try image_attachments.writeImageFilePartJson(scratch_alloc, writer, image);
-                    }
+                    try writeVercelImagePart(scratch_alloc, writer, image, budget);
                     wrote_part = true;
                 }
             }
@@ -706,7 +722,7 @@ fn findCacheBreakpoint(messages: []const ChatMessage) ?usize {
     return null;
 }
 
-pub fn parseGatewayCompletion(alloc: std.mem.Allocator, body: []const u8) !GatewayCompletion {
+pub fn parseModelCompletion(alloc: std.mem.Allocator, body: []const u8) !ModelCompletion {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
 
@@ -722,11 +738,11 @@ pub fn parseGatewayCompletion(alloc: std.mem.Allocator, body: []const u8) !Gatew
     const message_value = choice.object.get("message") orelse return error.InvalidGatewayResponse;
     if (message_value != .object) return error.InvalidGatewayResponse;
 
-    var output: GatewayCompletion = .{};
+    var output: ModelCompletion = .{};
     if (message_value.object.get("content")) |content| {
         if (content == .string) output.content = try alloc.dupe(u8, content.string);
     }
-    errdefer freeGatewayCompletion(alloc, output);
+    errdefer freeModelCompletion(alloc, output);
 
     if (choice.object.get("finish_reason")) |finish_reason| {
         if (finish_reason == .string and finish_reason.string.len > 0) {
@@ -788,7 +804,7 @@ pub fn parseGatewayCompletion(alloc: std.mem.Allocator, body: []const u8) !Gatew
     return output;
 }
 
-pub fn freeGatewayCompletion(alloc: std.mem.Allocator, completion: GatewayCompletion) void {
+pub fn freeModelCompletion(alloc: std.mem.Allocator, completion: ModelCompletion) void {
     if (completion.content) |content| alloc.free(content);
     for (completion.tool_calls) |tool_call| {
         alloc.free(tool_call.id);
@@ -798,11 +814,11 @@ pub fn freeGatewayCompletion(alloc: std.mem.Allocator, completion: GatewayComple
     if (completion.tool_calls.len > 0) alloc.free(completion.tool_calls);
 }
 
-fn checkParseGatewayCompletionAllocFailures(alloc: std.mem.Allocator) !void {
+fn checkParseModelCompletionAllocFailures(alloc: std.mem.Allocator) !void {
     const body = "{\"choices\":[{\"finish_reason\":\"tool_calls\",\"message\":{\"content\":\"hello\",\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{}\"}},{\"id\":\"call_2\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"src/main.zig\\\"}\"}}]}}]}";
 
-    const completion = try parseGatewayCompletion(alloc, body);
-    defer freeGatewayCompletion(alloc, completion);
+    const completion = try parseModelCompletion(alloc, body);
+    defer freeModelCompletion(alloc, completion);
 
     try std.testing.expectEqualStrings("hello", completion.content.?);
     try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
@@ -870,7 +886,33 @@ test "gateway request serializes an optional structured response format" {
     );
 }
 
-test "writeChatMessageJson serializes user text plus image file parts through core image writer" {
+fn testCapturedVercelImage(
+    alloc: std.mem.Allocator,
+    tmp: *std.testing.TmpDir,
+    name: []const u8,
+    bytes: []const u8,
+) !types.ImageAttachment {
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = bytes });
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
+    const media_type = alloc.dupe(u8, "image/png") catch |err| {
+        alloc.free(path);
+        return err;
+    };
+    var image = types.ImageAttachment{
+        .id = 1,
+        .path = path,
+        .media_type = media_type,
+    };
+    errdefer types.freeImageAttachment(alloc, image);
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    defer alloc.free(snapshot_dir);
+    try image_attachments.captureImageSnapshot(alloc, &image, snapshot_dir);
+    return image;
+}
+
+test "Vercel message JSON serializes user text and captured image bytes" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -912,6 +954,130 @@ test "writeChatMessageJson serializes user text plus image file parts through co
     try std.testing.expect(std.mem.find(u8, json, "\"type\":\"file\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"mediaType\":\"image/png\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"data\":\"iVBORw0KGgphYmM=\"") != null);
+}
+
+test "Vercel image serialization is snapshot-bound and allocator-owned" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const original = "\x89PNG\r\n\x1a\nimage-a";
+    const image = try testCapturedVercelImage(alloc, &tmp, "image.png", original);
+    defer types.freeImageAttachment(alloc, image);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "image.png",
+        .data = "\x89PNG\r\n\x1a\nimage-b",
+    });
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeVercelImagePart(alloc, &out.writer, image, null);
+    var expected_buffer: [128]u8 = undefined;
+    const expected = std.base64.standard.Encoder.encode(&expected_buffer, original);
+    try std.testing.expect(std.mem.find(u8, out.written(), expected) != null);
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var failed_out: std.Io.Writer.Allocating = .init(alloc);
+    defer failed_out.deinit();
+    try std.testing.expectError(
+        error.OutOfMemory,
+        writeVercelImagePart(failing.allocator(), &failed_out.writer, image, null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), failed_out.written().len);
+
+    {
+        var snapshot = try std.Io.Dir.createFileAbsolute(
+            std.testing.io,
+            image.snapshot_path.?,
+            .{ .truncate = true },
+        );
+        defer snapshot.close(std.testing.io);
+        try snapshot.writeStreamingAll(std.testing.io, "\x89PNG\r\n\x1a\ncorrupt");
+    }
+    var corrupt_out: std.Io.Writer.Allocating = .init(alloc);
+    defer corrupt_out.deinit();
+    try std.testing.expectError(
+        error.ImageSnapshotCorrupt,
+        writeVercelImagePart(alloc, &corrupt_out.writer, image, null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), corrupt_out.written().len);
+
+    try std.Io.Dir.deleteFileAbsolute(std.testing.io, image.snapshot_path.?);
+    try std.testing.expectError(
+        error.FileNotFound,
+        writeVercelImagePart(alloc, &corrupt_out.writer, image, null),
+    );
+}
+
+test "Vercel image serialization observes bounds and cancellation between chunks" {
+    const CancelWriter = struct {
+        cancel_flag: *std.atomic.Value(bool),
+        total_written: usize = 0,
+        buffer: [64]u8 = undefined,
+        interface: std.Io.Writer = undefined,
+
+        fn init(self: *@This(), cancel_flag: *std.atomic.Value(bool)) void {
+            self.* = .{ .cancel_flag = cancel_flag };
+            self.interface = .{
+                .vtable = &.{ .drain = drain },
+                .buffer = &self.buffer,
+                .end = 0,
+            };
+        }
+
+        fn drain(
+            writer: *std.Io.Writer,
+            data: []const []const u8,
+            splat: usize,
+        ) std.Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("interface", writer));
+            self.total_written += writer.end;
+            writer.end = 0;
+            var consumed: usize = 0;
+            for (data, 0..) |part, index| {
+                const repeat = if (index == data.len - 1) splat else 1;
+                consumed += part.len * repeat;
+            }
+            self.total_written += consumed;
+            if (self.total_written > 5 * 1024) self.cancel_flag.store(true, .seq_cst);
+            return consumed;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bytes: [12 * 1024]u8 = undefined;
+    @memset(&bytes, 'x');
+    @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
+    const image = try testCapturedVercelImage(alloc, &tmp, "image.png", &bytes);
+    defer types.freeImageAttachment(alloc, image);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var writer = CancelWriter{ .cancel_flag = &cancel_flag };
+    writer.init(&cancel_flag);
+    try std.testing.expectError(
+        error.Cancelled,
+        writeVercelImagePart(alloc, &writer.interface, image, .{ .cancel_flag = &cancel_flag }),
+    );
+    try std.testing.expect(writer.total_written > 3 * 1024);
+    try std.testing.expect(writer.total_written < 16 * 1024);
+
+    {
+        var snapshot = try std.Io.Dir.openFileAbsolute(
+            std.testing.io,
+            image.snapshot_path.?,
+            .{ .mode = .read_write },
+        );
+        defer snapshot.close(std.testing.io);
+        try snapshot.setLength(std.testing.io, image_attachments.max_image_bytes + 1);
+    }
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try std.testing.expectError(
+        error.ImageTooLarge,
+        writeVercelImagePart(alloc, &out.writer, image, null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
 }
 
 test "writeChatMessageJson serializes assistant tool call input as raw json" {
@@ -1456,7 +1622,7 @@ test "gateway request validation rejects mismatched tool result names" {
     try std.testing.expectError(error.InvalidGatewayHistory, buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{}, .auto));
 }
 
-test "parseGatewayCompletion duplicates returned strings" {
+test "parseModelCompletion duplicates returned strings" {
     const alloc = std.testing.allocator;
     const body = try alloc.dupe(
         u8,
@@ -1464,8 +1630,8 @@ test "parseGatewayCompletion duplicates returned strings" {
     );
     defer alloc.free(body);
 
-    const completion = try parseGatewayCompletion(alloc, body);
-    defer freeGatewayCompletion(alloc, completion);
+    const completion = try parseModelCompletion(alloc, body);
+    defer freeModelCompletion(alloc, completion);
 
     @memset(body, 'x');
 
@@ -1476,7 +1642,7 @@ test "parseGatewayCompletion duplicates returned strings" {
     try std.testing.expectEqualStrings("{}", completion.tool_calls[0].arguments_json);
 }
 
-test "parseGatewayCompletion skips malformed tool call entries" {
+test "parseModelCompletion skips malformed tool call entries" {
     const alloc = std.testing.allocator;
     const body =
         "{\"choices\":[{\"message\":{\"content\":\"ok\",\"tool_calls\":[" ++
@@ -1485,8 +1651,8 @@ test "parseGatewayCompletion skips malformed tool call entries" {
         "{\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}}" ++
         "]}}]}";
 
-    const completion = try parseGatewayCompletion(alloc, body);
-    defer freeGatewayCompletion(alloc, completion);
+    const completion = try parseModelCompletion(alloc, body);
+    defer freeModelCompletion(alloc, completion);
 
     try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
     try std.testing.expectEqualStrings("call_1", completion.tool_calls[0].id);
@@ -1494,7 +1660,7 @@ test "parseGatewayCompletion skips malformed tool call entries" {
     try std.testing.expectEqualStrings("{\"path\":\"a\"}", completion.tool_calls[0].arguments_json);
 }
 
-test "parseGatewayCompletion rejects malformed legacy tool arguments" {
+test "parseModelCompletion rejects malformed legacy tool arguments" {
     const body =
         "{\"choices\":[{\"finish_reason\":\"tool_calls\",\"message\":{\"tool_calls\":[" ++
         "{\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{]\"}}" ++
@@ -1502,11 +1668,11 @@ test "parseGatewayCompletion rejects malformed legacy tool arguments" {
 
     try std.testing.expectError(
         error.InvalidGatewayResponse,
-        parseGatewayCompletion(std.testing.allocator, body),
+        parseModelCompletion(std.testing.allocator, body),
     );
 }
 
-test "parseGatewayCompletion rejects duplicate-key legacy tool arguments" {
+test "parseModelCompletion rejects duplicate-key legacy tool arguments" {
     const body =
         "{\"choices\":[{\"finish_reason\":\"tool_calls\",\"message\":{\"tool_calls\":[" ++
         "{\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"depth\\\":1,\\\"depth\\\":2}\"}}" ++
@@ -1514,18 +1680,18 @@ test "parseGatewayCompletion rejects duplicate-key legacy tool arguments" {
 
     try std.testing.expectError(
         error.InvalidGatewayResponse,
-        parseGatewayCompletion(std.testing.allocator, body),
+        parseModelCompletion(std.testing.allocator, body),
     );
 }
 
-test "parseGatewayCompletion cleans up allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkParseGatewayCompletionAllocFailures, .{});
+test "parseModelCompletion cleans up allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkParseModelCompletionAllocFailures, .{});
 }
 
-test "freeGatewayCompletion frees parsed completions under testing allocator" {
+test "freeModelCompletion frees parsed completions under testing allocator" {
     const alloc = std.testing.allocator;
     const body = "{\"choices\":[{\"finish_reason\":\"tool_calls\",\"message\":{\"content\":\"hello\",\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{}\"}}]}}]}";
 
-    const completion = try parseGatewayCompletion(alloc, body);
-    freeGatewayCompletion(alloc, completion);
+    const completion = try parseModelCompletion(alloc, body);
+    freeModelCompletion(alloc, completion);
 }

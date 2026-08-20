@@ -4851,16 +4851,19 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             preferences: session_codec.DurableSessionPreferences,
         ) !void {
+            const descriptor = model_capabilities.resolveForApp(App, app, preferences.model);
+            const canonical_model = descriptor.id;
+            const fast_mode = preferences.fast_mode or descriptor.selected_fast_mode;
             app.selected_model.clearRetainingCapacity();
-            try app.selected_model.appendSlice(app.alloc, preferences.model);
+            try app.selected_model.appendSlice(app.alloc, canonical_model);
             if (app.session_persistence.process_model_override) |model| {
                 app.selected_model.clearRetainingCapacity();
                 try app.selected_model.appendSlice(app.alloc, model);
             }
             app.effort = preferences.effort;
-            app.fast_mode = preferences.fast_mode;
+            app.fast_mode = fast_mode;
             app.worker.syncQueuedPromptEffort(preferences.effort);
-            app.worker.syncQueuedPromptFastMode(preferences.fast_mode);
+            app.worker.syncQueuedPromptFastMode(fast_mode);
         }
 
         fn applySessionPreferencePatch(
@@ -7434,10 +7437,13 @@ test "resumed recovery checkpoint replays its unfinished turn once" {
         );
         defer writable.deinit(alloc);
         const checkpoint = session_codec.RecoveryCheckpoint{
-            .version = 3,
+            .version = session_codec.recovery_checkpoint_version,
             .route_identity = .{
                 .connection_id = @constCast("vercel"),
                 .adapter_kind = @constCast("vercel_ai_gateway"),
+                .endpoint = @constCast("https://ai-gateway.vercel.sh/v1/ai/language-model"),
+                .protocol = @constCast("vercel_ai_gateway"),
+                .credential_ref = @constCast("fx_login"),
                 .permission_review_model_id = @constCast("openai/gpt-5.4"),
                 .vision_model_id = @constCast("google/gemini-2.5-flash"),
                 .subagent_model_id = @constCast("saved/model"),

@@ -11,7 +11,6 @@ const app_render_runtime = @import("app_render_runtime.zig");
 const app_runtime_setup = @import("app_runtime_setup.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
-const credentials = @import("../../gateway/auth/credentials.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const host = @import("../hosts/host.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -37,10 +36,10 @@ const Allocator = std.mem.Allocator;
 pub const CapabilityProviders = struct {
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     skill_root_policy: skill_contract.RootPolicy,
-    terminal_title: host.TerminalTitle,
     connection_seed: connection_registry.Seed,
     adapter_registry: adapter_registry.AdapterRegistry = .{ .adapters = &.{} },
     model_descriptors: model_catalog.ModelDescriptorProvider = model_catalog.configured_model_descriptor_provider,
+    terminal_title: host.TerminalTitle,
 };
 
 fn BootstrapDeps(comptime App: type) type {
@@ -380,12 +379,26 @@ pub fn Runtime(comptime App: type) type {
             }
             if (comptime @hasField(App, "auth")) {
                 const auth_view = app.auth.view();
-                if (auth_view.active_source == null and auth_view.stored_key_status == .unavailable) {
+                if (auth_view.active_source == null and auth_view.store_status == .unavailable) {
                     debug_trace.logf("keychain", "interactive read skipped", .{});
+                    const destination = if (app.auth.pickerView().entered_secret) |presentation|
+                        presentation.storage_destination_label
+                    else
+                        "configured credential store";
+                    const secret_kind = if (app.auth.pickerView().entered_secret) |presentation|
+                        presentation.secret_kind_label
+                    else
+                        "credential";
+                    const body = try std.fmt.allocPrint(
+                        app.alloc,
+                        "fx could not read the saved {s} from {s}. It may be present but unreadable. Set FX_TRACE_LOG for the failing step, or open /login to choose another credential source.",
+                        .{ secret_kind, destination },
+                    );
+                    defer app.alloc.free(body);
                     try app.writeDomainNotice(.{
                         .topic = "keychain",
                         .tone = .warning,
-                        .body = "fx could not access " ++ credentials.stored_key_backend_label ++ ". Continuing without an API key.",
+                        .body = body,
                     }, true);
                 }
             }
@@ -548,11 +561,54 @@ const test_connection_seed = connection_registry.Seed{
     .id = "test",
     .display_name = "Test Gateway",
     .adapter_id = "test_gateway",
+    .protocol = "test_gateway",
     .credential_ref = "automatic",
 };
-const test_auth_provider = adapter_auth.Provider{ .kind = "test_gateway" };
+fn testSourceInventory(
+    _: *const anyopaque,
+    alloc: Allocator,
+    request: *adapter_auth.SourceInventoryRequest,
+) Allocator.Error!adapter_auth.SourceInventoryOutcome {
+    var sources = try alloc.alloc(adapter_auth.CredentialSourceDescriptor, 1);
+    errdefer alloc.free(sources);
+    sources[0] = adapter_auth.CredentialSourceDescriptor.init(
+        alloc,
+        "test_key",
+        "test key",
+        false,
+        false,
+        .{
+            .secret_kind_label = @constCast("API key"),
+            .verification_service_label = @constCast("Test Gateway"),
+            .storage_destination_label = @constCast("test store"),
+        },
+        false,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => unreachable,
+    };
+    errdefer sources[0].deinit(alloc);
+    var origin = try request.profile.clone(alloc);
+    errdefer origin.deinit(alloc);
+    const presentation = adapter_auth.AuthServicePresentation.init(alloc, "Test") catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => unreachable,
+    };
+    return .{ .loaded = .{
+        .origin_profile = origin,
+        .auth_service = presentation,
+        .sources = sources,
+    } };
+}
+
+const test_auth_provider = adapter_auth.Provider{
+    .kind = "test_gateway",
+    .auth_service_label = "Test",
+    .source_inventory_fn = testSourceInventory,
+};
 const test_adapters = [_]agent_stream_provider.ProviderAdapter{.{
     .kind = "test_gateway",
+    .supported_protocol = "test_gateway",
     .auth = test_auth_provider,
     .stream_fn = agent_stream_provider.unavailable_adapter.stream_fn,
 }};
@@ -724,9 +780,14 @@ fn makeStartupState(alloc: Allocator) !app_lifecycle.StartupState {
         const credential_team = try alloc.dupe(u8, "team_123");
         errdefer alloc.free(credential_team);
         state.credential = .{
-            .token = credential_token,
-            .source = .ai_gateway_api_key,
-            .team_id = credential_team,
+            .secret_bytes = credential_token,
+            .source = .{ .id = "environment", .label = "AI_GATEWAY_API_KEY", .refreshable = false },
+            .tenant_id = credential_team,
+            .catalog_access = .{ .authenticated = .{
+                .source = .{ .id = "environment", .label = "AI_GATEWAY_API_KEY", .refreshable = false },
+                .credential = credential_token,
+                .team_context = credential_team,
+            } },
         };
     }
     state.stored_key_status = .not_found;
@@ -952,11 +1013,11 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     try std.testing.expectEqualStrings("workspace · model-x", capture.titleText());
 
     try std.testing.expectEqualStrings("/workspace", app.workspace_root);
-    try std.testing.expectEqualStrings("api-key", app.auth.apiKey().?);
-    try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, app.auth.credentialSource().?);
-    try std.testing.expectEqualStrings("team_123", app.auth.gatewayTeam().?);
+    try std.testing.expectEqualStrings("api-key", app.auth.credentialSecret().?);
+    try std.testing.expectEqualStrings("environment", app.auth.credentialSource().?.id);
+    try std.testing.expectEqualStrings("team_123", app.auth.tenantContext().?);
     const auth_view = app.auth.view();
-    try std.testing.expectEqual(credentials.StoredKeyReadStatus.not_found, auth_view.stored_key_status);
+    try std.testing.expectEqual(adapter_auth.StoreStatus.not_found, auth_view.store_status);
     try std.testing.expect(auth_view.onboarding_skipped);
     try std.testing.expectEqualStrings("model-x", app.selected_model.items);
     try std.testing.expectEqual(types.PermissionMode.auto, app.permission_engine.mode);

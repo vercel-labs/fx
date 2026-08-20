@@ -12,7 +12,7 @@ const ToolCall = types.ToolCall;
 
 const removed_direct_question_guidance = "Treat it as interrupting any previous tool plan.";
 const removed_resume_guidance = "Continue from the latest meaningful state";
-const fixture_tools = &.{@import("../../../tooling/gateway_schema.zig").FunctionSchema{
+const fixture_tools = &.{@import("../../../tooling/tool_descriptor.zig").Descriptor{
     .name = "read_file",
     .description = "Read a file",
 }};

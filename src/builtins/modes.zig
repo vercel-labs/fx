@@ -41,7 +41,7 @@ test "built-in modes register exact ACP order and permission policy" {
 
 test "ask and code mode projections carry included custom provider guidance" {
     inline for (&.{ "ask", "code" }) |mode_id| {
-        var projection = try registry.buildGatewayToolProjection(
+        var projection = try registry.buildModelToolProjection(
             std.testing.allocator,
             builtin_tools.advertisement_set,
             mode_id,
@@ -67,7 +67,7 @@ test "built-in mode projections use the supplied tool set" {
         .read_only_tool_names = read_only_names[0..],
     };
 
-    var projection = try registry.buildGatewayToolProjection(std.testing.allocator, tool_set, "ask", .{});
+    var projection = try registry.buildModelToolProjection(std.testing.allocator, tool_set, "ask", .{});
     defer projection.deinit(std.testing.allocator);
     try std.testing.expect(projection.contains("read_file"));
     try std.testing.expect(!projection.contains("write_file"));

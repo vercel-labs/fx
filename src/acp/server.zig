@@ -13,10 +13,10 @@ const app_lifecycle = @import("../core/app/app_lifecycle.zig");
 const app_runtime_setup = @import("../core/app/app_runtime_setup.zig");
 const builtin_skills = @import("../builtins/skills.zig");
 const builtin_tools = @import("../builtins/tools.zig");
-const credentials = @import("../gateway/auth/credentials.zig");
+const adapter_auth = @import("../core/gateway/adapter_auth.zig");
 const secret = @import("../core/auth/secret.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
-const gateway_provider = @import("../core/gateway/gateway_provider.zig");
+const gateway_system = @import("../core/gateway/gateway_system.zig");
 const connection_registry = @import("../core/gateway/connection_registry.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const hooks = @import("../core/hooks/hooks.zig");
@@ -153,8 +153,8 @@ pub const ActiveSessionState = struct {
     model: []u8,
     mode: []const u8,
     workspace_root: []const u8,
-    api_key: []const u8,
-    credential_source: ?types.CredentialSource = null,
+    route_credential: []const u8,
+    route_source: ?adapter_auth.Source = null,
     agent_step_limit: usize,
     max_tool_result_bytes: usize,
     fast_mode: bool,
@@ -216,11 +216,11 @@ pub const ServerState = struct {
     client_elicitation: elicitation.Capabilities = .{},
     workspace_root: []u8 = &.{},
     workspace_access: workspace_access.WorkspaceAccess = .{},
-    api_key: []u8 = &.{},
-    credential_source: ?types.CredentialSource = null,
+    route_credential: []u8 = &.{},
+    route_source: ?adapter_auth.Source = null,
     credential_connection_id: ?[]const u8 = null,
     credential_adapter_kind: ?[]const u8 = null,
-    gateway_team: ?[]u8 = null,
+    route_tenant: ?[]u8 = null,
     connections: ?connection_registry.Runtime = null,
     selected_model: []u8 = &.{},
     configured_model: []u8 = &.{},
@@ -245,7 +245,7 @@ pub const ServerState = struct {
     terminal_client: terminal_client_runtime.Runtime = .{},
     subagent_store: ?session_store.Store = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
-    capability_resolver: gateway_provider.CapabilityResolver = .{},
+    capability_resolver: gateway_system.CapabilityResolver = .{},
     terminate_connection: bool = false,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{}),
@@ -270,8 +270,8 @@ pub const ServerState = struct {
         };
         self.workspace_access.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
-        if (self.api_key.len > 0) secret.zeroAndFree(self.alloc, self.api_key);
-        if (self.gateway_team) |team| self.alloc.free(team);
+        if (self.route_credential.len > 0) secret.zeroAndFree(self.alloc, self.route_credential);
+        if (self.route_tenant) |team| self.alloc.free(team);
         if (self.selected_model.len > 0) self.alloc.free(self.selected_model);
         if (self.configured_model.len > 0) self.alloc.free(self.configured_model);
         if (self.connections) |*connections| connections.deinit();
@@ -316,34 +316,34 @@ pub fn prepareConnectionCredential(
     alloc: Allocator,
     profile: connection_registry.Profile,
     model: []const u8,
-) !credentials.Credential {
-    const adapter = try state.cfg.gateway_provider.adapter_registry.resolveProfile(profile);
+) !adapter_auth.Credential {
+    const adapter = try state.cfg.gateway_system.adapter_registry.resolveProfile(profile);
     _ = adapter.auth orelse return error.MissingAuthCapability;
     if (state.credential_connection_id) |connection_id| {
-        if (state.api_key.len > 0 and
+        if (state.route_credential.len > 0 and
             std.mem.eql(u8, connection_id, profile.id) and
             (if (state.credential_adapter_kind) |kind|
                 std.mem.eql(u8, kind, profile.adapter_id)
             else
                 false) and
-            state.credential_source != null and
+            state.route_source != null and
             (std.mem.eql(u8, profile.credential_ref, "automatic") or
-                if (state.credential_source) |source|
-                    std.mem.eql(u8, profile.credential_ref, @tagName(source))
+                if (state.route_source) |source|
+                    std.mem.eql(u8, profile.credential_ref, source.id)
                 else
                     false))
         {
             return copyRetainedCredential(
                 alloc,
-                state.api_key,
-                state.credential_source.?,
-                state.gateway_team,
+                state.route_credential,
+                state.route_source.?,
+                state.route_tenant,
             );
         }
     }
     const resolution = try app_lifecycle.resolveConnectionCredential(
         alloc,
-        state.cfg.gateway_provider.adapter_registry,
+        state.cfg.gateway_system.adapter_registry,
         state.cfg.secret_store,
         profile,
         .refresh_if_needed,
@@ -356,13 +356,9 @@ pub fn prepareConnectionCredential(
         _ = try state.capability_resolver.resolve(
             state.alloc,
             catalog,
+            adapter.model_descriptors,
             .{
-                .access = credentials.catalogAccessForCredential(
-                    credential.source,
-                    credential.token,
-                    credential.gatewayTeam(),
-                ),
-                .endpoint = state.cfg.gateway_models_path,
+                .access = credential.catalog_access,
                 .cancel_flag = &catalog_cancel_flag,
             },
             model,
@@ -374,15 +370,21 @@ pub fn prepareConnectionCredential(
 fn copyRetainedCredential(
     alloc: Allocator,
     token: []const u8,
-    source: credentials.Source,
+    source: adapter_auth.Source,
     team: ?[]const u8,
-) Allocator.Error!credentials.Credential {
-    var result = credentials.Credential{
-        .token = try alloc.dupe(u8, token),
+) Allocator.Error!adapter_auth.Credential {
+    var result = adapter_auth.Credential{
+        .secret_bytes = try alloc.dupe(u8, token),
         .source = source,
+        .catalog_access = undefined,
     };
     errdefer result.deinit(alloc);
-    result.team_id = if (team) |value| try alloc.dupe(u8, value) else null;
+    result.tenant_id = if (team) |value| try alloc.dupe(u8, value) else null;
+    result.catalog_access = .{ .authenticated = .{
+        .source = source,
+        .credential = result.secret_bytes,
+        .team_context = result.tenant_id,
+    } };
     return result;
 }
 
@@ -394,7 +396,7 @@ fn resolveGenerationUsageCredential(
     const state: *ServerState = @ptrCast(@alignCast(raw.?));
     const connection_id = state.credential_connection_id orelse return error.Unavailable;
     const adapter_kind = state.credential_adapter_kind orelse return error.Unavailable;
-    if (state.api_key.len == 0 or
+    if (state.route_credential.len == 0 or
         !std.mem.eql(u8, reference.connection_id, connection_id) or
         !std.mem.eql(u8, reference.adapter_kind, adapter_kind))
     {
@@ -402,16 +404,16 @@ fn resolveGenerationUsageCredential(
     }
     const connections = state.connections orelse return error.Unavailable;
     const profile = connections.profile(connection_id) catch return error.Unavailable;
-    const source = state.credential_source orelse return error.Unavailable;
+    const source = state.route_source orelse return error.Unavailable;
     if (!std.mem.eql(u8, profile.adapter_id, reference.adapter_kind) or
-        !std.mem.eql(u8, reference.credential_ref, @tagName(source)))
+        !std.mem.eql(u8, reference.credential_ref, source.id))
     {
         return error.Unavailable;
     }
     return generation_usage_provider.ResolvedCredential.initCopy(
         alloc,
-        state.api_key,
-        state.gateway_team,
+        state.route_credential,
+        state.route_tenant,
     );
 }
 
@@ -422,15 +424,15 @@ fn prepareGenerationUsageDispatch(
     const state: *ServerState = @ptrCast(@alignCast(raw.?));
     const connection_id = state.credential_connection_id orelse return error.Unavailable;
     const adapter_kind = state.credential_adapter_kind orelse return error.Unavailable;
-    const source = state.credential_source orelse return error.Unavailable;
+    const source = state.route_source orelse return error.Unavailable;
     const connections = state.connections orelse return error.Unavailable;
     const profile = connections.profile(connection_id) catch return error.Unavailable;
     if (!std.mem.eql(u8, profile.adapter_id, adapter_kind)) return error.Unavailable;
-    const provider = state.cfg.gateway_provider.adapter_registry.resolveGenerationUsageForProfile(profile) catch null;
+    const provider = state.cfg.gateway_system.adapter_registry.resolveGenerationUsageForProfile(profile) catch null;
     return generation_usage_provider.Dispatch.init(alloc, &.{.{
         .id = profile.id,
         .adapter_kind = adapter_kind,
-        .credential_ref = @tagName(source),
+        .credential_ref = source.id,
         .provider = provider,
     }}, .{
         .context = state,
@@ -450,19 +452,19 @@ pub fn adoptConnectionCredential(
     state: *ServerState,
     connection_id: []const u8,
     adapter_kind: []const u8,
-    credential: credentials.Credential,
+    credential: adapter_auth.Credential,
 ) void {
-    if (state.api_key.len > 0) secret.zeroAndFree(state.alloc, state.api_key);
-    if (state.gateway_team) |team| state.alloc.free(team);
-    state.credential_source = credential.source;
+    if (state.route_credential.len > 0) secret.zeroAndFree(state.alloc, state.route_credential);
+    if (state.route_tenant) |team| state.alloc.free(team);
+    state.route_source = credential.source;
     state.credential_connection_id = connection_id;
     state.credential_adapter_kind = adapter_kind;
-    state.api_key = credential.token;
-    if (credential.team_id) |team| {
-        state.gateway_team = team;
-        if (credential.team_slug) |unused| state.alloc.free(unused);
+    state.route_credential = credential.secret_bytes;
+    if (credential.tenant_id) |team| {
+        state.route_tenant = team;
+        if (credential.tenant_slug) |unused| state.alloc.free(unused);
     } else {
-        state.gateway_team = credential.team_slug;
+        state.route_tenant = credential.tenant_slug;
     }
 }
 
@@ -1297,7 +1299,7 @@ fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_
                 state.cfg.default_model,
                 false,
                 state.cfg.default_agent_step_limit,
-                state.cfg.gateway_provider.connection_seed,
+                state.cfg.gateway_system.connection_seed,
             );
         }
     }
@@ -1306,7 +1308,7 @@ fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_
         state.cfg.default_model,
         false,
         state.cfg.default_agent_step_limit,
-        state.cfg.gateway_provider.connection_seed,
+        state.cfg.gateway_system.connection_seed,
     );
 }
 
@@ -1332,8 +1334,21 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         });
     };
     defer startup.deinit(alloc);
+    _ = app_lifecycle.migrateLegacyCredentialReference(
+        &startup,
+        alloc,
+        state.cfg.gateway_system.adapter_registry,
+        state.cfg.secret_store,
+        .stored,
+        null,
+    ) catch |err| {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.internal_error,
+            .message = app_lifecycle.legacyCredentialMigrationErrorMessage(err),
+        });
+    };
     const startup_profile = startup.connections.?.selectedProfile();
-    const descriptors = if (state.cfg.gateway_provider.adapter_registry.resolveProfile(startup_profile)) |adapter|
+    const descriptors = if (state.cfg.gateway_system.adapter_registry.resolveProfile(startup_profile)) |adapter|
         adapter.model_descriptors
     else |_|
         model_catalog.configured_model_descriptor_provider;
@@ -1361,13 +1376,6 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.workspace_root = startup.takeWorkspaceRoot();
     state.workspace_access = startup.takeWorkspaceAccess();
     state.connections = startup.takeConnections();
-    if (state.cfg.credential_override) |override| {
-        if (override.len > 0) {
-            state.api_key = try alloc.dupe(u8, override);
-            state.credential_source = .ai_gateway_api_key;
-            state.credential_connection_id = state.connections.?.selectedProfile().id;
-        }
-    }
 
     if (state.cfg.model_override) |override| {
         state.selected_model = try alloc.dupe(u8, override);
@@ -1667,7 +1675,7 @@ test "applySessionMode uses registered mode policy and ignores unknown modes" {
         .model = @constCast("model"),
         .mode = registry.default_mode_id,
         .workspace_root = "/tmp/workspace",
-        .api_key = "",
+        .route_credential = "",
         .agent_step_limit = 0,
         .max_tool_result_bytes = 0,
         .fast_mode = false,
@@ -1906,7 +1914,7 @@ test "ACP retained credential copy owns allocation failures" {
             var credential = try copyRetainedCredential(
                 alloc,
                 "secret",
-                .fx_login,
+                .{ .id = "fx_login", .label = "fx login", .refreshable = true },
                 "team",
             );
             defer credential.deinit(alloc);
@@ -1928,7 +1936,7 @@ test "ACP retained credential copy zeros a token when team allocation fails" {
     const alloc = Allocator{ .ptr = backing.ptr, .vtable = &vtable };
     try std.testing.expectError(
         error.OutOfMemory,
-        copyRetainedCredential(alloc, "secret", .fx_login, "team"),
+        copyRetainedCredential(alloc, "secret", .{ .id = "fx_login", .label = "fx login", .refreshable = true }, "team"),
     );
     for (buffer) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
@@ -1950,17 +1958,22 @@ test "ACP credential replacement zeros the previous token" {
         .alloc = alloc,
         .cfg = undefined,
         .writer = jsonrpc.Writer.init(),
-        .api_key = previous,
+        .route_credential = previous,
     };
 
     adoptConnectionCredential(&state, "connection", "adapter", .{
-        .token = replacement,
-        .source = .fx_login,
+        .secret_bytes = replacement,
+        .source = .{ .id = "fx_login", .label = "fx login", .refreshable = true },
+        .catalog_access = .{ .authenticated = .{
+            .source = .{ .id = "fx_login", .label = "fx login", .refreshable = true },
+            .credential = replacement,
+            .team_context = null,
+        } },
     });
-    defer secret.zeroAndFree(alloc, state.api_key);
+    defer secret.zeroAndFree(alloc, state.route_credential);
 
     for (buffer[0.."old-secret".len]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
-    try std.testing.expectEqualStrings("new-secret", state.api_key);
+    try std.testing.expectEqualStrings("new-secret", state.route_credential);
 }
 
 test "ACP legacy URL state requires consent and completion" {

@@ -24,7 +24,7 @@ pub fn historyContextBudgetTokensForCapabilities(capabilities: model_capabilitie
     );
 }
 
-pub fn buildGatewayMessages(
+pub fn buildModelMessages(
     alloc: Allocator,
     stable_prefix: []const ChatMessage,
     ephemeral_overlay: []const ChatMessage,
@@ -91,7 +91,7 @@ test "budgeted history projection uses corrected Anthropic window while remainin
     }
 
     const exact_budget = historyContextBudgetTokensForCapabilities(
-        model_capabilities.capabilitiesForModel("anthropic/claude-opus-4.8"),
+        .{ .context_window = 1_000_000 },
     );
     try std.testing.expectEqual(@as(usize, 250_000), exact_budget);
 
@@ -127,14 +127,14 @@ test "budgeted history projection uses corrected Anthropic window while remainin
         arena,
         &older_model_projection,
         history[0..4],
-        .{ .max_tokens = historyContextBudgetTokensForCapabilities(model_capabilities.capabilitiesForModel("anthropic/claude-opus-4.5")) },
+        .{ .max_tokens = historyContextBudgetTokensForCapabilities(.{ .context_window = 200_000 }) },
     );
     try std.testing.expectEqual(types.ChatRole.system, older_model_projection.items[0].role);
     try std.testing.expectEqual(@as(usize, 3), older_model_projection.items.len);
     try std.testing.expectEqualStrings(large_assistant, older_model_projection.items[older_model_projection.items.len - 1].content.?);
 }
 
-test "buildGatewayMessages orders transient overlay before history and current prompt" {
+test "buildModelMessages orders transient overlay before history and current prompt" {
     const alloc = std.testing.allocator;
     const stable_prefix = [_]ChatMessage{
         .{ .role = .system, .content = "stable system prompt" },
@@ -152,7 +152,7 @@ test "buildGatewayMessages orders transient overlay before history and current p
         .{ .role = .assistant, .content = "within turn assistant" },
     };
 
-    var messages = try buildGatewayMessages(alloc, &stable_prefix, &overlay, &history, current, &suffix);
+    var messages = try buildModelMessages(alloc, &stable_prefix, &overlay, &history, current, &suffix);
     defer messages.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 7), messages.items.len);
@@ -166,7 +166,7 @@ test "buildGatewayMessages orders transient overlay before history and current p
     try std.testing.expectEqual(types.ChatCachePolicy.no_cache, messages.items[2].cache_policy);
 }
 
-test "buildGatewayMessages preserves one system prefix for projected session history" {
+test "buildModelMessages preserves one system prefix for projected session history" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -237,7 +237,7 @@ test "buildGatewayMessages preserves one system prefix for projected session his
     const overlay = [_]ChatMessage{.{ .role = .system, .content = "ephemeral overlay" }};
     const current = ChatMessage{ .role = .user, .content = "current portable prompt" };
     const suffix = [_]ChatMessage{.{ .role = .assistant, .content = "within-turn suffix" }};
-    var messages = try buildGatewayMessages(
+    var messages = try buildModelMessages(
         arena,
         &stable_prefix,
         &overlay,

@@ -1,15 +1,15 @@
 const std = @import("std");
 const agent_stream_provider = @import("../../stream_provider.zig");
+const adapter_auth = @import("../../../gateway/adapter_auth.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
+const test_adapter = @import("../../../gateway/test_adapter.zig");
 const types = @import("../../../shared/types.zig");
 const token_estimate = @import("../../../shared/token_estimate.zig");
 const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
-const gateway_json = @import("../../../../gateway/gateway_json.zig");
 const model_capabilities = @import("../../../config/model_capabilities.zig");
 const connection_registry = @import("../../../gateway/connection_registry.zig");
 const route_snapshot = @import("../../../gateway/route_snapshot.zig");
-const test_model_descriptors = @import("../../../../builtins/gateway/model_descriptors.zig");
 const debug_trace = @import("../../../shared/debug_trace.zig");
 const image_attachments = @import("../../../images/image_attachments.zig");
 const io_mod = @import("../../../shared/io.zig");
@@ -19,6 +19,7 @@ const runtime_tool_contracts = @import("../tool_contracts.zig");
 const context_limits = @import("../../../config/context_limits.zig");
 const vision_executor = @import("../vision_executor.zig");
 const diagnostics = @import("../../../workspace/diagnostics.zig");
+
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const tool_dispatch = @import("../../../tooling/tool_dispatch.zig");
 
@@ -63,14 +64,14 @@ const VisionAndReadExecutor = struct {
         return .{
             .ctx = self,
             .run = execute,
-            .set_agent_stream_provider = setAgentStreamProvider,
+            .set_route_adapter = setRouteAdapter,
         };
     }
 
-    fn setAgentStreamProvider(raw: *anyopaque, provider: agent_stream_provider.Provider) void {
+    fn setRouteAdapter(raw: *anyopaque, adapter: agent_stream_provider.ProviderAdapter) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        if (self.vision.set_agent_stream_provider) |set_provider| {
-            set_provider(self.vision.ctx, provider);
+        if (self.vision.set_route_adapter) |set_adapter| {
+            set_adapter(self.vision.ctx, adapter);
         }
     }
 
@@ -172,7 +173,7 @@ fn expectPromptEntryRole(entry: std.json.Value, expected_role: types.ChatRole) !
     try std.testing.expect(entry == .object);
     const role = entry.object.get("role") orelse return error.TestExpectedPromptRoleMissing;
     try std.testing.expect(role == .string);
-    try std.testing.expectEqualStrings(gateway_json.roleName(expected_role), role.string);
+    try std.testing.expectEqualStrings(@tagName(expected_role), role.string);
 }
 
 fn expectGatewayPromptRoles(gateway: *const FakeGateway, index: usize, expected_roles: []const types.ChatRole) !void {
@@ -400,27 +401,38 @@ const VisionProviderScript = struct {
 
     const Response = union(enum) {
         content: []const u8,
-        http_status: std.http.Status,
+        failure: agent_stream_provider.StreamFailure.Category,
         cancel,
     };
 
     fn stream(
-        context: ?*anyopaque,
+        adapter: *const agent_stream_provider.ProviderAdapter,
         _: Allocator,
-        request: agent_stream_provider.Request,
-    ) anyerror!agent_stream_provider.Result {
-        const self: *VisionProviderScript = @ptrCast(@alignCast(context.?));
+        request: agent_stream_provider.AdapterRequest,
+        events: agent_stream_provider.EventSink,
+    ) anyerror!void {
+        const self: *VisionProviderScript = @ptrCast(@alignCast(adapter.context.?));
         if (self.calls >= self.responses.len) return error.TestVisionScriptExhausted;
         const response = self.responses[self.calls];
         self.calls += 1;
-        return switch (response) {
-            .content => |text| .{ .status = .ok, .completion = .{ .content = text } },
-            .http_status => |status| .{ .status = status },
-            .cancel => blk: {
-                request.cancel_flag.store(true, .seq_cst);
-                break :blk .{ .status = .ok };
+        switch (response) {
+            .content => |text| {
+                try events.emit(.provider_admitted);
+                try events.emit(.{ .text_delta = text });
+                try events.emit(.{ .finish = .{ .reason = .stop } });
             },
-        };
+            .failure => |category| {
+                try events.emit(.provider_admitted);
+                try events.emit(.{ .failure = .{
+                    .category = category,
+                    .retryable = category == .upstream_failure or category == .unavailable,
+                } });
+            },
+            .cancel => {
+                request.cancel_flag.store(true, .seq_cst);
+                try events.emit(.cancelled);
+            },
+        }
     }
 };
 
@@ -431,16 +443,14 @@ fn runScriptedVision(
     args_json: []const u8,
     output_limit_bytes: usize,
 ) !runtime_tool_contracts.ToolExecutionResult {
-    var provider = @import("../../../../builtins/gateway.zig").agent_stream_provider;
-    provider.context = script;
-    provider.stream_fn = VisionProviderScript.stream;
-    var adapter = @import("../../../../builtins/gateway.zig").provider_adapter;
-    adapter.legacy_provider = provider;
+    var adapter = test_adapter.provider_adapter;
+    adapter.context = script;
+    adapter.stream_fn = VisionProviderScript.stream;
     const route: route_snapshot.RouteSnapshot = .{
         .connection_id = "connection-a",
-        .adapter_kind = "vercel_ai_gateway",
+        .adapter_kind = test_adapter.connection_seed.adapter_id,
         .endpoint = "https://example.invalid",
-        .protocol = "vercel_ai_gateway",
+        .protocol = test_adapter.connection_seed.protocol.?,
         .credential_ref = "test",
         .primary_model_id = "google/gemini-2.5-flash",
         .permission_review_model_id = "openai/gpt-5.4",
@@ -572,7 +582,11 @@ test "processQueuedPrompt recovers when a model rejects post-Vision assistant pr
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
         .{ .content = "{\"images\":[{\"image_id\":1,\"status\":\"ok\",\"summary\":\"FX logo\",\"visible_text\":[],\"details\":[]}] }" },
-        .{ .status = .bad_request, .err_body = prefill_rejection },
+        .{
+            .failure_category = .protocol,
+            .failure_response_status = 400,
+            .failure_detail = prefill_rejection,
+        },
         .{ .content = "Recovered final answer" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -605,7 +619,6 @@ test "processQueuedPrompt recovers when a model rejects post-Vision assistant pr
         .user,
         "Continue from the preceding tool result.",
     );
-    try std.testing.expectEqual(@as(?std.http.Status, null), hooks.http_status);
     try std.testing.expectEqualStrings("Recovered final answer", hooks.finish_assistant_text.?);
 }
 
@@ -1391,7 +1404,7 @@ test "processQueuedPrompt preserves local failures when the filtered provider ba
     )};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
-        .{ .status = .service_unavailable },
+        .{ .failure_category = .unavailable, .failure_retryable = true },
         .{ .content = "Final filtered-outage answer" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -1666,7 +1679,7 @@ test "processQueuedPrompt reports exact Vision outage tip and permits normal rec
     const calls = [_]ToolCall{toolCall("call_vision_outage", "vision", "{\"image_ids\":[1],\"focus\":\"inspect\"}")};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
-        .{ .status = .bad_gateway, .err_body = "vision unavailable" },
+        .{ .failure_category = .upstream_failure, .failure_retryable = true, .failure_detail = "vision unavailable" },
         .{ .content = "I could not inspect the image." },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -1958,7 +1971,7 @@ test "vision does not retry a provider outage" {
     const catalog = [_]types.ImageAttachment{image};
 
     const responses = [_]VisionProviderScript.Response{
-        .{ .http_status = .bad_gateway },
+        .{ .failure = .upstream_failure },
         .{ .content = scripted_vision_ok },
     };
     var script = VisionProviderScript{ .responses = &responses };
@@ -2512,10 +2525,11 @@ test "processQueuedPrompt traces selected live controls without request payloads
     const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("max")};
     const capability_overrides = [_]ModelCapabilityOverride{.{
         .model = "openai/gpt-5.6-sol",
-        .capabilities = model_capabilities.resolveCapabilities("openai/gpt-5.6-sol", .{
+        .capabilities = .{
+            .supports_reasoning = true,
             .reasoning_efforts = .fromSlice(&efforts),
             .supports_fast_mode = true,
-        }),
+        },
     }};
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
@@ -2554,9 +2568,10 @@ test "processQueuedPrompt omits Fast without catalog support" {
     const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("high")};
     const capability_overrides = [_]ModelCapabilityOverride{.{
         .model = "anthropic/claude-opus-4.6",
-        .capabilities = model_capabilities.resolveCapabilities("anthropic/claude-opus-4.6", .{
+        .capabilities = .{
+            .supports_reasoning = true,
             .reasoning_efforts = .fromSlice(&efforts),
-        }),
+        },
     }};
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
@@ -2601,10 +2616,13 @@ test "processQueuedPrompt uses one admitted capability snapshot for history and 
     };
     const available_overrides = [_]ModelCapabilityOverride{.{
         .model = "anthropic/claude-opus-4.6",
-        .capabilities = model_capabilities.resolveCapabilities(
-            "anthropic/claude-opus-4.6",
-            .{ .context_window = 32_000, .max_output_tokens = 16_000 },
-        ),
+        .capabilities = blk: {
+            break :blk model_capabilities.Capabilities{
+                .prompt_caching = true,
+                .context_window = 32_000,
+                .max_output_tokens = 16_000,
+            };
+        },
     }};
     const completions = [_]FakeCompletion{.{ .content = "Done" }};
     var gateway = FakeGateway.init(alloc, &completions);
@@ -2650,7 +2668,6 @@ test "processQueuedPrompt projects bounded output limits into gateway requests" 
         var gateway = FakeGateway.init(alloc, &completions);
         defer gateway.deinit();
         var hooks = FakeAgentRuntimeDeps.init(alloc);
-        hooks.available_capability_overrides = &available_overrides;
         defer hooks.deinit();
         var fixture = PromptFixture{};
         var job = fixture.job();
@@ -2691,10 +2708,10 @@ test "processQueuedPrompt uses admitted catalog capabilities for opaque effort" 
     const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("future-tier")};
     const capability_overrides = [_]ModelCapabilityOverride{.{
         .model = "provider/new-reasoning-model",
-        .capabilities = model_capabilities.resolveCapabilities(
-            "provider/new-reasoning-model",
-            .{ .reasoning_efforts = .fromSlice(&efforts) },
-        ),
+        .capabilities = .{
+            .supports_reasoning = true,
+            .reasoning_efforts = .fromSlice(&efforts),
+        },
     }};
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
@@ -2791,14 +2808,14 @@ test "processQueuedPrompt publishes normalized adapter cancellation to the turn"
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
 }
 
-test "processQueuedPrompt keeps exact model identity and emits Gateway Fast" {
+test "processQueuedPrompt keeps exact model identity and emits selected fast mode" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .content = "Done" }};
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     const capability_overrides = [_]ModelCapabilityOverride{.{
         .model = "zai/glm-5.2",
-        .capabilities = model_capabilities.resolveCapabilities("zai/glm-5.2", .{ .supports_fast_mode = true }),
+        .capabilities = .{ .supports_fast_mode = true },
     }};
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
@@ -2815,7 +2832,6 @@ test "processQueuedPrompt keeps exact model identity and emits Gateway Fast" {
 
     try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
     try std.testing.expectEqualStrings("zai/glm-5.2", gateway.request_models.items[0]);
-    try std.testing.expectEqual(@as(usize, 0), hooks.capability_queries.items.len);
     try expectRootFieldAbsent(&gateway, 0, "fast");
     try expectBodyContains(&gateway, 0, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\"}}");
 }
@@ -2827,10 +2843,10 @@ test "processQueuedPrompt keeps directly selected fast model identity for portab
     defer gateway.deinit();
     const capability_overrides = [_]ModelCapabilityOverride{.{
         .model = "zai/glm-5.2-fast",
-        .capabilities = model_capabilities.resolveCapabilities(
-            "zai/glm-5.2-fast",
-            .{ .reasoning_efforts = .fromSlice(&[_]types.ReasoningEffort{types.ReasoningEffort.literal("high")}) },
-        ),
+        .capabilities = .{
+            .supports_reasoning = true,
+            .reasoning_efforts = .fromSlice(&[_]types.ReasoningEffort{types.ReasoningEffort.literal("high")}),
+        },
     }};
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
@@ -2859,10 +2875,11 @@ test "processQueuedPrompt filters stale controls against each queued model" {
         const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("xhigh")};
         const overrides = [_]ModelCapabilityOverride{.{
             .model = "anthropic/claude-opus-4.8",
-            .capabilities = model_capabilities.resolveCapabilities("anthropic/claude-opus-4.8", .{
+            .capabilities = .{
+                .supports_reasoning = true,
                 .reasoning_efforts = .fromSlice(&efforts),
                 .supports_fast_mode = true,
-            }),
+            },
         }};
         var hooks = FakeAgentRuntimeDeps.init(alloc);
         defer hooks.deinit();
@@ -2931,7 +2948,7 @@ test "processQueuedPrompt filters captured Fast by model capability" {
         defer gateway.deinit();
         const overrides = [_]ModelCapabilityOverride{.{
             .model = "anthropic/claude-opus-4.6",
-            .capabilities = model_capabilities.resolveCapabilities("anthropic/claude-opus-4.6", .{ .supports_fast_mode = true }),
+            .capabilities = .{ .supports_fast_mode = true },
         }};
         var hooks = FakeAgentRuntimeDeps.init(alloc);
         defer hooks.deinit();
@@ -2949,7 +2966,7 @@ test "processQueuedPrompt filters captured Fast by model capability" {
     }
 }
 
-test "provider and Fx search stay on connection A after selecting B" {
+test "provider and fx search stay on connection A after selecting B" {
     const Persistence = struct {
         fn write(
             _: ?*anyopaque,
@@ -2994,6 +3011,7 @@ test "provider and Fx search stay on connection A after selecting B" {
             switch (self.calls) {
                 1 => {
                     try expectRoute(request, "connection-a", "fake://a", "fake-ref-a", "secret-a", "fake/model-a");
+                    try std.testing.expectEqualStrings("session-a", request.session_id.?);
                     self.route_a_address = @intFromPtr(request.route);
                     try std.testing.expect(try self.registry.select("connection-b"));
                     const provider_search = ToolCall{
@@ -3016,6 +3034,7 @@ test "provider and Fx search stay on connection A after selecting B" {
                 },
                 2 => {
                     try expectRoute(request, "connection-a", "fake://a", "fake-ref-a", "secret-a", "fake/model-a");
+                    try std.testing.expectEqualStrings("session-a", request.session_id.?);
                     try std.testing.expectEqual(self.route_a_address.?, @intFromPtr(request.route));
                     try std.testing.expectEqualStrings("connection-b", self.registry.selectedProfile().id);
                     try events.emit(.{ .text_delta = "done-a" });
@@ -3023,10 +3042,11 @@ test "provider and Fx search stay on connection A after selecting B" {
                 },
                 3 => {
                     try expectRoute(request, "connection-b", "fake://b", "fake-ref-b", "secret-b", "fake/model-b");
+                    try std.testing.expectEqualStrings("session-b", request.session_id.?);
                     try events.emit(.{ .text_delta = "done-b" });
                     try events.emit(.{ .finish = .{ .reason = .stop } });
                 },
-                else => return error.TestUnexpectedGatewayRequest,
+                else => return error.TestUnexpectedAdapterRequest,
             }
         }
 
@@ -3037,9 +3057,9 @@ test "provider and Fx search stay on connection A after selecting B" {
             try std.testing.expectEqualStrings("fake://a", request.route.?.endpoint);
             try std.testing.expectEqualStrings("fake-ref-a", request.route.?.credential_ref);
             try std.testing.expectEqualStrings("secret-a", request.route_credential);
-            try std.testing.expectEqualStrings("test_non_vercel", request.provider_adapter.?.kind);
+            try std.testing.expectEqualStrings("test_non_vercel", request.route_adapter.?.kind);
             self.fx_search_calls += 1;
-            return .{ .model_output = "Fx search results from connection A" };
+            return .{ .model_output = "fx search results from connection A" };
         }
     };
 
@@ -3066,9 +3086,11 @@ test "provider and Fx search stay on connection A after selecting B" {
     var capture = Capture{ .registry = &registry };
     const adapter = agent_stream_provider.ProviderAdapter{
         .kind = "test_non_vercel",
+        .supported_protocol = "fake-protocol",
         .context = &capture,
         .stream_fn = Capture.stream,
     };
+    const adapters = [_]agent_stream_provider.ProviderAdapter{adapter};
 
     var fixture = PromptFixture{};
     const profile_a = registry.selectedProfile();
@@ -3093,12 +3115,18 @@ test "provider and Fx search stay on connection A after selecting B" {
     };
     defer hooks_a.deinit();
     var deps_a = hooks_a.deps();
-    deps_a.provider_adapter = adapter;
+    deps_a.adapter_registry = .{ .adapters = &adapters };
 
+    var lifecycle_a = test_support.testLifecycleContext(
+        lifecycle_hooks.RuntimeView.empty(),
+        alloc,
+        fixture.workspace_root,
+    );
+    lifecycle_a.scope.session_id = "session-a";
     try runtime_orchestrator.processQueuedPrompt(
         &deps_a,
         null,
-        test_support.testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, fixture.workspace_root),
+        lifecycle_a,
         fixture.config(),
         job_a,
     );
@@ -3124,11 +3152,17 @@ test "provider and Fx search stay on connection A after selecting B" {
     hooks_b.route_credential_overrides = hooks_a.route_credential_overrides;
     defer hooks_b.deinit();
     var deps_b = hooks_b.deps();
-    deps_b.provider_adapter = adapter;
+    deps_b.adapter_registry = .{ .adapters = &adapters };
+    var lifecycle_b = test_support.testLifecycleContext(
+        lifecycle_hooks.RuntimeView.empty(),
+        alloc,
+        fixture.workspace_root,
+    );
+    lifecycle_b.scope.session_id = "session-b";
     try runtime_orchestrator.processQueuedPrompt(
         &deps_b,
         null,
-        test_support.testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, fixture.workspace_root),
+        lifecycle_b,
         fixture.config(),
         job_b,
     );
@@ -3673,7 +3707,7 @@ test "processQueuedPrompt blocks accidental terminal restart of non-live backgro
     try expectBodyContains(&gateway, 1, command);
 }
 
-test "processQueuedPrompt projects history exactly once into each gateway request" {
+test "processQueuedPrompt projects history exactly once into each model request" {
     const alloc = std.testing.allocator;
     var history = [_]HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("past user unique history needle") },
@@ -4105,10 +4139,10 @@ test "processQueuedPrompt cancellation during provider backoff finishes interrup
     try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_clear_count);
 }
 
-test "processQueuedPrompt cancellation during HTTP backoff finishes interrupted" {
+test "processQueuedPrompt cancellation during retryable adapter backoff finishes interrupted" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
-        .{ .status = .service_unavailable },
+        .{ .failure_category = .unavailable, .failure_retryable = true },
         .{ .content = "must not send" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -4156,7 +4190,7 @@ test "processQueuedPrompt cancellation during network backoff clears retry statu
     try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_clear_count);
 }
 
-test "processQueuedPrompt disables provider option fast after a replay safe SSE failure" {
+test "processQueuedPrompt disables fast mode after a replay-safe stream failure" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
         .{ .finish_reason = .provider_error },
@@ -4166,7 +4200,7 @@ test "processQueuedPrompt disables provider option fast after a replay safe SSE 
     defer gateway.deinit();
     const overrides = [_]ModelCapabilityOverride{.{
         .model = "anthropic/claude-opus-4.6",
-        .capabilities = model_capabilities.resolveCapabilities("anthropic/claude-opus-4.6", .{ .supports_fast_mode = true }),
+        .capabilities = .{ .supports_fast_mode = true },
     }};
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
@@ -4188,17 +4222,17 @@ test "processQueuedPrompt disables provider option fast after a replay safe SSE 
     try expectRootFieldAbsent(&gateway, 1, "providerOptions");
 }
 
-test "processQueuedPrompt disables provider option fast after a replay safe HTTP failure" {
+test "processQueuedPrompt disables fast mode after a replay-safe adapter failure" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
-        .{ .status = .service_unavailable },
+        .{ .failure_category = .unavailable, .failure_retryable = true },
         .{ .content = "Recovered" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     const overrides = [_]ModelCapabilityOverride{.{
         .model = "anthropic/claude-opus-4.6",
-        .capabilities = model_capabilities.resolveCapabilities("anthropic/claude-opus-4.6", .{ .supports_fast_mode = true }),
+        .capabilities = .{ .supports_fast_mode = true },
     }};
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
@@ -4244,10 +4278,10 @@ test "processQueuedPrompt retries directly selected intrinsic fast model without
     try std.testing.expectEqualStrings("zai/glm-5.2-fast", gateway.request_models.items[1]);
 }
 
-test "processQueuedPrompt HTTP retry preserves directly selected intrinsic fast model ID" {
+test "processQueuedPrompt adapter retry preserves directly selected intrinsic fast model ID" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
-        .{ .status = .service_unavailable },
+        .{ .failure_category = .unavailable, .failure_retryable = true },
         .{ .content = "Recovered" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -4307,8 +4341,9 @@ test "processQueuedPrompt retries replay-safe ReadFailed before success" {
 
     const trace = try readTraceFile(alloc, trace_path, 65536);
     defer alloc.free(trace);
-    try std.testing.expect(std.mem.find(u8, trace, "event=stream_error") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "err=ReadFailed") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=stream_failure") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "category=transport") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "transport_cause=read_failed") != null);
     try std.testing.expect(std.mem.find(u8, trace, "provider_attempts=1/3") != null);
     try std.testing.expect(std.mem.find(u8, trace, "replay_safe=true") != null);
     try std.testing.expect(std.mem.find(u8, trace, "retry=true") != null);
@@ -4403,11 +4438,11 @@ test "processQueuedPrompt routes native network failure classes through one hear
 test "processQueuedPrompt starts network pacing independently from the shared retry budget" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
-        .{ .status = .service_unavailable, .retry_after_seconds = 0 },
-        .{ .status = .service_unavailable, .retry_after_seconds = 0 },
-        .{ .status = .service_unavailable, .retry_after_seconds = 0 },
-        .{ .status = .service_unavailable, .retry_after_seconds = 0 },
-        .{ .status = .service_unavailable, .retry_after_seconds = 0 },
+        .{ .failure_category = .provider_internal, .failure_retryable = true, .failure_detail = "HTTP 503", .retry_after_seconds = 0 },
+        .{ .failure_category = .provider_internal, .failure_retryable = true, .failure_detail = "HTTP 503", .retry_after_seconds = 0 },
+        .{ .failure_category = .provider_internal, .failure_retryable = true, .failure_detail = "HTTP 503", .retry_after_seconds = 0 },
+        .{ .failure_category = .provider_internal, .failure_retryable = true, .failure_detail = "HTTP 503", .retry_after_seconds = 0 },
+        .{ .failure_category = .provider_internal, .failure_retryable = true, .failure_detail = "HTTP 503", .retry_after_seconds = 0 },
         .{ .stream_error = error.ReadFailed },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -4429,9 +4464,9 @@ test "processQueuedPrompt starts network pacing independently from the shared re
     try std.testing.expectEqual(@as(u64, 0), network_status.delay_seconds);
 }
 
-test "processQueuedPrompt does not retry opaque JS host stream failures" {
+test "processQueuedPrompt does not retry opaque adapter stream failures" {
     const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{.{ .stream_error = error.JsHostStreamFailed }};
+    const completions = [_]FakeCompletion{.{ .stream_error = error.TestOpaqueAdapterFailure }};
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -4439,7 +4474,7 @@ test "processQueuedPrompt does not retry opaque JS host stream failures" {
     var fixture = PromptFixture{};
 
     try std.testing.expectError(
-        error.JsHostStreamFailed,
+        error.TestOpaqueAdapterFailure,
         runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()),
     );
 
@@ -4529,10 +4564,13 @@ test "processQueuedPrompt preserves fallback route and budget until selection ch
     const alloc = std.testing.allocator;
     var fixture = PromptFixture{};
     const checkpoint = session_codec.RecoveryCheckpoint{
-        .version = 2,
+        .version = session_codec.recovery_checkpoint_version,
         .route_identity = .{
-            .connection_id = @constCast("vercel"),
-            .adapter_kind = @constCast("vercel_ai_gateway"),
+            .connection_id = @constCast(test_adapter.connection_seed.id),
+            .adapter_kind = @constCast(test_adapter.connection_seed.adapter_id),
+            .endpoint = @constCast("https://example.invalid"),
+            .protocol = @constCast(test_adapter.connection_seed.protocol.?),
+            .credential_ref = @constCast(test_adapter.connection_seed.credential_ref),
             .permission_review_model_id = null,
             .vision_model_id = @constCast("google/gemini-2.5-flash"),
             .subagent_model_id = @constCast("zai/glm-5.2"),
@@ -4601,10 +4639,13 @@ test "processQueuedPrompt restores connectivity checkpoints through evidence" {
     const alloc = std.testing.allocator;
     var fixture = PromptFixture{};
     const checkpoint = session_codec.RecoveryCheckpoint{
-        .version = 2,
+        .version = session_codec.recovery_checkpoint_version,
         .route_identity = .{
-            .connection_id = @constCast("vercel"),
-            .adapter_kind = @constCast("vercel_ai_gateway"),
+            .connection_id = @constCast(test_adapter.connection_seed.id),
+            .adapter_kind = @constCast(test_adapter.connection_seed.adapter_id),
+            .endpoint = @constCast("https://example.invalid"),
+            .protocol = @constCast(test_adapter.connection_seed.protocol.?),
+            .credential_ref = @constCast(test_adapter.connection_seed.credential_ref),
             .permission_review_model_id = null,
             .vision_model_id = @constCast("google/gemini-2.5-flash"),
             .subagent_model_id = @constCast("zai/glm-5.2"),
@@ -4653,8 +4694,8 @@ test "processQueuedPrompt counts only failed provider attempts across tool follo
     };
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &first_calls },
-        .{ .status = .bad_gateway, .err_body = "gateway unavailable" },
-        .{ .status = .bad_gateway, .err_body = "gateway unavailable" },
+        .{ .failure_category = .upstream_failure, .failure_retryable = true, .failure_detail = "gateway unavailable", .failure_diagnostic_summary = "HTTP 502: gateway unavailable" },
+        .{ .failure_category = .upstream_failure, .failure_retryable = true, .failure_detail = "gateway unavailable", .failure_diagnostic_summary = "HTTP 502: gateway unavailable" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
@@ -5186,7 +5227,7 @@ test "processQueuedPrompt settles an interrupted local tool after a different st
     );
 }
 
-test "processQueuedPrompt settles an interrupted local tool after an HTTP failure" {
+test "processQueuedPrompt settles an interrupted local tool after an adapter failure" {
     const alloc = std.testing.allocator;
     const starts = [_]ToolCall{toolCall("call_read_interrupted", "read_file", "{}")};
     const completions = [_]FakeCompletion{
@@ -5194,7 +5235,7 @@ test "processQueuedPrompt settles an interrupted local tool after an HTTP failur
             .streamed_tool_starts = &starts,
             .stream_error_after_tool_starts = error.ReadFailed,
         },
-        .{ .status = .bad_gateway, .err_body = "upstream failed" },
+        .{ .failure_category = .upstream_failure, .failure_retryable = true, .failure_detail = "upstream failed" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
@@ -5209,7 +5250,7 @@ test "processQueuedPrompt settles an interrupted local tool after an HTTP failur
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try std.testing.expectEqual(@as(?std.http.Status, null), hooks.http_status);
+    try std.testing.expect(hooks.provider_failure_category == null);
     try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
     try expectFailedLifecycleContains(
         hooks.lifecycle_events.items,
@@ -5434,13 +5475,11 @@ test "processQueuedPrompt disable Fast recovery retries the same exact model" {
     const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("high")};
     const capability_overrides = [_]ModelCapabilityOverride{.{
         .model = "zai/glm-5.2",
-        .capabilities = model_capabilities.resolveCapabilities(
-            "zai/glm-5.2",
-            .{
-                .reasoning_efforts = .fromSlice(&efforts),
-                .supports_fast_mode = true,
-            },
-        ),
+        .capabilities = .{
+            .supports_reasoning = true,
+            .reasoning_efforts = .fromSlice(&efforts),
+            .supports_fast_mode = true,
+        },
     }};
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
@@ -5660,14 +5699,14 @@ test "processQueuedPrompt no-tool length bypasses silent-tool continuation" {
     try std.testing.expectEqualStrings("Done.", hooks.finish_assistant_text.?);
 }
 
-test "processQueuedPrompt non-ok gateway response sanitizes and clips HTTP detail" {
+test "processQueuedPrompt normalizes and clips provider failure detail" {
     const alloc = std.testing.allocator;
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(alloc);
     try body.appendSlice(alloc, " \n");
     for (0..4200) |_| try body.append(alloc, 'x');
     try body.appendSlice(alloc, "\n ");
-    const completions = [_]FakeCompletion{.{ .status = .bad_request, .err_body = body.items }};
+    const completions = [_]FakeCompletion{.{ .failure_category = .configuration, .failure_detail = body.items }};
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -5676,22 +5715,54 @@ test "processQueuedPrompt non-ok gateway response sanitizes and clips HTTP detai
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
-    try std.testing.expectEqual(std.http.Status.bad_request, hooks.http_status.?);
-    try std.testing.expect(hooks.http_detail.?.len <= 1024);
-    try std.testing.expect(hooks.http_detail.?.len > 1000);
-    try std.testing.expect(std.mem.startsWith(u8, hooks.http_detail.?, "\\x0a"));
-    try std.testing.expect(std.mem.indexOfScalar(u8, hooks.http_detail.?, '\n') == null);
+    try std.testing.expectEqual(
+        agent_stream_provider.StreamFailure.Category.configuration,
+        hooks.provider_failure_category.?,
+    );
+    try std.testing.expectEqual(@as(usize, 4096), hooks.provider_failure_detail.?.len);
+    try std.testing.expect(std.mem.find(u8, hooks.provider_failure_detail.?, "xxxx") != null);
 }
 
-test "processQueuedPrompt non-ok gateway response records schema diagnostics" {
+test "processQueuedPrompt preserves normalized terminal failures without another attempt" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "payment required", "model not found" }) |detail| {
+        const completions = [_]FakeCompletion{
+            .{ .failure_category = .protocol, .failure_detail = detail },
+            .{ .content = "must not be requested" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var config = fixture.config();
+        config.gateway_retry_count = 3;
+        config.max_provider_attempts = 3;
+
+        try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+        try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+        try std.testing.expectEqual(
+            agent_stream_provider.StreamFailure.Category.protocol,
+            hooks.provider_failure_category.?,
+        );
+        try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    }
+}
+
+test "processQueuedPrompt records normalized adapter diagnostics" {
     const alloc = std.testing.allocator;
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
 
-    const detail =
-        \\{"error":{"message":"Invalid input: expected string, received array","param":["prompt",0,"content"]}}
-    ;
-    const completions = [_]FakeCompletion{.{ .status = .bad_request, .err_body = detail }};
+    const completions = [_]FakeCompletion{.{
+        .failure_category = .configuration,
+        .failure_response_status = 400,
+        .failure_detail = "invalid request",
+        .failure_diagnostic_summary = "HTTP 400: invalid request",
+        .failure_tool_descriptor = "path=prompt.0.content expected=string received=array",
+        .failure_request_shape = "prompt.0 role=system content=string prompt.1 role=user content=array",
+    }};
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -5710,20 +5781,20 @@ test "processQueuedPrompt non-ok gateway response records schema diagnostics" {
     try std.testing.expect(call.step_id != 0);
     try std.testing.expectEqualStrings(
         "path=prompt.0.content expected=string received=array",
-        call.gatewaySchemaDiagnostic(),
+        call.toolDescriptorDiagnostic(),
     );
-    try std.testing.expect(std.mem.find(u8, call.gatewayRequestShape(), "prompt.0 role=system content=string") != null);
-    try std.testing.expect(std.mem.find(u8, call.gatewayRequestShape(), "prompt.1 role=user content=array") != null);
+    try std.testing.expect(std.mem.find(u8, call.modelRequestShape(), "prompt.0 role=system content=string") != null);
+    try std.testing.expect(std.mem.find(u8, call.modelRequestShape(), "prompt.1 role=user content=array") != null);
 }
 
-test "processQueuedPrompt refreshes fx login credential before gateway request" {
+test "processQueuedPrompt refreshes fx login credential before the model request" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .content = "Done." }};
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.credential_refresh_tokens = &.{"fresh-key"};
-    hooks.route_credential_source = .fx_login;
+    hooks.route_credential_source = .{ .id = "fx_login", .label = "fx login", .refreshable = true };
     defer hooks.deinit();
     var fixture = PromptFixture{};
     const job = fixture.job();
@@ -5733,15 +5804,15 @@ test "processQueuedPrompt refreshes fx login credential before gateway request" 
     try std.testing.expectEqual(@as(usize, 1), gateway.request_api_keys.items.len);
     try std.testing.expectEqualStrings("fresh-key", gateway.request_api_keys.items[0]);
     try std.testing.expectEqual(@as(usize, 1), hooks.credential_refresh_modes.items.len);
-    try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.if_needed, hooks.credential_refresh_modes.items[0]);
+    try std.testing.expectEqual(adapter_auth.RefreshMode.if_needed, hooks.credential_refresh_modes.items[0]);
 }
 
-test "processQueuedPrompt refreshes and retries once after fx login 401" {
+test "processQueuedPrompt refreshes and retries once after fx login authentication failure" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
         .{
-            .status = .unauthorized,
-            .err_body = "{\"error\":{\"message\":\"expired\"}}",
+            .failure_category = .authentication,
+            .failure_detail = "expired",
         },
         .{ .content = "Done." },
     };
@@ -5749,7 +5820,7 @@ test "processQueuedPrompt refreshes and retries once after fx login 401" {
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.credential_refresh_tokens = &.{ "still-stale", "fresh-after-401" };
-    hooks.route_credential_source = .fx_login;
+    hooks.route_credential_source = .{ .id = "fx_login", .label = "fx login", .refreshable = true };
     defer hooks.deinit();
     var fixture = PromptFixture{};
     const job = fixture.job();
@@ -5760,21 +5831,21 @@ test "processQueuedPrompt refreshes and retries once after fx login 401" {
     try std.testing.expectEqualStrings("still-stale", gateway.request_api_keys.items[0]);
     try std.testing.expectEqualStrings("fresh-after-401", gateway.request_api_keys.items[1]);
     try std.testing.expectEqual(@as(usize, 2), hooks.credential_refresh_modes.items.len);
-    try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.if_needed, hooks.credential_refresh_modes.items[0]);
-    try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.force, hooks.credential_refresh_modes.items[1]);
+    try std.testing.expectEqual(adapter_auth.RefreshMode.if_needed, hooks.credential_refresh_modes.items[0]);
+    try std.testing.expectEqual(adapter_auth.RefreshMode.force, hooks.credential_refresh_modes.items[1]);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
-test "processQueuedPrompt does not retry a second fx login 401" {
+test "processQueuedPrompt does not retry a second fx login authentication failure" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
         .{
-            .status = .unauthorized,
-            .err_body = "{\"error\":{\"message\":\"expired\"}}",
+            .failure_category = .authentication,
+            .failure_detail = "expired",
         },
         .{
-            .status = .unauthorized,
-            .err_body = "{\"error\":{\"message\":\"still unauthorized\"}}",
+            .failure_category = .authentication,
+            .failure_detail = "still unauthorized",
         },
         .{ .content = "must not be requested" },
     };
@@ -5782,7 +5853,7 @@ test "processQueuedPrompt does not retry a second fx login 401" {
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.credential_refresh_tokens = &.{ "still-stale", "fresh-after-401", "must-not-use" };
-    hooks.route_credential_source = .fx_login;
+    hooks.route_credential_source = .{ .id = "fx_login", .label = "fx login", .refreshable = true };
     defer hooks.deinit();
     var fixture = PromptFixture{};
     const job = fixture.job();
@@ -5793,7 +5864,7 @@ test "processQueuedPrompt does not retry a second fx login 401" {
     try std.testing.expectEqualStrings("still-stale", gateway.request_api_keys.items[0]);
     try std.testing.expectEqualStrings("fresh-after-401", gateway.request_api_keys.items[1]);
     try std.testing.expectEqual(@as(usize, 2), hooks.credential_refresh_modes.items.len);
-    try std.testing.expectEqual(std.http.Status.unauthorized, hooks.http_status.?);
+    try std.testing.expectEqual(agent_stream_provider.StreamFailure.Category.authentication, hooks.provider_failure_category.?);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
 }
 
@@ -5801,8 +5872,8 @@ test "processQueuedPrompt keeps the selected fx login credential when forced ref
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
         .{
-            .status = .unauthorized,
-            .err_body = "{\"error\":{\"message\":\"expired\"}}",
+            .failure_category = .authentication,
+            .failure_detail = "expired",
         },
         .{ .content = "must not be requested" },
     };
@@ -5810,7 +5881,7 @@ test "processQueuedPrompt keeps the selected fx login credential when forced ref
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.credential_refresh_tokens = &.{"selected-login-token"};
-    hooks.route_credential_source = .fx_login;
+    hooks.route_credential_source = .{ .id = "fx_login", .label = "fx login", .refreshable = true };
     defer hooks.deinit();
     var fixture = PromptFixture{};
     const job = fixture.job();
@@ -5820,9 +5891,9 @@ test "processQueuedPrompt keeps the selected fx login credential when forced ref
     try std.testing.expectEqual(@as(usize, 1), gateway.request_api_keys.items.len);
     try std.testing.expectEqualStrings("selected-login-token", gateway.request_api_keys.items[0]);
     try std.testing.expectEqual(@as(usize, 2), hooks.credential_refresh_modes.items.len);
-    try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.force, hooks.credential_refresh_modes.items[1]);
-    try std.testing.expectEqual(std.http.Status.unauthorized, hooks.http_status.?);
-    try std.testing.expectEqual(types.CredentialSource.fx_login, hooks.http_credential_source.?);
+    try std.testing.expectEqual(adapter_auth.RefreshMode.force, hooks.credential_refresh_modes.items[1]);
+    try std.testing.expectEqual(agent_stream_provider.StreamFailure.Category.authentication, hooks.provider_failure_category.?);
+    try std.testing.expectEqualStrings("fx_login", hooks.provider_failure_source.?.id);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
 }
 
@@ -5833,7 +5904,7 @@ test "processQueuedPrompt stops before Gateway after conditional refresh failure
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.credential_refresh_error = error.OAuthRequestFailed;
-    hooks.route_credential_source = .fx_login;
+    hooks.route_credential_source = .{ .id = "fx_login", .label = "fx login", .refreshable = true };
     defer hooks.deinit();
     var fixture = PromptFixture{};
     const job = fixture.job();
@@ -5845,21 +5916,21 @@ test "processQueuedPrompt stops before Gateway after conditional refresh failure
 
     try std.testing.expectEqual(@as(usize, 0), gateway.request_api_keys.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.credential_refresh_modes.items.len);
-    try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.if_needed, hooks.credential_refresh_modes.items[0]);
+    try std.testing.expectEqual(adapter_auth.RefreshMode.if_needed, hooks.credential_refresh_modes.items[0]);
 }
 
 test "processQueuedPrompt does not refresh or retry non-refreshable credential sources" {
     const alloc = std.testing.allocator;
-    const sources = [_]types.CredentialSource{
-        .vercel_oidc_token,
-        .ai_gateway_api_key,
-        .stored_key,
+    const sources = [_]adapter_auth.Source{
+        .{ .id = "source_a", .label = "source A", .refreshable = false },
+        .{ .id = "source_b", .label = "source B", .refreshable = false },
+        .{ .id = "source_c", .label = "source C", .refreshable = false },
     };
 
     for (sources) |source| {
         const completions = [_]FakeCompletion{.{
-            .status = .unauthorized,
-            .err_body = "{\"error\":{\"message\":\"invalid\"}}",
+            .failure_category = .authentication,
+            .failure_detail = "invalid",
         }};
         var gateway = FakeGateway.init(alloc, &completions);
         defer gateway.deinit();
@@ -5875,8 +5946,8 @@ test "processQueuedPrompt does not refresh or retry non-refreshable credential s
         try std.testing.expectEqual(@as(usize, 1), gateway.request_api_keys.items.len);
         try std.testing.expectEqualStrings("key", gateway.request_api_keys.items[0]);
         try std.testing.expectEqual(@as(usize, 0), hooks.credential_refresh_modes.items.len);
-        try std.testing.expectEqual(std.http.Status.unauthorized, hooks.http_status.?);
-        try std.testing.expectEqual(source, hooks.http_credential_source.?);
+        try std.testing.expectEqual(agent_stream_provider.StreamFailure.Category.authentication, hooks.provider_failure_category.?);
+        try std.testing.expectEqualStrings(source.id, hooks.provider_failure_source.?.id);
         try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
     }
 }
@@ -5996,8 +6067,8 @@ test "processQueuedPrompt trace records history shape returned tool calls and wa
     try std.testing.expect(std.mem.find(u8, trace, "event=projection_end") != null);
     try std.testing.expect(std.mem.find(u8, trace, "history_turn_kinds=interrupted") != null);
     try std.testing.expect(std.mem.find(u8, trace, "projected_message_roles=user,assistant,tool,user") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "event=before_payload_build") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "event=after_payload_build") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=before_model_request") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=model_request_built") != null);
     try std.testing.expect(std.mem.find(u8, trace, "event=returned_tool_call") != null);
     try std.testing.expect(std.mem.find(u8, trace, "call_id=call_1 tool_name=write_file") != null);
     try std.testing.expect(std.mem.find(u8, trace, "args_preview=<object_fields=3 values=[") != null);

@@ -4,6 +4,66 @@ const connection_registry = @import("connection_registry.zig");
 
 const Allocator = std.mem.Allocator;
 
+pub const recovery_identity_version: u8 = 1;
+
+pub const RecoveryRouteIdentity = struct {
+    version: u8 = recovery_identity_version,
+    connection_id: []u8,
+    adapter_kind: []u8,
+    endpoint: ?[]u8 = null,
+    protocol: ?[]u8 = null,
+    credential_ref: ?[]u8 = null,
+    permission_review_model_id: ?[]u8,
+    vision_model_id: ?[]u8,
+    subagent_model_id: []u8,
+
+    pub fn deinit(self: *RecoveryRouteIdentity, alloc: Allocator) void {
+        alloc.free(self.connection_id);
+        alloc.free(self.adapter_kind);
+        if (self.endpoint) |value| alloc.free(value);
+        if (self.protocol) |value| alloc.free(value);
+        if (self.credential_ref) |value| alloc.free(value);
+        if (self.permission_review_model_id) |model| alloc.free(model);
+        if (self.vision_model_id) |model| alloc.free(model);
+        alloc.free(self.subagent_model_id);
+        self.* = undefined;
+    }
+
+    pub fn dupe(self: RecoveryRouteIdentity, alloc: Allocator) !RecoveryRouteIdentity {
+        const connection_id = try alloc.dupe(u8, self.connection_id);
+        errdefer alloc.free(connection_id);
+        const adapter_kind = try alloc.dupe(u8, self.adapter_kind);
+        errdefer alloc.free(adapter_kind);
+        const endpoint = if (self.endpoint) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (endpoint) |value| alloc.free(value);
+        const protocol = if (self.protocol) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (protocol) |value| alloc.free(value);
+        const credential_ref = if (self.credential_ref) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (credential_ref) |value| alloc.free(value);
+        const permission_review_model_id = if (self.permission_review_model_id) |model|
+            try alloc.dupe(u8, model)
+        else
+            null;
+        errdefer if (permission_review_model_id) |model| alloc.free(model);
+        const vision_model_id = if (self.vision_model_id) |model|
+            try alloc.dupe(u8, model)
+        else
+            null;
+        errdefer if (vision_model_id) |model| alloc.free(model);
+        return .{
+            .version = self.version,
+            .connection_id = connection_id,
+            .adapter_kind = adapter_kind,
+            .endpoint = endpoint,
+            .protocol = protocol,
+            .credential_ref = credential_ref,
+            .permission_review_model_id = permission_review_model_id,
+            .vision_model_id = vision_model_id,
+            .subagent_model_id = try alloc.dupe(u8, self.subagent_model_id),
+        };
+    }
+};
+
 pub fn recoveryDescriptor(
     route_model: []const u8,
     resolved: model_capabilities.ModelDescriptor,
@@ -20,10 +80,28 @@ pub fn recoveryDescriptor(
 
 pub fn validateRecoveryProfile(
     profile: connection_registry.Profile,
-    expected_adapter_kind: []const u8,
+    seed: connection_registry.Seed,
+    identity: RecoveryRouteIdentity,
 ) !void {
-    if (!std.mem.eql(u8, profile.adapter_id, expected_adapter_kind)) {
-        return error.RecoveryRouteAdapterChanged;
+    if (identity.version != recovery_identity_version or
+        identity.endpoint == null or
+        identity.protocol == null or
+        identity.credential_ref == null)
+    {
+        return error.RecoveryRouteAuthorityUnavailable;
+    }
+    const endpoint = profile.endpoint orelse
+        (if (std.mem.eql(u8, profile.id, seed.id)) seed.endpoint else null) orelse
+        return error.RecoveryRouteAuthorityChanged;
+    const protocol = profile.protocol orelse return error.RecoveryRouteAuthorityChanged;
+    if (!std.mem.eql(u8, profile.id, identity.connection_id) or
+        !std.mem.eql(u8, profile.adapter_id, identity.adapter_kind) or
+        !std.mem.eql(u8, endpoint, identity.endpoint.?) or
+        !std.mem.eql(u8, protocol, identity.protocol.?) or
+        (!std.mem.eql(u8, profile.credential_ref, "automatic") and
+            !std.mem.eql(u8, profile.credential_ref, identity.credential_ref.?)))
+    {
+        return error.RecoveryRouteAuthorityChanged;
     }
 }
 
@@ -48,12 +126,10 @@ pub const RouteSnapshot = struct {
         profile: connection_registry.Profile,
         seed: connection_registry.Seed,
         model_descriptor: model_capabilities.ModelDescriptor,
-        seed_endpoint: []const u8,
     ) !RouteSnapshot {
-        const endpoint = if (std.mem.eql(u8, profile.id, seed.id))
-            seed_endpoint
-        else
-            profile.endpoint orelse return error.InvalidRouteEndpoint;
+        const endpoint = profile.endpoint orelse
+            (if (std.mem.eql(u8, profile.id, seed.id)) seed.endpoint else null) orelse
+            return error.InvalidRouteEndpoint;
         return admit(alloc, profile, model_descriptor, endpoint);
     }
 
@@ -72,26 +148,29 @@ pub const RouteSnapshot = struct {
         );
     }
 
-    pub fn admitRecovery(
+    fn admitRecovery(
         alloc: Allocator,
         profile: connection_registry.Profile,
-        expected_adapter_kind: []const u8,
-        permission_review_model_id: ?[]const u8,
-        vision_model_id: ?[]const u8,
-        subagent_model_id: []const u8,
+        identity: RecoveryRouteIdentity,
         model_descriptor: model_capabilities.ModelDescriptor,
         effective_endpoint: []const u8,
     ) !RouteSnapshot {
-        try validateRecoveryProfile(profile, expected_adapter_kind);
+        const credential_ref = identity.credential_ref orelse
+            return error.RecoveryRouteAuthorityUnavailable;
+        var pinned_profile = profile;
+        pinned_profile.id = identity.connection_id;
+        pinned_profile.adapter_id = identity.adapter_kind;
+        pinned_profile.protocol = identity.protocol;
+        pinned_profile.credential_ref = credential_ref;
         return admitWithInternalModels(
             alloc,
-            profile,
+            pinned_profile,
             model_descriptor,
             effective_endpoint,
             .{
-                .permission_review = permission_review_model_id,
-                .vision = vision_model_id,
-                .subagent = subagent_model_id,
+                .permission_review = identity.permission_review_model_id,
+                .vision = identity.vision_model_id,
+                .subagent = identity.subagent_model_id,
             },
         );
     }
@@ -100,26 +179,16 @@ pub const RouteSnapshot = struct {
         alloc: Allocator,
         profile: connection_registry.Profile,
         seed: connection_registry.Seed,
-        expected_adapter_kind: []const u8,
-        permission_review_model_id: ?[]const u8,
-        vision_model_id: ?[]const u8,
-        subagent_model_id: []const u8,
+        identity: RecoveryRouteIdentity,
         model_descriptor: model_capabilities.ModelDescriptor,
-        seed_endpoint: []const u8,
     ) !RouteSnapshot {
-        const endpoint = if (std.mem.eql(u8, profile.id, seed.id))
-            seed_endpoint
-        else
-            profile.endpoint orelse return error.InvalidRouteEndpoint;
+        try validateRecoveryProfile(profile, seed, identity);
         return admitRecovery(
             alloc,
             profile,
-            expected_adapter_kind,
-            permission_review_model_id,
-            vision_model_id,
-            subagent_model_id,
+            identity,
             model_descriptor,
-            endpoint,
+            identity.endpoint.?,
         );
     }
 
@@ -478,7 +547,7 @@ test "route admission rejects invalid model protocol and endpoint" {
     );
 }
 
-test "selected route applies the seed override only to the seed connection" {
+test "selected route uses profile endpoint before the seed endpoint" {
     const seed = connection_registry.Seed{
         .id = "seed",
         .display_name = "Seed",
@@ -504,7 +573,6 @@ test "selected route applies the seed override only to the seed connection" {
         custom_profile,
         seed,
         descriptor,
-        "https://override.invalid",
     );
     defer custom_route.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("https://custom.invalid", custom_route.endpoint);
@@ -515,13 +583,20 @@ test "selected route applies the seed override only to the seed connection" {
         custom_profile,
         seed,
         descriptor,
-        "https://override.invalid",
     );
     defer seed_route.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("https://override.invalid", seed_route.endpoint);
+    try std.testing.expectEqualStrings("https://custom.invalid", seed_route.endpoint);
 }
 
-test "recovery route rejects an adapter mismatch before admission" {
+test "recovery route rejects changed authority before admission" {
+    const seed = connection_registry.Seed{
+        .id = "saved",
+        .display_name = "Saved",
+        .adapter_id = "changed-adapter",
+        .endpoint = "https://saved.invalid",
+        .protocol = "saved-protocol",
+        .credential_ref = "saved-ref",
+    };
     const profile = connection_registry.Profile{
         .id = @constCast("saved"),
         .display_name = @constCast("Saved"),
@@ -534,16 +609,168 @@ test "recovery route rejects an adapter mismatch before admission" {
     };
 
     try std.testing.expectError(
-        error.RecoveryRouteAdapterChanged,
-        RouteSnapshot.admitRecovery(
+        error.RecoveryRouteAuthorityChanged,
+        RouteSnapshot.admitSelectedRecovery(
             std.testing.allocator,
             profile,
-            "persisted-adapter",
-            "persisted-reviewer",
-            "persisted-vision",
-            "persisted-child",
+            seed,
+            .{
+                .connection_id = @constCast("saved"),
+                .adapter_kind = @constCast("persisted-adapter"),
+                .endpoint = @constCast("https://saved.invalid"),
+                .protocol = @constCast("saved-protocol"),
+                .credential_ref = @constCast("saved-ref"),
+                .permission_review_model_id = @constCast("persisted-reviewer"),
+                .vision_model_id = @constCast("persisted-vision"),
+                .subagent_model_id = @constCast("persisted-child"),
+            },
             model_capabilities.configuredDescriptor("persisted-model", .{}),
-            profile.endpoint.?,
         ),
     );
+}
+
+test "recovery profile requires every pinned authority field" {
+    const seed = connection_registry.Seed{
+        .id = "saved",
+        .display_name = "Saved",
+        .adapter_id = "saved-adapter",
+        .endpoint = "https://saved.invalid",
+        .protocol = "saved-protocol",
+        .credential_ref = "saved-ref",
+    };
+    const identity = RecoveryRouteIdentity{
+        .connection_id = @constCast("saved"),
+        .adapter_kind = @constCast("saved-adapter"),
+        .endpoint = @constCast("https://saved.invalid"),
+        .protocol = @constCast("saved-protocol"),
+        .credential_ref = @constCast("saved-ref"),
+        .permission_review_model_id = null,
+        .vision_model_id = null,
+        .subagent_model_id = @constCast("saved-model"),
+    };
+    const changes = [_]struct {
+        endpoint: []u8,
+        protocol: []u8,
+        credential_ref: []u8,
+    }{
+        .{
+            .endpoint = @constCast("https://changed.invalid"),
+            .protocol = @constCast("saved-protocol"),
+            .credential_ref = @constCast("saved-ref"),
+        },
+        .{
+            .endpoint = @constCast("https://saved.invalid"),
+            .protocol = @constCast("changed-protocol"),
+            .credential_ref = @constCast("saved-ref"),
+        },
+        .{
+            .endpoint = @constCast("https://saved.invalid"),
+            .protocol = @constCast("saved-protocol"),
+            .credential_ref = @constCast("changed-ref"),
+        },
+    };
+    for (changes) |change| {
+        const profile = connection_registry.Profile{
+            .id = @constCast("saved"),
+            .display_name = @constCast("Saved"),
+            .adapter_id = @constCast("saved-adapter"),
+            .endpoint = change.endpoint,
+            .protocol = change.protocol,
+            .credential_ref = change.credential_ref,
+            .remembered_model = @constCast("saved-model"),
+            .internal_models = .{},
+        };
+        try std.testing.expectError(
+            error.RecoveryRouteAuthorityChanged,
+            validateRecoveryProfile(profile, seed, identity),
+        );
+    }
+
+    var legacy_identity = identity;
+    legacy_identity.version = 0;
+    const saved_profile = connection_registry.Profile{
+        .id = @constCast("saved"),
+        .display_name = @constCast("Saved"),
+        .adapter_id = @constCast("saved-adapter"),
+        .endpoint = @constCast("https://saved.invalid"),
+        .protocol = @constCast("saved-protocol"),
+        .credential_ref = @constCast("saved-ref"),
+        .remembered_model = @constCast("saved-model"),
+        .internal_models = .{},
+    };
+    try std.testing.expectError(
+        error.RecoveryRouteAuthorityUnavailable,
+        validateRecoveryProfile(saved_profile, seed, legacy_identity),
+    );
+}
+
+test "recovery route owns pinned authority and model presentation" {
+    const seed = connection_registry.Seed{
+        .id = "saved",
+        .display_name = "Saved",
+        .adapter_id = "saved-adapter",
+        .endpoint = "https://saved.invalid",
+        .protocol = "saved-protocol",
+        .credential_ref = "automatic",
+    };
+    const identity = RecoveryRouteIdentity{
+        .connection_id = @constCast("saved"),
+        .adapter_kind = @constCast("saved-adapter"),
+        .endpoint = @constCast("https://saved.invalid"),
+        .protocol = @constCast("saved-protocol"),
+        .credential_ref = @constCast("saved-effective-ref"),
+        .permission_review_model_id = @constCast("saved-reviewer"),
+        .vision_model_id = @constCast("saved-vision"),
+        .subagent_model_id = @constCast("saved-subagent"),
+    };
+    const profile = connection_registry.Profile{
+        .id = @constCast("saved"),
+        .display_name = @constCast("Saved"),
+        .adapter_id = @constCast("saved-adapter"),
+        .endpoint = @constCast("https://saved.invalid"),
+        .protocol = @constCast("saved-protocol"),
+        .credential_ref = @constCast("automatic"),
+        .remembered_model = @constCast("changed-model"),
+        .internal_models = .{},
+    };
+    var route = try RouteSnapshot.admitSelectedRecovery(
+        std.testing.allocator,
+        profile,
+        seed,
+        identity,
+        model_capabilities.configuredDescriptor("saved-primary", .{}),
+    );
+    defer route.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("https://saved.invalid", route.endpoint);
+    try std.testing.expectEqualStrings("saved-protocol", route.protocol);
+    try std.testing.expectEqualStrings("saved-effective-ref", route.credential_ref);
+    try std.testing.expectEqualStrings("saved-primary", route.primary_model_id);
+    try std.testing.expectEqualStrings("saved-reviewer", route.permission_review_model_id.?);
+    try std.testing.expectEqualStrings("saved-vision", route.vision_model_id.?);
+    try std.testing.expectEqualStrings("saved-subagent", route.subagent_model_id);
+}
+
+test "recovery identity duplication frees every allocation failure boundary" {
+    const identity = RecoveryRouteIdentity{
+        .connection_id = @constCast("saved"),
+        .adapter_kind = @constCast("saved-adapter"),
+        .endpoint = @constCast("https://saved.invalid"),
+        .protocol = @constCast("saved-protocol"),
+        .credential_ref = @constCast("saved-ref"),
+        .permission_review_model_id = @constCast("saved-reviewer"),
+        .vision_model_id = @constCast("saved-vision"),
+        .subagent_model_id = @constCast("saved-subagent"),
+    };
+    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var duplicated = try identity.dupe(probe.allocator());
+    duplicated.deinit(probe.allocator());
+
+    for (0..probe.alloc_index) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        try std.testing.expectError(error.OutOfMemory, identity.dupe(failing.allocator()));
+    }
 }

@@ -34,19 +34,19 @@ const ActiveTokenRequest = struct {
     }
 };
 
-pub const GatewayFailureDiagnostics = struct {
-    schema: []const u8 = "",
+pub const ModelFailureDiagnostics = struct {
+    tool_descriptor: []const u8 = "",
     request_shape: []const u8 = "",
 };
 
-pub fn recordGatewayCallMetric(model: []const u8, started_at_ms: i64, status: u16, response_bytes: u32, input_tokens: u32, output_tokens: u32, turn_id: u64, step_id: u64, subagent_id: u64, error_name: []const u8, terminal_stop_reason: []const u8) void {
-    recordGatewayCallMetricWithDiagnostics(model, started_at_ms, status, response_bytes, input_tokens, output_tokens, turn_id, step_id, subagent_id, error_name, terminal_stop_reason, .{});
+pub fn recordModelCallMetric(model: []const u8, started_at_ms: i64, response_bytes: u32, input_tokens: u32, output_tokens: u32, turn_id: u64, step_id: u64, subagent_id: u64, error_name: []const u8, terminal_stop_reason: []const u8) void {
+    recordModelCallMetricWithDiagnostics(model, started_at_ms, 0, response_bytes, input_tokens, output_tokens, turn_id, step_id, subagent_id, error_name, terminal_stop_reason, .{});
 }
 
-pub fn recordGatewayCallMetricWithDiagnostics(
+pub fn recordModelCallMetricWithDiagnostics(
     model: []const u8,
     started_at_ms: i64,
-    status: u16,
+    response_status: u16,
     response_bytes: u32,
     input_tokens: u32,
     output_tokens: u32,
@@ -55,14 +55,14 @@ pub fn recordGatewayCallMetricWithDiagnostics(
     subagent_id: u64,
     error_name: []const u8,
     terminal_stop_reason: []const u8,
-    failure_diagnostics: GatewayFailureDiagnostics,
+    failure_diagnostics: ModelFailureDiagnostics,
 ) void {
     const now_ms = io_mod.milliTimestamp();
     const elapsed = if (now_ms > started_at_ms) now_ms - started_at_ms else 0;
     var call: diagnostics.NetworkCall = .{
         .started_at_ms = started_at_ms,
         .duration_ms = @intCast(@min(@as(i64, elapsed), std.math.maxInt(u32))),
-        .status = status,
+        .status = response_status,
         .response_bytes = response_bytes,
         .input_tokens = input_tokens,
         .output_tokens = output_tokens,
@@ -73,8 +73,8 @@ pub fn recordGatewayCallMetricWithDiagnostics(
     call.setModel(model);
     if (error_name.len > 0) call.setError(error_name);
     if (terminal_stop_reason.len > 0) call.setTerminalStopReason(terminal_stop_reason);
-    if (failure_diagnostics.schema.len > 0) call.setGatewaySchemaDiagnostic(failure_diagnostics.schema);
-    if (failure_diagnostics.request_shape.len > 0) call.setGatewayRequestShape(failure_diagnostics.request_shape);
+    if (failure_diagnostics.tool_descriptor.len > 0) call.setToolDescriptorDiagnostic(failure_diagnostics.tool_descriptor);
+    if (failure_diagnostics.request_shape.len > 0) call.setModelRequestShape(failure_diagnostics.request_shape);
     diagnostics.recordNetworkCall(call);
 }
 
@@ -182,7 +182,7 @@ pub const StepLimitTrace = struct {
     ctx: TraceContext,
     step_index: usize,
     step_limit: usize,
-    gateway_message_count: usize,
+    message_count: usize,
     completed_tool_names: []const []u8,
     last_tool_call_name: []const u8,
     last_tool_call_id: []const u8,
@@ -197,13 +197,13 @@ pub fn traceStepLimitReached(trace: StepLimitTrace) void {
 
     debug_trace.logf(
         "agent",
-        "step limit reached turn_id={d} step_id={d} step_index={d} step_limit={d} gateway_messages={d} completed_tool_count={d} completed_tool_names={s} last_tool_call_name={s} last_tool_call_id={s} outcome_kind=step_limit",
+        "step limit reached turn_id={d} step_id={d} step_index={d} step_limit={d} model_messages={d} completed_tool_count={d} completed_tool_names={s} last_tool_call_name={s} last_tool_call_id={s} outcome_kind=step_limit",
         .{
             trace.ctx.turn_id,
             trace.ctx.step_id,
             trace.step_index,
             trace.step_limit,
-            trace.gateway_message_count,
+            trace.message_count,
             trace.completed_tool_names.len,
             completed_tool_names,
             trace.last_tool_call_name,
@@ -214,11 +214,11 @@ pub fn traceStepLimitReached(trace: StepLimitTrace) void {
         "agent",
         "step_limit_reached",
         trace.ctx,
-        "step_index={d} step_limit={d} gateway_messages={d} completed_tool_count={d} completed_tool_names={s} last_tool_call_name={s} last_tool_call_id={s} outcome_kind=step_limit",
+        "step_index={d} step_limit={d} model_messages={d} completed_tool_count={d} completed_tool_names={s} last_tool_call_name={s} last_tool_call_id={s} outcome_kind=step_limit",
         .{
             trace.step_index,
             trace.step_limit,
-            trace.gateway_message_count,
+            trace.message_count,
             trace.completed_tool_names.len,
             completed_tool_names,
             trace.last_tool_call_name,
@@ -331,12 +331,11 @@ test "tool telemetry facts count neutral local and provider descriptors" {
     try std.testing.expectEqual(@as(usize, 5), facts.total());
 }
 
-pub fn traceGatewayRequestBuilt(ctx: TraceContext, model: []const u8, payload_bytes: usize, gateway_message_count: usize, tool_facts: ToolFacts) void {
+pub fn traceModelRequestBuilt(ctx: TraceContext, model: []const u8, message_count: usize, tool_facts: ToolFacts) void {
     if (!debug_trace.isScopeEnabled("gateway")) return;
-    debug_trace.eventf("gateway", "request_built", ctx, "payload_bytes={d} model={s} gateway_messages={d} tool_schema_count={d} local_tool_count={d} provider_tool_count={d}", .{
-        payload_bytes,
+    debug_trace.eventf("gateway", "model_request_built", ctx, "model={s} message_count={d} tool_count={d} local_tool_count={d} provider_tool_count={d}", .{
         model,
-        gateway_message_count,
+        message_count,
         tool_facts.total(),
         tool_facts.local_count,
         tool_facts.provider_count,
@@ -350,13 +349,13 @@ pub fn toolExecutionResultKind(result: ToolExecutionResult) []const u8 {
     return "model_output";
 }
 
-test "gateway call metrics retain provider terminal stop reason" {
+test "model call metrics retain provider terminal stop reason" {
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
 
-    recordGatewayCallMetric("test/model", 0, 200, 12, 3, 4, 1, 1, 0, "", "stop");
-    recordGatewayCallMetric("test/model", 0, 200, 12, 3, 4, 1, 2, 0, "", "length");
-    recordGatewayCallMetric("test/model", 0, 200, 12, 3, 4, 1, 3, 0, "", "missing_provider_finish");
+    recordModelCallMetric("test/model", 0, 12, 3, 4, 1, 1, 0, "", "stop");
+    recordModelCallMetric("test/model", 0, 12, 3, 4, 1, 2, 0, "", "length");
+    recordModelCallMetric("test/model", 0, 12, 3, 4, 1, 3, 0, "", "missing_provider_finish");
 
     var calls: [diagnostics.network_ring_capacity]diagnostics.NetworkCall = undefined;
     const count = diagnostics.snapshotNetworkCalls(&calls);

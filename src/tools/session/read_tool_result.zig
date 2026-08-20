@@ -250,7 +250,7 @@ test "persisted provider search results remain readable" {
     const dir = try @import("../../core/shared/io.zig").dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(dir);
 
-    const handle = try result_store.storeLargeResult(alloc, dir, "legacy_provider_call", "perplexity_search", "historical provider search result");
+    const handle = try result_store.storeLargeResult(alloc, dir, "historical_model_call", "perplexity_search", "historical provider search result");
     defer alloc.free(handle);
 
     const args_json = try std.fmt.allocPrint(alloc, "{{\"handle\":\"{s}\"}}", .{handle});

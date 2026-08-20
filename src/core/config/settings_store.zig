@@ -90,10 +90,6 @@ pub const WorkspaceDirectoryMutation = struct {
 pub const UserSettingsPatch = struct {
     model: ?[]const u8 = null,
     permission_mode: ?types.PermissionMode = null,
-    credential_source: ?types.CredentialSource = null,
-    /// Removes the key entirely so resolution returns to plain precedence.
-    /// Distinct from a null `credential_source`, which means "leave unchanged".
-    clear_credential_source: bool = false,
     yolo_acknowledged: ?bool = null,
     effort: ?types.ReasoningEffort = null,
     fast_mode: ?bool = null,
@@ -111,8 +107,6 @@ pub const UserSettingsPatch = struct {
     fn isEmpty(self: UserSettingsPatch) bool {
         return self.model == null and
             self.permission_mode == null and
-            self.credential_source == null and
-            !self.clear_credential_source and
             self.yolo_acknowledged == null and
             self.effort == null and
             self.fast_mode == null and
@@ -220,6 +214,7 @@ const UserPreferenceField = enum(u4) {
     statusline_sandbox,
     statusline_context,
     statusline_session,
+    credential_source,
 
     fn mask(self: UserPreferenceField) u16 {
         return @as(u16, 1) << @intFromEnum(self);
@@ -240,6 +235,7 @@ const UserPreferenceField = enum(u4) {
             .statusline_sandbox => "settings.json.preference-migration.statusline_sandbox.json",
             .statusline_context => "settings.json.preference-migration.statusline_context.json",
             .statusline_session => "settings.json.preference-migration.statusline_session.json",
+            .credential_source => "settings.json.preference-migration.credential_source.json",
         };
     }
 };
@@ -258,6 +254,7 @@ const user_preference_fields = [_]UserPreferenceField{
     .statusline_sandbox,
     .statusline_context,
     .statusline_session,
+    .credential_source,
 };
 
 const SettingsMutation = union(enum) {
@@ -444,6 +441,19 @@ pub const Store = struct {
         snapshot: connection_registry.Snapshot,
     ) !CommitOutcome {
         return self.applyMutation(alloc, .{ .connections = snapshot });
+    }
+
+    pub fn persistConnectionSnapshot(
+        self: *Store,
+        alloc: Allocator,
+        snapshot: connection_registry.Snapshot,
+    ) !connection_registry.PersistenceOutcome {
+        var outcome = self.applyConnectionSnapshot(alloc, snapshot) catch |err| switch (err) {
+            error.SettingsCommitIndeterminate => return .{ .replaced_indeterminate = err },
+            else => return err,
+        };
+        defer outcome.deinit(alloc);
+        return .committed;
     }
 
     pub fn applyPermissionPatch(
@@ -931,26 +941,6 @@ pub fn validateMaxxingMode(mode: []const u8) !void {
     if (!presentation_mode.MaxxingMode.isPersistedLabel(mode)) return error.InvalidDurableField;
 }
 
-test "clearing the credential choice removes the key rather than blanking it" {
-    const alloc = std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-
-    var root = try std.json.parseFromSliceLeaky(
-        std.json.Value,
-        arena.allocator(),
-        "{\"model\":\"m\",\"credential_source\":\"fx_login\"}",
-        .{},
-    );
-    var application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .clear_credential_source = true });
-    try std.testing.expect(application.changed);
-    try std.testing.expect(!root.object.contains("credential_source"));
-    try std.testing.expect(root.object.contains("model"));
-
-    application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .clear_credential_source = true });
-    try std.testing.expect(!application.changed);
-}
-
 test "input appearance validation keeps experiment labels private" {
     try std.testing.expectError(error.InvalidDurableField, validateInputAppearance("minimal-maxxing"));
     try std.testing.expectError(error.InvalidDurableField, validateInputAppearance("no-lines"));
@@ -1022,7 +1012,50 @@ fn applyConnectionSnapshotToRoot(
     try connections.put(arena, "selected", .{ .string = try arena.dupe(u8, snapshot.selected_id) });
     try connections.put(arena, "profiles", .{ .array = profiles });
     try root.object.put(arena, "connections", .{ .object = connections });
-    return .{ .changed = true };
+    var application = PatchApplication{ .changed = true };
+    removeLegacyLeaf(
+        &root.object,
+        "credential_source",
+        .credential_source,
+        true,
+        &application,
+    );
+    try cleanupLegacyWorkspaceCredentialSources(arena, root, &application);
+    return application;
+}
+
+fn cleanupLegacyWorkspaceCredentialSources(
+    arena: Allocator,
+    root: *std.json.Value,
+    application: *PatchApplication,
+) !void {
+    const workspaces = root.object.getPtr("workspaces") orelse return;
+    if (workspaces.* != .object) return error.InvalidSettingsFormat;
+
+    var empty_workspaces: std.ArrayList([]const u8) = .empty;
+    defer empty_workspaces.deinit(arena);
+    var iterator = workspaces.object.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const removed_before = application.legacy_fields_removed;
+        removeLegacyLeaf(
+            &entry.value_ptr.object,
+            "credential_source",
+            .credential_source,
+            true,
+            application,
+        );
+        if (application.legacy_fields_removed != removed_before) {
+            application.legacy_workspaces_changed += 1;
+            if (entry.value_ptr.object.count() == 0) {
+                try empty_workspaces.append(arena, entry.key_ptr.*);
+            }
+        }
+    }
+    for (empty_workspaces.items) |workspace_root| {
+        _ = workspaces.object.orderedRemove(workspace_root);
+    }
+    if (workspaces.object.count() == 0) _ = root.object.orderedRemove("workspaces");
 }
 
 fn putOptionalString(
@@ -1045,11 +1078,6 @@ fn applyUserPatchToRoot(
     var application = PatchApplication{};
     if (patch.model) |value| application.changed = try putString(arena, &root.object, "model", value) or application.changed;
     if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", @tagName(value)) or application.changed;
-    if (patch.credential_source) |value| application.changed = try putString(arena, &root.object, "credential_source", @tagName(value)) or application.changed;
-    if (patch.clear_credential_source and root.object.contains("credential_source")) {
-        _ = root.object.orderedRemove("credential_source");
-        application.changed = true;
-    }
     if (patch.yolo_acknowledged) |value| application.changed = try putBool(arena, &root.object, "yolo_acknowledged", value) or application.changed;
     if (patch.effort) |value| application.changed = try putString(arena, &root.object, "effort", value.label()) or application.changed;
     if (patch.fast_mode) |value| application.changed = try putBool(arena, &root.object, "fast_mode", value) or application.changed;
@@ -1732,11 +1760,6 @@ fn validateKnownSettingsObject(
             return error.InvalidSettingsFormat;
         }
     }
-    if (object.get("credential_source")) |value| {
-        if (value != .string or types.parseCredentialSource(value.string) == null) {
-            return error.InvalidSettingsFormat;
-        }
-    }
     if (object.get("connections")) |value| {
         var stored = connection_registry.parseStored(alloc, value) catch return error.InvalidSettingsFormat;
         stored.deinit(alloc);
@@ -2073,6 +2096,100 @@ test "connection snapshot persists references and profile metadata without secre
     try std.testing.expect(profile.get("token") == null);
     try std.testing.expect(profile.get("secret") == null);
     try std.testing.expectEqual(true, parsed.value.object.get("future").?.bool);
+}
+
+test "connection snapshot atomically replaces legacy credential source state" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try writeStoreFixture(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"credential_source\":\"fx_login\",\"future\":true," ++
+            "\"workspaces\":{\"/workspace\":{\"credential_source\":\"stored_key\"}}}\n",
+    );
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+    var registry = try connection_registry.Runtime.init(alloc, .{
+        .id = "vercel",
+        .display_name = "Vercel AI Gateway",
+        .adapter_id = "vercel_ai_gateway",
+        .credential_ref = "fx_login",
+        .remembered_model = "openai/gpt-5.4",
+    }, null, connection_registry.Persistence.unavailable);
+    defer registry.deinit();
+
+    var outcome = try store.applyConnectionSnapshot(alloc, registry.snapshot());
+    defer outcome.deinit(alloc);
+    const committed = switch (outcome) {
+        .committed => |value| value,
+        .unchanged => return error.TestExpectedCommitted,
+    };
+    try std.testing.expectEqual(@as(usize, 2), committed.cleanup.fields_removed);
+    try std.testing.expectEqual(@as(usize, 1), committed.cleanup.workspaces_changed);
+    try std.testing.expectEqual(@as(usize, 1), committed.cleanup.recovery_paths.len);
+
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "credential_source") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"credential_ref\":\"fx_login\"") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"future\":true") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"workspaces\"") == null);
+}
+
+test "indeterminate connection persistence keeps live and renamed state aligned" {
+    const StorePersistence = struct {
+        fn write(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            snapshot: connection_registry.Snapshot,
+        ) !connection_registry.PersistenceOutcome {
+            const store: *Store = @ptrCast(@alignCast(raw.?));
+            return store.persistConnectionSnapshot(alloc, snapshot);
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+    var registry = try connection_registry.Runtime.init(alloc, .{
+        .id = "vercel",
+        .display_name = "Vercel AI Gateway",
+        .adapter_id = "vercel_ai_gateway",
+        .credential_ref = "automatic",
+        .remembered_model = "initial/model",
+    }, null, .{ .context = &store, .write_fn = StorePersistence.write });
+    defer registry.deinit();
+
+    store.failParentSyncAfterRenameForTest();
+    try std.testing.expectError(
+        error.SettingsCommitIndeterminate,
+        registry.rememberSelectedModel("replacement/model"),
+    );
+    try std.testing.expectEqualStrings(
+        "replacement/model",
+        registry.selectedProfile().remembered_model,
+    );
+
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    const profile = parsed.value.object.get("connections").?.object
+        .get("profiles").?.array.items[0].object;
+    try std.testing.expectEqualStrings(
+        registry.selectedProfile().remembered_model,
+        profile.get("remembered_model").?.string,
+    );
 }
 
 test "notification user patch preserves sibling fields and valid workspace overrides" {

@@ -210,6 +210,9 @@ jobs:
           shard_status=0
           test_number=0
           for test_file in "${selected[@]}"; do
+            if [ "$test_file" = "tui-auth-source-selection.test.ts" ]; then
+              (cd ../.. && zig build native-auth-e2e -Doptimize=${{ matrix.optimize }})
+            fi
             tmux_tmp_dir="$RUNNER_TEMP/fx-e2e-tmux-${SHARD_INDEX}-${test_number}"
             mkdir -p "$tmux_tmp_dir"
             if ! TMUX_TMPDIR="$tmux_tmp_dir" bun test --max-concurrency 1 "./$test_file"; then

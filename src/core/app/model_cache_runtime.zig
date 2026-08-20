@@ -1,26 +1,20 @@
 const std = @import("std");
-const credentials = @import("../../gateway/auth/credentials.zig");
+const adapter_auth = @import("../gateway/adapter_auth.zig");
 const secret = @import("../auth/secret.zig");
 const collections = @import("../shared/collections.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
-const model_catalog_metadata = @import("../gateway/model_catalog_metadata.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
-const test_builtin_gateway = if (@import("builtin").is_test)
-    @import("../../builtins/gateway.zig")
-else
-    struct {};
-const test_gateway_client = if (@import("builtin").is_test)
-    @import("../../gateway/client.zig")
+const test_adapter = if (@import("builtin").is_test)
+    @import("../gateway/test_adapter.zig")
 else
     struct {};
 
 const Allocator = std.mem.Allocator;
-const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
 
 const ModelCacheState = enum {
     idle,
@@ -35,9 +29,9 @@ const CatalogOutcome = struct {
 };
 
 const OwnedCatalogAccess = struct {
-    access: credentials.CatalogAccess,
+    access: adapter_auth.CatalogAccess,
 
-    fn init(alloc: Allocator, access: credentials.CatalogAccess) !OwnedCatalogAccess {
+    fn init(alloc: Allocator, access: adapter_auth.CatalogAccess) !OwnedCatalogAccess {
         return switch (access) {
             .public_only => .{ .access = access },
             .authenticated => |authenticated| blk: {
@@ -83,7 +77,7 @@ pub const ModelMenuLoadState = enum {
 
 pub const ModelMenuCatalogState = struct {
     access_level: ?model_catalog.AccessLevel = null,
-    public_only_reason: ?credentials.CatalogPublicOnlyReason = null,
+    public_only_reason: ?adapter_auth.CatalogPublicOnlyReason = null,
     private_models_hidden: bool = false,
     failure: ?Failure = null,
 
@@ -107,7 +101,7 @@ pub const model_provider_filter_count = std.meta.fields(ModelProviderFilter).len
 pub const ModelMenuItem = struct {
     id: []u8,
     provider: []const u8,
-    capabilities: model_capabilities.Capabilities,
+    descriptor: model_capabilities.ModelDescriptor,
 
     fn deinit(self: ModelMenuItem, alloc: Allocator) void {
         alloc.free(self.id);
@@ -263,7 +257,6 @@ pub const Runtime = struct {
     const Self = @This();
 
     alloc: Allocator,
-    models_path: []const u8,
     descriptor_provider: model_catalog.ModelDescriptorProvider,
     adapter_kind: ?[]const u8 = null,
     catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty,
@@ -277,18 +270,16 @@ pub const Runtime = struct {
     outcome: CatalogOutcome = .{},
     menu: ModelMenu = .{},
 
-    pub fn init(alloc: Allocator, models_path: []const u8) Self {
-        return initWithDescriptorProvider(alloc, models_path, model_catalog.configured_model_descriptor_provider);
+    pub fn init(alloc: Allocator) Self {
+        return initWithDescriptorProvider(alloc, model_catalog.configured_model_descriptor_provider);
     }
 
     pub fn initWithDescriptorProvider(
         alloc: Allocator,
-        models_path: []const u8,
         descriptor_provider: model_catalog.ModelDescriptorProvider,
     ) Self {
         return .{
             .alloc = alloc,
-            .models_path = models_path,
             .descriptor_provider = descriptor_provider,
         };
     }
@@ -302,7 +293,7 @@ pub const Runtime = struct {
     pub fn startWarmup(
         self: *Self,
         provider: model_catalog.Provider,
-        access: credentials.CatalogAccess,
+        access: adapter_auth.CatalogAccess,
     ) void {
         if (!self.beginLoad(access)) return;
 
@@ -332,13 +323,12 @@ pub const Runtime = struct {
     pub fn loadCooperative(
         self: *Self,
         provider: model_catalog.Provider,
-        access: credentials.CatalogAccess,
+        access: adapter_auth.CatalogAccess,
     ) void {
         if (!self.beginLoad(access)) return;
 
         const result = model_catalog.fetchWithPublicFallback(provider, self.alloc, .{
             .access = access,
-            .endpoint = self.models_path,
             .cancel_flag = &self.cancel_requested,
             .view = .picker,
         });
@@ -377,7 +367,7 @@ pub const Runtime = struct {
         self.mutex.unlock(io_mod.getIo());
     }
 
-    fn beginLoad(self: *Self, access: credentials.CatalogAccess) bool {
+    fn beginLoad(self: *Self, access: adapter_auth.CatalogAccess) bool {
         self.finishThreadIfDone();
 
         const requested_access = model_catalog.AccessMetadata.init(access);
@@ -537,14 +527,12 @@ pub const Runtime = struct {
         return try model_catalog.projectModelIds(alloc, self.catalog.items);
     }
 
-    pub fn metadataForModel(self: *Self, model: []const u8) ?model_capabilities.GatewayMetadata {
+    pub fn availableDescriptor(self: *Self, model: []const u8) model_capabilities.ModelDescriptor {
         self.finishThreadIfDone();
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        if (self.state != .ready) return null;
-
-        const entry = findCatalogModel(self.catalog.items, model) orelse return null;
-        return model_catalog_metadata.fromCatalogEntry(entry.*);
+        if (self.state != .ready) return self.descriptor_provider.fallback(model);
+        return self.descriptor_provider.resolve(self.catalog.items, model);
     }
 
     pub fn availableDescriptorWith(
@@ -679,7 +667,6 @@ pub const Runtime = struct {
 
         const result = model_catalog.fetchWithPublicFallback(provider, self.alloc, .{
             .access = access.access,
-            .endpoint = self.models_path,
             .cancel_flag = &self.cancel_requested,
             .view = .picker,
         });
@@ -753,7 +740,7 @@ pub const Runtime = struct {
                 menu.clearSnapshot(self.alloc);
                 menu.load_state = .failed;
             },
-            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items),
+            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items, self.descriptor_provider),
         }
         menu.catalog_state = modelMenuCatalogState(self.outcome);
     }
@@ -790,6 +777,7 @@ fn hydrateMenuSnapshot(
     alloc: Allocator,
     menu: *ModelMenu,
     catalog: []const model_catalog.ModelCatalogEntry,
+    descriptor_provider: model_catalog.ModelDescriptorProvider,
 ) !void {
     var items: std.ArrayList(ModelMenuItem) = .empty;
     errdefer {
@@ -802,13 +790,15 @@ fn hydrateMenuSnapshot(
         const item = item: {
             const id = try alloc.dupe(u8, entry.id);
             errdefer alloc.free(id);
+            const descriptor = model_catalog.rebaseDescriptorIdentity(
+                entry.id,
+                id,
+                descriptor_provider.resolve(catalog, entry.id),
+            );
             break :item ModelMenuItem{
                 .id = id,
-                .provider = modelProvider(id),
-                .capabilities = model_capabilities.resolveCapabilities(
-                    id,
-                    model_catalog_metadata.fromCatalogEntry(entry),
-                ),
+                .provider = descriptor.provider,
+                .descriptor = descriptor,
             };
         };
         items.append(alloc, item) catch |err| {
@@ -822,57 +812,12 @@ fn hydrateMenuSnapshot(
     menu.load_state = .ready;
 }
 
-fn modelProvider(model: []const u8) []const u8 {
-    const slash = std.mem.findScalar(u8, model, '/') orelse return "";
-    if (slash == 0) return "";
-    return model[0..slash];
-}
-
 fn findCatalogModel(catalog: []const model_catalog.ModelCatalogEntry, model: []const u8) ?*const model_catalog.ModelCatalogEntry {
     for (catalog) |*entry| {
         if (std.mem.eql(u8, entry.id, model)) return entry;
     }
     return null;
 }
-
-var stable_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableEmptyTestEnviron() !*const std.process.Environ.Map {
-    if (stable_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_test_environ = map;
-    return map;
-}
-
-const TestEnv = struct {
-    alloc: Allocator,
-    map: std.process.Environ.Map,
-
-    fn install(alloc: Allocator, models_url: []const u8) !*TestEnv {
-        _ = try stableEmptyTestEnviron();
-
-        const self = try alloc.create(TestEnv);
-        errdefer alloc.destroy(self);
-        self.* = .{
-            .alloc = alloc,
-            .map = std.process.Environ.Map.init(alloc),
-        };
-        errdefer self.map.deinit();
-        try self.map.put(e2e_gateway_models_url_env, models_url);
-        io_mod.setEnvironMap(&self.map);
-        return self;
-    }
-
-    fn deinit(self: *TestEnv) void {
-        if (stable_test_environ) |map| io_mod.setEnvironMap(map);
-        self.map.deinit();
-        const alloc = self.alloc;
-        alloc.destroy(self);
-    }
-};
 
 fn waitForWarmup(runtime: *Runtime) !void {
     var remaining_ms: u64 = 5000;
@@ -891,8 +836,27 @@ fn modelIdListContains(ids: []const []u8, needle: []const u8) bool {
     return false;
 }
 
-fn authenticatedCatalogAccess(credential: []const u8, team_context: ?[]const u8) credentials.CatalogAccess {
-    return credentials.catalogAccessForCredential(.ai_gateway_api_key, credential, team_context);
+const test_key_source = adapter_auth.Source{ .id = "test_api_key", .label = "TEST_API_KEY", .refreshable = false };
+const test_session_source = adapter_auth.Source{ .id = "fx_login", .label = "fx login", .refreshable = true };
+
+fn authenticatedCatalogAccess(credential: []const u8, team_context: ?[]const u8) adapter_auth.CatalogAccess {
+    return .{ .authenticated = .{
+        .source = test_key_source,
+        .credential = credential,
+        .team_context = team_context,
+    } };
+}
+
+fn sessionCatalogAccess(credential: []const u8, team_context: ?[]const u8) adapter_auth.CatalogAccess {
+    return .{ .authenticated = .{
+        .source = test_session_source,
+        .credential = credential,
+        .team_context = team_context,
+    } };
+}
+
+fn sessionRefreshFailureAccess() adapter_auth.CatalogAccess {
+    return .{ .public_only = .{ .reason = .refresh_failed, .source = test_session_source } };
 }
 
 fn testCatalog(alloc: Allocator, model_id: []const u8) !std.ArrayList(model_catalog.ModelCatalogEntry) {
@@ -905,6 +869,65 @@ fn testCatalog(alloc: Allocator, model_id: []const u8) !std.ArrayList(model_cata
     try entries.append(alloc, .{ .id = id, .model_type = model_type });
     return entries;
 }
+
+const TestCatalogProvider = struct {
+    calls: usize = 0,
+    credential_present: bool = false,
+    team: [32]u8 = undefined,
+    team_len: usize = 0,
+
+    const public_entries = [_]model_catalog.ModelCatalogEntry{
+        .{
+            .id = @constCast("openai/gpt-5"),
+            .model_type = @constCast("language"),
+            .has_tool_use = true,
+            .has_reasoning = true,
+            .has_vision = true,
+            .has_file_input = true,
+            .has_web_search = true,
+            .has_explicit_caching = true,
+            .has_implicit_caching = true,
+            .context_window = 256_000,
+            .max_tokens = 32_000,
+        },
+        .{
+            .id = @constCast("anthropic/claude-opus-4"),
+            .model_type = @constCast("language"),
+            .has_tool_use = true,
+        },
+        .{
+            .id = @constCast("anthropic/claude-sonnet-4"),
+            .model_type = @constCast("language"),
+            .has_tool_use = true,
+        },
+    };
+    const private_entry = model_catalog.ModelCatalogEntry{
+        .id = @constCast("private/blue-hornbill"),
+        .model_type = @constCast("language"),
+    };
+
+    fn fetch(raw: ?*anyopaque, alloc: Allocator, input: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+        const self: *TestCatalogProvider = @ptrCast(@alignCast(raw.?));
+        self.calls += 1;
+        self.credential_present = input.access.authorizationCredential() != null;
+        const team = input.access.teamContext() orelse "";
+        std.debug.assert(team.len <= self.team.len);
+        @memcpy(self.team[0..team.len], team);
+        self.team_len = team.len;
+
+        var catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+        errdefer model_catalog.freeModelCatalog(alloc, &catalog);
+        for (public_entries) |entry| try model_catalog.appendClonedModelCatalogEntry(alloc, &catalog, entry);
+        if (self.credential_present) {
+            try model_catalog.appendClonedModelCatalogEntry(alloc, &catalog, private_entry);
+        }
+        return .{ .catalog = catalog };
+    }
+
+    fn provider(self: *TestCatalogProvider) model_catalog.Provider {
+        return .{ .context = self, .fetch_fn = fetch };
+    }
+};
 
 const RefreshCatalog = struct {
     first_failure: ?model_catalog.Failure = null,
@@ -968,13 +991,13 @@ const StaleCatalog = struct {
 };
 
 test "model cache clears an old failure after a clean empty refresh" {
-    var runtime = Runtime.init(std.testing.allocator, "/v1/models");
+    var runtime = Runtime.initWithDescriptorProvider(std.testing.allocator, test_adapter.model_descriptor_provider);
     defer runtime.deinit();
     runtime.catalog = try testCatalog(std.testing.allocator, "public/original");
     runtime.outcome = .{
-        .loaded = .{ .access = .init(.{ .public_only = .no_credential }) },
+        .loaded = .{ .access = .init(.{ .public_only = .{ .reason = .no_credential } }) },
         .last_failure = .{
-            .access = .init(.{ .public_only = .no_credential }),
+            .access = .init(.{ .public_only = .{ .reason = .no_credential } }),
             .anonymous_fallback_used = false,
             .failure = .{ .category = .transport, .retryable = true },
         },
@@ -983,7 +1006,7 @@ test "model cache clears an old failure after a clean empty refresh" {
     runtime.reset();
 
     var provider = RefreshCatalog{};
-    runtime.startWarmup(provider.provider(), .{ .public_only = .no_credential });
+    runtime.startWarmup(provider.provider(), .{ .public_only = .{ .reason = .no_credential } });
     try waitForWarmup(&runtime);
 
     try std.testing.expectEqual(@as(usize, 1), provider.calls);
@@ -996,22 +1019,21 @@ test "model cache clears an old failure after a clean empty refresh" {
 test "model cache adapter switch clears the prior provider catalog" {
     var runtime = Runtime.initWithDescriptorProvider(
         std.testing.allocator,
-        "/v1/models",
-        test_builtin_gateway.model_descriptor_provider,
+        test_adapter.model_descriptor_provider,
     );
     defer runtime.deinit();
-    runtime.selectAdapter("adapter-a", test_builtin_gateway.model_descriptor_provider);
+    runtime.selectAdapter("adapter-a", test_adapter.model_descriptor_provider);
     var provider_a = AuthChangeCatalog{ .model_id = "provider-a/model" };
-    runtime.loadCooperative(provider_a.provider(), .{ .public_only = .no_credential });
+    runtime.loadCooperative(provider_a.provider(), .{ .public_only = .{ .reason = .no_credential } });
     try std.testing.expectEqualStrings(
         "provider-a/model",
         runtime.catalogModelCompletion("provider-a/model").?,
     );
 
-    runtime.selectAdapter("adapter-b", test_builtin_gateway.model_descriptor_provider);
+    runtime.selectAdapter("adapter-b", test_adapter.model_descriptor_provider);
     try std.testing.expect(runtime.catalogModelCompletion("provider-a/model") == null);
     var provider_b = AuthChangeCatalog{ .model_id = "provider-b/model" };
-    runtime.loadCooperative(provider_b.provider(), .{ .public_only = .no_credential });
+    runtime.loadCooperative(provider_b.provider(), .{ .public_only = .{ .reason = .no_credential } });
     try std.testing.expectEqual(@as(usize, 1), provider_b.calls);
     try std.testing.expectEqualStrings(
         "provider-b/model",
@@ -1020,87 +1042,82 @@ test "model cache adapter switch clears the prior provider catalog" {
 }
 
 test "cooperative model cache retries a ready catalog after a retryable fallback failure" {
-    var runtime = Runtime.init(std.testing.allocator, "/v1/models");
+    var runtime = Runtime.init(std.testing.allocator);
     defer runtime.deinit();
     runtime.catalog = try testCatalog(std.testing.allocator, "public/original");
     runtime.outcome = .{
-        .loaded = .{ .access = .init(.{ .public_only = .no_credential }) },
+        .loaded = .{ .access = .init(.{ .public_only = .{ .reason = .no_credential } }) },
         .last_failure = .{
-            .access = .init(.{ .public_only = .no_credential }),
+            .access = .init(.{ .public_only = .{ .reason = .no_credential } }),
             .anonymous_fallback_used = false,
             .failure = .{ .category = .transport, .retryable = true },
         },
     };
     runtime.state = .ready;
-    runtime.requested_access = .init(.{ .public_only = .no_credential });
+    runtime.requested_access = .init(.{ .public_only = .{ .reason = .no_credential } });
     runtime.last_attempt_ms = io_mod.milliTimestamp() - 1000;
 
     var provider = AuthChangeCatalog{ .model_id = "public/refreshed" };
-    runtime.loadCooperative(provider.provider(), .{ .public_only = .no_credential });
+    runtime.loadCooperative(provider.provider(), .{ .public_only = .{ .reason = .no_credential } });
 
     try std.testing.expectEqual(@as(usize, 1), provider.calls);
     try std.testing.expect(runtime.outcome.last_failure == null);
     try std.testing.expectEqualStrings("public/refreshed", runtime.catalog.items[0].id);
 }
 
-test "model cache projects anonymous fallback provenance for 401 and 403" {
-    for ([_]std.http.Status{ .unauthorized, .forbidden }) |status| {
-        var runtime = Runtime.init(std.testing.allocator, "/v1/models");
-        defer runtime.deinit();
-        var provider = RefreshCatalog{
-            .first_failure = .{ .category = .authentication, .http_status = status },
-            .fallback_model = "public/fallback",
-        };
+test "model cache projects normalized anonymous fallback provenance" {
+    var runtime = Runtime.initWithDescriptorProvider(std.testing.allocator, test_adapter.model_descriptor_provider);
+    defer runtime.deinit();
+    var provider = RefreshCatalog{
+        .first_failure = .{ .category = .authentication },
+        .fallback_model = "public/fallback",
+    };
 
-        runtime.startWarmup(provider.provider(), authenticatedCatalogAccess("rejected-key", "team_123"));
-        try waitForWarmup(&runtime);
+    runtime.startWarmup(provider.provider(), authenticatedCatalogAccess("rejected-key", "team_123"));
+    try waitForWarmup(&runtime);
 
-        const provenance = runtime.outcome.loaded.?;
-        try std.testing.expectEqual(model_catalog.AccessLevel.public_only, provenance.access.level);
-        try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, provenance.access.source.?);
-        try std.testing.expectEqual(credentials.CatalogPublicOnlyReason.authenticated_credential_rejected, provenance.access.public_only_reason.?);
-        try std.testing.expect(provenance.access.private_models_may_be_hidden);
-        try std.testing.expect(provenance.anonymous_fallback_used);
-        try std.testing.expectEqual(model_catalog.FailureCategory.authentication, provenance.fallback_failure.?.category);
-        try std.testing.expectEqual(status, provenance.fallback_failure.?.http_status.?);
-        try std.testing.expect(runtime.outcome.last_failure == null);
+    const provenance = runtime.outcome.loaded.?;
+    try std.testing.expectEqual(model_catalog.AccessLevel.public_only, provenance.access.level);
+    try std.testing.expectEqualStrings(test_key_source.id, provenance.access.source.?.id);
+    try std.testing.expectEqual(adapter_auth.CatalogPublicOnlyReason.credential_rejected, provenance.access.public_only_reason.?);
+    try std.testing.expect(provenance.access.private_models_may_be_hidden);
+    try std.testing.expect(provenance.anonymous_fallback_used);
+    try std.testing.expectEqual(model_catalog.FailureCategory.authentication, provenance.fallback_failure.?.category);
+    try std.testing.expect(runtime.outcome.last_failure == null);
 
-        try runtime.openMenu();
-        try std.testing.expectEqual(model_catalog.AccessLevel.public_only, runtime.menu.catalog_state.access_level.?);
-        try std.testing.expectEqual(credentials.CatalogPublicOnlyReason.authenticated_credential_rejected, runtime.menu.catalog_state.public_only_reason.?);
-        try std.testing.expect(runtime.menu.catalog_state.private_models_hidden);
-        try std.testing.expectEqual(model_catalog.FailureCategory.authentication, runtime.menu.catalog_state.failure.?.category);
-        try std.testing.expect(!runtime.menu.catalog_state.failure.?.retryable);
+    try runtime.openMenu();
+    try std.testing.expectEqual(model_catalog.AccessLevel.public_only, runtime.menu.catalog_state.access_level.?);
+    try std.testing.expectEqual(adapter_auth.CatalogPublicOnlyReason.credential_rejected, runtime.menu.catalog_state.public_only_reason.?);
+    try std.testing.expect(runtime.menu.catalog_state.private_models_hidden);
+    try std.testing.expectEqual(model_catalog.FailureCategory.authentication, runtime.menu.catalog_state.failure.?.category);
+    try std.testing.expect(!runtime.menu.catalog_state.failure.?.retryable);
 
-        runtime.startWarmup(provider.provider(), authenticatedCatalogAccess("rejected-key", "team_123"));
-        try std.testing.expectEqual(@as(usize, 2), provider.calls);
-    }
+    runtime.startWarmup(provider.provider(), authenticatedCatalogAccess("rejected-key", "team_123"));
+    try std.testing.expectEqual(@as(usize, 2), provider.calls);
 }
 
 test "model cache catalog auth refresh preserves the last public catalog" {
-    var runtime = Runtime.init(std.testing.allocator, "/v1/models");
+    var runtime = Runtime.initWithDescriptorProvider(std.testing.allocator, test_adapter.model_descriptor_provider);
     defer runtime.deinit();
     runtime.catalog = try testCatalog(std.testing.allocator, "public/original");
     runtime.outcome.loaded = .{
-        .access = .init(.{ .public_only = .no_credential }),
+        .access = .init(.{ .public_only = .{ .reason = .no_credential } }),
     };
     runtime.state = .ready;
     runtime.reset();
 
     var refresh_provider = RefreshCatalog{ .first_failure = .{
         .category = .authentication,
-        .http_status = .forbidden,
     } };
     runtime.startWarmup(refresh_provider.provider(), authenticatedCatalogAccess("rejected-key", "team_123"));
     try waitForWarmup(&runtime);
 
     try std.testing.expectEqual(@as(usize, 2), refresh_provider.calls);
     try std.testing.expectEqual(model_catalog.FailureCategory.authentication, runtime.outcome.last_failure.?.failure.category);
-    try std.testing.expectEqual(std.http.Status.forbidden, runtime.outcome.last_failure.?.failure.http_status.?);
     try std.testing.expect(runtime.outcome.last_failure.?.anonymous_fallback_used);
     try runtime.openMenu();
     try std.testing.expectEqual(
-        credentials.CatalogPublicOnlyReason.authenticated_credential_rejected,
+        adapter_auth.CatalogPublicOnlyReason.credential_rejected,
         runtime.menu.catalog_state.public_only_reason.?,
     );
     runtime.closeMenu();
@@ -1114,12 +1131,12 @@ test "model cache catalog auth refresh preserves the last public catalog" {
     try std.testing.expectEqual(@as(usize, 1), failed_provider.calls);
     try std.testing.expectEqual(model_catalog.AccessLevel.public_only, runtime.outcome.loaded.?.access.level);
     try std.testing.expect(runtime.outcome.loaded.?.access.source == null);
-    try std.testing.expectEqual(credentials.CatalogPublicOnlyReason.no_credential, runtime.outcome.loaded.?.access.public_only_reason.?);
+    try std.testing.expectEqual(adapter_auth.CatalogPublicOnlyReason.no_credential, runtime.outcome.loaded.?.access.public_only_reason.?);
     try std.testing.expect(runtime.outcome.loaded.?.access.private_models_may_be_hidden);
     try std.testing.expectEqual(model_catalog.FailureCategory.transport, runtime.outcome.last_failure.?.failure.category);
     try std.testing.expect(runtime.outcome.last_failure.?.failure.retryable);
     try runtime.openMenu();
-    try std.testing.expectEqual(credentials.CatalogPublicOnlyReason.no_credential, runtime.menu.catalog_state.public_only_reason.?);
+    try std.testing.expectEqual(adapter_auth.CatalogPublicOnlyReason.no_credential, runtime.menu.catalog_state.public_only_reason.?);
     try std.testing.expectEqual(model_catalog.FailureCategory.transport, runtime.menu.catalog_state.failure.?.category);
     try std.testing.expect(runtime.menu.catalog_state.failure.?.retryable);
     runtime.closeMenu();
@@ -1134,11 +1151,11 @@ test "model cache catalog auth refresh preserves the last public catalog" {
 }
 
 test "model cache refetches effective access across auth and team changes" {
-    const public_access: credentials.CatalogAccess = .{ .public_only = .no_credential };
+    const public_access: adapter_auth.CatalogAccess = .{ .public_only = .{ .reason = .no_credential } };
     const team_a_access = authenticatedCatalogAccess("team-key", "team_a");
     const team_b_access = authenticatedCatalogAccess("team-key", "team_b");
-    const fx_login_access = credentials.catalogAccessForCredential(.fx_login, "login-token", "ignored-team");
-    const cases = [_]struct { access: credentials.CatalogAccess, model_id: []const u8 }{
+    const fx_login_access = sessionCatalogAccess("login-token", "ignored-team");
+    const cases = [_]struct { access: adapter_auth.CatalogAccess, model_id: []const u8 }{
         .{ .access = public_access, .model_id = "public/original" },
         .{ .access = team_a_access, .model_id = "private/team-a" },
         .{ .access = team_b_access, .model_id = "private/team-b" },
@@ -1146,7 +1163,7 @@ test "model cache refetches effective access across auth and team changes" {
     };
 
     var provider = AuthChangeCatalog{};
-    var runtime = Runtime.init(std.testing.allocator, "/v1/models");
+    var runtime = Runtime.initWithDescriptorProvider(std.testing.allocator, test_adapter.model_descriptor_provider);
     defer runtime.deinit();
 
     for (cases, 0..) |case, index| {
@@ -1169,26 +1186,26 @@ test "model cache refetches effective access across auth and team changes" {
 
 test "model cache reloads a ready authenticated catalog after Fx login access downgrades" {
     const cases = [_]struct {
-        access: credentials.CatalogAccess,
-        reason: credentials.CatalogPublicOnlyReason,
+        access: adapter_auth.CatalogAccess,
+        reason: adapter_auth.CatalogPublicOnlyReason,
     }{
         .{
-            .access = .{ .public_only = .fx_login_refresh_required },
-            .reason = .fx_login_refresh_required,
+            .access = .{ .public_only = .{ .reason = .refresh_required, .source = test_session_source } },
+            .reason = .refresh_required,
         },
         .{
-            .access = credentials.catalogAccessAfterRefreshFailure(.fx_login),
-            .reason = .credential_refresh_failed,
+            .access = sessionRefreshFailureAccess(),
+            .reason = .refresh_failed,
         },
     };
 
     for (cases) |case| {
-        var runtime = Runtime.init(std.testing.allocator, "/v1/models");
+        var runtime = Runtime.initWithDescriptorProvider(std.testing.allocator, test_adapter.model_descriptor_provider);
         defer runtime.deinit();
         var private_provider = AuthChangeCatalog{ .model_id = "private/team-model" };
         runtime.startWarmup(
             private_provider.provider(),
-            credentials.catalogAccessForCredential(.fx_login, "login-token", "team_123"),
+            sessionCatalogAccess("login-token", "team_123"),
         );
         try waitForWarmup(&runtime);
 
@@ -1206,21 +1223,21 @@ test "model cache reloads a ready authenticated catalog after Fx login access do
 }
 
 test "model cache reuses a ready public catalog when only its public reason changes" {
-    var runtime = Runtime.init(std.testing.allocator, "/v1/models");
+    var runtime = Runtime.initWithDescriptorProvider(std.testing.allocator, test_adapter.model_descriptor_provider);
     defer runtime.deinit();
     var initial_provider = AuthChangeCatalog{ .model_id = "public/base-model" };
-    runtime.startWarmup(initial_provider.provider(), .{ .public_only = .fx_login_refresh_required });
+    runtime.startWarmup(initial_provider.provider(), .{ .public_only = .{ .reason = .refresh_required, .source = test_session_source } });
     try waitForWarmup(&runtime);
 
     var unused_provider = AuthChangeCatalog{ .model_id = "public/redundant-model" };
     runtime.startWarmup(
         unused_provider.provider(),
-        credentials.catalogAccessAfterRefreshFailure(.fx_login),
+        sessionRefreshFailureAccess(),
     );
 
     try std.testing.expectEqual(@as(usize, 0), unused_provider.calls);
     try std.testing.expectEqual(
-        credentials.CatalogPublicOnlyReason.credential_refresh_failed,
+        adapter_auth.CatalogPublicOnlyReason.refresh_failed,
         runtime.outcome.loaded.?.access.public_only_reason.?,
     );
     try std.testing.expectEqualStrings("public/base-model", runtime.catalogModelCompletion("public/base-model").?);
@@ -1228,10 +1245,10 @@ test "model cache reuses a ready public catalog when only its public reason chan
 }
 
 test "model cache auth change prevents a stale load from replacing the newer catalog" {
-    var runtime = Runtime.init(std.testing.allocator, "/v1/models");
+    var runtime = Runtime.initWithDescriptorProvider(std.testing.allocator, test_adapter.model_descriptor_provider);
     defer runtime.deinit();
     var stale = StaleCatalog{};
-    runtime.startWarmup(stale.provider(), .{ .public_only = .no_credential });
+    runtime.startWarmup(stale.provider(), .{ .public_only = .{ .reason = .no_credential } });
 
     var remaining_ms: u64 = 5000;
     while (!stale.started.load(.seq_cst) and remaining_ms > 0) : (remaining_ms -= 1) {
@@ -1270,11 +1287,11 @@ test "model cache access copies clean up every induced allocation failure" {
 }
 
 fn runRepeatedAuthChangeCycle(iteration: usize) !void {
-    var runtime = Runtime.init(std.testing.allocator, "/v1/models");
+    var runtime = Runtime.initWithDescriptorProvider(std.testing.allocator, test_adapter.model_descriptor_provider);
     defer runtime.deinit();
 
     var stale = StaleCatalog{};
-    runtime.startWarmup(stale.provider(), .{ .public_only = .no_credential });
+    runtime.startWarmup(stale.provider(), .{ .public_only = .{ .reason = .no_credential } });
     var remaining_ms: u64 = 5000;
     while (!stale.started.load(.seq_cst) and remaining_ms > 0) : (remaining_ms -= 1) {
         io_mod.sleep(std.time.ns_per_ms);
@@ -1303,28 +1320,15 @@ test "model cache repeated auth changes join stale loads before publication" {
 }
 
 test "model cache warmup publishes a snapshot and filtered completion" {
-    var fixture = try test_gateway_client.TestModelCatalogFixture.initPrivate();
-    defer fixture.deinit();
-    try fixture.start();
-    try std.testing.expect(fixture.waitForAcceptStart(5000));
-
-    const models_url = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "http://127.0.0.1:{d}/v1/models",
-        .{fixture.port()},
-    );
-    defer std.testing.allocator.free(models_url);
-    const env = try TestEnv.install(std.testing.allocator, models_url);
-    defer env.deinit();
-
-    var runtime = Runtime.init(std.testing.allocator, "/v1/models");
+    var fixture: TestCatalogProvider = .{};
+    var runtime = Runtime.initWithDescriptorProvider(std.testing.allocator, test_adapter.model_descriptor_provider);
     defer runtime.deinit();
-    runtime.startWarmup(test_builtin_gateway.model_catalog_provider, authenticatedCatalogAccess("test-key", "team_123"));
+    runtime.startWarmup(fixture.provider(), authenticatedCatalogAccess("test-key", "team_123"));
     try waitForWarmup(&runtime);
 
     const provenance = runtime.outcome.loaded.?;
     try std.testing.expectEqual(model_catalog.AccessLevel.authenticated, provenance.access.level);
-    try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, provenance.access.source.?);
+    try std.testing.expectEqualStrings(test_key_source.id, provenance.access.source.?.id);
     try std.testing.expect(!provenance.access.private_models_may_be_hidden);
     try std.testing.expect(!provenance.anonymous_fallback_used);
     try std.testing.expect(provenance.fallback_failure == null);
@@ -1338,16 +1342,17 @@ test "model cache warmup publishes a snapshot and filtered completion" {
     try std.testing.expect(modelIdListContains(snapshot.items, "anthropic/claude-sonnet-4"));
     try std.testing.expect(modelIdListContains(snapshot.items, "private/blue-hornbill"));
 
-    const metadata = runtime.metadataForModel("openai/gpt-5").?;
-    try std.testing.expect(metadata.supports_tool_use);
-    try std.testing.expect(metadata.supports_reasoning);
-    try std.testing.expect(metadata.supports_vision);
-    try std.testing.expect(metadata.supports_file_input);
-    try std.testing.expect(metadata.supports_web_search);
-    try std.testing.expect(metadata.supports_explicit_caching);
-    try std.testing.expect(metadata.supports_implicit_caching);
-    try std.testing.expectEqual(@as(?u32, 256_000), metadata.context_window);
-    try std.testing.expectEqual(@as(?u32, 32_000), metadata.max_output_tokens);
+    const descriptor = runtime.availableDescriptor("openai/gpt-5");
+    try std.testing.expectEqual(model_capabilities.CapabilitySource.catalog, descriptor.source);
+    try std.testing.expect(descriptor.capabilities.supports_tool_use);
+    try std.testing.expect(descriptor.capabilities.supports_reasoning);
+    try std.testing.expect(descriptor.capabilities.supports_vision);
+    try std.testing.expect(descriptor.capabilities.supports_file_input);
+    try std.testing.expect(descriptor.capabilities.supports_web_search);
+    try std.testing.expect(descriptor.capabilities.supports_explicit_caching);
+    try std.testing.expect(descriptor.capabilities.supports_implicit_caching);
+    try std.testing.expectEqual(@as(?u32, 256_000), descriptor.capabilities.context_window);
+    try std.testing.expectEqual(@as(?u32, 32_000), descriptor.capabilities.max_output_tokens);
 
     var completions: [2][]const u8 = undefined;
     const count = runtime.modelCompletions("OPUS", completions[0..]);
@@ -1361,13 +1366,53 @@ test "model cache warmup publishes a snapshot and filtered completion" {
     try std.testing.expectEqualStrings("private/blue-hornbill", runtime.catalogModelCompletion("private/blue-hornbill").?);
     try std.testing.expect(runtime.catalogModelCompletion("private/blue") == null);
 
-    try std.testing.expectEqualStrings("team_123", fixture.capturedHeaderValue(test_gateway_client.vercel_ai_gateway_team_header).?);
-    if (fixture.failure()) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expect(fixture.credential_present);
+    try std.testing.expectEqualStrings("team_123", fixture.team[0..fixture.team_len]);
+}
+
+test "model cache keeps exact catalog identity for menu and requests" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.initWithDescriptorProvider(alloc, test_adapter.model_descriptor_provider);
+    defer runtime.deinit();
+    try model_catalog.appendClonedModelCatalogEntry(alloc, &runtime.catalog, .{
+        .id = @constCast("zai/glm-5.2-fast"),
+        .model_type = @constCast("language"),
+        .has_reasoning = true,
+        .has_tool_use = true,
+        .has_vision = true,
+        .has_file_input = true,
+        .context_window = 262_144,
+        .max_tokens = 65_536,
+    });
+    runtime.state = .ready;
+
+    try runtime.openMenu();
+    const menu_descriptor = runtime.menu.itemAt(0).?.descriptor;
+    const fast = runtime.availableDescriptor("zai/glm-5.2-fast");
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const normal = try runtime.resolveForRequest("zai/glm-5.2", &cancel_flag);
+
+    for ([_]model_capabilities.ModelDescriptor{ menu_descriptor, fast }) |descriptor| {
+        try std.testing.expectEqual(model_capabilities.CapabilitySource.catalog, descriptor.source);
+        try std.testing.expect(!descriptor.selected_fast_mode);
+        try std.testing.expect(descriptor.capabilities.supports_reasoning);
+        try std.testing.expect(descriptor.capabilities.supports_tool_use);
+        try std.testing.expect(descriptor.capabilities.supports_vision);
+        try std.testing.expect(descriptor.capabilities.supports_file_input);
+        try std.testing.expectEqual(@as(?u32, 262_144), descriptor.capabilities.context_window);
+        try std.testing.expectEqual(@as(?u32, 65_536), descriptor.capabilities.max_output_tokens);
+    }
+    try std.testing.expectEqualStrings("zai/glm-5.2-fast", menu_descriptor.id);
+    try std.testing.expectEqualStrings("zai/glm-5.2-fast", fast.id);
+    try std.testing.expectEqual(model_capabilities.CapabilitySource.@"adapter-static", normal.source);
+    try std.testing.expectEqualStrings("zai/glm-5.2", normal.id);
+    try std.testing.expect(!normal.capabilities.supports_reasoning);
 }
 
 test "model menu owns resolved catalog state and filters without changing catalog order" {
     const alloc = std.testing.allocator;
-    var runtime = Runtime.initWithDescriptorProvider(alloc, "/v1/models", test_builtin_gateway.model_descriptor_provider);
+    var runtime = Runtime.initWithDescriptorProvider(alloc, test_adapter.model_descriptor_provider);
     defer runtime.deinit();
 
     const entries = [_]model_catalog.ModelCatalogEntry{
@@ -1398,19 +1443,20 @@ test "model menu owns resolved catalog state and filters without changing catalo
         },
     };
     runtime.state = .ready;
-    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries);
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, runtime.descriptor_provider);
     runtime.menu.active = true;
 
     try std.testing.expectEqual(ModelMenuLoadState.ready, runtime.menu.load_state);
     try std.testing.expectEqual(@as(usize, 4), runtime.menu.filteredItemCount());
     try std.testing.expectEqualStrings("openai/gpt-5", runtime.menu.itemAt(0).?.id);
     try std.testing.expectEqualStrings("private/blue-hornbill", runtime.menu.itemAt(2).?.id);
-    try std.testing.expect(runtime.menu.itemAt(0).?.capabilities.supports_reasoning);
-    try std.testing.expect(runtime.menu.itemAt(0).?.capabilities.supports_vision);
-    try std.testing.expectEqual(@as(?u32, 256_000), runtime.menu.itemAt(0).?.capabilities.context_window);
-    try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_fast_mode);
-    try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_file_input);
-    try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_web_search);
+    try std.testing.expectEqual(model_capabilities.CapabilitySource.catalog, runtime.menu.itemAt(0).?.descriptor.source);
+    try std.testing.expect(runtime.menu.itemAt(0).?.descriptor.capabilities.supports_reasoning);
+    try std.testing.expect(runtime.menu.itemAt(0).?.descriptor.capabilities.supports_vision);
+    try std.testing.expectEqual(@as(?u32, 256_000), runtime.menu.itemAt(0).?.descriptor.capabilities.context_window);
+    try std.testing.expect(runtime.menu.itemAt(1).?.descriptor.capabilities.supports_fast_mode);
+    try std.testing.expect(runtime.menu.itemAt(1).?.descriptor.capabilities.supports_file_input);
+    try std.testing.expect(runtime.menu.itemAt(1).?.descriptor.capabilities.supports_web_search);
 
     runtime.menu.setQuery("BLUE");
     try std.testing.expectEqual(@as(usize, 1), runtime.menu.filteredItemCount());
@@ -1446,14 +1492,14 @@ test "model menu snapshot construction cleans every allocation failure" {
 
     var probe = std.testing.FailingAllocator.init(backing, .{});
     var menu: ModelMenu = .{};
-    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries);
+    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries, test_adapter.model_descriptor_provider);
     menu.deinit(probe.allocator());
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
     for (0..probe.alloc_index) |fail_index| {
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
         var failed_menu: ModelMenu = .{};
-        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries)) {
+        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries, test_adapter.model_descriptor_provider)) {
             failed_menu.deinit(failing.allocator());
         } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
         try std.testing.expect(failing.has_induced_failure);
@@ -1462,23 +1508,10 @@ test "model menu snapshot construction cleans every allocation failure" {
 }
 
 test "model cache completion hydrates an open menu and reports once" {
-    var fixture = try test_gateway_client.TestModelCatalogFixture.initPrivate();
-    defer fixture.deinit();
-    try fixture.start();
-    try std.testing.expect(fixture.waitForAcceptStart(5000));
-
-    const models_url = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "http://127.0.0.1:{d}/v1/models",
-        .{fixture.port()},
-    );
-    defer std.testing.allocator.free(models_url);
-    const env = try TestEnv.install(std.testing.allocator, models_url);
-    defer env.deinit();
-
-    var runtime = Runtime.init(std.testing.allocator, "/v1/models");
+    var fixture: TestCatalogProvider = .{};
+    var runtime = Runtime.initWithDescriptorProvider(std.testing.allocator, test_adapter.model_descriptor_provider);
     defer runtime.deinit();
-    runtime.startWarmup(test_builtin_gateway.model_catalog_provider, authenticatedCatalogAccess("test-key", "team_123"));
+    runtime.startWarmup(fixture.provider(), authenticatedCatalogAccess("test-key", "team_123"));
     try runtime.openMenu();
     try std.testing.expectEqual(ModelMenuLoadState.loading, runtime.menu.load_state);
 
@@ -1500,70 +1533,43 @@ test "model cache completion hydrates an open menu and reports once" {
     runtime.reset();
     try std.testing.expect(!runtime.menu.active);
     try std.testing.expectEqual(ModelCacheState.idle, runtime.state);
-    if (fixture.failure()) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
 }
 
 test "model cache reset replaces ready public catalog with team catalog" {
-    var runtime = Runtime.init(std.testing.allocator, "/v1/models");
+    var runtime = Runtime.initWithDescriptorProvider(std.testing.allocator, test_adapter.model_descriptor_provider);
     defer runtime.deinit();
 
     {
-        var fixture = try test_gateway_client.TestModelCatalogFixture.init();
-        defer fixture.deinit();
-        try fixture.start();
-        try std.testing.expect(fixture.waitForAcceptStart(5000));
-
-        const models_url = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "http://127.0.0.1:{d}/v1/models",
-            .{fixture.port()},
-        );
-        defer std.testing.allocator.free(models_url);
-        const env = try TestEnv.install(std.testing.allocator, models_url);
-        defer env.deinit();
-
-        runtime.startWarmup(test_builtin_gateway.model_catalog_provider, .{ .public_only = .no_credential });
+        var fixture: TestCatalogProvider = .{};
+        runtime.startWarmup(fixture.provider(), .{ .public_only = .{ .reason = .no_credential } });
         try waitForWarmup(&runtime);
 
         var snapshot = (try runtime.snapshotCachedModelIds(std.testing.allocator)).?;
         defer collections.freeStringList(std.testing.allocator, &snapshot);
         try std.testing.expect(!modelIdListContains(snapshot.items, "private/blue-hornbill"));
-        try std.testing.expect(fixture.capturedHeaderValue("authorization") == null);
-        try std.testing.expect(fixture.capturedHeaderValue(test_gateway_client.vercel_ai_gateway_team_header) == null);
-        if (fixture.failure()) |err| return err;
+        try std.testing.expect(!fixture.credential_present);
+        try std.testing.expectEqual(@as(usize, 0), fixture.team_len);
     }
 
     runtime.reset();
 
     {
-        var fixture = try test_gateway_client.TestModelCatalogFixture.initPrivate();
-        defer fixture.deinit();
-        try fixture.start();
-        try std.testing.expect(fixture.waitForAcceptStart(5000));
-
-        const models_url = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "http://127.0.0.1:{d}/v1/models",
-            .{fixture.port()},
-        );
-        defer std.testing.allocator.free(models_url);
-        const env = try TestEnv.install(std.testing.allocator, models_url);
-        defer env.deinit();
-
-        runtime.startWarmup(test_builtin_gateway.model_catalog_provider, authenticatedCatalogAccess("team-key", "team_123"));
+        var fixture: TestCatalogProvider = .{};
+        runtime.startWarmup(fixture.provider(), authenticatedCatalogAccess("team-key", "team_123"));
         try waitForWarmup(&runtime);
 
         var snapshot = (try runtime.snapshotCachedModelIds(std.testing.allocator)).?;
         defer collections.freeStringList(std.testing.allocator, &snapshot);
         try std.testing.expect(modelIdListContains(snapshot.items, "private/blue-hornbill"));
-        try std.testing.expectEqualStrings("team_123", fixture.capturedHeaderValue(test_gateway_client.vercel_ai_gateway_team_header).?);
-        if (fixture.failure()) |err| return err;
+        try std.testing.expect(fixture.credential_present);
+        try std.testing.expectEqualStrings("team_123", fixture.team[0..fixture.team_len]);
     }
 }
 
 test "model cache request resolution distinguishes readiness miss failure idle and cancellation" {
     const alloc = std.testing.allocator;
-    var runtime = Runtime.initWithDescriptorProvider(alloc, "/v1/models", test_builtin_gateway.model_descriptor_provider);
+    var runtime = Runtime.initWithDescriptorProvider(alloc, test_adapter.model_descriptor_provider);
     defer runtime.deinit();
 
     {

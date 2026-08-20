@@ -1,10 +1,11 @@
 const std = @import("std");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
+const adapter_auth = @import("../gateway/adapter_auth.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const route_snapshot = @import("../gateway/route_snapshot.zig");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
-const gateway_schema = @import("../tooling/gateway_schema.zig");
+const tool_descriptor = @import("../tooling/tool_descriptor.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const file_mutation = @import("../tooling/file_mutation.zig");
@@ -36,7 +37,7 @@ pub const Config = struct {
     model_prompt_overlay: ?[]const u8 = null,
     skills_prompt_section: []const u8 = "",
     explicit_skills_prompt_section: []const u8 = "",
-    model_tools: []const gateway_schema.FunctionSchema,
+    model_tools: []const tool_descriptor.Descriptor,
     provider_tools: []const agent_stream_provider.ProviderToolAdvertisement = &.{},
     custom_tool_guidance: []const u8 = "",
     context_registry: context_contract.Registry,
@@ -48,6 +49,7 @@ pub const Config = struct {
         *anyopaque,
         Allocator,
         *const route_snapshot.RouteSnapshot,
+        adapter_auth.RefreshMode,
     ) anyerror!agent_runtime.RouteCredential,
 };
 
@@ -92,7 +94,6 @@ const Context = struct {
         result.on_web_search_progress = null;
         result.web_fetch_progress_ctx = null;
         result.on_web_fetch_progress = null;
-        result.model_capability_resolver = null;
         result.model_descriptor_resolver = null;
         result.route = if (self.admission.route) |*route| route else null;
         result.lifecycle_view = self.config.lifecycle_view;
@@ -141,8 +142,9 @@ pub fn run(
     const recovery_checkpoint = turn.snapshotRecoveryCheckpoint(arena) catch
         return error.OutOfMemory;
     const route = admission.route orelse return error.AdmissionFailed;
-    if (!config.tool_context.provider_adapter.acceptsRoute(&route) or
-        !route.containsModel(admission.model)) return error.AdmissionFailed;
+    _ = config.tool_context.adapter_registry.resolveRoute(&route) catch
+        return error.AdmissionFailed;
+    if (!route.containsModel(admission.model)) return error.AdmissionFailed;
     const prompt = worker_runtime.QueuedPrompt{
         .turn_id = 1,
         .prompt = arena.dupe(u8, message.content) catch return error.OutOfMemory,
@@ -184,7 +186,6 @@ pub fn run(
             .skills_prompt_section = config.skills_prompt_section,
             .explicit_skills_prompt_section = config.explicit_skills_prompt_section,
             .gateway_retry_count = config.tool_context.gateway_retry_count,
-            .gateway_chat_url = config.tool_context.gateway_chat_url,
             .model_tools = config.model_tools,
             .provider_tools = config.provider_tools,
             .custom_tool_guidance = config.custom_tool_guidance,
@@ -222,8 +223,7 @@ pub fn run(
 fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
     return .{
         .ctx = context,
-        .provider_adapter = context.config.tool_context.provider_adapter,
-        .agent_stream_provider = context.config.tool_context.agent_stream_provider,
+        .adapter_registry = context.config.tool_context.adapter_registry,
         .tool_registry = context.config.tool_context.tool_registry,
         .context_registry = context.config.context_registry,
         .context_enabled = context.config.context_enabled,
@@ -270,12 +270,14 @@ fn resolveRouteCredential(
     raw: *anyopaque,
     alloc: Allocator,
     route: *const route_snapshot.RouteSnapshot,
+    mode: adapter_auth.RefreshMode,
 ) !agent_runtime.RouteCredential {
     const context: *Context = @ptrCast(@alignCast(raw));
     return context.config.resolve_route_credential_fn(
         context.config.route_credential_ctx,
         alloc,
         route,
+        mode,
     );
 }
 
@@ -636,9 +638,8 @@ fn pushLiveRouteRecoveryStatus(
 fn captureProviderFailure(
     raw: *anyopaque,
     category: agent_stream_provider.StreamFailure.Category,
-    _: ?u16,
     detail: []const u8,
-    _: ?types.CredentialSource,
+    _: ?adapter_auth.Source,
 ) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     const formatted = try std.fmt.allocPrint(context.turn.alloc, "{s}: {s}", .{ @tagName(category), detail });

@@ -620,7 +620,7 @@ fn denyWebFetchPermission(_: *const tool_dispatch.Tool, _: tool_dispatch.ToolInp
 const web_fetch_dispatch_tool = tool_dispatch.Tool{
     .name = "web_fetch",
     .description = "Web fetch dispatch test fixture.",
-    .gateway_schema = .{
+    .descriptor = .{
         .name = "web_fetch",
         .description = "Web fetch dispatch test fixture.",
     },

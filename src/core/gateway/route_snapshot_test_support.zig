@@ -7,16 +7,16 @@ pub fn owned(alloc: std.mem.Allocator, model: []const u8) !route_snapshot.RouteS
     return route_snapshot.RouteSnapshot.admit(
         alloc,
         connection_registry.Profile{
-            .id = @constCast("vercel"),
-            .display_name = @constCast("Vercel AI Gateway"),
-            .adapter_id = @constCast("vercel_ai_gateway"),
+            .id = @constCast("test-connection"),
+            .display_name = @constCast("Example Cloud"),
+            .adapter_id = @constCast("test-adapter"),
             .endpoint = @constCast("https://example.invalid"),
-            .protocol = @constCast("vercel_ai_gateway"),
-            .credential_ref = @constCast("automatic"),
+            .protocol = @constCast("test-model-stream"),
+            .credential_ref = @constCast("test-credential"),
             .remembered_model = @constCast(model),
             .internal_models = .{
-                .permission_review = @constCast("openai/gpt-5.4"),
-                .vision = @constCast("google/gemini-2.5-flash"),
+                .permission_review = @constCast("test/reviewer"),
+                .vision = @constCast("test/vision"),
             },
         },
         model_capabilities.configuredDescriptor(model, .{}),

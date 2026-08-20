@@ -3,7 +3,7 @@ const agent_stream_provider = @import("../agent/stream_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const route_snapshot = @import("../gateway/route_snapshot.zig");
-const gateway_schema = @import("../tooling/gateway_schema.zig");
+const tool_descriptor = @import("../tooling/tool_descriptor.zig");
 const io_mod = @import("../shared/io.zig");
 const permissions = @import("permissions.zig");
 const session_usage = @import("../session/session_usage.zig");
@@ -91,7 +91,7 @@ pub const FileMutationAction = struct {
 pub const ToolAction = struct {
     tool_name: []const u8,
     arguments_json: []const u8,
-    descriptor: ?gateway_schema.FunctionSchema = null,
+    descriptor: ?tool_descriptor.Descriptor = null,
     schema_required: bool = false,
 };
 
@@ -137,6 +137,7 @@ pub const AdapterInput = struct {
     route: *const route_snapshot.RouteSnapshot,
     credential: []const u8,
     tenant: ?[]const u8 = null,
+    session_id: ?[]const u8 = null,
     cancel_flag: *std.atomic.Value(bool),
     usage: ?*session_usage.Usage = null,
     usage_allocator: std.mem.Allocator = std.heap.c_allocator,
@@ -145,7 +146,7 @@ pub const AdapterInput = struct {
 };
 
 pub const AccountedCompletion = struct {
-    value: types.GatewayCompletion,
+    value: types.ModelCompletion,
     context: *anyopaque,
     deinit_fn: *const fn (*anyopaque, std.mem.Allocator) void,
 
@@ -168,6 +169,7 @@ pub const AccountedRequest = struct {
     route: *const route_snapshot.RouteSnapshot,
     credential: []const u8,
     tenant: ?[]const u8,
+    session_id: ?[]const u8 = null,
     model: []const u8,
     model_request: agent_stream_provider.ModelRequest,
     cancel_flag: *std.atomic.Value(bool),
@@ -226,50 +228,15 @@ pub const OverrideFn = *const fn (
     ReviewRequest,
 ) anyerror!ParseOutcome;
 
-/// Borrowed runtime inputs for one provider-backed permission review. Every
-/// referenced slice and pointer must remain valid until `Classifier.review`
-/// returns.
-pub const ProviderInput = struct {
-    credential: []const u8 = "",
-    tenant: ?[]const u8 = null,
-    endpoint: []const u8 = "",
-    cancel_flag: ?*std.atomic.Value(bool) = null,
-    usage: ?*session_usage.Usage = null,
-    usage_allocator: std.mem.Allocator = std.heap.c_allocator,
-};
-
-pub const ProviderFn = *const fn (
-    ?*anyopaque,
-    std.mem.Allocator,
-    ProviderInput,
-    ReviewRequest,
-) anyerror!ParseOutcome;
-
-/// Registered implementation of automatic permission review. Core owns the
-/// review policy; providers perform the model transport selected at composition.
-pub const Provider = struct {
-    context: ?*anyopaque = null,
-    review_fn: ProviderFn,
-};
-
-/// One injected automatic-review capability. Provider and override state are
-/// borrowed and used synchronously by `review`.
+/// One admitted-route automatic-review capability. Test overrides remain
+/// synchronous and cannot introduce a production transport path.
 pub const Classifier = struct {
     adapter_input: ?AdapterInput = null,
-    provider: ?Provider = null,
-    provider_input: ProviderInput = .{},
     override_ctx: ?*anyopaque = null,
     override_fn: ?OverrideFn = null,
 
     pub fn disabled() Classifier {
         return .{};
-    }
-
-    pub fn withProvider(provider: Provider, provider_input: ProviderInput) Classifier {
-        return .{
-            .provider = provider,
-            .provider_input = provider_input,
-        };
     }
 
     pub fn withAdapter(input: AdapterInput) Classifier {
@@ -284,7 +251,7 @@ pub const Classifier = struct {
     }
 
     pub fn enabled(self: Classifier) bool {
-        return self.override_fn != null or self.adapter_input != null or self.provider != null;
+        return self.override_fn != null or self.adapter_input != null;
     }
 
     pub fn review(
@@ -310,17 +277,7 @@ pub const Classifier = struct {
                 else => return .invalid,
             };
         }
-        const provider = self.provider orelse return .invalid;
-        return provider.review_fn(
-            provider.context,
-            alloc,
-            self.provider_input,
-            request,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Cancelled => return error.Cancelled,
-            else => return .invalid,
-        };
+        return .invalid;
     }
 };
 
@@ -394,6 +351,7 @@ fn reviewWithAdapter(
             .route = input.route,
             .credential = input.credential,
             .tenant = input.tenant,
+            .session_id = input.session_id,
             .model = reviewer_model,
             .model_request = .{
                 .tools = &.{function_schema},
@@ -548,7 +506,7 @@ fn serializeEvidence(
             if (tool.descriptor) |descriptor| {
                 var schema_out: std.Io.Writer.Allocating = .init(alloc);
                 defer schema_out.deinit();
-                try gateway_schema.writeInputSchema(alloc, &schema_out.writer, descriptor);
+                try tool_descriptor.writeInputSchema(alloc, &schema_out.writer, descriptor);
                 try writeBoundedField(&out.writer, alloc, "schema_name", descriptor.name, max_action_field_bytes, &action_complete);
                 try writeBoundedField(&out.writer, alloc, "schema_description", descriptor.description, max_action_field_bytes, &action_complete);
                 try writeBoundedField(&out.writer, alloc, "input_schema", schema_out.written(), max_action_field_bytes, &action_complete);
@@ -843,7 +801,7 @@ const risk_values = [_][]const u8{ "low", "medium", "high", "critical" };
 const authorization_values = [_][]const u8{ "unknown", "low", "medium", "high" };
 const decision_values = [_][]const u8{ "allow", "ask" };
 const schema_required = [_][]const u8{ "risk", "authorization", "decision", "rationale" };
-const schema_properties = [_]gateway_schema.Property{
+const schema_properties = [_]tool_descriptor.Property{
     .{
         .name = "risk",
         .json_type = .string,
@@ -869,7 +827,7 @@ const schema_properties = [_]gateway_schema.Property{
     },
 };
 
-const function_schema: gateway_schema.FunctionSchema = .{
+const function_schema: tool_descriptor.Descriptor = .{
     .name = tool_name,
     .description = "Return a strict automatic permission assessment for one exact Fx action.",
     .input_schema = .{
@@ -879,7 +837,7 @@ const function_schema: gateway_schema.FunctionSchema = .{
     },
 };
 
-fn parseCompletion(alloc: std.mem.Allocator, completion: types.GatewayCompletion) !ParseOutcome {
+fn parseCompletion(alloc: std.mem.Allocator, completion: types.ModelCompletion) !ParseOutcome {
     if (completion.content) |content| {
         if (std.mem.trim(u8, content, " \t\r\n").len > 0) return .invalid;
     }
@@ -951,55 +909,6 @@ test "automatic reviewer defaults to the tested fifteen second budget" {
     try std.testing.expectEqual(@as(u32, 15_000), default_timeout_ms);
 }
 
-test "automatic reviewer classifier routes through the registered provider" {
-    const State = struct {
-        saw_input: bool = false,
-
-        fn review(
-            raw_ctx: ?*anyopaque,
-            _: std.mem.Allocator,
-            input: ProviderInput,
-            request: ReviewRequest,
-        ) anyerror!ParseOutcome {
-            const self: *@This() = @ptrCast(@alignCast(raw_ctx orelse return error.MissingProviderContext));
-            self.saw_input = std.mem.eql(u8, input.credential, "test-key") and
-                std.mem.eql(u8, input.tenant orelse "", "team_1") and
-                std.mem.eql(u8, input.endpoint, "https://example.test/chat") and
-                std.mem.eql(u8, request.workspace_root, "/tmp/workspace");
-            return .invalid;
-        }
-    };
-
-    var state = State{};
-    const classifier = Classifier.withProvider(.{
-        .context = @ptrCast(&state),
-        .review_fn = State.review,
-    }, .{
-        .credential = "test-key",
-        .tenant = "team_1",
-        .endpoint = "https://example.test/chat",
-    });
-    const outcome = try classifier.review(std.testing.allocator, .{
-        .workspace_root = "/tmp/workspace",
-        .review_turn = .{
-            .model = "openai/gpt-5",
-            .request_messages = &.{},
-            .pending_assistant = .{ .role = .assistant },
-            .target_call_id = "call_1",
-            .origin = .root,
-        },
-        .targets = &.{},
-        .action = .{ .tool = .{
-            .tool_name = "run_command",
-            .arguments_json = "{}",
-        } },
-        .escalation_reason = "test",
-    });
-
-    try std.testing.expectEqual(std.meta.Tag(ParseOutcome).invalid, std.meta.activeTag(outcome));
-    try std.testing.expect(state.saw_input);
-}
-
 test "missing or unsupported pinned reviewer returns invalid without adapter traffic" {
     const Counter = struct {
         calls: usize = 0,
@@ -1028,6 +937,7 @@ test "missing or unsupported pinned reviewer returns invalid without adapter tra
     var counter = Counter{};
     const adapter = agent_stream_provider.ProviderAdapter{
         .kind = "loopback",
+        .supported_protocol = "loopback",
         .context = &counter,
         .stream_fn = Counter.stream,
     };
@@ -1148,6 +1058,7 @@ test "accounted reviewer stops permanent and cancellation while bounding transie
     };
     const adapter = agent_stream_provider.ProviderAdapter{
         .kind = "loopback",
+        .supported_protocol = "loopback",
         .stream_fn = Fixture.adapterStream,
     };
     const pending = types.ChatMessage{
@@ -1301,7 +1212,7 @@ test "automatic review rejects malformed extra and legacy deny assessments" {
         .name = tool_name,
         .arguments_json = "{\"risk\":\"low\",\"authorization\":\"low\",\"decision\":\"allow\",\"rationale\":\"safe\"}",
     };
-    const completions = [_]types.GatewayCompletion{
+    const completions = [_]types.ModelCompletion{
         .{ .content = "allow" },
         .{ .tool_calls = &.{} },
         .{ .tool_calls = &.{ valid_call, valid_call } },

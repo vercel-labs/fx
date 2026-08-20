@@ -521,7 +521,7 @@ fn noopInputDeinit(_: *anyopaque, _: std.mem.Allocator) void {}
 const semantic_search_dispatch_tool = tool_dispatch.Tool{
     .name = "semantic_search",
     .description = "Semantic search dispatch test fixture.",
-    .gateway_schema = .{
+    .descriptor = .{
         .name = "semantic_search",
         .description = "Semantic search dispatch test fixture.",
     },

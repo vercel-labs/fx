@@ -414,7 +414,7 @@ fn executeTestSkillInstall(
 const test_install_skill = blk: {
     var tool = test_builtin_tools.skill;
     tool.name = "install_skill";
-    tool.gateway_schema.name = "install_skill";
+    tool.descriptor.name = "install_skill";
     tool.executor_kind = .install_skill;
     tool.activity_kind = .write;
     tool.requires_approval = true;
@@ -432,7 +432,7 @@ const test_install_skill = blk: {
 const test_web_search = blk: {
     var tool = test_builtin_tools.read_file;
     tool.name = "web_search";
-    tool.gateway_schema.name = "web_search";
+    tool.descriptor.name = "web_search";
     tool.executor_kind = .web_search;
     tool.action_label = "Searching";
     tool.completed_action_label = "Searched";

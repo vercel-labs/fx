@@ -806,15 +806,14 @@ test "legacy image snapshot repair captures available path once" {
     const replaced_path = try writeSessionTestImage(alloc, &tmp, "legacy.png", image_b);
     defer alloc.free(replaced_path);
 
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try image_attachments.writeImageFilePartJson(alloc, &out.writer, history[0].assistant.user.images[0]);
-    var expected_buf: [128]u8 = undefined;
-    const expected = std.base64.standard.Encoder.encode(&expected_buf, image_a);
-    var unexpected_buf: [128]u8 = undefined;
-    const unexpected = std.base64.standard.Encoder.encode(&unexpected_buf, image_b);
-    try std.testing.expect(std.mem.find(u8, out.written(), expected) != null);
-    try std.testing.expect(std.mem.find(u8, out.written(), unexpected) == null);
+    var verified = try image_attachments.loadVerifiedSnapshot(
+        alloc,
+        history[0].assistant.user.images[0],
+        .{},
+    );
+    defer verified.deinit(alloc);
+    try std.testing.expectEqualStrings(image_a, verified.bytes);
+    try std.testing.expect(!std.mem.eql(u8, image_b, verified.bytes));
 }
 
 test "legacy image snapshot repair drops unavailable path-only images" {

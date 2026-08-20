@@ -1334,7 +1334,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         (current) =>
           current.includes("resume-helper") &&
           !current.includes("Enter Use") &&
-          !current.includes("Fx needs access to Vercel AI Gateway"),
+          !current.includes("fx needs access to Vercel AI Gateway"),
         5_000,
       );
       expect(composerContains(pane, "resume-helper")).toBe(true);
@@ -1349,7 +1349,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "help command filters the catalog and opens selected commands",
+    "help command filters by command identity and opens selected commands",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-help-menu-")));
       workDirs.push(root);
@@ -1383,10 +1383,18 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("↑↓ Navigate");
       expect(pane).toContain("Enter Open");
 
-      await session.sendLiteralText("clipboard");
+      await session.sendLiteralText("login");
       grid = await waitForHelpMenu(session, 1);
       pane = grid.join("\n");
-      expect(composerContains(pane, "clipboard")).toBe(true);
+      expect(pane).toContain("/login");
+      expect(pane).toContain("sign in with Vercel");
+
+      await session.sendKeys("C-u");
+      await waitForHelpMenu(session, 39);
+      await session.sendLiteralText("paste");
+      grid = await waitForHelpMenu(session, 1);
+      pane = grid.join("\n");
+      expect(composerContains(pane, "paste")).toBe(true);
       expect(pane).toContain("Media");
       expect(pane).toContain("/paste");
       expect(pane).not.toContain("/clear");
@@ -1406,7 +1414,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("C-u");
       await session.sendText("/help");
       await waitForHelpMenu(session, 39);
-      await session.sendLiteralText("additional directories");
+      await session.sendLiteralText("workspace");
       await waitForHelpMenu(session, 1);
       await session.sendKeys("Enter");
       pane = await session.waitForPane(

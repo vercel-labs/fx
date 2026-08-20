@@ -523,6 +523,7 @@ test "unsupported pinned Vision route fails visibly without adapter traffic" {
     var counter = Counter{};
     const adapter = agent_stream_provider.ProviderAdapter{
         .kind = "loopback",
+        .supported_protocol = "loopback",
         .context = &counter,
         .stream_fn = Counter.stream,
     };

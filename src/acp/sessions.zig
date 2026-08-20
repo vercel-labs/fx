@@ -11,7 +11,8 @@ const session_codec = @import("../core/session/session_codec.zig");
 const session_store = @import("../core/session/session_store.zig");
 const js_host_session_store = @import("../core/session/js_host_session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
-const credentials = @import("../gateway/auth/credentials.zig");
+const auth_runtime = @import("../core/auth/auth_runtime.zig");
+const adapter_auth = @import("../core/gateway/adapter_auth.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const connection_registry = @import("../core/gateway/connection_registry.zig");
@@ -23,7 +24,7 @@ const types = @import("../core/shared/types.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
 const command_specs = @import("../core/slash_commands/command_specs.zig");
 const test_builtin_gateway = if (builtin.is_test)
-    @import("../builtins/gateway.zig")
+    @import("../core/gateway/test_adapter.zig")
 else
     struct {};
 
@@ -38,7 +39,7 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
         alloc,
         profile,
         state.selected_model,
-    ) catch |err| return handleCredentialFailure(state, alloc, msg, err);
+    ) catch |err| return handleCredentialFailure(state, alloc, msg, profile, err);
     var credential_owned = true;
     defer if (credential_owned) route_credential.deinit(alloc);
 
@@ -72,8 +73,8 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
         .model = model,
         .mode = state.cfg.mode_registry.default_mode_id,
         .workspace_root = state.workspace_root,
-        .api_key = state.api_key,
-        .credential_source = state.credential_source,
+        .route_credential = state.route_credential,
+        .route_source = state.route_source,
         .agent_step_limit = state.agent_step_limit,
         .max_tool_result_bytes = state.max_tool_result_bytes,
         .fast_mode = state.fast_mode,
@@ -175,7 +176,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         alloc,
         profile,
         state.selected_model,
-    ) catch |err| return handleCredentialFailure(state, alloc, msg, err);
+    ) catch |err| return handleCredentialFailure(state, alloc, msg, profile, err);
     var credential_owned = true;
     defer if (credential_owned) route_credential.deinit(alloc);
 
@@ -321,30 +322,31 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     var loaded_owned = true;
     defer if (loaded_owned) loaded.deinit(alloc);
     _ = session_codec.migrateLegacyRouteState(alloc, &loaded.state, .{
-        .connection_id = state.cfg.gateway_provider.connection_seed.id,
-        .adapter_kind = state.cfg.gateway_provider.connection_seed.adapter_id,
-        .permission_review_model_id = state.cfg.gateway_provider.connection_seed.internal_models.permission_review,
-        .vision_model_id = state.cfg.gateway_provider.connection_seed.internal_models.vision,
-    }) catch return state.writer.writeError(alloc, msg.id, .{
-        .code = ErrorCode.internal_error,
-        .message = "Session could not be loaded",
-    });
+        .connection_id = state.cfg.gateway_system.connection_seed.id,
+        .adapter_kind = state.cfg.gateway_system.connection_seed.adapter_id,
+        .permission_review_model_id = state.cfg.gateway_system.connection_seed.internal_models.permission_review,
+        .vision_model_id = state.cfg.gateway_system.connection_seed.internal_models.vision,
+    }) catch |err| return handleLoadFailure(state, alloc, msg, err);
     const loaded_connection = loaded.state.preferences.connection_id orelse
         session_codec.legacy_connection_id;
-    const profile = state.connections.?.profile(loaded_connection) catch
+    var profile = state.connections.?.profile(loaded_connection) catch
         return handleLoadFailure(state, alloc, msg, error.MissingSessionConnection);
     if (loaded.state.recovery_checkpoint) |checkpoint| {
         route_snapshot.validateRecoveryProfile(
             profile,
-            checkpoint.route_identity.?.adapter_kind,
+            state.cfg.gateway_system.connection_seed,
+            checkpoint.route_identity.?,
         ) catch |err| return handleLoadFailure(state, alloc, msg, err);
+        profile.credential_ref = checkpoint.route_identity.?.credential_ref orelse
+            return handleLoadFailure(state, alloc, msg, error.RecoveryRouteAuthorityUnavailable);
     }
-    var route_credential = server.prepareConnectionCredential(
+    var route_credential = (try prepareRestoredConnectionCredential(
         state,
         alloc,
+        msg,
         profile,
         loaded.state.preferences.model,
-    ) catch |err| return handleCredentialFailure(state, alloc, msg, err);
+    )) orelse return;
     var credential_owned = true;
     defer if (credential_owned) route_credential.deinit(alloc);
     const sid_copy = try alloc.dupe(u8, loaded.state.id);
@@ -375,8 +377,8 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
         .model = model_copy,
         .mode = state.cfg.mode_registry.default_mode_id,
         .workspace_root = state.workspace_root,
-        .api_key = state.api_key,
-        .credential_source = state.credential_source,
+        .route_credential = state.route_credential,
+        .route_source = state.route_source,
         .agent_step_limit = state.agent_step_limit,
         .max_tool_result_bytes = state.max_tool_result_bytes,
         .fast_mode = loaded.state.preferences.fast_mode,
@@ -577,23 +579,26 @@ fn handleRestoreSession(
         .{
             .seed_preferences = seed_preferences,
             .legacy_route_defaults = .{
-                .connection_id = state.cfg.gateway_provider.connection_seed.id,
-                .adapter_kind = state.cfg.gateway_provider.connection_seed.adapter_id,
-                .permission_review_model_id = state.cfg.gateway_provider.connection_seed.internal_models.permission_review,
-                .vision_model_id = state.cfg.gateway_provider.connection_seed.internal_models.vision,
+                .connection_id = state.cfg.gateway_system.connection_seed.id,
+                .adapter_kind = state.cfg.gateway_system.connection_seed.adapter_id,
+                .permission_review_model_id = state.cfg.gateway_system.connection_seed.internal_models.permission_review,
+                .vision_model_id = state.cfg.gateway_system.connection_seed.internal_models.vision,
             },
             .log = session_test_controls.logOptions(),
         },
     ) catch |err| return handleLoadFailure(state, alloc, msg, err);
     var writable_owned = true;
     defer if (writable_owned) writable.deinit(alloc);
-    const profile = state.connections.?.profile(writable.state.preferences.connection_id.?) catch
+    var profile = state.connections.?.profile(writable.state.preferences.connection_id.?) catch
         return handleLoadFailure(state, alloc, msg, error.MissingSessionConnection);
     if (writable.state.recovery_checkpoint) |checkpoint| {
         route_snapshot.validateRecoveryProfile(
             profile,
-            checkpoint.route_identity.?.adapter_kind,
+            state.cfg.gateway_system.connection_seed,
+            checkpoint.route_identity.?,
         ) catch |err| return handleLoadFailure(state, alloc, msg, err);
+        profile.credential_ref = checkpoint.route_identity.?.credential_ref orelse
+            return handleLoadFailure(state, alloc, msg, error.RecoveryRouteAuthorityUnavailable);
     }
 
     const sid_copy = try alloc.dupe(u8, writable.state.id);
@@ -603,12 +608,13 @@ fn handleRestoreSession(
         state.selected_model
     else
         writable.state.preferences.model;
-    var route_credential = server.prepareConnectionCredential(
+    var route_credential = (try prepareRestoredConnectionCredential(
         state,
         alloc,
+        msg,
         profile,
         effective_model,
-    ) catch |err| return handleCredentialFailure(state, alloc, msg, err);
+    )) orelse return;
     var credential_owned = true;
     defer if (credential_owned) route_credential.deinit(alloc);
     const model_copy = try alloc.dupe(u8, effective_model);
@@ -802,7 +808,7 @@ const SessionActivation = struct {
     mcp: ?*mcp_runtime.McpRuntime,
     connection_id: []const u8,
     adapter_kind: []const u8,
-    credential: credentials.Credential,
+    credential: adapter_auth.Credential,
 };
 
 fn activateSession(
@@ -824,8 +830,8 @@ fn activateSession(
         .model = activation.model,
         .mode = state.cfg.mode_registry.default_mode_id,
         .workspace_root = state.workspace_root,
-        .api_key = state.api_key,
-        .credential_source = state.credential_source,
+        .route_credential = state.route_credential,
+        .route_source = state.route_source,
         .agent_step_limit = state.agent_step_limit,
         .max_tool_result_bytes = state.max_tool_result_bytes,
         .fast_mode = activation.fast_mode,
@@ -915,10 +921,16 @@ fn handleLoadFailure(
             .message = "Saved connection is unavailable; select or restore that connection before resuming",
         });
     }
-    if (err == error.RecoveryRouteAdapterChanged) {
+    if (err == error.RecoveryRouteAuthorityChanged) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
-            .message = "Saved connection adapter changed; restore the original adapter before resuming",
+            .message = "Saved connection routing authority changed; restore the original connection before resuming",
+        });
+    }
+    if (err == error.RecoveryRouteAuthorityUnavailable) {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Saved recovery route lacks pinned authority and cannot be resumed",
         });
     }
     if (err == error.InvalidSessionFormat or
@@ -941,16 +953,39 @@ fn handleLoadFailure(
     });
 }
 
+fn prepareRestoredConnectionCredential(
+    state: *server.ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    profile: connection_registry.Profile,
+    model: []const u8,
+) !?adapter_auth.Credential {
+    return server.prepareConnectionCredential(
+        state,
+        alloc,
+        profile,
+        model,
+    ) catch |err| {
+        try handleCredentialFailure(state, alloc, msg, profile, err);
+        return null;
+    };
+}
+
 fn handleCredentialFailure(
     state: *server.ServerState,
     alloc: Allocator,
     msg: *jsonrpc.Message,
+    failed_profile: connection_registry.Profile,
     err: anyerror,
 ) !void {
     if (err == error.MissingCredential) {
+        const message = (try (auth_runtime.StatusSnapshot{
+            .connection_display_name = failed_profile.display_name,
+        }).missingHelpAlloc(alloc, .cli)).?;
+        defer alloc.free(message);
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
-            .message = credentials.missing_credential_message,
+            .message = message,
         });
     }
     return state.writer.writeError(alloc, msg.id, .{
@@ -1432,6 +1467,127 @@ test "ACP load maps one-off child denial to invalid params" {
     ) != null);
 }
 
+test "native and WASM ACP missing credential mapper names the failed saved profile" {
+    const alloc = std.testing.allocator;
+    const Effects = struct {
+        saved_auth: usize = 0,
+        selected_auth: usize = 0,
+
+        fn acquire(
+            raw: *const anyopaque,
+            _: Allocator,
+            request: adapter_auth.Request,
+        ) Allocator.Error!adapter_auth.Acquisition {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (std.mem.eql(u8, request.profile.id, "saved-a")) {
+                self.saved_auth += 1;
+            } else if (std.mem.eql(u8, request.profile.id, "selected-b")) {
+                self.selected_auth += 1;
+            }
+            return .{ .missing = .not_found };
+        }
+    };
+    const TestPersistence = struct {
+        fn write(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: connection_registry.Snapshot,
+        ) anyerror!connection_registry.PersistenceOutcome {
+            return .committed;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var capture = try tmp.dir.createFile(
+        io_mod.getIo(),
+        "acp-saved-credential-error.jsonl",
+        .{ .read = true },
+    );
+    defer capture.close(io_mod.getIo());
+    {
+        var state = try initAcpSessionTestState(arena, workspace, capture);
+        defer state.deinit();
+        var effects = Effects{};
+        var saved_adapter = test_builtin_gateway.provider_adapter;
+        saved_adapter.kind = "adapter-a";
+        saved_adapter.supported_protocol = "protocol-a";
+        saved_adapter.auth = .{
+            .kind = "adapter-a",
+            .context = &effects,
+            .acquire_fn = Effects.acquire,
+        };
+        var selected_adapter = test_builtin_gateway.provider_adapter;
+        selected_adapter.kind = "adapter-b";
+        selected_adapter.supported_protocol = "protocol-b";
+        selected_adapter.auth = .{
+            .kind = "adapter-b",
+            .context = &effects,
+            .acquire_fn = Effects.acquire,
+        };
+        const adapters = [_]@TypeOf(test_builtin_gateway.provider_adapter){
+            saved_adapter,
+            selected_adapter,
+        };
+        state.cfg.gateway_system.adapter_registry =
+            try @import("../core/gateway/adapter_registry.zig").AdapterRegistry.init(&adapters);
+        state.connections.?.deinit();
+        state.connections = try connection_registry.Runtime.init(
+            arena,
+            .{
+                .id = "selected-b",
+                .display_name = "Selected B",
+                .adapter_id = "adapter-b",
+                .endpoint = test_builtin_gateway.connection_seed.endpoint,
+                .protocol = "protocol-b",
+                .credential_ref = "present-b",
+                .remembered_model = "test/model",
+            },
+            null,
+            .{ .write_fn = TestPersistence.write },
+        );
+        try state.connections.?.add(.{
+            .id = "saved-a",
+            .display_name = "Saved A",
+            .adapter_id = "adapter-a",
+            .endpoint = test_builtin_gateway.connection_seed.endpoint,
+            .protocol = "protocol-a",
+            .credential_ref = "missing-a",
+            .remembered_model = "test/model",
+        });
+        var msg = jsonrpc.Message{
+            .id = .{ .integer = 1 },
+            .method = "session/load",
+        };
+        const saved_profile = try state.connections.?.profile("saved-a");
+        try std.testing.expect((try prepareRestoredConnectionCredential(
+            &state,
+            arena,
+            &msg,
+            saved_profile,
+            "test/model",
+        )) == null);
+        try std.testing.expectEqual(@as(usize, 1), effects.saved_auth);
+        try std.testing.expectEqual(@as(usize, 0), effects.selected_auth);
+        try capture.sync(io_mod.getIo());
+    }
+    var captured_file = try tmp.dir.openFile(
+        io_mod.getIo(),
+        "acp-saved-credential-error.jsonl",
+        .{},
+    );
+    defer captured_file.close(io_mod.getIo());
+    const captured = try io_mod.readFileToEnd(alloc, &captured_file, 4096);
+    defer alloc.free(captured);
+    try std.testing.expect(std.mem.find(u8, captured, "Saved A") != null);
+    try std.testing.expect(std.mem.find(u8, captured, "Selected B") == null);
+}
+
 var acp_session_stable_test_environ: ?*std.process.Environ.Map = null;
 
 fn stableAcpSessionTestEnviron() !*const std.process.Environ.Map {
@@ -1505,9 +1661,7 @@ fn acpSessionTestConfig() server.Config {
         .default_model = "test/model",
         .default_agent_step_limit = 8,
         .gateway_retry_count = 0,
-        .gateway_chat_url = "http://127.0.0.1/unused",
-        .gateway_models_path = "/v1/models",
-        .gateway_provider = test_builtin_gateway.provider,
+        .gateway_system = test_builtin_gateway.system,
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{ .system_prompt = "test" },
         .ignored_list_entries = &.{},
@@ -1530,8 +1684,8 @@ fn initAcpSessionTestState(
 ) !server.ServerState {
     const workspace = try alloc.dupe(u8, workspace_root);
     errdefer alloc.free(workspace);
-    const api_key = try alloc.dupe(u8, "test-key");
-    errdefer alloc.free(api_key);
+    const route_credential = try alloc.dupe(u8, "test-key");
+    errdefer alloc.free(route_credential);
     const selected_model = try alloc.dupe(u8, "test/model");
     errdefer alloc.free(selected_model);
     const configured_model = try alloc.dupe(u8, "test/model");
@@ -1539,7 +1693,7 @@ fn initAcpSessionTestState(
     const cfg = acpSessionTestConfig();
     const connections = try connection_registry.Runtime.init(
         alloc,
-        cfg.gateway_provider.connection_seed.profile("test/model", null),
+        cfg.gateway_system.connection_seed.profile("test/model", null),
         null,
         .unavailable,
     );
@@ -1549,10 +1703,14 @@ fn initAcpSessionTestState(
         .cfg = cfg,
         .writer = .{ .stdout = capture },
         .workspace_root = workspace,
-        .api_key = api_key,
-        .credential_source = .ai_gateway_api_key,
-        .credential_connection_id = cfg.gateway_provider.connection_seed.id,
-        .credential_adapter_kind = cfg.gateway_provider.connection_seed.adapter_id,
+        .route_credential = route_credential,
+        .route_source = .{
+            .id = cfg.gateway_system.connection_seed.credential_ref,
+            .label = "test credential",
+            .refreshable = false,
+        },
+        .credential_connection_id = cfg.gateway_system.connection_seed.id,
+        .credential_adapter_kind = cfg.gateway_system.connection_seed.adapter_id,
         .selected_model = selected_model,
         .configured_model = configured_model,
         .connections = connections,

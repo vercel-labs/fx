@@ -1,4 +1,5 @@
 const std = @import("std");
+const protocol_validation = @import("protocol_validation.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const secret = @import("../core/auth/secret.zig");
@@ -157,7 +158,6 @@ const HttpResult = struct {
     }
 };
 
-pub const PostResult = HttpResult;
 pub const GetResult = HttpResult;
 
 pub const GatewayJsonResult = union(enum) {
@@ -199,7 +199,7 @@ var test_cancel_watcher_spawn_error: ?anyerror = null;
 
 pub const StreamResult = struct {
     status: std.http.Status,
-    completion: types.GatewayCompletion = .{},
+    completion: types.ModelCompletion = .{},
     err_body: ?[]u8 = null,
     retry_after_seconds: ?u64 = null,
 
@@ -258,7 +258,7 @@ pub fn fetchGatewayGenerationResult(
     generation_id: []const u8,
     cancel_flag: *std.atomic.Value(bool),
 ) !GetResult {
-    if (!types.validGatewayGenerationId(generation_id)) return error.InvalidGenerationId;
+    if (!protocol_validation.validGenerationId(generation_id)) return error.InvalidGenerationId;
     var operation = GenerationLookupOperation{
         .alloc = alloc,
         .api_key = api_key,
@@ -607,73 +607,6 @@ pub fn isTrustedGenerationOrigin(origin: []const u8) bool {
         isLoopbackHttpUrl(origin);
 }
 
-pub fn postGatewayCompletion(
-    alloc: std.mem.Allocator,
-    api_key: []const u8,
-    model: []const u8,
-    retry_count: usize,
-    chat_url: []const u8,
-    payload: []const u8,
-) !PostResult {
-    const request_url = try resolveE2eGatewayUrl(e2e_gateway_chat_url_env, chat_url);
-    var attempt: usize = 0;
-    while (attempt < retry_count) : (attempt += 1) {
-        debug_trace.logf("stream", "open attempt={d}/{d} url={s} payload_bytes={d}", .{ attempt + 1, retry_count, request_url, payload.len });
-        var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-        defer client.deinit();
-
-        const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{api_key});
-        defer secret.zeroAndFree(alloc, auth_header);
-
-        const extra_headers = [_]std.http.Header{
-            .{ .name = "HTTP-Referer", .value = "https://github.com/vercel-labs/fx" },
-            .{ .name = "X-Title", .value = "fx" },
-            .{ .name = "Accept", .value = "application/json" },
-            .{ .name = "ai-gateway-protocol-version", .value = "0.0.1" },
-            .{ .name = "ai-language-model-specification-version", .value = "4" },
-            .{ .name = "ai-language-model-id", .value = model },
-            .{ .name = "ai-language-model-streaming", .value = "false" },
-        };
-
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        const result = client.fetch(.{
-            .location = .{ .url = request_url },
-            .method = .POST,
-            .payload = payload,
-            .headers = .{
-                .content_type = .{ .override = "application/json" },
-                .authorization = .{ .override = auth_header },
-                .accept_encoding = .omit,
-                .user_agent = .{ .override = user_agent },
-            },
-            .extra_headers = &extra_headers,
-            .response_writer = &out.writer,
-        }) catch |err| {
-            if (isRetryableGatewayError(err) and attempt + 1 < retry_count) {
-                io_mod.sleep((attempt + 1) * 150 * std.time.ns_per_ms);
-                continue;
-            }
-            return err;
-        };
-
-        if (isRetryableGatewayStatus(result.status) and attempt + 1 < retry_count) {
-            const delay_ns = retryBackoffDelayNs(attempt);
-            debug_trace.logf("stream", "retrying status={d} attempt={d} delay_ms={d}", .{ @intFromEnum(result.status), attempt + 1, delay_ns / std.time.ns_per_ms });
-            io_mod.sleep(delay_ns);
-            continue;
-        }
-
-        return .{
-            .status = result.status,
-            .body = try out.toOwnedSlice(),
-        };
-    }
-
-    return error.HttpConnectionClosing;
-}
-
 /// Monotonic request-delivery evidence. It becomes possibly sent before the
 /// first body write so any later transport failure is treated as potentially billed.
 pub const DeliveryCertainty = agent_stream_provider.DeliveryCertainty;
@@ -995,7 +928,7 @@ pub const StreamRequest = struct {
     chat_url: []const u8,
     payload: []const u8,
     team: ?[]const u8 = null,
-    /// Borrowed until `streamGatewayCompletion` returns.
+    /// Borrowed until `streamModelCompletion` returns.
     session_id: ?[]const u8 = null,
     trace_ctx: debug_trace.TraceContext = .{},
     content_capture_limit: ?usize = null,
@@ -1005,7 +938,7 @@ pub const StreamRequest = struct {
     provider_attempt_owner: ProviderAttemptOwner = .transport,
 };
 
-pub fn streamGatewayCompletion(
+pub fn streamModelCompletion(
     alloc: std.mem.Allocator,
     request: StreamRequest,
     callback_ctx: *anyopaque,
@@ -1015,7 +948,7 @@ pub fn streamGatewayCompletion(
 ) !StreamResult {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const expected_provider_tool_name = try expectedProviderToolName(alloc, request.payload);
-    return streamGatewayCompletionCore(
+    return streamModelCompletionCore(
         alloc,
         request,
         callback_ctx,
@@ -1113,7 +1046,7 @@ const BoundedGatewayOperation = struct {
     cancel_flag: *std.atomic.Value(bool),
 
     fn run(self: *@This()) !StreamResult {
-        return streamGatewayCompletionCore(
+        return streamModelCompletionCore(
             self.alloc,
             self.request,
             @ptrCast(&bounded_stream_discard_ctx),
@@ -1130,7 +1063,7 @@ var bounded_stream_discard_ctx: u8 = 0;
 
 fn discardBoundedContent(_: *anyopaque, _: []const u8) void {}
 
-fn streamGatewayCompletionCore(
+fn streamModelCompletionCore(
     alloc: std.mem.Allocator,
     request: StreamRequest,
     callback_ctx: *anyopaque,
@@ -1140,7 +1073,7 @@ fn streamGatewayCompletionCore(
     expected_provider_tool_name: ?[]const u8,
     watch_connected_socket: bool,
 ) !StreamResult {
-    return streamGatewayCompletionCoreWithOptions(
+    return streamModelCompletionCoreWithOptions(
         alloc,
         request,
         callback_ctx,
@@ -1153,7 +1086,7 @@ fn streamGatewayCompletionCore(
     );
 }
 
-fn streamGatewayCompletionCoreWithOptions(
+fn streamModelCompletionCoreWithOptions(
     alloc: std.mem.Allocator,
     request: StreamRequest,
     callback_ctx: *anyopaque,
@@ -1408,11 +1341,11 @@ fn streamGatewayCompletionCoreWithOptions(
             ));
         };
         if (cancel_flag.load(.seq_cst)) {
-            deinitGatewayCompletion(alloc, &completion);
+            deinitModelCompletion(alloc, &completion);
             return error.Cancelled;
         }
         if (system_resumed.load(.seq_cst)) {
-            deinitGatewayCompletion(alloc, &completion);
+            deinitModelCompletion(alloc, &completion);
             return error.SystemResumed;
         }
         completion.delivery_ambiguous = delivery_ambiguous;
@@ -1747,10 +1680,7 @@ fn spawn_gateway_cancel_watcher(
     if (builtin.is_test) {
         if (test_cancel_watcher_spawn_error) |err| return err;
     }
-    return if (comptime builtin.os.tag == .wasi)
-        error.ThreadUnavailable
-    else
-        std.Thread.spawn(.{}, GatewayCancelWatcher.run, .{ done, cancel_flag, system_resumed, stream });
+    return std.Thread.spawn(.{}, GatewayCancelWatcher.run, .{ done, cancel_flag, system_resumed, stream });
 }
 
 test "suspend gap classification compares boot and awake clocks" {
@@ -2224,7 +2154,7 @@ fn stringifyJsonValueOwned(alloc: std.mem.Allocator, value: std.json.Value) ![]u
     return out.toOwnedSlice();
 }
 
-fn deinitGatewayCompletion(alloc: std.mem.Allocator, completion: *types.GatewayCompletion) void {
+fn deinitModelCompletion(alloc: std.mem.Allocator, completion: *types.ModelCompletion) void {
     if (completion.content) |content| alloc.free(content);
     if (completion.generation_id) |id| alloc.free(id);
     if (completion.billing) |billing| alloc.free(@constCast(billing.model));
@@ -2493,7 +2423,7 @@ fn parseSseBilling(
     root: std.json.Value,
     created_at_ms: ?i64,
     tools: []const SseToolCallAccumulator,
-) SseBillingParseError!types.GatewayBilling {
+) SseBillingParseError!types.GenerationBilling {
     const timestamp = created_at_ms orelse return error.InvalidSseBilling;
     const usage = if (root == .object)
         root.object.get("usage") orelse return error.InvalidSseBilling
@@ -2699,7 +2629,7 @@ fn captureGenerationMetadata(
         return;
     }
     const generation_value = gateway.object.get("generationId") orelse return;
-    if (generation_value != .string or !types.validGatewayGenerationId(generation_value.string)) {
+    if (generation_value != .string or !protocol_validation.validGenerationId(generation_value.string)) {
         invalid.* = true;
         return;
     }
@@ -2717,7 +2647,7 @@ fn consumeSseStream(
     on_content_chunk: StreamCallback,
     on_tool_start: ?ToolStartCallback,
     cancel_flag: *std.atomic.Value(bool),
-) !types.GatewayCompletion {
+) !types.ModelCompletion {
     return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, cancel_flag, null, null, null);
 }
 
@@ -2735,7 +2665,7 @@ pub fn consumeGatewaySseStream(
     on_reasoning_chunk: ?StreamCallback,
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
-) !types.GatewayCompletion {
+) !types.ModelCompletion {
     return consumeSseStreamTraced(
         alloc,
         reader,
@@ -2763,7 +2693,7 @@ fn consumeSseStreamTraced(
     resolved_model_trace: ?ResolvedModelTrace,
     expected_provider_tool_name: ?[]const u8,
     content_capture_limit: ?usize,
-) !types.GatewayCompletion {
+) !types.ModelCompletion {
     var content_buf: std.ArrayList(u8) = .empty;
     defer content_buf.deinit(alloc);
 
@@ -2781,7 +2711,7 @@ fn consumeSseStreamTraced(
 
     var finish_reason_holder: ?types.ProviderFinishReason = null;
     var finish_usage: types.Usage = .{};
-    var finish_billing: ?types.GatewayBilling = null;
+    var finish_billing: ?types.GenerationBilling = null;
     defer if (finish_billing) |billing| alloc.free(@constCast(billing.model));
     var generation_id: ?[]u8 = null;
     defer if (generation_id) |id| alloc.free(id);
@@ -2853,7 +2783,7 @@ fn consumeSseStreamTraced(
         if (std.mem.eql(u8, event_type, "response-metadata")) {
             if (root.object.get("timestamp")) |timestamp_value| {
                 if (timestamp_value == .string) {
-                    const timestamp = types.parseGatewayTimestamp(
+                    const timestamp = protocol_validation.parseTimestamp(
                         timestamp_value.string,
                     ) catch null;
                     if (timestamp) |valid_timestamp| {
@@ -3234,8 +3164,8 @@ fn consumeSseStreamTraced(
         }
     }
 
-    var completion: types.GatewayCompletion = .{};
-    errdefer deinitGatewayCompletion(alloc, &completion);
+    var completion: types.ModelCompletion = .{};
+    errdefer deinitModelCompletion(alloc, &completion);
 
     if (content_buf.items.len > 0) {
         completion.content = try alloc.dupe(u8, content_buf.items);
@@ -3320,7 +3250,7 @@ test "consumeSseStream captures generation identity metadata" {
         null,
         &cancel_flag,
     );
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqualStrings(
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -3361,7 +3291,7 @@ test "consumeSseStream traces rejected terminal billing before fallback" {
         null,
         &cancel_flag,
     );
-    defer deinitGatewayCompletion(alloc, &completion);
+    defer deinitModelCompletion(alloc, &completion);
     try std.testing.expect(completion.billing == null);
 
     debug_trace.shutdown();
@@ -3396,7 +3326,7 @@ test "consumeSseStream captures exact terminal billing" {
         null,
         &cancel_flag,
     );
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     const billing = completion.billing.?;
     try std.testing.expectEqualStrings("provider/canonical", billing.model);
@@ -3422,7 +3352,7 @@ test "consumeSseStream ignores malformed finish usage totals" {
     };
 
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(types.ProviderFinishReason.stop, completion.finish_reason.?);
     try std.testing.expect(completion.usage.input_tokens == null);
@@ -3444,7 +3374,7 @@ test "consumeSseStream preserves provider error detail" {
     };
 
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
     try std.testing.expectEqualStrings("provider_down: wafer route unavailable", completion.provider_failure_detail.?);
@@ -3467,7 +3397,7 @@ test "consumeSseStream assigns a fallback identity to message-only provider erro
     };
 
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqualStrings(
         "provider_error: wafer route unavailable",
@@ -3730,7 +3660,7 @@ test "consumeSseStream traces every SSE event with keyless metadata" {
     var reader = std.Io.Reader.fixed(payload);
     var cancel_flag = std.atomic.Value(bool).init(false);
     var completion = try consumeSseStream(alloc, &reader, &capture, Capture.onContent, Capture.onToolStart, &cancel_flag);
-    defer deinitGatewayCompletion(alloc, &completion);
+    defer deinitModelCompletion(alloc, &completion);
     debug_trace.shutdown();
 
     try std.testing.expectEqualStrings("answer", completion.content.?);
@@ -3796,7 +3726,7 @@ test "consumeSseStream keyless tracing handles oversized CRLF payloads" {
     var reader = std.Io.Reader.fixed(payload.items);
     var cancel_flag = std.atomic.Value(bool).init(false);
     var completion = try consumeSseStream(alloc, &reader, &capture, Capture.onContent, null, &cancel_flag);
-    defer deinitGatewayCompletion(alloc, &completion);
+    defer deinitModelCompletion(alloc, &completion);
     debug_trace.shutdown();
 
     try std.testing.expectEqualStrings("answer", completion.content.?);
@@ -3970,7 +3900,7 @@ test "consumeSseStream serializes tool-call input that arrives as an array" {
     };
 
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqualStrings("[1,{\"nested\":true}]", completion.tool_calls[0].arguments_json);
     try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, completion.tool_calls[0].argument_integrity);
@@ -3989,7 +3919,7 @@ test "consumeSseStream preserves valid serialized final input bytes exactly" {
     };
 
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqualStrings(expected, completion.tool_calls[0].arguments_json);
     try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, completion.tool_calls[0].argument_integrity);
@@ -4022,7 +3952,7 @@ test "consumeSseStream preserves valid serialized scalar roots" {
             fn chunk(_: *anyopaque, _: []const u8) void {}
         };
         var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        defer deinitModelCompletion(std.testing.allocator, &completion);
 
         try std.testing.expectEqualStrings(input, completion.tool_calls[0].arguments_json);
         try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, completion.tool_calls[0].argument_integrity);
@@ -4060,7 +3990,7 @@ test "consumeSseStream replaces malformed trailing or duplicate-key serialized f
         };
 
         var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        defer deinitModelCompletion(std.testing.allocator, &completion);
 
         try std.testing.expectEqualStrings("{}", completion.tool_calls[0].arguments_json);
         try std.testing.expectEqual(types.ToolArgumentIntegrity.malformed_json, completion.tool_calls[0].argument_integrity);
@@ -4082,7 +4012,7 @@ test "consumeSseStream replaces duplicate-key exact-id ended fallback with safe 
     };
 
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqualStrings("{}", completion.tool_calls[0].arguments_json);
     try std.testing.expectEqual(types.ToolArgumentIntegrity.malformed_json, completion.tool_calls[0].argument_integrity);
@@ -4112,7 +4042,7 @@ test "consumeSseStream absent outer input uses exact-id ended fallback for compa
             fn chunk(_: *anyopaque, _: []const u8) void {}
         };
         var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        defer deinitModelCompletion(std.testing.allocator, &completion);
 
         try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", completion.tool_calls[0].arguments_json);
         try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, completion.tool_calls[0].argument_integrity);
@@ -4148,7 +4078,7 @@ test "consumeSseStream present unsupported final input does not use streamed fal
             fn chunk(_: *anyopaque, _: []const u8) void {}
         };
         var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        defer deinitModelCompletion(std.testing.allocator, &completion);
 
         try std.testing.expectEqualStrings("{}", completion.tool_calls[0].arguments_json);
         try std.testing.expectEqual(types.ToolArgumentIntegrity.malformed_json, completion.tool_calls[0].argument_integrity);
@@ -4197,7 +4127,7 @@ test "consumeSseStream rejects absent outer input without exact ended fallback" 
             fn chunk(_: *anyopaque, _: []const u8) void {}
         };
         var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        defer deinitModelCompletion(std.testing.allocator, &completion);
 
         try std.testing.expectEqual(
             types.AuthoritativeToolAdmission{ .reject_malformed_provider_result = case.expected },
@@ -4221,7 +4151,7 @@ test "consumeSseStream replaces malformed exact-id ended fallback with safe JSON
     };
 
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqualStrings("{}", completion.tool_calls[0].arguments_json);
     try std.testing.expectEqual(types.ToolArgumentIntegrity.malformed_json, completion.tool_calls[0].argument_integrity);
@@ -4261,7 +4191,7 @@ test "consumeSseStream does not publish labels from malformed streamed arguments
         Capture.onToolStart,
         &cancel_flag,
     );
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(@as(usize, 0), capture.labels);
     try std.testing.expect(!capture.leaked_sentinel);
@@ -4301,7 +4231,7 @@ test "consumeSseStream traces malformed argument metadata without source bytes" 
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
     var completion = try consumeSseStream(alloc, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(alloc, &completion);
+    defer deinitModelCompletion(alloc, &completion);
     debug_trace.shutdown();
 
     const trace = try readTraceFileForTest(alloc, trace_path);
@@ -4333,7 +4263,7 @@ test "consumeSseStream malformed final identity borrows no streamed state" {
     };
 
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
     try std.testing.expectEqual(.absent, completion.tool_calls[0].final_identity);
@@ -4372,7 +4302,7 @@ test "consumeSseStream preserves final identity states without recency aliases" 
             fn chunk(_: *anyopaque, _: []const u8) void {}
         };
         var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        defer deinitModelCompletion(std.testing.allocator, &completion);
 
         try std.testing.expectEqual(case.expected, completion.tool_calls[0].final_identity);
         try std.testing.expectEqualStrings(case.expected_id, completion.tool_calls[0].id);
@@ -4401,7 +4331,7 @@ test "consumeSseStream reconciles a changed final id with equivalent streamed in
         null,
         &cancel_flag,
     );
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
     try std.testing.expectEqualStrings("final_read", completion.tool_calls[0].id);
@@ -4439,7 +4369,7 @@ test "consumeSseStream reconciles interleaved changed ids by structural input" {
         null,
         &cancel_flag,
     );
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(@as(usize, 2), completion.tool_calls.len);
     try std.testing.expectEqualStrings("final_b", completion.tool_calls[0].id);
@@ -4476,7 +4406,7 @@ test "consumeSseStream does not alias changed ids with different input" {
         null,
         &cancel_flag,
     );
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
     try std.testing.expectEqualStrings("final_read", completion.tool_calls[0].id);
@@ -4526,7 +4456,7 @@ test "consumeSseStream isolates interleaved streamed inputs by exact event id" {
         Capture.onToolStart,
         &cancel_flag,
     );
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(@as(usize, 2), capture.starts);
     try std.testing.expectEqual(@as(usize, 2), capture.labels);
@@ -4599,7 +4529,7 @@ test "consumeSseStream ignores conflicting and late stream events without mutati
         Capture.onToolStart,
         &cancel_flag,
     );
-    defer deinitGatewayCompletion(alloc, &completion);
+    defer deinitModelCompletion(alloc, &completion);
     debug_trace.shutdown();
 
     try std.testing.expectEqual(@as(usize, 1), capture.starts);
@@ -4637,7 +4567,7 @@ test "consumeSseStream accepts authoritative final input before end" {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
     try std.testing.expectEqualStrings("read_file", completion.tool_calls[0].name);
@@ -4669,7 +4599,7 @@ test "consumeSseStream rejects a final tool name that conflicts with streamed id
             fn chunk(_: *anyopaque, _: []const u8) void {}
         };
         var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        defer deinitModelCompletion(std.testing.allocator, &completion);
 
         switch (types.authoritativeToolAdmission(completion)) {
             .admitted => return error.TestUnexpectedResult,
@@ -4692,7 +4622,7 @@ test "consumeSseStream rejects fallback from an open stream" {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqualStrings("", completion.tool_calls[0].arguments_json);
     try std.testing.expectEqual(
@@ -4713,7 +4643,7 @@ test "consumeSseStream keeps unmatched valid finals independent and alias-free" 
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqualStrings("final", completion.tool_calls[0].id);
     try std.testing.expectEqualStrings("grep_files", completion.tool_calls[0].name);
@@ -4734,7 +4664,7 @@ test "consumeSseStream preserves duplicate final ids for duplicate admission" {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(@as(usize, 2), completion.tool_calls.len);
     try std.testing.expect(completion.provider_result_identity_failure == null);
@@ -4759,7 +4689,7 @@ test "consumeSseStream duplicate final ids do not reuse finalized stream fallbac
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(@as(usize, 2), completion.tool_calls.len);
     try std.testing.expectEqualStrings("{\"path\":\"a\"}", completion.tool_calls[0].arguments_json);
@@ -4799,7 +4729,7 @@ test "consumeSseStream records malformed provider result correlation identity" {
             fn chunk(_: *anyopaque, _: []const u8) void {}
         };
         var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        defer deinitModelCompletion(std.testing.allocator, &completion);
 
         try std.testing.expectEqual(case.expected, completion.provider_result_identity_failure.?);
     }
@@ -4819,7 +4749,7 @@ test "consumeSseStream rejects ambiguous provider result correlation" {
     };
 
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(@as(usize, 2), completion.tool_calls.len);
     try std.testing.expectEqual(
@@ -4850,7 +4780,7 @@ test "consumeSseStream preserves missing provider result for admission" {
     };
 
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
     try std.testing.expectEqual(.provider_executed, completion.tool_calls[0].provenance);
@@ -4873,7 +4803,7 @@ test "consumeSseStream takes provider execution provenance from the final call" 
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(.provider_executed, completion.tool_calls[0].provenance);
     try std.testing.expectEqualStrings(
@@ -4897,7 +4827,7 @@ test "consumeSseStream rejects malformed final-call provider execution flags" {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(.fx_local, completion.tool_calls[0].provenance);
     try std.testing.expectEqual(
@@ -4918,7 +4848,7 @@ test "consumeSseStream rejects provider results for local calls" {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expect(completion.tool_calls[0].provider_result == null);
     try std.testing.expectEqual(
@@ -4939,7 +4869,7 @@ test "consumeSseStream preliminary-only results do not satisfy admission" {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expect(completion.provider_result_identity_failure == null);
     try std.testing.expect(completion.tool_calls[0].provider_result == null);
@@ -4991,7 +4921,7 @@ test "consumeSseStream rejects malformed and late provider result events" {
             fn chunk(_: *anyopaque, _: []const u8) void {}
         };
         var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        defer deinitModelCompletion(std.testing.allocator, &completion);
 
         try std.testing.expectEqual(case.expected, completion.provider_result_identity_failure.?);
         switch (types.authoritativeToolAdmission(completion)) {
@@ -5100,7 +5030,7 @@ test "consumeSseStream replaces preliminary results and preserves the first fina
     };
 
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
     try std.testing.expectEqualStrings("{\"final\":true}", completion.tool_calls[0].provider_result.?);
@@ -5143,7 +5073,7 @@ fn checkConsumeSseAllocationFailures(alloc: std.mem.Allocator) !void {
         Noop.toolStart,
         &cancel_flag,
     );
-    defer deinitGatewayCompletion(alloc, &completion);
+    defer deinitModelCompletion(alloc, &completion);
 
     try std.testing.expectEqualStrings("hello", completion.content.?);
     try std.testing.expectEqual(@as(usize, 3), completion.tool_calls.len);
@@ -5195,7 +5125,7 @@ test "consumeSseStream frees streamed state on cancellation after a start" {
         Capture.toolStart,
         &cancel_flag,
     );
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(@as(usize, 0), completion.tool_calls.len);
     try std.testing.expect(completion.finish_reason == null);
@@ -5247,7 +5177,7 @@ test "consumeSseStream frees unfinished streamed state at EOF" {
     var reader = std.Io.Reader.fixed(payload);
     var cancel_flag = std.atomic.Value(bool).init(false);
     var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    defer deinitModelCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(@as(usize, 0), completion.tool_calls.len);
     try std.testing.expect(completion.finish_reason == null);
@@ -5277,7 +5207,7 @@ test "consumeSseStream preview failure is metadata-only and non-fatal" {
     var reader = std.Io.Reader.fixed(payload);
     var cancel_flag = std.atomic.Value(bool).init(false);
     var completion = try consumeSseStream(alloc, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(alloc, &completion);
+    defer deinitModelCompletion(alloc, &completion);
     debug_trace.shutdown();
 
     try std.testing.expectEqualStrings("FX_PREVIEW_VALUE_SENTINEL", completion.content.?);
@@ -5319,7 +5249,7 @@ test "consumeSseStream unfiltered trace excludes all payload keys and values" {
     var reader = std.Io.Reader.fixed(payload);
     var cancel_flag = std.atomic.Value(bool).init(false);
     var completion = try consumeSseStream(alloc, &reader, undefined, Noop.chunk, null, &cancel_flag);
-    defer deinitGatewayCompletion(alloc, &completion);
+    defer deinitModelCompletion(alloc, &completion);
     debug_trace.shutdown();
 
     try std.testing.expectEqualStrings("FX_MODEL_TEXT_SENTINEL", completion.content.?);
@@ -5887,7 +5817,7 @@ test "direct gateway request-open cancellation interrupts real TLS setup" {
 
     var callback_ctx: u8 = 0;
     const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
-    const result = streamGatewayCompletionCoreWithOptions(
+    const result = streamModelCompletionCoreWithOptions(
         std.testing.allocator,
         .{
             .api_key = "test-key",
@@ -5923,7 +5853,7 @@ test "direct gateway request-open deadline interrupts real TLS setup" {
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
     const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
-    const result = streamGatewayCompletionCoreWithOptions(
+    const result = streamModelCompletionCoreWithOptions(
         std.testing.allocator,
         .{
             .api_key = "test-key",
@@ -5956,7 +5886,7 @@ test "TLS retry sleep consumes the original connection setup deadline" {
     var probe = RequestOpenProbe{ .tls_failure_attempt = 0 };
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
-    const result = streamGatewayCompletionCoreWithOptions(
+    const result = streamModelCompletionCoreWithOptions(
         std.testing.allocator,
         .{
             .api_key = "test-key",
@@ -5989,7 +5919,7 @@ test "transport-owned TLS setup retries before send" {
     var probe = RequestOpenProbe{ .tls_failure_attempt = 0 };
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
-    var result = try streamGatewayCompletionCoreWithOptions(
+    var result = try streamModelCompletionCoreWithOptions(
         std.testing.allocator,
         .{
             .api_key = "test-key",
@@ -6024,7 +5954,7 @@ test "a fresh setup epoch succeeds normally" {
 
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
-    var result = try streamGatewayCompletionCoreWithOptions(
+    var result = try streamModelCompletionCoreWithOptions(
         std.testing.allocator,
         .{
             .api_key = "test-key",
@@ -6059,7 +5989,7 @@ test "transport-owned TLS retry succeeds after delayed open" {
     };
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
-    var result = try streamGatewayCompletionCoreWithOptions(
+    var result = try streamModelCompletionCoreWithOptions(
         std.testing.allocator,
         .{
             .api_key = "test-key",
@@ -6097,7 +6027,7 @@ test "transport-owned TLS retry succeeds after delayed failure" {
     };
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
-    var result = try streamGatewayCompletionCoreWithOptions(
+    var result = try streamModelCompletionCoreWithOptions(
         std.testing.allocator,
         .{
             .api_key = "test-key",
@@ -6133,7 +6063,7 @@ test "response retry starts a fresh setup epoch without resetting delivery" {
     var delivery = DeliveryCertainty.init();
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
-    var result = try streamGatewayCompletionCoreWithOptions(
+    var result = try streamModelCompletionCoreWithOptions(
         std.testing.allocator,
         .{
             .api_key = "test-key",
@@ -6172,7 +6102,7 @@ test "agent-owned provider attempts return the first retryable response" {
     var delivery = DeliveryCertainty.init();
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
-    var result = try streamGatewayCompletionCoreWithOptions(
+    var result = try streamModelCompletionCoreWithOptions(
         std.testing.allocator,
         .{
             .api_key = "test-key",
@@ -6212,7 +6142,7 @@ test "agent-owned provider attempts return the first TLS setup failure" {
     var delivery = DeliveryCertainty.init();
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
-    const result = streamGatewayCompletionCoreWithOptions(
+    const result = streamModelCompletionCoreWithOptions(
         std.testing.allocator,
         .{
             .api_key = "test-key",
@@ -6257,7 +6187,7 @@ test "agent-owned provider attempts return immediate peer resets without transpo
     var delivery = DeliveryCertainty.init();
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
-    const result = streamGatewayCompletionCoreWithOptions(
+    const result = streamModelCompletionCoreWithOptions(
         std.testing.allocator,
         .{
             .api_key = "test-key",
@@ -6309,7 +6239,7 @@ test "TLS setup does not retry after a response made delivery possible" {
     var delivery = DeliveryCertainty.init();
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
-    const result = streamGatewayCompletionCoreWithOptions(
+    const result = streamModelCompletionCoreWithOptions(
         std.testing.allocator,
         .{
             .api_key = "test-key",
@@ -6346,7 +6276,7 @@ test "TLS setup does not retry after delivery when no certainty sink is provided
     var probe = RequestOpenProbe{ .tls_failure_attempt = 1 };
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
-    const result = streamGatewayCompletionCoreWithOptions(
+    const result = streamModelCompletionCoreWithOptions(
         std.testing.allocator,
         .{
             .api_key = "test-key",
@@ -6389,7 +6319,7 @@ test "direct gateway cancellation before admission opens no connection" {
     var cancel_flag = std.atomic.Value(bool).init(true);
     try std.testing.expectError(
         error.Cancelled,
-        streamGatewayCompletion(
+        streamModelCompletion(
             std.testing.allocator,
             .{
                 .api_key = "test-key",
@@ -6917,7 +6847,7 @@ test "bounded gateway progress does not extend the absolute deadline" {
 test "delivery certainty stays definitely unsent when request setup fails" {
     var delivery = DeliveryCertainty.init();
     var cancel_flag = std.atomic.Value(bool).init(false);
-    const result = streamGatewayCompletion(
+    const result = streamModelCompletion(
         std.testing.allocator,
         .{
             .api_key = "test-key",
@@ -7120,7 +7050,7 @@ fn expectDirectLoopbackCancellation(
     };
     var callback_ctx: u8 = 0;
     const started = std.Io.Clock.Timestamp.now(zio, .awake);
-    const result = streamGatewayCompletionCore(
+    const result = streamModelCompletionCore(
         std.testing.allocator,
         .{
             .api_key = "test-key",
@@ -7184,7 +7114,7 @@ test "direct gateway fails fast when cancellation watcher cannot start" {
     var callback_ctx: u8 = 0;
     var cancel_flag = std.atomic.Value(bool).init(false);
     const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
-    const result = streamGatewayCompletionCore(
+    const result = streamModelCompletionCore(
         std.testing.allocator,
         .{
             .api_key = "test-key",
@@ -7231,7 +7161,7 @@ test "direct gateway core callbacks stay on the invoking thread" {
     };
     var capture = CallbackCapture{ .expected_thread = std.Thread.getCurrentId() };
     var cancel_flag = std.atomic.Value(bool).init(false);
-    var result = try streamGatewayCompletionCore(
+    var result = try streamModelCompletionCore(
         std.testing.allocator,
         .{
             .api_key = "test-key",
@@ -7271,7 +7201,7 @@ test "gateway chat request sends fx user agent and attribution headers" {
     };
     var callback_ctx: u8 = 0;
     var cancel_flag = std.atomic.Value(bool).init(false);
-    var result = try streamGatewayCompletionCore(
+    var result = try streamModelCompletionCore(
         std.testing.allocator,
         .{
             .api_key = "test-key",

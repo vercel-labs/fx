@@ -5,7 +5,6 @@ const api_key_validator_contract = @import("../gateway/auth/api_key_validator.zi
 const adapter_auth = @import("../core/gateway/adapter_auth.zig");
 const adapter_registry = @import("../core/gateway/adapter_registry.zig");
 const agent_stream_provider_contract = @import("../core/agent/stream_provider.zig");
-const agent_runtime_telemetry = @import("../core/agent/runtime/telemetry.zig");
 const credentials = @import("../gateway/auth/credentials.zig");
 const login_flow = @import("../gateway/auth/login_flow.zig");
 const oauth_session = @import("../gateway/auth/oauth_session.zig");
@@ -15,6 +14,8 @@ const collections = @import("../core/shared/collections.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_error_format = @import("../gateway/gateway_error_format.zig");
 const gateway_client = @import("../gateway/client.zig");
+const model_catalog_failure = @import("../gateway/model_catalog_failure.zig");
+const protocol_validation = @import("../gateway/protocol_validation.zig");
 const gateway_failure_diagnostics = @import("../gateway/gateway_failure_diagnostics.zig");
 const gateway_json = @import("../gateway/gateway_json.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -22,18 +23,19 @@ const host = @import("../core/hosts/host.zig");
 const gateway_generation_usage = @import("../gateway/generation_usage.zig");
 const connection_registry = @import("../core/gateway/connection_registry.zig");
 const route_snapshot_contract = @import("../core/gateway/route_snapshot.zig");
-const gateway_provider = @import("../core/gateway/gateway_provider.zig");
+const gateway_system = @import("../core/gateway/gateway_system.zig");
 const account_usage_provider = @import("../core/gateway/account_usage_provider.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
-const model_catalog = @import("../core/gateway/model_catalog.zig");
 const model_descriptors = @import("gateway/model_descriptors.zig");
+const model_catalog_projection = @import("gateway/model_catalog_projection.zig");
+const model_catalog = @import("../core/gateway/model_catalog.zig");
 const output_contracts = @import("../core/output/output_contracts.zig");
 const shared_types = @import("../core/shared/types.zig");
 const session_usage = @import("../core/session/session_usage.zig");
 const web_search_contract = @import("../core/tooling/web_search_contract.zig");
 const web_search_policy = @import("../core/tooling/web_search_policy.zig");
 const web_search_provider = @import("../core/tooling/web_search_provider.zig");
-const gateway_schema = @import("../core/tooling/gateway_schema.zig");
+const tool_descriptor = @import("../core/tooling/tool_descriptor.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const sort_utils = @import("../core/shared/sort_utils.zig");
 
@@ -43,6 +45,61 @@ const FetchGatewayGetResultFn = *const fn (Allocator, ?[]const u8, []const u8) a
 const Request = web_search_contract.ProviderRequest;
 const Response = web_search_contract.ProviderResponse;
 const ProgressFn = web_search_contract.ProgressFn;
+
+pub const VercelTransportRequest = struct {
+    credential: []const u8,
+    tenant: ?[]const u8,
+    session_id: ?[]const u8,
+    model_id: []const u8,
+    retry_count: usize,
+    endpoint: []const u8,
+    payload: []const u8,
+    trace_ctx: debug_trace.TraceContext,
+    content_capture_limit: ?usize,
+    cooperative_pulse: ?agent_stream_provider_contract.CooperativePulse,
+    delivery: *agent_stream_provider_contract.DeliveryCertainty,
+    attempt_evidence: *agent_stream_provider_contract.AttemptEvidence,
+    callback_ctx: *anyopaque,
+    on_content_chunk: agent_stream_provider_contract.StreamCallback,
+    on_tool_start: ?agent_stream_provider_contract.ToolStartCallback,
+    on_reasoning_chunk: ?agent_stream_provider_contract.StreamCallback,
+    on_tool_input_chunk: ?agent_stream_provider_contract.StreamCallback,
+    cancel_flag: *std.atomic.Value(bool),
+    provider_attempt_owner: agent_stream_provider_contract.ProviderAttemptOwner,
+};
+
+pub const VercelTransportResponse = struct {
+    status: std.http.Status,
+    completion: shared_types.ModelCompletion = .{},
+    err_body: ?[]u8 = null,
+    failure_schema: ?[]u8 = null,
+    failure_request_shape: ?[]u8 = null,
+    retry_after_seconds: ?u64 = null,
+    owned: bool = false,
+
+    pub fn deinit(self: *VercelTransportResponse, alloc: Allocator) void {
+        if (self.owned) {
+            if (self.err_body) |body| alloc.free(body);
+            if (self.completion.content) |content| alloc.free(@constCast(content));
+            if (self.completion.generation_id) |id| alloc.free(@constCast(id));
+            if (self.completion.billing) |billing| alloc.free(@constCast(billing.model));
+            shared_types.freeToolCallSlice(alloc, @constCast(self.completion.tool_calls));
+            if (self.completion.provider_failure_detail) |detail| alloc.free(@constCast(detail));
+            if (self.failure_schema) |schema| alloc.free(schema);
+            if (self.failure_request_shape) |shape| alloc.free(shape);
+        }
+        self.* = .{ .status = self.status };
+    }
+};
+
+pub const VercelTransport = struct {
+    context: ?*anyopaque = null,
+    stream_fn: *const fn (?*anyopaque, Allocator, VercelTransportRequest) anyerror!VercelTransportResponse,
+
+    pub fn stream(self: VercelTransport, alloc: Allocator, request: VercelTransportRequest) !VercelTransportResponse {
+        return self.stream_fn(self.context, alloc, request);
+    }
+};
 
 pub const default_model = "zai/glm-5.2";
 pub const default_fast_mode = true;
@@ -122,10 +179,6 @@ pub const default_web_search_provider = web_search_provider.Provider{
     .execute_fn = executeWebSearchProvider,
 };
 
-pub const chat_url_provider = gateway_provider.ChatUrlProvider{
-    .resolve_fn = resolveChatUrlForProvider,
-};
-
 pub const account_usage = account_usage_provider.Provider{
     .fetch_fn = fetchCredits,
 };
@@ -139,12 +192,8 @@ pub const oauth_transport_provider = oauth_transport.Provider{
 };
 
 pub const generation_usage_provider = gateway_generation_usage.provider;
-pub const model_descriptor_provider = model_descriptors.provider;
 
-pub const agent_stream_provider = agent_stream_provider_contract.Provider{
-    .build_fn = buildAgentRequest,
-    .stream_fn = streamAgentCompletion,
-};
+const native_vercel_transport = VercelTransport{ .stream_fn = streamVercelTransport };
 
 /// The transport must outlive every operation through the returned provider.
 pub fn auth_provider_for_transport(transport: *const oauth_transport.Provider) adapter_auth.Provider {
@@ -174,6 +223,7 @@ pub const auth_provider = native_auth_provider();
 
 pub const provider_adapter = agent_stream_provider_contract.ProviderAdapter{
     .kind = connection_seed.adapter_id,
+    .supported_protocol = connection_seed.protocol.?,
     .auth = auth_provider,
     .account_usage = account_usage,
     .generation_usage = generation_usage_provider,
@@ -181,6 +231,7 @@ pub const provider_adapter = agent_stream_provider_contract.ProviderAdapter{
     .model_descriptors = model_descriptors.provider,
     .provider_tools = &.{.web_search},
     .web_search = default_web_search_provider,
+    .context = @constCast(&native_vercel_transport),
     .stream_fn = streamVercelAdapter,
 };
 
@@ -190,13 +241,9 @@ pub const production_adapter_registry = adapter_registry.AdapterRegistry{
     .adapters = &production_adapters,
 };
 
-pub const provider = gateway_provider.Provider{
+pub const system = gateway_system.System{
     .connection_seed = connection_seed,
-    .agent_stream = agent_stream_provider,
-    .provider_adapter = provider_adapter,
     .adapter_registry = production_adapter_registry,
-    .oauth_transport = oauth_transport_provider,
-    .chat_url = chat_url_provider,
 };
 
 fn vercelTransport(raw: *const anyopaque) oauth_transport.Provider {
@@ -205,7 +252,7 @@ fn vercelTransport(raw: *const anyopaque) oauth_transport.Provider {
 
 fn credentialSourceFromReference(reference: []const u8) !?credentials.Source {
     if (std.mem.eql(u8, reference, "automatic")) return null;
-    return shared_types.parseCredentialSource(reference) orelse error.InvalidCredentialReference;
+    return std.meta.stringToEnum(credentials.Source, reference) orelse error.InvalidCredentialReference;
 }
 
 fn normalizeAuthFailure(err: anyerror) adapter_auth.Failure {
@@ -711,7 +758,12 @@ fn submitVercelEnteredSecret(
     alloc: Allocator,
     submission: *adapter_auth.EnteredSecretSubmission,
 ) adapter_auth.EnteredSecretCompletion {
-    return submitVercelEnteredSecretWithValidator(raw, api_key_validator, alloc, submission);
+    return submitVercelEnteredSecretWithValidator(
+        raw,
+        api_key_validator,
+        alloc,
+        submission,
+    );
 }
 
 fn submitVercelEnteredSecretWithValidator(
@@ -835,6 +887,8 @@ fn submitVercelEnteredSecretWithValidator(
     });
 }
 
+pub const model_descriptor_provider = model_descriptors.provider;
+
 const AdapterEventBridge = struct {
     events: agent_stream_provider_contract.EventSink,
     failure: ?anyerror = null,
@@ -886,19 +940,26 @@ fn classifyVercelTransportError(
     delivery_ambiguous: bool,
 ) VercelTransportOutcome {
     if (err == error.Cancelled or cancel_requested) return .cancelled;
-    const cause: agent_stream_provider_contract.StreamFailure.TransportCause = switch (err) {
+    const evidence = gateway_client.networkFailureEvidence(
+        err,
+        if (delivery_ambiguous) .possibly_sent else .definitely_unsent,
+    ) orelse return .{ .propagate = err };
+    const cause: ?agent_stream_provider_contract.StreamFailure.TransportCause = switch (err) {
         error.ReadFailed => .read_failed,
         error.ConnectionResetByPeer => .connection_reset,
         error.ConnectionTimedOut => .connection_timed_out,
         error.HttpConnectionClosing => .connection_closing,
         error.SystemResumed => .system_resumed,
-        else => return .{ .propagate = err },
+        else => null,
     };
     return .{ .normalized = .{
         .category = .transport,
         .retryable = true,
-        .delivery_ambiguous = delivery_ambiguous,
-        .detail = @errorName(err),
+        .delivery_ambiguous = evidence.delivery == .possibly_sent,
+        .detail = if (evidence.cause == .system_resumed)
+            "system resumed during model request"
+        else
+            "network transport interrupted",
         .transport_cause = cause,
     } };
 }
@@ -952,9 +1013,17 @@ test "Vercel transport classification preserves every recovery transition" {
     const oom = classifyVercelTransportError(error.OutOfMemory, false, false);
     try std.testing.expect(oom == .propagate);
     try std.testing.expectEqual(error.OutOfMemory, oom.propagate);
-    const terminal = classifyVercelTransportError(error.UnknownHostName, false, false);
-    try std.testing.expect(terminal == .propagate);
-    try std.testing.expectEqual(error.UnknownHostName, terminal.propagate);
+    const setup = classifyVercelTransportError(error.UnknownHostName, false, false);
+    try std.testing.expect(setup == .normalized);
+    try std.testing.expectEqual(
+        @as(?agent_stream_provider_contract.StreamFailure.TransportCause, null),
+        setup.normalized.transport_cause,
+    );
+    try std.testing.expect(!setup.normalized.delivery_ambiguous);
+    try std.testing.expectEqualStrings("network transport interrupted", setup.normalized.detail.?);
+    const unrelated = classifyVercelTransportError(error.AccessDenied, false, false);
+    try std.testing.expect(unrelated == .propagate);
+    try std.testing.expectEqual(error.AccessDenied, unrelated.propagate);
 }
 
 test "Vercel HTTP classification preserves exact neutral codes and retry policy" {
@@ -983,27 +1052,22 @@ pub fn streamVercelAdapter(
     request: agent_stream_provider_contract.AdapterRequest,
     events: agent_stream_provider_contract.EventSink,
 ) anyerror!void {
-    const stream_provider = adapter.legacy_provider orelse agent_stream_provider;
-    const built_payload = try stream_provider.build(alloc, request.model_request);
+    const transport: *const VercelTransport = @ptrCast(@alignCast(adapter.context orelse
+        return error.ProviderAdapterUnavailable));
+    const endpoint = if (std.mem.eql(u8, request.route.connection_id, connection_seed.id))
+        chatUrl(request.route.endpoint)
+    else
+        request.route.endpoint;
+    const built_payload = try buildAgentRequest(null, alloc, request.model_request);
     const payload = try finalizeAgentRequestBody(alloc, request.model_id, built_payload);
     defer alloc.free(payload);
-    debug_trace.eventf("gateway", "after_payload_build", request.trace_ctx, "payload_bytes={d} model={s} gateway_messages={d}", .{
+    debug_trace.eventf("gateway", "vercel_payload_built", request.trace_ctx, "payload_bytes={d} model={s} message_count={d}", .{
         payload.len,
         request.model_id,
         request.model_request.messages.len,
     });
-    agent_runtime_telemetry.traceGatewayRequestBuilt(
-        request.trace_ctx,
-        request.model_id,
-        payload.len,
-        request.model_request.messages.len,
-        .{
-            .local_count = request.model_request.tools.len,
-            .provider_count = request.model_request.provider_tools.len,
-        },
-    );
     if (request.serialized_request_limit_bytes) |limit| {
-        if (payload.len > limit) {
+        if (!serializedRequestWithinLimit(payload.len, limit)) {
             try events.emit(.{ .failure = .{
                 .category = .request_too_large,
                 .detail = "serialized provider request exceeds the configured limit",
@@ -1011,16 +1075,26 @@ pub fn streamVercelAdapter(
             return;
         }
     }
+    const generation_scope = gateway_client.generationBaseUrl();
+    if (!shared_types.validGenerationLookupScope(generation_scope) or
+        !gateway_client.isTrustedGenerationOrigin(generation_scope))
+    {
+        try events.emit(.{ .failure = .{
+            .category = .configuration,
+            .detail = "invalid generation lookup scope",
+        } });
+        return;
+    }
     try events.emit(.provider_admitted);
 
     var bridge = AdapterEventBridge{ .events = events };
-    var result = stream_provider.stream(alloc, .{
-        .api_key = request.credential,
-        .team = request.tenant,
+    var result = transport.stream(alloc, .{
+        .credential = request.credential,
+        .tenant = request.tenant,
         .session_id = request.session_id,
-        .model = request.model_id,
+        .model_id = request.model_id,
         .retry_count = request.retry_count,
-        .chat_url = request.route.endpoint,
+        .endpoint = endpoint,
         .payload = payload,
         .trace_ctx = request.trace_ctx,
         .content_capture_limit = request.content_capture_limit,
@@ -1044,7 +1118,7 @@ pub fn streamVercelAdapter(
             .cancelled => try events.emit(.cancelled),
             .normalized => |failure| {
                 try events.emit(.{ .failure = failure });
-                return err;
+                return;
             },
             .propagate => |failure| return failure,
         }
@@ -1093,7 +1167,7 @@ pub fn streamVercelAdapter(
             .reason = result.completion.finish_reason,
             .generation_reference = if (result.completion.generation_id) |id| .{
                 .id = id,
-                .lookup_scope = result.generation_origin,
+                .lookup_scope = generation_scope,
             } else null,
             .generation_metadata_invalid = result.completion.generation_metadata_invalid,
             .delivery_ambiguous = result.completion.delivery_ambiguous,
@@ -1102,41 +1176,39 @@ pub fn streamVercelAdapter(
         } });
     } else {
         const failure_facts = classifyVercelHttpFailure(result.status);
-        const raw_detail = result.err_body orelse "";
-        const detail = try gateway_error_format.formatHttpErrorMessage(
-            alloc,
-            result.status,
-            raw_detail,
-        );
+        const detail = if (result.err_body) |body|
+            try gateway_error_format.formatHttpErrorMessage(alloc, result.status, body)
+        else
+            try gateway_error_format.formatHttpErrorMessage(alloc, result.status, "");
         defer alloc.free(detail);
-        const recovery_diagnostic = try gateway_error_format.formatHttpRecoveryDiagnostic(
-            alloc,
-            result.status,
-            raw_detail,
-        );
+        const recovery_diagnostic = if (result.err_body) |body|
+            try gateway_error_format.formatHttpRecoveryDiagnostic(alloc, result.status, body)
+        else
+            try gateway_error_format.formatHttpRecoveryDiagnostic(alloc, result.status, "");
         defer alloc.free(recovery_diagnostic);
         try events.emit(.{ .failure = .{
             .category = failure_facts.category,
+            .response_status = @intFromEnum(result.status),
             .retryable = failure_facts.retryable,
-            .response_code = @intFromEnum(result.status),
             .delivery_ambiguous = result.completion.delivery_ambiguous,
             .detail = detail,
             .retry_after_seconds = result.retry_after_seconds,
             .diagnostic = .{
-                .summary = result.failure_schema orelse recovery_diagnostic,
+                .summary = recovery_diagnostic,
+                .tool_descriptor = result.failure_schema,
                 .request_shape = result.failure_request_shape,
             },
         } });
     }
 }
 
-test "Vercel adapter sink failure does not mutate user cancellation" {
-    const FakeLegacy = struct {
-        fn build(_: ?*anyopaque, alloc: Allocator, _: agent_stream_provider_contract.BuildRequest) anyerror![]u8 {
-            return alloc.dupe(u8, "{}");
-        }
+fn serializedRequestWithinLimit(payload_bytes: usize, limit_bytes: usize) bool {
+    return payload_bytes <= limit_bytes;
+}
 
-        fn stream(_: ?*anyopaque, _: Allocator, request: agent_stream_provider_contract.Request) anyerror!agent_stream_provider_contract.Result {
+test "Vercel adapter sink failure does not mutate user cancellation" {
+    const FakeTransport = struct {
+        fn stream(_: ?*anyopaque, _: Allocator, request: VercelTransportRequest) anyerror!VercelTransportResponse {
             request.on_content_chunk(request.callback_ctx, "chunk");
             return .{ .status = .ok, .completion = .{ .finish_reason = .stop } };
         }
@@ -1148,10 +1220,8 @@ test "Vercel adapter sink failure does not mutate user cancellation" {
     };
 
     var adapter = provider_adapter;
-    adapter.legacy_provider = .{
-        .build_fn = FakeLegacy.build,
-        .stream_fn = FakeLegacy.stream,
-    };
+    const transport = VercelTransport{ .stream_fn = FakeTransport.stream };
+    adapter.context = @constCast(&transport);
     var cancelled = std.atomic.Value(bool).init(false);
     var delivery = agent_stream_provider_contract.DeliveryCertainty.init();
     var attempt_evidence: agent_stream_provider_contract.AttemptEvidence = .{};
@@ -1201,26 +1271,19 @@ test "Vercel adapter sink failure does not mutate user cancellation" {
     try std.testing.expect(!cancelled.load(.seq_cst));
 }
 
-test "Vercel adapter enforces serialized request limit before admission" {
-    const FakeLegacy = struct {
-        payload: []const u8,
+test "Vercel adapter enforces exact serialized limit before admission" {
+    const FakeTransport = struct {
         calls: usize = 0,
 
-        fn build(raw: ?*anyopaque, alloc: Allocator, _: agent_stream_provider_contract.BuildRequest) anyerror![]u8 {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            return alloc.dupe(u8, self.payload);
-        }
-
-        fn stream(raw: ?*anyopaque, _: Allocator, _: agent_stream_provider_contract.Request) anyerror!agent_stream_provider_contract.Result {
+        fn stream(raw: ?*anyopaque, _: Allocator, _: VercelTransportRequest) anyerror!VercelTransportResponse {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.calls += 1;
             return .{ .status = .ok, .completion = .{ .finish_reason = .stop } };
         }
     };
     const Capture = struct {
-        admitted: usize = 0,
         failures: usize = 0,
-        finishes: usize = 0,
+        admitted: usize = 0,
 
         fn emit(raw: *anyopaque, event: agent_stream_provider_contract.StreamEvent) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1230,21 +1293,18 @@ test "Vercel adapter enforces serialized request limit before admission" {
                     try std.testing.expectEqual(agent_stream_provider_contract.StreamFailure.Category.request_too_large, failure.category);
                     self.failures += 1;
                 },
-                .finish => self.finishes += 1,
                 else => {},
             }
         }
     };
 
-    const accepted_payload = "x" ** (16 * 1024);
-    const rejected_payload = accepted_payload ++ "x";
-    var fake = FakeLegacy{ .payload = rejected_payload };
+    try std.testing.expect(serializedRequestWithinLimit(16 * 1024, 16 * 1024));
+    try std.testing.expect(!serializedRequestWithinLimit(16 * 1024 + 1, 16 * 1024));
+
+    var fake_transport: FakeTransport = .{};
+    var transport = VercelTransport{ .context = &fake_transport, .stream_fn = FakeTransport.stream };
     var adapter = provider_adapter;
-    adapter.legacy_provider = .{
-        .context = &fake,
-        .build_fn = FakeLegacy.build,
-        .stream_fn = FakeLegacy.stream,
-    };
+    adapter.context = &transport;
     var cancelled = std.atomic.Value(bool).init(false);
     var delivery = agent_stream_provider_contract.DeliveryCertainty.init();
     var attempt_evidence: agent_stream_provider_contract.AttemptEvidence = .{};
@@ -1263,14 +1323,18 @@ test "Vercel adapter enforces serialized request limit before admission" {
         .selected_fast_mode = false,
         .fast_model_suffix = null,
     };
-    const request = agent_stream_provider_contract.AdapterRequest{
+    var state = agent_stream_provider_contract.EventState.init(std.testing.allocator);
+    defer state.deinit();
+    var sink_error: ?anyerror = null;
+    var capture: Capture = .{};
+    try adapter.stream(std.testing.allocator, .{
         .model_request = .{
             .tools = &.{},
             .messages = &.{},
             .tool_choice = .none,
             .capabilities = .{},
         },
-        .serialized_request_limit_bytes = 16 * 1024,
+        .serialized_request_limit_bytes = 0,
         .route = &route,
         .credential = "credential",
         .tenant = null,
@@ -1281,38 +1345,195 @@ test "Vercel adapter enforces serialized request limit before admission" {
         .delivery = &delivery,
         .attempt_evidence = &attempt_evidence,
         .cancel_flag = &cancelled,
+    }, .{
+        .context = &capture,
+        .state = &state,
+        .sink_error = &sink_error,
+        .emit_fn = Capture.emit,
+    });
+    try std.testing.expectEqual(@as(usize, 0), fake_transport.calls);
+    try std.testing.expectEqual(@as(usize, 0), capture.admitted);
+    try std.testing.expectEqual(@as(usize, 1), capture.failures);
+    try std.testing.expect(!state.provider_admitted);
+}
+
+fn vercelAdapterTestRoute() route_snapshot_contract.RouteSnapshot {
+    return .{
+        .connection_id = @constCast("vercel"),
+        .adapter_kind = @constCast(connection_seed.adapter_id),
+        .endpoint = @constCast("provider:endpoint"),
+        .protocol = @constCast("vercel_ai_gateway"),
+        .credential_ref = @constCast("automatic"),
+        .primary_model_id = @constCast("test/model"),
+        .permission_review_model_id = null,
+        .vision_model_id = null,
+        .subagent_model_id = @constCast("test/model"),
+        .capabilities = .{},
+        .capability_source = .configured,
+        .selected_fast_mode = false,
+        .fast_model_suffix = null,
+    };
+}
+
+fn streamVercelAdapterTestRequest(
+    adapter: agent_stream_provider_contract.ProviderAdapter,
+    route: *const route_snapshot_contract.RouteSnapshot,
+    delivery: *agent_stream_provider_contract.DeliveryCertainty,
+    attempt_evidence: *agent_stream_provider_contract.AttemptEvidence,
+    cancelled: *std.atomic.Value(bool),
+    events: agent_stream_provider_contract.EventSink,
+) !void {
+    try adapter.stream(std.testing.allocator, .{
+        .model_request = .{
+            .tools = &.{},
+            .messages = &.{},
+            .tool_choice = .none,
+            .capabilities = .{},
+        },
+        .route = route,
+        .credential = "credential",
+        .tenant = null,
+        .model_id = "test/model",
+        .retry_count = 1,
+        .trace_ctx = .{},
+        .content_capture_limit = null,
+        .delivery = delivery,
+        .attempt_evidence = attempt_evidence,
+        .cancel_flag = cancelled,
+    }, events);
+}
+
+test "Vercel adapter owns generation lookup scope for transport completions" {
+    const scope = "http://127.0.0.1:43123/gateway";
+    const env = try AdapterAuthTestEnv.install(std.testing.allocator, &.{.{
+        "FX_GATEWAY_BASE_URL",
+        scope ++ "/",
+    }});
+    defer env.deinit();
+
+    const FakeTransport = struct {
+        calls: usize = 0,
+
+        fn stream(raw: ?*anyopaque, _: Allocator, _: VercelTransportRequest) anyerror!VercelTransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return .{ .status = .ok, .completion = .{
+                .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                .finish_reason = .stop,
+            } };
+        }
+    };
+    const Capture = struct {
+        admitted: usize = 0,
+        finished: usize = 0,
+
+        fn emit(raw: *anyopaque, event: agent_stream_provider_contract.StreamEvent) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            switch (event) {
+                .provider_admitted => self.admitted += 1,
+                .finish => |finish| {
+                    const reference = finish.generation_reference orelse return error.MissingGenerationReference;
+                    try std.testing.expectEqualStrings("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV", reference.id);
+                    try std.testing.expectEqualStrings(scope, reference.lookup_scope.?);
+                    self.finished += 1;
+                },
+                else => {},
+            }
+        }
     };
 
+    var fake_transport: FakeTransport = .{};
+    var transport = VercelTransport{ .context = &fake_transport, .stream_fn = FakeTransport.stream };
+    var adapter = provider_adapter;
+    adapter.context = &transport;
+    var cancelled = std.atomic.Value(bool).init(false);
+    var delivery = agent_stream_provider_contract.DeliveryCertainty.init();
+    var attempt_evidence: agent_stream_provider_contract.AttemptEvidence = .{};
+    var route = vercelAdapterTestRoute();
     var state = agent_stream_provider_contract.EventState.init(std.testing.allocator);
     defer state.deinit();
     var sink_error: ?anyerror = null;
     var capture: Capture = .{};
-    try adapter.stream(std.testing.allocator, request, .{
+    try streamVercelAdapterTestRequest(adapter, &route, &delivery, &attempt_evidence, &cancelled, .{
         .context = &capture,
         .state = &state,
         .sink_error = &sink_error,
         .emit_fn = Capture.emit,
     });
-    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake_transport.calls);
+    try std.testing.expectEqual(@as(usize, 1), capture.admitted);
+    try std.testing.expectEqual(@as(usize, 1), capture.finished);
+}
+
+test "Vercel adapter rejects invalid normalized generation scope before effects" {
+    var oversized_tail: [512]u8 = @splat('a');
+    const oversized_scope = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:43123/{s}",
+        .{&oversized_tail},
+    );
+    defer std.testing.allocator.free(oversized_scope);
+    const env = try AdapterAuthTestEnv.install(std.testing.allocator, &.{.{
+        "FX_GATEWAY_BASE_URL",
+        oversized_scope,
+    }});
+    defer env.deinit();
+
+    const FakeTransport = struct {
+        calls: usize = 0,
+
+        fn stream(raw: ?*anyopaque, _: Allocator, _: VercelTransportRequest) anyerror!VercelTransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return .{ .status = .ok, .completion = .{ .finish_reason = .stop } };
+        }
+    };
+    const Capture = struct {
+        admitted: usize = 0,
+        failures: usize = 0,
+
+        fn emit(raw: *anyopaque, event: agent_stream_provider_contract.StreamEvent) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            switch (event) {
+                .provider_admitted => self.admitted += 1,
+                .failure => |failure| {
+                    try std.testing.expectEqual(
+                        agent_stream_provider_contract.StreamFailure.Category.configuration,
+                        failure.category,
+                    );
+                    self.failures += 1;
+                },
+                else => {},
+            }
+        }
+    };
+
+    var fake_transport: FakeTransport = .{};
+    var transport = VercelTransport{ .context = &fake_transport, .stream_fn = FakeTransport.stream };
+    var adapter = provider_adapter;
+    adapter.context = &transport;
+    var cancelled = std.atomic.Value(bool).init(false);
+    var delivery = agent_stream_provider_contract.DeliveryCertainty.init();
+    var attempt_evidence: agent_stream_provider_contract.AttemptEvidence = .{};
+    var route = vercelAdapterTestRoute();
+    var state = agent_stream_provider_contract.EventState.init(std.testing.allocator);
+    defer state.deinit();
+    var sink_error: ?anyerror = null;
+    var capture: Capture = .{};
+    try streamVercelAdapterTestRequest(adapter, &route, &delivery, &attempt_evidence, &cancelled, .{
+        .context = &capture,
+        .state = &state,
+        .sink_error = &sink_error,
+        .emit_fn = Capture.emit,
+    });
+    try std.testing.expectEqual(@as(usize, 0), fake_transport.calls);
     try std.testing.expectEqual(@as(usize, 0), capture.admitted);
     try std.testing.expectEqual(@as(usize, 1), capture.failures);
-    try std.testing.expect(!state.provider_admitted);
-
-    state.deinit();
-    state = agent_stream_provider_contract.EventState.init(std.testing.allocator);
-    fake.payload = accepted_payload;
-    capture = .{};
-    sink_error = null;
-    try adapter.stream(std.testing.allocator, request, .{
-        .context = &capture,
-        .state = &state,
-        .sink_error = &sink_error,
-        .emit_fn = Capture.emit,
-    });
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqual(@as(usize, 1), capture.admitted);
-    try std.testing.expectEqual(@as(usize, 1), capture.finishes);
-    try std.testing.expect(state.provider_admitted);
+    try std.testing.expectEqual(
+        agent_stream_provider_contract.DeliveryCertainty.State.definitely_unsent,
+        delivery.load(),
+    );
+    try std.testing.expect(!attempt_evidence.provider_admitted);
 }
 
 test "Vercel and peer adapters receive equivalent neutral requests with isolated wire formats" {
@@ -1330,14 +1551,15 @@ test "Vercel and peer adapters receive equivalent neutral requests with isolated
         fn vercelStream(
             raw: ?*anyopaque,
             alloc: Allocator,
-            request: agent_stream_provider_contract.Request,
-        ) anyerror!agent_stream_provider_contract.Result {
+            request: VercelTransportRequest,
+        ) anyerror!VercelTransportResponse {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.vercel_calls += 1;
             self.vercel_payload = try alloc.dupe(u8, request.payload);
             return .{
                 .status = .bad_gateway,
                 .err_body = @constCast("peer unavailable"),
+                .failure_schema = @constCast("path=prompt.0.content expected=string received=array"),
             };
         }
 
@@ -1361,18 +1583,22 @@ test "Vercel and peer adapters receive equivalent neutral requests with isolated
     };
     const Capture = struct {
         category: ?agent_stream_provider_contract.StreamFailure.Category = null,
-        response_code: ?u16 = null,
+        response_status: u16 = 0,
         retryable: bool = false,
         saw_http_detail: bool = false,
+        saw_tool_descriptor: bool = false,
 
         fn emit(raw: *anyopaque, event: agent_stream_provider_contract.StreamEvent) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (event == .failure) {
                 self.category = event.failure.category;
-                self.response_code = event.failure.response_code;
+                self.response_status = event.failure.response_status;
                 self.retryable = event.failure.retryable;
                 if (event.failure.detail) |detail| {
                     self.saw_http_detail = std.mem.find(u8, detail, "HTTP 502") != null;
+                }
+                if (event.failure.diagnostic) |diagnostic| {
+                    self.saw_tool_descriptor = diagnostic.tool_descriptor != null;
                 }
             }
         }
@@ -1400,21 +1626,22 @@ test "Vercel and peer adapters receive equivalent neutral requests with isolated
     const alloc = std.testing.allocator;
     var probe: Probe = .{};
     defer probe.deinit(alloc);
-    var vercel = provider_adapter;
-    vercel.legacy_provider = .{
+    const transport = VercelTransport{
         .context = &probe,
-        .build_fn = buildAgentRequest,
         .stream_fn = Probe.vercelStream,
     };
+    var vercel = provider_adapter;
+    vercel.context = @constCast(&transport);
     const peer = agent_stream_provider_contract.ProviderAdapter{
         .kind = "test_peer",
+        .supported_protocol = "test_peer",
         .context = &probe,
         .stream_fn = Probe.peerStream,
     };
     const adapters = [_]agent_stream_provider_contract.ProviderAdapter{ vercel, peer };
     const registry = try adapter_registry.AdapterRegistry.init(&adapters);
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
-    const tools = [_]gateway_schema.FunctionSchema{
+    const tools = [_]tool_descriptor.Descriptor{
         .{ .name = "read_file", .description = "Read" },
         .{ .name = "mcp_read", .description = "MCP read" },
     };
@@ -1427,8 +1654,8 @@ test "Vercel and peer adapters receive equivalent neutral requests with isolated
     };
     var cancelled = std.atomic.Value(bool).init(false);
     var delivery = agent_stream_provider_contract.DeliveryCertainty.init();
-    var vercel_attempt: agent_stream_provider_contract.AttemptEvidence = .{};
-    var peer_attempt: agent_stream_provider_contract.AttemptEvidence = .{};
+    var vercel_attempt_evidence: agent_stream_provider_contract.AttemptEvidence = .{};
+    var peer_attempt_evidence: agent_stream_provider_contract.AttemptEvidence = .{};
     var sink_error: ?anyerror = null;
     var vercel_capture: Capture = .{};
     var vercel_state = agent_stream_provider_contract.EventState.init(alloc);
@@ -1444,7 +1671,7 @@ test "Vercel and peer adapters receive equivalent neutral requests with isolated
         .trace_ctx = .{},
         .content_capture_limit = null,
         .delivery = &delivery,
-        .attempt_evidence = &vercel_attempt,
+        .attempt_evidence = &vercel_attempt_evidence,
         .cancel_flag = &cancelled,
     }, .{
         .context = &vercel_capture,
@@ -1467,7 +1694,7 @@ test "Vercel and peer adapters receive equivalent neutral requests with isolated
         .trace_ctx = .{},
         .content_capture_limit = null,
         .delivery = &delivery,
-        .attempt_evidence = &peer_attempt,
+        .attempt_evidence = &peer_attempt_evidence,
         .cancel_flag = &cancelled,
     }, .{
         .context = &peer_capture,
@@ -1481,12 +1708,14 @@ test "Vercel and peer adapters receive equivalent neutral requests with isolated
     try std.testing.expect(probe.peer_received_neutral_tools);
     try std.testing.expectEqual(agent_stream_provider_contract.StreamFailure.Category.upstream_failure, vercel_capture.category.?);
     try std.testing.expectEqual(agent_stream_provider_contract.StreamFailure.Category.upstream_failure, peer_capture.category.?);
-    try std.testing.expectEqual(@as(?u16, 502), vercel_capture.response_code);
     try std.testing.expect(vercel_capture.retryable);
-    try std.testing.expect(peer_capture.response_code == null);
     try std.testing.expect(!peer_capture.retryable);
+    try std.testing.expectEqual(@as(u16, 502), vercel_capture.response_status);
+    try std.testing.expectEqual(@as(u16, 0), peer_capture.response_status);
     try std.testing.expect(vercel_capture.saw_http_detail);
     try std.testing.expect(!peer_capture.saw_http_detail);
+    try std.testing.expect(vercel_capture.saw_tool_descriptor);
+    try std.testing.expect(!peer_capture.saw_tool_descriptor);
     try std.testing.expect(std.mem.find(u8, probe.vercel_payload.?, "\"type\":\"function\"") != null);
     try std.testing.expect(std.mem.find(u8, probe.vercel_payload.?, "gateway.perplexity_search") != null);
     try std.testing.expect(std.mem.find(u8, probe.vercel_payload.?, "wire-secret") == null);
@@ -1496,7 +1725,7 @@ test "Vercel and peer adapters receive equivalent neutral requests with isolated
 pub fn buildAgentRequest(
     _: ?*anyopaque,
     alloc: Allocator,
-    request: agent_stream_provider_contract.BuildRequest,
+    request: agent_stream_provider_contract.ModelRequest,
 ) anyerror![]u8 {
     const provider_options = model_capabilities.resolveProviderOptionsForCapabilities(
         request.capabilities,
@@ -1649,7 +1878,7 @@ fn buildVercelToolsJson(
         if (position < request.tools.len) {
             if (!first) try out.writer.writeByte(',');
             first = false;
-            try writeVercelFunctionSchema(
+            try writeVercelDescriptor(
                 alloc,
                 &out.writer,
                 request.tools[position],
@@ -1661,19 +1890,19 @@ fn buildVercelToolsJson(
     return out.toOwnedSlice();
 }
 
-fn writeVercelFunctionSchema(
+fn writeVercelDescriptor(
     alloc: Allocator,
     writer: *std.Io.Writer,
-    schema: gateway_schema.FunctionSchema,
+    schema: tool_descriptor.Descriptor,
 ) !void {
     try schema.validate();
     var capped_description: ?[]u8 = null;
     defer if (capped_description) |description| alloc.free(description);
-    if (schema.description.len > gateway_schema.description_max_bytes) {
-        const prefix_len = gateway_schema.description_max_bytes - gateway_schema.truncation_marker.len;
-        const description = try alloc.alloc(u8, gateway_schema.description_max_bytes);
+    if (schema.description.len > tool_descriptor.description_max_bytes) {
+        const prefix_len = tool_descriptor.description_max_bytes - tool_descriptor.truncation_marker.len;
+        const description = try alloc.alloc(u8, tool_descriptor.description_max_bytes);
         @memcpy(description[0..prefix_len], schema.description[0..prefix_len]);
-        @memcpy(description[prefix_len..], gateway_schema.truncation_marker);
+        @memcpy(description[prefix_len..], tool_descriptor.truncation_marker);
         capped_description = description;
     }
 
@@ -1682,7 +1911,7 @@ fn writeVercelFunctionSchema(
     try writer.writeAll(",\"description\":");
     try std.json.Stringify.value(capped_description orelse schema.description, .{}, writer);
     try writer.writeAll(",\"inputSchema\":");
-    try gateway_schema.writeInputSchema(alloc, writer, schema);
+    try tool_descriptor.writeInputSchema(alloc, writer, schema);
     try writer.writeByte('}');
 }
 
@@ -1703,11 +1932,11 @@ fn vercelWebSearchToolJson(alloc: Allocator) ![]u8 {
 
 test "agent request builder keeps default reasoning silent and emits output limit" {
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
-    const body = try agent_stream_provider.build(std.testing.allocator, .{
+    const body = try buildAgentRequest(null, std.testing.allocator, .{
         .tools = &.{},
         .messages = &messages,
         .tool_choice = .auto,
-        .capabilities = model_capabilities.capabilitiesForModel("anthropic/claude-opus-4.8"),
+        .capabilities = model_descriptor_provider.fallback("anthropic/claude-opus-4.8").capabilities,
         .max_output_tokens = 32_000,
     });
     defer std.testing.allocator.free(body);
@@ -1719,7 +1948,7 @@ test "agent request builder keeps default reasoning silent and emits output limi
 
 test "agent request builder serializes neutral provider search beside local tools" {
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
-    const body = try agent_stream_provider.build(std.testing.allocator, .{
+    const body = try buildAgentRequest(null, std.testing.allocator, .{
         .tools = &.{.{ .name = "read_file", .description = "Read" }},
         .provider_tools = &.{.{ .tool = .web_search, .local_schema_position = 1 }},
         .messages = &messages,
@@ -1739,7 +1968,7 @@ test "agent request builder serializes neutral provider search beside local tool
 
 test "agent request builder overlays selected dynamic schemas" {
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
-    const body = try agent_stream_provider.build(std.testing.allocator, .{
+    const body = try buildAgentRequest(null, std.testing.allocator, .{
         .tools = &.{.{ .name = "mcp_fs_read", .description = "Read" }},
         .messages = &messages,
         .tool_choice = .auto,
@@ -1754,7 +1983,7 @@ test "agent request builder overlays selected dynamic schemas" {
 
 test "required vision request contains only the registered vision schema" {
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "inspect image 7" }};
-    const body = try agent_stream_provider.build(std.testing.allocator, .{
+    const body = try buildAgentRequest(null, std.testing.allocator, .{
         .tools = &.{.{
             .name = "vision",
             .description = "registry-owned vision schema sentinel",
@@ -1775,20 +2004,20 @@ test "required vision request contains only the registered vision schema" {
     try std.testing.expect(std.mem.find(u8, body, "\"maxOutputTokens\":128000") != null);
 }
 
-fn streamAgentCompletion(
+fn streamVercelTransport(
     _: ?*anyopaque,
     alloc: Allocator,
-    request: agent_stream_provider_contract.Request,
-) anyerror!agent_stream_provider_contract.Result {
-    const result = gateway_client.streamGatewayCompletion(
+    request: VercelTransportRequest,
+) anyerror!VercelTransportResponse {
+    const result = gateway_client.streamModelCompletion(
         alloc,
         .{
-            .api_key = request.api_key,
-            .team = request.team,
+            .api_key = request.credential,
+            .team = request.tenant,
             .session_id = request.session_id,
-            .model = request.model,
+            .model = request.model_id,
             .retry_count = request.retry_count,
-            .chat_url = request.chat_url,
+            .chat_url = request.endpoint,
             .payload = request.payload,
             .trace_ctx = request.trace_ctx,
             .content_capture_limit = request.content_capture_limit,
@@ -1819,12 +2048,10 @@ fn streamAgentCompletion(
         .status = result.status,
         .completion = result.completion,
         .err_body = result.err_body,
-        .generation_origin = gateway_client.generationBaseUrl(),
-        .reconcile_generation_usage = true,
         .failure_schema = diagnostics.schema,
         .failure_request_shape = diagnostics.request_shape,
         .retry_after_seconds = result.retry_after_seconds,
-        .ownership = .owned,
+        .owned = true,
     };
 }
 
@@ -1855,7 +2082,7 @@ fn fetchCreditsWithFetch(
     var team_path: ?[]u8 = null;
     defer if (team_path) |path| alloc.free(path);
     if (gateway_team) |team| {
-        if (shared_types.validGatewayTeam(team)) {
+        if (protocol_validation.validTeam(team)) {
             team_path = std.fmt.allocPrint(alloc, "{s}?teamId={s}", .{ credits_path, team }) catch {
                 return creditsErrorSnapshot(alloc, "failed to fetch credits from gateway");
             };
@@ -2154,7 +2381,7 @@ pub fn executeGatewayWorker(
     const payload = try gateway_json.buildGatewayRequiredToolRequestBodyWithMaxOutputTokens(alloc, tools_json, &messages, request.max_output_tokens);
     defer alloc.free(payload);
 
-    const usage_observation = try session_usage.GatewayObservation.begin(config.usage);
+    const usage_observation = try session_usage.ModelInvocationObservation.begin(config.usage);
     var delivery = gateway_client.DeliveryCertainty.init();
     const provider_tool_name = try selectedToolName(request.backend);
     var stream = config.stream_fn(
@@ -2178,9 +2405,12 @@ pub fn executeGatewayWorker(
         return err;
     };
     defer stream.deinit(alloc);
+    if (stream.status != .ok) {
+        try usage_observation.fail(.unbilled);
+        return error.GatewayRequestFailed;
+    }
     try usage_observation.complete(
         config.usage_allocator,
-        stream.status,
         stream.completion,
         config.connection_id,
         gateway_client.generationBaseUrl(),
@@ -2190,8 +2420,7 @@ pub fn executeGatewayWorker(
             ledger.startReconciliation(config.usage_allocator);
         }
     }
-    if (stream.status != .ok) return error.GatewayRequestFailed;
-    return normalizeGatewayCompletion(alloc, request, stream.completion, on_progress, progress_ctx);
+    return normalizeModelCompletion(alloc, request, stream.completion, on_progress, progress_ctx);
 }
 
 fn deadlineAfterMs(timeout_ms: u32) std.Io.Clock.Timestamp {
@@ -2267,10 +2496,10 @@ fn streamGatewayWorker(
     );
 }
 
-fn normalizeGatewayCompletion(
+fn normalizeModelCompletion(
     alloc: Allocator,
     request: Request,
-    completion: shared_types.GatewayCompletion,
+    completion: shared_types.ModelCompletion,
     on_progress: ?ProgressFn,
     progress_ctx: ?*anyopaque,
 ) !Response {
@@ -2679,7 +2908,7 @@ test "gateway worker returns one bounded error for malformed provider result ide
     };
     for (failures) |failure| {
         var cancel_flag = std.atomic.Value(bool).init(false);
-        var response = try normalizeGatewayCompletion(std.testing.allocator, .{
+        var response = try normalizeModelCompletion(std.testing.allocator, .{
             .backend = perplexity_search_backend_id,
             .query = "latest Zig release",
             .cancel_flag = &cancel_flag,
@@ -2705,7 +2934,7 @@ test "gateway worker returns one bounded error for malformed provider result ide
 
 test "gateway worker rejects malformed provider arguments before accepting search results" {
     var cancel_flag = std.atomic.Value(bool).init(false);
-    var response = try normalizeGatewayCompletion(std.testing.allocator, .{
+    var response = try normalizeModelCompletion(std.testing.allocator, .{
         .backend = perplexity_search_backend_id,
         .query = "latest Zig release",
         .cancel_flag = &cancel_flag,
@@ -2729,7 +2958,7 @@ test "gateway worker rejects malformed provider arguments before accepting searc
 
 test "gateway worker rejects duplicate selected provider calls" {
     var cancel_flag = std.atomic.Value(bool).init(false);
-    var response = try normalizeGatewayCompletion(std.testing.allocator, .{
+    var response = try normalizeModelCompletion(std.testing.allocator, .{
         .backend = perplexity_search_backend_id,
         .query = "latest Zig release",
         .cancel_flag = &cancel_flag,
@@ -2761,7 +2990,7 @@ test "gateway worker rejects duplicate selected provider calls" {
 
 test "gateway worker accepts refined provider input without worker commentary" {
     var cancel_flag = std.atomic.Value(bool).init(false);
-    var response = try normalizeGatewayCompletion(std.testing.allocator, .{
+    var response = try normalizeModelCompletion(std.testing.allocator, .{
         .backend = perplexity_search_backend_id,
         .query = "current latest stable Zig release",
         .cancel_flag = &cancel_flag,
@@ -2786,7 +3015,7 @@ test "gateway worker accepts refined provider input without worker commentary" {
 
 test "gateway worker rejects an unselected provider call" {
     var cancel_flag = std.atomic.Value(bool).init(false);
-    var response = try normalizeGatewayCompletion(std.testing.allocator, .{
+    var response = try normalizeModelCompletion(std.testing.allocator, .{
         .backend = perplexity_search_backend_id,
         .query = "latest Zig release",
         .cancel_flag = &cancel_flag,
@@ -2830,7 +3059,7 @@ test "cancelled gateway worker performs zero stream requests" {
 test "web search drops worker text when no provider result arrives" {
     const alloc = std.testing.allocator;
     var cancel_flag = std.atomic.Value(bool).init(false);
-    var response = try normalizeGatewayCompletion(alloc, .{
+    var response = try normalizeModelCompletion(alloc, .{
         .backend = perplexity_search_backend_id,
         .query = "latest Zig release",
         .cancel_flag = &cancel_flag,
@@ -3327,25 +3556,43 @@ fn fetchCatalogForProvider(
     alloc: std.mem.Allocator,
     input: model_catalog.FetchInput,
 ) std.mem.Allocator.Error!model_catalog.ProviderResult {
+    const vercel_access = vercelCatalogAccess(input.access) catch return .{ .failure = .{ .category = .runtime } };
     const response = fetchModelCatalogResponse(
         alloc,
-        input.access,
-        input.endpoint,
+        vercel_access,
+        models_path,
         input.cancel_flag,
     ) catch |err| return .{ .failure = catalogRequestFailure(err) };
     const json_text = switch (response) {
         .success => |body| body,
-        .http_status => |status| return .{ .failure = model_catalog.failureForHttpStatus(status) },
+        .http_status => |status| return .{ .failure = model_catalog_failure.fromHttpStatus(status) },
     };
     defer alloc.free(json_text);
 
     const catalog = parseModelCatalogForView(alloc, json_text, input.view) catch |err| return .{
         .failure = .{
-            .category = if (err == error.OutOfMemory) .resource_exhausted else .malformed_response,
-            .http_status = .ok,
+            .category = if (err == error.OutOfMemory) .resource_exhausted else .invalid_content,
         },
     };
     return .{ .catalog = catalog };
+}
+
+fn vercelCatalogAccess(access: adapter_auth.CatalogAccess) !credentials.CatalogAccess {
+    return switch (access) {
+        .authenticated => |value| .{ .authenticated = .{
+            .source = std.meta.stringToEnum(credentials.CatalogAuthenticatedSource, value.source.id) orelse
+                return error.InvalidCredentialSource,
+            .credential = value.credential,
+            .team_context = value.team_context,
+        } },
+        .public_only => |value| .{ .public_only = switch (value.reason) {
+            .no_credential => .no_credential,
+            .tenant_required => .fx_login_team_required,
+            .refresh_required => .fx_login_refresh_required,
+            .refresh_failed => .{ .credential_refresh_failed = std.meta.stringToEnum(credentials.Source, (value.source orelse return error.MissingCredentialSource).id) orelse return error.InvalidCredentialSource },
+            .credential_rejected => .{ .authenticated_credential_rejected = std.meta.stringToEnum(credentials.Source, (value.source orelse return error.MissingCredentialSource).id) orelse return error.InvalidCredentialSource },
+        } },
+    };
 }
 
 fn fetchModelIdsForView(
@@ -3371,7 +3618,7 @@ fn fetchModelCatalogForView(
     const response = try fetchModelCatalogResponse(alloc, access, path, cancel_flag);
     const json_text = switch (response) {
         .success => |body| body,
-        .http_status => |status| return model_catalog.failureForHttpStatus(status).asError(),
+        .http_status => |status| return model_catalog_failure.fromHttpStatus(status).asError(),
     };
     defer alloc.free(json_text);
 
@@ -3413,7 +3660,7 @@ fn modelCatalogTeamPath(
 ) Allocator.Error!?[]u8 {
     if (access.credentialSource() != .fx_login) return null;
     const team = access.teamContext() orelse return null;
-    if (!shared_types.validGatewayTeam(team)) return null;
+    if (!protocol_validation.validTeam(team)) return null;
     return try std.fmt.allocPrint(alloc, "{s}?teamId={s}", .{ path, team });
 }
 
@@ -3425,7 +3672,7 @@ fn modelCatalogHeaderTeam(access: credentials.CatalogAccess) ?[]const u8 {
 fn catalogRequestFailure(err: anyerror) model_catalog.Failure {
     if (err == error.OutOfMemory) return .{ .category = .resource_exhausted };
     if (err == error.Cancelled) return .{ .category = .cancellation };
-    if (isInvalidGatewayResponse(err)) return .{ .category = .malformed_response };
+    if (isInvalidGatewayResponse(err)) return .{ .category = .invalid_content };
     return .{
         .category = .transport,
         .retryable = gateway_client.isRetryableGatewayError(err),
@@ -3452,7 +3699,6 @@ fn isInvalidGatewayResponse(err: anyerror) bool {
 test "catalog request failures preserve transport and cancellation facts" {
     const network = catalogRequestFailure(error.ConnectionResetByPeer);
     try std.testing.expectEqual(model_catalog.FailureCategory.transport, network.category);
-    try std.testing.expect(network.http_status == null);
     try std.testing.expect(network.retryable);
 
     const cancelled = catalogRequestFailure(error.Cancelled);
@@ -3460,7 +3706,7 @@ test "catalog request failures preserve transport and cancellation facts" {
     try std.testing.expect(!cancelled.retryable);
 
     const malformed = catalogRequestFailure(error.HttpHeadersInvalid);
-    try std.testing.expectEqual(model_catalog.FailureCategory.malformed_response, malformed.category);
+    try std.testing.expectEqual(model_catalog.FailureCategory.invalid_content, malformed.category);
 }
 
 fn modelCatalogUrl(alloc: Allocator, path: []const u8, base_url_override: ?[]const u8) ![]u8 {
@@ -3625,7 +3871,7 @@ pub fn parseModelCatalogForView(
         .full => return catalog,
         .picker => {
             defer freeModelCatalog(alloc, &catalog);
-            return model_catalog.projectPickerModelCatalog(alloc, catalog.items);
+            return model_catalog_projection.projectPickerCatalog(alloc, catalog.items);
         },
     }
 }
@@ -3649,7 +3895,7 @@ fn parseSortedModelCatalog(alloc: std.mem.Allocator, json_text: []const u8) !std
         };
     }
 
-    sort_utils.sort(ModelCatalogEntry, candidates.items, {}, model_catalog.compareModelCatalogEntries);
+    sort_utils.sort(ModelCatalogEntry, candidates.items, {}, model_catalog_projection.compare);
 
     return candidates;
 }
@@ -4421,7 +4667,7 @@ fn adapterAuthTestProfile(kind: []const u8, credential_ref: []const u8) connecti
         .display_name = @constCast("Test"),
         .adapter_id = @constCast(kind),
         .endpoint = null,
-        .protocol = null,
+        .protocol = @constCast(kind),
         .credential_ref = @constCast(credential_ref),
         .remembered_model = @constCast("model"),
         .internal_models = .{},
@@ -4538,6 +4784,7 @@ test "top-level status and interactive acquire resolve one adapter with zero cro
     };
     const peer_adapter = agent_stream_provider_contract.ProviderAdapter{
         .kind = "test_peer",
+        .supported_protocol = "test_peer",
         .auth = peer_auth,
         .stream_fn = agent_stream_provider_contract.unavailable_adapter.stream_fn,
     };
@@ -4638,6 +4885,7 @@ test "adapter auth preserves invalid references refresh failures and late cancel
         provider_adapter,
         .{
             .kind = "test_peer",
+            .supported_protocol = "test_peer",
             .auth = peer_auth,
             .stream_fn = agent_stream_provider_contract.unavailable_adapter.stream_fn,
         },

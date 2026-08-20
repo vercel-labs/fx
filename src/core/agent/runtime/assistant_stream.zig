@@ -1,6 +1,7 @@
 const std = @import("std");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
+const adapter_auth = @import("../../gateway/adapter_auth.zig");
 const types = @import("../../shared/types.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
@@ -507,7 +508,7 @@ pub fn emitProviderLengthNotice(hooks: *const AgentRuntimeDeps, arena: Allocator
 pub fn finishLengthLimitedToolCallCompletion(
     hooks: *const AgentRuntimeDeps,
     arena: Allocator,
-    completion: types.GatewayCompletion,
+    completion: types.ModelCompletion,
     streamed_content_len: usize,
 ) ![]const u8 {
     const blocker = "Provider response hit the length limit, so I did not execute the returned tool calls. Latest partial response is preserved above; retry with a narrower prompt or inspect stored tool output before continuing.";
@@ -687,7 +688,7 @@ const NoticeCapture = struct {
     }
 
     fn commandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
-    fn providerFailure(_: *anyopaque, _: agent_stream_provider.StreamFailure.Category, _: ?u16, _: []const u8, _: ?types.CredentialSource) !void {}
+    fn providerFailure(_: *anyopaque, _: agent_stream_provider.StreamFailure.Category, _: []const u8, _: ?adapter_auth.Source) !void {}
 
     fn formatError(_: *anyopaque, arena: Allocator, _: []const u8, err: anyerror) ![]const u8 {
         return std.fmt.allocPrint(arena, "{s}", .{@errorName(err)});
@@ -787,7 +788,7 @@ const StreamCapture = struct {
     fn noopPushDiff(_: *anyopaque, _: DiffEntryPayload) !void {}
     fn noopSystemNotice(_: *anyopaque, _: []const u8) !void {}
     fn noopCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
-    fn noopProviderFailure(_: *anyopaque, _: agent_stream_provider.StreamFailure.Category, _: ?u16, _: []const u8, _: ?types.CredentialSource) !void {}
+    fn noopProviderFailure(_: *anyopaque, _: agent_stream_provider.StreamFailure.Category, _: []const u8, _: ?adapter_auth.Source) !void {}
     fn noopFormatError(_: *anyopaque, arena: Allocator, _: []const u8, err: anyerror) ![]const u8 {
         return std.fmt.allocPrint(arena, "{s}", .{@errorName(err)});
     }

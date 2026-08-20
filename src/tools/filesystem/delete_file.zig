@@ -107,7 +107,7 @@ pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
 const delete_file_dispatch_tool = tool_dispatch.Tool{
     .name = "delete_file",
     .description = "Delete file dispatch test fixture.",
-    .gateway_schema = .{
+    .descriptor = .{
         .name = "delete_file",
         .description = "Delete file dispatch test fixture.",
     },

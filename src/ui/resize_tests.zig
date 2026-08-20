@@ -903,9 +903,9 @@ fn renderTestFooter(
 
 fn defaultFooterContext(input: *const InputRuntime) render_input.RenderContext {
     return .{
-        .slash_registry = builtin_commands.slash_registry,
+        .slash_registry = builtin_commands.testSlashRegistry(),
         .stream = .{},
-        .has_api_key = true,
+        .has_credential = true,
         .model = "test-model",
         .queued_count = 0,
         .subagent_count = 0,

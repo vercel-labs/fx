@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const app_permission_runtime = @import("../app/app_permission_runtime.zig");
 const app_session_runtime = @import("../app/app_session_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -17,6 +18,10 @@ const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const render_request = @import("../../ui/render_request.zig");
+const test_model_descriptor_provider = if (builtin.is_test)
+    @import("../gateway/test_adapter.zig").model_descriptor_provider
+else
+    struct {};
 
 const freeStringList = collections.freeStringList;
 const containsIgnoreCase = text_utils.containsIgnoreCase;
@@ -266,13 +271,15 @@ pub fn Commands(comptime App: type) type {
 
         pub fn showStatus(app: *App) !void {
             const auth = app.auth.statusSnapshot();
+            const auth_help = try auth.missingHelpAlloc(app.alloc, .interactive);
+            defer if (auth_help) |value| app.alloc.free(value);
             const text = try (output_contracts.StatusSnapshot{
                 .model = app.selected_model.items,
                 .update_channel = update_channel_label(app),
                 .build_channel = if (@hasDecl(App, "build_update_channel")) App.build_update_channel.label() else "stable",
                 .build_revision = if (@hasDecl(App, "build_revision")) App.build_revision else "",
                 .auth = auth,
-                .auth_help = auth.missingHelp(.interactive),
+                .auth_help = auth_help,
                 .permission_mode = app.permission_engine.mode,
                 .sandbox_backend = sandbox.effectiveBackend(
                     app.permission_engine.mode,
@@ -687,7 +694,7 @@ pub fn Commands(comptime App: type) type {
                 try applyFastMode(app, false, announce, true);
                 return;
             }
-            if (!model_capabilities.resolveForApp(App, app, model).supports_fast_mode) {
+            if (!model_capabilities.resolveForApp(App, app, model).capabilities.supports_fast_mode) {
                 if (announce) {
                     try app.writeDomainNotice(.{
                         .topic = "fast",
@@ -713,7 +720,7 @@ pub fn Commands(comptime App: type) type {
                     if (previous) "true" else "false",
                     if (app.fast_mode) "true" else "false",
                     app.selected_model.items,
-                    if (model_capabilities.resolveForApp(App, app, app.selected_model.items).supports_fast_mode) "true" else "false",
+                    if (model_capabilities.resolveForApp(App, app, app.selected_model.items).capabilities.supports_fast_mode) "true" else "false",
                 },
             );
 
@@ -758,9 +765,11 @@ pub fn Commands(comptime App: type) type {
         }
 
         pub fn selectModelFromPicker(app: *App, model: []const u8, effort: types.ReasoningEffort, fast_mode: bool) !void {
-            try setResolvedModelRuntime(app, model, true);
-            var patch = app_session_runtime.SessionPreferencePatch{ .model = model };
-            const capabilities = model_capabilities.resolveForApp(App, app, model);
+            const descriptor = model_capabilities.resolveForApp(App, app, model);
+            const canonical_model = descriptor.id;
+            try setResolvedModelRuntime(app, canonical_model, true);
+            var patch = app_session_runtime.SessionPreferencePatch{ .model = canonical_model };
+            const capabilities = descriptor.capabilities;
             if (capabilities.reasoning_efforts.len == 0) {
                 if (capabilities.supports_fast_mode) {
                     try applyFastMode(app, fast_mode, false, false);
@@ -1654,8 +1663,8 @@ const FakeApp = struct {
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
     cached_ids: ?[]const []const u8 = null,
-    gateway_metadata_model: ?[]const u8 = null,
-    gateway_metadata: model_capabilities.GatewayMetadata = .{},
+    descriptor_override_model: ?[]const u8 = null,
+    descriptor_override_capabilities: model_capabilities.Capabilities = .{},
     fetch_ids: []const []const u8 = &.{},
     fail_fetch: bool = false,
     last_tone: ?types.NoticeTone = null,
@@ -1762,13 +1771,13 @@ const FakeApp = struct {
         self.last_preference_permission_mode = mode;
     }
 
-    pub fn resolvedModelCapabilities(self: *FakeApp, model: []const u8) model_capabilities.Capabilities {
-        if (self.gateway_metadata_model) |metadata_model| {
-            if (std.mem.eql(u8, metadata_model, model)) {
-                return model_capabilities.resolveCapabilities(model, self.gateway_metadata);
+    pub fn resolvedModelDescriptor(self: *FakeApp, model: []const u8) model_capabilities.ModelDescriptor {
+        if (self.descriptor_override_model) |override_model| {
+            if (std.mem.eql(u8, override_model, model)) {
+                return model_capabilities.configuredDescriptor(model, self.descriptor_override_capabilities);
             }
         }
-        return model_capabilities.capabilitiesForModel(model);
+        return test_model_descriptor_provider.fallback(model);
     }
 
     fn setGatewayControls(
@@ -1777,8 +1786,9 @@ const FakeApp = struct {
         efforts: []const types.ReasoningEffort,
         supports_fast_mode: bool,
     ) void {
-        self.gateway_metadata_model = model;
-        self.gateway_metadata = .{
+        self.descriptor_override_model = model;
+        self.descriptor_override_capabilities = .{
+            .supports_reasoning = efforts.len > 0,
             .reasoning_efforts = .fromSlice(efforts),
             .supports_fast_mode = supports_fast_mode,
         };
@@ -3078,7 +3088,7 @@ test "session_commands model controls remain catalog validated" {
     try std.testing.expectEqual(@as(usize, 0), app.worker.fast_sync_count);
     try std.testing.expectEqual(@as(?bool, true), app.worker.synced_fast_mode);
     const unsupported_options = model_capabilities.resolveProviderOptionsForCapabilities(
-        app.resolvedModelCapabilities(app.selected_model.items),
+        app.resolvedModelDescriptor(app.selected_model.items).capabilities,
         app.effort,
         app.worker.synced_fast_mode.?,
     );
@@ -3086,18 +3096,14 @@ test "session_commands model controls remain catalog validated" {
     try std.testing.expect(!unsupported_options.fast);
 
     const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("high")};
-    app.gateway_metadata_model = "anthropic/claude-opus-4.6";
-    app.gateway_metadata = .{
-        .reasoning_efforts = .fromSlice(&efforts),
-        .supports_fast_mode = true,
-    };
+    app.setGatewayControls("anthropic/claude-opus-4.6", &efforts, true);
 
     try Commands(FakeApp).selectModelFromPicker(&app, "anthropic/claude-opus-4.6", types.ReasoningEffort.literal("high"), true);
 
     try std.testing.expectEqual(@as(?bool, true), app.worker.synced_fast_mode);
     try std.testing.expectEqual(@as(usize, 1), app.worker.fast_sync_count);
     const supported_options = model_capabilities.resolveProviderOptionsForCapabilities(
-        app.resolvedModelCapabilities(app.selected_model.items),
+        app.resolvedModelDescriptor(app.selected_model.items).capabilities,
         app.effort,
         app.worker.synced_fast_mode.?,
     );

@@ -1,4 +1,5 @@
 const std = @import("std");
+const protocol_validation = @import("protocol_validation.zig");
 const client = @import("client.zig");
 const generation_usage_provider = @import("../core/session/generation_usage_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
@@ -95,7 +96,7 @@ fn parseGenerationRecord(
     body: []const u8,
     expected_id: []const u8,
 ) !generation_usage_provider.Record {
-    if (!types.validGatewayGenerationId(expected_id)) {
+    if (!protocol_validation.validGenerationId(expected_id)) {
         return error.InvalidGenerationId;
     }
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| switch (err) {
@@ -111,7 +112,7 @@ fn parseGenerationRecord(
     const id_value = data.object.get("id") orelse
         return error.InvalidGenerationRecord;
     if (id_value != .string or
-        !types.validGatewayGenerationId(id_value.string))
+        !protocol_validation.validGenerationId(id_value.string))
     {
         return error.InvalidGenerationRecord;
     }
@@ -127,7 +128,7 @@ fn parseGenerationRecord(
     const created_at_value = data.object.get("created_at") orelse
         return error.InvalidGenerationRecord;
     if (created_at_value != .string) return error.InvalidGenerationRecord;
-    const created_at_ms = types.parseGatewayTimestamp(created_at_value.string) catch
+    const created_at_ms = protocol_validation.parseTimestamp(created_at_value.string) catch
         return error.InvalidGenerationRecord;
     const total_cost = try parseNonNegativeNumber(data.object.get("total_cost"));
     const prompt_tokens = try parseNonNegativeInteger(

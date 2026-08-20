@@ -106,7 +106,7 @@ pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
 const create_folder_dispatch_tool = tool_dispatch.Tool{
     .name = "create_folder",
     .description = "Create folder dispatch test fixture.",
-    .gateway_schema = .{
+    .descriptor = .{
         .name = "create_folder",
         .description = "Create folder dispatch test fixture.",
     },

@@ -141,11 +141,11 @@ test "help screen places composer and grouped directory without transcript chrom
         .help = .{
             .active = true,
             .registry = help_screen_test_registry,
-            .query = "saved",
+            .query = "resume",
         },
         .composer = .{
-            .input = "saved",
-            .cursor = "saved".len,
+            .input = "resume",
+            .cursor = "resume".len,
             .appearance = .lines,
             .prefix_style = input_presentation.ComposerPrefixStyle.rail,
         },
@@ -160,7 +160,7 @@ test "help screen places composer and grouped directory without transcript chrom
     var row: std.ArrayList(u8) = .empty;
     defer row.deinit(alloc);
     try grid.rowTextTrimmed(1, &row);
-    try std.testing.expect(std.mem.find(u8, row.items, "saved") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "resume") != null);
     row.clearRetainingCapacity();
     try grid.rowTextTrimmed(3, &row);
     try std.testing.expect(std.mem.find(u8, row.items, "Commands 1") != null);

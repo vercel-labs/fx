@@ -211,7 +211,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
 
 fn testSlashRegistry() SlashRegistry {
     const builtin_commands = @import("../../builtins/commands.zig");
-    return builtin_commands.slash_registry;
+    return builtin_commands.testSlashRegistry();
 }
 
 test "parse extracts model command payload" {
