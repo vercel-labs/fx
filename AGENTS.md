@@ -396,6 +396,8 @@ Whether automated or manual, the changelog is public product copy. Describe obse
 Public changelog entries must:
 
 * Spell the product name `fx`. Preserve different casing only when it is part of an exact code identifier such as `FX_MODEL`.
+* Use `### New Features` only when the diff proves users can do something that was not possible at the previous release. Rewritten, moved, exposed, hardened, or extended existing behavior is not automatically new.
+* Compare proposed notes with the previous release's changelog and README. Do not announce an existing capability as new; when the current diff improves or fixes it, describe only that new user-visible delta.
 * Use only relevant sections from `### Breaking Changes`, `### New Features`, `### Improvements`, `### Bug Fixes`, and `### Security`. Omit empty sections.
 * Bold a short feature or fix name, then describe the user-visible change after a colon.
 * Omit pull request numbers, issue numbers, commit hashes, contributor names, and author attribution.

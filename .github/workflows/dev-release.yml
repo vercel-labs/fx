@@ -105,7 +105,6 @@ jobs:
     env:
       RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
       BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
-      FX_WEB_DEPLOY_HOOK_URL: ${{ secrets.FX_WEB_DEPLOY_HOOK_URL }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -201,8 +200,15 @@ jobs:
           echo "updated=true" >> "$GITHUB_OUTPUT"
 
       - name: Deploy fx-web
-        if: steps.point-dev.outputs.updated == 'true' && env.FX_WEB_DEPLOY_HOOK_URL != ''
+        if: steps.point-dev.outputs.updated == 'true'
+        env:
+          FX_WEB_DEPLOY_HOOK_URL: ${{ secrets.FX_WEB_DEPLOY_HOOK_URL }}
         run: |
+          set -euo pipefail
+          if [ -z "$FX_WEB_DEPLOY_HOOK_URL" ]; then
+            echo "::error::FX_WEB_DEPLOY_HOOK_URL is not configured"
+            exit 1
+          fi
           curl --fail --silent --show-error \
             --retry 3 --retry-all-errors --max-time 30 \
             -X POST "$FX_WEB_DEPLOY_HOOK_URL"

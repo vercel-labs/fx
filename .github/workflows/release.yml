@@ -176,3 +176,25 @@ jobs:
             -H "x-cache-control-max-age: 60" \
             --data-binary "@/tmp/latest.txt")
           echo "Updated latest.txt to $VERSION ($HTTP_CODE)"
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::Failed to update latest.txt ($HTTP_CODE)"
+            exit 1
+          fi
+
+  deploy-fx-web:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Deploy fx-web
+        env:
+          FX_WEB_DEPLOY_HOOK_URL: ${{ secrets.FX_WEB_DEPLOY_HOOK_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "$FX_WEB_DEPLOY_HOOK_URL" ]; then
+            echo "::error::FX_WEB_DEPLOY_HOOK_URL is not configured"
+            exit 1
+          fi
+          curl --fail --silent --show-error \
+            --retry 3 --retry-all-errors --max-time 30 \
+            -X POST "$FX_WEB_DEPLOY_HOOK_URL"
