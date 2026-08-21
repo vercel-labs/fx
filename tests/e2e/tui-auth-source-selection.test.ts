@@ -357,6 +357,7 @@ tmuxTest(
         pane.includes("Setup") &&
         pane.includes("Sign in with Vercel") &&
         pane.includes("API key") &&
+        pane.includes("OpenCode Go API key") &&
         pane.includes("Change team") &&
         pane.includes("Switch credential"),
       TIMEOUT,
@@ -373,6 +374,13 @@ tmuxTest(
     await session.sendKeys("Enter");
     const apiKey = await session.waitForText("Paste your AI Gateway API key", TIMEOUT);
     expect(apiKey).toContain("Saves to");
+    await session.sendKeys("Escape");
+    await session.waitForText("Switch credential", TIMEOUT);
+
+    await session.sendKeys("Down");
+    await session.sendKeys("Enter");
+    const opencodeKey = await session.waitForText("Paste your OpenCode Go API key", TIMEOUT);
+    expect(opencodeKey).toContain("Saves to");
     await session.sendKeys("Escape");
     await session.waitForText("Switch credential", TIMEOUT);
 
@@ -450,7 +458,7 @@ async function waitForTrace(tracePath: string, needle: string): Promise<void> {
 }
 
 async function enterSwitchCredential(pickerSession: TmuxSession): Promise<void> {
-  for (let index = 0; index < 3; index += 1) {
+  for (let index = 0; index < 4; index += 1) {
     await pickerSession.sendKeys("Down");
   }
   await pickerSession.sendKeys("Enter");
@@ -514,6 +522,36 @@ profileStoredKeyTmuxTest(
 
     const output = await session.captureFullScrollback();
     expect(output).not.toContain(STORED_TOKEN);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+profileStoredKeyTmuxTest(
+  "OpenCode Go slash login stores its masked key separately from Gateway",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-opencode-go-login-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+
+    session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+      FX_DISABLE_KEYCHAIN: undefined,
+      OPENCODE_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login opencode-go");
+    const picker = await session.waitForText("Paste your OpenCode Go API key", TIMEOUT);
+    expect(picker).not.toContain("Paste your AI Gateway API key");
+    await session.sendLiteralText("opencode-secret-value");
+    await session.sendKeys("Enter");
+    await session.waitForText("Saved the OpenCode Go API key to profile file", TIMEOUT);
+
+    expect(readFileSync(join(home, ".fx", "opencode-go-api-key"), "utf8")).toBe(
+      "opencode-secret-value",
+    );
+    expect(existsSync(join(home, ".fx", "api-key"))).toBe(false);
+    expect(await session.captureFullScrollback()).not.toContain("opencode-secret-value");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -606,6 +644,7 @@ tmuxTest(
 
     await session.sendText("/setup");
     await session.waitForText("Change team", TIMEOUT);
+    await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Enter");

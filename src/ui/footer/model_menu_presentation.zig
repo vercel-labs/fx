@@ -203,6 +203,7 @@ fn providerTabLabel(index: usize) []const u8 {
         .openai => "OpenAI",
         .xai => "xAI",
         .zai => "Z.AI",
+        .opencode_go => "OpenCode Go",
         .others => "Others",
     };
 }

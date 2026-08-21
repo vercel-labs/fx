@@ -232,7 +232,7 @@ pub fn readSidecarOrFallback(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
 ) !DisplayMetadata {
-    var file = session_dir.dir.openFile(io_mod.getIo(), sidecar_file, .{
+    var file = io_mod.openFile(session_dir.dir, sidecar_file, .{
         .mode = .read_only,
         .allow_directory = false,
         .follow_symlinks = false,

@@ -13,7 +13,7 @@ pub const ParsedCommand = union(enum) {
     continue_recovery,
     rename_session: []const u8,
     help,
-    login,
+    login: []const u8,
     logout,
     setup,
     status,
@@ -59,7 +59,7 @@ pub const CommandHandlers = struct {
     resume_session: *const fn (ctx: *anyopaque) anyerror!void,
     continue_recovery: *const fn (ctx: *anyopaque) anyerror!void,
     show_help: *const fn (ctx: *anyopaque) anyerror!void,
-    login: *const fn (ctx: *anyopaque) anyerror!void,
+    login: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     logout: *const fn (ctx: *anyopaque) anyerror!void,
     setup: *const fn (ctx: *anyopaque) anyerror!void,
     show_status: *const fn (ctx: *anyopaque) anyerror!void,
@@ -111,7 +111,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .continue_recovery => .continue_recovery,
         .rename_session => .{ .rename_session = payload },
         .help => .help,
-        .login => .login,
+        .login => .{ .login = payload },
         .logout => .logout,
         .setup => .setup,
         .status => .status,
@@ -171,7 +171,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .continue_recovery => try handlers.continue_recovery(handlers.ctx),
         .rename_session => |rest| try handlers.rename_session(handlers.ctx, rest),
         .help => try handlers.show_help(handlers.ctx),
-        .login => try handlers.login(handlers.ctx),
+        .login => |rest| try handlers.login(handlers.ctx, rest),
         .logout => try handlers.logout(handlers.ctx),
         .setup => try handlers.setup(handlers.ctx),
         .status => try handlers.show_status(handlers.ctx),
@@ -264,6 +264,13 @@ test "parse recognizes logout" {
     switch (parse(testSlashRegistry(), "/logout")) {
         .unknown => return error.TestExpectedLogoutCommand,
         else => {},
+    }
+}
+
+test "parse extracts OpenCode Go login provider" {
+    switch (parse(testSlashRegistry(), "/login opencode-go")) {
+        .login => |provider| try std.testing.expectEqualStrings("opencode-go", provider),
+        else => return error.TestExpectedLoginCommand,
     }
 }
 
@@ -553,7 +560,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .resume_session = unexpectedNoPayload,
         .continue_recovery = unexpectedNoPayload,
         .show_help = unexpectedNoPayload,
-        .login = unexpectedNoPayload,
+        .login = unexpectedPayload,
         .logout = unexpectedNoPayload,
         .setup = unexpectedNoPayload,
         .show_status = unexpectedNoPayload,

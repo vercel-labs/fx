@@ -23,6 +23,7 @@ pub const Config = struct {
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     secret_store: host.SecretStore,
+    opencode_go_secret_store: host.SecretStore = host.unavailable_secret_store,
     prompt_policy: prompt_policy.Policy,
     ignored_list_entries: []const []const u8,
     max_list_entries: usize,

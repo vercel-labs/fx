@@ -252,7 +252,7 @@ fn ensureManagedDir(parent_path: []const u8, child_name: []const u8) !void {
             else => return err,
         };
         defer child.close(zio);
-        child.setPermissions(zio, (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700)))) catch
+        io_mod.applyDirPermissions(child, (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))) catch
             return error.CorruptArtifactStore;
         const stat = try child.stat(zio);
         if (comptime builtin.os.tag != .windows and (stat.kind != .directory or stat.permissions.toMode() & 0o777 != 0o700)) {

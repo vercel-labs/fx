@@ -206,9 +206,7 @@ fn openDeferredCacheDirectory(
 
 fn requirePrivateCacheDirectory(dir: std.Io.Dir) !void {
     const stat = try dir.stat(io_mod.getIo());
-    if (stat.kind != .directory or
-        (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else stat.permissions.toMode()) & 0o777 != (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else private_dir_permissions.toMode()))
-    {
+    if (stat.kind != .directory or !io_mod.unixModeMatches(stat, 0o700)) {
         return error.InvalidSessionIndex;
     }
 }
@@ -266,7 +264,7 @@ fn readDeferredCacheTokenFromDirectory(
     deferred: *const io_mod.VerifiedDir,
     session_id: []const u8,
 ) !DeferredCacheToken {
-    var file = deferred.dir.openFile(io_mod.getIo(), session_id, .{
+    var file = io_mod.openFile(deferred.dir, session_id, .{
         .mode = .read_only,
         .allow_directory = false,
         .follow_symlinks = false,
@@ -280,7 +278,7 @@ fn readDeferredCacheTokenFromDirectory(
     defer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.nlink != 1 or
-        (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else stat.permissions.toMode()) & 0o777 != (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else private_file_permissions.toMode()) or
+        !io_mod.unixModeMatches(stat, 0o600) or
         stat.size == 0 or stat.size > max_deferred_cache_token_bytes)
     {
         return error.InvalidSessionIndex;
@@ -1530,7 +1528,7 @@ pub fn refreshRelationshipMigrationSnapshot(
         return error.InvalidSessionIndex;
     if (target_stat.kind != .file or
         target_stat.nlink != 1 or
-        (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else target_stat.permissions.toMode()) & 0o777 != 0o600)
+        !io_mod.unixModeMatches(target_stat, 0o600))
     {
         return error.InvalidSessionIndex;
     }
@@ -1633,7 +1631,7 @@ fn openVerifiedSessionIndexFile(
     sessions: *const io_mod.VerifiedDir,
     name: []const u8,
 ) !std.Io.File {
-    var file = sessions.dir.openFile(io_mod.getIo(), name, .{
+    var file = io_mod.openFile(sessions.dir, name, .{
         .mode = .read_only,
         .allow_directory = false,
         .follow_symlinks = false,

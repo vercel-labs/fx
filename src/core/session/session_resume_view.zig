@@ -194,8 +194,7 @@ pub fn loadMatching(
 }
 
 fn safeFile(stat: std.Io.File.Stat) bool {
-    return stat.kind == .file and stat.nlink == 1 and
-        (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else stat.permissions.toMode()) & 0o777 == 0o600;
+    return stat.kind == .file and stat.nlink == 1 and io_mod.unixModeMatches(stat, 0o600);
 }
 
 fn validVisibleText(text: []const u8) bool {

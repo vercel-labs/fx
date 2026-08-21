@@ -11,6 +11,7 @@ pub const clipboard = host.Clipboard{
 };
 
 pub const secret_store = native_secret_store.provider;
+pub const opencode_go_secret_store = native_secret_store.opencode_go_provider;
 
 fn copyToClipboard(_: ?*anyopaque, text: []const u8) host.ClipboardError!bool {
     const argv = clipboardCommand(builtin.os.tag) orelse return false;

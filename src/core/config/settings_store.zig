@@ -362,18 +362,20 @@ pub const Store = struct {
         errdefer durable_home.close(zio);
 
         if (mode == .writable) {
-            durable_home.setPermissions(zio, (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700)))) catch {
+            io_mod.applyDirPermissions(durable_home, (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))) catch {
                 return error.PrivateStatePermissionsUnsupported;
             };
         }
         const stat = try durable_home.stat(zio);
         if (stat.kind != .directory) return error.DurablePathUnsafe;
-        const durable_mode = (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else stat.permissions.toMode()) & 0o777;
-        if (mode == .writable and durable_mode != 0o700) {
-            return error.PrivateStatePermissionsUnsupported;
-        }
-        if (mode == .read_only and durableModeWritableByGroupOrOther(durable_mode)) {
-            return error.PrivateStatePermissionsUnsupported;
+        if (comptime builtin.os.tag != .windows) {
+            const durable_mode = stat.permissions.toMode() & 0o777;
+            if (mode == .writable and durable_mode != 0o700) {
+                return error.PrivateStatePermissionsUnsupported;
+            }
+            if (mode == .read_only and durableModeWritableByGroupOrOther(durable_mode)) {
+                return error.PrivateStatePermissionsUnsupported;
+            }
         }
 
         return .{
@@ -694,7 +696,7 @@ pub const Store = struct {
         for (names.items) |name| {
             const stat = backups.statFile(io_mod.getIo(), name, .{ .follow_symlinks = false }) catch continue;
             if (stat.kind != .file or stat.nlink != 1 or stat.size > max_settings_bytes) continue;
-            var file = backups.openFile(io_mod.getIo(), name, .{
+            var file = io_mod.openFile(backups, name, .{
                 .allow_directory = false,
                 .follow_symlinks = false,
                 .resolve_beneath = true,
@@ -1838,7 +1840,7 @@ fn containsCopyWithFingerprint(
         if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
         const stat = dir.statFile(io_mod.getIo(), entry.name, .{ .follow_symlinks = false }) catch continue;
         if (stat.kind != .file or stat.nlink != 1 or stat.size > max_settings_bytes) continue;
-        var file = dir.openFile(io_mod.getIo(), entry.name, .{
+        var file = io_mod.openFile(dir, entry.name, .{
             .allow_directory = false,
             .follow_symlinks = false,
             .resolve_beneath = true,

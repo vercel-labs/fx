@@ -77,7 +77,7 @@ pub const OpenedSkillCandidate = struct {
         if (invalidResourceSegment(segment)) return error.InvalidSkillResourcePath;
 
         const child_segment = segments.next() orelse {
-            return self.dir.openFile(io_mod.getIo(), segment, .{
+            return io_mod.openFile(self.dir, segment, .{
                 .allow_directory = false,
                 .follow_symlinks = false,
             });
@@ -99,7 +99,7 @@ pub const OpenedSkillCandidate = struct {
             current_dir = next_dir;
             segment = next_segment;
         }
-        return current_dir.openFile(io_mod.getIo(), segment, .{
+        return io_mod.openFile(current_dir, segment, .{
             .allow_directory = false,
             .follow_symlinks = false,
         });
@@ -533,7 +533,7 @@ fn appendSkillCandidate(
         return;
     }
 
-    var file = candidate_dir.openFile(io_mod.getIo(), "SKILL.md", .{
+    var file = io_mod.openFile(candidate_dir, "SKILL.md", .{
         .allow_directory = false,
         .follow_symlinks = false,
     }) catch |err| {
@@ -655,7 +655,7 @@ pub fn openValidatedSkillCandidate(alloc: Allocator, skill: Skill) error{OutOfMe
             return if (err == error.FileNotFound) .missing else .{ .skipped = .unreadable };
         };
     };
-    var file = candidate_dir.openFile(io_mod.getIo(), "SKILL.md", .{
+    var file = io_mod.openFile(candidate_dir, "SKILL.md", .{
         .allow_directory = false,
         .follow_symlinks = false,
     }) catch |err| {

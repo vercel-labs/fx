@@ -459,9 +459,9 @@ fn normalizeAndVerifyPrivateDir(dir: std.Io.Dir) !void {
     if (comptime builtin.os.tag != .windows and (initial.permissions.toMode() & 0o200 == 0)) {
         return error.PrivateStatePermissionsUnsupported;
     }
-    try dir.setPermissions(
-        io_mod.getIo(),
-        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
+    try io_mod.applyDirPermissions(
+        dir,
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700)),
     );
     const stat = try dir.stat(io_mod.getIo());
     if (comptime builtin.os.tag != .windows and (stat.kind != .directory or stat.permissions.toMode() & 0o777 != 0o700)) {

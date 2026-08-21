@@ -5,6 +5,7 @@ const io_mod = @import("../shared/io.zig");
 const secret = @import("../auth/secret.zig");
 
 pub const service_name = "FX_AI_GATEWAY_API_KEY";
+pub const opencode_go_service_name = "FX_OPENCODE_GO_API_KEY";
 const mcp_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V1";
 
 /// Backing store for a resolved account name. Must outlive any argv built from it.
@@ -78,6 +79,10 @@ fn posixAccountName(buf: *AccountBuffer) ?[]const u8 {
 
 pub fn load(alloc: std.mem.Allocator) !?[]u8 {
     return loadFromService(alloc, service_name);
+}
+
+pub fn loadOpenCodeGo(alloc: std.mem.Allocator) !?[]u8 {
+    return loadFromService(alloc, opencode_go_service_name);
 }
 
 pub fn loadMcpCredentials(alloc: std.mem.Allocator) !?[]u8 {
@@ -252,6 +257,15 @@ pub fn storeValue(value: []const u8) Error!void {
     if (value.len == 0) return error.KeychainWriteFailed;
 
     if (comptime builtin.os.tag == .macos) return storeValueMac(service_name, value);
+    return error.UnsupportedPlatform;
+}
+
+pub fn storeOpenCodeGoValue(value: []const u8) Error!void {
+    if (!isAvailable()) return error.UnsupportedPlatform;
+    if (value.len == 0) return error.KeychainWriteFailed;
+    if (comptime builtin.os.tag == .macos) {
+        return storeValueMac(opencode_go_service_name, value);
+    }
     return error.UnsupportedPlatform;
 }
 

@@ -6,6 +6,7 @@ const app_lifecycle = @import("../app/app_lifecycle.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+const provider_id = @import("../providers/provider_id.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const background_runtime = @import("../background/background_runtime.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
@@ -224,6 +225,7 @@ pub const Config = struct {
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     secret_store: host.SecretStore,
+    opencode_go_secret_store: host.SecretStore = host.unavailable_secret_store,
     prompt_policy: prompt_policy.Policy,
     skill_root_policy: skill_contract.RootPolicy,
     ignored_list_entries: []const []const u8,
@@ -938,7 +940,10 @@ const AskContext = struct {
             .web_fetch_progress_ctx = @ptrCast(self),
             .on_web_fetch_progress = onWebFetchProgress,
             .web_search_runtime_ready = false,
-            .web_search_backend = self.web_search_runtime.dispatchBackend(),
+            .web_search_backend = if (self.credential_source == .opencode_go)
+                null
+            else
+                self.web_search_runtime.dispatchBackend(),
             .web_search_progress_ctx = @ptrCast(self),
             .on_web_search_progress = onWebSearchProgress,
             .model_capability_resolver = .{
@@ -980,6 +985,7 @@ const AskContext = struct {
 
     fn admissionAutoClassifier(self: *AskContext) permission_auto_classifier.Classifier {
         if (self.auto_classifier.enabled()) return self.auto_classifier;
+        if (self.credential_source == .opencode_go) return permission_auto_classifier.Classifier.disabled();
         const provider = self.cfg.permission_reviewer_provider orelse
             return permission_auto_classifier.Classifier.disabled();
         return permission_auto_classifier.Classifier.withProvider(provider, .{
@@ -1290,8 +1296,14 @@ pub fn runPromptCapture(alloc: Allocator, prompt: []const u8, auto_permission: b
     });
 }
 
-fn missingCredentialResult(alloc: Allocator, options: RunOptions) !PromptRunResult {
-    try options.deps.write_stderr(options.deps.stderr_ctx, "fx ask: " ++ credentials.missing_credential_message ++ "\n");
+fn missingCredentialResult(alloc: Allocator, options: RunOptions, model: []const u8) !PromptRunResult {
+    const message = switch (provider_id.fromModel(model)) {
+        .vercel_ai_gateway => credentials.missing_credential_message,
+        .opencode_go => credentials.missing_opencode_go_credential_message,
+    };
+    try options.deps.write_stderr(options.deps.stderr_ctx, "fx ask: ");
+    try options.deps.write_stderr(options.deps.stderr_ctx, message);
+    try options.deps.write_stderr(options.deps.stderr_ctx, "\n");
     return .{
         .exit_code = 1,
         .assistant_output = try alloc.dupe(u8, ""),
@@ -1343,10 +1355,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         cfg.saved_directories_suppressed,
     );
     try checkHeadlessCancellation(options.deps);
-
-    if (!options.continue_recovery and startup.credential == null) {
-        return missingCredentialResult(alloc, options);
-    }
 
     var owned_resumed_model: ?[]u8 = null;
     defer if (owned_resumed_model) |model| alloc.free(model);
@@ -1425,8 +1433,15 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     }
 
-    const credential = startup.credential orelse
-        return missingCredentialResult(alloc, options);
+    var opencode_credential = if (provider_id.fromModel(ctx.model) == .opencode_go)
+        try credentials.loadOpenCodeGoCredential(alloc, cfg.opencode_go_secret_store)
+    else
+        null;
+    defer if (opencode_credential) |*credential| credential.deinit(alloc);
+    const credential = if (provider_id.fromModel(ctx.model) == .opencode_go)
+        opencode_credential orelse return missingCredentialResult(alloc, options, ctx.model)
+    else
+        startup.credential orelse return missingCredentialResult(alloc, options, ctx.model);
     const api_key = credential.token;
     ctx.api_key = api_key;
     ctx.gateway_team = credential.gatewayTeam();
@@ -2843,7 +2858,10 @@ fn pushCommandOutputComplete(raw_ctx: *anyopaque, _: ?types.ToolLifecycleId) !vo
 fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.failed = true;
-    const auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
+    const auth_failure = if (gateway_error_format.detailIndicatesServerModelError(ctx.alloc, detail))
+        null
+    else
+        auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
     ctx.auth_failure = auth_failure;
     const message = if (auth_failure) |failure|
         try failure.renderText(ctx.alloc)

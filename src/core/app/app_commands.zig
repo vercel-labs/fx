@@ -553,10 +553,10 @@ pub fn Handlers(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        fn commandLogin(ctx: *anyopaque) !void {
+        fn commandLogin(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "runLoginCommand")) {
-                try app.runLoginCommand();
+                try app.runLoginCommand(rest);
             } else {
                 try app.writeDomainNotice(.{
                     .topic = "auth",

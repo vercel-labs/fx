@@ -393,9 +393,7 @@ fn openUsageRecoveryProfileRoot(
     };
     errdefer profile.close(zio);
     const stat = try profile.stat(zio);
-    if (stat.kind != .directory or
-        (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else stat.permissions.toMode()) & 0o777 != 0o700)
-    {
+    if (stat.kind != .directory or !io_mod.unixModeMatches(stat, 0o700)) {
         return error.InvalidUsageRecoveryIndex;
     }
     return .{ .dir = profile };
@@ -416,9 +414,7 @@ fn openUsageRecoveryDir(
     };
     errdefer dir.close(io_mod.getIo());
     const stat = try dir.stat(io_mod.getIo());
-    if (stat.kind != .directory or
-        (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else stat.permissions.toMode()) & 0o777 != 0o700)
-    {
+    if (stat.kind != .directory or !io_mod.unixModeMatches(stat, 0o700)) {
         return error.InvalidUsageRecoveryIndex;
     }
     return .{ .dir = dir };
@@ -428,7 +424,7 @@ fn validateUsageRecoveryMarker(
     recovery: *const io_mod.VerifiedDir,
     session_id: []const u8,
 ) !?i64 {
-    var marker = recovery.dir.openFile(io_mod.getIo(), session_id, .{
+    var marker = io_mod.openFile(recovery.dir, session_id, .{
         .mode = .read_only,
         .allow_directory = false,
         .follow_symlinks = false,
@@ -443,7 +439,7 @@ fn validateUsageRecoveryMarker(
         stat.nlink != 1 or
         stat.size == 0 or
         stat.size > max_usage_recovery_marker_bytes or
-        (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else stat.permissions.toMode()) & 0o777 != 0o600)
+        !io_mod.unixModeMatches(stat, 0o600))
     {
         return error.InvalidUsageRecoveryIndex;
     }
@@ -4721,7 +4717,7 @@ fn loadedWriterBelongsToRoot(
 
 fn prepareWritableSessionDir(dir: std.Io.Dir) !void {
     const permissions = (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700)));
-    dir.setPermissions(io_mod.getIo(), permissions) catch
+    io_mod.applyDirPermissions(dir, permissions) catch
         return error.PrivateStatePermissionsUnsupported;
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory) return error.SessionPathUnsafe;

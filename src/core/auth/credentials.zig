@@ -133,6 +133,7 @@ pub fn catalogAccessForCredential(
         .vercel_oidc_token => .vercel_oidc_token,
         .ai_gateway_api_key => .ai_gateway_api_key,
         .stored_key => .stored_key,
+        .opencode_go => return .{ .public_only = .no_credential },
         .fx_login => blk: {
             const team = team_context orelse
                 return .{ .public_only = .fx_login_team_required };
@@ -162,6 +163,7 @@ const FxLoginRefreshMode = enum { if_needed, force };
 
 pub const missing_credential_message = "Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_interactive_credential_message = "Fx needs access to Vercel AI Gateway. Run /login to sign in, /setup to use an API key, or set AI_GATEWAY_API_KEY.";
+pub const missing_opencode_go_credential_message = "OpenCode Go needs an API key. Run /login opencode-go or set OPENCODE_API_KEY after creating a key at opencode.ai/auth.";
 pub const unreadable_store_message = "Fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 
 pub const Credential = struct {
@@ -284,7 +286,20 @@ pub fn loadSource(
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
         .fx_login => loadFxLoginCredential(alloc, transport),
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
+        .opencode_go => loadEnvCredential(alloc, "OPENCODE_API_KEY", source),
     };
+}
+
+pub fn loadOpenCodeGoCredential(
+    alloc: std.mem.Allocator,
+    secret_store: host.SecretStore,
+) !?Credential {
+    if (try loadEnvCredential(alloc, "OPENCODE_API_KEY", .opencode_go)) |credential| {
+        return credential;
+    }
+    if (secret_store.isDisabled()) return null;
+    const value = (try secret_store.load(alloc)) orelse return null;
+    return .{ .token = value, .source = .opencode_go };
 }
 
 pub fn sourceExists(
@@ -320,6 +335,7 @@ pub fn sourceExists(
             secret.zeroAndFree(alloc, value);
             break :blk true;
         },
+        .opencode_go => nonEmptyEnvValue("OPENCODE_API_KEY") != null,
     };
 }
 
@@ -471,6 +487,7 @@ pub fn sourceLabel(source: Source) []const u8 {
         .ai_gateway_api_key => "AI_GATEWAY_API_KEY",
         .fx_login => "fx login",
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
+        .opencode_go => "OPENCODE_API_KEY",
     };
 }
 
@@ -500,6 +517,24 @@ test "missing credential messages use surface commands in preferred order" {
 
     try std.testing.expect(tui_login < tui_setup);
     try std.testing.expect(tui_setup < tui_env);
+}
+
+test "OpenCode Go credential is isolated to OPENCODE_API_KEY" {
+    const alloc = std.testing.allocator;
+    const env = try CredentialTestEnv.install(alloc, &.{
+        .{ "AI_GATEWAY_API_KEY", "gateway-key" },
+        .{ "OPENCODE_API_KEY", "go-key" },
+    });
+    defer env.deinit();
+
+    var credential = (try loadOpenCodeGoCredential(alloc, host.unavailable_secret_store)) orelse
+        return error.TestExpectedCredential;
+    defer credential.deinit(alloc);
+    try std.testing.expectEqual(Source.opencode_go, credential.source);
+    try std.testing.expectEqualStrings("go-key", credential.token);
+    const access = catalogAccessAt(credential, 0);
+    try std.testing.expectEqual(CatalogPublicOnlyReason.no_credential, access.publicOnlyReason().?);
+    try std.testing.expect(access.authorizationCredential() == null);
 }
 
 test "credential gateway team prefers team id" {

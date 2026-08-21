@@ -4,6 +4,7 @@ const agent_steps = @import("../config/agent_steps.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+const provider_id = @import("../providers/provider_id.zig");
 const host = @import("../hosts/host.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const input_appearance = @import("../config/input_appearance.zig");
@@ -252,6 +253,7 @@ pub const BootstrapConfig = struct {
     default_model: []const u8,
     default_agent_step_limit: usize,
     secret_store: host.SecretStore,
+    opencode_go_secret_store: host.SecretStore = host.unavailable_secret_store,
     resize_handler: ResizeHandler,
     fx_version: []const u8 = "",
     record_requested: bool = false,
@@ -450,7 +452,9 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     );
     errdefer state.deinit(cfg.alloc);
 
-    state.credential_onboarding_skipped = credentialOnboardingDisabled();
+    state.credential_onboarding_skipped = credentialOnboardingDisabled() or
+        (provider_id.fromModel(state.selected_model) == .opencode_go and
+            openCodeGoCredentialAvailable(cfg.alloc, cfg.opencode_go_secret_store));
 
     errdefer shutdownInteractiveShell(
         cfg.terminal,
@@ -513,6 +517,12 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     try cfg.shell.initViewportWithReservedRows(cfg.metrics, launch_start_row, effective_startup_min_body_rows);
 
     return state;
+}
+
+fn openCodeGoCredentialAvailable(alloc: Allocator, secret_store: host.SecretStore) bool {
+    var credential = credentials.loadOpenCodeGoCredential(alloc, secret_store) catch return false;
+    defer if (credential) |*value| value.deinit(alloc);
+    return credential != null;
 }
 
 fn prepareStartupViewport(

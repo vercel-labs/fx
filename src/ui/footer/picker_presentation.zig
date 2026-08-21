@@ -70,7 +70,13 @@ pub noinline fn composeAuthPickerRow(
         return composeSignInPickerRow(alloc, view.sign_in, row_index, width);
     }
     if (view.stage == .api_key) {
-        return composeApiKeyPickerRow(alloc, view.api_key_mask_count, row_index, width);
+        return composeApiKeyPickerRow(
+            alloc,
+            view.api_key_provider,
+            view.api_key_mask_count,
+            row_index,
+            width,
+        );
     }
     if (view.stage == .root and view.include_skip) {
         return composeOnboardingPickerRow(alloc, view, row_index, row_count, width);
@@ -276,6 +282,7 @@ fn composeSignInPickerRow(
 
 fn composeApiKeyPickerRow(
     alloc: Allocator,
+    provider: auth_runtime.ApiKeyProvider,
     mask_count: usize,
     row_index: u16,
     width: u16,
@@ -289,7 +296,10 @@ fn composeApiKeyPickerRow(
     else
         ui_render.dim_style);
     switch (row_index) {
-        0 => try row_text.appendClipped(alloc, &row, "   Paste your AI Gateway API key", width),
+        0 => try row_text.appendClipped(alloc, &row, switch (provider) {
+            .vercel_ai_gateway => "   Paste your AI Gateway API key",
+            .opencode_go => "   Paste your OpenCode Go API key",
+        }, width),
         1 => {
             try row_text.appendClipped(alloc, &row, "   ┃ ", width);
             if (mask_count == 0) {
@@ -1603,7 +1613,7 @@ test "auth picker composes only detected credential sources" {
         .include_skip = false,
     };
     const row_count = authPickerRowCount(view);
-    try std.testing.expectEqual(@as(u16, 5), row_count);
+    try std.testing.expectEqual(@as(u16, 6), row_count);
 
     var header = try composeAuthPickerRow(alloc, view, 0, row_count, 80);
     defer header.deinit(alloc);
@@ -1617,12 +1627,16 @@ test "auth picker composes only detected credential sources" {
     defer setup.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, setup.items, "API key") != null);
 
-    var change_team = try composeAuthPickerRow(alloc, view, 3, row_count, 80);
+    var opencode_go = try composeAuthPickerRow(alloc, view, 3, row_count, 80);
+    defer opencode_go.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, opencode_go.items, "OpenCode Go API key") != null);
+
+    var change_team = try composeAuthPickerRow(alloc, view, 4, row_count, 80);
     defer change_team.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, change_team.items, "Change team") != null);
     try std.testing.expect(std.mem.find(u8, change_team.items, "sign in first") != null);
 
-    var switch_credential = try composeAuthPickerRow(alloc, view, 4, row_count, 80);
+    var switch_credential = try composeAuthPickerRow(alloc, view, 5, row_count, 80);
     defer switch_credential.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, switch_credential.items, "Switch credential") != null);
 }
@@ -1725,6 +1739,23 @@ test "api key stage renders only a bounded mask and the configured backend label
     defer backend.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, backend.items, "Saves to") != null);
     try std.testing.expect(std.mem.find(u8, backend.items, credentials.stored_key_backend_label) != null);
+}
+
+test "OpenCode Go api key stage names the selected provider" {
+    const view = auth_runtime.PickerView{
+        .active = true,
+        .available_sources = .empty,
+        .selected_choice = null,
+        .active_source = null,
+        .include_skip = false,
+        .stage = .api_key,
+        .api_key_provider = .opencode_go,
+    };
+
+    var header = try composeAuthPickerRow(std.testing.allocator, view, 0, 4, 80);
+    defer header.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, header.items, "Paste your OpenCode Go API key") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "AI Gateway") == null);
 }
 
 test "api key field reads as a text field rather than a selectable row" {

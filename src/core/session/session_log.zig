@@ -1049,7 +1049,7 @@ pub const Root = struct {
         };
         defer durable_home.close(zio);
         if (mode == .writable) {
-            durable_home.setPermissions(zio, private_dir_permissions) catch
+            io_mod.applyDirPermissions(durable_home, private_dir_permissions) catch
                 return error.PrivateStatePermissionsUnsupported;
         }
         try verifyPrivateDir(durable_home, mode);
@@ -1081,7 +1081,7 @@ pub const Root = struct {
         };
         errdefer sessions_dir.close(zio);
         if (mode == .writable) {
-            sessions_dir.setPermissions(zio, private_dir_permissions) catch
+            io_mod.applyDirPermissions(sessions_dir, private_dir_permissions) catch
                 return error.PrivateStatePermissionsUnsupported;
         }
         try verifyPrivateDir(sessions_dir, mode);
@@ -1428,7 +1428,7 @@ fn openSessionDir(
     };
     errdefer dir.close(io_mod.getIo());
     if (mode == .writable) {
-        dir.setPermissions(io_mod.getIo(), private_dir_permissions) catch
+        io_mod.applyDirPermissions(dir, private_dir_permissions) catch
             return error.PrivateStatePermissionsUnsupported;
     }
     try verifyPrivateDir(dir, mode);
@@ -1441,7 +1441,7 @@ fn openManagedFile(
     mode: std.Io.Dir.OpenFileOptions.Mode,
 ) !std.Io.File {
     try validateLeaf(name);
-    var file = dir.dir.openFile(io_mod.getIo(), name, .{
+    var file = io_mod.openFile(dir.dir, name, .{
         .mode = mode,
         .allow_directory = false,
         .follow_symlinks = false,
@@ -4382,9 +4382,7 @@ fn cleanupOrphansImpl(
             report.ignored += 1;
             continue;
         };
-        if (stat.kind != .file or stat.nlink != 1 or
-            (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else stat.permissions.toMode()) & 0o777 != 0o600)
-        {
+        if (stat.kind != .file or stat.nlink != 1 or !io_mod.unixModeMatches(stat, 0o600)) {
             report.ignored += 1;
             continue;
         }

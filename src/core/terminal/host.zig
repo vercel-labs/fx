@@ -1370,9 +1370,7 @@ fn verifyEndpointPermissions(host_dir: *io_mod.VerifiedDir) !void {
         endpoint_name,
         .{ .follow_symlinks = false },
     );
-    if (stat.kind != .unix_domain_socket or
-        (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else stat.permissions.toMode()) & 0o777 != 0o600)
-    {
+    if (stat.kind != .unix_domain_socket or !io_mod.unixModeMatches(stat, 0o600)) {
         return error.PrivateEndpointPermissionsUnsupported;
     }
 }

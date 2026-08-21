@@ -6,6 +6,7 @@ const credentials = @import("../core/auth/credentials.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const io_mod = @import("../core/shared/io.zig");
+const gateway_error_format = @import("../core/shared/gateway_error_format.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const server = @import("server.zig");
@@ -240,7 +241,10 @@ const AcpContext = struct {
             .permission_grants = session.session_grants,
             .permission_rules = session.permission_rules,
             .tool_registry = self.toolRegistry(),
-            .permission_reviewer_provider = self.state.cfg.permission_reviewer_provider,
+            .permission_reviewer_provider = if (session.credential_source == .opencode_go)
+                null
+            else
+                self.state.cfg.permission_reviewer_provider,
             .auto_classifier = self.auto_classifier,
             .subagent_host = self.state.subagent_host,
             .subagent_caller_id = session.session_id,
@@ -275,7 +279,10 @@ const AcpContext = struct {
             .web_fetch_artifact_store = session.session_rt.webFetchArtifactStore(),
             .web_fetch_artifact_error = session.session_rt.webFetchArtifactError(),
             .web_search_runtime_ready = false,
-            .web_search_backend = self.state.web_search_runtime.dispatchBackend(),
+            .web_search_backend = if (session.credential_source == .opencode_go)
+                null
+            else
+                self.state.web_search_runtime.dispatchBackend(),
             .model_capability_resolver = .{
                 .ctx = @ptrCast(self),
                 .resolve_fn = resolveModelCapabilities,
@@ -1892,7 +1899,10 @@ fn pushCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
 fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     var buf: [1024]u8 = undefined;
-    const auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
+    const auth_failure = if (gateway_error_format.detailIndicatesServerModelError(ctx.alloc, detail))
+        null
+    else
+        auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
     const owned_message = if (auth_failure) |failure|
         try failure.renderText(ctx.alloc)
     else

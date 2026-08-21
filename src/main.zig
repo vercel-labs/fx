@@ -48,6 +48,8 @@ const command_specs = @import("core/slash_commands/command_specs.zig");
 const builtin_context = @import("builtins/context.zig");
 const builtin_devbox = @import("builtins/devbox.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
+const builtin_providers = @import("builtins/providers.zig");
+const provider_id = @import("core/providers/provider_id.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
@@ -430,7 +432,7 @@ const App = struct {
         return if (comptime host_target.is_wasm)
             js_host_stream_provider.provider()
         else
-            builtin_gateway.agent_stream_provider;
+            builtin_providers.agent_stream_provider;
     }
 
     pub fn cooperativeTransportPulse(self: *Self) !void {
@@ -455,6 +457,10 @@ const App = struct {
         return self.auth.secret_store;
     }
 
+    pub fn openCodeGoSecretStore(self: *const Self) host.SecretStore {
+        return self.auth.opencode_go_secret_store;
+    }
+
     pub fn clipboard(_: *const Self) host.Clipboard {
         return if (comptime host_profile.clipboard) native_host.clipboard else host.unavailable_clipboard;
     }
@@ -475,6 +481,7 @@ const App = struct {
         else
             oauth_transport.unavailable_provider,
         if (host_target.is_wasm) host.unavailable_secret_store else native_host.secret_store,
+        if (host_target.is_wasm) host.unavailable_secret_store else native_host.opencode_go_secret_store,
     ),
     selected_model: std.ArrayList(u8) = .empty,
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
@@ -570,6 +577,7 @@ const App = struct {
             else
                 background_process.provider),
         };
+        app.shell.stdout_file = std.Io.File.stdout();
         if (comptime host_profile.js_host_workspace) {
             app.workspace_host = js_host_workspace.Runtime.init(alloc) catch |err| blk: {
                 if (err != error.WorkspaceUnavailable) {
@@ -906,8 +914,8 @@ const App = struct {
         try AuthAppRuntime.openSetupHub(self);
     }
 
-    pub fn runLoginCommand(self: *App) !void {
-        try AuthAppRuntime.runLoginCommand(self);
+    pub fn runLoginCommand(self: *App, rest: []const u8) !void {
+        try AuthAppRuntime.runLoginCommand(self, rest);
     }
 
     pub fn runLogoutCommand(self: *App) !void {
@@ -1246,11 +1254,39 @@ const App = struct {
         const model_copy = try std.heap.c_allocator.dupe(u8, self.selected_model.items);
         errdefer std.heap.c_allocator.free(model_copy);
 
-        const gateway_credential = self.auth.gatewayCredential() orelse return error.MissingApiKey;
-        const api_key_copy = try std.heap.c_allocator.dupe(u8, gateway_credential.api_key);
+        const uses_opencode_go = provider_id.fromModel(model_copy) == .opencode_go;
+        var opencode_credential = if (uses_opencode_go)
+            try credentials.loadOpenCodeGoCredential(
+                std.heap.c_allocator,
+                native_host.opencode_go_secret_store,
+            )
+        else
+            null;
+        defer if (opencode_credential) |*credential| credential.deinit(std.heap.c_allocator);
+        const go_credential = if (uses_opencode_go)
+            opencode_credential orelse return error.MissingOpenCodeGoApiKey
+        else
+            null;
+        const gateway_credential = if (uses_opencode_go)
+            null
+        else
+            self.auth.gatewayCredential() orelse return error.MissingApiKey;
+        const provider_api_key = if (uses_opencode_go)
+            go_credential.?.token
+        else
+            gateway_credential.?.api_key;
+        const provider_source = if (uses_opencode_go)
+            go_credential.?.source
+        else
+            gateway_credential.?.source;
+        const provider_team = if (uses_opencode_go)
+            go_credential.?.gatewayTeam()
+        else
+            gateway_credential.?.gateway_team;
+        const api_key_copy = try std.heap.c_allocator.dupe(u8, provider_api_key);
         errdefer secret.zeroAndFree(std.heap.c_allocator, api_key_copy);
 
-        const gateway_team_copy = if (gateway_credential.gateway_team) |team|
+        const gateway_team_copy = if (provider_team) |team|
             try std.heap.c_allocator.dupe(u8, team)
         else
             null;
@@ -1326,7 +1362,7 @@ const App = struct {
             .model = model_copy,
             .api_key = api_key_copy,
             .gateway_team = gateway_team_copy,
-            .credential_source = gateway_credential.source,
+            .credential_source = provider_source,
             .permission_mode = self.permission_engine.mode,
             .sandbox_backend = sandbox.effectiveBackend(
                 self.permission_engine.mode,
@@ -1682,7 +1718,7 @@ const App = struct {
     pub fn fetchModelIds(self: *App) !std.ArrayList([]u8) {
         return AgentAppRuntime.fetchModelIds(
             self,
-            if (comptime host_target.is_wasm) js_host_model_catalog.provider else builtin_gateway.model_catalog_provider,
+            if (comptime host_target.is_wasm) js_host_model_catalog.provider else builtin_providers.model_catalog_provider,
             builtin_gateway.models_path,
         );
     }
@@ -1699,7 +1735,7 @@ const App = struct {
             );
         } else {
             self.model_cache.startWarmup(
-                builtin_gateway.model_catalog_provider,
+                builtin_providers.model_catalog_provider,
                 self.auth.modelCatalogAccess(),
             );
         }
@@ -2925,14 +2961,20 @@ fn rawArgs(c_argc: c_int, c_argv: [*][*:0]c_char) []const [*:0]const u8 {
 
 fn argsFromRaw(raw_args: []const [*:0]const u8) std.process.Args {
     if (comptime builtin.os.tag == .windows) {
-        return .{ .vector = &[_]u16{} };
+        return .{ .vector = windowsCommandLineW() };
     }
     return .{ .vector = raw_args };
 }
 
+fn windowsCommandLineW() []const u16 {
+    const command_line = std.os.windows.peb().ProcessParameters.CommandLine;
+    const buffer = command_line.Buffer orelse return &.{};
+    return buffer[0 .. command_line.Length / @sizeOf(u16)];
+}
+
 fn environBlockFromRaw(raw_env: RawEnviron) std.process.Environ.Block {
     if (comptime builtin.os.tag == .windows) {
-        return .{ .use_global = false };
+        return .global;
     }
     var count: usize = 0;
     while (raw_env[count] != null) : (count += 1) {}
@@ -3204,10 +3246,11 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .models_path = builtin_gateway.models_path,
         .gateway_retry_count = builtin_gateway.retry_count,
         .gateway_chat_url = builtin_gateway.default_chat_url,
-        .gateway_provider = builtin_gateway.provider,
+        .gateway_provider = builtin_providers.provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
+        .opencode_go_secret_store = native_host.opencode_go_secret_store,
         .prompt_policy = builtin_context.prompt_policy,
         .skill_root_policy = builtin_skills.root_policy,
         .ignored_list_entries = &ignored_list_entries,
@@ -3240,10 +3283,11 @@ fn localEntryConfig() app_entry_runtime.Config {
         .models_path = builtin_gateway.models_path,
         .gateway_retry_count = builtin_gateway.retry_count,
         .gateway_chat_url = builtin_gateway.default_chat_url,
-        .gateway_provider = builtin_gateway.provider,
+        .gateway_provider = builtin_providers.provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
+        .opencode_go_secret_store = native_host.opencode_go_secret_store,
         .prompt_policy = .{ .system_prompt = "" },
         .skill_root_policy = builtin_skills.root_policy,
         .ignored_list_entries = &.{},
@@ -3275,10 +3319,11 @@ fn emptyEntryConfig() app_entry_runtime.Config {
         .models_path = "",
         .gateway_retry_count = 0,
         .gateway_chat_url = "",
-        .gateway_provider = builtin_gateway.provider,
+        .gateway_provider = builtin_providers.provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
+        .opencode_go_secret_store = native_host.opencode_go_secret_store,
         .prompt_policy = .{ .system_prompt = "" },
         .skill_root_policy = builtin_skills.root_policy,
         .ignored_list_entries = &.{},
@@ -3774,10 +3819,14 @@ test {
     _ = @import("ui/settings_screen.zig");
     _ = @import("builtins/context.zig");
     _ = @import("builtins/gateway.zig");
+    _ = @import("builtins/opencode_go.zig");
+    _ = @import("builtins/providers.zig");
+    _ = @import("core/providers/provider_id.zig");
     _ = @import("core/shared/debug_trace.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/shared/display_width.zig");
     _ = @import("core/cli/doctor_runtime.zig");
+    _ = @import("core/auth/credentials.zig");
     _ = @import("core/auth/login_flow.zig");
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");
@@ -3855,6 +3904,7 @@ test {
     _ = @import("core/terminal/tmux_session.zig");
     _ = @import("core/terminal/client.zig");
     _ = @import("core/app/input_approval_runtime.zig");
+    _ = @import("acp/server.zig");
     _ = @import("acp/sessions.zig");
     _ = @import("core/tasks/task_helpers.zig");
     _ = @import("core/shared/text_utils.zig");

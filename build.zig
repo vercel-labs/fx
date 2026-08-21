@@ -58,9 +58,9 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .stack_check = false,
             .stack_protector = false,
-            .omit_frame_pointer = true,
-            .unwind_tables = .none,
-            .error_tracing = false,
+            .omit_frame_pointer = optimize != .Debug,
+            .unwind_tables = if (optimize == .Debug) .sync else .none,
+            .error_tracing = optimize == .Debug,
             .strip = optimize != .Debug,
         }),
     });

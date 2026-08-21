@@ -294,8 +294,8 @@ pub const Store = struct {
                 else => return error.DurableLayoutFailed,
             };
         }
-        self.durable_home.?.dir.setPermissions(
-            io_mod.getIo(),
+        io_mod.applyDirPermissions(
+            self.durable_home.?.dir,
             private_dir_permissions,
         ) catch return error.PrivateStatePermissionsUnsupported;
         const stat = try self.durable_home.?.dir.stat(io_mod.getIo());
@@ -317,7 +317,7 @@ pub const Store = struct {
     fn acquireExistingLock(self: *Store) !?io_mod.TimedAdvisoryLock {
         const durable_home = self.durable_home orelse return null;
         const zio = io_mod.getIo();
-        const file = durable_home.dir.openFile(zio, usage_lock_file, .{
+        const file = io_mod.openFile(durable_home.dir, usage_lock_file, .{
             .mode = .read_write,
             .allow_directory = false,
             .follow_symlinks = false,

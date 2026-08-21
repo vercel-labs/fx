@@ -21,7 +21,7 @@ pub fn explicitThemeOverride() ?bool {
 
 pub fn detectTheme(_: std.mem.Allocator, terminal_state: *const shell_runtime.TerminalState) Detection {
     if (explicitThemeOverride()) |light| return .{ .light = light, .rgb = null };
-    if (comptime builtin.os.tag == .wasi) return .{ .light = false, .rgb = null };
+    if (comptime builtin.os.tag == .wasi or builtin.os.tag == .windows) return .{ .light = false, .rgb = null };
 
     // One probe derives both light/dark and the RGB used for bar shading.
     if (queryTerminalBackground(terminal_state)) |info| {

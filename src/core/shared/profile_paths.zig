@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 pub const root_dir_name = ".fx";
 pub const auth_file_name = "auth.json";
 pub const api_key_file_name = "api-key";
+pub const opencode_go_api_key_file_name = "opencode-go-api-key";
 pub const sessions_dir_name = "sessions";
 pub const prompt_history_file_name = "history.jsonl";
 pub const usage_file_name = "usage.jsonl";
@@ -56,6 +57,10 @@ pub fn authPath(alloc: Allocator, home: []const u8) ![]u8 {
 
 pub fn apiKeyPath(alloc: Allocator, home: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ home, root_dir_name, api_key_file_name });
+}
+
+pub fn opencodeGoApiKeyPath(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{ home, root_dir_name, opencode_go_api_key_file_name });
 }
 
 pub fn sessionsDir(alloc: Allocator, home: []const u8) ![]u8 {
@@ -126,6 +131,13 @@ test "profile path helpers preserve current default locations" {
     const api_key = try apiKeyPath(alloc, "/tmp/fake-home");
     defer alloc.free(api_key);
     try std.testing.expectEqualStrings("/tmp/fake-home/.fx/api-key", api_key);
+
+    const opencode_go_api_key = try opencodeGoApiKeyPath(alloc, "/tmp/fake-home");
+    defer alloc.free(opencode_go_api_key);
+    try std.testing.expectEqualStrings(
+        "/tmp/fake-home/.fx/opencode-go-api-key",
+        opencode_go_api_key,
+    );
 
     const sessions = try sessionsDir(alloc, "/tmp/fake-home");
     defer alloc.free(sessions);

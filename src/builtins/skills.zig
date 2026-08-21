@@ -298,7 +298,7 @@ fn installFromDirectoryWithMetadataReader(
     var root_dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), source_dir, .{ .iterate = true });
     defer root_dir.close(io_mod.getIo());
 
-    var maybe_root_file = root_dir.openFile(io_mod.getIo(), "SKILL.md", .{ .follow_symlinks = false }) catch |err| blk: {
+    var maybe_root_file = io_mod.openFile(root_dir, "SKILL.md", .{ .follow_symlinks = false }) catch |err| blk: {
         try propagateInstallOpenError(err);
         break :blk null;
     };

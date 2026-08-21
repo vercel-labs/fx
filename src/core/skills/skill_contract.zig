@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 
 pub const max_frontmatter_bytes: usize = 64 * 1024;
@@ -432,6 +433,7 @@ const SkillMetadataScanner = struct {
 };
 
 pub fn readMetadataPrefix(alloc: std.mem.Allocator, file: *std.Io.File, file_size: usize) ![]u8 {
+    if (comptime builtin.os.tag == .windows) file.flags.nonblocking = true;
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(alloc);
     var chunk: [16 * 1024]u8 = undefined;
@@ -441,7 +443,7 @@ pub fn readMetadataPrefix(alloc: std.mem.Allocator, file: *std.Io.File, file_siz
 
     while (content.items.len < readable_size) {
         const wanted = @min(chunk.len, readable_size - content.items.len);
-        const read = try file.readPositionalAll(io_mod.getIo(), chunk[0..wanted], content.items.len);
+        const read = try io_mod.readPositionalAll(file.*, chunk[0..wanted], content.items.len);
         if (read == 0) return error.UnexpectedEndOfFile;
         try content.appendSlice(alloc, chunk[0..read]);
 

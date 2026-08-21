@@ -239,8 +239,8 @@ pub const Store = struct {
             };
         }
 
-        self.durable_home.?.dir.setPermissions(
-            io_mod.getIo(),
+        io_mod.applyDirPermissions(
+            self.durable_home.?.dir,
             private_dir_permissions,
         ) catch return error.PrivateStatePermissionsUnsupported;
         const stat = try self.durable_home.?.dir.stat(io_mod.getIo());
@@ -267,7 +267,7 @@ pub const Store = struct {
         if (self.durable_home == null) return null;
         const zio = io_mod.getIo();
         var created = false;
-        var file = self.durable_home.?.dir.openFile(zio, history_file, .{
+        var file = io_mod.openFile(self.durable_home.?.dir, history_file, .{
             .mode = if (writable) .read_write else .read_only,
             .allow_directory = false,
             .follow_symlinks = false,
