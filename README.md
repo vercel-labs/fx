@@ -46,7 +46,15 @@ The OpenAI Codex route uses ChatGPT subscription access directly and never sends
 
 You can also configure an OpenAI-compatible endpoint such as OpenRouter or DeepSeek directly.
 
-Store the endpoint and model in `~/.fx/settings.json`, and keep the API key in the environment:
+Run the interactive setup flow:
+
+```bash
+fx setup custom
+```
+
+It prompts for the endpoint, securely reads the API key, fetches available models, and lets you choose one.
+
+For headless or preconfigured environments, store the endpoint and model in `~/.fx/settings.json`, and keep the API key in the environment:
 
 ```json
 {

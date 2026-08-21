@@ -18,6 +18,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
+const openai_compat = @import("../../gateway/openai_compat.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
@@ -1000,6 +1001,9 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .setup => |rest| {
+            if (rest.len == 1 and std.ascii.eqlIgnoreCase(rest[0], "custom")) {
+                return if (try runCustomSetup(alloc, cfg.secret_store, deps)) .handled_success else .handled_failure;
+            }
             if (rest.len != 0) {
                 try writeTopLevelUsage(cfg.command_catalog, deps, .setup);
                 return .handled_failure;
@@ -1693,6 +1697,125 @@ fn writeStdout(deps: RunDeps, text: []const u8) !void {
 
 fn writeStderr(deps: RunDeps, text: []const u8) !void {
     try deps.write_stderr(deps.stderr_ctx, text);
+}
+
+fn readSetupLine(alloc: Allocator) ![]u8 {
+    var buffer: [2048]u8 = undefined;
+    var reader = std.Io.File.stdin().reader(io_mod.getIo(), &buffer);
+    const line = try reader.interface.takeDelimiter('\n');
+    return try alloc.dupe(u8, std.mem.trim(u8, line orelse "", " \t\r"));
+}
+
+fn runCustomSetup(
+    alloc: Allocator,
+    secret_store: host.SecretStore,
+    deps: RunDeps,
+) !bool {
+    if (secret_store.isDisabled()) {
+        try writeStderr(deps, "fx setup custom: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n");
+        return false;
+    }
+    if (!deps.setup_terminal_available(deps.setup_ctx)) {
+        try writeStderr(deps, "fx setup custom: an interactive terminal is required\n");
+        return false;
+    }
+
+    try writeStderr(deps, "OpenAI-compatible endpoint [https://openrouter.ai/api/v1]: ");
+    const endpoint_input = readSetupLine(alloc) catch return false;
+    defer alloc.free(endpoint_input);
+    const endpoint = if (endpoint_input.len == 0) "https://openrouter.ai/api/v1" else endpoint_input;
+    config_runtime.custom_provider.validate(endpoint, "OPENROUTER_API_KEY") catch {
+        try writeStderr(deps, "fx setup custom: endpoint must use HTTPS, or loopback HTTP for testing\n");
+        return false;
+    };
+
+    try writeStderr(deps, "API key (input hidden): ");
+    const key = deps.read_masked_key(
+        deps.setup_ctx,
+        alloc,
+        deps.write_stderr,
+        deps.stderr_ctx,
+    ) catch {
+        try writeStderr(deps, "\nfx setup custom: API key was not saved\n");
+        return false;
+    };
+    defer secret.zeroAndFree(alloc, key);
+    try writeStderr(deps, "\n");
+
+    const chat_url = try std.fmt.allocPrint(alloc, "{s}/chat/completions", .{std.mem.trimEnd(u8, endpoint, "/")});
+    defer alloc.free(chat_url);
+    const access: credentials.CatalogAccess = .{ .authenticated = .{
+        .source = .custom_api_key,
+        .credential = key,
+        .team_context = null,
+    } };
+    const catalog_result: ?model_catalog.ProviderResult = blk: {
+        break :blk openai_compat.fetchCatalog(alloc, chat_url, access) catch |err| {
+            debug_trace.logf("custom_provider", "catalog fetch failed err={s}", .{@errorName(err)});
+            try writeStderr(deps, "fx setup custom: could not fetch models; enter a model ID manually\n");
+            break :blk null;
+        };
+    };
+    var selected_model: []u8 = &.{};
+    defer if (selected_model.len > 0) alloc.free(selected_model);
+    if (catalog_result) |result| {
+        switch (result) {
+            .failure => try writeStderr(deps, "fx setup custom: model catalog unavailable; enter a model ID manually\n"),
+            .catalog => |catalog_value| {
+                var catalog = catalog_value;
+                defer model_catalog.freeModelCatalog(alloc, &catalog);
+                if (catalog.items.len > 0) {
+                    try writeStdout(deps, "Available models:\n");
+                    for (catalog.items, 0..) |entry, index| {
+                        const line = try std.fmt.allocPrint(alloc, "  {d}. {s}\n", .{ index + 1, entry.id });
+                        defer alloc.free(line);
+                        try writeStdout(deps, line);
+                    }
+                    try writeStderr(deps, "Choose a model number or enter a model ID: ");
+                    const choice = readSetupLine(alloc) catch return false;
+                    defer alloc.free(choice);
+                    const number = std.fmt.parseInt(usize, choice, 10) catch 0;
+                    if (number > 0 and number <= catalog.items.len) {
+                        selected_model = try alloc.dupe(u8, catalog.items[number - 1].id);
+                    } else if (choice.len > 0) {
+                        selected_model = try alloc.dupe(u8, choice);
+                    }
+                }
+            },
+        }
+    }
+    if (selected_model.len == 0) {
+        try writeStderr(deps, "Model ID: ");
+        const model = readSetupLine(alloc) catch return false;
+        defer alloc.free(model);
+        if (model.len == 0) {
+            try writeStderr(deps, "fx setup custom: model ID is required\n");
+            return false;
+        }
+        selected_model = try alloc.dupe(u8, model);
+    }
+
+    secret_store.store(alloc, key) catch {
+        try writeStderr(deps, "fx setup custom: API key was not saved\n");
+        return false;
+    };
+    var attempt = config_runtime.attemptUserPreferences(alloc, .{
+        .provider = .custom,
+        .custom_base_url = endpoint,
+        .custom_api_key_env = "OPENROUTER_API_KEY",
+        .custom_model = selected_model,
+    });
+    defer attempt.deinit(alloc);
+    switch (attempt) {
+        .failure => |failure| {
+            debug_trace.logf("custom_provider", "settings persistence failed err={s}", .{@errorName(failure.err)});
+            try writeStderr(deps, "fx setup custom: settings could not be saved\n");
+            return false;
+        },
+        .outcome => {},
+    }
+    try writeStdout(deps, "Custom provider configured and selected.\n");
+    return true;
 }
 
 fn runPasteSetup(

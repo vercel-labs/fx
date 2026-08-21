@@ -249,11 +249,20 @@ pub fn resolveForProvider(
         return .{ .credential = credential };
     }
     if (provider == .custom) {
-        // The custom key lives in the user-configured environment variable;
-        // no precedence walk, OAuth refresh, or stored-key fallback applies.
-        const env_name = custom_api_key_env orelse return .{};
-        const credential = try loadEnvCredential(alloc, env_name, .custom_api_key);
-        return .{ .credential = credential };
+        // Prefer the configured environment variable, then use the existing
+        // secure host store for interactive setup. The active provider choice
+        // determines how the stored value is interpreted.
+        if (custom_api_key_env) |env_name| {
+            if (try loadEnvCredential(alloc, env_name, .custom_api_key)) |credential| {
+                return .{ .credential = credential };
+            }
+        }
+        if (!secret_store.isDisabled()) {
+            if (try secret_store.load(alloc)) |token| {
+                return .{ .credential = .{ .token = token, .source = .custom_api_key } };
+            }
+        }
+        return .{};
     }
     return resolvePreferring(
         alloc,
