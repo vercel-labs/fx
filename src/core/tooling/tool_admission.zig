@@ -788,6 +788,7 @@ fn reviewRequestForCall(
                 .resolved_cwd = command.resolved_cwd,
                 .background = command.background,
                 .target_os = command.target_os,
+                .environment = command.environment,
             } };
         } else blk: {
             break :blk .{ .tool = .{
@@ -5897,5 +5898,38 @@ test "automatic trusted-root folder creation bypasses reviewer while external do
             command_admission.ToolExecutionAuthority.ordinary,
             outcome.execution_authority.?,
         );
+    }
+}
+
+test "the review request carries the shell a profiled command will run under" {
+    // The evidence serializer can only report an environment that this function
+    // hands it, so pin the wiring here: a command asking for the user profile
+    // must reach the reviewer described as a user shell, not as legacy.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var background: BackgroundRuntime = .{};
+    defer background.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, &background, .{});
+    input.permission_review_turn = testReviewTurn();
+
+    const request = try reviewRequestForCall(input, arena, .{
+        .id = "test-environment",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"git status\",\"profile\":\"user\"}",
+    }, &.{}, false, null);
+
+    switch (request.action) {
+        .command => |command| switch (command.environment) {
+            .user => |shell_path| try std.testing.expect(shell_path.len > 0),
+            else => |other| {
+                std.debug.print("\n[WIRE] reviewer was told environment={s}, expected user\n", .{@tagName(std.meta.activeTag(command.environment))});
+                _ = other;
+                return error.TestExpectedUserEnvironment;
+            },
+        },
+        else => return error.TestExpectedCommandAction,
     }
 }
