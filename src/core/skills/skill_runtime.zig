@@ -299,6 +299,19 @@ const CanonicalSkillPaths = struct {
     }
 };
 
+fn isCompatSkillSource(source: SkillSource) bool {
+    return switch (source) {
+        .workspace_fx, .workspace_shared, .global_fx => false,
+        else => true,
+    };
+}
+
+fn shouldIncludeSkillSource(source: SkillSource) bool {
+    if (!isCompatSkillSource(source)) return true;
+    if (io_mod.getenv("FX_DISABLE_SKILL_COMPAT") != null) return false;
+    return true;
+}
+
 pub fn loadVisibleSkills(
     alloc: Allocator,
     workspace_root: ?[]const u8,
@@ -335,6 +348,7 @@ pub fn loadVisibleSkills(
 
     if (home) |home_root| {
         for (root_policy.global_roots) |spec| {
+            if (!shouldIncludeSkillSource(spec.source)) continue;
             try appendSpecRoot(alloc, &roots, home_root, spec);
         }
     }
@@ -366,6 +380,7 @@ fn appendWorkspaceRoots(
         }
 
         for (root_specs) |spec| {
+            if (!shouldIncludeSkillSource(spec.source)) continue;
             try appendSpecRoot(alloc, roots, dir, spec);
         }
     }
