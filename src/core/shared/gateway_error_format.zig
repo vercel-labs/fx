@@ -98,7 +98,15 @@ fn formatHttpDiagnostic(
         stringField(error_object, "type") orelse
         if (param_object) |param| stringField(param, "name") else null;
     const message = stringField(error_object, "message") orelse if (param_object) |param| stringField(param, "message") else null;
-    const provider = stringField(error_object, "provider") orelse providerFromGatewayMessage(message);
+    const metadata_raw = if (error_object.get("metadata")) |metadata_value|
+        if (objectValue(metadata_value)) |metadata| stringField(metadata, "raw") else null
+    else
+        null;
+    const useful_message = if (message != null and std.mem.eql(u8, message.?, "Provider returned error"))
+        metadata_raw orelse message
+    else
+        message;
+    const provider = stringField(error_object, "provider") orelse providerFromGatewayMessage(useful_message);
 
     const raw = try formatParsedHttpMessage(
         alloc,
@@ -106,7 +114,7 @@ fn formatHttpDiagnostic(
         @intFromEnum(status),
         provider,
         code,
-        message,
+        useful_message,
     );
     defer alloc.free(raw);
     return sanitizeExternalText(alloc, raw, max_bytes);
@@ -374,6 +382,19 @@ test "formatHttpErrorMessage renders live restricted provider body shape" {
 
     try std.testing.expectEqualStrings(
         "API access denied · HTTP 403 · Provider: wafer · no_providers_available: Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer",
+        line,
+    );
+}
+
+test "formatHttpErrorMessage uses provider raw detail for generic errors" {
+    const detail =
+        \\{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"model backend rejected request","provider_name":"Stealth"}}}
+    ;
+    const line = try formatHttpErrorMessage(std.testing.allocator, .bad_request, detail);
+    defer std.testing.allocator.free(line);
+
+    try std.testing.expectEqualStrings(
+        "API request failed · HTTP 400 · model backend rejected request",
         line,
     );
 }

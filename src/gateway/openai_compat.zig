@@ -85,15 +85,52 @@ pub fn buildRequest(
         try writeMessage(&out.writer, message);
     }
     try out.writer.writeAll("],\"tools\":");
-    if (request.serialized_tools.len == 0) {
-        try out.writer.writeAll("[]");
-    } else {
-        try out.writer.writeAll(request.serialized_tools);
-    }
+    try writeOpenAiTools(&out.writer, alloc, request.serialized_tools);
     try out.writer.writeAll(",\"tool_choice\":");
     try writeJsonString(&out.writer, request.tool_choice.label());
     try out.writer.writeAll(",\"stream\":true}");
     return out.toOwnedSlice();
+}
+
+fn writeOpenAiTools(
+    writer: *std.Io.Writer,
+    alloc: Allocator,
+    serialized_tools: []const u8,
+) !void {
+    if (serialized_tools.len == 0) {
+        try writer.writeAll("[]");
+        return;
+    }
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, serialized_tools, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.InvalidToolSchema;
+
+    try writer.writeByte('[');
+    var wrote_tool = false;
+    for (parsed.value.array.items) |tool| {
+        if (tool != .object) return error.InvalidToolSchema;
+        const object = tool.object;
+        const type_value = object.get("type") orelse return error.InvalidToolSchema;
+        const type_name = if (type_value == .string) type_value.string else return error.InvalidToolSchema;
+        if (!std.mem.eql(u8, type_name, "function")) continue;
+        if (wrote_tool) try writer.writeByte(',');
+        wrote_tool = true;
+
+        const name = object.get("name") orelse return error.InvalidToolSchema;
+        const description = object.get("description");
+        const parameters = object.get("inputSchema") orelse object.get("parameters") orelse return error.InvalidToolSchema;
+        try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
+        try std.json.Stringify.value(name, .{}, writer);
+        if (description) |value| {
+            try writer.writeAll(",\"description\":");
+            try std.json.Stringify.value(value, .{}, writer);
+        }
+        try writer.writeAll(",\"parameters\":");
+        try std.json.Stringify.value(parameters, .{}, writer);
+        try writer.writeAll("}}");
+    }
+    try writer.writeByte(']');
 }
 
 fn writeMessage(writer: *std.Io.Writer, message: types.ChatMessage) !void {
@@ -493,14 +530,15 @@ test "builds OpenAI-compatible messages and tools" {
     const body = try buildRequest(null, std.testing.allocator, .{
         .model = "deepseek-chat",
         .messages = &.{message},
-        .serialized_tools = "[{\"type\":\"function\"}]",
+        .serialized_tools = "[{\"type\":\"function\",\"name\":\"read_file\",\"inputSchema\":{\"type\":\"object\"}},{\"type\":\"provider\",\"id\":\"gateway.search\"}]",
         .tool_choice = .auto,
         .provider_options = .{},
     });
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.find(u8, body, "\"model\":\"deepseek-chat\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]") != null);
-    try std.testing.expect(std.mem.find(u8, body, "\"tools\":[{\"type\":\"function\"}]") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"parameters\":{\"type\":\"object\"}}}]") != null);
+    try std.testing.expect(std.mem.find(u8, body, "gateway.search") == null);
 }
 
 test "parses OpenAI SSE content and finish reason" {
