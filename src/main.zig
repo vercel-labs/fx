@@ -890,6 +890,13 @@ const App = struct {
         );
     }
 
+    pub fn runCustomProviderSetup(self: *App) !void {
+        const executable = try std.process.executablePathAlloc(io_mod.getIo(), self.alloc);
+        defer self.alloc.free(executable);
+        const argv = [_][]const u8{ executable, "setup", "custom" };
+        try self.runExternalInteractive(&argv);
+    }
+
     pub fn runExternalInteractive(self: *App, argv: []const []const u8) !void {
         try self.flushBeforeBlockingExternalWork();
 

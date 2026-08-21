@@ -594,8 +594,28 @@ pub fn Handlers(comptime App: type) type {
             }
         }
 
-        fn commandSetup(ctx: *anyopaque) !void {
+        fn commandSetup(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (std.mem.eql(u8, rest, "custom")) {
+                if (comptime @hasDecl(App, "runCustomProviderSetup")) {
+                    try app.runCustomProviderSetup();
+                } else {
+                    try app.writeDomainNotice(.{
+                        .topic = "setup",
+                        .tone = .@"error",
+                        .body = "custom provider setup is not available in this runtime",
+                    }, true);
+                }
+                return;
+            }
+            if (rest.len != 0) {
+                try app.writeDomainNotice(.{
+                    .topic = "setup",
+                    .tone = .warning,
+                    .body = "usage: /setup [custom]",
+                }, true);
+                return;
+            }
             if (comptime @hasDecl(App, "openSetupHub")) {
                 try app.openSetupHub();
             } else {

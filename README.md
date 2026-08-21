@@ -52,6 +52,8 @@ Run the interactive setup flow:
 fx setup custom
 ```
 
+Inside an interactive fx session, use `/setup custom` to launch the same wizard.
+
 It prompts for the endpoint, securely reads the API key, fetches available models, and lets you choose one.
 
 For headless or preconfigured environments, store the endpoint and model in `~/.fx/settings.json`, and keep the API key in the environment:
