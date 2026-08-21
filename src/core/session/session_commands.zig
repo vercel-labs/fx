@@ -272,6 +272,7 @@ pub fn Commands(comptime App: type) type {
             const text = try (output_contracts.StatusSnapshot{
                 .model = provider_runtime.model(app),
                 .provider = provider_runtime.provider(app),
+                .version = if (@hasDecl(App, "app_version")) App.app_version else "",
                 .update_channel = update_channel_label(app),
                 .build_channel = if (@hasDecl(App, "build_update_channel")) App.build_update_channel.label() else "stable",
                 .build_revision = if (@hasDecl(App, "build_revision")) App.build_revision else "",

@@ -725,6 +725,7 @@ describe("cli: status", () => {
       expect(r.code).toBe(0);
       const json = JSON.parse(r.stdout.trim());
       expect(json.kind).toBe("status");
+      expect(json.version).toBe(sourceVersion());
       expect(json).toHaveProperty("model");
       expect(json).toHaveProperty("workspace");
       expect(json).toHaveProperty("permission_mode");
