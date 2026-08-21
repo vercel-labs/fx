@@ -16,6 +16,8 @@
   { "file": "mcp-stdio.test.ts", "weight": 84 },
   { "file": "notifications.test.ts", "weight": 9 },
   { "file": "oauth-keychain-migration.test.ts", "weight": 30 },
+  { "file": "openai-compatible-fake.test.ts", "weight": 5 },
+  { "file": "openai-responses-fake.test.ts", "weight": 5 },
   { "file": "permission-errors.test.ts", "weight": 1 },
   { "file": "prompt-history.test.ts", "weight": 14 },
   { "file": "session-recovery.test.ts", "weight": 13 },

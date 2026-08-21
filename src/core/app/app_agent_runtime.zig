@@ -218,6 +218,7 @@ pub fn Runtime(comptime App: type) type {
                 .model = app.selected_model.items,
                 .gateway_retry_count = gateway_retry_count,
                 .gateway_chat_url = gateway_chat_url,
+                .gateway_wire_kind = app.auth.gatewayWireKind(),
                 .gateway_models_path = if (comptime @hasField(App, "web_search_models_path")) app.web_search_models_path else "/v1/models",
                 .agent_step_limit = app.agent_step_limit,
                 .fast_mode = agent_settings.fast_mode,
@@ -289,6 +290,7 @@ pub fn Runtime(comptime App: type) type {
                     .worker_model = app.selected_model.items,
                     .gateway_retry_count = gateway_retry_count,
                     .gateway_chat_url = gateway_chat_url,
+                    .gateway_wire_kind = app.auth.gatewayWireKind(),
                     .usage = &app.session.usage,
                     .usage_allocator = app.alloc,
                 });
@@ -1094,6 +1096,7 @@ pub fn Runtime(comptime App: type) type {
                 else
                     null,
                 .gateway_chat_url = gateway_chat_url,
+                .gateway_wire_kind = app.auth.gatewayWireKind(),
                 .gateway_tools_json = tool_projection.tools_json,
                 .custom_tool_guidance = tool_projection.custom_guidance,
                 .agent_step_limit = app.agent_step_limit,
@@ -1467,7 +1470,7 @@ const FakeApp = struct {
             .source = .ai_gateway_api_key,
         };
         defer credential.deinit(alloc);
-        _ = app.auth.adoptCredential(alloc, &credential);
+        _ = try app.auth.adoptCredential(alloc, &credential);
         errdefer app.auth.deinit(alloc);
         try app.selected_model.appendSlice(alloc, "test-model");
         return app;

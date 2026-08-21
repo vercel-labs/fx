@@ -35,9 +35,11 @@ const TIMEOUT = 15_000;
 const NO_GATEWAY_AUTH = {
   AI_GATEWAY_API_KEY: undefined,
   VERCEL_OIDC_TOKEN: undefined,
+  OPENAI_API_KEY: undefined,
+  LITELLM_API_KEY: undefined,
 };
 const MISSING_AUTH_MESSAGE =
-  "Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
+  "Fx needs model access. Run fx login to sign in, fx setup to use a Gateway API key, set AI_GATEWAY_API_KEY, or set OPENAI_API_KEY for an OpenAI-compatible server.";
 
 const KEYCHAIN_SERVICE = "FX_AI_GATEWAY_API_KEY";
 

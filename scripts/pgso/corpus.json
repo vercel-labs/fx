@@ -23,6 +23,7 @@
     },
     "env_unset": [
       "AI_GATEWAY_API_KEY",
+      "OPENAI_API_KEY",
       "VERCEL_OIDC_TOKEN"
     ],
     "timeout_seconds": 1800,
@@ -88,6 +89,8 @@
     {"name": "e2e-gateway-stream-lifecycle", "argv": ["bun", "test", "--max-concurrency", "1", "./gateway-stream-lifecycle.test.ts"], "test_file": "gateway-stream-lifecycle.test.ts"},
     {"name": "e2e-web-fetch-fake-network", "argv": ["bun", "test", "--max-concurrency", "1", "./web-fetch-fake-network.test.ts"], "test_file": "web-fetch-fake-network.test.ts"},
     {"name": "e2e-web-search-fake-gateway", "argv": ["bun", "test", "--max-concurrency", "1", "./web-search-fake-gateway.test.ts"], "test_file": "web-search-fake-gateway.test.ts"},
+    {"name": "e2e-openai-compatible-fake", "argv": ["bun", "test", "--max-concurrency", "1", "./openai-compatible-fake.test.ts"], "test_file": "openai-compatible-fake.test.ts"},
+    {"name": "e2e-openai-responses-fake", "argv": ["bun", "test", "--max-concurrency", "1", "./openai-responses-fake.test.ts"], "test_file": "openai-responses-fake.test.ts"},
     {"name": "e2e-vision-route-fake-gateway", "argv": ["bun", "test", "--max-concurrency", "1", "./vision-route-fake-gateway.test.ts"], "test_file": "vision-route-fake-gateway.test.ts"},
     {"name": "e2e-acp", "argv": ["bun", "test", "--max-concurrency", "1", "./acp.test.ts"], "test_file": "acp.test.ts"},
     {"name": "e2e-mcp-http", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-http.test.ts"], "test_file": "mcp-http.test.ts"},

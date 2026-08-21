@@ -4,6 +4,7 @@ const credentials = @import("credentials.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("login_flow.zig");
 const oauth_transport = @import("oauth_transport.zig");
+const openai_transport = @import("../gateway/openai_transport.zig");
 const secret = @import("secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -21,6 +22,7 @@ pub const CredentialRefreshMode = enum {
 const credential_source_order = [_]credentials.Source{
     .vercel_oidc_token,
     .ai_gateway_api_key,
+    .openai_api_key,
     .fx_login,
     .stored_key,
 };
@@ -602,6 +604,7 @@ pub const Runtime = struct {
     api_key_input: std.ArrayList(u8) = .empty,
     api_key_returns_to_root: bool = false,
     api_key_save: ApiKeySaveRuntime = .{},
+    transport_route: openai_transport.TransportRoute = .{},
 
     pub fn init(
         validator: api_key_validator.Provider,
@@ -622,7 +625,25 @@ pub const Runtime = struct {
         self.clearTeamSelection(alloc);
         self.team_query.deinit(alloc);
         if (self.selected_credential) |*credential| credential.deinit(alloc);
+        self.transport_route.deinit(alloc);
         self.* = .{};
+    }
+
+    pub fn gatewayChatUrl(self: *const Self, gateway_fallback: []const u8) []const u8 {
+        const base = self.transport_route.chatUrl(gateway_fallback);
+        return openai_transport.resolveGatewayChatUrl(
+            base,
+            io_mod.getenv(openai_transport.gateway_chat_url_env),
+        );
+    }
+
+    pub fn gatewayWireKind(self: *const Self) openai_transport.WireKind {
+        return self.transport_route.wire_kind;
+    }
+
+    fn refreshTransportRoute(self: *Self, alloc: Allocator) !void {
+        self.transport_route.deinit(alloc);
+        self.transport_route = try openai_transport.buildTransportRoute(alloc, self.credentialSource());
     }
 
     /// Borrows the current credential until this runtime replaces or releases it.
@@ -959,7 +980,7 @@ pub const Runtime = struct {
                 var owned = credential.*;
                 outcome = .reload_failed;
                 defer owned.deinit(alloc);
-                break :blk .{ .saved = self.adoptCredential(alloc, &owned) };
+                break :blk .{ .saved = self.adoptCredential(alloc, &owned) catch break :blk .reload_failed };
             },
         };
     }
@@ -1067,7 +1088,7 @@ pub const Runtime = struct {
 
     /// Moves the credential into this session and returns whether its source,
     /// token, effective Gateway team, or readiness changed.
-    pub fn adoptCredential(self: *Self, alloc: Allocator, credential: *credentials.Credential) bool {
+    pub fn adoptCredential(self: *Self, alloc: Allocator, credential: *credentials.Credential) !bool {
         const changed = if (self.selected_credential) |selected|
             selected.source != credential.source or
                 !std.mem.eql(u8, selected.token, credential.token) or
@@ -1076,7 +1097,12 @@ pub const Runtime = struct {
         else
             true;
         const source = credential.source;
+
+        var new_route = try openai_transport.buildTransportRoute(alloc, source);
+        errdefer new_route.deinit(alloc);
+
         if (self.selected_credential) |*selected| selected.deinit(alloc);
+        self.transport_route.deinit(alloc);
 
         self.selected_credential = credential.*;
         self.credential_refresh_failure_source = null;
@@ -1085,6 +1111,7 @@ pub const Runtime = struct {
         credential.team_slug = null;
         self.source_inventory.insert(source);
         if (source == .stored_key) self.stored_key_status = .not_attempted;
+        self.transport_route = new_route;
         return changed;
     }
 
@@ -1113,7 +1140,7 @@ pub const Runtime = struct {
         var credential = (try loader(ctx, alloc, source)) orelse return null;
         defer credential.deinit(alloc);
         if (credential.source != source) return error.CredentialSourceMismatch;
-        return self.adoptCredential(alloc, &credential);
+        return try self.adoptCredential(alloc, &credential);
     }
 
     pub fn selectSource(self: *Self, alloc: Allocator, source: credentials.Source) !?bool {
@@ -1130,7 +1157,7 @@ pub const Runtime = struct {
         };
         var credential = loaded;
         defer credential.deinit(alloc);
-        return self.adoptCredential(alloc, &credential);
+        return try self.adoptCredential(alloc, &credential);
     }
 
     /// Drops the current selection and re-runs precedence after the user clears
@@ -1150,6 +1177,7 @@ pub const Runtime = struct {
         if (self.selected_credential) |*credential| credential.deinit(alloc);
         self.selected_credential = null;
         self.credential_refresh_failure_source = null;
+        try self.refreshTransportRoute(alloc);
 
         try self.refreshSourceInventoryWithProbe(alloc, ctx, probe);
         for (credential_source_order) |source| {
@@ -1184,6 +1212,7 @@ pub const Runtime = struct {
             if (self.selected_credential) |*credential| credential.deinit(alloc);
             self.selected_credential = null;
             self.credential_refresh_failure_source = null;
+            try self.refreshTransportRoute(alloc);
         }
 
         try self.refreshSourceInventoryWithProbe(alloc, ctx, probe);
@@ -1504,7 +1533,7 @@ test "catalog access records a refresh failure until another credential is adopt
 
     var login = try makeTestCredential(alloc, "login-token", .fx_login, null, null);
     defer login.deinit(alloc);
-    _ = runtime.adoptCredential(alloc, &login);
+    _ = try runtime.adoptCredential(alloc, &login);
     runtime.recordCredentialRefreshFailure(.fx_login);
 
     const failed = runtime.modelCatalogAccess();
@@ -1512,10 +1541,79 @@ test "catalog access records a refresh failure until another credential is adopt
 
     var api_key = try makeTestCredential(alloc, "api-key", .ai_gateway_api_key, null, null);
     defer api_key.deinit(alloc);
-    _ = runtime.adoptCredential(alloc, &api_key);
+    _ = try runtime.adoptCredential(alloc, &api_key);
 
     const authenticated = runtime.modelCatalogAccess();
     try std.testing.expectEqualStrings("api-key", authenticated.authorizationCredential().?);
+}
+
+test "auth runtime rebuilds transport route when credential changes" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    var gateway = try makeTestCredential(alloc, "gw-key", .ai_gateway_api_key, null, null);
+    defer gateway.deinit(alloc);
+    _ = try runtime.adoptCredential(alloc, &gateway);
+    try std.testing.expectEqual(openai_transport.WireKind.gateway, runtime.transport_route.wire_kind);
+    try std.testing.expectEqualStrings(
+        "https://ai-gateway.vercel.sh/v3/ai/language-model",
+        runtime.gatewayChatUrl("https://ai-gateway.vercel.sh/v3/ai/language-model"),
+    );
+
+    var openai = try makeTestCredential(alloc, "oa-key", .openai_api_key, null, null);
+    defer openai.deinit(alloc);
+    openai_transport.configureProfileApiStyle("chat");
+    defer openai_transport.configureProfileApiStyle(null);
+    _ = try runtime.adoptCredential(alloc, &openai);
+    try std.testing.expectEqual(openai_transport.WireKind.openai_chat, runtime.transport_route.wire_kind);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        runtime.gatewayChatUrl("https://ai-gateway.vercel.sh/v3/ai/language-model"),
+        openai_transport.chat_completions_suffix,
+    ));
+}
+
+var stable_auth_runtime_test_environ: ?*std.process.Environ.Map = null;
+
+fn stableAuthRuntimeTestEnviron() !*const std.process.Environ.Map {
+    if (stable_auth_runtime_test_environ) |map| return map;
+
+    const alloc = std.heap.page_allocator;
+    const map = try alloc.create(std.process.Environ.Map);
+    map.* = std.process.Environ.Map.init(alloc);
+    stable_auth_runtime_test_environ = map;
+    return map;
+}
+
+test "auth runtime adoptCredential leaves session unchanged when route build fails" {
+    const alloc = std.testing.allocator;
+    var long_host: [1000]u8 = undefined;
+    @memset(&long_host, 'a');
+    const oversized = try std.fmt.allocPrint(alloc, "https://{s}/v1", .{long_host[0..]});
+    defer alloc.free(oversized);
+
+    var env_map = std.process.Environ.Map.init(alloc);
+    defer env_map.deinit();
+    try env_map.put(openai_transport.openai_base_url_env, oversized);
+    const stable_environ = try stableAuthRuntimeTestEnviron();
+    io_mod.setEnvironMap(&env_map);
+    defer io_mod.setEnvironMap(stable_environ);
+
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    var gateway = try makeTestCredential(alloc, "gw-key", .ai_gateway_api_key, null, null);
+    defer gateway.deinit(alloc);
+    _ = try runtime.adoptCredential(alloc, &gateway);
+
+    var openai = try makeTestCredential(alloc, "oa-key", .openai_api_key, null, null);
+    defer openai.deinit(alloc);
+
+    try std.testing.expectError(error.OpenAiWireUrlTooLong, runtime.adoptCredential(alloc, &openai));
+    try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, runtime.credentialSource().?);
+    try std.testing.expectEqual(openai_transport.WireKind.gateway, runtime.transport_route.wire_kind);
+    try std.testing.expectEqualStrings("gw-key", runtime.apiKey().?);
 }
 
 test "auth runtime adopts credential ownership and prefers team id" {
@@ -1526,7 +1624,7 @@ test "auth runtime adopts credential ownership and prefers team id" {
     var credential = try makeTestCredential(alloc, "token-a", .stored_key, "team_123", "vercel-labs");
     defer credential.deinit(alloc);
 
-    try std.testing.expect(runtime.adoptCredential(alloc, &credential));
+    try std.testing.expect(try runtime.adoptCredential(alloc, &credential));
     try std.testing.expectEqualStrings("token-a", runtime.apiKey().?);
     try std.testing.expectEqual(credentials.Source.stored_key, runtime.credentialSource().?);
     try std.testing.expectEqualStrings("team_123", runtime.gatewayTeam().?);
@@ -1537,12 +1635,12 @@ test "auth runtime adopts credential ownership and prefers team id" {
     var different_source = try makeTestCredential(alloc, "token-a", .fx_login, null, "team_123");
     defer different_source.deinit(alloc);
 
-    try std.testing.expect(runtime.adoptCredential(alloc, &different_source));
+    try std.testing.expect(try runtime.adoptCredential(alloc, &different_source));
     try std.testing.expectEqual(credentials.Source.fx_login, runtime.credentialSource().?);
 
     var unchanged = try makeTestCredential(alloc, "token-a", .fx_login, null, "team_123");
     defer unchanged.deinit(alloc);
-    try std.testing.expect(!runtime.adoptCredential(alloc, &unchanged));
+    try std.testing.expect(!try runtime.adoptCredential(alloc, &unchanged));
 }
 
 test "auth runtime exposes one current Gateway credential for prompt admission" {
@@ -1554,7 +1652,7 @@ test "auth runtime exposes one current Gateway credential for prompt admission" 
 
     var credential = try makeTestCredential(alloc, "token-a", .fx_login, "team_123", "vercel-labs");
     defer credential.deinit(alloc);
-    _ = runtime.adoptCredential(alloc, &credential);
+    _ = try runtime.adoptCredential(alloc, &credential);
 
     const gateway_credential = runtime.gatewayCredential().?;
     try std.testing.expectEqualStrings("token-a", gateway_credential.api_key);
@@ -1570,7 +1668,7 @@ test "auth runtime withholds an Fx credential across its expiry boundary" {
     var credential = try makeTestCredential(alloc, "stale-token", .fx_login, "team_123", "vercel-labs");
     defer credential.deinit(alloc);
     credential.refresh_after_ms = 40_000;
-    _ = runtime.adoptCredential(alloc, &credential);
+    _ = try runtime.adoptCredential(alloc, &credential);
 
     try std.testing.expect(!runtime.credentialNeedsRefreshAt(39_999));
     try std.testing.expect(runtime.gatewayCredentialAt(39_999) != null);
@@ -1588,7 +1686,7 @@ test "auth runtime withholds an Fx credential across its expiry boundary" {
     var refreshed = try makeTestCredential(alloc, "stale-token", .fx_login, "team_123", "vercel-labs");
     defer refreshed.deinit(alloc);
     refreshed.refresh_after_ms = 140_000;
-    try std.testing.expect(runtime.adoptCredential(alloc, &refreshed));
+    try std.testing.expect(try runtime.adoptCredential(alloc, &refreshed));
     try std.testing.expect(!runtime.credentialNeedsRefreshAt(40_000));
     try std.testing.expectEqualStrings("stale-token", runtime.gatewayCredentialAt(40_000).?.api_key);
 }
@@ -1611,7 +1709,7 @@ test "auth runtime view preserves missing and loaded states" {
     runtime.source_inventory.insert(.fx_login);
     var credential = try makeTestCredential(alloc, "token", .fx_login, "team_123", null);
     defer credential.deinit(alloc);
-    _ = runtime.adoptCredential(alloc, &credential);
+    _ = try runtime.adoptCredential(alloc, &credential);
     const loaded = runtime.view();
     try std.testing.expectEqual(credentials.Source.fx_login, loaded.active_source.?);
     try std.testing.expectEqualStrings("team_123", loaded.selected_team.?);
@@ -1634,7 +1732,7 @@ test "auth status snapshot labels every credential source without exposing token
         defer runtime.deinit(alloc);
         var credential = try makeTestCredential(alloc, "credential-secret", source, null, null);
         defer credential.deinit(alloc);
-        _ = runtime.adoptCredential(alloc, &credential);
+        _ = try runtime.adoptCredential(alloc, &credential);
 
         const snapshot = runtime.statusSnapshot();
         try std.testing.expectEqualStrings(credentials.sourceLabel(source), snapshot.activeSourceLabel());
@@ -1657,7 +1755,7 @@ test "auth status snapshot preserves display team and surface-specific missing h
 
     var credential = try makeTestCredential(alloc, "token", .fx_login, "team_123", "vercel-labs");
     defer credential.deinit(alloc);
-    _ = runtime.adoptCredential(alloc, &credential);
+    _ = try runtime.adoptCredential(alloc, &credential);
 
     const selected = runtime.statusSnapshot();
     try std.testing.expectEqualStrings("vercel-labs", selected.team.?);
@@ -1757,7 +1855,7 @@ test "auth runtime pins every supported credential source to the session" {
     for (sources) |source| {
         var credential = try makeTestCredential(alloc, @tagName(source), source, null, null);
         defer credential.deinit(alloc);
-        _ = runtime.adoptCredential(alloc, &credential);
+        _ = try runtime.adoptCredential(alloc, &credential);
 
         try std.testing.expectEqual(source, runtime.credentialSource().?);
         try std.testing.expectEqualStrings(@tagName(source), runtime.apiKey().?);
@@ -1777,7 +1875,7 @@ test "auth runtime explicitly selects the requested credential source" {
 
     var startup = try makeTestCredential(alloc, "startup-token", .vercel_oidc_token, null, null);
     defer startup.deinit(alloc);
-    _ = runtime.adoptCredential(alloc, &startup);
+    _ = try runtime.adoptCredential(alloc, &startup);
 
     try std.testing.expect((try runtime.selectSourceWithLoader(alloc, .fx_login, null, Loader.load)).?);
     try std.testing.expectEqual(credentials.Source.fx_login, runtime.credentialSource().?);
@@ -1802,7 +1900,7 @@ test "auth runtime failed selection preserves the active credential" {
     defer runtime.deinit(alloc);
     var active = try makeTestCredential(alloc, "active-token", .ai_gateway_api_key, null, null);
     defer active.deinit(alloc);
-    _ = runtime.adoptCredential(alloc, &active);
+    _ = try runtime.adoptCredential(alloc, &active);
 
     var loader = Loader{ .missing = .fx_login, .failing = .stored_key };
     try std.testing.expect((try runtime.selectSourceWithLoader(alloc, .fx_login, &loader, Loader.load)) == null);
@@ -1842,7 +1940,7 @@ test "logout replaces an active fx login with the next available source" {
 
     var active = try makeTestCredential(alloc, "fx-token", .fx_login, null, null);
     defer active.deinit(alloc);
-    _ = runtime.adoptCredential(alloc, &active);
+    _ = try runtime.adoptCredential(alloc, &active);
 
     var fixture = LogoutFixture{
         .existing = SourceSet.initMany(&.{ .ai_gateway_api_key, .stored_key }),
@@ -1868,7 +1966,7 @@ test "logout preserves an active non-login credential" {
 
     var active = try makeTestCredential(alloc, "active-api-key", .ai_gateway_api_key, null, null);
     defer active.deinit(alloc);
-    _ = runtime.adoptCredential(alloc, &active);
+    _ = try runtime.adoptCredential(alloc, &active);
     runtime.source_inventory.insert(.fx_login);
 
     var fixture = LogoutFixture{ .existing = SourceSet.initOne(.ai_gateway_api_key) };
@@ -1893,7 +1991,7 @@ test "logout clears the active login and re-enables auth selection when no sourc
 
     var active = try makeTestCredential(alloc, "fx-token", .fx_login, null, null);
     defer active.deinit(alloc);
-    _ = runtime.adoptCredential(alloc, &active);
+    _ = try runtime.adoptCredential(alloc, &active);
 
     var fixture = LogoutFixture{ .existing = .empty };
     try std.testing.expect(try runtime.reconcileAfterFxLoginLogoutWithDeps(
@@ -1915,7 +2013,7 @@ test "logout reconciliation adopts a newer concurrent fx login" {
 
     var active = try makeTestCredential(alloc, "old-fx-token", .fx_login, null, null);
     defer active.deinit(alloc);
-    _ = runtime.adoptCredential(alloc, &active);
+    _ = try runtime.adoptCredential(alloc, &active);
 
     var fixture = LogoutFixture{ .existing = SourceSet.initOne(.fx_login) };
     try std.testing.expect(try runtime.reconcileAfterFxLoginLogoutWithDeps(
@@ -1938,7 +2036,7 @@ test "auth picker root starts on sign in and keeps sources in the switch stage" 
     runtime.source_inventory = SourceSet.initMany(&.{ .ai_gateway_api_key, .fx_login });
     var credential = try makeTestCredential(alloc, "token", .ai_gateway_api_key, null, null);
     defer credential.deinit(alloc);
-    _ = runtime.adoptCredential(alloc, &credential);
+    _ = try runtime.adoptCredential(alloc, &credential);
 
     runtime.openPicker(alloc);
 
@@ -2016,7 +2114,7 @@ test "clearing a remembered choice re-resolves even when no login was active" {
     // once the remembered choice that pinned it there is gone.
     var pinned = try makeTestCredential(alloc, "stored-token", .stored_key, null, null);
     defer pinned.deinit(alloc);
-    _ = runtime.adoptCredential(alloc, &pinned);
+    _ = try runtime.adoptCredential(alloc, &pinned);
     try std.testing.expectEqual(credentials.Source.stored_key, runtime.credentialSource().?);
 
     var fixture = LogoutFixture{
@@ -2032,6 +2130,27 @@ test "clearing a remembered choice re-resolves even when no login was active" {
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, runtime.credentialSource().?);
 }
 
+test "switch credential stage includes OpenAI in inventory without panic" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    runtime.source_inventory = SourceSet.initMany(&.{ .ai_gateway_api_key, .openai_api_key, .fx_login });
+    var active = try makeTestCredential(alloc, "gateway-token", .ai_gateway_api_key, null, null);
+    defer active.deinit(alloc);
+    _ = try runtime.adoptCredential(alloc, &active);
+    runtime.openPicker(alloc);
+    runtime.openSwitchCredentialPicker(alloc);
+
+    const switch_view = runtime.pickerView();
+    try std.testing.expectEqual(@as(usize, 4), switch_view.choiceCount());
+    try std.testing.expect((Choice{ .source = .openai_api_key }).eql(switch_view.choiceAt(1).?));
+    try std.testing.expectEqualStrings(
+        credentials.sourceLabel(.openai_api_key),
+        switch_view.choiceLabel(switch_view.choiceAt(1).?),
+    );
+}
+
 test "switch credential stage includes the active source and pops to its root action" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
@@ -2039,7 +2158,7 @@ test "switch credential stage includes the active source and pops to its root ac
 
     var active = try makeTestCredential(alloc, "active-token", .stored_key, null, null);
     defer active.deinit(alloc);
-    _ = runtime.adoptCredential(alloc, &active);
+    _ = try runtime.adoptCredential(alloc, &active);
     runtime.openPicker(alloc);
     runtime.openSwitchCredentialPicker(alloc);
 
@@ -2149,7 +2268,7 @@ test "auth picker cancellation preserves the active credential source" {
     runtime.source_inventory = SourceSet.initMany(&.{ .ai_gateway_api_key, .fx_login });
     var active = try makeTestCredential(alloc, "active-token", .ai_gateway_api_key, null, null);
     defer active.deinit(alloc);
-    _ = runtime.adoptCredential(alloc, &active);
+    _ = try runtime.adoptCredential(alloc, &active);
 
     runtime.openPicker(alloc);
     _ = runtime.movePicker(1);

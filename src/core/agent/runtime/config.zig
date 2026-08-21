@@ -1,4 +1,5 @@
 const std = @import("std");
+const openai_transport = @import("../../gateway/openai_transport.zig");
 const types = @import("../../shared/types.zig");
 const tool_result_limits = @import("../../tooling/tool_result_limits.zig");
 const session_child_store = @import("../../session/session_child_store.zig");
@@ -29,6 +30,7 @@ pub const Config = struct {
     /// from cancellation. Headless hosts leave this null.
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
     gateway_chat_url: []const u8,
+    gateway_wire_kind: openai_transport.WireKind,
     gateway_tools_json: []const u8,
     custom_tool_guidance: []const u8 = "",
     agent_step_limit: usize,

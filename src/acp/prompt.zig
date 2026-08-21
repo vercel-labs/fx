@@ -210,6 +210,7 @@ const AcpContext = struct {
             .worker_model = session.model,
             .gateway_retry_count = self.state.cfg.gateway_retry_count,
             .gateway_chat_url = self.state.cfg.gateway_chat_url,
+            .gateway_wire_kind = self.state.cfg.gateway_wire_kind,
             .usage = &session.session_rt.usage,
             .usage_allocator = self.state.alloc,
         });
@@ -231,6 +232,7 @@ const AcpContext = struct {
             .model = session.model,
             .gateway_retry_count = self.state.cfg.gateway_retry_count,
             .gateway_chat_url = self.state.cfg.gateway_chat_url,
+            .gateway_wire_kind = self.state.cfg.gateway_wire_kind,
             .gateway_models_path = self.state.cfg.gateway_models_path,
             .agent_step_limit = session.agent_step_limit,
             .fast_mode = session.fast_mode,
@@ -729,6 +731,7 @@ fn buildAgentConfig(state: *server.ServerState, session: *server.ActiveSessionSt
         .explicit_skills_prompt_section = sections.explicit_skills_prompt_section,
         .gateway_retry_count = state.cfg.gateway_retry_count,
         .gateway_chat_url = state.cfg.gateway_chat_url,
+        .gateway_wire_kind = state.cfg.gateway_wire_kind,
         .gateway_tools_json = sections.gateway_tools_json,
         .custom_tool_guidance = sections.custom_tool_guidance,
         .agent_step_limit = session.agent_step_limit,

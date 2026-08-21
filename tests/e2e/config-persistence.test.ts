@@ -29,6 +29,8 @@ const TIMEOUT = 20_000;
 const NO_AUTH = {
   AI_GATEWAY_API_KEY: "",
   VERCEL_OIDC_TOKEN: "",
+  OPENAI_API_KEY: "",
+  LITELLM_API_KEY: "",
   FX_MODEL: undefined,
   NO_COLOR: "1",
 };
@@ -582,7 +584,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         });
         await session.waitForText("Run /help", TIMEOUT);
         await session.sendText("/output quiet");
-        await session.waitForText("Fx needs access to Vercel AI Gateway", TIMEOUT);
+        await session.waitForText("Fx needs model access", TIMEOUT);
         expect(composerContains(await session.capturePane(), "/output quiet")).toBe(
           true,
         );

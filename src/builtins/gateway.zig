@@ -14,6 +14,11 @@ const gateway_error_format = @import("../core/shared/gateway_error_format.zig");
 const gateway_client = @import("../gateway/client.zig");
 const gateway_failure_diagnostics = @import("../core/gateway/gateway_failure_diagnostics.zig");
 const gateway_json = @import("../core/gateway/gateway_json.zig");
+const openai_json = @import("../core/gateway/openai_json.zig");
+const openai_responses_json = @import("../core/gateway/openai_responses_json.zig");
+const openai_transport = @import("../core/gateway/openai_transport.zig");
+const openai_client = @import("../gateway/openai_client.zig");
+const openai_responses_client = @import("../gateway/openai_responses_client.zig");
 const io_mod = @import("../core/shared/io.zig");
 const gateway_generation_usage = @import("../gateway/generation_usage.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
@@ -40,6 +45,7 @@ const ProgressFn = web_search_contract.ProgressFn;
 pub const default_model = "zai/glm-5.2";
 pub const default_chat_url = "https://ai-gateway.vercel.sh/v3/ai/language-model";
 pub const models_path = "/coding-agent/v1/models";
+pub const openai_models_path = openai_transport.models_path;
 const credits_path = "/coding-agent/v1/credits";
 pub const retry_count: usize = 3;
 pub const chat_url_env = "FX_GATEWAY_CHAT_URL";
@@ -144,6 +150,11 @@ pub fn buildAgentRequest(
     alloc: Allocator,
     request: agent_stream_provider_contract.BuildRequest,
 ) anyerror![]u8 {
+    switch (request.wire_kind) {
+        .openai_responses => return buildOpenAiResponsesAgentRequest(alloc, request),
+        .openai_chat => return buildOpenAiAgentRequest(alloc, request),
+        .gateway => {},
+    }
     const budget: ?gateway_json.BuildBudget = if (request.budget) |value|
         .{ .deadline = value.deadline, .cancel_flag = value.cancel_flag }
     else
@@ -283,6 +294,59 @@ fn writeVisionGatewaySchema(
     return out.toOwnedSlice();
 }
 
+test "agent request builder dispatches on wire kind not URL suffix" {
+    const alloc = std.testing.allocator;
+    const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
+    const openai_like_url = "https://example.invalid/v1/chat/completions";
+    const neutral_url = "https://example.invalid/custom-endpoint";
+
+    const chat_body = try agent_stream_provider.build(alloc, .{
+        .model = "gpt-4o",
+        .serialized_tools = "[]",
+        .messages = &messages,
+        .tool_choice = .auto,
+        .provider_options = model_capabilities.resolveProviderOptions("gpt-4o", .auto, false),
+        .chat_url = neutral_url,
+        .wire_kind = .openai_chat,
+    });
+    defer alloc.free(chat_body);
+    try std.testing.expect(std.mem.find(u8, chat_body, "\"stream\":true") != null);
+    try std.testing.expect(std.mem.find(u8, chat_body, "maxOutputTokens") == null);
+
+    const gateway_body = try agent_stream_provider.build(alloc, .{
+        .model = "anthropic/claude-opus-4.8",
+        .serialized_tools = "[]",
+        .messages = &messages,
+        .tool_choice = .auto,
+        .provider_options = model_capabilities.resolveProviderOptions(
+            "anthropic/claude-opus-4.8",
+            .auto,
+            false,
+        ),
+        .max_output_tokens = 32_000,
+        .chat_url = openai_like_url,
+        .wire_kind = .gateway,
+    });
+    defer alloc.free(gateway_body);
+    try std.testing.expect(std.mem.find(u8, gateway_body, "\"maxOutputTokens\":32000") != null);
+    try std.testing.expect(std.mem.find(u8, gateway_body, "\"max_tokens\"") == null);
+
+    const responses_body = try agent_stream_provider.build(alloc, .{
+        .model = "gpt-5",
+        .serialized_tools = "[]",
+        .messages = &messages,
+        .tool_choice = .auto,
+        .provider_options = model_capabilities.resolveProviderOptions("gpt-5", .auto, false),
+        .max_output_tokens = 8192,
+        .chat_url = openai_like_url,
+        .wire_kind = .openai_responses,
+    });
+    defer alloc.free(responses_body);
+    try std.testing.expect(std.mem.find(u8, responses_body, "\"input\":[") != null);
+    try std.testing.expect(std.mem.find(u8, responses_body, "\"max_output_tokens\":8192") != null);
+    try std.testing.expect(std.mem.find(u8, responses_body, "\"messages\":[") == null);
+}
+
 test "agent request builder keeps default reasoning silent and emits output limit" {
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
     const body = try agent_stream_provider.build(std.testing.allocator, .{
@@ -420,11 +484,69 @@ test "required vision request contains only the registered vision schema" {
     try std.testing.expect(std.mem.find(u8, body, "\"maxOutputTokens\":128000") != null);
 }
 
+fn buildOpenAiResponsesAgentRequest(
+    alloc: Allocator,
+    request: agent_stream_provider_contract.BuildRequest,
+) anyerror![]u8 {
+    if (request.verified_images != null or request.response_format != null) {
+        return error.VisionUnavailable;
+    }
+    if (request.vision_mode == .required) return error.VisionUnavailable;
+
+    const budget: ?gateway_json.BuildBudget = if (request.budget) |value|
+        .{ .deadline = value.deadline, .cancel_flag = value.cancel_flag }
+    else
+        null;
+    if (budget) |active| try active.check();
+
+    return openai_responses_json.buildResponsesBody(
+        alloc,
+        request.model,
+        request.serialized_tools,
+        request.messages,
+        request.tool_choice,
+        request.max_output_tokens,
+        request.provider_options.reasoning,
+        budget,
+    );
+}
+
+fn buildOpenAiAgentRequest(
+    alloc: Allocator,
+    request: agent_stream_provider_contract.BuildRequest,
+) anyerror![]u8 {
+    if (request.verified_images != null or request.response_format != null) {
+        return error.VisionUnavailable;
+    }
+    if (request.vision_mode == .required) return error.VisionUnavailable;
+
+    const budget: ?gateway_json.BuildBudget = if (request.budget) |value|
+        .{ .deadline = value.deadline, .cancel_flag = value.cancel_flag }
+    else
+        null;
+    if (budget) |active| try active.check();
+
+    return openai_json.buildChatCompletionsBody(
+        alloc,
+        request.model,
+        request.serialized_tools,
+        request.messages,
+        request.tool_choice,
+        request.max_output_tokens,
+        budget,
+    );
+}
+
 fn streamAgentCompletion(
     _: ?*anyopaque,
     alloc: Allocator,
     request: agent_stream_provider_contract.Request,
 ) anyerror!agent_stream_provider_contract.Result {
+    switch (request.wire_kind) {
+        .openai_responses => return streamOpenAiResponsesAgentCompletion(alloc, request),
+        .openai_chat => return streamOpenAiAgentCompletion(alloc, request),
+        .gateway => {},
+    }
     const result = gateway_client.streamGatewayCompletion(
         alloc,
         .{
@@ -473,11 +595,100 @@ fn streamAgentCompletion(
     };
 }
 
+fn streamOpenAiResponsesAgentCompletion(
+    alloc: Allocator,
+    request: agent_stream_provider_contract.Request,
+) anyerror!agent_stream_provider_contract.Result {
+    const result = openai_responses_client.streamOpenAiResponsesCompletion(
+        alloc,
+        .{
+            .api_key = request.api_key,
+            .model = request.model,
+            .retry_count = request.retry_count,
+            .responses_url = request.chat_url,
+            .payload = request.payload,
+            .trace_ctx = request.trace_ctx,
+            .content_capture_limit = request.content_capture_limit,
+            .delivery = request.delivery,
+            .on_tool_input_chunk = request.on_tool_input_chunk,
+            .provider_attempt_owner = switch (request.provider_attempt_owner) {
+                .transport => .transport,
+                .agent => .agent,
+            },
+        },
+        request.callback_ctx,
+        request.on_content_chunk,
+        request.on_tool_start,
+        request.cancel_flag,
+    ) catch |err| {
+        request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
+            err,
+            request.delivery.load(),
+        );
+        return err;
+    };
+    return .{
+        .status = result.status,
+        .completion = result.completion,
+        .err_body = result.err_body,
+        .retry_after_seconds = result.retry_after_seconds,
+        .reconcile_generation_usage = false,
+        .ownership = .owned,
+    };
+}
+
+fn streamOpenAiAgentCompletion(
+    alloc: Allocator,
+    request: agent_stream_provider_contract.Request,
+) anyerror!agent_stream_provider_contract.Result {
+    const result = openai_client.streamOpenAiCompletion(
+        alloc,
+        .{
+            .api_key = request.api_key,
+            .model = request.model,
+            .retry_count = request.retry_count,
+            .chat_url = request.chat_url,
+            .payload = request.payload,
+            .trace_ctx = request.trace_ctx,
+            .content_capture_limit = request.content_capture_limit,
+            .delivery = request.delivery,
+            .on_tool_input_chunk = request.on_tool_input_chunk,
+            .provider_attempt_owner = switch (request.provider_attempt_owner) {
+                .transport => .transport,
+                .agent => .agent,
+            },
+        },
+        request.callback_ctx,
+        request.on_content_chunk,
+        request.on_tool_start,
+        request.cancel_flag,
+    ) catch |err| {
+        request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
+            err,
+            request.delivery.load(),
+        );
+        return err;
+    };
+    return .{
+        .status = result.status,
+        .completion = result.completion,
+        .err_body = result.err_body,
+        .retry_after_seconds = result.retry_after_seconds,
+        .reconcile_generation_usage = false,
+        .ownership = .owned,
+    };
+}
+
 fn fetchCredits(
     _: ?*anyopaque,
     alloc: Allocator,
     input: gateway_provider.CreditsLookupInput,
 ) output_contracts.CreditsSnapshot {
+    if (input.credential_source) |source| {
+        if (openai_transport.isOpenAiCredentialSource(source)) {
+            return creditsErrorSnapshot(alloc, "Credits are available only with Vercel AI Gateway.");
+        }
+    }
     return fetchCreditsWithFetch(
         alloc,
         input.credential,
@@ -697,6 +908,12 @@ fn executeWebSearchProvider(
     on_progress: ?ProgressFn,
     progress_ctx: ?*anyopaque,
 ) !Response {
+    if (inputs.gateway_wire_kind != .gateway) {
+        const message = try alloc.dupe(u8, "Gateway web search is unavailable in OpenAI-compatible mode.");
+        const content = try alloc.alloc(web_search_contract.ResultItem, 1);
+        content[0] = .{ .error_text = message };
+        return .{ .content = content };
+    }
     return executeGatewayWorker(alloc, .{
         .api_key = inputs.api_key,
         .team = inputs.gateway_team,
@@ -708,16 +925,20 @@ fn executeWebSearchProvider(
     }, request, on_progress, progress_ctx);
 }
 
-pub fn chatUrl(fallback: []const u8) []const u8 {
-    return resolveChatUrl(fallback, io_mod.getenv(chat_url_env));
+pub fn chatUrlForRoute(route: openai_transport.TransportRoute, fallback: []const u8) []const u8 {
+    return resolveChatUrl(route.chatUrl(fallback), io_mod.getenv(chat_url_env));
 }
 
 pub fn defaultChatUrl() []const u8 {
-    return chatUrl(default_chat_url);
+    return resolveChatUrl(default_chat_url, io_mod.getenv(chat_url_env));
+}
+
+pub fn defaultModelsEndpoint() []const u8 {
+    return models_path;
 }
 
 fn resolveChatUrlForProvider(_: ?*anyopaque, fallback: []const u8) []const u8 {
-    return chatUrl(fallback);
+    return resolveChatUrl(fallback, io_mod.getenv(chat_url_env));
 }
 
 fn fetchCliModelCatalog(
@@ -1842,15 +2063,16 @@ test "built-in credits provider ignores non-string fields" {
 }
 
 test "built-in model catalog owns default and loopback target resolution" {
-    const default_url = try modelCatalogUrl(std.testing.allocator, models_path, null);
+    const gateway_access = credentials.catalogAccessForCredential(.ai_gateway_api_key, "test-key", null);
+    const default_url = try modelCatalogUrl(std.testing.allocator, gateway_access, models_path, null);
     defer std.testing.allocator.free(default_url);
     try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/coding-agent/v1/models", default_url);
 
-    const loopback_url = try modelCatalogUrl(std.testing.allocator, models_path, "http://127.0.0.1:43123");
+    const loopback_url = try modelCatalogUrl(std.testing.allocator, gateway_access, models_path, "http://127.0.0.1:43123");
     defer std.testing.allocator.free(loopback_url);
     try std.testing.expectEqualStrings("http://127.0.0.1:43123/coding-agent/v1/models", loopback_url);
 
-    const rejected_url = try modelCatalogUrl(std.testing.allocator, models_path, "https://gateway.example");
+    const rejected_url = try modelCatalogUrl(std.testing.allocator, gateway_access, models_path, "https://gateway.example");
     defer std.testing.allocator.free(rejected_url);
     try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/coding-agent/v1/models", rejected_url);
 }
@@ -2078,6 +2300,7 @@ fn fetchModelCatalogResponse(
 
     const model_catalog_url = try modelCatalogUrl(
         alloc,
+        access,
         team_path orelse path,
         io_mod.getenv(base_url_env),
     );
@@ -2148,7 +2371,17 @@ test "catalog request failures preserve transport and cancellation facts" {
     try std.testing.expectEqual(model_catalog.FailureCategory.malformed_response, malformed.category);
 }
 
-fn modelCatalogUrl(alloc: Allocator, path: []const u8, base_url_override: ?[]const u8) ![]u8 {
+fn modelCatalogUrl(
+    alloc: Allocator,
+    access: credentials.CatalogAccess,
+    path: []const u8,
+    base_url_override: ?[]const u8,
+) ![]u8 {
+    if (access.credentialSource()) |source| {
+        if (openai_transport.isOpenAiCredentialSource(source)) {
+            return openai_transport.formatModelsUrl(alloc, openai_transport.resolveOpenAiBaseUrl());
+        }
+    }
     const base_url = if (base_url_override) |candidate| blk: {
         if (gateway_client.isLoopbackHttpUrl(candidate)) break :blk candidate;
         debug_trace.logf("gateway", "ignoring {s}: not loopback http", .{base_url_env});

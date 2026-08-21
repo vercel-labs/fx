@@ -10,6 +10,7 @@ const sandbox = @import("../permissions/sandbox.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const settings_store = @import("settings_store.zig");
 const update_target = @import("../upgrade/update_target.zig");
+const openai_transport = @import("../gateway/openai_transport.zig");
 pub const context_limits = @import("context_limits.zig");
 
 const Allocator = std.mem.Allocator;
@@ -64,12 +65,18 @@ pub const Settings = struct {
     notification_max: ?bool = null,
     permission_rules: types.PermissionRuleSet = .{},
     has_permission_rules: bool = false,
+    openai_api_key: ?[]u8 = null,
+    openai_base_url: ?[]u8 = null,
+    openai_api_style: ?[]u8 = null,
 
     pub fn deinit(self: *Settings, alloc: Allocator) void {
         if (self.model) |value| alloc.free(value);
         if (self.input_appearance) |value| alloc.free(value);
         if (self.maxxing_mode) |value| alloc.free(value);
         if (self.sandbox) |value| alloc.free(value);
+        if (self.openai_api_key) |value| alloc.free(value);
+        if (self.openai_base_url) |value| alloc.free(value);
+        if (self.openai_api_style) |value| alloc.free(value);
         self.permission_rules.deinit(alloc);
         self.* = .{};
     }
@@ -558,6 +565,9 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "update_channel",
         "permission_mode",
         "credential_source",
+        "openai_api_key",
+        "openai_base_url",
+        "openai_api_style",
         "yolo_acknowledged",
         "permission",
         "additional_directories",
@@ -1339,6 +1349,27 @@ fn parseProfileOnlyFields(
             return error.InvalidCredentialSource;
     }
 
+    if (root.object.get("openai_api_key")) |openai_api_key_value| {
+        if (openai_api_key_value != .string) return error.InvalidOpenAiApiKeyType;
+        const trimmed = std.mem.trim(u8, openai_api_key_value.string, " \t\r\n");
+        if (trimmed.len > 0) settings.openai_api_key = try alloc.dupe(u8, trimmed);
+    }
+
+    if (root.object.get("openai_base_url")) |openai_base_url_value| {
+        if (openai_base_url_value != .string) return error.InvalidOpenAiBaseUrlType;
+        const trimmed = std.mem.trim(u8, openai_base_url_value.string, " \t\r\n");
+        if (trimmed.len > 0) settings.openai_base_url = try alloc.dupe(u8, trimmed);
+    }
+
+    if (root.object.get("openai_api_style")) |openai_api_style_value| {
+        if (openai_api_style_value != .string) return error.InvalidOpenAiApiStyleType;
+        const trimmed = std.mem.trim(u8, openai_api_style_value.string, " \t\r\n");
+        if (trimmed.len > 0) {
+            if (openai_transport.ApiStyle.parse(trimmed) == null) return error.InvalidOpenAiApiStyleValue;
+            settings.openai_api_style = try alloc.dupe(u8, trimmed);
+        }
+    }
+
     if (root.object.get("yolo_acknowledged")) |acknowledged_value| {
         if (acknowledged_value != .bool) return error.InvalidYoloAcknowledgedType;
         settings.yolo_acknowledged = acknowledged_value.bool;
@@ -1515,6 +1546,21 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
     }
     if (incoming.permission_mode) |value| target.permission_mode = value;
     if (incoming.credential_source) |value| target.credential_source = value;
+    if (incoming.openai_api_key) |value| {
+        if (target.openai_api_key) |current| alloc.free(current);
+        target.openai_api_key = value;
+        incoming.openai_api_key = null;
+    }
+    if (incoming.openai_base_url) |value| {
+        if (target.openai_base_url) |current| alloc.free(current);
+        target.openai_base_url = value;
+        incoming.openai_base_url = null;
+    }
+    if (incoming.openai_api_style) |value| {
+        if (target.openai_api_style) |current| alloc.free(current);
+        target.openai_api_style = value;
+        incoming.openai_api_style = null;
+    }
     if (incoming.yolo_acknowledged) |value| target.yolo_acknowledged = value;
     if (incoming.max_agent_steps) |value| target.max_agent_steps = value;
     if (incoming.max_tool_result_bytes) |value| target.max_tool_result_bytes = value;
@@ -3028,7 +3074,7 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try writeFixtureFile(
         tmp.dir,
         "workspace/.fx.json",
-        "{\"model\":\"project/model\",\"permission_mode\":\"ask\",\"permission\":\"deny\",\"prompt_history\":{\"enabled\":false},\"statusLine\":{\"sandbox\":false,\"context\":true},\"skill_match_fuzzy\":true,\"first_call_tool_choice\":\"auto\",\"auto_upgrade\":true,\"update_channel\":\"stable\",\"fast_mode\":true,\"input_appearance\":\"lines\",\"maxxing_mode\":\"normal\",\"slash_menu_categories\":true,\"effort\":\"low\",\"output_level\":\"normal\",\"startup_scrollback\":true,\"max_agent_steps\":17}\n",
+        "{\"model\":\"project/model\",\"permission_mode\":\"ask\",\"permission\":\"deny\",\"prompt_history\":{\"enabled\":false},\"statusLine\":{\"sandbox\":false,\"context\":true},\"skill_match_fuzzy\":true,\"first_call_tool_choice\":\"auto\",\"auto_upgrade\":true,\"update_channel\":\"stable\",\"fast_mode\":true,\"input_appearance\":\"lines\",\"maxxing_mode\":\"normal\",\"slash_menu_categories\":true,\"effort\":\"low\",\"output_level\":\"normal\",\"startup_scrollback\":true,\"openai_api_key\":\"project-key\",\"openai_base_url\":\"http://project.example/v1\",\"openai_api_style\":\"responses\",\"max_agent_steps\":17}\n",
     );
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -3057,7 +3103,7 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try std.testing.expectEqual(@as(usize, 1), result.settings.permission_rules.rules.len);
     try expectPermissionRule(result.settings.permission_rules.rules[0], "bash", "profile *", .allow);
 
-    try std.testing.expectEqual(@as(usize, 15), result.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 18), result.diagnostics.len);
     inline for (&.{
         "model",
         "permission_mode",
@@ -3074,6 +3120,9 @@ test "project profile-only settings are ignored and diagnosed by key" {
         "slash_menu_categories",
         "effort",
         "startup_scrollback",
+        "openai_api_key",
+        "openai_base_url",
+        "openai_api_style",
     }) |key| {
         try expectIgnoredProjectKey(result.diagnostics, key);
     }
@@ -3385,6 +3434,27 @@ test "detailed settings preserve model precedence and source" {
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("workspace/model", result.settings.model.?);
     try std.testing.expectEqual(ModelSource.user_workspace, result.model_source.?);
+}
+
+test "detailed settings merge profile openai base url from user settings" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"openai_base_url\":\"https://litellm.example/v1\",\"model\":\"chatgpt/gpt-5.6-luna\"}\n",
+    );
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("https://litellm.example/v1", result.settings.openai_base_url.?);
+    try std.testing.expectEqualStrings("chatgpt/gpt-5.6-luna", result.settings.model.?);
 }
 
 test "detailed settings expose target sources and permission views" {

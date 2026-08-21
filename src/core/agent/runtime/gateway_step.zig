@@ -1,5 +1,6 @@
 const std = @import("std");
 const agent_stream_provider = @import("../stream_provider.zig");
+const openai_transport = @import("../../gateway/openai_transport.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const types = @import("../../shared/types.zig");
 const session_usage = @import("../../session/session_usage.zig");
@@ -33,6 +34,7 @@ pub fn streamGatewayCompletion(
     model: []const u8,
     retry_count: usize,
     chat_url: []const u8,
+    wire_kind: openai_transport.WireKind,
     payload: []const u8,
     cooperative_pulse: ?agent_stream_provider.CooperativePulse,
     delivery: *DeliveryCertainty,
@@ -60,6 +62,7 @@ pub fn streamGatewayCompletion(
         .model = model,
         .retry_count = retry_count,
         .chat_url = chat_url,
+        .wire_kind = wire_kind,
         .payload = payload,
         .trace_ctx = trace_ctx,
         .content_capture_limit = content_capture_limit,
@@ -349,6 +352,7 @@ test "pre-send gateway failure settles usage as unbilled" {
         "test/model",
         1,
         "not a valid URL",
+        .gateway,
         "{}",
         null,
         &delivery,
@@ -406,6 +410,7 @@ test "possibly sent gateway failure marks billing incomplete" {
         "test/model",
         1,
         "https://example.test/chat",
+        .gateway,
         "{}",
         null,
         &delivery,

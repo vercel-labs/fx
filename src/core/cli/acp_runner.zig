@@ -5,6 +5,7 @@ const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
 const gateway_provider = @import("../gateway/gateway_provider.zig");
+const openai_transport = @import("../gateway/openai_transport.zig");
 const host = @import("../hosts/host.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
@@ -18,6 +19,7 @@ pub const Config = struct {
     default_agent_step_limit: usize,
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
+    gateway_wire_kind: openai_transport.WireKind = .gateway,
     gateway_models_path: []const u8,
     gateway_provider: gateway_provider.Provider,
     background_process_provider: background_process_provider.Provider =

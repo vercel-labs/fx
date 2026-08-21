@@ -27,7 +27,7 @@ curl -fsSL https://fx.sh/setup.sh | bash
 
 ## Run fx
 
-To get started, sign in with Vercel:
+By default, fx uses [Vercel AI Gateway](https://vercel.com/docs/ai-gateway). Sign in with Vercel:
 
 ```bash
 fx login
@@ -38,6 +38,26 @@ Or add an AI Gateway API key:
 ```bash
 fx setup
 ```
+
+You can also point fx at any OpenAI-compatible server without Vercel login. By default fx uses the Chat Completions wire (`/v1/chat/completions`), which works with Ollama, Groq, LiteLLM, vLLM, and most compatible hosts:
+
+```bash
+export OPENAI_API_KEY=your-key
+export FX_MODEL=gpt-4o
+# optional: export FX_OPENAI_BASE_URL=http://127.0.0.1:11434/v1
+fx
+```
+
+For official OpenAI models that require the Responses API (for example tools plus reasoning on gpt-5.x), set the Responses wire explicitly:
+
+```bash
+export OPENAI_API_KEY=your-key
+export FX_OPENAI_API_STYLE=responses
+export FX_MODEL=gpt-5
+fx
+```
+
+Profile settings in `~/.fx/settings.json` can store `openai_api_key`, `openai_base_url`, and `openai_api_style` (`chat` or `responses`). Project `.fx.json` cannot set them.
 
 Run fx from a project:
 

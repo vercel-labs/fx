@@ -410,6 +410,8 @@ async function startFxWithoutAuth(
       HOME: testHome,
       AI_GATEWAY_API_KEY: undefined,
       VERCEL_OIDC_TOKEN: undefined,
+      OPENAI_API_KEY: undefined,
+      LITELLM_API_KEY: undefined,
       FX_OAUTH_CLIENT_ID: undefined,
       FX_DISABLE_KEYCHAIN: "1",
       FX_SKIP_ONBOARDING: "1",
@@ -1114,7 +1116,7 @@ tmuxTest(
     await session.sendText(" preserve this exact prompt");
     const blocked = await session.waitForPane(
       (pane) =>
-        pane.includes("Fx needs access to Vercel AI Gateway") &&
+        pane.includes("Fx needs model access") &&
         pane.includes("preserve this exact prompt") &&
         pane.includes("Image 1"),
       TIMEOUT,

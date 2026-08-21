@@ -2,8 +2,11 @@ const std = @import("std");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const openai_transport = @import("../gateway/openai_transport.zig");
 const types = @import("../shared/types.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
+
+pub const WireKind = openai_transport.WireKind;
 
 const Allocator = std.mem.Allocator;
 
@@ -103,6 +106,8 @@ pub const BuildRequest = struct {
     budget: ?BuildBudget = null,
     verified_images: ?[]const image_attachments.VerifiedSnapshot = null,
     response_format: ?StructuredResponseFormat = null,
+    chat_url: []const u8 = "",
+    wire_kind: openai_transport.WireKind = .gateway,
 };
 
 pub const Request = struct {
@@ -113,6 +118,7 @@ pub const Request = struct {
     model: []const u8,
     retry_count: usize,
     chat_url: []const u8,
+    wire_kind: openai_transport.WireKind = .gateway,
     payload: []const u8,
     trace_ctx: debug_trace.TraceContext,
     content_capture_limit: ?usize,

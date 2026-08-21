@@ -4165,7 +4165,7 @@ test "trace auth summary preserves missing and loaded status text" {
         .source = .fx_login,
     };
     defer credential.deinit(alloc);
-    _ = app.auth.adoptCredential(alloc, &credential);
+    _ = try app.auth.adoptCredential(alloc, &credential);
     var loaded: std.Io.Writer.Allocating = .init(alloc);
     defer loaded.deinit();
     try writeAuthStateSummary(&loaded.writer, &app);

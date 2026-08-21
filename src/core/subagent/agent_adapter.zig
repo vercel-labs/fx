@@ -177,6 +177,7 @@ pub fn run(
             .explicit_skills_prompt_section = config.explicit_skills_prompt_section,
             .gateway_retry_count = config.tool_context.gateway_retry_count,
             .gateway_chat_url = config.tool_context.gateway_chat_url,
+            .gateway_wire_kind = config.tool_context.gateway_wire_kind,
             .gateway_tools_json = config.gateway_tools_json,
             .custom_tool_guidance = config.custom_tool_guidance,
             .agent_step_limit = config.tool_context.agent_step_limit,

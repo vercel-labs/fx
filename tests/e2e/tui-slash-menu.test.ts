@@ -1353,7 +1353,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         (current) =>
           current.includes("resume-helper") &&
           !current.includes("Enter Use") &&
-          !current.includes("Fx needs access to Vercel AI Gateway"),
+          !current.includes("Fx needs model access"),
         5_000,
       );
       expect(composerContains(pane, "resume-helper")).toBe(true);

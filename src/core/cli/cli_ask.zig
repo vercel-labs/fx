@@ -14,6 +14,7 @@ const process_supervisor = @import("../background/process_supervisor.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const devbox_executor = @import("../execution/devbox_executor.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
+const openai_transport = @import("../gateway/openai_transport.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
@@ -219,6 +220,7 @@ pub const Config = struct {
     default_agent_step_limit: usize,
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
+    gateway_wire_kind: openai_transport.WireKind = .gateway,
     gateway_models_path: []const u8,
     gateway_provider: gateway_provider.Provider,
     background_process_provider: background_process_provider.Provider =
@@ -926,6 +928,7 @@ const AskContext = struct {
             .worker_model = self.model,
             .gateway_retry_count = self.cfg.gateway_retry_count,
             .gateway_chat_url = self.cfg.gateway_chat_url,
+            .gateway_wire_kind = self.cfg.gateway_wire_kind,
             .usage = &self.session.usage,
             .usage_allocator = self.alloc,
         });
@@ -947,6 +950,7 @@ const AskContext = struct {
             .model = self.model,
             .gateway_retry_count = self.cfg.gateway_retry_count,
             .gateway_chat_url = self.cfg.gateway_chat_url,
+            .gateway_wire_kind = self.cfg.gateway_wire_kind,
             .gateway_models_path = self.cfg.gateway_models_path,
             .agent_step_limit = self.agent_step_limit,
             .fast_mode = self.fast_mode,
@@ -1398,9 +1402,13 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         return missingCredentialResult(alloc, options);
     }
 
+    var runtime_cfg = cfg;
+    runtime_cfg.gateway_chat_url = startup.gatewayChatUrl(cfg.gateway_chat_url);
+    runtime_cfg.gateway_wire_kind = startup.gatewayWireKind();
+
     var owned_resumed_model: ?[]u8 = null;
     defer if (owned_resumed_model) |model| alloc.free(model);
-    var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
+    var ctx = AskContext.init(alloc, runtime_cfg, options.deps, startup.workspace_root);
     defer ctx.deinit();
     if (options.save_session) {
         _ = try ctx.session.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
@@ -1628,8 +1636,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
         .skills_prompt_section = skills_section,
         .explicit_skills_prompt_section = explicit_skills.text,
-        .gateway_retry_count = cfg.gateway_retry_count,
-        .gateway_chat_url = cfg.gateway_chat_url,
+        .gateway_retry_count = ctx.cfg.gateway_retry_count,
+        .gateway_chat_url = ctx.cfg.gateway_chat_url,
+        .gateway_wire_kind = ctx.cfg.gateway_wire_kind,
         .gateway_tools_json = tool_projection.tools_json,
         .custom_tool_guidance = tool_projection.custom_guidance,
         .agent_step_limit = startup.agent_step_limit,
