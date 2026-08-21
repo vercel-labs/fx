@@ -1,6 +1,6 @@
 # Plan: Generic OpenAI-Compatible Provider (`custom`)
 
-Status: implementation in progress. Configuration, credentials, buffered chat completions, and basic tool-call response parsing are implemented. Streaming, remote model catalogs, and capability UI polish remain planned.
+Status: implementation in progress. Configuration, credentials, incremental SSE chat completions, tool-call response parsing, remote model catalogs, and deterministic E2E coverage are implemented. Real-provider validation, final review, and CI remain.
 
 This plan adds a third provider to fx alongside Gateway (Vercel AI Gateway) and
 Codex (ChatGPT subscription). The new provider is called `custom` and speaks any

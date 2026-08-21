@@ -81,6 +81,7 @@
     {"name": "e2e-cli", "argv": ["bun", "test", "--max-concurrency", "1", "./cli.test.ts"], "test_file": "cli.test.ts", "allow_keychain": true},
     {"name": "e2e-ask-presentation", "argv": ["bun", "test", "--max-concurrency", "1", "./ask-presentation.test.ts"], "test_file": "ask-presentation.test.ts"},
     {"name": "e2e-config-persistence", "argv": ["bun", "test", "--max-concurrency", "1", "./config-persistence.test.ts"], "test_file": "config-persistence.test.ts"},
+    {"name": "e2e-custom-provider", "argv": ["bun", "test", "--max-concurrency", "1", "./custom-provider.test.ts"], "test_file": "custom-provider.test.ts"},
     {"name": "e2e-prompt-history", "argv": ["bun", "test", "--max-concurrency", "1", "./prompt-history.test.ts"], "test_file": "prompt-history.test.ts"},
     {"name": "e2e-auth-refresh", "argv": ["bun", "test", "--max-concurrency", "1", "./auth-refresh.test.ts"], "test_file": "auth-refresh.test.ts"},
     {"name": "e2e-file-tool-paths", "argv": ["bun", "test", "--max-concurrency", "1", "./file-tool-paths.test.ts"], "test_file": "file-tool-paths.test.ts"},

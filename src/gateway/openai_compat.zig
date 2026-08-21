@@ -146,26 +146,46 @@ fn streamCompletion(
     const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});
     defer alloc.free(auth_header);
 
-    var body: std.Io.Writer.Allocating = .init(alloc);
-    defer body.deinit();
-    const response = client.fetch(.{
-        .location = .{ .url = request.chat_url },
-        .method = .POST,
-        .payload = request.payload,
+    const uri = try std.Uri.parse(request.chat_url);
+    var http_request = try client.request(.POST, uri, .{
+        .keep_alive = false,
         .headers = .{
             .content_type = .{ .override = "application/json" },
             .authorization = .{ .override = auth_header },
             .accept_encoding = .omit,
             .user_agent = .{ .override = "fx" },
         },
-        .response_writer = &body.writer,
-    }) catch |err| {
-        return err;
-    };
+    });
+    defer http_request.deinit();
+    try http_request.sendBodyComplete(@constCast(request.payload));
+    var response = try http_request.receiveHead(&.{});
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+    var saw_sse = false;
+    if (response.head.status == .ok) {
+        var transfer_buffer: [8192]u8 = undefined;
+        var response_reader = response.reader(&transfer_buffer);
+        while (try response_reader.takeDelimiter('\n')) |line| {
+            try body.writer.writeAll(line);
+            try body.writer.writeByte('\n');
+            const trimmed = std.mem.trimEnd(u8, line, "\r");
+            if (std.mem.startsWith(u8, trimmed, "data:")) {
+                const data = std.mem.trimStart(u8, trimmed[5..], " ");
+                if (!std.mem.eql(u8, data, "[DONE]")) {
+                    saw_sse = true;
+                    try emitSseDelta(alloc, data, request);
+                }
+            }
+        }
+    } else {
+        var error_buffer: [4096]u8 = undefined;
+        const error_reader = response.reader(&error_buffer);
+        _ = try error_reader.streamRemaining(&body.writer);
+    }
 
-    if (response.status != .ok) {
+    if (response.head.status != .ok) {
         return .{
-            .status = response.status,
+            .status = response.head.status,
             .err_body = try body.toOwnedSlice(),
             .ownership = .owned,
         };
@@ -173,37 +193,75 @@ fn streamCompletion(
 
     const bytes = try body.toOwnedSlice();
     defer alloc.free(bytes);
-    var completion = if (std.mem.startsWith(u8, std.mem.trimStart(u8, bytes, " \t\r\n"), "data:"))
+    var completion = if (saw_sse)
         try parseSseCompletion(alloc, bytes)
     else
         try parseCompletion(alloc, bytes);
     errdefer deinitCompletion(alloc, &completion);
 
-    if (completion.content) |content| {
-        request.on_content_chunk(request.callback_ctx, content);
-    }
-    if (request.on_reasoning_chunk) |callback| {
-        if (completion.provider_failure_detail) |reasoning| {
-            callback(request.callback_ctx, reasoning);
-            alloc.free(@constCast(reasoning));
-            completion.provider_failure_detail = null;
-        } else if (!std.mem.startsWith(u8, std.mem.trimStart(u8, bytes, " \t\r\n"), "data:")) {
-            if (try parseReasoningContent(alloc, bytes)) |reasoning| {
+    if (!saw_sse) {
+        if (completion.content) |content| {
+            request.on_content_chunk(request.callback_ctx, content);
+        }
+        if (request.on_reasoning_chunk) |callback| {
+            if (completion.provider_failure_detail) |reasoning| {
+                callback(request.callback_ctx, reasoning);
+                alloc.free(@constCast(reasoning));
+                completion.provider_failure_detail = null;
+            } else if (try parseReasoningContent(alloc, bytes)) |reasoning| {
                 defer alloc.free(reasoning);
                 callback(request.callback_ctx, reasoning);
             }
         }
-    }
-    for (completion.tool_calls) |call| {
-        if (request.on_tool_start) |callback| callback(request.callback_ctx, call.id, call.name, null);
-        if (request.on_tool_input_chunk) |callback| callback(request.callback_ctx, call.arguments_json);
+        for (completion.tool_calls) |call| {
+            if (request.on_tool_start) |callback| callback(request.callback_ctx, call.id, call.name, null);
+            if (request.on_tool_input_chunk) |callback| callback(request.callback_ctx, call.arguments_json);
+        }
     }
 
     return .{
-        .status = response.status,
+        .status = response.head.status,
         .completion = completion,
         .ownership = .owned,
     };
+}
+
+fn emitSseDelta(
+    alloc: Allocator,
+    data: []const u8,
+    request: stream_provider.Request,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.MalformedResponse;
+    const choices = parsed.value.object.get("choices") orelse return;
+    if (choices != .array or choices.array.items.len == 0) return;
+    const choice = choices.array.items[0];
+    if (choice != .object) return;
+    const delta = choice.object.get("delta") orelse return;
+    if (delta != .object) return;
+    if (delta.object.get("content")) |content| {
+        if (content == .string) request.on_content_chunk(request.callback_ctx, content.string);
+    }
+    if (delta.object.get("reasoning_content") orelse delta.object.get("reasoning")) |reasoning| {
+        if (reasoning == .string) if (request.on_reasoning_chunk) |callback| callback(request.callback_ctx, reasoning.string);
+    }
+    if (delta.object.get("tool_calls")) |tool_calls| {
+        if (tool_calls != .array) return error.MalformedResponse;
+        for (tool_calls.array.items) |item| {
+            if (item != .object) continue;
+            const function = item.object.get("function") orelse continue;
+            if (function != .object) continue;
+            const id = item.object.get("id");
+            const name = function.object.get("name");
+            if (id != null and name != null and id.? == .string and name.? == .string) {
+                if (request.on_tool_start) |callback| callback(request.callback_ctx, id.?.string, name.?.string, null);
+            }
+            if (function.object.get("arguments")) |arguments| {
+                if (arguments == .string) if (request.on_tool_input_chunk) |callback| callback(request.callback_ctx, arguments.string);
+            }
+        }
+    }
 }
 
 const SseToolAccumulator = struct {
