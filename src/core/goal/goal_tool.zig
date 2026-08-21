@@ -23,30 +23,10 @@ pub const GoalToolContext = struct {
     max_goal_token_budget: ?i64 = null,
 };
 
-pub const GoalToolKind = enum { get, create, update };
-
-pub const GoalToolError = error{
-    NoGoal,
-    UnfinishedGoal,
-    InvalidStatus,
-    ObjectiveEmpty,
-    ObjectiveTooLong,
-    BudgetNotPositive,
-    BudgetExceedsMax,
-    OutOfMemory,
-};
-
-/// Result returned to the model by the goal tools.
-pub const GoalToolResponse = struct {
-    goal: ?goal_store.Goal = null,
-    remaining_tokens: ?i64 = null,
-    completion_budget_report: ?[]const u8 = null,
-};
-
 /// Reads the current goal (get_goal tool).
 pub fn handleGet(ctx: *const GoalToolContext, alloc: Allocator) ![]u8 {
     const goal = ctx.goal orelse return jsonNullGoal(alloc);
-    return jsonResponse(alloc, goal, null, .omit);
+    return jsonResponse(alloc, goal, .omit);
 }
 
 /// Creates a new goal (create_goal tool). Fails if an unfinished goal exists.
@@ -65,7 +45,7 @@ pub fn handleCreate(
     }, ctx.now_ms, rand_u64) catch |err| return errorJson(alloc, err);
     var o = outcome;
     defer o.deinit(alloc);
-    return jsonResponse(alloc, o.goal, null, .omit);
+    return jsonResponse(alloc, o.goal, .omit);
 }
 
 /// Marks the existing goal complete or blocked (update_goal tool).
@@ -83,12 +63,12 @@ pub fn handleUpdate(
     var o = outcome;
     defer o.deinit(alloc);
     const report: ReportMode = if (status == .complete) .include else .omit;
-    return jsonResponse(alloc, o.goal, null, report);
+    return jsonResponse(alloc, o.goal, report);
 }
 
 const ReportMode = enum { include, omit };
 
-fn jsonResponse(alloc: Allocator, goal: goal_store.Goal, _: ?*const u8, report: ReportMode) ![]u8 {
+fn jsonResponse(alloc: Allocator, goal: goal_store.Goal, report: ReportMode) ![]u8 {
     const goal_json = try goal_store.toJson(alloc, goal);
     defer alloc.free(goal_json);
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -116,7 +96,7 @@ fn jsonNullGoal(alloc: Allocator) ![]u8 {
     return alloc.dupe(u8, s);
 }
 
-fn errorJson(alloc: Allocator, err: GoalToolError) ![]u8 {
+fn errorJson(alloc: Allocator, err: goal_service.ServiceError) ![]u8 {
     const msg = switch (err) {
         error.NoGoal => "no goal exists for this session; create one with create_goal first",
         error.UnfinishedGoal => "cannot create a new goal because this session has an unfinished goal; complete the existing goal first with update_goal",
@@ -129,15 +109,9 @@ fn errorJson(alloc: Allocator, err: GoalToolError) ![]u8 {
     };
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try out.writer.writeAll("{\"error\":\"");
-    for (msg) |c| {
-        switch (c) {
-            '"' => try out.writer.writeAll("\\\""),
-            '\\' => try out.writer.writeAll("\\\\"),
-            else => try out.writer.writeByte(c),
-        }
-    }
-    try out.writer.writeAll("\"}");
+    try out.writer.writeAll("{\"error\":");
+    try std.json.Stringify.value(msg, .{}, &out.writer);
+    try out.writer.writeAll("}");
     return try out.toOwnedSlice();
 }
 
@@ -163,8 +137,8 @@ test "handleGet returns goal json when present" {
     const ctx: GoalToolContext = .{ .goal = goal };
     const out = try handleGet(&ctx, alloc);
     defer alloc.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"goal_id\":\"g1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"remaining_tokens\":800") != null);
+    try std.testing.expect(std.mem.find(u8, out, "\"goal_id\":\"g1\"") != null);
+    try std.testing.expect(std.mem.find(u8, out, "\"remaining_tokens\":800") != null);
 }
 
 test "handleCreate returns error json for empty objective" {
@@ -172,7 +146,7 @@ test "handleCreate returns error json for empty objective" {
     const ctx: GoalToolContext = .{};
     const out = try handleCreate(&ctx, alloc, "  ", null, 0x1);
     defer alloc.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "objective must not be empty") != null);
+    try std.testing.expect(std.mem.find(u8, out, "objective must not be empty") != null);
 }
 
 test "handleCreate returns goal json on success" {
@@ -180,8 +154,8 @@ test "handleCreate returns goal json on success" {
     const ctx: GoalToolContext = .{ .now_ms = 10 };
     const out = try handleCreate(&ctx, alloc, "ship the release", 500, 0x1);
     defer alloc.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "ship the release") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"status\":\"active\"") != null);
+    try std.testing.expect(std.mem.find(u8, out, "ship the release") != null);
+    try std.testing.expect(std.mem.find(u8, out, "\"status\":\"active\"") != null);
 }
 
 test "handleUpdate returns error json when no goal" {
@@ -189,7 +163,7 @@ test "handleUpdate returns error json when no goal" {
     const ctx: GoalToolContext = .{};
     const out = try handleUpdate(&ctx, alloc, .complete);
     defer alloc.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "no goal exists") != null);
+    try std.testing.expect(std.mem.find(u8, out, "no goal exists") != null);
 }
 
 test "handleUpdate returns error for invalid status" {
@@ -204,7 +178,7 @@ test "handleUpdate returns error for invalid status" {
     const ctx: GoalToolContext = .{ .goal = goal };
     const out = try handleUpdate(&ctx, alloc, .active);
     defer alloc.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "complete or blocked") != null);
+    try std.testing.expect(std.mem.find(u8, out, "complete or blocked") != null);
 }
 
 test "handleUpdate marks complete with budget report" {
@@ -221,6 +195,6 @@ test "handleUpdate marks complete with budget report" {
     const ctx: GoalToolContext = .{ .goal = goal, .now_ms = 5 };
     const out = try handleUpdate(&ctx, alloc, .complete);
     defer alloc.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"status\":\"complete\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "completion_budget_report") != null);
+    try std.testing.expect(std.mem.find(u8, out, "\"status\":\"complete\"") != null);
+    try std.testing.expect(std.mem.find(u8, out, "completion_budget_report") != null);
 }

@@ -58,42 +58,23 @@ pub fn newGoalId(alloc: Allocator, now_ms: i64, rand_u64: u64) ![]u8 {
 pub fn toJson(alloc: Allocator, goal: Goal) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try out.writer.writeAll("{");
-    try writeJsonStr(&out.writer, "goal_id");
-    try out.writer.writeAll(":");
-    try writeJsonStr(&out.writer, goal.goal_id);
-    try out.writer.writeAll(",");
-    try writeJsonStr(&out.writer, "objective");
-    try out.writer.writeAll(":");
-    try writeJsonStr(&out.writer, goal.objective);
-    try out.writer.print(",\"status\":\"{s}\",", .{goal.status.asStr()});
+    try out.writer.writeAll("{\"goal_id\":");
+    try std.json.Stringify.value(goal.goal_id, .{}, &out.writer);
+    try out.writer.writeAll(",\"objective\":");
+    try std.json.Stringify.value(goal.objective, .{}, &out.writer);
+    try out.writer.writeAll(",\"status\":");
+    try std.json.Stringify.value(goal.status.asStr(), .{}, &out.writer);
     if (goal.token_budget) |budget| {
-        try out.writer.print("\"token_budget\":{d},", .{budget});
+        try out.writer.print(",\"token_budget\":{d}", .{budget});
     } else {
-        try out.writer.writeAll("\"token_budget\":null,");
+        try out.writer.writeAll(",\"token_budget\":null");
     }
-    try out.writer.print("\"tokens_used\":{d},", .{goal.tokens_used});
-    try out.writer.print("\"time_used_seconds\":{d},", .{goal.time_used_seconds});
-    try out.writer.print("\"created_at_ms\":{d},", .{goal.created_at_ms});
-    try out.writer.print("\"updated_at_ms\":{d}", .{goal.updated_at_ms});
+    try out.writer.print(",\"tokens_used\":{d}", .{goal.tokens_used});
+    try out.writer.print(",\"time_used_seconds\":{d}", .{goal.time_used_seconds});
+    try out.writer.print(",\"created_at_ms\":{d}", .{goal.created_at_ms});
+    try out.writer.print(",\"updated_at_ms\":{d}", .{goal.updated_at_ms});
     try out.writer.writeAll("}");
     return try out.toOwnedSlice();
-}
-
-fn writeJsonStr(writer: *std.Io.Writer, s: []const u8) !void {
-    try writer.writeAll("\"");
-    for (s) |c| {
-        switch (c) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            0...8, 0x0b, 0x0c, 0x0e...0x1f => try writer.print("\\u{x:0>4}", .{c}),
-            else => try writer.writeByte(c),
-        }
-    }
-    try writer.writeAll("\"");
 }
 
 /// Parses a goal from a JSON value object. Caller owns the returned goal.

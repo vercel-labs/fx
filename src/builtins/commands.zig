@@ -571,7 +571,7 @@ test "goal slash command appears in completion and registry" {
     try std.testing.expectEqualStrings("/goal", completion);
 
     const description = nthSlashCompletionDescription("/go", 0) orelse return error.TestExpectedEqual;
-    try std.testing.expect(std.mem.indexOf(u8, description, "persistent goal") != null);
+    try std.testing.expect(std.mem.find(u8, description, "persistent goal") != null);
 }
 
 test "built-in slash registry resolves primary commands and aliases" {

@@ -36,11 +36,6 @@ pub const SetOutcome = struct {
     }
 };
 
-/// Reads the current goal, if any.
-pub fn getGoal(goal: ?goal_store.Goal) ?goal_store.Goal {
-    return goal;
-}
-
 /// Creates or updates the session goal according to `request`.
 ///
 /// - `objective` set: create a new goal when none exists, or replace when the
@@ -71,12 +66,10 @@ pub fn set(
         if (trimmed_objective != null) break :blk request.max_goal_token_budget;
         break :blk null;
     };
-    if (effective_budget) |b| {
-        if (b <= 0) return error.BudgetNotPositive;
-        if (request.max_goal_token_budget) |max| {
-            if (b > max) return error.BudgetExceedsMax;
-        }
-    }
+    goal_types.validateGoalBudget(effective_budget, request.max_goal_token_budget) catch |err| switch (err) {
+        error.BudgetNotPositive => return error.BudgetNotPositive,
+        error.BudgetExceedsMax => return error.BudgetExceedsMax,
+    };
 
     if (trimmed_objective) |obj| {
         if (existing) |existing_goal| {
@@ -120,15 +113,9 @@ pub fn set(
     return .{ .goal = updated, .previous_goal = previous };
 }
 
-/// Returns true if the goal was cleared.
-pub fn clear(alloc: Allocator, goal: ?goal_store.Goal) ServiceError!bool {
-    _ = alloc;
-    if (goal) |g| {
-        // Caller frees the goal; this only signals deletion.
-        _ = g;
-        return true;
-    }
-    return false;
+/// Returns true if a goal existed (the caller frees it).
+pub fn clear(goal: ?goal_store.Goal) bool {
+    return goal != null;
 }
 
 test "set creates a new goal when none exists" {
@@ -239,12 +226,17 @@ test "set applies max budget when objective provided without explicit budget" {
 }
 
 test "clear returns false when no goal" {
-    const alloc = std.testing.allocator;
-    try std.testing.expect(!(try clear(alloc, null)));
+    try std.testing.expect(!clear(null));
 }
 
 test "clear returns true when goal exists" {
     const alloc = std.testing.allocator;
-    try std.testing.expect(try clear(alloc, null) == false);
-    // Actual clear with a goal requires the caller to free it.
+    var goal: goal_store.Goal = .{
+        .goal_id = try alloc.dupe(u8, "g1"),
+        .objective = try alloc.dupe(u8, "ship it"),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+    };
+    defer goal.deinit(alloc);
+    try std.testing.expect(clear(goal));
 }

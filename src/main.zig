@@ -151,6 +151,7 @@ const transcript_runtime = @import("ui/transcript/runtime.zig");
 const resume_projection = @import("ui/transcript/resume_projection.zig");
 const assistant_pacer = @import("ui/assistant/pacer.zig");
 const approval_prompt = @import("core/permissions/approval_prompt.zig");
+const goal_module = @import("core/goal/goal.zig");
 
 const Allocator = std.mem.Allocator;
 const Layout = types.Layout;
@@ -559,6 +560,7 @@ const App = struct {
     fast_mode: bool = false,
     auto_upgrade_enabled: bool = true,
     effort: ReasoningEffort = .auto,
+    goal: ?goal_module.goal_store.Goal = null,
     diff_entries: std.ArrayList(@import("core/output/diff.zig").DiffEntry) = .empty,
     next_diff_id: u32 = 1,
 
@@ -858,6 +860,7 @@ const App = struct {
         self.question_prompt.deinit(self.alloc);
 
         self.change_tracker.deinit(std.heap.c_allocator);
+        if (self.goal) |*goal| goal.deinit(self.alloc);
         for (self.diff_entries.items) |*entry| entry.deinit(std.heap.c_allocator);
         self.diff_entries.deinit(std.heap.c_allocator);
         self.mcp.deinit(self.alloc);
