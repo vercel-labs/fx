@@ -573,6 +573,17 @@ fn parseStore(alloc: Allocator, bytes: []const u8) !Store {
     return store;
 }
 
+/// An authorization server may issue a grant with no expiry, in which case the
+/// stored record carries a null `expires_at_ms`. Treat that the way
+/// `mcp_auth.tokenExpiresAt` treats a missing `expires_in`: the grant does not
+/// expire on its own and is replaced only when the server rejects it.
+fn parseExpiresAtMs(object: std.json.ObjectMap) !i64 {
+    const value = object.get("expires_at_ms") orelse return std.math.maxInt(i64);
+    if (value == .null) return std.math.maxInt(i64);
+    if (value != .integer) return error.InvalidMcpCredentialStore;
+    return value.integer;
+}
+
 fn parseCredentials(
     alloc: Allocator,
     object: std.json.ObjectMap,
@@ -615,9 +626,7 @@ fn parseCredentials(
         "revocation_endpoint",
     );
     errdefer if (revocation_endpoint) |value| alloc.free(value);
-    const expires_at = object.get("expires_at_ms") orelse
-        return error.InvalidMcpCredentialStore;
-    if (expires_at != .integer) return error.InvalidMcpCredentialStore;
+    const expires_at_ms = try parseExpiresAtMs(object);
     return .{
         .endpoint = endpoint,
         .resource = resource,
@@ -629,7 +638,7 @@ fn parseCredentials(
         .scope = scope,
         .token_type = token_type,
         .token_endpoint_auth_method = token_endpoint_auth_method,
-        .expires_at_ms = expires_at.integer,
+        .expires_at_ms = expires_at_ms,
         .authorization_endpoint = authorization_endpoint,
         .token_endpoint = token_endpoint,
         .revocation_endpoint = revocation_endpoint,
@@ -841,6 +850,42 @@ test "credential store rejects missing identity fields" {
     try std.testing.expectError(
         error.InvalidMcpCredentialStore,
         parseStore(std.testing.allocator, "{\"version\":1,\"credentials\":[{}]}"),
+    );
+}
+
+test "credential store keeps a null expiry as a grant that does not expire" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"version":1,"credentials":[
+        \\{"server_identity":"one","endpoint":"https://mcp.example/a","resource":"https://mcp.example/","issuer":"https://issuer.example","client_id":"client","client_secret":null,"access_token":"secret-one","refresh_token":"refresh-one","scope":"read","token_type":"Bearer","token_endpoint_auth_method":"none","expires_at_ms":null,"authorization_endpoint":"https://issuer.example/authorize","token_endpoint":"https://issuer.example/token","revocation_endpoint":null},
+        \\{"server_identity":"two","endpoint":"https://mcp.example/a","resource":"https://mcp.example/","issuer":"https://issuer.example","client_id":"client","client_secret":null,"access_token":"secret-two","refresh_token":"refresh-two","scope":"read","token_type":"Bearer","token_endpoint_auth_method":"none","expires_at_ms":456,"authorization_endpoint":"https://issuer.example/authorize","token_endpoint":"https://issuer.example/token","revocation_endpoint":null}
+        \\]}
+    ;
+    var store = try parseStore(alloc, json);
+    defer store.deinit(alloc);
+
+    // The null record loads, and does not take the rest of the store with it.
+    try std.testing.expectEqual(@as(usize, 2), store.credentials.items.len);
+    try std.testing.expectEqualStrings(
+        "two",
+        store.credentials.items[1].server_identity,
+    );
+
+    const unexpiring = store.credentials.items[0].credentials;
+    try std.testing.expectEqual(std.math.maxInt(i64), unexpiring.expires_at_ms);
+    // Year 2100, far past any real token lifetime.
+    try std.testing.expect(!unexpiring.needsRefresh(4_102_444_800_000));
+}
+
+test "credential store still rejects a non-numeric expiry" {
+    const json =
+        \\{"version":1,"credentials":[
+        \\{"server_identity":"one","endpoint":"https://mcp.example/a","resource":"https://mcp.example/","issuer":"https://issuer.example","client_id":"client","client_secret":null,"access_token":"secret-one","refresh_token":"refresh-one","scope":"read","token_type":"Bearer","token_endpoint_auth_method":"none","expires_at_ms":"soon","authorization_endpoint":"https://issuer.example/authorize","token_endpoint":"https://issuer.example/token","revocation_endpoint":null}
+        \\]}
+    ;
+    try std.testing.expectError(
+        error.InvalidMcpCredentialStore,
+        parseStore(std.testing.allocator, json),
     );
 }
 
