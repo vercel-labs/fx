@@ -2,6 +2,8 @@ const std = @import("std");
 const io_mod = @import("../core/shared/io.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const types = @import("../core/shared/types.zig");
+const credentials = @import("../core/auth/credentials.zig");
+const model_catalog = @import("../core/gateway/model_catalog.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -9,6 +11,63 @@ pub const agent_stream_provider = stream_provider.Provider{
     .build_fn = buildRequest,
     .stream_fn = streamCompletion,
 };
+
+pub fn fetchCatalog(
+    alloc: Allocator,
+    chat_url: []const u8,
+    access: credentials.CatalogAccess,
+) !model_catalog.ProviderResult {
+    const models_url = try modelsUrl(alloc, chat_url);
+    defer alloc.free(models_url);
+    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+    defer client.deinit();
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+    var headers: [1]std.http.Header = undefined;
+    var header_count: usize = 0;
+    var auth_header: ?[]u8 = null;
+    defer if (auth_header) |value| alloc.free(value);
+    if (access.authorizationCredential()) |token| {
+        auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
+        headers[header_count] = .{ .name = "Authorization", .value = auth_header.? };
+        header_count += 1;
+    }
+    const response = client.fetch(.{
+        .location = .{ .url = models_url },
+        .method = .GET,
+        .headers = .{ .accept_encoding = .omit },
+        .extra_headers = headers[0..header_count],
+        .response_writer = &body.writer,
+    }) catch |err| return err;
+    if (response.status != .ok) return .{ .failure = model_catalog.failureForHttpStatus(response.status) };
+    const bytes = try body.toOwnedSlice();
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .failure = .{ .category = .malformed_response } };
+    const data = parsed.value.object.get("data") orelse return .{ .failure = .{ .category = .malformed_response } };
+    if (data != .array) return .{ .failure = .{ .category = .malformed_response } };
+    var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+    errdefer model_catalog.freeModelCatalog(alloc, &entries);
+    for (data.array.items) |item| {
+        if (item != .object) continue;
+        const id = item.object.get("id") orelse continue;
+        if (id != .string or id.string.len == 0) continue;
+        try entries.append(alloc, .{
+            .id = try alloc.dupe(u8, id.string),
+            .model_type = try alloc.dupe(u8, "custom"),
+        });
+    }
+    return .{ .catalog = entries };
+}
+
+fn modelsUrl(alloc: Allocator, chat_url: []const u8) ![]u8 {
+    const marker = "/chat/completions";
+    if (std.mem.find(u8, chat_url, marker)) |index| {
+        return try std.fmt.allocPrint(alloc, "{s}/models", .{chat_url[0..index]});
+    }
+    return try std.fmt.allocPrint(alloc, "{s}/models", .{std.mem.trimEnd(u8, chat_url, "/")});
+}
 
 pub fn buildRequest(
     _: ?*anyopaque,
@@ -33,7 +92,7 @@ pub fn buildRequest(
     }
     try out.writer.writeAll(",\"tool_choice\":");
     try writeJsonString(&out.writer, request.tool_choice.label());
-    try out.writer.writeAll(",\"stream\":false}");
+    try out.writer.writeAll(",\"stream\":true}");
     return out.toOwnedSlice();
 }
 
@@ -114,16 +173,25 @@ fn streamCompletion(
 
     const bytes = try body.toOwnedSlice();
     defer alloc.free(bytes);
-    var completion = try parseCompletion(alloc, bytes);
+    var completion = if (std.mem.startsWith(u8, std.mem.trimStart(u8, bytes, " \t\r\n"), "data:"))
+        try parseSseCompletion(alloc, bytes)
+    else
+        try parseCompletion(alloc, bytes);
     errdefer deinitCompletion(alloc, &completion);
 
     if (completion.content) |content| {
         request.on_content_chunk(request.callback_ctx, content);
     }
     if (request.on_reasoning_chunk) |callback| {
-        if (try parseReasoningContent(alloc, bytes)) |reasoning| {
-            defer alloc.free(reasoning);
+        if (completion.provider_failure_detail) |reasoning| {
             callback(request.callback_ctx, reasoning);
+            alloc.free(@constCast(reasoning));
+            completion.provider_failure_detail = null;
+        } else if (!std.mem.startsWith(u8, std.mem.trimStart(u8, bytes, " \t\r\n"), "data:")) {
+            if (try parseReasoningContent(alloc, bytes)) |reasoning| {
+                defer alloc.free(reasoning);
+                callback(request.callback_ctx, reasoning);
+            }
         }
     }
     for (completion.tool_calls) |call| {
@@ -135,6 +203,126 @@ fn streamCompletion(
         .status = response.status,
         .completion = completion,
         .ownership = .owned,
+    };
+}
+
+const SseToolAccumulator = struct {
+    id: std.ArrayList(u8) = .empty,
+    name: std.ArrayList(u8) = .empty,
+    arguments: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        self.id.deinit(alloc);
+        self.name.deinit(alloc);
+        self.arguments.deinit(alloc);
+    }
+};
+
+fn parseSseCompletion(alloc: Allocator, bytes: []const u8) !types.GatewayCompletion {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var content: std.ArrayList(u8) = .empty;
+    var reasoning: std.ArrayList(u8) = .empty;
+    var tools: std.ArrayList(SseToolAccumulator) = .empty;
+    defer content.deinit(alloc);
+    defer reasoning.deinit(alloc);
+    defer {
+        for (tools.items) |*tool| tool.deinit(alloc);
+        tools.deinit(alloc);
+    }
+    var finish_reason: ?types.ProviderFinishReason = null;
+    var input_tokens: ?u64 = null;
+    var output_tokens: ?u64 = null;
+    var generation_id: ?[]const u8 = null;
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trimEnd(u8, line, "\r");
+        if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
+        const data = std.mem.trimStart(u8, trimmed[5..], " ");
+        if (std.mem.eql(u8, data, "[DONE]")) continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, arena, data, .{}) catch return error.MalformedResponse;
+        if (parsed.value != .object) continue;
+        const root = parsed.value.object;
+        if (root.get("id")) |id| {
+            if (id == .string) generation_id = id.string;
+        }
+        if (root.get("usage")) |usage| if (usage == .object) {
+            if (usage.object.get("prompt_tokens")) |value| input_tokens = jsonU64(value);
+            if (usage.object.get("completion_tokens")) |value| output_tokens = jsonU64(value);
+        };
+        const choices = root.get("choices") orelse continue;
+        if (choices != .array or choices.array.items.len == 0) continue;
+        const choice = choices.array.items[0];
+        if (choice != .object) continue;
+        if (choice.object.get("finish_reason")) |finish| {
+            if (finish == .string and !std.mem.eql(u8, finish.string, "null")) finish_reason = parseFinishReason(finish.string);
+        }
+        const delta = choice.object.get("delta") orelse continue;
+        if (delta != .object) continue;
+        if (delta.object.get("content")) |value| {
+            if (value == .string) try content.appendSlice(alloc, value.string);
+        }
+        if (delta.object.get("reasoning_content") orelse delta.object.get("reasoning")) |value| {
+            if (value == .string) try reasoning.appendSlice(alloc, value.string);
+        }
+        if (delta.object.get("tool_calls")) |tool_calls| {
+            if (tool_calls != .array) return error.MalformedResponse;
+            for (tool_calls.array.items) |item| {
+                if (item != .object) return error.MalformedResponse;
+                const index_value = item.object.get("index") orelse return error.MalformedResponse;
+                const index = jsonUsize(index_value) orelse return error.MalformedResponse;
+                while (tools.items.len <= index) try tools.append(alloc, .{});
+                const tool = &tools.items[index];
+                if (item.object.get("id")) |id| {
+                    if (id == .string) try tool.id.appendSlice(alloc, id.string);
+                }
+                const function = item.object.get("function") orelse continue;
+                if (function != .object) continue;
+                if (function.object.get("name")) |name| {
+                    if (name == .string) try tool.name.appendSlice(alloc, name.string);
+                }
+                if (function.object.get("arguments")) |arguments| {
+                    if (arguments == .string) try tool.arguments.appendSlice(alloc, arguments.string);
+                }
+            }
+        }
+    }
+
+    var completion = types.GatewayCompletion{
+        .content = if (content.items.len > 0) try alloc.dupe(u8, content.items) else null,
+        .generation_id = if (generation_id) |id| try alloc.dupe(u8, id) else null,
+        .finish_reason = finish_reason,
+        .usage = .{ .input_tokens = input_tokens, .output_tokens = output_tokens },
+    };
+    errdefer deinitCompletion(alloc, &completion);
+    if (reasoning.items.len > 0) completion.provider_failure_detail = try alloc.dupe(u8, reasoning.items);
+    var calls: std.ArrayList(types.ToolCall) = .empty;
+    errdefer {
+        for (calls.items) |call| {
+            alloc.free(@constCast(call.id));
+            alloc.free(@constCast(call.name));
+            alloc.free(@constCast(call.arguments_json));
+        }
+        calls.deinit(alloc);
+    }
+    for (tools.items) |tool| {
+        if (tool.name.items.len == 0) continue;
+        try calls.append(alloc, .{
+            .id = try alloc.dupe(u8, tool.id.items),
+            .name = try alloc.dupe(u8, tool.name.items),
+            .arguments_json = try alloc.dupe(u8, tool.arguments.items),
+        });
+    }
+    completion.tool_calls = try calls.toOwnedSlice(alloc);
+    return completion;
+}
+
+fn jsonUsize(value: std.json.Value) ?usize {
+    return switch (value) {
+        .integer => |number| if (number >= 0) @intCast(number) else null,
+        else => null,
     };
 }
 
@@ -255,6 +443,17 @@ test "builds OpenAI-compatible messages and tools" {
     try std.testing.expect(std.mem.find(u8, body, "\"model\":\"deepseek-chat\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"tools\":[{\"type\":\"function\"}]") != null);
+}
+
+test "parses OpenAI SSE content and finish reason" {
+    const sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n" ++
+        "data: {\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3}}\n" ++
+        "data: [DONE]\n";
+    var completion = try parseSseCompletion(std.testing.allocator, sse);
+    defer deinitCompletion(std.testing.allocator, &completion);
+    try std.testing.expectEqualStrings("hi", completion.content.?);
+    try std.testing.expectEqual(types.ProviderFinishReason.stop, completion.finish_reason.?);
+    try std.testing.expectEqual(@as(u64, 2), completion.usage.input_tokens.?);
 }
 
 test "parses OpenAI tool calls and usage" {

@@ -450,6 +450,9 @@ const App = struct {
         provider: model_provider.ProviderId,
         access: credentials.CatalogAccess,
     ) !model_catalog.ProviderResult {
+        if (provider == .custom and self.custom_chat_url.len > 0) {
+            return openai_compat.fetchCatalog(self.alloc, self.custom_chat_url, access);
+        }
         return builtin_providers.modelCatalog(provider).fetch(self.alloc, .{
             .access = access,
             .endpoint = builtin_gateway.models_path,

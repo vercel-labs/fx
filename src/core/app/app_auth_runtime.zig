@@ -649,6 +649,17 @@ pub fn Runtime(comptime App: type) type {
             }
             try app.flushBeforeBlockingExternalWork();
 
+            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
+                debug_trace.logf("provider", "settings load failed err={s}", .{@errorName(err)});
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .@"error",
+                    .body = "Could not load the saved provider configuration. The current provider is unchanged.",
+                }, true);
+                return;
+            };
+            defer settings.deinit(app.alloc);
+
             const resolution = credentials.resolveForProvider(
                 app.alloc,
                 app.auth.oauthTransport(),
@@ -656,7 +667,7 @@ pub fn Runtime(comptime App: type) type {
                 .refresh_if_needed,
                 target,
                 null,
-                null,
+                if (target == .custom) settings.custom_api_key_env else null,
             ) catch |err| {
                 debug_trace.logf("provider", "credential preparation failed provider={t} err={s}", .{ target, @errorName(err) });
                 try app.writeDomainNotice(.{
@@ -727,16 +738,6 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
-            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
-                debug_trace.logf("provider", "settings load failed err={s}", .{@errorName(err)});
-                try app.writeDomainNotice(.{
-                    .topic = "provider",
-                    .tone = .@"error",
-                    .body = "Could not load the saved provider model. The current provider is unchanged.",
-                }, true);
-                return;
-            };
-            defer settings.deinit(app.alloc);
             const saved_model = switch (target) {
                 .gateway => settings.model,
                 .codex => settings.codex_model,
@@ -794,6 +795,7 @@ pub fn Runtime(comptime App: type) type {
                 var persistence = config_runtime.attemptUserPreferences(app.alloc, switch (target) {
                     .gateway => .{ .provider = .gateway, .model = provider_runtime.model(app) },
                     .codex => .{ .provider = .codex, .codex_model = provider_runtime.model(app) },
+                    .custom => .{ .provider = .custom, .custom_model = provider_runtime.model(app) },
                 });
                 defer persistence.deinit(app.alloc);
                 switch (persistence) {
