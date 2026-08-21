@@ -6,7 +6,6 @@ const pathing = @import("../../core/workspace/pathing.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const workspace_files = @import("../../core/workspace/workspace_files.zig");
-const sort_utils = @import("../../core/shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -139,7 +138,7 @@ fn callWithWorkspaceOptions(ctx: tool_dispatch.DispatchContext, erased: tool_dis
     var skipped_overlong: usize = 0;
     const is_scoped_search_root = root_relative.len > 0 and !std.mem.eql(u8, root_relative, ".");
     var discovery_options = workspace_options;
-    discovery_options.include_untracked = is_scoped_search_root;
+    discovery_options.include_untracked = true;
     discovery_options.force_fallback = discovery_options.force_fallback or is_scoped_search_root;
     discovery_options.include_hidden = discovery_options.include_hidden or shouldIncludeHidden(root_relative, input.pattern);
     discovery_options.sort_paths = true;
@@ -152,22 +151,10 @@ fn callWithWorkspaceOptions(ctx: tool_dispatch.DispatchContext, erased: tool_dis
             }
             return .{ .failure = try std.fmt.allocPrint(ctx.allocator, "Unable to discover glob candidates: {s} ({s})", .{ root.absolute, @errorName(err) }) };
         };
-        var candidate_files = discovered.files;
+        const candidate_files = discovered.files;
         candidate_incomplete = discovered.incomplete;
         candidate_cap = discovered.candidate_cap;
         skipped_overlong = discovered.skipped_overlong;
-        if (shouldMergeRootUntracked(root_relative, discovered, discovery_options)) {
-            const merged = mergeRootUntrackedCandidates(arena, root.absolute, ctx.ignored_list_entries, discovered) catch |err| {
-                if (err == error.OutOfMemory) return error.OutOfMemory;
-                if (tool_result_errors.isFilesystemAccessDenied(err)) {
-                    return .{ .failure = try tool_result_errors.filesystemAccessDeniedJson(ctx.allocator, "glob_files", root.absolute, err) };
-                }
-                return .{ .failure = try std.fmt.allocPrint(ctx.allocator, "Unable to discover glob candidates: {s} ({s})", .{ root.absolute, @errorName(err) }) };
-            };
-            candidate_files = merged.files;
-            candidate_incomplete = candidate_incomplete or merged.incomplete;
-            skipped_overlong += merged.skipped_overlong;
-        }
 
         for (candidate_files) |candidate| {
             if (!compiled_pattern.matchesPath(candidate)) continue;
@@ -337,87 +324,10 @@ fn shouldIncludeHidden(root_relative: []const u8, pattern: []const u8) bool {
     return workspace_files.pathContainsHiddenDirectoryComponent(root_relative) or patternContainsHiddenDirectoryComponent(pattern);
 }
 
-const MergedRootCandidates = struct {
-    files: []const []const u8,
-    incomplete: bool = false,
-    skipped_overlong: usize = 0,
-};
-
 fn discoverWorkspaceFiles(arena: Allocator, absolute_root: []const u8, ignored: []const []const u8, options: workspace_files.Options) !workspace_files.Result {
     var discover_options = options;
     discover_options.ignored_names = ignored;
     return workspace_files.discover(arena, absolute_root, discover_options);
-}
-
-fn shouldMergeRootUntracked(root_relative: []const u8, result: workspace_files.Result, options: workspace_files.Options) bool {
-    return result.source == .git and !options.include_untracked and !options.force_fallback and (root_relative.len == 0 or std.mem.eql(u8, root_relative, "."));
-}
-
-fn mergeRootUntrackedCandidates(
-    arena: Allocator,
-    absolute_root: []const u8,
-    ignored: []const []const u8,
-    discovered: workspace_files.Result,
-) !MergedRootCandidates {
-    var files: std.ArrayList([]const u8) = .empty;
-    errdefer files.deinit(arena);
-    try files.appendSlice(arena, discovered.files);
-
-    var seen = std.StringHashMap(void).init(arena);
-    defer seen.deinit();
-    for (discovered.files) |path| {
-        try seen.put(path, {});
-    }
-
-    var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), absolute_root, .{ .iterate = true }) catch {
-        return .{ .files = try files.toOwnedSlice(arena) };
-    };
-    defer dir.close(io_mod.getIo());
-
-    var incomplete = false;
-    var skipped_overlong: usize = 0;
-    var iter = dir.iterate();
-    while (try iter.next(io_mod.getIo())) |entry| {
-        switch (entry.kind) {
-            .file, .sym_link => {},
-            else => continue,
-        }
-        if (rootNameIgnored(ignored, entry.name)) continue;
-        if (seen.contains(entry.name)) continue;
-        if (entry.name.len > workspace_files.max_relative_path_bytes) {
-            skipped_overlong += 1;
-            continue;
-        }
-        if (files.items.len >= discovered.candidate_cap) {
-            incomplete = true;
-            break;
-        }
-        const owned = try arena.dupe(u8, entry.name);
-        try seen.put(owned, {});
-        try files.append(arena, owned);
-    }
-
-    sortCandidatePaths(files.items);
-    return .{
-        .files = try files.toOwnedSlice(arena),
-        .incomplete = incomplete,
-        .skipped_overlong = skipped_overlong,
-    };
-}
-
-fn rootNameIgnored(ignored: []const []const u8, name: []const u8) bool {
-    for (ignored) |entry| {
-        if (std.mem.eql(u8, name, entry)) return true;
-    }
-    return false;
-}
-
-fn sortCandidatePaths(paths: [][]const u8) void {
-    sort_utils.sort([]const u8, paths, {}, struct {
-        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.lessThan(u8, a, b);
-        }
-    }.lessThan);
 }
 
 fn patternContainsHiddenDirectoryComponent(pattern: []const u8) bool {
@@ -938,6 +848,54 @@ test "glob_files root git discovery includes untracked files" {
 
     try std.testing.expectEqual(.success, result.status);
     try std.testing.expectEqualStrings("[glob] 1 matches for untracked-*.txt\n - untracked-target.txt\n", result.body);
+}
+
+test "glob_files root git discovery includes nested untracked files" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+
+    try runGitForTest(alloc, workspace, &.{"init"});
+    const tracked = try writeTempFile(alloc, &tmp, "src/tracked.txt", "tracked\n");
+    defer alloc.free(tracked);
+    try runGitForTest(alloc, workspace, &.{ "add", "src/tracked.txt" });
+    const untracked = try writeTempFile(alloc, &tmp, "src/untracked-target.txt", "untracked\n");
+    defer alloc.free(untracked);
+
+    var result = try dispatchGlobFiles(alloc, workspace, "**/*.txt", ".");
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expectEqualStrings("[glob] 2 matches for **/*.txt\n - src/tracked.txt\n - src/untracked-target.txt\n", result.body);
+}
+
+test "glob_files root git discovery excludes ignored files at every depth" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+
+    try runGitForTest(alloc, workspace, &.{"init"});
+    const ignore_file = try writeTempFile(alloc, &tmp, ".gitignore", "*.log\n");
+    defer alloc.free(ignore_file);
+    const tracked = try writeTempFile(alloc, &tmp, "kept.txt", "kept\n");
+    defer alloc.free(tracked);
+    try runGitForTest(alloc, workspace, &.{ "add", "kept.txt" });
+    const ignored_root = try writeTempFile(alloc, &tmp, "root.log", "ignored\n");
+    defer alloc.free(ignored_root);
+    const ignored_nested = try writeTempFile(alloc, &tmp, "src/nested.log", "ignored\n");
+    defer alloc.free(ignored_nested);
+
+    var result = try dispatchGlobFiles(alloc, workspace, "**/*.log", ".");
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expectEqualStrings("[glob] no matches for **/*.log\n", result.body);
 }
 
 test "glob_files static base extraction handles literal and wildcard patterns" {
