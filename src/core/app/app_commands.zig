@@ -7,6 +7,7 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const background_commands = @import("../background/background_commands.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
+const route_snapshot_test_support = @import("../gateway/route_snapshot_test_support.zig");
 const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const command_router = @import("../slash_commands/command_router.zig");
@@ -2716,8 +2717,7 @@ test "workspace mutation admission rejects queue-zero processing gap" {
     try app.worker.enqueuePrompt(alloc, .{
         .prompt = try alloc.dupe(u8, "active turn"),
         .images = &.{},
-        .model = try alloc.dupe(u8, "test-model"),
-        .api_key = try alloc.dupe(u8, "test-key"),
+        .route = try route_snapshot_test_support.owned(alloc, "test-model"),
         .permission_mode = .auto,
         .history = try alloc.alloc(types.HistoryTurn, 0),
         .grants = try alloc.alloc(types.PermissionGrant, 0),
@@ -2762,8 +2762,7 @@ test "workspace list refresh waits for an idle turn" {
     try app.worker.enqueuePrompt(alloc, .{
         .prompt = try alloc.dupe(u8, "active turn"),
         .images = &.{},
-        .model = try alloc.dupe(u8, "test-model"),
-        .api_key = try alloc.dupe(u8, "test-key"),
+        .route = try route_snapshot_test_support.owned(alloc, "test-model"),
         .permission_mode = .auto,
         .history = try alloc.alloc(types.HistoryTurn, 0),
         .grants = try alloc.alloc(types.PermissionGrant, 0),

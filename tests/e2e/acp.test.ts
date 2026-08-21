@@ -4770,7 +4770,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "missing API key returns JSON-RPC error on initialize",
+    "missing API key preserves initialize and rejects a new session",
     async () => {
       const root = createIsolatedRoot("fx-acp-missing-auth-");
       try {
@@ -4783,7 +4783,9 @@ describe("acp: model-independent", () => {
             FX_DISABLE_KEYCHAIN: "1",
           },
         });
-        const resp = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
+        const initialized = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
+        expect(initialized.result).toBeDefined();
+        const resp = await client.request("session/new", {}, 2) as any;
         expect(resp.error).toBeDefined();
         expect(resp.error.message).toContain("fx login");
         expect(resp.error.message).toContain("fx setup");

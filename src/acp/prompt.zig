@@ -11,6 +11,7 @@ const acp_types = @import("types.zig");
 const server = @import("server.zig");
 const sessions = @import("sessions.zig");
 const agent_runtime = @import("../core/agent/agent_runtime.zig");
+const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const diff_mod = @import("../core/output/diff.zig");
 const file_mutation = @import("../core/tooling/file_mutation.zig");
 const file_mutation_contract = @import("../core/tooling/file_mutation_contract.zig");
@@ -39,6 +40,8 @@ const skill_invocation = @import("../core/skills/skill_invocation.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
+const route_snapshot = @import("../core/gateway/route_snapshot.zig");
+const connection_registry = @import("../core/gateway/connection_registry.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
 const devbox_executor = @import("../core/execution/devbox_executor.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
@@ -558,16 +561,68 @@ pub fn handlePrompt(
     const current_images = if (recovery_checkpoint) |checkpoint| checkpoint.user.images else &.{};
     const authorized_image_catalog = try session.session_rt.snapshotImageCatalog(alloc, current_images);
     defer types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
+    const connection_id = if (recovery_checkpoint) |checkpoint|
+        checkpoint.route_identity.?.connection_id
+    else if (session.writable) |*writable|
+        writable.state.preferences.connection_id.?
+    else if (session.wasm_state) |*durable|
+        durable.preferences.connection_id.?
+    else
+        state.connections.?.selectedProfile().id;
+    const profile = state.connections.?.profile(connection_id) catch
+        return error.MissingSessionConnection;
+    if (recovery_checkpoint) |checkpoint| {
+        try route_snapshot.validateRecoveryProfile(
+            profile,
+            checkpoint.route_identity.?.adapter_kind,
+        );
+    }
+    var descriptor = if (recovery_checkpoint) |checkpoint| recovery_descriptor: {
+        const resolved = availableModelDescriptor(@ptrCast(&ctx), checkpoint.route_model);
+        break :recovery_descriptor route_snapshot.recoveryDescriptor(
+            checkpoint.route_model,
+            resolved,
+        );
+    } else availableModelDescriptor(@ptrCast(&ctx), session.model);
+    if (model_capabilities.requiresResolvedRequestCapabilities(
+        current_images.len > 0 or authorized_image_catalog.len > 0,
+        session.effort,
+        session.fast_mode,
+        descriptor.capabilities,
+    )) {
+        const model = if (recovery_checkpoint) |checkpoint| checkpoint.route_model else session.model;
+        const resolved = try resolveModelDescriptor(@ptrCast(&ctx), alloc, model);
+        descriptor = if (recovery_checkpoint) |checkpoint|
+            route_snapshot.recoveryDescriptor(checkpoint.route_model, resolved)
+        else
+            resolved;
+    }
+    var route = if (recovery_checkpoint) |checkpoint|
+        try route_snapshot.RouteSnapshot.admitSelectedRecovery(
+            alloc,
+            profile,
+            state.cfg.gateway_provider.connection_seed,
+            checkpoint.route_identity.?.adapter_kind,
+            checkpoint.route_identity.?.permission_review_model_id,
+            descriptor,
+            state.cfg.gateway_chat_url,
+        )
+    else
+        try route_snapshot.RouteSnapshot.admitSelected(
+            alloc,
+            profile,
+            state.cfg.gateway_provider.connection_seed,
+            descriptor,
+            state.cfg.gateway_chat_url,
+        );
+    defer route.deinit(alloc);
 
     const job: worker_runtime.QueuedPrompt = .{
         .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
         .prompt = @constCast(owned_prompt),
         .images = @constCast(current_images),
         .authorized_image_catalog = authorized_image_catalog,
-        .model = session.model,
-        .api_key = @constCast(session.api_key),
-        .credential_source = session.credential_source,
-        .gateway_team = state.gateway_team,
+        .route = route,
         .permission_mode = captured_permission_mode,
         .sandbox_backend = captured_sandbox_backend,
         .history = context_history,
@@ -983,12 +1038,39 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .push_context_notice = pushContextNotice,
         .push_command_output_complete = pushCommandOutputComplete,
         .push_http_error = pushHttpError,
-        .available_model_capabilities = availableModelCapabilities,
-        .resolve_model_capabilities = resolveModelCapabilities,
+        .resolve_route_credential = resolveRouteCredential,
+        .available_model_descriptor = availableModelDescriptor,
+        .resolve_model_descriptor = resolveModelDescriptor,
         .format_tool_execution_error = formatToolExecutionError,
         .record_tool_call_rejected = recordToolCallRejected,
         .usage = &session.session_rt.usage,
         .usage_allocator = ctx.state.alloc,
+    };
+}
+
+fn resolveRouteCredential(
+    raw_ctx: *anyopaque,
+    alloc: Allocator,
+    route: *const route_snapshot.RouteSnapshot,
+) !agent_runtime.RouteCredential {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*active| active else return error.NoActiveSession;
+    const admitted_connection = if (session.writable) |*writable|
+        writable.state.preferences.connection_id.?
+    else if (session.wasm_state) |*durable|
+        durable.preferences.connection_id.?
+    else
+        ctx.state.connections.?.selectedProfile().id;
+    if (!std.mem.eql(u8, route.connection_id, admitted_connection)) {
+        return error.RouteCredentialMismatch;
+    }
+    const credential = try alloc.dupe(u8, session.api_key);
+    errdefer alloc.free(credential);
+    const tenant = if (ctx.state.gateway_team) |value| try alloc.dupe(u8, value) else null;
+    return .{
+        .credential = credential,
+        .tenant = tenant,
+        .legacy_source = session.credential_source,
     };
 }
 
@@ -1071,6 +1153,18 @@ fn availableModelCapabilities(
 ) model_capabilities.Capabilities {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     return ctx.state.capability_resolver.available(model);
+}
+
+fn resolveModelDescriptor(raw_ctx: *anyopaque, alloc: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.ModelDescriptor {
+    var descriptor = model_capabilities.configuredDescriptor(model, .{});
+    descriptor.capabilities = try resolveModelCapabilities(raw_ctx, alloc, model);
+    descriptor.source = .catalog;
+    return descriptor;
+}
+
+fn availableModelDescriptor(raw_ctx: *anyopaque, model: []const u8) model_capabilities.ModelDescriptor {
+    const descriptor = model_capabilities.configuredDescriptor(model, availableModelCapabilities(raw_ctx, model));
+    return descriptor;
 }
 
 fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) !void {
@@ -3330,11 +3424,18 @@ fn initTestAcpState(alloc: Allocator, workspace_root: []const u8, mode: Permissi
 
     const selected_backend: sandbox.BackendKind = .none;
     const cfg = testServerConfig();
+    const connections = try connection_registry.Runtime.init(
+        alloc,
+        cfg.gateway_provider.connection_seed.profile("test-model", null),
+        null,
+        .unavailable,
+    );
     return .{
         .alloc = alloc,
         .cfg = cfg,
         .writer = jsonrpc.Writer.init(),
         .workspace_root = owned_workspace,
+        .connections = connections,
         .sandbox_backend = selected_backend,
         .web_search_runtime = @import("../core/tooling/web_search_runtime.zig").Runtime.init(.{
             .provider = cfg.gateway_provider.web_search,
@@ -3358,6 +3459,71 @@ fn initTestAcpState(alloc: Allocator, workspace_root: []const u8, mode: Permissi
             .pending_prompt_id = null,
         },
     };
+}
+
+test "fake non-Vercel adapter completes an ACP root turn on its admitted route" {
+    const Fake = struct {
+        calls: usize = 0,
+
+        fn stream(
+            adapter: *const agent_stream_provider.ProviderAdapter,
+            _: Allocator,
+            request: agent_stream_provider.AdapterRequest,
+            events: agent_stream_provider.EventSink,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(adapter.context.?));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("test_non_vercel", request.route.adapter_kind);
+            try std.testing.expectEqualStrings("fake-protocol", request.route.protocol);
+            try std.testing.expectEqualStrings("fake://acp", request.route.endpoint);
+            try std.testing.expectEqualStrings("fake-key", request.credential);
+            try events.emit(.provider_admitted);
+            try events.emit(.{ .finish = .{ .reason = .stop } });
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var output = try tmp.dir.createFile(io_mod.getIo(), "acp-route-snapshot.jsonl", .{});
+    defer output.close(io_mod.getIo());
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .auto);
+    defer state.deinit();
+    state.writer = .{ .stdout = output };
+    var fake = Fake{};
+    state.cfg.gateway_chat_url = "fake://acp";
+    state.cfg.gateway_provider.provider_adapter = .{
+        .kind = "test_non_vercel",
+        .context = &fake,
+        .stream_fn = Fake.stream,
+    };
+    state.connections.?.deinit();
+    state.connections = try connection_registry.Runtime.init(
+        alloc,
+        .{
+            .id = "fake",
+            .display_name = "Fake",
+            .adapter_id = "test_non_vercel",
+            .endpoint = "fake://acp",
+            .protocol = "fake-protocol",
+            .credential_ref = "fake-ref",
+            .remembered_model = "test-model",
+        },
+        null,
+        .unavailable,
+    );
+    state.api_key = try alloc.dupe(u8, "fake-key");
+    state.active_session.?.api_key = state.api_key;
+    var msg = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/prompt",
+        .params_raw = "{\"sessionId\":\"session_1\",\"prompt\":[{\"type\":\"text\",\"text\":\"hello\"}]}",
+    };
+    const outcome = try handlePrompt(&state, alloc, &msg, "normal", .auto, .none);
+
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expect(outcome == .stop_reason);
+    try std.testing.expectEqual(acp_types.StopReason.end_turn, outcome.stop_reason);
 }
 
 test "stripAnsiAlloc returns the original slice for clean text and strips escapes" {

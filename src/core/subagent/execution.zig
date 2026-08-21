@@ -1235,6 +1235,7 @@ fn livePresentationEventBytes(event: worker_runtime.WorkerEvent) ?usize {
         => |text| text.len,
         .command_output_complete,
         .clear_route_recovery_status,
+        .authentication_failed,
         .route_recovery_status,
         .turn_token_update,
         .tool_payload_started,
@@ -8401,7 +8402,7 @@ const GatewayExecution = struct {
         defer session.freeHistoryTurnSlice(turn.alloc, history);
         var job = fixture.job();
         job.prompt = message.content;
-        job.model = admission.model;
+        job.route = agent_test_support.testRouteForModel(admission.model);
         job.permission_mode = admission.permission_mode;
         job.sandbox_backend = admission.sandbox_backend;
         job.history = history;

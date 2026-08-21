@@ -1,6 +1,7 @@
 const std = @import("std");
 const agent_stream_provider = @import("../stream_provider.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
+const route_snapshot = @import("../../gateway/route_snapshot.zig");
 const types = @import("../../shared/types.zig");
 const session_usage = @import("../../session/session_usage.zig");
 const message = @import("../../shared/message.zig");
@@ -29,6 +30,7 @@ const CollectedTerminal = union(enum) {
     finish,
     failure: struct {
         category: agent_stream_provider.StreamFailure.Category,
+        http_status: ?std.http.Status = null,
         retry_after_seconds: ?u64,
     },
     cancelled,
@@ -144,9 +146,10 @@ const AdapterEventCollector = struct {
                 }
             },
             .failure => |failure| {
-                if (failure.category == .ambiguous_delivery) self.completion.delivery_ambiguous = true;
+                if (failure.category == .ambiguous_delivery or failure.delivery_ambiguous) self.completion.delivery_ambiguous = true;
                 self.terminal = .{ .failure = .{
                     .category = failure.category,
+                    .http_status = failure.http_status,
                     .retry_after_seconds = failure.retry_after_seconds,
                 } };
                 if (failure.detail) |detail| self.failure_detail = try self.alloc.dupe(u8, detail);
@@ -197,7 +200,7 @@ const LegacyGatewayCompatibilityBridge = struct {
                 .reconcile_generation_usage = collector.completion.generation_id != null,
             },
             .failure => |failure| .{
-                .status = statusForFailure(failure.category),
+                .status = failure.http_status orelse statusForFailure(failure.category),
                 .err_body = collector.failure_detail,
                 .retry_after_seconds = failure.retry_after_seconds,
                 .failure_diagnostic_summary = collector.failure_diagnostic_summary,
@@ -227,7 +230,10 @@ const LegacyGatewayCompatibilityBridge = struct {
         collector: *const AdapterEventCollector,
         delivery: *const DeliveryCertainty,
     ) session_usage.DeliveryOutcome {
-        if (collector.terminal == .failure and collector.terminal.failure.category == .ambiguous_delivery) {
+        if (collector.terminal == .failure and
+            (collector.terminal.failure.category == .ambiguous_delivery or
+                collector.completion.delivery_ambiguous))
+        {
             return .ambiguous_delivery;
         }
         return if (delivery.load() == .possibly_sent) .ambiguous_delivery else .unbilled;
@@ -237,12 +243,12 @@ const LegacyGatewayCompatibilityBridge = struct {
 pub fn streamModelRequest(
     adapter: agent_stream_provider.ProviderAdapter,
     alloc: Allocator,
+    route: *const route_snapshot.RouteSnapshot,
     credential: []const u8,
     tenant: ?[]const u8,
     session_id: ?[]const u8,
     model: []const u8,
     retry_count: usize,
-    endpoint: []const u8,
     model_request: agent_stream_provider.ModelRequest,
     cooperative_pulse: ?agent_stream_provider.CooperativePulse,
     delivery: *DeliveryCertainty,
@@ -278,12 +284,12 @@ pub fn streamModelRequest(
     var sink_error: ?anyerror = null;
     adapter.stream(alloc, .{
         .model_request = model_request,
+        .route = route,
         .credential = credential,
         .tenant = tenant,
         .session_id = session_id,
         .model_id = model,
         .retry_count = retry_count,
-        .endpoint = endpoint,
         .trace_ctx = trace_ctx,
         .content_capture_limit = content_capture_limit,
         .cooperative_pulse = cooperative_pulse,
@@ -583,6 +589,22 @@ fn dupeGatewayToolCalls(alloc: Allocator, source: anytype) ![]types.ToolCall {
     return copy;
 }
 
+fn testingRoute(endpoint: []const u8) route_snapshot.RouteSnapshot {
+    return .{
+        .connection_id = @constCast("test"),
+        .adapter_kind = @constCast("test"),
+        .endpoint = @constCast(endpoint),
+        .protocol = @constCast("test"),
+        .credential_ref = @constCast("test_ref"),
+        .primary_model_id = @constCast("test/model"),
+        .permission_review_model_id = null,
+        .capabilities = .{},
+        .capability_source = .configured,
+        .selected_fast_mode = false,
+        .fast_model_suffix = null,
+    };
+}
+
 test "dupeGatewayToolCalls preserves argument integrity for shared agent admission" {
     const source = [_]types.ToolCall{.{
         .id = "call_1",
@@ -641,15 +663,16 @@ test "neutral adapter events materialize owned completion state" {
     var delivery = DeliveryCertainty.init();
     var attempt_evidence: AttemptEvidence = .{};
     var callback_ctx: u8 = 0;
+    var route = testingRoute("https://example.invalid");
     const result = try streamModelRequest(
-        .{ .stream_fn = Fake.stream },
+        .{ .kind = "test", .stream_fn = Fake.stream },
         std.testing.allocator,
+        &route,
         "credential",
         null,
         null,
         "test/model",
         1,
-        "https://example.invalid",
         .{
             .model = "test/model",
             .serialized_tools = "[]",
@@ -711,15 +734,16 @@ test "non-http adapter failure drives legacy gateway compatibility bridge" {
     var delivery = DeliveryCertainty.init();
     var attempt_evidence: AttemptEvidence = .{};
     var callback_ctx: u8 = 0;
+    var route = testingRoute("provider:endpoint");
     const result = try streamModelRequest(
-        .{ .stream_fn = Fake.stream },
+        .{ .kind = "test", .stream_fn = Fake.stream },
         alloc,
+        &route,
         "credential",
         null,
         null,
         "test/model",
         1,
-        "provider:endpoint",
         .{
             .model = "test/model",
             .serialized_tools = "[]",
@@ -793,17 +817,18 @@ test "usage reservation failure stops before adapter network effects" {
     var delivery = DeliveryCertainty.init();
     var attempt_evidence: AttemptEvidence = .{};
     var callback_ctx: u8 = 0;
+    var route = testingRoute("provider:endpoint");
     try std.testing.expectError(
         error.UsageCapacityExceeded,
         streamModelRequest(
-            .{ .context = &fake, .stream_fn = Fake.stream },
+            .{ .kind = "test", .context = &fake, .stream_fn = Fake.stream },
             alloc,
+            &route,
             "credential",
             null,
             null,
             "test/model",
             1,
-            "provider:endpoint",
             .{
                 .model = "test/model",
                 .serialized_tools = "[]",
@@ -831,6 +856,140 @@ test "usage reservation failure stops before adapter network effects" {
     try std.testing.expect(!attempt_evidence.provider_admitted);
     try std.testing.expectEqual(agent_stream_provider.DeliveryCertainty.State.definitely_unsent, delivery.load());
     for (held.items) |observation| try observation.fail(.unbilled);
+}
+
+test "normalized failure state preserves HTTP status and delivery independently" {
+    const Callbacks = struct {
+        fn content(_: *anyopaque, _: []const u8) void {}
+    };
+
+    for ([_]std.http.Status{ .payment_required, .not_found, .request_timeout }) |status| {
+        var callback_ctx: u8 = 0;
+        var attempt_evidence: AttemptEvidence = .{};
+        var collector = AdapterEventCollector{
+            .alloc = std.testing.allocator,
+            .usage = null,
+            .attempt_evidence = &attempt_evidence,
+            .content_capture_limit = null,
+            .callback_ctx = &callback_ctx,
+            .on_content_chunk = Callbacks.content,
+            .on_tool_start = null,
+            .on_reasoning_chunk = null,
+            .on_tool_input_chunk = null,
+        };
+        defer collector.deinit();
+
+        try AdapterEventCollector.emit(&collector, .{ .failure = .{
+            .category = .protocol,
+            .http_status = status,
+        } });
+        const legacy = try LegacyGatewayCompatibilityBridge.fromCollector(&collector);
+        var delivery = DeliveryCertainty.init();
+        try std.testing.expectEqual(status, legacy.status);
+        try std.testing.expect(!collector.completion.delivery_ambiguous);
+        try std.testing.expectEqual(
+            session_usage.DeliveryOutcome.unbilled,
+            LegacyGatewayCompatibilityBridge.failedDeliveryOutcome(&collector, &delivery),
+        );
+    }
+
+    var callback_ctx: u8 = 0;
+    var attempt_evidence: AttemptEvidence = .{};
+    var collector = AdapterEventCollector{
+        .alloc = std.testing.allocator,
+        .usage = null,
+        .attempt_evidence = &attempt_evidence,
+        .content_capture_limit = null,
+        .callback_ctx = &callback_ctx,
+        .on_content_chunk = Callbacks.content,
+        .on_tool_start = null,
+        .on_reasoning_chunk = null,
+        .on_tool_input_chunk = null,
+    };
+    defer collector.deinit();
+    try AdapterEventCollector.emit(&collector, .{ .failure = .{
+        .category = .provider_internal,
+        .http_status = .internal_server_error,
+        .delivery_ambiguous = true,
+    } });
+    const legacy = try LegacyGatewayCompatibilityBridge.fromCollector(&collector);
+    var delivery = DeliveryCertainty.init();
+    try std.testing.expectEqual(std.http.Status.internal_server_error, legacy.status);
+    try std.testing.expect(collector.completion.delivery_ambiguous);
+    try std.testing.expectEqual(
+        session_usage.DeliveryOutcome.ambiguous_delivery,
+        LegacyGatewayCompatibilityBridge.failedDeliveryOutcome(&collector, &delivery),
+    );
+}
+
+test "normalized delivery-ambiguous failure keeps usage incomplete" {
+    const Fake = struct {
+        fn stream(
+            _: *const agent_stream_provider.ProviderAdapter,
+            _: Allocator,
+            _: agent_stream_provider.AdapterRequest,
+            events: agent_stream_provider.EventSink,
+        ) anyerror!void {
+            try events.emit(.provider_admitted);
+            try events.emit(.{ .failure = .{
+                .category = .provider_internal,
+                .http_status = .internal_server_error,
+                .delivery_ambiguous = true,
+            } });
+        }
+    };
+    const Callbacks = struct {
+        fn content(_: *anyopaque, _: []const u8) void {}
+    };
+
+    const alloc = std.testing.allocator;
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var delivery = DeliveryCertainty.init();
+    var attempt_evidence: AttemptEvidence = .{};
+    var callback_ctx: u8 = 0;
+    var route = testingRoute("provider:endpoint");
+    const result = try streamModelRequest(
+        .{ .kind = "test", .stream_fn = Fake.stream },
+        alloc,
+        &route,
+        "credential",
+        null,
+        null,
+        "test/model",
+        1,
+        .{
+            .model = "test/model",
+            .serialized_tools = "[]",
+            .messages = &.{},
+            .tool_choice = .none,
+            .capabilities = .{},
+        },
+        null,
+        &delivery,
+        &attempt_evidence,
+        &callback_ctx,
+        Callbacks.content,
+        null,
+        null,
+        null,
+        &cancel_flag,
+        &usage,
+        alloc,
+        .{},
+        null,
+        .agent,
+    );
+    defer deinitCollectedCompletion(alloc, result.completion);
+    defer if (result.err_body) |body| alloc.free(body);
+
+    try std.testing.expectEqual(std.http.Status.internal_server_error, result.status);
+    try std.testing.expect(result.completion.delivery_ambiguous);
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(session_usage.Availability.incomplete, snapshot.billing);
+    try std.testing.expect(snapshot.api_duration_complete);
 }
 
 pub const VisionToolMode = agent_stream_provider.VisionMode;

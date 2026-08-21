@@ -1,5 +1,7 @@
 const std = @import("std");
 const app_lifecycle = @import("app_lifecycle.zig");
+const model_catalog = @import("../gateway/model_catalog.zig");
+const connection_registry = @import("../gateway/connection_registry.zig");
 const app_input_runtime = @import("app_input_runtime.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
@@ -34,6 +36,8 @@ pub const CapabilityProviders = struct {
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     skill_root_policy: skill_contract.RootPolicy,
     terminal_title: host.TerminalTitle,
+    connection_seed: connection_registry.Seed,
+    model_descriptors: model_catalog.ModelDescriptorProvider = model_catalog.configured_model_descriptor_provider,
 };
 
 fn BootstrapDeps(comptime App: type) type {
@@ -79,6 +83,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             footer_rows: u16,
             default_model: []const u8,
+            default_fast_mode: bool,
             default_agent_step_limit: usize,
             resize_handler: app_lifecycle.ResizeHandler,
             record_requested: bool,
@@ -88,9 +93,12 @@ pub fn Runtime(comptime App: type) type {
                 app,
                 footer_rows,
                 default_model,
+                default_fast_mode,
                 default_agent_step_limit,
                 resize_handler,
                 record_requested,
+                capability_providers.connection_seed,
+                capability_providers.model_descriptors,
                 defaultDeps(capability_providers),
             );
         }
@@ -176,9 +184,12 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             footer_rows: u16,
             default_model: []const u8,
+            default_fast_mode: bool,
             default_agent_step_limit: usize,
             resize_handler: app_lifecycle.ResizeHandler,
             record_requested: bool,
+            connection_seed: connection_registry.Seed,
+            model_descriptors: model_catalog.ModelDescriptorProvider,
             deps: BootstrapDeps(App),
         ) !void {
             errdefer app.deinit();
@@ -192,7 +203,10 @@ pub fn Runtime(comptime App: type) type {
                 .footer_rows = footer_rows,
                 .startup_min_body_rows = ui_render.welcome_message_reserved_rows,
                 .default_model = default_model,
+                .default_fast_mode = default_fast_mode,
+                .connection_seed = connection_seed,
                 .default_agent_step_limit = default_agent_step_limit,
+                .model_descriptors = model_descriptors,
                 .secret_store = if (comptime @hasDecl(App, "secretStore"))
                     app.secretStore()
                 else
@@ -206,6 +220,10 @@ pub fn Runtime(comptime App: type) type {
             app.workspace_root = startup.takeWorkspaceRoot();
             if (comptime @hasDecl(App, "adoptWorkspaceAccess")) {
                 app.adoptWorkspaceAccess(startup.takeWorkspaceAccess());
+            }
+            if (startup.takeConnections()) |connections_value| {
+                var connections = connections_value;
+                app.auth.adoptConnections(app.alloc, &connections);
             }
             if (startup.takeCredential()) |credential_value| {
                 var credential = credential_value;
@@ -834,9 +852,17 @@ fn runBootstrapForTest(app: *TestApp, capture: *TestCapture) !void {
         app,
         4,
         "default-model",
+        false,
         24,
         resizeHandlerForTest,
         false,
+        .{
+            .id = "test",
+            .display_name = "Test Gateway",
+            .adapter_id = "test_gateway",
+            .credential_ref = "automatic",
+        },
+        model_catalog.configured_model_descriptor_provider,
         testDeps(),
     );
 }

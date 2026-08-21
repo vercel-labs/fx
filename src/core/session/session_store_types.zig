@@ -137,6 +137,7 @@ pub const ResumeTarget = union(enum) {
 pub const ResumeOptions = struct {
     allow_large_legacy: bool = false,
     seed_preferences: ?session_codec.DurableSessionPreferences = null,
+    legacy_route_defaults: ?session_codec.LegacyRouteDefaults = null,
     log: session_log.Options = .{},
 };
 

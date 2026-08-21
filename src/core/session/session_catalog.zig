@@ -17,6 +17,7 @@ pub const LoadState = enum {
 pub const ResumeFailure = enum {
     open_elsewhere,
     being_updated,
+    select_connection,
     unavailable,
 };
 

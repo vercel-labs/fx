@@ -978,6 +978,7 @@ pub fn Runtime(comptime App: type) type {
                     runtime.worker_status_state().set_api(text, .danger);
                     runtime.render_requests.request(.footer);
                 },
+                .authentication_failed => {},
                 .begin_prompt,
                 .begin_prompt_with_skill_bindings,
                 .append_user_feedback,

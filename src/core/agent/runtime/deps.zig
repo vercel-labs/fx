@@ -1,6 +1,8 @@
 const std = @import("std");
 const agent_stream_provider = @import("../stream_provider.zig");
 const auth_runtime = @import("../../auth/auth_runtime.zig");
+const secret = @import("../../auth/secret.zig");
+const route_snapshot = @import("../../gateway/route_snapshot.zig");
 const session_usage = @import("../../session/session_usage.zig");
 const session_codec = @import("../../session/session_codec.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
@@ -103,11 +105,41 @@ pub const ToolActivityRecorder = struct {
 fn acknowledgePromptFinalization(_: *anyopaque, _: u64, _: types.TurnPresentationOutcome, _: ?types.ProviderCompletionDisposition) !void {}
 fn discardToolLifecycle(_: *anyopaque, _: types.ToolLifecycleEvent) !void {}
 fn discardRouteRecoveryStatus(_: *anyopaque, _: types.RouteRecoveryStatus) !void {}
-fn localAvailableModelCapabilities(_: *anyopaque, model: []const u8) model_capabilities.Capabilities {
-    return model_capabilities.capabilitiesForModel(model);
+fn localAvailableModelDescriptor(_: *anyopaque, model: []const u8) model_capabilities.ModelDescriptor {
+    return model_capabilities.configuredDescriptor(model, .{});
 }
-fn localModelCapabilities(_: *anyopaque, _: Allocator, model: []const u8) !model_capabilities.Capabilities {
-    return model_capabilities.capabilitiesForModel(model);
+fn localModelDescriptor(_: *anyopaque, _: Allocator, model: []const u8) !model_capabilities.ModelDescriptor {
+    return model_capabilities.configuredDescriptor(model, .{});
+}
+
+fn localAvailableModelCapabilities(_: *anyopaque, _: []const u8) model_capabilities.Capabilities {
+    return .{};
+}
+
+fn localModelCapabilities(_: *anyopaque, _: Allocator, _: []const u8) !model_capabilities.Capabilities {
+    return .{};
+}
+
+pub const RouteCredential = struct {
+    credential: []u8,
+    tenant: ?[]u8 = null,
+    /// Vercel credential refresh and error copy retain this read-only bridge
+    /// until G11 removes the legacy source-specific paths.
+    legacy_source: ?types.CredentialSource = null,
+
+    pub fn deinit(self: *RouteCredential, alloc: Allocator) void {
+        secret.zeroAndFree(alloc, self.credential);
+        if (self.tenant) |tenant| alloc.free(tenant);
+        self.* = undefined;
+    }
+};
+
+fn routeCredentialUnavailable(
+    _: *anyopaque,
+    _: Allocator,
+    _: *const route_snapshot.RouteSnapshot,
+) anyerror!RouteCredential {
+    return error.RouteCredentialUnavailable;
 }
 
 fn sandboxWideningUnavailable(
@@ -228,8 +260,13 @@ pub const AgentRuntimeDeps = struct {
     push_route_recovery_status: *const fn (ctx: *anyopaque, status: types.RouteRecoveryStatus) anyerror!void = discardRouteRecoveryStatus,
     push_command_output_complete: *const fn (ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) anyerror!void,
     push_http_error: *const fn (ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) anyerror!void,
+    resolve_route_credential: *const fn (ctx: *anyopaque, alloc: Allocator, route: *const route_snapshot.RouteSnapshot) anyerror!RouteCredential = routeCredentialUnavailable,
     refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode) anyerror!?[]u8 = null,
     request_route_recovery: ?*const fn (ctx: *anyopaque, arena: Allocator, request: RouteRecoveryRequest) anyerror!RouteRecoveryDecision = null,
+    /// Read-only admission compatibility callbacks. Root surfaces resolve the
+    /// descriptor before the loop; G11 removes these unused loop-era fields.
+    available_model_descriptor: *const fn (ctx: *anyopaque, model: []const u8) model_capabilities.ModelDescriptor = localAvailableModelDescriptor,
+    resolve_model_descriptor: *const fn (ctx: *anyopaque, arena: Allocator, model: []const u8) anyerror!model_capabilities.ModelDescriptor = localModelDescriptor,
     available_model_capabilities: *const fn (ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities = localAvailableModelCapabilities,
     resolve_model_capabilities: *const fn (ctx: *anyopaque, arena: Allocator, model: []const u8) anyerror!model_capabilities.Capabilities = localModelCapabilities,
     format_tool_execution_error: *const fn (ctx: *anyopaque, arena: Allocator, tool_name: []const u8, err: anyerror) anyerror![]const u8,

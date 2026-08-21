@@ -6,6 +6,7 @@ const permission_auto_classifier = @import("../permissions/auto_classifier.zig")
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const route_snapshot = @import("../gateway/route_snapshot.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
@@ -325,6 +326,8 @@ pub fn Bindings(comptime App: type) type {
                     agentRequestRouteRecovery
                 else
                     null,
+                .available_model_descriptor = agentAvailableModelDescriptor,
+                .resolve_model_descriptor = agentResolveModelDescriptor,
                 .available_model_capabilities = agentAvailableModelCapabilities,
                 .resolve_model_capabilities = agentResolveModelCapabilities,
                 .format_tool_execution_error = agentFormatToolExecutionError,
@@ -337,6 +340,9 @@ pub fn Bindings(comptime App: type) type {
                     .removed = ui_render.diff_removed_marker_style,
                 },
             };
+            if (comptime @hasDecl(App, "resolveRouteCredential")) {
+                deps.resolve_route_credential = resolveRouteCredential;
+            }
             if (comptime @hasField(@TypeOf(app.session), "usage")) {
                 deps.usage = &app.session.usage;
                 if (comptime @hasField(App, "session_persistence") and
@@ -358,6 +364,15 @@ pub fn Bindings(comptime App: type) type {
                 deps.request_sandbox_widening = agentRequestSandboxWidening;
             }
             return deps;
+        }
+
+        fn resolveRouteCredential(
+            raw_ctx: *anyopaque,
+            alloc: std.mem.Allocator,
+            route: *const route_snapshot.RouteSnapshot,
+        ) !agent_runtime.RouteCredential {
+            const app: *App = @ptrCast(@alignCast(raw_ctx));
+            return app.resolveRouteCredential(alloc, route);
         }
 
         fn refreshGatewayCredential(
@@ -592,23 +607,38 @@ pub fn Bindings(comptime App: type) type {
             }
         }
 
-        fn agentResolveModelCapabilities(ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
+        fn agentResolveModelDescriptor(ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.ModelDescriptor {
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "resolveModelDescriptorForRequest")) {
+                return app.resolveModelDescriptorForRequest(model);
+            }
+            if (comptime @hasDecl(App, "resolvedModelDescriptor")) {
+                return app.resolvedModelDescriptor(model);
+            }
             if (comptime @hasDecl(App, "resolveModelCapabilitiesForRequest")) {
-                return app.resolveModelCapabilitiesForRequest(model);
+                return model_capabilities.configuredDescriptor(
+                    model,
+                    try app.resolveModelCapabilitiesForRequest(model),
+                );
             }
-            if (comptime @hasDecl(App, "resolvedModelCapabilities")) {
-                return app.resolvedModelCapabilities(model);
+            return model_capabilities.configuredDescriptor(model, .{});
+        }
+
+        fn agentResolveModelCapabilities(ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
+            const descriptor = try agentResolveModelDescriptor(ctx, std.heap.c_allocator, model);
+            return descriptor.capabilities;
+        }
+
+        fn agentAvailableModelDescriptor(ctx: *anyopaque, model: []const u8) model_capabilities.ModelDescriptor {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "resolvedModelDescriptor")) {
+                return app.resolvedModelDescriptor(model);
             }
-            return model_capabilities.capabilitiesForModel(model);
+            return model_capabilities.configuredDescriptor(model, .{});
         }
 
         fn agentAvailableModelCapabilities(ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime @hasDecl(App, "resolvedModelCapabilities")) {
-                return app.resolvedModelCapabilities(model);
-            }
-            return model_capabilities.capabilitiesForModel(model);
+            return agentAvailableModelDescriptor(ctx, model).capabilities;
         }
 
         fn agentRequestToolPermission(ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
@@ -910,6 +940,9 @@ pub fn Bindings(comptime App: type) type {
         fn agentPushHttpError(ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             const auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
+            if (auth_failure != null) {
+                try app_worker_runtime.Runtime(App).pushEvent(app, .authentication_failed);
+            }
             const message = if (auth_failure) |failure|
                 try failure.renderText(std.heap.c_allocator)
             else
@@ -1786,6 +1819,23 @@ test "agent deps forward app callbacks through core types" {
     const formatted = try deps.format_tool_execution_error(deps.ctx, std.testing.allocator, "tool", error.Boom);
     defer std.testing.allocator.free(formatted);
     try std.testing.expectEqualStrings("tool:Boom", formatted);
+}
+
+test "unauthorized HTTP errors publish authentication failure before status text" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    const deps = Bindings(FakeApp).agentRuntimeDeps(&app);
+    try deps.push_http_error(
+        deps.ctx,
+        .unauthorized,
+        "invalid credential",
+        .ai_gateway_api_key,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), app.worker.events.items.len);
+    try std.testing.expect(app.worker.events.items[0] == .authentication_failed);
+    try std.testing.expect(app.worker.events.items[1] == .api_status_text);
 }
 
 test "agent deps use request-time model capability resolution when available" {

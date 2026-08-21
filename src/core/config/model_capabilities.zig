@@ -243,6 +243,35 @@ pub fn resolveProviderOptionsForCapabilities(
     return resolved;
 }
 
+pub fn requiresResolvedRequestCapabilities(
+    has_images: bool,
+    effort: types.ReasoningEffort,
+    fast_mode: bool,
+    available: Capabilities,
+) bool {
+    return has_images or
+        (!effort.isDefault() and !reasoningEffortSupported(available, effort)) or
+        (fast_mode and !available.supports_fast_mode);
+}
+
+test "model descriptors preserve explicit provenance and routing" {
+    const configured = configuredDescriptor("provider/model", .{ .supports_tool_use = true });
+    try std.testing.expectEqual(CapabilitySource.configured, configured.source);
+    try std.testing.expect(configured.capabilities.supports_tool_use);
+
+    const catalog = ModelDescriptor{
+        .id = "provider/model",
+        .display_name = "Model",
+        .source = .catalog,
+        .selected_fast_mode = true,
+        .fast_route = .{ .suffix = "-fast" },
+    };
+    try std.testing.expectEqualStrings("provider/model", try catalog.routeModel(std.testing.allocator, false));
+    const fast = try catalog.routeModel(std.testing.allocator, true);
+    defer std.testing.allocator.free(fast);
+    try std.testing.expectEqualStrings("provider/model-fast", fast);
+}
+
 test "capabilities never infer reasoning or Fast controls from model IDs" {
     const models = [_][]const u8{
         "openai/gpt-5.6-sol",

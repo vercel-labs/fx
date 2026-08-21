@@ -1,4 +1,5 @@
 const std = @import("std");
+const connection_registry = @import("../gateway/connection_registry.zig");
 const host = @import("../hosts/host.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -14,7 +15,7 @@ const update_target = @import("../upgrade/update_target.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
-pub const max_model_bytes: usize = 1024;
+pub const max_model_bytes = connection_registry.max_model_bytes;
 const lock_deadline_ms: u64 = 2000;
 const backup_keep_count: usize = 5;
 const corrupt_keep_count: usize = 3;
@@ -262,6 +263,7 @@ const user_preference_fields = [_]UserPreferenceField{
 
 const SettingsMutation = union(enum) {
     user: UserSettingsPatch,
+    connections: connection_registry.Snapshot,
     workspace: struct {
         workspace_root: []const u8,
         patch: WorkspaceSettingsPatch,
@@ -272,6 +274,7 @@ const SettingsMutation = union(enum) {
     fn operation(self: SettingsMutation) []const u8 {
         return switch (self) {
             .user => "user_patch",
+            .connections => "connection_snapshot",
             .workspace => "workspace_patch",
             .workspace_directory => "workspace_directory_patch",
             .permission => "permission_patch",
@@ -281,6 +284,7 @@ const SettingsMutation = union(enum) {
     fn scope(self: SettingsMutation) SettingsScope {
         return switch (self) {
             .user => .user,
+            .connections => .user,
             .workspace, .workspace_directory => .local,
             .permission => |mutation| switch (mutation.scope) {
                 .user => .user,
@@ -295,6 +299,7 @@ const SettingsMutation = union(enum) {
                 "commit_first"
             else
                 "runtime_first",
+            .connections => "commit_first",
             .workspace => "runtime_first",
             .workspace_directory => "commit_first",
             .permission => "commit_first",
@@ -304,6 +309,7 @@ const SettingsMutation = union(enum) {
     fn isEmpty(self: SettingsMutation) bool {
         return switch (self) {
             .user => |patch| patch.isEmpty(),
+            .connections => false,
             .workspace => |workspace| workspace.patch.isEmpty(),
             .workspace_directory => false,
             .permission => false,
@@ -431,6 +437,14 @@ pub const Store = struct {
         patch: UserSettingsPatch,
     ) !CommitOutcome {
         return self.applyMutation(alloc, .{ .user = patch });
+    }
+
+    pub fn applyConnectionSnapshot(
+        self: *Store,
+        alloc: Allocator,
+        snapshot: connection_registry.Snapshot,
+    ) !CommitOutcome {
+        return self.applyMutation(alloc, .{ .connections = snapshot });
     }
 
     pub fn applyPermissionPatch(
@@ -835,6 +849,7 @@ fn validateWorkspaceRoot(workspace_root: []const u8) !void {
 fn validateMutation(mutation: SettingsMutation) !void {
     switch (mutation) {
         .user => |patch| try validateUserPatch(patch),
+        .connections => |snapshot| try connection_registry.validate(snapshot),
         .workspace => |workspace| {
             try validateWorkspaceRoot(workspace.workspace_root);
             try validatePatch(workspace.patch);
@@ -956,6 +971,7 @@ fn applyMutationToRoot(
 ) !PatchApplication {
     return switch (mutation) {
         .user => |patch| applyUserPatchToRoot(arena, root, patch),
+        .connections => |snapshot| applyConnectionSnapshotToRoot(arena, root, snapshot),
         .workspace => |workspace| applyWorkspacePatchToRoot(
             arena,
             root,
@@ -969,6 +985,38 @@ fn applyMutationToRoot(
         ),
         .permission => |permission| applyPermissionMutationToRoot(arena, root, permission),
     };
+}
+
+fn applyConnectionSnapshotToRoot(
+    arena: Allocator,
+    root: *std.json.Value,
+    snapshot: connection_registry.Snapshot,
+) !PatchApplication {
+    var profiles = std.json.Array.init(arena);
+    for (snapshot.profiles) |profile| {
+        var object: std.json.ObjectMap = .empty;
+        try object.put(arena, "id", .{ .string = try arena.dupe(u8, profile.id) });
+        try object.put(arena, "display_name", .{ .string = try arena.dupe(u8, profile.display_name) });
+        try object.put(arena, "adapter_id", .{ .string = try arena.dupe(u8, profile.adapter_id) });
+        if (profile.endpoint) |value| {
+            try object.put(arena, "endpoint", .{ .string = try arena.dupe(u8, value) });
+        }
+        if (profile.protocol) |value| {
+            try object.put(arena, "protocol", .{ .string = try arena.dupe(u8, value) });
+        }
+        try object.put(arena, "credential_ref", .{ .string = try arena.dupe(u8, profile.credential_ref) });
+        try object.put(arena, "remembered_model", .{ .string = try arena.dupe(u8, profile.remembered_model) });
+        if (profile.permission_review_model) |value| {
+            try object.put(arena, "permission_review_model", .{ .string = try arena.dupe(u8, value) });
+        }
+        try profiles.append(.{ .object = object });
+    }
+
+    var connections: std.json.ObjectMap = .empty;
+    try connections.put(arena, "selected", .{ .string = try arena.dupe(u8, snapshot.selected_id) });
+    try connections.put(arena, "profiles", .{ .array = profiles });
+    try root.object.put(arena, "connections", .{ .object = connections });
+    return .{ .changed = true };
 }
 
 fn applyUserPatchToRoot(
@@ -1625,9 +1673,9 @@ fn validateCandidate(
     };
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidSettingsFormat;
-    try validateKnownSettingsObject(parsed.value.object, false);
+    try validateKnownSettingsObject(alloc, parsed.value.object, false);
     const workspace_root = switch (mutation) {
-        .user => return,
+        .user, .connections => return,
         .workspace => |workspace| workspace.workspace_root,
         .workspace_directory => |workspace| workspace.workspace_root,
         .permission => |permission| switch (permission.scope) {
@@ -1649,10 +1697,11 @@ fn validateCandidate(
         return error.InvalidSettingsFormat;
     };
     if (workspace != .object) return error.InvalidSettingsFormat;
-    try validateKnownSettingsObject(workspace.object, true);
+    try validateKnownSettingsObject(alloc, workspace.object, true);
 }
 
 fn validateKnownSettingsObject(
+    alloc: Allocator,
     object: std.json.ObjectMap,
     tolerate_non_object_user_containers: bool,
 ) !void {
@@ -1673,6 +1722,10 @@ fn validateKnownSettingsObject(
         if (value != .string or types.parseCredentialSource(value.string) == null) {
             return error.InvalidSettingsFormat;
         }
+    }
+    if (object.get("connections")) |value| {
+        var stored = connection_registry.parseStored(alloc, value) catch return error.InvalidSettingsFormat;
+        stored.deinit(alloc);
     }
     if (object.get("max_agent_steps")) |value| {
         if (value != .integer or value.integer < 0) return error.InvalidSettingsFormat;
@@ -2050,6 +2103,48 @@ test "workspace patch ignores malformed nested workspace statusline" {
     );
     try std.testing.expectEqual(@as(i64, 7), workspace.get("future").?.integer);
     try std.testing.expectEqualStrings("none", workspace.get("sandbox").?.string);
+}
+
+test "connection snapshot persists references and profile metadata without secret bytes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", "{\"future\":true}\n");
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+    var registry = try connection_registry.Runtime.init(alloc, .{
+        .id = "vercel",
+        .display_name = "Vercel AI Gateway",
+        .adapter_id = "vercel_ai_gateway",
+        .endpoint = "https://ai-gateway.vercel.sh/v3/ai/language-model",
+        .protocol = "vercel_ai_gateway",
+        .credential_ref = "ai_gateway_api_key",
+        .remembered_model = "openai/gpt-5.4",
+        .permission_review_model = "openai/gpt-5.4",
+    }, null, connection_registry.Persistence.unavailable);
+    defer registry.deinit();
+
+    var outcome = try store.applyConnectionSnapshot(alloc, registry.snapshot());
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .committed);
+
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    const connections = parsed.value.object.get("connections").?.object;
+    try std.testing.expectEqualStrings("vercel", connections.get("selected").?.string);
+    const profile = connections.get("profiles").?.array.items[0].object;
+    try std.testing.expectEqualStrings("ai_gateway_api_key", profile.get("credential_ref").?.string);
+    try std.testing.expectEqualStrings("openai/gpt-5.4", profile.get("remembered_model").?.string);
+    try std.testing.expect(profile.get("api_key") == null);
+    try std.testing.expect(profile.get("token") == null);
+    try std.testing.expect(profile.get("secret") == null);
+    try std.testing.expectEqual(true, parsed.value.object.get("future").?.bool);
 }
 
 test "notification user patch preserves sibling fields and valid workspace overrides" {

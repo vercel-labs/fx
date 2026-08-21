@@ -11,7 +11,6 @@ const api_key_validator = @import("core/auth/api_key_validator.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
 const js_host_auth = @import("core/auth/js_host_auth.zig");
 const credentials = @import("core/auth/credentials.zig");
-const secret = @import("core/auth/secret.zig");
 const model_cache_runtime = @import("core/app/model_cache_runtime.zig");
 const app_auth_runtime = @import("core/app/app_auth_runtime.zig");
 const app_host_config_runtime = @import("core/app/app_host_config_runtime.zig");
@@ -51,6 +50,7 @@ const builtin_devbox = @import("builtins/devbox.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
+const route_snapshot = @import("core/gateway/route_snapshot.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
 const builtin_hooks = @import("builtins/hooks.zig");
 const builtin_mcp = @import("builtins/mcp.zig");
@@ -458,6 +458,41 @@ const App = struct {
         return adapter;
     }
 
+    pub fn resolveRouteCredential(
+        self: *App,
+        alloc: Allocator,
+        route: *const route_snapshot.RouteSnapshot,
+    ) !agent_runtime.RouteCredential {
+        const selected = try self.auth.selectedConnectionProfile();
+        if (std.mem.eql(u8, route.connection_id, selected.id)) {
+            if (self.auth.gatewayCredential()) |credential| {
+                if (!std.mem.eql(u8, route.credential_ref, "automatic") and
+                    !std.mem.eql(u8, route.credential_ref, @tagName(credential.source)))
+                {
+                    return error.RouteCredentialMismatch;
+                }
+                var result = agent_runtime.RouteCredential{
+                    .credential = try alloc.dupe(u8, credential.api_key),
+                    .legacy_source = credential.source,
+                };
+                errdefer result.deinit(alloc);
+                result.tenant = if (credential.gateway_team) |value| try alloc.dupe(u8, value) else null;
+                return result;
+            }
+        }
+        var credential = try self.auth.resolveCredentialReference(alloc, route.credential_ref);
+        defer credential.deinit(alloc);
+        const tenant = if (credential.gatewayTeam()) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (tenant) |value| alloc.free(value);
+        const token = credential.token;
+        credential.token = &.{};
+        return .{
+            .credential = token,
+            .tenant = tenant,
+            .legacy_source = credential.source,
+        };
+    }
+
     pub fn secretStore(self: *const Self) host.SecretStore {
         return self.auth.secret_store;
     }
@@ -605,6 +640,7 @@ const App = struct {
             &app,
             footer_rows,
             builtin_gateway.default_model,
+            false,
             default_max_agent_steps,
             handle_sigwinch,
             launch.record_requested,
@@ -612,6 +648,8 @@ const App = struct {
                 .load_mcp_runtime = if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
                 .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
                 .terminal_title = app.terminalTitle(),
+                .connection_seed = builtin_gateway.connection_seed,
+                .model_descriptors = builtin_gateway.model_descriptor_provider,
             },
         );
         errdefer app.deinit();
@@ -1225,6 +1263,21 @@ const App = struct {
         return SessionAppRuntime.continuePausedRecovery(self);
     }
 
+    pub fn legacySessionRouteDefaults(_: *App) session_codec.LegacyRouteDefaults {
+        return .{
+            .connection_id = builtin_gateway.connection_seed.id,
+            .adapter_kind = builtin_gateway.connection_seed.adapter_id,
+            .permission_review_model_id = builtin_gateway.connection_seed.permission_review_model,
+        };
+    }
+
+    pub fn requireSessionConnection(self: *App, id: []const u8) !void {
+        _ = self.auth.connectionProfile(id) catch |err| switch (err) {
+            error.UnknownConnection => return error.MissingSessionConnection,
+            else => return err,
+        };
+    }
+
     pub fn queueRecoveryCheckpoint(
         self: *App,
         checkpoint: *const session_codec.RecoveryCheckpoint,
@@ -1254,18 +1307,28 @@ const App = struct {
         const prompt_copy = try std.heap.c_allocator.dupe(u8, prompt);
         errdefer std.heap.c_allocator.free(prompt_copy);
 
-        const model_copy = try std.heap.c_allocator.dupe(u8, self.selected_model.items);
-        errdefer std.heap.c_allocator.free(model_copy);
-
-        const gateway_credential = self.auth.gatewayCredential() orelse return error.MissingApiKey;
-        const api_key_copy = try std.heap.c_allocator.dupe(u8, gateway_credential.api_key);
-        errdefer secret.zeroAndFree(std.heap.c_allocator, api_key_copy);
-
-        const gateway_team_copy = if (gateway_credential.gateway_team) |team|
-            try std.heap.c_allocator.dupe(u8, team)
+        const connection_id = if (recovery_checkpoint) |checkpoint|
+            checkpoint.route_identity.?.connection_id
+        else if (self.session_persistence.session_preferences) |preferences|
+            preferences.connection_id orelse session_codec.legacy_connection_id
         else
-            null;
-        errdefer if (gateway_team_copy) |team| std.heap.c_allocator.free(team);
+            (try self.auth.selectedConnectionProfile()).id;
+        const profile = self.auth.connectionProfile(connection_id) catch |err| switch (err) {
+            error.UnknownConnection => return error.MissingSessionConnection,
+            else => return err,
+        };
+        if (recovery_checkpoint) |checkpoint| {
+            try route_snapshot.validateRecoveryProfile(
+                profile,
+                checkpoint.route_identity.?.adapter_kind,
+            );
+        }
+        const selected_profile = try self.auth.selectedConnectionProfile();
+        if (std.mem.eql(u8, profile.id, selected_profile.id) and
+            self.auth.gatewayCredential() == null)
+        {
+            return error.MissingApiKey;
+        }
 
         const authorized_image_catalog = try self.session.snapshotImageCatalog(
             std.heap.c_allocator,
@@ -1275,6 +1338,48 @@ const App = struct {
                 self.pending_images.items,
         );
         errdefer types.freeImageAttachmentSlice(std.heap.c_allocator, authorized_image_catalog);
+        var descriptor = if (recovery_checkpoint) |checkpoint| recovery_descriptor: {
+            const resolved = self.resolvedModelDescriptor(checkpoint.route_model);
+            break :recovery_descriptor route_snapshot.recoveryDescriptor(
+                checkpoint.route_model,
+                resolved,
+            );
+        } else self.resolvedModelDescriptor(self.selected_model.items);
+        if (model_capabilities.requiresResolvedRequestCapabilities(
+            authorized_image_catalog.len > 0,
+            self.effort,
+            self.fast_mode,
+            descriptor.capabilities,
+        )) {
+            const model = if (recovery_checkpoint) |checkpoint|
+                checkpoint.route_model
+            else
+                self.selected_model.items;
+            const resolved = try self.resolveModelDescriptorForRequest(model);
+            descriptor = if (recovery_checkpoint) |checkpoint|
+                route_snapshot.recoveryDescriptor(checkpoint.route_model, resolved)
+            else
+                resolved;
+        }
+        var route = if (recovery_checkpoint) |checkpoint|
+            try route_snapshot.RouteSnapshot.admitSelectedRecovery(
+                std.heap.c_allocator,
+                profile,
+                builtin_gateway.connection_seed,
+                checkpoint.route_identity.?.adapter_kind,
+                checkpoint.route_identity.?.permission_review_model_id,
+                descriptor,
+                builtin_gateway.defaultChatUrl(),
+            )
+        else
+            try route_snapshot.RouteSnapshot.admitSelected(
+                std.heap.c_allocator,
+                profile,
+                builtin_gateway.connection_seed,
+                descriptor,
+                builtin_gateway.defaultChatUrl(),
+            );
+        errdefer route.deinit(std.heap.c_allocator);
 
         const history_copy = try self.session.snapshotContextHistory(std.heap.c_allocator);
         errdefer types.freeHistoryTurnSlice(std.heap.c_allocator, history_copy);
@@ -1334,10 +1439,7 @@ const App = struct {
             .prompt = prompt_copy,
             .images = images_copy,
             .authorized_image_catalog = authorized_image_catalog,
-            .model = model_copy,
-            .api_key = api_key_copy,
-            .gateway_team = gateway_team_copy,
-            .credential_source = gateway_credential.source,
+            .route = route,
             .permission_mode = self.permission_engine.mode,
             .sandbox_backend = sandbox.effectiveBackend(
                 self.permission_engine.mode,
@@ -1736,8 +1838,21 @@ const App = struct {
         return model_capabilities.resolveCapabilities(model, self.model_cache.metadataForModel(model));
     }
 
+    pub fn resolvedModelDescriptor(self: *App, model: []const u8) model_capabilities.ModelDescriptor {
+        var descriptor = builtin_gateway.model_descriptor_provider.fallback(model);
+        descriptor.capabilities = self.resolvedModelCapabilities(model);
+        return descriptor;
+    }
+
     pub fn resolveModelCapabilitiesForRequest(self: *App, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
         return self.model_cache.resolveForRequest(model, &self.worker.worker_cancel_requested);
+    }
+
+    pub fn resolveModelDescriptorForRequest(self: *App, model: []const u8) model_capabilities.ResolveError!model_capabilities.ModelDescriptor {
+        var descriptor = builtin_gateway.model_descriptor_provider.fallback(model);
+        descriptor.capabilities = try self.resolveModelCapabilitiesForRequest(model);
+        descriptor.source = .catalog;
+        return descriptor;
     }
 
     /// Must be called after init() returns so the loader thread captures

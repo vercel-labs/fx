@@ -20,7 +20,6 @@ pub fn Runtime(comptime App: type) type {
                 if (session_codec.validateModelPreference(model)) |_| {
                     app.selected_model.clearRetainingCapacity();
                     try app.selected_model.appendSlice(app.alloc, model);
-                    try app.worker.syncQueuedPromptModel(std.heap.c_allocator, model);
                 } else |err| {
                     debug_trace.logf(
                         "host_config",

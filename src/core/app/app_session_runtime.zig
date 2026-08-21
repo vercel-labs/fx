@@ -1297,10 +1297,15 @@ pub fn Runtime(comptime App: type) type {
             effort: types.ReasoningEffort,
             fast_mode: bool,
         ) !void {
+            const connection_id = if (comptime @hasField(App, "auth"))
+                (try app.auth.selectedConnectionProfile()).id
+            else
+                session_codec.legacy_connection_id;
             try replacePreferences(
                 app.alloc,
                 &app.session_persistence.workspace_preferences,
                 .{
+                    .connection_id = @constCast(connection_id),
                     .model = @constCast(configured_model),
                     .effort = effort,
                     .fast_mode = fast_mode,
@@ -1636,7 +1641,10 @@ pub fn Runtime(comptime App: type) type {
                     &admission,
                     session_id,
                     app.workspace_root,
-                    .{ .seed_preferences = app.session_persistence.workspace_preferences },
+                    .{
+                        .seed_preferences = app.session_persistence.workspace_preferences,
+                        .legacy_route_defaults = legacyRouteDefaults(app),
+                    },
                 );
             } else try loadResumeTargetForWrite(app, resume_target, .{});
             var loaded_owned = true;
@@ -1833,6 +1841,7 @@ pub fn Runtime(comptime App: type) type {
                 app.workspace_root,
                 .{
                     .seed_preferences = app.session_persistence.workspace_preferences,
+                    .legacy_route_defaults = legacyRouteDefaults(app),
                     .log = log_options,
                 },
             );
@@ -1845,6 +1854,10 @@ pub fn Runtime(comptime App: type) type {
         ) !void {
             var loaded_owned = true;
             errdefer if (loaded_owned) loaded.deinit(app.alloc);
+
+            if (comptime @hasDecl(App, "requireSessionConnection")) {
+                try app.requireSessionConnection(loaded.state.preferences.connection_id.?);
+            }
 
             var display = try readNativeResumeDisplay(app, loaded);
             defer display.deinit(app.alloc);
@@ -2806,20 +2819,33 @@ pub fn Runtime(comptime App: type) type {
                 result.session_error = err;
             };
 
-            var settings_attempt = config_runtime.attemptUserPreferences(
-                app.alloc,
-                patch.userSettingsPatch(),
-            );
-            switch (settings_attempt) {
-                .outcome => |outcome| {
-                    result.settings_outcome = outcome;
-                    settings_attempt = undefined;
-                },
-                .failure => |failure| {
-                    result.settings_error = failure.err;
-                    result.settings_failure_cleanup = failure.cleanup;
-                    settings_attempt = undefined;
-                },
+            if (patch.model) |model| {
+                if (comptime @hasField(App, "auth") and
+                    @hasDecl(@TypeOf(app.auth), "rememberSelectedConnectionModel"))
+                {
+                    app.auth.rememberSelectedConnectionModel(model) catch |err| {
+                        result.settings_error = err;
+                    };
+                }
+            }
+            if (result.settings_error == null) {
+                // G11 removes this compatibility projection once session and
+                // status readers consume selected connection identity.
+                var settings_attempt = config_runtime.attemptUserPreferences(
+                    app.alloc,
+                    patch.userSettingsPatch(),
+                );
+                switch (settings_attempt) {
+                    .outcome => |outcome| {
+                        result.settings_outcome = outcome;
+                        settings_attempt = undefined;
+                    },
+                    .failure => |failure| {
+                        result.settings_error = failure.err;
+                        result.settings_failure_cleanup = failure.cleanup;
+                        settings_attempt = undefined;
+                    },
+                }
             }
             if (result.settings_error == null) {
                 applyPreferencePatch(
@@ -4838,10 +4864,6 @@ pub fn Runtime(comptime App: type) type {
                 app.selected_model.clearRetainingCapacity();
                 try app.selected_model.appendSlice(app.alloc, model);
             }
-            try app.worker.syncQueuedPromptModel(
-                std.heap.c_allocator,
-                app.selected_model.items,
-            );
             app.effort = preferences.effort;
             app.fast_mode = preferences.fast_mode;
             app.worker.syncQueuedPromptEffort(preferences.effort);
@@ -4890,6 +4912,14 @@ pub fn Runtime(comptime App: type) type {
             }, true);
         }
     };
+}
+
+fn legacyRouteDefaults(app: anytype) ?session_codec.LegacyRouteDefaults {
+    const App = @TypeOf(app.*);
+    if (comptime @hasDecl(App, "legacySessionRouteDefaults")) {
+        return app.legacySessionRouteDefaults();
+    }
+    return null;
 }
 
 fn replacePreferences(
@@ -5013,27 +5043,12 @@ const FakeBackground = struct {
 };
 
 const FakeWorker = struct {
-    model: std.ArrayList(u8) = .empty,
     effort: types.ReasoningEffort = .auto,
     fast_mode: bool = false,
-
-    fn deinit(self: *FakeWorker, alloc: Allocator) void {
-        self.model.deinit(alloc);
-        self.* = .{};
-    }
 
     pub fn queuedPromptCount(self: *const FakeWorker) usize {
         _ = self;
         return 0;
-    }
-
-    fn syncQueuedPromptModel(
-        self: *FakeWorker,
-        alloc: Allocator,
-        model: []const u8,
-    ) !void {
-        self.model.clearRetainingCapacity();
-        try self.model.appendSlice(alloc, model);
     }
 
     fn syncQueuedPromptEffort(
@@ -5229,7 +5244,6 @@ const TestApp = struct {
         if (self.requested_resume) |*target| target.deinit(self.alloc);
         self.session.deinit(self.alloc);
         self.background.deinit();
-        self.worker.deinit(std.heap.c_allocator);
         self.selected_model.deinit(self.alloc);
         self.permission_engine.deinit(self.alloc);
         for (self.mcp_tool_names.items) |name| self.alloc.free(name);
@@ -5929,6 +5943,7 @@ fn writeSessionFixture(
         .updated_at_ms = 456,
         .conversation_language = session_runtime.ConversationLanguage.literal("en"),
         .preferences = .{
+            .connection_id = try alloc.dupe(u8, "vercel"),
             .model = try alloc.dupe(u8, "saved/model"),
             .effort = types.ReasoningEffort.literal("medium"),
             .fast_mode = false,
@@ -7426,6 +7441,12 @@ test "resumed recovery checkpoint replays its unfinished turn once" {
         );
         defer writable.deinit(alloc);
         const checkpoint = session_codec.RecoveryCheckpoint{
+            .version = 2,
+            .route_identity = .{
+                .connection_id = @constCast("vercel"),
+                .adapter_kind = @constCast("vercel_ai_gateway"),
+                .permission_review_model_id = @constCast("openai/gpt-5.4"),
+            },
             .turn_id = 41,
             .user = .{ .text = @constCast("unfinished prompt") },
             .assistant_source = @constCast("Partial output before EOF."),

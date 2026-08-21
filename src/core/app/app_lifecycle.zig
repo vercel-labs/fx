@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -8,6 +9,12 @@ const host = @import("../hosts/host.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const input_appearance = @import("../config/input_appearance.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const connection_registry = @import("../gateway/connection_registry.zig");
+const model_catalog = @import("../gateway/model_catalog.zig");
+const test_model_descriptors = if (builtin.is_test)
+    @import("../../builtins/gateway/model_descriptors.zig")
+else
+    struct {};
 const debug_trace = @import("../shared/debug_trace.zig");
 const record_tape = @import("../workspace/record_tape.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
@@ -119,6 +126,7 @@ pub const StartupState = struct {
     workspace_root: []u8 = &.{},
     workspace_access: workspace_access.WorkspaceAccess = .{},
     credential: ?credentials.Credential = null,
+    connections: ?connection_registry.Runtime = null,
     credential_onboarding_skipped: bool = false,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
     selected_model: []u8 = &.{},
@@ -157,6 +165,7 @@ pub const StartupState = struct {
         self.workspace_access.deinit(alloc);
         if (self.workspace_root.len > 0) alloc.free(self.workspace_root);
         if (self.credential) |*credential| credential.deinit(alloc);
+        if (self.connections) |*connections| connections.deinit();
         if (self.selected_model.len > 0) alloc.free(self.selected_model);
         if (self.configured_model.len > 0) alloc.free(self.configured_model);
         self.permission_rules.deinit(alloc);
@@ -201,6 +210,12 @@ pub const StartupState = struct {
         return value;
     }
 
+    pub fn takeConnections(self: *StartupState) ?connection_registry.Runtime {
+        const value = self.connections;
+        self.connections = null;
+        return value;
+    }
+
     pub fn takeSelectedModel(self: *StartupState) []u8 {
         const value = self.selected_model;
         self.selected_model = &.{};
@@ -211,6 +226,24 @@ pub const StartupState = struct {
         const value = self.permission_rules;
         self.permission_rules = .{};
         return value;
+    }
+
+    pub fn normalizeModels(
+        self: *StartupState,
+        alloc: Allocator,
+        descriptors: model_catalog.ModelDescriptorProvider,
+    ) !void {
+        const selected = descriptors.fallback(self.selected_model);
+        const configured = descriptors.fallback(self.configured_model);
+        const normalized_selected = try alloc.dupe(u8, selected.id);
+        errdefer alloc.free(normalized_selected);
+        const normalized_configured = try alloc.dupe(u8, configured.id);
+
+        alloc.free(self.selected_model);
+        alloc.free(self.configured_model);
+        self.selected_model = normalized_selected;
+        self.configured_model = normalized_configured;
+        self.fast_mode = self.fast_mode or selected.selected_fast_mode;
     }
 };
 
@@ -251,7 +284,10 @@ pub const BootstrapConfig = struct {
     footer_rows: u16,
     startup_min_body_rows: u16 = 0,
     default_model: []const u8,
+    default_fast_mode: bool = false,
+    connection_seed: connection_registry.Seed,
     default_agent_step_limit: usize,
+    model_descriptors: model_catalog.ModelDescriptorProvider,
     secret_store: host.SecretStore,
     resize_handler: ResizeHandler,
     fx_version: []const u8 = "",
@@ -263,15 +299,23 @@ pub fn loadStartupState(
     transport: oauth_transport.Provider,
     secret_store: host.SecretStore,
     default_model: []const u8,
+    default_fast_mode: bool,
     default_agent_step_limit: usize,
+    connection_seed: connection_registry.Seed,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, null, .refresh_if_needed);
+    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_fast_mode, default_agent_step_limit, connection_seed, null, .refresh_if_needed);
 }
 
-pub fn loadStartupStateWithoutCredentials(alloc: Allocator, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
+pub fn loadStartupStateWithoutCredentials(
+    alloc: Allocator,
+    default_model: []const u8,
+    default_fast_mode: bool,
+    default_agent_step_limit: usize,
+    connection_seed: connection_registry.Seed,
+) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_agent_step_limit, null, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_fast_mode, default_agent_step_limit, connection_seed, null, null);
 }
 
 pub fn loadEmbeddedStartupState(
@@ -279,7 +323,9 @@ pub fn loadEmbeddedStartupState(
     home_dir: []const u8,
     workspace_root: []const u8,
     default_model: []const u8,
+    default_fast_mode: bool,
     default_agent_step_limit: usize,
+    connection_seed: connection_registry.Seed,
 ) !StartupState {
     const owned_workspace_root = try io_mod.realpathAlloc(alloc, workspace_root);
     return loadStartupStateFromOwnedWorkspace(
@@ -288,7 +334,9 @@ pub fn loadEmbeddedStartupState(
         host.unavailable_secret_store,
         owned_workspace_root,
         default_model,
+        default_fast_mode,
         default_agent_step_limit,
+        connection_seed,
         home_dir,
         null,
     );
@@ -298,10 +346,12 @@ pub fn loadCatalogStartupState(
     alloc: Allocator,
     secret_store: host.SecretStore,
     default_model: []const u8,
+    default_fast_mode: bool,
     default_agent_step_limit: usize,
+    connection_seed: connection_registry.Seed,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, null, .stored);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_fast_mode, default_agent_step_limit, connection_seed, null, .stored);
 }
 
 pub fn loadStartupStatus(
@@ -356,10 +406,97 @@ pub fn applyWorkspaceLaunch(
 
 fn loadStartupStateForWorkspace(alloc: Allocator, workspace_root: []const u8, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const owned_workspace_root = try alloc.dupe(u8, workspace_root);
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, default_agent_step_limit, null, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, false, default_agent_step_limit, test_connection_seed, null, null);
+}
+
+fn loadStartupStateForWorkspaceWithFastDefault(alloc: Allocator, workspace_root: []const u8, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
+    const owned_workspace_root = try alloc.dupe(u8, workspace_root);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, true, default_agent_step_limit, test_connection_seed, null, null);
 }
 
 const CredentialLoadMode = credentials.LoadMode;
+
+const test_connection_seed = connection_registry.Seed{
+    .id = "test",
+    .display_name = "Test Gateway",
+    .adapter_id = "test_gateway",
+    .credential_ref = "automatic",
+};
+
+fn connectionUsesSeedAdapter(
+    profile: connection_registry.Profile,
+    seed: connection_registry.Seed,
+) bool {
+    return std.mem.eql(u8, profile.adapter_id, seed.adapter_id) and
+        optionalStringEqual(profile.protocol, seed.protocol);
+}
+
+fn optionalStringEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn credentialSourceFromReference(reference: []const u8) !?credentials.Source {
+    if (std.mem.eql(u8, reference, "automatic")) return null;
+    return types.parseCredentialSource(reference) orelse error.InvalidCredentialReference;
+}
+
+pub fn resolveConnectionCredential(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    profile: connection_registry.Profile,
+    seed: connection_registry.Seed,
+    mode: credentials.LoadMode,
+) !credentials.Resolution {
+    if (!connectionUsesSeedAdapter(profile, seed)) {
+        return error.UnsupportedConnectionAdapter;
+    }
+    return credentials.resolvePreferring(
+        alloc,
+        transport,
+        secret_store,
+        mode,
+        try credentialSourceFromReference(profile.credential_ref),
+    );
+}
+
+fn loadSelectedConnectionCredential(
+    state: *StartupState,
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    profile: connection_registry.Profile,
+    seed: connection_registry.Seed,
+    mode: CredentialLoadMode,
+) !void {
+    const connections = &state.connections.?;
+    const resolution = resolveConnectionCredential(
+        alloc,
+        transport,
+        secret_store,
+        profile,
+        seed,
+        mode,
+    ) catch |err| switch (err) {
+        error.UnsupportedConnectionAdapter => {
+            connections.markSelectedDisconnected(.unsupported_adapter);
+            return;
+        },
+        error.InvalidCredentialReference => {
+            connections.markSelectedDisconnected(.invalid_credential_reference);
+            return;
+        },
+        else => return err,
+    };
+    state.credential = resolution.credential;
+    state.stored_key_status = resolution.stored_key_status;
+    if (state.credential != null) {
+        connections.markSelectedConnected();
+    } else {
+        connections.markSelectedDisconnected(.missing_credential);
+    }
+}
 
 fn loadStartupStateFromOwnedWorkspace(
     alloc: Allocator,
@@ -367,7 +504,9 @@ fn loadStartupStateFromOwnedWorkspace(
     secret_store: host.SecretStore,
     owned_workspace_root: []u8,
     default_model: []const u8,
+    default_fast_mode: bool,
     default_agent_step_limit: usize,
+    connection_seed: connection_registry.Seed,
     profile_home: ?[]const u8,
     credential_mode: ?CredentialLoadMode,
 ) !StartupState {
@@ -391,18 +530,35 @@ fn loadStartupStateFromOwnedWorkspace(
         false,
     );
 
-    state.configured_model = try alloc.dupe(u8, settings.model orelse default_model);
-    state.model_source = detailed.model_source orelse .compiled_default;
-    state.selected_model = try loadInitialModel(alloc, default_model, settings.model);
+    const legacy_credential_ref: ?[]const u8 = if (settings.credential_source) |source| @tagName(source) else null;
+    state.connections = try connection_registry.Runtime.init(
+        alloc,
+        connection_seed.profile(settings.model orelse default_model, legacy_credential_ref),
+        if (settings.connections) |*connections| connections else null,
+        config_runtime.connectionPersistence(),
+    );
+    const selected_connection = state.connections.?.selectedProfile();
+    state.configured_model = try alloc.dupe(u8, selected_connection.remembered_model);
+    state.model_source = if (settings.connections != null)
+        .user_global
+    else
+        detailed.model_source orelse .compiled_default;
+    state.selected_model = try loadInitialModel(alloc, selected_connection.remembered_model, null);
     if (hasProcessModelOverride()) state.model_source = .process_override;
     state.config_diagnostics = detailed.diagnostics;
     detailed.diagnostics = &.{};
     state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
     if (credential_mode) |mode| {
-        const resolution = try credentials.resolvePreferring(alloc, transport, secret_store, mode, settings.credential_source);
-        state.credential = resolution.credential;
-        state.stored_key_status = resolution.stored_key_status;
+        try loadSelectedConnectionCredential(
+            &state,
+            alloc,
+            transport,
+            secret_store,
+            selected_connection,
+            connection_seed,
+            mode,
+        );
     }
     state.permission_mode = loadPermissionMode(settings.permission_mode);
     state.yolo_acknowledged = settings.yolo_acknowledged orelse false;
@@ -411,7 +567,8 @@ fn loadStartupStateFromOwnedWorkspace(
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});
     state.context_enabled = settings.context orelse true;
-    state.fast_mode = settings.fast_mode orelse false;
+    state.fast_mode = settings.fast_mode orelse
+        (default_fast_mode and state.model_source == .compiled_default);
     state.input_appearance = initialInputAppearance(settings.input_appearance);
     state.maxxing_mode = initialMaxxingMode(settings.maxxing_mode);
     state.slash_menu_categories = settings.slash_menu_categories orelse true;
@@ -448,9 +605,12 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         cfg.alloc,
         cfg.secret_store,
         cfg.default_model,
+        cfg.default_fast_mode,
         cfg.default_agent_step_limit,
+        cfg.connection_seed,
     );
     errdefer state.deinit(cfg.alloc);
+    try state.normalizeModels(cfg.alloc, cfg.model_descriptors);
 
     state.credential_onboarding_skipped = credentialOnboardingDisabled();
 
@@ -1968,7 +2128,9 @@ test "loadStartupState applies core env overrides" {
         oauth_transport.unavailable_provider,
         host.unavailable_secret_store,
         "default-model",
+        false,
         12,
+        test_connection_seed,
     );
     defer state.deinit(std.testing.allocator);
 
@@ -1985,6 +2147,87 @@ test "loadStartupState applies core env overrides" {
 }
 
 test "loadStartupState defaults fast mode off and preserves explicit preferences" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home);
+
+    var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home }});
+    defer env.deinit();
+
+    var state = try loadStartupState(
+        std.testing.allocator,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        "zai/glm-5.2-fast",
+        true,
+        12,
+        .{
+            .id = "vercel",
+            .display_name = "Vercel AI Gateway",
+            .adapter_id = "vercel_ai_gateway",
+            .endpoint = "https://ai-gateway.vercel.sh/v3/ai/language-model",
+            .protocol = "vercel_ai_gateway",
+            .credential_ref = "automatic",
+            .permission_review_model = "openai/gpt-5.4",
+        },
+    );
+    defer state.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("zai/glm-5.2-fast", state.selected_model);
+}
+
+test "built-in Vercel connection reuses credential resolution and CatalogAccess ownership" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"connections\":{\"selected\":\"vercel\",\"profiles\":[{\"id\":\"vercel\",\"display_name\":\"Vercel AI Gateway\",\"adapter_id\":\"vercel_ai_gateway\",\"endpoint\":\"https://ai-gateway.vercel.sh/v3/ai/language-model\",\"protocol\":\"vercel_ai_gateway\",\"credential_ref\":\"ai_gateway_api_key\",\"remembered_model\":\"openai/gpt-5.4\",\"permission_review_model\":\"openai/gpt-5.4\"}]}}\n",
+    );
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var env = try TestEnv.install(alloc, &.{
+        .{ .key = "HOME", .value = home },
+        .{ .key = "AI_GATEWAY_API_KEY", .value = "gateway-key" },
+    });
+    defer env.deinit();
+
+    var state = try loadStartupState(
+        alloc,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        "default-model",
+        false,
+        12,
+        .{
+            .id = "vercel",
+            .display_name = "Vercel AI Gateway",
+            .adapter_id = "vercel_ai_gateway",
+            .endpoint = "https://ai-gateway.vercel.sh/v3/ai/language-model",
+            .protocol = "vercel_ai_gateway",
+            .credential_ref = "automatic",
+            .permission_review_model = "openai/gpt-5.4",
+        },
+    );
+    defer state.deinit(alloc);
+
+    const selected = state.connections.?.selectedProfile();
+    try std.testing.expectEqualStrings("vercel", selected.id);
+    try std.testing.expectEqualStrings("openai/gpt-5.4", state.selected_model);
+    try std.testing.expectEqual(connection_registry.AuthStateTag.connected, std.meta.activeTag(selected.auth));
+    try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, state.credential.?.source);
+    const access = state.modelCatalogAccess();
+    try std.testing.expectEqualStrings("gateway-key", access.authorizationCredential().?);
+    try std.testing.expectEqual(state.credential.?.token.ptr, access.authorizationCredential().?.ptr);
+    try std.testing.expect(!@hasField(connection_registry.Profile, "api_key"));
+}
+
+test "loadStartupState canonicalizes fast model defaults" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 

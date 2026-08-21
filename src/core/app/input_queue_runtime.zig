@@ -4,6 +4,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
+const route_snapshot_test_support = @import("../gateway/route_snapshot_test_support.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const core_input_runtime = @import("../input/runtime.zig");
@@ -774,18 +775,15 @@ const ReviewTestApp = struct {
 fn makeReviewTestPrompt(alloc: std.mem.Allocator, text: []const u8) !worker_runtime.QueuedPrompt {
     const prompt = try alloc.dupe(u8, text);
     errdefer alloc.free(prompt);
-    const model = try alloc.dupe(u8, "test/model");
-    errdefer alloc.free(model);
-    const api_key = try alloc.dupe(u8, "key");
-    errdefer alloc.free(api_key);
+    var route = try route_snapshot_test_support.owned(alloc, "test/model");
+    errdefer route.deinit(alloc);
     const history = try alloc.alloc(types.HistoryTurn, 0);
     errdefer alloc.free(history);
     const grants = try alloc.alloc(types.PermissionGrant, 0);
     return .{
         .prompt = prompt,
         .images = &.{},
-        .model = model,
-        .api_key = api_key,
+        .route = route,
         .permission_mode = .auto,
         .history = history,
         .grants = grants,
