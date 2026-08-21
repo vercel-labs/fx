@@ -1723,24 +1723,33 @@ fn runCustomSetup(
     try writeStderr(deps, "OpenAI-compatible endpoint [https://openrouter.ai/api/v1]: ");
     const endpoint_input = readSetupLine(alloc) catch return false;
     defer alloc.free(endpoint_input);
-    const endpoint = if (endpoint_input.len == 0) "https://openrouter.ai/api/v1" else endpoint_input;
+    const endpoint_is_key = std.mem.startsWith(u8, endpoint_input, "sk-");
+    const endpoint = if (endpoint_input.len == 0 or endpoint_is_key)
+        "https://openrouter.ai/api/v1"
+    else
+        endpoint_input;
     config_runtime.custom_provider.validate(endpoint, "OPENROUTER_API_KEY") catch {
         try writeStderr(deps, "fx setup custom: endpoint must use HTTPS, or loopback HTTP for testing\n");
         return false;
     };
 
-    try writeStderr(deps, "API key (input hidden): ");
-    const key = deps.read_masked_key(
-        deps.setup_ctx,
-        alloc,
-        deps.write_stderr,
-        deps.stderr_ctx,
-    ) catch {
-        try writeStderr(deps, "\nfx setup custom: API key was not saved\n");
-        return false;
+    const key = if (endpoint_is_key)
+        try alloc.dupe(u8, endpoint_input)
+    else blk: {
+        try writeStderr(deps, "API key (input hidden): ");
+        const entered = deps.read_masked_key(
+            deps.setup_ctx,
+            alloc,
+            deps.write_stderr,
+            deps.stderr_ctx,
+        ) catch {
+            try writeStderr(deps, "\nfx setup custom: API key was not saved\n");
+            return false;
+        };
+        try writeStderr(deps, "\n");
+        break :blk entered;
     };
     defer secret.zeroAndFree(alloc, key);
-    try writeStderr(deps, "\n");
 
     const chat_url = try std.fmt.allocPrint(alloc, "{s}/chat/completions", .{std.mem.trimEnd(u8, endpoint, "/")});
     defer alloc.free(chat_url);
