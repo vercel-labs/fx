@@ -308,8 +308,8 @@ fn isCompatSkillSource(source: SkillSource) bool {
 
 fn shouldIncludeSkillSource(source: SkillSource) bool {
     if (!isCompatSkillSource(source)) return true;
-    if (io_mod.getenv("FX_DISABLE_SKILL_COMPAT") != null) return false;
-    return true;
+    const value = io_mod.getenv("FX_DISABLE_SKILL_COMPAT") orelse return true;
+    return !(std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true"));
 }
 
 pub fn loadVisibleSkills(
@@ -3129,9 +3129,22 @@ test "loadVisibleSkills respects FX_DISABLE_SKILL_COMPAT for compat roots" {
     const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(managed_root);
 
+    const workspace_roots = [_]skill_contract.RootSpec{
+        .{ .source = .workspace_fx, .path = ".fx/skills" },
+        .{ .source = .workspace_shared, .path = "skills" },
+        .{ .source = .workspace_codex, .path = ".codex/skills" },
+    };
+    const root_policy: skill_contract.RootPolicy = .{
+        .workspace_roots = &workspace_roots,
+        .managed_root_source = .global_fx,
+        .global_roots = &test_global_roots,
+    };
+
     // Without the gate, compat roots are retained.
     {
-        var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+        const env = try TestEnviron.install(alloc);
+        defer env.deinit();
+        var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, root_policy);
         defer discovery.deinit(alloc);
         try std.testing.expectEqual(@as(usize, 5), discovery.skills.len);
         try std.testing.expect(findSkillByName(discovery.skills, "local-codex") != null);
@@ -3141,12 +3154,24 @@ test "loadVisibleSkills respects FX_DISABLE_SKILL_COMPAT for compat roots" {
         try std.testing.expect(findSkillByName(discovery.skills, "workspace-shared") != null);
     }
 
-    // With FX_DISABLE_SKILL_COMPAT, compat roots are dropped and fx roots remain.
-    {
+    // Explicit false values retain compatibility roots.
+    for ([_][]const u8{ "0", "false", "FALSE" }) |value| {
         const env = try TestEnviron.install(alloc);
         defer env.deinit();
-        try env.put("FX_DISABLE_SKILL_COMPAT", "1");
-        var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+        try env.put("FX_DISABLE_SKILL_COMPAT", value);
+        var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, root_policy);
+        defer discovery.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 5), discovery.skills.len);
+        try std.testing.expect(findSkillByName(discovery.skills, "local-codex") != null);
+        try std.testing.expect(findSkillByName(discovery.skills, "global-codex") != null);
+    }
+
+    // Explicit true values drop compatibility roots and retain fx roots.
+    for ([_][]const u8{ "1", "true", "TRUE" }) |value| {
+        const env = try TestEnviron.install(alloc);
+        defer env.deinit();
+        try env.put("FX_DISABLE_SKILL_COMPAT", value);
+        var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, root_policy);
         defer discovery.deinit(alloc);
         try std.testing.expect(findSkillByName(discovery.skills, "local-codex") == null);
         try std.testing.expect(findSkillByName(discovery.skills, "global-codex") == null);
