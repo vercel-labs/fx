@@ -1577,9 +1577,29 @@ pub fn Runtime(comptime App: type) type {
                 try requestNormalViewportRecovery(app);
             }
 
+            if (!question_active and approval == null and
+                fullscreenEnabled(app) and
+                app.terminal.alternate_screen_owner == .none and
+                !app.shell.fullTranscriptActive())
+            {
+                try app_lifecycle.openFullTranscript(
+                    app.alloc,
+                    &app.terminal,
+                    &app.shell,
+                    &app.metrics,
+                );
+            }
+
             return .{ .inline_render = .{
                 .alternate_screen_owns_rendering = app.terminal.alternate_screen_owner != .none,
             } };
+        }
+
+        fn fullscreenEnabled(app: *const App) bool {
+            if (comptime @hasField(App, "fullscreen_enabled")) {
+                return app.fullscreen_enabled;
+            }
+            return false;
         }
 
         fn renderFrameAttempt(app: *App, snapshot: render_request.AttemptSnapshot) !FrameAttemptResult {
@@ -4538,6 +4558,7 @@ const CoordinatorTestApp = struct {
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.testing.allocator, "/v1/models"),
     stream: types.StreamState = .{},
     fast_mode: bool = false,
+    fullscreen_enabled: bool = false,
     effort: types.ReasoningEffort = .auto,
     statusline_sandbox: bool = false,
     statusline_context: bool = false,
@@ -4634,6 +4655,58 @@ fn initCoordinatorProjectionTestApp(
     try app.shell.initBacking(alloc);
     try app.shell.enableShadowVt(alloc);
     return app;
+}
+
+test "core.app_render_runtime fullscreen resumes after a catalog surface yields ownership" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "fullscreen-resume.log", .{ .read = true });
+    defer file.close(io_mod.getIo());
+
+    var app = try initCoordinatorProjectionTestApp(alloc, file);
+    defer app.deinit();
+    app.fullscreen_enabled = true;
+
+    _ = try Runtime(CoordinatorTestApp).reconcileBeforeFrameRender(&app, 0);
+    try std.testing.expect(app.terminal.fullTranscriptScreenActive());
+    try std.testing.expect(app.shell.fullTranscriptActive());
+
+    app.input_runtime.settings_menu.open();
+    _ = try Runtime(CoordinatorTestApp).reconcileBeforeFrameRender(&app, 0);
+    try std.testing.expect(!app.terminal.fullTranscriptScreenActive());
+    try std.testing.expect(!app.shell.fullTranscriptActive());
+
+    app.input_runtime.settings_menu.close();
+    _ = try Runtime(CoordinatorTestApp).reconcileBeforeFrameRender(&app, 0);
+    try std.testing.expect(app.terminal.fullTranscriptScreenActive());
+    try std.testing.expect(app.shell.fullTranscriptActive());
+}
+
+test "core.app_render_runtime fullscreen yields to inline approval and resumes after it clears" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "fullscreen-approval-resume.log", .{ .read = true });
+    defer file.close(io_mod.getIo());
+
+    var app = try initCoordinatorProjectionTestApp(alloc, file);
+    defer app.deinit();
+    app.fullscreen_enabled = true;
+    try app_lifecycle.openFullTranscript(app.alloc, &app.terminal, &app.shell, &app.metrics);
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
+        .id = 42,
+        .label = "terminal.exec printf approval",
+    }));
+
+    _ = try Runtime(CoordinatorTestApp).reconcileBeforeFrameRender(&app, 0);
+    try std.testing.expect(!app.terminal.fullTranscriptScreenActive());
+    try std.testing.expect(!app.shell.fullTranscriptActive());
+
+    app.approval_prompt.clear(alloc);
+    _ = try Runtime(CoordinatorTestApp).reconcileBeforeFrameRender(&app, 0);
+    try std.testing.expect(app.terminal.fullTranscriptScreenActive());
+    try std.testing.expect(app.shell.fullTranscriptActive());
 }
 
 test "core.app_render_runtime keeps final token progress during paced response tail" {

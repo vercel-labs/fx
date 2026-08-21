@@ -100,6 +100,7 @@ pub const UserSettingsPatch = struct {
     maxxing_mode: ?[]const u8 = null,
     slash_menu_categories: ?bool = null,
     update_channel: ?update_target.Channel = null,
+    fullscreen: ?bool = null,
     startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
     statusline_item: ?StatuslineItemPatch = null,
@@ -119,6 +120,7 @@ pub const UserSettingsPatch = struct {
             self.maxxing_mode == null and
             self.slash_menu_categories == null and
             self.update_channel == null and
+            self.fullscreen == null and
             self.startup_scrollback == null and
             self.prompt_history_enabled == null and
             self.statusline_item == null and
@@ -214,6 +216,7 @@ const UserPreferenceField = enum(u4) {
     maxxing_mode,
     slash_menu_categories,
     update_channel,
+    fullscreen,
     startup_scrollback,
     prompt_history_enabled,
     statusline_sandbox,
@@ -234,6 +237,7 @@ const UserPreferenceField = enum(u4) {
             .maxxing_mode => "settings.json.preference-migration.maxxing_mode.json",
             .slash_menu_categories => "settings.json.preference-migration.slash_menu_categories.json",
             .update_channel => "settings.json.preference-migration.update_channel.json",
+            .fullscreen => "settings.json.preference-migration.fullscreen.json",
             .startup_scrollback => "settings.json.preference-migration.startup_scrollback.json",
             .prompt_history_enabled => "settings.json.preference-migration.prompt_history_enabled.json",
             .statusline_sandbox => "settings.json.preference-migration.statusline_sandbox.json",
@@ -252,6 +256,7 @@ const user_preference_fields = [_]UserPreferenceField{
     .maxxing_mode,
     .slash_menu_categories,
     .update_channel,
+    .fullscreen,
     .startup_scrollback,
     .prompt_history_enabled,
     .statusline_sandbox,
@@ -990,6 +995,7 @@ fn applyUserPatchToRoot(
     if (patch.maxxing_mode) |value| application.changed = try putString(arena, &root.object, "maxxing_mode", value) or application.changed;
     if (patch.slash_menu_categories) |value| application.changed = try putBool(arena, &root.object, "slash_menu_categories", value) or application.changed;
     if (patch.update_channel) |value| application.changed = try putString(arena, &root.object, "update_channel", value.label()) or application.changed;
+    if (patch.fullscreen) |value| application.changed = try putBool(arena, &root.object, "fullscreen", value) or application.changed;
     if (patch.startup_scrollback) |value| application.changed = try putBool(arena, &root.object, "startup_scrollback", value) or application.changed;
 
     if (patch.prompt_history_enabled) |enabled| {
@@ -1109,6 +1115,13 @@ fn cleanupLegacyWorkspacePreferences(
             "update_channel",
             .update_channel,
             patch.update_channel != null,
+            application,
+        );
+        removeLegacyLeaf(
+            &entry.value_ptr.object,
+            "fullscreen",
+            .fullscreen,
+            patch.fullscreen != null,
             application,
         );
         removeLegacyLeaf(
@@ -1683,7 +1696,7 @@ fn validateKnownSettingsObject(
     if (object.get("context_limits")) |value| {
         _ = context_limits.parseJsonObject(value) catch return error.InvalidSettingsFormat;
     }
-    inline for (&.{ "context", "fast_mode", "auto_upgrade", "slash_menu_categories", "startup_scrollback", "yolo_acknowledged" }) |key| {
+    inline for (&.{ "context", "fast_mode", "auto_upgrade", "slash_menu_categories", "fullscreen", "startup_scrollback", "yolo_acknowledged" }) |key| {
         if (object.get(key)) |value| {
             if (value != .bool) return error.InvalidSettingsFormat;
         }
@@ -1945,6 +1958,26 @@ test "user patch writes user preferences at top level" {
     try std.testing.expect(std.mem.find(u8, bytes, "\"notifications\":{\"turn_end\":true,\"attention_required\":false}") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"future\":{\"nested\":7}") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"workspaces\"") == null);
+}
+
+test "fullscreen user preference writes at top level" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var outcome = try store.applyUserPatch(alloc, .{ .fullscreen = false });
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .committed);
+
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"fullscreen\":false") != null);
 }
 
 test "notification user patch preserves sibling fields and valid workspace overrides" {

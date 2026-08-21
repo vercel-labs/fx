@@ -137,6 +137,7 @@ pub const StartupState = struct {
     slash_menu_categories: bool = true,
     auto_upgrade: bool = true,
     update_channel: update_target.Channel = .stable,
+    fullscreen: bool = true,
     startup_scrollback: bool = true,
     prompt_history_enabled: bool = true,
     prompt_history_store_allowed: bool = true,
@@ -416,6 +417,7 @@ fn loadStartupStateFromOwnedWorkspace(
     state.slash_menu_categories = settings.slash_menu_categories orelse true;
     state.auto_upgrade = settings.auto_upgrade orelse true;
     state.update_channel = settings.update_channel orelse .stable;
+    state.fullscreen = loadFullscreen(settings.fullscreen);
     state.startup_scrollback = settings.startup_scrollback orelse true;
     state.effort = settings.effort orelse .auto;
     state.first_call_tool_choice = settings.first_call_tool_choice orelse .auto;
@@ -1083,6 +1085,26 @@ fn loadPermissionMode(configured: ?PermissionMode) PermissionMode {
     const fallback = configured orelse default_permission_mode;
     const mode = io_mod.getenv("FX_PERMISSION_MODE") orelse return fallback;
     return config_runtime.parsePermissionMode(mode) orelse fallback;
+}
+
+fn loadFullscreen(configured: ?bool) bool {
+    return resolveFullscreen(configured, io_mod.getenv("FX_FULLSCREEN"));
+}
+
+fn resolveFullscreen(configured: ?bool, override: ?[]const u8) bool {
+    const fallback = configured orelse true;
+    const raw = override orelse return fallback;
+    if (std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true")) return true;
+    if (std.mem.eql(u8, raw, "0") or std.ascii.eqlIgnoreCase(raw, "false")) return false;
+    return fallback;
+}
+
+test "fullscreen environment override accepts both directions" {
+    try std.testing.expect(resolveFullscreen(false, "1"));
+    try std.testing.expect(resolveFullscreen(false, "true"));
+    try std.testing.expect(!resolveFullscreen(true, "0"));
+    try std.testing.expect(!resolveFullscreen(true, "false"));
+    try std.testing.expect(resolveFullscreen(true, "invalid"));
 }
 
 fn loadAgentStepLimit(fallback: usize, configured: ?usize) usize {

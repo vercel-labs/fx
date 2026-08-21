@@ -535,6 +535,7 @@ const App = struct {
     context_enabled: bool = true,
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
+    fullscreen_enabled: bool = true,
     auto_upgrade_enabled: bool = true,
     effort: ReasoningEffort = .auto,
     diff_entries: std.ArrayList(@import("core/output/diff.zig").DiffEntry) = .empty,

@@ -51,6 +51,7 @@ pub const Settings = struct {
     slash_menu_categories: ?bool = null,
     auto_upgrade: ?bool = null,
     update_channel: ?update_target.Channel = null,
+    fullscreen: ?bool = null,
     startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
     effort: ?types.ReasoningEffort = null,
@@ -110,6 +111,7 @@ pub const ConfigSources = struct {
     input_appearance: ConfigSource = .compiled_default,
     maxxing_mode: ConfigSource = .compiled_default,
     slash_menu_categories: ConfigSource = .compiled_default,
+    fullscreen: ConfigSource = .compiled_default,
     startup_scrollback: ConfigSource = .compiled_default,
     prompt_history_enabled: ConfigSource = .compiled_default,
     statusline_sandbox: ConfigSource = .compiled_default,
@@ -518,6 +520,7 @@ fn hasLegacyWorkspacePreferences(root: std.json.Value) bool {
             "input_appearance",
             "maxxing_mode",
             "slash_menu_categories",
+            "fullscreen",
             "startup_scrollback",
         }) |key| {
             if (workspace.contains(key)) return true;
@@ -546,6 +549,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "input_appearance",
         "maxxing_mode",
         "slash_menu_categories",
+        "fullscreen",
         "startup_scrollback",
         "prompt_history",
         "statusLine",
@@ -591,6 +595,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.input_appearance != null) sources.input_appearance = source;
     if (settings.maxxing_mode != null) sources.maxxing_mode = source;
     if (settings.slash_menu_categories != null) sources.slash_menu_categories = source;
+    if (settings.fullscreen != null) sources.fullscreen = source;
     if (settings.startup_scrollback != null) sources.startup_scrollback = source;
     if (settings.prompt_history_enabled != null) sources.prompt_history_enabled = source;
     if (settings.statusline_sandbox != null) sources.statusline_sandbox = source;
@@ -1380,6 +1385,11 @@ fn parseProfileOnlyFields(
             return error.InvalidUpdateChannelValue;
     }
 
+    if (root.object.get("fullscreen")) |fullscreen_value| {
+        if (fullscreen_value != .bool) return error.InvalidFullscreenType;
+        settings.fullscreen = fullscreen_value.bool;
+    }
+
     if (root.object.get("startup_scrollback")) |startup_scrollback_value| {
         const value = startup_scrollback_value;
         if (value != .bool) return error.InvalidStartupScrollbackType;
@@ -1511,6 +1521,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
     if (incoming.slash_menu_categories) |value| target.slash_menu_categories = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
     if (incoming.update_channel) |value| target.update_channel = value;
+    if (incoming.fullscreen) |value| target.fullscreen = value;
     if (incoming.startup_scrollback) |value| target.startup_scrollback = value;
     if (incoming.prompt_history_enabled) |value| target.prompt_history_enabled = value;
     if (incoming.effort) |value| target.effort = value;
@@ -2100,6 +2111,30 @@ test "startup_scrollback parses merges rejects invalid type and round trips" {
     const json = try serializeJsonObject(std.testing.allocator, parsed.value);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"startup_scrollback\":false") != null);
+}
+
+test "fullscreen is a profile-only boolean preference" {
+    var enabled = try parseSettingsJson(std.testing.allocator, "{\"fullscreen\":true}");
+    defer enabled.deinit(std.testing.allocator);
+    try std.testing.expectEqual(true, enabled.fullscreen.?);
+
+    var disabled = try parseSettingsJson(std.testing.allocator, "{\"fullscreen\":false}");
+    defer disabled.deinit(std.testing.allocator);
+    mergeSettings(&enabled, &disabled, std.testing.allocator);
+    try std.testing.expectEqual(false, enabled.fullscreen.?);
+
+    try std.testing.expectError(
+        error.InvalidFullscreenType,
+        parseSettingsJson(std.testing.allocator, "{\"fullscreen\":\"off\"}"),
+    );
+
+    var project = try parseSettingsJsonForLayer(
+        std.testing.allocator,
+        "{\"fullscreen\":false}",
+        .project,
+    );
+    defer project.deinit(std.testing.allocator);
+    try std.testing.expect(project.fullscreen == null);
 }
 
 test "slash menu categories parses merges and rejects invalid types" {

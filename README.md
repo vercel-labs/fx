@@ -48,6 +48,8 @@ fx
 
 The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands.
 
+Interactive fx starts in fullscreen mode. fx owns the scrollback viewport while the composer and status area stay docked, so the mouse wheel and Page Up/Page Down can move through the transcript without replaying it into terminal history. Press Ctrl+O or Escape to return to inline mode for the current run. To keep inline mode across launches, run `/settings fullscreen off`, set `"fullscreen": false` in `~/.fx/settings.json`, or launch once with `FX_FULLSCREEN=0`.
+
 List saved sessions with `fx sessions`. Resume the latest session for the current workspace, or select an exact session ID, through the same command group:
 
 ```bash

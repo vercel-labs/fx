@@ -1579,7 +1579,8 @@ pub fn Handlers(comptime App: type) type {
                 if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
                 closeHelpMenuIfPresent(app);
                 closeInlineCommandMenusIfPresent(app);
-                app.input_runtime.settings_menu.openWithStartupScrollback(
+                app.input_runtime.settings_menu.openWithPreferences(
+                    settings.fullscreen orelse true,
                     settings.startup_scrollback orelse true,
                 );
                 app.shell.render_requests.request(.footer);
@@ -3337,6 +3338,7 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     if (comptime @hasField(App, "permission_engine")) snapshot.permission_mode = @tagName(app.permission_engine.mode);
     if (comptime @hasField(App, "input_runtime")) {
         snapshot.input_appearance = app.input_runtime.input_appearance.label();
+        snapshot.fullscreen = app.input_runtime.settings_menu.fullscreen;
         snapshot.startup_scrollback = app.input_runtime.settings_menu.startup_scrollback;
         if (comptime @hasField(@TypeOf(app.input_runtime), "slash_menu_categories")) {
             snapshot.slash_menu_categories = app.input_runtime.slash_menu_categories;
@@ -3497,6 +3499,14 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
                 .{ .slash_menu_categories = enabled },
                 runtime_changed,
             );
+        },
+        .fullscreen => {
+            const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
+            try session_commands.Commands(@TypeOf(app.*)).handleSettings(
+                app,
+                if (enabled) "fullscreen on" else "fullscreen off",
+            );
+            app.input_runtime.settings_menu.fullscreen = enabled;
         },
         .effort => {
             const effort = types.ReasoningEffort.parseDisplayLabel(change.value) orelse

@@ -1162,6 +1162,66 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
 }
 
 test.skipIf(!tmuxAvailable())(
+  "fullscreen owns transcript scrollback from startup",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-fullscreen-owned-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    const tapePath = join(root, "fullscreen.fxtape");
+    mkdirSync(home, { recursive: true });
+    mkdirSync(workspace, { recursive: true });
+
+    const lines = Array.from(
+      { length: 80 },
+      (_, index) => `OWNED_SCROLLBACK_${pad(index, 3)}`,
+    ).join("\n");
+    const gateway = startFakeGateway([fakeGatewayFinalText(lines)]);
+    let session: TmuxSession | null = null;
+    try {
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspace,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_FULLSCREEN: undefined,
+          FX_RECORD: tapePath,
+        },
+        stderrPath,
+        width: 88,
+        height: 24,
+      });
+      await session.waitForText(REVIEW_FOOTER, TIMEOUT);
+      await session.sendText("Write the owned scrollback fixture.");
+      await session.waitForText("OWNED_SCROLLBACK_079", TIMEOUT);
+
+      await session.sendHexBytes(PAGE_UP);
+      await session.waitForText("OWNED_SCROLLBACK_050", TIMEOUT);
+      const viewport = await session.capturePane();
+      expect(viewport).toContain("OWNED_SCROLLBACK_050");
+      expect(viewport).not.toContain("OWNED_SCROLLBACK_079");
+
+      await session.sendHexBytes(CTRL_O);
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      const alternate = alternateScreenStats(readFileSync(tapePath));
+      expect(alternate.enters).toBe(1);
+      expect(alternate.leaves).toBe(1);
+      expect(alternate.maximumDepth).toBe(1);
+      expect(alternate.depth).toBe(0);
+    } finally {
+      if (session) await session.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
+test.skipIf(!tmuxAvailable())(
   "Ctrl-O repeatedly survives mixed long chats, dense tool batches, live output, resize storms, and resume",
   async () => {
     await runStress({

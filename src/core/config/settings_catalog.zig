@@ -30,6 +30,7 @@ pub const SettingId = enum {
     statusline_context,
     statusline_session,
     slash_menu_categories,
+    fullscreen,
     model,
     effort,
     fast_mode,
@@ -60,6 +61,7 @@ pub const Snapshot = struct {
     statusline_context: bool = false,
     statusline_session: bool = false,
     slash_menu_categories: bool = true,
+    fullscreen: bool = true,
     startup_scrollback: bool = true,
     prompt_history: bool = true,
     sound_level: []const u8 = "on",
@@ -77,6 +79,7 @@ pub const Snapshot = struct {
             .statusline_context => onOff(self.statusline_context),
             .statusline_session => onOff(self.statusline_session),
             .slash_menu_categories => onOff(self.slash_menu_categories),
+            .fullscreen => onOff(self.fullscreen),
             .startup_scrollback => onOff(self.startup_scrollback),
             .prompt_history => onOff(self.prompt_history),
             .sound_level => self.sound_level,
@@ -363,14 +366,23 @@ pub const Menu = struct {
     category: Category = .all,
     selected_index: usize = 0,
     window_start: usize = 0,
+    fullscreen: bool = true,
     startup_scrollback: bool = true,
 
     pub fn open(self: *Menu) void {
         self.* = .{ .active = true };
     }
 
-    pub fn openWithStartupScrollback(self: *Menu, enabled: bool) void {
-        self.* = .{ .active = true, .startup_scrollback = enabled };
+    pub fn openWithPreferences(
+        self: *Menu,
+        fullscreen: bool,
+        startup_scrollback: bool,
+    ) void {
+        self.* = .{
+            .active = true,
+            .fullscreen = fullscreen,
+            .startup_scrollback = startup_scrollback,
+        };
     }
 
     pub fn close(self: *Menu) void {
@@ -437,6 +449,7 @@ const specs = [_]Spec{
     .{ .id = .statusline_context, .category = .interface, .label = "Status line context", .description = "Show context usage in the status line" },
     .{ .id = .statusline_session, .category = .interface, .label = "Status line session", .description = "Show the session title in the status line" },
     .{ .id = .slash_menu_categories, .category = .interface, .label = "Slash menu categories", .description = "Show categories and skill sources in slash-command results" },
+    .{ .id = .fullscreen, .category = .interface, .label = "Fullscreen", .description = "Own transcript scrolling in the alternate screen" },
     .{ .id = .model, .category = .agent, .label = "Model", .description = "Choose the model used for new turns" },
     .{ .id = .effort, .category = .agent, .label = "Reasoning effort", .description = "Control how much reasoning the model applies" },
     .{ .id = .fast_mode, .category = .agent, .label = "Fast mode", .description = "Use faster inference when the model supports it" },
@@ -558,6 +571,7 @@ fn staticOptionsFor(id: SettingId) []const []const u8 {
         .statusline_context,
         .statusline_session,
         .slash_menu_categories,
+        .fullscreen,
         .startup_scrollback,
         .prompt_history,
         => &on_off_options,
@@ -622,8 +636,8 @@ test "settings catalog projects grouped searchable preferences" {
         .sandbox = "os",
     };
 
-    try std.testing.expectEqual(@as(usize, 14), filteredCount(snapshot, .all, ""));
-    try std.testing.expectEqual(@as(usize, 6), filteredCount(snapshot, .interface, ""));
+    try std.testing.expectEqual(@as(usize, 15), filteredCount(snapshot, .all, ""));
+    try std.testing.expectEqual(@as(usize, 7), filteredCount(snapshot, .interface, ""));
     try std.testing.expectEqual(@as(usize, 4), filteredCount(snapshot, .agent, ""));
     try std.testing.expectEqual(@as(usize, 1), filteredCount(snapshot, .notifications, ""));
     try std.testing.expectEqual(@as(usize, 3), filteredCount(snapshot, .advanced, ""));
@@ -694,6 +708,19 @@ test "settings catalog exposes slash menu categories as an interface toggle" {
     try std.testing.expectEqualStrings("off", hide.value);
 }
 
+test "settings catalog exposes fullscreen as an interface toggle" {
+    const snapshot: Snapshot = .{ .fullscreen = true };
+    try std.testing.expectEqual(@as(usize, 15), filteredCount(snapshot, .all, ""));
+    try std.testing.expectEqual(@as(usize, 7), filteredCount(snapshot, .interface, ""));
+    const item = itemAt(snapshot, .interface, "fullscreen", 0).?;
+    try std.testing.expectEqual(SettingId.fullscreen, item.id);
+    try std.testing.expectEqualStrings("on", item.value);
+
+    const disabled = changeAt(&snapshot, .fullscreen, 0).?;
+    try std.testing.expectEqual(SettingId.fullscreen, disabled.setting);
+    try std.testing.expectEqualStrings("off", disabled.value);
+}
+
 test "settings menu navigates rows and changes selected values inline" {
     const snapshot: Snapshot = .{
         .model = "zai/glm-5.2",
@@ -731,7 +758,7 @@ test "settings menu navigates rows and changes selected values inline" {
     menu.selected_index = 0;
     try std.testing.expect(menu.changeSelectedOption(&snapshot, "", 1) == null);
 
-    menu.openWithStartupScrollback(false);
+    menu.openWithPreferences(true, false);
     try std.testing.expect(!menu.startup_scrollback);
 }
 

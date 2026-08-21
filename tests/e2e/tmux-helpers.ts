@@ -492,6 +492,7 @@ export class TmuxSession {
     );
     const defaultArgs = [
       ["FX_DISABLE_KEYCHAIN", "1"],
+      ["FX_FULLSCREEN", "0"],
       ["FX_SKIP_ONBOARDING", "1"],
       ["FX_SOUND", "0"],
     ].flatMap(([key, value]) =>

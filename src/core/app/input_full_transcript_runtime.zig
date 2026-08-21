@@ -124,8 +124,10 @@ pub fn Runtime(comptime App: type) type {
                     &app.shell,
                     &app.metrics,
                 );
+                setFullscreenEnabled(app, true);
                 requestActiveSurfaceFrame(app);
             } else if (to == .inline_mode) {
+                if (event == .toggle) setFullscreenEnabled(app, false);
                 try app_lifecycle.closeFullTranscript(
                     app.alloc,
                     &app.terminal,
@@ -172,6 +174,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "terminal")) return;
             const from = app.shell.transcriptPresentationDepth();
             if (!from.active()) return;
+            setFullscreenEnabled(app, false);
             try app_lifecycle.closeFullTranscript(
                 app.alloc,
                 &app.terminal,
@@ -347,6 +350,12 @@ pub fn Runtime(comptime App: type) type {
                 .full => "full",
             };
         }
+
+        fn setFullscreenEnabled(app: *App, enabled: bool) void {
+            if (comptime @hasField(App, "fullscreen_enabled")) {
+                app.fullscreen_enabled = enabled;
+            }
+        }
     };
 }
 
@@ -403,6 +412,7 @@ const ApprovalRoutingApp = struct {
     terminal: shell_runtime.TerminalState = .{
         .alternate_screen_owner = .full_transcript,
     },
+    fullscreen_enabled: bool = false,
 
     fn deinit(self: *ApprovalRoutingApp) void {
         self.approval_prompt.deinit(self.alloc);
@@ -436,6 +446,16 @@ test "full transcript owns raw semantic and remapped ctrl-l" {
         transcript_presentation.Depth.review,
         app.subagents.depth,
     );
+}
+
+test "full transcript preference tracks the owned scrollback surface" {
+    var app = ApprovalRoutingApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    Runtime(ApprovalRoutingApp).setFullscreenEnabled(&app, true);
+    try std.testing.expect(app.fullscreen_enabled);
+    Runtime(ApprovalRoutingApp).setFullscreenEnabled(&app, false);
+    try std.testing.expect(!app.fullscreen_enabled);
 }
 
 test "selected child approval owns ctrl-o ahead of transcript depth" {

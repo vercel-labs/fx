@@ -435,7 +435,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "open the fx feedback form", .presentation_category = .product, .show_in_welcome = true },
     .{ .kind = .trace, .command = "/trace", .help_entry = "/trace", .completion_description = "copy a private diagnostic trace", .presentation_category = .product },
     .{ .kind = .compact, .command = "/compact", .help_entry = "/compact", .completion_description = "compact older conversation turns", .presentation_category = .session },
-    .{ .kind = .settings, .command = "/settings", .help_entry = "/settings [startup-scrollback [on|off]]", .completion_description = "browse and update settings", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
+    .{ .kind = .settings, .command = "/settings", .help_entry = "/settings [fullscreen|startup-scrollback [on|off]]", .completion_description = "browse and update settings", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .alias, .command = "/alias", .aliases = &.{}, .help_entry = "/alias [name] [command]", .completion_description = "show alias availability", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .credits, .command = "/credits", .aliases = &.{"/balance"}, .help_entry = "/credits (/balance)", .completion_description = "show gateway credits balance", .presentation_category = .account, .requires_prompt_credential = true },
     .{ .kind = .paste, .command = "/paste", .help_entry = "/paste", .completion_description = "attach an image from the clipboard when supported", .presentation_category = .media },
@@ -585,6 +585,14 @@ test "built-in slash registry resolves primary commands and aliases" {
     try std.testing.expect(!models.requires_prompt_credential);
 
     try std.testing.expect(command_specs.matchedSlashPrefix(slash_registry, "/model\nmodel-id", .model) == null);
+}
+
+test "built-in settings help documents fullscreen preference" {
+    const settings = slash_registry.lookup("/settings") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings(
+        "/settings [fullscreen|startup-scrollback [on|off]]",
+        settings.help_entry.?,
+    );
 }
 
 test "exact slash command matching includes hidden completion aliases" {

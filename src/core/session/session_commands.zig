@@ -172,6 +172,7 @@ fn appendShadowedUserSources(
     try appendShadowedUserSource(writer, "permission_mode", patch.permission_mode != null, sources.permission_mode, &wrote_header);
     try appendShadowedUserSource(writer, "effort", patch.effort != null, sources.effort, &wrote_header);
     try appendShadowedUserSource(writer, "fast_mode", patch.fast_mode != null, sources.fast_mode, &wrote_header);
+    try appendShadowedUserSource(writer, "fullscreen", patch.fullscreen != null, sources.fullscreen, &wrote_header);
     try appendShadowedUserSource(writer, "startup_scrollback", patch.startup_scrollback != null, sources.startup_scrollback, &wrote_header);
     try appendShadowedUserSource(writer, "input_appearance", patch.input_appearance != null, sources.input_appearance, &wrote_header);
     try appendShadowedUserSource(writer, "prompt_history", patch.prompt_history_enabled != null, sources.prompt_history_enabled, &wrote_header);
@@ -298,10 +299,14 @@ pub fn Commands(comptime App: type) type {
                 try writeSettingsUsage(app);
                 return;
             };
-            if (!std.ascii.eqlIgnoreCase(first.word, "startup-scrollback")) {
+            const setting: enum { fullscreen, startup_scrollback } = if (std.ascii.eqlIgnoreCase(first.word, "fullscreen"))
+                .fullscreen
+            else if (std.ascii.eqlIgnoreCase(first.word, "startup-scrollback"))
+                .startup_scrollback
+            else {
                 try writeSettingsUsage(app);
                 return;
-            }
+            };
 
             const value_split = splitFirstWord(first.rest);
             if (value_split) |split| {
@@ -310,11 +315,17 @@ pub fn Commands(comptime App: type) type {
                     return;
                 }
                 if (std.ascii.eqlIgnoreCase(split.word, "on")) {
-                    try saveStartupScrollbackSetting(app, true);
+                    switch (setting) {
+                        .fullscreen => try saveFullscreenSetting(app, true),
+                        .startup_scrollback => try saveStartupScrollbackSetting(app, true),
+                    }
                     return;
                 }
                 if (std.ascii.eqlIgnoreCase(split.word, "off")) {
-                    try saveStartupScrollbackSetting(app, false);
+                    switch (setting) {
+                        .fullscreen => try saveFullscreenSetting(app, false),
+                        .startup_scrollback => try saveStartupScrollbackSetting(app, false),
+                    }
                     return;
                 }
                 try writeSettingsUsage(app);
@@ -327,7 +338,10 @@ pub fn Commands(comptime App: type) type {
             };
             defer settings.deinit(app.alloc);
 
-            try saveStartupScrollbackSetting(app, !(settings.startup_scrollback orelse true));
+            switch (setting) {
+                .fullscreen => try saveFullscreenSetting(app, !(settings.fullscreen orelse true)),
+                .startup_scrollback => try saveStartupScrollbackSetting(app, !(settings.startup_scrollback orelse true)),
+            }
         }
 
         pub fn handleModel(app: *App, query: []const u8) !void {
@@ -923,13 +937,15 @@ pub fn Commands(comptime App: type) type {
             defer detailed.deinit(app.alloc);
             const settings = &detailed.settings;
 
+            const fullscreen_label = if (settings.fullscreen orelse true) "on" else "off";
             const startup_scrollback_label = if (settings.startup_scrollback orelse true) "on" else "off";
-            const msg = try std.fmt.allocPrint(app.alloc, "model: {s}\nmodel_config_source: {s}\npermission_mode: {s}\nworkspace: {s}\nstep_limit: {d}\nstartup_scrollback: {s}", .{
+            const msg = try std.fmt.allocPrint(app.alloc, "model: {s}\nmodel_config_source: {s}\npermission_mode: {s}\nworkspace: {s}\nstep_limit: {d}\nfullscreen: {s}\nstartup_scrollback: {s}", .{
                 app.selected_model.items,
                 @tagName(detailed.sources.model),
                 permissions.permissionModeLabel(app.permission_engine.mode),
                 app.workspace_root,
                 app.agent_step_limit,
+                fullscreen_label,
                 startup_scrollback_label,
             });
             defer app.alloc.free(msg);
@@ -989,11 +1005,56 @@ pub fn Commands(comptime App: type) type {
             }
         }
 
+        fn saveFullscreenSetting(app: *App, enabled: bool) !void {
+            var attempt = config_runtime.attemptUserPreferences(
+                app.alloc,
+                .{ .fullscreen = enabled },
+            );
+            defer attempt.deinit(app.alloc);
+            switch (attempt) {
+                .failure => |failure| try reportUserSettingsFailure(
+                    app,
+                    "fullscreen",
+                    failure.err,
+                    failure.cleanup,
+                    false,
+                ),
+                .outcome => |outcome| {
+                    const sources = try reportUserSettingsCommit(
+                        app,
+                        "fullscreen",
+                        .{ .fullscreen = enabled },
+                        outcome,
+                        null,
+                        false,
+                    );
+                    const label = if (enabled) "on" else "off";
+                    var out: std.Io.Writer.Allocating = .init(app.alloc);
+                    defer out.deinit();
+                    try out.writer.print("fullscreen: {s} ", .{label});
+                    if (sources) |resolved| {
+                        switch (resolved.fullscreen) {
+                            .user_global => try out.writer.writeAll("(applies on next launch)"),
+                            else => try out.writer.print(
+                                "(saved user default; current source={s})",
+                                .{@tagName(resolved.fullscreen)},
+                            ),
+                        }
+                    } else {
+                        try out.writer.writeAll("(saved user default; next-launch source unknown)");
+                    }
+                    const msg = try out.toOwnedSlice();
+                    defer app.alloc.free(msg);
+                    try app.writeDomainNotice(.{ .topic = "settings", .tone = .neutral, .body = msg }, true);
+                },
+            }
+        }
+
         fn writeSettingsUsage(app: *App) !void {
             try app.writeDomainNotice(.{
                 .topic = "settings",
                 .tone = .@"error",
-                .body = "usage: /settings [startup-scrollback [on|off]]",
+                .body = "usage: /settings [fullscreen|startup-scrollback [on|off]]",
             }, true);
         }
 
@@ -2069,6 +2130,31 @@ test "session_commands handleSettings toggles and persists startup scrollback" {
     try std.testing.expectEqual(false, disabled.startup_scrollback.?);
 }
 
+test "session_commands fullscreen setting persists the next-launch preference" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(alloc, home_root);
+    defer home.deinit();
+    var app = try FakeApp.init(alloc, workspace_root, "anthropic/test-model");
+    defer app.deinit();
+
+    try Commands(FakeApp).handleSettings(&app, "fullscreen off");
+    try expectTranscriptContains(&app, "fullscreen: off (applies on next launch)");
+
+    var settings = try config_runtime.loadMergedSettings(alloc, workspace_root);
+    defer settings.deinit(alloc);
+    try std.testing.expectEqual(false, settings.fullscreen.?);
+}
+
 test "session_commands startup scrollback ignores project profile-only shadowing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2173,11 +2259,11 @@ test "session_commands handleSettings reports usage and save failures" {
     defer app.deinit();
 
     try Commands(FakeApp).handleSettings(&app, "bogus");
-    try expectTranscriptContains(&app, "usage: /settings [startup-scrollback [on|off]]");
+    try expectTranscriptContains(&app, "usage: /settings [fullscreen|startup-scrollback [on|off]]");
 
     app.clearTranscript();
     try Commands(FakeApp).handleSettings(&app, "startup-scrollback off extra");
-    try expectTranscriptContains(&app, "usage: /settings [startup-scrollback [on|off]]");
+    try expectTranscriptContains(&app, "usage: /settings [fullscreen|startup-scrollback [on|off]]");
 
     app.clearTranscript();
     try Commands(FakeApp).handleSettings(&app, "startup-scrollback off");

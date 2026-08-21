@@ -272,6 +272,9 @@ pub fn Runtime(comptime App: type) type {
             app.worker.agent_turn_settings.effort = startup.effort;
             app.context_enabled = startup.context_enabled;
             app.fast_mode = startup.fast_mode;
+            if (comptime @hasField(App, "fullscreen_enabled")) {
+                app.fullscreen_enabled = startup.fullscreen;
+            }
             app.input_runtime.input_appearance = startup.input_appearance;
             app.input_runtime.slash_menu_categories = startup.slash_menu_categories;
             app.shell.maxxing_mode = startup.maxxing_mode;
@@ -444,6 +447,14 @@ pub fn Runtime(comptime App: type) type {
                 .none => {},
                 .ready => |entry_id| try deps.publish_staged_resume_view(app, entry_id),
             }
+            if (startup.fullscreen) {
+                try app_lifecycle.openFullTranscript(
+                    app.alloc,
+                    &app.terminal,
+                    &app.shell,
+                    &app.metrics,
+                );
+            }
             app.shell.render_requests.request(.first_frame);
         }
     };
@@ -536,6 +547,7 @@ const TestApp = struct {
     terminal_input_runtime: ui_input.Runtime = .{},
     context_enabled: bool = true,
     fast_mode: bool = false,
+    fullscreen_enabled: bool = false,
     auto_upgrade_enabled: bool = true,
     upgrader: auto_upgrade.AutoUpgrade = .{},
     effort: types.ReasoningEffort = .auto,
@@ -665,6 +677,7 @@ var active_app_for_pointer_check: ?*TestApp = null;
 
 fn makeStartupState(alloc: Allocator) !app_lifecycle.StartupState {
     var state = app_lifecycle.StartupState{ .agent_step_limit = 19 };
+    state.fullscreen = false;
     state.max_tool_result_bytes = 131072;
     state.first_call_tool_choice = .none;
     state.workspace_root = try alloc.dupe(u8, "/workspace");
