@@ -90,6 +90,8 @@ pub const Mutation = if (host_target.is_wasm) HostMutation else NativeMutation;
 const NativeMutation = struct {
     fx_dir: io_mod.VerifiedDir,
     lock: io_mod.TimedAdvisoryLock,
+    file_name: []const u8 = auth_file_name,
+    expected_issuer: ?[]const u8 = null,
 
     pub fn deinit(self: *Mutation) void {
         self.lock.release();
@@ -98,17 +100,17 @@ const NativeMutation = struct {
     }
 
     pub fn load(self: *Mutation, alloc: Allocator) !?Session {
-        return loadFromDir(alloc, &self.fx_dir.dir, .report_open_failure);
+        return loadFromDir(alloc, &self.fx_dir.dir, self.file_name, self.expected_issuer, .report_open_failure);
     }
 
     pub fn save(self: *Mutation, alloc: Allocator, session: Session) !void {
         const text = try stringify(alloc, session);
         defer secret.zeroAndFree(alloc, text);
-        try io_mod.durableReplaceVerified(alloc, &self.fx_dir, auth_file_name, text);
+        try io_mod.durableReplaceVerified(alloc, &self.fx_dir, self.file_name, text);
     }
 
     pub fn delete(self: *Mutation) !DeleteOutcome {
-        return deleteAuthFile(&self.fx_dir.dir, .{});
+        return deleteSessionFile(&self.fx_dir.dir, self.file_name, .{});
     }
 };
 
@@ -241,7 +243,20 @@ pub fn load(alloc: Allocator) !?Session {
     };
     defer fx_dir.close(io_mod.getIo());
 
-    return loadFromDir(alloc, &fx_dir, .tolerate_open_failure);
+    return loadFromDir(alloc, &fx_dir, auth_file_name, null, .tolerate_open_failure);
+}
+
+pub fn loadNamed(alloc: Allocator, file_name: []const u8, expected_issuer: []const u8) !?Session {
+    if (comptime host_target.is_wasm) return null;
+    const home = io_mod.getenv("HOME") orelse return null;
+    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch return null;
+    defer home_dir.close(io_mod.getIo());
+    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch return null;
+    defer fx_dir.close(io_mod.getIo());
+    return loadFromDir(alloc, &fx_dir, file_name, expected_issuer, .tolerate_open_failure);
 }
 
 fn loadFromHost(alloc: Allocator, store: js_host_auth.SessionStore) !?Session {
@@ -256,8 +271,8 @@ fn loadFromHost(alloc: Allocator, store: js_host_auth.SessionStore) !?Session {
     };
 }
 
-fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, mode: LoadMode) !?Session {
-    var file = fx_dir.openFile(io_mod.getIo(), auth_file_name, .{
+fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, file_name: []const u8, expected_issuer: ?[]const u8, mode: LoadMode) !?Session {
+    var file = fx_dir.openFile(io_mod.getIo(), file_name, .{
         .mode = .read_only,
         .allow_directory = false,
         .follow_symlinks = false,
@@ -279,7 +294,7 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, mode: LoadMode) !?Session 
 
     const bytes = try io_mod.readFileToEnd(alloc, &file, max_auth_file_bytes);
     defer secret.zeroAndFree(alloc, bytes);
-    return parse(alloc, bytes) catch |err| switch (err) {
+    return parseExpectedIssuer(alloc, bytes, expected_issuer) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
             debug_trace.logf("auth", "session load failed step=parse err={s}", .{@errorName(err)});
@@ -300,6 +315,18 @@ pub fn saveNewSession(alloc: Allocator, session: Session) !void {
     try mutation.save(alloc, session);
 }
 
+pub fn saveNamed(alloc: Allocator, file_name: []const u8, expected_issuer: []const u8, session: Session) !void {
+    var mutation = (try beginNamedMutation(file_name, expected_issuer)) orelse return error.ProviderOAuthUnsupported;
+    defer mutation.deinit();
+    try mutation.save(alloc, session);
+}
+
+pub fn deleteNamed(file_name: []const u8, expected_issuer: []const u8) !DeleteOutcome {
+    var mutation = (try beginNamedMutation(file_name, expected_issuer)) orelse return .missing;
+    defer mutation.deinit();
+    return mutation.delete();
+}
+
 pub fn beginExistingMutation() !?Mutation {
     if (comptime host_target.is_wasm) {
         return @as(?Mutation, HostMutation.init(js_host_auth.oauth_session_store));
@@ -314,7 +341,20 @@ pub fn beginExistingMutation() !?Mutation {
         error.FileNotFound => return null,
         else => return err,
     };
-    return @as(?Mutation, try lockMutation(fx_dir));
+    return @as(?Mutation, try lockMutation(fx_dir, auth_file_name));
+}
+
+pub fn beginNamedMutation(file_name: []const u8, expected_issuer: []const u8) !?Mutation {
+    if (comptime host_target.is_wasm) return null;
+    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    var home_dir = io_mod.VerifiedDir{
+        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
+    };
+    defer home_dir.close();
+    const fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name);
+    var mutation = try lockMutation(fx_dir, file_name);
+    mutation.expected_issuer = expected_issuer;
+    return @as(?Mutation, mutation);
 }
 
 fn beginMutation() !Mutation {
@@ -325,15 +365,17 @@ fn beginMutation() !Mutation {
     defer home_dir.close();
 
     const fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name);
-    return lockMutation(fx_dir);
+    return lockMutation(fx_dir, auth_file_name);
 }
 
-fn lockMutation(open_fx_dir: io_mod.VerifiedDir) !Mutation {
+fn lockMutation(open_fx_dir: io_mod.VerifiedDir, file_name: []const u8) !Mutation {
     var probe = MutationLockProbe{ .fx_dir = open_fx_dir.dir };
-    return lockMutationWithOps(open_fx_dir, mutation_lock_deadline_ms, .{
+    var mutation = try lockMutationWithOps(open_fx_dir, mutation_lock_deadline_ms, .{
         .ctx = &probe,
         .try_lock = MutationLockProbe.tryLock,
     });
+    mutation.file_name = file_name;
+    return mutation;
 }
 
 fn lockMutationWithOps(
@@ -381,8 +423,8 @@ fn openExistingPrivateFxDir(home_dir: *io_mod.VerifiedDir) !io_mod.VerifiedDir {
     return .{ .dir = dir };
 }
 
-fn deleteAuthFile(fx_dir: *std.Io.Dir, ops: io_mod.DurableOps) !DeleteOutcome {
-    fx_dir.deleteFile(io_mod.getIo(), auth_file_name) catch |err| switch (err) {
+fn deleteSessionFile(fx_dir: *std.Io.Dir, file_name: []const u8, ops: io_mod.DurableOps) !DeleteOutcome {
+    fx_dir.deleteFile(io_mod.getIo(), file_name) catch |err| switch (err) {
         error.FileNotFound => return .missing,
         else => return err,
     };
@@ -391,6 +433,22 @@ fn deleteAuthFile(fx_dir: *std.Io.Dir, ops: io_mod.DurableOps) !DeleteOutcome {
 }
 
 pub fn parse(alloc: Allocator, bytes: []const u8) !Session {
+    return parseExpectedIssuer(alloc, bytes, null);
+}
+
+test "named sessions require their exact provider issuer" {
+    const bytes =
+        "{\"version\":1,\"issuer\":\"xai\",\"client_id\":\"client\",\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_at_ms\":4102444800000,\"scope\":\"openid\",\"token_type\":\"Bearer\"}";
+    var session = try parseExpectedIssuer(std.testing.allocator, bytes, "xai");
+    defer session.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("access", session.access_token);
+    try std.testing.expectError(
+        error.InvalidAuthSession,
+        parseExpectedIssuer(std.testing.allocator, bytes, "anthropic"),
+    );
+}
+
+fn parseExpectedIssuer(alloc: Allocator, bytes: []const u8, expected_issuer: ?[]const u8) !Session {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidAuthSession;
@@ -398,9 +456,9 @@ pub fn parse(alloc: Allocator, bytes: []const u8) !Session {
     const version = object.get("version") orelse return error.InvalidAuthSession;
     if (version != .integer or version.integer != schema_version) return error.InvalidAuthSession;
     const saved_issuer = try requiredString(object, "issuer");
-    if (!std.mem.eql(u8, saved_issuer, issuer) and !isLoopbackE2EIssuer(saved_issuer)) {
-        return error.InvalidAuthSession;
-    }
+    if (expected_issuer) |expected| {
+        if (!std.mem.eql(u8, saved_issuer, expected)) return error.InvalidAuthSession;
+    } else if (!std.mem.eql(u8, saved_issuer, issuer) and !isLoopbackE2EIssuer(saved_issuer)) return error.InvalidAuthSession;
 
     const expires_at_ms = try requiredInteger(object, "expires_at_ms");
     const owned_issuer = try alloc.dupe(u8, saved_issuer);
@@ -551,7 +609,7 @@ fn check_parse_allocation_failures(alloc: Allocator) !void {
 }
 
 fn check_load_allocation_failures(alloc: Allocator, dir: *std.Io.Dir) !void {
-    var session = (try loadFromDir(alloc, dir, .report_open_failure)) orelse return error.TestUnexpectedMissingSession;
+    var session = (try loadFromDir(alloc, dir, auth_file_name, null, .report_open_failure)) orelse return error.TestUnexpectedMissingSession;
     defer session.deinit(alloc);
 }
 
@@ -651,10 +709,10 @@ test "OAuth mutation loads report auth file open failures" {
     defer tmp.cleanup();
     try tmp.dir.symLink(std.testing.io, "missing-auth-target", auth_file_name, .{ .is_directory = false });
 
-    try std.testing.expect((try loadFromDir(std.testing.allocator, &tmp.dir, .tolerate_open_failure)) == null);
+    try std.testing.expect((try loadFromDir(std.testing.allocator, &tmp.dir, auth_file_name, null, .tolerate_open_failure)) == null);
     try std.testing.expectError(
         error.SymLinkLoop,
-        loadFromDir(std.testing.allocator, &tmp.dir, .report_open_failure),
+        loadFromDir(std.testing.allocator, &tmp.dir, auth_file_name, null, .report_open_failure),
     );
 }
 
@@ -707,10 +765,10 @@ test "OAuth session deletion reports deleted and missing files" {
         .ctx = &probe,
         .sync_dir = DeleteSyncProbe.syncDir,
     };
-    const deleted = try deleteAuthFile(&tmp.dir, ops);
+    const deleted = try deleteSessionFile(&tmp.dir, auth_file_name, ops);
     try std.testing.expectEqual(DeleteOutcome.deleted, deleted);
     try std.testing.expectEqual(@as(usize, 1), probe.sync_count);
-    const missing = try deleteAuthFile(&tmp.dir, ops);
+    const missing = try deleteSessionFile(&tmp.dir, auth_file_name, ops);
     try std.testing.expectEqual(DeleteOutcome.missing, missing);
     try std.testing.expectEqual(@as(usize, 1), probe.sync_count);
 }
@@ -727,7 +785,7 @@ test "OAuth session deletion reports directory sync failure after unlink" {
         .ctx = &probe,
         .sync_dir = DeleteSyncProbe.syncDir,
     };
-    const outcome = try deleteAuthFile(&tmp.dir, ops);
+    const outcome = try deleteSessionFile(&tmp.dir, auth_file_name, ops);
     try std.testing.expectEqual(DeleteOutcome.deleted_not_durable, outcome);
     try std.testing.expectEqual(@as(usize, 1), probe.sync_count);
     try std.testing.expectError(
@@ -736,7 +794,7 @@ test "OAuth session deletion reports directory sync failure after unlink" {
     );
 
     probe.fail = false;
-    const missing = try deleteAuthFile(&tmp.dir, ops);
+    const missing = try deleteSessionFile(&tmp.dir, auth_file_name, ops);
     try std.testing.expectEqual(DeleteOutcome.missing, missing);
     try std.testing.expectEqual(@as(usize, 1), probe.sync_count);
 }

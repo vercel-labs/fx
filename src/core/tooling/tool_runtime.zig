@@ -994,7 +994,7 @@ fn executeVisionRequest(
 ) !ToolExecutionResult {
     if (state.runtime.credential_source) |source| switch (source) {
         .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .stored_key => {},
-        .anthropic_oauth_token, .anthropic_api_key, .codex_login, .xai_api_key => return error.VisionProviderCredentialUnavailable,
+        .anthropic_fx_login, .anthropic_oauth_token, .anthropic_api_key, .codex_fx_login, .codex_login, .xai_oauth_token, .xai_api_key => return error.VisionProviderCredentialUnavailable,
     };
     const config: vision_executor.Config = .{
         .stream_provider = state.runtime.agent_stream_provider,

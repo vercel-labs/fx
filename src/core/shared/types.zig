@@ -92,9 +92,12 @@ pub const CredentialSource = enum {
     ai_gateway_api_key,
     fx_login,
     stored_key,
+    anthropic_fx_login,
     anthropic_oauth_token,
     anthropic_api_key,
+    codex_fx_login,
     codex_login,
+    xai_oauth_token,
     xai_api_key,
 };
 

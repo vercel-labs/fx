@@ -6,6 +6,7 @@ const io_mod = @import("../shared/io.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
+const provider_oauth = @import("provider_oauth.zig");
 const secret = @import("secret.zig");
 const types = @import("../shared/types.zig");
 const inference_provider = @import("../gateway/inference_provider.zig");
@@ -134,9 +135,12 @@ pub fn catalogAccessForCredential(
         .vercel_oidc_token => .vercel_oidc_token,
         .ai_gateway_api_key => .ai_gateway_api_key,
         .stored_key => .stored_key,
+        .anthropic_fx_login,
         .anthropic_oauth_token,
         .anthropic_api_key,
+        .codex_fx_login,
         .codex_login,
+        .xai_oauth_token,
         .xai_api_key,
         => return .{ .public_only = .no_credential },
         .fx_login => blk: {
@@ -236,9 +240,9 @@ pub fn resolveForModel(
             mode,
             if (preferred) |source| if (sourceSupportsProvider(source, route.provider)) source else null else null,
         ),
-        .anthropic_max => .{ .credential = try loadAnthropicCredential(alloc) },
-        .openai_codex => .{ .credential = try loadCodexCredential(alloc) },
-        .xai_direct => .{ .credential = try loadEnvCredential(alloc, "XAI_API_KEY", .xai_api_key) },
+        .anthropic_max => .{ .credential = try loadAnthropicCredential(alloc, transport, mode) },
+        .openai_codex => .{ .credential = try loadCodexCredential(alloc, transport, mode) },
+        .xai_direct => .{ .credential = try loadXaiCredential(alloc, transport, mode) },
     };
 }
 
@@ -252,9 +256,9 @@ fn sourceSupportsProvider(source: Source, provider: inference_provider.ProviderI
             .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .stored_key => true,
             else => false,
         },
-        .anthropic_max => source == .anthropic_oauth_token or source == .anthropic_api_key,
-        .openai_codex => source == .codex_login,
-        .xai_direct => source == .xai_api_key,
+        .anthropic_max => source == .anthropic_fx_login or source == .anthropic_oauth_token or source == .anthropic_api_key,
+        .openai_codex => source == .codex_fx_login or source == .codex_login,
+        .xai_direct => source == .xai_oauth_token or source == .xai_api_key,
     };
 }
 
@@ -331,9 +335,12 @@ pub fn loadSource(
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
         .fx_login => loadFxLoginCredential(alloc, transport),
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
+        .anthropic_fx_login => loadManagedProviderCredential(alloc, transport, .anthropic, .refresh_if_needed),
         .anthropic_oauth_token => loadAnthropicOAuthCredential(alloc),
         .anthropic_api_key => loadEnvCredential(alloc, "ANTHROPIC_API_KEY", source),
-        .codex_login => loadCodexCredential(alloc),
+        .codex_fx_login => loadManagedProviderCredential(alloc, transport, .openai_codex, .refresh_if_needed),
+        .codex_login => loadCodexCredential(alloc, transport, .refresh_if_needed),
+        .xai_oauth_token => loadManagedProviderCredential(alloc, transport, .xai, .refresh_if_needed),
         .xai_api_key => loadEnvCredential(alloc, "XAI_API_KEY", source),
     };
 }
@@ -371,9 +378,15 @@ pub fn sourceExists(
             secret.zeroAndFree(alloc, value);
             break :blk true;
         },
+        .anthropic_fx_login => managedProviderExists(alloc, .anthropic),
         .anthropic_oauth_token => probeCredential(alloc, try loadAnthropicOAuthCredential(alloc)),
         .anthropic_api_key => nonEmptyEnvValue("ANTHROPIC_API_KEY") != null,
-        .codex_login => probeCredential(alloc, try loadCodexCredential(alloc)),
+        .codex_fx_login => managedProviderExists(alloc, .openai_codex),
+        .codex_login => blk: {
+            if (nonEmptyEnvValue("CODEX_ACCESS_TOKEN") != null) break :blk true;
+            break :blk try managedOrExternalSourceExists(alloc, .openai_codex, ".codex/auth.json", &.{ "tokens", "access_token" });
+        },
+        .xai_oauth_token => managedProviderExists(alloc, .xai),
         .xai_api_key => nonEmptyEnvValue("XAI_API_KEY") != null,
     };
 }
@@ -384,7 +397,8 @@ fn probeCredential(alloc: std.mem.Allocator, loaded: ?Credential) bool {
     return true;
 }
 
-fn loadAnthropicCredential(alloc: std.mem.Allocator) !?Credential {
+fn loadAnthropicCredential(alloc: std.mem.Allocator, transport: oauth_transport.Provider, mode: LoadMode) !?Credential {
+    if (try loadManagedProviderCredential(alloc, transport, .anthropic, mode)) |credential| return credential;
     if (try loadAnthropicOAuthCredential(alloc)) |credential| return credential;
     return loadEnvCredential(alloc, "ANTHROPIC_API_KEY", .anthropic_api_key);
 }
@@ -405,9 +419,48 @@ fn loadAnthropicOAuthCredential(alloc: std.mem.Allocator) !?Credential {
     return null;
 }
 
-fn loadCodexCredential(alloc: std.mem.Allocator) !?Credential {
+fn loadCodexCredential(alloc: std.mem.Allocator, transport: oauth_transport.Provider, mode: LoadMode) !?Credential {
+    if (try loadManagedProviderCredential(alloc, transport, .openai_codex, mode)) |credential| return credential;
     if (try loadEnvCredential(alloc, "CODEX_ACCESS_TOKEN", .codex_login)) |credential| return credential;
     return loadJsonCredential(alloc, ".codex/auth.json", &.{ "tokens", "access_token" }, .codex_login);
+}
+
+fn loadXaiCredential(alloc: std.mem.Allocator, transport: oauth_transport.Provider, mode: LoadMode) !?Credential {
+    if (try loadManagedProviderCredential(alloc, transport, .xai, mode)) |credential| return credential;
+    return loadEnvCredential(alloc, "XAI_API_KEY", .xai_api_key);
+}
+
+fn loadManagedProviderCredential(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    provider: provider_oauth.Provider,
+    mode: LoadMode,
+) !?Credential {
+    var session = (try provider_oauth.loadManagedSession(alloc, transport, provider, mode == .refresh_if_needed)) orelse return null;
+    defer session.deinit(alloc);
+    const token = session.access_token;
+    session.access_token = &.{};
+    return .{
+        .token = token,
+        .source = provider.credentialSource(),
+        .refresh_after_ms = oauth_session.refresh_deadline_ms(session.expires_at_ms),
+    };
+}
+
+fn managedProviderExists(alloc: std.mem.Allocator, provider: provider_oauth.Provider) !bool {
+    var session = (try oauth_session.loadNamed(alloc, provider.fileName(), @tagName(provider))) orelse return false;
+    session.deinit(alloc);
+    return true;
+}
+
+fn managedOrExternalSourceExists(
+    alloc: std.mem.Allocator,
+    provider: provider_oauth.Provider,
+    relative_path: []const u8,
+    keys: []const []const u8,
+) !bool {
+    if (try managedProviderExists(alloc, provider)) return true;
+    return probeCredential(alloc, try loadJsonCredential(alloc, relative_path, keys, provider.credentialSource()));
 }
 
 fn loadJsonCredential(
@@ -588,15 +641,18 @@ pub fn sourceLabel(source: Source) []const u8 {
         .ai_gateway_api_key => "AI_GATEWAY_API_KEY",
         .fx_login => "fx login",
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
+        .anthropic_fx_login => "fx Anthropic login",
         .anthropic_oauth_token => "Anthropic Max login",
         .anthropic_api_key => "ANTHROPIC_API_KEY",
+        .codex_fx_login => "fx Codex login",
         .codex_login => "ChatGPT/Codex login",
+        .xai_oauth_token => "xAI Grok/X login",
         .xai_api_key => "XAI_API_KEY",
     };
 }
 
 pub fn sourceRefreshable(source: Source) bool {
-    return source == .fx_login;
+    return source == .fx_login or provider_oauth.Provider.fromCredentialSource(source) != null;
 }
 
 test "stored key label discloses the backend that answered" {
@@ -874,9 +930,12 @@ test "provider-qualified models resolve only their provider credential" {
 
 test "direct provider credentials never authorize the Gateway catalog" {
     const direct_sources = [_]Source{
+        .anthropic_fx_login,
         .anthropic_oauth_token,
         .anthropic_api_key,
+        .codex_fx_login,
         .codex_login,
+        .xai_oauth_token,
         .xai_api_key,
     };
     for (direct_sources) |source| {
@@ -889,9 +948,12 @@ test "direct provider credentials never authorize the Gateway catalog" {
 test "credential sources are scoped to their model route" {
     try std.testing.expect(sourceSupportsModel(.fx_login, "anthropic/claude-opus"));
     try std.testing.expect(!sourceSupportsModel(.anthropic_oauth_token, "anthropic/claude-opus"));
+    try std.testing.expect(sourceSupportsModel(.anthropic_fx_login, "anthropic-max/claude-opus"));
     try std.testing.expect(sourceSupportsModel(.anthropic_oauth_token, "anthropic-max/claude-opus"));
     try std.testing.expect(!sourceSupportsModel(.ai_gateway_api_key, "anthropic-max/claude-opus"));
+    try std.testing.expect(sourceSupportsModel(.codex_fx_login, "openai-codex/gpt-5"));
     try std.testing.expect(sourceSupportsModel(.codex_login, "openai-codex/gpt-5"));
+    try std.testing.expect(sourceSupportsModel(.xai_oauth_token, "xai-direct/grok-4"));
     try std.testing.expect(sourceSupportsModel(.xai_api_key, "xai-direct/grok-4"));
 }
 

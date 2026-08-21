@@ -64,12 +64,16 @@ fn executeOAuthRequest(
             .name = "content-type",
             .value = "application/x-www-form-urlencoded",
         }},
+        .post_json => &.{.{
+            .name = "content-type",
+            .value = "application/json",
+        }},
     };
     var response = try executeRequest(
         alloc,
         switch (request.method) {
             .get => "GET",
-            .post_form => "POST",
+            .post_form, .post_json => "POST",
         },
         request.url,
         headers,
@@ -126,6 +130,7 @@ fn executeRequest(
     }
     return .{
         .disposition = if (status == 200) .accepted else .rejected,
+        .status = status,
         .body = try alloc.dupe(u8, response_buffer[0..@intCast(response_len)]),
     };
 }

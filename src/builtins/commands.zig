@@ -89,14 +89,14 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .login,
         .token = "login",
-        .usage = "login",
-        .summary = "Sign in with Vercel",
+        .usage = "login [vercel|anthropic|openai-codex|xai] [--device-code|--manual-code]",
+        .summary = "Sign in to an inference provider",
     },
     .{
         .kind = .logout,
         .token = "logout",
-        .usage = "logout",
-        .summary = "Sign out of the current Vercel session",
+        .usage = "logout [vercel|anthropic|openai-codex|xai]",
+        .summary = "Sign out of an inference provider",
     },
     .{
         .kind = .setup,

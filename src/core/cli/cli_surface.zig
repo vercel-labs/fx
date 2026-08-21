@@ -21,6 +21,7 @@ const github_publish = @import("../github/github_publish.zig");
 const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
+const provider_oauth = @import("../auth/provider_oauth.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -723,9 +724,37 @@ fn runNonInteractiveWithDeps(
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
-            if (rest.len != 0) {
-                try writeStderr(deps, "usage: fx login\n");
+            if (rest.len > 2) {
+                try writeStderr(deps, "usage: fx login [vercel|anthropic|openai-codex|xai] [--device-code|--manual-code]\n");
                 return .handled_failure;
+            }
+            if (rest.len >= 1 and !std.ascii.eqlIgnoreCase(rest[0], "vercel")) {
+                const provider = provider_oauth.Provider.parse(rest[0]) orelse {
+                    try writeStderr(deps, "fx login: unknown provider; use vercel, anthropic, openai-codex, or xai\n");
+                    return .handled_failure;
+                };
+                const method: provider_oauth.LoginMethod = if (rest.len == 2 and std.mem.eql(u8, rest[1], "--device-code"))
+                    .device_code
+                else if (rest.len == 2 and std.mem.eql(u8, rest[1], "--manual-code"))
+                    .manual_code
+                else if (rest.len == 1)
+                    .browser
+                else {
+                    try writeStderr(deps, "usage: fx login [vercel|anthropic|openai-codex|xai] [--device-code|--manual-code]\n");
+                    return .handled_failure;
+                };
+                provider_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener, provider, method) catch |err| {
+                    const message = switch (err) {
+                        error.AccessDenied => "fx login: authorization denied\n",
+                        error.ExpiredToken, error.LoginTimedOut => "fx login: authorization expired; run fx login again\n",
+                        error.ProviderOAuthUnsupported => "fx login: provider OAuth is unavailable on this platform\n",
+                        error.ProviderLoginMethodUnsupported => "fx login: this provider does not support the selected login method\n",
+                        else => "fx login: failed to sign in to provider\n",
+                    };
+                    try writeStderr(deps, message);
+                    return .handled_failure;
+                };
+                return .handled_success;
             }
             login_flow.runLogin(
                 alloc,
@@ -744,9 +773,26 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .logout => |rest| {
-            if (rest.len != 0) {
-                try writeStderr(deps, "usage: fx logout\n");
+            if (rest.len > 1) {
+                try writeStderr(deps, "usage: fx logout [vercel|anthropic|openai-codex|xai]\n");
                 return .handled_failure;
+            }
+            if (rest.len == 1 and !std.ascii.eqlIgnoreCase(rest[0], "vercel")) {
+                const provider = provider_oauth.Provider.parse(rest[0]) orelse {
+                    try writeStderr(deps, "fx logout: unknown provider; use vercel, anthropic, openai-codex, or xai\n");
+                    return .handled_failure;
+                };
+                const outcome = provider_oauth.logout(provider) catch {
+                    try writeStderr(deps, "fx logout: failed to remove provider session\n");
+                    return .handled_failure;
+                };
+                const line = if (outcome == .missing)
+                    try std.fmt.allocPrint(alloc, "No {s} session found.\n", .{provider.label()})
+                else
+                    try std.fmt.allocPrint(alloc, "Signed out of {s}.\n", .{provider.label()});
+                defer alloc.free(line);
+                try writeStdout(deps, line);
+                return .handled_success;
             }
             const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
                 error.SessionDeleteFailed => {

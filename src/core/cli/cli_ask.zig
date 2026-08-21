@@ -1791,7 +1791,7 @@ fn refreshGatewayCredential(
     mode: auth_runtime.CredentialRefreshMode,
 ) !?[]u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    return auth_runtime.refreshFxLoginToken(
+    return auth_runtime.refreshCredentialToken(
         ctx.cfg.gateway_provider.oauth_transport,
         alloc,
         source,

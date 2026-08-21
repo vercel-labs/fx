@@ -4,6 +4,7 @@ const credentials = @import("credentials.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("login_flow.zig");
 const oauth_transport = @import("oauth_transport.zig");
+const provider_oauth = @import("provider_oauth.zig");
 const secret = @import("secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -23,9 +24,12 @@ const credential_source_order = [_]credentials.Source{
     .ai_gateway_api_key,
     .fx_login,
     .stored_key,
+    .anthropic_fx_login,
     .anthropic_oauth_token,
     .anthropic_api_key,
+    .codex_fx_login,
     .codex_login,
+    .xai_oauth_token,
     .xai_api_key,
 };
 
@@ -99,24 +103,29 @@ pub const FailureSnapshot = struct {
     }
 };
 
-/// Returns an owned token when the selected fx-login credential can be
+/// Returns an owned token when the selected managed OAuth credential can be
 /// refreshed. The caller must release it with `secret.zeroAndFree`.
-pub fn refreshFxLoginToken(
+pub fn refreshCredentialToken(
     transport: oauth_transport.Provider,
     alloc: Allocator,
     source: credentials.Source,
     mode: CredentialRefreshMode,
 ) !?[]u8 {
-    if (source != .fx_login) return null;
-
-    var credential = switch (mode) {
-        .if_needed => (try credentials.loadFxLoginCredential(alloc, transport)) orelse return null,
-        .force => (try credentials.refreshFxLoginCredential(alloc, transport)) orelse return null,
-    };
-    defer credential.deinit(alloc);
-
-    const token = credential.token;
-    credential.token = &.{};
+    if (source == .fx_login) {
+        var credential = switch (mode) {
+            .if_needed => (try credentials.loadFxLoginCredential(alloc, transport)) orelse return null,
+            .force => (try credentials.refreshFxLoginCredential(alloc, transport)) orelse return null,
+        };
+        defer credential.deinit(alloc);
+        const token = credential.token;
+        credential.token = &.{};
+        return token;
+    }
+    const provider = provider_oauth.Provider.fromCredentialSource(source) orelse return null;
+    var session = (try provider_oauth.refreshManagedSession(alloc, transport, provider, mode == .force)) orelse return null;
+    defer session.deinit(alloc);
+    const token = session.access_token;
+    session.access_token = &.{};
     return token;
 }
 
@@ -1456,7 +1465,7 @@ fn expectApiKeyAllocationCleared(
 
 test "auth runtime token refresher ignores non-refreshable credential sources" {
     for ([_]credentials.Source{ .vercel_oidc_token, .ai_gateway_api_key, .stored_key }) |source| {
-        try std.testing.expect((try refreshFxLoginToken(
+        try std.testing.expect((try refreshCredentialToken(
             oauth_transport.unavailable_provider,
             std.testing.allocator,
             source,

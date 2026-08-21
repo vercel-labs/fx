@@ -1,4 +1,5 @@
 const std = @import("std");
+const credentials = @import("../../auth/credentials.zig");
 const builtin = @import("builtin");
 const agent_steps = @import("../../config/agent_steps.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
@@ -1419,7 +1420,7 @@ fn refreshGatewayCredentialForJob(
     trace_ctx: TraceContext,
 ) !bool {
     const source = job.credential_source orelse return false;
-    if (source != .fx_login) return false;
+    if (!credentials.sourceRefreshable(source)) return false;
     const refresh = deps.refresh_gateway_credential orelse return false;
 
     const refreshed = refresh(deps.ctx, alloc, source, mode) catch |err| {

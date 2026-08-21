@@ -605,21 +605,26 @@ const OAuthHttpOperation = struct {
         defer secret.zeroAndFree(self.alloc, response_buffer);
         var response_writer = std.Io.Writer.fixed(response_buffer);
 
+        const extra_headers = [_]std.http.Header{
+            .{ .name = "accept", .value = "application/json" },
+        };
         const result = client.fetch(.{
             .location = .{ .url = self.request.url },
             .method = switch (self.request.method) {
                 .get => .GET,
-                .post_form => .POST,
+                .post_form, .post_json => .POST,
             },
             .payload = self.request.payload,
             .headers = .{
-                .content_type = if (self.request.method == .post_form)
-                    .{ .override = "application/x-www-form-urlencoded" }
-                else
-                    .default,
+                .content_type = switch (self.request.method) {
+                    .get => .default,
+                    .post_form => .{ .override = "application/x-www-form-urlencoded" },
+                    .post_json => .{ .override = "application/json" },
+                },
                 .user_agent = .{ .override = gateway_client.user_agent },
                 .accept_encoding = .omit,
             },
+            .extra_headers = &extra_headers,
             .response_writer = &response_writer,
         }) catch |err| switch (err) {
             error.WriteFailed => return error.OAuthResponseTooLarge,
@@ -630,6 +635,7 @@ const OAuthHttpOperation = struct {
 
         return .{
             .disposition = if (result.status == .ok) .accepted else .rejected,
+            .status = @intFromEnum(result.status),
             .body = try self.alloc.dupe(u8, body),
         };
     }

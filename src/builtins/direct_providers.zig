@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const stream_provider = @import("../core/agent/stream_provider.zig");
+const secret = @import("../core/auth/secret.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 
@@ -460,7 +461,7 @@ fn resolveCodexAccountId(alloc: Allocator, token: []const u8) ![]u8 {
     var file = std.Io.Dir.cwd().openFile(io_mod.getIo(), path, .{}) catch return error.CodexAccountIdUnavailable;
     defer file.close(io_mod.getIo());
     const bytes = io_mod.readFileToEnd(alloc, &file, 1024 * 1024) catch return error.CodexAccountIdUnavailable;
-    defer alloc.free(bytes);
+    defer secret.zeroAndFree(alloc, bytes);
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch return error.CodexAccountIdUnavailable;
     defer parsed.deinit();
     if (parsed.value != .object) return error.CodexAccountIdUnavailable;

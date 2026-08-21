@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 pub const Method = enum {
     get,
     post_form,
+    post_json,
 };
 
 pub const Request = struct {
@@ -23,6 +24,7 @@ pub const Disposition = enum {
 
 pub const Response = struct {
     disposition: Disposition,
+    status: ?u16 = null,
     /// Owned bytes allocated with the allocator passed to `Provider.execute`.
     body: []u8,
 
@@ -30,6 +32,7 @@ pub const Response = struct {
         secret.zeroAndFree(alloc, self.body);
         self.* = .{
             .disposition = .rejected,
+            .status = null,
             .body = &.{},
         };
     }

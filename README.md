@@ -40,23 +40,38 @@ fx setup
 ```
 
 The native CLI and ACP server can also connect directly to subscription and
-vendor providers with a provider-qualified model ID:
+vendor providers. Sign in once with fx:
 
 ```bash
-# Reuse an existing Claude Code Max/Pro login, or set ANTHROPIC_OAUTH_TOKEN.
+fx login anthropic      # Claude Pro or Max, browser OAuth
+fx login anthropic --manual-code  # Paste the redirect when using SSH
+fx login openai-codex   # ChatGPT Plus or Pro, browser OAuth
+fx login openai-codex --device-code  # ChatGPT login on a headless machine
+fx login xai            # SuperGrok or X Premium, device OAuth
+```
+
+fx stores refreshable provider sessions in private files under `~/.fx/` and
+refreshes them before expiry or after an unauthorized response. Select a direct
+provider with a provider-qualified model ID:
+
+```bash
+# Use the fx-managed Anthropic login, an existing Claude Code login, or an API key.
 FX_MODEL=anthropic-max/claude-opus-4-8 fx
 
-# Reuse an existing Codex CLI ChatGPT Plus/Pro login, or set CODEX_ACCESS_TOKEN.
+# Use the fx-managed Codex login or an existing Codex CLI login.
 FX_MODEL=openai-codex/gpt-5.5 fx
 
-# Use xAI directly with XAI_API_KEY.
+# Use the fx-managed xAI login or XAI_API_KEY.
 FX_MODEL=xai-direct/grok-4.6 fx
 ```
 
-Anthropic API keys are also accepted through `ANTHROPIC_API_KEY`. Direct
-provider credentials are scoped to their route and are never sent to Vercel AI
-Gateway. Existing IDs such as `anthropic/...` and `xai/...` continue to use AI
-Gateway. Direct routes currently support text and function tools; the
+Managed sessions take precedence over environment variables and external CLI
+credential files. Anthropic API keys are accepted through `ANTHROPIC_API_KEY`;
+Codex accepts `CODEX_ACCESS_TOKEN`; xAI accepts `XAI_API_KEY`. Remove a managed
+session with `fx logout anthropic`, `fx logout openai-codex`, or `fx logout xai`.
+Direct-provider credentials are scoped to their route and are never sent to
+Vercel AI Gateway. Existing IDs such as `anthropic/...` and `xai/...` continue
+to use AI Gateway. Direct routes currently support text and function tools; the
 Gateway-backed vision helper is not advertised on those routes.
 
 Run fx from a project:
