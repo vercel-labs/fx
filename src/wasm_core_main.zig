@@ -57,6 +57,10 @@ pub fn main(init: std.process.Init) !void {
 
 const js_host_gateway_provider = gateway_provider.Provider{
     .agent_stream = js_host_stream_provider.provider(),
+    .provider_adapter = .{
+        .legacy_provider = js_host_stream_provider.provider(),
+        .stream_fn = builtin_gateway.provider_adapter.stream_fn,
+    },
     .oauth_transport = oauth_transport.unavailable_provider,
     .chat_url = .{ .resolve_fn = resolveChatUrl },
     .cli_model_catalog = .{ .fetch_fn = fetchCliModelCatalog },

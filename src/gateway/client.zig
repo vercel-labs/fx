@@ -1747,7 +1747,10 @@ fn spawn_gateway_cancel_watcher(
     if (builtin.is_test) {
         if (test_cancel_watcher_spawn_error) |err| return err;
     }
-    return std.Thread.spawn(.{}, GatewayCancelWatcher.run, .{ done, cancel_flag, system_resumed, stream });
+    return if (comptime builtin.os.tag == .wasi)
+        error.ThreadUnavailable
+    else
+        std.Thread.spawn(.{}, GatewayCancelWatcher.run, .{ done, cancel_flag, system_resumed, stream });
 }
 
 test "suspend gap classification compares boot and awake clocks" {

@@ -88,6 +88,7 @@ pub const CreditsProvider = struct {
 
 pub const Provider = struct {
     agent_stream: agent_stream_provider.Provider,
+    provider_adapter: agent_stream_provider.ProviderAdapter,
     oauth_transport: oauth_transport.Provider,
     chat_url: ChatUrlProvider,
     cli_model_catalog: CliModelCatalogProvider,

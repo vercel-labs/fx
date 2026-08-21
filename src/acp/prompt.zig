@@ -224,6 +224,7 @@ const AcpContext = struct {
             .max_command_output_bytes = self.state.cfg.max_command_output_bytes,
             .max_tool_result_bytes = session.max_tool_result_bytes,
             .api_key = session.api_key,
+            .provider_adapter = self.state.cfg.gateway_provider.provider_adapter,
             .agent_stream_provider = self.state.cfg.gateway_provider.agent_stream,
             .credential_source = session.credential_source,
             .oauth_transport = self.state.cfg.gateway_provider.oauth_transport,
@@ -942,6 +943,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
     const session = if (ctx.state.active_session) |*active| active else unreachable;
     return .{
         .ctx = @ptrCast(ctx),
+        .provider_adapter = ctx.state.cfg.gateway_provider.provider_adapter,
         .agent_stream_provider = ctx.state.cfg.gateway_provider.agent_stream,
         .flush_assistant_stream_per_content_chunk = host_target.is_wasm,
         .tool_registry = ctx.toolRegistry(),

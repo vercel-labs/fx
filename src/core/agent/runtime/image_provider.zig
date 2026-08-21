@@ -49,7 +49,6 @@ pub fn inspect(
         .{ .role = .system, .content = system_prompt },
         .{ .role = .user, .content = user_prompt },
     };
-    const provider_opts = model_capabilities.resolveProviderOptions(model, .auto, false);
     const payload = try request.stream_provider.build(
         alloc,
         .{
@@ -57,7 +56,7 @@ pub fn inspect(
             .serialized_tools = "[]",
             .messages = &messages,
             .tool_choice = .none,
-            .provider_options = provider_opts,
+            .capabilities = model_capabilities.capabilitiesForModel(model),
             .budget = .{ .cancel_flag = request.cancel_flag },
             .verified_images = images,
             .response_format = request.response_format,

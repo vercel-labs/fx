@@ -208,6 +208,10 @@ pub fn Runtime(comptime App: type) type {
                 .max_command_output_bytes = max_command_output_bytes,
                 .max_tool_result_bytes = agent_settings.max_tool_result_bytes,
                 .api_key = app.auth.apiKey() orelse "",
+                .provider_adapter = if (comptime @hasDecl(App, "providerAdapter"))
+                    app.providerAdapter()
+                else
+                    agent_stream_provider.unavailable_adapter,
                 .agent_stream_provider = if (comptime @hasDecl(App, "agentStreamProvider"))
                     app.agentStreamProvider()
                 else
@@ -1496,6 +1500,12 @@ const FakeApp = struct {
 
     pub fn agentStreamProvider(self: *const FakeApp) agent_stream_provider.Provider {
         return self.agent_stream_provider;
+    }
+
+    pub fn providerAdapter(self: *const FakeApp) agent_stream_provider.ProviderAdapter {
+        var adapter = test_builtin_gateway.provider_adapter;
+        adapter.legacy_provider = self.agent_stream_provider;
+        return adapter;
     }
 
     fn deinit(self: *FakeApp) void {

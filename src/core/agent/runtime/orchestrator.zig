@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const agent_steps = @import("../../config/agent_steps.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const types = @import("../../shared/types.zig");
+const agent_stream_provider = @import("../stream_provider.zig");
 const worker_runtime = @import("../worker_runtime.zig");
 const session_runtime = @import("../../session/session.zig");
 const session_codec = @import("../../session/session_codec.zig");
@@ -2897,54 +2898,27 @@ fn processQueuedPromptLoop(
                 config.first_call_tool_choice
             else
                 .auto;
-            const request_payload = deps.agent_stream_provider.build(
-                overlay_arena,
-                .{
-                    .model = gateway_model,
-                    .tool_registry = deps.tool_registry,
-                    .serialized_tools = config.gateway_tools_json,
-                    .messages = request_messages,
-                    .tool_choice = tool_choice,
-                    .selected_dynamic_tool_schemas = selected_dynamic_tool_schemas.items,
-                    .vision_mode = vision_mode,
-                    .provider_options = provider_opts,
-                    .max_output_tokens = request_max_output_tokens(request_capabilities),
-                    .budget = .{ .cancel_flag = config.cancel_flag },
-                },
-            ) catch |err| {
-                if (err == error.Cancelled) {
-                    runtime_telemetry.traceCancelObserved(step_ctx, false);
-                    try clearAutoRetryStatusIfNeeded(deps, recovery_strategy != null);
-                    try runtime_interruption.persistInterruptedTurnOnce(
-                        deps,
-                        finalization,
-                        job,
-                        null,
-                        null,
-                        completed_tool_names.items,
-                        &interrupted_persisted,
-                        step_ctx,
-                        within_turn_suffix.items,
-                        stop_state.retained_candidate,
-                        &stop_state.terminal_materializing,
-                    );
-                    finish_trace.finish("interrupted");
-                    return;
-                }
-                return err;
+            const model_request = agent_stream_provider.ModelRequest{
+                .model = gateway_model,
+                .serialized_tools = config.gateway_tools_json,
+                .messages = request_messages,
+                .tool_choice = tool_choice,
+                .selected_dynamic_tool_schemas = selected_dynamic_tool_schemas.items,
+                .vision_mode = vision_mode,
+                .vision_tool_schema = if (vision_mode == .unavailable)
+                    null
+                else
+                    (deps.tool_registry.lookup("vision") orelse return error.VisionToolNotRegistered).gateway_schema,
+                .capabilities = request_capabilities,
+                .reasoning_effort = config.effort,
+                .fast_mode = route_fast_mode,
+                .max_output_tokens = request_max_output_tokens(request_capabilities),
+                .budget = .{ .cancel_flag = config.cancel_flag },
             };
             summary_accumulator.prepareTokenRequest();
             runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, .changed) catch |progress_err| {
                 debug_trace.logf("agent", "token progress publication failed source=gateway_prepare err={s}", .{@errorName(progress_err)});
             };
-            debug_trace.eventf("gateway", "after_payload_build", step_ctx, "payload_bytes={d} model={s} gateway_messages={d}", .{ request_payload.len, gateway_model, request_messages.len });
-            runtime_telemetry.traceGatewayRequestBuilt(
-                step_ctx,
-                gateway_model,
-                request_payload.len,
-                request_messages.len,
-                config.gateway_tools_json,
-            );
             try persistRecoveryCheckpoint(
                 deps,
                 arena,
@@ -2970,8 +2944,8 @@ fn processQueuedPromptLoop(
             const gateway_wait_started_ms = io_mod.milliTimestamp();
             var gateway_delivery = runtime_gateway_step.DeliveryCertainty.init();
             var gateway_attempt_evidence: runtime_gateway_step.AttemptEvidence = .{};
-            stream_result = runtime_gateway_step.streamGatewayCompletion(
-                deps.agent_stream_provider,
+            stream_result = runtime_gateway_step.streamModelRequest(
+                deps.provider_adapter,
                 arena,
                 active_api_key,
                 job.gateway_team,
@@ -2979,7 +2953,7 @@ fn processQueuedPromptLoop(
                 gateway_model,
                 config.gateway_retry_count,
                 config.gateway_chat_url,
-                request_payload,
+                model_request,
                 deps.cooperative_transport_pulse,
                 &gateway_delivery,
                 &gateway_attempt_evidence,

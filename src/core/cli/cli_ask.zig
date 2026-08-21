@@ -940,6 +940,7 @@ const AskContext = struct {
             .max_command_output_bytes = self.cfg.max_command_output_bytes,
             .max_tool_result_bytes = self.max_tool_result_bytes,
             .api_key = self.api_key,
+            .provider_adapter = self.cfg.gateway_provider.provider_adapter,
             .agent_stream_provider = self.cfg.gateway_provider.agent_stream,
             .gateway_team = self.gateway_team,
             .credential_source = self.credential_source,
@@ -1787,6 +1788,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
     );
     return .{
         .ctx = @ptrCast(ctx),
+        .provider_adapter = ctx.cfg.gateway_provider.provider_adapter,
         .agent_stream_provider = ctx.cfg.gateway_provider.agent_stream,
         .tool_registry = ctx.toolRegistry(),
         .context_registry = ctx.deps.context_registry,

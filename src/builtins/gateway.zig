@@ -5,6 +5,7 @@ pub const permission_reviewer = @import("gateway/permission_reviewer.zig");
 
 const api_key_validator_contract = @import("../core/auth/api_key_validator.zig");
 const agent_stream_provider_contract = @import("../core/agent/stream_provider.zig");
+const agent_runtime_telemetry = @import("../core/agent/runtime/telemetry.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const oauth_transport = @import("../core/auth/oauth_transport.zig");
 const secret = @import("../core/auth/secret.zig");
@@ -19,6 +20,7 @@ const gateway_generation_usage = @import("../gateway/generation_usage.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
+const model_descriptors = @import("gateway/model_descriptors.zig");
 const output_contracts = @import("../core/output/output_contracts.zig");
 const shared_types = @import("../core/shared/types.zig");
 const session_usage = @import("../core/session/session_usage.zig");
@@ -122,14 +124,20 @@ pub const oauth_transport_provider = oauth_transport.Provider{
 };
 
 pub const generation_usage_provider = gateway_generation_usage.provider;
+pub const model_descriptor_provider = model_descriptors.provider;
 
 pub const agent_stream_provider = agent_stream_provider_contract.Provider{
     .build_fn = buildAgentRequest,
     .stream_fn = streamAgentCompletion,
 };
 
+pub const provider_adapter = agent_stream_provider_contract.ProviderAdapter{
+    .stream_fn = streamVercelAdapter,
+};
+
 pub const provider = gateway_provider.Provider{
     .agent_stream = agent_stream_provider,
+    .provider_adapter = provider_adapter,
     .oauth_transport = oauth_transport_provider,
     .chat_url = chat_url_provider,
     .cli_model_catalog = cli_model_catalog_provider,
@@ -139,11 +147,349 @@ pub const provider = gateway_provider.Provider{
     .model_catalog = model_catalog_provider,
 };
 
+const AdapterEventBridge = struct {
+    events: agent_stream_provider_contract.EventSink,
+    failure: ?anyerror = null,
+    saw_text: bool = false,
+
+    fn emit(self: *AdapterEventBridge, event: agent_stream_provider_contract.StreamEvent) void {
+        if (self.failure != null) return;
+        self.events.emit(event) catch |err| {
+            self.failure = err;
+        };
+    }
+
+    fn content(raw: *anyopaque, chunk: []const u8) void {
+        const self: *AdapterEventBridge = @ptrCast(@alignCast(raw));
+        self.saw_text = true;
+        self.emit(.{ .text_delta = chunk });
+    }
+
+    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
+        const self: *AdapterEventBridge = @ptrCast(@alignCast(raw));
+        self.emit(.{ .reasoning_delta = chunk });
+    }
+
+    fn toolInput(raw: *anyopaque, chunk: []const u8) void {
+        const self: *AdapterEventBridge = @ptrCast(@alignCast(raw));
+        self.emit(.{ .tool_input_delta = chunk });
+    }
+
+    fn toolStart(
+        raw: *anyopaque,
+        id: []const u8,
+        name: []const u8,
+        label: ?[]const u8,
+    ) void {
+        const self: *AdapterEventBridge = @ptrCast(@alignCast(raw));
+        self.emit(.{ .tool_input_started = .{ .id = id, .name = name, .label = label } });
+    }
+};
+
+fn streamVercelAdapter(
+    adapter: *const agent_stream_provider_contract.ProviderAdapter,
+    alloc: Allocator,
+    request: agent_stream_provider_contract.AdapterRequest,
+    events: agent_stream_provider_contract.EventSink,
+) anyerror!void {
+    const stream_provider = adapter.legacy_provider orelse agent_stream_provider;
+    const payload = try stream_provider.build(alloc, request.model_request);
+    defer alloc.free(payload);
+    debug_trace.eventf("gateway", "after_payload_build", request.trace_ctx, "payload_bytes={d} model={s} gateway_messages={d}", .{
+        payload.len,
+        request.model_id,
+        request.model_request.messages.len,
+    });
+    agent_runtime_telemetry.traceGatewayRequestBuilt(
+        request.trace_ctx,
+        request.model_id,
+        payload.len,
+        request.model_request.messages.len,
+        request.model_request.serialized_tools,
+    );
+    if (request.serialized_request_limit_bytes) |limit| {
+        if (payload.len > limit) {
+            try events.emit(.{ .failure = .{
+                .category = .request_too_large,
+                .detail = "serialized provider request exceeds the configured limit",
+            } });
+            return;
+        }
+    }
+    try events.emit(.provider_admitted);
+
+    var bridge = AdapterEventBridge{ .events = events };
+    var result = stream_provider.stream(alloc, .{
+        .api_key = request.credential,
+        .team = request.tenant,
+        .session_id = request.session_id,
+        .model = request.model_id,
+        .retry_count = request.retry_count,
+        .chat_url = request.endpoint,
+        .payload = payload,
+        .trace_ctx = request.trace_ctx,
+        .content_capture_limit = request.content_capture_limit,
+        .cooperative_pulse = request.cooperative_pulse,
+        .delivery = request.delivery,
+        .attempt_evidence = request.attempt_evidence,
+        .callback_ctx = &bridge,
+        .on_content_chunk = AdapterEventBridge.content,
+        .on_tool_start = AdapterEventBridge.toolStart,
+        .on_reasoning_chunk = AdapterEventBridge.reasoning,
+        .on_tool_input_chunk = AdapterEventBridge.toolInput,
+        .cancel_flag = request.cancel_flag,
+        .provider_attempt_owner = request.provider_attempt_owner,
+    }) catch |err| {
+        if (bridge.failure) |failure| return failure;
+        if (err == error.Cancelled or request.cancel_flag.load(.seq_cst)) {
+            try events.emit(.cancelled);
+        } else {
+            try events.emit(.{ .failure = .{
+                .category = if (request.delivery.load() == .possibly_sent) .ambiguous_delivery else .transport,
+                .detail = @errorName(err),
+            } });
+        }
+        return err;
+    };
+    defer result.deinit(alloc);
+    if (bridge.failure) |failure| return failure;
+
+    if (result.status == .ok) {
+        if (!bridge.saw_text) {
+            if (result.completion.content) |content| try events.emit(.{ .text_delta = content });
+        }
+        tool_calls: for (result.completion.tool_calls) |call| switch (call.provenance) {
+            .fx_local => try events.emit(.{ .fx_tool_call = call }),
+            .provider_executed => {
+                var started = call;
+                started.provider_result = null;
+                events.emit(.{ .provider_tool_started = started }) catch |err| {
+                    if (err == error.DuplicateProviderToolStart and result.completion.provider_result_identity_failure != null) break :tool_calls;
+                    if (err == error.DuplicateProviderToolStart) return error.MalformedAuthoritativeToolIdentity;
+                    return err;
+                };
+                if (call.provider_result) |provider_result| {
+                    try events.emit(.{ .provider_tool_result = .{
+                        .call_id = call.id,
+                        .result = provider_result,
+                    } });
+                }
+            },
+        };
+        try events.emit(.{ .usage = .{
+            .tokens = result.completion.usage,
+            .billing = if (result.completion.billing) |billing| .{
+                .created_at_ms = billing.created_at_ms,
+                .model_id = billing.model,
+                .total_cost = billing.total_cost,
+                .input_tokens = billing.input_tokens,
+                .output_tokens = billing.output_tokens,
+                .cache_read_tokens = billing.cache_read_tokens,
+                .cache_write_tokens = billing.cache_write_tokens,
+                .reasoning_tokens = billing.reasoning_tokens,
+                .billable_web_search_calls = billing.billable_web_search_calls,
+            } else null,
+        } });
+        try events.emit(.{ .finish = .{
+            .reason = result.completion.finish_reason,
+            .generation_reference = if (result.completion.generation_id) |id| .{
+                .id = id,
+                .lookup_scope = result.generation_origin,
+            } else null,
+            .generation_metadata_invalid = result.completion.generation_metadata_invalid,
+            .delivery_ambiguous = result.completion.delivery_ambiguous,
+            .provider_result_identity_failure = result.completion.provider_result_identity_failure,
+            .provider_failure_detail = result.completion.provider_failure_detail,
+        } });
+    } else {
+        try events.emit(.{ .failure = .{
+            .category = switch (result.status) {
+                .unauthorized => .authentication,
+                .forbidden => .authorization,
+                .too_many_requests => .rate_limited,
+                .bad_request => .configuration,
+                .unprocessable_entity => .invalid_content,
+                .payload_too_large => .request_too_large,
+                .internal_server_error => .provider_internal,
+                .bad_gateway => .upstream_failure,
+                .service_unavailable => .unavailable,
+                .gateway_timeout => .timeout,
+                else => .protocol,
+            },
+            .detail = result.err_body,
+            .retry_after_seconds = result.retry_after_seconds,
+            .diagnostic = if (result.failure_schema) |summary| .{
+                .summary = summary,
+                .request_shape = result.failure_request_shape,
+            } else null,
+        } });
+    }
+}
+
+test "Vercel adapter sink failure does not mutate user cancellation" {
+    const FakeLegacy = struct {
+        fn build(_: ?*anyopaque, alloc: Allocator, _: agent_stream_provider_contract.BuildRequest) anyerror![]u8 {
+            return alloc.dupe(u8, "{}");
+        }
+
+        fn stream(_: ?*anyopaque, _: Allocator, request: agent_stream_provider_contract.Request) anyerror!agent_stream_provider_contract.Result {
+            request.on_content_chunk(request.callback_ctx, "chunk");
+            return .{ .status = .ok, .completion = .{ .finish_reason = .stop } };
+        }
+    };
+    const RejectingSink = struct {
+        fn emit(_: *anyopaque, _: agent_stream_provider_contract.StreamEvent) anyerror!void {
+            return error.TestSinkFailure;
+        }
+    };
+
+    var adapter = provider_adapter;
+    adapter.legacy_provider = .{
+        .build_fn = FakeLegacy.build,
+        .stream_fn = FakeLegacy.stream,
+    };
+    var cancelled = std.atomic.Value(bool).init(false);
+    var delivery = agent_stream_provider_contract.DeliveryCertainty.init();
+    var attempt_evidence: agent_stream_provider_contract.AttemptEvidence = .{};
+    var state = agent_stream_provider_contract.EventState.init(std.testing.allocator);
+    defer state.deinit();
+    var sink_error: ?anyerror = null;
+    var sink_context: u8 = 0;
+    try std.testing.expectError(error.TestSinkFailure, adapter.stream(std.testing.allocator, .{
+        .model_request = .{
+            .model = "test/model",
+            .serialized_tools = "[]",
+            .messages = &.{},
+            .tool_choice = .none,
+            .capabilities = .{},
+        },
+        .credential = "credential",
+        .tenant = null,
+        .model_id = "test/model",
+        .retry_count = 1,
+        .endpoint = "provider:endpoint",
+        .trace_ctx = .{},
+        .content_capture_limit = null,
+        .delivery = &delivery,
+        .attempt_evidence = &attempt_evidence,
+        .cancel_flag = &cancelled,
+    }, .{
+        .context = &sink_context,
+        .state = &state,
+        .sink_error = &sink_error,
+        .emit_fn = RejectingSink.emit,
+    }));
+    try std.testing.expectEqual(error.TestSinkFailure, sink_error.?);
+    try std.testing.expect(!cancelled.load(.seq_cst));
+}
+
+test "Vercel adapter enforces serialized request limit before admission" {
+    const FakeLegacy = struct {
+        calls: usize = 0,
+
+        fn build(_: ?*anyopaque, alloc: Allocator, request: agent_stream_provider_contract.BuildRequest) anyerror![]u8 {
+            return alloc.dupe(u8, request.serialized_tools);
+        }
+
+        fn stream(raw: ?*anyopaque, _: Allocator, _: agent_stream_provider_contract.Request) anyerror!agent_stream_provider_contract.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return .{ .status = .ok, .completion = .{ .finish_reason = .stop } };
+        }
+    };
+    const Capture = struct {
+        admitted: usize = 0,
+        failures: usize = 0,
+        finishes: usize = 0,
+
+        fn emit(raw: *anyopaque, event: agent_stream_provider_contract.StreamEvent) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            switch (event) {
+                .provider_admitted => self.admitted += 1,
+                .failure => |failure| {
+                    try std.testing.expectEqual(agent_stream_provider_contract.StreamFailure.Category.request_too_large, failure.category);
+                    self.failures += 1;
+                },
+                .finish => self.finishes += 1,
+                else => {},
+            }
+        }
+    };
+
+    const accepted_payload = "x" ** (16 * 1024);
+    const rejected_payload = accepted_payload ++ "x";
+    var fake: FakeLegacy = .{};
+    var adapter = provider_adapter;
+    adapter.legacy_provider = .{
+        .context = &fake,
+        .build_fn = FakeLegacy.build,
+        .stream_fn = FakeLegacy.stream,
+    };
+    var cancelled = std.atomic.Value(bool).init(false);
+    var delivery = agent_stream_provider_contract.DeliveryCertainty.init();
+    var attempt_evidence: agent_stream_provider_contract.AttemptEvidence = .{};
+    var state = agent_stream_provider_contract.EventState.init(std.testing.allocator);
+    defer state.deinit();
+    var sink_error: ?anyerror = null;
+    var capture: Capture = .{};
+    var request = agent_stream_provider_contract.AdapterRequest{
+        .model_request = .{
+            .model = "test/model",
+            .serialized_tools = rejected_payload,
+            .messages = &.{},
+            .tool_choice = .none,
+            .capabilities = .{},
+        },
+        .serialized_request_limit_bytes = 16 * 1024,
+        .credential = "credential",
+        .tenant = null,
+        .model_id = "test/model",
+        .retry_count = 1,
+        .endpoint = "provider:endpoint",
+        .trace_ctx = .{},
+        .content_capture_limit = null,
+        .delivery = &delivery,
+        .attempt_evidence = &attempt_evidence,
+        .cancel_flag = &cancelled,
+    };
+    try adapter.stream(std.testing.allocator, request, .{
+        .context = &capture,
+        .state = &state,
+        .sink_error = &sink_error,
+        .emit_fn = Capture.emit,
+    });
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), capture.admitted);
+    try std.testing.expectEqual(@as(usize, 1), capture.failures);
+    try std.testing.expect(!state.provider_admitted);
+
+    state.deinit();
+    state = agent_stream_provider_contract.EventState.init(std.testing.allocator);
+    capture = .{};
+    sink_error = null;
+    request.model_request.serialized_tools = accepted_payload;
+    try adapter.stream(std.testing.allocator, request, .{
+        .context = &capture,
+        .state = &state,
+        .sink_error = &sink_error,
+        .emit_fn = Capture.emit,
+    });
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), capture.admitted);
+    try std.testing.expectEqual(@as(usize, 1), capture.finishes);
+    try std.testing.expect(state.provider_admitted);
+}
+
 pub fn buildAgentRequest(
     _: ?*anyopaque,
     alloc: Allocator,
     request: agent_stream_provider_contract.BuildRequest,
 ) anyerror![]u8 {
+    const provider_options = model_capabilities.resolveProviderOptionsForCapabilities(
+        request.capabilities,
+        request.reasoning_effort,
+        request.fast_mode,
+    );
     const budget: ?gateway_json.BuildBudget = if (request.budget) |value|
         .{ .deadline = value.deadline, .cancel_flag = value.cancel_flag }
     else
@@ -158,7 +504,7 @@ pub fn buildAgentRequest(
             request.serialized_tools,
             request.messages,
             images,
-            request.provider_options,
+            provider_options,
             request.tool_choice,
             .{
                 .name = response_format.name,
@@ -177,7 +523,7 @@ pub fn buildAgentRequest(
                 alloc,
                 request.serialized_tools,
                 request.messages,
-                request.provider_options,
+                provider_options,
                 request.tool_choice,
                 request.max_output_tokens,
                 active,
@@ -187,7 +533,7 @@ pub fn buildAgentRequest(
                 alloc,
                 request.serialized_tools,
                 request.messages,
-                request.provider_options,
+                provider_options,
                 request.tool_choice,
                 request.max_output_tokens,
             );
@@ -195,7 +541,7 @@ pub fn buildAgentRequest(
     }
 
     const vision_schema = if (request.vision_mode != .unavailable)
-        try writeVisionGatewaySchema(alloc, request.tool_registry)
+        try writeVisionGatewaySchema(alloc, request.vision_tool_schema orelse return error.VisionToolNotRegistered)
     else
         null;
     defer if (vision_schema) |schema| alloc.free(schema);
@@ -208,7 +554,7 @@ pub fn buildAgentRequest(
                 alloc,
                 tools_json,
                 request.messages,
-                request.provider_options,
+                provider_options,
                 request.max_output_tokens,
                 active,
             )
@@ -217,7 +563,7 @@ pub fn buildAgentRequest(
                 alloc,
                 tools_json,
                 request.messages,
-                request.provider_options,
+                provider_options,
                 request.max_output_tokens,
             );
         return finalizeAgentRequestBody(alloc, request.model, try body);
@@ -238,7 +584,7 @@ pub fn buildAgentRequest(
             alloc,
             tools_json,
             request.messages,
-            request.provider_options,
+            provider_options,
             request.tool_choice,
             request.max_output_tokens,
             active,
@@ -248,7 +594,7 @@ pub fn buildAgentRequest(
             alloc,
             tools_json,
             request.messages,
-            request.provider_options,
+            provider_options,
             request.tool_choice,
             request.max_output_tokens,
         );
@@ -274,12 +620,11 @@ fn finalizeAgentRequestBody(
 
 fn writeVisionGatewaySchema(
     alloc: Allocator,
-    registry: tool_dispatch.Registry,
+    schema: gateway_schema.FunctionSchema,
 ) ![]u8 {
-    const vision_tool = registry.lookup("vision") orelse return error.VisionToolNotRegistered;
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    try gateway_schema.writeBuiltinFunctionSchema(alloc, &out.writer, vision_tool.gateway_schema);
+    try gateway_schema.writeBuiltinFunctionSchema(alloc, &out.writer, schema);
     return out.toOwnedSlice();
 }
 
@@ -290,11 +635,7 @@ test "agent request builder keeps default reasoning silent and emits output limi
         .serialized_tools = "[]",
         .messages = &messages,
         .tool_choice = .auto,
-        .provider_options = model_capabilities.resolveProviderOptions(
-            "anthropic/claude-opus-4.8",
-            .auto,
-            false,
-        ),
+        .capabilities = model_capabilities.capabilitiesForModel("anthropic/claude-opus-4.8"),
         .max_output_tokens = 32_000,
     });
     defer std.testing.allocator.free(body);
@@ -321,7 +662,7 @@ test "agent request builder scopes the product user agent to GLM 5.2" {
             .serialized_tools = "[]",
             .messages = &messages,
             .tool_choice = .auto,
-            .provider_options = model_capabilities.resolveProviderOptions(case.model, .auto, false),
+            .capabilities = model_capabilities.capabilitiesForModel(case.model),
         });
         defer alloc.free(body);
 
@@ -349,11 +690,7 @@ test "agent request builder overlays selected dynamic schemas" {
         .messages = &messages,
         .tool_choice = .auto,
         .selected_dynamic_tool_schemas = &.{selected_schema},
-        .provider_options = model_capabilities.resolveProviderOptions(
-            "anthropic/claude",
-            .auto,
-            false,
-        ),
+        .capabilities = model_capabilities.capabilitiesForModel("anthropic/claude"),
         .max_output_tokens = 64_000,
     });
     defer std.testing.allocator.free(body);
@@ -363,51 +700,20 @@ test "agent request builder overlays selected dynamic schemas" {
 }
 
 test "required vision request contains only the registered vision schema" {
-    const Callbacks = struct {
-        fn decode(_: tool_dispatch.DispatchContext, _: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-            return error.InvalidToolArguments;
-        }
-
-        fn call(_: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-            return error.InvalidToolArguments;
-        }
-
-        fn readsOnly(_: tool_dispatch.ToolInput) bool {
-            return true;
-        }
-
-        fn isIrreversible(_: tool_dispatch.ToolInput) bool {
-            return false;
-        }
-    };
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "inspect image 7" }};
-    const vision_tool = tool_dispatch.Tool{
+    const vision_schema = gateway_schema.FunctionSchema{
         .name = "vision",
         .description = "registry-owned vision schema sentinel",
-        .gateway_schema = .{
-            .name = "vision",
-            .description = "registry-owned vision schema sentinel",
-        },
-        .executor_kind = .vision,
-        .decode = Callbacks.decode,
-        .call = Callbacks.call,
-        .reads_only_fn = Callbacks.readsOnly,
-        .irreversible_fn = Callbacks.isIrreversible,
     };
-    const registered_tools = [_]tool_dispatch.Tool{vision_tool};
     const body = try agent_stream_provider.build(std.testing.allocator, .{
         .model = "zai/glm-5.2",
-        .tool_registry = .{ .tools = registered_tools[0..] },
         .serialized_tools = "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]",
         .messages = &messages,
         .tool_choice = .none,
         .selected_dynamic_tool_schemas = &.{"{\"type\":\"function\",\"name\":\"mcp_fs_read\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}"},
         .vision_mode = .required,
-        .provider_options = model_capabilities.resolveProviderOptions(
-            "zai/glm-5.2",
-            .auto,
-            false,
-        ),
+        .vision_tool_schema = vision_schema,
+        .capabilities = model_capabilities.capabilitiesForModel("zai/glm-5.2"),
         .max_output_tokens = 128_000,
     });
     defer std.testing.allocator.free(body);

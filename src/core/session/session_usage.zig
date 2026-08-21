@@ -1402,7 +1402,9 @@ pub const Usage = struct {
         self.reconciliation_mutex.lockUncancelable(io_mod.getIo());
         defer self.reconciliation_mutex.unlock(io_mod.getIo());
         self.reconciliation_cancel.store(true, .seq_cst);
-        _ = self.reconciliation_work_epoch.fetchAdd(1, .seq_cst);
+        if (comptime builtin.os.tag != .wasi) {
+            _ = self.reconciliation_work_epoch.fetchAdd(1, .seq_cst);
+        }
         const thread = self.reconciliation_thread;
         self.reconciliation_thread = null;
         if (thread) |handle| handle.join();
@@ -1449,7 +1451,9 @@ pub const Usage = struct {
                 }
             }
         }
-        _ = self.reconciliation_work_epoch.fetchAdd(1, .seq_cst);
+        if (comptime builtin.os.tag != .wasi) {
+            _ = self.reconciliation_work_epoch.fetchAdd(1, .seq_cst);
+        }
         if (self.reconciliation_thread) |thread| {
             if (same_key and !self.reconciliation_done.load(.seq_cst)) return;
             self.reconciliation_cancel.store(true, .seq_cst);
@@ -1460,6 +1464,7 @@ pub const Usage = struct {
         }
         self.reconciliation_key_digest = key_digest;
         if (builtin.is_test) return;
+        if (comptime builtin.os.tag == .wasi) return;
 
         self.mutex.lockUncancelable(io_mod.getIo());
         const still_has_pending = self.pending.items.len > 0;

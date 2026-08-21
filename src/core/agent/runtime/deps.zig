@@ -185,6 +185,8 @@ pub const DiffMarkerStyles = struct {
 
 pub const AgentRuntimeDeps = struct {
     ctx: *anyopaque,
+    provider_adapter: agent_stream_provider.ProviderAdapter = agent_stream_provider.unavailable_adapter,
+    // Compatibility seam retained for Vision and removed at G11.
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     flush_assistant_stream_per_content_chunk: bool = false,
     cooperative_transport_pulse: ?agent_stream_provider.CooperativePulse = null,

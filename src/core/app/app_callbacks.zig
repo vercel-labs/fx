@@ -266,6 +266,10 @@ pub fn Bindings(comptime App: type) type {
         pub fn agentRuntimeDeps(app: *App) agent_runtime.AgentRuntimeDeps {
             var deps: agent_runtime.AgentRuntimeDeps = .{
                 .ctx = @ptrCast(app),
+                .provider_adapter = if (comptime @hasDecl(App, "providerAdapter"))
+                    app.providerAdapter()
+                else
+                    agent_stream_provider.unavailable_adapter,
                 .agent_stream_provider = if (comptime @hasDecl(App, "agentStreamProvider"))
                     app.agentStreamProvider()
                 else

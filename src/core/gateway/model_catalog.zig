@@ -1,4 +1,5 @@
 const std = @import("std");
+const model_capabilities = @import("../config/model_capabilities.zig");
 const credentials = @import("../auth/credentials.zig");
 const collections = @import("../shared/collections.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -291,6 +292,53 @@ pub const ModelCatalogEntry = struct {
     max_tokens: u32 = 0,
     web_search_price: ?[]u8 = null,
 };
+
+pub const ModelDescriptorProvider = struct {
+    context: ?*anyopaque = null,
+    fallback_fn: *const fn (?*anyopaque, []const u8) model_capabilities.ModelDescriptor,
+    catalog_fn: *const fn (?*anyopaque, ModelCatalogEntry) model_capabilities.ModelDescriptor,
+
+    pub fn fallback(self: ModelDescriptorProvider, model: []const u8) model_capabilities.ModelDescriptor {
+        return self.fallback_fn(self.context, model);
+    }
+
+    pub fn catalog(self: ModelDescriptorProvider, entry: ModelCatalogEntry) model_capabilities.ModelDescriptor {
+        return self.catalog_fn(self.context, entry);
+    }
+
+    pub fn resolve(
+        self: ModelDescriptorProvider,
+        entries: []const ModelCatalogEntry,
+        selected_model: []const u8,
+    ) model_capabilities.ModelDescriptor {
+        const fallback_descriptor = self.fallback(selected_model);
+        for (entries) |entry| {
+            if (std.mem.eql(u8, entry.id, fallback_descriptor.id)) {
+                return catalogSelection(fallback_descriptor, self.catalog(entry));
+            }
+        }
+        for (entries) |entry| {
+            const descriptor = self.catalog(entry);
+            if (std.mem.eql(u8, descriptor.id, fallback_descriptor.id)) {
+                return catalogSelection(fallback_descriptor, descriptor);
+            }
+        }
+        return fallback_descriptor;
+    }
+};
+
+fn catalogSelection(
+    fallback: model_capabilities.ModelDescriptor,
+    catalog: model_capabilities.ModelDescriptor,
+) model_capabilities.ModelDescriptor {
+    std.debug.assert(catalog.source == .catalog);
+    var resolved = catalog;
+    resolved.id = fallback.id;
+    resolved.display_name = fallback.display_name;
+    resolved.provider = fallback.provider;
+    resolved.selected_fast_mode = fallback.selected_fast_mode;
+    return resolved;
+}
 
 pub fn freeModelCatalog(alloc: std.mem.Allocator, entries: *std.ArrayList(ModelCatalogEntry)) void {
     for (entries.items) |entry| freeModelCatalogEntry(alloc, entry);
