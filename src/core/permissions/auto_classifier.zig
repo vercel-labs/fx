@@ -8,6 +8,7 @@ const permissions = @import("permissions.zig");
 const session_usage = @import("../session/session_usage.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const command_environment = @import("../execution/command_environment.zig");
+const shell_resolver = @import("../terminal/shell_resolver.zig");
 const types = @import("../shared/types.zig");
 
 pub const tool_name = "permission_decision";
@@ -498,6 +499,22 @@ fn writeEnvironment(
                 return;
             }
             try writeBoundedField(writer, alloc, "environment_shell", shell_path, max_action_field_bytes, action_complete);
+
+            // The path alone reads like an ordinary `bash -c`, where aliases do
+            // not apply. What fx runs is a login shell with alias expansion, and
+            // that is the difference that decides what the command means, so the
+            // reviewer gets the startup words themselves.
+            var invocation = shell_resolver.capturedInvocation(environment, "") catch {
+                action_complete.* = false;
+                try writer.writeAll("environment_invocation: <unknown>\n");
+                return;
+            };
+            // `setCommand` appended the placeholder; the words before it are the
+            // startup semantics, and the command is already its own field.
+            if (invocation.len > 0) invocation.len -= 1;
+            const startup = try shell_resolver.formatInvocationCommand(alloc, &invocation);
+            defer alloc.free(startup);
+            try writeBoundedField(writer, alloc, "environment_invocation", startup, max_action_field_bytes, action_complete);
         },
     }
 }
@@ -1890,7 +1907,6 @@ test "command evidence names the shell that will interpret the command" {
             .command = "git status",
             .resolved_cwd = "/tmp/workspace",
             .background = false,
-            .backend = .none,
             .target_os = .linux,
             .environment = .{ .user = "/bin/bash" },
         } },
@@ -1901,6 +1917,15 @@ test "command evidence names the shell that will interpret the command" {
     const payload = capture.payload[0..capture.len];
     try std.testing.expect(std.mem.find(u8, payload, "environment: user") != null);
     try std.testing.expect(std.mem.find(u8, payload, "/bin/bash") != null);
+
+    // The startup words are what separate this from an ordinary `bash -c`, where
+    // the operator's aliases would not apply at all.
+    const invocation_line = std.mem.find(u8, payload, "environment_invocation:") orelse
+        return error.TestExpectedInvocation;
+    const rest = payload[invocation_line..];
+    const line_end = std.mem.findScalar(u8, rest, '\n') orelse rest.len;
+    const invocation = rest[0..line_end];
+    try std.testing.expect(std.mem.find(u8, invocation, "expand_aliases") != null);
 }
 
 test "a shell-routed command whose shell is unnamed cannot be auto-approved" {
@@ -1955,7 +1980,6 @@ test "a shell-routed command whose shell is unnamed cannot be auto-approved" {
             .command = "git status",
             .resolved_cwd = "/tmp/workspace",
             .background = false,
-            .backend = .none,
             .target_os = .linux,
             .environment = .{ .user = "" },
         } },
