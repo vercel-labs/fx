@@ -10,7 +10,13 @@
         in
         {
           default = pkgs.stdenv.mkDerivation {
-            name = "fx";
+            pname = "fx";
+            version =
+              let
+                line = pkgs.lib.findFirst (pkgs.lib.hasPrefix "pub const version = ") null
+                  (pkgs.lib.splitString "\n" (builtins.readFile ./src/main.zig));
+              in
+              pkgs.lib.removeSuffix "\";" (pkgs.lib.removePrefix "pub const version = \"" line);
             src = ./.;
             nativeBuildInputs = [ pkgs.makeBinaryWrapper pkgs.zig ];
             postInstall = ''
