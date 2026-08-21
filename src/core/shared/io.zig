@@ -387,6 +387,42 @@ pub fn getenv(key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Returns the user's home directory path. Caller owns the returned slice.
+/// On Windows: USERPROFILE -> HOME -> HOMEDRIVE+HOMEPATH -> error.HomeNotFound.
+/// On POSIX: HOME -> error.HomeNotFound.
+pub fn homeDir(alloc: std.mem.Allocator) ![]u8 {
+    if (comptime builtin.os.tag == .windows) {
+        if (getenv("USERPROFILE")) |value| return alloc.dupe(u8, value);
+        if (getenv("HOME")) |value| return alloc.dupe(u8, value);
+        const drive = getenv("HOMEDRIVE") orelse return error.HomeNotFound;
+        const path = getenv("HOMEPATH") orelse return error.HomeNotFound;
+        return std.fs.path.join(alloc, &.{ drive, path });
+    }
+    if (getenv("HOME")) |value| return alloc.dupe(u8, value);
+    return error.HomeNotFound;
+}
+
+/// Returns the system temp directory path. Caller owns the returned slice.
+/// On Windows: TEMP -> TMP -> error.TempNotFound.
+/// On POSIX: TMPDIR or "/tmp" (always succeeds).
+pub fn tempDir(alloc: std.mem.Allocator) ![]u8 {
+    if (comptime builtin.os.tag == .windows) {
+        if (getenv("TEMP")) |value| return alloc.dupe(u8, value);
+        if (getenv("TMP")) |value| return alloc.dupe(u8, value);
+        return error.TempNotFound;
+    }
+    if (getenv("TMPDIR")) |value| return alloc.dupe(u8, value);
+    return alloc.dupe(u8, "/tmp");
+}
+
+/// Lookup an environment variable. On Windows the underlying Environ.Map
+/// already performs case-insensitive lookup, so the behavior is identical to
+/// `getenv` on every supported platform. Callers that need to read variables
+/// such as `Path`/`Path` interchangeably should use this helper.
+pub fn getenvCaseInsensitive(key: []const u8) ?[]const u8 {
+    return getenv(key);
+}
+
 pub fn e2eFailIfDurableMutationAttempted() void {
     const enabled = getenv("FX_E2E_FAIL_ON_DURABLE_MUTATION") orelse return;
     if (!std.mem.eql(u8, enabled, "1")) return;
