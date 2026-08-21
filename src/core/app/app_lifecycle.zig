@@ -414,7 +414,12 @@ fn loadStartupStateFromOwnedWorkspace(
     state.configured_model = try alloc.dupe(u8, configured_selection.model);
     if (settings.custom_base_url) |base_url| {
         const trimmed = std.mem.trimEnd(u8, base_url, "/");
-        state.custom_chat_url = try std.fmt.allocPrint(alloc, "{s}/chat/completions", .{trimmed});
+        const completion_suffix = "/chat/completions";
+        const endpoint = if (std.mem.endsWith(u8, trimmed, completion_suffix))
+            trimmed[0 .. trimmed.len - completion_suffix.len]
+        else
+            trimmed;
+        state.custom_chat_url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ endpoint, completion_suffix });
     }
     state.model_source = detailed.model_source orelse .compiled_default;
     state.selected_model = try loadInitialModel(alloc, configured_selection.model, null);

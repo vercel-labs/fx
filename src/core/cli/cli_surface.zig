@@ -1728,7 +1728,12 @@ fn runCustomSetup(
         "https://openrouter.ai/api/v1"
     else
         endpoint_input;
-    config_runtime.custom_provider.validate(endpoint, "OPENROUTER_API_KEY") catch {
+    const completion_suffix = "/chat/completions";
+    const endpoint_base = if (std.mem.endsWith(u8, endpoint, completion_suffix))
+        endpoint[0 .. endpoint.len - completion_suffix.len]
+    else
+        endpoint;
+    config_runtime.custom_provider.validate(endpoint_base, "OPENROUTER_API_KEY") catch {
         try writeStderr(deps, "fx setup custom: endpoint must use HTTPS, or loopback HTTP for testing\n");
         return false;
     };
@@ -1751,7 +1756,7 @@ fn runCustomSetup(
     };
     defer secret.zeroAndFree(alloc, key);
 
-    const chat_url = try std.fmt.allocPrint(alloc, "{s}/chat/completions", .{std.mem.trimEnd(u8, endpoint, "/")});
+    const chat_url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ std.mem.trimEnd(u8, endpoint_base, "/"), completion_suffix });
     defer alloc.free(chat_url);
     const access: credentials.CatalogAccess = .{ .authenticated = .{
         .source = .custom_api_key,
@@ -1810,7 +1815,7 @@ fn runCustomSetup(
     };
     var attempt = config_runtime.attemptUserPreferences(alloc, .{
         .provider = .custom,
-        .custom_base_url = endpoint,
+        .custom_base_url = endpoint_base,
         .custom_api_key_env = "OPENROUTER_API_KEY",
         .custom_model = selected_model,
     });
