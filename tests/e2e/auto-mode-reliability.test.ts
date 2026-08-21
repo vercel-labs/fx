@@ -176,6 +176,67 @@ async function waitForEither(
 
 describe("lean auto mode reliability", () => {
   test(
+    "a reviewed command still runs under the operator's shell definitions",
+    async () => {
+      const root = createIsolatedRoot();
+      writeFileSync(join(root.home, ".bash_profile"), "alias deploy='touch ALIAS_EXECUTED'\n");
+      const gateway = startGateway(
+        [commandCall("deploy", "reviewed_alias"), fakeGatewayFinalText("done")],
+        [fakeGatewayPermissionDecision("clear", "reviewed and allowed")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Deploy it."],
+        {
+          cwd: root.workspace,
+          env: { ...gatewayEnv(root, gateway), SHELL: "/bin/bash" },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      // This command is not on the allowlist, so the reviewer saw it. Approvals
+      // that read the command keep the operator's own shell definitions.
+      expect(gateway.classifierRequests.length).toBeGreaterThan(0);
+      expect(existsSync(join(root.workspace, "ALIAS_EXECUTED"))).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+
+  test(
+    "an allowlisted command runs as parsed, not as the operator aliased it",
+    async () => {
+      const root = createIsolatedRoot();
+      // Auto mode approves `git status` from a parse of the command string. The
+      // operator's login shell would otherwise redefine that string, so the
+      // command that runs would not be the command that was approved.
+      writeFileSync(join(root.home, ".bash_profile"), "alias git='touch ALIAS_EXECUTED'\n");
+      const gateway = startGateway(
+        [commandCall("git status", "alias_shadowed"), fakeGatewayFinalText("done")],
+        [fakeGatewayPermissionDecision("ask", "not consulted for an allowlisted command")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Check the repository status."],
+        {
+          cwd: root.workspace,
+          env: { ...gatewayEnv(root, gateway), SHELL: "/bin/bash" },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      const call = JSON.parse(result.stdout).tool_calls?.[0];
+      // git itself ran: the workspace is not a repository, so it fails that way.
+      expect(call?.command_result?.exit_code).toBe(128);
+      expect(existsSync(join(root.workspace, "ALIAS_EXECUTED"))).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+
+  test(
     "a configured safe command bypasses automatic review",
     async () => {
       const root = createIsolatedRoot();

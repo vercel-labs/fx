@@ -169,10 +169,25 @@ pub fn profileShell(
 
 const captured_zsh_user_prelude = "\\builtin trap - TERM; ";
 
+/// Whether the operator's shell may redefine the command words before running
+/// them. An approval granted by reading the command string is only honest if the
+/// words that were read are the words that run, so a caller holding such an
+/// approval asks for `as_parsed`.
+pub const WordResolution = enum { shell_defined, as_parsed };
+
 pub fn capturedInvocation(
     alloc: Allocator,
     environment_value: Environment,
     command: []const u8,
+) (ResolveError || Allocator.Error)!Invocation {
+    return capturedInvocationResolving(alloc, environment_value, command, .shell_defined);
+}
+
+pub fn capturedInvocationResolving(
+    alloc: Allocator,
+    environment_value: Environment,
+    command: []const u8,
+    words: WordResolution,
 ) (ResolveError || Allocator.Error)!Invocation {
     switch (environment_value) {
         .legacy, .workspace_clean => return error.UnsupportedShell,
@@ -189,8 +204,13 @@ pub fn capturedInvocation(
             var invocation = try resolve(path, .user_login);
             if (std.mem.eql(u8, std.fs.path.basename(path), "bash")) {
                 removeInteractiveFlag(&invocation);
-                invocation.append("-O");
-                invocation.append("expand_aliases");
+                // Alias expansion is what lets a login shell rewrite the command
+                // words. It stays on for a command a human or the reviewer looked
+                // at, and comes off for one approved by parsing the string.
+                if (words == .shell_defined) {
+                    invocation.append("-O");
+                    invocation.append("expand_aliases");
+                }
             }
             const effective_command = if (shellKind(path) == .zsh)
                 try std.mem.concat(alloc, u8, &.{ captured_zsh_user_prelude, command })
