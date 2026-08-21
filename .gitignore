@@ -55,3 +55,6 @@ benchmarks/baseline.json
 .vibe/
 .windsurf/
 .zencoder/
+.verify-zig-out/
+.zig-toolchain*/
+.zig-toolchain*.zip
