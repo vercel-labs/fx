@@ -362,6 +362,9 @@ fn writeTerminalSafe(writer: *std.Io.Writer, alloc: Allocator, raw: []const u8) 
 
 pub const StatusSnapshot = struct {
     model: []const u8,
+    /// Custom OpenAI-compatible endpoint, when one is configured. Absent means
+    /// inference uses Vercel AI Gateway.
+    endpoint: ?[]const u8 = null,
     update_channel: []const u8 = "stable",
     build_channel: []const u8 = "stable",
     build_revision: []const u8 = "",
@@ -387,6 +390,9 @@ pub const StatusSnapshot = struct {
         defer out.deinit();
 
         try out.writer.print("[status] model={s}\n", .{self.model});
+        if (self.endpoint) |endpoint| {
+            try out.writer.print("[status] endpoint={s}\n", .{endpoint});
+        }
         try out.writer.print("[status] update_channel={s}\n", .{self.update_channel});
         try out.writer.print("[status] build_channel={s}\n", .{self.build_channel});
         if (self.build_revision.len > 0) {
@@ -418,6 +424,7 @@ pub const StatusSnapshot = struct {
         defer out.deinit();
 
         try out.writer.print("model={s}\n", .{self.model});
+        if (self.endpoint) |endpoint| try out.writer.print("endpoint={s}\n", .{endpoint});
         try out.writer.print("update_channel={s}\n", .{self.update_channel});
         try out.writer.print("build_channel={s}\n", .{self.build_channel});
         if (self.build_revision.len > 0) {
@@ -448,6 +455,10 @@ pub const StatusSnapshot = struct {
     pub fn writeJson(self: StatusSnapshot, writer: *std.Io.Writer) !void {
         try writer.writeAll("{\"kind\":\"status\",\"model\":");
         try std.json.Stringify.value(self.model, .{}, writer);
+        if (self.endpoint) |endpoint| {
+            try writer.writeAll(",\"endpoint\":");
+            try std.json.Stringify.value(endpoint, .{}, writer);
+        }
         try writer.writeAll(",\"update_channel\":");
         try std.json.Stringify.value(self.update_channel, .{}, writer);
         try writer.writeAll(",\"build_channel\":");
@@ -1871,6 +1882,37 @@ test "core status snapshot text and json stay stable" {
         "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"sandbox\":\"none\",\"workspace\":\"/tmp/fx\",\"history_turns\":3,\"session_permission_grants\":1,\"agent_step_limit\":24}",
         json,
     );
+}
+
+test "core status snapshot reports a configured custom endpoint" {
+    const snapshot = StatusSnapshot{
+        .model = "llama3.3",
+        .endpoint = "http://localhost:11434/v1",
+        .permission_mode = .ask,
+        .workspace_root = "/tmp/fx",
+        .history_turns = 0,
+        .session_permission_grants = 0,
+        .agent_step_limit = 24,
+    };
+
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "[status] endpoint=http://localhost:11434/v1\n") != null);
+
+    const interactive = try snapshot.renderInteractiveBody(std.testing.allocator);
+    defer std.testing.allocator.free(interactive);
+    try std.testing.expect(std.mem.find(u8, interactive, "endpoint=http://localhost:11434/v1\n") != null);
+
+    const json = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "\"endpoint\":\"http://localhost:11434/v1\"") != null);
+
+    // A gateway session must not gain the field at all.
+    var gateway = snapshot;
+    gateway.endpoint = null;
+    const gateway_json = try gateway.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(gateway_json);
+    try std.testing.expect(std.mem.find(u8, gateway_json, "endpoint") == null);
 }
 
 test "core status snapshot includes selected team when present" {

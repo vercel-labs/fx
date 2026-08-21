@@ -6,6 +6,7 @@ const io_mod = @import("../shared/io.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
+const custom_endpoint = @import("../config/custom_endpoint.zig");
 const secret = @import("secret.zig");
 const types = @import("../shared/types.zig");
 
@@ -35,6 +36,7 @@ pub const CatalogAuthenticatedSource = enum {
     ai_gateway_api_key,
     fx_login,
     stored_key,
+    custom_endpoint,
 
     fn credentialSource(self: CatalogAuthenticatedSource) Source {
         return switch (self) {
@@ -42,6 +44,7 @@ pub const CatalogAuthenticatedSource = enum {
             .ai_gateway_api_key => .ai_gateway_api_key,
             .fx_login => .fx_login,
             .stored_key => .stored_key,
+            .custom_endpoint => .custom_endpoint,
         };
     }
 };
@@ -133,6 +136,7 @@ pub fn catalogAccessForCredential(
         .vercel_oidc_token => .vercel_oidc_token,
         .ai_gateway_api_key => .ai_gateway_api_key,
         .stored_key => .stored_key,
+        .custom_endpoint => .custom_endpoint,
         .fx_login => blk: {
             const team = team_context orelse
                 return .{ .public_only = .fx_login_team_required };
@@ -222,6 +226,13 @@ pub fn resolvePreferring(
     mode: LoadMode,
     preferred: ?Source,
 ) !Resolution {
+    // A configured endpoint owns resolution outright. Vercel sources are not
+    // consulted at all, so no later step can hand one of their tokens to a
+    // third-party endpoint, and a remembered Vercel preference cannot revive one.
+    if (custom_endpoint.isConfigured()) {
+        return .{ .credential = try loadCustomEndpointCredential(alloc, secret_store) };
+    }
+
     if (preferred) |source| {
         if (source != .stored_key or !secret_store.isDisabled()) {
             const chosen = loadPreferredSource(alloc, transport, secret_store, mode, source) catch |err| blk: {
@@ -279,11 +290,46 @@ pub fn loadSource(
     secret_store: host.SecretStore,
     source: Source,
 ) !?Credential {
+    if (custom_endpoint.isConfigured()) {
+        return loadCustomEndpointCredential(alloc, secret_store);
+    }
     return switch (source) {
         .vercel_oidc_token => loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", source),
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
         .fx_login => loadFxLoginCredential(alloc, transport),
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
+        .custom_endpoint => null,
+    };
+}
+
+/// Stands in for a keyless custom endpoint so a turn is not blocked for want of
+/// a credential. The transport maps it back to "send no Authorization header",
+/// so the value itself never leaves the process.
+pub const custom_endpoint_keyless_placeholder = "fx-custom-endpoint-keyless";
+
+/// A configured custom endpoint takes over credential resolution entirely: a
+/// Vercel token is meaningless to a third-party endpoint, and resolving one
+/// here would put it one layer away from being sent there. Only FX_API_KEY and
+/// the stored key — both of which the user set for this endpoint — can resolve.
+fn loadCustomEndpointCredential(
+    alloc: std.mem.Allocator,
+    secret_store: host.SecretStore,
+) !?Credential {
+    if (try loadEnvCredential(alloc, "FX_API_KEY", .custom_endpoint)) |credential| return credential;
+    if (!secret_store.isDisabled()) {
+        if (loadStoredKeyCredential(alloc, secret_store) catch |err| blk: {
+            if (err == error.OutOfMemory) return err;
+            debug_trace.logf("auth", "custom endpoint stored key load failed err={s}", .{@errorName(err)});
+            break :blk null;
+        }) |stored| {
+            var credential = stored;
+            credential.source = .custom_endpoint;
+            return credential;
+        }
+    }
+    return .{
+        .token = try alloc.dupe(u8, custom_endpoint_keyless_placeholder),
+        .source = .custom_endpoint,
     };
 }
 
@@ -293,8 +339,9 @@ pub fn sourceExists(
     source: Source,
 ) !bool {
     return switch (source) {
-        .vercel_oidc_token => nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
-        .ai_gateway_api_key => nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null,
+        .custom_endpoint => custom_endpoint.isConfigured(),
+        .vercel_oidc_token => !custom_endpoint.isConfigured() and nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
+        .ai_gateway_api_key => !custom_endpoint.isConfigured() and nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null,
         .fx_login => blk: {
             const loaded = oauth_session.load(alloc) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -471,6 +518,7 @@ pub fn sourceLabel(source: Source) []const u8 {
         .ai_gateway_api_key => "AI_GATEWAY_API_KEY",
         .fx_login => "fx login",
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
+        .custom_endpoint => "custom endpoint",
     };
 }
 
@@ -714,6 +762,68 @@ test "source-specific credential loading bypasses generic precedence" {
     try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .ai_gateway_api_key));
     try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .vercel_oidc_token));
     try std.testing.expect(!(try sourceExists(alloc, host.unavailable_secret_store, .stored_key)));
+}
+
+test "a custom endpoint satisfies the api key slot with or without FX_API_KEY" {
+    const alloc = std.testing.allocator;
+    {
+        const env = try CredentialTestEnv.install(alloc, &.{
+            .{ "FX_BASE_URL", "http://localhost:11434/v1" },
+            .{ "FX_API_KEY", "endpoint-key" },
+        });
+        defer env.deinit();
+
+        var credential = (try loadSource(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .ai_gateway_api_key)).?;
+        defer credential.deinit(alloc);
+        try std.testing.expectEqualStrings("endpoint-key", credential.token);
+        try std.testing.expectEqual(Source.custom_endpoint, credential.source);
+        try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .custom_endpoint));
+    }
+    {
+        const env = try CredentialTestEnv.install(alloc, &.{
+            .{ "FX_BASE_URL", "http://localhost:11434/v1" },
+        });
+        defer env.deinit();
+
+        var keyless = (try loadSource(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .ai_gateway_api_key)).?;
+        defer keyless.deinit(alloc);
+        try std.testing.expectEqualStrings(custom_endpoint_keyless_placeholder, keyless.token);
+    }
+    {
+        const env = try CredentialTestEnv.install(alloc, &.{
+            .{ "FX_API_KEY", "ignored-without-base-url" },
+        });
+        defer env.deinit();
+
+        try std.testing.expect((try loadSource(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .ai_gateway_api_key)) == null);
+        try std.testing.expect(!(try sourceExists(alloc, host.unavailable_secret_store, .ai_gateway_api_key)));
+        try std.testing.expect(!(try sourceExists(alloc, host.unavailable_secret_store, .custom_endpoint)));
+    }
+}
+
+test "a configured endpoint keeps Vercel credentials out of resolution" {
+    const alloc = std.testing.allocator;
+    const env = try CredentialTestEnv.install(alloc, &.{
+        .{ "VERCEL_OIDC_TOKEN", "oidc-token" },
+        .{ "AI_GATEWAY_API_KEY", "gateway-key" },
+        .{ "FX_BASE_URL", "http://localhost:11434/v1" },
+        .{ "FX_API_KEY", "endpoint-key" },
+    });
+    defer env.deinit();
+
+    // Every source resolves to the endpoint credential, so no code path can
+    // hand a Vercel token to a third-party endpoint.
+    for ([_]Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .stored_key }) |source| {
+        var credential = (try loadSource(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, source)).?;
+        defer credential.deinit(alloc);
+        try std.testing.expectEqualStrings("endpoint-key", credential.token);
+    }
+    try std.testing.expect(!(try sourceExists(alloc, host.unavailable_secret_store, .vercel_oidc_token)));
+
+    const resolution = try resolve(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .refresh_if_needed);
+    var selected = resolution.credential orelse return error.TestExpectedCredential;
+    defer selected.deinit(alloc);
+    try std.testing.expectEqualStrings("endpoint-key", selected.token);
 }
 
 test "a remembered choice outranks the environment" {
