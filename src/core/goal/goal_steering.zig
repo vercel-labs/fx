@@ -29,11 +29,11 @@ pub fn render(
             }
             // Find closing }}
             const start = i + 2;
-            const close = std.mem.indexOfPos(u8, template, start, "}}") orelse return error.UnterminatedPlaceholder;
+            const close = std.mem.findPos(u8, template, start, "}}") orelse return error.UnterminatedPlaceholder;
             const raw = template[start..close];
             const name = std.mem.trim(u8, raw, " \t");
             if (name.len == 0) return error.EmptyPlaceholder;
-            if (std.mem.indexOf(u8, name, "{{") != null) return error.NestedPlaceholder;
+            if (std.mem.find(u8, name, "{{") != null) return error.NestedPlaceholder;
             const value = lookupValue(name, values) orelse return error.MissingValue;
             try out.writer.writeAll(value);
             i = close + 2;
@@ -66,6 +66,21 @@ fn escapeXmlText(alloc: Allocator, input: []const u8) ![]u8 {
     return try out.toOwnedSlice();
 }
 
+/// Formats an optional integer as a string, or `none_label` when null.
+fn formatOptInt(alloc: Allocator, val: ?i64, none_label: []const u8) ![]u8 {
+    if (val) |v| return std.fmt.allocPrint(alloc, "{d}", .{v});
+    return alloc.dupe(u8, none_label);
+}
+
+/// Formats remaining tokens for a goal, or `unbounded_label` when no budget.
+fn formatRemainingTokens(alloc: Allocator, goal: goal_store.Goal, unbounded_label: []const u8) ![]u8 {
+    if (goal.token_budget) |b| {
+        const rem = if (b > goal.tokens_used) b - goal.tokens_used else 0;
+        return std.fmt.allocPrint(alloc, "{d}", .{rem});
+    }
+    return alloc.dupe(u8, unbounded_label);
+}
+
 const continuation_template = @embedFile("templates/continuation.md");
 const budget_limit_template = @embedFile("templates/budget_limit.md");
 const objective_updated_template = @embedFile("templates/objective_updated.md");
@@ -76,12 +91,9 @@ pub fn continuationPrompt(alloc: Allocator, goal: goal_store.Goal) ![]u8 {
     defer alloc.free(objective);
     const tokens_used = try std.fmt.allocPrint(alloc, "{d}", .{goal.tokens_used});
     defer alloc.free(tokens_used);
-    const token_budget = if (goal.token_budget) |b| try std.fmt.allocPrint(alloc, "{d}", .{b}) else try alloc.dupe(u8, "none");
+    const token_budget = try formatOptInt(alloc, goal.token_budget, "none");
     defer alloc.free(token_budget);
-    const remaining_tokens = if (goal.token_budget) |b| blk: {
-        const rem = if (b > goal.tokens_used) b - goal.tokens_used else 0;
-        break :blk try std.fmt.allocPrint(alloc, "{d}", .{rem});
-    } else try alloc.dupe(u8, "unbounded");
+    const remaining_tokens = try formatRemainingTokens(alloc, goal, "unbounded");
     defer alloc.free(remaining_tokens);
     return render(alloc, continuation_template, &.{
         .{ .name = "objective", .value = objective },
@@ -99,7 +111,7 @@ pub fn budgetLimitPrompt(alloc: Allocator, goal: goal_store.Goal) ![]u8 {
     defer alloc.free(time_used_seconds);
     const tokens_used = try std.fmt.allocPrint(alloc, "{d}", .{goal.tokens_used});
     defer alloc.free(tokens_used);
-    const token_budget = if (goal.token_budget) |b| try std.fmt.allocPrint(alloc, "{d}", .{b}) else try alloc.dupe(u8, "none");
+    const token_budget = try formatOptInt(alloc, goal.token_budget, "none");
     defer alloc.free(token_budget);
     return render(alloc, budget_limit_template, &.{
         .{ .name = "objective", .value = objective },
@@ -115,12 +127,9 @@ pub fn objectiveUpdatedPrompt(alloc: Allocator, goal: goal_store.Goal) ![]u8 {
     defer alloc.free(objective);
     const tokens_used = try std.fmt.allocPrint(alloc, "{d}", .{goal.tokens_used});
     defer alloc.free(tokens_used);
-    const token_budget = if (goal.token_budget) |b| try std.fmt.allocPrint(alloc, "{d}", .{b}) else try alloc.dupe(u8, "none");
+    const token_budget = try formatOptInt(alloc, goal.token_budget, "none");
     defer alloc.free(token_budget);
-    const remaining_tokens = if (goal.token_budget) |b| blk: {
-        const rem = if (b > goal.tokens_used) b - goal.tokens_used else 0;
-        break :blk try std.fmt.allocPrint(alloc, "{d}", .{rem});
-    } else try alloc.dupe(u8, "unknown");
+    const remaining_tokens = try formatRemainingTokens(alloc, goal, "unknown");
     defer alloc.free(remaining_tokens);
     return render(alloc, objective_updated_template, &.{
         .{ .name = "objective", .value = objective },
@@ -160,10 +169,10 @@ test "continuationPrompt renders budget fields" {
     defer goal.deinit(alloc);
     const prompt = try continuationPrompt(alloc, goal);
     defer alloc.free(prompt);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "ship &lt;release&gt;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Tokens used: 250") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Token budget: 1000") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Tokens remaining: 750") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "ship &lt;release&gt;") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "Tokens used: 250") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "Token budget: 1000") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "Tokens remaining: 750") != null);
 }
 
 test "continuationPrompt renders unbounded when no budget" {
@@ -179,8 +188,8 @@ test "continuationPrompt renders unbounded when no budget" {
     defer goal.deinit(alloc);
     const prompt = try continuationPrompt(alloc, goal);
     defer alloc.free(prompt);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Token budget: none") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Tokens remaining: unbounded") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "Token budget: none") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "Tokens remaining: unbounded") != null);
 }
 
 test "budgetLimitPrompt includes time used" {
@@ -197,7 +206,7 @@ test "budgetLimitPrompt includes time used" {
     defer goal.deinit(alloc);
     const prompt = try budgetLimitPrompt(alloc, goal);
     defer alloc.free(prompt);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Time spent pursuing goal: 120 seconds") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "Time spent pursuing goal: 120 seconds") != null);
 }
 
 test "objectiveUpdatedPrompt renders unknown remaining when no budget" {
@@ -213,5 +222,5 @@ test "objectiveUpdatedPrompt renders unknown remaining when no budget" {
     defer goal.deinit(alloc);
     const prompt = try objectiveUpdatedPrompt(alloc, goal);
     defer alloc.free(prompt);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Tokens remaining: unknown") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "Tokens remaining: unknown") != null);
 }

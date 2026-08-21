@@ -41,6 +41,7 @@ const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const transcript_blocks = @import("../../ui/render_engine/transcript_blocks.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
+const goal_runtime = @import("../goal/goal_runtime.zig");
 const test_builtin_skills = if (@import("builtin").is_test)
     @import("../../builtins/skills.zig")
 else
@@ -2075,7 +2076,6 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandHandleGoal(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            const goal_runtime = @import("../goal/goal_runtime.zig");
             try goal_runtime.handleGoalCommand(App, app, rest);
         }
 
