@@ -948,7 +948,7 @@ describe("filesystem path handling", () => {
   );
 
   test(
-    "automatic review receives a large prepared overwrite before blocking on ask",
+    "oversized automatic review fails closed before reviewer traffic",
     async () => {
       const root = createIsolatedRoot();
       const target = join(root.external, "large-review.txt");
@@ -995,10 +995,7 @@ describe("filesystem path handling", () => {
         const json = parseFxJson(result);
 
         expect(gateway.requests).toHaveLength(2);
-        expect(gateway.classifierRequests).toHaveLength(1);
-        expect(
-          Buffer.byteLength(gateway.classifierRequests[0]!.body),
-        ).toBeGreaterThan(16 * 1024);
+        expect(gateway.classifierRequests).toHaveLength(0);
         expect(gateway.remainingResponseCount()).toBe(0);
         expect(json.tool_calls).toEqual([
           { name: "write_file", status: "error" },
@@ -1007,13 +1004,10 @@ describe("filesystem path handling", () => {
         expect(result.stderr).not.toContain("Auto agent approved this request");
         expect(readFileSync(target, "utf8")).toBe("before\n");
         const trace = readFileSync(tracePath, "utf8");
-        expect(trace).toContain(
-          "event=auto_review_compose_result result=ready",
-        );
-        expect(trace).toContain("event=auto_review_transport_start");
-        expect(trace).toContain(
-          "event=auto_review_result tool_name=write_file decision=ask",
-        );
+        expect(trace).toContain("event=auto_review_compose_result result=ready");
+        expect(trace).toContain("event=auto_review_send attempt=1");
+        expect(trace).not.toContain("event=auto_review_transport_start");
+        expect(trace).toContain("fallback_reason=invalid_or_unavailable");
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });

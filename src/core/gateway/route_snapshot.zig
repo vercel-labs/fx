@@ -36,6 +36,8 @@ pub const RouteSnapshot = struct {
     credential_ref: []const u8,
     primary_model_id: []const u8,
     permission_review_model_id: ?[]const u8,
+    vision_model_id: ?[]const u8,
+    subagent_model_id: []const u8,
     capabilities: model_capabilities.Capabilities,
     capability_source: model_capabilities.CapabilitySource,
     selected_fast_mode: bool,
@@ -61,12 +63,12 @@ pub const RouteSnapshot = struct {
         model_descriptor: model_capabilities.ModelDescriptor,
         effective_endpoint: []const u8,
     ) !RouteSnapshot {
-        return admitWithReviewer(
+        return admitWithInternalModels(
             alloc,
             profile,
             model_descriptor,
             effective_endpoint,
-            profile.permission_review_model,
+            profile.internal_models.input(),
         );
     }
 
@@ -75,16 +77,22 @@ pub const RouteSnapshot = struct {
         profile: connection_registry.Profile,
         expected_adapter_kind: []const u8,
         permission_review_model_id: ?[]const u8,
+        vision_model_id: ?[]const u8,
+        subagent_model_id: []const u8,
         model_descriptor: model_capabilities.ModelDescriptor,
         effective_endpoint: []const u8,
     ) !RouteSnapshot {
         try validateRecoveryProfile(profile, expected_adapter_kind);
-        return admitWithReviewer(
+        return admitWithInternalModels(
             alloc,
             profile,
             model_descriptor,
             effective_endpoint,
-            permission_review_model_id,
+            .{
+                .permission_review = permission_review_model_id,
+                .vision = vision_model_id,
+                .subagent = subagent_model_id,
+            },
         );
     }
 
@@ -94,6 +102,8 @@ pub const RouteSnapshot = struct {
         seed: connection_registry.Seed,
         expected_adapter_kind: []const u8,
         permission_review_model_id: ?[]const u8,
+        vision_model_id: ?[]const u8,
+        subagent_model_id: []const u8,
         model_descriptor: model_capabilities.ModelDescriptor,
         seed_endpoint: []const u8,
     ) !RouteSnapshot {
@@ -106,17 +116,19 @@ pub const RouteSnapshot = struct {
             profile,
             expected_adapter_kind,
             permission_review_model_id,
+            vision_model_id,
+            subagent_model_id,
             model_descriptor,
             endpoint,
         );
     }
 
-    fn admitWithReviewer(
+    fn admitWithInternalModels(
         alloc: Allocator,
         profile: connection_registry.Profile,
         model_descriptor: model_capabilities.ModelDescriptor,
         effective_endpoint: []const u8,
-        permission_review_model: ?[]const u8,
+        internal_models: connection_registry.InternalModelsInput,
     ) !RouteSnapshot {
         if (model_descriptor.id.len == 0) return error.InvalidRouteModel;
         const protocol_value = profile.protocol orelse return error.InvalidRouteProtocol;
@@ -134,11 +146,27 @@ pub const RouteSnapshot = struct {
         errdefer alloc.free(credential_ref);
         const primary_model_id = try alloc.dupe(u8, model_descriptor.id);
         errdefer alloc.free(primary_model_id);
-        const permission_review_model_id = if (permission_review_model) |value|
+        const permission_review_model_id = if (internal_models.permission_review) |value|
             try alloc.dupe(u8, value)
         else
             null;
         errdefer if (permission_review_model_id) |value| alloc.free(value);
+        const resolved_vision_model = internal_models.vision orelse
+            if (model_descriptor.capabilities.supports_vision and
+                model_descriptor.capabilities.supports_file_input)
+                model_descriptor.id
+            else
+                null;
+        const vision_model_id = if (resolved_vision_model) |value|
+            try alloc.dupe(u8, value)
+        else
+            null;
+        errdefer if (vision_model_id) |value| alloc.free(value);
+        const subagent_model_id = try alloc.dupe(
+            u8,
+            internal_models.subagent orelse model_descriptor.id,
+        );
+        errdefer alloc.free(subagent_model_id);
         const fast_model_suffix = if (model_descriptor.capabilities.supports_fast_mode)
             switch (model_descriptor.fast_route) {
                 .same_model => null,
@@ -155,6 +183,8 @@ pub const RouteSnapshot = struct {
             .credential_ref = credential_ref,
             .primary_model_id = primary_model_id,
             .permission_review_model_id = permission_review_model_id,
+            .vision_model_id = vision_model_id,
+            .subagent_model_id = subagent_model_id,
             .capabilities = model_descriptor.capabilities,
             .capability_source = model_descriptor.source,
             .selected_fast_mode = model_descriptor.selected_fast_mode,
@@ -170,6 +200,8 @@ pub const RouteSnapshot = struct {
         alloc.free(self.credential_ref);
         alloc.free(self.primary_model_id);
         if (self.permission_review_model_id) |value| alloc.free(value);
+        if (self.vision_model_id) |value| alloc.free(value);
+        alloc.free(self.subagent_model_id);
         if (self.fast_model_suffix) |value| alloc.free(value);
         self.* = undefined;
     }
@@ -188,6 +220,80 @@ pub const RouteSnapshot = struct {
         };
     }
 
+    /// Returns the Vision model resolved at admission. A distinct configured
+    /// model is explicitly assigned to this workload by the connection owner;
+    /// a primary-model fallback retains its normalized capabilities.
+    pub fn visionDescriptor(
+        self: *const RouteSnapshot,
+    ) ?model_capabilities.ModelDescriptor {
+        const model = self.vision_model_id orelse return null;
+        if (std.mem.eql(u8, model, self.primary_model_id)) return self.descriptor();
+        return model_capabilities.configuredDescriptor(model, .{
+            .supports_vision = true,
+            .supports_file_input = true,
+        });
+    }
+
+    /// Copies the pinned connection authority while admitting one model for a
+    /// child workload. This never consults connection selection or a registry.
+    pub fn deriveForModel(
+        self: *const RouteSnapshot,
+        alloc: Allocator,
+        descriptor_value: model_capabilities.ModelDescriptor,
+    ) !RouteSnapshot {
+        const connection_id = try alloc.dupe(u8, self.connection_id);
+        errdefer alloc.free(connection_id);
+        const adapter_kind = try alloc.dupe(u8, self.adapter_kind);
+        errdefer alloc.free(adapter_kind);
+        const endpoint = try alloc.dupe(u8, self.endpoint);
+        errdefer alloc.free(endpoint);
+        const protocol = try alloc.dupe(u8, self.protocol);
+        errdefer alloc.free(protocol);
+        const credential_ref = try alloc.dupe(u8, self.credential_ref);
+        errdefer alloc.free(credential_ref);
+        const primary_model_id = try alloc.dupe(u8, descriptor_value.id);
+        errdefer alloc.free(primary_model_id);
+        const permission_review_model_id = if (self.permission_review_model_id) |value|
+            try alloc.dupe(u8, value)
+        else
+            null;
+        errdefer if (permission_review_model_id) |value| alloc.free(value);
+        const vision_model_id = if (self.vision_model_id) |value|
+            try alloc.dupe(u8, value)
+        else
+            null;
+        errdefer if (vision_model_id) |value| alloc.free(value);
+        const subagent_model_id = try alloc.dupe(u8, self.subagent_model_id);
+        errdefer alloc.free(subagent_model_id);
+        const fast_model_suffix = if (descriptor_value.capabilities.supports_fast_mode)
+            switch (descriptor_value.fast_route) {
+                .same_model => null,
+                .suffix => |suffix| try alloc.dupe(u8, suffix),
+            }
+        else
+            null;
+
+        return .{
+            .connection_id = connection_id,
+            .adapter_kind = adapter_kind,
+            .endpoint = endpoint,
+            .protocol = protocol,
+            .credential_ref = credential_ref,
+            .primary_model_id = primary_model_id,
+            .permission_review_model_id = permission_review_model_id,
+            .vision_model_id = vision_model_id,
+            .subagent_model_id = subagent_model_id,
+            .capabilities = descriptor_value.capabilities,
+            .capability_source = descriptor_value.source,
+            .selected_fast_mode = descriptor_value.selected_fast_mode,
+            .fast_model_suffix = fast_model_suffix,
+        };
+    }
+
+    pub fn clone(self: *const RouteSnapshot, alloc: Allocator) !RouteSnapshot {
+        return self.deriveForModel(alloc, self.descriptor());
+    }
+
     /// Returns borrowed primary storage unless the admitted fast suffix is used.
     /// A suffixed result is allocated by `alloc` and owned by the caller.
     pub fn modelFor(self: *const RouteSnapshot, alloc: Allocator, fast_mode: bool) ![]const u8 {
@@ -196,6 +302,13 @@ pub const RouteSnapshot = struct {
 
     pub fn containsModel(self: *const RouteSnapshot, model: []const u8) bool {
         if (std.mem.eql(u8, self.primary_model_id, model)) return true;
+        if (self.permission_review_model_id) |reviewer| {
+            if (std.mem.eql(u8, reviewer, model)) return true;
+        }
+        if (self.vision_model_id) |vision| {
+            if (std.mem.eql(u8, vision, model)) return true;
+        }
+        if (std.mem.eql(u8, self.subagent_model_id, model)) return true;
         const suffix = self.fast_model_suffix orelse return false;
         if (model.len != self.primary_model_id.len + suffix.len) return false;
         return std.mem.eql(u8, model[0..self.primary_model_id.len], self.primary_model_id) and
@@ -220,7 +333,11 @@ test "route admission owns immutable secret-free routing facts" {
         .protocol = &protocol,
         .credential_ref = &credential_ref,
         .remembered_model = &primary_model,
-        .permission_review_model = &reviewer_model,
+        .internal_models = .{
+            .permission_review = &reviewer_model,
+            .vision = @constCast("vision-a"),
+            .subagent = @constCast("child-a"),
+        },
     };
     const descriptor = model_capabilities.ModelDescriptor{
         .id = &primary_model,
@@ -257,6 +374,8 @@ test "route admission owns immutable secret-free routing facts" {
     try std.testing.expectEqualStrings("ref_a", route.credential_ref);
     try std.testing.expectEqualStrings("model-a", route.primary_model_id);
     try std.testing.expectEqualStrings("review-a", route.permission_review_model_id.?);
+    try std.testing.expectEqualStrings("vision-a", route.vision_model_id.?);
+    try std.testing.expectEqualStrings("child-a", route.subagent_model_id);
     try std.testing.expect(route.capabilities.supports_tool_use);
     try std.testing.expect(route.containsModel("model-a"));
     try std.testing.expect(route.containsModel("model-a-fast"));
@@ -264,6 +383,62 @@ test "route admission owns immutable secret-free routing facts" {
     try std.testing.expect(!@hasField(RouteSnapshot, "credential"));
     try std.testing.expect(!@hasField(RouteSnapshot, "api_key"));
     try std.testing.expect(!@hasField(RouteSnapshot, "token"));
+}
+
+test "internal model resolution is pinned per admission and null never consults defaults" {
+    var profile = connection_registry.Profile{
+        .id = @constCast("connection-a"),
+        .display_name = @constCast("A"),
+        .adapter_id = @constCast("loopback"),
+        .endpoint = @constCast("http://127.0.0.1/a"),
+        .protocol = @constCast("loopback"),
+        .credential_ref = @constCast("key-a"),
+        .remembered_model = @constCast("primary-a"),
+        .internal_models = .{
+            .permission_review = @constCast("reviewer-a"),
+            .vision = @constCast("vision-a"),
+            .subagent = @constCast("child-a"),
+        },
+    };
+    const primary = model_capabilities.configuredDescriptor("primary-a", .{
+        .supports_tool_use = true,
+    });
+    var first = try RouteSnapshot.admit(
+        std.testing.allocator,
+        profile,
+        primary,
+        profile.endpoint.?,
+    );
+    defer first.deinit(std.testing.allocator);
+
+    profile.internal_models = .{};
+    var second = try RouteSnapshot.admit(
+        std.testing.allocator,
+        profile,
+        primary,
+        profile.endpoint.?,
+    );
+    defer second.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("reviewer-a", first.permission_review_model_id.?);
+    try std.testing.expectEqualStrings("vision-a", first.vision_model_id.?);
+    try std.testing.expectEqualStrings("child-a", first.subagent_model_id);
+    try std.testing.expect(second.permission_review_model_id == null);
+    try std.testing.expect(second.vision_model_id == null);
+    try std.testing.expectEqualStrings("primary-a", second.subagent_model_id);
+
+    const vision_primary = model_capabilities.configuredDescriptor("primary-a", .{
+        .supports_vision = true,
+        .supports_file_input = true,
+    });
+    var third = try RouteSnapshot.admit(
+        std.testing.allocator,
+        profile,
+        vision_primary,
+        profile.endpoint.?,
+    );
+    defer third.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("primary-a", third.vision_model_id.?);
 }
 
 test "route admission rejects invalid model protocol and endpoint" {
@@ -275,7 +450,7 @@ test "route admission rejects invalid model protocol and endpoint" {
         .protocol = null,
         .credential_ref = @constCast("ref"),
         .remembered_model = @constCast("model"),
-        .permission_review_model = null,
+        .internal_models = .{},
     };
     const descriptor = model_capabilities.configuredDescriptor("model", .{});
     try std.testing.expectError(
@@ -320,7 +495,7 @@ test "selected route applies the seed override only to the seed connection" {
         .protocol = @constCast("shared-protocol"),
         .credential_ref = @constCast("custom-ref"),
         .remembered_model = @constCast("custom-model"),
-        .permission_review_model = null,
+        .internal_models = .{},
     };
     const descriptor = model_capabilities.configuredDescriptor("custom-model", .{});
 
@@ -355,7 +530,7 @@ test "recovery route rejects an adapter mismatch before admission" {
         .protocol = @constCast("saved-protocol"),
         .credential_ref = @constCast("saved-ref"),
         .remembered_model = @constCast("saved-model"),
-        .permission_review_model = @constCast("current-reviewer"),
+        .internal_models = .{ .permission_review = @constCast("current-reviewer") },
     };
 
     try std.testing.expectError(
@@ -365,6 +540,8 @@ test "recovery route rejects an adapter mismatch before admission" {
             profile,
             "persisted-adapter",
             "persisted-reviewer",
+            "persisted-vision",
+            "persisted-child",
             model_capabilities.configuredDescriptor("persisted-model", .{}),
             profile.endpoint.?,
         ),

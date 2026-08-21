@@ -280,7 +280,40 @@ fn runAskChild(
         .context_enabled = ctx.context_enabled,
         .project_context = ctx.modelVisibleProjectContext(),
         .lifecycle_view = ctx.lifecycle_view,
+        .route_credential_ctx = ctx,
+        .resolve_route_credential_fn = resolveAskChildRouteCredential,
     }, turn, message, admission, cancel);
+}
+
+fn resolveAskChildRouteCredential(
+    raw: *anyopaque,
+    alloc: Allocator,
+    route: *const route_snapshot.RouteSnapshot,
+) !agent_runtime.RouteCredential {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw));
+    const preferred = if (std.mem.eql(u8, route.credential_ref, "automatic"))
+        null
+    else
+        types.parseCredentialSource(route.credential_ref) orelse
+            return error.InvalidCredentialReference;
+    const resolution = try credentials.resolvePreferring(
+        alloc,
+        ctx.cfg.gateway_provider.oauth_transport,
+        ctx.cfg.secret_store,
+        .refresh_if_needed,
+        preferred,
+    );
+    var credential = resolution.credential orelse return error.MissingCredential;
+    defer credential.deinit(alloc);
+    const tenant = if (credential.gatewayTeam()) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (tenant) |value| alloc.free(value);
+    const token = credential.token;
+    credential.token = &.{};
+    return .{
+        .credential = token,
+        .tenant = tenant,
+        .legacy_source = credential.source,
+    };
 }
 
 pub const PromptRunResult = struct {
@@ -837,7 +870,8 @@ const AskContext = struct {
                     .legacy_route_defaults = .{
                         .connection_id = self.cfg.gateway_provider.connection_seed.id,
                         .adapter_kind = self.cfg.gateway_provider.connection_seed.adapter_id,
-                        .permission_review_model_id = self.cfg.gateway_provider.connection_seed.permission_review_model,
+                        .permission_review_model_id = self.cfg.gateway_provider.connection_seed.internal_models.permission_review,
+                        .vision_model_id = self.cfg.gateway_provider.connection_seed.internal_models.vision,
                     },
                 },
             )
@@ -1686,6 +1720,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             cfg.gateway_provider.connection_seed,
             checkpoint.route_identity.?.adapter_kind,
             checkpoint.route_identity.?.permission_review_model_id,
+            checkpoint.route_identity.?.vision_model_id,
+            checkpoint.route_identity.?.subagent_model_id,
             descriptor,
             cfg.gateway_chat_url,
         )
@@ -7156,11 +7192,13 @@ test "ask rejects a changed recovery adapter before credential and provider effe
     state.preferences.connection_id = try alloc.dupe(u8, "vercel");
     var writable = try store.startWritableSession(alloc, state);
     const checkpoint = session_codec.RecoveryCheckpoint{
-        .version = 2,
+        .version = 3,
         .route_identity = .{
             .connection_id = @constCast("vercel"),
             .adapter_kind = @constCast("changed-adapter"),
             .permission_review_model_id = @constCast("reviewer/model"),
+            .vision_model_id = @constCast("vision/model"),
+            .subagent_model_id = @constCast("model"),
         },
         .turn_id = 5,
         .user = .{ .text = @constCast("resume") },

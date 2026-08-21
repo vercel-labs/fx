@@ -1,8 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const permission_reviewer = @import("gateway/permission_reviewer.zig");
-
 const api_key_validator_contract = @import("../core/auth/api_key_validator.zig");
 const agent_stream_provider_contract = @import("../core/agent/stream_provider.zig");
 const agent_runtime_telemetry = @import("../core/agent/runtime/telemetry.zig");
@@ -60,7 +58,10 @@ pub const connection_seed = connection_registry.Seed{
     .endpoint = default_chat_url,
     .protocol = "vercel_ai_gateway",
     .credential_ref = "automatic",
-    .permission_review_model = "openai/gpt-5.4",
+    .internal_models = .{
+        .permission_review = "zai/glm-5.2",
+        .vision = "google/gemini-2.5-flash",
+    },
 };
 
 const web_search_system_prompt = "Research the user's query with the web_search tool and preserve sources for citation.";
@@ -259,7 +260,9 @@ pub fn streamVercelAdapter(
             try events.emit(.cancelled);
         } else {
             try events.emit(.{ .failure = .{
-                .category = if (request.delivery.load() == .possibly_sent) .ambiguous_delivery else .transport,
+                .category = .transport,
+                .retryable = gateway_client.isRetryableGatewayError(err),
+                .delivery_ambiguous = request.delivery.load() == .possibly_sent,
                 .detail = @errorName(err),
             } });
         }
@@ -330,6 +333,12 @@ pub fn streamVercelAdapter(
                 .gateway_timeout => .timeout,
                 else => .protocol,
             },
+            .retryable = blk: {
+                const code: u16 = @intFromEnum(result.status);
+                break :blk code == 408 or code == 425 or code == 429 or code >= 500;
+            },
+            .http_status = result.status,
+            .delivery_ambiguous = result.completion.delivery_ambiguous,
             .detail = result.err_body,
             .retry_after_seconds = result.retry_after_seconds,
             .diagnostic = if (result.failure_schema) |summary| .{
@@ -377,6 +386,8 @@ test "Vercel adapter sink failure does not mutate user cancellation" {
         .credential_ref = @constCast("automatic"),
         .primary_model_id = @constCast("test/model"),
         .permission_review_model_id = null,
+        .vision_model_id = null,
+        .subagent_model_id = @constCast("test/model"),
         .capabilities = .{},
         .capability_source = .configured,
         .selected_fast_mode = false,
@@ -467,6 +478,8 @@ test "Vercel adapter enforces serialized request limit before admission" {
         .credential_ref = @constCast("automatic"),
         .primary_model_id = @constCast("test/model"),
         .permission_review_model_id = null,
+        .vision_model_id = null,
+        .subagent_model_id = @constCast("test/model"),
         .capabilities = .{},
         .capability_source = .configured,
         .selected_fast_mode = false,
@@ -558,6 +571,40 @@ pub fn buildAgentRequest(
     if (request.response_format != null) return error.StructuredResponseRequiresVerifiedImages;
 
     if (request.vision_mode == .unavailable and request.selected_dynamic_tool_schemas.len == 0) {
+        if (request.required_tool_call_id) |target_call_id| {
+            const active = budget orelse return error.PendingToolReviewRequiresBudget;
+            const body = try gateway_json.buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
+                alloc,
+                request.serialized_tools,
+                request.messages,
+                target_call_id,
+                provider_options,
+                request.max_output_tokens orelse 2048,
+                active.deadline orelse return error.PendingToolReviewRequiresDeadline,
+                active.cancel_flag orelse return error.PendingToolReviewRequiresCancellation,
+            );
+            return finalizeAgentRequestBody(alloc, request.model, body);
+        }
+        if (request.require_tool_call) {
+            const body = if (budget) |active|
+                gateway_json.buildGatewayRequiredToolRequestBodyWithOptionsAndBudget(
+                    alloc,
+                    request.serialized_tools,
+                    request.messages,
+                    provider_options,
+                    request.max_output_tokens,
+                    active,
+                )
+            else
+                gateway_json.buildGatewayRequiredToolRequestBodyWithOptionsAndOutputLimit(
+                    alloc,
+                    request.serialized_tools,
+                    request.messages,
+                    provider_options,
+                    request.max_output_tokens,
+                );
+            return finalizeAgentRequestBody(alloc, request.model, try body);
+        }
         const body = if (budget) |active|
             gateway_json.buildGatewayRequestBodyWithOptionsAndBudget(
                 alloc,

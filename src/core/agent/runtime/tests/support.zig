@@ -85,6 +85,8 @@ fn testRouteForDescriptor(descriptor: model_capabilities.ModelDescriptor) route_
         .credential_ref = @constCast("automatic"),
         .primary_model_id = @constCast(descriptor.id),
         .permission_review_model_id = null,
+        .vision_model_id = @constCast("google/gemini-2.5-flash"),
+        .subagent_model_id = @constCast(descriptor.id),
         .capabilities = descriptor.capabilities,
         .capability_source = descriptor.source,
         .selected_fast_mode = descriptor.selected_fast_mode,

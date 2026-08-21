@@ -604,6 +604,8 @@ pub fn handlePrompt(
             state.cfg.gateway_provider.connection_seed,
             checkpoint.route_identity.?.adapter_kind,
             checkpoint.route_identity.?.permission_review_model_id,
+            checkpoint.route_identity.?.vision_model_id,
+            checkpoint.route_identity.?.subagent_model_id,
             descriptor,
             state.cfg.gateway_chat_url,
         )
@@ -744,7 +746,40 @@ pub fn runSubagentChild(
         .context_enabled = state.context_enabled,
         .project_context = state.context_snapshot.modelVisibleBytes(),
         .lifecycle_view = state.lifecycle_view,
+        .route_credential_ctx = state,
+        .resolve_route_credential_fn = resolveAcpChildRouteCredential,
     }, turn, message, admission, cancel);
+}
+
+fn resolveAcpChildRouteCredential(
+    raw: *anyopaque,
+    alloc: Allocator,
+    route: *const route_snapshot.RouteSnapshot,
+) !agent_runtime.RouteCredential {
+    const state: *server.ServerState = @ptrCast(@alignCast(raw));
+    const preferred = if (std.mem.eql(u8, route.credential_ref, "automatic"))
+        null
+    else
+        types.parseCredentialSource(route.credential_ref) orelse
+            return error.InvalidCredentialReference;
+    const resolution = try credentials.resolvePreferring(
+        alloc,
+        state.cfg.gateway_provider.oauth_transport,
+        state.cfg.secret_store,
+        .refresh_if_needed,
+        preferred,
+    );
+    var credential = resolution.credential orelse return error.MissingCredential;
+    defer credential.deinit(alloc);
+    const tenant = if (credential.gatewayTeam()) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (tenant) |value| alloc.free(value);
+    const token = credential.token;
+    credential.token = &.{};
+    return .{
+        .credential = token,
+        .tenant = tenant,
+        .legacy_source = credential.source,
+    };
 }
 
 fn refreshProjectContext(

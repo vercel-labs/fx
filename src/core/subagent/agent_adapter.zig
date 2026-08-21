@@ -1,8 +1,6 @@
 const std = @import("std");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
-const model_capabilities = @import("../config/model_capabilities.zig");
-const connection_registry = @import("../gateway/connection_registry.zig");
 const route_snapshot = @import("../gateway/route_snapshot.zig");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -43,6 +41,12 @@ pub const Config = struct {
     context_enabled: bool,
     project_context: []const u8 = "",
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
+    route_credential_ctx: *anyopaque,
+    resolve_route_credential_fn: *const fn (
+        *anyopaque,
+        Allocator,
+        *const route_snapshot.RouteSnapshot,
+    ) anyerror!agent_runtime.RouteCredential,
 };
 
 const Context = struct {
@@ -87,6 +91,8 @@ const Context = struct {
         result.web_fetch_progress_ctx = null;
         result.on_web_fetch_progress = null;
         result.model_capability_resolver = null;
+        result.model_descriptor_resolver = null;
+        result.route = if (self.admission.route) |*route| route else null;
         result.lifecycle_view = self.config.lifecycle_view;
         result.lifecycle_scope = .{
             .kind = .subagent,
@@ -132,28 +138,13 @@ pub fn run(
     const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
     const recovery_checkpoint = turn.snapshotRecoveryCheckpoint(arena) catch
         return error.OutOfMemory;
-    const credential_ref = if (config.tool_context.credential_source) |source| @tagName(source) else "automatic";
-    const route = route_snapshot.RouteSnapshot.admit(
-        arena,
-        connection_registry.Profile{
-            .id = @constCast(config.tool_context.provider_adapter.kind),
-            .display_name = @constCast(config.tool_context.provider_adapter.kind),
-            .adapter_id = @constCast(config.tool_context.provider_adapter.kind),
-            .endpoint = @constCast(config.tool_context.gateway_chat_url),
-            .protocol = @constCast(config.tool_context.provider_adapter.kind),
-            .credential_ref = @constCast(credential_ref),
-            .remembered_model = admission.model,
-            .permission_review_model = null,
-        },
-        model_capabilities.configuredDescriptor(admission.model, .{}),
-        config.tool_context.gateway_chat_url,
-    ) catch return error.OutOfMemory;
+    const route = admission.route orelse return error.AdmissionFailed;
+    if (!config.tool_context.provider_adapter.acceptsRoute(&route) or
+        !route.containsModel(admission.model)) return error.AdmissionFailed;
     const prompt = worker_runtime.QueuedPrompt{
         .turn_id = 1,
         .prompt = arena.dupe(u8, message.content) catch return error.OutOfMemory,
         .images = &.{},
-        // G6 replaces this child-local compatibility admission with explicit
-        // root-to-child route inheritance.
         .route = route,
         .permission_mode = admission.permission_mode,
         .sandbox_backend = admission.sandbox_backend,
@@ -275,20 +266,14 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
 fn resolveRouteCredential(
     raw: *anyopaque,
     alloc: Allocator,
-    _: *const route_snapshot.RouteSnapshot,
+    route: *const route_snapshot.RouteSnapshot,
 ) !agent_runtime.RouteCredential {
     const context: *Context = @ptrCast(@alignCast(raw));
-    const credential = try alloc.dupe(u8, context.config.tool_context.api_key);
-    errdefer alloc.free(credential);
-    const tenant = if (context.config.tool_context.gateway_team) |value|
-        try alloc.dupe(u8, value)
-    else
-        null;
-    return .{
-        .credential = credential,
-        .tenant = tenant,
-        .legacy_source = context.config.tool_context.credential_source,
-    };
+    return context.config.resolve_route_credential_fn(
+        context.config.route_credential_ctx,
+        alloc,
+        route,
+    );
 }
 
 fn finalizeTurn(

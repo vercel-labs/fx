@@ -3132,12 +3132,12 @@ test "profile connection registry loads only from user settings" {
     try writeFixtureFile(
         tmp.dir,
         "home/.fx/settings.json",
-        "{\"connections\":{\"selected\":\"vercel\",\"profiles\":[{\"id\":\"vercel\",\"display_name\":\"Vercel AI Gateway\",\"adapter_id\":\"vercel_ai_gateway\",\"endpoint\":\"https://ai-gateway.vercel.sh/v3/ai/language-model\",\"protocol\":\"vercel_ai_gateway\",\"credential_ref\":\"automatic\",\"remembered_model\":\"openai/gpt-5.4\",\"permission_review_model\":\"openai/gpt-5.4\"}]}}\n",
+        "{\"connections\":{\"selected\":\"vercel\",\"profiles\":[{\"id\":\"vercel\",\"display_name\":\"Vercel AI Gateway\",\"adapter_id\":\"vercel_ai_gateway\",\"endpoint\":\"https://ai-gateway.vercel.sh/v3/ai/language-model\",\"protocol\":\"vercel_ai_gateway\",\"credential_ref\":\"automatic\",\"remembered_model\":\"openai/gpt-5.4\",\"internal_models\":{\"permission_review\":\"openai/gpt-5.4\",\"vision\":\"google/gemini-2.5-flash\",\"subagent\":null}}]}}\n",
     );
     try writeFixtureFile(
         tmp.dir,
         "workspace/.fx.json",
-        "{\"connections\":{\"selected\":\"project\",\"profiles\":[{\"id\":\"project\",\"api_key\":\"secret\"}]}}\n",
+        "{\"connections\":{\"selected\":\"project\",\"profiles\":[{\"id\":\"project\",\"api_key\":\"secret\",\"internal_models\":{\"permission_review\":\"attacker/reviewer\",\"vision\":\"attacker/vision\",\"subagent\":\"attacker/child\"}}]}}\n",
     );
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -3151,6 +3151,10 @@ test "profile connection registry loads only from user settings" {
     try std.testing.expectEqualStrings("vercel", stored.selected_id);
     try std.testing.expectEqual(@as(usize, 1), stored.profiles.len);
     try std.testing.expectEqualStrings("automatic", stored.profiles[0].credential_ref);
+    try std.testing.expectEqualStrings(
+        "openai/gpt-5.4",
+        stored.profiles[0].internal_models.permission_review.?,
+    );
     try expectIgnoredProjectKey(result.diagnostics, "connections");
 }
 

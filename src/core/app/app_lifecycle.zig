@@ -2171,7 +2171,7 @@ test "loadStartupState defaults fast mode off and preserves explicit preferences
             .endpoint = "https://ai-gateway.vercel.sh/v3/ai/language-model",
             .protocol = "vercel_ai_gateway",
             .credential_ref = "automatic",
-            .permission_review_model = "openai/gpt-5.4",
+            .internal_models = .{ .permission_review = "openai/gpt-5.4" },
         },
     );
     defer state.deinit(std.testing.allocator);
@@ -2211,7 +2211,10 @@ test "built-in Vercel connection reuses credential resolution and CatalogAccess 
             .endpoint = "https://ai-gateway.vercel.sh/v3/ai/language-model",
             .protocol = "vercel_ai_gateway",
             .credential_ref = "automatic",
-            .permission_review_model = "openai/gpt-5.4",
+            .internal_models = .{
+                .permission_review = "openai/gpt-5.4",
+                .vision = "google/gemini-2.5-flash",
+            },
         },
     );
     defer state.deinit(alloc);

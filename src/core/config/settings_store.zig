@@ -1006,9 +1006,16 @@ fn applyConnectionSnapshotToRoot(
         }
         try object.put(arena, "credential_ref", .{ .string = try arena.dupe(u8, profile.credential_ref) });
         try object.put(arena, "remembered_model", .{ .string = try arena.dupe(u8, profile.remembered_model) });
-        if (profile.permission_review_model) |value| {
-            try object.put(arena, "permission_review_model", .{ .string = try arena.dupe(u8, value) });
-        }
+        var internal_models: std.json.ObjectMap = .empty;
+        try putOptionalString(
+            arena,
+            &internal_models,
+            "permission_review",
+            profile.internal_models.permission_review,
+        );
+        try putOptionalString(arena, &internal_models, "vision", profile.internal_models.vision);
+        try putOptionalString(arena, &internal_models, "subagent", profile.internal_models.subagent);
+        try object.put(arena, "internal_models", .{ .object = internal_models });
         try profiles.append(.{ .object = object });
     }
 
@@ -1017,6 +1024,18 @@ fn applyConnectionSnapshotToRoot(
     try connections.put(arena, "profiles", .{ .array = profiles });
     try root.object.put(arena, "connections", .{ .object = connections });
     return .{ .changed = true };
+}
+
+fn putOptionalString(
+    arena: Allocator,
+    object: *std.json.ObjectMap,
+    key: []const u8,
+    value: ?[]const u8,
+) !void {
+    try object.put(arena, key, if (value) |text|
+        .{ .string = try arena.dupe(u8, text) }
+    else
+        .null);
 }
 
 fn applyUserPatchToRoot(
@@ -2124,7 +2143,10 @@ test "connection snapshot persists references and profile metadata without secre
         .protocol = "vercel_ai_gateway",
         .credential_ref = "ai_gateway_api_key",
         .remembered_model = "openai/gpt-5.4",
-        .permission_review_model = "openai/gpt-5.4",
+        .internal_models = .{
+            .permission_review = "openai/gpt-5.4",
+            .vision = "google/gemini-2.5-flash",
+        },
     }, null, connection_registry.Persistence.unavailable);
     defer registry.deinit();
 
@@ -2141,6 +2163,17 @@ test "connection snapshot persists references and profile metadata without secre
     const profile = connections.get("profiles").?.array.items[0].object;
     try std.testing.expectEqualStrings("ai_gateway_api_key", profile.get("credential_ref").?.string);
     try std.testing.expectEqualStrings("openai/gpt-5.4", profile.get("remembered_model").?.string);
+    const internal_models = profile.get("internal_models").?.object;
+    try std.testing.expectEqualStrings(
+        "openai/gpt-5.4",
+        internal_models.get("permission_review").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "google/gemini-2.5-flash",
+        internal_models.get("vision").?.string,
+    );
+    try std.testing.expect(internal_models.get("subagent").? == .null);
+    try std.testing.expect(profile.get("permission_review_model") == null);
     try std.testing.expect(profile.get("api_key") == null);
     try std.testing.expect(profile.get("token") == null);
     try std.testing.expect(profile.get("secret") == null);

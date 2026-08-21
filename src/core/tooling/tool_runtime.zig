@@ -49,6 +49,7 @@ const command_replay_store = @import("../session/command_replay_store.zig");
 const session_store = @import("../session/session_store.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const route_snapshot = @import("../gateway/route_snapshot.zig");
 const mcp_access_policy = @import("../mcp/access_policy.zig");
 const tool_admission = @import("tool_admission.zig");
 const tool_args = @import("tool_args.zig");
@@ -133,6 +134,7 @@ pub const Context = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     api_key: []const u8,
     provider_adapter: agent_stream_provider.ProviderAdapter = agent_stream_provider.unavailable_adapter,
+    route: ?*const route_snapshot.RouteSnapshot = null,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     gateway_team: ?[]const u8 = null,
     credential_source: ?types.CredentialSource = null,
@@ -214,6 +216,7 @@ pub const Context = struct {
     workspace_executor: ?js_host_workspace.Executor = null,
     host_sandbox_default: tool_admission.HostSandboxDefault = .none,
     model_capability_resolver: ?model_capabilities.Resolver = null,
+    model_descriptor_resolver: ?model_capabilities.Resolver = null,
     /// False when running outside an interactive TUI (e.g. ACP). Tools
     /// that require a live user (like `ask_user_question`) short-circuit
     /// in that case.
@@ -274,6 +277,11 @@ pub const Context = struct {
 
     fn admissionAutoClassifier(self: Context) permission_auto_classifier.Classifier {
         if (self.auto_classifier.enabled()) return self.auto_classifier;
+        if (self.permission_review_turn) |turn| {
+            if (turn.adapter_input) |input| {
+                return permission_auto_classifier.Classifier.withAdapter(input);
+            }
+        }
         const provider = self.permission_reviewer_provider orelse
             return permission_auto_classifier.Classifier.disabled();
         return permission_auto_classifier.Classifier.withProvider(provider, .{
@@ -367,6 +375,15 @@ pub fn executeToolCallAuthorized(
             request.advertised_dynamic_tool_names;
     }
     execution_ctx.max_tool_result_bytes = request.max_tool_result_bytes;
+    if (request.route) |route| {
+        execution_ctx.route = route;
+        execution_ctx.provider_adapter = request.provider_adapter orelse
+            return error.MissingRouteAdapter;
+        execution_ctx.api_key = request.route_credential;
+        execution_ctx.gateway_team = request.route_tenant;
+        execution_ctx.gateway_chat_url = route.endpoint;
+        execution_ctx.model = route.primary_model_id;
+    }
     execution_ctx.current_turn_messages = request.current_turn_messages;
     execution_ctx.output_chunk_lifecycle_id = request.lifecycle_id;
     execution_ctx.command_timeout_started_ms = request.command_timeout_started_ms;
@@ -993,13 +1010,14 @@ fn executeVisionRequest(
     request: tool_contracts.vision.VisionRequest,
     authority: command_admission.ToolExecutionAuthority,
 ) !ToolExecutionResult {
+    const route = state.runtime.route orelse return visionRouteUnavailable(alloc);
     const config: vision_executor.Config = .{
-        .stream_provider = state.runtime.agent_stream_provider,
-        .api_key = state.runtime.api_key,
-        .gateway_team = state.runtime.gateway_team,
+        .adapter = state.runtime.provider_adapter,
+        .route = route,
+        .credential = state.runtime.api_key,
+        .tenant = state.runtime.gateway_team,
         .session_id = state.runtime.lifecycle_scope.session_id,
         .retry_count = state.runtime.gateway_retry_count,
-        .chat_url = state.runtime.gateway_chat_url,
         .cancel_flag = state.runtime.cancel_flag,
         .usage = &state.runtime.session.usage,
         .usage_allocator = state.runtime.session_allocator,
@@ -1023,6 +1041,23 @@ fn executeVisionRequest(
     const raw_paths = request.paths() orelse return error.InvalidVisionExecutionAuthority;
     if (raw_paths.len != approved_targets.len) return error.InvalidVisionExecutionAuthority;
     return executeVisionPathRequest(state, alloc, request, approved_targets, config);
+}
+
+fn visionRouteUnavailable(alloc: Allocator) Allocator.Error!ToolExecutionResult {
+    return .{
+        .status = .failure,
+        .status_detail = "the parent turn has no admitted Vision route",
+        .model_output = try alloc.dupe(
+            u8,
+            "Vision is unavailable because the parent turn has no admitted Vision route.",
+        ),
+        .system_notice = "Vision is unavailable on the pinned parent route.",
+        .interactive_notice = .{
+            .topic = "vision",
+            .tone = .@"error",
+            .body = "The selected connection and model do not provide Vision for this turn.",
+        },
+    };
 }
 
 fn executeVisionPathRequest(
@@ -1734,7 +1769,8 @@ fn executeSubagentProvider(
         .root_user_messages = ctx.root_user_messages,
         .root_user_evidence_complete = ctx.root_user_evidence_complete,
         .defaults = .{
-            .model = ctx.model,
+            .model = if (ctx.route) |route| route.subagent_model_id else ctx.model,
+            .route = ctx.route,
             .effort = ctx.effort,
             .fast_mode = ctx.fast_mode,
             .conversation_language = ctx.session.languageSnapshot(),
@@ -2122,6 +2158,25 @@ const TestRuntime = struct {
     gateway_team: ?[]const u8 = null,
     gateway_retry_count: usize = 0,
     gateway_chat_url: []const u8 = "",
+    route: route_snapshot.RouteSnapshot = .{
+        .connection_id = "test-connection",
+        .adapter_kind = "vercel_ai_gateway",
+        .endpoint = "https://gateway.invalid/chat",
+        .protocol = "vercel_ai_gateway",
+        .credential_ref = "test",
+        .primary_model_id = "google/gemini-2.5-flash",
+        .permission_review_model_id = "openai/gpt-5.4",
+        .vision_model_id = "google/gemini-2.5-flash",
+        .subagent_model_id = "google/gemini-2.5-flash",
+        .capabilities = .{
+            .supports_tool_use = true,
+            .supports_vision = true,
+            .supports_file_input = true,
+        },
+        .capability_source = .configured,
+        .selected_fast_mode = false,
+        .fast_model_suffix = null,
+    },
     context_limits: context_limits.Values = .{},
     command_artifact_dir: ?[]const u8 = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
@@ -2169,6 +2224,7 @@ const TestRuntime = struct {
             .max_tool_result_bytes = self.max_tool_result_bytes,
             .api_key = self.api_key,
             .provider_adapter = provider_adapter,
+            .route = &self.route,
             .agent_stream_provider = self.agent_stream_provider,
             .gateway_team = self.gateway_team,
             .model = self.model,

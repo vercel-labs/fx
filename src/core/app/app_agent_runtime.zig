@@ -1062,7 +1062,18 @@ pub fn Runtime(comptime App: type) type {
                 .context_enabled = if (comptime @hasField(App, "context_enabled")) app.context_enabled else true,
                 .project_context = modelVisibleProjectContext(app),
                 .lifecycle_view = app.lifecycle_view,
+                .route_credential_ctx = app,
+                .resolve_route_credential_fn = resolveSubagentRouteCredential,
             }, turn, message, admission, cancel);
+        }
+
+        fn resolveSubagentRouteCredential(
+            raw: *anyopaque,
+            alloc: Allocator,
+            route: *const route_snapshot.RouteSnapshot,
+        ) !agent_runtime.RouteCredential {
+            const app: *App = @ptrCast(@alignCast(raw));
+            return app.resolveRouteCredential(alloc, route);
         }
 
         fn appendClaimedContextNotice(app: *App, writer: *std.Io.Writer, notice: []const u8) !void {
@@ -2447,7 +2458,7 @@ fn makeNonVercelQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {
             .protocol = @constCast("fake-protocol"),
             .credential_ref = @constCast("fake-ref"),
             .remembered_model = @constCast("test-model"),
-            .permission_review_model = null,
+            .internal_models = .{},
         },
         test_builtin_gateway.connection_seed,
         model_capabilities.configuredDescriptor("test-model", .{}),

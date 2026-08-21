@@ -27,6 +27,52 @@ pub const AuthState = union(AuthStateTag) {
     connected,
 };
 
+/// Borrowed, profile-owned model settings. Null is an authoritative absence,
+/// not permission to consult an adapter default at runtime.
+pub const InternalModelsInput = struct {
+    permission_review: ?[]const u8 = null,
+    vision: ?[]const u8 = null,
+    subagent: ?[]const u8 = null,
+};
+
+pub const InternalModels = struct {
+    permission_review: ?[]u8 = null,
+    vision: ?[]u8 = null,
+    subagent: ?[]u8 = null,
+
+    fn init(alloc: Allocator, values: InternalModelsInput) !InternalModels {
+        const permission_review = if (values.permission_review) |value|
+            try alloc.dupe(u8, value)
+        else
+            null;
+        errdefer if (permission_review) |value| alloc.free(value);
+        const vision = if (values.vision) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (vision) |value| alloc.free(value);
+        return .{
+            .permission_review = permission_review,
+            .vision = vision,
+            .subagent = if (values.subagent) |value| try alloc.dupe(u8, value) else null,
+        };
+    }
+
+    pub fn input(self: InternalModels) InternalModelsInput {
+        return .{
+            .permission_review = self.permission_review,
+            .vision = self.vision,
+            .subagent = self.subagent,
+        };
+    }
+
+    fn deinit(self: *InternalModels, alloc: Allocator) void {
+        if (self.permission_review) |value| alloc.free(value);
+        if (self.vision) |value| alloc.free(value);
+        if (self.subagent) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+const InternalModelsSource = enum { canonical, legacy_flat };
+
 /// Borrowed input. A Runtime or Stored value duplicates every field it keeps.
 pub const ProfileInput = struct {
     id: []const u8,
@@ -36,7 +82,7 @@ pub const ProfileInput = struct {
     protocol: ?[]const u8 = null,
     credential_ref: []const u8,
     remembered_model: []const u8,
-    permission_review_model: ?[]const u8 = null,
+    internal_models: InternalModelsInput = .{},
 };
 
 /// Provider-owned metadata used only to seed a built-in connection. Core adds
@@ -49,7 +95,7 @@ pub const Seed = struct {
     endpoint: ?[]const u8 = null,
     protocol: ?[]const u8 = null,
     credential_ref: []const u8,
-    permission_review_model: ?[]const u8 = null,
+    internal_models: InternalModelsInput = .{},
 
     pub fn profile(
         self: Seed,
@@ -64,7 +110,7 @@ pub const Seed = struct {
             .protocol = self.protocol,
             .credential_ref = credential_ref orelse self.credential_ref,
             .remembered_model = remembered_model,
-            .permission_review_model = self.permission_review_model,
+            .internal_models = self.internal_models,
         };
     }
 };
@@ -77,10 +123,16 @@ pub const Profile = struct {
     protocol: ?[]u8,
     credential_ref: []u8,
     remembered_model: []u8,
-    permission_review_model: ?[]u8,
+    internal_models: InternalModels,
+    internal_models_source: InternalModelsSource = .canonical,
     auth: AuthState = .{ .disconnected = .not_checked },
 
-    fn init(alloc: Allocator, profile_input: ProfileInput, auth: AuthState) !Profile {
+    fn init(
+        alloc: Allocator,
+        profile_input: ProfileInput,
+        auth: AuthState,
+        internal_models_source: InternalModelsSource,
+    ) !Profile {
         try validateProfile(profile_input);
         const id = try alloc.dupe(u8, profile_input.id);
         errdefer alloc.free(id);
@@ -96,10 +148,7 @@ pub const Profile = struct {
         errdefer alloc.free(credential_ref);
         const remembered_model = try alloc.dupe(u8, profile_input.remembered_model);
         errdefer alloc.free(remembered_model);
-        const permission_review_model = if (profile_input.permission_review_model) |value|
-            try alloc.dupe(u8, value)
-        else
-            null;
+        const internal_models = try InternalModels.init(alloc, profile_input.internal_models);
         return .{
             .id = id,
             .display_name = display_name,
@@ -108,7 +157,8 @@ pub const Profile = struct {
             .protocol = protocol,
             .credential_ref = credential_ref,
             .remembered_model = remembered_model,
-            .permission_review_model = permission_review_model,
+            .internal_models = internal_models,
+            .internal_models_source = internal_models_source,
             .auth = auth,
         };
     }
@@ -122,7 +172,7 @@ pub const Profile = struct {
             .protocol = self.protocol,
             .credential_ref = self.credential_ref,
             .remembered_model = self.remembered_model,
-            .permission_review_model = self.permission_review_model,
+            .internal_models = self.internal_models.input(),
         };
     }
 
@@ -131,6 +181,7 @@ pub const Profile = struct {
             alloc,
             self.asInput(),
             if (preserve_auth) self.auth else .{ .disconnected = .not_checked },
+            self.internal_models_source,
         );
     }
 
@@ -142,7 +193,7 @@ pub const Profile = struct {
         if (self.protocol) |value| alloc.free(value);
         alloc.free(self.credential_ref);
         alloc.free(self.remembered_model);
-        if (self.permission_review_model) |value| alloc.free(value);
+        self.internal_models.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -223,8 +274,33 @@ const StoredProfile = struct {
     credential_ref: []const u8,
     remembered_model: []const u8,
     permission_review_model: ?[]const u8 = null,
+    internal_models: ?StoredInternalModels = null,
 
-    fn input(self: StoredProfile) ProfileInput {
+    const StoredInternalModels = struct {
+        permission_review: ?[]const u8 = null,
+        vision: ?[]const u8 = null,
+        subagent: ?[]const u8 = null,
+    };
+
+    fn input(self: StoredProfile, has_legacy: bool, has_canonical: bool) !ProfileInput {
+        if (has_canonical and self.internal_models == null) {
+            return error.InvalidConnectionsShape;
+        }
+        if (has_legacy and has_canonical and
+            !optionalStringsEqual(
+                self.permission_review_model,
+                self.internal_models.?.permission_review,
+            ))
+        {
+            return error.ConflictingInternalModels;
+        }
+        const internal = if (self.internal_models) |value| InternalModelsInput{
+            .permission_review = value.permission_review,
+            .vision = value.vision,
+            .subagent = value.subagent,
+        } else InternalModelsInput{
+            .permission_review = self.permission_review_model,
+        };
         return .{
             .id = self.id,
             .display_name = self.display_name,
@@ -233,14 +309,14 @@ const StoredProfile = struct {
             .protocol = self.protocol,
             .credential_ref = self.credential_ref,
             .remembered_model = self.remembered_model,
-            .permission_review_model = self.permission_review_model,
+            .internal_models = internal,
         };
     }
 };
 
 const StoredDocument = struct {
     selected: []const u8,
-    profiles: []StoredProfile,
+    profiles: []std.json.Value,
 };
 
 pub const Runtime = struct {
@@ -265,7 +341,27 @@ pub const Runtime = struct {
             try validateSnapshot(value.snapshot());
             try self.profiles.ensureTotalCapacity(alloc, value.profiles.len + 1);
             for (value.profiles) |profile_value| {
-                self.profiles.appendAssumeCapacity(try profile_value.clone(alloc, false));
+                var cloned = try profile_value.clone(alloc, false);
+                errdefer cloned.deinit(alloc);
+                if (cloned.internal_models_source == .legacy_flat and
+                    std.mem.eql(u8, cloned.id, seed.id) and
+                    std.mem.eql(u8, cloned.adapter_id, seed.adapter_id))
+                {
+                    if (cloned.internal_models.vision == null) {
+                        cloned.internal_models.vision = if (seed.internal_models.vision) |model|
+                            try alloc.dupe(u8, model)
+                        else
+                            null;
+                    }
+                    if (cloned.internal_models.subagent == null) {
+                        cloned.internal_models.subagent = if (seed.internal_models.subagent) |model|
+                            try alloc.dupe(u8, model)
+                        else
+                            null;
+                    }
+                    cloned.internal_models_source = .canonical;
+                }
+                self.profiles.appendAssumeCapacity(cloned);
             }
             if (self.indexOf(seed.id) == null) {
                 if (value.profiles.len == max_profiles) return error.TooManyConnections;
@@ -273,12 +369,18 @@ pub const Runtime = struct {
                     alloc,
                     seed,
                     .{ .disconnected = .not_checked },
+                    .canonical,
                 ));
             }
             self.selected_index = self.indexOf(value.selected_id) orelse
                 return error.UnknownSelectedConnection;
         } else {
-            var profile_value = try Profile.init(alloc, seed, .{ .disconnected = .not_checked });
+            var profile_value = try Profile.init(
+                alloc,
+                seed,
+                .{ .disconnected = .not_checked },
+                .canonical,
+            );
             errdefer profile_value.deinit(alloc);
             try self.profiles.append(alloc, profile_value);
         }
@@ -329,6 +431,7 @@ pub const Runtime = struct {
             self.alloc,
             input,
             .{ .disconnected = .not_checked },
+            .canonical,
         ));
         try self.commit(&next);
     }
@@ -441,10 +544,16 @@ pub fn parseStored(alloc: Allocator, value: std.json.Value) !Stored {
     }
     try profiles.ensureTotalCapacity(alloc, parsed.value.profiles.len);
     for (parsed.value.profiles) |profile_value| {
+        if (profile_value != .object) return error.InvalidConnectionsShape;
+        var decoded = try std.json.parseFromValue(StoredProfile, alloc, profile_value, .{});
+        defer decoded.deinit();
+        const has_legacy = profile_value.object.contains("permission_review_model");
+        const has_canonical = profile_value.object.contains("internal_models");
         profiles.appendAssumeCapacity(try Profile.init(
             alloc,
-            profile_value.input(),
+            try decoded.value.input(has_legacy, has_canonical),
             .{ .disconnected = .not_checked },
+            if (has_canonical) .canonical else .legacy_flat,
         ));
     }
 
@@ -490,7 +599,14 @@ fn validateProfile(input: ProfileInput) !void {
         if (input.protocol == null) return error.ProtocolRequired;
     }
     if (input.protocol) |protocol| try validateIdentifier(protocol);
-    if (input.permission_review_model) |model| try validateModel(model);
+    if (input.internal_models.permission_review) |model| try validateModel(model);
+    if (input.internal_models.vision) |model| try validateModel(model);
+    if (input.internal_models.subagent) |model| try validateModel(model);
+}
+
+fn optionalStringsEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
 }
 
 fn validateIdentifier(value: []const u8) !void {
@@ -531,7 +647,10 @@ const test_seed = ProfileInput{
     .protocol = "vercel_ai_gateway",
     .credential_ref = "automatic",
     .remembered_model = "zai/glm-5.2-fast",
-    .permission_review_model = "openai/gpt-5.4",
+    .internal_models = .{
+        .permission_review = "openai/gpt-5.4",
+        .vision = "google/gemini-2.5-flash",
+    },
 };
 
 const test_local = ProfileInput{
@@ -775,4 +894,70 @@ test "profile parser safely rejects duplicate ids and unknown selection" {
     );
     defer unknown_value.deinit();
     try std.testing.expectError(error.UnknownSelectedConnection, parseStored(alloc, unknown_value.value));
+}
+
+test "internal model defaults materialize once and canonical null stays authoritative" {
+    const alloc = std.testing.allocator;
+    var fresh = try Runtime.init(alloc, test_seed, null, Persistence.unavailable);
+    defer fresh.deinit();
+    try std.testing.expectEqualStrings(
+        "openai/gpt-5.4",
+        fresh.selectedProfile().internal_models.permission_review.?,
+    );
+    try std.testing.expectEqualStrings(
+        "google/gemini-2.5-flash",
+        fresh.selectedProfile().internal_models.vision.?,
+    );
+    try std.testing.expect(fresh.selectedProfile().internal_models.subagent == null);
+
+    var value = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"selected\":\"vercel\",\"profiles\":[{\"id\":\"vercel\",\"display_name\":\"Vercel AI Gateway\",\"adapter_id\":\"vercel_ai_gateway\",\"endpoint\":\"https://example.invalid\",\"protocol\":\"vercel_ai_gateway\",\"credential_ref\":\"automatic\",\"remembered_model\":\"primary/model\",\"internal_models\":{\"permission_review\":null,\"vision\":null,\"subagent\":null}}]}",
+        .{},
+    );
+    defer value.deinit();
+    var stored = try parseStored(alloc, value.value);
+    defer stored.deinit(alloc);
+    var restarted = try Runtime.init(alloc, test_seed, &stored, Persistence.unavailable);
+    defer restarted.deinit();
+    const internal = restarted.selectedProfile().internal_models;
+    try std.testing.expect(internal.permission_review == null);
+    try std.testing.expect(internal.vision == null);
+    try std.testing.expect(internal.subagent == null);
+}
+
+test "flat reviewer migrates boundedly and conflicting canonical value rejects" {
+    const alloc = std.testing.allocator;
+    var legacy_value = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"selected\":\"vercel\",\"profiles\":[{\"id\":\"vercel\",\"display_name\":\"Vercel AI Gateway\",\"adapter_id\":\"vercel_ai_gateway\",\"endpoint\":\"https://example.invalid\",\"protocol\":\"vercel_ai_gateway\",\"credential_ref\":\"automatic\",\"remembered_model\":\"primary/model\",\"permission_review_model\":\"legacy/reviewer\"}]}",
+        .{},
+    );
+    defer legacy_value.deinit();
+    var stored = try parseStored(alloc, legacy_value.value);
+    defer stored.deinit(alloc);
+    var migrated = try Runtime.init(alloc, test_seed, &stored, Persistence.unavailable);
+    defer migrated.deinit();
+    try std.testing.expectEqualStrings(
+        "legacy/reviewer",
+        migrated.selectedProfile().internal_models.permission_review.?,
+    );
+    try std.testing.expectEqualStrings(
+        "google/gemini-2.5-flash",
+        migrated.selectedProfile().internal_models.vision.?,
+    );
+
+    var conflict = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"selected\":\"vercel\",\"profiles\":[{\"id\":\"vercel\",\"display_name\":\"Vercel\",\"adapter_id\":\"vercel_ai_gateway\",\"credential_ref\":\"automatic\",\"remembered_model\":\"model\",\"permission_review_model\":\"old/reviewer\",\"internal_models\":{\"permission_review\":\"new/reviewer\",\"vision\":null,\"subagent\":null}}]}",
+        .{},
+    );
+    defer conflict.deinit();
+    try std.testing.expectError(
+        error.ConflictingInternalModels,
+        parseStored(alloc, conflict.value),
+    );
 }

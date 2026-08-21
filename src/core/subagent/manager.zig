@@ -2,6 +2,7 @@ const std = @import("std");
 const approval_persistence = @import("approval_persistence.zig");
 const authority = @import("authority.zig");
 const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
+const model_capabilities = @import("../config/model_capabilities.zig");
 const communication = @import("communication.zig");
 const communication_manager_mod = @import("communication_manager.zig");
 const communication_store = @import("communication_store.zig");
@@ -10,6 +11,7 @@ const domain = @import("domain.zig");
 const tool_result = @import("tool_result.zig");
 const work_events = @import("work_events.zig");
 const io_mod = @import("../shared/io.zig");
+const route_snapshot = @import("../gateway/route_snapshot.zig");
 const relationship_index = @import("relationship_index.zig");
 const session = @import("../session/session.zig");
 const session_child_store = @import("../session/session_child_store.zig");
@@ -386,6 +388,7 @@ pub const Context = struct {
     expected_generation: ?u64 = null,
     relationship_authorization: RelationshipAuthorization = .none,
     target_authorization: TargetAuthorization = .none,
+    work_route: ?*const route_snapshot.RouteSnapshot = null,
     timestamp_ms: i64,
 };
 
@@ -3400,6 +3403,11 @@ fn buildCreateRecord(
             context.root_user_intent_context,
             context.root_user_messages,
             context.root_user_evidence_complete,
+            context.work_route,
+            command.configuration.model orelse if (context.work_route) |route|
+                route.subagent_model_id
+            else
+                null,
             context.timestamp_ms,
         );
         errdefer message.deinit(alloc);
@@ -3475,6 +3483,11 @@ fn reduceSend(
         context.root_user_intent_context,
         context.root_user_messages,
         context.root_user_evidence_complete,
+        context.work_route,
+        source.configuration.model orelse if (context.work_route) |route|
+            route.subagent_model_id
+        else
+            null,
         context.timestamp_ms,
     );
     errdefer if (message) |*value| value.deinit(alloc);
@@ -3883,6 +3896,8 @@ fn makeQueuedMessage(
     root_user_intent_context: []const u8,
     root_user_messages: []const []const u8,
     root_user_evidence_complete: bool,
+    route: ?*const route_snapshot.RouteSnapshot,
+    model: ?[]const u8,
     timestamp_ms: i64,
 ) !domain.QueuedMessage {
     const id = try alloc.dupe(u8, operation_id);
@@ -3907,6 +3922,18 @@ fn makeQueuedMessage(
     else
         try alloc.alloc([]u8, 0);
     errdefer freeRootUserMessages(alloc, owned_root_user_messages);
+    const work_route = if (route) |parent_route| blk: {
+        const child_model = model orelse parent_route.subagent_model_id;
+        const descriptor = if (std.mem.eql(u8, child_model, parent_route.primary_model_id))
+            parent_route.descriptor()
+        else
+            model_capabilities.configuredDescriptor(child_model, .{});
+        break :blk try parent_route.deriveForModel(alloc, descriptor);
+    } else null;
+    errdefer if (work_route) |route_value| {
+        var owned = route_value;
+        owned.deinit(alloc);
+    };
     return .{
         .id = id,
         .source_id = source,
@@ -3914,6 +3941,7 @@ fn makeQueuedMessage(
         .root_user_intent_context = owned_root_user_intent_context,
         .root_user_messages = owned_root_user_messages,
         .root_user_evidence_complete = evidence_complete,
+        .route = work_route,
         .created_at_ms = timestamp_ms,
     };
 }
@@ -4130,6 +4158,8 @@ fn cancelPendingMessages(alloc: Allocator, messages: []domain.QueuedMessage) !vo
         const reason = try alloc.dupe(u8, "cancelled by lifecycle command");
         if (message.cancellation_reason) |old| alloc.free(old);
         message.cancellation_reason = reason;
+        if (message.route) |*route| route.deinit(alloc);
+        message.route = null;
         message.status = .cancelled;
     }
 }

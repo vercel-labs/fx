@@ -3,8 +3,8 @@ const builtin = @import("builtin");
 const agent_stream_provider = @import("../stream_provider.zig");
 const context_limits = @import("../../config/context_limits.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
+const route_snapshot = @import("../../gateway/route_snapshot.zig");
 const image_attachments = @import("../../images/image_attachments.zig");
-const session_usage = @import("../../session/session_usage.zig");
 const types = @import("../../shared/types.zig");
 const image_provider = @import("image_provider.zig");
 const tool_contracts = @import("tool_contracts.zig");
@@ -26,14 +26,14 @@ const system_prompt =
     "Extract exactly one record for every requested image ID, in requested order.";
 
 pub const Config = struct {
-    stream_provider: agent_stream_provider.Provider,
-    api_key: []const u8,
-    gateway_team: ?[]const u8,
+    adapter: agent_stream_provider.ProviderAdapter,
+    route: *const route_snapshot.RouteSnapshot,
+    credential: []const u8,
+    tenant: ?[]const u8,
     session_id: ?[]const u8 = null,
     retry_count: usize,
-    chat_url: []const u8,
     cancel_flag: ?*std.atomic.Value(bool),
-    usage: ?*session_usage.Usage,
+    usage: ?*@import("../../session/session_usage.zig").Usage,
     usage_allocator: Allocator,
     trace_ctx: debug_trace.TraceContext,
     output_limit: context_limits.Resolved,
@@ -62,6 +62,9 @@ pub fn executeRequest(
 ) !tool_contracts.ToolExecutionResult {
     const image_ids = request.image_ids() orelse
         return failedArguments(alloc, error.InvalidVisionRequest);
+    if (config.route.vision_model_id == null) {
+        return unsupportedVision(alloc, image_ids);
+    }
     const authorized = image_attachments.resolve_authorized_images(
         alloc,
         authorized_catalog,
@@ -278,12 +281,12 @@ fn runBatchAttempt(
         user_prompt,
         verified_images,
         .{
-            .stream_provider = config.stream_provider,
-            .api_key = config.api_key,
-            .gateway_team = config.gateway_team,
+            .adapter = config.adapter,
+            .route = config.route,
+            .credential = config.credential,
+            .tenant = config.tenant,
             .session_id = config.session_id,
             .retry_count = config.retry_count,
-            .chat_url = config.chat_url,
             .cancel_flag = cancel_flag,
             .usage = config.usage,
             .usage_allocator = config.usage_allocator,
@@ -372,6 +375,32 @@ fn runBatchAttempt(
         return .invalid_response;
     }
     return .{ .parsed = parsed };
+}
+
+fn unsupportedVision(
+    alloc: Allocator,
+    image_ids: []const usize,
+) !tool_contracts.ToolExecutionResult {
+    const records = try alloc.alloc(vision_contracts.VisionImageResult, image_ids.len);
+    defer alloc.free(records);
+    for (image_ids, records) |image_id, *record| {
+        record.* = .{
+            .image_id = image_id,
+            .outcome = .{ .failed = .vision_unavailable },
+        };
+    }
+    const result = vision_contracts.VisionResult{ .images = records };
+    return .{
+        .model_output = try vision_contracts.stringify_vision_result(alloc, result),
+        .status = .failure,
+        .status_detail = "the pinned route does not support Vision file input",
+        .system_notice = outage_system_notice,
+        .interactive_notice = .{
+            .topic = "vision",
+            .tone = .@"error",
+            .body = outage_tip,
+        },
+    };
 }
 
 fn failedArguments(alloc: Allocator, err: anyerror) !tool_contracts.ToolExecutionResult {
@@ -474,6 +503,76 @@ fn totalFailureStatusDetail(records: []const vision_contracts.VisionImageResult)
         .vision_unavailable => "Vision is unavailable right now",
         .missing_provider_record => "provider omitted every requested image",
     };
+}
+
+test "unsupported pinned Vision route fails visibly without adapter traffic" {
+    const Counter = struct {
+        calls: usize = 0,
+
+        fn stream(
+            adapter: *const agent_stream_provider.ProviderAdapter,
+            _: Allocator,
+            _: agent_stream_provider.AdapterRequest,
+            _: agent_stream_provider.EventSink,
+        ) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(adapter.context.?));
+            self.calls += 1;
+        }
+    };
+
+    var counter = Counter{};
+    const adapter = agent_stream_provider.ProviderAdapter{
+        .kind = "loopback",
+        .context = &counter,
+        .stream_fn = Counter.stream,
+    };
+    const route = route_snapshot.RouteSnapshot{
+        .connection_id = "connection-a",
+        .adapter_kind = "loopback",
+        .endpoint = "http://127.0.0.1/a",
+        .protocol = "loopback",
+        .credential_ref = "key-a",
+        .primary_model_id = "primary-a",
+        .permission_review_model_id = null,
+        .vision_model_id = null,
+        .subagent_model_id = "primary-a",
+        .capabilities = .{},
+        .capability_source = .configured,
+        .selected_fast_mode = false,
+        .fast_model_suffix = null,
+    };
+    var image_ids = [_]usize{1};
+    const request = vision_contracts.VisionRequest{
+        .source = .{ .image_ids = &image_ids },
+        .focus = @constCast("describe"),
+    };
+    const result = try executeRequest(
+        std.testing.allocator,
+        request,
+        &.{},
+        .{
+            .adapter = adapter,
+            .route = &route,
+            .credential = "credential-a",
+            .tenant = null,
+            .retry_count = 0,
+            .cancel_flag = null,
+            .usage = null,
+            .usage_allocator = std.testing.allocator,
+            .trace_ctx = .{},
+            .output_limit = .{
+                .value = .{ .bytes = 1024 },
+                .source = .command_line,
+            },
+        },
+    );
+    defer std.testing.allocator.free(result.model_output);
+
+    try std.testing.expectEqual(@as(usize, 0), counter.calls);
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+    try std.testing.expect(result.system_notice != null);
+    try std.testing.expect(result.interactive_notice != null);
+    try std.testing.expect(std.mem.find(u8, result.model_output, "vision_unavailable") != null);
 }
 
 fn parseBatchAttemptForTest(json: []const u8) !BatchAttempt {

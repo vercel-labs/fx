@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const question_prompt = @import("../agent/question_prompt.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
@@ -10,6 +11,11 @@ const terminal_ui_projection = @import("../terminal/ui_projection.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const route_snapshot = @import("../gateway/route_snapshot.zig");
+const test_model_descriptors = if (builtin.is_test)
+    @import("../../builtins/gateway/model_descriptors.zig")
+else
+    struct {};
 const picker_state = @import("../input/picker_state.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
@@ -3058,11 +3064,26 @@ pub fn Runtime(comptime App: type) type {
                 });
                 return;
             }
+            var route: ?route_snapshot.RouteSnapshot = if (comptime @hasDecl(
+                App,
+                "admitSubagentWorkRoute",
+            ))
+                app.admitSubagentWorkRoute(app.alloc) catch {
+                    app.subagents.submissionRejected(app.alloc, .{
+                        .code = .store_failure,
+                        .retryable = true,
+                    });
+                    return;
+                }
+            else
+                null;
+            defer if (route) |*owned| owned.deinit(app.alloc);
             var result = host.sendMessage(app.alloc, .{
                 .caller_id = host.root_id,
                 .invocation_id = submission.invocation_id,
                 .child_id = submission.child_id,
                 .content = submission.content,
+                .route = if (route) |*owned| owned else null,
                 .timestamp_ms = io_mod.milliTimestamp(),
                 .identity_epoch = identity_epoch,
             }) catch {
@@ -3176,10 +3197,28 @@ pub fn Runtime(comptime App: type) type {
                 });
                 return;
             }
+            const publishes_work = switch (mutation.command) {
+                .create => |create| create.prompt != null,
+                .message => |message| message == .send,
+                .inspect, .relationship, .configure, .lifecycle => false,
+            };
+            var route: ?route_snapshot.RouteSnapshot = if (publishes_work and
+                comptime @hasDecl(App, "admitSubagentWorkRoute"))
+                app.admitSubagentWorkRoute(app.alloc) catch {
+                    app.subagents.mutationRejected(app.alloc, .{
+                        .code = .store_failure,
+                        .retryable = true,
+                    });
+                    return;
+                }
+            else
+                null;
+            defer if (route) |*owned| owned.deinit(app.alloc);
             var result = host.executeHumanCommand(app.alloc, &mutation.command, .{
                 .invocation_id = mutation.invocation_id,
                 .defaults = .{
                     .model = app.selected_model.items,
+                    .route = if (route) |*owned| owned else null,
                     .effort = app.effort,
                     .fast_mode = if (comptime @hasField(App, "fast_mode")) app.fast_mode else false,
                     .conversation_language = app.session.languageSnapshot(),

@@ -14,7 +14,10 @@ pub fn owned(alloc: std.mem.Allocator, model: []const u8) !route_snapshot.RouteS
             .protocol = @constCast("vercel_ai_gateway"),
             .credential_ref = @constCast("automatic"),
             .remembered_model = @constCast(model),
-            .permission_review_model = null,
+            .internal_models = .{
+                .permission_review = @constCast("openai/gpt-5.4"),
+                .vision = @constCast("google/gemini-2.5-flash"),
+            },
         },
         model_capabilities.configuredDescriptor(model, .{}),
         "https://example.invalid",

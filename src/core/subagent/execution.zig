@@ -13,6 +13,7 @@ const runtime_lifecycle = @import("../agent/runtime/lifecycle.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const route_snapshot = @import("../gateway/route_snapshot.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const session = @import("../session/session.zig");
 const session_child_store = @import("../session/session_child_store.zig");
@@ -48,6 +49,7 @@ else
 const Allocator = std.mem.Allocator;
 
 pub const TurnPreferences = struct {
+    connection_id: ?[]const u8 = null,
     model: []const u8,
     effort: types.ReasoningEffort,
 };
@@ -59,6 +61,7 @@ pub fn resolveTurnPreferences(
     persisted: session_codec.DurableSessionPreferences,
 ) TurnPreferences {
     return .{
+        .connection_id = persisted.connection_id,
         .model = configuration.model orelse persisted.model,
         .effort = configuration.effort orelse persisted.effort,
     };
@@ -185,6 +188,9 @@ fn finishWorkWithFailureReason(
         .awaiting_approval => .awaiting_approval,
         .paused => .interrupted,
     };
+    if (outcome != .awaiting_approval and outcome != .paused) {
+        releaseWorkRoute(alloc, message);
+    }
     const current = message.status;
     record.updated_at_ms = timestamp_ms;
     if (outcome == .awaiting_approval or outcome == .paused) {
@@ -243,6 +249,7 @@ pub fn cancelWork(
         if (message.cancellation_reason) |old| alloc.free(old);
         message.cancellation_reason = owned_reason;
         const previous = message.status;
+        releaseWorkRoute(alloc, message);
         message.status = .cancelled;
         try transitions.append(alloc, .{
             .work_item_id = message.id,
@@ -292,6 +299,7 @@ pub fn recoverAfterRestart(
             if (previous != .pending and std.mem.eql(u8, message.id, work_id)) {
                 if (message.cancellation_reason) |old| alloc.free(old);
                 message.cancellation_reason = null;
+                releaseWorkRoute(alloc, message);
                 message.status = .completed;
                 result.completed += 1;
                 try transitions.append(alloc, .{
@@ -376,6 +384,7 @@ pub const CaptureRequest = struct {
     child_id: []const u8,
     parent_id: []const u8,
     source_id: []const u8,
+    route: ?*const route_snapshot.RouteSnapshot = null,
     configuration: domain.Configuration,
     preferences: TurnPreferences,
 };
@@ -1273,7 +1282,7 @@ fn livePresentationEventBytes(event: worker_runtime.WorkerEvent) ?usize {
 const Slot = struct {
     owner: *Owner,
     child_id: []u8,
-    retry_interrupted: bool,
+    retry_interrupted: std.atomic.Value(bool),
     cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     active_worker: ?*worker_runtime.WorkerRuntime = null,
@@ -1388,7 +1397,7 @@ pub const Owner = struct {
         self.dropCompletionLocked(child_id);
         for (self.slots.items) |slot| {
             if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
-            slot.retry_interrupted = slot.retry_interrupted or retry_interrupted;
+            if (retry_interrupted) slot.retry_interrupted.store(true, .seq_cst);
             slot.wake_requested = true;
             slot.restart_failed = false;
             self.reaper_cond.broadcast(io_mod.getIo());
@@ -1403,7 +1412,7 @@ pub const Owner = struct {
         slot.* = .{
             .owner = self,
             .child_id = owned_id,
-            .retry_interrupted = retry_interrupted,
+            .retry_interrupted = std.atomic.Value(bool).init(retry_interrupted),
         };
         try self.slots.append(self.alloc, slot);
         errdefer _ = self.slots.pop();
@@ -2756,7 +2765,8 @@ fn runOne(slot: *Slot) OneResult {
         communication_state,
         record,
     ) catch return .control_failed;
-    const index = nextRunnableIndex(record.queue, slot.retry_interrupted) orelse
+    const retry_interrupted = slot.retry_interrupted.load(.seq_cst);
+    const index = nextRunnableIndex(record.queue, retry_interrupted) orelse
         return if (record.mode == .one_off and record.state == .completed)
             .completed
         else
@@ -2770,6 +2780,7 @@ fn runOne(slot: *Slot) OneResult {
         .child_id = record.child_id,
         .parent_id = parent_id,
         .source_id = record.queue[index].source_id,
+        .route = if (record.queue[index].route) |*route| route else null,
         .configuration = record.configuration,
         .preferences = preferences,
     }) catch {
@@ -2901,7 +2912,7 @@ fn runOne(slot: *Slot) OneResult {
     if (outcome == .failed) return .failed;
     if (current.mode == .one_off) return .completed;
     if (hasPending(current.queue) or
-        (slot.retry_interrupted and nextRunnableIndex(current.queue, true) != null))
+        (retry_interrupted and nextRunnableIndex(current.queue, true) != null))
     {
         return .more_work;
     }
@@ -3004,6 +3015,7 @@ fn failAdmission(
     timestamp_ms: i64,
 ) TransitionError!void {
     const previous = record.queue[index].status;
+    releaseWorkRoute(alloc, &record.queue[index]);
     record.queue[index].status = .failed;
     record.updated_at_ms = timestamp_ms;
     record.state = if (record.mode == .one_off)
@@ -3019,6 +3031,11 @@ fn failAdmission(
         "admission_failed",
         timestamp_ms,
     );
+}
+
+fn releaseWorkRoute(alloc: Allocator, message: *domain.QueuedMessage) void {
+    if (message.route) |*route| route.deinit(alloc);
+    message.route = null;
 }
 
 fn serviceFailureReason(err: ServiceError) []const u8 {
@@ -3172,6 +3189,39 @@ test "pure execution reductions preserve FIFO cancellation precedence and restar
     try std.testing.expectEqual(domain.QueueStatus.interrupted, cancel_fifo.queue[1].status);
 }
 
+test "durable work routes survive held states and release on every terminal transition" {
+    const alloc = std.testing.allocator;
+    const route = agent_test_support.testRouteForModel("model/pinned");
+
+    var approval = try testRecord(alloc, .persistent, &.{"approval"});
+    defer approval.deinit(alloc);
+    approval.queue[0].route = try route.clone(alloc);
+    try admitWork(alloc, &approval, 0, 1);
+    try std.testing.expectEqual(
+        CompletionDecision.committed,
+        try finishWork(alloc, &approval, "approval", .awaiting_approval, 2),
+    );
+    try std.testing.expect(approval.queue[0].route != null);
+    try std.testing.expectEqual(@as(usize, 1), try cancelWork(alloc, &approval, "denied", 3));
+    try std.testing.expect(approval.queue[0].route == null);
+
+    var paused = try testRecord(alloc, .persistent, &.{"paused"});
+    defer paused.deinit(alloc);
+    paused.queue[0].route = try route.clone(alloc);
+    try admitWork(alloc, &paused, 0, 4);
+    try std.testing.expectEqual(
+        CompletionDecision.committed,
+        try finishWork(alloc, &paused, "paused", .paused, 5),
+    );
+    try std.testing.expect(paused.queue[0].route != null);
+    try admitWork(alloc, &paused, 0, 6);
+    try std.testing.expectEqual(
+        CompletionDecision.committed,
+        try finishWork(alloc, &paused, "paused", .completed, 7),
+    );
+    try std.testing.expect(paused.queue[0].route == null);
+}
+
 test "restart recovery never promotes a committed interrupted transcript to completion" {
     const interrupted_history = [_]types.HistoryTurn{.{ .interrupted = .{
         .user = .{ .text = @constCast("interrupted work") },
@@ -3189,6 +3239,66 @@ test "restart recovery never promotes a committed interrupted transcript to comp
         "work-id",
         completedWorkIdForRecovery("work-id", &completed_history).?,
     );
+}
+
+test "transcript-authoritative routed recovery releases its route and persists once" {
+    const alloc = std.testing.allocator;
+    var env = try TestEnvironment.init(alloc);
+    defer env.deinit(alloc);
+    try env.createSession(alloc, "child-recovery");
+    try env.installControl(
+        alloc,
+        "child-recovery",
+        .persistent,
+        "model/pinned",
+        .auto,
+        &.{"work-id"},
+    );
+
+    var capability = try env.store.openSubagentControlCapabilityWritable(
+        alloc,
+        "child-recovery",
+        .{},
+    );
+    defer capability.deinit();
+    const storage = control_store.Store{
+        .capability = &capability,
+        .expected_child_id = "child-recovery",
+    };
+    var lock = try storage.acquireLock();
+    defer lock.release();
+    var record = try storage.load(alloc);
+    defer record.deinit(alloc);
+    const route = agent_test_support.testRouteForModel("model/pinned");
+    record.queue[0].route = try route.clone(alloc);
+    try admitWork(alloc, &record, 0, 2);
+    try storage.save(alloc, record);
+
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("committed work") },
+        .assistant = @constCast("done"),
+    } }};
+    const recovered = try recoverAfterRestart(
+        alloc,
+        &record,
+        completedWorkIdForRecovery("work-id", &history),
+        3,
+    );
+    try std.testing.expectEqual(@as(usize, 1), recovered.completed);
+    try std.testing.expectEqual(domain.QueueStatus.completed, record.queue[0].status);
+    try std.testing.expect(record.queue[0].route == null);
+    try storage.save(alloc, record);
+
+    var restored = try storage.load(alloc);
+    defer restored.deinit(alloc);
+    try std.testing.expectEqual(domain.QueueStatus.completed, restored.queue[0].status);
+    try std.testing.expect(restored.queue[0].route == null);
+    try std.testing.expect(nextRunnableIndex(restored.queue, true) == null);
+    const event_count = restored.events.len;
+    const repeated = try recoverAfterRestart(alloc, &restored, "work-id", 4);
+    try std.testing.expectEqual(@as(usize, 0), repeated.completed);
+    try std.testing.expectEqual(@as(usize, 0), repeated.interrupted);
+    try std.testing.expectEqual(event_count, restored.events.len);
 }
 
 test "admission snapshot is isolated owned and preserves configured permission mode" {
@@ -4837,7 +4947,7 @@ test "start wakes a reaper retry after a joined child restart failed" {
     slot.* = .{
         .owner = &owner,
         .child_id = owned_id,
-        .retry_interrupted = false,
+        .retry_interrupted = std.atomic.Value(bool).init(false),
         .finished = true,
         .wake_requested = true,
         .restart_failed = true,
@@ -6789,7 +6899,7 @@ fn runExternalExecutionProcess(
     var slot = Slot{
         .owner = &owner,
         .child_id = @constCast("live-child"),
-        .retry_interrupted = false,
+        .retry_interrupted = std.atomic.Value(bool).init(false),
     };
     return if (runOne(&slot) == .idle) 0 else 91;
 }

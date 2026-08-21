@@ -742,21 +742,23 @@ fn schemaForReview(
     call: ToolCall,
     is_dynamic_tool: bool,
 ) !?[]const u8 {
-    if (!is_dynamic_tool) return null;
-    const context = input.mcp_runtime.context orelse return null;
-    const tool_schema = input.mcp_runtime.tool_schema orelse return null;
-    const result = (try tool_schema(
-        context,
-        arena,
-        call.name,
-        input.permission_rules,
-        input.context_limits,
-        input.mcp_runtime.access,
-    )) orelse return null;
-    return switch (result) {
-        .selected => |payload| payload.model_output,
-        .rejected => null,
-    };
+    if (is_dynamic_tool) {
+        const context = input.mcp_runtime.context orelse return null;
+        const tool_schema = input.mcp_runtime.tool_schema orelse return null;
+        const result = (try tool_schema(
+            context,
+            arena,
+            call.name,
+            input.permission_rules,
+            input.context_limits,
+            input.mcp_runtime.access,
+        )) orelse return null;
+        return switch (result) {
+            .selected => |payload| payload.model_output,
+            .rejected => null,
+        };
+    }
+    return null;
 }
 
 fn reviewRequestForCall(
@@ -928,7 +930,9 @@ fn runAutomaticReview(
             "event=auto_review_result tool_name={s} decision=cancelled_or_error fallback_reason={s} elapsed_ms={d} execution_started=false call_id={s}",
             .{ call.name, @errorName(err), io_mod.milliTimestamp() - started_ms, call.id },
         );
-        return err;
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (err == error.Cancelled) return error.Cancelled;
+        return .invalid;
     };
     switch (review) {
         .valid => |result| debug_trace.logf(
@@ -4232,30 +4236,16 @@ test "incomplete review authority maps to auto denial without reviewer transport
         review_calls: usize = 0,
         transport_calls: usize = 0,
 
-        fn send(
-            raw_ctx: *anyopaque,
-            _: Allocator,
-            _: []const u8,
-            _: []const u8,
-            _: std.Io.Clock.Timestamp,
-            _: *std.atomic.Value(bool),
-        ) anyerror!permission_auto_classifier.TransportOutcome {
-            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
-            self.transport_calls += 1;
-            return .permanent_failure;
-        }
-
         fn review(
             raw_ctx: *anyopaque,
-            alloc: Allocator,
+            _: Allocator,
             request: permission_auto_classifier.ReviewRequest,
         ) anyerror!permission_auto_classifier.ParseOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.review_calls += 1;
-            return permission_auto_classifier.Reviewer.withTransport(.{
-                .context = raw_ctx,
-                .send_fn = send,
-            }, null, 1000).review(alloc, request);
+            if (request.review_turn.current_root_request.len == 0) return .invalid;
+            self.transport_calls += 1;
+            return .invalid;
         }
     };
 
@@ -5218,9 +5208,101 @@ test "human approval phase bypasses automatic review" {
         &.{},
     );
     try std.testing.expectEqual(ToolPermissionDecision.permission_required, headless.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.permission_required, headless.denial_reason.?);
+    try std.testing.expectEqual(
+        types.ToolPermissionDenialReason.permission_required,
+        headless.denial_reason.?,
+    );
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expectEqual(@as(usize, 1), recording.calls);
+}
+
+test "cancelled automatic review remains absorbing with a prompter" {
+    const CancelledReviewer = struct {
+        calls: usize = 0,
+
+        fn classify(
+            raw_ctx: *anyopaque,
+            _: Allocator,
+            _: permission_auto_classifier.ReviewRequest,
+        ) anyerror!permission_auto_classifier.ParseOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+            self.calls += 1;
+            return error.Cancelled;
+        }
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var background: BackgroundRuntime = .{};
+    defer background.deinit(std.testing.allocator);
+    var reviewer = CancelledReviewer{};
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        &background,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&reviewer),
+            CancelledReviewer.classify,
+        ),
+    );
+    input.permission_prompter = recording.prompter();
+
+    try std.testing.expectError(error.Cancelled, requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        .{
+            .id = "cancelled-review",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"exec\",\"command\":\"rm -rf cancelled-review\"}",
+        },
+        .auto,
+        &.{},
+    ));
+
+    try std.testing.expectEqual(@as(usize, 1), reviewer.calls);
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
+}
+
+test "cancelled automatic review remains absorbing without a prompter" {
+    const CancelledReviewer = struct {
+        fn classify(
+            _: *anyopaque,
+            _: Allocator,
+            _: permission_auto_classifier.ReviewRequest,
+        ) anyerror!permission_auto_classifier.ParseOutcome {
+            return error.Cancelled;
+        }
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var background: BackgroundRuntime = .{};
+    defer background.deinit(std.testing.allocator);
+    var reviewer: u8 = 0;
+    const input = testInputWithClassifier(
+        &worker,
+        &background,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&reviewer),
+            CancelledReviewer.classify,
+        ),
+    );
+
+    try std.testing.expectError(error.Cancelled, requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        .{
+            .id = "cancelled-review-headless",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"exec\",\"command\":\"rm -rf cancelled-review-headless\"}",
+        },
+        .auto,
+        &.{},
+    ));
 }
 
 test "configured command authority skips automatic review" {

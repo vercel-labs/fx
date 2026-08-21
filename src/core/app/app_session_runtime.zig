@@ -7441,11 +7441,13 @@ test "resumed recovery checkpoint replays its unfinished turn once" {
         );
         defer writable.deinit(alloc);
         const checkpoint = session_codec.RecoveryCheckpoint{
-            .version = 2,
+            .version = 3,
             .route_identity = .{
                 .connection_id = @constCast("vercel"),
                 .adapter_kind = @constCast("vercel_ai_gateway"),
                 .permission_review_model_id = @constCast("openai/gpt-5.4"),
+                .vision_model_id = @constCast("google/gemini-2.5-flash"),
+                .subagent_model_id = @constCast("saved/model"),
             },
             .turn_id = 41,
             .user = .{ .text = @constCast("unfinished prompt") },

@@ -7,6 +7,8 @@ const file_mutation = @import("../../tooling/file_mutation.zig");
 const tool_admission = @import("../../tooling/tool_admission.zig");
 const session_permission_state = @import("../../permissions/session_permission_state.zig");
 const command_replay_store = @import("../../session/command_replay_store.zig");
+const route_snapshot = @import("../../gateway/route_snapshot.zig");
+const stream_provider = @import("../stream_provider.zig");
 
 pub const vision = @import("vision_contracts.zig");
 
@@ -149,6 +151,12 @@ pub const ToolExecutionRequest = struct {
     result_allocator: Allocator,
     call: ToolCall,
     authority: command_admission.ToolExecutionAuthority,
+    /// Borrowed provider authority already admitted and resolved by the
+    /// owning turn. Tool implementations may consume it but never retain it.
+    route: ?*const route_snapshot.RouteSnapshot = null,
+    provider_adapter: ?stream_provider.ProviderAdapter = null,
+    route_credential: []const u8 = "",
+    route_tenant: ?[]const u8 = null,
     /// Borrowed root-user evidence for subagent execution. This is never
     /// populated from an assistant-authored task prompt.
     root_user_intent_context: []const u8 = "",

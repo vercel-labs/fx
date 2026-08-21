@@ -8,6 +8,7 @@ const agent_stream_provider = @import("../stream_provider.zig");
 const worker_runtime = @import("../worker_runtime.zig");
 const session_runtime = @import("../../session/session.zig");
 const session_codec = @import("../../session/session_codec.zig");
+const session_usage = @import("../../session/session_usage.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const gateway_error_format = @import("../../shared/gateway_error_format.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
@@ -1143,7 +1144,9 @@ fn recoverySelectionChanged(
         !optionalStringsEqual(
             route.permission_review_model_id,
             identity.permission_review_model_id,
-        );
+        ) or
+        !optionalStringsEqual(route.vision_model_id, identity.vision_model_id) or
+        !std.mem.eql(u8, route.subagent_model_id, identity.subagent_model_id);
 }
 
 fn optionalStringsEqual(left: ?[]const u8, right: ?[]const u8) bool {
@@ -1243,7 +1246,7 @@ fn persistRecoveryCheckpoint(
         current_turn_messages,
     );
     try effect.set(deps.ctx, .{
-        .version = 2,
+        .version = 3,
         .route_identity = .{
             .connection_id = @constCast(job.route.connection_id),
             .adapter_kind = @constCast(job.route.adapter_kind),
@@ -1251,6 +1254,11 @@ fn persistRecoveryCheckpoint(
                 @constCast(model)
             else
                 null,
+            .vision_model_id = if (job.route.vision_model_id) |model|
+                @constCast(model)
+            else
+                null,
+            .subagent_model_id = @constCast(job.route.subagent_model_id),
         },
         .delivery = delivery,
         .turn_id = job.turn_id,
@@ -1311,6 +1319,344 @@ fn isPostVisionAssistantPrefillRejection(
     }
     return std.mem.find(u8, detail, "does not support assistant message prefill") != null and
         std.mem.find(u8, detail, "must end with a user message") != null;
+}
+
+const OwnedPermissionReviewStream = struct {
+    result: runtime_gateway_step.StreamResult,
+};
+
+fn deinitPermissionReviewStream(raw: *anyopaque, alloc: Allocator) void {
+    const owned: *OwnedPermissionReviewStream = @ptrCast(@alignCast(raw));
+    owned.result.deinit(alloc);
+    alloc.destroy(owned);
+}
+
+fn discardPermissionReviewChunk(_: *anyopaque, _: []const u8) void {}
+
+fn permissionReviewFailureOutcome(
+    failure_info: ?runtime_gateway_step.StreamFailureInfo,
+    status: ?std.http.Status,
+) permission_auto_classifier.AccountedOutcome {
+    if (failure_info) |failure| {
+        if (failure.category == .timeout) return .timed_out;
+    }
+    if (status) |value| switch (value) {
+        .request_timeout, .gateway_timeout => return .timed_out,
+        else => {},
+    };
+    if (failure_info) |failure| {
+        return if (failure.retryable) .transient_failure else .permanent_failure;
+    }
+    const value = status orelse return .permanent_failure;
+    const code: u16 = @intFromEnum(value);
+    return if (code == 425 or code == 429 or code >= 500)
+        .transient_failure
+    else
+        .permanent_failure;
+}
+
+fn streamPermissionReviewAttempt(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    request: permission_auto_classifier.AccountedRequest,
+) error{OutOfMemory}!permission_auto_classifier.AccountedOutcome {
+    var delivery = runtime_gateway_step.DeliveryCertainty.init();
+    var attempt_evidence: runtime_gateway_step.AttemptEvidence = .{};
+    var failure_info: ?runtime_gateway_step.StreamFailureInfo = null;
+    var callback_context: u8 = 0;
+    var result = runtime_gateway_step.streamModelRequest(
+        request.adapter,
+        alloc,
+        request.route,
+        request.credential,
+        request.tenant,
+        null,
+        request.model,
+        1,
+        request.model_request,
+        null,
+        &delivery,
+        &attempt_evidence,
+        &callback_context,
+        discardPermissionReviewChunk,
+        null,
+        null,
+        null,
+        request.cancel_flag,
+        request.usage,
+        request.usage_allocator,
+        request.trace_ctx,
+        16 * 1024,
+        8 * 1024,
+        &failure_info,
+        .transport,
+    ) catch |err| {
+        debug_trace.logf(
+            "permission",
+            "event=auto_review_stream_failure err={s}",
+            .{@errorName(err)},
+        );
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (err == error.Cancelled or request.cancel_flag.load(.seq_cst)) return .cancelled;
+        if (err == error.Timeout) return .timed_out;
+        return permissionReviewFailureOutcome(failure_info, null);
+    };
+    if (request.cancel_flag.load(.seq_cst)) {
+        result.deinit(alloc);
+        return .cancelled;
+    }
+    if (result.status != .ok) {
+        const status = result.status;
+        debug_trace.logf(
+            "permission",
+            "event=auto_review_stream_rejected status={d} category={s}",
+            .{
+                @intFromEnum(status),
+                if (failure_info) |failure| @tagName(failure.category) else "unknown",
+            },
+        );
+        result.deinit(alloc);
+        return permissionReviewFailureOutcome(failure_info, status);
+    }
+    if (result.completion.finish_reason) |reason| switch (reason) {
+        .provider_error => {
+            result.deinit(alloc);
+            return .transient_failure;
+        },
+        .content_filter => {
+            result.deinit(alloc);
+            return .permanent_failure;
+        },
+        .stop, .length, .tool_calls, .other => {},
+    };
+    const owned = alloc.create(OwnedPermissionReviewStream) catch {
+        result.deinit(alloc);
+        return error.OutOfMemory;
+    };
+    owned.* = .{ .result = result };
+    return .{ .completion = .{
+        .value = owned.result.completion,
+        .context = owned,
+        .deinit_fn = deinitPermissionReviewStream,
+    } };
+}
+
+test "permission review sends usage and generation metadata through session usage" {
+    const Fake = struct {
+        fn stream(
+            _: *const agent_stream_provider.ProviderAdapter,
+            _: Allocator,
+            _: agent_stream_provider.AdapterRequest,
+            events: agent_stream_provider.EventSink,
+        ) anyerror!void {
+            try events.emit(.provider_admitted);
+            try events.emit(.{ .usage = .{ .tokens = .{
+                .input_tokens = 3,
+                .output_tokens = 5,
+            } } });
+            try events.emit(.{ .finish = .{
+                .reason = .stop,
+                .generation_reference = .{
+                    .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    .lookup_scope = "https://reviewer.invalid/generation",
+                },
+            } });
+        }
+    };
+
+    const route = route_snapshot.RouteSnapshot{
+        .connection_id = "connection-a",
+        .adapter_kind = "loopback",
+        .endpoint = "https://reviewer.invalid/chat",
+        .protocol = "loopback",
+        .credential_ref = "key-a",
+        .primary_model_id = "primary-a",
+        .permission_review_model_id = "reviewer-a",
+        .vision_model_id = null,
+        .subagent_model_id = "primary-a",
+        .capabilities = .{},
+        .capability_source = .configured,
+        .selected_fast_mode = false,
+        .fast_model_suffix = null,
+    };
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(std.testing.allocator);
+    var outcome = try streamPermissionReviewAttempt(null, std.testing.allocator, .{
+        .adapter = .{ .kind = "loopback", .stream_fn = Fake.stream },
+        .route = &route,
+        .credential = "credential-a",
+        .tenant = null,
+        .model = "reviewer-a",
+        .model_request = .{
+            .model = "reviewer-a",
+            .serialized_tools = "[]",
+            .messages = &.{},
+            .tool_choice = .auto,
+            .capabilities = .{},
+        },
+        .cancel_flag = &cancel_flag,
+        .usage = &usage,
+        .usage_allocator = std.testing.allocator,
+        .trace_ctx = .{},
+    });
+    defer if (outcome == .completion) outcome.completion.deinit(std.testing.allocator);
+    try std.testing.expect(outcome == .completion);
+    try std.testing.expectEqual(@as(?u64, 3), outcome.completion.value.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 5), outcome.completion.value.usage.output_tokens);
+
+    var snapshot = try usage.snapshot(std.testing.allocator);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(session_usage.Availability.pending, snapshot.billing);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.pending.len);
+    try std.testing.expectEqualStrings(
+        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        snapshot.pending[0].id,
+    );
+}
+
+test "production permission reviewer bounds normalized failure attempts" {
+    const Fixture = struct {
+        const Outcome = enum {
+            request_timeout,
+            gateway_timeout,
+            rate_limited,
+            transient,
+            permanent,
+            content_filter,
+            cancelled,
+        };
+
+        outcome: Outcome,
+        calls: usize = 0,
+
+        fn stream(
+            adapter: *const agent_stream_provider.ProviderAdapter,
+            _: Allocator,
+            _: agent_stream_provider.AdapterRequest,
+            events: agent_stream_provider.EventSink,
+        ) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(adapter.context.?));
+            self.calls += 1;
+            if (self.outcome != .cancelled) try events.emit(.provider_admitted);
+            switch (self.outcome) {
+                .request_timeout => try events.emit(.{ .failure = .{
+                    .category = .protocol,
+                    .retryable = true,
+                    .http_status = .request_timeout,
+                } }),
+                .gateway_timeout => try events.emit(.{ .failure = .{
+                    .category = .timeout,
+                    .retryable = true,
+                    .http_status = .gateway_timeout,
+                } }),
+                .rate_limited => try events.emit(.{ .failure = .{
+                    .category = .rate_limited,
+                    .retryable = true,
+                    .http_status = .too_many_requests,
+                } }),
+                .transient => try events.emit(.{ .failure = .{
+                    .category = .upstream_failure,
+                    .retryable = true,
+                    .http_status = .bad_gateway,
+                } }),
+                .permanent => try events.emit(.{ .failure = .{
+                    .category = .configuration,
+                    .http_status = .bad_request,
+                } }),
+                .content_filter => try events.emit(.{ .finish = .{ .reason = .content_filter } }),
+                .cancelled => try events.emit(.cancelled),
+            }
+        }
+    };
+
+    const route = route_snapshot.RouteSnapshot{
+        .connection_id = "connection-a",
+        .adapter_kind = "loopback",
+        .endpoint = "http://127.0.0.1/a",
+        .protocol = "loopback",
+        .credential_ref = "key-a",
+        .primary_model_id = "primary-a",
+        .permission_review_model_id = "reviewer-a",
+        .vision_model_id = null,
+        .subagent_model_id = "primary-a",
+        .capabilities = .{},
+        .capability_source = .configured,
+        .selected_fast_mode = false,
+        .fast_model_suffix = null,
+    };
+    const pending = types.ChatMessage{
+        .role = .assistant,
+        .tool_calls = &.{.{
+            .id = "call-1",
+            .name = "run_command",
+            .arguments_json = "{\"command\":\"pwd\"}",
+        }},
+    };
+    const request = permission_auto_classifier.ReviewRequest{
+        .workspace_root = "/tmp/workspace",
+        .review_turn = .{
+            .model = "primary-a",
+            .request_messages = &.{.{ .role = .user, .content = "Inspect this workspace." }},
+            .pending_assistant = pending,
+            .target_call_id = "call-1",
+            .origin = .root,
+            .current_root_request = "Inspect this workspace.",
+            .root_text_bindings = &.{.{
+                .message_index = 0,
+                .text = "Inspect this workspace.",
+            }},
+        },
+        .targets = &.{},
+        .action = .{ .tool = .{
+            .tool_name = "run_command",
+            .arguments_json = "{\"command\":\"pwd\"}",
+        } },
+        .escalation_reason = "test",
+    };
+    var cancel_flag = std.atomic.Value(bool).init(false);
+
+    inline for (.{
+        .{ Fixture.Outcome.request_timeout, @as(usize, 1) },
+        .{ Fixture.Outcome.gateway_timeout, @as(usize, 1) },
+        .{ Fixture.Outcome.rate_limited, @as(usize, 1) },
+        .{ Fixture.Outcome.transient, @as(usize, 1) },
+        .{ Fixture.Outcome.permanent, @as(usize, 1) },
+        .{ Fixture.Outcome.content_filter, @as(usize, 1) },
+    }) |case| {
+        var fixture = Fixture{ .outcome = case[0] };
+        var outcome = try permission_auto_classifier.Classifier.withAdapter(.{
+            .adapter = .{
+                .kind = "loopback",
+                .context = &fixture,
+                .stream_fn = Fixture.stream,
+            },
+            .route = &route,
+            .credential = "credential-a",
+            .cancel_flag = &cancel_flag,
+            .stream = .{ .stream_fn = streamPermissionReviewAttempt },
+        }).review(std.testing.allocator, request);
+        defer outcome.deinit(std.testing.allocator);
+        try std.testing.expect(outcome == .invalid);
+        try std.testing.expectEqual(case[1], fixture.calls);
+    }
+
+    var cancelled = Fixture{ .outcome = .cancelled };
+    try std.testing.expectError(
+        error.Cancelled,
+        permission_auto_classifier.Classifier.withAdapter(.{
+            .adapter = .{
+                .kind = "loopback",
+                .context = &cancelled,
+                .stream_fn = Fixture.stream,
+            },
+            .route = &route,
+            .credential = "credential-a",
+            .cancel_flag = &cancel_flag,
+            .stream = .{ .stream_fn = streamPermissionReviewAttempt },
+        }).review(std.testing.allocator, request),
+    );
+    try std.testing.expectEqual(@as(usize, 1), cancelled.calls);
 }
 
 fn waitForRecoveryDelay(
@@ -2022,6 +2368,7 @@ fn containsImageId(image_ids: []const usize, candidate: usize) bool {
 
 fn buildReviewTurnContext(
     config: Config,
+    adapter_input: permission_auto_classifier.AdapterInput,
     model: []const u8,
     current_prompt: []const u8,
     root_user_intent_context: []const u8,
@@ -2044,6 +2391,7 @@ fn buildReviewTurnContext(
         },
         .current_root_request = current_root_request,
         .auto_permission_phase = auto_permission_phase,
+        .adapter_input = adapter_input,
     };
 }
 
@@ -2985,6 +3333,8 @@ fn processQueuedPromptLoop(
                 deps.usage,
                 deps.usage_allocator,
                 step_ctx,
+                null,
+                null,
                 null,
                 .agent,
             ) catch |err| {
@@ -4892,6 +5242,17 @@ fn processQueuedPromptLoop(
 
                     const parallel_review_context = buildReviewTurnContext(
                         config,
+                        .{
+                            .adapter = deps.provider_adapter,
+                            .route = &job.route,
+                            .credential = route_credential.credential,
+                            .tenant = route_credential.tenant,
+                            .cancel_flag = config.cancel_flag,
+                            .usage = deps.usage,
+                            .usage_allocator = deps.usage_allocator,
+                            .stream = .{ .stream_fn = streamPermissionReviewAttempt },
+                            .trace_ctx = step_ctx,
+                        },
                         successful_gateway_model,
                         job.prompt,
                         root_user_intent_context,
@@ -5049,6 +5410,10 @@ fn processQueuedPromptLoop(
                     var parallel_exec_ctx = runtime_parallel_execution.ParallelHookExecContext{
                         .hooks = deps,
                         .turn_id = turn_id,
+                        .route = &job.route,
+                        .provider_adapter = deps.provider_adapter,
+                        .route_credential = route_credential.credential,
+                        .route_tenant = route_credential.tenant,
                         .root_user_intent_context = parallel_execution_root_user_context,
                         .current_turn_messages = within_turn_suffix.items,
                         .session_grants = local_grants.items,
@@ -5878,6 +6243,17 @@ fn processQueuedPromptLoop(
                 tool_call;
             const review_context = buildReviewTurnContext(
                 config,
+                .{
+                    .adapter = deps.provider_adapter,
+                    .route = &job.route,
+                    .credential = route_credential.credential,
+                    .tenant = route_credential.tenant,
+                    .cancel_flag = config.cancel_flag,
+                    .usage = deps.usage,
+                    .usage_allocator = deps.usage_allocator,
+                    .stream = .{ .stream_fn = streamPermissionReviewAttempt },
+                    .trace_ctx = step_ctx,
+                },
                 successful_gateway_model,
                 job.prompt,
                 root_user_intent_context,
@@ -6425,6 +6801,10 @@ fn processQueuedPromptLoop(
                 .result_allocator = arena,
                 .call = execution_call,
                 .authority = execution_authority,
+                .route = &job.route,
+                .provider_adapter = deps.provider_adapter,
+                .route_credential = route_credential.credential,
+                .route_tenant = route_credential.tenant,
                 .root_user_intent_context = tool_execution_root_user_context,
                 .root_user_messages = &.{},
                 .root_user_evidence_complete = true,
@@ -6857,6 +7237,10 @@ fn processQueuedPromptLoop(
                             .result_allocator = arena,
                             .call = execution_call,
                             .authority = broader_authority,
+                            .route = &job.route,
+                            .provider_adapter = deps.provider_adapter,
+                            .route_credential = route_credential.credential,
+                            .route_tenant = route_credential.tenant,
                             .root_user_intent_context = tool_execution_root_user_context,
                             .root_user_messages = &.{},
                             .root_user_evidence_complete = true,
