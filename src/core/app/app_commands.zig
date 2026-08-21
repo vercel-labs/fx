@@ -357,6 +357,7 @@ pub fn Handlers(comptime App: type) type {
                 .handle_notifications = commandHandleNotifications,
                 .handle_workspace = commandHandleWorkspace,
                 .show_version = commandShowVersion,
+                .handle_goal = commandHandleGoal,
                 .unknown = commandUnknown,
             };
         }
@@ -1750,6 +1751,12 @@ pub fn Handlers(comptime App: type) type {
                 .tone = .neutral,
                 .body = App.app_version,
             }, true);
+        }
+
+        fn commandHandleGoal(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const goal_runtime = @import("../goal/goal_runtime.zig");
+            try goal_runtime.handleGoalCommand(App, app, rest);
         }
 
         fn commandUnknown(ctx: *anyopaque, _: []const u8) !void {

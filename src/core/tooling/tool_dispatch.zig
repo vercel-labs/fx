@@ -30,6 +30,7 @@ const workspace_access = @import("../workspace/workspace_access.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
 const terminal_contracts = @import("../terminal/contracts.zig");
 const tool_args = @import("tool_args.zig");
+const goal_module = @import("../goal/goal.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -266,6 +267,8 @@ pub const DispatchContext = struct {
     web_search_completion_sink: ?*?core_types.WebSearchCompletion = null,
     web_fetch_completion_sink: ?*?core_types.WebFetchCompletion = null,
     tool_result_memory_sink: ?*?core_types.ToolResultMemory = null,
+    /// Per-session goal context for the goal tools. Borrowed from the host.
+    goal_ctx: ?*goal_module.GoalToolContext = null,
 };
 
 /// Function pointer used by ask_user_question to request live user answers.
@@ -394,6 +397,9 @@ pub const ExecutorKind = enum {
     mcp_features,
     ask_user_question,
     vision,
+    get_goal,
+    create_goal,
+    update_goal,
 };
 
 pub const ApprovalPolicy = enum {

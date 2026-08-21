@@ -75,6 +75,7 @@ pub const SlashKind = enum {
     notifications,
     workspace,
     version,
+    goal,
 };
 
 pub const OptionDoc = struct {
