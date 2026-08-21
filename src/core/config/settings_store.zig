@@ -8,6 +8,7 @@ const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const context_limits = @import("context_limits.zig");
 const input_appearance = @import("input_appearance.zig");
 const model_provider = @import("model_provider.zig");
+const custom_provider = @import("custom_provider.zig");
 const presentation_mode = @import("presentation_mode.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
@@ -92,6 +93,9 @@ pub const UserSettingsPatch = struct {
     model: ?[]const u8 = null,
     provider: ?model_provider.ProviderId = null,
     codex_model: ?[]const u8 = null,
+    custom_base_url: ?[]const u8 = null,
+    custom_api_key_env: ?[]const u8 = null,
+    custom_model: ?[]const u8 = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     /// Removes the key entirely so resolution returns to plain precedence.
@@ -115,6 +119,9 @@ pub const UserSettingsPatch = struct {
         return self.model == null and
             self.provider == null and
             self.codex_model == null and
+            self.custom_base_url == null and
+            self.custom_api_key_env == null and
+            self.custom_model == null and
             self.permission_mode == null and
             self.credential_source == null and
             !self.clear_credential_source and
@@ -964,6 +971,26 @@ test "provider patch keeps independent Gateway and Codex models" {
     try std.testing.expectEqual(model_provider.ProviderId.codex, model_provider.parse(root.object.get("provider").?.string).?);
 }
 
+test "custom provider patch persists endpoint and model" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{}", .{});
+    const application = try applyUserPatchToRoot(arena.allocator(), &root, .{
+        .provider = .custom,
+        .custom_base_url = "https://openrouter.ai/api/v1",
+        .custom_api_key_env = "OPENROUTER_API_KEY",
+        .custom_model = "deepseek/deepseek-chat",
+    });
+    try std.testing.expect(application.changed);
+    try std.testing.expectEqualStrings("custom", root.object.get("provider").?.string);
+    try std.testing.expectEqualStrings("deepseek/deepseek-chat", root.object.get("custom_model").?.string);
+    const custom = root.object.get("custom_provider").?.object;
+    try std.testing.expectEqualStrings("https://openrouter.ai/api/v1", custom.get("base_url").?.string);
+    try std.testing.expectEqualStrings("OPENROUTER_API_KEY", custom.get("api_key_env").?.string);
+}
+
 test "input appearance validation keeps experiment labels private" {
     try std.testing.expectError(error.InvalidDurableField, validateInputAppearance("minimal-maxxing"));
     try std.testing.expectError(error.InvalidDurableField, validateInputAppearance("no-lines"));
@@ -1007,6 +1034,25 @@ fn applyUserPatchToRoot(
     if (patch.model) |value| application.changed = try putString(arena, &root.object, "model", value) or application.changed;
     if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", @tagName(value)) or application.changed;
     if (patch.codex_model) |value| application.changed = try putString(arena, &root.object, "codex_model", value) or application.changed;
+    if (patch.custom_base_url != null or patch.custom_api_key_env != null) {
+        var custom_object = if (root.object.get("custom_provider")) |existing|
+            switch (existing) {
+                .object => |map| map,
+                else => std.json.ObjectMap.empty,
+            }
+        else
+            std.json.ObjectMap.empty;
+        if (patch.custom_base_url) |value| {
+            try custom_object.put(arena, "base_url", .{ .string = try arena.dupe(u8, value) });
+            application.changed = true;
+        }
+        if (patch.custom_api_key_env) |value| {
+            try custom_object.put(arena, "api_key_env", .{ .string = try arena.dupe(u8, value) });
+            application.changed = true;
+        }
+        try root.object.put(arena, "custom_provider", .{ .object = custom_object });
+    }
+    if (patch.custom_model) |value| application.changed = try putString(arena, &root.object, "custom_model", value) or application.changed;
     if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", @tagName(value)) or application.changed;
     if (patch.credential_source) |value| application.changed = try putString(arena, &root.object, "credential_source", @tagName(value)) or application.changed;
     if (patch.clear_credential_source and root.object.contains("credential_source")) {
@@ -1697,6 +1743,17 @@ fn validateKnownSettingsObject(
     if (object.get("codex_model")) |value| {
         if (value != .string) return error.InvalidSettingsFormat;
         try validateModel(value.string);
+    }
+    if (object.get("custom_model")) |value| {
+        if (value != .string) return error.InvalidSettingsFormat;
+        try validateModel(value.string);
+    }
+    if (object.get("custom_provider")) |value| {
+        if (value != .object) return error.InvalidSettingsFormat;
+        const base_url = value.object.get("base_url") orelse return error.InvalidSettingsFormat;
+        const api_key_env = value.object.get("api_key_env") orelse return error.InvalidSettingsFormat;
+        if (base_url != .string or api_key_env != .string) return error.InvalidSettingsFormat;
+        custom_provider.validate(base_url.string, api_key_env.string) catch return error.InvalidSettingsFormat;
     }
     if (object.get("permission_mode")) |value| {
         if (value != .string or

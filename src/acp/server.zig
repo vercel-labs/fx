@@ -357,6 +357,7 @@ pub fn selectCredentialForProvider(
             .refresh_if_needed,
             provider,
             state.credential_source,
+            null,
         );
         break :blk resolution.credential orelse return false;
     };
@@ -373,6 +374,7 @@ pub fn streamProviderFor(
         .gateway => state.cfg.gateway_provider.agent_stream,
         .codex => state.cfg.codex_agent_stream orelse
             @import("../core/agent/stream_provider.zig").unavailable_provider,
+        .custom => @import("../core/agent/stream_provider.zig").unavailable_provider,
     };
 }
 
@@ -383,6 +385,9 @@ pub fn catalogProviderFor(
     return switch (provider) {
         .gateway => state.cfg.gateway_provider.model_catalog,
         .codex => state.cfg.codex_model_catalog,
+        // The custom catalog arrives with model listing support; until then
+        // the picker relies on manual entry.
+        .custom => null,
     };
 }
 
@@ -1381,6 +1386,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             .refresh_if_needed,
             state.provider,
             preferred,
+            null,
         );
         routed_credential = resolution.credential;
         if (routed_credential == null) {
@@ -1649,6 +1655,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .refresh_if_needed,
                     target,
                     null,
+                    null,
                 );
                 break :credential resolution.credential orelse
                     return state.writer.writeError(alloc, msg.id, .{
@@ -1704,6 +1711,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             const saved_model = switch (target) {
                 .gateway => settings.model,
                 .codex => settings.codex_model,
+                .custom => settings.custom_model,
             };
             var selected_model = catalog.items[0].id;
             if (saved_model) |saved| {

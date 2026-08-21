@@ -39,11 +39,18 @@ pub const ProviderRoute = struct {
 pub const ProviderRoutes = struct {
     gateway: ProviderRoute,
     codex: ProviderRoute,
+    /// Custom endpoints have no transport yet; selection routes to an
+    /// unavailable provider until the OpenAI-compatible transport lands.
+    custom: ?ProviderRoute = null,
 
     pub fn select(self: ProviderRoutes, provider: model_provider.ProviderId) ProviderRoute {
         return switch (provider) {
             .gateway => self.gateway,
             .codex => self.codex,
+            .custom => self.custom orelse .{
+                .agent_stream_provider = stream_provider.unavailable_provider,
+                .permission_reviewer_provider = null,
+            },
         };
     }
 };
@@ -190,6 +197,7 @@ pub fn run(
             .refresh_if_needed,
             admission.provider,
             config.tool_context.credential_source,
+            null,
         ) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             turn.setFailureDiagnostic("model_credential_resolution_failed", @errorName(err)) catch

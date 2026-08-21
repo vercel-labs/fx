@@ -44,6 +44,30 @@ Inside fx, `/provider` switches between Gateway and Codex, and `/model` lists th
 
 The OpenAI Codex route uses ChatGPT subscription access directly and never sends its OAuth token to Vercel AI Gateway. The session is stored privately at `~/.fx/chatgpt-auth.json` and refreshed when needed. On supported Codex models, `/fast` requests OpenAI's priority service tier and consumes ChatGPT credits at the higher Fast mode rate.
 
+You can also configure an OpenAI-compatible endpoint such as OpenRouter or DeepSeek directly.
+
+Store the endpoint and model in `~/.fx/settings.json`, and keep the API key in the environment:
+
+```json
+{
+  "custom_provider": {
+    "base_url": "https://openrouter.ai/api/v1",
+    "api_key_env": "OPENROUTER_API_KEY"
+  },
+  "custom_model": "deepseek/deepseek-chat"
+}
+```
+
+Then run:
+
+```bash
+export OPENROUTER_API_KEY=your-key
+fx provider custom
+fx ask "explain the changes in this repository"
+```
+
+The custom endpoint uses the OpenAI-compatible chat completions format.
+
 To use an AI Gateway API key instead:
 
 ```bash

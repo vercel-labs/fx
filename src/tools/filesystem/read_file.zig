@@ -129,7 +129,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     };
 
     const zio = io_mod.getIo();
-    var file = io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), target) catch |err| {
+    var file = io_mod.openExistingReadOnlyRegularFileNonBlocking(std.Io.Dir.cwd(), target) catch |err| {
         return readFileFailure(ctx.allocator, err, target);
     };
     defer file.close(zio);

@@ -16,6 +16,7 @@ const context_contract = @import("../workspace/context_contract.zig");
 const devbox_executor = @import("../execution/devbox_executor.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
+const openai_compat = @import("../../gateway/openai_compat.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
@@ -281,6 +282,10 @@ fn runAskChild(
                 .agent_stream_provider = ctx.cfg.codex_agent_stream orelse agent_stream_provider.unavailable_provider,
                 .permission_reviewer_provider = ctx.cfg.codex_permission_reviewer_provider,
             },
+            .custom = .{
+                .agent_stream_provider = openai_compat.agent_stream_provider,
+                .permission_reviewer_provider = null,
+            },
         },
         .system_prompt = ctx.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = ctx.cfg.prompt_policy.modelPromptOverlay(admission.model),
@@ -517,6 +522,7 @@ const AskContext = struct {
     cfg: Config,
     deps: RunDeps,
     workspace_root: []const u8,
+    custom_chat_url: []u8 = &.{},
     workspace_access: workspace_access.WorkspaceAccess = .{},
     api_key: []const u8 = "",
     gateway_team: ?[]const u8 = null,
@@ -725,6 +731,7 @@ const AskContext = struct {
         self.permission_rules.deinit(self.alloc);
         self.session.deinit(self.alloc);
         if (self.skills_dir.len > 0) self.alloc.free(self.skills_dir);
+        if (self.custom_chat_url.len > 0) self.alloc.free(self.custom_chat_url);
         self.context_snapshot.deinit(self.alloc);
         if (self.mcp) |m| {
             m.retireAndWait();
@@ -972,7 +979,10 @@ const AskContext = struct {
             .secret_store = self.cfg.secret_store,
             .model = self.model,
             .gateway_retry_count = self.cfg.gateway_retry_count,
-            .gateway_chat_url = self.cfg.gateway_chat_url,
+            .gateway_chat_url = if (self.provider == .custom and self.custom_chat_url.len > 0)
+                self.custom_chat_url
+            else
+                self.cfg.gateway_chat_url,
             .gateway_models_path = self.cfg.gateway_models_path,
             .agent_step_limit = self.agent_step_limit,
             .fast_mode = self.fast_mode,
@@ -1059,6 +1069,8 @@ const AskContext = struct {
         const provider = switch (self.provider) {
             .gateway => self.cfg.permission_reviewer_provider,
             .codex => self.cfg.codex_permission_reviewer_provider,
+            // No auto classifier credential exists for a custom endpoint.
+            .custom => null,
         } orelse
             return permission_auto_classifier.Classifier.disabled();
         return permission_auto_classifier.Classifier.withProvider(provider, .{
@@ -1075,6 +1087,7 @@ const AskContext = struct {
         return switch (self.provider) {
             .gateway => self.cfg.gateway_provider.agent_stream,
             .codex => self.cfg.codex_agent_stream orelse agent_stream_provider.unavailable_provider,
+            .custom => openai_compat.agent_stream_provider,
         };
     }
 
@@ -1447,6 +1460,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     var owned_resumed_model: ?[]u8 = null;
     defer if (owned_resumed_model) |model| alloc.free(model);
     var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
+    ctx.custom_chat_url = startup.takeCustomChatUrl();
     defer ctx.deinit();
     if (options.save_session) {
         _ = try ctx.session.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
@@ -1539,6 +1553,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             .refresh_if_needed,
             ctx.provider,
             preferred,
+            null,
         );
         routed_credential = resolution.credential;
         if (routed_credential == null) {
@@ -1701,7 +1716,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .skills_prompt_section = skills_section,
         .explicit_skills_prompt_section = explicit_skills.text,
         .gateway_retry_count = cfg.gateway_retry_count,
-        .gateway_chat_url = cfg.gateway_chat_url,
+        .gateway_chat_url = if (ctx.provider == .custom and ctx.custom_chat_url.len > 0)
+            ctx.custom_chat_url
+        else
+            cfg.gateway_chat_url,
         .gateway_tools_json = tool_projection.tools_json,
         .custom_tool_guidance = tool_projection.custom_guidance,
         .agent_step_limit = startup.agent_step_limit,
@@ -2007,6 +2025,8 @@ fn selectModelCatalog(
     return switch (provider) {
         .gateway => gateway,
         .codex => codex,
+        // Custom model listing lands with catalog support; manual entry only.
+        .custom => null,
     };
 }
 

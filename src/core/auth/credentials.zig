@@ -40,6 +40,7 @@ pub const CatalogAuthenticatedSource = enum {
     fx_login,
     stored_key,
     chatgpt_subscription,
+    custom_api_key,
 
     fn credentialSource(self: CatalogAuthenticatedSource) Source {
         return switch (self) {
@@ -48,6 +49,7 @@ pub const CatalogAuthenticatedSource = enum {
             .fx_login => .fx_login,
             .stored_key => .stored_key,
             .chatgpt_subscription => .chatgpt_subscription,
+            .custom_api_key => .custom_api_key,
         };
     }
 };
@@ -143,6 +145,7 @@ pub fn catalogAccessForCredential(
         .ai_gateway_api_key => .ai_gateway_api_key,
         .stored_key => .stored_key,
         .chatgpt_subscription => .chatgpt_subscription,
+        .custom_api_key => .custom_api_key,
         .fx_login => blk: {
             const team = team_context orelse
                 return .{ .public_only = .fx_login_team_required };
@@ -236,12 +239,20 @@ pub fn resolveForProvider(
     mode: LoadMode,
     provider: model_provider.ProviderId,
     preferred: ?Source,
+    custom_api_key_env: ?[]const u8,
 ) !Resolution {
     if (provider == .codex) {
         const credential = switch (mode) {
             .stored => try loadStoredChatGptCredential(alloc),
             .refresh_if_needed => try loadChatGptCredential(alloc, transport, .if_needed),
         };
+        return .{ .credential = credential };
+    }
+    if (provider == .custom) {
+        // The custom key lives in the user-configured environment variable;
+        // no precedence walk, OAuth refresh, or stored-key fallback applies.
+        const env_name = custom_api_key_env orelse return .{};
+        const credential = try loadEnvCredential(alloc, env_name, .custom_api_key);
         return .{ .credential = credential };
     }
     return resolvePreferring(
@@ -333,6 +344,10 @@ pub fn loadSource(
         .fx_login => loadFxLoginCredential(alloc, transport),
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
         .chatgpt_subscription => loadChatGptCredential(alloc, transport, .if_needed),
+        // A custom key resolves only through `resolveForProvider`, which is the
+        // one caller that knows the user-configured variable name. Generic
+        // precedence never claims a custom credential.
+        .custom_api_key => null,
     };
 }
 
@@ -357,6 +372,9 @@ pub fn sourceExists(
             break :blk true;
         },
         .chatgpt_subscription => chatgpt_oauth.sourceExists(alloc),
+        // See `loadSource`: the variable name is configuration, so generic
+        // probes cannot answer for custom keys.
+        .custom_api_key => false,
         .stored_key => blk: {
             if (secret_store.isDisabled()) break :blk false;
             const stored = secret_store.load(alloc) catch |err| switch (err) {
@@ -552,6 +570,7 @@ pub fn sourceLabel(source: Source) []const u8 {
         .fx_login => "fx login",
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
         .chatgpt_subscription => "Codex subscription",
+        .custom_api_key => "custom provider API key",
     };
 }
 
@@ -777,6 +796,28 @@ const SecretStoreFixture = struct {
         return false;
     }
 };
+
+test "custom provider resolves its configured environment variable" {
+    const alloc = std.testing.allocator;
+    const env = try CredentialTestEnv.install(alloc, &.{
+        .{ "OPENROUTER_API_KEY", "openrouter-key" },
+    });
+    defer env.deinit();
+
+    const resolution = try resolveForProvider(
+        alloc,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        .refresh_if_needed,
+        .custom,
+        null,
+        "OPENROUTER_API_KEY",
+    );
+    var credential = resolution.credential orelse return error.TestExpectedCredential;
+    defer credential.deinit(alloc);
+    try std.testing.expectEqualStrings("openrouter-key", credential.token);
+    try std.testing.expectEqual(Source.custom_api_key, credential.source);
+}
 
 test "source-specific credential loading bypasses generic precedence" {
     const alloc = std.testing.allocator;

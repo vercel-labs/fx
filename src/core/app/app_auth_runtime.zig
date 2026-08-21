@@ -656,6 +656,7 @@ pub fn Runtime(comptime App: type) type {
                 .refresh_if_needed,
                 target,
                 null,
+                null,
             ) catch |err| {
                 debug_trace.logf("provider", "credential preparation failed provider={t} err={s}", .{ target, @errorName(err) });
                 try app.writeDomainNotice(.{
@@ -739,6 +740,7 @@ pub fn Runtime(comptime App: type) type {
             const saved_model = switch (target) {
                 .gateway => settings.model,
                 .codex => settings.codex_model,
+                .custom => settings.custom_model,
             };
             const requested_model = io_mod.getenv("FX_MODEL") orelse saved_model;
             var selected: ?[]const u8 = null;

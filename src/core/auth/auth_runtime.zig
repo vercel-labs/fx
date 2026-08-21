@@ -626,6 +626,7 @@ pub fn loadStatusSnapshotForProvider(
             .stored,
             selected_provider,
             preferred,
+            null,
         )
     else
         credentials.resolvePreferring(
@@ -1337,6 +1338,9 @@ pub const Runtime = struct {
         provider: model_provider.ProviderId,
     ) !?bool {
         return switch (provider) {
+            // A custom key lives in the configured environment variable; there
+            // is no interactive source selection to perform.
+            .custom => false,
             .codex => if (self.credentialSource() == .chatgpt_subscription)
                 false
             else

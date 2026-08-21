@@ -267,6 +267,9 @@ pub fn Runtime(comptime App: type) type {
 
             var selected_model = startup.takeSelectedModel();
             defer if (selected_model.len > 0) app.alloc.free(selected_model);
+            if (comptime @hasField(App, "custom_chat_url")) {
+                app.custom_chat_url = startup.takeCustomChatUrl();
+            }
             if (comptime @hasField(App, "provider_selection")) {
                 app.provider_selection.adoptOwned(startup.provider, &selected_model);
             } else {

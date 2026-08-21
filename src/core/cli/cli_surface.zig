@@ -861,7 +861,7 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <gateway|codex>\n");
+                try writeStderr(deps, "usage: fx provider <gateway|codex|custom>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
@@ -877,7 +877,12 @@ fn runNonInteractiveWithDeps(
             };
             defer settings.deinit(alloc);
             if ((settings.provider orelse .gateway) == target) {
-                try writeStdout(deps, if (target == .codex) "Codex is already selected.\n" else "Gateway is already selected.\n");
+                const message = switch (target) {
+                    .gateway => "Gateway is already selected.\n",
+                    .codex => "Codex is already selected.\n",
+                    .custom => "Custom provider is already selected.\n",
+                };
+                try writeStdout(deps, message);
                 return .handled_success;
             }
 
@@ -888,6 +893,7 @@ fn runNonInteractiveWithDeps(
                 .refresh_if_needed,
                 target,
                 settings.credential_source,
+                settings.custom_api_key_env,
             );
             defer if (resolution.credential) |*credential| credential.deinit(alloc);
             if (resolution.credential == null and target == .codex) {
@@ -903,15 +909,48 @@ fn runNonInteractiveWithDeps(
                     .refresh_if_needed,
                     target,
                     settings.credential_source,
+                    settings.custom_api_key_env,
                 );
             }
             const credential = if (resolution.credential) |*value| value else {
-                try writeStderr(deps, if (target == .codex)
-                    "fx provider: run fx login codex first\n"
-                else
-                    "fx provider: configure a Gateway credential first\n");
+                if (target == .custom) {
+                    const env_name = settings.custom_api_key_env orelse "the configured API key variable";
+                    const message = try std.fmt.allocPrint(alloc, "fx provider: set {s} first\n", .{env_name});
+                    defer alloc.free(message);
+                    try writeStderr(deps, message);
+                } else {
+                    try writeStderr(deps, if (target == .codex)
+                        "fx provider: run fx login codex first\n"
+                    else
+                        "fx provider: configure a Gateway credential first\n");
+                }
                 return .handled_failure;
             };
+            if (target == .custom) {
+                if (settings.custom_base_url == null or settings.custom_api_key_env == null) {
+                    try writeStderr(deps, "fx provider: configure custom_provider.base_url and custom_provider.api_key_env first\n");
+                    return .handled_failure;
+                }
+                const selected_model = settings.custom_model orelse {
+                    try writeStderr(deps, "fx provider: configure custom_model first\n");
+                    return .handled_failure;
+                };
+                var attempt = config_runtime.attemptUserPreferences(alloc, .{
+                    .provider = .custom,
+                    .custom_model = selected_model,
+                });
+                defer attempt.deinit(alloc);
+                switch (attempt) {
+                    .failure => |failure| {
+                        debug_trace.logf("config", "custom provider persistence failed err={s}", .{@errorName(failure.err)});
+                        try writeStderr(deps, "fx provider: failed to save provider selection\n");
+                        return .handled_failure;
+                    },
+                    .outcome => {},
+                }
+                try writeStdout(deps, "Provider set to custom.\n");
+                return .handled_success;
+            }
             const catalog_provider = if (target == .codex)
                 cfg.codex_model_catalog orelse {
                     try writeStderr(deps, "fx provider: Codex model catalog is unavailable\n");

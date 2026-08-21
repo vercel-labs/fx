@@ -54,6 +54,7 @@ const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_providers = @import("builtins/providers.zig");
 const openai_codex_models = @import("gateway/openai_codex_models.zig");
 const openai_codex_permission_reviewer = @import("gateway/openai_codex_permission_reviewer.zig");
+const openai_compat = @import("gateway/openai_compat.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
@@ -436,6 +437,9 @@ const App = struct {
     }
 
     pub fn agentStreamProvider(self: *const Self) agent_stream_provider.Provider {
+        if (self.provider_selection.selection().provider == .custom) {
+            return openai_compat.agent_stream_provider;
+        }
         return self.subagentProviderRoutes()
             .select(self.provider_selection.selection().provider)
             .agent_stream_provider;
@@ -500,6 +504,7 @@ const App = struct {
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
     workspace_root: []u8 = &.{},
+    custom_chat_url: []u8 = &.{},
     workspace_identity: statusline_identity.Runtime = .{},
     workspace_host: WorkspaceHostRuntime = .{},
     workspace: app_workspace_runtime.State = .{},
@@ -865,6 +870,7 @@ const App = struct {
         self.lifecycle_runtime.deinit();
 
         self.auth.deinit(self.alloc);
+        if (self.custom_chat_url.len > 0) self.alloc.free(self.custom_chat_url);
         WorkspaceAppRuntime.deinit(self);
         self.workspace_identity.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
@@ -1609,6 +1615,13 @@ const App = struct {
                     openai_codex_permission_reviewer.provider
                 else
                     null,
+            },
+            .custom = .{
+                .agent_stream_provider = if (comptime host_target.is_wasm)
+                    agent_stream_provider.unavailable_provider
+                else
+                    builtin_providers.agentStream(.custom),
+                .permission_reviewer_provider = null,
             },
         };
     }

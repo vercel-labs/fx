@@ -355,6 +355,7 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
             .vercel_oidc_token => "Gateway catalog: authenticated with the Vercel session.",
             .stored_key => "Gateway catalog: authenticated with the stored API key.",
             .chatgpt_subscription => "Codex catalog: authenticated with a subscription.",
+            .custom_api_key => "Custom provider catalog: authenticated with an API key.",
         };
     }
     return null;

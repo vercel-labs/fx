@@ -226,7 +226,11 @@ pub fn Runtime(comptime App: type) type {
                     host.unavailable_secret_store,
                 .model = provider_runtime.model(app),
                 .gateway_retry_count = gateway_retry_count,
-                .gateway_chat_url = gateway_chat_url,
+                .gateway_chat_url = if (provider_runtime.provider(app) == .custom and
+                    @hasField(App, "custom_chat_url") and app.custom_chat_url.len > 0)
+                    app.custom_chat_url
+                else
+                    gateway_chat_url,
                 .gateway_models_path = if (comptime @hasField(App, "web_search_models_path")) app.web_search_models_path else "/v1/models",
                 .agent_step_limit = app.agent_step_limit,
                 .fast_mode = agent_settings.fast_mode,
@@ -1142,7 +1146,11 @@ pub fn Runtime(comptime App: type) type {
                     &app.worker.worker_recovery_pause_requested
                 else
                     null,
-                .gateway_chat_url = gateway_chat_url,
+                .gateway_chat_url = if (provider_runtime.provider(app) == .custom and
+                    @hasField(App, "custom_chat_url") and app.custom_chat_url.len > 0)
+                    app.custom_chat_url
+                else
+                    gateway_chat_url,
                 .gateway_tools_json = tool_projection.tools_json,
                 .custom_tool_guidance = tool_projection.custom_guidance,
                 .agent_step_limit = app.agent_step_limit,

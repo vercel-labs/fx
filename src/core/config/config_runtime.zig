@@ -10,6 +10,7 @@ const sandbox = @import("../permissions/sandbox.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const settings_store = @import("settings_store.zig");
 const model_provider = @import("model_provider.zig");
+pub const custom_provider = @import("custom_provider.zig");
 const update_target = @import("../upgrade/update_target.zig");
 pub const context_limits = @import("context_limits.zig");
 
@@ -40,6 +41,9 @@ pub const Settings = struct {
     model: ?[]u8 = null,
     provider: ?model_provider.ProviderId = null,
     codex_model: ?[]u8 = null,
+    custom_base_url: ?[]u8 = null,
+    custom_api_key_env: ?[]u8 = null,
+    custom_model: ?[]u8 = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     yolo_acknowledged: ?bool = null,
@@ -71,6 +75,9 @@ pub const Settings = struct {
     pub fn deinit(self: *Settings, alloc: Allocator) void {
         if (self.model) |value| alloc.free(value);
         if (self.codex_model) |value| alloc.free(value);
+        if (self.custom_base_url) |value| alloc.free(value);
+        if (self.custom_api_key_env) |value| alloc.free(value);
+        if (self.custom_model) |value| alloc.free(value);
         if (self.input_appearance) |value| alloc.free(value);
         if (self.maxxing_mode) |value| alloc.free(value);
         if (self.sandbox) |value| alloc.free(value);
@@ -111,6 +118,9 @@ pub const ConfigSources = struct {
     model: ConfigSource = .compiled_default,
     provider: ConfigSource = .compiled_default,
     codex_model: ConfigSource = .compiled_default,
+    custom_base_url: ConfigSource = .compiled_default,
+    custom_api_key_env: ConfigSource = .compiled_default,
+    custom_model: ConfigSource = .compiled_default,
     permission_mode: ConfigSource = .compiled_default,
     effort: ConfigSource = .compiled_default,
     fast_mode: ConfigSource = .compiled_default,
@@ -550,6 +560,8 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "model",
         "provider",
         "codex_model",
+        "custom_provider",
+        "custom_model",
         "effort",
         "fast_mode",
         "input_appearance",
@@ -596,6 +608,9 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.model != null) sources.model = source;
     if (settings.provider != null) sources.provider = source;
     if (settings.codex_model != null) sources.codex_model = source;
+    if (settings.custom_base_url != null) sources.custom_base_url = source;
+    if (settings.custom_api_key_env != null) sources.custom_api_key_env = source;
+    if (settings.custom_model != null) sources.custom_model = source;
     if (settings.permission_mode != null) sources.permission_mode = source;
     if (settings.effort != null) sources.effort = source;
     if (settings.fast_mode != null) sources.fast_mode = source;
@@ -1349,6 +1364,22 @@ fn parseProfileOnlyFields(
         settings.codex_model = try alloc.dupe(u8, model_value.string);
     }
 
+    if (root.object.get("custom_model")) |model_value| {
+        if (model_value != .string) return error.InvalidCustomModelType;
+        settings_store.validateModel(model_value.string) catch return error.InvalidCustomModelValue;
+        settings.custom_model = try alloc.dupe(u8, model_value.string);
+    }
+
+    if (root.object.get("custom_provider")) |custom_value| {
+        if (custom_value != .object) return error.InvalidCustomProviderType;
+        const base_url_value = custom_value.object.get("base_url") orelse return error.MissingCustomBaseUrl;
+        const api_key_env_value = custom_value.object.get("api_key_env") orelse return error.MissingCustomApiKeyEnv;
+        if (base_url_value != .string or api_key_env_value != .string) return error.InvalidCustomProviderType;
+        custom_provider.validate(base_url_value.string, api_key_env_value.string) catch return error.InvalidCustomProviderValue;
+        settings.custom_base_url = try alloc.dupe(u8, base_url_value.string);
+        settings.custom_api_key_env = try alloc.dupe(u8, api_key_env_value.string);
+    }
+
     if (root.object.get("permission_mode")) |permission_mode_value| {
         const value = permission_mode_value;
         if (value != .string) return error.InvalidPermissionModeType;
@@ -1540,6 +1571,21 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
         if (target.codex_model) |current| alloc.free(current);
         target.codex_model = value;
         incoming.codex_model = null;
+    }
+    if (incoming.custom_base_url) |value| {
+        if (target.custom_base_url) |current| alloc.free(current);
+        target.custom_base_url = value;
+        incoming.custom_base_url = null;
+    }
+    if (incoming.custom_api_key_env) |value| {
+        if (target.custom_api_key_env) |current| alloc.free(current);
+        target.custom_api_key_env = value;
+        incoming.custom_api_key_env = null;
+    }
+    if (incoming.custom_model) |value| {
+        if (target.custom_model) |current| alloc.free(current);
+        target.custom_model = value;
+        incoming.custom_model = null;
     }
     if (incoming.permission_mode) |value| target.permission_mode = value;
     if (incoming.credential_source) |value| target.credential_source = value;
@@ -2092,6 +2138,18 @@ test "provider settings keep independent Gateway and Codex models" {
     try std.testing.expectEqual(model_provider.ProviderId.codex, settings.provider.?);
     try std.testing.expectEqualStrings("gateway/model", settings.model.?);
     try std.testing.expectEqualStrings("gpt-5.4-mini", settings.codex_model.?);
+}
+
+test "custom provider settings parse and validate" {
+    var settings = try parseSettingsJson(
+        std.testing.allocator,
+        "{\"provider\":\"custom\",\"custom_provider\":{\"base_url\":\"https://openrouter.ai/api/v1\",\"api_key_env\":\"OPENROUTER_API_KEY\"},\"custom_model\":\"deepseek/deepseek-chat\"}",
+    );
+    defer settings.deinit(std.testing.allocator);
+    try std.testing.expectEqual(model_provider.ProviderId.custom, settings.provider.?);
+    try std.testing.expectEqualStrings("https://openrouter.ai/api/v1", settings.custom_base_url.?);
+    try std.testing.expectEqualStrings("OPENROUTER_API_KEY", settings.custom_api_key_env.?);
+    try std.testing.expectEqualStrings("deepseek/deepseek-chat", settings.custom_model.?);
 }
 
 test "max_agent_steps explicit zero survives serialization round trip" {

@@ -254,7 +254,7 @@ fn openExistingRegularFileWithPolicy(
 /// Opens an existing read-only regular file without following the final
 /// symlink or blocking if a special file races the metadata check. Hard-linked
 /// regular files remain valid. The caller owns the returned file.
-pub fn openExistingReadOnlyRegularFile(
+pub fn openExistingReadOnlyRegularFileNonBlocking(
     dir: std.Io.Dir,
     sub_path: []const u8,
 ) !std.Io.File {

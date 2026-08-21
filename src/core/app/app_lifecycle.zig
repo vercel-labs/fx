@@ -125,6 +125,7 @@ pub const StartupState = struct {
     provider: model_provider.ProviderId = .gateway,
     selected_model: []u8 = &.{},
     configured_model: []u8 = &.{},
+    custom_chat_url: []u8 = &.{},
     model_source: config_runtime.ModelSource = .compiled_default,
     permission_mode: PermissionMode = default_permission_mode,
     yolo_acknowledged: bool = false,
@@ -161,6 +162,7 @@ pub const StartupState = struct {
         if (self.credential) |*credential| credential.deinit(alloc);
         if (self.selected_model.len > 0) alloc.free(self.selected_model);
         if (self.configured_model.len > 0) alloc.free(self.configured_model);
+        if (self.custom_chat_url.len > 0) alloc.free(self.custom_chat_url);
         self.permission_rules.deinit(alloc);
         if (self.config_diagnostics.len > 0) {
             for (self.config_diagnostics) |*diagnostic| diagnostic.deinit(alloc);
@@ -206,6 +208,12 @@ pub const StartupState = struct {
     pub fn takeSelectedModel(self: *StartupState) []u8 {
         const value = self.selected_model;
         self.selected_model = &.{};
+        return value;
+    }
+
+    pub fn takeCustomChatUrl(self: *StartupState) []u8 {
+        const value = self.custom_chat_url;
+        self.custom_chat_url = &.{};
         return value;
     }
 
@@ -404,6 +412,10 @@ fn loadStartupStateFromOwnedWorkspace(
     const configured_selection = try configuredProviderSelection(default_model, settings);
     state.provider = configured_selection.provider;
     state.configured_model = try alloc.dupe(u8, configured_selection.model);
+    if (settings.custom_base_url) |base_url| {
+        const trimmed = std.mem.trimEnd(u8, base_url, "/");
+        state.custom_chat_url = try std.fmt.allocPrint(alloc, "{s}/chat/completions", .{trimmed});
+    }
     state.model_source = detailed.model_source orelse .compiled_default;
     state.selected_model = try loadInitialModel(alloc, configured_selection.model, null);
     if (hasProcessModelOverride()) state.model_source = .process_override;
@@ -419,6 +431,7 @@ fn loadStartupStateFromOwnedWorkspace(
             mode,
             state.provider,
             settings.credential_source,
+            settings.custom_api_key_env,
         );
         state.credential = resolution.credential;
         state.stored_key_status = resolution.stored_key_status;
@@ -1122,6 +1135,7 @@ fn configuredProviderSelection(
     const model = switch (provider) {
         .gateway => settings.model orelse default_model,
         .codex => settings.codex_model orelse return error.CodexModelNotSelected,
+        .custom => settings.custom_model orelse return error.CustomModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
 }

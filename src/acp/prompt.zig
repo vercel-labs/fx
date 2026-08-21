@@ -250,6 +250,9 @@ const AcpContext = struct {
             .permission_reviewer_provider = switch (session.provider) {
                 .gateway => self.state.cfg.permission_reviewer_provider,
                 .codex => self.state.cfg.codex_permission_reviewer_provider,
+                // No auto classifier credential exists for a custom endpoint;
+                // admission falls back to interactive review.
+                .custom => null,
             },
             .auto_classifier = self.auto_classifier,
             .subagent_host = self.state.subagent_host,

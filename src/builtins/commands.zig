@@ -137,7 +137,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .provider,
         .token = "provider",
-        .usage = "provider <gateway|codex>",
+        .usage = "provider <gateway|codex|custom>",
         .summary = "Choose the model provider used by fx",
     },
     .{
@@ -294,7 +294,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .login, .usage = "login [vercel|codex]" },
         .{ .kind = .logout, .usage = "logout [vercel|codex]" },
-        .{ .kind = .provider, .usage = "provider <gateway|codex>" },
+        .{ .kind = .provider, .usage = "provider <gateway|codex|custom>" },
         .{ .kind = .setup, .usage = "setup" },
         .{ .kind = .teams, .usage = "teams" },
         .{ .kind = .credits, .usage = "credits|balance" },
