@@ -5,15 +5,6 @@ const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// Goal token delta for a single usage record. fx has no cached-input split, so
-/// every input token counts toward the goal budget; fx treats all input as
-/// billable.
-pub fn goalTokenDeltaForUsage(usage: types.ToolUsage) i64 {
-    const input = @as(i64, @intCast(usage.input_tokens));
-    const output = @as(i64, @intCast(usage.output_tokens));
-    return input + @max(output, 0);
-}
-
 /// In-memory accounting state for the active goal's budget consumption. One
 /// per session. Tracks the last-accounted token usage baseline and the
 /// wall-clock baseline so deltas are computed only once per turn boundary.
@@ -124,11 +115,6 @@ pub fn accountProgress(
     };
     if (budget_limit_reached) updated.status = .budget_limited;
     return .{ .goal = updated, .budget_limit_reached = budget_limit_reached };
-}
-
-test "goalTokenDeltaForUsage sums input and output" {
-    const usage = types.ToolUsage{ .input_tokens = 120, .output_tokens = 80 };
-    try std.testing.expectEqual(@as(i64, 200), goalTokenDeltaForUsage(usage));
 }
 
 test "recordUsage returns delta and advances baseline" {
