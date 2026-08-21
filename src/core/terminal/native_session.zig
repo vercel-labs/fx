@@ -3391,6 +3391,7 @@ const Session = struct {
         const command_path = if (request.command != null) paths.command else null;
         const bootstrap = try shell_resolver.buildBootstrap(
             self.alloc,
+            invocation.kind,
             executable,
             paths.marker_socket,
             &nonce,
@@ -3738,6 +3739,7 @@ const Session = struct {
         defer self.alloc.free(executable);
         const bootstrap = try shell_resolver.buildBootstrap(
             self.alloc,
+            invocation.kind,
             executable,
             control_path,
             &nonce,

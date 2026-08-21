@@ -14,12 +14,13 @@ pub const ResolveError = error{
 pub const Profile = command_environment.Profile;
 pub const Environment = command_environment.Environment;
 
-const ShellKind = enum { bash, zsh };
+pub const ShellKind = enum { bash, zsh, fish };
 
 fn shellKind(path: []const u8) ?ShellKind {
     const basename = std.fs.path.basename(path);
     if (std.mem.eql(u8, basename, "bash")) return .bash;
     if (std.mem.eql(u8, basename, "zsh")) return .zsh;
+    if (std.mem.eql(u8, basename, "fish")) return .fish;
     return null;
 }
 
@@ -36,6 +37,7 @@ fn supportedLoginShell(configured_login_shell: ?[]const u8) ResolveError![]const
 
 pub const Invocation = struct {
     path: []const u8,
+    kind: ShellKind,
     values: [6][]const u8 = @splat(""),
     len: usize = 0,
 
@@ -78,7 +80,7 @@ pub fn resolve(
 
     const kind = shellKind(selection.path) orelse return error.UnsupportedShell;
 
-    var result = Invocation{ .path = selection.path };
+    var result = Invocation{ .path = selection.path, .kind = kind };
     result.append(selection.path);
     switch (kind) {
         .bash => {
@@ -93,6 +95,14 @@ pub fn resolve(
         .zsh => {
             if (selection.clean_start) {
                 result.append("-f");
+            } else {
+                result.append("-l");
+            }
+            result.append("-i");
+        },
+        .fish => {
+            if (selection.clean_start) {
+                result.append("--no-config");
             } else {
                 result.append("-l");
             }
@@ -181,10 +191,16 @@ pub fn capturedInvocation(environment_value: Environment, command: []const u8) R
         },
         .user => |path| {
             var invocation = try resolve(path, .user_login);
-            if (std.mem.eql(u8, std.fs.path.basename(path), "bash")) {
-                removeInteractiveFlag(&invocation);
-                invocation.append("-O");
-                invocation.append("expand_aliases");
+            switch (invocation.kind) {
+                .bash => {
+                    removeInteractiveFlag(&invocation);
+                    invocation.append("-O");
+                    invocation.append("expand_aliases");
+                },
+                // Fish loads functions from configuration without -i, and a
+                // forced interactive capture would leak greeting output.
+                .fish => removeInteractiveFlag(&invocation),
+                .zsh => {},
             }
             invocation.setCommand(command);
             return invocation;
@@ -213,6 +229,7 @@ fn removeInteractiveFlag(invocation: *Invocation) void {
 
 pub fn buildBootstrap(
     alloc: Allocator,
+    kind: ShellKind,
     executable: []const u8,
     control_path: []const u8,
     nonce: []const u8,
@@ -221,11 +238,24 @@ pub fn buildBootstrap(
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(alloc);
 
-    try output.appendSlice(alloc, "set +x; ");
+    switch (kind) {
+        // Disable tracing so user configuration cannot leak the control nonce.
+        .bash, .zsh => try output.appendSlice(alloc, "set +x; "),
+        .fish => try output.appendSlice(alloc, "set -e fish_trace; "),
+    }
     if (command_path) |path| {
-        try output.appendSlice(alloc, "fx_terminal_command=$(< ");
-        try appendShellWord(&output, alloc, path);
-        try output.appendSlice(alloc, ") || exit 125; ");
+        switch (kind) {
+            .bash, .zsh => {
+                try output.appendSlice(alloc, "fx_terminal_command=$(< ");
+                try appendShellWord(&output, alloc, path);
+                try output.appendSlice(alloc, ") || exit 125; ");
+            },
+            .fish => {
+                try output.appendSlice(alloc, "set fx_terminal_command (string collect < ");
+                try appendShellWord(&output, alloc, path);
+                try output.appendSlice(alloc, ") || exit 125; ");
+            },
+        }
     }
     try appendMarker(&output, alloc, executable, control_path, nonce, "shell-ready");
     if (command_path) |_| {
@@ -238,11 +268,18 @@ pub fn buildBootstrap(
             nonce,
             "command-started",
         );
-        try output.appendSlice(
-            alloc,
-            " || exit 125; builtin eval -- \"$fx_terminal_command\"; " ++
-                "fx_terminal_status=$?; exit \"$fx_terminal_status\"\n",
-        );
+        switch (kind) {
+            .bash, .zsh => try output.appendSlice(
+                alloc,
+                " || exit 125; builtin eval -- \"$fx_terminal_command\"; " ++
+                    "fx_terminal_status=$?; exit \"$fx_terminal_status\"\n",
+            ),
+            .fish => try output.appendSlice(
+                alloc,
+                " || exit 125; eval $fx_terminal_command; " ++
+                    "set fx_terminal_status $status; exit $fx_terminal_status\n",
+            ),
+        }
     } else {
         try output.appendSlice(alloc, " || exit 125\n");
     }
@@ -349,12 +386,32 @@ test "resolver rejects missing relative and unsupported shells" {
     );
     try std.testing.expectError(
         error.UnsupportedShell,
-        resolve(null, .{ .executable = .{ .path = "/bin/fish" } }),
+        resolve(null, .{ .executable = .{ .path = "/usr/local/bin/nu" } }),
+    );
+}
+
+test "resolver builds fish interactive argv" {
+    const user = try resolve("/opt/homebrew/bin/fish", .user_login);
+    try std.testing.expectEqual(ShellKind.fish, user.kind);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "/opt/homebrew/bin/fish", "-l", "-i" },
+        user.argv(),
+    );
+
+    const clean = try resolve(
+        null,
+        .{ .executable = .{ .path = "/usr/bin/fish", .clean_start = true } },
+    );
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "/usr/bin/fish", "--no-config", "-i" },
+        clean.argv(),
     );
 }
 
 test "login shell resolution falls back without accepting explicit unsupported shells" {
-    const fallback = try resolve("/opt/homebrew/bin/fish", .user_login);
+    const fallback = try resolve("/usr/local/bin/nu", .user_login);
     try std.testing.expectEqualStrings(fallbackLoginShell(), fallback.path);
     if (builtin.os.tag == .macos) {
         try std.testing.expectEqualSlices(
@@ -372,7 +429,7 @@ test "login shell resolution falls back without accepting explicit unsupported s
 
     try std.testing.expectError(
         error.UnsupportedShell,
-        resolve(null, .{ .executable = .{ .path = "/opt/homebrew/bin/fish" } }),
+        resolve(null, .{ .executable = .{ .path = "/usr/local/bin/nu" } }),
     );
 }
 
@@ -400,6 +457,18 @@ test "captured profiles use exact non-PTY argv" {
         []const u8,
         &.{ "/bin/zsh", "-l", "-i", "-c", "printf user" },
         zsh_user.argv(),
+    );
+    const fish_clean = try capturedInvocation(.{ .clean = "/usr/bin/fish" }, "printf clean");
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "/usr/bin/fish", "--no-config", "-c", "printf clean" },
+        fish_clean.argv(),
+    );
+    const fish_user = try capturedInvocation(.{ .user = "/usr/bin/fish" }, "printf user");
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "/usr/bin/fish", "-l", "-c", "printf user" },
+        fish_user.argv(),
     );
 }
 
@@ -434,8 +503,8 @@ test "unsupported login shell profiles fall back for captured and persistent exe
     const arena = arena_state.allocator();
 
     const fallback = fallbackLoginShell();
-    const user_environment = try environment(arena, "/opt/homebrew/bin/fish", .user);
-    const clean_environment = try environment(arena, "/opt/homebrew/bin/fish", .clean);
+    const user_environment = try environment(arena, "/usr/local/bin/nu", .user);
+    const clean_environment = try environment(arena, "/usr/local/bin/nu", .clean);
     try std.testing.expect(user_environment.eql(.{ .user = fallback }));
     try std.testing.expect(clean_environment.eql(.{ .clean = fallback }));
 
@@ -446,17 +515,36 @@ test "unsupported login shell profiles fall back for captured and persistent exe
 
     try std.testing.expectEqualStrings(
         fallback,
-        (try profileShell(arena, "/opt/homebrew/bin/fish", .user)).executable.path,
+        (try profileShell(arena, "/usr/local/bin/nu", .user)).executable.path,
     );
     try std.testing.expectEqualStrings(
         fallback,
-        (try profileShell(arena, "/opt/homebrew/bin/fish", .clean)).executable.path,
+        (try profileShell(arena, "/usr/local/bin/nu", .clean)).executable.path,
+    );
+}
+
+test "fish login shell profiles resolve natively for captured and persistent execution" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const fish = "/opt/homebrew/bin/fish";
+    try std.testing.expect((try environment(arena, fish, .user)).eql(.{ .user = fish }));
+    try std.testing.expect((try environment(arena, fish, .clean)).eql(.{ .clean = fish }));
+    try std.testing.expectEqual(
+        contracts.ShellSpec.user_login,
+        try profileShell(arena, fish, .user),
+    );
+    try std.testing.expectEqualStrings(
+        fish,
+        (try profileShell(arena, fish, .clean)).executable.path,
     );
 }
 
 test "bootstrap quotes private paths and separates command completion" {
     const commandless = try buildBootstrap(
         std.testing.allocator,
+        .zsh,
         "/tmp/fx'bin",
         "/tmp/control",
         "nonce",
@@ -471,6 +559,7 @@ test "bootstrap quotes private paths and separates command completion" {
 
     const command = try buildBootstrap(
         std.testing.allocator,
+        .bash,
         "/tmp/fx",
         "/tmp/control",
         "nonce",
@@ -498,15 +587,53 @@ test "bootstrap quotes private paths and separates command completion" {
     );
 }
 
-fn checkBootstrapAllocationFailures(alloc: Allocator) !void {
-    const bootstrap = try buildBootstrap(
-        alloc,
+test "fish bootstrap uses fish dialect for capture eval and status" {
+    const commandless = try buildBootstrap(
+        std.testing.allocator,
+        .fish,
+        "/tmp/fx'bin",
+        "/tmp/control",
+        "nonce",
+        null,
+    );
+    defer std.testing.allocator.free(commandless);
+    try std.testing.expectEqualStrings(
+        "set -e fish_trace; '/tmp/fx'\"'\"'bin' '--fx-internal-terminal-control' " ++
+            "'/tmp/control' 'nonce' 'shell-ready' || exit 125\n",
+        commandless,
+    );
+
+    const command = try buildBootstrap(
+        std.testing.allocator,
+        .fish,
         "/tmp/fx",
         "/tmp/control",
         "nonce",
         "/tmp/command",
     );
-    defer alloc.free(bootstrap);
+    defer std.testing.allocator.free(command);
+    try std.testing.expectEqualStrings(
+        "set -e fish_trace; " ++
+            "set fx_terminal_command (string collect < '/tmp/command') || exit 125; " ++
+            "'/tmp/fx' '--fx-internal-terminal-control' '/tmp/control' 'nonce' 'shell-ready' || exit 125; " ++
+            "'/tmp/fx' '--fx-internal-terminal-control' '/tmp/control' 'nonce' 'command-started' || exit 125; " ++
+            "eval $fx_terminal_command; set fx_terminal_status $status; exit $fx_terminal_status\n",
+        command,
+    );
+}
+
+fn checkBootstrapAllocationFailures(alloc: Allocator) !void {
+    inline for (.{ ShellKind.bash, ShellKind.fish }) |kind| {
+        const bootstrap = try buildBootstrap(
+            alloc,
+            kind,
+            "/tmp/fx",
+            "/tmp/control",
+            "nonce",
+            "/tmp/command",
+        );
+        defer alloc.free(bootstrap);
+    }
     const source = try buildSourceCommand(alloc, "/tmp/bootstrap");
     defer alloc.free(source);
 }

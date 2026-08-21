@@ -7392,7 +7392,7 @@ test("Bash and zsh preserve trusted normal startup and controlled clean startup"
     {
       cwd: home,
       shell: {
-        executable: { path: "/bin/fish", clean_start: true },
+        executable: { path: "/bin/nu", clean_start: true },
       },
       backend: "native",
       return_when: { started: {} },
