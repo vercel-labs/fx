@@ -845,13 +845,24 @@ const SupportedRegistry = struct {
     /// while other threads are reading.
     pub fn shutdownSessionsOnly(self: *SupportedRegistry) void {
         const zio = io_mod.getIo();
+        // Take a reference on every live session before releasing the lock.
+        // A bare pointer copy would not stop a client that still holds the
+        // registry from recycling a reference-free slot and destroying the
+        // session this loop is about to signal, which is the use-after-free
+        // this drain exists to prevent. Recycling skips a referenced slot.
+        var pinned: [max_sessions]?*Session = @splat(null);
         self.mutex.lockUncancelable(zio);
-        var sessions = self.sessions;
+        for (&self.sessions, 0..) |*entry, index| {
+            const session = entry.* orelse continue;
+            self.references[index] += 1;
+            pinned[index] = session;
+        }
         self.mutex.unlock(zio);
 
-        for (&sessions) |*entry| {
-            const session = entry.* orelse continue;
+        for (&pinned, 0..) |maybe_session, index| {
+            const session = maybe_session orelse continue;
             session.shutdown();
+            self.releaseReference(index, session);
         }
     }
 
@@ -7285,7 +7296,15 @@ test "shutdownSessionsOnly signals live sessions and leaves them allocated" {
     };
     registry.sessions[0] = &session;
 
+    // A slot with no outstanding reference is exactly the slot a client may
+    // recycle, so this is the case the pin has to cover.
+    try std.testing.expectEqual(@as(usize, 0), registry.references[0]);
+
     registry.shutdownSessionsOnly();
+
+    // Every reference taken to pin the session for shutdown is given back, so
+    // the drain cannot wedge a later removeOwned that waits for the count.
+    try std.testing.expectEqual(@as(usize, 0), registry.references[0]);
 
     // The liveness handle is released, so the session was actually shut down.
     try std.testing.expect(session.liveness_file == null);
@@ -7294,4 +7313,65 @@ test "shutdownSessionsOnly signals live sessions and leaves them allocated" {
     // client threads still hold session pointers.
     try std.testing.expect(registry.sessions[0] == &session);
     try std.testing.expectEqual(contracts.Lifecycle.running, session.lifecycle);
+}
+
+test "a referenced slot is never recycled out from under its holder" {
+    if (!isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-recycle-guard");
+    var probe: WorkProbe = .{};
+    var resident = try Session.init(
+        alloc,
+        .{ .context = &probe, .update_fn = WorkProbe.update },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer resident.deinitUnlaunched();
+    resident.lifecycle = .exited;
+    try std.testing.expect(resident.isRecyclable());
+
+    const incoming_id = try alloc.dupe(u8, "terminal-recycle-incoming");
+    var incoming = try Session.init(
+        alloc,
+        .{ .context = &probe, .update_fn = WorkProbe.update },
+        &fixture.profile,
+        "test-host",
+        incoming_id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer incoming.deinitUnlaunched();
+
+    var registry = SupportedRegistry{
+        .alloc = alloc,
+        .tracker = .{ .context = &probe, .update_fn = WorkProbe.update },
+        .profile = &fixture.profile,
+        .host_identity = "test-host",
+        .durable_root = "/workspace",
+        .transport_root = "/workspace",
+        .sessions = @splat(&resident),
+        .references = @splat(1),
+    };
+
+    // Every slot holds a recyclable session, so only the reference keeps them.
+    // This is what makes it safe to signal a session after releasing the lock.
+    try std.testing.expect(registry.reserve(&incoming) == null);
+
+    // Drop the references and the same slots become recyclable again, so the
+    // check above is about the reference and not about some other refusal.
+    registry.references = @splat(0);
+    const reservation = registry.reserve(&incoming) orelse
+        return error.TestExpectedRecycle;
+    try std.testing.expectEqual(@as(?*Session, &resident), reservation.evicted);
 }
