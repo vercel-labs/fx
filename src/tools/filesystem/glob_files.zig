@@ -898,6 +898,30 @@ test "glob_files root git discovery excludes ignored files at every depth" {
     try std.testing.expectEqualStrings("[glob] no matches for **/*.log\n", result.body);
 }
 
+// Untracked files inside ignored-name directories reach root globs the same way
+// they already reach grep_files, which scans an untracked pass git leaves unfiltered.
+test "glob_files root git discovery reports untracked files inside ignored directory names" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+
+    try runGitForTest(alloc, workspace, &.{"init"});
+    const tracked = try writeTempFile(alloc, &tmp, "kept.txt", "kept\n");
+    defer alloc.free(tracked);
+    try runGitForTest(alloc, workspace, &.{ "add", "kept.txt" });
+    const vendored = try writeTempFile(alloc, &tmp, "node_modules/pkg/index.txt", "vendored\n");
+    defer alloc.free(vendored);
+
+    var result = try dispatchGlobFiles(alloc, workspace, "**/*.txt", ".");
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "node_modules/pkg/index.txt") != null);
+}
+
 test "glob_files static base extraction handles literal and wildcard patterns" {
     var base = extractStaticGlobBase("src/core/**/*.zig");
     try std.testing.expectEqualStrings("src/core", base.base);

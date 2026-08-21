@@ -436,6 +436,13 @@ async function runTerminalToolScenario(args: {
   }
 }
 
+function runGit(cwd: string, args: string[]) {
+  const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+  if (result.exitCode !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString()}`);
+  }
+}
+
 describe("filesystem path handling", () => {
   test(
     "active added roots reach read cwd and search admission without loading their instructions",
@@ -1495,4 +1502,114 @@ describe("filesystem path handling", () => {
     120_000,
   );
 
+  test(
+    "root globs return untracked files at any depth",
+    async () => {
+      const root = createIsolatedRoot();
+      try {
+        mkdirSync(join(root.workspace, "src"), { recursive: true });
+        writeFileSync(join(root.workspace, "src", "tracked.txt"), "tracked\n");
+        runGit(root.workspace, ["init", "--quiet"]);
+        runGit(root.workspace, ["add", "src/tracked.txt"]);
+        writeFileSync(join(root.workspace, "src", "untracked.txt"), "fresh\n");
+
+        const gateway = startFakeGateway([
+          toolCall("glob_untracked_1", "glob_files", {
+            pattern: "**/*.txt",
+            path: ".",
+          }),
+          finalText("glob complete"),
+        ]);
+        try {
+          const result = await runFx(
+            [
+              "ask",
+              "--auto",
+              "--json",
+              "--no-save",
+              "Execute the requested tool once.",
+            ],
+            {
+              cwd: root.workspace,
+              env: gatewayEnv(root, gateway, root.home),
+              timeoutMs: TIMEOUT,
+            },
+          );
+          const json = parseFxJson(result);
+          expect(gateway.requests).toHaveLength(2);
+          const toolOutput = toolResultOutput(
+            gateway.requests[1]!.body,
+            "glob_untracked_1",
+          );
+          expect(toolOutput).toContain("src/tracked.txt");
+          expect(toolOutput).toContain("src/untracked.txt");
+          expect(json.tool_calls).toEqual([
+            { name: "glob_files", status: "success" },
+          ]);
+        } finally {
+          gateway.stop();
+        }
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "root globs skip gitignored files at every depth",
+    async () => {
+      const root = createIsolatedRoot();
+      try {
+        mkdirSync(join(root.workspace, "src"), { recursive: true });
+        writeFileSync(join(root.workspace, "src", "tracked.txt"), "tracked\n");
+        runGit(root.workspace, ["init", "--quiet"]);
+        runGit(root.workspace, ["add", "src/tracked.txt"]);
+        writeFileSync(join(root.workspace, ".gitignore"), "*.log\n");
+        writeFileSync(join(root.workspace, "root.log"), "ignored\n");
+        writeFileSync(join(root.workspace, "src", "nested.log"), "ignored\n");
+
+        const gateway = startFakeGateway([
+          toolCall("glob_ignored_1", "glob_files", {
+            pattern: "**/*.log",
+            path: ".",
+          }),
+          finalText("glob complete"),
+        ]);
+        try {
+          const result = await runFx(
+            [
+              "ask",
+              "--auto",
+              "--json",
+              "--no-save",
+              "Execute the requested tool once.",
+            ],
+            {
+              cwd: root.workspace,
+              env: gatewayEnv(root, gateway, root.home),
+              timeoutMs: TIMEOUT,
+            },
+          );
+          const json = parseFxJson(result);
+          expect(gateway.requests).toHaveLength(2);
+          const toolOutput = toolResultOutput(
+            gateway.requests[1]!.body,
+            "glob_ignored_1",
+          );
+          expect(toolOutput).toContain("no matches");
+          expect(toolOutput).not.toContain("root.log");
+          expect(toolOutput).not.toContain("nested.log");
+          expect(json.tool_calls).toEqual([
+            { name: "glob_files", status: "success" },
+          ]);
+        } finally {
+          gateway.stop();
+        }
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 });
