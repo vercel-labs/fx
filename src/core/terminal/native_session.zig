@@ -665,6 +665,8 @@ const UnsupportedRegistry = struct {
         return .{ .alloc = alloc };
     }
 
+    pub fn shutdownSessionsOnly(_: *UnsupportedRegistry) void {}
+
     pub fn deinit(self: *UnsupportedRegistry) void {
         self.* = undefined;
     }
@@ -832,6 +834,25 @@ const SupportedRegistry = struct {
         self.releaseReference(slot.index, session);
         reserved = false;
         session_owned = false;
+    }
+
+    /// Kills every live session's process without freeing any session state.
+    ///
+    /// For a host that must exit while client threads are still running: those
+    /// threads may hold session pointers, so nothing here may be destroyed, but
+    /// the child processes still have to be signalled or they outlive the host
+    /// that owns them. `deinit` does both; this does only the half that is safe
+    /// while other threads are reading.
+    pub fn shutdownSessionsOnly(self: *SupportedRegistry) void {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        var sessions = self.sessions;
+        self.mutex.unlock(zio);
+
+        for (&sessions) |*entry| {
+            const session = entry.* orelse continue;
+            session.shutdown();
+        }
     }
 
     pub fn deinit(self: *SupportedRegistry) void {
@@ -7222,4 +7243,55 @@ test "malformed raw fallback durably replaces an invalid checkpoint with corrupt
         contracts.ScreenRecovery{ .unavailable = .corrupt },
         reopened.facts().screen_recovery,
     );
+}
+
+test "shutdownSessionsOnly signals live sessions and leaves them allocated" {
+    if (!isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-shutdown-only");
+    var probe: WorkProbe = .{};
+    var session = try Session.init(
+        alloc,
+        .{ .context = &probe, .update_fn = WorkProbe.update },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer session.deinitUnlaunched();
+
+    session.markLive();
+    session.lifecycle = .running;
+    // A real handle, so releasing it is observable rather than vacuous.
+    session.liveness_file = try std.Io.Dir.createFileAbsolute(
+        io_mod.getIo(),
+        "/dev/null",
+        .{ .truncate = false },
+    );
+
+    var registry = SupportedRegistry{
+        .alloc = alloc,
+        .tracker = .{ .context = &probe, .update_fn = WorkProbe.update },
+        .profile = &fixture.profile,
+        .host_identity = "test-host",
+        .durable_root = "/workspace",
+        .transport_root = "/workspace",
+    };
+    registry.sessions[0] = &session;
+
+    registry.shutdownSessionsOnly();
+
+    // The liveness handle is released, so the session was actually shut down.
+    try std.testing.expect(session.liveness_file == null);
+    // And the session is still allocated: the registry slot still points at it
+    // and the object is readable, which is what makes this safe to call while
+    // client threads still hold session pointers.
+    try std.testing.expect(registry.sessions[0] == &session);
+    try std.testing.expectEqual(contracts.Lifecycle.running, session.lifecycle);
 }
