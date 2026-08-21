@@ -1,10 +1,14 @@
 const std = @import("std");
+const account_usage_provider = @import("../gateway/account_usage_provider.zig");
+const model_catalog = @import("../gateway/model_catalog.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const route_snapshot = @import("../gateway/route_snapshot.zig");
+const generation_usage_provider = @import("../session/generation_usage_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
 const gateway_schema = @import("../tooling/gateway_schema.zig");
+const web_search_provider = @import("../tooling/web_search_provider.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -91,6 +95,17 @@ pub const StructuredResponseFormat = struct {
     schema_json: []const u8,
 };
 
+/// Data-only capabilities that an adapter may serialize into its provider's
+/// native tool advertisement format.
+pub const ProviderTool = enum {
+    web_search,
+};
+
+pub const ProviderToolAdvertisement = struct {
+    tool: ProviderTool,
+    local_schema_position: usize,
+};
+
 /// Provider-neutral description of one model request. All slices are borrowed
 /// for the duration of `ProviderAdapter.stream`.
 pub const ModelRequest = struct {
@@ -99,6 +114,7 @@ pub const ModelRequest = struct {
     /// G11 removes the bridge after every caller supplies neutral descriptors.
     model: []const u8,
     serialized_tools: []const u8,
+    provider_tools: []const ProviderToolAdvertisement = &.{},
     messages: []const types.ChatMessage,
     tool_choice: types.ToolChoice,
     require_tool_call: bool = false,
@@ -117,8 +133,9 @@ pub const ModelRequest = struct {
     response_format: ?StructuredResponseFormat = null,
 };
 
-test "model request exposes only data-only vision metadata" {
+test "model request exposes only data-only tool and vision metadata" {
     try std.testing.expect(!@hasField(ModelRequest, "tool_registry"));
+    try std.testing.expect(@typeInfo(ProviderTool) == .@"enum");
     try std.testing.expect(!@hasField(gateway_schema.FunctionSchema, "call"));
     try std.testing.expect(!@hasField(gateway_schema.FunctionSchema, "runtime_provider"));
 }
@@ -230,13 +247,10 @@ pub const GenerationReference = struct {
     lookup_scope: ?[]const u8 = null,
 
     pub fn validate(self: GenerationReference) error{InvalidGenerationReference}!void {
-        try validatePart(self.id, false);
-        if (self.lookup_scope) |scope| try validatePart(scope, true);
-    }
-
-    fn validatePart(value: []const u8, allow_empty: bool) error{InvalidGenerationReference}!void {
-        if ((!allow_empty and value.len == 0) or value.len > max_bytes) return error.InvalidGenerationReference;
-        for (value) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidGenerationReference;
+        if (!types.validGenerationReferenceId(self.id)) return error.InvalidGenerationReference;
+        if (self.lookup_scope) |scope| {
+            if (!types.validGenerationLookupScope(scope)) return error.InvalidGenerationReference;
+        }
     }
 };
 
@@ -479,6 +493,12 @@ pub const ProviderAdapter = struct {
     /// Bounded G1 bridge for existing injected Vercel stream providers. G11
     /// removes this field after the old seam has no callers.
     legacy_provider: ?Provider = null,
+    account_usage: ?account_usage_provider.Provider = null,
+    generation_usage: ?generation_usage_provider.Provider = null,
+    model_catalog: ?model_catalog.Provider = null,
+    model_descriptors: model_catalog.ModelDescriptorProvider = model_catalog.configured_model_descriptor_provider,
+    provider_tools: []const ProviderTool = &.{},
+    web_search: ?web_search_provider.Provider = null,
     stream_fn: AdapterStreamFn,
 
     pub fn acceptsRoute(self: ProviderAdapter, route: *const route_snapshot.RouteSnapshot) bool {

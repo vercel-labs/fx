@@ -1,6 +1,5 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const secret = @import("../auth/secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const generation_fact_codec = @import("generation_fact_codec.zig");
 const generation_usage = @import("generation_usage_provider.zig");
@@ -9,15 +8,14 @@ const types = @import("../shared/types.zig");
 pub const usage_report = @import("usage_report.zig");
 
 const Allocator = std.mem.Allocator;
-const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const max_models: usize = 32;
 const max_pending_generations: usize = 16;
 const max_publication_backlog: usize = 16;
 const max_usage_incidents: usize = 16;
 const max_model_bytes: usize = 1024;
-const max_origin_bytes: usize = 2048;
-const max_team_bytes: usize = 255;
+const max_connection_id_bytes: usize = 128;
+const max_lookup_scope_bytes: usize = 2048;
 const max_identifier_bytes: usize = 8 * 1024;
 const max_active_invocations: usize = 64;
 const shutdown_reconciliation_budget_ms: usize = 250;
@@ -108,8 +106,8 @@ pub const GatewayObservation = struct {
         alloc: Allocator,
         status: std.http.Status,
         completion: types.GatewayCompletion,
-        origin: []const u8,
-        team: ?[]const u8,
+        connection_id: []const u8,
+        lookup_scope: ?[]const u8,
     ) !void {
         const ledger = self.usage orelse return;
         const generation_id = completion.generation_id;
@@ -152,8 +150,8 @@ pub const GatewayObservation = struct {
             self.elapsedMs(),
             delivery,
             id,
-            origin,
-            team,
+            connection_id,
+            lookup_scope,
         );
         debug_trace.logf(
             "session",
@@ -226,28 +224,27 @@ pub const ModelAggregate = struct {
 pub const PendingGeneration = struct {
     id: []u8,
     sequence: u64,
-    origin: []u8,
-    team: ?[]u8,
+    connection_id: []u8,
+    lookup_scope: ?[]u8,
     observed_at_ms: ?i64 = null,
 
     fn deinit(self: *PendingGeneration, alloc: Allocator) void {
         alloc.free(self.id);
-        alloc.free(self.origin);
-        if (self.team) |team| alloc.free(team);
+        alloc.free(self.connection_id);
+        if (self.lookup_scope) |scope| alloc.free(scope);
         self.* = undefined;
     }
 
     fn dupe(self: PendingGeneration, alloc: Allocator) Allocator.Error!PendingGeneration {
         const id = try alloc.dupe(u8, self.id);
         errdefer alloc.free(id);
-        const origin = try alloc.dupe(u8, self.origin);
-        errdefer alloc.free(origin);
-        const team = if (self.team) |value| try alloc.dupe(u8, value) else null;
+        const connection_id = try alloc.dupe(u8, self.connection_id);
+        errdefer alloc.free(connection_id);
         return .{
             .id = id,
             .sequence = self.sequence,
-            .origin = origin,
-            .team = team,
+            .connection_id = connection_id,
+            .lookup_scope = if (self.lookup_scope) |value| try alloc.dupe(u8, value) else null,
             .observed_at_ms = self.observed_at_ms,
         };
     }
@@ -336,9 +333,7 @@ pub const Usage = struct {
     reconciliation_done: std.atomic.Value(bool) = .init(true),
     reconciliation_cancel: std.atomic.Value(bool) = .init(false),
     reconciliation_work_epoch: std.atomic.Value(u64) = .init(0),
-    reconciliation_key_digest: ?[Sha256.digest_length]u8 = null,
-    reconciliation_credential_blocked: bool = false,
-    generation_usage_provider: generation_usage.Provider = generation_usage.unavailable_provider,
+    reconciliation_source: generation_usage.Source = generation_usage.unavailable_source,
 
     pub fn initFresh() Usage {
         return .{
@@ -349,12 +344,6 @@ pub const Usage = struct {
             .reasoning_tokens = 0,
             .request_count = 0,
         };
-    }
-
-    pub fn initFreshWithProvider(provider: generation_usage.Provider) Usage {
-        var usage = initFresh();
-        usage.generation_usage_provider = provider;
-        return usage;
     }
 
     pub fn initLegacy() Usage {
@@ -442,6 +431,14 @@ pub const Usage = struct {
         if (sink != null) self.flushProfilePublications();
     }
 
+    pub fn configureReconciliationSource(
+        self: *Usage,
+        source: generation_usage.Source,
+    ) void {
+        self.stopReconciliation();
+        self.reconciliation_source = source;
+    }
+
     pub fn persistCheckpoint(self: *Usage) bool {
         self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
         defer self.checkpoint_mutex.unlock(io_mod.getIo());
@@ -479,8 +476,8 @@ pub const Usage = struct {
         duration_ms: u64,
         outcome: DeliveryOutcome,
         id: []const u8,
-        origin: []const u8,
-        team: ?[]const u8,
+        connection_id: []const u8,
+        lookup_scope: ?[]const u8,
     ) !void {
         self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
         self.finishObservedInvocation(
@@ -489,8 +486,8 @@ pub const Usage = struct {
             duration_ms,
             outcome,
             id,
-            origin,
-            team,
+            connection_id,
+            lookup_scope,
         ) catch |err| {
             self.markBillingIncomplete();
             _ = self.persistCheckpointBestEffortLocked();
@@ -558,17 +555,23 @@ pub const Usage = struct {
         duration_ms: u64,
         outcome: DeliveryOutcome,
         id: []const u8,
-        origin: []const u8,
-        team: ?[]const u8,
+        connection_id: []const u8,
+        lookup_scope: ?[]const u8,
     ) !void {
         try validateGenerationId(id);
-        try validateOrigin(origin);
-        if (team) |value| try validateTeam(value);
+        try validateConnectionId(connection_id);
+        if (lookup_scope) |value| try validateLookupScope(value);
 
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         if (!self.finishInvocationUnlocked(sequence, duration_ms, outcome)) return;
-        self.observeGenerationUnlocked(alloc, sequence, id, origin, team) catch |err| {
+        self.observeGenerationUnlocked(
+            alloc,
+            sequence,
+            id,
+            connection_id,
+            lookup_scope,
+        ) catch |err| {
             self.billing = .incomplete;
             self.dirty = true;
             return err;
@@ -617,8 +620,8 @@ pub const Usage = struct {
         alloc: Allocator,
         sequence: u64,
         id: []const u8,
-        origin: []const u8,
-        team: ?[]const u8,
+        connection_id: []const u8,
+        lookup_scope: ?[]const u8,
     ) !void {
         for (self.pending.items) |pending| {
             if (pending.sequence == sequence and !std.mem.eql(u8, pending.id, id)) {
@@ -628,8 +631,8 @@ pub const Usage = struct {
             }
             if (std.mem.eql(u8, pending.id, id)) {
                 if (pending.sequence != sequence or
-                    !std.mem.eql(u8, pending.origin, origin) or
-                    !optionalStringsEqual(pending.team, team))
+                    !std.mem.eql(u8, pending.connection_id, connection_id) or
+                    !optionalStringsEqual(pending.lookup_scope, lookup_scope))
                 {
                     self.billing = .incomplete;
                     self.dirty = true;
@@ -643,9 +646,9 @@ pub const Usage = struct {
             self.dirty = true;
             return error.UsageCapacityExceeded;
         }
-        var added_identifier_bytes = std.math.add(usize, id.len, origin.len) catch
+        var added_identifier_bytes = std.math.add(usize, id.len, connection_id.len) catch
             return self.failOverflow();
-        if (team) |value| {
+        if (lookup_scope) |value| {
             added_identifier_bytes = std.math.add(
                 usize,
                 added_identifier_bytes,
@@ -664,15 +667,15 @@ pub const Usage = struct {
         }
         const owned_id = try alloc.dupe(u8, id);
         errdefer alloc.free(owned_id);
-        const owned_origin = try alloc.dupe(u8, origin);
-        errdefer alloc.free(owned_origin);
-        const owned_team = if (team) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (owned_team) |value| alloc.free(value);
+        const owned_connection_id = try alloc.dupe(u8, connection_id);
+        errdefer alloc.free(owned_connection_id);
+        const owned_lookup_scope = if (lookup_scope) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (owned_lookup_scope) |value| alloc.free(value);
         try self.pending.append(alloc, .{
             .id = owned_id,
             .sequence = sequence,
-            .origin = owned_origin,
-            .team = owned_team,
+            .connection_id = owned_connection_id,
+            .lookup_scope = owned_lookup_scope,
             .observed_at_ms = io_mod.milliTimestamp(),
         });
         if (self.billing == .complete) self.billing = .pending;
@@ -773,8 +776,8 @@ pub const Usage = struct {
         if (model_index == null) {
             const resolved_pending = self.pending.items[pending_index];
             var removed_identifier_bytes = resolved_pending.id.len +|
-                resolved_pending.origin.len;
-            if (resolved_pending.team) |team| removed_identifier_bytes +|= team.len;
+                resolved_pending.connection_id.len;
+            if (resolved_pending.lookup_scope) |scope| removed_identifier_bytes +|= scope.len;
             const next_identifier_bytes = std.math.add(
                 usize,
                 self.identifierBytesUnlocked() -| removed_identifier_bytes,
@@ -1364,105 +1367,20 @@ pub const Usage = struct {
         return self.dirty;
     }
 
-    pub fn startReconciliation(
-        self: *Usage,
-        alloc: Allocator,
-        api_key: []const u8,
-    ) void {
-        self.startReconciliationWithCredential(alloc, api_key, false, null);
-    }
-
-    /// Installs the host's authoritative credential regardless of the prior key.
-    pub fn replaceReconciliationCredential(
-        self: *Usage,
-        alloc: Allocator,
-        api_key: []const u8,
-    ) void {
-        self.startReconciliationWithCredential(alloc, api_key, true, null);
-    }
-
-    /// Replaces a producer's key only while that key is still authoritative.
-    pub fn refreshReconciliationCredential(
-        self: *Usage,
-        alloc: Allocator,
-        expected_api_key: []const u8,
-        refreshed_api_key: []const u8,
-    ) void {
-        self.startReconciliationWithCredential(
-            alloc,
-            refreshed_api_key,
-            true,
-            expected_api_key,
-        );
-    }
-
-    /// Cancels credential work and rejects stale producer starts until replaced.
-    pub fn clearReconciliationCredential(self: *Usage) void {
-        self.reconciliation_cancel.store(true, .seq_cst);
+    pub fn startReconciliation(self: *Usage, alloc: Allocator) void {
         self.reconciliation_mutex.lockUncancelable(io_mod.getIo());
         defer self.reconciliation_mutex.unlock(io_mod.getIo());
-        self.reconciliation_cancel.store(true, .seq_cst);
-        if (comptime builtin.os.tag != .wasi) {
-            _ = self.reconciliation_work_epoch.fetchAdd(1, .seq_cst);
-        }
-        const thread = self.reconciliation_thread;
-        self.reconciliation_thread = null;
-        if (thread) |handle| handle.join();
-        self.reconciliation_done.store(true, .seq_cst);
-        self.reconciliation_cancel.store(false, .seq_cst);
-        self.reconciliation_key_digest = null;
-        self.reconciliation_credential_blocked = true;
-    }
-
-    fn startReconciliationWithCredential(
-        self: *Usage,
-        alloc: Allocator,
-        api_key: []const u8,
-        replace_existing: bool,
-        expected_api_key: ?[]const u8,
-    ) void {
-        if (api_key.len == 0) return;
-        const key_digest = reconciliationKeyDigest(api_key);
-        const expected_digest = if (expected_api_key) |expected|
-            reconciliationKeyDigest(expected)
-        else
-            null;
-        self.reconciliation_mutex.lockUncancelable(io_mod.getIo());
-        defer self.reconciliation_mutex.unlock(io_mod.getIo());
-        const authoritative_replace =
-            replace_existing and expected_api_key == null;
-        if (self.reconciliation_credential_blocked and
-            !authoritative_replace)
-        {
-            return;
-        }
-        if (authoritative_replace) {
-            self.reconciliation_credential_blocked = false;
-        }
-        const same_key = if (self.reconciliation_key_digest) |active_digest|
-            std.mem.eql(u8, &active_digest, &key_digest)
-        else
-            false;
-        if (self.reconciliation_key_digest) |active_digest| {
-            if (!same_key) {
-                if (!replace_existing) return;
-                if (expected_digest) |expected| {
-                    if (!std.mem.eql(u8, &active_digest, &expected)) return;
-                }
-            }
-        }
         if (comptime builtin.os.tag != .wasi) {
             _ = self.reconciliation_work_epoch.fetchAdd(1, .seq_cst);
         }
         if (self.reconciliation_thread) |thread| {
-            if (same_key and !self.reconciliation_done.load(.seq_cst)) return;
+            if (!self.reconciliation_done.load(.seq_cst)) return;
             self.reconciliation_cancel.store(true, .seq_cst);
             self.reconciliation_thread = null;
             thread.join();
             self.reconciliation_done.store(true, .seq_cst);
             self.reconciliation_cancel.store(false, .seq_cst);
         }
-        self.reconciliation_key_digest = key_digest;
         if (builtin.is_test) return;
         if (comptime builtin.os.tag == .wasi) return;
 
@@ -1471,21 +1389,22 @@ pub const Usage = struct {
         self.mutex.unlock(io_mod.getIo());
         if (!still_has_pending) return;
 
-        const api_key_copy = alloc.dupe(u8, api_key) catch |err| {
+        var dispatch = self.reconciliation_source.prepare(alloc) catch |err| {
             debug_trace.logf(
                 "session",
-                "usage reconciliation start failed reason={s}",
+                "usage reconciliation prepare failed reason={s}",
                 .{@errorName(err)},
             );
             return;
         };
+        var dispatch_owned = true;
+        defer if (dispatch_owned) dispatch.deinit(alloc);
         self.reconciliation_cancel.store(false, .seq_cst);
         self.reconciliation_done.store(false, .seq_cst);
-        self.reconciliation_key_digest = key_digest;
         self.reconciliation_thread = std.Thread.spawn(
             .{},
             reconciliationThreadMain,
-            .{ self, alloc, api_key_copy, self.generation_usage_provider },
+            .{ self, alloc, dispatch },
         ) catch |err| {
             self.reconciliation_done.store(true, .seq_cst);
             debug_trace.logf(
@@ -1493,9 +1412,9 @@ pub const Usage = struct {
                 "usage reconciliation start failed reason={s}",
                 .{@errorName(err)},
             );
-            secret.zeroAndFree(alloc, api_key_copy);
             return;
         };
+        dispatch_owned = false;
     }
 
     pub fn cancelReconciliation(self: *Usage) void {
@@ -1610,8 +1529,8 @@ pub const Usage = struct {
         for (self.models.items) |model| total +|= model.model.len;
         for (self.pending.items) |generation| {
             total +|= generation.id.len;
-            total +|= generation.origin.len;
-            if (generation.team) |team| total +|= team.len;
+            total +|= generation.connection_id.len;
+            if (generation.lookup_scope) |scope| total +|= scope.len;
         }
         for (self.publication_backlog.items) |fact| {
             total +|= fact.id.len;
@@ -1664,8 +1583,8 @@ pub const Usage = struct {
         for (self.pending.items, snapshot_value.pending) |generation, saved| {
             if (!std.mem.eql(u8, generation.id, saved.id) or
                 generation.sequence != saved.sequence or
-                !std.mem.eql(u8, generation.origin, saved.origin) or
-                !optionalStringsEqual(generation.team, saved.team) or
+                !std.mem.eql(u8, generation.connection_id, saved.connection_id) or
+                !optionalStringsEqual(generation.lookup_scope, saved.lookup_scope) or
                 generation.observed_at_ms != saved.observed_at_ms)
             {
                 return false;
@@ -1840,8 +1759,8 @@ pub fn validateSnapshot(snapshot: Snapshot) !void {
     }
     for (snapshot.pending, 0..) |generation, index| {
         try validateGenerationId(generation.id);
-        try validateOrigin(generation.origin);
-        if (generation.team) |team| try validateTeam(team);
+        try validateConnectionId(generation.connection_id);
+        if (generation.lookup_scope) |scope| try validateLookupScope(scope);
         if (generation.sequence == 0 or generation.sequence >= snapshot.next_sequence) {
             return error.InvalidUsageSnapshot;
         }
@@ -1850,10 +1769,10 @@ pub fn validateSnapshot(snapshot: Snapshot) !void {
         }
         identifier_bytes = std.math.add(usize, identifier_bytes, generation.id.len) catch
             return error.UsageCapacityExceeded;
-        identifier_bytes = std.math.add(usize, identifier_bytes, generation.origin.len) catch
+        identifier_bytes = std.math.add(usize, identifier_bytes, generation.connection_id.len) catch
             return error.UsageCapacityExceeded;
-        if (generation.team) |team| {
-            identifier_bytes = std.math.add(usize, identifier_bytes, team.len) catch
+        if (generation.lookup_scope) |scope| {
+            identifier_bytes = std.math.add(usize, identifier_bytes, scope.len) catch
                 return error.UsageCapacityExceeded;
         }
         for (snapshot.pending[0..index]) |prior| {
@@ -1969,7 +1888,11 @@ pub fn snapshotEql(first: Snapshot, second: Snapshot) bool {
         }
     }
     for (first.pending, second.pending) |left, right| {
-        if (left.observed_at_ms != right.observed_at_ms) return false;
+        if (!std.mem.eql(u8, left.connection_id, right.connection_id) or
+            left.observed_at_ms != right.observed_at_ms)
+        {
+            return false;
+        }
     }
     for (first.publication_backlog, second.publication_backlog) |left, right| {
         if (!usage_report.GenerationFact.eql(left, right)) return false;
@@ -2018,8 +1941,7 @@ pub fn billingProjectionEql(first: Snapshot, second: Snapshot) bool {
     for (first.pending, second.pending) |left, right| {
         if (!std.mem.eql(u8, left.id, right.id) or
             left.sequence != right.sequence or
-            !std.mem.eql(u8, left.origin, right.origin) or
-            !optionalStringsEqual(left.team, right.team))
+            !optionalStringsEqual(left.lookup_scope, right.lookup_scope))
         {
             return false;
         }
@@ -2078,13 +2000,16 @@ pub fn writeSnapshot(writer: *std.Io.Writer, snapshot: Snapshot) !void {
         try writer.writeAll("{\"id\":");
         try std.json.Stringify.value(pending.id, .{}, writer);
         try writer.print(",\"sequence\":{d},\"origin\":", .{pending.sequence});
-        try std.json.Stringify.value(pending.origin, .{}, writer);
-        try writer.writeAll(",\"team\":");
-        if (pending.team) |team| {
-            try std.json.Stringify.value(team, .{}, writer);
+        if (pending.lookup_scope) |scope| {
+            try std.json.Stringify.value(scope, .{}, writer);
         } else {
-            try writer.writeAll("null");
+            try std.json.Stringify.value(
+                types.null_generation_lookup_scope_sentinel,
+                .{},
+                writer,
+            );
         }
+        try writer.writeAll(",\"team\":null");
         try writer.writeByte('}');
     }
     try writer.writeAll("]}");
@@ -2094,7 +2019,7 @@ pub fn writeSnapshot(writer: *std.Io.Writer, snapshot: Snapshot) !void {
 /// session event stream.
 pub fn writeRichSnapshot(writer: *std.Io.Writer, snapshot: Snapshot) !void {
     try validateSnapshot(snapshot);
-    try writer.writeAll("{\"schema_version\":2,\"billing\":");
+    try writer.writeAll("{\"schema_version\":3,\"billing\":");
     try std.json.Stringify.value(@tagName(snapshot.billing), .{}, writer);
     try writer.print(
         ",\"api_duration_complete\":{s},\"wall_duration_complete\":{s},\"code_complete\":{s},\"next_sequence\":{d},\"settled_through_sequence\":{d},\"api_duration_ms\":{d},\"wall_duration_ms\":{d},\"total_cost\":{d},\"input_tokens\":{d},\"output_tokens\":{d},\"cache_read_tokens\":{d},\"cache_write_tokens\":{d},\"reasoning_tokens\":",
@@ -2152,11 +2077,11 @@ pub fn writeRichSnapshot(writer: *std.Io.Writer, snapshot: Snapshot) !void {
         if (index > 0) try writer.writeByte(',');
         try writer.writeAll("{\"id\":");
         try std.json.Stringify.value(pending.id, .{}, writer);
-        try writer.print(",\"sequence\":{d},\"origin\":", .{pending.sequence});
-        try std.json.Stringify.value(pending.origin, .{}, writer);
-        try writer.writeAll(",\"team\":");
-        if (pending.team) |team| {
-            try std.json.Stringify.value(team, .{}, writer);
+        try writer.print(",\"sequence\":{d},\"connection_id\":", .{pending.sequence});
+        try std.json.Stringify.value(pending.connection_id, .{}, writer);
+        try writer.writeAll(",\"lookup_scope\":");
+        if (pending.lookup_scope) |scope| {
+            try std.json.Stringify.value(scope, .{}, writer);
         } else {
             try writer.writeAll("null");
         }
@@ -2191,14 +2116,16 @@ pub fn parseSnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
     if (value != .object) {
         return error.InvalidUsageSnapshot;
     }
-    const legacy = value.object.count() == 18;
-    if (!legacy) {
-        if (value.object.count() != 23 or
-            try parseNonNegativeInteger(value.object.get("schema_version")) != 2)
-        {
-            return error.InvalidUsageSnapshot;
-        }
-    }
+    const rollback_readable = value.object.count() == 18;
+    const schema_version = if (rollback_readable)
+        @as(u64, 1)
+    else if (value.object.count() == 23)
+        try parseNonNegativeInteger(value.object.get("schema_version"))
+    else
+        return error.InvalidUsageSnapshot;
+    if (schema_version < 1 or schema_version > 3) return error.InvalidUsageSnapshot;
+    const legacy_metrics = schema_version == 1;
+    const legacy_pending = schema_version < 3;
     const billing_value = value.object.get("billing") orelse return error.InvalidUsageSnapshot;
     if (billing_value != .string) return error.InvalidUsageSnapshot;
     const billing = std.meta.stringToEnum(Availability, billing_value.string) orelse
@@ -2217,14 +2144,14 @@ pub fn parseSnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
     const output_tokens = try parseNonNegativeInteger(value.object.get("output_tokens"));
     const cache_read_tokens = try parseNonNegativeInteger(value.object.get("cache_read_tokens"));
     const cache_write_tokens = try parseNonNegativeInteger(value.object.get("cache_write_tokens"));
-    const reasoning_tokens = if (legacy)
+    const reasoning_tokens = if (legacy_metrics)
         null
     else blk: {
         const field = value.object.get("reasoning_tokens") orelse
             return error.InvalidUsageSnapshot;
         break :blk try parseOptionalNonNegativeInteger(field);
     };
-    const request_count = if (legacy)
+    const request_count = if (legacy_metrics)
         null
     else blk: {
         const field = value.object.get("request_count") orelse
@@ -2248,7 +2175,7 @@ pub fn parseSnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
     var model_count: usize = 0;
     errdefer for (models[0..model_count]) |*model| model.deinit(alloc);
     for (models_value.array.items, 0..) |model_value, index| {
-        const expected_model_fields: usize = if (legacy) 8 else 10;
+        const expected_model_fields: usize = if (legacy_metrics) 8 else 10;
         if (model_value != .object or
             model_value.object.count() != expected_model_fields)
         {
@@ -2262,14 +2189,14 @@ pub fn parseSnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
         const model_output_tokens = try parseNonNegativeInteger(model_value.object.get("output_tokens"));
         const model_cache_read_tokens = try parseNonNegativeInteger(model_value.object.get("cache_read_tokens"));
         const model_cache_write_tokens = try parseNonNegativeInteger(model_value.object.get("cache_write_tokens"));
-        const model_reasoning_tokens = if (legacy)
+        const model_reasoning_tokens = if (legacy_metrics)
             null
         else blk: {
             const field = model_value.object.get("reasoning_tokens") orelse
                 return error.InvalidUsageSnapshot;
             break :blk try parseOptionalNonNegativeInteger(field);
         };
-        const model_request_count = if (legacy)
+        const model_request_count = if (legacy_metrics)
             null
         else blk: {
             const field = model_value.object.get("request_count") orelse
@@ -2299,46 +2226,57 @@ pub fn parseSnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
     var pending_count: usize = 0;
     errdefer for (pending[0..pending_count]) |*generation| generation.deinit(alloc);
     for (pending_value.array.items, 0..) |pending_entry, index| {
-        const expected_pending_fields: usize = if (legacy) 4 else 5;
+        const expected_pending_fields: usize = if (legacy_metrics) 4 else 5;
         if (pending_entry != .object or
             pending_entry.object.count() != expected_pending_fields)
         {
             return error.InvalidUsageSnapshot;
         }
         const id_value = pending_entry.object.get("id") orelse return error.InvalidUsageSnapshot;
-        const origin_value = pending_entry.object.get("origin") orelse return error.InvalidUsageSnapshot;
-        const team_value = pending_entry.object.get("team") orelse return error.InvalidUsageSnapshot;
-        if (id_value != .string or origin_value != .string) return error.InvalidUsageSnapshot;
+        const connection_value = pending_entry.object.get(if (legacy_pending) "origin" else "connection_id") orelse
+            return error.InvalidUsageSnapshot;
+        const lookup_scope_value = pending_entry.object.get(if (legacy_pending) "origin" else "lookup_scope") orelse
+            return error.InvalidUsageSnapshot;
+        if (id_value != .string or connection_value != .string) return error.InvalidUsageSnapshot;
         const sequence = try parseNonNegativeInteger(pending_entry.object.get("sequence"));
-        const observed_at_ms = if (legacy)
+        const observed_at_ms = if (legacy_metrics)
             null
         else blk: {
             const field = pending_entry.object.get("observed_at_ms") orelse
                 return error.InvalidUsageSnapshot;
             break :blk try parseOptionalNonNegativeI64(field);
         };
-        if (team_value != .null and team_value != .string) return error.InvalidUsageSnapshot;
+        if (!legacy_pending and lookup_scope_value != .null and lookup_scope_value != .string) {
+            return error.InvalidUsageSnapshot;
+        }
         const id = try alloc.dupe(u8, id_value.string);
         errdefer alloc.free(id);
-        const origin = try alloc.dupe(u8, origin_value.string);
-        errdefer alloc.free(origin);
-        const team = switch (team_value) {
+        const connection_id = try alloc.dupe(
+            u8,
+            if (legacy_pending) "vercel" else connection_value.string,
+        );
+        errdefer alloc.free(connection_id);
+        const lookup_scope = switch (lookup_scope_value) {
             .null => null,
-            .string => |text| try alloc.dupe(u8, text),
+            .string => |text| if (legacy_pending and std.mem.eql(
+                u8,
+                text,
+                types.null_generation_lookup_scope_sentinel,
+            )) null else try alloc.dupe(u8, text),
             else => unreachable,
         };
-        errdefer if (team) |text| alloc.free(text);
+        errdefer if (lookup_scope) |text| alloc.free(text);
         pending[index] = .{
             .id = id,
             .sequence = sequence,
-            .origin = origin,
-            .team = team,
+            .connection_id = connection_id,
+            .lookup_scope = lookup_scope,
             .observed_at_ms = observed_at_ms,
         };
         pending_count += 1;
     }
 
-    const publication_backlog = if (legacy) blk: {
+    const publication_backlog = if (legacy_metrics) blk: {
         break :blk try alloc.alloc(usage_report.GenerationFact, 0);
     } else blk: {
         const backlog_value = value.object.get("publication_backlog") orelse
@@ -2372,7 +2310,7 @@ pub fn parseSnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
         if (publication_backlog.len > 0) alloc.free(publication_backlog);
     }
 
-    const incidents = if (legacy) blk: {
+    const incidents = if (legacy_metrics) blk: {
         break :blk try alloc.alloc(usage_report.Incident, 0);
     } else blk: {
         const incidents_value = value.object.get("incidents") orelse
@@ -2454,19 +2392,18 @@ fn writeOptionalU64(writer: *std.Io.Writer, value: ?u64) !void {
 fn reconciliationThreadMain(
     usage: *Usage,
     alloc: Allocator,
-    api_key: []u8,
-    provider: generation_usage.Provider,
+    dispatch: generation_usage.Dispatch,
 ) void {
-    defer secret.zeroAndFree(alloc, api_key);
+    var owned_dispatch = dispatch;
+    defer owned_dispatch.deinit(alloc);
     defer usage.reconciliation_done.store(true, .seq_cst);
     var observed_epoch = usage.reconciliation_work_epoch.load(.seq_cst);
     while (!usage.reconciliation_cancel.load(.seq_cst)) {
         reconcilePendingBlocking(
             usage,
             alloc,
-            api_key,
             &usage.reconciliation_cancel,
-            provider,
+            owned_dispatch,
             30,
         );
         if (usage.reconciliation_cancel.load(.seq_cst)) return;
@@ -2484,21 +2421,14 @@ fn reconciliationThreadMain(
     }
 }
 
-fn reconciliationKeyDigest(api_key: []const u8) [Sha256.digest_length]u8 {
-    var digest: [Sha256.digest_length]u8 = undefined;
-    Sha256.hash(api_key, &digest, .{});
-    return digest;
-}
-
 fn reconcilePendingBlocking(
     usage: *Usage,
     alloc: Allocator,
-    api_key: []const u8,
     cancel_flag: *std.atomic.Value(bool),
-    provider: generation_usage.Provider,
+    dispatch: generation_usage.Dispatch,
     max_attempts: usize,
 ) void {
-    if (api_key.len == 0 or cancel_flag.load(.seq_cst)) return;
+    if (cancel_flag.load(.seq_cst)) return;
     var attempt: usize = 0;
     while (attempt < max_attempts and !cancel_flag.load(.seq_cst)) : (attempt += 1) {
         var current = usage.snapshot(alloc) catch |err| {
@@ -2515,13 +2445,13 @@ fn reconcilePendingBlocking(
 
         var retry_needed = false;
         for (current.pending) |pending| {
-            var outcome = provider.lookup(alloc, .{
-                .credential = api_key,
-                .tenant = pending.team,
-                .origin = pending.origin,
-                .generation_id = pending.id,
-                .cancel_flag = cancel_flag,
-            }) catch |err| {
+            var outcome = dispatch.lookup(
+                alloc,
+                pending.connection_id,
+                pending.id,
+                pending.lookup_scope,
+                cancel_flag,
+            ) catch |err| {
                 if (err == error.Cancelled) return;
                 debug_trace.logf(
                     "session",
@@ -2735,8 +2665,40 @@ pub fn dupeSnapshotOwned(alloc: Allocator, source: Snapshot) !Snapshot {
     };
 }
 
+pub const RebindPendingConnectionError = Allocator.Error || error{
+    InvalidConnectionIdentifier,
+};
+
+/// Restores current-session routing data after its rich extension disappears.
+pub fn rebindPendingConnection(
+    alloc: Allocator,
+    snapshot: *Snapshot,
+    connection_id: []const u8,
+) RebindPendingConnectionError!void {
+    try validateConnectionId(connection_id);
+    if (snapshot.pending.len == 0) return;
+    const replacements = try alloc.alloc(?[]u8, snapshot.pending.len);
+    defer alloc.free(replacements);
+    @memset(replacements, null);
+    errdefer for (replacements) |replacement| {
+        if (replacement) |value| alloc.free(value);
+    };
+    for (snapshot.pending, replacements) |pending, *replacement| {
+        if (!std.mem.eql(u8, pending.connection_id, connection_id)) {
+            replacement.* = try alloc.dupe(u8, connection_id);
+        }
+    }
+    for (snapshot.pending, replacements) |*pending, *replacement| {
+        if (replacement.*) |value| {
+            alloc.free(pending.connection_id);
+            pending.connection_id = value;
+            replacement.* = null;
+        }
+    }
+}
+
 fn validateGenerationId(id: []const u8) !void {
-    if (!types.validGatewayGenerationId(id)) return error.InvalidGenerationId;
+    if (!types.validGenerationReferenceId(id)) return error.InvalidGenerationId;
 }
 
 fn validateModel(model: []const u8) !void {
@@ -2748,21 +2710,25 @@ fn validateModel(model: []const u8) !void {
     }
 }
 
-fn validateOrigin(origin: []const u8) !void {
-    if (origin.len == 0 or origin.len > max_origin_bytes) {
-        return error.InvalidGatewayOrigin;
+fn validateConnectionId(connection_id: []const u8) !void {
+    if (connection_id.len == 0 or connection_id.len > max_connection_id_bytes) {
+        return error.InvalidConnectionIdentifier;
     }
-    for (origin) |char| {
-        if (char < 0x21 or char > 0x7e) return error.InvalidGatewayOrigin;
+    for (connection_id) |char| {
+        if (!(std.ascii.isAlphanumeric(char) or char == '_' or char == '-' or char == '.' or char == ':')) {
+            return error.InvalidConnectionIdentifier;
+        }
     }
 }
 
-fn validateTeam(team: []const u8) !void {
-    if (team.len == 0 or team.len > max_team_bytes) {
-        return error.InvalidGatewayTeam;
+fn validateLookupScope(scope: []const u8) !void {
+    if (scope.len == 0 or scope.len > max_lookup_scope_bytes or
+        std.mem.eql(u8, scope, types.null_generation_lookup_scope_sentinel))
+    {
+        return error.InvalidGenerationLookupScope;
     }
-    for (team) |char| {
-        if (char < 0x21 or char > 0x7e) return error.InvalidGatewayTeam;
+    for (scope) |char| {
+        if (char < 0x20 or char == 0x7f) return error.InvalidGenerationLookupScope;
     }
 }
 
@@ -2953,8 +2919,8 @@ test "profile publication failure preserves session totals and retries backlog" 
         1,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
     try usage.applyGeneration(alloc, .{
         .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -3034,8 +3000,8 @@ test "restored publication backlog settles the pending generation exactly" {
         1,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
     try source.applyGeneration(alloc, .{
         .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -3121,8 +3087,8 @@ test "no-checkpoint usage drains a transient publication failure" {
         1,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
     try usage.applyGeneration(alloc, .{
         .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -3173,8 +3139,8 @@ test "missing profile publication sink keeps the durable pending bridge" {
         1,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
     try usage.applyGeneration(alloc, .{
         .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -3251,8 +3217,8 @@ test "usage snapshot parsing releases every partial allocation" {
         1,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
     try usage.applyGeneration(alloc, .{
         .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -3271,8 +3237,8 @@ test "usage snapshot parsing releases every partial allocation" {
         1,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        "team_1",
     );
 
     var snapshot = try usage.snapshot(alloc);
@@ -3322,8 +3288,8 @@ test "fresh usage aggregates authoritative generations in invocation order" {
         125,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        "team_1",
     );
     try usage.applyGeneration(alloc, .{
         .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -3343,8 +3309,8 @@ test "fresh usage aggregates authoritative generations in invocation order" {
         75,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        "team_1",
     );
     try usage.applyGeneration(alloc, .{
         .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW",
@@ -3394,8 +3360,8 @@ test "usage deduplicates terminal and generation callbacks" {
         10,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
     try usage.finishObservedInvocation(
         alloc,
@@ -3403,8 +3369,8 @@ test "usage deduplicates terminal and generation callbacks" {
         10,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
     const record = GenerationRecord{
         .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -3439,8 +3405,8 @@ test "usage deduplicates callbacks after the durable settlement boundary" {
         10,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
     try usage.applyGeneration(alloc, .{
         .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -3464,8 +3430,8 @@ test "usage deduplicates callbacks after the durable settlement boundary" {
         10,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
 
     var current = try usage.snapshot(alloc);
@@ -3488,8 +3454,8 @@ test "model aggregates remain ordered by invocation when reconciliation finishes
         1,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
     try usage.finishObservedInvocation(
         alloc,
@@ -3497,8 +3463,8 @@ test "model aggregates remain ordered by invocation when reconciliation finishes
         1,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
 
     try usage.applyGeneration(alloc, .{
@@ -3563,8 +3529,8 @@ test "active invocation dominates separate pending and publication state" {
         1,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
 
     var pending = try usage.snapshot(alloc);
@@ -3647,8 +3613,8 @@ test "generation allocation failure marks billing incomplete before snapshot" {
             1,
             .observed_generation,
             "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "vercel",
             "https://ai-gateway.vercel.sh",
-            null,
         ),
     );
     var snapshot = try usage.snapshot(alloc);
@@ -3718,8 +3684,8 @@ test "pending and ambiguous generation states remain honest" {
         8,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
 
     var pending = try usage.snapshot(alloc);
@@ -3746,8 +3712,8 @@ test "successful response without generation identity marks billing incomplete" 
         alloc,
         .ok,
         .{},
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
 
     var snapshot = try usage.snapshot(alloc);
@@ -3762,7 +3728,6 @@ const TestGenerationUsageProvider = struct {
         retry,
         preserve_pending,
         reject,
-        unavailable,
         cancelled,
     },
     calls: usize = 0,
@@ -3782,7 +3747,7 @@ const TestGenerationUsageProvider = struct {
                 input.generation_id,
                 "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
             ) and
-            std.mem.eql(u8, input.origin, "https://provider.example");
+            std.mem.eql(u8, input.lookup_scope orelse "", "https://provider.example");
         return switch (self.outcome) {
             .found => blk: {
                 const id = try alloc.dupe(u8, input.generation_id);
@@ -3802,7 +3767,6 @@ const TestGenerationUsageProvider = struct {
             .retry => .retry,
             .preserve_pending => .preserve_pending,
             .reject => .reject,
-            .unavailable => error.Unavailable,
             .cancelled => error.Cancelled,
         };
     }
@@ -3815,35 +3779,32 @@ const TestGenerationUsageProvider = struct {
     }
 };
 
-test "usage restore and reset retain the injected generation provider" {
-    const alloc = std.testing.allocator;
-    var fake = TestGenerationUsageProvider{ .outcome = .found };
-    const provider = fake.provider();
-    var usage = Usage.initFreshWithProvider(provider);
-    defer usage.deinit(alloc);
-
-    var saved = try usage.snapshot(alloc);
-    defer saved.deinit(alloc);
-
-    usage.resetFresh(alloc);
-    try std.testing.expect(
-        usage.generation_usage_provider.lookup_fn == provider.lookup_fn,
-    );
-    try usage.restore(alloc, saved, 1);
-    try std.testing.expect(
-        usage.generation_usage_provider.lookup_fn == provider.lookup_fn,
-    );
-    usage.resetLegacy(alloc);
-    try std.testing.expect(
-        usage.generation_usage_provider.lookup_fn == provider.lookup_fn,
-    );
+fn resolveTestGenerationCredential(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    credential_ref: []const u8,
+) generation_usage.ResolveCredentialError!generation_usage.ResolvedCredential {
+    return .{ .token = try alloc.dupe(u8, credential_ref) };
 }
 
-test "reconciliation settles usage through the injected provider" {
+fn testGenerationDispatch(
+    alloc: Allocator,
+    provider: generation_usage.Provider,
+) !generation_usage.Dispatch {
+    return generation_usage.Dispatch.init(alloc, &.{.{
+        .id = "connection-a",
+        .credential_ref = "credential",
+        .provider = provider,
+    }}, .{ .resolve_fn = resolveTestGenerationCredential });
+}
+
+test "reconciliation settles usage through the originating connection" {
     const alloc = std.testing.allocator;
     var fake = TestGenerationUsageProvider{ .outcome = .found };
-    var usage = Usage.initFreshWithProvider(fake.provider());
+    var usage = Usage.initFresh();
     defer usage.deinit(alloc);
+    var dispatch = try testGenerationDispatch(alloc, fake.provider());
+    defer dispatch.deinit(alloc);
 
     const sequence = try usage.reserveInvocation();
     try usage.finishObservedInvocation(
@@ -3852,17 +3813,15 @@ test "reconciliation settles usage through the injected provider" {
         5,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "connection-a",
         "https://provider.example",
-        null,
     );
     var cancel = std.atomic.Value(bool).init(false);
-    const provider = usage.generation_usage_provider;
     reconcilePendingBlocking(
         &usage,
         alloc,
-        "credential",
         &cancel,
-        provider,
+        dispatch,
         1,
     );
 
@@ -3899,8 +3858,8 @@ test "terminal Gateway billing settles the durable observation immediately" {
                 .billable_web_search_calls = 2,
             },
         },
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
 
     var snapshot = try usage.snapshot(alloc);
@@ -3925,8 +3884,8 @@ test "successful retry after ambiguous delivery retains known generation" {
             .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
             .delivery_ambiguous = true,
         },
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
     try usage.applyGeneration(alloc, .{
         .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -4018,8 +3977,8 @@ test "usage keeps more than sixteen exact resolved models" {
             1,
             .observed_generation,
             id,
+            "vercel",
             "https://ai-gateway.vercel.sh",
-            null,
         );
         try usage.applyGeneration(alloc, .{
             .id = id,
@@ -4088,8 +4047,8 @@ test "sixteenth pending generation is the capacity boundary" {
             1,
             .observed_generation,
             id,
+            "vercel",
             "https://ai-gateway.vercel.sh",
-            null,
         );
     }
 
@@ -4116,8 +4075,8 @@ test "sixteenth pending generation is the capacity boundary" {
             1,
             .observed_generation,
             overflow_id,
+            "vercel",
             "https://ai-gateway.vercel.sh",
-            null,
         ),
     );
 
@@ -4142,8 +4101,8 @@ test "populated usage snapshot keeps the rollback-readable durable shape" {
         120,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        "team_alpha",
     );
     try usage.applyGeneration(alloc, .{
         .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -4163,8 +4122,8 @@ test "populated usage snapshot keeps the rollback-readable durable shape" {
         90,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
     try usage.applyGeneration(alloc, .{
         .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW",
@@ -4186,8 +4145,8 @@ test "populated usage snapshot keeps the rollback-readable durable shape" {
         30,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        "team_beta",
     );
     try usage.recordCommittedLines(5, 3);
 
@@ -4214,6 +4173,7 @@ test "populated usage snapshot keeps the rollback-readable durable shape" {
     }
     var decoded = try parseSnapshotValue(alloc, parsed.value);
     defer decoded.deinit(alloc);
+    try std.testing.expectEqualStrings("vercel", decoded.pending[0].connection_id);
 
     try std.testing.expectEqual(snapshot.billing, decoded.billing);
     try std.testing.expectEqual(snapshot.api_duration_complete, decoded.api_duration_complete);
@@ -4249,8 +4209,8 @@ test "populated usage snapshot keeps the rollback-readable durable shape" {
     for (snapshot.pending, decoded.pending) |expected, actual| {
         try std.testing.expectEqualStrings(expected.id, actual.id);
         try std.testing.expectEqual(expected.sequence, actual.sequence);
-        try std.testing.expectEqualStrings(expected.origin, actual.origin);
-        try std.testing.expect(optionalStringsEqual(expected.team, actual.team));
+        try std.testing.expectEqualStrings(expected.connection_id, actual.connection_id);
+        try std.testing.expect(optionalStringsEqual(expected.lookup_scope, actual.lookup_scope));
     }
 
     const Publisher = struct {
@@ -4307,8 +4267,8 @@ test "rich usage snapshot preserves optional metrics and recovery state" {
         5,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
     try usage.applyGeneration(alloc, .{
         .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -4328,9 +4288,9 @@ test "rich usage snapshot preserves optional metrics and recovery state" {
         pending_sequence,
         6,
         .observed_generation,
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "request-pending",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        "team_alpha",
     );
 
     var snapshot = try usage.snapshot(alloc);
@@ -4378,6 +4338,52 @@ test "rich usage snapshot preserves optional metrics and recovery state" {
     );
 }
 
+test "schema two pending usage migrates to the built-in connection" {
+    const alloc = std.testing.allocator;
+    var usage = Usage.initFresh();
+    defer usage.deinit(alloc);
+    const sequence = try usage.reserveInvocation();
+    try usage.finishObservedInvocation(
+        alloc,
+        sequence,
+        1,
+        .observed_generation,
+        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
+        "https://ai-gateway.vercel.sh",
+    );
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writeRichSnapshot(&encoded.writer, snapshot);
+    const old_version = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        encoded.written(),
+        "\"schema_version\":3",
+        "\"schema_version\":2",
+    );
+    defer alloc.free(old_version);
+    const old_pending = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        old_version,
+        "\"connection_id\":\"vercel\",\"lookup_scope\":\"https://ai-gateway.vercel.sh\"",
+        "\"origin\":\"https://ai-gateway.vercel.sh\",\"team\":null",
+    );
+    defer alloc.free(old_pending);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, old_pending, .{});
+    defer parsed.deinit();
+    var migrated = try parseSnapshotValue(alloc, parsed.value);
+    defer migrated.deinit(alloc);
+    try std.testing.expectEqualStrings("vercel", migrated.pending[0].connection_id);
+    try std.testing.expectEqualStrings(
+        "https://ai-gateway.vercel.sh",
+        migrated.pending[0].lookup_scope.?,
+    );
+}
+
 test "owned snapshot incident overflow matches runtime retention" {
     const alloc = std.testing.allocator;
     var usage = Usage.initFresh();
@@ -4412,6 +4418,8 @@ test "provider rejection removes pending generation and marks billing incomplete
     var fake = TestGenerationUsageProvider{ .outcome = .reject };
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
+    var dispatch = try testGenerationDispatch(alloc, fake.provider());
+    defer dispatch.deinit(alloc);
 
     const sequence = try usage.reserveInvocation();
     try usage.finishObservedInvocation(
@@ -4420,16 +4428,15 @@ test "provider rejection removes pending generation and marks billing incomplete
         5,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "connection-a",
         "https://provider.example",
-        null,
     );
     var cancel = std.atomic.Value(bool).init(false);
     reconcilePendingBlocking(
         &usage,
         alloc,
-        "credential",
         &cancel,
-        fake.provider(),
+        dispatch,
         1,
     );
 
@@ -4445,6 +4452,8 @@ test "provider preserve outcome keeps pending generation for a future credential
     var fake = TestGenerationUsageProvider{ .outcome = .preserve_pending };
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
+    var dispatch = try testGenerationDispatch(alloc, fake.provider());
+    defer dispatch.deinit(alloc);
 
     const sequence = try usage.reserveInvocation();
     try usage.finishObservedInvocation(
@@ -4453,16 +4462,15 @@ test "provider preserve outcome keeps pending generation for a future credential
         5,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "connection-a",
         "https://provider.example",
-        null,
     );
     var cancel = std.atomic.Value(bool).init(false);
     reconcilePendingBlocking(
         &usage,
         alloc,
-        "credential",
         &cancel,
-        fake.provider(),
+        dispatch,
         1,
     );
 
@@ -4482,6 +4490,8 @@ test "provider retry outcome leaves pending generation unchanged" {
     var fake = TestGenerationUsageProvider{ .outcome = .retry };
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
+    var dispatch = try testGenerationDispatch(alloc, fake.provider());
+    defer dispatch.deinit(alloc);
 
     const sequence = try usage.reserveInvocation();
     try usage.finishObservedInvocation(
@@ -4490,16 +4500,15 @@ test "provider retry outcome leaves pending generation unchanged" {
         5,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "connection-a",
         "https://provider.example",
-        null,
     );
     var cancel = std.atomic.Value(bool).init(false);
     reconcilePendingBlocking(
         &usage,
         alloc,
-        "credential",
         &cancel,
-        fake.provider(),
+        dispatch,
         1,
     );
 
@@ -4510,11 +4519,13 @@ test "provider retry outcome leaves pending generation unchanged" {
     try std.testing.expectEqual(@as(usize, 1), snapshot.pending.len);
 }
 
-test "provider failure leaves pending generation unchanged" {
+test "missing originating connection preserves pending generation without fallback" {
     const alloc = std.testing.allocator;
-    var fake = TestGenerationUsageProvider{ .outcome = .unavailable };
+    var fake = TestGenerationUsageProvider{ .outcome = .found };
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
+    var dispatch = try testGenerationDispatch(alloc, fake.provider());
+    defer dispatch.deinit(alloc);
 
     const sequence = try usage.reserveInvocation();
     try usage.finishObservedInvocation(
@@ -4523,22 +4534,21 @@ test "provider failure leaves pending generation unchanged" {
         5,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "missing-connection",
         "https://provider.example",
-        null,
     );
     var cancel = std.atomic.Value(bool).init(false);
     reconcilePendingBlocking(
         &usage,
         alloc,
-        "credential",
         &cancel,
-        fake.provider(),
+        dispatch,
         1,
     );
 
     var snapshot = try usage.snapshot(alloc);
     defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expectEqual(Availability.pending, snapshot.billing);
     try std.testing.expectEqual(@as(usize, 1), snapshot.pending.len);
 }
@@ -4548,6 +4558,8 @@ test "provider cancellation stops reconciliation and preserves pending usage" {
     var fake = TestGenerationUsageProvider{ .outcome = .cancelled };
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
+    var dispatch = try testGenerationDispatch(alloc, fake.provider());
+    defer dispatch.deinit(alloc);
 
     const sequence = try usage.reserveInvocation();
     try usage.finishObservedInvocation(
@@ -4556,16 +4568,15 @@ test "provider cancellation stops reconciliation and preserves pending usage" {
         5,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "connection-a",
         "https://provider.example",
-        null,
     );
     var cancel = std.atomic.Value(bool).init(false);
     reconcilePendingBlocking(
         &usage,
         alloc,
-        "credential",
         &cancel,
-        fake.provider(),
+        dispatch,
         2,
     );
 
@@ -4659,8 +4670,8 @@ test "gateway observation checkpoints active and terminal usage states" {
         alloc,
         .ok,
         .{ .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV" },
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
     try std.testing.expectEqual(@as(usize, 2), capture.calls);
     try std.testing.expectEqual(Availability.pending, capture.billing[1]);
@@ -4732,24 +4743,65 @@ test "terminal checkpoint failure preserves request progress as incomplete" {
     try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
 }
 
-test "pending generation origins remain bounded transport inputs" {
-    try validateOrigin("https://ai-gateway.vercel.sh");
-    try validateOrigin("http://127.0.0.1:3000");
-    try validateOrigin("https://provider.example");
+test "pending generation routing inputs remain bounded" {
+    try validateConnectionId("connection-a");
+    try validateConnectionId("provider:profile_1");
+    try validateLookupScope("https://provider.example");
 
     try std.testing.expectError(
-        error.InvalidGatewayOrigin,
-        validateOrigin(""),
+        error.InvalidConnectionIdentifier,
+        validateConnectionId(""),
     );
     try std.testing.expectError(
-        error.InvalidGatewayOrigin,
-        validateOrigin("https://provider.example\ninjected"),
+        error.InvalidGenerationLookupScope,
+        validateLookupScope("https://provider.example\ninjected"),
     );
-    var oversized: [max_origin_bytes + 1]u8 = @splat('a');
+    var oversized: [max_lookup_scope_bytes + 1]u8 = @splat('a');
     try std.testing.expectError(
-        error.InvalidGatewayOrigin,
-        validateOrigin(&oversized),
+        error.InvalidGenerationLookupScope,
+        validateLookupScope(&oversized),
     );
+}
+
+test "pending connection rebind is allocation atomic" {
+    const alloc = std.testing.allocator;
+    var usage = Usage.initFresh();
+    defer usage.deinit(alloc);
+    for ([_][]const u8{ "request-a", "request-b" }) |id| {
+        const sequence = try usage.reserveInvocation();
+        try usage.finishObservedInvocation(
+            alloc,
+            sequence,
+            1,
+            .observed_generation,
+            id,
+            "vercel",
+            null,
+        );
+    }
+
+    var probe_snapshot = try usage.snapshot(alloc);
+    var probe = std.testing.FailingAllocator.init(alloc, .{});
+    try rebindPendingConnection(probe.allocator(), &probe_snapshot, "connection-a");
+    const allocation_count = probe.alloc_index;
+    probe_snapshot.deinit(alloc);
+
+    for (0..allocation_count) |fail_index| {
+        var snapshot = try usage.snapshot(alloc);
+        defer snapshot.deinit(alloc);
+        var failing = std.testing.FailingAllocator.init(
+            alloc,
+            .{ .fail_index = fail_index },
+        );
+        try std.testing.expectError(
+            error.OutOfMemory,
+            rebindPendingConnection(failing.allocator(), &snapshot, "connection-a"),
+        );
+        try std.testing.expect(failing.has_induced_failure);
+        for (snapshot.pending) |pending| {
+            try std.testing.expectEqualStrings("vercel", pending.connection_id);
+        }
+    }
 }
 
 test "reconciliation retry delay observes cancellation promptly" {
@@ -4775,54 +4827,94 @@ test "reconciliation retry delay observes cancellation promptly" {
     try std.testing.expect(completed_at_ms - signalled_at_ms < cancellation_response_bound_ms);
 }
 
-test "stale reconciliation credential cannot replace a refreshed credential" {
+test "terminal generation lookup stays on connection A after selecting B" {
     const alloc = std.testing.allocator;
+    const FakeProvider = struct {
+        calls: usize = 0,
+        saw_null_scope: bool = false,
+
+        fn lookup(
+            raw: ?*anyopaque,
+            allocator: Allocator,
+            input: generation_usage.LookupInput,
+        ) generation_usage.LookupError!generation_usage.LookupOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            self.saw_null_scope = input.lookup_scope == null;
+            const id = try allocator.dupe(u8, input.generation_id);
+            errdefer allocator.free(id);
+            return .{ .found = .{
+                .id = id,
+                .model = try allocator.dupe(u8, "provider/model"),
+                .total_cost = 0.5,
+                .input_tokens = 2,
+                .output_tokens = 1,
+                .cache_read_tokens = 0,
+                .cache_write_tokens = 0,
+                .billable_web_search_calls = 0,
+            } };
+        }
+
+        fn provider(self: *@This()) generation_usage.Provider {
+            return .{ .context = self, .lookup_fn = lookup };
+        }
+    };
+    var provider_a: FakeProvider = .{};
+    var provider_b: FakeProvider = .{};
+    const selected_connection_id = "connection-b";
+    try std.testing.expectEqualStrings("connection-b", selected_connection_id);
+
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
-
-    usage.startReconciliation(alloc, "initial-key");
-    usage.replaceReconciliationCredential(alloc, "refreshed-key");
-    usage.startReconciliation(alloc, "initial-key");
-    usage.refreshReconciliationCredential(
+    const observation = try GatewayObservation.begin(&usage);
+    try observation.complete(
         alloc,
-        "initial-key",
-        "stale-producer-key",
+        .ok,
+        .{ .generation_id = "request-42" },
+        "connection-a",
+        null,
     );
+    var queued = try usage.snapshot(alloc);
+    defer queued.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), queued.pending.len);
+    try std.testing.expectEqualStrings("connection-a", queued.pending[0].connection_id);
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writeRichSnapshot(&encoded.writer, queued);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "credential-a") == null);
 
-    const expected = reconciliationKeyDigest("refreshed-key");
-    try std.testing.expectEqualSlices(
-        u8,
-        &expected,
-        &(usage.reconciliation_key_digest orelse return error.TestUnexpectedResult),
-    );
+    var dispatch = try generation_usage.Dispatch.init(alloc, &.{
+        .{ .id = "connection-a", .credential_ref = "credential-a", .provider = provider_a.provider() },
+        .{ .id = "connection-b", .credential_ref = "credential-b", .provider = provider_b.provider() },
+    }, .{ .resolve_fn = resolveTestGenerationCredential });
+    defer dispatch.deinit(alloc);
+    var cancel = std.atomic.Value(bool).init(false);
+    reconcilePendingBlocking(&usage, alloc, &cancel, dispatch, 1);
+    try std.testing.expectEqual(@as(usize, 1), provider_a.calls);
+    try std.testing.expectEqual(@as(usize, 0), provider_b.calls);
+    try std.testing.expect(provider_a.saw_null_scope);
 
-    usage.refreshReconciliationCredential(
+    var missing_usage = Usage.initFresh();
+    defer missing_usage.deinit(alloc);
+    const missing_observation = try GatewayObservation.begin(&missing_usage);
+    try missing_observation.complete(
         alloc,
-        "refreshed-key",
-        "next-key",
+        .ok,
+        .{ .generation_id = "request-missing" },
+        "connection-a",
+        null,
     );
-    const next_expected = reconciliationKeyDigest("next-key");
-    try std.testing.expectEqualSlices(
-        u8,
-        &next_expected,
-        &(usage.reconciliation_key_digest orelse return error.TestUnexpectedResult),
-    );
-
-    usage.clearReconciliationCredential();
-    usage.refreshReconciliationCredential(
-        alloc,
-        "next-key",
-        "stale-after-clear",
-    );
-    try std.testing.expect(usage.reconciliation_key_digest == null);
-    try std.testing.expect(usage.reconciliation_credential_blocked);
-
-    usage.replaceReconciliationCredential(alloc, "replacement-key");
-    const replacement_expected = reconciliationKeyDigest("replacement-key");
-    try std.testing.expectEqualSlices(
-        u8,
-        &replacement_expected,
-        &(usage.reconciliation_key_digest orelse return error.TestUnexpectedResult),
-    );
-    try std.testing.expect(!usage.reconciliation_credential_blocked);
+    var missing_dispatch = try generation_usage.Dispatch.init(alloc, &.{.{
+        .id = "connection-b",
+        .credential_ref = "credential-b",
+        .provider = provider_b.provider(),
+    }}, .{ .resolve_fn = resolveTestGenerationCredential });
+    defer missing_dispatch.deinit(alloc);
+    reconcilePendingBlocking(&missing_usage, alloc, &cancel, missing_dispatch, 1);
+    var pending = try missing_usage.snapshot(alloc);
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(Availability.pending, pending.billing);
+    try std.testing.expectEqual(@as(usize, 1), pending.pending.len);
+    try std.testing.expectEqual(@as(usize, 1), provider_a.calls);
+    try std.testing.expectEqual(@as(usize, 0), provider_b.calls);
 }

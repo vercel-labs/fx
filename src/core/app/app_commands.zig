@@ -1600,10 +1600,14 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandShowCredits(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            var snapshot = app.creditsProvider().fetch(app.alloc, .{
-                .credential = app.auth.apiKey(),
-                .tenant = app.auth.gatewayTeam(),
-            });
+            var snapshot = app.fetchAccountUsage() catch {
+                try app.writeDomainNotice(.{
+                    .topic = "credits",
+                    .tone = .@"error",
+                    .body = "Failed to fetch account usage.",
+                }, true);
+                return;
+            };
             defer snapshot.deinit(app.alloc);
             const text = snapshot.renderInteractiveBody(app.alloc) catch {
                 try app.writeDomainNotice(.{
@@ -3559,18 +3563,7 @@ fn writeSandboxPersistenceFailure(app: anytype, err: anyerror) !void {
 const SurfaceOnlyApp = struct {};
 
 const CreditsCommandFakeApp = struct {
-    const FakeAuth = struct {
-        fn apiKey(_: *const FakeAuth) ?[]const u8 {
-            return "credential";
-        }
-
-        fn gatewayTeam(_: *const FakeAuth) ?[]const u8 {
-            return "tenant";
-        }
-    };
-
     alloc: std.mem.Allocator,
-    auth: FakeAuth = .{},
     calls: usize = 0,
     saw_expected_input: bool = false,
     notice_body: std.ArrayList(u8) = .empty,
@@ -3581,24 +3574,10 @@ const CreditsCommandFakeApp = struct {
         self.notice_body.deinit(self.alloc);
     }
 
-    fn creditsProvider(self: *CreditsCommandFakeApp) gateway_provider.CreditsProvider {
-        return .{
-            .context = self,
-            .fetch_fn = fetchCredits,
-        };
-    }
-
-    fn fetchCredits(
-        raw: ?*anyopaque,
-        alloc: std.mem.Allocator,
-        input: gateway_provider.CreditsLookupInput,
-    ) output_contracts.CreditsSnapshot {
-        const self: *CreditsCommandFakeApp = @ptrCast(@alignCast(raw.?));
+    fn fetchAccountUsage(self: *CreditsCommandFakeApp) !output_contracts.CreditsSnapshot {
         self.calls += 1;
-        self.saw_expected_input =
-            std.mem.eql(u8, input.credential orelse "", "credential") and
-            std.mem.eql(u8, input.tenant orelse "", "tenant");
-        return .{ .balance = alloc.dupe(u8, "10") catch null };
+        self.saw_expected_input = true;
+        return .{ .balance = try self.alloc.dupe(u8, "10") };
     }
 
     noinline fn writeDomainNotice(

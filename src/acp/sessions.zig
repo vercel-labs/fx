@@ -51,10 +51,7 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
     const model = try alloc.dupe(u8, durable.preferences.model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model);
-    var session_rt = session_runtime.SessionRuntime.init(
-        state.cfg.max_history_turns,
-        state.cfg.gateway_provider.generation_usage,
-    );
+    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
     const revision = js_host_session_store.commit(alloc, durable, null) catch
@@ -212,10 +209,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     defer if (model_owned) alloc.free(model_copy);
     const session_dir = try session_store.sessionDirPath(alloc, store.sessions_dir, writable.active_id);
     defer alloc.free(session_dir);
-    var session_rt = session_runtime.SessionRuntime.init(
-        state.cfg.max_history_turns,
-        state.cfg.gateway_provider.generation_usage,
-    );
+    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
     _ = try session_rt.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
@@ -358,7 +352,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     const model_copy = try alloc.dupe(u8, loaded.state.preferences.model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model_copy);
-    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns, state.cfg.gateway_provider.generation_usage);
+    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
     try session_rt.restoreWithPermissionState(
@@ -620,10 +614,7 @@ fn handleRestoreSession(
     var model_owned = true;
     defer if (model_owned) alloc.free(model_copy);
 
-    var session_rt = session_runtime.SessionRuntime.init(
-        state.cfg.max_history_turns,
-        state.cfg.gateway_provider.generation_usage,
-    );
+    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
     _ = try session_rt.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
@@ -845,11 +836,9 @@ fn activateSession(
         .pending_prompt_id = null,
     };
     server.enableSubagentHost(state);
+    server.configureGenerationUsageSource(state);
     state.active_session.?.session_rt.attachProfileUsagePublisher(state.alloc);
-    state.active_session.?.session_rt.usage.startReconciliation(
-        state.alloc,
-        state.api_key,
-    );
+    state.active_session.?.session_rt.usage.startReconciliation(state.alloc);
     activateManagedBackground(state, store);
 }
 
@@ -1617,10 +1606,6 @@ test "ACP new and loaded sessions provide a writable subagent host" {
         );
         try std.testing.expectEqualStrings("review", new_active.mode);
         try std.testing.expect(new_writable.state.usage != null);
-        try std.testing.expect(
-            new_active.session_rt.usage.generation_usage_provider.lookup_fn ==
-                state.cfg.gateway_provider.generation_usage.lookup_fn,
-        );
         io_mod.sleep(10 * std.time.ns_per_ms);
         var live_usage = try new_active.session_rt.usage.snapshot(alloc);
         defer live_usage.deinit(alloc);
@@ -1656,10 +1641,6 @@ test "ACP new and loaded sessions provide a writable subagent host" {
         try std.testing.expect(loaded_writable.state.usage != null);
         try std.testing.expect(state.subagent_store != null);
         try std.testing.expect(state.subagent_host != null);
-        try std.testing.expect(
-            loaded_active.session_rt.usage.generation_usage_provider.lookup_fn ==
-                state.cfg.gateway_provider.generation_usage.lookup_fn,
-        );
 
         try capture.sync(io_mod.getIo());
     }

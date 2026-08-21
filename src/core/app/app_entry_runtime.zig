@@ -820,9 +820,8 @@ test "app entry returns after handled CLI success without initializing app" {
     try std.testing.expectEqualStrings("entry_test_tool", capture.seen_config.?.tool_set.order[0]);
     try std.testing.expectEqualStrings("skills", capture.seen_config.?.skill_root_policy.workspace_roots[0].path);
     try std.testing.expect(capture.seen_config.?.gateway_provider.chat_url.resolve_fn == test_builtin_gateway.chat_url_provider.resolve_fn);
-    try std.testing.expect(capture.seen_config.?.gateway_provider.cli_model_catalog.fetch_fn == test_builtin_gateway.cli_model_catalog_provider.fetch_fn);
-    try std.testing.expect(capture.seen_config.?.gateway_provider.web_search.execute_fn == test_builtin_gateway.default_web_search_provider.execute_fn);
-    try std.testing.expect(capture.seen_config.?.gateway_provider.model_catalog.fetch_fn == test_builtin_gateway.model_catalog_provider.fetch_fn);
+    try std.testing.expect(capture.seen_config.?.gateway_provider.provider_adapter.web_search.?.execute_fn == test_builtin_gateway.default_web_search_provider.execute_fn);
+    try std.testing.expect(capture.seen_config.?.gateway_provider.provider_adapter.model_catalog.?.fetch_fn == test_builtin_gateway.model_catalog_provider.fetch_fn);
     try std.testing.expect(
         capture.seen_config.?.background_process_provider.spawn_prepared_fn ==
             cfg.background_process_provider.spawn_prepared_fn,

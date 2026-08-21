@@ -592,12 +592,10 @@ pub fn Runtime(comptime App: type) type {
                 @hasField(@TypeOf(app.session), "usage"))
             {
                 if (app.auth.gatewayCredential()) |credential| {
-                    app.session.usage.replaceReconciliationCredential(
-                        app.alloc,
-                        credential.api_key,
-                    );
+                    _ = credential;
+                    app.session.usage.startReconciliation(app.alloc);
                 } else {
-                    app.session.usage.clearReconciliationCredential();
+                    app.session.usage.cancelReconciliation();
                 }
             }
         }
@@ -765,22 +763,18 @@ const TestGatewayCredential = struct {
 };
 
 const TestUsage = struct {
-    refresh_count: usize = 0,
-    clear_count: usize = 0,
-    last_key: ?[]const u8 = null,
+    start_count: usize = 0,
+    cancel_count: usize = 0,
 
-    fn replaceReconciliationCredential(
+    fn startReconciliation(
         self: *TestUsage,
         _: std.mem.Allocator,
-        api_key: []const u8,
     ) void {
-        self.refresh_count += 1;
-        self.last_key = api_key;
+        self.start_count += 1;
     }
 
-    fn clearReconciliationCredential(self: *TestUsage) void {
-        self.clear_count += 1;
-        self.last_key = null;
+    fn cancelReconciliation(self: *TestUsage) void {
+        self.cancel_count += 1;
     }
 };
 
@@ -947,11 +941,7 @@ test "auth source changes invalidate the catalog and failed selection preserves 
     try std.testing.expectEqual(credentials.Source.stored_key, app.auth.selected_source.?);
     try std.testing.expectEqual(@as(usize, 2), app.model_cache.reset_count);
     try std.testing.expectEqual(@as(usize, 2), app.model_cache_warmup_count);
-    try std.testing.expectEqual(@as(usize, 2), app.session.usage.refresh_count);
-    try std.testing.expectEqualStrings(
-        "refreshed-key",
-        app.session.usage.last_key.?,
-    );
+    try std.testing.expectEqual(@as(usize, 2), app.session.usage.start_count);
 
     app.auth.select_result = null;
     try std.testing.expect(!try runtime.selectCredentialSource(&app, .ai_gateway_api_key));
@@ -1137,17 +1127,17 @@ test "prompt credential refresh reloads the catalog after the credential changes
     try std.testing.expectEqual(@as(usize, 2), app.auth.refresh_count);
     try std.testing.expectEqual(@as(usize, 1), app.model_cache.reset_count);
     try std.testing.expectEqual(@as(usize, 1), app.model_cache_warmup_count);
-    try std.testing.expectEqual(@as(usize, 1), app.session.usage.refresh_count);
+    try std.testing.expectEqual(@as(usize, 1), app.session.usage.start_count);
 }
 
-test "credential removal clears the reconciliation credential" {
+test "credential removal cancels reconciliation" {
     var app: TestApp = .{};
     app.auth.gateway_ready = false;
 
     Runtime(TestApp).applyCredentialChange(&app, true);
 
-    try std.testing.expectEqual(@as(usize, 1), app.session.usage.clear_count);
-    try std.testing.expectEqual(@as(usize, 0), app.session.usage.refresh_count);
+    try std.testing.expectEqual(@as(usize, 1), app.session.usage.cancel_count);
+    try std.testing.expectEqual(@as(usize, 0), app.session.usage.start_count);
 }
 
 test "logout result reconciles live auth and renders only sanitized notices" {

@@ -6,11 +6,12 @@ const web_search_policy = @import("web_search_policy.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Inputs = struct {
-    api_key: []const u8,
-    gateway_team: ?[]const u8 = null,
-    worker_model: []const u8,
-    gateway_retry_count: usize,
-    gateway_chat_url: []const u8,
+    connection_id: []const u8 = "vercel",
+    credential: []const u8,
+    tenant: ?[]const u8 = null,
+    model: []const u8,
+    retry_count: usize,
+    endpoint: []const u8,
     usage: ?*session_usage.Usage = null,
     usage_allocator: Allocator = std.heap.c_allocator,
 };

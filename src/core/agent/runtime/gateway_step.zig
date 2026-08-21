@@ -198,7 +198,7 @@ const LegacyGatewayCompatibilityBridge = struct {
     status: std.http.Status,
     err_body: ?[]const u8 = null,
     retry_after_seconds: ?u64 = null,
-    generation_origin: []const u8 = "",
+    generation_origin: ?[]const u8 = null,
     reconcile_generation_usage: bool = false,
     failure_diagnostic_summary: ?[]const u8 = null,
     failure_request_shape: ?[]const u8 = null,
@@ -209,7 +209,7 @@ const LegacyGatewayCompatibilityBridge = struct {
             .none => error.MissingTerminalEvent,
             .finish => .{
                 .status = .ok,
-                .generation_origin = collector.generation_origin orelse "",
+                .generation_origin = collector.generation_origin,
                 .reconcile_generation_usage = collector.completion.generation_id != null,
             },
             .failure => |failure| .{
@@ -370,12 +370,14 @@ pub fn streamModelRequest(
             usage_allocator,
             legacy.status,
             completion,
+            route.connection_id,
             legacy.generation_origin,
-            tenant,
         );
     }
-    if (legacy.reconcile_generation_usage) {
-        if (usage) |ledger| ledger.startReconciliation(usage_allocator, credential);
+    if (comptime @import("builtin").os.tag != .wasi) {
+        if (legacy.reconcile_generation_usage) {
+            if (usage) |ledger| ledger.startReconciliation(usage_allocator);
+        }
     }
     if (completion.billing) |billing| {
         alloc.free(@constCast(billing.model));
@@ -472,13 +474,13 @@ pub fn streamGatewayCompletion(
         usage_allocator,
         result.status,
         result.completion,
+        "vercel",
         result.generation_origin,
-        team,
     );
     if (comptime @import("builtin").os.tag != .wasi) {
         if (result.reconcile_generation_usage) {
             if (usage) |ledger| {
-                ledger.startReconciliation(usage_allocator, api_key);
+                ledger.startReconciliation(usage_allocator);
             }
         }
     }
@@ -661,7 +663,7 @@ test "neutral adapter events materialize owned completion state" {
             events: agent_stream_provider.EventSink,
         ) anyerror!void {
             try events.emit(.provider_admitted);
-            var generation = [_]u8{ 'g', 'e', 'n', '_', '0', '1', 'A', 'R', 'Z', '3', 'N', 'D', 'E', 'K', 'T', 'S', 'V', '4', 'R', 'R', 'F', 'F', 'Q', '6', '9', 'G', '5', 'F', 'A', 'V' };
+            var generation = [_]u8{ 'r', 'e', 'q', 'u', 'e', 's', 't', '-', '4', '2' };
             const local_call = types.ToolCall{
                 .id = "local_1",
                 .name = "read_file",
@@ -685,7 +687,6 @@ test "neutral adapter events materialize owned completion state" {
                 .reason = .tool_calls,
                 .generation_reference = .{
                     .id = &generation,
-                    .lookup_scope = "https://example.invalid/generation",
                 },
             } });
             @memset(&generation, 'x');
@@ -745,12 +746,13 @@ test "neutral adapter events materialize owned completion state" {
     try std.testing.expectEqualStrings("{\"results\":[]}", result.completion.tool_calls[1].provider_result.?);
     try std.testing.expectEqual(@as(?u64, 3), result.completion.usage.input_tokens);
     try std.testing.expectEqual(@as(?u64, 5), result.completion.usage.output_tokens);
-    try std.testing.expectEqualStrings("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV", result.completion.generation_id.?);
+    try std.testing.expectEqualStrings("request-42", result.completion.generation_id.?);
     var usage_snapshot = try usage.snapshot(std.testing.allocator);
     defer usage_snapshot.deinit(std.testing.allocator);
     try std.testing.expectEqual(session_usage.Availability.pending, usage_snapshot.billing);
     try std.testing.expectEqual(@as(usize, 1), usage_snapshot.pending.len);
-    try std.testing.expectEqualStrings("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV", usage_snapshot.pending[0].id);
+    try std.testing.expectEqualStrings("request-42", usage_snapshot.pending[0].id);
+    try std.testing.expect(usage_snapshot.pending[0].lookup_scope == null);
 }
 
 test "non-http adapter failure drives legacy gateway compatibility bridge" {

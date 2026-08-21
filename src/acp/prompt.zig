@@ -41,7 +41,9 @@ const context_contract = @import("../core/workspace/context_contract.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const route_snapshot = @import("../core/gateway/route_snapshot.zig");
+const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const connection_registry = @import("../core/gateway/connection_registry.zig");
+const model_catalog = @import("../core/gateway/model_catalog.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
 const devbox_executor = @import("../core/execution/devbox_executor.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
@@ -90,6 +92,7 @@ const AcpContext = struct {
     alloc: Allocator,
     state: *server.ServerState,
     session_id: []const u8,
+    connection_adapter_kind: []const u8 = "",
     /// Tool-call IDs already announced with a pending update. Keys are owned
     /// copies of provider call ids so the ID stays stable from permission
     /// review through execution.
@@ -207,15 +210,6 @@ const AcpContext = struct {
 
     fn toolContext(self: *AcpContext) tool_runtime.Context {
         const session = if (self.state.active_session) |*active| active else unreachable;
-        self.state.web_search_runtime.configure(.{
-            .api_key = session.api_key,
-            .gateway_team = self.state.gateway_team,
-            .worker_model = session.model,
-            .gateway_retry_count = self.state.cfg.gateway_retry_count,
-            .gateway_chat_url = self.state.cfg.gateway_chat_url,
-            .usage = &session.session_rt.usage,
-            .usage_allocator = self.state.alloc,
-        });
         var tc: tool_runtime.Context = .{
             .workspace_root = self.state.workspace_root,
             .access_scope = self.state.workspace_access.scope(self.state.workspace_root),
@@ -520,6 +514,9 @@ pub fn handlePrompt(
         .permission_rules = session.permission_rules,
         .mcp_runtime = session.mcp,
         .subagent_available = state.subagent_host != null,
+        .terminal_available = state.subagent_host != null and
+            tool_dispatch.ToolCapabilities.for_host(host.current()).terminalAvailable(),
+        .provider_tools = state.cfg.gateway_provider.provider_adapter.provider_tools,
     });
     defer tool_projection.deinit(alloc);
 
@@ -571,6 +568,7 @@ pub fn handlePrompt(
         state.connections.?.selectedProfile().id;
     const profile = state.connections.?.profile(connection_id) catch
         return error.MissingSessionConnection;
+    ctx.connection_adapter_kind = profile.adapter_id;
     if (recovery_checkpoint) |checkpoint| {
         try route_snapshot.validateRecoveryProfile(
             profile,
@@ -651,6 +649,7 @@ pub fn handlePrompt(
         .skills_prompt_section = skills_section,
         .explicit_skills_prompt_section = explicit_skills.text,
         .gateway_tools_json = tool_projection.tools_json,
+        .provider_tools = tool_projection.provider_tools,
         .custom_tool_guidance = tool_projection.custom_guidance,
     });
     agent_config.session_child_capability = if (session.writable) |*writable|
@@ -703,6 +702,7 @@ pub fn runSubagentChild(
         .alloc = alloc,
         .state = state,
         .session_id = session_id,
+        .connection_adapter_kind = if (admission.route) |route| route.adapter_kind else "",
         .captured_mode = captured_mode,
         .captured_permission_mode = admission.permission_mode,
         .captured_sandbox_backend = admission.sandbox_backend,
@@ -717,6 +717,8 @@ pub fn runSubagentChild(
             .permission_rules = admission.rules,
             .mcp_runtime = mcp,
             .subagent_available = true,
+            .terminal_available = tool_dispatch.ToolCapabilities.for_host(host.current()).terminalAvailable(),
+            .provider_tools = state.cfg.gateway_provider.provider_adapter.provider_tools,
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(alloc);
@@ -741,6 +743,7 @@ pub fn runSubagentChild(
         .skills_prompt_section = bounded_skills.text,
         .explicit_skills_prompt_section = explicit_skills.text,
         .gateway_tools_json = child_projection.tools_json,
+        .provider_tools = child_projection.provider_tools,
         .custom_tool_guidance = child_projection.custom_guidance,
         .context_registry = state.cfg.context_registry,
         .context_enabled = state.context_enabled,
@@ -809,6 +812,7 @@ const AgentConfigSections = struct {
     skills_prompt_section: []const u8,
     explicit_skills_prompt_section: []const u8,
     gateway_tools_json: []const u8,
+    provider_tools: []const agent_stream_provider.ProviderToolAdvertisement = &.{},
     custom_tool_guidance: []const u8,
 };
 
@@ -821,6 +825,7 @@ fn buildAgentConfig(state: *server.ServerState, session: *server.ActiveSessionSt
         .gateway_retry_count = state.cfg.gateway_retry_count,
         .gateway_chat_url = state.cfg.gateway_chat_url,
         .gateway_tools_json = sections.gateway_tools_json,
+        .provider_tools = sections.provider_tools,
         .custom_tool_guidance = sections.custom_tool_guidance,
         .agent_step_limit = session.agent_step_limit,
         .max_tool_result_bytes = session.max_tool_result_bytes,
@@ -1169,10 +1174,16 @@ fn resolveModelCapabilities(
     model: []const u8,
 ) model_capabilities.ResolveError!model_capabilities.Capabilities {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const session = if (ctx.state.active_session) |*active| active else return model_capabilities.capabilitiesForModel(model);
+    const adapter = ctx.state.cfg.gateway_provider.provider_adapter;
+    const descriptors = adapter.model_descriptors;
+    const session = if (ctx.state.active_session) |*active| active else return descriptors.fallback(model).capabilities;
+    const catalog = gateway_provider.modelCatalogForAdapter(
+        ctx.connection_adapter_kind,
+        adapter,
+    ) orelse return descriptors.fallback(model).capabilities;
     return ctx.state.capability_resolver.resolve(
         ctx.state.alloc,
-        ctx.state.cfg.gateway_provider.model_catalog,
+        catalog,
         .{
             .access = credentials.catalogAccessForCredential(session.credential_source, session.api_key, ctx.state.gateway_team),
             .endpoint = ctx.state.cfg.gateway_models_path,
@@ -1187,18 +1198,26 @@ fn availableModelCapabilities(
     model: []const u8,
 ) model_capabilities.Capabilities {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const adapter = ctx.state.cfg.gateway_provider.provider_adapter;
+    if (gateway_provider.modelCatalogForAdapter(
+        ctx.connection_adapter_kind,
+        adapter,
+    ) == null) return adapter.model_descriptors.fallback(model).capabilities;
     return ctx.state.capability_resolver.available(model);
 }
 
 fn resolveModelDescriptor(raw_ctx: *anyopaque, alloc: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.ModelDescriptor {
-    var descriptor = model_capabilities.configuredDescriptor(model, .{});
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    var descriptor = ctx.state.cfg.gateway_provider.provider_adapter.model_descriptors.fallback(model);
     descriptor.capabilities = try resolveModelCapabilities(raw_ctx, alloc, model);
     descriptor.source = .catalog;
     return descriptor;
 }
 
 fn availableModelDescriptor(raw_ctx: *anyopaque, model: []const u8) model_capabilities.ModelDescriptor {
-    const descriptor = model_capabilities.configuredDescriptor(model, availableModelCapabilities(raw_ctx, model));
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    var descriptor = ctx.state.cfg.gateway_provider.provider_adapter.model_descriptors.fallback(model);
+    descriptor.capabilities = availableModelCapabilities(raw_ctx, model);
     return descriptor;
 }
 
@@ -2762,8 +2781,8 @@ test "ACP usage checkpoints maintain the profile recovery marker" {
         1,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
     var pending = try usage.snapshot(alloc);
     defer pending.deinit(alloc);
@@ -3472,9 +3491,7 @@ fn initTestAcpState(alloc: Allocator, workspace_root: []const u8, mode: Permissi
         .workspace_root = owned_workspace,
         .connections = connections,
         .sandbox_backend = selected_backend,
-        .web_search_runtime = @import("../core/tooling/web_search_runtime.zig").Runtime.init(.{
-            .provider = cfg.gateway_provider.web_search,
-        }),
+        .web_search_runtime = @import("../core/tooling/web_search_runtime.zig").Runtime.init(.{}),
         .active_session = .{
             .session_id = session_id,
             .model = model,
@@ -3559,6 +3576,149 @@ test "fake non-Vercel adapter completes an ACP root turn on its admitted route" 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expect(outcome == .stop_reason);
     try std.testing.expectEqual(acp_types.StopReason.end_turn, outcome.stop_reason);
+}
+
+test "mismatched ACP adapter forces static capabilities without provider traffic" {
+    const web_search_contract = @import("../core/tooling/web_search_contract.zig");
+    const web_search_runtime = @import("../core/tooling/web_search_runtime.zig");
+    const Traffic = struct {
+        catalog_calls: usize = 0,
+        search_calls: usize = 0,
+        model_calls: usize = 0,
+
+        fn fetchCatalog(
+            raw: ?*anyopaque,
+            _: Allocator,
+            _: model_catalog.FetchInput,
+        ) Allocator.Error!model_catalog.ProviderResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.catalog_calls += 1;
+            return .{ .failure = .{ .category = .transport } };
+        }
+
+        fn preferredSearchBackends(
+            raw: ?*anyopaque,
+        ) anyerror!?[]const web_search_contract.SearchBackendId {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.search_calls += 1;
+            return null;
+        }
+
+        fn search(
+            raw: ?*anyopaque,
+            _: Allocator,
+            _: web_search_runtime.Inputs,
+            _: web_search_contract.ProviderRequest,
+            _: ?web_search_contract.ProgressFn,
+            _: ?*anyopaque,
+        ) anyerror!web_search_contract.ProviderResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.search_calls += 1;
+            return error.TestUnexpectedSearch;
+        }
+
+        fn stream(
+            adapter: *const agent_stream_provider.ProviderAdapter,
+            _: Allocator,
+            _: agent_stream_provider.AdapterRequest,
+            events: agent_stream_provider.EventSink,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(adapter.context.?));
+            self.model_calls += 1;
+            try events.emit(.{ .finish = .{ .reason = .stop } });
+        }
+
+        fn secretStoreDisabled(_: ?*anyopaque) bool {
+            return false;
+        }
+
+        fn loadSecret(
+            _: ?*anyopaque,
+            alloc: Allocator,
+        ) host.SecretStoreLoadError!?[]u8 {
+            return try alloc.dupe(u8, "fake-key");
+        }
+
+        fn storeSecret(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: []const u8,
+        ) host.SecretStoreWriteError!void {}
+
+        fn storeSecretInteractively(_: ?*anyopaque) host.SecretStoreWriteError!bool {
+            return false;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var output = try tmp.dir.createFile(io_mod.getIo(), "acp-mismatch.jsonl", .{});
+    defer output.close(io_mod.getIo());
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .auto);
+    defer state.deinit();
+    state.writer = .{ .stdout = output };
+    var traffic = Traffic{};
+    state.cfg.gateway_provider.connection_seed = .{
+        .id = "mismatched",
+        .display_name = "Mismatched",
+        .adapter_id = "unavailable_adapter",
+        .endpoint = "fake://acp-mismatch",
+        .protocol = "unavailable_adapter",
+        .credential_ref = "stored_key",
+    };
+    state.connections.?.deinit();
+    state.connections = try connection_registry.Runtime.init(
+        alloc,
+        state.cfg.gateway_provider.connection_seed.profile("test-model", null),
+        null,
+        .unavailable,
+    );
+    var adapter = test_builtin_gateway.provider_adapter;
+    adapter.kind = "provider_adapter";
+    adapter.context = &traffic;
+    adapter.model_catalog = .{
+        .context = &traffic,
+        .fetch_fn = Traffic.fetchCatalog,
+    };
+    var search = test_builtin_gateway.default_web_search_provider;
+    search.context = &traffic;
+    search.preferred_backends_fn = Traffic.preferredSearchBackends;
+    search.execute_fn = Traffic.search;
+    adapter.web_search = search;
+    adapter.stream_fn = Traffic.stream;
+    state.cfg.gateway_provider.provider_adapter = adapter;
+    state.cfg.secret_store = .{
+        .backend_label = "test",
+        .is_disabled_fn = Traffic.secretStoreDisabled,
+        .load_fn = Traffic.loadSecret,
+        .store_fn = Traffic.storeSecret,
+        .store_interactive_fn = Traffic.storeSecretInteractively,
+    };
+    state.active_session.?.effort = types.ReasoningEffort.literal("high");
+    const profile = state.connections.?.selectedProfile();
+    const credential = try server.prepareConnectionCredential(
+        &state,
+        alloc,
+        profile,
+        state.active_session.?.model,
+    );
+    server.adoptConnectionCredential(&state, profile.id, credential);
+    state.active_session.?.api_key = state.api_key;
+    state.active_session.?.credential_source = state.credential_source;
+    var msg = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/prompt",
+        .params_raw = "{\"sessionId\":\"session_1\",\"prompt\":[{\"type\":\"text\",\"text\":\"force capability resolution\"}]}",
+    };
+
+    try std.testing.expectError(
+        error.RouteAdapterMismatch,
+        handlePrompt(&state, alloc, &msg, "normal", .auto, .none),
+    );
+    try std.testing.expectEqual(@as(usize, 0), traffic.catalog_calls);
+    try std.testing.expectEqual(@as(usize, 0), traffic.search_calls);
+    try std.testing.expectEqual(@as(usize, 0), traffic.model_calls);
 }
 
 test "stripAnsiAlloc returns the original slice for clean text and strips escapes" {
@@ -4003,7 +4163,7 @@ test "ACP deps reject malformed native web_search calls" {
     try std.testing.expectEqualStrings("web_search field \"query\" must contain at least two characters", result.failure);
 }
 
-test "ACP prompt projection configures web search then blocks native execution" {
+test "ACP prompt projection leaves Fx search uninstalled" {
     const alloc = std.testing.allocator;
     const web_search_contract = @import("../core/tooling/web_search_contract.zig");
     const web_search_runtime = @import("../core/tooling/web_search_runtime.zig");
@@ -4036,19 +4196,10 @@ test "ACP prompt projection configures web search then blocks native execution" 
     state.writer = .{ .stdout = capture };
     var ctx = AcpContext{ .alloc = arena, .state = &state, .session_id = "session_1" };
     var provider_state = ProviderState{};
-    var provider = state.web_search_runtime.provider orelse return error.TestExpectedEqual;
+    var provider = test_builtin_gateway.default_web_search_provider;
     provider.context = @ptrCast(&provider_state);
     provider.execute_fn = FailingWebSearchProvider.execute;
-    state.web_search_runtime = web_search_runtime.Runtime.init(.{
-        .provider = provider,
-    });
-
-    state.web_search_runtime.configure(.{
-        .api_key = "stale-key",
-        .worker_model = "stale-model",
-        .gateway_retry_count = 99,
-        .gateway_chat_url = "https://stale.invalid/chat",
-    });
+    state.cfg.gateway_provider.provider_adapter.web_search = provider;
 
     var messages: std.ArrayList(ChatMessage) = .empty;
     defer messages.deinit(arena);
@@ -4056,8 +4207,6 @@ test "ACP prompt projection configures web search then blocks native execution" 
     const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
     try append_static(deps.ctx, arena, &messages);
     try deps.append_runtime_context(deps.ctx, arena, &messages);
-
-    try std.testing.expectEqualStrings("stale-key", state.web_search_runtime.api_key);
 
     const validate = deps.validate_tool_call orelse return error.TestExpectedEqual;
     const validation = try validate(deps.ctx, arena, .{
@@ -4067,11 +4216,6 @@ test "ACP prompt projection configures web search then blocks native execution" 
     });
     const session = state.active_session orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("web_search field \"query\" must contain at least two characters", validation.failure);
-    try std.testing.expectEqualStrings(session.api_key, state.web_search_runtime.api_key);
-    try std.testing.expectEqualStrings(session.model, state.web_search_runtime.worker_model);
-    try std.testing.expectEqual(state.cfg.gateway_retry_count, state.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, state.web_search_runtime.gateway_chat_url);
-
     const execute = deps.execute_tool_call;
     const execution = try execute(deps.ctx, .{
         .call_allocator = arena,
@@ -4086,10 +4230,6 @@ test "ACP prompt projection configures web search then blocks native execution" 
         .advertised_dynamic_tool_names = &.{},
         .max_tool_result_bytes = session.max_tool_result_bytes,
     });
-    try std.testing.expectEqualStrings(session.api_key, state.web_search_runtime.api_key);
-    try std.testing.expectEqualStrings(session.model, state.web_search_runtime.worker_model);
-    try std.testing.expectEqual(state.cfg.gateway_retry_count, state.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, state.web_search_runtime.gateway_chat_url);
     try std.testing.expectEqual(.failure, execution.status);
     try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
 }
@@ -4488,12 +4628,14 @@ test "ACP full advertisement includes direct provider search with explicit permi
     };
     var projection = try tool_advertisement.buildGatewayToolProjectionForSet(std.testing.allocator, builtin_tools.advertisement_set, .{
         .permission_rules = .{ .rules = &rules },
+        .provider_tools = &.{.web_search},
     });
     defer projection.deinit(std.testing.allocator);
     const json = projection.tools_json;
 
     try std.testing.expect(std.mem.find(u8, json, "\"name\":\"web_search\"") == null);
-    try std.testing.expect(std.mem.find(u8, json, "gateway.perplexity_search") != null);
+    try std.testing.expectEqual(@as(usize, 1), projection.provider_tools.len);
+    try std.testing.expectEqual(.web_search, projection.provider_tools[0].tool);
     try std.testing.expectEqualStrings(builtin_tools.web_search.description, projection.custom_guidance);
 }
 
@@ -4534,14 +4676,9 @@ test "ACP prompt agent config carries request options from active session" {
     const tool_ctx = ctx.toolContext();
     try std.testing.expect(!tool_ctx.web_search_runtime_ready);
     try std.testing.expect(tool_ctx.web_search_backend != null);
-    try std.testing.expect(state.web_search_runtime.provider.?.execute_fn == state.cfg.gateway_provider.web_search.execute_fn);
-    try std.testing.expect(state.web_search_runtime.provider.?.preferred_backends_fn == state.cfg.gateway_provider.web_search.preferred_backends_fn);
+    try std.testing.expect(state.cfg.gateway_provider.provider_adapter.web_search != null);
     try std.testing.expect(tool_ctx.web_fetch_runtime.? == &state.web_fetch_runtime);
     try std.testing.expectEqualStrings("team_123", tool_ctx.gateway_team.?);
-    try std.testing.expectEqualStrings("team_123", state.web_search_runtime.gateway_team.?);
-    try std.testing.expectEqualStrings(session.model, state.web_search_runtime.worker_model);
-    try std.testing.expectEqual(state.cfg.gateway_retry_count, state.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, state.web_search_runtime.gateway_chat_url);
     try std.testing.expectEqualStrings("/models", tool_ctx.gateway_models_path);
     try std.testing.expect(tool_ctx.devbox_provider.?.execute_fn == unavailableDevboxForTest);
 }

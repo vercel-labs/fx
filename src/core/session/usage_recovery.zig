@@ -282,8 +282,8 @@ test "recovery registry reads only marked durable session state" {
         1,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
     try runtime_usage.applyGeneration(alloc, .{
         .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",

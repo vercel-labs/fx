@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT } from "../evals/eval-helpers";
 import {
+  AUTO_DUAL_SEARCH_SERIALIZED_TOOL_NAMES,
   AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
   findUnavailableCapabilityReferences,
@@ -6673,10 +6674,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const initialRequest = parseGatewayRequest(providerGateway.requests[0]!.body);
       const continuingRequest = parseGatewayRequest(providerGateway.requests[1]!.body);
       expect(serializedToolNames(initialRequest)).toEqual(
-        AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
+        AUTO_DUAL_SEARCH_SERIALIZED_TOOL_NAMES,
       );
       expect(serializedToolNames(continuingRequest)).toEqual(
-        AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
+        AUTO_DUAL_SEARCH_SERIALIZED_TOOL_NAMES,
       );
       expect(toolShapesWithoutDescriptions(continuingRequest)).toEqual(
         toolShapesWithoutDescriptions(initialRequest),
@@ -6716,6 +6717,96 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(replay).toContain("└ Searched web");
       expect(replay).not.toContain("Working perplexity_search");
       expect(existsSync(tracePath)).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "explicit TUI Fx search worker uses the admitted adapter",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-local-search-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const finalText = "FX_SEARCH_WORKER_DONE";
+      const sourceUrl = "https://example.test/fx-local-search";
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+
+      const searchGateway = startFakeGateway([
+        fakeGatewayToolCall("fx_search_1", "web_search", {
+          query: "Fx local search fixture",
+        }),
+        fakeGatewaySse([
+          {
+            type: "tool-call",
+            toolCallId: "worker_provider_search_1",
+            toolName: "perplexity_search",
+            input: {},
+          },
+          {
+            type: "tool-result",
+            toolCallId: "worker_provider_search_1",
+            result: {
+              results: [{ title: "Fx local source", url: sourceUrl }],
+            },
+          },
+          {
+            type: "finish",
+            finishReason: { unified: "tool-calls", raw: "tool-calls" },
+          },
+        ]),
+        fakeGatewayFinalText(finalText),
+      ]);
+      gateway = searchGateway;
+
+      session = await TmuxSession.create({
+        cwd: realpathSync(workspace),
+        width: 96,
+        height: 30,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "connection-a-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_PERMISSION_MODE: "auto",
+          FX_GATEWAY_BASE_URL: searchGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: searchGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: searchGateway.chatUrl,
+          FX_MODEL: MODEL,
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Use the installed Fx search worker.");
+      await session.waitForText(finalText, TIMEOUT);
+      await waitForCondition(
+        () => searchGateway.requests.length === 3,
+        "Fx search worker completion",
+      );
+
+      expect(searchGateway.requests.map((request) =>
+        request.headers.get("authorization")
+      )).toEqual([
+        "Bearer connection-a-key",
+        "Bearer connection-a-key",
+        "Bearer connection-a-key",
+      ]);
+      expect(searchGateway.requests.map((request) =>
+        request.headers.get("ai-language-model-id")
+      )).toEqual([MODEL, MODEL, MODEL]);
+      expect(serializedToolNames(parseGatewayRequest(searchGateway.requests[0]!.body))).toEqual(
+        AUTO_DUAL_SEARCH_SERIALIZED_TOOL_NAMES,
+      );
+      expect(searchGateway.requests[1]!.body).toContain("gateway.perplexity_search");
+      expect(searchGateway.requests[1]!.body).not.toContain('"name":"web_search"');
+      expect(searchGateway.requests[2]!.body).toContain(sourceUrl);
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toContain("└ Searched Fx local search fixture");
+      expect(scrollback).not.toContain("Would you like to allow this action?");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,

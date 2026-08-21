@@ -7,7 +7,6 @@ const text_utils = @import("../shared/text_utils.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const image_attachments = @import("../images/image_attachments.zig");
-const generation_usage_provider = @import("generation_usage_provider.zig");
 const web_fetch_artifacts = @import("web_fetch_artifacts.zig");
 pub const session_usage = @import("session_usage.zig");
 pub const profile_usage_runtime = @import("profile_usage_runtime.zig");
@@ -1593,12 +1592,8 @@ pub const SessionRuntime = struct {
     max_history_turns: usize,
     context_history_start: usize = 0,
 
-    pub fn init(
-        max_history_turns: usize,
-        provider: generation_usage_provider.Provider,
-    ) SessionRuntime {
+    pub fn init(max_history_turns: usize) SessionRuntime {
         return .{
-            .usage = session_usage.Usage.initFreshWithProvider(provider),
             .max_history_turns = max_history_turns,
         };
     }
@@ -2282,8 +2277,8 @@ test "unavailable profile usage keeps reconciled generation pending in host runt
         1,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
     try runtime.usage.applyGeneration(alloc, .{
         .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -2342,8 +2337,8 @@ test "readable profile usage does not attach publishers or flush recovery" {
         1,
         .observed_generation,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "vercel",
         "https://ai-gateway.vercel.sh",
-        null,
     );
     try runtime.usage.applyGeneration(alloc, .{
         .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",

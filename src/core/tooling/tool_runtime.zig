@@ -863,7 +863,34 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         host_capabilities.current(),
     );
     capabilities.web_search_runtime_ready =
-        ctx.web_search_runtime_ready and ctx.web_search_backend != null;
+        ctx.web_search_runtime_ready and ctx.web_search_backend != null and
+        ctx.provider_adapter.web_search != null;
+    // Availability preflight has no route; invocation still requires an exact match.
+    const web_search_route_compatible = if (ctx.route) |route|
+        ctx.provider_adapter.acceptsRoute(route)
+    else
+        true;
+    const web_search_invocation: ?tool_dispatch.WebSearchInvocation = if (ctx.route) |route|
+        if (ctx.provider_adapter.acceptsRoute(route))
+            if (ctx.provider_adapter.web_search) |provider| .{
+                .provider = provider,
+                .inputs = .{
+                    .connection_id = route.connection_id,
+                    .credential = ctx.api_key,
+                    .tenant = ctx.gateway_team,
+                    .model = route.primary_model_id,
+                    .retry_count = ctx.gateway_retry_count,
+                    .endpoint = route.endpoint,
+                    .usage = &ctx.session.usage,
+                    .usage_allocator = ctx.session_allocator,
+                },
+            } else null
+        else
+            null
+    else
+        null;
+    capabilities.web_search_runtime_ready =
+        capabilities.web_search_runtime_ready and web_search_route_compatible;
     return .{
         .allocator = arena,
         .permission_mode = ctx.permission_mode,
@@ -902,6 +929,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .web_fetch_artifact_error = ctx.web_fetch_artifact_error,
         .tool_capabilities = capabilities,
         .web_search_backend = ctx.web_search_backend,
+        .web_search_invocation = web_search_invocation,
         .web_search_progress_ctx = ctx.web_search_progress_ctx,
         .on_web_search_progress = ctx.on_web_search_progress,
         .web_fetch_progress_ctx = ctx.web_fetch_progress_ctx,
@@ -4517,6 +4545,68 @@ test "checkToolAvailability rejects missing web_search runtime without catalog o
     }) orelse return error.TestExpectedEqual;
 
     try std.testing.expectEqualStrings(tool_dispatch.web_search_unavailable_message, reason);
+}
+
+test "web search invocation projects the pinned route after another route is selected" {
+    const alloc = std.testing.allocator;
+    var backend = WebSearchBackendFixture{};
+    var connection_a = TestRuntime{
+        .api_key = "credential-a",
+        .gateway_team = "tenant-a",
+        .gateway_retry_count = 2,
+        .web_search_runtime_ready = true,
+        .web_search_backend = .{
+            .ctx = @ptrCast(&backend),
+            .execute_fn = WebSearchBackendFixture.search,
+        },
+    };
+    defer connection_a.deinit(alloc);
+    connection_a.route.connection_id = "connection-a";
+    connection_a.route.endpoint = "https://connection-a.invalid/chat";
+    connection_a.route.primary_model_id = "provider/model-a";
+
+    var connection_b = TestRuntime{ .api_key = "credential-b" };
+    defer connection_b.deinit(alloc);
+    connection_b.route.connection_id = "connection-b";
+    _ = connection_b.context();
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const dispatch = typedDispatchContext(connection_a.context(), arena_state.allocator());
+    const invocation = dispatch.web_search_invocation orelse return error.TestExpectedEqual;
+
+    try std.testing.expectEqualStrings("connection-a", invocation.inputs.connection_id);
+    try std.testing.expectEqualStrings("credential-a", invocation.inputs.credential);
+    try std.testing.expectEqualStrings("tenant-a", invocation.inputs.tenant.?);
+    try std.testing.expectEqualStrings("provider/model-a", invocation.inputs.model);
+    try std.testing.expectEqualStrings("https://connection-a.invalid/chat", invocation.inputs.endpoint);
+    try std.testing.expect(invocation.inputs.usage == &connection_a.session.usage);
+}
+
+test "unsupported route blocks Fx search while route-free preflight stays available" {
+    const alloc = std.testing.allocator;
+    var backend = WebSearchBackendFixture{};
+    var rt = TestRuntime{
+        .web_search_runtime_ready = true,
+        .web_search_backend = .{
+            .ctx = @ptrCast(&backend),
+            .execute_fn = WebSearchBackendFixture.search,
+        },
+    };
+    defer rt.deinit(alloc);
+    rt.route.adapter_kind = "unsupported";
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const dispatch = typedDispatchContext(rt.context(), arena_state.allocator());
+    try std.testing.expect(dispatch.web_search_invocation == null);
+    try std.testing.expect(!dispatch.tool_capabilities.web_search_runtime_ready);
+
+    var no_route = rt.context();
+    no_route.route = null;
+    const missing = typedDispatchContext(no_route, arena_state.allocator());
+    try std.testing.expect(missing.web_search_invocation == null);
+    try std.testing.expect(missing.tool_capabilities.web_search_runtime_ready);
 }
 
 test "validateToolCall rejects invalid private web_search before backend invocation" {

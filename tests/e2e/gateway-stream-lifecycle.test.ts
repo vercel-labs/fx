@@ -601,6 +601,228 @@ async function waitForMcpServerReady(
 }
 
 describe("gateway stream lifecycle", () => {
+  test("deferred usage keeps its connection across selection and sidecar loss", async () => {
+    const root = createFixtureRoot("generation-connection-scope");
+    const modelA = "primary-a";
+    const generationA = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const generationMissing = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    let completion = 0;
+    const generationCredentials: Array<string | null> = [];
+    const gatewayB = startDynamicFakeGateway(() =>
+      fakeGatewayFinalText("WRONG_CONNECTION")
+    );
+    const deferred = (id: string, text: string) => fakeGatewaySse([
+      {
+        type: "text-start",
+        id: "answer",
+        providerMetadata: { gateway: { generationId: id } },
+      },
+      { type: "text-delta", id: "answer", delta: text },
+      { type: "text-end", id: "answer" },
+      { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+    ]);
+    const gatewayA = startDynamicFakeGateway(() => {
+      completion += 1;
+      if (completion === 1) return deferred(generationA, "queued on A");
+      if (completion === 4) return deferred(generationMissing, "missing A queued");
+      return fakeGatewayFinalText("resumed on A");
+    }, {
+      models: [{ id: modelA, type: "language", tags: ["tool-use"] }],
+      generationResponse(id, request) {
+        generationCredentials.push(request.headers.get("authorization"));
+        if (id === generationA && generationCredentials.length === 3) {
+          return Response.json({
+            data: {
+              id,
+              total_cost: 0.01,
+              created_at: new Date().toISOString(),
+              model: modelA,
+              is_byok: false,
+              native_tokens_prompt: 2,
+              native_tokens_completion: 1,
+              native_tokens_reasoning: 0,
+              native_tokens_cached: 0,
+              native_tokens_cache_creation: 0,
+              billable_web_search_calls: 0,
+            },
+          });
+        }
+        return new Response("preserve", { status: 401 });
+      },
+    });
+    const settings = (selected: "connection-a" | "vercel", includeA = true) => ({
+      connections: {
+        selected,
+        profiles: [
+          ...(includeA
+            ? [{
+              id: "connection-a",
+              display_name: "Connection A",
+              adapter_id: "vercel_ai_gateway",
+              endpoint: gatewayA.chatUrl,
+              protocol: "vercel_ai_gateway",
+              credential_ref: "ai_gateway_api_key",
+              remembered_model: modelA,
+              internal_models: {
+                permission_review: null,
+                vision: null,
+                subagent: null,
+              },
+            }]
+            : []),
+          {
+            id: "vercel",
+            display_name: "Vercel fallback trap",
+            adapter_id: "vercel_ai_gateway",
+            endpoint: gatewayB.chatUrl,
+            protocol: "vercel_ai_gateway",
+            credential_ref: "vercel_oidc_token",
+            remembered_model: "primary-b",
+            internal_models: {
+              permission_review: null,
+              vision: null,
+              subagent: null,
+            },
+          },
+        ],
+      },
+    });
+    const env = {
+      HOME: root.home,
+      AI_GATEWAY_API_KEY: "credential-a",
+      VERCEL_OIDC_TOKEN: "credential-b",
+      FX_GATEWAY_BASE_URL: gatewayA.baseUrl,
+      FX_E2E_GATEWAY_MODELS_URL:
+        `${gatewayA.baseUrl}/coding-agent/v1/models`,
+      FX_MODEL: undefined,
+      FX_AUTO_UPGRADE: "0",
+    };
+
+    try {
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify(settings("connection-a")),
+      );
+      const first = await runFx(
+        ["ask", "--json", "Queue generation usage on A."],
+        { cwd: root.workspace, env, timeoutMs: 15_000 },
+      );
+      expect(first.code).toBe(0);
+      const sessionId = parseAskJson(first.stdout).session_id;
+      const sidecarPath = join(
+        root.home,
+        ".fx",
+        "sessions",
+        sessionId,
+        "usage-v2.json",
+      );
+      const firstSidecar = readFileSync(sidecarPath, "utf8");
+      expect(firstSidecar).toContain(`"connection_id":"connection-a"`);
+      expect(firstSidecar).not.toContain("credential-a");
+      expect(gatewayA.generationRequests).toEqual([generationA]);
+
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify(settings("vercel")),
+      );
+      const intact = await runFx(
+        ["ask", "--json", "--resume-id", sessionId, "Keep A with intact usage state."],
+        { cwd: root.workspace, env, timeoutMs: 15_000 },
+      );
+      expect(intact.code).toBe(0);
+      expect(gatewayA.generationRequests).toEqual([generationA, generationA]);
+      expect(generationCredentials).toEqual([
+        "Bearer credential-a",
+        "Bearer credential-a",
+      ]);
+      expect(gatewayB.requests).toHaveLength(0);
+      expect(gatewayB.generationRequests).toHaveLength(0);
+
+      rmSync(sidecarPath);
+      expect(existsSync(sidecarPath)).toBe(false);
+      const resumed = await runFx(
+        ["ask", "--json", "--resume-id", sessionId, "Settle A after selecting B."],
+        { cwd: root.workspace, env, timeoutMs: 15_000 },
+      );
+      expect(resumed.code).toBe(0);
+      expect(gatewayA.generationRequests).toEqual([
+        generationA,
+        generationA,
+        generationA,
+      ]);
+      expect(generationCredentials).toEqual([
+        "Bearer credential-a",
+        "Bearer credential-a",
+        "Bearer credential-a",
+      ]);
+      expect(gatewayB.requests).toHaveLength(0);
+      expect(gatewayB.generationRequests).toHaveLength(0);
+
+      const missing = await runFx(
+        ["ask", "--json", "--resume-id", sessionId, "Queue missing A usage."],
+        { cwd: root.workspace, env, timeoutMs: 15_000 },
+      );
+      expect(missing.code).toBe(0);
+      expect(gatewayA.generationRequests).toEqual([
+        generationA,
+        generationA,
+        generationA,
+        generationMissing,
+      ]);
+      const currentSidecar = readFileSync(sidecarPath, "utf8");
+      const mismatchedSidecar = currentSidecar.replace(
+        `"connection_id":"connection-a"`,
+        `"connection_id":"vercel"`,
+      );
+      expect(mismatchedSidecar).not.toBe(currentSidecar);
+      writeFileSync(sidecarPath, mismatchedSidecar);
+      const recovered = await runFx(
+        ["ask", "--json", "--resume-id", sessionId, "Recover corrupt usage state."],
+        { cwd: root.workspace, env, timeoutMs: 15_000 },
+      );
+      expect(recovered.code).toBe(0);
+      expect(gatewayA.generationRequests).toEqual([
+        generationA,
+        generationA,
+        generationA,
+        generationMissing,
+        generationMissing,
+      ]);
+      expect(generationCredentials).toEqual([
+        "Bearer credential-a",
+        "Bearer credential-a",
+        "Bearer credential-a",
+        "Bearer credential-a",
+        "Bearer credential-a",
+      ]);
+      expect(gatewayB.requests).toHaveLength(0);
+      expect(gatewayB.generationRequests).toHaveLength(0);
+      expect(readFileSync(sidecarPath, "utf8")).toContain(
+        `"connection_id":"connection-a"`,
+      );
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify(settings("vercel", false)),
+      );
+      const trafficBeforeMissingResume = gatewayA.generationRequests.length;
+      const rejected = await runFx(
+        ["ask", "--json", "--resume-id", sessionId, "Do not fall back."],
+        { cwd: root.workspace, env, timeoutMs: 15_000 },
+      );
+      expect(rejected.code).not.toBe(0);
+      expect(gatewayA.generationRequests).toHaveLength(trafficBeforeMissingResume);
+      expect(gatewayB.requests).toHaveLength(0);
+      expect(gatewayB.generationRequests).toHaveLength(0);
+      const pendingSidecar = readFileSync(sidecarPath, "utf8");
+      expect(pendingSidecar).toContain(generationMissing);
+      expect(pendingSidecar).toContain(`"connection_id":"connection-a"`);
+    } finally {
+      gatewayA.stop();
+      gatewayB.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("reviewer Vision and subagent stay on the parent connection", async () => {
     const root = createFixtureRoot("pinned-internal-workloads");
     const tracePath = join(root.root, "trace.log");

@@ -45,11 +45,12 @@ test "ask and code mode projections carry included custom provider guidance" {
             std.testing.allocator,
             builtin_tools.advertisement_set,
             mode_id,
-            .{},
+            .{ .provider_tools = &.{.web_search} },
         );
         defer projection.deinit(std.testing.allocator);
 
-        try std.testing.expect(std.mem.find(u8, projection.tools_json, "gateway.perplexity_search") != null);
+        try std.testing.expectEqual(@as(usize, 1), projection.provider_tools.len);
+        try std.testing.expectEqual(.web_search, projection.provider_tools[0].tool);
         try std.testing.expectEqualStrings(builtin_tools.web_search.description, projection.custom_guidance);
     }
 }

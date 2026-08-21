@@ -34,7 +34,7 @@ pub fn streamStartMayHaveExecutedAtProvider(
 ) bool {
     if (isProviderSearchAlias(tool_name)) return true;
     const spec = registry.lookup(tool_name) orelse return false;
-    return spec.provider_executed;
+    return spec.provider_tool != null;
 }
 
 pub const ProvisionalToolStatuses = struct {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const agent_stream_provider = @import("../agent/stream_provider.zig");
 const gateway_schema = @import("gateway_schema.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const permissions = @import("../permissions/permissions.zig");
@@ -13,6 +14,9 @@ pub const Options = struct {
     permission_rules: types.PermissionRuleSet = .{},
     mcp_runtime: ?*mcp_runtime.McpRuntime = null,
     subagent_available: bool = false,
+    terminal_available: bool = false,
+    provider_tools: []const agent_stream_provider.ProviderTool = &.{},
+    fx_web_search_installed: bool = false,
 };
 
 const BuildKind = enum { full, read_only };
@@ -406,13 +410,6 @@ const test_grep_files = blk: {
     break :blk spec;
 };
 
-fn writeTestWebSearchProviderAdvertisement(
-    _: Allocator,
-    writer: *std.Io.Writer,
-) tool_dispatch.GatewayAdvertisementError!void {
-    try writer.writeAll("{\"type\":\"provider\",\"id\":\"gateway.perplexity_search\",\"name\":\"perplexity_search\",\"args\":{}}");
-}
-
 const test_web_fetch = blk: {
     var spec = test_read_file;
     spec.name = "web_fetch";
@@ -443,8 +440,7 @@ const test_web_search_base = blk: {
 
 const test_web_search = blk: {
     var spec = test_web_search_base;
-    spec.write_gateway_advertisement_fn = writeTestWebSearchProviderAdvertisement;
-    spec.provider_executed = true;
+    spec.provider_tool = .web_search;
     break :blk spec;
 };
 
@@ -637,18 +633,10 @@ const test_mcp_search_tools = blk: {
     break :blk spec;
 };
 
-fn writeTestMirrorProviderAdvertisement(
-    _: Allocator,
-    writer: *std.Io.Writer,
-) tool_dispatch.GatewayAdvertisementError!void {
-    try writer.writeAll("{\"type\":\"provider\",\"id\":\"gateway.mirror_search\",\"name\":\"mirror_search\",\"args\":{}}");
-}
-
 const test_mirror_provider_tool = blk: {
     var spec = test_web_search_base;
     spec.name = "mirror_search";
-    spec.write_gateway_advertisement_fn = writeTestMirrorProviderAdvertisement;
-    spec.provider_executed = true;
+    spec.provider_tool = .web_search;
     break :blk spec;
 };
 
@@ -657,10 +645,12 @@ const test_mirror_provider_tool = blk: {
 /// with the allocator passed to the builder.
 pub const EffectiveToolProjection = struct {
     tools_json: []u8,
+    provider_tools: []agent_stream_provider.ProviderToolAdvertisement,
     custom_guidance: []u8,
 
     pub fn deinit(self: *EffectiveToolProjection, alloc: Allocator) void {
         alloc.free(self.tools_json);
+        alloc.free(self.provider_tools);
         alloc.free(self.custom_guidance);
         self.* = undefined;
     }
@@ -766,20 +756,23 @@ fn buildToolProjection(alloc: Allocator, tool_set: tool_set_contract.ToolSet, ki
     errdefer tools_out.deinit();
     var guidance_out: std.Io.Writer.Allocating = .init(alloc);
     errdefer guidance_out.deinit();
+    var provider_tools: std.ArrayList(agent_stream_provider.ProviderToolAdvertisement) = .empty;
+    errdefer provider_tools.deinit(alloc);
 
     var first = true;
     var first_custom_guidance = true;
+    var local_schema_count: usize = 0;
     try tools_out.writer.writeByte('[');
 
     for (tool_set.order) |tool_name| {
         const tool = tool_set.registry.lookup(tool_name) orelse continue;
-        try writeBuiltinTool(alloc, &tools_out.writer, &guidance_out.writer, &first, &first_custom_guidance, tool.*, kind, tool_set, options);
+        try writeBuiltinTool(alloc, &tools_out.writer, &guidance_out.writer, &provider_tools, &local_schema_count, &first, &first_custom_guidance, tool.*, kind, tool_set, options);
     }
 
     if (kind == .full) {
         for (tool_set.registry.tools) |tool| {
             if (isCanonicalToolName(tool_set, tool.name)) continue;
-            try writeBuiltinTool(alloc, &tools_out.writer, &guidance_out.writer, &first, &first_custom_guidance, tool, kind, tool_set, options);
+            try writeBuiltinTool(alloc, &tools_out.writer, &guidance_out.writer, &provider_tools, &local_schema_count, &first, &first_custom_guidance, tool, kind, tool_set, options);
         }
     }
 
@@ -787,8 +780,11 @@ fn buildToolProjection(alloc: Allocator, tool_set: tool_set_contract.ToolSet, ki
     const tools_json = try tools_out.toOwnedSlice();
     errdefer alloc.free(tools_json);
     const custom_guidance = try guidance_out.toOwnedSlice();
+    errdefer alloc.free(custom_guidance);
+    const owned_provider_tools = try provider_tools.toOwnedSlice(alloc);
     return .{
         .tools_json = tools_json,
+        .provider_tools = owned_provider_tools,
         .custom_guidance = custom_guidance,
     };
 }
@@ -863,6 +859,8 @@ fn writeBuiltinTool(
     alloc: Allocator,
     tools_writer: *std.Io.Writer,
     guidance_writer: *std.Io.Writer,
+    provider_tools: *std.ArrayList(agent_stream_provider.ProviderToolAdvertisement),
+    local_schema_count: *usize,
     first: *bool,
     first_custom_guidance: *bool,
     tool: tool_dispatch.Tool,
@@ -873,22 +871,46 @@ fn writeBuiltinTool(
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
-    if (options.permission_mode != .yolo) {
-        if (tool.provider_executed and !providerExecutionIsAllowed(tool.name, options.permission_rules)) return;
-        if (permissions.rulesDenyAllTargetsForTool(options.permission_rules, tool.name)) return;
-    }
-    try writeComma(tools_writer, first);
-    if (tool.write_gateway_advertisement_fn) |write_advertisement| {
-        try write_advertisement(alloc, tools_writer);
-        if (first_custom_guidance.*) {
-            first_custom_guidance.* = false;
-        } else {
-            try guidance_writer.writeAll("\n\n");
+    if (tool.provider_tool) |provider_tool| {
+        if (providerToolIsSupported(provider_tool, options.provider_tools) and
+            (options.permission_mode == .yolo or providerExecutionIsAllowed(tool.name, options.permission_rules)))
+        {
+            if (!providerAdvertisementIsPresent(provider_tools.items, provider_tool)) {
+                try provider_tools.append(alloc, .{
+                    .tool = provider_tool,
+                    .local_schema_position = local_schema_count.*,
+                });
+            }
+            if (first_custom_guidance.*) {
+                first_custom_guidance.* = false;
+            } else {
+                try guidance_writer.writeAll("\n\n");
+            }
+            try guidance_writer.writeAll(tool.description);
         }
-        try guidance_writer.writeAll(tool.description);
-        return;
+        if (tool.executor_kind != .web_search or !options.fx_web_search_installed) return;
     }
+    if (options.permission_mode != .yolo and
+        permissions.rulesDenyAllTargetsForTool(options.permission_rules, tool.name)) return;
+    try writeComma(tools_writer, first);
     try gateway_schema.writeBuiltinFunctionSchema(alloc, tools_writer, tool.gateway_schema);
+    local_schema_count.* += 1;
+}
+
+fn providerToolIsSupported(
+    needle: agent_stream_provider.ProviderTool,
+    tools: []const agent_stream_provider.ProviderTool,
+) bool {
+    for (tools) |tool| if (tool == needle) return true;
+    return false;
+}
+
+fn providerAdvertisementIsPresent(
+    tools: []const agent_stream_provider.ProviderToolAdvertisement,
+    needle: agent_stream_provider.ProviderTool,
+) bool {
+    for (tools) |tool| if (tool.tool == needle) return true;
+    return false;
 }
 
 /// A provider-executed tool is never dispatched locally, so an unsettled `ask`
@@ -1034,11 +1056,14 @@ fn appendTestMcpServer(runtime: *mcp_runtime.McpRuntime, name: []const u8) !usiz
     return index;
 }
 
-test "full routes advertise direct provider search instead of native web_search" {
+test "full routes project neutral provider search separately from local schemas" {
     var rules = [_]types.PermissionRule{
         .{ .permission = @constCast("web_search"), .pattern = @constCast("*"), .action = .allow },
     };
-    const options = Options{ .permission_rules = .{ .rules = &rules } };
+    const options = Options{
+        .permission_rules = .{ .rules = &rules },
+        .provider_tools = &.{.web_search},
+    };
     var default_projection = try buildTestGatewayToolProjection(std.testing.allocator, options);
     defer default_projection.deinit(std.testing.allocator);
     var registry_projection = try buildTestGatewayToolProjectionForRegistry(std.testing.allocator, test_all_tools[0..], options);
@@ -1048,11 +1073,41 @@ test "full routes advertise direct provider search instead of native web_search"
         const json = projection.tools_json;
         var names = try collectToolNames(std.testing.allocator, json);
         defer freeNames(std.testing.allocator, &names);
-        try expectContainsName(names.items, "perplexity_search");
+        try expectNotContainsName(names.items, "perplexity_search");
         try expectNotContainsName(names.items, "web_search");
-        try std.testing.expect(std.mem.find(u8, json, "gateway.perplexity_search") != null);
+        try std.testing.expectEqual(@as(usize, 1), projection.provider_tools.len);
+        try std.testing.expectEqual(.web_search, projection.provider_tools[0].tool);
         try std.testing.expectEqualStrings(test_web_search.description, projection.custom_guidance);
     }
+}
+
+test "explicit Fx search install keeps local and provider authorities separate" {
+    var projection = try buildTestGatewayToolProjection(std.testing.allocator, .{
+        .provider_tools = &.{.web_search},
+        .fx_web_search_installed = true,
+    });
+    defer projection.deinit(std.testing.allocator);
+
+    var names = try collectToolNames(std.testing.allocator, projection.tools_json);
+    defer freeNames(std.testing.allocator, &names);
+    try expectContainsName(names.items, "web_search");
+    try expectNotContainsName(names.items, "perplexity_search");
+    try std.testing.expectEqual(@as(usize, 1), projection.provider_tools.len);
+    try std.testing.expectEqual(.web_search, projection.provider_tools[0].tool);
+    try std.testing.expectEqualStrings(
+        "web_search",
+        names.items[projection.provider_tools[0].local_schema_position],
+    );
+    try std.testing.expectEqualStrings(test_web_search.description, projection.custom_guidance);
+}
+
+test "unsupported provider search advertises neither authority" {
+    var projection = try buildTestGatewayToolProjection(std.testing.allocator, .{});
+    defer projection.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), projection.provider_tools.len);
+    try std.testing.expect(std.mem.find(u8, projection.tools_json, "\"name\":\"web_search\"") == null);
+    try std.testing.expectEqualStrings("", projection.custom_guidance);
 }
 
 test "provider search advertisement respects no-rule allow ask and deny" {
@@ -1070,7 +1125,10 @@ test "provider search advertisement respects no-rule allow ask and deny" {
         var rules = [_]types.PermissionRule{
             .{ .permission = @constCast("web_search"), .pattern = @constCast("*"), .action = case.action orelse .deny },
         };
-        const options: Options = if (case.action) |_| .{ .permission_rules = .{ .rules = &rules } } else .{};
+        const options: Options = if (case.action) |_| .{
+            .permission_rules = .{ .rules = &rules },
+            .provider_tools = &.{.web_search},
+        } else .{ .provider_tools = &.{.web_search} };
 
         var full_projection = try buildTestGatewayToolProjection(std.testing.allocator, options);
         defer full_projection.deinit(std.testing.allocator);
@@ -1079,12 +1137,10 @@ test "provider search advertisement respects no-rule allow ask and deny" {
             const json = projection.tools_json;
             var names = try collectToolNames(std.testing.allocator, json);
             defer freeNames(std.testing.allocator, &names);
-            try std.testing.expectEqual(case.advertised, std.mem.find(u8, json, "gateway.perplexity_search") != null);
+            try std.testing.expectEqual(@as(usize, if (case.advertised) 1 else 0), projection.provider_tools.len);
             if (case.advertised) {
-                try expectContainsName(names.items, "perplexity_search");
                 try std.testing.expectEqualStrings(test_web_search.description, projection.custom_guidance);
             } else {
-                try expectNotContainsName(names.items, "perplexity_search");
                 try std.testing.expectEqualStrings("", projection.custom_guidance);
             }
             try expectNotContainsName(names.items, "web_search");
@@ -1110,13 +1166,16 @@ test "provider execution gate follows the registry declaration, not the tool nam
         var projection = try buildTestGatewayToolProjectionForRegistry(
             std.testing.allocator,
             tools[0..],
-            .{ .permission_rules = .{ .rules = &rules } },
+            .{
+                .permission_rules = .{ .rules = &rules },
+                .provider_tools = &.{.web_search},
+            },
         );
         defer projection.deinit(std.testing.allocator);
 
         try std.testing.expectEqual(
             case.advertised,
-            std.mem.find(u8, projection.tools_json, "gateway.mirror_search") != null,
+            projection.provider_tools.len == 1,
         );
         if (!case.advertised) try std.testing.expectEqualStrings("", projection.custom_guidance);
     }
@@ -1151,6 +1210,7 @@ test "yolo advertisement ignores permission filtering" {
     var projection = try buildTestGatewayToolProjection(std.testing.allocator, .{
         .permission_mode = .yolo,
         .permission_rules = .{ .rules = &rules },
+        .provider_tools = &.{.web_search},
     });
     defer projection.deinit(std.testing.allocator);
 
@@ -1158,7 +1218,8 @@ test "yolo advertisement ignores permission filtering" {
     defer freeNames(std.testing.allocator, &names);
     try expectContainsName(names.items, "terminal");
     try expectContainsName(names.items, "write_file");
-    try expectContainsName(names.items, "perplexity_search");
+    try std.testing.expectEqual(@as(usize, 1), projection.provider_tools.len);
+    try std.testing.expectEqual(.web_search, projection.provider_tools[0].tool);
 }
 
 test "edit category-wide deny strips aliased write tools" {
@@ -1245,22 +1306,8 @@ test "target-specific edit and bash denies keep tools advertised" {
     try expectContainsName(names.items, "terminal");
 }
 
-fn writeTestRegisteredProviderAdvertisement(
-    _: Allocator,
-    writer: *std.Io.Writer,
-) tool_dispatch.GatewayAdvertisementError!void {
-    try writer.writeAll("{\"type\":\"provider\",\"id\":\"fixture.registered\",\"name\":\"registered_provider\",\"args\":{}}");
-}
-
-fn writeTestSecondRegisteredProviderAdvertisement(
-    _: Allocator,
-    writer: *std.Io.Writer,
-) tool_dispatch.GatewayAdvertisementError!void {
-    try writer.writeAll("{\"type\":\"provider\",\"id\":\"fixture.second\",\"name\":\"second_provider\",\"args\":{}}");
-}
-
 fn checkEffectiveToolProjectionAllocationFailures(alloc: Allocator) !void {
-    var projection = buildTestGatewayToolProjection(alloc, .{}) catch |err|
+    var projection = buildTestGatewayToolProjection(alloc, .{ .provider_tools = &.{.web_search} }) catch |err|
         return switch (err) {
             error.WriteFailed => error.OutOfMemory,
             else => err,

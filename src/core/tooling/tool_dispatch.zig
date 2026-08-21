@@ -1,4 +1,5 @@
 const std = @import("std");
+const agent_stream_provider = @import("../agent/stream_provider.zig");
 const background_runtime = @import("../background/background_runtime.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const core_permissions = @import("../permissions/permissions.zig");
@@ -25,6 +26,7 @@ const tool_result_errors = @import("tool_result_errors.zig");
 const tool_result_limits = @import("tool_result_limits.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const web_search_contract = @import("web_search_contract.zig");
+const web_search_provider = @import("web_search_provider.zig");
 const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
@@ -48,7 +50,7 @@ pub const default_max_read_file_bytes: usize = 50 * 1024;
 pub const default_max_read_file_lines: usize = 400;
 pub const default_max_read_file_line_len: usize = 2000;
 
-pub const web_search_unavailable_message = "web_search is unavailable: no local runtime with a configured Gateway transport policy is installed";
+pub const web_search_unavailable_message = "web_search is unavailable: Fx search is not installed for this surface or selected connection";
 pub const web_fetch_unavailable_message = "web_fetch is unavailable: no local WebFetch runtime is installed";
 pub const terminal_unavailable_message =
     "{\"error\":{\"tool\":\"terminal\",\"code\":\"unsupported_host\",\"retryable\":false}}";
@@ -90,6 +92,11 @@ pub const WebSearchBackend = struct {
     ) !web_search_contract.ExecutionOutput {
         return self.execute_fn(self.ctx, ctx, request);
     }
+};
+
+pub const WebSearchInvocation = struct {
+    provider: web_search_provider.Provider,
+    inputs: web_search_provider.Inputs,
 };
 
 pub const VisionProviderFn = *const fn (
@@ -241,6 +248,7 @@ pub const DispatchContext = struct {
     web_fetch_artifact_store: ?*web_fetch_artifacts.Store = null,
     web_fetch_artifact_error: ?anyerror = null,
     web_search_backend: ?WebSearchBackend = null,
+    web_search_invocation: ?WebSearchInvocation = null,
     tool_call_id: []const u8 = "",
     tool_call_name: []const u8 = "",
     web_search_progress_ctx: ?*anyopaque = null,
@@ -338,17 +346,6 @@ pub const ReadsOnlyFn = *const fn (ToolInput) bool;
 /// Function pointer classifying whether an input is irreversible.
 pub const IrreversibleFn = *const fn (ToolInput) bool;
 
-pub const GatewayAdvertisementError = std.mem.Allocator.Error || std.Io.Writer.Error || error{
-    InvalidWebSearchBackend,
-    ConflictingDomainFilters,
-    InvalidGatewayAdvertisement,
-};
-
-pub const WriteGatewayAdvertisementFn = *const fn (
-    std.mem.Allocator,
-    *std.Io.Writer,
-) GatewayAdvertisementError!void;
-
 pub const LabelArgKind = enum {
     none,
     name,
@@ -428,11 +425,10 @@ pub const Tool = struct {
     name: []const u8,
     description: []const u8,
     gateway_schema: gateway_schema.FunctionSchema,
-    write_gateway_advertisement_fn: ?WriteGatewayAdvertisementFn = null,
-    /// Set when the provider runs the tool instead of fx dispatch. Such a tool
-    /// never reaches a call-time permission check, so advertisement is its only
+    provider_tool: ?agent_stream_provider.ProviderTool = null,
+    /// A provider tool never reaches local dispatch or a call-time permission
+    /// check, so advertisement is its only
     /// enforcement point and requires an already-settled allow.
-    provider_executed: bool = false,
     executor_kind: ExecutorKind = .list_files,
     activity_kind: core_types.ToolActivityKind = .read,
     requires_approval: bool = false,

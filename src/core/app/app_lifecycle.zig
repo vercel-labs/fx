@@ -268,6 +268,18 @@ pub const StartupStatus = struct {
         }
         self.* = undefined;
     }
+
+    pub fn normalizeModel(
+        self: *StartupStatus,
+        alloc: Allocator,
+        descriptors: model_catalog.ModelDescriptorProvider,
+    ) !void {
+        const descriptor = descriptors.fallback(self.selected_model);
+        const normalized = try alloc.dupe(u8, descriptor.id);
+        if (self.owned_selected_model) |owned| alloc.free(owned);
+        self.selected_model = normalized;
+        self.owned_selected_model = normalized;
+    }
 };
 
 const StartupStatusModel = struct {

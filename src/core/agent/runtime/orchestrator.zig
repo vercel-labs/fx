@@ -1806,18 +1806,14 @@ fn refreshGatewayCredentialForJob(
         );
         return false;
     } orelse return false;
-    const previous_api_key = route_credential.credential;
-    if (comptime !host_target.is_wasm) {
-        if (deps.usage) |usage| {
-            usage.refreshReconciliationCredential(
-                deps.usage_allocator,
-                previous_api_key,
-                refreshed,
-            );
-        }
-    }
     secret.zeroAndFree(alloc, route_credential.credential);
     route_credential.credential = refreshed;
+    if (comptime !host_target.is_wasm) {
+        if (deps.usage) |usage| {
+            usage.cancelReconciliation();
+            usage.startReconciliation(deps.usage_allocator);
+        }
+    }
     debug_trace.eventf(
         "gateway",
         "credential_refreshed",
@@ -3261,6 +3257,7 @@ fn processQueuedPromptLoop(
             const model_request = agent_stream_provider.ModelRequest{
                 .model = gateway_model,
                 .serialized_tools = config.gateway_tools_json,
+                .provider_tools = config.provider_tools,
                 .messages = request_messages,
                 .tool_choice = tool_choice,
                 .selected_dynamic_tool_schemas = selected_dynamic_tool_schemas.items,

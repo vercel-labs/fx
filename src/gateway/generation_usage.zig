@@ -16,13 +16,14 @@ fn lookup(
     alloc: Allocator,
     input: generation_usage_provider.LookupInput,
 ) generation_usage_provider.LookupError!generation_usage_provider.LookupOutcome {
-    if (!client.isTrustedGenerationOrigin(input.origin)) return .reject;
+    const origin = input.lookup_scope orelse return .reject;
+    if (!client.isTrustedGenerationOrigin(origin)) return .reject;
 
     var response = client.fetchGatewayGenerationResult(
         alloc,
         input.credential,
         input.tenant,
-        input.origin,
+        origin,
         input.generation_id,
         input.cancel_flag,
     ) catch |err| switch (err) {
@@ -34,7 +35,7 @@ fn lookup(
                 "generation usage lookup failed reason={s}",
                 .{@errorName(err)},
             );
-            return error.Unavailable;
+            return .retry;
         },
     };
     defer response.deinit(alloc);
@@ -272,7 +273,7 @@ test "generation lookup rejects untrusted origins before transport" {
     const outcome = try provider.lookup(std.testing.allocator, .{
         .credential = "unused",
         .tenant = null,
-        .origin = "https://example.com",
+        .lookup_scope = "https://example.com",
         .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
         .cancel_flag = &cancel,
     });
