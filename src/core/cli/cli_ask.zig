@@ -307,6 +307,9 @@ pub const PromptRunResult = struct {
     session_id: []u8 = &.{},
     tool_calls: []ToolCallRecord = &.{},
     step_count: usize = 0,
+    usage_requests: u64 = 0,
+    usage_input_tokens: u64 = 0,
+    usage_output_tokens: u64 = 0,
     error_code: ?[]const u8 = null,
     auth_failure: ?auth_runtime.FailureSnapshot = null,
     recovery: ?types.RouteRecoveryStatus = null,
@@ -550,6 +553,11 @@ const AskContext = struct {
     store: ?session_store.Store = null,
     writable: ?session_store.LoadedWritableSession = null,
     session_write_mutex: std.Io.Mutex = .init,
+    /// Cumulative provider-settled usage across this turn's model requests.
+    /// Inputs sum each request's full prompt, matching per-request billing.
+    usage_requests: u64 = 0,
+    usage_input_tokens: u64 = 0,
+    usage_output_tokens: u64 = 0,
     requested_resume: ?ResumeTarget = null,
     seed_model: []const u8 = "",
     command_timeout_ms: ?usize = null,
@@ -1750,24 +1758,14 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .context_limits = ctx.context_limits,
         .session_child_capability = session_child_capability,
     }, job) catch |err| switch (err) {
-        error.NonInteractivePermissionRequired => {
-            const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
-            errdefer alloc.free(assistant_output);
-            const tool_calls = try takeToolCallRecords(&ctx, alloc);
-            return .{
-                .exit_code = 1,
-                .assistant_output = assistant_output,
-                .interrupted = ctx.processInterruptRequested(),
-                .tool_calls = tool_calls,
-                .error_code = "NonInteractivePermissionRequired",
-            };
-        },
+        error.NonInteractivePermissionRequired => return takeFailedPromptRunResult(
+            &ctx,
+            alloc,
+            "NonInteractivePermissionRequired",
+        ),
         else => {
             if (!options.output_mode.capturesJson()) return err;
-            var failed_result = try takePromptRunResult(&ctx, alloc);
-            failed_result.exit_code = 1;
-            failed_result.error_code = @errorName(err);
-            return failed_result;
+            return takeFailedPromptRunResult(&ctx, alloc, @errorName(err));
         },
     };
     worker_events_drained = true;
@@ -1799,11 +1797,24 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .session_id = session_id,
         .tool_calls = tool_calls,
         .step_count = ctx.step_count,
+        .usage_requests = ctx.usage_requests,
+        .usage_input_tokens = ctx.usage_input_tokens,
+        .usage_output_tokens = ctx.usage_output_tokens,
         .error_code = ctx.typed_error_code,
         .auth_failure = ctx.auth_failure,
         .recovery = ctx.last_recovery_status,
         .recovery_durable = ctx.writable != null,
     };
+}
+fn takeFailedPromptRunResult(
+    ctx: *AskContext,
+    alloc: Allocator,
+    error_code: []const u8,
+) !PromptRunResult {
+    var result = try takePromptRunResult(ctx, alloc);
+    result.exit_code = 1;
+    result.error_code = error_code;
+    return result;
 }
 
 fn takeToolCallRecords(ctx: *AskContext, alloc: Allocator) ![]ToolCallRecord {
@@ -1986,13 +1997,17 @@ fn persistUsageCheckpoint(
     );
 }
 
-/// Overwrite session totals with the latest completion usage (same semantics as
-/// interactive `agentReportUsage`). Gateway `input_tokens` is full-prompt
-/// occupancy, not a delta, so overwrite rather than accumulate.
+/// Session totals are overwritten with the latest completion usage (same
+/// semantics as interactive `agentReportUsage`): gateway `input_tokens` is
+/// full-prompt occupancy, not a delta. The turn accumulators sum every
+/// settled request instead, matching how per-request billing adds up.
 fn reportUsage(raw_ctx: *anyopaque, usage: types.Usage) void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    ctx.usage_requests +|= 1;
+    if (usage.input_tokens) |input| ctx.usage_input_tokens +|= input;
+    if (usage.output_tokens) |output| ctx.usage_output_tokens +|= output;
     const writable = if (ctx.writable) |*value| value else return;
     if (usage.input_tokens) |input| writable.state.total_input_tokens = input;
     if (usage.output_tokens) |output| writable.state.total_output_tokens = output;
@@ -3559,6 +3574,10 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
     try out.writer.writeAll(",\"session_id\":");
     try std.json.Stringify.value(result.session_id, .{}, &out.writer);
     try out.writer.print(",\"steps\":{d}", .{result.step_count});
+    try out.writer.print(
+        ",\"usage\":{{\"requests\":{d},\"input_tokens\":{d},\"output_tokens\":{d}}}",
+        .{ result.usage_requests, result.usage_input_tokens, result.usage_output_tokens },
+    );
     try out.writer.writeAll(",\"tool_calls\":[");
     for (result.tool_calls, 0..) |tc, i| {
         if (i > 0) try out.writer.writeAll(",");
@@ -7412,7 +7431,7 @@ test "saved ask initializes subagent host and background persistence" {
     try std.testing.expectEqualStrings(workspace, sessions.items[0].workspace_root.?);
 }
 
-test "headless ask overwrites session usage from latest completion" {
+test "headless ask tracks turn usage while preserving latest session usage" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7444,6 +7463,23 @@ test "headless ask overwrites session usage from latest completion" {
 
     try std.testing.expectEqual(@as(u64, 107), ctx.writable.?.state.total_input_tokens);
     try std.testing.expectEqual(@as(u64, 23), ctx.writable.?.state.total_output_tokens);
+    try std.testing.expectEqual(@as(u64, 2), ctx.usage_requests);
+    try std.testing.expectEqual(@as(u64, 207), ctx.usage_input_tokens);
+    try std.testing.expectEqual(@as(u64, 43), ctx.usage_output_tokens);
+    var failed = try takeFailedPromptRunResult(
+        &ctx,
+        alloc,
+        "NonInteractivePermissionRequired",
+    );
+    defer failed.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 1), failed.exit_code);
+    try std.testing.expectEqualStrings(
+        "NonInteractivePermissionRequired",
+        failed.error_code.?,
+    );
+    try std.testing.expectEqual(@as(u64, 2), failed.usage_requests);
+    try std.testing.expectEqual(@as(u64, 207), failed.usage_input_tokens);
+    try std.testing.expectEqual(@as(u64, 43), failed.usage_output_tokens);
 }
 
 test "saved ask settles profile publication before persistence teardown" {
@@ -7948,6 +7984,9 @@ test "render final JSON preserves shape escaping order and newline" {
         .session_id = try alloc.dupe(u8, "123"),
         .tool_calls = tool_calls,
         .step_count = 2,
+        .usage_requests = 3,
+        .usage_input_tokens = 1200,
+        .usage_output_tokens = 450,
     };
     defer result.deinit(alloc);
 
@@ -7955,7 +7994,7 @@ test "render final JSON preserves shape escaping order and newline" {
     defer alloc.free(json);
 
     try std.testing.expectEqualStrings(
-        "{\"output\":\"hello \\\"zig\\\"\\n\",\"exit_code\":0,\"model\":\"model-x\",\"session_id\":\"123\",\"steps\":2,\"tool_calls\":[{\"name\":\"read_file\",\"status\":\"success\"}]}\n",
+        "{\"output\":\"hello \\\"zig\\\"\\n\",\"exit_code\":0,\"model\":\"model-x\",\"session_id\":\"123\",\"steps\":2,\"usage\":{\"requests\":3,\"input_tokens\":1200,\"output_tokens\":450},\"tool_calls\":[{\"name\":\"read_file\",\"status\":\"success\"}]}\n",
         json,
     );
 }
@@ -7972,7 +8011,7 @@ test "render final JSON emits empty tool call array" {
     defer alloc.free(json);
 
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[]}\n",
+        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"usage\":{\"requests\":0,\"input_tokens\":0,\"output_tokens\":0},\"tool_calls\":[]}\n",
         json,
     );
 }
@@ -8699,7 +8738,7 @@ test "json run with missing API key prints diagnostic then final object" {
     try std.testing.expectEqual(@as(u8, 1), exit_code);
     try std.testing.expectEqualStrings("fx ask: " ++ credentials.missing_credential_message ++ "\n", stderr_capture.bytes.items);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"MissingCredentials\"}\n",
+        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"usage\":{\"requests\":0,\"input_tokens\":0,\"output_tokens\":0},\"tool_calls\":[],\"error\":\"MissingCredentials\"}\n",
         stdout_capture.bytes.items,
     );
 }
@@ -8962,7 +9001,7 @@ test "quiet suppresses streaming while quiet json captures final output" {
     const json_exit = try runWithDeps(alloc, &.{ "--quiet", "--json", "hello" }, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup));
     try std.testing.expectEqual(@as(u8, 0), json_exit);
     try std.testing.expect(std.mem.startsWith(u8, stdout_capture.bytes.items, "{\"output\":\"assistant text\",\"exit_code\":0,\"model\":\"model\",\"session_id\":\""));
-    try std.testing.expect(std.mem.endsWith(u8, stdout_capture.bytes.items, "\",\"steps\":0,\"tool_calls\":[]}\n"));
+    try std.testing.expect(std.mem.endsWith(u8, stdout_capture.bytes.items, "\",\"steps\":0,\"usage\":{\"requests\":0,\"input_tokens\":0,\"output_tokens\":0},\"tool_calls\":[]}\n"));
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 }
 
