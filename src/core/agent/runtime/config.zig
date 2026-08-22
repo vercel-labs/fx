@@ -35,7 +35,10 @@ pub const Config = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     step_limit_notice: []const u8 = default_step_limit_notice,
     cancel_flag: *std.atomic.Value(bool),
-    review_enabled: bool = false,
+    /// Inject one bounded verification reminder after an observed file mutation.
+    /// Off by default: a 32-coordinate paired comparison showed no
+    /// statistically supported quality lift and measurable token overhead.
+    final_verification_enabled: bool = false,
     fast_mode: bool = false,
     effort: ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
