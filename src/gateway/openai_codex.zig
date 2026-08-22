@@ -69,6 +69,12 @@ pub fn buildRequest(
     const writer = &out.writer;
     try writer.writeAll("{\"model\":");
     try std.json.Stringify.value(request.model, .{}, writer);
+    if (request.session_id) |session_id| {
+        if (session_id.len > 0) {
+            try writer.writeAll(",\"prompt_cache_key\":");
+            try std.json.Stringify.value(session_id, .{}, writer);
+        }
+    }
     try writer.writeAll(",\"store\":false,\"stream\":true,\"instructions\":");
     try std.json.Stringify.value(instructions.written(), .{}, writer);
     try writer.writeAll(",\"input\":[");
@@ -484,6 +490,25 @@ test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning\":{\"effort\":\"high\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"service_tier\":\"priority\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"max_output_tokens\"") == null);
+}
+
+test "OpenAI Codex omits prompt cache key without a non-empty session identity" {
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Hello." }};
+    for ([_]?[]const u8{ null, "" }) |session_id| {
+        const body = try buildRequest(std.testing.allocator, .{
+            .model = "gpt-5.6-sol",
+            .session_id = session_id,
+            .messages = &messages,
+            .tool_choice = .none,
+            .provider_options = .{},
+        });
+        defer std.testing.allocator.free(body);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .object);
+        try std.testing.expect(parsed.value.object.get("prompt_cache_key") == null);
+    }
 }
 
 fn makeSizedProviderState(alloc: Allocator, size: usize) ![]u8 {

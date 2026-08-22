@@ -319,6 +319,7 @@ pub const OverrideFn = *const fn (
 pub const ProviderInput = struct {
     credential: []const u8 = "",
     credential_source: ?types.CredentialSource = null,
+    session_id: ?[]const u8 = null,
     account_id: ?[]const u8 = null,
     tenant: ?[]const u8 = null,
     endpoint: []const u8 = "",

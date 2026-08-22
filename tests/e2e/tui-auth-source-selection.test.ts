@@ -2676,7 +2676,7 @@ test(
         { mode: 0o600 },
       );
       const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Read the README, then finish."],
+        ["ask", "--json", "--auto", "Read the README, then finish."],
         {
           env: {
             HOME: home,
@@ -2695,6 +2695,12 @@ test(
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
       expect(result.stdout).toContain("CODEX_TOOL_LOOP_OK");
       expect(codex.bodies).toHaveLength(2);
+      const output = JSON.parse(result.stdout) as { session_id: string };
+      expect(output.session_id.length).toBeGreaterThan(0);
+      const promptCacheKeys = codex.bodies.map(
+        (body) => (JSON.parse(body) as { prompt_cache_key?: string }).prompt_cache_key,
+      );
+      expect(promptCacheKeys).toEqual([output.session_id, output.session_id]);
       expect(codex.bodies[1]).toContain('"encrypted_content":"opaque-tool-loop"');
       expect(codex.bodies[1]).toContain('"type":"function_call_output"');
       for (const request of [...gateway.requests, ...gateway.modelRequests]) {
@@ -2893,6 +2899,10 @@ test(
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
       expect(result.stdout).toContain("CODEX_VISION_DISABLED_OK");
       expect(codex.bodies).toHaveLength(2);
+      expect((JSON.parse(result.stdout) as { session_id: string }).session_id).toBe("");
+      expect(codex.bodies.map(
+        (body) => (JSON.parse(body) as { prompt_cache_key?: string }).prompt_cache_key,
+      )).toEqual([undefined, undefined]);
       expect(codex.bodies[0]).not.toContain('"name":"vision"');
       const continuation = JSON.parse(codex.bodies[1]) as {
         input: Array<{ type?: string; output?: string }>;
@@ -2996,8 +3006,15 @@ test(
       );
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
       expect(result.stdout).toContain("CODEX_AUTO_REVIEW_OK");
-      expect(codex.bodies.map((body) => (JSON.parse(body) as { model: string }).model))
+      const requests = codex.bodies.map(
+        (body) => JSON.parse(body) as { model: string; prompt_cache_key?: string },
+      );
+      expect(requests.map((request) => request.model))
         .toEqual(["gpt-5.6-sol", "gpt-5.4-mini", "gpt-5.6-sol"]);
+      const output = JSON.parse(result.stdout) as { session_id: string };
+      expect(output.session_id.length).toBeGreaterThan(0);
+      expect(requests.map((request) => request.prompt_cache_key))
+        .toEqual([output.session_id, output.session_id, output.session_id]);
       expect(codex.bodies[1]).toContain('"name":"permission_decision"');
       expect(codex.bodies[2]).toContain('"type":"function_call_output"');
       expect(codex.bodies[2]).toContain("exit_code=0");
