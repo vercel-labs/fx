@@ -174,6 +174,107 @@ describe.skipIf(!tmuxAvailable())("tui: credits slash command", () => {
 
 describe.skipIf(!tmuxAvailable() || CLIPBOARD_PROGRAM === null)("tui: clipboard host", () => {
   test(
+    "Ctrl-O copies boxed code after scrolling and a boxed-to-unboxed resize",
+    async () => {
+      if (CLIPBOARD_PROGRAM === null) throw new Error("unsupported clipboard platform");
+
+      const workDir = mkdtempSync(join(tmpdir(), "fx-code-block-copy-"));
+      const homeDir = join(workDir, "home");
+      const binDir = join(workDir, "bin");
+      const capturePath = join(workDir, "clipboard.txt");
+      const stderrPath = join(workDir, "stderr.log");
+      const clipboardPath = join(binDir, CLIPBOARD_PROGRAM);
+      mkdirSync(homeDir);
+      mkdirSync(binDir);
+      writeFileSync(clipboardPath, "#!/bin/sh\ncat > \"$FX_TEST_CLIPBOARD_CAPTURE\"\n");
+      chmodSync(clipboardPath, 0o755);
+
+      const code = "const copied = true;\n";
+      const reply = [
+        ...Array.from({ length: 24 }, (_, index) => `context row ${index + 1}`),
+        "```zig",
+        code.trimEnd(),
+        "```",
+      ].join("\n");
+      const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText(reply));
+      try {
+        session = await TmuxSession.create({
+          cwd: workDir,
+          stderrPath,
+          env: {
+            HOME: homeDir,
+            AI_GATEWAY_API_KEY: "code-copy-fake-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+            FX_TEST_CLIPBOARD_CAPTURE: capturePath,
+            PATH: `${binDir}:${process.env.PATH ?? ""}`,
+          },
+          width: 100,
+          height: 28,
+        });
+        await session.waitForComposer(10_000);
+
+        await session.sendText("render the code fixture");
+        await session.waitForText("const copied = true;", 10_000);
+        const inline = await session.waitForComposer(10_000);
+        expect(inline).not.toContain("Copy");
+
+        await session.sendKeys("C-o");
+        await session.waitForText("Copy", 10_000);
+        await session.sendHexBytes(toHexBytes("\x1b[<64;1;1M"));
+        await session.sendHexBytes(toHexBytes("\x1b[<65;1;1M"));
+        const wide = await session.waitForText("Copy", 10_000);
+        const staleTarget = textCoordinate(wide, "Copy");
+
+        await session.resizeWindow(24, 28, 750);
+        const narrow = await session.capturePane();
+        expect(narrow).not.toContain("Copy");
+        expect(narrow).toContain("Review");
+        await session.sendHexBytes(toHexBytes(
+          `\x1b[<0;${staleTarget.column};${staleTarget.row}M`,
+        ));
+        expect(existsSync(capturePath)).toBe(false);
+        expect(await session.capturePane()).toContain("Review");
+
+        await session.resizeWindow(100, 28, 750);
+        const boxed = await session.waitForText("Copy", 10_000);
+        const target = textCoordinate(boxed, "Copy");
+        await session.sendHexBytes(toHexBytes(
+          `\x1b[<0;${target.column};${target.row}M`,
+        ));
+        const restored = await session.waitForComposer(10_000);
+        expect(restored).not.toContain("Review ·");
+        expect(readFileSync(capturePath, "utf8")).toBe(code);
+
+        writeFileSync(clipboardPath, "#!/bin/sh\nexit 23\n");
+        await session.sendKeys("C-o");
+        const failureView = await session.waitForText("Copy", 10_000);
+        const failureTarget = textCoordinate(failureView, "Copy");
+        await session.sendHexBytes(toHexBytes(
+          `\x1b[<0;${failureTarget.column};${failureTarget.row}M`,
+        ));
+        const failed = await session.waitForText(
+          "Failed to copy code block to clipboard.",
+          10_000,
+        );
+        expect(hasEmptyComposer(failed)).toBe(true);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        gateway.stop();
+        rmSync(workDir, { recursive: true, force: true });
+      }
+    },
+    LONG_TIMEOUT,
+  );
+
+  test(
     "/copy sends exact reply bytes to the host clipboard and reports process failure",
     async () => {
       if (CLIPBOARD_PROGRAM === null) throw new Error("unsupported clipboard platform");
@@ -515,4 +616,20 @@ function countOccurrences(value: string, needle: string): number {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function toHexBytes(value: string): string[] {
+  return Array.from(Buffer.from(value, "utf8"), (byte) =>
+    byte.toString(16).padStart(2, "0")
+  );
+}
+
+function textCoordinate(pane: string, text: string): { row: number; column: number } {
+  const rows = pane.replace(/\n$/, "").split("\n");
+  const rowIndex = rows.findIndex((row) => row.includes(text));
+  if (rowIndex < 0) throw new Error(`Missing ${JSON.stringify(text)} in pane`);
+  return {
+    row: rowIndex + 1,
+    column: rows[rowIndex].indexOf(text) + 1,
+  };
 }

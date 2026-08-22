@@ -89,6 +89,16 @@ const FrameAttemptResult = struct {
     }
 };
 
+fn publishCodeCopyFrameForAttempt(
+    alloc: std.mem.Allocator,
+    runtime: *transcript_runtime.TranscriptRuntime,
+    candidate: *full_transcript_screen.CodeCopyInteractionFrame,
+    committed: bool,
+) void {
+    if (!committed) return;
+    runtime.commitCodeCopyFrame(alloc, candidate);
+}
+
 const InlineRenderReconciliation = struct {
     alternate_screen_owns_rendering: bool = false,
     terminal_transition: render_engine.terminal_diff.FrameTerminalTransition = .none,
@@ -1689,6 +1699,8 @@ pub fn Runtime(comptime App: type) type {
             defer if (owned_transcript_source) |*source| source.deinit(app.alloc);
             var transcript_source: ?*transcript_runtime.TranscriptPreparationSource = null;
             var full_transcript_projection: ?*full_transcript_screen.Projection = null;
+            var staged_code_copy_frame: ?full_transcript_screen.CodeCopyInteractionFrame = null;
+            defer if (staged_code_copy_frame) |*frame| frame.deinit(app.alloc);
             var transcript_transition: ?transcript_runtime.TranscriptTransition = null;
             defer if (transcript_transition) |*transition| transition.deinit(app.alloc);
             var footer_measurement: ?surface_frame.SurfaceFooterMeasurement = null;
@@ -1976,7 +1988,7 @@ pub fn Runtime(comptime App: type) type {
                             app.fullTranscriptSidecarCapability()
                         else
                             null;
-                        const staged = try presentation_shell.prepareFullTranscriptSurfacePaintInterruptible(
+                        var staged = try presentation_shell.prepareFullTranscriptSurfacePaintInterruptible(
                             app.alloc,
                             &app.metrics,
                             projection,
@@ -1987,6 +1999,8 @@ pub fn Runtime(comptime App: type) type {
                         owned_transcript_source = staged.source;
                         transcript_source = &owned_transcript_source.?;
                         prepared_transcript = staged.prepared;
+                        staged_code_copy_frame = staged.code_copy_frame;
+                        staged.code_copy_frame = .{};
                         footer_frame.paint.viewport = prepared_transcript.?.selection;
                         try validatePreparedTranscriptFitsPlan(&prepared_transcript.?, footer_frame.paint);
                     }
@@ -2180,6 +2194,14 @@ pub fn Runtime(comptime App: type) type {
                 if (!render_requests.hasReason(.external_damage)) {
                     presentation_shell.footer_viewport.clearExternalInvalidation();
                 }
+            }
+            if (staged_code_copy_frame) |*candidate| {
+                publishCodeCopyFrameForAttempt(
+                    app.alloc,
+                    presentation_shell,
+                    candidate,
+                    result.is_committed(),
+                );
             }
             if (result.is_committed() and child_view != null) {
                 if (presentation_shell.resolvedTailViewport()) |viewport| {
@@ -3627,6 +3649,29 @@ fn solveFixedPointForTest(
         FixedPointTestContext.prepareCandidate,
         FixedPointTestContext.resolveCandidate,
     );
+}
+
+test "code copy targets publish only for a committed frame" {
+    const alloc = std.testing.allocator;
+    var runtime = transcript_runtime.TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    var candidate = full_transcript_screen.CodeCopyInteractionFrame{};
+    defer candidate.deinit(alloc);
+    try candidate.targets.append(alloc, .{
+        .entry_id = 41,
+        .row = 3,
+        .first_col = 72,
+        .last_col = 75,
+    });
+
+    publishCodeCopyFrameForAttempt(alloc, &runtime, &candidate, false);
+    try std.testing.expectEqual(@as(?u32, null), runtime.codeCopyHit(3, 72));
+    try std.testing.expectEqual(@as(usize, 1), candidate.targets.items.len);
+
+    publishCodeCopyFrameForAttempt(alloc, &runtime, &candidate, true);
+    try std.testing.expectEqual(@as(?u32, 41), runtime.codeCopyHit(3, 72));
+    try std.testing.expectEqual(@as(usize, 0), candidate.targets.items.len);
 }
 
 test "assistant tail writability changes remain traceable" {

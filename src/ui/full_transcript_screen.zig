@@ -561,6 +561,7 @@ pub const Projection = struct {
             self.item_boundaries.appendAssumeCapacity(.{
                 .entry_id = boundary.entry_id,
                 .segment_index = first_segment + boundary.segment_index,
+                .code_copy_span = boundary.code_copy_span,
             });
         }
         suffix.item_boundaries.items.len = 0;
@@ -580,7 +581,79 @@ pub const Projection = struct {
 const ItemBoundary = struct {
     entry_id: u32,
     segment_index: usize,
+    code_copy_span: ?transcript_blocks.CodeBlockActionSpan = null,
 };
+
+test "full projection boundary stores final code copy columns" {
+    const alloc = std.testing.allocator;
+    const language = try alloc.dupe(u8, "zig");
+    defer alloc.free(language);
+    const code = try alloc.dupe(u8, "const value = 1;");
+    defer alloc.free(code);
+    const entries = [_]transcript_blocks.TranscriptEntry{.{ .assistant_code_block = .{
+        .id = 7,
+        .block = .{ .language = language, .code = code },
+    } }};
+    var projection = try buildProjection(alloc, &entries, &.{}, &.{}, .{}, 80, null);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), projection.item_boundaries.items.len);
+    if (comptime @hasField(ItemBoundary, "code_copy_span")) {
+        const span = projection.item_boundaries.items[0].code_copy_span orelse
+            return error.TestUnexpectedResult;
+        const source = try renderProjectionViewportSource(alloc, &projection, null, 80, 8, 0);
+        defer alloc.free(source);
+        const copy_byte = std.mem.find(u8, source, "Copy") orelse
+            return error.TestUnexpectedResult;
+        const expected_first: u16 = @intCast(
+            display_width.visibleWidthIgnoringAnsi(source[0..copy_byte]) + 1,
+        );
+        try std.testing.expectEqual(expected_first, span.first_col);
+        try std.testing.expectEqual(expected_first + 3, span.last_col);
+
+        var suffix = try buildProjection(alloc, &entries, &.{}, &.{}, .{}, 80, null);
+        defer suffix.deinit(alloc);
+        try std.testing.expect(try projection.replaceFromEntry(alloc, 7, &suffix));
+        try std.testing.expect(projection.item_boundaries.items[0].code_copy_span != null);
+    } else {
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "code copy targets project visible rows and exact columns" {
+    const alloc = std.testing.allocator;
+    const language = try alloc.dupe(u8, "zig");
+    defer alloc.free(language);
+    const code = try alloc.dupe(u8, "const value = 1;");
+    defer alloc.free(code);
+    const entries = [_]transcript_blocks.TranscriptEntry{.{ .assistant_code_block = .{
+        .id = 9,
+        .block = .{ .language = language, .code = code },
+    } }};
+    var projection = try buildProjection(alloc, &entries, &.{}, &.{}, .{}, 80, null);
+    defer projection.deinit(alloc);
+    _ = try measureProjectionInterruptible(alloc, &projection, null, 80, null);
+
+    if (comptime @hasDecl(@This(), "codeCopyTargetsForWindow")) {
+        const collect = @field(@This(), "codeCopyTargetsForWindow");
+        var frame = try collect(alloc, &projection, 0, 4, 8);
+        defer frame.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), frame.targets.items.len);
+        const target = frame.targets.items[0];
+        try std.testing.expectEqual(@as(u32, 9), target.entry_id);
+        try std.testing.expectEqual(@as(u16, 4), target.row);
+        try std.testing.expectEqual(@as(?u32, 9), frame.hitTest(target.row, target.first_col));
+        try std.testing.expectEqual(@as(?u32, 9), frame.hitTest(target.row, target.last_col));
+        try std.testing.expectEqual(@as(?u32, null), frame.hitTest(target.row, target.first_col - 1));
+        try std.testing.expectEqual(@as(?u32, null), frame.hitTest(target.row + 1, target.first_col));
+
+        var hidden = try collect(alloc, &projection, 1, 4, 8);
+        defer hidden.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), hidden.targets.items.len);
+    } else {
+        return error.TestUnexpectedResult;
+    }
+}
 
 test "projection finds a repositioned entry by transcript order" {
     const alloc = std.testing.allocator;
@@ -634,6 +707,67 @@ pub const ProjectionMeasurement = struct {
     item_rows: []const transcript_presentation.ItemRow = &.{},
 };
 
+pub const CodeCopyTarget = struct {
+    entry_id: u32,
+    row: u16,
+    first_col: u16,
+    last_col: u16,
+};
+
+pub const CodeCopyInteractionFrame = struct {
+    targets: std.ArrayList(CodeCopyTarget) = .empty,
+
+    pub fn deinit(self: *CodeCopyInteractionFrame, alloc: Allocator) void {
+        self.targets.deinit(alloc);
+        self.* = undefined;
+    }
+
+    pub fn clear(self: *CodeCopyInteractionFrame) void {
+        self.targets.clearRetainingCapacity();
+    }
+
+    pub fn hitTest(self: CodeCopyInteractionFrame, row: u16, col: u16) ?u32 {
+        for (self.targets.items) |target| {
+            if (target.row == row and col >= target.first_col and col <= target.last_col) {
+                return target.entry_id;
+            }
+        }
+        return null;
+    }
+};
+
+pub fn codeCopyTargetsForWindow(
+    alloc: Allocator,
+    projection: *const Projection,
+    document_offset: u32,
+    area_top: u16,
+    visible_rows: u16,
+) !CodeCopyInteractionFrame {
+    if (projection.measured_item_rows.items.len != projection.item_boundaries.items.len) {
+        return error.MissingProjectionMeasurement;
+    }
+
+    var targets: std.ArrayList(CodeCopyTarget) = .empty;
+    errdefer targets.deinit(alloc);
+    const document_end = document_offset +| visible_rows;
+    for (projection.item_boundaries.items, projection.measured_item_rows.items) |boundary, item| {
+        const span = boundary.code_copy_span orelse continue;
+        if (item.row < document_offset or item.row >= document_end) continue;
+        const relative_row = item.row - document_offset;
+        const screen_row = std.math.cast(
+            u16,
+            @as(u32, area_top) + relative_row,
+        ) orelse return error.InvalidTargetRow;
+        try targets.append(alloc, .{
+            .entry_id = boundary.entry_id,
+            .row = screen_row,
+            .first_col = span.first_col,
+            .last_col = span.last_col,
+        });
+    }
+    return .{ .targets = targets };
+}
+
 /// Owns the in-progress static writer while composing a Projection, so every
 /// build-time segment boundary transfers through one place.
 const ProjectionBuilder = struct {
@@ -680,6 +814,17 @@ const ProjectionBuilder = struct {
             .entry_id = entry_id,
             .segment_index = self.projection.segments.items.len,
         });
+    }
+
+    fn recordCodeAction(
+        self: *ProjectionBuilder,
+        entry_id: u32,
+        span: transcript_blocks.CodeBlockActionSpan,
+    ) void {
+        std.debug.assert(self.projection.item_boundaries.items.len > 0);
+        const boundary = &self.projection.item_boundaries.items[self.projection.item_boundaries.items.len - 1];
+        std.debug.assert(boundary.entry_id == entry_id);
+        boundary.code_copy_span = span;
     }
 
     fn appendStoredResult(self: *ProjectionBuilder, stored: StoredResult) !void {
@@ -4434,6 +4579,7 @@ pub fn buildProjectionForDepthWithEntryActionsInterruptible(
         .override_kind = ProjectionComposeContext.overrideKind,
         .append_override = ProjectionComposeContext.appendOverride,
         .before_entry = ProjectionComposeContext.beforeEntry,
+        .record_code_action = ProjectionComposeContext.recordCodeAction,
         .append_detail = ProjectionComposeContext.appendDetail,
     };
     try transcript_blocks.renderEntriesForFullPresentationInterruptible(
@@ -6637,7 +6783,11 @@ fn renderProjectionViewportSourceWithSelection(
                     cols,
                     checkpoint,
                 );
-                break :blk selector.select_offset(selector.context, measurement, visible_rows);
+                break :blk selector.select_offset(
+                    selector.context,
+                    measurement,
+                    visible_rows,
+                );
             },
         };
         return renderProjectionWindow(alloc, projection, capability, cols, visible_rows, offset, checkpoint) catch |err| switch (err) {
@@ -6971,6 +7121,15 @@ const ProjectionComposeContext = struct {
             _ = out;
             try self.builder.markAnchor();
         }
+    }
+
+    fn recordCodeAction(
+        context: *anyopaque,
+        entry_id: u32,
+        span: transcript_blocks.CodeBlockActionSpan,
+    ) !void {
+        const self = fromOpaque(context);
+        self.builder.recordCodeAction(entry_id, span);
     }
 
     fn appendDetail(

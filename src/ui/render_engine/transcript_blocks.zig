@@ -96,6 +96,7 @@ pub const FullPresentationSink = struct {
     override_kind: *const fn (context: *anyopaque, entry: TranscriptEntry) ?TranscriptBlockKind,
     append_override: *const fn (context: *anyopaque, entry: TranscriptEntry, out: *std.Io.Writer.Allocating) anyerror!bool,
     before_entry: *const fn (context: *anyopaque, entry_id: u32, out: *std.Io.Writer.Allocating) anyerror!void,
+    record_code_action: ?*const fn (context: *anyopaque, entry_id: u32, span: CodeBlockActionSpan) anyerror!void = null,
     append_detail: *const fn (context: *anyopaque, entry_id: u32, out: *std.Io.Writer.Allocating) anyerror!FullDetailAppend,
 };
 
@@ -903,18 +904,29 @@ pub fn renderCodeBlockForTranscript(
     block: assistant_presentation.CodeBlockPayload,
     cols: u16,
 ) ![]u8 {
-    return renderCodeBlockForTranscriptWithTheme(alloc, block, cols, .dark);
+    return (try renderCodeBlockForTranscriptWithTheme(alloc, block, cols, .dark, null)).bytes;
 }
+
+pub const CodeBlockActionSpan = struct {
+    first_col: u16,
+    last_col: u16,
+};
+
+const CodeBlockRender = struct {
+    bytes: []u8,
+    action_span: ?CodeBlockActionSpan = null,
+};
 
 fn renderCodeBlockForTranscriptWithTheme(
     alloc: Allocator,
     block: assistant_presentation.CodeBlockPayload,
     cols: u16,
     theme: CodeHighlightTheme,
-) ![]u8 {
+    header_action: ?[]const u8,
+) !CodeBlockRender {
     var rendered: std.ArrayList(u8) = .empty;
     errdefer rendered.deinit(alloc);
-    if (cols == 0) return rendered.toOwnedSlice(alloc);
+    if (cols == 0) return .{ .bytes = try rendered.toOwnedSlice(alloc) };
 
     const profile = if (block.language.len > 0)
         code_highlight_languages.resolve(block.language)
@@ -937,14 +949,24 @@ fn renderCodeBlockForTranscriptWithTheme(
     const available_width: usize = cols;
     const frame_would_wrap =
         max_code_width > available_width -| 4 and max_code_width <= available_width;
-    if (cols <= 5 or frame_would_wrap) {
+    const action_width = if (header_action) |action| display_width.visibleWidth(action) else 0;
+    if (cols <= 5 or frame_would_wrap or (header_action != null and cols < action_width + 4)) {
         try renderUnboxedCode(alloc, code, cols, &rendered);
-        return rendered.toOwnedSlice(alloc);
+        return .{ .bytes = try rendered.toOwnedSlice(alloc) };
     }
 
-    const panel_width = codePanelWidth(max_code_width, language, cols);
+    const panel_width = codePanelWidth(max_code_width, language, header_action, cols);
     const inner_width = panel_width - 4;
-    if (language.len > 0) {
+    var action_span: ?CodeBlockActionSpan = null;
+    if (header_action) |action| {
+        action_span = try appendCodePanelActionHeader(
+            alloc,
+            &rendered,
+            panel_width,
+            language,
+            action,
+        );
+    } else if (language.len > 0) {
         try appendCodePanelHeader(alloc, &rendered, panel_width, language);
     } else {
         try appendCodePanelBorder(alloc, &rendered, panel_width, "┌", "┐");
@@ -961,7 +983,10 @@ fn renderCodeBlockForTranscriptWithTheme(
     }
     if (!emitted_line) try appendCodePanelLine(alloc, &rendered, "", inner_width);
     try appendCodePanelBorder(alloc, &rendered, panel_width, "└", "┘");
-    return rendered.toOwnedSlice(alloc);
+    return .{
+        .bytes = try rendered.toOwnedSlice(alloc),
+        .action_span = action_span,
+    };
 }
 
 const CodeStyle = struct {
@@ -1028,12 +1053,62 @@ fn maxCodeLineWidth(code: []const u8) usize {
     return max_width;
 }
 
-fn codePanelWidth(max_code_width: usize, language: []const u8, cols: u16) usize {
+fn codePanelWidth(
+    max_code_width: usize,
+    language: []const u8,
+    header_action: ?[]const u8,
+    cols: u16,
+) usize {
     const label_width = if (language.len == 0) 0 else @min(
         display_width.visibleWidth(language),
         @as(usize, cols) - 5,
     );
-    return @min(@as(usize, cols), @max(@as(usize, 6), @max(max_code_width + 4, label_width + 5)));
+    const action_width = if (header_action) |action|
+        if (label_width == 0)
+            display_width.visibleWidth(action) + 4
+        else
+            label_width + display_width.visibleWidth(action) + 7
+    else
+        0;
+    return @min(
+        @as(usize, cols),
+        @max(@as(usize, 6), @max(max_code_width + 4, @max(label_width + 5, action_width))),
+    );
+}
+
+fn appendCodePanelActionHeader(
+    alloc: Allocator,
+    out: *std.ArrayList(u8),
+    panel_width: usize,
+    language: []const u8,
+    action: []const u8,
+) !CodeBlockActionSpan {
+    const action_width = display_width.visibleWidth(action);
+    std.debug.assert(action_width > 0);
+    std.debug.assert(panel_width >= action_width + 4);
+    const action_first_col = panel_width - action_width - 1;
+    const header_width = action_first_col - 3;
+
+    try out.appendSlice(alloc, "┌");
+    const label_limit = header_width -| 2;
+    const label = display_width.prefixByWidth(language, label_limit);
+    const label_width = display_width.visibleWidth(label);
+    if (label_width > 0) {
+        try out.appendSlice(alloc, " ");
+        try out.appendSlice(alloc, "\x1b[2m");
+        try out.appendSlice(alloc, label);
+        try out.appendSlice(alloc, "\x1b[22m ");
+    }
+    var edge: usize = label_width + @as(usize, @intFromBool(label_width > 0)) * 2;
+    while (edge < header_width) : (edge += 1) try out.appendSlice(alloc, "─");
+    try out.appendSlice(alloc, " ");
+    try out.appendSlice(alloc, action);
+    try out.appendSlice(alloc, " ┐\n");
+    std.debug.assert(panel_width <= std.math.maxInt(u16));
+    return .{
+        .first_col = @intCast(action_first_col),
+        .last_col = @intCast(action_first_col + action_width - 1),
+    };
 }
 
 fn appendCodePanelHeader(
@@ -1618,10 +1693,16 @@ fn renderEntryToBlockForPresentationInterruptible(
                 e.block,
                 cols -| gutter,
                 styles.code_highlight_theme,
+                if (presentation == .full) "Copy" else null,
             );
-            defer alloc.free(rendered);
-            const prefixed = try assistant_wrap.prefixStructuralRows(alloc, rendered, gutter);
-            break :blk try normalizeOwnedRenderedBlock(alloc, kind, prefixed);
+            defer alloc.free(rendered.bytes);
+            const prefixed = try assistant_wrap.prefixStructuralRows(alloc, rendered.bytes, gutter);
+            var normalized = try normalizeOwnedRenderedBlock(alloc, kind, prefixed);
+            if (rendered.action_span) |span| normalized.code_action_span = .{
+                .first_col = span.first_col + gutter,
+                .last_col = span.last_col + gutter,
+            };
+            break :blk normalized;
         },
         .assistant_thematic_rule => blk: {
             const rendered = try renderThematicRuleForTranscript(alloc, cols);
@@ -1706,6 +1787,9 @@ pub fn renderEntriesForFullPresentationInterruptible(
 
         try out.writer.splatByteAll('\n', sequence.separatorNewlineCountBefore(block.kind));
         try sink.before_entry(sink.context, entry_id, out);
+        if (block.code_action_span) |span| {
+            if (sink.record_code_action) |record| try record(sink.context, entry_id, span);
+        }
         try out.writer.writeAll(block.bytes);
         const detail = try sink.append_detail(sink.context, entry_id, out);
         sequence.observe(block.kind, detail.ends_with_newline, if (detail.attached) 0 else block.stored_tail_newlines);
@@ -2641,6 +2725,7 @@ pub const RenderedBlock = struct {
     stored_tail_newlines: usize,
     allocation: []const u8 = &.{},
     owned: bool = false,
+    code_action_span: ?CodeBlockActionSpan = null,
 
     pub fn deinit(self: RenderedBlock, alloc: Allocator) void {
         if (self.owned) alloc.free(self.allocation);
@@ -3026,6 +3111,58 @@ test "renderCodeBlockForTranscript frames language labels in the top border" {
             "└────┘\n",
         wide_rune,
     );
+}
+
+test "full presentation shows Copy only for boxed code blocks" {
+    const alloc = std.testing.allocator;
+    const language = try alloc.dupe(u8, "zig");
+    defer alloc.free(language);
+    const code = try alloc.dupe(u8, "const value = 1;");
+    defer alloc.free(code);
+    const entry = TranscriptEntry{ .assistant_code_block = .{
+        .id = 1,
+        .block = .{ .language = language, .code = code },
+    } };
+
+    const inline_block = try renderEntryToBlockForPresentation(alloc, entry, 80, .{}, .compact);
+    defer inline_block.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, inline_block.bytes, "Copy") == null);
+
+    const boxed = try renderEntryToBlockForPresentation(alloc, entry, 80, .{}, .full);
+    defer boxed.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, boxed.bytes, "Copy") != null);
+
+    const unboxed = try renderEntryToBlockForPresentation(alloc, entry, 5, .{}, .full);
+    defer unboxed.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, unboxed.bytes, "Copy") == null);
+}
+
+test "boxed code action span is one-based inclusive and panel-local" {
+    const alloc = std.testing.allocator;
+    const language = try alloc.dupe(u8, "zig");
+    defer alloc.free(language);
+    const code = try alloc.dupe(u8, "const value = 1;");
+    defer alloc.free(code);
+    const block = assistant_presentation.CodeBlockPayload{
+        .language = language,
+        .code = code,
+    };
+
+    const boxed = try renderCodeBlockForTranscriptWithTheme(alloc, block, 80, .dark, "Copy");
+    defer alloc.free(boxed.bytes);
+    const copy_byte = std.mem.find(u8, boxed.bytes, "Copy") orelse
+        return error.TestUnexpectedResult;
+    const expected_first: u16 = @intCast(
+        display_width.visibleWidthIgnoringAnsi(boxed.bytes[0..copy_byte]) + 1,
+    );
+    const span = boxed.action_span orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(expected_first, span.first_col);
+    try std.testing.expectEqual(expected_first + 3, span.last_col);
+
+    const unboxed = try renderCodeBlockForTranscriptWithTheme(alloc, block, 5, .dark, "Copy");
+    defer alloc.free(unboxed.bytes);
+    try std.testing.expect(unboxed.action_span == null);
+    try std.testing.expect(std.mem.find(u8, unboxed.bytes, "Copy") == null);
 }
 
 test "renderCodeBlockForTranscript bounds highlighted rows across every supported width" {

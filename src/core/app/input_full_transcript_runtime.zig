@@ -1,4 +1,5 @@
 const std = @import("std");
+const host = @import("../hosts/host.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
@@ -10,6 +11,8 @@ const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const approval_prompt = @import("../permissions/approval_prompt.zig");
 const subagent_runtime = @import("../../ui/subagent/runtime.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
+const full_transcript_screen = @import("../../ui/full_transcript_screen.zig");
+const render_request = @import("../../ui/render_request.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 
 pub fn Runtime(comptime App: type) type {
@@ -23,6 +26,7 @@ pub fn Runtime(comptime App: type) type {
             redraw,
             wheel_scroll: input_action.MouseWheel,
             page_scroll: input_action.MouseWheel,
+            pointer: input_action.MousePointer,
         };
 
         fn requestActiveSurfaceFrame(app: *App) void {
@@ -197,6 +201,7 @@ pub fn Runtime(comptime App: type) type {
                 .cursor_right => .{ .navigate = .right },
                 .escape => .close,
                 .mouse_wheel => |direction| .{ .wheel_scroll = direction },
+                .mouse_pointer => |pointer| .{ .pointer = pointer },
                 .page_up => .{ .page_scroll = .up },
                 .page_down => .{ .page_scroll = .down },
                 .composer_shortcut => |shortcut| switch (shortcut) {
@@ -247,7 +252,63 @@ pub fn Runtime(comptime App: type) type {
                     }
                     requestActiveSurfaceFrame(app);
                 },
+                .pointer => |pointer| try routeCodeCopyPointer(app, pointer),
             }
+        }
+
+        fn routeCodeCopyPointer(
+            app: *App,
+            pointer: input_action.MousePointer,
+        ) !void {
+            if (pointer.kind != .press or pointer.shift or pointer.alt or pointer.ctrl) return;
+            if (childRouteActive(app)) {
+                const child = childPresentationShell(app) orelse return;
+                return activateCodeCopyPointer(app, child, pointer);
+            }
+            if (comptime @hasDecl(@TypeOf(app.shell), "codeCopyHit") and
+                @hasDecl(@TypeOf(app.shell), "assistantCodeBlockSource"))
+            {
+                return activateCodeCopyPointer(app, &app.shell, pointer);
+            }
+        }
+
+        fn activateCodeCopyPointer(
+            app: *App,
+            active_shell: anytype,
+            pointer: input_action.MousePointer,
+        ) !void {
+            const entry_id = active_shell.codeCopyHit(
+                pointer.row,
+                pointer.column,
+            ) orelse return;
+            const code = active_shell.assistantCodeBlockSource(entry_id) orelse {
+                debug_trace.logf(
+                    "full_transcript",
+                    "code_copy_target_stale entry_id={d}",
+                    .{entry_id},
+                );
+                return;
+            };
+            const copied = if (comptime @hasDecl(App, "clipboard"))
+                app.clipboard().copy(code) catch |err| failed: {
+                    debug_trace.logf(
+                        "full_transcript",
+                        "code_copy_failed entry_id={d} err={s}",
+                        .{ entry_id, @errorName(err) },
+                    );
+                    break :failed false;
+                }
+            else
+                false;
+
+            try closeScreen(app, .code_copy);
+            if (copied) return;
+            _ = try active_shell.appendSemanticNotice(app.alloc, .{
+                .topic = "clipboard",
+                .tone = .@"error",
+                .body = "Failed to copy code block to clipboard.",
+            });
+            requestActiveSurfaceFrame(app);
         }
 
         fn childPresentationShell(
@@ -315,7 +376,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         const TransitionRoute = enum { root, child };
-        const TransitionTrigger = enum { ctrl_o, left, right, escape, ctrl_c };
+        const TransitionTrigger = enum { ctrl_o, left, right, escape, ctrl_c, code_copy };
 
         fn triggerForEvent(
             event: transcript_presentation.Event,
@@ -473,4 +534,269 @@ test "approval for another child does not steal selected child transcript input"
 
     app.subagents.approval_child_id = "child-one";
     try std.testing.expect(Runtime(ApprovalRoutingApp).approvalOwnsCurrentSurface(&app));
+}
+
+const CodeCopyTestClipboard = struct {
+    succeed: bool = true,
+    copied: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *CodeCopyTestClipboard, alloc: std.mem.Allocator) void {
+        self.copied.deinit(alloc);
+    }
+
+    fn clipboard(self: *CodeCopyTestClipboard) host.Clipboard {
+        return .{ .context = self, .copy_fn = copy };
+    }
+
+    fn copy(raw_context: ?*anyopaque, bytes: []const u8) host.ClipboardError!bool {
+        const self: *CodeCopyTestClipboard = @ptrCast(@alignCast(raw_context.?));
+        self.copied.clearRetainingCapacity();
+        self.copied.appendSlice(std.testing.allocator, bytes) catch return error.CopyFailed;
+        return self.succeed;
+    }
+};
+
+const CodeCopyRoutingSubagents = struct {
+    active: bool = false,
+    child: transcript_runtime.TranscriptRuntime = .{},
+
+    fn deinit(self: *CodeCopyRoutingSubagents, alloc: std.mem.Allocator) void {
+        self.child.deinit(alloc);
+    }
+
+    pub fn isViewActive(self: *const CodeCopyRoutingSubagents) bool {
+        return self.active;
+    }
+
+    pub fn childRouteId(self: *const CodeCopyRoutingSubagents) ?[]const u8 {
+        return if (self.active) "child-one" else null;
+    }
+
+    pub fn childConversationRuntime(
+        self: *CodeCopyRoutingSubagents,
+    ) ?*transcript_runtime.TranscriptRuntime {
+        return if (self.active) &self.child else null;
+    }
+
+    pub fn childFullTranscriptRequested(self: *const CodeCopyRoutingSubagents) bool {
+        return self.active and self.child.fullTranscriptActive();
+    }
+
+    pub fn childTranscriptPresentationDepth(
+        self: *const CodeCopyRoutingSubagents,
+    ) transcript_presentation.Depth {
+        return if (self.active)
+            self.child.transcriptPresentationDepth()
+        else
+            .inline_mode;
+    }
+
+    pub fn closeChildTranscriptPresentation(
+        self: *CodeCopyRoutingSubagents,
+        alloc: std.mem.Allocator,
+    ) !bool {
+        if (!self.active) return false;
+        return self.child.setTranscriptPresentationDepth(alloc, .inline_mode);
+    }
+
+    pub fn activeRenderRequests(
+        self: *CodeCopyRoutingSubagents,
+    ) *render_request.RenderRequestState {
+        return &self.child.render_requests;
+    }
+};
+
+const CodeCopyRoutingApp = struct {
+    alloc: std.mem.Allocator,
+    metrics: types.Metrics = .{},
+    approval_prompt: approval_prompt.ApprovalPrompt = .{},
+    terminal: shell_runtime.TerminalState = .{},
+    shell: transcript_runtime.TranscriptRuntime = .{},
+    subagents: CodeCopyRoutingSubagents = .{},
+    clipboard_state: CodeCopyTestClipboard = .{},
+
+    fn deinit(self: *CodeCopyRoutingApp) void {
+        self.clipboard_state.deinit(self.alloc);
+        self.subagents.deinit(self.alloc);
+        self.shell.deinit(self.alloc);
+        self.approval_prompt.deinit(self.alloc);
+    }
+
+    pub fn clipboard(self: *CodeCopyRoutingApp) host.Clipboard {
+        return self.clipboard_state.clipboard();
+    }
+};
+
+fn prepareCodeCopyRoute(
+    alloc: std.mem.Allocator,
+    runtime: *transcript_runtime.TranscriptRuntime,
+) !void {
+    runtime.layout = .{
+        .rows = 12,
+        .cols = 80,
+        .content_bottom = 8,
+        .divider_top_row = 9,
+        .input_row = 10,
+        .divider_bottom_row = 11,
+        .hint_row = 12,
+    };
+    runtime.owned_top_row = 1;
+    runtime.viewport_top_row = 1;
+    const language = try alloc.dupe(u8, "zig");
+    var owns_language = true;
+    errdefer if (owns_language) alloc.free(language);
+    const code = try alloc.dupe(u8, "const copied = true;\n");
+    var owns_code = true;
+    errdefer if (owns_code) alloc.free(code);
+    const entry_id = try runtime.appendAssistantCodeBlockOwned(alloc, .{
+        .language = language,
+        .code = code,
+    });
+    owns_language = false;
+    owns_code = false;
+    runtime.full_transcript = .{ .depth = .review };
+
+    var frame: full_transcript_screen.CodeCopyInteractionFrame = .{};
+    defer frame.deinit(alloc);
+    try frame.targets.append(alloc, .{
+        .entry_id = entry_id,
+        .row = 4,
+        .first_col = 70,
+        .last_col = 73,
+    });
+    runtime.commitCodeCopyFrame(alloc, &frame);
+}
+
+fn semanticNoticeCount(runtime: *const transcript_runtime.TranscriptRuntime) usize {
+    var count: usize = 0;
+    for (runtime.entries.items) |entry| {
+        if (entry == .semantic_notice) count += 1;
+    }
+    return count;
+}
+
+test "code copy closes and reports on the active transcript route" {
+    const alloc = std.testing.allocator;
+    const Route = enum { root, child };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    for ([_]Route{ .root, .child }) |route| {
+        for ([_]bool{ true, false }) |copy_succeeds| {
+            const out_file = try tmp.dir.createFile(
+                @import("../shared/io.zig").getIo(),
+                "code-copy-route.out",
+                .{ .truncate = true },
+            );
+            var app = CodeCopyRoutingApp{ .alloc = alloc };
+            defer app.deinit();
+            app.shell.stdout_file = out_file;
+            defer app.shell.stdout_file.close(@import("../shared/io.zig").getIo());
+            app.clipboard_state.succeed = copy_succeeds;
+
+            const active = switch (route) {
+                .root => &app.shell,
+                .child => blk: {
+                    app.subagents.active = true;
+                    break :blk &app.subagents.child;
+                },
+            };
+            try prepareCodeCopyRoute(alloc, active);
+            if (route == .root) {
+                app.terminal.alternate_screen_owner = .full_transcript;
+            }
+
+            try std.testing.expect(try Runtime(CodeCopyRoutingApp).routeAction(
+                &app,
+                .{ .mouse_pointer = .{
+                    .kind = .press,
+                    .column = 71,
+                    .row = 4,
+                } },
+            ));
+
+            try std.testing.expectEqualStrings(
+                "const copied = true;\n",
+                app.clipboard_state.copied.items,
+            );
+            try std.testing.expectEqual(
+                transcript_presentation.Depth.inline_mode,
+                active.transcriptPresentationDepth(),
+            );
+            try std.testing.expectEqual(
+                @as(usize, @intFromBool(!copy_succeeds)),
+                semanticNoticeCount(active),
+            );
+            if (!copy_succeeds) {
+                const notice = active.entries.items[active.entries.items.len - 1].semantic_notice;
+                try std.testing.expectEqualStrings(
+                    "Failed to copy code block to clipboard.",
+                    notice.body,
+                );
+            }
+
+            const inactive = switch (route) {
+                .root => &app.subagents.child,
+                .child => &app.shell,
+            };
+            try std.testing.expectEqual(
+                transcript_presentation.Depth.inline_mode,
+                inactive.transcriptPresentationDepth(),
+            );
+            try std.testing.expectEqual(@as(usize, 0), semanticNoticeCount(inactive));
+        }
+    }
+}
+
+test "code copy ignores non-target and modified pointer actions" {
+    const alloc = std.testing.allocator;
+    var app = CodeCopyRoutingApp{ .alloc = alloc };
+    defer app.deinit();
+    app.subagents.active = true;
+    try prepareCodeCopyRoute(alloc, &app.subagents.child);
+
+    const pointers = [_]input_action.MousePointer{
+        .{ .kind = .press, .column = 69, .row = 4 },
+        .{ .kind = .press, .column = 74, .row = 4 },
+        .{ .kind = .press, .column = 71, .row = 5 },
+        .{ .kind = .drag, .column = 71, .row = 4 },
+        .{ .kind = .release, .column = 71, .row = 4 },
+        .{ .kind = .press, .column = 71, .row = 4, .shift = true },
+        .{ .kind = .press, .column = 71, .row = 4, .alt = true },
+        .{ .kind = .press, .column = 71, .row = 4, .ctrl = true },
+    };
+    for (pointers) |pointer| {
+        try std.testing.expect(try Runtime(CodeCopyRoutingApp).routeAction(
+            &app,
+            .{ .mouse_pointer = pointer },
+        ));
+        try std.testing.expectEqual(
+            transcript_presentation.Depth.review,
+            app.subagents.child.transcriptPresentationDepth(),
+        );
+        try std.testing.expectEqual(@as(usize, 0), app.clipboard_state.copied.items.len);
+    }
+
+    var stale_frame: full_transcript_screen.CodeCopyInteractionFrame = .{};
+    defer stale_frame.deinit(alloc);
+    try stale_frame.targets.append(alloc, .{
+        .entry_id = 999,
+        .row = 4,
+        .first_col = 70,
+        .last_col = 73,
+    });
+    app.subagents.child.commitCodeCopyFrame(alloc, &stale_frame);
+    try std.testing.expect(try Runtime(CodeCopyRoutingApp).routeAction(
+        &app,
+        .{ .mouse_pointer = .{
+            .kind = .press,
+            .column = 71,
+            .row = 4,
+        } },
+    ));
+    try std.testing.expectEqual(
+        transcript_presentation.Depth.review,
+        app.subagents.child.transcriptPresentationDepth(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.clipboard_state.copied.items.len);
 }

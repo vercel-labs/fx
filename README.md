@@ -68,6 +68,8 @@ fx
 
 The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands.
 
+Press `Ctrl-O` to review the transcript. Completed code blocks with boxed headers show `Copy` in the top-right; click it to copy the code and return to the inline view.
+
 The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
 
 ```json

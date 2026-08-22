@@ -751,6 +751,58 @@ test "full transcript viewport snapshot restores reading position" {
     ));
 }
 
+test "full transcript code copy frame clears through dirty scroll and close" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .full_transcript = .{ .depth = .review } };
+    defer runtime.deinit(alloc);
+
+    if (comptime @hasDecl(TranscriptRuntime, "commitCodeCopyFrame") and
+        @hasDecl(TranscriptRuntime, "codeCopyHit"))
+    {
+        const commit = @field(TranscriptRuntime, "commitCodeCopyFrame");
+        const hit = @field(TranscriptRuntime, "codeCopyHit");
+
+        var dirty_frame: full_transcript_screen.CodeCopyInteractionFrame = .{};
+        defer dirty_frame.deinit(alloc);
+        try dirty_frame.targets.append(alloc, .{
+            .entry_id = 1,
+            .row = 4,
+            .first_col = 10,
+            .last_col = 13,
+        });
+        commit(&runtime, alloc, &dirty_frame);
+        try std.testing.expectEqual(@as(?u32, 1), hit(&runtime, 4, 11));
+        runtime.markTranscriptDirty();
+        try std.testing.expectEqual(@as(?u32, null), hit(&runtime, 4, 11));
+
+        var scroll_frame: full_transcript_screen.CodeCopyInteractionFrame = .{};
+        defer scroll_frame.deinit(alloc);
+        try scroll_frame.targets.append(alloc, .{
+            .entry_id = 2,
+            .row = 5,
+            .first_col = 20,
+            .last_col = 23,
+        });
+        commit(&runtime, alloc, &scroll_frame);
+        runtime.scrollFullTranscript(.up, .wheel);
+        try std.testing.expectEqual(@as(?u32, null), hit(&runtime, 5, 21));
+
+        var close_frame: full_transcript_screen.CodeCopyInteractionFrame = .{};
+        defer close_frame.deinit(alloc);
+        try close_frame.targets.append(alloc, .{
+            .entry_id = 3,
+            .row = 6,
+            .first_col = 30,
+            .last_col = 33,
+        });
+        commit(&runtime, alloc, &close_frame);
+        runtime.closeFullTranscriptState();
+        try std.testing.expectEqual(@as(?u32, null), hit(&runtime, 6, 31));
+    } else {
+        return error.TestUnexpectedResult;
+    }
+}
+
 test "opening the full transcript leaves compact command projection unchanged" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{ .layout = .{
@@ -823,12 +875,63 @@ test "full transcript staging paints its selected wheel viewport without reselec
     );
     defer staged.source.deinit(alloc);
     defer staged.prepared.deinit(alloc);
+    defer staged.code_copy_frame.deinit(alloc);
 
     try std.testing.expectEqual(@as(u32, 3), runtime.full_transcript.scroll_rows);
     try std.testing.expect(!runtime.full_transcript.follow_tail);
     try std.testing.expectEqual(@as(usize, 0), staged.prepared.selection.start_line);
     try std.testing.expect(std.mem.find(u8, staged.source.bytes, "row-3") != null);
     try std.testing.expect(std.mem.find(u8, staged.source.bytes, "row-0") == null);
+}
+
+test "full transcript staging carries visible code copy targets" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 12,
+            .cols = 80,
+            .content_bottom = 8,
+            .divider_top_row = 9,
+            .input_row = 10,
+            .divider_bottom_row = 11,
+            .hint_row = 12,
+        },
+        .owned_top_row = 1,
+        .full_transcript = .{ .depth = .review },
+    };
+    defer runtime.deinit(alloc);
+
+    var language: ?[]u8 = try alloc.dupe(u8, "zig");
+    errdefer if (language) |bytes| alloc.free(bytes);
+    var code: ?[]u8 = try alloc.dupe(u8, "const value = 1;");
+    errdefer if (code) |bytes| alloc.free(bytes);
+    _ = try runtime.appendAssistantCodeBlockOwned(alloc, .{
+        .language = language.?,
+        .code = code.?,
+    });
+    language = null;
+    code = null;
+    var projection = try runtime.buildFullTranscriptProjection(alloc, null);
+    defer projection.deinit(alloc);
+    var metrics: Metrics = .{};
+    var staged = try runtime.prepareFullTranscriptSurfacePaint(
+        alloc,
+        &metrics,
+        &projection,
+        null,
+        .{ .top = 2, .bottom = 8 },
+    );
+    defer staged.source.deinit(alloc);
+    defer staged.prepared.deinit(alloc);
+    defer staged.code_copy_frame.deinit(alloc);
+
+    if (comptime @hasField(TranscriptRuntime.FullTranscriptSurfacePaint, "code_copy_frame")) {
+        const frame = @field(staged, "code_copy_frame");
+        try std.testing.expectEqual(@as(usize, 1), frame.targets.items.len);
+        try std.testing.expectEqual(@as(u16, 2), frame.targets.items[0].row);
+    } else {
+        return error.TestUnexpectedResult;
+    }
 }
 
 test "full transcript projection cache survives navigation and invalidates on content change" {
@@ -1643,6 +1746,7 @@ test "full transcript staging keeps its selected viewport visible during resize 
     );
     defer staged.source.deinit(alloc);
     defer staged.prepared.deinit(alloc);
+    defer staged.code_copy_frame.deinit(alloc);
 
     try std.testing.expect(std.mem.find(u8, staged.source.bytes, "row-3") != null);
     try std.testing.expect(std.mem.find(u8, staged.source.bytes, "row-0") == null);
@@ -1819,6 +1923,7 @@ test "full transcript opening follows the tail instead of consuming its compact 
     );
     defer staged.source.deinit(alloc);
     defer staged.prepared.deinit(alloc);
+    defer staged.code_copy_frame.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 0), staged.prepared.selection.start_line);
     try std.testing.expectEqual(
@@ -4124,6 +4229,7 @@ pub const TranscriptRuntime = struct {
     full_transcript_open_rows: u16 = 0,
     full_transcript_primary_recovery_entry_id: ?u32 = null,
     full_transcript_projection_cache: FullTranscriptProjectionCache = .{},
+    full_transcript_code_copy_frame: full_transcript_screen.CodeCopyInteractionFrame = .{},
     full_transcript_content_revision: u64 = 0,
     full_transcript_review_revision: u64 = 0,
     compact_transcript_source_cache: CompactTranscriptSourceCache = .{},
@@ -4233,6 +4339,7 @@ pub const TranscriptRuntime = struct {
         self.disableShadowVt();
         self.compact_transcript_source_cache.deinit(alloc);
         self.full_transcript_projection_cache.deinit(alloc);
+        self.full_transcript_code_copy_frame.deinit(alloc);
         self.lifecycle_state.deinit(alloc);
         for (self.tool_details.items) |*detail| detail.deinit(alloc);
         self.tool_details.deinit(alloc);
@@ -6230,7 +6337,37 @@ pub const TranscriptRuntime = struct {
     }
 
     pub fn closeFullTranscriptState(self: *TranscriptRuntime) void {
+        self.clearCodeCopyFrame();
         self.full_transcript = self.full_transcript.closed();
+    }
+
+    pub fn commitCodeCopyFrame(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        candidate: *full_transcript_screen.CodeCopyInteractionFrame,
+    ) void {
+        self.full_transcript_code_copy_frame.deinit(alloc);
+        self.full_transcript_code_copy_frame = candidate.*;
+        candidate.* = .{};
+    }
+
+    pub fn codeCopyHit(self: *const TranscriptRuntime, row: u16, col: u16) ?u32 {
+        return self.full_transcript_code_copy_frame.hitTest(row, col);
+    }
+
+    pub fn assistantCodeBlockSource(self: *const TranscriptRuntime, entry_id: u32) ?[]const u8 {
+        for (self.entries.items) |entry| {
+            if (entry.id() != entry_id) continue;
+            return switch (entry) {
+                .assistant_code_block => |code_block| code_block.block.code,
+                else => null,
+            };
+        }
+        return null;
+    }
+
+    fn clearCodeCopyFrame(self: *TranscriptRuntime) void {
+        self.full_transcript_code_copy_frame.clear();
     }
 
     pub fn fullTranscriptAnchorEntryId(self: *const TranscriptRuntime) ?u32 {
@@ -6246,6 +6383,7 @@ pub const TranscriptRuntime = struct {
         direction: input_action.MouseWheel,
         unit: FullTranscriptScrollUnit,
     ) void {
+        self.clearCodeCopyFrame();
         const rows = switch (unit) {
             .wheel => full_transcript_wheel_rows,
             .page => self.fullTranscriptPageRows(),
@@ -9246,6 +9384,7 @@ pub const TranscriptRuntime = struct {
     pub const FullTranscriptSurfacePaint = struct {
         source: TranscriptPreparationSource,
         prepared: transcript_painter.PreparedTranscriptSurfacePaint,
+        code_copy_frame: full_transcript_screen.CodeCopyInteractionFrame,
     };
 
     pub noinline fn buildFullTranscriptProjection(
@@ -9588,6 +9727,19 @@ pub const TranscriptRuntime = struct {
             .{ .context = self, .select_offset = selectProjectionViewportOffset },
             checkpoint,
         );
+        const selected_offset = self.full_transcript.select_visual_offset(
+            projection.measured_total_rows,
+            area.height(),
+            projection.measured_item_rows.items,
+        ).offset;
+        var code_copy_frame = try full_transcript_screen.codeCopyTargetsForWindow(
+            alloc,
+            projection,
+            selected_offset,
+            area.top,
+            area.height(),
+        );
+        errdefer code_copy_frame.deinit(alloc);
         var source = try self.prepareFullTranscriptViewportSource(alloc, source_bytes);
         errdefer source.deinit(alloc);
         const prepared = try transcript_painter.preparePreselectedTranscriptSurfacePaintFromSourceForArea(
@@ -9597,7 +9749,11 @@ pub const TranscriptRuntime = struct {
             &source,
             area,
         );
-        return .{ .source = source, .prepared = prepared };
+        return .{
+            .source = source,
+            .prepared = prepared,
+            .code_copy_frame = code_copy_frame,
+        };
     }
 
     fn selectProjectionViewportOffset(
@@ -9740,6 +9896,7 @@ pub const TranscriptRuntime = struct {
     }
 
     pub fn markTranscriptDirty(self: *TranscriptRuntime) void {
+        self.clearCodeCopyFrame();
         self.transcript_band_dirty = true;
         self.render_requests.request(.transcript);
     }

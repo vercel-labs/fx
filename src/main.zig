@@ -3911,6 +3911,7 @@ test {
     _ = @import("core/app/app_terminal_runtime.zig");
     _ = @import("tools/terminal/terminal.zig");
     _ = @import("core/app/input_approval_runtime.zig");
+    _ = @import("core/app/input_full_transcript_runtime.zig");
     _ = @import("acp/sessions.zig");
     _ = @import("core/tasks/task_helpers.zig");
     _ = @import("core/shared/text_utils.zig");
