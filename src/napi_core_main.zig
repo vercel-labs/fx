@@ -12,6 +12,7 @@ const fetch_state = @import("napi_fetch_state.zig");
 const streamable_http = @import("core/mcp/streamable_http.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
+const secret = @import("core/auth/secret.zig");
 const builtin_context = @import("builtins/context.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_modes = @import("builtins/modes.zig");
@@ -495,7 +496,7 @@ const Runtime = struct {
         self.fetch.deinit();
         self.input.deinit(self.alloc);
         self.output.deinit(self.alloc);
-        self.alloc.free(self.credential);
+        secret.zeroAndFree(self.alloc, self.credential);
         if (self.model) |model| self.alloc.free(model);
         self.alloc.free(self.home);
         self.alloc.free(self.workspace_root);
@@ -618,7 +619,7 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         else => return error.InvalidApiKey,
     };
     const api_key = credential orelse return error.InvalidApiKey;
-    errdefer alloc.free(api_key);
+    errdefer secret.zeroAndFree(alloc, api_key);
     const model = getNamedString(env, options, "model", alloc, max_model_bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidModel,
