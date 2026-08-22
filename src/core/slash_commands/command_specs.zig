@@ -163,6 +163,8 @@ pub const SlashPresentationCategory = enum {
 pub const SlashSpec = struct {
     kind: SlashKind,
     command: []const u8,
+    /// Optional completion-only label when the command accepts useful subcommands.
+    display_command: ?[]const u8 = null,
     aliases: []const []const u8 = &.{},
     show_aliases_in_completion: bool = true,
     help_entry: ?[]const u8 = null,
@@ -649,7 +651,8 @@ pub fn nthSlashCompletionLabel(registry: SlashRegistry, prefix: []const u8, n: u
     if (workspaceArgCompletionPrefix(prefix)) |query| {
         return nthWorkspaceArgLabel(query, n);
     }
-    return nthSlashCompletion(registry, prefix, n);
+    const match = nthSlashCommandCompletionMatch(registry, prefix, n) orelse return null;
+    return match.spec.display_command orelse match.command;
 }
 
 pub fn nthSlashCompletionDescription(registry: SlashRegistry, prefix: []const u8, n: usize) ?[]const u8 {
