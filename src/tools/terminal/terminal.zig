@@ -342,10 +342,11 @@ fn actionFieldCorrection(
 }
 
 const OwnedInput = struct {
-    parsed: std.json.Parsed(Input),
+    arena_state: std.heap.ArenaAllocator.State,
+    value: Input,
 
-    fn deinit(self: *OwnedInput) void {
-        self.parsed.deinit();
+    fn deinit(self: *OwnedInput, alloc: Allocator) void {
+        self.arena_state.promote(alloc).deinit();
         self.* = undefined;
     }
 };
@@ -412,18 +413,11 @@ pub fn decode(
         },
     };
 
-    var normalized: std.Io.Writer.Allocating = .init(ctx.allocator);
-    defer normalized.deinit();
-    std.json.Stringify.value(raw, .{}, &normalized.writer) catch
-        return error.OutOfMemory;
-    const normalized_json = try normalized.toOwnedSlice();
-    defer ctx.allocator.free(normalized_json);
-
-    const parsed = std.json.parseFromSlice(
+    const input = std.json.parseFromValueLeaky(
         Input,
-        ctx.allocator,
-        normalized_json,
-        .{ .allocate = .alloc_always },
+        arena,
+        raw,
+        .{},
     ) catch {
         return .{ .failure = try ctx.allocator.dupe(
             u8,
@@ -431,7 +425,11 @@ pub fn decode(
         ) };
     };
     const owned = try ctx.allocator.create(OwnedInput);
-    owned.* = .{ .parsed = parsed };
+    owned.* = .{
+        .arena_state = arena_state.state,
+        .value = input,
+    };
+    arena_state.state = .init;
     return .{ .input = .{
         .ptr = owned,
         .deinit_fn = inputDeinit,
@@ -473,7 +471,7 @@ fn normalizeCompositeArguments(
 
 fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
     const input: *OwnedInput = @ptrCast(@alignCast(ptr));
-    input.deinit();
+    input.deinit(alloc);
     alloc.destroy(input);
 }
 
@@ -481,7 +479,7 @@ pub fn validate(
     ctx: tool_dispatch.DispatchContext,
     erased: tool_dispatch.ToolInput,
 ) tool_dispatch.DispatchError!?[]u8 {
-    const input = &erased.as(OwnedInput).parsed.value;
+    const input = &erased.as(OwnedInput).value;
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -532,7 +530,7 @@ pub fn call(
     ctx: tool_dispatch.DispatchContext,
     erased: tool_dispatch.ToolInput,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    const input = &erased.as(OwnedInput).parsed.value;
+    const input = &erased.as(OwnedInput).value;
     if (input.action == .exec) return callExec(ctx, input);
     const runtime = ctx.terminal_client orelse return structuredFailure(
         ctx.allocator,
@@ -713,7 +711,7 @@ fn durableAction(action: Action) ?contracts.Action {
 }
 
 pub fn isCapturedCommand(erased: tool_dispatch.ToolInput) bool {
-    return erased.as(OwnedInput).parsed.value.action == .exec;
+    return erased.as(OwnedInput).value.action == .exec;
 }
 
 const PreparedRequest = struct {
@@ -1274,7 +1272,7 @@ fn mapErrorCode(err: anyerror) contracts.StructuredErrorCode {
 }
 
 pub fn readsOnly(erased: tool_dispatch.ToolInput) bool {
-    const input = erased.as(OwnedInput).parsed.value;
+    const input = erased.as(OwnedInput).value;
     return switch (input.action) {
         .read, .screen, .list => true,
         .inspect => input.acknowledge_event_id == null,
@@ -1413,11 +1411,30 @@ test "terminal decoder accepts every public action and owns its input" {
                 defer input.deinit(alloc);
                 try std.testing.expectEqual(
                     case[0],
-                    input.as(OwnedInput).parsed.value.action,
+                    input.as(OwnedInput).value.action,
                 );
             },
         }
     }
+}
+
+test "terminal decoder keeps complex decode within allocation budget" {
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = counted.allocator();
+    const args =
+        "{\"action\":\"start\",\"cwd\":\"/workspace\",\"backend\":\"native\",\"command\":\"printf SHOULD_NOT_RUN\",\"return_when\":\"{\\\"kind\\\":\\\"started\\\"}\",\"initial_monitors\":\"[{\\\"condition\\\":{\\\"kind\\\":\\\"path_exists\\\",\\\"path\\\":\\\"/private/tmp/fx-monitor-outside-ready\\\",\\\"check_interval_ms\\\":1000},\\\"notify\\\":{\\\"kind\\\":\\\"on_match\\\"},\\\"lifetime\\\":{\\\"kind\\\":\\\"until_match\\\"}}]\"}";
+    const decoded = try decode(.{ .allocator = alloc }, args);
+    switch (decoded) {
+        .failure => |message| {
+            defer alloc.free(message);
+            return error.TestUnexpectedResult;
+        },
+        .input => |input| input.deinit(alloc),
+    }
+
+    try std.testing.expectEqual(counted.allocations, counted.deallocations);
+    try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+    try std.testing.expect(counted.allocations <= 6);
 }
 
 test "terminal presentation maps every action to operation-first labels" {
@@ -1532,7 +1549,7 @@ test "terminal decoder elides known null placeholders but structures unknown nul
         },
         .input => |input| {
             defer input.deinit(alloc);
-            const value = input.as(OwnedInput).parsed.value;
+            const value = input.as(OwnedInput).value;
             try std.testing.expectEqual(Action.start, value.action);
             try std.testing.expect(value.session_id == null);
         },
@@ -1575,7 +1592,7 @@ test "terminal decoder elides textual null placeholders like real nulls" {
         },
         .input => |input| {
             defer input.deinit(alloc);
-            const value = input.as(OwnedInput).parsed.value;
+            const value = input.as(OwnedInput).value;
             try std.testing.expectEqual(Action.exec, value.action);
             try std.testing.expectEqualStrings("echo ONE", value.command.?);
             try std.testing.expectEqualStrings(".", value.cwd.?);
@@ -1598,7 +1615,7 @@ test "terminal decoder elides textual null placeholders like real nulls" {
         },
         .input => |input| {
             defer input.deinit(alloc);
-            const value = input.as(OwnedInput).parsed.value;
+            const value = input.as(OwnedInput).value;
             try std.testing.expectEqual(Action.start, value.action);
             try std.testing.expect(value.shell == null);
             try std.testing.expect(value.write == null);
@@ -1622,7 +1639,7 @@ test "terminal decoder keeps command text that merely contains a null placeholde
             defer input.deinit(alloc);
             try std.testing.expectEqualStrings(
                 "echo null",
-                input.as(OwnedInput).parsed.value.command.?,
+                input.as(OwnedInput).value.command.?,
             );
         },
     }
@@ -1900,7 +1917,7 @@ test "terminal decoder normalizes gateway stringified start composites" {
         },
         .input => |input| {
             defer input.deinit(alloc);
-            const parsed = input.as(OwnedInput).parsed.value;
+            const parsed = input.as(OwnedInput).value;
             try std.testing.expectEqual(ReturnKind.started, parsed.return_when.?.kind);
             try std.testing.expectEqual(@as(usize, 1), parsed.initial_monitors.len);
             const monitor = parsed.initial_monitors[0];
@@ -2249,7 +2266,7 @@ test "terminal public wait ceiling maps to action-specific Core requests" {
             const request = try semanticRequest(
                 arena,
                 ctx,
-                &input.as(OwnedInput).parsed.value,
+                &input.as(OwnedInput).value,
             );
             switch (request) {
                 .start => |value| try std.testing.expectEqual(
@@ -2275,7 +2292,7 @@ test "terminal public wait ceiling maps to action-specific Core requests" {
             const request = try semanticRequest(
                 arena,
                 ctx,
-                &input.as(OwnedInput).parsed.value,
+                &input.as(OwnedInput).value,
             );
             switch (request) {
                 .wait => |value| try std.testing.expectEqual(
@@ -2442,7 +2459,7 @@ test "terminal public list rejects lifecycle and projects supported filters" {
             const request = try semanticRequest(
                 arena,
                 ctx,
-                &input.as(OwnedInput).parsed.value,
+                &input.as(OwnedInput).value,
             );
             try request.validate();
             switch (request) {
@@ -2474,7 +2491,7 @@ test "terminal public list rejects lifecycle and projects supported filters" {
             const request = try semanticRequest(
                 arena,
                 ctx,
-                &input.as(OwnedInput).parsed.value,
+                &input.as(OwnedInput).value,
             );
             try request.validate();
             switch (request) {
@@ -2504,7 +2521,7 @@ test "terminal public list rejects lifecycle and projects supported filters" {
             const request = try semanticRequest(
                 arena,
                 ctx,
-                &input.as(OwnedInput).parsed.value,
+                &input.as(OwnedInput).value,
             );
             try request.validate();
             switch (request) {
@@ -2536,7 +2553,7 @@ test "terminal public list rejects lifecycle and projects supported filters" {
                 semanticRequest(
                     arena,
                     ctx,
-                    &input.as(OwnedInput).parsed.value,
+                    &input.as(OwnedInput).value,
                 ),
             );
         },
