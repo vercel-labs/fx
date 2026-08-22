@@ -569,11 +569,7 @@ fn consumeSse(
     var saw_content_delta = false;
     var event_count: usize = 0;
 
-    stream: while (true) {
-        const json_text = sse.next(alloc, reader) catch |err| switch (err) {
-            error.ReadFailed => break :stream,
-            else => return err,
-        } orelse break :stream;
+    while (try sse.next(alloc, reader)) |json_text| {
         defer sse.release();
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
         event_count = try checkedAccumulatedSize(event_count, 1, max_sse_events);
@@ -740,7 +736,7 @@ fn consumeSse(
     };
 }
 
-/// Grok's proxy sometimes closes after tool or text deltas without
+/// Grok's proxy sometimes ends cleanly after tool or text deltas without
 /// `response.completed`. Salvage only when every tool already has parseable
 /// arguments, or when the stream delivered visible text and no tools.
 fn streamHasUsableOutput(
@@ -1348,11 +1344,15 @@ fn deinitTestCompletion(completion: *types.GatewayCompletion) void {
 
 fn consumeTestSse(bytes: []const u8) !types.GatewayCompletion {
     var reader: std.Io.Reader = .fixed(bytes);
+    return consumeTestSseReader(&reader);
+}
+
+fn consumeTestSseReader(reader: anytype) !types.GatewayCompletion {
     var cancelled = std.atomic.Value(bool).init(false);
     var callback_context: u8 = 0;
     return consumeSse(
         std.testing.allocator,
-        &reader,
+        reader,
         &callback_context,
         ignoreTestChunk,
         null,
@@ -1491,6 +1491,32 @@ test "xAI Grok SSE still rejects empty or truncated streams without a terminal e
         "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}\n\n" ++
             "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\"}\n\n",
     );
+}
+
+test "xAI Grok SSE preserves read failure after usable output" {
+    const PartialReadFailure = struct {
+        calls: usize = 0,
+
+        fn takeDelimiter(self: *@This(), _: u8) error{ StreamTooLong, ReadFailed }!?[]const u8 {
+            defer self.calls += 1;
+            if (self.calls == 0) {
+                return "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hello\"}";
+            }
+            return error.ReadFailed;
+        }
+
+        fn buffered(self: *@This()) []const u8 {
+            return if (self.calls > 1)
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"truncated"
+            else
+                "";
+        }
+
+        fn tossBuffered(_: *@This()) void {}
+    };
+
+    var reader = PartialReadFailure{};
+    try std.testing.expectError(error.ReadFailed, consumeTestSseReader(&reader));
 }
 
 test "xAI Grok SSE reader accepts the exact line bound and rejects one beyond" {
