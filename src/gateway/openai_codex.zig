@@ -10,6 +10,7 @@ const gateway_client = @import("client.zig");
 const Allocator = std.mem.Allocator;
 const endpoint = "https://chatgpt.com/backend-api/codex/responses";
 const generation_origin = "https://chatgpt.com/backend-api/codex";
+const turn_state_header = "x-codex-turn-state";
 const e2e_endpoint_env = "FX_E2E_OPENAI_CODEX_RESPONSES_URL";
 const max_error_body_bytes: usize = 1024 * 1024;
 const max_sse_line_bytes: usize = 32 * 1024 * 1024;
@@ -346,6 +347,10 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
     extra_count += 1;
     extra_headers_buf[extra_count] = .{ .name = "accept", .value = "text/event-stream" };
     extra_count += 1;
+    if (request.provider_turn_state) |turn_state| if (turn_state.get()) |value| {
+        extra_headers_buf[extra_count] = .{ .name = turn_state_header, .value = value };
+        extra_count += 1;
+    };
     if (request.session_id) |session_id| if (session_id.len > 0) {
         extra_headers_buf[extra_count] = .{ .name = "session-id", .value = session_id };
         extra_count += 1;
@@ -412,6 +417,9 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
             .ownership = .owned,
         };
     }
+    if (request.provider_turn_state) |turn_state| {
+        try capture_response_turn_state(response.head, turn_state);
+    }
 
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
@@ -423,6 +431,7 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
         request.on_tool_start,
         request.on_reasoning_chunk,
         request.on_tool_input_chunk,
+        request.provider_turn_state,
         request.cancel_flag,
         request.content_capture_limit,
         .{},
@@ -433,6 +442,19 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
         .generation_origin = generation_origin,
         .ownership = .owned,
     };
+}
+
+fn capture_response_turn_state(
+    head: std.http.Client.Response.Head,
+    turn_state: *stream_provider.ProviderTurnState,
+) Allocator.Error!void {
+    if (turn_state.get() != null) return;
+    var headers = head.iterateHeaders();
+    while (headers.next()) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, turn_state_header)) continue;
+        try turn_state.capture(header.value);
+        if (turn_state.get() != null) return;
+    }
 }
 
 const ToolAccumulator = struct {
@@ -514,6 +536,7 @@ fn consumeSse(
     on_tool_start: ?stream_provider.ToolStartCallback,
     on_reasoning_chunk: ?stream_provider.StreamCallback,
     on_tool_input_chunk: ?stream_provider.StreamCallback,
+    provider_turn_state: ?*stream_provider.ProviderTurnState,
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
     limits: CodexLimits,
@@ -550,7 +573,13 @@ fn consumeSse(
         if (parsed.value != .object) continue;
         const event_type = stringField(parsed.value.object, "type") orelse continue;
 
-        if (std.mem.eql(u8, event_type, "response.output_item.added")) {
+        if (std.mem.eql(u8, event_type, "response.metadata")) {
+            if (provider_turn_state) |turn_state| {
+                if (metadataHeaderValue(parsed.value.object, turn_state_header)) |value| {
+                    try turn_state.capture(value);
+                }
+            }
+        } else if (std.mem.eql(u8, event_type, "response.output_item.added")) {
             const output_index = integerField(parsed.value.object, "output_index") orelse continue;
             const item = parsed.value.object.get("item") orelse continue;
             if (item != .object) continue;
@@ -785,6 +814,18 @@ fn parseUsage(response: std.json.ObjectMap) types.Usage {
         .input_tokens = unsignedField(value.object, "input_tokens"),
         .output_tokens = unsignedField(value.object, "output_tokens"),
     };
+}
+
+fn metadataHeaderValue(event: std.json.ObjectMap, name: []const u8) ?[]const u8 {
+    const headers = event.get("headers") orelse return null;
+    if (headers != .object) return null;
+    var iterator = headers.object.iterator();
+    while (iterator.next()) |entry| {
+        if (!std.ascii.eqlIgnoreCase(entry.key_ptr.*, name)) continue;
+        if (entry.value_ptr.* != .string) return null;
+        return entry.value_ptr.*.string;
+    }
+    return null;
 }
 
 fn stringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -1056,6 +1097,7 @@ test "OpenAI Codex SSE maps text reasoning tools and usage" {
         Capture.toolStart,
         Capture.reasoningChunk,
         null,
+        null,
         &cancelled,
         null,
         .{},
@@ -1077,6 +1119,95 @@ test "OpenAI Codex SSE maps text reasoning tools and usage" {
     try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
 }
 
+test "OpenAI Codex SSE metadata captures the first usable exact turn-state value" {
+    const sse_text =
+        "data: {\"type\":\"response.metadata\",\"headers\":{\"x-codex-turn-state\":\"\"}}\n\n" ++
+        "data: {\"type\":\"response.metadata\",\"headers\":{\"x-codex-turn-state\":\" \"}}\n\n" ++
+        "data: {\"type\":\"response.metadata\",\"headers\":{\"x-codex-turn-state\":\"\\t\"}}\n\n" ++
+        "data: {\"type\":\"response.metadata\",\"headers\":{\"x-codex-turn-state\":\"unsafe\\r\\nstate\"}}\n\n" ++
+        "data: {\"type\":\"response.metadata\",\"headers\":{\"X-Codex-Turn-State\":\"metadata-state/+=\"}}\n\n" ++
+        "data: {\"type\":\"response.metadata\",\"headers\":{\"x-codex-turn-state\":\"replacement-state\"}}\n\n" ++
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+    var reader: std.Io.Reader = .fixed(sse_text);
+    var cancelled = std.atomic.Value(bool).init(false);
+    var callback_context: u8 = 0;
+    var turn_state = stream_provider.ProviderTurnState.init(std.testing.allocator);
+    defer turn_state.deinit();
+    const completion = try consumeSse(
+        std.testing.allocator,
+        &reader,
+        &callback_context,
+        struct {
+            fn ignore(_: *anyopaque, _: []const u8) void {}
+        }.ignore,
+        null,
+        null,
+        null,
+        &turn_state,
+        &cancelled,
+        null,
+        .{},
+    );
+    defer freeOpenAICodexTestCompletion(completion);
+
+    try std.testing.expectEqualStrings("metadata-state/+=", turn_state.get().?);
+}
+
+test "OpenAI Codex response headers skip unusable duplicate turn state" {
+    const head = try std.http.Client.Response.Head.parse(
+        "HTTP/1.1 200 OK\r\nx-codex-turn-state: \t \r\nX-Codex-Turn-State: header-state/+=\r\n\r\n",
+    );
+    var turn_state = stream_provider.ProviderTurnState.init(std.testing.allocator);
+    defer turn_state.deinit();
+    try capture_response_turn_state(head, &turn_state);
+
+    try std.testing.expectEqualStrings("header-state/+=", turn_state.get().?);
+}
+
+test "OpenAI Codex failed partial stream keeps its first turn state" {
+    const sse_text =
+        "data: {\"type\":\"response.metadata\",\"headers\":{\"x-codex-turn-state\":\"failed-attempt-state\"}}\n\n" ++
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n";
+    const cases = [_]struct {
+        initial: ?[]const u8,
+        expected: []const u8,
+    }{
+        .{ .initial = null, .expected = "failed-attempt-state" },
+        .{ .initial = "accepted-state", .expected = "accepted-state" },
+    };
+    for (cases) |case| {
+        var reader: std.Io.Reader = .fixed(sse_text);
+        var cancelled = std.atomic.Value(bool).init(false);
+        var callback_context: u8 = 0;
+        var turn_state = stream_provider.ProviderTurnState.init(std.testing.allocator);
+        defer turn_state.deinit();
+        if (case.initial) |initial| try turn_state.capture(initial);
+
+        const result = consumeSse(
+            std.testing.allocator,
+            &reader,
+            &callback_context,
+            struct {
+                fn ignore(_: *anyopaque, _: []const u8) void {}
+            }.ignore,
+            null,
+            null,
+            null,
+            &turn_state,
+            &cancelled,
+            null,
+            .{},
+        );
+        if (result) |completion| {
+            freeOpenAICodexTestCompletion(completion);
+            return error.TestExpectedOpenAICodexStreamIncomplete;
+        } else |err| {
+            try std.testing.expectEqual(error.OpenAICodexStreamIncomplete, err);
+        }
+        try std.testing.expectEqualStrings(case.expected, turn_state.get().?);
+    }
+}
+
 fn consumeOpenAICodexTestSse(sse_text: []const u8, limits: CodexLimits) !types.GatewayCompletion {
     var reader: std.Io.Reader = .fixed(sse_text);
     var cancelled = std.atomic.Value(bool).init(false);
@@ -1088,6 +1219,7 @@ fn consumeOpenAICodexTestSse(sse_text: []const u8, limits: CodexLimits) !types.G
         struct {
             fn ignore(_: *anyopaque, _: []const u8) void {}
         }.ignore,
+        null,
         null,
         null,
         null,

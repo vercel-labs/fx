@@ -16,6 +16,7 @@ const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 
 pub const DeliveryCertainty = agent_stream_provider.DeliveryCertainty;
 pub const AttemptEvidence = agent_stream_provider.AttemptEvidence;
+pub const ProviderTurnState = agent_stream_provider.ProviderTurnState;
 
 pub const StreamResult = struct {
     status: std.http.Status,
@@ -39,6 +40,7 @@ pub fn streamGatewayCompletion(
     cooperative_pulse: ?agent_stream_provider.CooperativePulse,
     delivery: *DeliveryCertainty,
     attempt_evidence: *AttemptEvidence,
+    provider_turn_state: ?*ProviderTurnState,
     callback_ctx: *anyopaque,
     on_content_chunk: agent_stream_provider.StreamCallback,
     on_tool_start: ?agent_stream_provider.ToolStartCallback,
@@ -69,6 +71,7 @@ pub fn streamGatewayCompletion(
         .content_capture_limit = content_capture_limit,
         .delivery = delivery,
         .attempt_evidence = attempt_evidence,
+        .provider_turn_state = provider_turn_state,
         .on_reasoning_chunk = on_reasoning_chunk,
         .on_tool_input_chunk = on_tool_input_chunk,
         .cooperative_pulse = cooperative_pulse,
@@ -367,6 +370,7 @@ test "pre-send gateway failure settles usage as unbilled" {
         null,
         &delivery,
         &attempt_evidence,
+        null,
         &callback_ctx,
         Callbacks.content,
         null,
@@ -426,6 +430,7 @@ test "possibly sent gateway failure marks billing incomplete" {
         null,
         &delivery,
         &attempt_evidence,
+        null,
         &callback_ctx,
         Callbacks.content,
         null,

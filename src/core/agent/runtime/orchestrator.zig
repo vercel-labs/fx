@@ -2801,6 +2801,12 @@ fn processQueuedPromptLoop(
     else
         .none;
     var restore_recovery_source = job.recovery_checkpoint != null;
+    var provider_turn_state = runtime_gateway_step.ProviderTurnState.init(std.heap.c_allocator);
+    defer provider_turn_state.deinit();
+    const provider_turn_state_ptr: ?*runtime_gateway_step.ProviderTurnState = if (job.provider == .codex)
+        &provider_turn_state
+    else
+        null;
     var step: usize = 0;
     while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
         current_step_index = step + 1;
@@ -3176,6 +3182,7 @@ fn processQueuedPromptLoop(
                 deps.cooperative_transport_pulse,
                 &gateway_delivery,
                 &gateway_attempt_evidence,
+                provider_turn_state_ptr,
                 @ptrCast(&stream_ctx),
                 runtime_assistant_stream.onStreamContentChunk,
                 if (vision_mode == .required)
@@ -3545,6 +3552,7 @@ fn processQueuedPromptLoop(
                         deps.cooperative_transport_pulse,
                         &replay_delivery,
                         &replay_evidence,
+                        provider_turn_state_ptr,
                         @ptrCast(&stream_ctx),
                         runtime_assistant_stream.onStreamContentChunk,
                         if (vision_mode == .required)
