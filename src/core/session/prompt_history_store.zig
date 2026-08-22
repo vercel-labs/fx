@@ -10,9 +10,14 @@ const history_lock_file = "history.lock";
 const lock_deadline_ms: u64 = 2000;
 const default_scan_block_bytes: usize = 1024 * 1024;
 const max_record_bytes: usize = 256 * 1024;
-const compaction_threshold_bytes: u64 = 2 * 1024 * 1024;
+const compaction_trigger_bytes: usize = 2 * 1024 * 1024;
 const compaction_record_limit: usize = 1000;
-const compaction_byte_limit: usize = 1024 * 1024;
+const compaction_target_bytes: usize = 1024 * 1024;
+comptime {
+    if (compaction_target_bytes + max_record_bytes > compaction_trigger_bytes) {
+        @compileError("prompt history compaction must leave room for a maximum-size record");
+    }
+}
 const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 
@@ -140,7 +145,7 @@ pub const Store = struct {
         try file.writePositionalAll(io_mod.getIo(), line, boundary);
         file.sync(io_mod.getIo()) catch return error.PromptHistoryWriteFailed;
         const committed_length = boundary + line.len;
-        if (committed_length <= compaction_threshold_bytes) return .appended;
+        if (committed_length <= compaction_trigger_bytes) return .appended;
 
         self.compact(alloc) catch |err| switch (err) {
             error.PromptHistoryCompactionStale => return .compaction_stale,
@@ -820,7 +825,7 @@ fn compactRecords(
         try retained.append(alloc, canonical);
         retained_bytes += canonical.len;
         while (retained.items.len > compaction_record_limit or
-            retained_bytes > compaction_byte_limit)
+            retained_bytes > compaction_target_bytes)
         {
             const oldest = retained.orderedRemove(0);
             retained_bytes -= oldest.len;
@@ -1132,9 +1137,9 @@ test "compaction retains bounded records and leaves append headroom" {
     try std.testing.expect(retained_count > 0);
     try std.testing.expect(retained_count <= compaction_record_limit);
     const compacted_length = try store.historyLengthForTest();
-    try std.testing.expect(compacted_length <= compaction_byte_limit);
+    try std.testing.expect(compacted_length <= compaction_target_bytes);
 
-    const follow_up_text = "y" ** (64 * 1024);
+    const follow_up_text = "y" ** (max_record_bytes - 1024);
     const follow_up_line = try serializeRecord(
         alloc,
         3001,
@@ -1142,13 +1147,14 @@ test "compaction retains bounded records and leaves append headroom" {
         follow_up_text,
     );
     defer alloc.free(follow_up_line);
+    try std.testing.expect(follow_up_line.len <= max_record_bytes);
     try std.testing.expectEqual(
         AppendOutcome.appended,
         try store.append(alloc, 3001, "/tmp/workspace", follow_up_text),
     );
     const follow_up_length = try store.historyLengthForTest();
     try std.testing.expectEqual(compacted_length + follow_up_line.len, follow_up_length);
-    try std.testing.expect(follow_up_length > compaction_byte_limit);
+    try std.testing.expect(follow_up_length > compaction_target_bytes);
 
     const entries = try store.loadRecentForWorkspace(alloc, "/tmp/workspace", 100);
     defer freeLoadedEntries(alloc, entries);
