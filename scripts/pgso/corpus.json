@@ -50,6 +50,7 @@
       "argv": ["{binary}", "status", "--json"],
       "cwd": ".",
       "env_set": {"FX_SKIP_ONBOARDING": "1"},
+      "profile_runs": 100,
       "timeout_seconds": 60,
       "requires_tmux": false
     },
@@ -58,6 +59,7 @@
       "argv": ["{binary}", "background", "--json"],
       "cwd": ".",
       "env_set": {"FX_SKIP_ONBOARDING": "1"},
+      "profile_runs": 100,
       "timeout_seconds": 60,
       "requires_tmux": false
     },
@@ -66,6 +68,7 @@
       "argv": ["{binary}", "doctor", "--json"],
       "cwd": ".",
       "env_set": {"FX_SKIP_ONBOARDING": "1"},
+      "profile_runs": 100,
       "timeout_seconds": 60,
       "requires_tmux": false
     },
@@ -82,6 +85,7 @@
     {"name": "e2e-ask-presentation", "argv": ["bun", "test", "--max-concurrency", "1", "./ask-presentation.test.ts"], "test_file": "ask-presentation.test.ts"},
     {"name": "e2e-config-persistence", "argv": ["bun", "test", "--max-concurrency", "1", "./config-persistence.test.ts"], "test_file": "config-persistence.test.ts"},
     {"name": "e2e-prompt-history", "argv": ["bun", "test", "--max-concurrency", "1", "./prompt-history.test.ts"], "test_file": "prompt-history.test.ts"},
+    {"name": "e2e-profile-layout", "argv": ["bun", "test", "--max-concurrency", "1", "./profile-layout.test.ts"], "test_file": "profile-layout.test.ts", "requires_tmux": false},
     {"name": "e2e-auth-refresh", "argv": ["bun", "test", "--max-concurrency", "1", "./auth-refresh.test.ts"], "test_file": "auth-refresh.test.ts"},
     {"name": "e2e-file-tool-paths", "argv": ["bun", "test", "--max-concurrency", "1", "./file-tool-paths.test.ts"], "test_file": "file-tool-paths.test.ts"},
     {"name": "e2e-file-tool-permissions", "argv": ["bun", "test", "--max-concurrency", "1", "./file-tool-permissions.test.ts"], "test_file": "file-tool-permissions.test.ts"},

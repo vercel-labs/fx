@@ -3,6 +3,7 @@ const agent_steps = @import("agent_steps.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const profile_roots = @import("../shared/profile_roots.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
@@ -694,8 +695,14 @@ pub fn loadStartupStatusSettingsFromHome(alloc: Allocator, home_dir: []const u8,
 }
 
 pub fn ensureStateLayout(paths: Paths) !void {
-    if (paths.home_fx_dir) |dir| try ensureAbsoluteDir(dir);
-    if (paths.sessions_dir) |dir| try ensureAbsoluteDir(dir);
+    if (paths.home_fx_dir) |dir| {
+        var root = try io_mod.openOrCreateVerifiedPrivateRootAbsolute(dir, null);
+        root.close();
+    }
+    if (paths.sessions_dir) |dir| {
+        var sessions = try io_mod.openOrCreateVerifiedPrivateRootAbsolute(dir, null);
+        sessions.close();
+    }
 }
 
 pub fn parsePermissionMode(raw: []const u8) ?types.PermissionMode {
@@ -722,21 +729,10 @@ pub fn makeAbsolutePath(path_abs: []const u8) !void {
     try root.createDirPath(zio, relative_to_root);
 }
 
-fn ensureAbsoluteDir(path_abs: []const u8) !void {
-    const zio = io_mod.getIo();
-    var dir = std.Io.Dir.openDirAbsolute(zio, path_abs, .{}) catch |err| switch (err) {
-        error.FileNotFound => {
-            try makeAbsolutePath(path_abs);
-            return;
-        },
-        else => return err,
-    };
-    dir.close(zio);
-}
-
 pub fn userSettingsPath(alloc: Allocator) !?[]u8 {
     const home = io_mod.getenv("HOME") orelse return null;
-    return try profile_paths.settingsPath(alloc, home);
+    const roots = try profile_roots.processRoots(home);
+    return try profile_paths.settingsPath(alloc, roots.config);
 }
 
 pub const AllowlistResetScope = settings_store.AllowlistResetScope;
@@ -882,13 +878,15 @@ fn discoverPathsWithOptionalHome(alloc: Allocator, home_dir: ?[]const u8, worksp
         paths.home_dir = try alloc.dupe(u8, home);
         errdefer alloc.free(paths.home_dir.?);
 
-        paths.home_fx_dir = try profile_paths.rootDir(alloc, home);
+        const roots = try profile_roots.processRoots(home);
+
+        paths.home_fx_dir = try alloc.dupe(u8, roots.config);
         errdefer alloc.free(paths.home_fx_dir.?);
 
-        paths.user_settings = try profile_paths.settingsPath(alloc, home);
+        paths.user_settings = try profile_paths.settingsPath(alloc, roots.config);
         errdefer alloc.free(paths.user_settings.?);
 
-        paths.sessions_dir = try profile_paths.sessionsDir(alloc, home);
+        paths.sessions_dir = try profile_paths.sessionsDir(alloc, roots.state);
         errdefer alloc.free(paths.sessions_dir.?);
     }
 
@@ -1670,7 +1668,8 @@ fn expectIgnoredProjectKey(diagnostics: []const ConfigDiagnostic, key: []const u
 }
 
 fn readSettingsBytesForTest(alloc: Allocator, home: []const u8) ![]u8 {
-    const path = try profile_paths.settingsPath(alloc, home);
+    const roots = try profile_roots.processRoots(home);
+    const path = try profile_paths.settingsPath(alloc, roots.config);
     defer alloc.free(path);
 
     var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
@@ -1700,10 +1699,19 @@ test "discoverPathsFromHome returns home-backed and workspace paths" {
     defer paths.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("/Users/tester", paths.home_dir.?);
-    try std.testing.expectEqualStrings("/Users/tester/.fx/settings.json", paths.user_settings.?);
+    try std.testing.expectEqualStrings(
+        "/Users/tester/" ++ profile_roots.test_relative_roots.config ++ "/settings.json",
+        paths.user_settings.?,
+    );
     try std.testing.expectEqualStrings("/tmp/workspace/.fx.json", paths.workspace_settings);
-    try std.testing.expectEqualStrings("/Users/tester/.fx", paths.home_fx_dir.?);
-    try std.testing.expectEqualStrings("/Users/tester/.fx/sessions", paths.sessions_dir.?);
+    try std.testing.expectEqualStrings(
+        "/Users/tester/" ++ profile_roots.test_relative_roots.config,
+        paths.home_fx_dir.?,
+    );
+    try std.testing.expectEqualStrings(
+        "/Users/tester/" ++ profile_roots.test_relative_roots.state ++ "/sessions",
+        paths.sessions_dir.?,
+    );
     try std.testing.expectEqualStrings("/tmp/workspace", paths.workspace_root);
 }
 
@@ -2188,7 +2196,7 @@ test "oversized user and workspace settings propagate StreamTooLong" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/" ++ profile_roots.test_relative_roots.config);
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -2196,7 +2204,8 @@ test "oversized user and workspace settings propagate StreamTooLong" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try profile_paths.settingsPath(std.testing.allocator, home_root);
+    const roots = try profile_roots.processRoots(home_root);
+    const user_settings = try profile_paths.settingsPath(std.testing.allocator, roots.config);
     defer std.testing.allocator.free(user_settings);
     const workspace_settings = try std.fs.path.join(std.testing.allocator, &.{ workspace_root, ".fx.json" });
     defer std.testing.allocator.free(workspace_settings);
@@ -2204,7 +2213,11 @@ test "oversized user and workspace settings propagate StreamTooLong" {
     try writeRepeatedByteAbsolute(user_settings, 'a', max_settings_bytes + 1);
     try std.testing.expectError(error.StreamTooLong, loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_root));
 
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{}");
+    try writeFixtureFile(
+        tmp.dir,
+        "home/" ++ profile_roots.test_relative_roots.config ++ "/settings.json",
+        "{}",
+    );
     try writeRepeatedByteAbsolute(workspace_settings, 'b', max_settings_bytes + 1);
     try std.testing.expectError(error.StreamTooLong, loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_root));
 }
@@ -2351,7 +2364,10 @@ test "userSettingsPath follows absent and present HOME" {
 
         const path = (try userSettingsPath(std.testing.allocator)).?;
         defer std.testing.allocator.free(path);
-        try std.testing.expectEqualStrings("/Users/tester/.fx/settings.json", path);
+        try std.testing.expectEqualStrings(
+            "/Users/tester/" ++ profile_roots.test_relative_roots.config ++ "/settings.json",
+            path,
+        );
     }
 }
 
@@ -2371,7 +2387,10 @@ test "HOME test helper remains stable across absent A and B states" {
 
         const path = (try userSettingsPath(std.testing.allocator)).?;
         defer std.testing.allocator.free(path);
-        try std.testing.expectEqualStrings("/home/a/.fx/settings.json", path);
+        try std.testing.expectEqualStrings(
+            "/home/a/" ++ profile_roots.test_relative_roots.config ++ "/settings.json",
+            path,
+        );
     }
 
     {
@@ -2380,7 +2399,10 @@ test "HOME test helper remains stable across absent A and B states" {
 
         const path = (try userSettingsPath(std.testing.allocator)).?;
         defer std.testing.allocator.free(path);
-        try std.testing.expectEqualStrings("/home/b/.fx/settings.json", path);
+        try std.testing.expectEqualStrings(
+            "/home/b/" ++ profile_roots.test_relative_roots.config ++ "/settings.json",
+            path,
+        );
     }
 }
 

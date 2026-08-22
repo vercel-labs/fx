@@ -12,6 +12,7 @@ const operation = @import("core/terminal/operation.zig");
 const policy = @import("core/terminal/host_policy.zig");
 const profile_paths = @import("core/shared/profile_paths.zig");
 const command_runner = @import("core/execution/command_runner.zig");
+const profile_roots = @import("core/shared/profile_roots.zig");
 const session_child_store = @import("core/session/session_child_store.zig");
 const store = @import("core/terminal/store.zig");
 const native_session = @import("core/terminal/native_session.zig");
@@ -404,7 +405,8 @@ fn openFixtureOwnerCapability(
     alloc: Allocator,
     home: []const u8,
 ) !session_child_store.SessionChildCapability {
-    const sessions_path = try profile_paths.sessionsDir(alloc, home);
+    const roots = try profile_roots.processRoots(home);
+    const sessions_path = try profile_paths.sessionsDir(alloc, roots.state);
     defer alloc.free(sessions_path);
     const owner_path = try std.fs.path.join(
         alloc,

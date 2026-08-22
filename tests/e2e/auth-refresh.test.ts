@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runFx } from "../evals/eval-helpers";
+import { fxProfileRoots, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -125,7 +125,9 @@ async function waitForFileText(path: string, text: string): Promise<void> {
 }
 
 function sessionIdsFromHome(home: string): string[] {
-  return readdirSync(join(home, ".fx", "sessions"), {
+  // Only called by tests that let fx initialize a fresh home, so the sessions live under
+  // whichever state root the layout resolved rather than a fixed `~/.fx`.
+  return readdirSync(join(fxProfileRoots(home).state, "sessions"), {
     withFileTypes: true,
   })
     .filter((entry) => entry.isDirectory() && entry.name !== "latest")

@@ -220,7 +220,7 @@ pub fn removeSkill(skills_dir: []const u8, name: []const u8) !void {
 pub fn createSkillTemplate(alloc: Allocator, skills_dir: []const u8, name: []const u8) ![]const u8 {
     try skill_contract.validateManagedSkillName(name);
 
-    try io_mod.makeDirRecursive(skills_dir);
+    try ensureManagedSkillsRoot(skills_dir);
 
     const skill_dir = try std.fs.path.join(alloc, &.{ skills_dir, name });
     defer alloc.free(skill_dir);
@@ -241,7 +241,7 @@ pub fn createSkillTemplate(alloc: Allocator, skills_dir: []const u8, name: []con
 }
 
 fn installFromGitHub(alloc: Allocator, skills_dir: []const u8, url: []const u8, filter: ?[]const u8) !InstallResult {
-    try ensureDir(skills_dir);
+    try ensureManagedSkillsRoot(skills_dir);
 
     const tmp_dir = try std.fmt.allocPrint(alloc, "/tmp/fx-skill-install-{d}", .{io_mod.milliTimestamp()});
     defer alloc.free(tmp_dir);
@@ -298,7 +298,7 @@ fn installFromDirectoryWithMetadataReader(
     filter: ?[]const u8,
     metadata_reader: InstallMetadataReader,
 ) !InstallResult {
-    try ensureDir(skills_dir);
+    try ensureManagedSkillsRoot(skills_dir);
 
     var result = InstallResult{ .installed = .empty };
     errdefer result.deinit(alloc);
@@ -692,7 +692,7 @@ fn copySkillDirWithOptions(
     options: CopySkillDirOptions,
 ) !void {
     try skill_contract.validateManagedSkillName(skill_name);
-    try ensureDir(skills_dir);
+    try ensureManagedSkillsRoot(skills_dir);
 
     const dest_dir = try std.fs.path.join(alloc, &.{ skills_dir, skill_name });
     defer alloc.free(dest_dir);
@@ -758,6 +758,14 @@ fn copyDirRecursive(alloc: Allocator, src_dir: []const u8, dest_dir: []const u8)
 fn copyFile(alloc: Allocator, src_path: []const u8, dst_path: []const u8) !void {
     if (std.fs.path.dirname(dst_path)) |parent| try ensureDir(parent);
     try io_mod.copyFileAtomic(alloc, src_path, dst_path);
+}
+
+/// The managed skills root is fx-owned, and under the XDG layout nothing else on the startup
+/// path creates the data root, so an install can be what brings it into existence. Creating it
+/// through the verified helper keeps the whole chain at mode 0700 instead of the process umask.
+fn ensureManagedSkillsRoot(skills_dir: []const u8) !void {
+    var root = try io_mod.openOrCreateVerifiedPrivateRootAbsolute(skills_dir, null);
+    root.close();
 }
 
 fn ensureDir(path: []const u8) !void {
@@ -2094,7 +2102,7 @@ test "built-in skills command creates and removes managed skills" {
         .name = "exact-skill",
         .info = .{
             .path = skill_dir,
-            .source_label = "global ~/.fx/skills",
+            .source_label = "global fx skills",
             .managed_install = true,
         },
     }};
@@ -2164,6 +2172,33 @@ test "built-in skills command creates a missing managed parent root" {
     const content = try readAbsoluteFile(alloc, skill_file, 1024 * 1024);
     defer alloc.free(content);
     try std.testing.expect(std.mem.find(u8, content, "name: fresh-root") != null);
+}
+
+test "installing into a missing data root keeps the whole chain private" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    // The XDG data root has no other creator on the startup path, so an install can be the
+    // first thing that materializes it. The umask must not decide its mode.
+    const skills_dir = try std.fs.path.join(alloc, &.{ root, "home", ".local", "share", "fx", "skills" });
+    defer alloc.free(skills_dir);
+
+    var empty_ctx = StaticSkillCtx{ .skills = &.{} };
+    var created = try executeCommand(alloc, parseCommand("create private-root"), staticCommandRequest(skills_dir, &empty_ctx));
+    defer created.deinit(alloc);
+
+    const data_root = std.fs.path.dirname(skills_dir).?;
+    for ([_][]const u8{ data_root, skills_dir }) |path| {
+        var dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), path, .{});
+        defer dir.close(io_mod.getIo());
+        const stat = try dir.stat(io_mod.getIo());
+        try std.testing.expectEqual(@as(u32, 0o700), stat.permissions.toMode() & 0o777);
+    }
 }
 
 test "built-in skills command refuses to remove compatibility roots" {

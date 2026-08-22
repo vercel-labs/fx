@@ -1,6 +1,7 @@
 const std = @import("std");
 const io_mod = @import("io.zig");
 const profile_paths = @import("profile_paths.zig");
+const profile_roots = @import("profile_roots.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -441,13 +442,22 @@ fn resolveLogPath(alloc: Allocator, workspace_root: []const u8, raw_path: []cons
 
 fn defaultLogPath(alloc: Allocator) ![]u8 {
     if (io_mod.getenv("HOME")) |home| {
-        return defaultLogPathForHome(alloc, home);
+        const path = try defaultLogPathForHome(alloc, home);
+        errdefer alloc.free(path);
+        // Tracing is often the first thing a session does, so it can be what brings the state
+        // root into existence. Create it under the private contract instead of letting the
+        // generic parent walk below leave the root readable by the rest of the profile.
+        const roots = try profile_roots.processRoots(home);
+        var root = try io_mod.openOrCreateVerifiedPrivateRootAbsolute(roots.state, null);
+        root.close();
+        return path;
     }
     return fallbackLogPathForMillis(alloc, io_mod.milliTimestamp());
 }
 
 fn defaultLogPathForHome(alloc: Allocator, home: []const u8) ![]u8 {
-    return profile_paths.traceLogPath(alloc, home);
+    const roots = try profile_roots.processRoots(home);
+    return profile_paths.traceLogPath(alloc, roots.state);
 }
 
 fn fallbackLogPathForMillis(alloc: Allocator, millis: i64) ![]u8 {
@@ -500,11 +510,14 @@ test "isTruthy parses accepted and rejected values" {
     try std.testing.expect(!isTruthy(null));
 }
 
-test "home default log path uses fx logs directory" {
+test "home default log path uses the state root logs directory" {
     const alloc = std.testing.allocator;
     const path = try defaultLogPathForHome(alloc, "/tmp/fake-home");
     defer alloc.free(path);
-    try std.testing.expectEqualStrings("/tmp/fake-home/.fx/logs/trace.log", path);
+    try std.testing.expectEqualStrings(
+        "/tmp/fake-home/" ++ profile_roots.test_relative_roots.state ++ "/logs/trace.log",
+        path,
+    );
 }
 
 test "fallback default log path uses tmp trace path" {

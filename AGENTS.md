@@ -116,19 +116,34 @@ Do not scatter help text or argument parsing across multiple files.
 
 ## Configuration and State
 
-Profile configuration and runtime state lives under `~/.fx/`. Project `.fx.json` contains committed project defaults only.
+On Linux, fx splits the profile across the three XDG Base Directory roots, appending `fx` to each one. Project `.fx.json` contains committed project defaults only.
+
+| Root | Variable | Default | Holds |
+| --- | --- | --- | --- |
+| config | `XDG_CONFIG_HOME` | `~/.config/fx` | `settings.json`, `mcp.json`, `AGENTS.md`, `backups/` |
+| state | `XDG_STATE_HOME` | `~/.local/state/fx` | `sessions/`, `logs/`, `history.jsonl`, `recordings/`, `usage.jsonl`, `usage-recovery/`, `auth.json`, `chatgpt-auth.json`, `grok-auth.json`, `api-key`, `mcp-credentials/`, `terminal-host/` |
+| data | `XDG_DATA_HOME` | `~/.local/share/fx` | `skills/`, `memories.json` |
+
+A variable that is unset, empty, or relative is ignored in favor of the default. The terminal host places its socket under `XDG_RUNTIME_DIR` and falls back to a private per-user directory under `/tmp` when that variable is unusable.
+
+Two rules override the resolution above:
+
+* A legacy profile wins. When `~/.fx` already holds a recognized profile entry, all three roots collapse back to `~/.fx`. fx never moves, copies, or deletes anything to migrate an existing profile.
+* Only Linux splits. macOS and every other target resolve all three roots to `~/.fx` whatever the XDG environment exports.
+
+Run `fx doctor` to read the active layout and the three resolved roots instead of inferring them. Migrating a legacy `~/.fx` by hand means three moves, one per destination, and never a single `mv`: `settings.json`, `mcp.json`, `AGENTS.md`, and `backups/` go to the config root, `sessions/`, `logs/`, `history.jsonl`, `recordings/`, `usage.jsonl`, `usage-recovery/`, `auth.json`, `chatgpt-auth.json`, `grok-auth.json`, `api-key`, `mcp-credentials/`, and `terminal-host/` go to the state root, and `skills/` and `memories.json` go to the data root. The split only takes effect once no recognized entry is left in `~/.fx`.
 
 Config precedence (highest wins):
 
 1. Environment variables such as `FX_MODEL`, `FX_PERMISSION_MODE`, and `FX_MAX_AGENT_STEPS`
-2. `~/.fx/settings.json` → `workspaces["<workspace_path>"]` (profile workspace overrides)
-3. `~/.fx/settings.json` top-level (profile global settings)
+2. `<config root>/settings.json` → `workspaces["<workspace_path>"]` (profile workspace overrides)
+3. `<config root>/settings.json` top-level (profile global settings)
 4. `<workspace>/.fx.json` (committed project defaults)
 5. Built-in defaults
 
 Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `permission_mode`, `credential_source`, and `permission` are ignored from project config before their values are parsed.
 
-Runtime state lives under `~/.fx/sessions/<session-id>/` (`session.json`, `background/`, `subagent/`, `logs/`). Sessions are global and portable across workspaces — each session tracks its `workspace_root` which updates when resumed in a different workspace. A subagent child is an ordinary session with its own directory; `subagent/` holds create-operation identities on a parent and the control record on a child.
+Runtime state lives under `<state root>/sessions/<session-id>/` (`session.json`, `background/`, `subagent/`, `logs/`). Sessions are global and portable across workspaces: each session tracks its `workspace_root`, which updates when resumed in a different workspace. A subagent child is an ordinary session with its own directory; `subagent/` holds create-operation identities on a parent and the control record on a child.
 
 ## Permissions
 

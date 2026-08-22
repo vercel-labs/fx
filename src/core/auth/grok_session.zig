@@ -3,6 +3,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const profile_roots = @import("../shared/profile_roots.zig");
 const secret = @import("secret.zig");
 
 const Allocator = std.mem.Allocator;
@@ -85,13 +86,12 @@ pub const Mutation = struct {
 pub fn load(alloc: Allocator) !?Session {
     if (comptime host_target.is_wasm) return null;
     const home = io_mod.getenv("HOME") orelse return null;
-    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
-        debug_trace.logf("auth", "Grok session load failed step=open_home err={s}", .{@errorName(err)});
+    const roots = profile_roots.processRoots(home) catch |err| {
+        debug_trace.logf("auth", "Grok session load failed step=resolve_roots err={s}", .{@errorName(err)});
         return null;
     };
-    defer home_dir.close(io_mod.getIo());
 
-    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
+    var fx_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), roots.state, .{
         .iterate = true,
         .follow_symlinks = false,
     }) catch |err| {
@@ -147,12 +147,9 @@ pub fn saveNewSession(alloc: Allocator, session: Session) !void {
 pub fn beginExistingMutation() !?Mutation {
     if (comptime host_target.is_wasm) return null;
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-    var home_dir = io_mod.VerifiedDir{
-        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
-    };
-    defer home_dir.close();
+    const roots = try profile_roots.processRoots(home);
 
-    const fx_dir = openExistingPrivateFxDir(&home_dir) catch |err| switch (err) {
+    const fx_dir = openExistingPrivateFxDir(roots.state) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -161,12 +158,17 @@ pub fn beginExistingMutation() !?Mutation {
 
 fn beginMutation() !Mutation {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-    var home_dir = io_mod.VerifiedDir{
-        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
-    };
-    defer home_dir.close();
+    const roots = try profile_roots.processRoots(home);
 
-    const fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name);
+    var failure: io_mod.BaseDirFailure = .{};
+    const fx_dir = io_mod.openOrCreateVerifiedPrivateRootAbsolute(roots.state, &failure) catch |err| {
+        debug_trace.logf(
+            "auth",
+            "state root creation failed path={s} err={s}",
+            .{ failure.path, @errorName(failure.err) },
+        );
+        return err;
+    };
     return lockMutation(fx_dir);
 }
 
@@ -182,8 +184,8 @@ fn lockMutation(open_fx_dir: io_mod.VerifiedDir) !Mutation {
     return .{ .fx_dir = fx_dir, .lock = lock };
 }
 
-fn openExistingPrivateFxDir(home_dir: *io_mod.VerifiedDir) !io_mod.VerifiedDir {
-    var dir = try home_dir.dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
+fn openExistingPrivateFxDir(state_root: []const u8) !io_mod.VerifiedDir {
+    var dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), state_root, .{
         .iterate = true,
         .follow_symlinks = false,
     });

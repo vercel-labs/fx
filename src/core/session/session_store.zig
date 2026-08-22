@@ -5,6 +5,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const profile_roots = @import("../shared/profile_roots.zig");
 const core_types = @import("../shared/types.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const artifact_digest = @import("artifact_digest.zig");
@@ -468,11 +469,8 @@ fn openUsageRecoveryProfileRoot(
     home_path: []const u8,
 ) !?io_mod.VerifiedDir {
     const zio = io_mod.getIo();
-    var home = try std.Io.Dir.openDirAbsolute(zio, home_path, .{
-        .iterate = true,
-    });
-    defer home.close(zio);
-    var profile = home.openDir(zio, profile_paths.root_dir_name, .{
+    const roots = try profile_roots.processRoots(home_path);
+    var profile = std.Io.Dir.openDirAbsolute(zio, roots.state, .{
         .iterate = true,
         .follow_symlinks = false,
     }) catch |err| switch (err) {
@@ -12514,7 +12512,10 @@ test "missing home is empty for reads and bootstrapped privately for writes" {
     const home_stat = try home_dir.stat(io_mod.getIo());
     try std.testing.expectEqual(std.Io.File.Kind.directory, home_stat.kind);
     try std.testing.expectEqual(@as(u32, 0o700), home_stat.permissions.toMode() & 0o777);
-    const sessions_path = try std.fs.path.join(alloc, &.{ missing_home, ".fx", "sessions" });
+    const sessions_path = try std.fs.path.join(
+        alloc,
+        &.{ missing_home, profile_roots.test_relative_roots.state, "sessions" },
+    );
     defer alloc.free(sessions_path);
     try std.Io.Dir.accessAbsolute(io_mod.getIo(), sessions_path, .{});
 }
@@ -12589,6 +12590,11 @@ test "first write creates only the private session layout" {
     var writable = try store.startWritableSession(alloc, state);
     defer writable.deinit(alloc);
 
+    // The only entry a fresh home gains is the base directory of the resolved state root, and
+    // the sessions layout hangs off that root. Linux splits it, macOS keeps it on `~/.fx`.
+    const state_relative = profile_roots.test_relative_roots.state;
+    const state_base = state_relative[0 .. std.mem.indexOfScalar(u8, state_relative, '/') orelse
+        state_relative.len];
     var home_dir = try std.Io.Dir.openDirAbsolute(
         io_mod.getIo(),
         home,
@@ -12598,10 +12604,10 @@ test "first write creates only the private session layout" {
     var home_iter = home_dir.iterate();
     const durable_entry = (try home_iter.next(io_mod.getIo())) orelse
         return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings(".fx", durable_entry.name);
+    try std.testing.expectEqualStrings(state_base, durable_entry.name);
     try std.testing.expect((try home_iter.next(io_mod.getIo())) == null);
 
-    var durable_dir = try home_dir.openDir(io_mod.getIo(), ".fx", .{
+    var durable_dir = try home_dir.openDir(io_mod.getIo(), state_relative, .{
         .iterate = true,
     });
     defer durable_dir.close(io_mod.getIo());
@@ -13609,10 +13615,15 @@ test "history page maps missing unsafe unavailable unsupported and corrupt sessi
     try std.testing.expectError(error.CorruptSession, ctx.store.loadHistoryPage(alloc, "history-authority-corrupt", null, 1));
 
     try tmp.dir.createDirPath(io_mod.getIo(), "outside-history-session");
+    // Absolute, so the escape hop count does not depend on how deep the resolved root sits.
+    const tmp_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(tmp_root);
+    const outside_session = try std.fs.path.join(alloc, &.{ tmp_root, "outside-history-session" });
+    defer alloc.free(outside_session);
     tmp.dir.symLink(
         io_mod.getIo(),
-        "../../../outside-history-session",
-        "home/.fx/sessions/history-unsafe",
+        outside_session,
+        "home/" ++ profile_roots.test_relative_roots.state ++ "/sessions/history-unsafe",
         .{ .is_directory = true },
     ) catch |err| switch (err) {
         error.AccessDenied => return error.SkipZigTest,

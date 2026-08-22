@@ -9,6 +9,7 @@ const terminal_store = @import("store.zig");
 const host_capabilities = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const profile_roots = @import("../shared/profile_roots.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
@@ -28,6 +29,7 @@ const max_connection_requests: usize = 32;
 const listener_poll_ms = 50;
 const transport_hash_bytes: usize = 16;
 const transport_hash_context = "fx.terminal.transport.v1\x00";
+const runtime_dir_env = "XDG_RUNTIME_DIR";
 const socket_permissions: std.Io.File.Permissions = switch (builtin.os.tag) {
     .macos, .linux => .fromMode(0o600),
     else => .default_file,
@@ -75,11 +77,103 @@ fn validateEndpointPathForTarget(
     if (path.len >= limit) return error.NameTooLong;
 }
 
+/// Only Linux takes its runtime directory from the environment. macOS never sets
+/// `XDG_RUNTIME_DIR`, so it keeps the `/private/tmp` fallback and must stay silent about it
+/// rather than warning on every run.
+fn honorsRuntimeDir(target: std.Target.Os.Tag) bool {
+    return target == .linux;
+}
+
+var runtime_dir_warned = std.atomic.Value(bool).init(false);
+
+/// The specification asks for a warning when `XDG_RUNTIME_DIR` is unusable. Returns true when
+/// this call emitted it, so the message appears once per process instead of once per host
+/// connection.
+fn warnRuntimeDirFallbackOnce(reason: []const u8, path: []const u8) bool {
+    if (runtime_dir_warned.swap(true, .acq_rel)) return false;
+    debug_trace.logf(
+        "terminal_host",
+        "XDG_RUNTIME_DIR unusable reason={s} path={s}, using the terminal host fallback",
+        .{ reason, path },
+    );
+    return true;
+}
+
+/// The runtime directory fx may place its endpoint in, or null when the environment does not
+/// offer one it can trust. The specification requires the directory to be user-owned and mode
+/// 0700, so a shared or misconfigured one is refused in favor of the existing fallback.
+fn acceptedRuntimeDir(target: std.Target.Os.Tag, uid: std.c.uid_t) ?[]const u8 {
+    if (!honorsRuntimeDir(target)) return null;
+    const raw = io_mod.getenv(runtime_dir_env) orelse "";
+    const base = std.mem.trimEnd(u8, raw, "/");
+    if (base.len == 0 or !std.fs.path.isAbsolute(base)) {
+        _ = warnRuntimeDirFallbackOnce(
+            if (raw.len == 0) "unset" else "not absolute",
+            raw,
+        );
+        return null;
+    }
+    verifyRuntimeDirBase(base, uid) catch |err| {
+        _ = warnRuntimeDirFallbackOnce(@errorName(err), base);
+        return null;
+    };
+    return base;
+}
+
+fn verifyRuntimeDirBase(base: []const u8, uid: std.c.uid_t) !void {
+    const zio = io_mod.getIo();
+    var dir = std.Io.Dir.openDirAbsolute(zio, base, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.SymLinkLoop, error.NotDir => return error.RuntimeDirectoryUnsafe,
+        else => return err,
+    };
+    defer dir.close(zio);
+    return verifyPrivateRuntimeDir(dir, uid);
+}
+
+const RuntimeDirEndpoint = struct { root: []u8, endpoint: []u8 };
+
+/// The endpoint fx would place under an accepted runtime directory, or null when the socket
+/// would not fit the platform limit, in which case the caller keeps its existing fallbacks.
+fn runtimeDirEndpoint(
+    alloc: Allocator,
+    target: std.Target.Os.Tag,
+    base: []const u8,
+) !?RuntimeDirEndpoint {
+    const root = try std.fs.path.join(
+        alloc,
+        &.{ base, profile_roots.app_dir_name, host_dir_name },
+    );
+    errdefer alloc.free(root);
+    const endpoint = try std.fs.path.join(alloc, &.{ root, endpoint_name });
+    errdefer alloc.free(endpoint);
+    validateEndpointPathForTarget(target, endpoint) catch |err| switch (err) {
+        error.NameTooLong => {
+            alloc.free(endpoint);
+            alloc.free(root);
+            return null;
+        },
+        else => return err,
+    };
+    return .{ .root = root, .endpoint = endpoint };
+}
+
 const EndpointSelection = struct {
     authority_root: []u8,
     transport_root: []u8,
     endpoint_path: []u8,
+    /// Leading bytes of `transport_root` naming a directory fx does not own. Zero when the
+    /// transport shares the authority root, which needs no separate directory.
+    transport_base_len: usize,
     uses_fallback: bool,
+
+    /// True when the transport lives outside the authority root, so the endpoint needs its own
+    /// verified private directory.
+    fn transportIsSeparate(self: EndpointSelection) bool {
+        return !std.mem.eql(u8, self.transport_root, self.authority_root);
+    }
 
     fn deinit(self: *EndpointSelection, alloc: Allocator) void {
         alloc.free(self.endpoint_path);
@@ -94,14 +188,31 @@ fn resolveEndpointSelection(
     target: std.Target.Os.Tag,
     home: []const u8,
     uid: std.c.uid_t,
+    runtime_dir: ?[]const u8,
 ) !EndpointSelection {
     const runtime_base = runtimeBase(target) orelse
         return error.TerminalHostUnsupported;
+    const state_root = (try profile_roots.processRoots(home)).state;
     const authority_root = try std.fs.path.join(
         alloc,
-        &.{ home, profile_paths.root_dir_name, host_dir_name },
+        &.{ state_root, host_dir_name },
     );
     errdefer alloc.free(authority_root);
+
+    // Only the transport moves. Authority stays anchored to the profile state root, so a
+    // runtime directory that disappears at logout never takes the host identity with it.
+    if (runtime_dir) |base| {
+        if (try runtimeDirEndpoint(alloc, target, base)) |selected| {
+            return .{
+                .authority_root = authority_root,
+                .transport_root = selected.root,
+                .endpoint_path = selected.endpoint,
+                .transport_base_len = base.len,
+                .uses_fallback = false,
+            };
+        }
+    }
+
     const profile_endpoint = try std.fs.path.join(
         alloc,
         &.{ authority_root, endpoint_name },
@@ -113,6 +224,7 @@ fn resolveEndpointSelection(
             .authority_root = authority_root,
             .transport_root = transport_root,
             .endpoint_path = profile_endpoint,
+            .transport_base_len = 0,
             .uses_fallback = false,
         };
     } else |err| switch (err) {
@@ -153,6 +265,7 @@ fn resolveEndpointSelection(
         .authority_root = authority_root,
         .transport_root = transport_root,
         .endpoint_path = endpoint_path,
+        .transport_base_len = runtime_base.len,
         .uses_fallback = true,
     };
 }
@@ -199,14 +312,17 @@ pub const Paths = struct {
 
     pub fn open(alloc: Allocator, home: []const u8) !Paths {
         if (!isSupported()) return error.TerminalHostUnsupported;
+        const uid = std.c.getuid();
         var selection = try resolveEndpointSelection(
             alloc,
             builtin.os.tag,
             home,
-            std.c.getuid(),
+            uid,
+            acceptedRuntimeDir(builtin.os.tag, uid),
         );
         var selection_owned = true;
         errdefer if (selection_owned) selection.deinit(alloc);
+        const state_root = (try profile_roots.processRoots(home)).state;
         var home_dir = io_mod.VerifiedDir{
             .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{
                 .iterate = true,
@@ -214,10 +330,7 @@ pub const Paths = struct {
             }),
         };
         errdefer home_dir.close();
-        var fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(
-            &home_dir,
-            profile_paths.root_dir_name,
-        );
+        var fx_dir = try io_mod.openOrCreateVerifiedPrivateRootAbsolute(state_root, null);
         errdefer fx_dir.close();
         var host_dir = try io_mod.openOrCreateVerifiedPrivateDir(
             &fx_dir,
@@ -226,10 +339,11 @@ pub const Paths = struct {
         errdefer host_dir.close();
         var transport_dir: ?io_mod.VerifiedDir = null;
         errdefer if (transport_dir) |*dir| dir.close();
-        if (selection.uses_fallback) {
-            transport_dir = try openRuntimeTransportDir(
+        if (selection.transportIsSeparate()) {
+            transport_dir = try openTransportDir(
                 selection.transport_root,
-                std.c.getuid(),
+                selection.transport_base_len,
+                uid,
             );
         }
         selection_owned = false;
@@ -261,19 +375,41 @@ pub const Paths = struct {
     }
 };
 
-fn openRuntimeTransportDir(
+/// Opens the transport root, creating every segment fx owns. `base_len` marks the prefix fx does
+/// not own: the system runtime base or `XDG_RUNTIME_DIR` itself, which is opened as-is. Each
+/// remaining segment is created 0700 and verified, so `$XDG_RUNTIME_DIR/fx/terminal-host` costs two
+/// verified levels instead of the single one the `/tmp` fallback needs.
+fn openTransportDir(
     transport_root: []const u8,
+    base_len: usize,
     uid: std.c.uid_t,
 ) !io_mod.VerifiedDir {
-    const parent_path = std.fs.path.dirname(transport_root) orelse
+    if (base_len == 0 or base_len >= transport_root.len) {
         return error.RuntimeDirectoryUnsafe;
-    const name = std.fs.path.basename(transport_root);
-    var parent = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), parent_path, .{
+    }
+    const zio = io_mod.getIo();
+    var current = try std.Io.Dir.openDirAbsolute(zio, transport_root[0..base_len], .{
         .iterate = true,
         .follow_symlinks = false,
     });
-    defer parent.close(io_mod.getIo());
-    return openVerifiedPrivateRuntimeDir(parent, name, uid);
+    var current_owned = true;
+    errdefer if (current_owned) current.close(zio);
+
+    var segments = std.mem.tokenizeScalar(
+        u8,
+        transport_root[base_len..],
+        std.fs.path.sep,
+    );
+    var opened_any = false;
+    while (segments.next()) |segment| {
+        const child = try openVerifiedPrivateRuntimeDir(current, segment, uid);
+        current.close(zio);
+        current = child.dir;
+        opened_any = true;
+    }
+    if (!opened_any) return error.RuntimeDirectoryUnsafe;
+    current_owned = false;
+    return .{ .dir = current };
 }
 
 fn openVerifiedPrivateRuntimeDir(
@@ -1514,6 +1650,14 @@ test "endpoint paths honor the native sockaddr capacity" {
     try std.testing.expectError(error.NameTooLong, validateEndpointPath(&oversized));
 }
 
+/// Authority root suffix the host resolves for the platform under test. macOS pins every root
+/// to `~/.fx`, while a fresh Linux profile moves to the XDG state root, so freezing both keeps
+/// the assertion honest on all four Full CI platforms.
+const expected_authority_suffix = if (builtin.os.tag == .linux)
+    "/.local/state/" ++ profile_roots.app_dir_name ++ "/" ++ host_dir_name
+else
+    "/" ++ profile_paths.root_dir_name ++ "/" ++ host_dir_name;
+
 test "endpoint selection preserves short homes and deterministically separates long homes" {
     if (!isSupported()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -1523,11 +1667,12 @@ test "endpoint selection preserves short homes and deterministically separates l
         builtin.os.tag,
         short_home,
         501,
+        null,
     );
     defer short.deinit(alloc);
     const expected_short = try std.fs.path.join(
         alloc,
-        &.{ short_home, profile_paths.root_dir_name, host_dir_name },
+        &.{ (try profile_roots.processRoots(short_home)).state, host_dir_name },
     );
     defer alloc.free(expected_short);
     try std.testing.expect(!short.uses_fallback);
@@ -1541,6 +1686,7 @@ test "endpoint selection preserves short homes and deterministically separates l
         builtin.os.tag,
         first_home,
         501,
+        null,
     );
     defer first.deinit(alloc);
     var reopened = try resolveEndpointSelection(
@@ -1548,6 +1694,7 @@ test "endpoint selection preserves short homes and deterministically separates l
         builtin.os.tag,
         first_home,
         501,
+        null,
     );
     defer reopened.deinit(alloc);
     var second = try resolveEndpointSelection(
@@ -1555,6 +1702,7 @@ test "endpoint selection preserves short homes and deterministically separates l
         builtin.os.tag,
         second_home,
         501,
+        null,
     );
     defer second.deinit(alloc);
 
@@ -1566,7 +1714,7 @@ test "endpoint selection preserves short homes and deterministically separates l
     try std.testing.expect(std.mem.endsWith(
         u8,
         first.authority_root,
-        "/.fx/terminal-host",
+        expected_authority_suffix,
     ));
     try std.testing.expect(!std.mem.eql(
         u8,
@@ -1579,7 +1727,7 @@ test "endpoint selection allocation and unsupported targets fail closed" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(
         error.TerminalHostUnsupported,
-        resolveEndpointSelection(alloc, .windows, "C:\\profile", 501),
+        resolveEndpointSelection(alloc, .windows, "C:\\profile", 501, null),
     );
 
     const long_home = "/profiles/" ++ "x" ** 160;
@@ -1589,6 +1737,7 @@ test "endpoint selection allocation and unsupported targets fail closed" {
         .macos,
         long_home,
         501,
+        null,
     );
     selected.deinit(probe.allocator());
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
@@ -1603,6 +1752,7 @@ test "endpoint selection allocation and unsupported targets fail closed" {
             .macos,
             long_home,
             501,
+            null,
         )) |value| {
             var owned = value;
             owned.deinit(failing.allocator());
@@ -1674,5 +1824,235 @@ test "runtime transport directories reject symlinks non-private modes and foreig
     try std.testing.expectError(
         error.RuntimeDirectoryUnsafe,
         openVerifiedPrivateRuntimeDir(tmp.dir, "linked", std.c.getuid()),
+    );
+}
+
+var stable_test_environ: ?*std.process.Environ.Map = null;
+
+/// A process-lifetime empty environment tests fall back to after swapping `XDG_RUNTIME_DIR`, so
+/// `io_mod.getenv` never reads a map that has gone out of scope.
+fn stableEmptyTestEnviron() !*const std.process.Environ.Map {
+    if (stable_test_environ) |map| return map;
+    const alloc = std.heap.page_allocator;
+    const map = try alloc.create(std.process.Environ.Map);
+    map.* = std.process.Environ.Map.init(alloc);
+    stable_test_environ = map;
+    return map;
+}
+
+const RuntimeDirEnv = struct {
+    map: std.process.Environ.Map,
+
+    fn install(self: *RuntimeDirEnv, alloc: Allocator, value: ?[]const u8) !void {
+        _ = try stableEmptyTestEnviron();
+        self.* = .{ .map = std.process.Environ.Map.init(alloc) };
+        errdefer self.map.deinit();
+        if (value) |raw| try self.map.put(runtime_dir_env, raw);
+        io_mod.setEnvironMap(&self.map);
+    }
+
+    fn deinit(self: *RuntimeDirEnv) void {
+        if (stable_test_environ) |map| io_mod.setEnvironMap(map);
+        self.map.deinit();
+    }
+};
+
+test "an accepted runtime directory moves the transport and leaves authority in the profile" {
+    if (!isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const home = "/home/terminal-runtime";
+    const runtime_dir = "/run/user/1000";
+
+    var selection = try resolveEndpointSelection(
+        alloc,
+        .linux,
+        home,
+        1000,
+        runtime_dir,
+    );
+    defer selection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "/run/user/1000/fx/terminal-host/host.sock",
+        selection.endpoint_path,
+    );
+    try validateEndpointPathForTarget(.linux, selection.endpoint_path);
+    try std.testing.expect(!selection.uses_fallback);
+    try std.testing.expect(selection.transportIsSeparate());
+    try std.testing.expectEqual(
+        @as(usize, runtime_dir.len),
+        selection.transport_base_len,
+    );
+
+    const expected_authority = try std.fs.path.join(
+        alloc,
+        &.{ (try profile_roots.processRoots(home)).state, host_dir_name },
+    );
+    defer alloc.free(expected_authority);
+    try std.testing.expectEqualStrings(expected_authority, selection.authority_root);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        selection.authority_root,
+        expected_authority_suffix,
+    ));
+}
+
+test "a runtime directory that overflows the socket limit falls back by home length" {
+    if (!isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    // 105 bytes, so the socket under it needs 132 and cannot fit the 108-byte Linux limit.
+    const oversized = "/run/user/1000/" ++ "d" ** 90;
+    try std.testing.expectError(
+        error.NameTooLong,
+        validateEndpointPathForTarget(
+            .linux,
+            oversized ++ "/fx/terminal-host/host.sock",
+        ),
+    );
+
+    const long_home = "/profiles/" ++ "a" ** 160;
+    var long = try resolveEndpointSelection(alloc, .linux, long_home, 1000, oversized);
+    defer long.deinit(alloc);
+    try std.testing.expect(long.uses_fallback);
+    try std.testing.expect(std.mem.startsWith(u8, long.transport_root, "/tmp/fx-terminal-1000-"));
+    try validateEndpointPathForTarget(.linux, long.endpoint_path);
+
+    // The profile endpoint still fits for an ordinary home, and a socket next to the host
+    // identity beats one in the shared temporary directory.
+    const short_home = "/home/terminal-short";
+    var short = try resolveEndpointSelection(alloc, .linux, short_home, 1000, oversized);
+    defer short.deinit(alloc);
+    try std.testing.expect(!short.uses_fallback);
+    try std.testing.expect(!short.transportIsSeparate());
+    try std.testing.expectEqual(@as(usize, 0), short.transport_base_len);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        short.endpoint_path,
+        short.authority_root,
+    ));
+}
+
+test "only linux honors a runtime directory and only a private one owned by the user" {
+    if (!isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const uid = std.c.getuid();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var private = try openVerifiedPrivateRuntimeDir(tmp.dir, "runtime", uid);
+    private.close();
+    const private_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "runtime");
+    defer alloc.free(private_path);
+
+    try tmp.dir.createDir(
+        std.testing.io,
+        "shared",
+        std.Io.File.Permissions.fromMode(0o755),
+    );
+    try tmp.dir.setFilePermissions(
+        std.testing.io,
+        "shared",
+        std.Io.File.Permissions.fromMode(0o755),
+        .{ .follow_symlinks = false },
+    );
+    const shared_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "shared");
+    defer alloc.free(shared_path);
+
+    const trailing_slash = try std.fmt.allocPrint(alloc, "{s}/", .{private_path});
+    defer alloc.free(trailing_slash);
+
+    {
+        var env: RuntimeDirEnv = undefined;
+        try env.install(alloc, private_path);
+        defer env.deinit();
+        try std.testing.expectEqualStrings(
+            private_path,
+            acceptedRuntimeDir(.linux, uid).?,
+        );
+        // macOS never sets the variable and keeps its own fallback, so it must ignore one.
+        try std.testing.expect(acceptedRuntimeDir(.macos, uid) == null);
+        // A directory owned by somebody else is refused even when it is private.
+        try std.testing.expect(acceptedRuntimeDir(.linux, uid + 1) == null);
+    }
+
+    {
+        var env: RuntimeDirEnv = undefined;
+        try env.install(alloc, trailing_slash);
+        defer env.deinit();
+        try std.testing.expectEqualStrings(
+            private_path,
+            acceptedRuntimeDir(.linux, uid).?,
+        );
+    }
+
+    for ([_]?[]const u8{ null, "", "relative/runtime", "/nonexistent-fx-runtime-dir" }) |value| {
+        var env: RuntimeDirEnv = undefined;
+        try env.install(alloc, value);
+        defer env.deinit();
+        try std.testing.expect(acceptedRuntimeDir(.linux, uid) == null);
+    }
+
+    {
+        var env: RuntimeDirEnv = undefined;
+        try env.install(alloc, shared_path);
+        defer env.deinit();
+        try std.testing.expect(acceptedRuntimeDir(.linux, uid) == null);
+    }
+}
+
+test "the runtime directory fallback warns once per process" {
+    const previous = runtime_dir_warned.swap(false, .acq_rel);
+    defer runtime_dir_warned.store(previous, .release);
+
+    try std.testing.expect(warnRuntimeDirFallbackOnce("unset", ""));
+    try std.testing.expect(!warnRuntimeDirFallbackOnce("unset", ""));
+    try std.testing.expect(!warnRuntimeDirFallbackOnce("RuntimeDirectoryUnsafe", "/run/user/1000"));
+}
+
+test "the transport directory creates every segment fx owns and none it does not" {
+    if (!isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const uid = std.c.getuid();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(base);
+    const transport_root = try std.fs.path.join(
+        alloc,
+        &.{ base, profile_roots.app_dir_name, host_dir_name },
+    );
+    defer alloc.free(transport_root);
+
+    var opened = try openTransportDir(transport_root, base.len, uid);
+    opened.close();
+    // Restarting a host must reuse the directories rather than fail on them.
+    var reopened = try openTransportDir(transport_root, base.len, uid);
+    reopened.close();
+
+    const nested = try std.fs.path.join(
+        alloc,
+        &.{ profile_roots.app_dir_name, host_dir_name },
+    );
+    defer alloc.free(nested);
+    for ([_][]const u8{ profile_roots.app_dir_name, nested }) |sub_path| {
+        const stat = try tmp.dir.statFile(
+            std.testing.io,
+            sub_path,
+            .{ .follow_symlinks = false },
+        );
+        try std.testing.expectEqual(
+            @as(std.posix.mode_t, 0o700),
+            stat.permissions.toMode() & 0o777,
+        );
+    }
+
+    try std.testing.expectError(
+        error.RuntimeDirectoryUnsafe,
+        openTransportDir(transport_root, 0, uid),
+    );
+    try std.testing.expectError(
+        error.RuntimeDirectoryUnsafe,
+        openTransportDir(transport_root, transport_root.len, uid),
     );
 }

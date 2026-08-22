@@ -796,8 +796,9 @@ describe("gateway stream lifecycle", () => {
         status: "error",
       });
       expect(gateway.requestCount()).toBe(2);
+      // The tool names the path the resolved layout uses, not a fixed `~/.fx` literal.
       expect(toolResultOutput(gateway.requests[1]!.body, callId)).toContain(
-        "memory clear failed: saved memories were not removed; ensure ~/.fx/memories.json is a removable file and retry",
+        `memory clear failed: saved memories were not removed; ensure ${memoriesPath} is a removable file and retry`,
       );
       expect(readFileSync(survivorPath, "utf8")).toBe("still present\n");
     } finally {
@@ -845,8 +846,9 @@ describe("gateway stream lifecycle", () => {
         status: "error",
       });
       expect(gateway.requestCount()).toBe(2);
+      // The tool names the path the resolved layout uses, not a fixed `~/.fx` literal.
       expect(toolResultOutput(gateway.requests[1]!.body, callId)).toContain(
-        "memory store is malformed; ~/.fx/memories.json was not modified",
+        `memory store is malformed; ${memoriesPath} was not modified`,
       );
       expect(readFileSync(memoriesPath, "utf8")).toBe(corruptStore);
     } finally {

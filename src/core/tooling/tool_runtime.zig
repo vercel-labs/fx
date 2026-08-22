@@ -13,6 +13,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
+const profile_roots = @import("../shared/profile_roots.zig");
 const tool_contracts = @import("../agent/runtime/tool_contracts.zig");
 const vision_executor = @import("../agent/runtime/vision_executor.zig");
 const background_runtime = @import("../background/background_runtime.zig");
@@ -7539,7 +7540,10 @@ test "memory tool uses isolated HOME and preserves outputs" {
     try expectToolOutput(ctx, "memory", "{\"action\":\"save\",\"fact\":\"likes Zig\"}", "remembered");
     try expectToolOutput(ctx, "memory", "{\"action\":\"list\"}", "- likes Zig\n");
 
-    const memories_path = try std.fs.path.join(alloc, &.{ home, ".fx", "memories.json" });
+    const memories_path = try std.fs.path.join(
+        alloc,
+        &.{ home, profile_roots.test_relative_roots.data, "memories.json" },
+    );
     defer alloc.free(memories_path);
     var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), memories_path, .{});
     const content = blk: {
@@ -7572,8 +7576,15 @@ test "memory tool uses isolated HOME and preserves outputs" {
         .arguments_json = "{\"action\":\"clear\"}",
     });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, failed_clear.status);
+    // Built from the same resolved path the tool reports, so the message follows the layout.
+    const expected_clear_failure = try std.fmt.allocPrint(
+        alloc,
+        "memory clear failed: saved memories were not removed; ensure {s} is a removable file and retry",
+        .{memories_path},
+    );
+    defer alloc.free(expected_clear_failure);
     try std.testing.expectEqualStrings(
-        "memory clear failed: saved memories were not removed; ensure ~/.fx/memories.json is a removable file and retry",
+        expected_clear_failure,
         failed_clear.model_output,
     );
 

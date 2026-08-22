@@ -1,6 +1,7 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const profile_roots = @import("../shared/profile_roots.zig");
 const generation_fact_codec = @import("generation_fact_codec.zig");
 const usage_report = @import("usage_report.zig");
 
@@ -278,16 +279,10 @@ pub const Store = struct {
 
     fn ensureWritable(self: *Store) !void {
         if (self.durable_home == null) {
-            const zio = io_mod.getIo();
-            var home = io_mod.VerifiedDir{
-                .dir = std.Io.Dir.openDirAbsolute(zio, self.home_path, .{
-                    .iterate = true,
-                }) catch return error.DurableLayoutFailed,
-            };
-            defer home.close();
-            self.durable_home = io_mod.openOrCreateVerifiedPrivateDir(
-                &home,
-                profile_paths.root_dir_name,
+            const roots = profile_roots.processRoots(self.home_path) catch return error.DurableLayoutFailed;
+            self.durable_home = io_mod.openOrCreateVerifiedPrivateRootAbsolute(
+                roots.state,
+                null,
             ) catch |err| switch (err) {
                 error.PrivateStatePermissionsUnsupported, error.DurablePathUnsafe => return err,
                 else => return error.DurableLayoutFailed,
@@ -616,10 +611,9 @@ fn openExistingUsageFile(
 
 fn openExistingDurableHome(home_path: []const u8) !?io_mod.VerifiedDir {
     const zio = io_mod.getIo();
-    var home = try std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true });
-    defer home.close(zio);
+    const roots = try profile_roots.processRoots(home_path);
 
-    if (home.openDir(zio, profile_paths.root_dir_name, .{
+    if (std.Io.Dir.openDirAbsolute(zio, roots.state, .{
         .iterate = true,
         .follow_symlinks = false,
     })) |dir| {
@@ -1347,12 +1341,16 @@ test "profile usage store repairs an existing profile directory to private mode"
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    const state_relative = profile_roots.test_relative_roots.state;
+    if (std.fs.path.dirname(state_relative)) |parent| {
+        try tmp.dir.createDirPath(io_mod.getIo(), parent);
+    }
     try tmp.dir.createDir(
         io_mod.getIo(),
-        ".fx",
+        state_relative,
         std.Io.File.Permissions.fromMode(0o755),
     );
-    var profile = try tmp.dir.openDir(io_mod.getIo(), ".fx", .{ .iterate = true });
+    var profile = try tmp.dir.openDir(io_mod.getIo(), state_relative, .{ .iterate = true });
     defer profile.close(io_mod.getIo());
     profile.setPermissions(io_mod.getIo(), .fromMode(0o755)) catch
         return error.SkipZigTest;
@@ -1646,14 +1644,18 @@ test "profile usage store refuses a symlinked ledger leaf" {
         AppendOutcome.appended,
         try store.appendFact(alloc, first),
     );
-    try tmp.dir.deleteFile(io_mod.getIo(), ".fx/usage.jsonl");
+    const ledger_relative = profile_roots.test_relative_roots.state ++ "/usage.jsonl";
+    try tmp.dir.deleteFile(io_mod.getIo(), ledger_relative);
     var outside = try tmp.dir.createFile(io_mod.getIo(), "outside-usage", .{});
     try outside.writeStreamingAll(io_mod.getIo(), "outside");
     outside.close(io_mod.getIo());
+    // Absolute, so the escape hop count does not depend on how deep the resolved root sits.
+    const outside_path = try std.fs.path.join(alloc, &.{ home, "outside-usage" });
+    defer alloc.free(outside_path);
     tmp.dir.symLink(
         io_mod.getIo(),
-        "../outside-usage",
-        ".fx/usage.jsonl",
+        outside_path,
+        ledger_relative,
         .{ .is_directory = false },
     ) catch |err| switch (err) {
         error.AccessDenied => return error.SkipZigTest,

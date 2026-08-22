@@ -4,6 +4,7 @@ const mcp_auth = @import("mcp_auth.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const profile_roots = @import("../shared/profile_roots.zig");
 const secret = @import("../auth/secret.zig");
 
 const Allocator = std.mem.Allocator;
@@ -348,14 +349,8 @@ fn openOrCreateLockedDirControlled(
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !LockedDir {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-    var home_dir = io_mod.VerifiedDir{
-        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
-    };
-    defer home_dir.close();
-    var root = try io_mod.openOrCreateVerifiedPrivateDir(
-        &home_dir,
-        profile_paths.root_dir_name,
-    );
+    const roots = try profile_roots.processRoots(home);
+    var root = try io_mod.openOrCreateVerifiedPrivateRootAbsolute(roots.state, null);
     defer root.close();
     var credentials_dir = try io_mod.openOrCreateVerifiedPrivateDir(
         &root,
@@ -387,16 +382,8 @@ fn openExistingLockedDirControlled(
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !?LockedDir {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-    var home_dir = io_mod.VerifiedDir{
-        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{
-            .iterate = true,
-        }),
-    };
-    defer home_dir.close();
-    var root = openExistingPrivateChild(
-        &home_dir,
-        profile_paths.root_dir_name,
-    ) catch |err| switch (err) {
+    const roots = try profile_roots.processRoots(home);
+    var root = openExistingPrivateRoot(roots.state) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -438,6 +425,16 @@ fn openLockedDirForReadControlled(
         .profile_file => openExistingLockedDirControlled(cancel_flag),
         .macos_keychain => try openOrCreateLockedDirControlled(cancel_flag),
     };
+}
+
+fn openExistingPrivateRoot(root_abs: []const u8) !io_mod.VerifiedDir {
+    var dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), root_abs, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    errdefer dir.close(io_mod.getIo());
+    try normalizeAndVerifyPrivateDir(dir);
+    return .{ .dir = dir };
 }
 
 fn openExistingPrivateChild(
@@ -1184,7 +1181,11 @@ test "credential store is private atomic and supports restart deletion" {
     defer loaded.deinit(alloc);
     try std.testing.expectEqualStrings("access-secret", loaded.access_token);
 
-    var root = try tmp.dir.openDir(std.testing.io, "home/.fx", .{ .iterate = true });
+    var root = try tmp.dir.openDir(
+        std.testing.io,
+        "home/" ++ profile_roots.test_relative_roots.state,
+        .{ .iterate = true },
+    );
     defer root.close(std.testing.io);
     const root_stat = try root.stat(std.testing.io);
     try std.testing.expectEqual(

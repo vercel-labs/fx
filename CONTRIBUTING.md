@@ -117,41 +117,57 @@ duplicate, stale, and unclassified files without running the full PGSO gate.
 
 ## Configuration and State
 
+On Linux, the profile is split across the three XDG Base Directory roots, with `fx` appended to each one:
+
+| Root | Variable | Default | Holds |
+| --- | --- | --- | --- |
+| config | `XDG_CONFIG_HOME` | `~/.config/fx` | `settings.json`, `mcp.json`, `AGENTS.md`, `backups/` |
+| state | `XDG_STATE_HOME` | `~/.local/state/fx` | `sessions/`, `logs/`, `history.jsonl`, `recordings/`, `usage.jsonl`, `usage-recovery/`, `auth.json`, `chatgpt-auth.json`, `grok-auth.json`, `api-key`, `mcp-credentials/`, `terminal-host/` |
+| data | `XDG_DATA_HOME` | `~/.local/share/fx` | `skills/`, `memories.json` |
+
+A variable that is unset, empty, or holds a relative path is ignored in favor of the default. The terminal host takes its socket directory from `XDG_RUNTIME_DIR`, falling back to a private per-user directory under `/tmp`.
+
+Two rules override that resolution. A legacy `~/.fx` holding a recognized profile entry collapses all three roots back to `~/.fx`, and fx never moves, copies, or deletes anything to migrate. macOS and every other non-Linux target resolve all three roots to `~/.fx` whatever the XDG environment exports.
+
+Moving a legacy profile is a manual three-destination operation, never a single `mv`. Send `settings.json`, `mcp.json`, `AGENTS.md`, and `backups/` to the config root; `sessions/`, `logs/`, `history.jsonl`, `recordings/`, `usage.jsonl`, `usage-recovery/`, `auth.json`, `chatgpt-auth.json`, `grok-auth.json`, `api-key`, `mcp-credentials/`, and `terminal-host/` to the state root; and `skills/` and `memories.json` to the data root. The XDG layout activates only once `~/.fx` holds no recognized entry.
+
+`fx doctor` reports the active layout and the three resolved roots. Use it instead of assuming a path when debugging.
+
 Config precedence (highest wins):
 
 1. Environment variables such as `FX_MODEL`, `FX_PERMISSION_MODE`, and `FX_MAX_AGENT_STEPS`
-2. `~/.fx/settings.json` → `workspaces["<workspace_path>"]` (profile workspace overrides)
-3. `~/.fx/settings.json` top-level (profile global settings)
+2. `<config root>/settings.json` → `workspaces["<workspace_path>"]` (profile workspace overrides)
+3. `<config root>/settings.json` top-level (profile global settings)
 4. `<workspace>/.fx.json` (committed project defaults)
 5. Built-in defaults
 
 Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `update_channel`, `permission_mode`, and `permission` are ignored from project config before their values are parsed.
 
-Runtime state lives under `~/.fx/`:
+Runtime state lives under the state root:
 
-* `~/.fx/sessions/<session-id>/session.json`
+* `<state root>/sessions/<session-id>/session.json`
 
-* `~/.fx/sessions/<session-id>/background/`
+* `<state root>/sessions/<session-id>/background/`
 
-* `~/.fx/sessions/<session-id>/subagent/`
+* `<state root>/sessions/<session-id>/subagent/`
 
-* `~/.fx/sessions/<session-id>/logs/`
+* `<state root>/sessions/<session-id>/logs/`
 
 Sessions are global and portable across workspaces. Each session tracks a `workspace_root` that updates when resumed from a different directory.
 
-Subagent children are ordinary sessions with their own `~/.fx/sessions/<child-id>/` directory and their own history. The `subagent/` directory is per session on both sides of the relationship: a parent records create-operation identities there, and a child records its own control state there.
+Subagent children are ordinary sessions with their own `<state root>/sessions/<child-id>/` directory and their own history. The `subagent/` directory is per session on both sides of the relationship: a parent records create-operation identities there, and a child records its own control state there.
 
 ## Skills
 
 There are two distinct skill categories in `fx`:
 
-* `fx` roots that belong to the product itself: `.fx/skills`, `skills/`, `~/.fx/skills`
+* `fx` roots that belong to the product itself: `.fx/skills`, `skills/`, `<data root>/skills`
 
 * compatibility roots discovered for other agent installs: `.opencode/skills`, `.codex/skills`, `.claude/skills`, `.agents/skills`, `.claw/skills`, plus their global equivalents
 
 `/skills list` should make that distinction visible to the user.
 
-`/skills add` and `/skills install` install full skill directories into the profile-owned `~/.fx/skills` managed root, not just `SKILL.md`. Workspace `.fx/skills` and `skills/` remain discoverable project-local instructions, not managed install targets.
+`/skills add` and `/skills install` install full skill directories into the profile-owned `<data root>/skills` managed root, not just `SKILL.md`. Workspace `.fx/skills` and `skills/` remain discoverable project-local instructions, not managed install targets.
 
 The interactive agent can also install skills via the `install_skill` tool when the user asks to install one in conversation, including pasted `npx skills add ...` syntax.
 
@@ -163,7 +179,7 @@ Version-scoped adapters retain legacy stdio,
 `2024-11-05` HTTP+SSE. Native sessions load runnable MCP configuration only
 from the trusted profile:
 
-* `~/.fx/mcp.json`
+* `<config root>/mcp.json`
 
 Project `.fx.json` does not define runnable MCP commands, URLs, env, or secrets.
 

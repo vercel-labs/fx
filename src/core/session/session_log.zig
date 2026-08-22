@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const profile_roots = @import("../shared/profile_roots.zig");
 const session = @import("session.zig");
 const session_child_store = @import("session_child_store.zig");
 const session_codec = @import("session_codec.zig");
@@ -995,29 +996,10 @@ pub const Root = struct {
         mode: OpenMode,
     ) !Root {
         const zio = io_mod.getIo();
-        var home = std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => blk: {
-                if (mode == .read_only) {
-                    return .{
-                        .sessions = null,
-                        .display_root = try std.fs.path.join(
-                            alloc,
-                            &.{ home_path, profile_paths.root_dir_name, profile_paths.sessions_dir_name },
-                        ),
-                        .mode = mode,
-                    };
-                }
-                std.Io.Dir.createDirAbsolute(zio, home_path, private_dir_permissions) catch |create_err| switch (create_err) {
-                    error.PathAlreadyExists => {},
-                    else => return create_err,
-                };
-                break :blk try std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true });
-            },
-            else => return err,
-        };
-        defer home.close(zio);
+        const roots = try profile_roots.processRoots(home_path);
+        const state_root = roots.state;
 
-        var durable_home = home.openDir(zio, profile_paths.root_dir_name, .{
+        var durable_home = std.Io.Dir.openDirAbsolute(zio, state_root, .{
             .iterate = true,
             .follow_symlinks = false,
         }) catch |err| switch (err) {
@@ -1025,23 +1007,19 @@ pub const Root = struct {
                 if (mode == .read_only) {
                     return .{
                         .sessions = null,
-                        .display_root = try std.fs.path.join(
-                            alloc,
-                            &.{ home_path, profile_paths.root_dir_name, profile_paths.sessions_dir_name },
-                        ),
+                        .display_root = try profile_paths.sessionsDir(alloc, state_root),
                         .mode = mode,
                     };
                 }
-                var verified_home = io_mod.VerifiedDir{
-                    .dir = try std.Io.Dir.openDirAbsolute(zio, home_path, .{
-                        .iterate = true,
-                    }),
+                var failure: io_mod.BaseDirFailure = .{};
+                const created = io_mod.openOrCreateVerifiedPrivateRootAbsolute(state_root, &failure) catch |create_err| {
+                    debug_trace.logf(
+                        "session_log",
+                        "state root creation failed path={s} err={s}",
+                        .{ failure.path, @errorName(failure.err) },
+                    );
+                    return create_err;
                 };
-                defer verified_home.close();
-                const created = try io_mod.openOrCreateVerifiedPrivateDir(
-                    &verified_home,
-                    profile_paths.root_dir_name,
-                );
                 break :blk created.dir;
             },
             error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
@@ -1062,10 +1040,7 @@ pub const Root = struct {
                 if (mode == .read_only) {
                     return .{
                         .sessions = null,
-                        .display_root = try std.fs.path.join(
-                            alloc,
-                            &.{ home_path, profile_paths.root_dir_name, profile_paths.sessions_dir_name },
-                        ),
+                        .display_root = try profile_paths.sessionsDir(alloc, state_root),
                         .mode = mode,
                     };
                 }

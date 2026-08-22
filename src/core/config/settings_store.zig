@@ -2,6 +2,7 @@ const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const profile_roots = @import("../shared/profile_roots.zig");
 const types = @import("../shared/types.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const context_limits = @import("context_limits.zig");
@@ -297,10 +298,10 @@ pub const Store = struct {
     fail_migration_snapshot: bool = false,
     last_failure_cleanup: LegacyCleanup = .{},
 
-    fn initReadOnlyAbsent(alloc: Allocator, home_path: []const u8) !Store {
+    fn initReadOnlyAbsent(alloc: Allocator, config_root: []const u8) !Store {
         return .{
             .durable_home = null,
-            .display_root = try profile_paths.rootDir(alloc, home_path),
+            .display_root = try alloc.dupe(u8, config_root),
             .availability = .read_only_absent,
             .mode = .read_only,
         };
@@ -308,27 +309,25 @@ pub const Store = struct {
 
     pub fn initFromHome(alloc: Allocator, home_path: []const u8, mode: OpenMode) !Store {
         const zio = io_mod.getIo();
-        var home = std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => {
-                if (mode == .read_only) return initReadOnlyAbsent(alloc, home_path);
-                return err;
-            },
-            else => return err,
-        };
-        defer home.close(zio);
+        const roots = try profile_roots.processRoots(home_path);
+        const config_root = roots.config;
 
-        var durable_home = home.openDir(zio, profile_paths.root_dir_name, .{
+        var durable_home = std.Io.Dir.openDirAbsolute(zio, config_root, .{
             .iterate = true,
             .follow_symlinks = false,
         }) catch |err| switch (err) {
             error.FileNotFound => blk: {
-                if (mode == .read_only) return initReadOnlyAbsent(alloc, home_path);
+                if (mode == .read_only) return initReadOnlyAbsent(alloc, config_root);
 
-                var verified_home = io_mod.VerifiedDir{
-                    .dir = try std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true }),
+                var failure: io_mod.BaseDirFailure = .{};
+                const created = io_mod.openOrCreateVerifiedPrivateRootAbsolute(config_root, &failure) catch |create_err| {
+                    debug_trace.logf(
+                        "settings",
+                        "config root creation failed path={s} err={s}",
+                        .{ failure.path, @errorName(failure.err) },
+                    );
+                    return create_err;
                 };
-                defer verified_home.close();
-                const created = try io_mod.openOrCreateVerifiedPrivateDir(&verified_home, profile_paths.root_dir_name);
                 break :blk created.dir;
             },
             error.NotDir, error.SymLinkLoop => return error.DurablePathUnsafe,

@@ -31,6 +31,9 @@ import {
 const INTERNAL_MODE = "--fx-internal-terminal-host";
 const HEADER_BYTES = 28;
 const TERMINAL_FIXTURE_SHELL = terminalFixtureShell();
+// Every test home shares this process' uid, so an inherited XDG_RUNTIME_DIR would give them one
+// shared terminal-host socket. Tests that exercise the runtime directory set it through extraEnv.
+const ISOLATED_RUNTIME_DIR = { XDG_RUNTIME_DIR: "" } as const;
 const CLEANUP_CHILD_EXIT_TIMEOUT_MS = 5_000;
 const PRIVATE_TMUX_COMMAND_TIMEOUT_MS = 5_000;
 const PRIVATE_TMUX_SETTLE_TIMEOUT_MS = 5_000;
@@ -445,6 +448,7 @@ async function runClientFixture(
   const child = spawn(executable, args, {
     env: {
       ...process.env,
+      ...ISOLATED_RUNTIME_DIR,
       HOME: home,
       SHELL: TERMINAL_FIXTURE_SHELL,
       FX_TERMINAL_HOST_IDLE_MS: String(idleMs),
@@ -715,6 +719,7 @@ function startHost(
   const child = spawn(binary, [INTERNAL_MODE], {
     env: {
       ...process.env,
+      ...ISOLATED_RUNTIME_DIR,
       HOME: home,
       SHELL: TERMINAL_FIXTURE_SHELL,
       FX_TERMINAL_HOST_IDLE_MS: String(idleMs),
@@ -737,6 +742,7 @@ function startHostWithAdvertisedProtocol(
   const child = spawn(binary, [INTERNAL_MODE], {
     env: {
       ...process.env,
+      ...ISOLATED_RUNTIME_DIR,
       HOME: home,
       SHELL: TERMINAL_FIXTURE_SHELL,
       FX_TERMINAL_HOST_IDLE_MS: String(idleMs),
@@ -9615,6 +9621,40 @@ test("long profile homes use distinct private transport roots and retain durable
   expect(readdirSync(firstTransport.dir)).toEqual([]);
   expect(readdirSync(secondTransport.dir)).toEqual([]);
 }, 15_000);
+
+test.skipIf(process.platform !== "linux")(
+  "a private XDG_RUNTIME_DIR carries the transport while authority stays in the profile",
+  async () => {
+    const home = makeHome();
+    const durable = hostPaths(home);
+    const runtimeDir = mkdtempSync(join(tmpdir(), "fx-terminal-runtime-"));
+    chmodSync(runtimeDir, 0o700);
+    transportRoots.add(runtimeDir);
+    const transportDir = join(runtimeDir, "fx", "terminal-host");
+    const socket = join(transportDir, "host.sock");
+    expect(Buffer.byteLength(socket)).toBeLessThan(108);
+
+    startHost(home, undefined, 30_000, { XDG_RUNTIME_DIR: runtimeDir });
+    await waitFor(
+      () => existsSync(socket) && existsSync(durable.identity),
+      5_000,
+    );
+
+    expect(statSync(join(runtimeDir, "fx")).mode & 0o777).toBe(0o700);
+    expect(statSync(transportDir).mode & 0o777).toBe(0o700);
+    expect(statSync(socket).mode & 0o777).toBe(0o600);
+    expect(readdirSync(transportDir).sort()).toEqual(["host.sock"]);
+
+    // Only the transport moved: the host identity and its lock stay in the profile.
+    expect(existsSync(durable.socket)).toBe(false);
+    expect(existsSync(durable.lock)).toBe(true);
+
+    const session = await handshake(socket, { minimum: 4, current: 5 });
+    expect(session.hostRange.current).toBeGreaterThanOrEqual(4);
+    session.client.close();
+  },
+  15_000,
+);
 
 test("long-home transport roots reject symlink and non-private components without mutation", async () => {
   const symlinkHome = makeLongHome(141);
