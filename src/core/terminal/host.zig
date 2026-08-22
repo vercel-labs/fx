@@ -432,42 +432,33 @@ fn runSupported(alloc: Allocator, config: Config) !void {
     var identity_created = true;
     defer if (identity_created) cleanupIdentity(&paths.host_dir);
 
-    var state = HostState{
-        .idle_grace_ms = config.idle_grace_ms,
-    };
-    var persistent_store = try terminal_store.ProfileStore.init(
-        alloc,
-        home,
-        config.process_provider,
-    );
-    // Both of these are reached by detached client threads through `state` and
-    // `registry`, so they may only be torn down once those threads are gone.
-    // On a path that exits with clients still live, leaving them allocated is
-    // strictly safer than freeing memory another thread is still reading; the
-    // process is on its way out and the OS reclaims it.
+    // Detached client threads reach all three of these, so none of them may
+    // live in this frame: returning from here invalidates the frame whether or
+    // not anything was torn down, which would leave a client still running on
+    // a dead stack slot. They share one heap allocation instead, and on a path
+    // that exits with clients still live it is deliberately never freed. The
+    // process is on its way out and the OS reclaims it, which is strictly
+    // safer than freeing memory another thread is still reading.
+    const shared = try Shared.init(alloc, config, home, &host_instance, &paths);
+    const state = &shared.state;
+    const registry = &shared.registry;
     var clients_drained = false;
-    defer if (clients_drained) persistent_store.deinit();
-    var registry = try native_session.Registry.init(alloc, .{
-        .context = &state,
-        .update_fn = updateLiveWork,
-        .monitor_update_fn = updateMonitorWork,
-    }, &persistent_store, &host_instance, paths.authority_root_path, paths.transport_root_path);
-    defer if (clients_drained) registry.deinit();
+    defer if (clients_drained) shared.deinit(alloc);
     defer {
-        clients_drained = drainConnectedClients(&state, client_drain_timeout_ms);
+        clients_drained = drainConnectedClients(state, client_drain_timeout_ms);
         if (!clients_drained) {
             debug_trace.logf(
                 "terminal_host",
                 "host exiting with {d} client thread(s) still running; keeping shared state alive",
                 .{state.connected_clients.load(.acquire)},
             );
-            // The registry is not freed below, so nothing tears the session
+            // Nothing below frees the registry, so nothing tears the session
             // processes down either. Signal them here: killing a session another
             // thread may be reading is defined behavior, freeing it is not.
             registry.shutdownSessionsOnly();
         }
     }
-    var idle_thread = try std.Thread.spawn(.{}, idleOwner, .{&state});
+    var idle_thread = try std.Thread.spawn(.{}, idleOwner, .{state});
     defer {
         state.stopping.store(true, .release);
         state.changed.set(io_mod.getIo());
@@ -498,8 +489,8 @@ fn runSupported(alloc: Allocator, config: Config) !void {
             stream,
             config.process_provider,
             config.hello,
-            &state,
-            &registry,
+            state,
+            registry,
         }) catch |err| {
             stream.close(io_mod.getIo());
             _ = state.connected_clients.fetchSub(1, .acq_rel);
@@ -522,6 +513,73 @@ fn runSupported(alloc: Allocator, config: Config) !void {
 /// freeing the state they share. Long enough for a client mid-request to
 /// finish, short enough that a broken host still exits.
 const client_drain_timeout_ms: u64 = 2_000;
+
+/// The state a detached client thread reaches: `state` and `registry` directly,
+/// `persistent_store` through the registry. One allocation so the host can hand
+/// out pointers that stay valid after `runSupported` returns, and so the whole
+/// group is either reclaimed together or deliberately left behind together.
+const Shared = struct {
+    state: HostState,
+    persistent_store: terminal_store.ProfileStore,
+    registry: native_session.Registry,
+    /// The registry keeps these three as plain slices, so they belong to the
+    /// group rather than to the caller. `host_instance` is a frame array and
+    /// the two roots belong to `Paths`, whose `deinit` is not held back by the
+    /// drain: leaving them where they were would hand a surviving registry one
+    /// pointer into a dead frame and two into freed memory.
+    host_identity: []u8,
+    durable_root: []u8,
+    transport_root: []u8,
+
+    /// Errors here are the only ones that may free the allocation, because no
+    /// client thread exists yet. Once the host starts accepting, a failure has
+    /// to leak instead, which is why this is not an `errdefer` in the caller.
+    fn init(
+        alloc: Allocator,
+        config: Config,
+        home: []const u8,
+        host_identity: []const u8,
+        paths: *const Paths,
+    ) !*Shared {
+        const shared = try alloc.create(Shared);
+        errdefer alloc.destroy(shared);
+        const owned_identity = try alloc.dupe(u8, host_identity);
+        errdefer alloc.free(owned_identity);
+        const durable_root = try alloc.dupe(u8, paths.authority_root_path);
+        errdefer alloc.free(durable_root);
+        const transport_root = try alloc.dupe(u8, paths.transport_root_path);
+        errdefer alloc.free(transport_root);
+        shared.* = .{
+            .state = .{ .idle_grace_ms = config.idle_grace_ms },
+            .persistent_store = try terminal_store.ProfileStore.init(
+                alloc,
+                home,
+                config.process_provider,
+            ),
+            .registry = undefined,
+            .host_identity = owned_identity,
+            .durable_root = durable_root,
+            .transport_root = transport_root,
+        };
+        errdefer shared.persistent_store.deinit();
+        shared.registry = try native_session.Registry.init(alloc, .{
+            .context = &shared.state,
+            .update_fn = updateLiveWork,
+            .monitor_update_fn = updateMonitorWork,
+        }, &shared.persistent_store, shared.host_identity, shared.durable_root, shared.transport_root);
+        return shared;
+    }
+
+    /// Only ever called once the drain confirmed no client thread is left.
+    fn deinit(self: *Shared, alloc: Allocator) void {
+        self.registry.deinit();
+        self.persistent_store.deinit();
+        alloc.free(self.transport_root);
+        alloc.free(self.durable_root);
+        alloc.free(self.host_identity);
+        alloc.destroy(self);
+    }
+};
 
 const HostState = struct {
     idle_grace_ms: u64,
@@ -1766,4 +1824,49 @@ test "a client that leaves during the drain window still drains" {
 
     try std.testing.expect(drainConnectedClients(&state, 2_000));
     try std.testing.expectEqual(@as(usize, 0), state.connected_clients.load(.acquire));
+}
+
+test "shared host state is allocator owned and freed as one group" {
+    if (!isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var paths = try Paths.open(alloc, home);
+    defer paths.deinit(alloc);
+
+    // A caller-owned buffer rather than a literal, because that is what the
+    // host passes: `host_instance` is an array in `runSupported`'s frame.
+    var identity_buf = "terminal-test-owner".*;
+    const shared = try Shared.init(alloc, .{
+        .process_provider = background_process_provider.process_supervisor_test_provider,
+        .idle_grace_ms = 0,
+    }, home, &identity_buf, &paths);
+
+    // The registry points at the store beside it, so the pointers a client
+    // thread follows all land inside this one allocation rather than in the
+    // caller's frame.
+    try std.testing.expectEqual(&shared.persistent_store, shared.registry.profile);
+    try std.testing.expectEqual(@as(?*anyopaque, &shared.state), shared.registry.tracker.context);
+
+    // The three slices the registry holds are copies, not aliases. `paths` is
+    // freed on every exit, including the one that keeps the registry alive, so
+    // an alias here would be a read of freed memory rather than a stale one.
+    try std.testing.expect(shared.durable_root.ptr != paths.authority_root_path.ptr);
+    try std.testing.expect(shared.transport_root.ptr != paths.transport_root_path.ptr);
+    try std.testing.expectEqualStrings(paths.authority_root_path, shared.durable_root);
+    try std.testing.expectEqualStrings(paths.transport_root_path, shared.transport_root);
+    try std.testing.expectEqualStrings("terminal-test-owner", shared.host_identity);
+    try std.testing.expect(shared.host_identity.ptr != &identity_buf);
+    try std.testing.expectEqual(shared.host_identity.ptr, shared.registry.host_identity.ptr);
+    try std.testing.expectEqual(shared.durable_root.ptr, shared.registry.durable_root.ptr);
+    try std.testing.expectEqual(shared.transport_root.ptr, shared.registry.transport_root.ptr);
+
+    // And the whole group goes back to the allocator together. A stack-resident
+    // group could not be destroyed this way, and the testing allocator reports
+    // whatever `deinit` forgets.
+    shared.deinit(alloc);
 }
