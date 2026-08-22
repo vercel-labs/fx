@@ -38,6 +38,7 @@ const runtime_telemetry = @import("telemetry.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
 const runtime_gateway_step = @import("gateway_step.zig");
 const runtime_vision_contracts = @import("vision_contracts.zig");
+const runtime_vision_repetition = @import("vision_repetition.zig");
 const image_attachments = @import("../../images/image_attachments.zig");
 const runtime_assistant_stream = @import("assistant_stream.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
@@ -2740,6 +2741,8 @@ fn processQueuedPromptLoop(
     var interrupted_persisted = interrupted_persisted_ptr.*;
     defer interrupted_persisted_ptr.* = interrupted_persisted;
     var silent_tool_steps: usize = 0;
+    var vision_repetition: runtime_vision_repetition.State = .{};
+    defer vision_repetition.deinit(arena);
     var continuation_injected = false;
     var last_step_ctx = finish_trace.ctx;
     var current_step_index: usize = 0;
@@ -4993,11 +4996,13 @@ fn processQueuedPromptLoop(
                 runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, effective_tool_calls[0]) == .ask;
             if (!first_tool_is_ask) try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
             silent_tool_steps = 0;
+            vision_repetition.clear(arena);
         } else {
             silent_tool_steps += 1;
         }
 
         var step_batch = runtime_tool_batch.StepBatchState{};
+        var vision_repetition_blocked = false;
         terminal_validation_retry.beginBatch();
         malformed_arguments_retry.beginBatch();
         for (effective_tool_calls) |tool_call| {
@@ -6580,6 +6585,76 @@ fn processQueuedPromptLoop(
                 );
             }
 
+            const canonical_vision_targets: ?[]const runtime_vision_repetition.CanonicalPathTarget = switch (execution_authority) {
+                .vision_paths => |authority| blk: {
+                    const targets = try arena.alloc(
+                        runtime_vision_repetition.CanonicalPathTarget,
+                        authority.targets.len,
+                    );
+                    for (authority.targets, targets) |authority_target, *target| {
+                        target.* = .{
+                            .path = authority_target.canonical_path,
+                            .identity = authority_target.identity,
+                        };
+                    }
+                    break :blk targets;
+                },
+                .ordinary, .run_command, .file_mutation => null,
+            };
+            const vision_repetition_disposition = try vision_repetition.beginCall(
+                arena,
+                tool_call,
+                !step_has_content,
+                canonical_vision_targets,
+            );
+            if (vision_repetition_disposition == .block) {
+                const blocked_output = try tool_result_errors.toolExecutionFailureJson(
+                    arena,
+                    .{
+                        .tool_name = "vision",
+                        .message = runtime_vision_repetition.blocked_message,
+                        .suggestion = runtime_vision_repetition.blocked_suggestion,
+                    },
+                );
+                _ = try stream_ctx.provisional_statuses.finishDeniedCall(
+                    deps,
+                    stream_ctx.alloc,
+                    call_allocator,
+                    turn_id,
+                    execution_call,
+                    status_started,
+                    tool_display_target,
+                    "Blocked",
+                    advertised_dynamic_tool_names,
+                );
+                try runtime_tool_batch.appendToolResultContent(
+                    arena,
+                    &within_turn_suffix,
+                    &completed_tool_names,
+                    &step_batch,
+                    tool_call,
+                    blocked_output,
+                    null,
+                    .{ .increment_error = true },
+                );
+                try runtime_tool_admission.recordRejectedToolCall(
+                    deps,
+                    arena,
+                    tool_call,
+                    blocked_output,
+                    null,
+                );
+                debug_trace.eventf(
+                    "agent",
+                    "repeated_vision_blocked",
+                    step_ctx,
+                    "call_id={s} successful_calls={d}",
+                    .{ tool_call.id, vision_repetition.successful_calls },
+                );
+                vision_repetition_blocked = true;
+                continue;
+            }
+
             if (decision == .always and live_authority == null) {
                 if (execution_authority == .file_mutation) {
                     const offer = execution_authority.file_mutation.grant_offer orelse
@@ -6867,6 +6942,12 @@ fn processQueuedPromptLoop(
                 try deps.pushContextNotice(notice);
             }
 
+            const vision_repetition_warning = vision_repetition.finishCall(
+                vision_repetition_disposition,
+                execution.status == .success and
+                    !tool_result_errors.isToolOutputError(safe_tool_output),
+            );
+
             if (execution.finish_turn) {
                 try runtime_tool_batch.appendToolResultContent(
                     arena,
@@ -6970,6 +7051,23 @@ fn processQueuedPromptLoop(
                 prepared.memory,
                 execution,
             );
+            if (vision_repetition_warning) {
+                try within_turn_suffix.append(arena, .{
+                    .role = .system,
+                    .content = runtime_vision_repetition.warning_notice,
+                });
+                try deps.push_system_notice(
+                    deps.ctx,
+                    runtime_vision_repetition.warning_notice,
+                );
+                debug_trace.eventf(
+                    "agent",
+                    "repeated_vision_warning",
+                    step_ctx,
+                    "successful_calls={d}",
+                    .{vision_repetition.successful_calls},
+                );
+            }
             replay_handed_off = true;
             if (execution.system_notice) |notice| {
                 try within_turn_suffix.append(arena, .{ .role = .system, .content = notice });
@@ -7012,6 +7110,21 @@ fn processQueuedPromptLoop(
             &within_turn_suffix,
             &step_batch,
         );
+        if (vision_repetition_blocked) {
+            try finishFailedTurnWithNotice(
+                deps,
+                finalization,
+                arena,
+                job,
+                within_turn_suffix.items,
+                &summary_accumulator,
+                stop_state,
+                &finish_trace,
+                runtime_vision_repetition.stopped_notice,
+                "repeated_vision",
+            );
+            return;
+        }
         if (malformed_arguments_retry.finishBatch()) {
             debug_trace.eventf(
                 "agent",
