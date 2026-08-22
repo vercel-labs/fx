@@ -354,6 +354,21 @@ fn appendShellWord(
     try output.append(alloc, '\'');
 }
 
+/// Creates an executable shell fixture. The caller owns the returned path.
+fn createExecutableTestShell(
+    alloc: Allocator,
+    dir: std.Io.Dir,
+    name: []const u8,
+) ![]u8 {
+    var file = try dir.createFile(std.testing.io, name, .{});
+    defer file.close(std.testing.io);
+    try file.setPermissions(
+        std.testing.io,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    return io_mod.dirRealpathAlloc(alloc, dir, name);
+}
+
 test "resolver builds Bash and zsh interactive argv" {
     const bash = try resolve("/bin/bash", .user_login);
     try std.testing.expectEqualSlices(
@@ -507,28 +522,36 @@ test "login shell resolution falls back without accepting explicit unsupported s
 }
 
 test "captured profiles use exact non-PTY argv" {
-    const bash_clean = try capturedInvocation(.{ .clean = "/bin/bash" }, "printf clean");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bash_path = try createExecutableTestShell(alloc, tmp.dir, "bash");
+    defer alloc.free(bash_path);
+    const zsh_path = try createExecutableTestShell(alloc, tmp.dir, "zsh");
+    defer alloc.free(zsh_path);
+
+    const bash_clean = try capturedInvocation(.{ .clean = bash_path }, "printf clean");
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{ "/bin/bash", "--noprofile", "--norc", "-c", "printf clean" },
+        &.{ bash_path, "--noprofile", "--norc", "-c", "printf clean" },
         bash_clean.argv(),
     );
-    const bash_user = try capturedInvocation(.{ .user = "/bin/bash" }, "printf user");
+    const bash_user = try capturedInvocation(.{ .user = bash_path }, "printf user");
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{ "/bin/bash", "--login", "-O", "expand_aliases", "-c", "printf user" },
+        &.{ bash_path, "--login", "-O", "expand_aliases", "-c", "printf user" },
         bash_user.argv(),
     );
-    const zsh_clean = try capturedInvocation(.{ .clean = "/bin/zsh" }, "printf clean");
+    const zsh_clean = try capturedInvocation(.{ .clean = zsh_path }, "printf clean");
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{ "/bin/zsh", "-f", "-c", "printf clean" },
+        &.{ zsh_path, "-f", "-c", "printf clean" },
         zsh_clean.argv(),
     );
-    const zsh_user = try capturedInvocation(.{ .user = "/bin/zsh" }, "printf user");
+    const zsh_user = try capturedInvocation(.{ .user = zsh_path }, "printf user");
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{ "/bin/zsh", "-l", "-i", "-c", "printf user" },
+        &.{ zsh_path, "-l", "-i", "-c", "printf user" },
         zsh_user.argv(),
     );
 }
@@ -544,17 +567,25 @@ test "captured invocation provider projection shell-quotes every argv word" {
 }
 
 test "profile normalization defaults captured and persistent execution to user" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bash_path = try createExecutableTestShell(alloc, tmp.dir, "bash");
+    defer alloc.free(bash_path);
+    const zsh_path = try createExecutableTestShell(alloc, tmp.dir, "zsh");
+    defer alloc.free(zsh_path);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try std.testing.expect((try environment(arena, "/bin/bash", null)).eql(.{ .user = "/bin/bash" }));
-    try std.testing.expect((try environment(arena, "/bin/zsh", null)).eql(.{ .user = "/bin/zsh" }));
-    try std.testing.expect((try environment(arena, "/bin/zsh", .clean)).eql(.{ .clean = "/bin/zsh" }));
-    try std.testing.expect((try environment(arena, "/bin/zsh", .user)).eql(.{ .user = "/bin/zsh" }));
-    try std.testing.expectEqual(contracts.ShellSpec.user_login, try profileShell(arena, "/bin/zsh", .user));
+    try std.testing.expect((try environment(arena, bash_path, null)).eql(.{ .user = bash_path }));
+    try std.testing.expect((try environment(arena, zsh_path, null)).eql(.{ .user = zsh_path }));
+    try std.testing.expect((try environment(arena, zsh_path, .clean)).eql(.{ .clean = zsh_path }));
+    try std.testing.expect((try environment(arena, zsh_path, .user)).eql(.{ .user = zsh_path }));
+    try std.testing.expectEqual(contracts.ShellSpec.user_login, try profileShell(arena, zsh_path, .user));
     try std.testing.expectEqualStrings(
-        "/bin/zsh",
-        (try profileShell(arena, "/bin/zsh", .clean)).executable.path,
+        zsh_path,
+        (try profileShell(arena, zsh_path, .clean)).executable.path,
     );
 }
 
