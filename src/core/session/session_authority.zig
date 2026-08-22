@@ -33,6 +33,11 @@ const AuthorityMarker = struct {
     }
 };
 
+const OpenedSessionFile = struct {
+    file: std.Io.File,
+    stat: std.Io.File.Stat,
+};
+
 const LegacyFingerprint = struct {
     schema: session_json.LegacySchemaVersion,
     primary_bytes: u64,
@@ -115,20 +120,19 @@ fn isPreparedCreationOrphan(
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
 ) !bool {
-    var file = openSessionFile(session_dir, "session.json", .read_only) catch |err| switch (err) {
+    var opened = openSessionFileWithStat(session_dir, "session.json", .read_only) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
-    defer file.close(io_mod.getIo());
-    const stat = try file.stat(io_mod.getIo());
-    if (stat.size > session_projection.manifest_max_bytes) {
+    defer opened.file.close(io_mod.getIo());
+    if (opened.stat.size > session_projection.manifest_max_bytes) {
         return false;
     }
 
     const manifest_bytes = readExactLegacyFile(
         alloc,
-        &file,
-        stat.size,
+        &opened.file,
+        opened.stat.size,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidSessionFormat,
@@ -492,12 +496,12 @@ pub fn readOptionalSessionFile(
     name: []const u8,
     max_bytes: usize,
 ) !?[]u8 {
-    var file = openSessionFile(session_dir, name, .read_only) catch |err| switch (err) {
+    var opened = openSessionFileWithStat(session_dir, name, .read_only) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
-    defer file.close(io_mod.getIo());
-    return io_mod.readFileToEnd(alloc, &file, max_bytes) catch |err| switch (err) {
+    defer opened.file.close(io_mod.getIo());
+    return io_mod.readFileToEndSized(alloc, &opened.file, opened.stat.size, max_bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidSessionFormat,
     };
@@ -510,9 +514,19 @@ pub fn openSessionFile(
     name: []const u8,
     mode: session_log.OpenMode,
 ) !std.Io.File {
+    const opened = try openSessionFileWithStat(session_dir, name, mode);
+    return opened.file;
+}
+
+fn openSessionFileWithStat(
+    session_dir: *io_mod.VerifiedDir,
+    name: []const u8,
+    mode: session_log.OpenMode,
+) !OpenedSessionFile {
     const file = session_dir.dir.openFile(io_mod.getIo(), name, .{
         .mode = if (mode == .writable) .read_write else .read_only,
-        .allow_directory = false,
+        // The stat below rejects directories and other non-files.
+        .allow_directory = true,
         .follow_symlinks = false,
         .resolve_beneath = true,
     }) catch |err| switch (err) {
@@ -520,8 +534,9 @@ pub fn openSessionFile(
         else => return err,
     };
     errdefer file.close(io_mod.getIo());
-    try verifyOpenedSessionFile(try file.stat(io_mod.getIo()), mode);
-    return file;
+    const stat = try file.stat(io_mod.getIo());
+    try verifyOpenedSessionFile(stat, mode);
+    return .{ .file = file, .stat = stat };
 }
 
 fn verifyOpenedSessionFile(
@@ -749,7 +764,7 @@ pub fn readExactLegacyFile(
 ) ![]u8 {
     const limit = std.math.add(u64, size, 1) catch return error.OutOfMemory;
     const max_bytes = std.math.cast(usize, limit) orelse return error.OutOfMemory;
-    return io_mod.readFileToEnd(alloc, file, max_bytes);
+    return io_mod.readFileToEndSized(alloc, file, size, max_bytes);
 }
 
 /// Normalizes a canonical-replay `OutOfMemory` into
