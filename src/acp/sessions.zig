@@ -890,16 +890,27 @@ fn handleLoadFailure(
 }
 
 pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
-    var store = session_store.Store.initReadOnly(
-        alloc,
-        state.workspace_root,
-    ) catch {
+    const cwd_filter = parseListSessionsCwd(alloc, msg) catch |err| switch (err) {
+        error.InvalidParams => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Invalid params",
+        }),
+        else => return err,
+    };
+    defer if (cwd_filter) |cwd| alloc.free(cwd);
+    var store = (if (state.cfg.home_override) |home|
+        session_store.Store.initReadOnlyFromHome(alloc, home, cwd_filter orelse state.workspace_root)
+    else
+        session_store.Store.initReadOnly(alloc, cwd_filter orelse state.workspace_root)) catch {
         try state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
         return;
     };
     defer store.deinit(alloc);
 
-    var session_list = store.listForWorkspace(alloc) catch {
+    var session_list = (if (cwd_filter != null)
+        store.listForWorkspace(alloc)
+    else
+        store.list(alloc)) catch {
         try state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
         return;
     };
@@ -917,7 +928,7 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
         try out.writer.writeAll("{\"sessionId\":");
         try writeJsonStr(summary.id, &out.writer);
         try out.writer.writeAll(",\"cwd\":");
-        try writeJsonStr(state.workspace_root, &out.writer);
+        try writeJsonStr(summary.workspace_root orelse state.workspace_root, &out.writer);
         try out.writer.writeAll(",\"updatedAt\":");
         const iso = try formatIso8601(alloc, summary.updated_at_ms);
         defer alloc.free(iso);
@@ -927,6 +938,20 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
     try out.writer.writeAll("]}");
 
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+}
+
+fn parseListSessionsCwd(
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+) !?[]u8 {
+    const raw = msg.params_raw orelse return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch
+        return error.InvalidParams;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidParams;
+    const cwd = parsed.value.object.get("cwd") orelse return null;
+    if (cwd != .string) return error.InvalidParams;
+    return try alloc.dupe(u8, cwd.string);
 }
 
 fn sendHistoryTurnAsUpdates(state: *server.ServerState, alloc: Allocator, session_id: []const u8, turn: types.HistoryTurn) !void {
