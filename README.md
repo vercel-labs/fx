@@ -25,6 +25,8 @@ It's open source (Apache-2.0), model-agnostic, and suitable for both local and c
 curl -fsSL https://fx.sh/setup.sh | bash
 ```
 
+With Nix: `nix profile add github:vercel-labs/fx`
+
 ## Run fx
 
 Sign in with Vercel AI Gateway:
