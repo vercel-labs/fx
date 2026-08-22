@@ -189,8 +189,8 @@ pub fn streamPrepared(
     payload: []const u8,
 ) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    const account_id = try chatgpt_oauth.extractAccountId(alloc, request.credential.secret);
-    defer alloc.free(account_id);
+    var request_identity = try chatgpt_oauth.extractRequestIdentity(alloc, request.credential.secret);
+    defer request_identity.deinit(alloc);
     const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.credential.secret});
     defer secret.zeroAndFree(alloc, auth_header);
     const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
@@ -201,8 +201,12 @@ pub fn streamPrepared(
 
     var extra_headers_buf: [7]std.http.Header = undefined;
     var extra_count: usize = 0;
-    extra_headers_buf[extra_count] = .{ .name = "chatgpt-account-id", .value = account_id };
+    extra_headers_buf[extra_count] = .{ .name = "chatgpt-account-id", .value = request_identity.account_id };
     extra_count += 1;
+    if (request_identity.residency) |residency| {
+        extra_headers_buf[extra_count] = .{ .name = "x-openai-internal-codex-residency", .value = residency };
+        extra_count += 1;
+    }
     extra_headers_buf[extra_count] = .{ .name = "originator", .value = "fx" };
     extra_count += 1;
     extra_headers_buf[extra_count] = .{ .name = "OpenAI-Beta", .value = "responses=experimental" };

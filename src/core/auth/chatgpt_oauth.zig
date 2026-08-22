@@ -672,7 +672,20 @@ fn sessionFromToken(alloc: Allocator, token: *TokenSet, now_ms: i64) !chatgpt_se
     return session;
 }
 
-pub fn extractAccountId(alloc: Allocator, token: []const u8) ![]u8 {
+const max_codex_residency_bytes: usize = 64;
+
+pub const RequestIdentity = struct {
+    account_id: []u8,
+    residency: ?[]u8,
+
+    pub fn deinit(self: *RequestIdentity, alloc: Allocator) void {
+        alloc.free(self.account_id);
+        if (self.residency) |residency| alloc.free(residency);
+        self.* = undefined;
+    }
+};
+
+pub fn extractRequestIdentity(alloc: Allocator, token: []const u8) !RequestIdentity {
     var parts = std.mem.splitScalar(u8, token, '.');
     _ = parts.next() orelse return error.InvalidChatGptAccessToken;
     const payload = parts.next() orelse return error.InvalidChatGptAccessToken;
@@ -692,8 +705,36 @@ pub fn extractAccountId(alloc: Allocator, token: []const u8) ![]u8 {
     if (parsed.value != .object) return error.InvalidChatGptAccessToken;
     const claim = parsed.value.object.get(jwt_auth_claim) orelse return error.InvalidChatGptAccessToken;
     if (claim != .object) return error.InvalidChatGptAccessToken;
-    return dupeRequiredString(alloc, claim.object, "chatgpt_account_id") catch
+
+    const account_id = dupeRequiredString(alloc, claim.object, "chatgpt_account_id") catch
         return error.InvalidChatGptAccessToken;
+    errdefer alloc.free(account_id);
+    return .{
+        .account_id = account_id,
+        .residency = try dupeResidencyClaim(alloc, claim.object),
+    };
+}
+
+pub fn extractAccountId(alloc: Allocator, token: []const u8) ![]u8 {
+    const identity = try extractRequestIdentity(alloc, token);
+    if (identity.residency) |residency| alloc.free(residency);
+    return identity.account_id;
+}
+
+fn dupeResidencyClaim(alloc: Allocator, claim: std.json.ObjectMap) !?[]u8 {
+    const value = claim.get("chatgpt_compute_residency") orelse return null;
+    if (value != .string) return null;
+    const residency = std.mem.trim(u8, value.string, " \t\r\n");
+    if (std.mem.eql(u8, residency, "no_constraint") or !validResidencyClaim(residency)) return null;
+    return try alloc.dupe(u8, residency);
+}
+
+fn validResidencyClaim(residency: []const u8) bool {
+    if (residency.len == 0 or residency.len > max_codex_residency_bytes) return false;
+    for (residency) |byte| {
+        if (byte < 0x21 or byte > 0x7e) return false;
+    }
+    return true;
 }
 
 fn dupeRequiredString(alloc: Allocator, object: std.json.ObjectMap, key: []const u8) ![]u8 {
@@ -843,6 +884,20 @@ fn writeStdout(text: []const u8) !void {
     try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
 }
 
+fn testAccessToken(alloc: Allocator, auth_claim_json: []const u8) ![]u8 {
+    const payload = try std.fmt.allocPrint(
+        alloc,
+        "{{\"https://api.openai.com/auth\":{s}}}",
+        .{auth_claim_json},
+    );
+    defer alloc.free(payload);
+    const encoded_len = std.base64.url_safe_no_pad.Encoder.calcSize(payload.len);
+    const encoded = try alloc.alloc(u8, encoded_len);
+    defer alloc.free(encoded);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, payload);
+    return std.fmt.allocPrint(alloc, "header.{s}.signature", .{encoded});
+}
+
 test "ChatGPT E2E OAuth endpoint overrides accept only loopback HTTP" {
     try std.testing.expect(isLoopbackHttpUrl("http://127.0.0.1:1234/token"));
     try std.testing.expect(isLoopbackHttpUrl("http://localhost:1234/token"));
@@ -852,19 +907,81 @@ test "ChatGPT E2E OAuth endpoint overrides accept only loopback HTTP" {
 
 test "ChatGPT account id is extracted from the namespaced JWT claim" {
     const alloc = std.testing.allocator;
-    const payload =
-        \\{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_test"}}
-    ;
-    const encoded_len = std.base64.url_safe_no_pad.Encoder.calcSize(payload.len);
-    const encoded = try alloc.alloc(u8, encoded_len);
-    defer alloc.free(encoded);
-    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, payload);
-    const token = try std.fmt.allocPrint(alloc, "header.{s}.signature", .{encoded});
+    const token = try testAccessToken(alloc, "{\"chatgpt_account_id\":\"acct_test\"}");
     defer alloc.free(token);
 
     const account_id = try extractAccountId(alloc, token);
     defer alloc.free(account_id);
     try std.testing.expectEqualStrings("acct_test", account_id);
+}
+
+test "ChatGPT request identity extracts bounded compute residency" {
+    const alloc = std.testing.allocator;
+    const max_residency = "r" ** max_codex_residency_bytes;
+    const max_claim = try std.fmt.allocPrint(
+        alloc,
+        "{{\"chatgpt_account_id\":\"acct_test\",\"chatgpt_compute_residency\":\"{s}\"}}",
+        .{max_residency},
+    );
+    defer alloc.free(max_claim);
+    const cases = [_]struct {
+        claim: []const u8,
+        expected_residency: ?[]const u8,
+    }{
+        .{
+            .claim = "{\"chatgpt_account_id\":\"acct_test\",\"chatgpt_data_residency\":\"eu\",\"chatgpt_compute_residency\":\"us\"}",
+            .expected_residency = "us",
+        },
+        .{
+            .claim = "{\"chatgpt_account_id\":\"acct_test\",\"chatgpt_compute_residency\":\"  eu  \"}",
+            .expected_residency = "eu",
+        },
+        .{ .claim = max_claim, .expected_residency = max_residency },
+        .{
+            .claim = "{\"chatgpt_account_id\":\"acct_test\",\"chatgpt_data_residency\":\"eu\"}",
+            .expected_residency = null,
+        },
+        .{ .claim = "{\"chatgpt_account_id\":\"acct_test\"}", .expected_residency = null },
+    };
+
+    for (cases) |case| {
+        const token = try testAccessToken(alloc, case.claim);
+        defer alloc.free(token);
+        var identity = try extractRequestIdentity(alloc, token);
+        defer identity.deinit(alloc);
+        try std.testing.expectEqualStrings("acct_test", identity.account_id);
+        if (case.expected_residency) |expected| {
+            try std.testing.expectEqualStrings(expected, identity.residency orelse "");
+        } else {
+            try std.testing.expect(identity.residency == null);
+        }
+    }
+}
+
+test "ChatGPT request identity omits unconstrained and unsafe compute residency" {
+    const alloc = std.testing.allocator;
+    const overlong_residency = "r" ** (max_codex_residency_bytes + 1);
+    const overlong_claim = try std.fmt.allocPrint(
+        alloc,
+        "{{\"chatgpt_account_id\":\"acct_test\",\"chatgpt_compute_residency\":\"{s}\"}}",
+        .{overlong_residency},
+    );
+    defer alloc.free(overlong_claim);
+    const claims = [_][]const u8{
+        "{\"chatgpt_account_id\":\"acct_test\",\"chatgpt_compute_residency\":\"no_constraint\"}",
+        "{\"chatgpt_account_id\":\"acct_test\",\"chatgpt_compute_residency\":\"\"}",
+        "{\"chatgpt_account_id\":\"acct_test\",\"chatgpt_compute_residency\":\"us\\r\\nx-injected: yes\"}",
+        "{\"chatgpt_account_id\":\"acct_test\",\"chatgpt_compute_residency\":42}",
+        overlong_claim,
+    };
+
+    for (claims) |claim| {
+        const token = try testAccessToken(alloc, claim);
+        defer alloc.free(token);
+        var identity = try extractRequestIdentity(alloc, token);
+        defer identity.deinit(alloc);
+        try std.testing.expect(identity.residency == null);
+    }
 }
 
 test "Codex refresh uses JSON and accepts omitted token rotation and lifetime" {

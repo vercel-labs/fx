@@ -377,9 +377,15 @@ function startFakeOAuth(
   };
 }
 
-function chatgptAccessToken(accountId = "acct_e2e"): string {
+function chatgptAccessToken(
+  accountId = "acct_e2e",
+  authClaims: Record<string, unknown> = {},
+): string {
   const payload = Buffer.from(JSON.stringify({
-    "https://api.openai.com/auth": { chatgpt_account_id: accountId },
+    "https://api.openai.com/auth": {
+      chatgpt_account_id: accountId,
+      ...authClaims,
+    },
   })).toString("base64url");
   return `header.${payload}.signature`;
 }
@@ -734,9 +740,11 @@ function startFakeCodexToolLoop(options: {
   toolName?: string;
   toolArguments?: object;
   finalText?: string;
+  authClaims?: Record<string, unknown>;
 } = {}) {
   const bodies: string[] = [];
-  const accessToken = chatgptAccessToken("acct_tool_loop");
+  const requestHeaders: Headers[] = [];
+  const accessToken = chatgptAccessToken("acct_tool_loop", options.authClaims);
   const toolName = options.toolName ?? "read_file";
   const toolArguments = options.toolArguments ?? { path: "README.md" };
   const finalText = options.finalText ?? "CODEX_TOOL_LOOP_OK";
@@ -750,6 +758,7 @@ function startFakeCodexToolLoop(options: {
           { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
         ] });
       }
+      requestHeaders.push(new Headers(request.headers));
       bodies.push(await request.text());
       if (bodies.length === 1) {
         return new Response(
@@ -771,6 +780,7 @@ function startFakeCodexToolLoop(options: {
   return {
     accessToken,
     bodies,
+    requestHeaders,
     responsesUrl: `http://127.0.0.1:${server.port}/responses`,
     modelsUrl: `http://127.0.0.1:${server.port}/models`,
     stop() { server.stop(true); },
@@ -2663,11 +2673,13 @@ tmuxTest(
 );
 
 test(
-  "ChatGPT tool loops round-trip encrypted reasoning without Gateway leakage",
+  "ChatGPT tool loops round-trip encrypted reasoning and residency without Gateway leakage",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-chatgpt-tool-loop-"));
     gateway = startFakeGateway([]);
-    const codex = startFakeCodexToolLoop();
+    const codex = startFakeCodexToolLoop({
+      authClaims: { chatgpt_compute_residency: "us" },
+    });
     try {
       writeSeededChatGptLogin(home, codex.accessToken);
       writeFileSync(
@@ -2695,11 +2707,14 @@ test(
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
       expect(result.stdout).toContain("CODEX_TOOL_LOOP_OK");
       expect(codex.bodies).toHaveLength(2);
+      expect(codex.requestHeaders).toHaveLength(2);
+      expect(codex.requestHeaders.every((headers) =>
+        headers.get("x-openai-internal-codex-residency") === "us"
+      )).toBe(true);
       expect(codex.bodies[1]).toContain('"encrypted_content":"opaque-tool-loop"');
       expect(codex.bodies[1]).toContain('"type":"function_call_output"');
-      for (const request of [...gateway.requests, ...gateway.modelRequests]) {
-        expect(request.headers.get("authorization")).not.toBe(`Bearer ${codex.accessToken}`);
-      }
+      expect(gateway.requests).toHaveLength(0);
+      expect(gateway.modelRequests).toHaveLength(0);
     } finally {
       codex.stop();
     }
