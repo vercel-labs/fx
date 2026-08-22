@@ -47,11 +47,25 @@ fx login grok
 fx
 ```
 
-`fx login codex` and `fx login grok` select that provider and a model from its authenticated catalog. Inside fx, open `/setup` and choose **Switch provider** to move between Gateway, Codex, and Grok. `/model` lists the active provider's fetched models. Subscription model IDs are the raw IDs returned by each authenticated catalog. Use `/logout codex` or `/logout grok` to remove that subscription session without affecting other providers; choosing it again from **Switch provider** starts sign-in.
+Or use OpenCode Zen (pay-as-you-go curated gateway) or OpenCode Go (low-cost subscription). Both ask you to paste an API key from https://opencode.ai/auth:
+
+```bash
+fx login zen
+fx
+```
+
+```bash
+fx login go
+fx
+```
+
+`fx login codex`, `fx login grok`, `fx login zen`, and `fx login go` select that provider and a model from its authenticated catalog. Inside fx, open `/setup` and choose **Switch provider** to move between Gateway, Codex, Grok, OpenCode Zen, and OpenCode Go. `/model` lists the active provider's fetched models. Provider model IDs are the raw IDs returned by each live catalog. Use `/logout codex`, `/logout grok`, `/logout zen`, or `/logout go` to remove that session without affecting other providers; choosing it again from **Switch provider** starts sign-in.
 
 The OpenAI Codex route uses ChatGPT subscription access directly and never sends its OAuth token to Vercel AI Gateway. The session is stored privately at `~/.fx/chatgpt-auth.json` and refreshed when needed. On supported Codex models, `/fast` requests OpenAI's priority service tier and consumes ChatGPT credits at the higher Fast mode rate.
 
 The Grok route uses subscription access directly at xAI and never sends its OAuth token to Vercel AI Gateway or OpenAI. Its session is stored privately at `~/.fx/grok-auth.json`, refreshed when needed, and used only with the authenticated xAI catalog and Responses API.
+
+OpenCode Zen and OpenCode Go use API keys stored privately at `~/.fx/zen-auth.json` and `~/.fx/go-auth.json` (mode 0600). Those keys are never sent to Vercel AI Gateway. Zen inference uses `https://opencode.ai/zen/v1/...`; Go uses `https://opencode.ai/zen/go/v1/...`. Catalogs are fetched live from `/models` for the active product.
 
 To use an AI Gateway API key instead:
 

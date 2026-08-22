@@ -6,6 +6,8 @@ const background_record_liveness = @import("../background/background_record_live
 const background_store = @import("../background/background_store.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
+const opencode_login = @import("../auth/opencode_login.zig");
+const opencode_session = @import("../auth/opencode_session.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
@@ -183,6 +185,12 @@ pub const Config = struct {
     grok_agent_stream: ?agent_stream_provider.Provider = null,
     grok_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
     grok_model_catalog: ?model_catalog.Provider = null,
+    zen_agent_stream: ?agent_stream_provider.Provider = null,
+    zen_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
+    zen_model_catalog: ?model_catalog.Provider = null,
+    go_agent_stream: ?agent_stream_provider.Provider = null,
+    go_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
+    go_model_catalog: ?model_catalog.Provider = null,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     url_opener: host.UrlOpener,
@@ -694,6 +702,8 @@ fn activateProviderSelection(
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
+            .zen => "OpenCode Zen is already selected.\n",
+            .go => "OpenCode Go is already selected.\n",
         });
         return true;
     }
@@ -731,6 +741,38 @@ fn activateProviderSelection(
             settings.credential_source,
         );
     }
+    if (resolution.credential == null and target == .zen and caller == .provider_command) {
+        opencode_login.runLogin(alloc, .zen) catch |err| {
+            debug_trace.logf("auth", "provider selection Zen login failed err={s}", .{@errorName(err)});
+            try writeProviderActivationError(alloc, deps, caller, "OpenCode Zen login failed");
+            return false;
+        };
+        performed_login = .zen;
+        resolution = try credentials.resolveForProvider(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            cfg.secret_store,
+            .refresh_if_needed,
+            target,
+            settings.credential_source,
+        );
+    }
+    if (resolution.credential == null and target == .go and caller == .provider_command) {
+        opencode_login.runLogin(alloc, .go) catch |err| {
+            debug_trace.logf("auth", "provider selection Go login failed err={s}", .{@errorName(err)});
+            try writeProviderActivationError(alloc, deps, caller, "OpenCode Go login failed");
+            return false;
+        };
+        performed_login = .go;
+        resolution = try credentials.resolveForProvider(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            cfg.secret_store,
+            .refresh_if_needed,
+            target,
+            settings.credential_source,
+        );
+    }
 
     const credential = if (resolution.credential) |*value| value else {
         try writeProviderActivationError(
@@ -740,6 +782,8 @@ fn activateProviderSelection(
             switch (target) {
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
+                .zen => "OpenCode Zen API key is unavailable",
+                .go => "OpenCode Go API key is unavailable",
                 .gateway => "configure a Gateway credential first",
             },
         );
@@ -752,6 +796,14 @@ fn activateProviderSelection(
         },
         .grok => cfg.grok_model_catalog orelse {
             try writeProviderActivationError(alloc, deps, caller, "Grok model catalog is unavailable");
+            return false;
+        },
+        .zen => cfg.zen_model_catalog orelse {
+            try writeProviderActivationError(alloc, deps, caller, "OpenCode Zen model catalog is unavailable");
+            return false;
+        },
+        .go => cfg.go_model_catalog orelse {
+            try writeProviderActivationError(alloc, deps, caller, "OpenCode Go model catalog is unavailable");
             return false;
         },
         .gateway => cfg.gateway_provider.model_catalog,
@@ -780,6 +832,8 @@ fn activateProviderSelection(
         .gateway => settings.model,
         .codex => settings.codex_model,
         .grok => settings.grok_model,
+        .zen => settings.zen_model,
+        .go => settings.go_model,
     };
     const selected_model = selectCatalogModel(loaded.catalog.items, saved_model) orelse {
         try writeProviderActivationError(alloc, deps, caller, "target model catalog is empty");
@@ -789,6 +843,8 @@ fn activateProviderSelection(
         .gateway => .{ .provider = target, .model = selected_model },
         .codex => .{ .provider = target, .codex_model = selected_model },
         .grok => .{ .provider = target, .grok_model = selected_model },
+        .zen => .{ .provider = target, .zen_model = selected_model },
+        .go => .{ .provider = target, .go_model = selected_model },
     });
     defer attempt.deinit(alloc);
     switch (attempt) {
@@ -802,6 +858,8 @@ fn activateProviderSelection(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
+        .zen => try writeStdout(deps, "Signed in with OpenCode Zen.\n"),
+        .go => try writeStdout(deps, "Signed in with OpenCode Go.\n"),
         .gateway => unreachable,
     };
     if (caller == .provider_command) {
@@ -809,6 +867,8 @@ fn activateProviderSelection(
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
+            .zen => "Provider set to OpenCode Zen.\n",
+            .go => "Provider set to OpenCode Go.\n",
         });
     }
     return true;
@@ -905,6 +965,10 @@ fn runNonInteractiveWithDeps(
                 .codex_model_catalog = cfg.codex_model_catalog,
                 .grok_agent_stream = cfg.grok_agent_stream,
                 .grok_model_catalog = cfg.grok_model_catalog,
+                .zen_agent_stream = cfg.zen_agent_stream,
+                .zen_model_catalog = cfg.zen_model_catalog,
+                .go_agent_stream = cfg.go_agent_stream,
+                .go_model_catalog = cfg.go_model_catalog,
                 .background_process_provider = cfg.background_process_provider,
                 .secret_store = cfg.secret_store,
                 .prompt_policy = cfg.prompt_policy,
@@ -933,7 +997,7 @@ fn runNonInteractiveWithDeps(
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx login [vercel|codex|grok|zen|go]\n");
                 return .handled_failure;
             };
             // Preserve the original `fx login` behavior for scripts and users.
@@ -987,12 +1051,34 @@ fn runNonInteractiveWithDeps(
                     }
                     try writeStdout(deps, "Signed in with Grok.\n");
                 },
+                .zen => {
+                    opencode_login.runLogin(alloc, .zen) catch |err| {
+                        debug_trace.logf("auth", "OpenCode Zen login failed err={s}", .{@errorName(err)});
+                        try writeStderr(deps, "fx login: failed to sign in with OpenCode Zen\n");
+                        return .handled_failure;
+                    };
+                    if (!try activateProviderSelection(alloc, cfg, deps, .zen, .provider_login)) {
+                        return .handled_failure;
+                    }
+                    try writeStdout(deps, "Signed in with OpenCode Zen.\n");
+                },
+                .go => {
+                    opencode_login.runLogin(alloc, .go) catch |err| {
+                        debug_trace.logf("auth", "OpenCode Go login failed err={s}", .{@errorName(err)});
+                        try writeStderr(deps, "fx login: failed to sign in with OpenCode Go\n");
+                        return .handled_failure;
+                    };
+                    if (!try activateProviderSelection(alloc, cfg, deps, .go, .provider_login)) {
+                        return .handled_failure;
+                    }
+                    try writeStdout(deps, "Signed in with OpenCode Go.\n");
+                },
             }
             return .handled_success;
         },
         .logout => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx logout [vercel|codex|grok|zen|go]\n");
                 return .handled_failure;
             };
             // Preserve the original `fx logout` behavior for scripts and users.
@@ -1040,6 +1126,36 @@ fn runNonInteractiveWithDeps(
                     },
                 };
             }
+            if (login_provider == .zen or login_provider == .go) {
+                const kind: opencode_session.Kind = if (login_provider == .zen) .zen else .go;
+                const name = opencode_login.productName(kind);
+                const outcome = opencode_session.logout(kind) catch {
+                    const message = try std.fmt.allocPrint(alloc, "fx logout: failed to durably remove saved {s} login\n", .{name});
+                    defer alloc.free(message);
+                    try writeStderr(deps, message);
+                    return .handled_failure;
+                };
+                return switch (outcome) {
+                    .deleted => result: {
+                        const message = try std.fmt.allocPrint(alloc, "Signed out of {s}.\n", .{name});
+                        defer alloc.free(message);
+                        try writeStdout(deps, message);
+                        break :result .handled_success;
+                    },
+                    .missing => result: {
+                        const message = try std.fmt.allocPrint(alloc, "No {s} login session found.\n", .{name});
+                        defer alloc.free(message);
+                        try writeStdout(deps, message);
+                        break :result .handled_success;
+                    },
+                    .deleted_not_durable => result: {
+                        const message = try std.fmt.allocPrint(alloc, "fx logout: failed to durably remove saved {s} login\n", .{name});
+                        defer alloc.free(message);
+                        try writeStderr(deps, message);
+                        break :result .handled_failure;
+                    },
+                };
+            }
             const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
                     try writeStderr(deps, "fx logout: failed to durably remove saved Fx login\n");
@@ -1081,11 +1197,11 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <gateway|codex|grok>\n");
+                try writeStderr(deps, "usage: fx provider <gateway|codex|grok|zen|go>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
+                try writeStderr(deps, "fx provider: expected gateway, codex, grok, zen, or go\n");
                 return .handled_failure;
             };
             return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command))
@@ -1175,6 +1291,14 @@ fn runNonInteractiveWithDeps(
                 },
                 .grok => cfg.grok_cli_model_catalog orelse {
                     try writeStderr(deps, "fx models: Grok model catalog is unavailable\n");
+                    return .handled_failure;
+                },
+                .zen => cfg.zen_cli_model_catalog orelse {
+                    try writeStderr(deps, "fx models: OpenCode Zen model catalog is unavailable\n");
+                    return .handled_failure;
+                },
+                .go => cfg.go_cli_model_catalog orelse {
+                    try writeStderr(deps, "fx models: OpenCode Go model catalog is unavailable\n");
                     return .handled_failure;
                 },
                 .gateway => cfg.gateway_provider.cli_model_catalog,
@@ -2993,6 +3117,10 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .codex_model_catalog = cfg.codex_model_catalog,
         .grok_agent_stream = cfg.grok_agent_stream,
         .grok_model_catalog = cfg.grok_model_catalog,
+        .zen_agent_stream = cfg.zen_agent_stream,
+        .zen_model_catalog = cfg.zen_model_catalog,
+        .go_agent_stream = cfg.go_agent_stream,
+        .go_model_catalog = cfg.go_model_catalog,
         .background_process_provider = cfg.background_process_provider,
         .secret_store = cfg.secret_store,
         .prompt_policy = cfg.prompt_policy,

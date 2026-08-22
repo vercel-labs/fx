@@ -362,7 +362,7 @@ fn writeTerminalSafe(writer: *std.Io.Writer, alloc: Allocator, raw: []const u8) 
 
 fn gatewayProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     const source = auth.active_source orelse return auth.gateway_connected;
-    return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription);
+    return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription and source != .zen_api_key and source != .go_api_key);
 }
 
 fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
@@ -371,6 +371,14 @@ fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
 
 fn grokProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     return auth.grok_connected or auth.active_source == .grok_subscription;
+}
+
+fn zenProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
+    return auth.zen_connected or auth.active_source == .zen_api_key;
+}
+
+fn goProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
+    return auth.go_connected or auth.active_source == .go_api_key;
 }
 
 fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.StatusSnapshot) !void {
@@ -387,6 +395,16 @@ fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.Status
     if (grokProviderConnected(auth)) {
         if (wrote_provider) try writer.writeAll(", Grok");
         if (!wrote_provider) try writer.writeAll("Grok");
+        wrote_provider = true;
+    }
+    if (zenProviderConnected(auth)) {
+        if (wrote_provider) try writer.writeAll(", OpenCode Zen");
+        if (!wrote_provider) try writer.writeAll("OpenCode Zen");
+        wrote_provider = true;
+    }
+    if (goProviderConnected(auth)) {
+        if (wrote_provider) try writer.writeAll(", OpenCode Go");
+        if (!wrote_provider) try writer.writeAll("OpenCode Go");
         wrote_provider = true;
     }
     if (!wrote_provider) try writer.writeAll("none");
@@ -525,6 +543,16 @@ pub const StatusSnapshot = struct {
             if (grokProviderConnected(self.auth)) {
                 if (wrote_provider) try writer.writeByte(',');
                 try std.json.Stringify.value("grok", .{}, writer);
+                wrote_provider = true;
+            }
+            if (zenProviderConnected(self.auth)) {
+                if (wrote_provider) try writer.writeByte(',');
+                try std.json.Stringify.value("opencode-zen", .{}, writer);
+                wrote_provider = true;
+            }
+            if (goProviderConnected(self.auth)) {
+                if (wrote_provider) try writer.writeByte(',');
+                try std.json.Stringify.value("opencode-go", .{}, writer);
             }
             try writer.writeByte(']');
         }
@@ -750,6 +778,8 @@ pub const ModelListSnapshot = struct {
             .gateway => "gateway",
             .codex => model_provider.label(.codex),
             .grok => model_provider.label(.grok),
+            .zen => model_provider.label(.zen),
+            .go => model_provider.label(.go),
         };
     }
 
@@ -764,6 +794,8 @@ pub const ModelListSnapshot = struct {
             .authenticated_credential_rejected => "Your Gateway credential was rejected; using the public model catalog.",
             .chatgpt_subscription => "Codex models require an authenticated Codex catalog.",
             .grok_subscription => "Grok models require an authenticated Grok catalog.",
+            .zen_api_key => "OpenCode Zen models require an authenticated Zen catalog.",
+            .go_api_key => "OpenCode Go models require an authenticated Go catalog.",
         };
     }
 };
@@ -2031,6 +2063,44 @@ test "status distinguishes the selected model route from connected providers" {
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"model_source\":\"Codex subscription\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"connected_providers\":[\"vercel-ai-gateway\",\"codex\"]") != null);
+}
+
+test "zen and go status never collapse connected providers to Vercel AI Gateway" {
+    inline for ([_]struct {
+        provider: model_provider.ProviderId,
+        source: credentials.Source,
+        label: []const u8,
+        json_id: []const u8,
+    }{
+        .{ .provider = .zen, .source = .zen_api_key, .label = "OpenCode Zen", .json_id = "opencode-zen" },
+        .{ .provider = .go, .source = .go_api_key, .label = "OpenCode Go", .json_id = "opencode-go" },
+    }) |case| {
+        const snapshot = StatusSnapshot{
+            .model = "live-model",
+            .provider = case.provider,
+            .auth = .{
+                .active_source = case.source,
+                .gateway_connected = false,
+                .zen_connected = case.source == .zen_api_key,
+                .go_connected = case.source == .go_api_key,
+            },
+            .permission_mode = .auto,
+            .workspace_root = "/tmp/fx",
+            .history_turns = 0,
+            .session_permission_grants = 0,
+            .agent_step_limit = 24,
+        };
+        const text = try snapshot.renderText(std.testing.allocator);
+        defer std.testing.allocator.free(text);
+        try std.testing.expect(std.mem.find(u8, text, case.label) != null);
+        try std.testing.expect(std.mem.find(u8, text, "Vercel AI Gateway") == null);
+        try std.testing.expectEqual(false, gatewayProviderConnected(snapshot.auth));
+
+        const json = try snapshot.renderJson(std.testing.allocator);
+        defer std.testing.allocator.free(json);
+        try std.testing.expect(std.mem.find(u8, json, case.json_id) != null);
+        try std.testing.expect(std.mem.find(u8, json, "vercel-ai-gateway") == null);
+    }
 }
 
 test "MCP config diagnostic renders in status text and JSON but not interactive body" {

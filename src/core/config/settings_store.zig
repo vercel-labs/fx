@@ -89,6 +89,8 @@ pub const UserSettingsPatch = struct {
     provider: ?model_provider.ProviderId = null,
     codex_model: ?[]const u8 = null,
     grok_model: ?[]const u8 = null,
+    zen_model: ?[]const u8 = null,
+    go_model: ?[]const u8 = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     /// Removes the key entirely so resolution returns to plain precedence.
@@ -111,6 +113,8 @@ pub const UserSettingsPatch = struct {
             self.provider == null and
             self.codex_model == null and
             self.grok_model == null and
+            self.zen_model == null and
+            self.go_model == null and
             self.permission_mode == null and
             self.credential_source == null and
             !self.clear_credential_source and
@@ -902,6 +906,60 @@ test "provider patch keeps independent provider models" {
     try std.testing.expectEqual(model_provider.ProviderId.codex, model_provider.parse(root.object.get("provider").?.string).?);
 }
 
+test "provider patch persists zen and go without collapsing to gateway" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    inline for ([_]struct {
+        provider: model_provider.ProviderId,
+        field: []const u8,
+        model: []const u8,
+    }{
+        .{ .provider = .zen, .field = "zen_model", .model = "zen-live" },
+        .{ .provider = .go, .field = "go_model", .model = "go-live" },
+    }) |case| {
+        var root = try std.json.parseFromSliceLeaky(
+            std.json.Value,
+            arena.allocator(),
+            "{\"model\":\"gateway/model\"}",
+            .{},
+        );
+        var patch = UserSettingsPatch{ .provider = case.provider };
+        if (case.provider == .zen) patch.zen_model = case.model;
+        if (case.provider == .go) patch.go_model = case.model;
+        const application = try applyUserPatchToRoot(arena.allocator(), &root, patch);
+        try std.testing.expect(application.changed);
+        try std.testing.expectEqualStrings("gateway/model", root.object.get("model").?.string);
+        try std.testing.expectEqualStrings(@tagName(case.provider), root.object.get("provider").?.string);
+        try std.testing.expectEqualStrings(case.model, root.object.get(case.field).?.string);
+        try std.testing.expectEqual(case.provider, model_provider.parse(root.object.get("provider").?.string).?);
+        try std.testing.expect(model_provider.parse(root.object.get("provider").?.string).? != .gateway);
+    }
+}
+
+test "unknown provider and extra keys stay valid for later patches" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    var root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        "{\"provider\":\"local\",\"local_model\":\"qwen3.8-9b\"}",
+        .{},
+    );
+    try validateKnownSettingsObject(root.object, false);
+    const application = try applyUserPatchToRoot(arena.allocator(), &root, .{
+        .provider = .go,
+        .go_model = "go-live",
+    });
+    try std.testing.expect(application.changed);
+    try std.testing.expectEqualStrings("go", root.object.get("provider").?.string);
+    try std.testing.expectEqualStrings("go-live", root.object.get("go_model").?.string);
+    try std.testing.expectEqualStrings("qwen3.8-9b", root.object.get("local_model").?.string);
+}
+
 fn applyMutationToRoot(
     arena: Allocator,
     root: *std.json.Value,
@@ -931,6 +989,8 @@ fn applyUserPatchToRoot(
     if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", @tagName(value)) or application.changed;
     if (patch.codex_model) |value| application.changed = try putString(arena, &root.object, "codex_model", value) or application.changed;
     if (patch.grok_model) |value| application.changed = try putString(arena, &root.object, "grok_model", value) or application.changed;
+    if (patch.zen_model) |value| application.changed = try putString(arena, &root.object, "zen_model", value) or application.changed;
+    if (patch.go_model) |value| application.changed = try putString(arena, &root.object, "go_model", value) or application.changed;
     if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", @tagName(value)) or application.changed;
     if (patch.credential_source) |value| application.changed = try putString(arena, &root.object, "credential_source", @tagName(value)) or application.changed;
     if (patch.clear_credential_source and root.object.contains("credential_source")) {
@@ -1607,15 +1667,23 @@ fn validateKnownSettingsObject(
         try validateModel(value.string);
     }
     if (object.get("provider")) |value| {
-        if (value != .string or model_provider.parse(value.string) == null) {
-            return error.InvalidSettingsFormat;
-        }
+        if (value != .string) return error.InvalidSettingsFormat;
+        // Unknown ids (other checkouts) are skipped so the rest of the file still loads/writes.
+        _ = model_provider.parse(value.string);
     }
     if (object.get("codex_model")) |value| {
         if (value != .string) return error.InvalidSettingsFormat;
         try validateModel(value.string);
     }
     if (object.get("grok_model")) |value| {
+        if (value != .string) return error.InvalidSettingsFormat;
+        try validateModel(value.string);
+    }
+    if (object.get("zen_model")) |value| {
+        if (value != .string) return error.InvalidSettingsFormat;
+        try validateModel(value.string);
+    }
+    if (object.get("go_model")) |value| {
         if (value != .string) return error.InvalidSettingsFormat;
         try validateModel(value.string);
     }

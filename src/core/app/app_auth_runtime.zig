@@ -10,6 +10,8 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
+const opencode_login = @import("../auth/opencode_login.zig");
+const opencode_session = @import("../auth/opencode_session.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
@@ -47,12 +49,19 @@ fn decideProviderSwitch(facts: ProviderSwitchFacts) ProviderSwitchDecision {
     return .prepare;
 }
 
+fn usesApiKeySignIn(provider: model_provider.ProviderId) bool {
+    return provider == .zen or provider == .go;
+}
+
 fn providerFailureMessage(
     intent: ProviderSwitchIntent,
+    target: model_provider.ProviderId,
     ordinary: []const u8,
-    after_oauth: []const u8,
+    after_subscription: []const u8,
+    after_api_key: []const u8,
 ) []const u8 {
-    return if (intent == .post_oauth) after_oauth else ordinary;
+    if (intent != .post_oauth) return ordinary;
+    return if (usesApiKeySignIn(target)) after_api_key else after_subscription;
 }
 
 fn selectCatalogModel(
@@ -79,6 +88,8 @@ pub fn Runtime(comptime App: type) type {
                 const required_source: credentials.Source = switch (provider) {
                     .codex => .chatgpt_subscription,
                     .grok => .grok_subscription,
+                    .zen => .zen_api_key,
+                    .go => .go_api_key,
                     .gateway => app.auth.credentialSource() orelse .fx_login,
                 };
                 const route_change = app.auth.selectForProvider(app.alloc, provider) catch |err| switch (err) {
@@ -95,6 +106,10 @@ pub fn Runtime(comptime App: type) type {
                             credentials.missing_grok_interactive_credential_message
                         else if (provider == .codex)
                             credentials.missing_chatgpt_interactive_credential_message
+                        else if (provider == .zen)
+                            credentials.missing_zen_interactive_credential_message
+                        else if (provider == .go)
+                            credentials.missing_go_interactive_credential_message
                         else
                             credentials.missing_interactive_credential_message,
                     }, true);
@@ -153,7 +168,7 @@ pub fn Runtime(comptime App: type) type {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .warning,
-                        .body = "Usage: /logout [vercel|codex|grok]",
+                        .body = "Usage: /logout [vercel|codex|grok|zen|go]",
                     });
                     return;
                 };
@@ -176,6 +191,65 @@ pub fn Runtime(comptime App: type) type {
             const grok_is_only_logout_session = provider_inventory.contains(.grok_subscription) and
                 !provider_inventory.contains(.fx_login) and
                 !provider_inventory.contains(.chatgpt_subscription);
+
+            const selected_model_uses_zen = if (comptime provider_runtime.supported(App))
+                provider_runtime.provider(app) == .zen
+            else
+                false;
+            const selected_model_uses_go = if (comptime provider_runtime.supported(App))
+                provider_runtime.provider(app) == .go
+            else
+                false;
+            const logout_zen = if (requested_provider) |provider|
+                provider == .zen
+            else
+                selected_model_uses_zen or app.auth.credentialSource() == .zen_api_key;
+            if (logout_zen) {
+                const outcome = opencode_session.logout(.zen) catch {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Could not durably sign out of OpenCode Zen. The current source is unchanged.",
+                    });
+                    return;
+                };
+                const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterOpenCodeLogout"))
+                    try app.auth.reconcileAfterOpenCodeLogout(app.alloc, .zen_api_key)
+                else
+                    false;
+                applyCredentialChange(app, changed);
+                try writeAuthNotice(app, switch (outcome) {
+                    .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of OpenCode Zen." },
+                    .missing => .{ .topic = "auth", .tone = .neutral, .body = "No OpenCode Zen login session found." },
+                    .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of OpenCode Zen, but could not confirm the profile directory update." },
+                });
+                return;
+            }
+            const logout_go = if (requested_provider) |provider|
+                provider == .go
+            else
+                selected_model_uses_go or app.auth.credentialSource() == .go_api_key;
+            if (logout_go) {
+                const outcome = opencode_session.logout(.go) catch {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Could not durably sign out of OpenCode Go. The current source is unchanged.",
+                    });
+                    return;
+                };
+                const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterOpenCodeLogout"))
+                    try app.auth.reconcileAfterOpenCodeLogout(app.alloc, .go_api_key)
+                else
+                    false;
+                applyCredentialChange(app, changed);
+                try writeAuthNotice(app, switch (outcome) {
+                    .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of OpenCode Go." },
+                    .missing => .{ .topic = "auth", .tone = .neutral, .body = "No OpenCode Go login session found." },
+                    .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of OpenCode Go, but could not confirm the profile directory update." },
+                });
+                return;
+            }
             const logout_grok = if (requested_provider) |provider|
                 provider == .grok
             else
@@ -315,6 +389,8 @@ pub fn Runtime(comptime App: type) type {
                     .login => try beginSignIn(app, true),
                     .chatgpt_login => try beginChatGptSignIn(app),
                     .grok_login => try beginGrokSignIn(app),
+                    .zen_login => try beginOpenCodeKeyLogin(app, .zen),
+                    .go_login => try beginOpenCodeKeyLogin(app, .go),
                     .setup => {
                         if (comptime !runtime_profile.allows(App, .native_auth)) {
                             try app.writeDomainNotice(.{
@@ -509,6 +585,19 @@ pub fn Runtime(comptime App: type) type {
                 .empty => return,
                 .saved => |changed| {
                     applyCredentialChange(app, changed);
+                    const destination = if (@hasDecl(@TypeOf(app.auth), "takeApiKeyDestination"))
+                        app.auth.takeApiKeyDestination()
+                    else
+                        null;
+                    if (destination) |provider| {
+                        if (provider == .zen or provider == .go) {
+                            if (comptime provider_runtime.supported(App)) {
+                                app.auth.closePicker(app.alloc);
+                                try switchProvider(app, provider, false, .post_oauth);
+                                return;
+                            }
+                        }
+                    }
                     rememberCredentialSource(app, .stored_key);
                     const body = try std.fmt.allocPrint(
                         app.alloc,
@@ -621,7 +710,7 @@ pub fn Runtime(comptime App: type) type {
         fn rememberCredentialSource(app: *App, source: credentials.Source) void {
             // ChatGPT is selected by model route, not as a global Gateway
             // credential preference. Its saved session coexists independently.
-            if (source == .chatgpt_subscription or source == .grok_subscription) return;
+            if (source == .chatgpt_subscription or source == .grok_subscription or source == .zen_api_key or source == .go_api_key) return;
             if (comptime @hasDecl(App, "persistCredentialSourcePreference")) {
                 app.persistCredentialSourcePreference(source);
                 return;
@@ -730,6 +819,49 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+
+        fn beginOpenCodeKeyLogin(app: *App, provider: model_provider.ProviderId) !void {
+            if (comptime !runtime_profile.allows(App, .native_auth)) {
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = "OpenCode API key login is unavailable in this WASM session.",
+                }, true);
+                return;
+            }
+            try app.flushBeforeBlockingExternalWork();
+            if (@hasDecl(@TypeOf(app.auth), "openOpenCodeApiKeyPickerFromRoot")) {
+                app.auth.openOpenCodeApiKeyPickerFromRoot(app.alloc, provider);
+                app.shell.render_requests.request(.footer);
+                return;
+            }
+            try app.writeDomainNotice(.{
+                .topic = "auth",
+                .tone = .warning,
+                .body = if (provider == .go)
+                    credentials.missing_go_interactive_credential_message
+                else
+                    credentials.missing_zen_interactive_credential_message,
+            }, true);
+        }
+
+        fn beginOpenCodeKeyLoginForProviderSwitch(app: *App, provider: model_provider.ProviderId) !void {
+            try app.flushBeforeBlockingExternalWork();
+            if (@hasDecl(@TypeOf(app.auth), "openOpenCodeApiKeyPickerForProviderSwitch")) {
+                app.auth.openOpenCodeApiKeyPickerForProviderSwitch(app.alloc, provider);
+                app.shell.render_requests.request(.footer);
+                return;
+            }
+            try app.writeDomainNotice(.{
+                .topic = "auth",
+                .tone = .warning,
+                .body = if (provider == .go)
+                    "Run fx login go, then try switching again."
+                else
+                    "Run fx login zen, then try switching again.",
+            }, true);
+        }
+
         fn switchProvider(
             app: *App,
             target: model_provider.ProviderId,
@@ -787,9 +919,11 @@ pub fn Runtime(comptime App: type) type {
                         .tone = .warning,
                         .body = providerFailureMessage(
                             intent,
+                            target,
                             "Provider switching is unavailable until active and queued work finishes.",
                             "Subscription sign-in completed, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged.",
-                        ),
+                            "Sign-in completed, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged.",
+                            ),
                     }, true);
                     return;
                 },
@@ -810,9 +944,11 @@ pub fn Runtime(comptime App: type) type {
                     .tone = .@"error",
                     .body = providerFailureMessage(
                         intent,
+                        target,
                         "Could not prepare the target provider credential. The current provider is unchanged.",
                         "Subscription sign-in completed, but its credential could not be prepared. The current provider is unchanged.",
-                    ),
+                        "Sign-in completed, but its credential could not be prepared. The current provider is unchanged.",
+                        ),
                 }, true);
                 return;
             };
@@ -825,15 +961,26 @@ pub fn Runtime(comptime App: type) type {
                     try beginGrokSignInForProviderSwitch(app);
                     return;
                 }
+                if ((target == .zen or target == .go) and allow_login) {
+                    try beginOpenCodeKeyLoginForProviderSwitch(app, target);
+                    return;
+                }
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .warning,
                     .body = if (intent == .post_oauth)
-                        "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged."
+                        (if (usesApiKeySignIn(target))
+                            "Sign-in completed, but its saved credential is unavailable. The current provider is unchanged."
+                        else
+                            "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged.")
                     else if (target == .codex)
                         "Run fx login codex, then try switching again."
                     else if (target == .grok)
                         "Run fx login grok, then try switching again."
+                    else if (target == .zen)
+                        "Run fx login zen, then try switching again."
+                    else if (target == .go)
+                        "Run fx login go, then try switching again."
                     else
                         credentials.missing_interactive_credential_message,
                 }, true);
@@ -846,9 +993,11 @@ pub fn Runtime(comptime App: type) type {
                     .tone = .@"error",
                     .body = providerFailureMessage(
                         intent,
+                        target,
                         "The target credential cannot authorize that provider. The current provider is unchanged.",
                         "Subscription sign-in completed, but its credential cannot authorize the provider. The current provider is unchanged.",
-                    ),
+                        "Sign-in completed, but its credential cannot authorize the provider. The current provider is unchanged.",
+                        ),
                 }, true);
                 return;
             }
@@ -866,9 +1015,11 @@ pub fn Runtime(comptime App: type) type {
                     .tone = .@"error",
                     .body = providerFailureMessage(
                         intent,
+                        target,
                         "Could not load the target provider catalog. The current provider is unchanged.",
                         "Subscription sign-in completed, but its model catalog could not be loaded. The current provider is unchanged.",
-                    ),
+                        "Sign-in completed, but its model catalog could not be loaded. The current provider is unchanged.",
+                        ),
                 }, true);
                 return;
             };
@@ -881,9 +1032,11 @@ pub fn Runtime(comptime App: type) type {
                         .tone = .@"error",
                         .body = providerFailureMessage(
                             intent,
+                            target,
                             "The target provider catalog could not be validated. The current provider is unchanged.",
                             "Subscription sign-in completed, but its model catalog could not be validated. The current provider is unchanged.",
-                        ),
+                            "Sign-in completed, but its model catalog could not be validated. The current provider is unchanged.",
+                            ),
                     }, true);
                     return;
                 },
@@ -895,31 +1048,26 @@ pub fn Runtime(comptime App: type) type {
                     .tone = .@"error",
                     .body = providerFailureMessage(
                         intent,
+                        target,
                         "The target provider returned no supported models. The current provider is unchanged.",
                         "Subscription sign-in completed, but its model catalog returned no supported models. The current provider is unchanged.",
-                    ),
+                        "Sign-in completed, but its model catalog returned no supported models. The current provider is unchanged.",
+                        ),
                 }, true);
                 return;
             }
 
-            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
-                debug_trace.logf("provider", "settings load failed err={s}", .{@errorName(err)});
-                try app.writeDomainNotice(.{
-                    .topic = "provider",
-                    .tone = .@"error",
-                    .body = providerFailureMessage(
-                        intent,
-                        "Could not load the saved provider model. The current provider is unchanged.",
-                        "Subscription sign-in completed, but its saved provider model could not be loaded. The current provider is unchanged.",
-                    ),
-                }, true);
-                return;
+            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| blk: {
+                debug_trace.logf("provider", "settings load failed err={s}; using empty defaults", .{@errorName(err)});
+                break :blk config_runtime.Settings{};
             };
             defer settings.deinit(app.alloc);
             const saved_model = switch (target) {
                 .gateway => settings.model,
                 .codex => settings.codex_model,
                 .grok => settings.grok_model,
+                .zen => settings.zen_model,
+                .go => settings.go_model,
             };
             const current_model = if (intent == .post_oauth and current == target)
                 provider_runtime.model(app)
@@ -939,9 +1087,11 @@ pub fn Runtime(comptime App: type) type {
                     .tone = .warning,
                     .body = providerFailureMessage(
                         intent,
+                        target,
                         "Provider switching is unavailable until active and queued work finishes.",
                         "Subscription sign-in completed, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged.",
-                    ),
+                        "Sign-in completed, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged.",
+                        ),
                 }, true);
                 return;
             }
@@ -985,6 +1135,8 @@ pub fn Runtime(comptime App: type) type {
                     .gateway => .{ .provider = .gateway, .model = provider_runtime.model(app) },
                     .codex => .{ .provider = .codex, .codex_model = provider_runtime.model(app) },
                     .grok => .{ .provider = .grok, .grok_model = provider_runtime.model(app) },
+                    .zen => .{ .provider = .zen, .zen_model = provider_runtime.model(app) },
+                    .go => .{ .provider = .go, .go_model = provider_runtime.model(app) },
                 });
                 defer persistence.deinit(app.alloc);
                 switch (persistence) {
@@ -1327,7 +1479,60 @@ test "post OAuth catalog selection keeps valid current then saved then first" {
     try std.testing.expectEqualStrings("current", selectCatalogModel(&entries, "current", "saved").?);
     try std.testing.expectEqualStrings("saved", selectCatalogModel(&entries, "missing", "saved").?);
     try std.testing.expectEqualStrings("first", selectCatalogModel(&entries, "missing", "also-missing").?);
+    try std.testing.expectEqualStrings("first", selectCatalogModel(&entries, null, null).?);
     try std.testing.expect(selectCatalogModel(&.{}, "current", "saved") == null);
+}
+
+test "unknown saved model still selects first catalog entry after provider switch" {
+    const catalog = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("zen-default"), .model_type = @constCast("language") },
+        .{ .id = @constCast("zen-alt"), .model_type = @constCast("language") },
+    };
+    const saved_model: ?[]const u8 = null;
+    try std.testing.expectEqualStrings("zen-default", selectCatalogModel(&catalog, null, saved_model).?);
+}
+
+test "post sign-in failure copy distinguishes API key providers from subscriptions" {
+    try std.testing.expectEqualStrings(
+        "Could not load the saved provider model. The current provider is unchanged.",
+        providerFailureMessage(
+            .manual,
+            .go,
+            "Could not load the saved provider model. The current provider is unchanged.",
+            "Subscription sign-in completed, but its saved provider model could not be loaded. The current provider is unchanged.",
+            "Sign-in completed, but its saved provider model could not be loaded. The current provider is unchanged.",
+        ),
+    );
+    try std.testing.expectEqualStrings(
+        "Subscription sign-in completed, but its saved provider model could not be loaded. The current provider is unchanged.",
+        providerFailureMessage(
+            .post_oauth,
+            .codex,
+            "ordinary",
+            "Subscription sign-in completed, but its saved provider model could not be loaded. The current provider is unchanged.",
+            "Sign-in completed, but its saved provider model could not be loaded. The current provider is unchanged.",
+        ),
+    );
+    try std.testing.expectEqualStrings(
+        "Sign-in completed, but its saved provider model could not be loaded. The current provider is unchanged.",
+        providerFailureMessage(
+            .post_oauth,
+            .go,
+            "ordinary",
+            "Subscription sign-in completed, but its saved provider model could not be loaded. The current provider is unchanged.",
+            "Sign-in completed, but its saved provider model could not be loaded. The current provider is unchanged.",
+        ),
+    );
+    try std.testing.expectEqualStrings(
+        "Sign-in completed, but its saved provider model could not be loaded. The current provider is unchanged.",
+        providerFailureMessage(
+            .post_oauth,
+            .zen,
+            "ordinary",
+            "Subscription sign-in completed, but its saved provider model could not be loaded. The current provider is unchanged.",
+            "Sign-in completed, but its saved provider model could not be loaded. The current provider is unchanged.",
+        ),
+    );
 }
 
 const TestModelCache = struct {
@@ -1411,7 +1616,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
             switch (provider) {
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
-                .gateway => unreachable,
+                .gateway, .zen, .go => unreachable,
             }
 
             try std.testing.expectEqual(@as(usize, 0), app.auth.start_count);

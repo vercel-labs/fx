@@ -226,6 +226,10 @@ pub const Config = struct {
     codex_model_catalog: ?model_catalog.Provider = null,
     grok_agent_stream: ?agent_stream_provider.Provider = null,
     grok_model_catalog: ?model_catalog.Provider = null,
+    zen_agent_stream: ?agent_stream_provider.Provider = null,
+    zen_model_catalog: ?model_catalog.Provider = null,
+    go_agent_stream: ?agent_stream_provider.Provider = null,
+    go_model_catalog: ?model_catalog.Provider = null,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     secret_store: host.SecretStore,
@@ -284,6 +288,14 @@ fn runAskChild(
             .grok = .{
                 .agent_stream_provider = ctx.cfg.grok_agent_stream orelse agent_stream_provider.unavailable_provider,
                 .permission_reviewer_provider = ctx.cfg.grok_permission_reviewer_provider,
+            },
+            .zen = .{
+                .agent_stream_provider = ctx.cfg.zen_agent_stream orelse agent_stream_provider.unavailable_provider,
+                .permission_reviewer_provider = ctx.cfg.permission_reviewer_provider,
+            },
+            .go = .{
+                .agent_stream_provider = ctx.cfg.go_agent_stream orelse agent_stream_provider.unavailable_provider,
+                .permission_reviewer_provider = ctx.cfg.permission_reviewer_provider,
             },
         },
         .system_prompt = ctx.cfg.prompt_policy.system_prompt,
@@ -1058,7 +1070,7 @@ const AskContext = struct {
     fn admissionAutoClassifier(self: *AskContext) permission_auto_classifier.Classifier {
         if (self.auto_classifier.enabled()) return self.auto_classifier;
         const provider = switch (self.provider) {
-            .gateway => self.cfg.permission_reviewer_provider,
+            .gateway, .zen, .go => self.cfg.permission_reviewer_provider,
             .codex => self.cfg.codex_permission_reviewer_provider,
             .grok => self.cfg.grok_permission_reviewer_provider,
         } orelse
@@ -1079,6 +1091,8 @@ const AskContext = struct {
             .gateway => self.cfg.gateway_provider.agent_stream,
             .codex => self.cfg.codex_agent_stream orelse agent_stream_provider.unavailable_provider,
             .grok => self.cfg.grok_agent_stream orelse agent_stream_provider.unavailable_provider,
+            .zen => self.cfg.zen_agent_stream orelse agent_stream_provider.unavailable_provider,
+            .go => self.cfg.go_agent_stream orelse agent_stream_provider.unavailable_provider,
         };
     }
 
@@ -1398,12 +1412,13 @@ fn missingCredentialResult(
     options: RunOptions,
     provider: model_provider.ProviderId,
 ) !PromptRunResult {
-    const message = if (provider == .codex)
-        credentials.missing_chatgpt_credential_message
-    else if (provider == .grok)
-        credentials.missing_grok_credential_message
-    else
-        credentials.missing_credential_message;
+    const message = switch (provider) {
+        .codex => credentials.missing_chatgpt_credential_message,
+        .grok => credentials.missing_grok_credential_message,
+        .zen => credentials.missing_zen_credential_message,
+        .go => credentials.missing_go_credential_message,
+        .gateway => credentials.missing_credential_message,
+    };
     try options.deps.write_stderr(options.deps.stderr_ctx, "fx ask: ");
     try options.deps.write_stderr(options.deps.stderr_ctx, message);
     try options.deps.write_stderr(options.deps.stderr_ctx, "\n");
@@ -2005,6 +2020,8 @@ fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8
         ctx.cfg.gateway_provider.model_catalog,
         ctx.cfg.codex_model_catalog,
         ctx.cfg.grok_model_catalog,
+        ctx.cfg.zen_model_catalog,
+        ctx.cfg.go_model_catalog,
     ) orelse return model_capabilities.capabilitiesForModel(model);
     return ctx.capability_resolver.resolve(
         ctx.alloc,
@@ -2023,11 +2040,15 @@ fn selectModelCatalog(
     gateway: model_catalog.Provider,
     codex: ?model_catalog.Provider,
     grok: ?model_catalog.Provider,
+    zen: ?model_catalog.Provider,
+    go: ?model_catalog.Provider,
 ) ?model_catalog.Provider {
     return switch (provider) {
         .gateway => gateway,
         .codex => codex,
         .grok => grok,
+        .zen => zen,
+        .go => go,
     };
 }
 
@@ -2046,10 +2067,18 @@ test "provider catalog selection never falls back across origins" {
     var grok_tag: u8 = 0;
     var grok = test_builtin_gateway.model_catalog_provider;
     grok.context = &grok_tag;
+    var zen_tag: u8 = 0;
+    var zen = test_builtin_gateway.model_catalog_provider;
+    zen.context = &zen_tag;
+    var go_tag: u8 = 0;
+    var go = test_builtin_gateway.model_catalog_provider;
+    go.context = &go_tag;
     const cases = [_]struct {
         provider: model_provider.ProviderId,
         codex: ?model_catalog.Provider,
         grok: ?model_catalog.Provider,
+        zen: ?model_catalog.Provider = null,
+        go: ?model_catalog.Provider = null,
         expected_context: ?*anyopaque,
     }{
         .{ .provider = .gateway, .codex = codex, .grok = grok, .expected_context = &gateway_tag },
@@ -2057,10 +2086,14 @@ test "provider catalog selection never falls back across origins" {
         .{ .provider = .codex, .codex = null, .grok = grok, .expected_context = null },
         .{ .provider = .grok, .codex = codex, .grok = grok, .expected_context = &grok_tag },
         .{ .provider = .grok, .codex = codex, .grok = null, .expected_context = null },
+        .{ .provider = .zen, .codex = codex, .grok = grok, .expected_context = null },
+        .{ .provider = .go, .codex = codex, .grok = grok, .expected_context = null },
+        .{ .provider = .zen, .codex = codex, .grok = grok, .zen = zen, .expected_context = &zen_tag },
+        .{ .provider = .go, .codex = codex, .grok = grok, .go = go, .expected_context = &go_tag },
     };
 
     for (cases) |case| {
-        const selected = selectModelCatalog(case.provider, gateway, case.codex, case.grok);
+        const selected = selectModelCatalog(case.provider, gateway, case.codex, case.grok, case.zen, case.go);
         if (case.expected_context) |expected| {
             try std.testing.expect(selected != null);
             try std.testing.expect(selected.?.context.? == expected);

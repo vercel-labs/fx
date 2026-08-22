@@ -54,6 +54,8 @@ const builtin_providers = @import("builtins/providers.zig");
 const openai_codex_models = @import("gateway/openai_codex_models.zig");
 const openai_codex_permission_reviewer = @import("gateway/openai_codex_permission_reviewer.zig");
 const xai_grok_models = @import("gateway/xai_grok_models.zig");
+const opencode_models = @import("gateway/opencode_models.zig");
+const opencode = @import("gateway/opencode.zig");
 const xai_grok_permission_reviewer = @import("gateway/xai_grok_permission_reviewer.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
@@ -1629,6 +1631,26 @@ const App = struct {
                     builtin_providers.agentStream(.grok),
                 .permission_reviewer_provider = if (comptime host_profile.tools and !host_target.is_wasm)
                     xai_grok_permission_reviewer.provider
+                else
+                    null,
+            },
+            .zen = .{
+                .agent_stream_provider = if (comptime host_target.is_wasm)
+                    agent_stream_provider.unavailable_provider
+                else
+                    builtin_providers.agentStream(.zen),
+                .permission_reviewer_provider = if (comptime host_profile.tools)
+                    builtin_gateway.permission_reviewer.provider
+                else
+                    null,
+            },
+            .go = .{
+                .agent_stream_provider = if (comptime host_target.is_wasm)
+                    agent_stream_provider.unavailable_provider
+                else
+                    builtin_providers.agentStream(.go),
+                .permission_reviewer_provider = if (comptime host_profile.tools)
+                    builtin_gateway.permission_reviewer.provider
                 else
                     null,
             },
@@ -3266,6 +3288,12 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .grok_agent_stream = builtin_providers.agentStream(.grok),
         .grok_cli_model_catalog = xai_grok_models.cli_model_catalog_provider,
         .grok_model_catalog = xai_grok_models.model_catalog_provider,
+        .zen_agent_stream = builtin_providers.agentStream(.zen),
+        .zen_cli_model_catalog = opencode_models.zen_cli_model_catalog_provider,
+        .zen_model_catalog = opencode_models.zen_model_catalog_provider,
+        .go_agent_stream = builtin_providers.agentStream(.go),
+        .go_cli_model_catalog = opencode_models.go_cli_model_catalog_provider,
+        .go_model_catalog = opencode_models.go_model_catalog_provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3309,6 +3337,12 @@ fn localEntryConfig() app_entry_runtime.Config {
         .grok_agent_stream = builtin_providers.agentStream(.grok),
         .grok_cli_model_catalog = xai_grok_models.cli_model_catalog_provider,
         .grok_model_catalog = xai_grok_models.model_catalog_provider,
+        .zen_agent_stream = builtin_providers.agentStream(.zen),
+        .zen_cli_model_catalog = opencode_models.zen_cli_model_catalog_provider,
+        .zen_model_catalog = opencode_models.zen_model_catalog_provider,
+        .go_agent_stream = builtin_providers.agentStream(.go),
+        .go_cli_model_catalog = opencode_models.go_cli_model_catalog_provider,
+        .go_model_catalog = opencode_models.go_model_catalog_provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3349,6 +3383,12 @@ fn emptyEntryConfig() app_entry_runtime.Config {
         .grok_agent_stream = builtin_providers.agentStream(.grok),
         .grok_cli_model_catalog = xai_grok_models.cli_model_catalog_provider,
         .grok_model_catalog = xai_grok_models.model_catalog_provider,
+        .zen_agent_stream = builtin_providers.agentStream(.zen),
+        .zen_cli_model_catalog = opencode_models.zen_cli_model_catalog_provider,
+        .zen_model_catalog = opencode_models.zen_model_catalog_provider,
+        .go_agent_stream = builtin_providers.agentStream(.go),
+        .go_cli_model_catalog = opencode_models.go_cli_model_catalog_provider,
+        .go_model_catalog = opencode_models.go_model_catalog_provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3857,6 +3897,10 @@ test {
     _ = @import("gateway/xai_grok_models.zig");
     _ = @import("gateway/xai_grok.zig");
     _ = @import("gateway/xai_grok_permission_reviewer.zig");
+    _ = @import("core/auth/opencode_session.zig");
+    _ = @import("core/auth/opencode_login.zig");
+    _ = @import("gateway/opencode_models.zig");
+    _ = @import("gateway/opencode.zig");
     _ = credentials;
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");
