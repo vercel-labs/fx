@@ -116,6 +116,88 @@ fn terminal_request_normalization_eligible(
     return base_nested_terminal_advertised and vision_mode != .required;
 }
 
+fn projected_terminal_request_arguments(
+    alloc: Allocator,
+    arguments_json: []const u8,
+) Allocator.Error!?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    if (parsed.value.object.count() == 1) {
+        if (parsed.value.object.get("request")) |request| {
+            if (request == .object) return null;
+        }
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    std.json.Stringify.value(.{ .request = parsed.value }, .{}, &out.writer) catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+fn free_terminal_request_projection(
+    alloc: Allocator,
+    source: []const ChatMessage,
+    projected: []const ChatMessage,
+) void {
+    if (source.ptr == projected.ptr) return;
+    for (projected, source) |message, original| {
+        if (message.tool_calls.ptr == original.tool_calls.ptr) continue;
+        for (message.tool_calls, original.tool_calls) |call, original_call| {
+            if (call.arguments_json.ptr != original_call.arguments_json.ptr) {
+                alloc.free(@constCast(call.arguments_json));
+            }
+        }
+        alloc.free(@constCast(message.tool_calls));
+    }
+    alloc.free(@constCast(projected));
+}
+
+fn project_terminal_request_messages(
+    alloc: Allocator,
+    registry: tool_dispatch.Registry,
+    attempt_eligible: bool,
+    source: []const ChatMessage,
+) Allocator.Error![]const ChatMessage {
+    if (!attempt_eligible) return source;
+
+    var projected: ?[]ChatMessage = null;
+    errdefer if (projected) |messages| {
+        free_terminal_request_projection(alloc, source, messages);
+    };
+
+    for (source, 0..) |message, message_index| {
+        if (message.role != .assistant) continue;
+        for (message.tool_calls, 0..) |call, call_index| {
+            if (call.argument_integrity != .valid) continue;
+            const tool = registry.lookup(call.name) orelse continue;
+            if (tool.executor_kind != .terminal) continue;
+            const arguments_json = try projected_terminal_request_arguments(
+                alloc,
+                call.arguments_json,
+            ) orelse continue;
+
+            if (projected == null) {
+                projected = alloc.dupe(ChatMessage, source) catch |err| {
+                    alloc.free(arguments_json);
+                    return err;
+                };
+            }
+            if (projected.?[message_index].tool_calls.ptr == message.tool_calls.ptr) {
+                projected.?[message_index].tool_calls = alloc.dupe(ToolCall, message.tool_calls) catch |err| {
+                    alloc.free(arguments_json);
+                    return err;
+                };
+            }
+            @constCast(projected.?[message_index].tool_calls)[call_index].arguments_json = arguments_json;
+        }
+    }
+    return projected orelse source;
+}
+
 fn normalized_terminal_request_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
@@ -186,6 +268,117 @@ test "terminal request normalization follows effective attempt advertisement" {
     try std.testing.expect(terminal_request_normalization_eligible(true, .optional));
     try std.testing.expect(!terminal_request_normalization_eligible(true, .required));
     try std.testing.expect(!terminal_request_normalization_eligible(false, .unavailable));
+}
+
+test "terminal request projection wraps eligible flat objects without changing source messages" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const terminal_tool = tool_dispatch.Tool{
+        .name = "terminal",
+        .description = "terminal",
+        .gateway_schema = .{ .name = "terminal", .description = "terminal" },
+        .executor_kind = .terminal,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    var browser_terminal = terminal_tool;
+    browser_terminal.name = "browser_terminal";
+    browser_terminal.executor_kind = .run_command;
+    const tools = [_]tool_dispatch.Tool{ terminal_tool, browser_terminal };
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+
+    const cases = [_]struct {
+        id: []const u8,
+        input: []const u8,
+        expected: []const u8,
+    }{
+        .{ .id = "missing-action", .input = "{}", .expected = "{\"request\":{}}" },
+        .{ .id = "null-action", .input = "{\"action\":null}", .expected = "{\"request\":{\"action\":null}}" },
+        .{ .id = "non-string-action", .input = "{\"action\":7}", .expected = "{\"request\":{\"action\":7}}" },
+        .{ .id = "unknown-action", .input = "{\"action\":\"unknown\"}", .expected = "{\"request\":{\"action\":\"unknown\"}}" },
+        .{ .id = "valid-action", .input = "{\"action\":\"list\"}", .expected = "{\"request\":{\"action\":\"list\"}}" },
+        .{ .id = "null-request", .input = "{\"request\":null}", .expected = "{\"request\":{\"request\":null}}" },
+        .{ .id = "request-sibling", .input = "{\"request\":{\"action\":\"list\"},\"sibling\":true}", .expected = "{\"request\":{\"request\":{\"action\":\"list\"},\"sibling\":true}}" },
+        .{ .id = "exact-wrapper", .input = "{\"request\":{\"action\":\"list\"}}", .expected = "{\"request\":{\"action\":\"list\"}}" },
+        .{ .id = "non-object", .input = "[]", .expected = "[]" },
+    };
+    var calls: [cases.len + 3]ToolCall = undefined;
+    for (cases, 0..) |case, index| {
+        calls[index] = .{ .id = case.id, .name = "terminal", .arguments_json = case.input };
+    }
+    calls[cases.len] = .{ .id = "malformed", .name = "terminal", .arguments_json = "{", .argument_integrity = .malformed_json };
+    calls[cases.len + 1] = .{ .id = "unknown-tool", .name = "missing", .arguments_json = "{}" };
+    calls[cases.len + 2] = .{ .id = "other-executor", .name = "browser_terminal", .arguments_json = "{}" };
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "keep user message", .tool_calls = calls[0..1] },
+        .{ .role = .assistant, .content = "assistant", .tool_calls = &calls, .provider_state_json = "[]", .cache_policy = .no_cache },
+        .{ .role = .tool, .content = "keep result", .tool_call_id = "valid-action", .tool_name = "terminal" },
+    };
+
+    const projected = try project_terminal_request_messages(arena, registry, true, &messages);
+    try std.testing.expect(projected.ptr != messages[0..].ptr);
+    try std.testing.expectEqualStrings("keep user message", projected[0].content.?);
+    try std.testing.expectEqual(messages[0].tool_calls.ptr, projected[0].tool_calls.ptr);
+    try std.testing.expectEqualStrings("assistant", projected[1].content.?);
+    try std.testing.expectEqualStrings("[]", projected[1].provider_state_json.?);
+    try std.testing.expectEqual(.no_cache, projected[1].cache_policy);
+    try std.testing.expectEqualStrings("keep result", projected[2].content.?);
+    for (cases, 0..) |case, index| {
+        try std.testing.expectEqualStrings(case.expected, projected[1].tool_calls[index].arguments_json);
+        try std.testing.expectEqualStrings(case.input, messages[1].tool_calls[index].arguments_json);
+    }
+    try std.testing.expectEqualStrings("{", projected[1].tool_calls[cases.len].arguments_json);
+    try std.testing.expectEqualStrings("{}", projected[1].tool_calls[cases.len + 1].arguments_json);
+    try std.testing.expectEqualStrings("{}", projected[1].tool_calls[cases.len + 2].arguments_json);
+
+    const idempotent = try project_terminal_request_messages(arena, registry, true, projected);
+    try std.testing.expectEqual(projected.ptr, idempotent.ptr);
+    const ineligible = try project_terminal_request_messages(arena, registry, false, &messages);
+    try std.testing.expectEqual(messages[0..].ptr, ineligible.ptr);
+}
+
+fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void {
+    const terminal_tool = tool_dispatch.Tool{
+        .name = "terminal",
+        .description = "terminal",
+        .gateway_schema = .{ .name = "terminal", .description = "terminal" },
+        .executor_kind = .terminal,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    const tools = [_]tool_dispatch.Tool{terminal_tool};
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+    const first_calls = [_]ToolCall{
+        .{ .id = "one", .name = "terminal", .arguments_json = "{}" },
+        .{ .id = "two", .name = "terminal", .arguments_json = "{\"action\":null}" },
+    };
+    const second_calls = [_]ToolCall{
+        .{ .id = "three", .name = "terminal", .arguments_json = "{\"action\":\"list\"}" },
+    };
+    const source = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &first_calls },
+        .{ .role = .assistant, .tool_calls = &second_calls },
+    };
+    const projected = try project_terminal_request_messages(alloc, registry, true, &source);
+    if (projected.ptr == source[0..].ptr) return error.TestUnexpectedResult;
+    defer free_terminal_request_projection(alloc, &source, projected);
+    try std.testing.expectEqualStrings("{\"request\":{}}", projected[0].tool_calls[0].arguments_json);
+    try std.testing.expectEqualStrings("{\"request\":{\"action\":null}}", projected[0].tool_calls[1].arguments_json);
+    try std.testing.expectEqualStrings("{\"request\":{\"action\":\"list\"}}", projected[1].tool_calls[0].arguments_json);
+}
+
+test "terminal request projection cleans every partial allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        check_terminal_request_projection_allocation_failures,
+        .{},
+    );
 }
 
 test "terminal request normalization unwraps only exact eligible native calls" {
@@ -3059,7 +3252,16 @@ fn processQueuedPromptLoop(
                     job.authorized_image_catalog,
                 );
             };
-            const request_messages = projected_request_messages;
+            const terminal_request_eligible = terminal_request_normalization_eligible(
+                base_nested_terminal_advertised,
+                vision_mode,
+            );
+            const request_messages = try project_terminal_request_messages(
+                overlay_arena,
+                deps.tool_registry,
+                terminal_request_eligible,
+                projected_request_messages,
+            );
             last_gateway_message_count = request_messages.len;
             const provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);
@@ -3577,10 +3779,7 @@ fn processQueuedPromptLoop(
             stream_result.completion.tool_calls = try normalize_terminal_request_tool_calls(
                 arena,
                 deps.tool_registry,
-                terminal_request_normalization_eligible(
-                    base_nested_terminal_advertised,
-                    vision_mode,
-                ),
+                terminal_request_eligible,
                 stream_result.completion.tool_calls,
             );
             if (recovery_strategy == .reconcile_tool and

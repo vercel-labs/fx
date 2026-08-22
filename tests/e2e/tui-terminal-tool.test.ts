@@ -1444,23 +1444,27 @@ test.skipIf(!tmuxAvailable())(
       gateway.requests[1]!.body,
       "terminal_mixed_start",
     );
-    expect(mixedInput.request).toBeUndefined();
-    expect(mixedInput.action).toBe("start");
-    expect(mixedInput.session_id).toBe("terminal-foreign");
+    expect(mixedInput.request).toEqual(expect.objectContaining({
+      action: "start",
+      session_id: "terminal-foreign",
+    }));
     const validStartInput = toolCallInput(
       gateway.requests[2]!.body,
       "terminal_valid_start",
     );
-    expect(validStartInput.request).toBeUndefined();
-    expect(validStartInput.action).toBe("start");
+    expect(validStartInput.request).toEqual(expect.objectContaining({
+      action: "start",
+    }));
     const validCloseInput = toolCallInput(
       gateway.requests[3]!.body,
       "terminal_valid_close",
     );
     expect(validCloseInput).toEqual({
-      action: "close",
-      session_id: terminalSessionId,
-      close_policy: "force",
+      request: {
+        action: "close",
+        session_id: terminalSessionId,
+        close_policy: "force",
+      },
     });
 
     const scrollback = await active.captureFullScrollback();
@@ -1554,30 +1558,32 @@ test.skipIf(!tmuxAvailable())(
       {
         id: "terminal_s_1",
         input: {
-          unknown_zeta: null,
-          action: "start",
-          session_id: "terminal-a",
-          sections: null,
+          request: {
+            action: "inspect",
+            session_id: "terminal-a",
+            sections: null,
+          },
         },
       },
       {
         id: "terminal_t_1",
-        input: { action: "list" },
+        input: { request: { action: "list" } },
       },
     ];
     const secondBatch = [
       {
         id: "terminal_s_2",
         input: {
-          sections: null,
-          session_id: "terminal-b",
-          action: "start",
-          unknown_zeta: null,
+          request: {
+            sections: null,
+            session_id: "terminal-b",
+            action: "inspect",
+          },
         },
       },
       {
         id: "terminal_t_2",
-        input: { action: "list" },
+        input: { request: { action: "list" } },
       },
     ];
     const gateway = startFakeGateway([
@@ -1587,10 +1593,14 @@ test.skipIf(!tmuxAvailable())(
           toolResultText(body, "terminal_s_1"),
         ).error;
         expect(correction.code).toBe("invalid_action_fields");
-        expect(correction.invalid_fields).toEqual([
+        expect(correction.action).toBe("inspect");
+        expect(correction.invalid_fields).toEqual(["sections"]);
+        expect(correction.allowed_fields).toEqual([
+          "action",
           "session_id",
-          "sections",
-          "unknown_zeta",
+          "after_event_id",
+          "acknowledge_event_id",
+          "max_events",
         ]);
         expect(JSON.parse(toolResultText(body, "terminal_t_1")).success.list)
           .toBeDefined();
@@ -1601,7 +1611,10 @@ test.skipIf(!tmuxAvailable())(
       },
     ]);
     gateways.push(gateway);
-    const active = await launch(fixture, gateway);
+    const active = await launch(fixture, gateway, {
+      FX_TRACE_SCOPES:
+        "input,terminal,terminal_client,terminal_store,terminal_host,agent,worker,gateway,tool,permission",
+    });
 
     await active.sendText("Exercise repeated terminal validation corrections.");
     const pane = await active.waitForText(
@@ -1611,9 +1624,63 @@ test.skipIf(!tmuxAvailable())(
     expect(pane).toContain("no terminal effect");
     expect(gateway.requests).toHaveLength(2);
     expect(terminalRecords(fixture.home)).toEqual([]);
+
+    const committed = sessionEventLogs(fixture.home)
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as any)
+      .find((event) =>
+        event.kind === "history_turn_committed" &&
+        event.payload?.turn?.execution?.tool_steps?.some((step: any) =>
+          step.tool_calls?.some((call: any) => call.id === "terminal_s_2")
+        )
+      );
+    expect(committed).toBeDefined();
+    const secondStep = committed.payload.turn.execution.tool_steps.find(
+      (step: any) =>
+        step.tool_calls?.some((call: any) => call.id === "terminal_s_2"),
+    );
+    const secondInspect = secondStep.tool_results.find(
+      (result: any) => result.tool_call_id === "terminal_s_2",
+    );
+    const secondList = secondStep.tool_results.find(
+      (result: any) => result.tool_call_id === "terminal_t_2",
+    );
+    expect(secondInspect.status).toBe("failure");
+    expect(JSON.parse(secondInspect.output).error).toEqual({
+      code: "invalid_action_fields",
+      action: "inspect",
+      invalid_fields: ["sections"],
+      missing_fields: [],
+      allowed_fields: [
+        "action",
+        "session_id",
+        "after_event_id",
+        "acknowledge_event_id",
+        "max_events",
+      ],
+      conflicts: [],
+    });
+    expect(secondList.status).toBe("success");
+    expect(JSON.parse(secondList.output).success.list).toBeDefined();
+
     const trace = readFileSync(fixture.tracePath, "utf8");
-    expect(trace).not.toContain("event=permission_requested");
-    expect(trace).not.toContain("event=before_tool_execution");
+    for (const callId of ["terminal_s_1", "terminal_s_2"]) {
+      expect(trace).not.toMatch(
+        new RegExp(`event=permission_requested[^\\n]*call_id=${callId}\\b`),
+      );
+      expect(trace).not.toMatch(
+        new RegExp(`event=before_tool_execution[^\\n]*call_id=${callId}\\b`),
+      );
+    }
+    for (const callId of ["terminal_t_1", "terminal_t_2"]) {
+      expect(trace).toMatch(
+        new RegExp(`event=permission_requested[^\\n]*call_id=${callId}\\b`),
+      );
+      expect(trace).toMatch(
+        new RegExp(`event=before_tool_execution[^\\n]*call_id=${callId}\\b`),
+      );
+    }
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,

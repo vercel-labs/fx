@@ -2690,7 +2690,7 @@ describe("gateway stream lifecycle", () => {
       );
       expect(historicalCalls).toHaveLength(1);
       expect(historicalCalls[0]).toEqual(
-        expect.objectContaining({ input: {} }),
+        expect.objectContaining({ input: { request: {} } }),
       );
       expect(historicalResults).toHaveLength(1);
       expect(gateway.requests[2].body).toContain("tool_execution_failed");
