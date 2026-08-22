@@ -3,7 +3,6 @@ const permission_auto_classifier = @import("../core/permissions/auto_classifier.
 const gateway_json = @import("../core/gateway/gateway_json.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const types = @import("../core/shared/types.zig");
-const session_usage = @import("../core/session/session_usage.zig");
 const openai_codex = @import("openai_codex.zig");
 const openai_codex_models = @import("openai_codex_models.zig");
 
@@ -16,8 +15,6 @@ pub const provider = permission_auto_classifier.Provider{
 const ReviewConfig = struct {
     credential: []const u8,
     cancel_flag: ?*std.atomic.Value(bool),
-    usage: ?*session_usage.Usage,
-    usage_allocator: Allocator,
 };
 
 fn reviewCodex(
@@ -30,8 +27,6 @@ fn reviewCodex(
     var config = ReviewConfig{
         .credential = input.credential,
         .cancel_flag = input.cancel_flag,
-        .usage = input.usage,
-        .usage_allocator = input.usage_allocator,
     };
     return permission_auto_classifier.Reviewer.withTransportModel(
         .{
@@ -104,7 +99,6 @@ fn sendReview(
     var delivery = stream_provider.DeliveryCertainty.init();
     var evidence: stream_provider.AttemptEvidence = .{};
     var callback_context: u8 = 0;
-    const usage_observation = try session_usage.GatewayObservation.begin(config.usage);
     var result = openai_codex.agent_stream_provider.stream(alloc, .{
         .api_key = config.credential,
         .credential_source = .chatgpt_subscription,
@@ -124,23 +118,12 @@ fn sendReview(
         .cancel_flag = cancel_flag,
         .provider_attempt_owner = .transport,
     }) catch |err| {
-        usage_observation.fail(if (delivery.load() == .possibly_sent)
-            .ambiguous_delivery
-        else
-            .unbilled) catch return .permanent_failure;
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (err == error.Cancelled or cancel_flag.load(.seq_cst)) return .cancelled;
         return .transient_failure;
     };
     var result_owned = true;
     defer if (result_owned) result.deinit(alloc);
-    usage_observation.complete(
-        config.usage_allocator,
-        result.status,
-        result.completion,
-        "https://chatgpt.com/backend-api/codex",
-        null,
-    ) catch return .permanent_failure;
     if (cancel_flag.load(.seq_cst)) return .cancelled;
     if (result.status != .ok) {
         const code: u16 = @intFromEnum(result.status);

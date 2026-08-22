@@ -53,7 +53,8 @@ pub fn streamGatewayCompletion(
 ) !StreamResult {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const started_at_ms = io_mod.milliTimestamp();
-    const usage_observation = try session_usage.GatewayObservation.begin(usage);
+    const observed_usage = if (provider.observes_gateway_usage) usage else null;
+    const usage_observation = try session_usage.GatewayObservation.begin(observed_usage);
     attempt_evidence.provider_admitted = true;
     var result = provider.stream(alloc, .{
         .api_key = api_key,
@@ -445,4 +446,85 @@ test "possibly sent gateway failure marks billing incomplete" {
     try std.testing.expectEqual(session_usage.Availability.incomplete, snapshot.billing);
     try std.testing.expect(snapshot.api_duration_complete);
     try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
+}
+
+test "provider-local streams do not consume Gateway observation capacity" {
+    const LocalProvider = struct {
+        calls: usize = 0,
+
+        fn stream(
+            raw: ?*anyopaque,
+            _: Allocator,
+            request: agent_stream_provider.Request,
+        ) anyerror!agent_stream_provider.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            request.delivery.markPossiblySent();
+            return .{
+                .status = .ok,
+                .completion = .{
+                    .generation_id = "resp_provider_local",
+                    .finish_reason = .stop,
+                    .usage = .{ .input_tokens = 3, .output_tokens = 1 },
+                },
+            };
+        }
+    };
+    const Callbacks = struct {
+        fn content(_: *anyopaque, _: []const u8) void {}
+    };
+
+    const alloc = std.testing.allocator;
+    var local_provider: LocalProvider = .{};
+    const provider = agent_stream_provider.Provider{
+        .context = &local_provider,
+        .stream_fn = LocalProvider.stream,
+        .observes_gateway_usage = false,
+    };
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var callback_ctx: u8 = 0;
+
+    for (0..65) |_| {
+        var delivery = DeliveryCertainty.init();
+        var attempt_evidence: AttemptEvidence = .{};
+        const result = try streamGatewayCompletion(
+            provider,
+            alloc,
+            "subscription-token",
+            .chatgpt_subscription,
+            "acct_test",
+            null,
+            "session-test",
+            "gpt-test",
+            1,
+            "https://provider.example/responses",
+            "{}",
+            null,
+            &delivery,
+            &attempt_evidence,
+            &callback_ctx,
+            Callbacks.content,
+            null,
+            null,
+            null,
+            &cancel_flag,
+            &usage,
+            alloc,
+            .{},
+            null,
+            .agent,
+        );
+        try std.testing.expectEqual(std.http.Status.ok, result.status);
+    }
+
+    try std.testing.expectEqual(@as(usize, 65), local_provider.calls);
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(session_usage.Availability.complete, snapshot.billing);
+    try std.testing.expect(snapshot.api_duration_complete);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.next_sequence);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.settled_through_sequence);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.pending.len);
 }

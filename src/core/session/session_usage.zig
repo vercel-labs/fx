@@ -146,7 +146,7 @@ pub const GatewayObservation = struct {
             );
             return;
         }
-        try ledger.finishObservedInvocationDurably(
+        const accepted = try ledger.finishObservedInvocationDurably(
             alloc,
             self.sequence,
             self.elapsedMs(),
@@ -155,6 +155,7 @@ pub const GatewayObservation = struct {
             origin,
             team,
         );
+        if (!accepted) return;
         debug_trace.logf(
             "session",
             "usage generation queued sequence={d} id={s}",
@@ -481,9 +482,9 @@ pub const Usage = struct {
         id: []const u8,
         origin: []const u8,
         team: ?[]const u8,
-    ) !void {
+    ) !bool {
         self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
-        self.finishObservedInvocation(
+        const accepted = self.finishObservedInvocationAccepted(
             alloc,
             sequence,
             duration_ms,
@@ -501,10 +502,11 @@ pub const Usage = struct {
             );
             self.checkpoint_mutex.unlock(io_mod.getIo());
             self.flushProfilePublications();
-            return;
+            return false;
         };
         _ = self.persistCheckpointBestEffortLocked();
         self.checkpoint_mutex.unlock(io_mod.getIo());
+        return accepted;
     }
 
     fn persistCheckpointRequiredLocked(self: *Usage) !void {
@@ -561,18 +563,39 @@ pub const Usage = struct {
         origin: []const u8,
         team: ?[]const u8,
     ) !void {
+        _ = try self.finishObservedInvocationAccepted(
+            alloc,
+            sequence,
+            duration_ms,
+            outcome,
+            id,
+            origin,
+            team,
+        );
+    }
+
+    fn finishObservedInvocationAccepted(
+        self: *Usage,
+        alloc: Allocator,
+        sequence: u64,
+        duration_ms: u64,
+        outcome: DeliveryOutcome,
+        id: []const u8,
+        origin: []const u8,
+        team: ?[]const u8,
+    ) !bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (!self.finishInvocationUnlocked(sequence, duration_ms, outcome)) return false;
         try validateGenerationId(id);
         try validateOrigin(origin);
         if (team) |value| try validateTeam(value);
-
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        if (!self.finishInvocationUnlocked(sequence, duration_ms, outcome)) return;
         self.observeGenerationUnlocked(alloc, sequence, id, origin, team) catch |err| {
             self.billing = .incomplete;
             self.dirty = true;
             return err;
         };
+        return true;
     }
 
     fn finishInvocationUnlocked(
@@ -3023,7 +3046,7 @@ test "restored publication backlog settles the pending generation exactly" {
     });
 
     const sequence = try source.reserveInvocationDurably();
-    try source.finishObservedInvocationDurably(
+    _ = try source.finishObservedInvocationDurably(
         alloc,
         sequence,
         1,
@@ -3110,7 +3133,7 @@ test "no-checkpoint usage drains a transient publication failure" {
     });
 
     const sequence = try usage.reserveInvocationDurably();
-    try usage.finishObservedInvocationDurably(
+    _ = try usage.finishObservedInvocationDurably(
         alloc,
         sequence,
         1,
@@ -3617,7 +3640,10 @@ test "active invocation capacity fails before Gateway admission" {
         GatewayObservation.begin(&usage),
     );
 
-    for (observations) |observation| try observation.fail(.unbilled);
+    try observations[0].fail(.unbilled);
+    const replacement = try GatewayObservation.begin(&usage);
+    for (observations[1..]) |observation| try observation.fail(.unbilled);
+    try replacement.fail(.unbilled);
     var snapshot = try usage.snapshot(alloc);
     defer snapshot.deinit(alloc);
     try std.testing.expectEqual(Availability.complete, snapshot.billing);
@@ -3649,7 +3675,99 @@ test "generation allocation failure marks billing incomplete before snapshot" {
     var snapshot = try usage.snapshot(alloc);
     defer snapshot.deinit(alloc);
     try std.testing.expectEqual(Availability.incomplete, snapshot.billing);
+    try std.testing.expect(snapshot.api_duration_complete);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
     try std.testing.expectEqual(@as(usize, 0), snapshot.pending.len);
+}
+
+test "invalid generation identity settles the Gateway observation" {
+    const alloc = std.testing.allocator;
+    var usage = Usage.initFresh();
+    defer usage.deinit(alloc);
+
+    const observation = try GatewayObservation.begin(&usage);
+    try observation.complete(
+        alloc,
+        .ok,
+        .{ .generation_id = "resp_provider_local" },
+        "https://ai-gateway.vercel.sh",
+        null,
+    );
+
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(Availability.incomplete, snapshot.billing);
+    try std.testing.expect(snapshot.api_duration_complete);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.pending.len);
+}
+
+test "rejected observed generation settles without publishing its identity or billing" {
+    const alloc = std.testing.allocator;
+    const rejected_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const PublicationProbe = struct {
+        rejected_id: []const u8,
+        pending: usize = 0,
+        generations: usize = 0,
+        incidents: usize = 0,
+
+        fn publish(raw: *anyopaque, event: usage_report.ProfileEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            switch (event) {
+                .pending => |marker| {
+                    if (std.mem.eql(u8, marker.id, self.rejected_id)) self.pending += 1;
+                },
+                .generation => |fact| {
+                    if (std.mem.eql(u8, fact.id, self.rejected_id)) self.generations += 1;
+                },
+                .incident => self.incidents += 1,
+            }
+        }
+    };
+
+    var probe = PublicationProbe{ .rejected_id = rejected_id };
+    var usage = Usage.initFresh();
+    defer usage.deinit(alloc);
+    usage.configurePublicationSink(.{
+        .context = &probe,
+        .allocator = alloc,
+        .publish = PublicationProbe.publish,
+    });
+
+    const observation = try GatewayObservation.begin(&usage);
+    try observation.complete(
+        alloc,
+        .ok,
+        .{
+            .generation_id = rejected_id,
+            .billing = .{
+                .created_at_ms = 1,
+                .model = "provider/model",
+                .total_cost = 0.25,
+                .input_tokens = 10,
+                .output_tokens = 2,
+                .cache_read_tokens = 1,
+                .cache_write_tokens = 0,
+                .reasoning_tokens = 1,
+                .billable_web_search_calls = 0,
+            },
+        },
+        "https://provider.example\ninvalid",
+        null,
+    );
+
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(Availability.incomplete, snapshot.billing);
+    try std.testing.expect(snapshot.api_duration_complete);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.pending.len);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.input_tokens);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.output_tokens);
+    try std.testing.expectEqual(@as(f64, 0), snapshot.total_cost);
+    try std.testing.expectEqual(@as(usize, 0), probe.pending);
+    try std.testing.expectEqual(@as(usize, 0), probe.generations);
+    try std.testing.expectEqual(@as(usize, 1), probe.incidents);
 }
 
 test "concurrent invocation completion and snapshots stay internally consistent" {
@@ -3905,6 +4023,67 @@ test "terminal Gateway billing settles the durable observation immediately" {
     try std.testing.expectEqual(@as(u64, 130), snapshot.input_tokens);
     try std.testing.expectEqual(@as(u64, 25), snapshot.output_tokens);
     try std.testing.expectEqual(@as(u64, 2), snapshot.billable_web_search_calls);
+}
+
+test "duplicate Gateway terminal callback does not republish inline billing" {
+    const alloc = std.testing.allocator;
+    const PublicationProbe = struct {
+        generations: usize = 0,
+
+        fn publish(raw: *anyopaque, event: usage_report.ProfileEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            switch (event) {
+                .generation => self.generations += 1,
+                .pending, .incident => {},
+            }
+        }
+    };
+
+    var probe = PublicationProbe{};
+    var usage = Usage.initFresh();
+    defer usage.deinit(alloc);
+    usage.configurePublicationSink(.{
+        .context = &probe,
+        .allocator = alloc,
+        .publish = PublicationProbe.publish,
+    });
+
+    const observation = try GatewayObservation.begin(&usage);
+    const completion: types.GatewayCompletion = .{
+        .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        .billing = .{
+            .created_at_ms = 100,
+            .model = "provider/model",
+            .total_cost = 0.0123,
+            .input_tokens = 130,
+            .output_tokens = 25,
+            .cache_read_tokens = 20,
+            .cache_write_tokens = 10,
+            .reasoning_tokens = 5,
+            .billable_web_search_calls = 2,
+        },
+    };
+    try observation.complete(
+        alloc,
+        .ok,
+        completion,
+        "https://ai-gateway.vercel.sh",
+        null,
+    );
+    try observation.complete(
+        alloc,
+        .ok,
+        completion,
+        "https://ai-gateway.vercel.sh",
+        null,
+    );
+
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), probe.generations);
+    try std.testing.expectEqual(@as(f64, 0.0123), snapshot.total_cost);
+    try std.testing.expectEqual(@as(u64, 130), snapshot.input_tokens);
+    try std.testing.expectEqual(@as(u64, 25), snapshot.output_tokens);
 }
 
 test "successful retry after ambiguous delivery retains known generation" {

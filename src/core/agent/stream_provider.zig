@@ -185,6 +185,7 @@ pub const BuildFn = *const fn (
 pub const Provider = struct {
     /// When set, context must remain valid until every in-flight `stream` returns.
     context: ?*anyopaque = null,
+    observes_gateway_usage: bool = true,
     build_fn: BuildFn = unavailableBuild,
     stream_fn: StreamFn,
 
@@ -209,6 +210,10 @@ fn unavailableStream(_: ?*anyopaque, _: Allocator, _: Request) anyerror!Result {
 pub const unavailable_provider = Provider{
     .stream_fn = unavailableStream,
 };
+
+test "stream providers observe Gateway usage by default" {
+    try std.testing.expect(unavailable_provider.observes_gateway_usage);
+}
 
 test "stream provider dispatches request and preserves ordered callbacks" {
     const Fake = struct {

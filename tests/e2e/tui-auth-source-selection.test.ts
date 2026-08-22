@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -115,6 +116,28 @@ function writeSeededGrokLogin(testHome: string, accessToken: string, accountId =
     account_id: accountId,
   }) + "\n", { mode: 0o600 });
   chmodSync(authPath, 0o600);
+}
+
+function readSingleUsageSnapshot(testHome: string): {
+  billing: string;
+  next_sequence: number;
+  settled_through_sequence: number;
+  pending: unknown[];
+} {
+  const sessionsDir = join(testHome, ".fx", "sessions");
+  const usagePaths = readdirSync(sessionsDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => join(sessionsDir, entry.name, "usage-v2.json"))
+    .filter((path) => existsSync(path));
+  expect(usagePaths).toHaveLength(1);
+  return (JSON.parse(readFileSync(usagePaths[0]!, "utf8")) as {
+    snapshot: {
+      billing: string;
+      next_sequence: number;
+      settled_through_sequence: number;
+      pending: unknown[];
+    };
+  }).snapshot;
 }
 
 function writeSeededFxLogin(
@@ -734,6 +757,45 @@ function startFakeCodexToolLoop(options: {
       return new Response(
         `data: ${JSON.stringify({ type: "response.output_text.delta", delta: finalText })}\n\n` +
           'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":7,"output_tokens":3}}}\n\n',
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
+  return {
+    accessToken,
+    bodies,
+    responsesUrl: `http://127.0.0.1:${server.port}/responses`,
+    modelsUrl: `http://127.0.0.1:${server.port}/models`,
+    stop() { server.stop(true); },
+  };
+}
+
+function startFakeCodexCapacityLoop() {
+  const bodies: string[] = [];
+  const accessToken = chatgptAccessToken("acct_capacity_loop");
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      if (new URL(request.url).pathname === "/models") {
+        return Response.json({ models: [
+          { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
+        ] });
+      }
+      bodies.push(await request.text());
+      const call = bodies.length;
+      if (call <= 64) {
+        return new Response(
+          `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 0, item: { type: "function_call", call_id: `call_capacity_${call}`, name: "read_file" } })}\n\n` +
+            `data: ${JSON.stringify({ type: "response.function_call_arguments.done", output_index: 0, arguments: JSON.stringify({ path: "README.md", start_line: call, line_count: 1 }) })}\n\n` +
+            `data: ${JSON.stringify({ type: "response.completed", response: { id: `resp_capacity_${call}`, status: "completed", usage: { input_tokens: 5, output_tokens: 2 } } })}\n\n`,
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      const text = call === 65 ? "CODEX_CAPACITY_65_OK" : "CODEX_CAPACITY_NEXT_OK";
+      return new Response(
+        `data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\n` +
+          `data: ${JSON.stringify({ type: "response.completed", response: { id: `resp_capacity_${call}`, status: "completed", usage: { input_tokens: 7, output_tokens: 3 } } })}\n\n`,
         { headers: { "content-type": "text/event-stream" } },
       );
     },
@@ -2479,6 +2541,44 @@ test(
   60_000,
 );
 
+tmuxTest(
+  "Codex remains usable beyond Gateway observation capacity in one process",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-capacity-loop-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexCapacityLoop();
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Read enough lines to complete the capacity loop.");
+      await session.waitForText("CODEX_CAPACITY_65_OK", 120_000);
+      expect(codex.bodies).toHaveLength(65);
+
+      await session.sendText("Confirm the same process remains usable.");
+      await session.waitForText("CODEX_CAPACITY_NEXT_OK", TIMEOUT);
+      expect(codex.bodies).toHaveLength(66);
+      expect(await session.captureFullScrollback()).not.toContain("UsageCapacityExceeded");
+      expect(gateway.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  150_000,
+);
+
 test(
   "Grok tool loops round-trip encrypted reasoning without Gateway leakage",
   async () => {
@@ -2712,7 +2812,7 @@ test(
         { mode: 0o600 },
       );
       const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Run pwd, then finish."],
+        ["ask", "--json", "--auto", "Run pwd, then finish."],
         {
           env: {
             HOME: home,
@@ -2736,6 +2836,12 @@ test(
       for (const request of gateway.requests) {
         expect(request.body).not.toContain("permission_decision");
       }
+      expect(readSingleUsageSnapshot(home)).toMatchObject({
+        billing: "complete",
+        next_sequence: 1,
+        settled_through_sequence: 0,
+        pending: [],
+      });
     } finally {
       codex.stop();
     }
@@ -2757,7 +2863,7 @@ test(
         { mode: 0o600 },
       );
       const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Run pwd, then finish."],
+        ["ask", "--json", "--auto", "Run pwd, then finish."],
         {
           env: {
             HOME: home,
@@ -2791,6 +2897,12 @@ test(
       for (const request of gateway.requests) {
         expect(request.body).not.toContain("permission_decision");
       }
+      expect(readSingleUsageSnapshot(home)).toMatchObject({
+        billing: "complete",
+        next_sequence: 1,
+        settled_through_sequence: 0,
+        pending: [],
+      });
     } finally {
       grok.stop();
     }

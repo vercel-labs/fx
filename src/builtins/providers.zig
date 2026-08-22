@@ -1,3 +1,4 @@
+const std = @import("std");
 const model_provider = @import("../core/config/model_provider.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
@@ -21,4 +22,10 @@ pub fn modelCatalog(provider: model_provider.ProviderId) model_catalog.Provider 
         .codex => openai_codex_models.model_catalog_provider,
         .grok => xai_grok_models.model_catalog_provider,
     };
+}
+
+test "subscription providers opt out of Gateway usage observation" {
+    try std.testing.expect(agentStream(.gateway).observes_gateway_usage);
+    try std.testing.expect(!agentStream(.codex).observes_gateway_usage);
+    try std.testing.expect(!agentStream(.grok).observes_gateway_usage);
 }

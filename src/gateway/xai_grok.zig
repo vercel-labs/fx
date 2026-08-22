@@ -25,6 +25,7 @@ const transfer_buffer_bytes: usize = 256 * 1024;
 const connect_timeout_ms: i64 = 30_000;
 
 pub const agent_stream_provider = stream_provider.Provider{
+    .observes_gateway_usage = false,
     .build_fn = buildRequest,
     .stream_fn = streamCompletion,
 };

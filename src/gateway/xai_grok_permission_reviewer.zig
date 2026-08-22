@@ -3,7 +3,6 @@ const permission_auto_classifier = @import("../core/permissions/auto_classifier.
 const gateway_json = @import("../core/gateway/gateway_json.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const types = @import("../core/shared/types.zig");
-const session_usage = @import("../core/session/session_usage.zig");
 const xai_grok = @import("xai_grok.zig");
 
 const Allocator = std.mem.Allocator;
@@ -16,8 +15,6 @@ const ReviewConfig = struct {
     credential: []const u8,
     account_id: []const u8,
     cancel_flag: ?*std.atomic.Value(bool),
-    usage: ?*session_usage.Usage,
-    usage_allocator: Allocator,
 };
 
 fn reviewGrok(
@@ -32,8 +29,6 @@ fn reviewGrok(
         .credential = input.credential,
         .account_id = account_id,
         .cancel_flag = input.cancel_flag,
-        .usage = input.usage,
-        .usage_allocator = input.usage_allocator,
     };
     return permission_auto_classifier.Reviewer.withTransportModel(
         .{
@@ -106,7 +101,6 @@ fn sendReview(
     var delivery = stream_provider.DeliveryCertainty.init();
     var evidence: stream_provider.AttemptEvidence = .{};
     var callback_context: u8 = 0;
-    const usage_observation = try session_usage.GatewayObservation.begin(config.usage);
     var result = xai_grok.agent_stream_provider.stream(alloc, .{
         .api_key = config.credential,
         .credential_source = .grok_subscription,
@@ -128,21 +122,10 @@ fn sendReview(
         .cancel_flag = cancel_flag,
         .provider_attempt_owner = .transport,
     }) catch |err| {
-        usage_observation.fail(if (delivery.load() == .possibly_sent)
-            .ambiguous_delivery
-        else
-            .unbilled) catch return .permanent_failure;
         return mapStreamError(err, cancel_flag);
     };
     var result_owned = true;
     defer if (result_owned) result.deinit(alloc);
-    usage_observation.complete(
-        config.usage_allocator,
-        result.status,
-        result.completion,
-        "https://api.x.ai/v1",
-        null,
-    ) catch return .permanent_failure;
     if (cancel_flag.load(.seq_cst)) return .cancelled;
     if (result.status != .ok) {
         const code: u16 = @intFromEnum(result.status);
