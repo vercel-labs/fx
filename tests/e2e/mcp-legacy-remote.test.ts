@@ -441,10 +441,10 @@ describe("version-scoped legacy MCP remote transports", () => {
     // without a delay: roughly three seconds of listener lifetime here. The
     // lower bound is what keeps the upper bound honest -- without it the test
     // passes just as well when the listener never runs at all. Before the
-    // floor this fixture drew 13946 reconnects.
-    // Spacing first: it is the property the floor actually guarantees, and a
-    // count in a window is satisfied by any floor at all. 400ms rather than
-    // 500ms leaves room for scheduler jitter without admitting a storm.
+    // default this fixture drew 13946 reconnects.
+    // Spacing first: it is the property the default actually guarantees, and a
+    // count in a window is satisfied by any delay at all. 800ms rather than
+    // 1000ms leaves room for scheduler jitter without admitting a storm.
     const listenerGets = streamable.requests.filter((entry) =>
       entry.httpMethod === "GET" && entry.at !== undefined
     );
@@ -452,7 +452,7 @@ describe("version-scoped legacy MCP remote transports", () => {
       entry.at! - listenerGets[index]!.at!
     );
     expect(gaps.length).toBeGreaterThanOrEqual(1);
-    expect(Math.min(...gaps)).toBeGreaterThanOrEqual(400);
+    expect(Math.min(...gaps)).toBeGreaterThanOrEqual(800);
 
     expect(streamable.resumeCalls).toBeGreaterThanOrEqual(2);
     expect(streamable.resumeCalls).toBeLessThanOrEqual(10);
@@ -481,7 +481,7 @@ describe("version-scoped legacy MCP remote transports", () => {
     expect(streamable.cancellationNotifications).toBeGreaterThanOrEqual(1);
   }, 30_000);
 
-  test("Streamable HTTP listener floors a server retry hint below its minimum", async () => {
+  test("Streamable HTTP listener reconnects on the server's own retry hint", async () => {
     streamable = startLegacyStreamableHttpFixture("2025-06-18", {
       listChanged: true,
       mode: "retry_hint_listener",
@@ -502,10 +502,23 @@ describe("version-scoped legacy MCP remote transports", () => {
     const result = await runAsk(root, gateway, "Use the legacy tool.");
 
     expect(result.code).toBe(0);
-    // `retry: 1` is a server-supplied delay below the client's floor. Honouring
-    // it verbatim is the same request storm as no delay at all.
+    // SEP-1699 makes the retry field a MUST, so a server that asked for 500ms
+    // gets 500ms and not the client's own default. Both bounds matter: the
+    // lower one is the conformance suite's "reconnected too early", the upper
+    // one is its "very late" threshold at twice the hint, which is exactly
+    // what a 1000ms default applied on top of the hint would trip.
+    const listenerGets = streamable.requests.filter((entry) =>
+      entry.httpMethod === "GET" && entry.at !== undefined
+    );
+    const gaps = listenerGets.slice(1).map((entry, index) =>
+      entry.at! - listenerGets[index]!.at!
+    );
+    expect(gaps.length).toBeGreaterThanOrEqual(1);
+    expect(Math.min(...gaps)).toBeGreaterThanOrEqual(450);
+    expect(Math.max(...gaps)).toBeLessThan(1_000);
+
     expect(streamable.resumeCalls).toBeGreaterThanOrEqual(2);
-    expect(streamable.resumeCalls).toBeLessThanOrEqual(10);
+    expect(streamable.resumeCalls).toBeLessThanOrEqual(12);
   }, 30_000);
 
   test("Streamable HTTP call resume waits between attempts when the server keeps closing", async () => {
@@ -519,7 +532,7 @@ describe("version-scoped legacy MCP remote transports", () => {
 
     expect(result.code).toBe(0);
     // The tool call never receives a final response, so it resumes until the
-    // operation deadline. Each resume must wait. Before the floor this fixture
+    // operation deadline. Each resume must wait. Before the default this fixture
     // drew 16953 resume requests in five seconds.
     expect(streamable.resumeCalls).toBeGreaterThanOrEqual(2);
     expect(streamable.resumeCalls).toBeLessThanOrEqual(10);

@@ -118,10 +118,11 @@ export function startLegacyStreamableHttpFixture(
         });
         resumeCalls += 1;
         if (mode === "retry_hint_listener") {
-          // A server asking to be reconnected to almost immediately. The
-          // client is expected to treat its own floor as a minimum rather
-          // than honour a hint below it.
-          return new Response("retry: 1\n\n", {
+          // A server that closes the listener stream immediately but says how
+          // long to wait first. The client is expected to honor the hint
+          // rather than substitute its own delay. 500ms is the value the MCP
+          // conformance suite uses for the same check.
+          return new Response("retry: 500\n\n", {
             headers: { "content-type": "text/event-stream" },
           });
         }
