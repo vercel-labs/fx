@@ -1627,7 +1627,7 @@ test "auth picker composes only detected credential sources" {
         .include_skip = false,
     };
     const row_count = authPickerRowCount(view);
-    try std.testing.expectEqual(@as(u16, 6), row_count);
+    try std.testing.expectEqual(@as(u16, 7), row_count);
 
     var header = try composeAuthPickerRow(alloc, view, 0, row_count, 80);
     defer header.deinit(alloc);
@@ -1645,12 +1645,16 @@ test "auth picker composes only detected credential sources" {
     defer setup.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, setup.items, "API key") != null);
 
-    var change_team = try composeAuthPickerRow(alloc, view, 4, row_count, 80);
+    var custom_setup = try composeAuthPickerRow(alloc, view, 4, row_count, 80);
+    defer custom_setup.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, custom_setup.items, "OpenAI-compatible endpoint") != null);
+
+    var change_team = try composeAuthPickerRow(alloc, view, 5, row_count, 80);
     defer change_team.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, change_team.items, "Change team") != null);
     try std.testing.expect(std.mem.find(u8, change_team.items, "sign in first") != null);
 
-    var switch_credential = try composeAuthPickerRow(alloc, view, 5, row_count, 80);
+    var switch_credential = try composeAuthPickerRow(alloc, view, 6, row_count, 80);
     defer switch_credential.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, switch_credential.items, "Switch credential") != null);
 }

@@ -421,7 +421,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
     .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "choose Vercel or Codex sign-in", .presentation_category = .account },
     .{ .kind = .logout, .command = "/logout", .help_entry = "/logout [vercel|codex]", .completion_description = "sign out of a provider session", .presentation_category = .account, .has_args = true, .accepts_payload = true },
-    .{ .kind = .setup, .command = "/setup", .display_command = "/setup [custom]", .help_entry = "/setup [custom]", .completion_description = "manage accounts and custom provider access", .presentation_category = .account, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
+    .{ .kind = .setup, .command = "/setup", .help_entry = "/setup", .completion_description = "manage accounts and provider access", .presentation_category = .account, .show_in_welcome = true },
     .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show token and turn statistics", .presentation_category = .account },
     .{ .kind = .usage, .command = "/usage", .aliases = &.{"/cost"}, .help_entry = "/usage (/cost)", .completion_description = "show local fx tokens, models, and spend", .presentation_category = .account },
     .{ .kind = .status, .command = "/status", .help_entry = "/status", .completion_description = "show runtime configuration", .presentation_category = .general, .show_in_welcome = true },

@@ -274,6 +274,17 @@ pub fn Runtime(comptime App: type) type {
                         prepareApiKeyInputBoundary(app);
                         app.auth.openApiKeyPickerFromRoot(app.alloc);
                     },
+                    .custom_setup => {
+                        if (comptime !runtime_profile.allows(App, .native_auth)) {
+                            try app.writeDomainNotice(.{
+                                .topic = "setup",
+                                .tone = .warning,
+                                .body = "Custom provider setup is unavailable in this WASM session.",
+                            }, true);
+                            return;
+                        }
+                        try app.runCustomProviderSetup();
+                    },
                     .change_team => try beginTeamPicker(app),
                     .switch_credential => app.auth.openSwitchCredentialPicker(app.alloc),
                     .automatic => try applyAutomaticCredential(app),

@@ -145,6 +145,7 @@ pub const AcquisitionAction = enum {
     login,
     chatgpt_login,
     setup,
+    custom_setup,
     change_team,
     switch_credential,
     /// Clears a remembered choice so resolution returns to plain precedence.
@@ -379,11 +380,11 @@ pub const PickerView = struct {
     pub fn choiceCount(self: PickerView) usize {
         return switch (self.stage) {
             .root => if (self.include_skip)
-                if (comptime host_target.is_wasm) 2 else 3
+                if (comptime host_target.is_wasm) 2 else 4
             else if (comptime host_target.is_wasm)
                 4
             else
-                5,
+                6,
             .provider => 2,
             .sign_in, .api_key => 0,
             .change_team => blk: {
@@ -404,12 +405,14 @@ pub const PickerView = struct {
                     switch (index) {
                         0 => .{ .action = .login },
                         1 => .{ .action = .setup },
+                        2 => .{ .action = .custom_setup },
                         else => null,
                     }
                 else switch (index) {
                     0 => .{ .action = .login },
                     1 => .{ .action = .chatgpt_login },
                     2 => .{ .action = .setup },
+                    3 => .{ .action = .custom_setup },
                     else => null,
                 }
             else if (comptime host_target.is_wasm)
@@ -424,8 +427,9 @@ pub const PickerView = struct {
                 0 => .{ .action = .login },
                 1 => .{ .action = .chatgpt_login },
                 2 => .{ .action = .setup },
-                3 => .{ .action = .change_team },
-                4 => .{ .action = .switch_credential },
+                3 => .{ .action = .custom_setup },
+                4 => .{ .action = .change_team },
+                5 => .{ .action = .switch_credential },
                 else => null,
             },
             .provider => switch (index) {
@@ -474,6 +478,7 @@ pub const PickerView = struct {
                 .login => "Sign in with Vercel",
                 .chatgpt_login => "Sign in with Codex",
                 .setup => if (self.include_skip) "Add an API key" else "API key",
+                .custom_setup => "OpenAI-compatible endpoint",
                 .change_team => "Change team",
                 .switch_credential => "Switch credential",
                 .automatic => "Automatic",
@@ -489,7 +494,7 @@ pub const PickerView = struct {
             .action => |action| switch (action) {
                 .login => if (self.fx_login_session_available) "connected" else "",
                 .chatgpt_login => if (self.available_sources.contains(.chatgpt_subscription)) "connected" else "",
-                .setup, .switch_credential => "",
+                .setup, .custom_setup, .switch_credential => "",
                 .automatic => "use normal precedence",
                 .change_team => if (self.fx_login_session_available) "choose a team" else "sign in first",
             },
@@ -500,7 +505,8 @@ pub const PickerView = struct {
     pub fn choiceEnabled(self: PickerView, choice: Choice) bool {
         return switch (choice) {
             .action => |action| (action != .change_team or self.fx_login_session_available) and
-                (action != .chatgpt_login or !host_target.is_wasm),
+                (action != .chatgpt_login or !host_target.is_wasm) and
+                (action != .custom_setup or !host_target.is_wasm),
             .provider, .source, .team => true,
         };
     }
@@ -1242,7 +1248,7 @@ pub const Runtime = struct {
                         self.openSwitchCredentialPicker(alloc);
                         return null;
                     },
-                    .setup => {},
+                    .setup, .custom_setup => {},
                     // Only reachable from the switch screen, never the root.
                     .automatic => unreachable,
                     .login, .chatgpt_login => self.closePicker(alloc),
@@ -2210,8 +2216,8 @@ test "auth picker root starts on sign in and keeps sources in the switch stage" 
     const picker = runtime.pickerView();
     try std.testing.expect(picker.active);
     try std.testing.expect((Choice{ .action = .login }).eql(picker.selected_choice.?));
-    try std.testing.expectEqual(@as(usize, 5), picker.choiceCount());
-    try std.testing.expect(picker.choiceAt(5) == null);
+    try std.testing.expectEqual(@as(usize, 6), picker.choiceCount());
+    try std.testing.expect(picker.choiceAt(6) == null);
 }
 
 test "credential switcher excludes provider-routed ChatGPT sessions" {
@@ -2228,7 +2234,7 @@ test "credential switcher excludes provider-routed ChatGPT sessions" {
     try std.testing.expect((Choice{ .action = .automatic }).eql(picker.choiceAt(1).?));
 }
 
-test "auth picker navigation wraps across the five hub actions" {
+test "auth picker navigation wraps across the six hub actions" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     runtime.source_inventory = SourceSet.initMany(&.{ .ai_gateway_api_key, .fx_login });
@@ -2238,6 +2244,8 @@ test "auth picker navigation wraps across the five hub actions" {
     try std.testing.expect((Choice{ .action = .chatgpt_login }).eql(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
     try std.testing.expect((Choice{ .action = .setup }).eql(runtime.pickerView().selected_choice.?));
+    try std.testing.expect(runtime.movePicker(1));
+    try std.testing.expect((Choice{ .action = .custom_setup }).eql(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
     try std.testing.expect((Choice{ .action = .change_team }).eql(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
@@ -2269,7 +2277,7 @@ test "auth picker without credentials exposes acquisition actions" {
     try std.testing.expect(picker.active_source == null);
     try std.testing.expect((Choice{ .action = .login }).eql(picker.selected_choice.?));
     try std.testing.expectEqual(@as(usize, 0), picker.available_sources.count());
-    try std.testing.expectEqual(@as(usize, 5), picker.choiceCount());
+    try std.testing.expectEqual(@as(usize, 6), picker.choiceCount());
     try std.testing.expect(!picker.choiceEnabled(.{ .action = .change_team }));
     try std.testing.expectEqualStrings("missing", picker.activeSourceLabel());
 }
@@ -2281,12 +2289,13 @@ test "auth onboarding picker exposes the setup paths" {
 
     const picker = runtime.pickerView();
     try std.testing.expect(picker.include_skip);
-    try std.testing.expectEqual(@as(usize, 3), picker.choiceCount());
+    try std.testing.expectEqual(@as(usize, 4), picker.choiceCount());
     try std.testing.expect((Choice{ .action = .login }).eql(picker.choiceAt(0).?));
     try std.testing.expect((Choice{ .action = .chatgpt_login }).eql(picker.choiceAt(1).?));
     try std.testing.expect((Choice{ .action = .setup }).eql(picker.choiceAt(2).?));
     try std.testing.expectEqualStrings("Add an API key", picker.choiceLabel(picker.choiceAt(2).?));
-    try std.testing.expect(picker.choiceAt(3) == null);
+    try std.testing.expect((Choice{ .action = .custom_setup }).eql(picker.choiceAt(3).?));
+    try std.testing.expect(picker.choiceAt(4) == null);
 }
 
 test "clearing a remembered choice re-resolves even when no login was active" {
