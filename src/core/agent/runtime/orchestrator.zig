@@ -3742,7 +3742,9 @@ fn processQueuedPromptLoop(
                 continue;
             }
 
-            if (isRetryableModelStatus(stream_result.status)) {
+            if (isRetryableModelStatus(stream_result.status) and
+                stream_result.retry_disposition != .terminal)
+            {
                 const cause: model_response_recovery.FailureCause = if (stream_result.status == .too_many_requests)
                     .rate_limited
                 else

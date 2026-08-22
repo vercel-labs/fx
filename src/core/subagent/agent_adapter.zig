@@ -40,12 +40,14 @@ pub const ProviderRoutes = struct {
     gateway: ProviderRoute,
     codex: ProviderRoute,
     grok: ProviderRoute,
+    opencode: ProviderRoute,
 
     pub fn select(self: ProviderRoutes, provider: model_provider.ProviderId) ProviderRoute {
         return switch (provider) {
             .gateway => self.gateway,
             .codex => self.codex,
             .grok => self.grok,
+            .opencode => self.opencode,
         };
     }
 };
@@ -73,11 +75,14 @@ test "provider routes select independent streams and reviewers" {
     const gateway_reviewer = auto_classifier.Provider{ .context = &gateway_tag, .review_fn = Reviewer.review };
     const codex_reviewer = auto_classifier.Provider{ .context = &codex_tag, .review_fn = Reviewer.review };
     const grok_reviewer = auto_classifier.Provider{ .context = &grok_tag, .review_fn = Reviewer.review };
+    const opencode_stream = stream_provider.unavailable_provider;
     const routes = ProviderRoutes{
         .gateway = .{ .agent_stream_provider = gateway_stream, .permission_reviewer_provider = gateway_reviewer },
         .codex = .{ .agent_stream_provider = codex_stream, .permission_reviewer_provider = codex_reviewer },
         .grok = .{ .agent_stream_provider = grok_stream, .permission_reviewer_provider = grok_reviewer },
+        .opencode = .{ .agent_stream_provider = opencode_stream, .permission_reviewer_provider = null },
     };
+    try std.testing.expect(routes.select(.opencode).permission_reviewer_provider == null);
 
     try std.testing.expect(routes.select(.gateway).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
     try std.testing.expect(routes.select(.gateway).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));

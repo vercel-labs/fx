@@ -55,7 +55,7 @@ fn teamQueryProjection(query: []const u8, width: u16) TeamQueryProjection {
 pub fn authPickerRowCount(view: auth_runtime.PickerView) u16 {
     if (view.stage == .sign_in) return 7;
     if (view.stage == .api_key) return 4;
-    if (view.stage == .root and view.include_skip) return 18;
+    if (view.stage == .root and view.include_skip) return 19;
     return @intCast(1 + @max(view.choiceCount(), 1));
 }
 
@@ -157,13 +157,13 @@ const onboarding_note = "   ⚠︎ Note: fx is experimental and defaults to auto
 const onboarding_note_link = onboarding_note ++ " \x1b]8;id=fx-onboarding;https://fx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\";
 
 fn onboardingProjectedRowIndex(view: auth_runtime.PickerView, row_index: u16, row_count: u16) u16 {
-    if (row_count >= 18) return row_index;
+    if (row_count >= 19) return row_index;
 
     const selected_row: u16 = 8 + @as(u16, @intCast(view.selectedIndex()));
-    const priority = [_]u16{ selected_row, 11, 9, 10, 8, 15, 7, 12, 5, 0, 2, 3, 6, 13, 14, 1, 4, 16, 17 };
+    const priority = [_]u16{ selected_row, 12, 9, 10, 11, 8, 16, 7, 13, 5, 0, 2, 3, 6, 14, 15, 1, 4, 17, 18 };
 
     var projected_index: u16 = 0;
-    for (0..18) |source_row| {
+    for (0..19) |source_row| {
         for (priority[0..@min(row_count, priority.len)]) |included_row| {
             if (source_row != included_row) continue;
             if (projected_index == row_index) return @intCast(source_row);
@@ -171,7 +171,7 @@ fn onboardingProjectedRowIndex(view: auth_runtime.PickerView, row_index: u16, ro
             break;
         }
     }
-    return 17;
+    return 18;
 }
 
 fn composeOnboardingPickerRow(
@@ -191,6 +191,7 @@ fn composeOnboardingPickerRow(
         9 => 1,
         10 => 2,
         11 => 3,
+        12 => 4,
         else => null,
     };
     if (maybe_choice_index) |choice_index| {
@@ -218,10 +219,10 @@ fn composeOnboardingPickerRow(
         5 => "   You can change this anytime with /setup.",
         6 => "",
         7 => "   Get started",
-        12 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
-        13, 14 => "",
-        15 => "   Esc to set up later · Explore all commands with /help",
-        16, 17 => "",
+        13 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
+        14, 15 => "",
+        16 => "   Esc to set up later · Explore all commands with /help",
+        17, 18 => "",
         else => "",
     };
     try row_text.appendClipped(alloc, &row, label, width);
@@ -371,6 +372,11 @@ pub fn authPickerReservedRows(view: auth_runtime.PickerView, terminal_rows: u16,
     if (view.stage == .sign_in or (view.stage == .root and view.include_skip)) {
         const available_rows = terminal_rows -| (5 +| input_extra +| banner_rows);
         return @min(authPickerRowCount(view), @max(available_rows, 1));
+    }
+    if (view.stage == .root) {
+        const available_rows = terminal_rows -| (5 +| input_extra +| banner_rows);
+        const max_rows = input_presentation.max_model_picker_rows + 1;
+        return @min(authPickerRowCount(view), @min(max_rows, @max(available_rows, 1)));
     }
     return @min(authPickerRowCount(view), activeListPickerReservedRows(terminal_rows, input_extra, banner_rows));
 }
@@ -1581,7 +1587,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
         .include_skip = true,
     };
 
-    try std.testing.expectEqual(@as(u16, 18), authPickerRowCount(view));
+    try std.testing.expectEqual(@as(u16, 19), authPickerRowCount(view));
     var screen: std.ArrayList(u8) = .empty;
     defer screen.deinit(alloc);
     for (0..authPickerRowCount(view)) |row_index| {
@@ -1597,6 +1603,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
     try std.testing.expect(std.mem.find(u8, screen.items, "⚠︎ Note: fx is experimental and defaults to auto mode. \x1b]8;id=fx-onboarding;https://fx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Learn more: https://") == null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Vercel") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with OpenCode") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Add an API key") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Esc to set up later · Explore all commands with /help") != null);
 
@@ -1620,11 +1627,15 @@ test "auth onboarding composes the welcome copy and setup choices" {
     defer grok_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, grok_row.items, "Sign in with Grok") != null);
 
-    var unselected_row = try composeAuthPickerRow(alloc, view, 11, authPickerRowCount(view), 100);
+    var opencode_row = try composeAuthPickerRow(alloc, view, 11, authPickerRowCount(view), 100);
+    defer opencode_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, opencode_row.items, "Sign in with OpenCode") != null);
+
+    var unselected_row = try composeAuthPickerRow(alloc, view, 12, authPickerRowCount(view), 100);
     defer unselected_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, unselected_row.items, "Add an API key") != null);
 
-    var narrow_note = try composeAuthPickerRow(alloc, view, 12, authPickerRowCount(view), 58);
+    var narrow_note = try composeAuthPickerRow(alloc, view, 13, authPickerRowCount(view), 58);
     defer narrow_note.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, narrow_note.items, "https://fx.sh/docs/stability") == null);
 
@@ -1652,7 +1663,8 @@ test "auth picker composes only detected credential sources" {
         .include_skip = false,
     };
     const row_count = authPickerRowCount(view);
-    try std.testing.expectEqual(@as(u16, 8), row_count);
+    try std.testing.expectEqual(@as(u16, 9), row_count);
+    try std.testing.expectEqual(@as(u16, 7), authPickerReservedRows(view, 40, 0, 0));
 
     var header = try composeAuthPickerRow(alloc, view, 0, row_count, 80);
     defer header.deinit(alloc);
@@ -1670,20 +1682,24 @@ test "auth picker composes only detected credential sources" {
     defer grok.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, grok.items, "Sign in with Grok") != null);
 
-    var setup = try composeAuthPickerRow(alloc, view, 4, row_count, 80);
+    var opencode = try composeAuthPickerRow(alloc, view, 4, row_count, 80);
+    defer opencode.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, opencode.items, "Sign in with OpenCode") != null);
+
+    var setup = try composeAuthPickerRow(alloc, view, 5, row_count, 80);
     defer setup.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, setup.items, "API key") != null);
 
-    var switch_provider = try composeAuthPickerRow(alloc, view, 5, row_count, 80);
+    var switch_provider = try composeAuthPickerRow(alloc, view, 6, row_count, 80);
     defer switch_provider.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, switch_provider.items, "Switch provider") != null);
 
-    var change_team = try composeAuthPickerRow(alloc, view, 6, row_count, 80);
+    var change_team = try composeAuthPickerRow(alloc, view, 7, row_count, 80);
     defer change_team.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, change_team.items, "Change team") != null);
     try std.testing.expect(std.mem.find(u8, change_team.items, "sign in first") != null);
 
-    var switch_credential = try composeAuthPickerRow(alloc, view, 7, row_count, 80);
+    var switch_credential = try composeAuthPickerRow(alloc, view, 8, row_count, 80);
     defer switch_credential.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, switch_credential.items, "Switch credential") != null);
 }

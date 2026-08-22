@@ -362,7 +362,7 @@ fn writeTerminalSafe(writer: *std.Io.Writer, alloc: Allocator, raw: []const u8) 
 
 fn gatewayProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     const source = auth.active_source orelse return auth.gateway_connected;
-    return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription);
+    return auth.gateway_connected or model_provider.authorizesCredential(.gateway, source);
 }
 
 fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
@@ -371,6 +371,10 @@ fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
 
 fn grokProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     return auth.grok_connected or auth.active_source == .grok_subscription;
+}
+
+fn openCodeProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
+    return auth.opencode_connected or auth.active_source == .opencode_api_key;
 }
 
 fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.StatusSnapshot) !void {
@@ -388,6 +392,10 @@ fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.Status
         if (wrote_provider) try writer.writeAll(", Grok");
         if (!wrote_provider) try writer.writeAll("Grok");
         wrote_provider = true;
+    }
+    if (openCodeProviderConnected(auth)) {
+        if (wrote_provider) try writer.writeAll(", OpenCode");
+        if (!wrote_provider) try writer.writeAll("OpenCode");
     }
     if (!wrote_provider) try writer.writeAll("none");
 }
@@ -525,6 +533,11 @@ pub const StatusSnapshot = struct {
             if (grokProviderConnected(self.auth)) {
                 if (wrote_provider) try writer.writeByte(',');
                 try std.json.Stringify.value("grok", .{}, writer);
+                wrote_provider = true;
+            }
+            if (openCodeProviderConnected(self.auth)) {
+                if (wrote_provider) try writer.writeByte(',');
+                try std.json.Stringify.value("opencode", .{}, writer);
             }
             try writer.writeByte(']');
         }
@@ -750,6 +763,7 @@ pub const ModelListSnapshot = struct {
             .gateway => "gateway",
             .codex => model_provider.label(.codex),
             .grok => model_provider.label(.grok),
+            .opencode => model_provider.label(.opencode),
         };
     }
 

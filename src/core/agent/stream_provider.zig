@@ -139,6 +139,11 @@ pub const ResultOwnership = enum {
     owned,
 };
 
+pub const RetryDisposition = enum {
+    status_default,
+    terminal,
+};
+
 pub const Result = struct {
     status: std.http.Status,
     completion: types.GatewayCompletion = .{},
@@ -149,6 +154,7 @@ pub const Result = struct {
     failure_schema: ?[]u8 = null,
     failure_request_shape: ?[]u8 = null,
     retry_after_seconds: ?u64 = null,
+    retry_disposition: RetryDisposition = .status_default,
     ownership: ResultOwnership = .borrowed,
 
     /// Providers mark allocated response fields as `owned`; test and embedded

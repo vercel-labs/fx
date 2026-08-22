@@ -18,6 +18,7 @@ const io_mod = @import("../core/shared/io.zig");
 const gateway_generation_usage = @import("../gateway/generation_usage.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
+const model_provider = @import("../core/config/model_provider.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const output_contracts = @import("../core/output/output_contracts.zig");
 const shared_types = @import("../core/shared/types.zig");
@@ -425,8 +426,10 @@ fn streamAgentCompletion(
     alloc: Allocator,
     request: agent_stream_provider_contract.Request,
 ) anyerror!agent_stream_provider_contract.Result {
-    if (request.credential_source == .chatgpt_subscription or request.credential_source == .grok_subscription) {
-        return error.SubscriptionCredentialCannotAuthorizeGateway;
+    if (request.credential_source != null and
+        !model_provider.authorizesCredential(.gateway, request.credential_source))
+    {
+        return error.ProviderCredentialCannotAuthorizeGateway;
     }
     const result = gateway_client.streamGatewayCompletion(
         alloc,
@@ -486,6 +489,9 @@ fn fetchCredits(
     }
     if (input.credential_source == .grok_subscription) {
         return creditsErrorSnapshot(alloc, "AI Gateway credits are unavailable for a Grok subscription.");
+    }
+    if (input.credential_source == .opencode_api_key) {
+        return creditsErrorSnapshot(alloc, "AI Gateway credits are unavailable for an OpenCode API key.");
     }
     return fetchCreditsWithFetch(
         alloc,

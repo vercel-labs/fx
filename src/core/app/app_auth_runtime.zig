@@ -10,11 +10,14 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
+const opencode_session = @import("../auth/opencode_session.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const types = @import("../shared/types.zig");
+const collections = @import("../shared/collections.zig");
+const opencode_models = @import("../../gateway/opencode_models.zig");
 
 fn oauthAuthEnabled(comptime App: type) bool {
     return runtime_profile.allows(App, .native_auth) or
@@ -76,11 +79,8 @@ pub fn Runtime(comptime App: type) type {
                 @hasDecl(@TypeOf(app.auth), "selectForProvider"))
             {
                 const provider = provider_runtime.provider(app);
-                const required_source: credentials.Source = switch (provider) {
-                    .codex => .chatgpt_subscription,
-                    .grok => .grok_subscription,
-                    .gateway => app.auth.credentialSource() orelse .fx_login,
-                };
+                const required_source = model_provider.requiredCredentialSource(provider) orelse
+                    app.auth.credentialSource() orelse .fx_login;
                 const route_change = app.auth.selectForProvider(app.alloc, provider) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => return recoverCredentialFailure(app, required_source, err),
@@ -91,12 +91,10 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "auth",
                         .tone = .warning,
-                        .body = if (provider == .grok)
-                            credentials.missing_grok_interactive_credential_message
-                        else if (provider == .codex)
-                            credentials.missing_chatgpt_interactive_credential_message
-                        else
-                            credentials.missing_interactive_credential_message,
+                        .body = credentials.missingCredentialMessage(
+                            model_provider.requiredCredentialSource(provider),
+                            .interactive,
+                        ),
                     }, true);
                     app.shell.render_requests.request(.footer);
                     return false;
@@ -153,7 +151,7 @@ pub fn Runtime(comptime App: type) type {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .warning,
-                        .body = "Usage: /logout [vercel|codex|grok]",
+                        .body = "Usage: /logout [vercel|codex|grok|opencode]",
                     });
                     return;
                 };
@@ -166,16 +164,53 @@ pub fn Runtime(comptime App: type) type {
                 provider_runtime.provider(app) == .grok
             else
                 false;
+            const selected_model_uses_opencode = if (comptime provider_runtime.supported(App))
+                provider_runtime.provider(app) == .opencode
+            else
+                false;
             const provider_inventory = if (comptime @hasDecl(@TypeOf(app.auth), "pickerView")) inventory: {
                 try app.auth.refreshSourceInventory(app.alloc);
                 break :inventory app.auth.pickerView().available_sources;
             } else @as(auth_runtime.SourceSet, .empty);
             const chatgpt_is_only_logout_session = provider_inventory.contains(.chatgpt_subscription) and
                 !provider_inventory.contains(.fx_login) and
-                !provider_inventory.contains(.grok_subscription);
+                !provider_inventory.contains(.grok_subscription) and
+                !provider_inventory.contains(.opencode_api_key);
             const grok_is_only_logout_session = provider_inventory.contains(.grok_subscription) and
                 !provider_inventory.contains(.fx_login) and
-                !provider_inventory.contains(.chatgpt_subscription);
+                !provider_inventory.contains(.chatgpt_subscription) and
+                !provider_inventory.contains(.opencode_api_key);
+            const opencode_is_only_logout_session = provider_inventory.contains(.opencode_api_key) and
+                !provider_inventory.contains(.fx_login) and
+                !provider_inventory.contains(.chatgpt_subscription) and
+                !provider_inventory.contains(.grok_subscription);
+            const logout_opencode = if (requested_provider) |provider|
+                provider == .opencode
+            else
+                selected_model_uses_opencode or
+                    app.auth.credentialSource() == .opencode_api_key or
+                    opencode_is_only_logout_session;
+            if (logout_opencode) {
+                const outcome = opencode_session.logout() catch {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Could not durably sign out of OpenCode. The current source is unchanged.",
+                    });
+                    return;
+                };
+                const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterOpenCodeLogout"))
+                    try app.auth.reconcileAfterOpenCodeLogout(app.alloc)
+                else
+                    false;
+                applyCredentialChange(app, changed);
+                try writeAuthNotice(app, switch (outcome) {
+                    .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of OpenCode." },
+                    .missing => .{ .topic = "auth", .tone = .neutral, .body = "No OpenCode login session found." },
+                    .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of OpenCode, but could not confirm the profile directory update." },
+                });
+                return;
+            }
             const logout_grok = if (requested_provider) |provider|
                 provider == .grok
             else
@@ -315,6 +350,7 @@ pub fn Runtime(comptime App: type) type {
                     .login => try beginSignIn(app, true),
                     .chatgpt_login => try beginChatGptSignIn(app),
                     .grok_login => try beginGrokSignIn(app),
+                    .opencode_login => try beginOpenCodeSignIn(app),
                     .setup => {
                         if (comptime !runtime_profile.allows(App, .native_auth)) {
                             try app.writeDomainNotice(.{
@@ -621,7 +657,7 @@ pub fn Runtime(comptime App: type) type {
         fn rememberCredentialSource(app: *App, source: credentials.Source) void {
             // ChatGPT is selected by model route, not as a global Gateway
             // credential preference. Its saved session coexists independently.
-            if (source == .chatgpt_subscription or source == .grok_subscription) return;
+            if (!model_provider.authorizesCredential(.gateway, source)) return;
             if (comptime @hasDecl(App, "persistCredentialSourcePreference")) {
                 app.persistCredentialSourcePreference(source);
                 return;
@@ -702,6 +738,44 @@ pub fn Runtime(comptime App: type) type {
                 app.shell.render_requests.request(.footer);
                 if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
             }
+        }
+
+        fn beginOpenCodeSignIn(app: *App) anyerror!void {
+            if (comptime provider_runtime.supported(App)) {
+                const decision = decideProviderSwitch(.{
+                    .current = provider_runtime.provider(app),
+                    .target = .opencode,
+                    .target_credential_ready = false,
+                    .intent = .post_oauth,
+                    .stream_active = app.stream.active,
+                    .queued_prompts = app.worker.queuedPromptCount(),
+                });
+                if (decision == .busy) {
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .warning,
+                        .body = "OpenCode sign-in is unavailable until active and queued work finishes.",
+                    }, true);
+                    return;
+                }
+            }
+            const key = io_mod.getenv("OPENCODE_API_KEY") orelse {
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = "Set OPENCODE_API_KEY to your opencode.ai key, then choose Sign in with OpenCode again.",
+                }, true);
+                return;
+            };
+            var session = opencode_session.Session{ .api_key = try app.alloc.dupe(u8, key) };
+            defer session.deinit(app.alloc);
+            opencode_session.saveNewSession(app.alloc, session) catch |err| {
+                debug_trace.logf("auth", "OpenCode login failed err={s}", .{@errorName(err)});
+                try writeLoginError(app, .opencode_api_key, err);
+                return;
+            };
+            try app.auth.refreshSourceInventory(app.alloc);
+            try switchProvider(app, .opencode, false, .post_oauth);
         }
 
         fn beginCodexSignInForProviderSwitch(app: *App) !void {
@@ -825,6 +899,10 @@ pub fn Runtime(comptime App: type) type {
                     try beginGrokSignInForProviderSwitch(app);
                     return;
                 }
+                if (target == .opencode and allow_login) {
+                    try beginOpenCodeSignIn(app);
+                    return;
+                }
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .warning,
@@ -834,6 +912,8 @@ pub fn Runtime(comptime App: type) type {
                         "Run fx login codex, then try switching again."
                     else if (target == .grok)
                         "Run fx login grok, then try switching again."
+                    else if (target == .opencode)
+                        "Set OPENCODE_API_KEY and run fx login opencode, then try switching again."
                     else
                         credentials.missing_interactive_credential_message,
                 }, true);
@@ -920,6 +1000,7 @@ pub fn Runtime(comptime App: type) type {
                 .gateway => settings.model,
                 .codex => settings.codex_model,
                 .grok => settings.grok_model,
+                .opencode => settings.opencode_model,
             };
             const current_model = if (intent == .post_oauth and current == target)
                 provider_runtime.model(app)
@@ -985,6 +1066,7 @@ pub fn Runtime(comptime App: type) type {
                     .gateway => .{ .provider = .gateway, .model = provider_runtime.model(app) },
                     .codex => .{ .provider = .codex, .codex_model = provider_runtime.model(app) },
                     .grok => .{ .provider = .grok, .grok_model = provider_runtime.model(app) },
+                    .opencode => .{ .provider = .opencode, .opencode_model = provider_runtime.model(app) },
                 });
                 defer persistence.deinit(app.alloc);
                 switch (persistence) {
@@ -1125,7 +1207,66 @@ pub fn Runtime(comptime App: type) type {
                 return false;
             }
             if (!try ensurePromptCredential(app)) return false;
-            return preparePromptCredential(app);
+            if (!try preparePromptCredential(app)) return false;
+            return reconcileOpenCodeModelForPrompt(app);
+        }
+
+        fn reconcileOpenCodeModelIds(app: *App, model_ids: []const []u8) !void {
+            if (provider_runtime.provider(app) != .opencode or io_mod.getenv("FX_MODEL") != null) return;
+
+            const current = provider_runtime.model(app);
+            const replacement = opencode_models.selectAvailableModel(model_ids, current) orelse return;
+            if (std.mem.eql(u8, replacement, current)) return;
+
+            try provider_runtime.replaceModel(app, replacement);
+            try app.worker.syncQueuedPromptModel(std.heap.c_allocator, replacement);
+            var persistence = app.persistRuntimePreferences(.{
+                .provider = .opencode,
+                .model = replacement,
+            });
+            defer persistence.deinit(app.alloc);
+            const saved = persistence.settings_error == null and persistence.session_error == null;
+            try app.writeDomainNotice(.{
+                .topic = "provider",
+                .tone = if (saved) .neutral else .warning,
+                .body = if (saved)
+                    "The saved OpenCode model is unavailable. Switched to a supported model."
+                else
+                    "The saved OpenCode model is unavailable. Switched for this run, but could not save the selection.",
+            }, true);
+        }
+
+        pub fn reconcileLoadedProviderModel(app: *App) !void {
+            if (comptime !provider_runtime.supported(App) or
+                !@hasDecl(App, "snapshotCachedModelIds")) return;
+            var model_ids = (try app.snapshotCachedModelIds(app.alloc)) orelse return;
+            defer collections.freeStringList(app.alloc, &model_ids);
+            try reconcileOpenCodeModelIds(app, model_ids.items);
+        }
+
+        fn reconcileOpenCodeModelForPrompt(app: *App) !bool {
+            if (comptime !provider_runtime.supported(App) or
+                !@hasDecl(App, "snapshotCachedModelIds") or
+                !@hasDecl(App, "fetchModelIds")) return true;
+            if (provider_runtime.provider(app) != .opencode or io_mod.getenv("FX_MODEL") != null) return true;
+            if (try app.snapshotCachedModelIds(app.alloc)) |model_ids_value| {
+                var model_ids = model_ids_value;
+                defer collections.freeStringList(app.alloc, &model_ids);
+                try reconcileOpenCodeModelIds(app, model_ids.items);
+            } else if (!opencode_models.supportsChatCompletionsModel(provider_runtime.model(app))) {
+                var model_ids = app.fetchModelIds() catch |err| {
+                    debug_trace.logf("provider", "OpenCode prompt catalog failed err={s}", .{@errorName(err)});
+                    try app.writeDomainNotice(.{
+                        .topic = "provider",
+                        .tone = .warning,
+                        .body = "Could not refresh the OpenCode model list. Try again.",
+                    }, true);
+                    return false;
+                };
+                defer collections.freeStringList(app.alloc, &model_ids);
+                try reconcileOpenCodeModelIds(app, model_ids.items);
+            }
+            return true;
         }
 
         fn preparePromptCredential(app: *App) !bool {
@@ -1190,7 +1331,7 @@ pub fn Runtime(comptime App: type) type {
             {
                 if (app.auth.gatewayCredential()) |credential| {
                     const subscription = if (comptime @hasField(@TypeOf(credential), "source"))
-                        credential.source == .chatgpt_subscription or credential.source == .grok_subscription
+                        !model_provider.authorizesCredential(.gateway, credential.source)
                     else
                         false;
                     if (subscription) {
@@ -1220,6 +1361,8 @@ pub fn Runtime(comptime App: type) type {
                     error.GrokLoginTimedOut, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "Grok sign-in expired. The current credential is unchanged; run /login to try again." },
                     else => .{ .topic = "auth", .tone = .@"error", .body = "Grok sign-in failed. The current credential is unchanged." },
                 }
+            else if (source == .opencode_api_key)
+                .{ .topic = "auth", .tone = .@"error", .body = "OpenCode sign-in failed. Check OPENCODE_API_KEY; the current credential is unchanged." }
             else switch (err) {
                 error.ClientIdMissing => .{ .topic = "auth", .tone = .@"error", .body = "fx login is not configured yet. The current credential is unchanged." },
                 error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in was denied. The current credential is unchanged." },
@@ -1411,7 +1554,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
             switch (provider) {
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
-                .gateway => unreachable,
+                .gateway, .opencode => unreachable,
             }
 
             try std.testing.expectEqual(@as(usize, 0), app.auth.start_count);

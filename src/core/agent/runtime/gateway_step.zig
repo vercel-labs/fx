@@ -1,6 +1,7 @@
 const std = @import("std");
 const agent_stream_provider = @import("../stream_provider.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
+const model_provider = @import("../../config/model_provider.zig");
 const types = @import("../../shared/types.zig");
 const session_usage = @import("../../session/session_usage.zig");
 const message = @import("../../shared/message.zig");
@@ -22,6 +23,7 @@ pub const StreamResult = struct {
     completion: types.GatewayCompletion = .{},
     err_body: ?[]u8 = null,
     retry_after_seconds: ?u64 = null,
+    retry_disposition: agent_stream_provider.RetryDisposition = .status_default,
 };
 
 pub fn streamGatewayCompletion(
@@ -107,7 +109,9 @@ pub fn streamGatewayCompletion(
     if (comptime @import("builtin").os.tag != .wasi) {
         if (result.reconcile_generation_usage) {
             if (usage) |ledger| {
-                if (credential_source == .chatgpt_subscription or credential_source == .grok_subscription) {
+                if (credential_source != null and
+                    !model_provider.authorizesCredential(.gateway, credential_source))
+                {
                     ledger.clearReconciliationCredential();
                 } else {
                     ledger.startReconciliation(usage_allocator, api_key);
@@ -122,6 +126,7 @@ pub fn streamGatewayCompletion(
             .completion = result.completion,
             .err_body = result.err_body,
             .retry_after_seconds = result.retry_after_seconds,
+            .retry_disposition = result.retry_disposition,
         };
     }
 
@@ -145,6 +150,7 @@ pub fn streamGatewayCompletion(
     const generation_metadata_invalid = result.completion.generation_metadata_invalid;
     const provider_result_identity_failure = result.completion.provider_result_identity_failure;
     const retry_after_seconds = result.retry_after_seconds;
+    const retry_disposition = result.retry_disposition;
     return .{
         .status = status,
         .completion = .{
@@ -161,6 +167,7 @@ pub fn streamGatewayCompletion(
         },
         .err_body = err_body,
         .retry_after_seconds = retry_after_seconds,
+        .retry_disposition = retry_disposition,
     };
 }
 

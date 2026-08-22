@@ -4,12 +4,14 @@ pub const Id = enum {
     vercel,
     codex,
     grok,
+    opencode,
 
     pub fn slug(self: Id) []const u8 {
         return switch (self) {
             .vercel => "vercel",
             .codex => "codex",
             .grok => "grok",
+            .opencode => "opencode",
         };
     }
 };
@@ -40,6 +42,12 @@ pub const entries = [_]Entry{
         .description = "SuperGrok or X Premium subscription",
         .subscription = true,
     },
+    .{
+        .id = .opencode,
+        .name = "OpenCode",
+        .description = "Zen or Go API key from opencode.ai",
+        .subscription = false,
+    },
 };
 
 pub fn parse(value: []const u8) ?Id {
@@ -47,6 +55,7 @@ pub fn parse(value: []const u8) ?Id {
         std.ascii.eqlIgnoreCase(value, "ai-gateway")) return .vercel;
     if (std.ascii.eqlIgnoreCase(value, "codex")) return .codex;
     if (std.ascii.eqlIgnoreCase(value, "grok")) return .grok;
+    if (std.ascii.eqlIgnoreCase(value, "opencode")) return .opencode;
     return null;
 }
 
@@ -59,9 +68,12 @@ test "auth provider catalog exposes subscription providers without aliases" {
     try std.testing.expectEqual(Id.vercel, parse("vercel").?);
     try std.testing.expectEqual(Id.codex, parse("codex").?);
     try std.testing.expectEqual(Id.grok, parse("grok").?);
+    try std.testing.expectEqual(Id.opencode, parse("opencode").?);
+    try std.testing.expect(parse("zen") == null);
     try std.testing.expect(parse("openai-codex") == null);
     try std.testing.expect(parse("chatgpt") == null);
     try std.testing.expect(parse("unknown") == null);
     try std.testing.expect(find(.codex).subscription);
     try std.testing.expect(find(.grok).subscription);
+    try std.testing.expect(!find(.opencode).subscription);
 }

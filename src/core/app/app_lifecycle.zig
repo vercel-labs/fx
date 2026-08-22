@@ -1113,6 +1113,7 @@ fn configuredProviderSelection(
         .gateway => settings.model orelse default_model,
         .codex => settings.codex_model orelse return error.CodexModelNotSelected,
         .grok => settings.grok_model orelse return error.GrokModelNotSelected,
+        .opencode => settings.opencode_model orelse return error.OpenCodeModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
 }

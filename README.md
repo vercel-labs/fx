@@ -47,11 +47,21 @@ fx login grok
 fx
 ```
 
-`fx login codex` and `fx login grok` select that provider and a model from its authenticated catalog. Inside fx, open `/setup` and choose **Switch provider** to move between Gateway, Codex, and Grok. `/model` lists the active provider's fetched models. Subscription model IDs are the raw IDs returned by each authenticated catalog. Use `/logout codex` or `/logout grok` to remove that subscription session without affecting other providers; choosing it again from **Switch provider** starts sign-in.
+Or use an OpenCode Zen or Go API key:
+
+```bash
+export OPENCODE_API_KEY=<your-opencode-api-key>
+fx login opencode
+fx
+```
+
+The provider-specific login commands select that provider and a model from its live catalog. Inside fx, open `/setup` and choose **Switch provider** to move between Gateway, Codex, Grok, and OpenCode. `/model` lists the active provider's supported fetched models. Use `/logout codex`, `/logout grok`, or `/logout opencode` to remove that saved provider session without affecting the others; choosing it again from **Switch provider** starts sign-in.
 
 The OpenAI Codex route uses ChatGPT subscription access directly and never sends its OAuth token to Vercel AI Gateway. The session is stored privately at `~/.fx/chatgpt-auth.json` and refreshed when needed. On supported Codex models, `/fast` requests OpenAI's priority service tier and consumes ChatGPT credits at the higher Fast mode rate.
 
 The Grok route uses subscription access directly at xAI and never sends its OAuth token to Vercel AI Gateway or OpenAI. Its session is stored privately at `~/.fx/grok-auth.json`, refreshed when needed, and used only with the authenticated xAI catalog and Responses API.
+
+`fx login opencode` imports `OPENCODE_API_KEY` into a private copy at `~/.fx/opencode-auth.json`; later commands use that saved copy, so `fx logout opencode` remains effective even while the environment variable is exported. The OpenCode route sends the saved key only to OpenCode. fx currently lists the Zen and Go models whose published endpoint uses OpenAI-compatible Chat Completions; models requiring OpenAI Responses, Anthropic Messages, or Gemini protocols remain hidden. Go model IDs use the `go/<model-id>` prefix in fx.
 
 To use an AI Gateway API key instead:
 

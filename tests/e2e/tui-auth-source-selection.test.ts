@@ -593,6 +593,60 @@ function startFakeGrokOAuth(options: {
   };
 }
 
+function startFakeOpenCode() {
+  const apiKey = "opencode-e2e-api-key";
+  const requests: Array<{
+    path: string;
+    authorization: string | null;
+    body: string | null;
+  }> = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      const body = request.method === "POST" ? await request.text() : null;
+      requests.push({
+        path: url.pathname,
+        authorization: request.headers.get("authorization"),
+        body,
+      });
+      if (url.pathname === "/zen/models") {
+        return Response.json({ data: [
+          { id: "gpt-5.6-sol", object: "model" },
+          { id: "big-pickle", object: "model" },
+        ] });
+      }
+      if (url.pathname === "/go/models") {
+        return Response.json({ data: [
+          { id: "minimax-m3", object: "model" },
+          { id: "kimi-k3", object: "model" },
+        ] });
+      }
+      if (url.pathname === "/chat") {
+        return new Response(
+          'data: {"id":"opencode-generation","choices":[{"delta":{"content":"OPENCODE_DIRECT_RESPONSE"},"finish_reason":null}]}\n\n' +
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2}}\n\n' +
+            "data: [DONE]\n\n",
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+  const baseUrl = `http://127.0.0.1:${server.port}`;
+  return {
+    apiKey,
+    requests,
+    env: {
+      FX_E2E_OPENCODE_ZEN_MODELS_URL: `${baseUrl}/zen/models`,
+      FX_E2E_OPENCODE_GO_MODELS_URL: `${baseUrl}/go/models`,
+      FX_E2E_OPENCODE_CHAT_URL: `${baseUrl}/chat`,
+    },
+    stop() { server.stop(true); },
+  };
+}
+
 async function runGrokLoginWithBrowser(env: Record<string, string | undefined>) {
   const childEnv: NodeJS.ProcessEnv = { ...process.env };
   for (const [key, value] of Object.entries(env)) {
@@ -1309,6 +1363,7 @@ tmuxTest(
         pane.includes("Sign in with Vercel") &&
         pane.includes("Sign in with Codex") &&
         pane.includes("Sign in with Grok") &&
+        pane.includes("Sign in with OpenCode") &&
         pane.includes("API key") &&
         pane.includes("Switch provider"),
       TIMEOUT,
@@ -1321,6 +1376,7 @@ tmuxTest(
     await session.sendKeys("Escape");
     await session.waitForText("Setup", TIMEOUT);
 
+    await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Down");
@@ -1410,7 +1466,7 @@ async function waitForTrace(tracePath: string, needle: string): Promise<void> {
 }
 
 async function enterSwitchCredential(pickerSession: TmuxSession): Promise<void> {
-  for (let index = 0; index < 6; index += 1) {
+  for (let index = 0; index < 7; index += 1) {
     await pickerSession.sendKeys("Down");
   }
   await pickerSession.sendKeys("Enter");
@@ -1420,7 +1476,7 @@ async function enterSwitchCredential(pickerSession: TmuxSession): Promise<void> 
 async function openProviderPicker(pickerSession: TmuxSession): Promise<void> {
   await pickerSession.sendText("/setup");
   await pickerSession.waitForText("Setup", TIMEOUT);
-  for (let index = 0; index < 4; index += 1) {
+  for (let index = 0; index < 5; index += 1) {
     await pickerSession.sendKeys("Down");
   }
   await pickerSession.sendKeys("Enter");
@@ -1457,6 +1513,7 @@ profileStoredKeyTmuxTest(
 
     await session.sendText("/setup");
     await session.waitForText("API key", TIMEOUT);
+    await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Down");
@@ -1580,6 +1637,7 @@ tmuxTest(
 
     await session.sendText("/setup");
     await session.waitForText("Setup", TIMEOUT);
+    await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Down");
@@ -2161,6 +2219,76 @@ test(
   },
   60_000,
 );
+
+test("OpenCode CLI login filters protocols, routes its key directly, and logs out locally", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-opencode-cli-login-"));
+  gateway = startFakeGateway([]);
+  const opencode = startFakeOpenCode();
+  try {
+    const commonEnv = {
+      HOME: home,
+      AI_GATEWAY_API_KEY: "gateway-opencode-sentinel",
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_SKIP_ONBOARDING: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_MODEL: undefined,
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      ...opencode.env,
+    };
+    const loginEnv = { ...commonEnv, OPENCODE_API_KEY: opencode.apiKey };
+    const login = await runFx(["login", "opencode"], {
+      env: loginEnv,
+      timeoutMs: TIMEOUT,
+    });
+    expect(login.code, `stdout: ${login.stdout}\nstderr: ${login.stderr}`).toBe(0);
+    expect(login.stdout).toContain("Signed in with OpenCode.");
+
+    const authPath = join(home, ".fx", "opencode-auth.json");
+    expect(existsSync(authPath)).toBe(true);
+    expect(statSync(authPath).mode & 0o077).toBe(0);
+    const settingsPath = join(home, ".fx", "settings.json");
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    expect(settings.provider).toBe("opencode");
+    expect(settings.opencode_model).toBe("big-pickle");
+
+    const storedEnv = { ...commonEnv, OPENCODE_API_KEY: undefined };
+    const models = await runFx(["models", "--json"], { env: storedEnv, timeoutMs: TIMEOUT });
+    expect(models.code, `stdout: ${models.stdout}\nstderr: ${models.stderr}`).toBe(0);
+    const modelIds = (JSON.parse(models.stdout) as { models: Array<{ id: string }> }).models
+      .map((model) => model.id);
+    expect(modelIds).toEqual(["big-pickle", "go/kimi-k3"]);
+
+    const ask = await runFx(["ask", "--json", "--auto", "--no-save", "Answer directly."], {
+      env: storedEnv,
+      timeoutMs: TIMEOUT,
+    });
+    expect(ask.code, `stdout: ${ask.stdout}\nstderr: ${ask.stderr}`).toBe(0);
+    expect(ask.stdout).toContain("OPENCODE_DIRECT_RESPONSE");
+    const chatRequests = opencode.requests.filter((request) => request.path === "/chat");
+    expect(chatRequests).toHaveLength(1);
+    expect(chatRequests[0]!.authorization).toBe(`Bearer ${opencode.apiKey}`);
+    expect(JSON.parse(chatRequests[0]!.body ?? "{}").model).toBe("big-pickle");
+    for (const request of [...gateway.requests, ...gateway.modelRequests]) {
+      expect(request.headers.get("authorization")).not.toBe(`Bearer ${opencode.apiKey}`);
+    }
+
+    const logout = await runFx(["logout", "opencode"], { env: loginEnv, timeoutMs: TIMEOUT });
+    expect(logout.code, `stdout: ${logout.stdout}\nstderr: ${logout.stderr}`).toBe(0);
+    expect(logout.stdout).toContain("Signed out of OpenCode.");
+    expect(existsSync(authPath)).toBe(false);
+
+    const missing = await runFx(["ask", "--json", "--no-save", "Still OpenCode?"], {
+      env: loginEnv,
+      timeoutMs: TIMEOUT,
+    });
+    expect(missing.code).toBe(1);
+    expect(missing.stderr).toContain("fx login opencode");
+  } finally {
+    opencode.stop();
+  }
+});
 
 test("Grok logout removes local credentials when remote revocation fails", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-grok-logout-revoke-failure-"));

@@ -89,6 +89,7 @@ pub const UserSettingsPatch = struct {
     provider: ?model_provider.ProviderId = null,
     codex_model: ?[]const u8 = null,
     grok_model: ?[]const u8 = null,
+    opencode_model: ?[]const u8 = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     /// Removes the key entirely so resolution returns to plain precedence.
@@ -111,6 +112,7 @@ pub const UserSettingsPatch = struct {
             self.provider == null and
             self.codex_model == null and
             self.grok_model == null and
+            self.opencode_model == null and
             self.permission_mode == null and
             self.credential_source == null and
             !self.clear_credential_source and
@@ -931,6 +933,7 @@ fn applyUserPatchToRoot(
     if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", @tagName(value)) or application.changed;
     if (patch.codex_model) |value| application.changed = try putString(arena, &root.object, "codex_model", value) or application.changed;
     if (patch.grok_model) |value| application.changed = try putString(arena, &root.object, "grok_model", value) or application.changed;
+    if (patch.opencode_model) |value| application.changed = try putString(arena, &root.object, "opencode_model", value) or application.changed;
     if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", @tagName(value)) or application.changed;
     if (patch.credential_source) |value| application.changed = try putString(arena, &root.object, "credential_source", @tagName(value)) or application.changed;
     if (patch.clear_credential_source and root.object.contains("credential_source")) {
@@ -1612,6 +1615,10 @@ fn validateKnownSettingsObject(
         }
     }
     if (object.get("codex_model")) |value| {
+        if (value != .string) return error.InvalidSettingsFormat;
+        try validateModel(value.string);
+    }
+    if (object.get("opencode_model")) |value| {
         if (value != .string) return error.InvalidSettingsFormat;
         try validateModel(value.string);
     }
