@@ -17,6 +17,7 @@ const command_admission = @import("../permissions/command_admission.zig");
 const command_runner = @import("../execution/command_runner.zig");
 const execution_router = @import("../execution/router.zig");
 const io_mod = @import("../shared/io.zig");
+const self_exe = @import("../shared/self_exe.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
 const workspace_pathing = @import("../workspace/pathing.zig");
@@ -3373,10 +3374,7 @@ const Session = struct {
             pinnedShell(request.shell, self.shell),
         );
 
-        const executable = try std.process.executablePathAlloc(
-            io_mod.getIo(),
-            self.alloc,
-        );
+        const executable = try self_exe.pathForPeerReexec(self.alloc);
         defer self.alloc.free(executable);
         var paths = try tmux_session.Paths.init(
             self.alloc,
@@ -3485,10 +3483,7 @@ const Session = struct {
         durable_root: []const u8,
         transport_root: []const u8,
     ) !bool {
-        const executable = try std.process.executablePathAlloc(
-            io_mod.getIo(),
-            self.alloc,
-        );
+        const executable = try self_exe.pathForPeerReexec(self.alloc);
         defer self.alloc.free(executable);
         const backend = tmux_session.Backend.recover(
             self.alloc,
@@ -3731,10 +3726,7 @@ const Session = struct {
             null;
         defer if (command_path) |path| self.alloc.free(path);
 
-        const executable = try std.process.executablePathAlloc(
-            io_mod.getIo(),
-            self.alloc,
-        );
+        const executable = try self_exe.pathForPeerReexec(self.alloc);
         defer self.alloc.free(executable);
         const bootstrap = try shell_resolver.buildBootstrap(
             self.alloc,
