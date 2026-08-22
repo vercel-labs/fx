@@ -1,5 +1,4 @@
 const std = @import("std");
-const agent_stream_provider = @import("../agent/stream_provider.zig");
 const credentials = @import("../auth/credentials.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -88,14 +87,11 @@ pub const CreditsProvider = struct {
 };
 
 pub const Provider = struct {
-    agent_stream: agent_stream_provider.Provider,
     oauth_transport: oauth_transport.Provider,
     chat_url: ChatUrlProvider,
-    cli_model_catalog: CliModelCatalogProvider,
     credits: CreditsProvider,
     generation_usage: generation_usage_provider.Provider,
     web_search: web_search_provider.Provider,
-    model_catalog: model_catalog.Provider,
 };
 
 test "credits lookup dispatches through the injected provider" {

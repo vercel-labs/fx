@@ -1,10 +1,10 @@
 const std = @import("std");
 const agent_runtime = @import("../agent/agent_runtime.zig");
-const stream_provider = @import("../agent/stream_provider.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const model_provider = @import("../config/model_provider.zig");
+const provider_set = @import("../gateway/provider_set.zig");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
@@ -31,66 +31,10 @@ const tool_host = @import("tool_host.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const ProviderRoute = struct {
-    agent_stream_provider: stream_provider.Provider,
-    permission_reviewer_provider: ?auto_classifier.Provider,
-};
-
-pub const ProviderRoutes = struct {
-    gateway: ProviderRoute,
-    codex: ProviderRoute,
-    grok: ProviderRoute,
-
-    pub fn select(self: ProviderRoutes, provider: model_provider.ProviderId) ProviderRoute {
-        return switch (provider) {
-            .gateway => self.gateway,
-            .codex => self.codex,
-            .grok => self.grok,
-        };
-    }
-};
-
-test "provider routes select independent streams and reviewers" {
-    var gateway_tag: u8 = 0;
-    var codex_tag: u8 = 0;
-    var grok_tag: u8 = 0;
-    var gateway_stream = stream_provider.unavailable_provider;
-    gateway_stream.context = &gateway_tag;
-    var codex_stream = stream_provider.unavailable_provider;
-    codex_stream.context = &codex_tag;
-    var grok_stream = stream_provider.unavailable_provider;
-    grok_stream.context = &grok_tag;
-    const Reviewer = struct {
-        fn review(
-            _: ?*anyopaque,
-            _: Allocator,
-            _: auto_classifier.ProviderInput,
-            _: auto_classifier.ReviewRequest,
-        ) anyerror!auto_classifier.ParseOutcome {
-            return .invalid;
-        }
-    };
-    const gateway_reviewer = auto_classifier.Provider{ .context = &gateway_tag, .review_fn = Reviewer.review };
-    const codex_reviewer = auto_classifier.Provider{ .context = &codex_tag, .review_fn = Reviewer.review };
-    const grok_reviewer = auto_classifier.Provider{ .context = &grok_tag, .review_fn = Reviewer.review };
-    const routes = ProviderRoutes{
-        .gateway = .{ .agent_stream_provider = gateway_stream, .permission_reviewer_provider = gateway_reviewer },
-        .codex = .{ .agent_stream_provider = codex_stream, .permission_reviewer_provider = codex_reviewer },
-        .grok = .{ .agent_stream_provider = grok_stream, .permission_reviewer_provider = grok_reviewer },
-    };
-
-    try std.testing.expect(routes.select(.gateway).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
-    try std.testing.expect(routes.select(.gateway).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
-    try std.testing.expect(routes.select(.codex).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
-    try std.testing.expect(routes.select(.codex).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
-    try std.testing.expect(routes.select(.grok).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&grok_tag)));
-    try std.testing.expect(routes.select(.grok).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&grok_tag)));
-}
-
 pub const Config = struct {
     host: *tool_host.Runtime,
     tool_context: tool_runtime.Context,
-    provider_routes: ProviderRoutes,
+    provider_set: provider_set.Set,
     system_prompt: []const u8,
     model_prompt_overlay: ?[]const u8 = null,
     skills_prompt_section: []const u8 = "",
@@ -183,9 +127,9 @@ pub fn run(
     var routed_credential: ?credentials.Credential = null;
     defer if (routed_credential) |*credential| credential.deinit(turn.alloc);
     var routed_config = config;
-    const route = config.provider_routes.select(admission.provider);
-    routed_config.tool_context.agent_stream_provider = route.agent_stream_provider;
-    routed_config.tool_context.permission_reviewer_provider = route.permission_reviewer_provider;
+    const provider = config.provider_set.select(admission.provider);
+    routed_config.tool_context.agent_stream_provider = provider.agent_stream_or_unavailable();
+    routed_config.tool_context.permission_reviewer_provider = provider.permission_reviewer;
     routed_config.tool_context.auto_classifier = auto_classifier.Classifier.disabled();
     if (!model_provider.authorizesCredential(
         admission.provider,

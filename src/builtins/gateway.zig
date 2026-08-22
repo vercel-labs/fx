@@ -17,6 +17,7 @@ const gateway_json = @import("../core/gateway/gateway_json.zig");
 const io_mod = @import("../core/shared/io.zig");
 const gateway_generation_usage = @import("../gateway/generation_usage.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
+const provider_set = @import("../core/gateway/provider_set.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const output_contracts = @import("../core/output/output_contracts.zig");
@@ -128,15 +129,19 @@ pub const agent_stream_provider = agent_stream_provider_contract.Provider{
     .stream_fn = streamAgentCompletion,
 };
 
-pub const provider = gateway_provider.Provider{
+pub const provider_bundle = provider_set.Bundle{
     .agent_stream = agent_stream_provider,
+    .cli_model_catalog = cli_model_catalog_provider,
+    .model_catalog = model_catalog_provider,
+    .permission_reviewer = permission_reviewer.provider,
+};
+
+pub const provider = gateway_provider.Provider{
     .oauth_transport = oauth_transport_provider,
     .chat_url = chat_url_provider,
-    .cli_model_catalog = cli_model_catalog_provider,
     .credits = credits_provider,
     .generation_usage = generation_usage_provider,
     .web_search = default_web_search_provider,
-    .model_catalog = model_catalog_provider,
 };
 
 pub fn buildAgentRequest(

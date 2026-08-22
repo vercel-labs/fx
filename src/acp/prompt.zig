@@ -39,6 +39,7 @@ const skill_invocation = @import("../core/skills/skill_invocation.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
+const provider_set = @import("../core/gateway/provider_set.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const display_width = @import("../core/shared/display_width.zig");
@@ -244,11 +245,7 @@ const AcpContext = struct {
             .permission_grants = session.session_grants,
             .permission_rules = session.permission_rules,
             .tool_registry = self.toolRegistry(),
-            .permission_reviewer_provider = switch (session.provider) {
-                .gateway => self.state.cfg.permission_reviewer_provider,
-                .codex => self.state.cfg.codex_permission_reviewer_provider,
-                .grok => self.state.cfg.grok_permission_reviewer_provider,
-            },
+            .permission_reviewer_provider = self.state.cfg.provider_set.select(session.provider).permission_reviewer,
             .auto_classifier = self.auto_classifier,
             .subagent_host = self.state.subagent_host,
             .subagent_caller_id = session.session_id,
@@ -693,20 +690,7 @@ pub fn runSubagentChild(
     return subagent_agent_adapter.run(.{
         .host = subagent_host,
         .tool_context = ctx.toolContext(),
-        .provider_routes = .{
-            .gateway = .{
-                .agent_stream_provider = server.streamProviderFor(state, .gateway),
-                .permission_reviewer_provider = state.cfg.permission_reviewer_provider,
-            },
-            .codex = .{
-                .agent_stream_provider = server.streamProviderFor(state, .codex),
-                .permission_reviewer_provider = state.cfg.codex_permission_reviewer_provider,
-            },
-            .grok = .{
-                .agent_stream_provider = server.streamProviderFor(state, .grok),
-                .permission_reviewer_provider = state.cfg.grok_permission_reviewer_provider,
-            },
-        },
+        .provider_set = state.cfg.provider_set,
         .system_prompt = state.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(admission.model),
         .skills_prompt_section = bounded_skills.text,
@@ -1100,7 +1084,8 @@ fn resolveModelCapabilities(
     const session = if (ctx.state.active_session) |*active| active else return model_capabilities.capabilitiesForModel(model);
     return ctx.state.capability_resolver.resolve(
         ctx.state.alloc,
-        ctx.state.cfg.gateway_provider.model_catalog,
+        ctx.state.cfg.provider_set.select(session.provider).model_catalog orelse
+            return model_capabilities.capabilitiesForModel(model),
         .{
             .access = credentials.catalogAccessForCredentialAndAccount(
                 session.credential_source,
@@ -3323,6 +3308,7 @@ fn testServerConfig() server.Config {
         .gateway_chat_url = "http://127.0.0.1",
         .gateway_models_path = "/models",
         .gateway_provider = test_builtin_gateway.provider,
+        .provider_set = provider_set.gateway_only(test_builtin_gateway.provider_bundle),
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{
             .system_prompt = "test",

@@ -38,6 +38,7 @@ const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
+const provider_set = @import("../gateway/provider_set.zig");
 const test_builtin_gateway = if (@import("builtin").is_test)
     @import("../../builtins/gateway.zig")
 else
@@ -1014,28 +1015,28 @@ pub fn Runtime(comptime App: type) type {
             defer explicit_skills.deinit(alloc);
             const prompt_policy = app.promptPolicy();
             const tool_context = childToolContext(app.subagentToolContextForAdmission(admission));
-            const provider_routes = if (comptime @hasDecl(App, "subagentProviderRoutes"))
-                app.subagentProviderRoutes()
+            const providers = if (comptime @hasDecl(App, "providerSet"))
+                app.providerSet()
             else
-                subagent_agent_adapter.ProviderRoutes{
+                provider_set.Set{
                     .gateway = .{
-                        .agent_stream_provider = tool_context.agent_stream_provider,
-                        .permission_reviewer_provider = tool_context.permission_reviewer_provider,
+                        .agent_stream = tool_context.agent_stream_provider,
+                        .permission_reviewer = tool_context.permission_reviewer_provider,
                     },
                     .codex = .{
-                        .agent_stream_provider = tool_context.agent_stream_provider,
-                        .permission_reviewer_provider = tool_context.permission_reviewer_provider,
+                        .agent_stream = tool_context.agent_stream_provider,
+                        .permission_reviewer = tool_context.permission_reviewer_provider,
                     },
                     .grok = .{
-                        .agent_stream_provider = tool_context.agent_stream_provider,
-                        .permission_reviewer_provider = tool_context.permission_reviewer_provider,
+                        .agent_stream = tool_context.agent_stream_provider,
+                        .permission_reviewer = tool_context.permission_reviewer_provider,
                     },
                 };
             return subagent_agent_adapter.run(.{
                 .host = app_session_runtime.Runtime(App).subagentHost(app) orelse
                     return error.ProviderFailed,
                 .tool_context = tool_context,
-                .provider_routes = provider_routes,
+                .provider_set = providers,
                 .system_prompt = prompt_policy.system_prompt,
                 .model_prompt_overlay = prompt_policy.modelPromptOverlay(admission.model),
                 .skills_prompt_section = bounded_skills.text,

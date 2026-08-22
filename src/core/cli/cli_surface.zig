@@ -18,7 +18,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
-const agent_stream_provider = @import("../agent/stream_provider.zig");
+const provider_set = @import("../gateway/provider_set.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
@@ -30,7 +30,6 @@ const oauth_transport = @import("../auth/oauth_transport.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
-const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const session_store = @import("../session/session_store.zig");
 const usage_report = @import("../session/usage_report.zig");
@@ -177,12 +176,7 @@ pub const Config = struct {
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
     gateway_provider: gateway_provider.Provider,
-    codex_agent_stream: ?agent_stream_provider.Provider = null,
-    codex_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
-    codex_model_catalog: ?model_catalog.Provider = null,
-    grok_agent_stream: ?agent_stream_provider.Provider = null,
-    grok_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
-    grok_model_catalog: ?model_catalog.Provider = null,
+    provider_set: provider_set.Set,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     url_opener: host.UrlOpener,
@@ -203,9 +197,6 @@ pub const Config = struct {
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     acp_runner: acp_runner.Runner,
-    permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
-    codex_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
-    grok_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
 };
 
 const LocalSurfaceOptions = struct {
@@ -745,16 +736,13 @@ fn activateProviderSelection(
         );
         return false;
     };
-    const catalog_provider = switch (target) {
-        .codex => cfg.codex_model_catalog orelse {
-            try writeProviderActivationError(alloc, deps, caller, "Codex model catalog is unavailable");
-            return false;
-        },
-        .grok => cfg.grok_model_catalog orelse {
-            try writeProviderActivationError(alloc, deps, caller, "Grok model catalog is unavailable");
-            return false;
-        },
-        .gateway => cfg.gateway_provider.model_catalog,
+    const catalog_provider = cfg.provider_set.select(target).model_catalog orelse {
+        try writeProviderActivationError(alloc, deps, caller, switch (target) {
+            .codex => "Codex model catalog is unavailable",
+            .grok => "Grok model catalog is unavailable",
+            .gateway => "Gateway model catalog is unavailable",
+        });
+        return false;
     };
     const fetch_result = model_catalog.fetchWithPublicFallback(catalog_provider, alloc, .{
         .access = credentials.catalogAccessAt(credential.*, io_mod.milliTimestamp()),
@@ -901,10 +889,7 @@ fn runNonInteractiveWithDeps(
                 .gateway_chat_url = cfg.gateway_provider.chat_url.resolve(cfg.gateway_chat_url),
                 .gateway_models_path = cfg.models_path,
                 .gateway_provider = cfg.gateway_provider,
-                .codex_agent_stream = cfg.codex_agent_stream,
-                .codex_model_catalog = cfg.codex_model_catalog,
-                .grok_agent_stream = cfg.grok_agent_stream,
-                .grok_model_catalog = cfg.grok_model_catalog,
+                .provider_set = cfg.provider_set,
                 .background_process_provider = cfg.background_process_provider,
                 .secret_store = cfg.secret_store,
                 .prompt_policy = cfg.prompt_policy,
@@ -918,9 +903,6 @@ fn runNonInteractiveWithDeps(
                 .max_history_turns = cfg.max_history_turns,
                 .context_registry = cfg.context_registry,
                 .mode_registry = cfg.mode_registry,
-                .permission_reviewer_provider = cfg.permission_reviewer_provider,
-                .codex_permission_reviewer_provider = cfg.codex_permission_reviewer_provider,
-                .grok_permission_reviewer_provider = cfg.grok_permission_reviewer_provider,
                 .context_limit_overrides = global_args.modifiers.context_limit_overrides,
                 .additional_directories = global_args.modifiers.additional_directories,
                 .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
@@ -1168,16 +1150,13 @@ fn runNonInteractiveWithDeps(
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
             const catalog_access = startup.modelCatalogAccess();
-            const catalog_provider = switch (startup.provider) {
-                .codex => cfg.codex_cli_model_catalog orelse {
-                    try writeStderr(deps, "fx models: Codex model catalog is unavailable\n");
-                    return .handled_failure;
-                },
-                .grok => cfg.grok_cli_model_catalog orelse {
-                    try writeStderr(deps, "fx models: Grok model catalog is unavailable\n");
-                    return .handled_failure;
-                },
-                .gateway => cfg.gateway_provider.cli_model_catalog,
+            const catalog_provider = cfg.provider_set.select(startup.provider).cli_model_catalog orelse {
+                try writeStderr(deps, switch (startup.provider) {
+                    .gateway => "fx models: Gateway model catalog is unavailable\n",
+                    .codex => "fx models: Codex model catalog is unavailable\n",
+                    .grok => "fx models: Grok model catalog is unavailable\n",
+                });
+                return .handled_failure;
             };
             const loaded = switch (catalog_provider.fetch(alloc, .{
                 .access = catalog_access,
@@ -2989,10 +2968,7 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .gateway_chat_url = cfg.gateway_provider.chat_url.resolve(cfg.gateway_chat_url),
         .gateway_models_path = cfg.models_path,
         .gateway_provider = cfg.gateway_provider,
-        .codex_agent_stream = cfg.codex_agent_stream,
-        .codex_model_catalog = cfg.codex_model_catalog,
-        .grok_agent_stream = cfg.grok_agent_stream,
-        .grok_model_catalog = cfg.grok_model_catalog,
+        .provider_set = cfg.provider_set,
         .background_process_provider = cfg.background_process_provider,
         .secret_store = cfg.secret_store,
         .prompt_policy = cfg.prompt_policy,
@@ -3007,9 +2983,6 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .max_history_turns = cfg.max_history_turns,
         .mode_registry = cfg.mode_registry,
         .load_mcp_runtime = cfg.load_mcp_runtime,
-        .permission_reviewer_provider = cfg.permission_reviewer_provider,
-        .codex_permission_reviewer_provider = cfg.codex_permission_reviewer_provider,
-        .grok_permission_reviewer_provider = cfg.grok_permission_reviewer_provider,
     };
 }
 
@@ -3715,7 +3688,7 @@ test "ACP command routes parsed options and launch config through the injected r
                     expected.context_registry.defaultProvider().id,
                 ) and
                 std.mem.eql(u8, cfg.mode_registry.default_mode_id, expected.mode_registry.default_mode_id) and
-                cfg.permission_reviewer_provider.?.review_fn == expected.permission_reviewer_provider.?.review_fn;
+                cfg.provider_set.gateway.permission_reviewer.?.review_fn == expected.provider_set.gateway.permission_reviewer.?.review_fn;
 
             const limit_matches = cfg.context_limit_overrides.len == 1 and
                 cfg.context_limit_overrides[0].name == .project_instructions_total_bytes and
@@ -3734,7 +3707,7 @@ test "ACP command routes parsed options and launch config through the injected r
     };
 
     var cfg = testConfig();
-    cfg.permission_reviewer_provider = test_builtin_gateway.permission_reviewer.provider;
+    cfg.provider_set.gateway.permission_reviewer = test_builtin_gateway.permission_reviewer.provider;
     var capture = Capture{ .expected = cfg };
     cfg.acp_runner = .{ .context = &capture, .run_fn = Capture.run };
     const result = try runIfRequestedWithDeps(
@@ -4811,7 +4784,7 @@ test "runIfRequested model fetch failure is handled" {
     defer capture.deinit();
     var probe = ModelFetchProbe{ .outcome = .failure };
     var cfg = testConfig();
-    cfg.gateway_provider.cli_model_catalog = probe.provider();
+    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
     deps.load_startup_state = failingStartupState;
@@ -4830,7 +4803,7 @@ test "runIfRequested model fetch failure preserves json output" {
     defer capture.deinit();
     var probe = ModelFetchProbe{ .outcome = .failure };
     var cfg = testConfig();
-    cfg.gateway_provider.cli_model_catalog = probe.provider();
+    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
     deps.load_catalog_startup_state = stubLoadCatalogStartupState;
@@ -4854,7 +4827,7 @@ test "runIfRequested model provider cancellation is handled" {
     defer capture.deinit();
     var probe = ModelFetchProbe{ .outcome = .cancelled };
     var cfg = testConfig();
-    cfg.gateway_provider.cli_model_catalog = probe.provider();
+    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
     deps.load_catalog_startup_state = stubLoadCatalogStartupState;
@@ -4872,7 +4845,7 @@ test "runIfRequested models passes startup team to fetch seam" {
     defer capture.deinit();
     var probe = ModelFetchProbe{};
     var cfg = testConfig();
-    cfg.gateway_provider.cli_model_catalog = probe.provider();
+    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
     deps.load_catalog_startup_state = stubLoadCatalogStartupState;
@@ -5260,6 +5233,7 @@ fn testConfig() Config {
         .gateway_retry_count = 1,
         .gateway_chat_url = "https://example.test/chat",
         .gateway_provider = test_builtin_gateway.provider,
+        .provider_set = provider_set.gateway_only(test_builtin_gateway.provider_bundle),
         .url_opener = host.unavailable_url_opener,
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{ .system_prompt = "system" },

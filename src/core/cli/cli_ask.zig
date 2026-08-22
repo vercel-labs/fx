@@ -15,6 +15,7 @@ const process_supervisor = @import("../background/process_supervisor.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
+const provider_set = @import("../gateway/provider_set.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
@@ -222,10 +223,7 @@ pub const Config = struct {
     gateway_chat_url: []const u8,
     gateway_models_path: []const u8,
     gateway_provider: gateway_provider.Provider,
-    codex_agent_stream: ?agent_stream_provider.Provider = null,
-    codex_model_catalog: ?model_catalog.Provider = null,
-    grok_agent_stream: ?agent_stream_provider.Provider = null,
-    grok_model_catalog: ?model_catalog.Provider = null,
+    provider_set: provider_set.Set,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     secret_store: host.SecretStore,
@@ -241,9 +239,6 @@ pub const Config = struct {
     max_history_turns: usize,
     mode_registry: mode_registry.Registry,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
-    permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
-    codex_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
-    grok_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
@@ -272,20 +267,7 @@ fn runAskChild(
     return subagent_agent_adapter.run(.{
         .host = ctx.subagent_host orelse return error.ProviderFailed,
         .tool_context = ctx.toolContext(),
-        .provider_routes = .{
-            .gateway = .{
-                .agent_stream_provider = ctx.cfg.gateway_provider.agent_stream,
-                .permission_reviewer_provider = ctx.cfg.permission_reviewer_provider,
-            },
-            .codex = .{
-                .agent_stream_provider = ctx.cfg.codex_agent_stream orelse agent_stream_provider.unavailable_provider,
-                .permission_reviewer_provider = ctx.cfg.codex_permission_reviewer_provider,
-            },
-            .grok = .{
-                .agent_stream_provider = ctx.cfg.grok_agent_stream orelse agent_stream_provider.unavailable_provider,
-                .permission_reviewer_provider = ctx.cfg.grok_permission_reviewer_provider,
-            },
-        },
+        .provider_set = ctx.cfg.provider_set,
         .system_prompt = ctx.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = ctx.cfg.prompt_policy.modelPromptOverlay(admission.model),
         .skills_prompt_section = ctx.subagent_skills_prompt,
@@ -1057,11 +1039,7 @@ const AskContext = struct {
 
     fn admissionAutoClassifier(self: *AskContext) permission_auto_classifier.Classifier {
         if (self.auto_classifier.enabled()) return self.auto_classifier;
-        const provider = switch (self.provider) {
-            .gateway => self.cfg.permission_reviewer_provider,
-            .codex => self.cfg.codex_permission_reviewer_provider,
-            .grok => self.cfg.grok_permission_reviewer_provider,
-        } orelse
+        const provider = self.cfg.provider_set.select(self.provider).permission_reviewer orelse
             return permission_auto_classifier.Classifier.disabled();
         return permission_auto_classifier.Classifier.withProvider(provider, .{
             .credential = self.api_key,
@@ -1075,11 +1053,7 @@ const AskContext = struct {
     }
 
     fn agentStreamProvider(self: *const AskContext) agent_stream_provider.Provider {
-        return switch (self.provider) {
-            .gateway => self.cfg.gateway_provider.agent_stream,
-            .codex => self.cfg.codex_agent_stream orelse agent_stream_provider.unavailable_provider,
-            .grok => self.cfg.grok_agent_stream orelse agent_stream_provider.unavailable_provider,
-        };
+        return self.cfg.provider_set.select(self.provider).agent_stream_or_unavailable();
     }
 
     fn writeStdout(self: *AskContext, text: []const u8) !void {
@@ -2000,12 +1974,8 @@ fn reportUsage(raw_ctx: *anyopaque, usage: types.Usage) void {
 
 fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const catalog = selectModelCatalog(
-        ctx.provider,
-        ctx.cfg.gateway_provider.model_catalog,
-        ctx.cfg.codex_model_catalog,
-        ctx.cfg.grok_model_catalog,
-    ) orelse return model_capabilities.capabilitiesForModel(model);
+    const catalog = ctx.cfg.provider_set.select(ctx.provider).model_catalog orelse
+        return model_capabilities.capabilitiesForModel(model);
     return ctx.capability_resolver.resolve(
         ctx.alloc,
         catalog,
@@ -2018,56 +1988,9 @@ fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8
     );
 }
 
-fn selectModelCatalog(
-    provider: model_provider.ProviderId,
-    gateway: model_catalog.Provider,
-    codex: ?model_catalog.Provider,
-    grok: ?model_catalog.Provider,
-) ?model_catalog.Provider {
-    return switch (provider) {
-        .gateway => gateway,
-        .codex => codex,
-        .grok => grok,
-    };
-}
-
 fn availableModelCapabilities(raw_ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     return ctx.capability_resolver.available(model);
-}
-
-test "provider catalog selection never falls back across origins" {
-    var gateway_tag: u8 = 0;
-    var codex_tag: u8 = 0;
-    var gateway = test_builtin_gateway.model_catalog_provider;
-    gateway.context = &gateway_tag;
-    var codex = test_builtin_gateway.model_catalog_provider;
-    codex.context = &codex_tag;
-    var grok_tag: u8 = 0;
-    var grok = test_builtin_gateway.model_catalog_provider;
-    grok.context = &grok_tag;
-    const cases = [_]struct {
-        provider: model_provider.ProviderId,
-        codex: ?model_catalog.Provider,
-        grok: ?model_catalog.Provider,
-        expected_context: ?*anyopaque,
-    }{
-        .{ .provider = .gateway, .codex = codex, .grok = grok, .expected_context = &gateway_tag },
-        .{ .provider = .codex, .codex = codex, .grok = grok, .expected_context = &codex_tag },
-        .{ .provider = .codex, .codex = null, .grok = grok, .expected_context = null },
-        .{ .provider = .grok, .codex = codex, .grok = grok, .expected_context = &grok_tag },
-        .{ .provider = .grok, .codex = codex, .grok = null, .expected_context = null },
-    };
-
-    for (cases) |case| {
-        const selected = selectModelCatalog(case.provider, gateway, case.codex, case.grok);
-        if (case.expected_context) |expected| {
-            try std.testing.expect(selected != null);
-            try std.testing.expect(selected.?.context.? == expected);
-        } else {
-            try std.testing.expect(selected == null);
-        }
-    }
 }
 
 fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) !void {
@@ -3856,6 +3779,7 @@ fn testConfig() Config {
         .gateway_chat_url = "https://example.invalid/chat",
         .gateway_models_path = "/models",
         .gateway_provider = test_builtin_gateway.provider,
+        .provider_set = provider_set.gateway_only(test_builtin_gateway.provider_bundle),
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{
             .system_prompt = "system",
@@ -5388,7 +5312,7 @@ test "fx ask automatic review observes worker cancellation" {
     var stderr_capture: TestCapture = .{};
     defer stderr_capture.deinit(alloc);
     var cfg = testConfig();
-    cfg.permission_reviewer_provider = .{ .review_fn = Provider.review };
+    cfg.provider_set.gateway.permission_reviewer = .{ .review_fn = Provider.review };
     var ctx = AskContext.init(
         alloc,
         cfg,

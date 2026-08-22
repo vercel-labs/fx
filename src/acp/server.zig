@@ -365,24 +365,14 @@ pub fn streamProviderFor(
     state: *const ServerState,
     provider: model_provider.ProviderId,
 ) @import("../core/agent/stream_provider.zig").Provider {
-    return switch (provider) {
-        .gateway => state.cfg.gateway_provider.agent_stream,
-        .codex => state.cfg.codex_agent_stream orelse
-            @import("../core/agent/stream_provider.zig").unavailable_provider,
-        .grok => state.cfg.grok_agent_stream orelse
-            @import("../core/agent/stream_provider.zig").unavailable_provider,
-    };
+    return state.cfg.provider_set.select(provider).agent_stream_or_unavailable();
 }
 
 pub fn catalogProviderFor(
     state: *const ServerState,
     provider: model_provider.ProviderId,
 ) ?@import("../core/gateway/model_catalog.zig").Provider {
-    return switch (provider) {
-        .gateway => state.cfg.gateway_provider.model_catalog,
-        .codex => state.cfg.codex_model_catalog,
-        .grok => state.cfg.grok_model_catalog,
-    };
+    return state.cfg.provider_set.select(provider).model_catalog;
 }
 
 pub fn refreshModelCredential(

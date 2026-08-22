@@ -5,6 +5,7 @@ const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
 const background_process_provider = @import("core/execution/background_process_provider.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
+const provider_set = @import("core/gateway/provider_set.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
 const host = @import("core/hosts/host.zig");
 const io_mod = @import("core/shared/io.zig");
@@ -39,6 +40,7 @@ pub fn main(init: std.process.Init) !void {
         .gateway_chat_url = builtin_gateway.default_chat_url,
         .gateway_models_path = builtin_gateway.models_path,
         .gateway_provider = js_host_gateway_provider,
+        .provider_set = js_host_provider_set,
         .background_process_provider = background_process_provider.unavailable_provider,
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = builtin_context.prompt_policy,
@@ -56,15 +58,18 @@ pub fn main(init: std.process.Init) !void {
 }
 
 const js_host_gateway_provider = gateway_provider.Provider{
-    .agent_stream = js_host_stream_provider.provider(),
     .oauth_transport = oauth_transport.unavailable_provider,
     .chat_url = .{ .resolve_fn = resolveChatUrl },
-    .cli_model_catalog = .{ .fetch_fn = fetchCliModelCatalog },
     .credits = .{ .fetch_fn = fetchCredits },
     .generation_usage = generation_usage_provider.unavailable_provider,
     .web_search = unavailable_web_search_provider,
-    .model_catalog = js_host_model_catalog.provider,
 };
+
+const js_host_provider_set = provider_set.gateway_only(.{
+    .agent_stream = js_host_stream_provider.provider(),
+    .cli_model_catalog = .{ .fetch_fn = fetchCliModelCatalog },
+    .model_catalog = js_host_model_catalog.provider,
+});
 
 fn resolveChatUrl(_: ?*anyopaque, fallback: []const u8) []const u8 {
     return fallback;

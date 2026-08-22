@@ -51,11 +51,8 @@ const command_specs = @import("core/slash_commands/command_specs.zig");
 const builtin_context = @import("builtins/context.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_providers = @import("builtins/providers.zig");
-const openai_codex_models = @import("gateway/openai_codex_models.zig");
-const openai_codex_permission_reviewer = @import("gateway/openai_codex_permission_reviewer.zig");
-const xai_grok_models = @import("gateway/xai_grok_models.zig");
-const xai_grok_permission_reviewer = @import("gateway/xai_grok_permission_reviewer.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
+const provider_set = @import("core/gateway/provider_set.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
@@ -84,7 +81,6 @@ const hooks = @import("core/hooks/hooks.zig");
 const github_publish = @import("core/github/github_publish.zig");
 const subagent_domain = @import("core/subagent/domain.zig");
 const subagent_execution = @import("core/subagent/execution.zig");
-const subagent_agent_adapter = @import("core/subagent/agent_adapter.zig");
 const types = @import("core/shared/types.zig");
 const image_attachments = @import("core/images/image_attachments.zig");
 const permissions = @import("core/permissions/permissions.zig");
@@ -433,9 +429,9 @@ const App = struct {
     }
 
     pub fn agentStreamProvider(self: *const Self) agent_stream_provider.Provider {
-        return self.subagentProviderRoutes()
+        return self.providerSet()
             .select(self.provider_selection.selection().provider)
-            .agent_stream_provider;
+            .agent_stream_or_unavailable();
     }
 
     pub fn fetchProviderCatalog(
@@ -443,7 +439,9 @@ const App = struct {
         provider: model_provider.ProviderId,
         access: credentials.CatalogAccess,
     ) !model_catalog.ProviderResult {
-        return builtin_providers.modelCatalog(provider).fetch(self.alloc, .{
+        const catalog = self.providerSet().select(provider).model_catalog orelse
+            return error.ModelCatalogUnavailable;
+        return catalog.fetch(self.alloc, .{
             .access = access,
             .endpoint = builtin_gateway.models_path,
             .cancel_flag = &self.worker.worker_cancel_requested,
@@ -1571,44 +1569,33 @@ const App = struct {
     }
 
     pub fn permissionReviewerProvider(self: *const App) ?permission_auto_classifier.Provider {
-        return self.subagentProviderRoutes()
+        return self.providerSet()
             .select(self.provider_selection.selection().provider)
-            .permission_reviewer_provider;
+            .permission_reviewer;
     }
 
-    pub fn subagentProviderRoutes(_: *const App) subagent_agent_adapter.ProviderRoutes {
-        return .{
-            .gateway = .{
-                .agent_stream_provider = if (comptime host_target.is_wasm)
-                    js_host_stream_provider.provider()
-                else
-                    builtin_providers.agentStream(.gateway),
-                .permission_reviewer_provider = if (comptime host_profile.tools)
-                    builtin_gateway.permission_reviewer.provider
-                else
-                    null,
-            },
-            .codex = .{
-                .agent_stream_provider = if (comptime host_target.is_wasm)
-                    agent_stream_provider.unavailable_provider
-                else
-                    builtin_providers.agentStream(.codex),
-                .permission_reviewer_provider = if (comptime host_profile.tools and !host_target.is_wasm)
-                    openai_codex_permission_reviewer.provider
-                else
-                    null,
-            },
-            .grok = .{
-                .agent_stream_provider = if (comptime host_target.is_wasm)
-                    agent_stream_provider.unavailable_provider
-                else
-                    builtin_providers.agentStream(.grok),
-                .permission_reviewer_provider = if (comptime host_profile.tools and !host_target.is_wasm)
-                    xai_grok_permission_reviewer.provider
-                else
-                    null,
-            },
-        };
+    pub fn providerSet(_: *const App) provider_set.Set {
+        if (comptime host_target.is_wasm) {
+            return .{
+                .gateway = .{
+                    .agent_stream = js_host_stream_provider.provider(),
+                    .model_catalog = js_host_model_catalog.provider,
+                    .permission_reviewer = if (comptime host_profile.tools)
+                        builtin_gateway.permission_reviewer.provider
+                    else
+                        null,
+                },
+                .codex = .{},
+                .grok = .{},
+            };
+        }
+        var providers = builtin_providers.native;
+        if (comptime !host_profile.tools) {
+            providers.gateway.permission_reviewer = null;
+            providers.codex.permission_reviewer = null;
+            providers.grok.permission_reviewer = null;
+        }
+        return providers;
     }
 
     pub fn describeToolAction(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
@@ -1718,7 +1705,7 @@ const App = struct {
             if (comptime host_target.is_wasm)
                 js_host_model_catalog.provider
             else
-                builtin_providers.modelCatalog(self.provider_selection.selection().provider),
+                self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse unreachable,
             builtin_gateway.models_path,
         );
     }
@@ -1735,7 +1722,7 @@ const App = struct {
             );
         } else {
             self.model_cache.startWarmup(
-                builtin_providers.modelCatalog(self.provider_selection.selection().provider),
+                self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse unreachable,
                 self.auth.modelCatalogAccess(),
             );
         }
@@ -3235,12 +3222,7 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .gateway_retry_count = builtin_gateway.retry_count,
         .gateway_chat_url = builtin_gateway.default_chat_url,
         .gateway_provider = native_gateway_provider,
-        .codex_agent_stream = builtin_providers.agentStream(.codex),
-        .codex_cli_model_catalog = openai_codex_models.cli_model_catalog_provider,
-        .codex_model_catalog = openai_codex_models.model_catalog_provider,
-        .grok_agent_stream = builtin_providers.agentStream(.grok),
-        .grok_cli_model_catalog = xai_grok_models.cli_model_catalog_provider,
-        .grok_model_catalog = xai_grok_models.model_catalog_provider,
+        .provider_set = builtin_providers.native,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3260,9 +3242,6 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
         .acp_runner = .{ .run_fn = runAcpServer },
-        .permission_reviewer_provider = builtin_gateway.permission_reviewer.provider,
-        .codex_permission_reviewer_provider = openai_codex_permission_reviewer.provider,
-        .grok_permission_reviewer_provider = xai_grok_permission_reviewer.provider,
     };
 }
 
@@ -3278,12 +3257,7 @@ fn localEntryConfig() app_entry_runtime.Config {
         .gateway_retry_count = builtin_gateway.retry_count,
         .gateway_chat_url = builtin_gateway.default_chat_url,
         .gateway_provider = native_gateway_provider,
-        .codex_agent_stream = builtin_providers.agentStream(.codex),
-        .codex_cli_model_catalog = openai_codex_models.cli_model_catalog_provider,
-        .codex_model_catalog = openai_codex_models.model_catalog_provider,
-        .grok_agent_stream = builtin_providers.agentStream(.grok),
-        .grok_cli_model_catalog = xai_grok_models.cli_model_catalog_provider,
-        .grok_model_catalog = xai_grok_models.model_catalog_provider,
+        .provider_set = builtin_providers.native,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3318,12 +3292,7 @@ fn emptyEntryConfig() app_entry_runtime.Config {
         .gateway_retry_count = 0,
         .gateway_chat_url = "",
         .gateway_provider = native_gateway_provider,
-        .codex_agent_stream = builtin_providers.agentStream(.codex),
-        .codex_cli_model_catalog = openai_codex_models.cli_model_catalog_provider,
-        .codex_model_catalog = openai_codex_models.model_catalog_provider,
-        .grok_agent_stream = builtin_providers.agentStream(.grok),
-        .grok_cli_model_catalog = xai_grok_models.cli_model_catalog_provider,
-        .grok_model_catalog = xai_grok_models.model_catalog_provider,
+        .provider_set = builtin_providers.native,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3837,6 +3806,7 @@ test {
     _ = @import("core/auth/oauth_session.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/gateway/gateway_json.zig");
+    _ = @import("core/gateway/provider_set.zig");
     _ = @import("core/github/git_context.zig");
     _ = @import("core/github/github_publish.zig");
     _ = @import("core/github/github_workflows.zig");
