@@ -7427,10 +7427,11 @@ test "headless ask tracks turn usage while preserving latest session usage" {
     const report_fn = deps.report_usage orelse return error.TestExpectedEqual;
     report_fn(deps.ctx, .{ .input_tokens = 100, .output_tokens = 20 });
     report_fn(deps.ctx, .{ .input_tokens = 107, .output_tokens = 23 });
+    report_fn(deps.ctx, .{});
 
     try std.testing.expectEqual(@as(u64, 107), ctx.writable.?.state.total_input_tokens);
     try std.testing.expectEqual(@as(u64, 23), ctx.writable.?.state.total_output_tokens);
-    try std.testing.expectEqual(@as(u64, 2), ctx.usage_requests);
+    try std.testing.expectEqual(@as(u64, 3), ctx.usage_requests);
     try std.testing.expectEqual(@as(u64, 207), ctx.usage_input_tokens);
     try std.testing.expectEqual(@as(u64, 43), ctx.usage_output_tokens);
     var failed = try takeFailedPromptRunResult(
@@ -7444,7 +7445,7 @@ test "headless ask tracks turn usage while preserving latest session usage" {
         "NonInteractivePermissionRequired",
         failed.error_code.?,
     );
-    try std.testing.expectEqual(@as(u64, 2), failed.usage_requests);
+    try std.testing.expectEqual(@as(u64, 3), failed.usage_requests);
     try std.testing.expectEqual(@as(u64, 207), failed.usage_input_tokens);
     try std.testing.expectEqual(@as(u64, 43), failed.usage_output_tokens);
 }

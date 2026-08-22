@@ -141,6 +141,14 @@ function sse(body: string): Response {
   });
 }
 
+function successfulResponseWithoutUsage(text: string): Response {
+  return sse(
+    `data: ${JSON.stringify({ type: "text-delta", id: "answer", delta: text })}\n\n` +
+      'data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"}}\n\n' +
+      "data: [DONE]\n\n",
+  );
+}
+
 function startGateway(
   response: () => Response,
   classifierDecision: "clear" | "caution" = "clear",
@@ -278,6 +286,11 @@ function parseAskJson(stdout: string): {
   exit_code: number;
   error?: string;
   session_id: string;
+  usage: {
+    requests: number;
+    input_tokens: number;
+    output_tokens: number;
+  };
   tool_calls: Array<{ name: string; status: string }>;
   recovery?: {
     state: string;
@@ -755,6 +768,39 @@ describe("gateway stream lifecycle", () => {
       expect(gateway.requests[0]!.body).not.toContain(
         "Continue from the latest meaningful state",
       );
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("no-save ask counts a settled response without provider token usage", async () => {
+    const root = createFixtureRoot("ask-null-usage");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() =>
+      successfulResponseWithoutUsage("NULL_USAGE_ASK_COMPLETE")
+    );
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 30_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(json.output).toContain("NULL_USAGE_ASK_COMPLETE");
+      expect(json.usage).toEqual({
+        requests: 1,
+        input_tokens: 0,
+        output_tokens: 0,
+      });
+      expect(gateway.requests).toHaveLength(1);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
