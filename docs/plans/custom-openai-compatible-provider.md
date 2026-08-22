@@ -1,28 +1,24 @@
 # Plan: Generic OpenAI-Compatible Provider (`custom`)
 
-Status: implementation in progress. Configuration, credentials, incremental SSE chat completions, tool-call response parsing, remote model catalogs, and deterministic E2E coverage are implemented. Real-provider validation, final review, and CI remain.
+Status: implementation in progress.
+Configuration, credentials, incremental SSE chat completions, tool-call response parsing, remote model catalogs, and deterministic E2E coverage are implemented.
+Real-provider validation, final review, and CI remain.
 
-This plan adds a third provider to fx alongside Gateway (Vercel AI Gateway) and
-Codex (ChatGPT subscription). The new provider is called `custom` and speaks any
-OpenAI-compatible chat completions endpoint. One implementation covers
-OpenRouter, DeepSeek direct, Moonshot/Kimi, Groq, Together, xAI, Mistral, and
-future providers without per-provider code paths.
+This plan adds a third provider to fx alongside Gateway (Vercel AI Gateway) and Codex (ChatGPT subscription).
+The new provider is called `custom` and speaks any OpenAI-compatible chat completions endpoint.
+One implementation covers OpenRouter, DeepSeek direct, Moonshot/Kimi, Groq, Together, xAI, Mistral, and future providers without per-provider code paths.
 
 ## Goals
 
-- Users can point fx at any OpenAI-compatible endpoint with a base URL, an API
-  key environment variable name, and a model ID.
-- Streaming, tool calling, and the `/model` picker work through the same
-  internal contracts the Gateway and Codex transports already use.
+- Users can point fx at any OpenAI-compatible endpoint with a base URL, an API key environment variable name, and a model ID.
+- Streaming, tool calling, and the `/model` picker work through the same internal contracts the Gateway and Codex transports already use.
 - Missing provider capabilities degrade visibly instead of failing silently.
 
 ## Non-goals for v1
 
-- No per-provider quirk tables or special-case adapters beyond the generic
-  normalization described here.
+- No per-provider quirk tables or special-case adapters beyond the generic normalization described here.
 - No storing API keys in settings files or project config.
-- No support for gateway-only features such as hosted web search, Fast mode, or
-  generation cost lookups on custom endpoints.
+- No support for gateway-only features such as hosted web search, Fast mode, or generation cost lookups on custom endpoints.
 
 ## Example configuration
 
