@@ -353,6 +353,8 @@ pub const SessionPreferencePatch = struct {
                 .gateway => patch.model = self.model,
                 .codex => patch.codex_model = self.model,
                 .grok => patch.grok_model = self.model,
+                .zen => patch.zen_model = self.model,
+                .go => patch.go_model = self.model,
             }
         } else {
             patch.model = self.model;
@@ -9944,4 +9946,20 @@ test "terminal title bounds session and model context" {
     try std.testing.expect(label.len <= Runtime(TestApp).terminal_title_label_max_bytes);
     try std.testing.expect(std.mem.find(u8, label, "...") != null);
     try std.testing.expect(std.mem.find(u8, label, " · provider/") != null);
+}
+
+test "zen and go preference patches write scoped models not gateway model" {
+    inline for ([_]model_provider.ProviderId{ .zen, .go }) |provider| {
+        const patch = SessionPreferencePatch{ .provider = provider, .model = "live-model" };
+        const user = patch.userSettingsPatch();
+        try std.testing.expectEqual(provider, user.provider.?);
+        try std.testing.expect(user.model == null);
+        if (provider == .zen) {
+            try std.testing.expectEqualStrings("live-model", user.zen_model.?);
+            try std.testing.expect(user.go_model == null);
+        } else {
+            try std.testing.expectEqualStrings("live-model", user.go_model.?);
+            try std.testing.expect(user.zen_model == null);
+        }
+    }
 }

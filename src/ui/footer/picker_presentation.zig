@@ -1,5 +1,6 @@
 const std = @import("std");
 const auth_runtime = @import("../../core/auth/auth_runtime.zig");
+const model_provider = @import("../../core/config/model_provider.zig");
 const credentials = @import("../../core/auth/credentials.zig");
 const login_flow = @import("../../core/auth/login_flow.zig");
 const picker_state = @import("../../core/input/picker_state.zig");
@@ -70,7 +71,7 @@ pub noinline fn composeAuthPickerRow(
         return composeSignInPickerRow(alloc, view.sign_in, view.sign_in_source, row_index, width);
     }
     if (view.stage == .api_key) {
-        return composeApiKeyPickerRow(alloc, view.api_key_mask_count, row_index, width);
+        return composeApiKeyPickerRow(alloc, view.api_key_mask_count, view.api_key_destination, row_index, width);
     }
     if (view.stage == .root and view.include_skip) {
         return composeOnboardingPickerRow(alloc, view, row_index, row_count, width);
@@ -160,7 +161,7 @@ fn onboardingProjectedRowIndex(view: auth_runtime.PickerView, row_index: u16, ro
     if (row_count >= 18) return row_index;
 
     const selected_row: u16 = 8 + @as(u16, @intCast(view.selectedIndex()));
-    const priority = [_]u16{ selected_row, 11, 9, 10, 8, 15, 7, 12, 5, 0, 2, 3, 6, 13, 14, 1, 4, 16, 17 };
+    const priority = [_]u16{ selected_row, 13, 9, 10, 11, 12, 8, 16, 7, 14, 5, 0, 2, 3, 6, 15, 1, 4, 17 };
 
     var projected_index: u16 = 0;
     for (0..18) |source_row| {
@@ -191,6 +192,8 @@ fn composeOnboardingPickerRow(
         9 => 1,
         10 => 2,
         11 => 3,
+        12 => 4,
+        13 => 5,
         else => null,
     };
     if (maybe_choice_index) |choice_index| {
@@ -218,10 +221,10 @@ fn composeOnboardingPickerRow(
         5 => "   You can change this anytime with /setup.",
         6 => "",
         7 => "   Get started",
-        12 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
-        13, 14 => "",
-        15 => "   Esc to set up later · Explore all commands with /help",
-        16, 17 => "",
+        14 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
+        15 => "",
+        16 => "   Esc to set up later · Explore all commands with /help",
+        17 => "",
         else => "",
     };
     try row_text.appendClipped(alloc, &row, label, width);
@@ -307,6 +310,7 @@ fn composeSignInPickerRow(
 fn composeApiKeyPickerRow(
     alloc: Allocator,
     mask_count: usize,
+    destination: model_provider.ProviderId,
     row_index: u16,
     width: u16,
 ) !std.ArrayList(u8) {
@@ -318,8 +322,18 @@ fn composeApiKeyPickerRow(
         ui_render.selected_completion_style
     else
         ui_render.dim_style);
+    const prompt = switch (destination) {
+        .zen => "   Paste your OpenCode Zen API key",
+        .go => "   Paste your OpenCode Go API key",
+        else => "   Paste your AI Gateway API key",
+    };
+    const save_target = switch (destination) {
+        .zen => "~/.fx/zen-auth.json",
+        .go => "~/.fx/go-auth.json",
+        else => credentials.stored_key_backend_label,
+    };
     switch (row_index) {
-        0 => try row_text.appendClipped(alloc, &row, "   Paste your AI Gateway API key", width),
+        0 => try row_text.appendClipped(alloc, &row, prompt, width),
         1 => {
             try row_text.appendClipped(alloc, &row, "   ┃ ", width);
             if (mask_count == 0) {
@@ -335,7 +349,7 @@ fn composeApiKeyPickerRow(
             const label = std.fmt.bufPrint(
                 &label_buf,
                 "   Saves to {s}",
-                .{credentials.stored_key_backend_label},
+                .{save_target},
             ) catch "   Saves to configured credential store";
             try row_text.appendClipped(alloc, &row, label, width);
         },
@@ -1620,11 +1634,19 @@ test "auth onboarding composes the welcome copy and setup choices" {
     defer grok_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, grok_row.items, "Sign in with Grok") != null);
 
-    var unselected_row = try composeAuthPickerRow(alloc, view, 11, authPickerRowCount(view), 100);
+    var zen_row = try composeAuthPickerRow(alloc, view, 11, authPickerRowCount(view), 100);
+    defer zen_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, zen_row.items, "Sign in with OpenCode Zen") != null);
+
+    var go_row = try composeAuthPickerRow(alloc, view, 12, authPickerRowCount(view), 100);
+    defer go_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, go_row.items, "Sign in with OpenCode Go") != null);
+
+    var unselected_row = try composeAuthPickerRow(alloc, view, 13, authPickerRowCount(view), 100);
     defer unselected_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, unselected_row.items, "Add an API key") != null);
 
-    var narrow_note = try composeAuthPickerRow(alloc, view, 12, authPickerRowCount(view), 58);
+    var narrow_note = try composeAuthPickerRow(alloc, view, 14, authPickerRowCount(view), 58);
     defer narrow_note.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, narrow_note.items, "https://fx.sh/docs/stability") == null);
 
@@ -1652,7 +1674,7 @@ test "auth picker composes only detected credential sources" {
         .include_skip = false,
     };
     const row_count = authPickerRowCount(view);
-    try std.testing.expectEqual(@as(u16, 8), row_count);
+    try std.testing.expectEqual(@as(u16, 10), row_count);
 
     var header = try composeAuthPickerRow(alloc, view, 0, row_count, 80);
     defer header.deinit(alloc);
@@ -1670,20 +1692,28 @@ test "auth picker composes only detected credential sources" {
     defer grok.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, grok.items, "Sign in with Grok") != null);
 
-    var setup = try composeAuthPickerRow(alloc, view, 4, row_count, 80);
+    var zen = try composeAuthPickerRow(alloc, view, 4, row_count, 80);
+    defer zen.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, zen.items, "OpenCode Zen") != null);
+
+    var go = try composeAuthPickerRow(alloc, view, 5, row_count, 80);
+    defer go.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, go.items, "OpenCode Go") != null);
+
+    var setup = try composeAuthPickerRow(alloc, view, 6, row_count, 80);
     defer setup.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, setup.items, "API key") != null);
 
-    var switch_provider = try composeAuthPickerRow(alloc, view, 5, row_count, 80);
+    var switch_provider = try composeAuthPickerRow(alloc, view, 7, row_count, 80);
     defer switch_provider.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, switch_provider.items, "Switch provider") != null);
 
-    var change_team = try composeAuthPickerRow(alloc, view, 6, row_count, 80);
+    var change_team = try composeAuthPickerRow(alloc, view, 8, row_count, 80);
     defer change_team.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, change_team.items, "Change team") != null);
     try std.testing.expect(std.mem.find(u8, change_team.items, "sign in first") != null);
 
-    var switch_credential = try composeAuthPickerRow(alloc, view, 7, row_count, 80);
+    var switch_credential = try composeAuthPickerRow(alloc, view, 9, row_count, 80);
     defer switch_credential.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, switch_credential.items, "Switch credential") != null);
 }

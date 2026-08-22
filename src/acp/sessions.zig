@@ -562,12 +562,13 @@ fn handleRestoreSession(
     if (!try server.selectCredentialForProvider(state, effective_provider)) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
-            .message = if (effective_provider == .codex)
-                credentials.missing_chatgpt_credential_message
-            else if (effective_provider == .grok)
-                credentials.missing_grok_credential_message
-            else
-                credentials.missing_credential_message,
+            .message = switch (effective_provider) {
+                .codex => credentials.missing_chatgpt_credential_message,
+                .grok => credentials.missing_grok_credential_message,
+                .zen => credentials.missing_zen_credential_message,
+                .go => credentials.missing_go_credential_message,
+                .gateway => credentials.missing_credential_message,
+            },
         });
     }
     const model_copy = try alloc.dupe(u8, effective_model);
@@ -795,7 +796,7 @@ fn activateSession(
     };
     server.enableSubagentHost(state);
     state.active_session.?.session_rt.attachProfileUsagePublisher(state.alloc);
-    if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription) {
+    if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription or state.credential_source == .zen_api_key or state.credential_source == .go_api_key) {
         state.active_session.?.session_rt.usage.clearReconciliationCredential();
     } else {
         state.active_session.?.session_rt.usage.startReconciliation(

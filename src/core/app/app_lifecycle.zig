@@ -1113,6 +1113,8 @@ fn configuredProviderSelection(
         .gateway => settings.model orelse default_model,
         .codex => settings.codex_model orelse return error.CodexModelNotSelected,
         .grok => settings.grok_model orelse return error.GrokModelNotSelected,
+        .zen => settings.zen_model orelse return error.ZenModelNotSelected,
+        .go => settings.go_model orelse return error.GoModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
 }
@@ -1155,6 +1157,25 @@ test "startup provider chooses only its provider-scoped model" {
     const grok = try configuredProviderSelection("default/model", &grok_settings);
     try std.testing.expectEqual(model_provider.ProviderId.grok, grok.provider);
     try std.testing.expectEqualStrings("grok-model", grok.model);
+
+    const zen_settings = config_runtime.Settings{
+        .model = @constCast("gateway/model"),
+        .provider = .zen,
+        .zen_model = @constCast("zen-model"),
+    };
+    const zen = try configuredProviderSelection("default/model", &zen_settings);
+    try std.testing.expectEqual(model_provider.ProviderId.zen, zen.provider);
+    try std.testing.expectEqualStrings("zen-model", zen.model);
+    try std.testing.expect(zen.provider != .gateway);
+
+    const go_settings = config_runtime.Settings{
+        .provider = .go,
+        .go_model = @constCast("go-model"),
+    };
+    const go = try configuredProviderSelection("default/model", &go_settings);
+    try std.testing.expectEqual(model_provider.ProviderId.go, go.provider);
+    try std.testing.expectEqualStrings("go-model", go.model);
+    try std.testing.expect(go.provider != .gateway);
 }
 
 fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) ![]u8 {

@@ -25,6 +25,10 @@ pub const Config = struct {
     codex_model_catalog: ?model_catalog.Provider = null,
     grok_agent_stream: ?agent_stream_provider.Provider = null,
     grok_model_catalog: ?model_catalog.Provider = null,
+    zen_agent_stream: ?agent_stream_provider.Provider = null,
+    zen_model_catalog: ?model_catalog.Provider = null,
+    go_agent_stream: ?agent_stream_provider.Provider = null,
+    go_model_catalog: ?model_catalog.Provider = null,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     secret_store: host.SecretStore,

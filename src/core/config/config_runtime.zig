@@ -39,6 +39,8 @@ pub const Settings = struct {
     provider: ?model_provider.ProviderId = null,
     codex_model: ?[]u8 = null,
     grok_model: ?[]u8 = null,
+    zen_model: ?[]u8 = null,
+    go_model: ?[]u8 = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     yolo_acknowledged: ?bool = null,
@@ -67,6 +69,8 @@ pub const Settings = struct {
         if (self.model) |value| alloc.free(value);
         if (self.codex_model) |value| alloc.free(value);
         if (self.grok_model) |value| alloc.free(value);
+        if (self.zen_model) |value| alloc.free(value);
+        if (self.go_model) |value| alloc.free(value);
         self.permission_rules.deinit(alloc);
         self.* = .{};
     }
@@ -103,6 +107,8 @@ pub const ConfigSources = struct {
     provider: ConfigSource = .compiled_default,
     codex_model: ConfigSource = .compiled_default,
     grok_model: ConfigSource = .compiled_default,
+    zen_model: ConfigSource = .compiled_default,
+    go_model: ConfigSource = .compiled_default,
     permission_mode: ConfigSource = .compiled_default,
     effort: ConfigSource = .compiled_default,
     fast_mode: ConfigSource = .compiled_default,
@@ -536,6 +542,8 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "provider",
         "codex_model",
         "grok_model",
+        "zen_model",
+        "go_model",
         "effort",
         "fast_mode",
         "slash_menu_categories",
@@ -581,6 +589,8 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.provider != null) sources.provider = source;
     if (settings.codex_model != null) sources.codex_model = source;
     if (settings.grok_model != null) sources.grok_model = source;
+    if (settings.zen_model != null) sources.zen_model = source;
+    if (settings.go_model != null) sources.go_model = source;
     if (settings.permission_mode != null) sources.permission_mode = source;
     if (settings.effort != null) sources.effort = source;
     if (settings.fast_mode != null) sources.fast_mode = source;
@@ -1264,9 +1274,9 @@ fn parseProfileOnlyFields(
     }
 
     if (root.object.get("provider")) |provider_value| {
-        if (provider_value != .string) return error.InvalidProviderType;
-        settings.provider = model_provider.parse(provider_value.string) orelse
-            return error.InvalidProviderValue;
+        if (provider_value == .string) {
+            settings.provider = model_provider.parse(provider_value.string);
+        }
     }
 
     if (root.object.get("codex_model")) |model_value| {
@@ -1279,6 +1289,18 @@ fn parseProfileOnlyFields(
         if (model_value != .string) return error.InvalidGrokModelType;
         settings_store.validateModel(model_value.string) catch return error.InvalidGrokModelValue;
         settings.grok_model = try alloc.dupe(u8, model_value.string);
+    }
+
+    if (root.object.get("zen_model")) |model_value| {
+        if (model_value != .string) return error.InvalidZenModelType;
+        settings_store.validateModel(model_value.string) catch return error.InvalidZenModelValue;
+        settings.zen_model = try alloc.dupe(u8, model_value.string);
+    }
+
+    if (root.object.get("go_model")) |model_value| {
+        if (model_value != .string) return error.InvalidGoModelType;
+        settings_store.validateModel(model_value.string) catch return error.InvalidGoModelValue;
+        settings.go_model = try alloc.dupe(u8, model_value.string);
     }
 
     if (root.object.get("permission_mode")) |permission_mode_value| {
@@ -1445,6 +1467,16 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
         if (target.grok_model) |current| alloc.free(current);
         target.grok_model = value;
         incoming.grok_model = null;
+    }
+    if (incoming.zen_model) |value| {
+        if (target.zen_model) |current| alloc.free(current);
+        target.zen_model = value;
+        incoming.zen_model = null;
+    }
+    if (incoming.go_model) |value| {
+        if (target.go_model) |current| alloc.free(current);
+        target.go_model = value;
+        incoming.go_model = null;
     }
     if (incoming.permission_mode) |value| target.permission_mode = value;
     if (incoming.credential_source) |value| target.credential_source = value;
@@ -1980,6 +2012,37 @@ test "provider settings keep independent provider models" {
     try std.testing.expectEqualStrings("gateway/model", settings.model.?);
     try std.testing.expectEqualStrings("gpt-5.4-mini", settings.codex_model.?);
     try std.testing.expectEqualStrings("grok-4.20-0309-non-reasoning", settings.grok_model.?);
+}
+
+test "unknown provider and extra keys degrade without failing settings load" {
+    var settings = try parseSettingsJson(
+        std.testing.allocator,
+        "{\"provider\":\"local\",\"local_model\":\"qwen3.8-9b\",\"go_model\":\"go-default\"}",
+    );
+    defer settings.deinit(std.testing.allocator);
+    try std.testing.expect(settings.provider == null);
+    try std.testing.expect(settings.model == null);
+    try std.testing.expectEqualStrings("go-default", settings.go_model.?);
+}
+
+test "merged settings tolerate unknown checkout-local provider values" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"provider\":\"local\",\"local_model\":\"qwen3.8-9b\"}");
+
+    var settings = try loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_root);
+    defer settings.deinit(std.testing.allocator);
+    try std.testing.expect(settings.provider == null);
+    try std.testing.expect(settings.zen_model == null);
+    try std.testing.expect(settings.go_model == null);
 }
 
 test "max_agent_steps explicit zero survives serialization round trip" {

@@ -245,7 +245,7 @@ const AcpContext = struct {
             .permission_rules = session.permission_rules,
             .tool_registry = self.toolRegistry(),
             .permission_reviewer_provider = switch (session.provider) {
-                .gateway => self.state.cfg.permission_reviewer_provider,
+                .gateway, .zen, .go => self.state.cfg.permission_reviewer_provider,
                 .codex => self.state.cfg.codex_permission_reviewer_provider,
                 .grok => self.state.cfg.grok_permission_reviewer_provider,
             },
@@ -443,12 +443,13 @@ pub fn handlePrompt(
     if (!try server.selectCredentialForProvider(state, session.provider)) {
         return .{ .rpc_error = .{
             .code = ErrorCode.invalid_request,
-            .message = if (session.provider == .codex)
-                credentials.missing_chatgpt_credential_message
-            else if (session.provider == .grok)
-                credentials.missing_grok_credential_message
-            else
-                credentials.missing_credential_message,
+            .message = switch (session.provider) {
+                .codex => credentials.missing_chatgpt_credential_message,
+                .grok => credentials.missing_grok_credential_message,
+                .zen => credentials.missing_zen_credential_message,
+                .go => credentials.missing_go_credential_message,
+                .gateway => credentials.missing_credential_message,
+            },
         } };
     }
 
@@ -705,6 +706,14 @@ pub fn runSubagentChild(
             .grok = .{
                 .agent_stream_provider = server.streamProviderFor(state, .grok),
                 .permission_reviewer_provider = state.cfg.grok_permission_reviewer_provider,
+            },
+            .zen = .{
+                .agent_stream_provider = server.streamProviderFor(state, .zen),
+                .permission_reviewer_provider = state.cfg.permission_reviewer_provider,
+            },
+            .go = .{
+                .agent_stream_provider = server.streamProviderFor(state, .go),
+                .permission_reviewer_provider = state.cfg.permission_reviewer_provider,
             },
         },
         .system_prompt = state.cfg.prompt_policy.system_prompt,

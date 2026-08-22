@@ -322,7 +322,7 @@ fn adoptServerCredential(state: *ServerState, credential: *credentials.Credentia
         active.credential_source = state.credential_source;
         active.account_id = state.account_id;
         if (comptime !host_target.is_wasm) {
-            if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription) {
+            if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription or state.credential_source == .zen_api_key or state.credential_source == .go_api_key) {
                 active.session_rt.usage.clearReconciliationCredential();
             }
         }
@@ -371,6 +371,10 @@ pub fn streamProviderFor(
             @import("../core/agent/stream_provider.zig").unavailable_provider,
         .grok => state.cfg.grok_agent_stream orelse
             @import("../core/agent/stream_provider.zig").unavailable_provider,
+        .zen => state.cfg.zen_agent_stream orelse
+            @import("../core/agent/stream_provider.zig").unavailable_provider,
+        .go => state.cfg.go_agent_stream orelse
+            @import("../core/agent/stream_provider.zig").unavailable_provider,
     };
 }
 
@@ -382,6 +386,8 @@ pub fn catalogProviderFor(
         .gateway => state.cfg.gateway_provider.model_catalog,
         .codex => state.cfg.codex_model_catalog,
         .grok => state.cfg.grok_model_catalog,
+        .zen => state.cfg.zen_model_catalog,
+        .go => state.cfg.go_model_catalog,
     };
 }
 
@@ -401,7 +407,7 @@ pub fn refreshModelCredential(
         expected_account_id,
     ) orelse return null;
     errdefer secret.zeroAndFree(alloc, refreshed);
-    if (source == .chatgpt_subscription or source == .grok_subscription) {
+    if (source == .chatgpt_subscription or source == .grok_subscription or source == .zen_api_key or source == .go_api_key) {
         try publishRefreshedSubscriptionToken(state, refreshed, source, expected_account_id);
     }
     return refreshed;
@@ -440,7 +446,7 @@ pub fn releaseActiveSession(state: *ServerState) !void {
         active.session_rt.usage.cancelReconciliation();
         active.session_rt.usage.finishProfilePublicationsBeforeShutdown();
         flushActiveSessionUsage(state) catch |err| {
-            if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription) {
+            if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription or state.credential_source == .zen_api_key or state.credential_source == .go_api_key) {
                 active.session_rt.usage.clearReconciliationCredential();
             } else {
                 active.session_rt.usage.startReconciliation(
@@ -1380,12 +1386,13 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         if (routed_credential == null) {
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_request,
-                .message = if (state.provider == .codex)
-                    credentials.missing_chatgpt_credential_message
-                else if (state.provider == .grok)
-                    credentials.missing_grok_credential_message
-                else
-                    credentials.missing_credential_message,
+                .message = switch (state.provider) {
+                    .codex => credentials.missing_chatgpt_credential_message,
+                    .grok => credentials.missing_grok_credential_message,
+                    .zen => credentials.missing_zen_credential_message,
+                    .go => credentials.missing_go_credential_message,
+                    .gateway => credentials.missing_credential_message,
+                },
             });
         }
         break :routed &routed_credential.?;
@@ -1393,12 +1400,13 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     if (credential.token.len == 0) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
-            .message = if (state.provider == .codex)
-                credentials.missing_chatgpt_credential_message
-            else if (state.provider == .grok)
-                credentials.missing_grok_credential_message
-            else
-                credentials.missing_credential_message,
+            .message = switch (state.provider) {
+                .codex => credentials.missing_chatgpt_credential_message,
+                .grok => credentials.missing_grok_credential_message,
+                .zen => credentials.missing_zen_credential_message,
+                .go => credentials.missing_go_credential_message,
+                .gateway => credentials.missing_credential_message,
+            },
         });
     }
     adoptServerCredential(state, credential);
@@ -1659,12 +1667,13 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 break :credential resolution.credential orelse
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
-                        .message = if (target == .codex)
-                            credentials.missing_chatgpt_credential_message
-                        else if (target == .grok)
-                            credentials.missing_grok_credential_message
-                        else
-                            credentials.missing_credential_message,
+                        .message = switch (target) {
+                            .codex => credentials.missing_chatgpt_credential_message,
+                            .grok => credentials.missing_grok_credential_message,
+                            .zen => credentials.missing_zen_credential_message,
+                            .go => credentials.missing_go_credential_message,
+                            .gateway => credentials.missing_credential_message,
+                        },
                     });
             };
             defer staged_credential.deinit(alloc);
@@ -1714,6 +1723,8 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .gateway => settings.model,
                 .codex => settings.codex_model,
                 .grok => settings.grok_model,
+                .zen => settings.zen_model,
+                .go => settings.go_model,
             };
             var selected_model = catalog.items[0].id;
             if (saved_model) |saved| {

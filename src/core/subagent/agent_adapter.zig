@@ -40,12 +40,16 @@ pub const ProviderRoutes = struct {
     gateway: ProviderRoute,
     codex: ProviderRoute,
     grok: ProviderRoute,
+    zen: ProviderRoute,
+    go: ProviderRoute,
 
     pub fn select(self: ProviderRoutes, provider: model_provider.ProviderId) ProviderRoute {
         return switch (provider) {
             .gateway => self.gateway,
             .codex => self.codex,
             .grok => self.grok,
+            .zen => self.zen,
+            .go => self.go,
         };
     }
 };
@@ -54,12 +58,18 @@ test "provider routes select independent streams and reviewers" {
     var gateway_tag: u8 = 0;
     var codex_tag: u8 = 0;
     var grok_tag: u8 = 0;
+    var zen_tag: u8 = 0;
+    var go_tag: u8 = 0;
     var gateway_stream = stream_provider.unavailable_provider;
     gateway_stream.context = &gateway_tag;
     var codex_stream = stream_provider.unavailable_provider;
     codex_stream.context = &codex_tag;
     var grok_stream = stream_provider.unavailable_provider;
     grok_stream.context = &grok_tag;
+    var zen_stream = stream_provider.unavailable_provider;
+    zen_stream.context = &zen_tag;
+    var go_stream = stream_provider.unavailable_provider;
+    go_stream.context = &go_tag;
     const Reviewer = struct {
         fn review(
             _: ?*anyopaque,
@@ -73,10 +83,14 @@ test "provider routes select independent streams and reviewers" {
     const gateway_reviewer = auto_classifier.Provider{ .context = &gateway_tag, .review_fn = Reviewer.review };
     const codex_reviewer = auto_classifier.Provider{ .context = &codex_tag, .review_fn = Reviewer.review };
     const grok_reviewer = auto_classifier.Provider{ .context = &grok_tag, .review_fn = Reviewer.review };
+    const zen_reviewer = auto_classifier.Provider{ .context = &zen_tag, .review_fn = Reviewer.review };
+    const go_reviewer = auto_classifier.Provider{ .context = &go_tag, .review_fn = Reviewer.review };
     const routes = ProviderRoutes{
         .gateway = .{ .agent_stream_provider = gateway_stream, .permission_reviewer_provider = gateway_reviewer },
         .codex = .{ .agent_stream_provider = codex_stream, .permission_reviewer_provider = codex_reviewer },
         .grok = .{ .agent_stream_provider = grok_stream, .permission_reviewer_provider = grok_reviewer },
+        .zen = .{ .agent_stream_provider = zen_stream, .permission_reviewer_provider = zen_reviewer },
+        .go = .{ .agent_stream_provider = go_stream, .permission_reviewer_provider = go_reviewer },
     };
 
     try std.testing.expect(routes.select(.gateway).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
@@ -85,6 +99,12 @@ test "provider routes select independent streams and reviewers" {
     try std.testing.expect(routes.select(.codex).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
     try std.testing.expect(routes.select(.grok).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&grok_tag)));
     try std.testing.expect(routes.select(.grok).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&grok_tag)));
+    try std.testing.expect(routes.select(.zen).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&zen_tag)));
+    try std.testing.expect(routes.select(.zen).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&zen_tag)));
+    try std.testing.expect(routes.select(.go).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&go_tag)));
+    try std.testing.expect(routes.select(.go).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&go_tag)));
+    try std.testing.expect(routes.select(.zen).agent_stream_provider.context.? != @as(*anyopaque, @ptrCast(&gateway_tag)));
+    try std.testing.expect(routes.select(.go).agent_stream_provider.context.? != @as(*anyopaque, @ptrCast(&gateway_tag)));
 }
 
 pub const Config = struct {
