@@ -577,11 +577,21 @@ function codexLatestToolResult(body: string): { callId: string; output: string }
 function startAcpFakeCodex(options: {
   unauthorizedResponses?: number;
   route?: (body: string) => string | Promise<string>;
+  responseTurnStates?: readonly (string | null)[];
 } = {}) {
   const accessToken = acpChatGptAccessToken("acct_acp_e2e", "stale");
   const refreshedAccessToken = acpChatGptAccessToken("acct_acp_e2e", "fresh");
-  const requests: Array<{ path: string; authorization: string | null; body: string }> = [];
-  const modelRequests: Array<{ path: string; authorization: string | null }> = [];
+  const requests: Array<{
+    path: string;
+    authorization: string | null;
+    turnState: string | null;
+    body: string;
+  }> = [];
+  const modelRequests: Array<{
+    path: string;
+    authorization: string | null;
+    turnState: string | null;
+  }> = [];
   const tokenRequests: Array<{ path: string; authorization: string | null }> = [];
   let unauthorizedResponses = options.unauthorizedResponses ?? 0;
   const server = Bun.serve({
@@ -589,7 +599,11 @@ function startAcpFakeCodex(options: {
     port: 0,
     async fetch(request) {
       const path = new URL(request.url).pathname;
-      const recorded = { path, authorization: request.headers.get("authorization") };
+      const recorded = {
+        path,
+        authorization: request.headers.get("authorization"),
+        turnState: request.headers.get("x-codex-turn-state"),
+      };
       if (path === "/models") {
         modelRequests.push(recorded);
         return Response.json({ models: [
@@ -611,9 +625,14 @@ function startAcpFakeCodex(options: {
         unauthorizedResponses -= 1;
         return Response.json({ error: { message: "expired" } }, { status: 401 });
       }
+      const headers = new Headers({ "content-type": "text/event-stream" });
+      const responseTurnState = options.responseTurnStates?.[requests.length - 1];
+      if (responseTurnState !== null && responseTurnState !== undefined) {
+        headers.set("x-codex-turn-state", responseTurnState);
+      }
       return new Response(
         options.route ? await options.route(body) : codexFinalText("ACP_CHATGPT_RESPONSE"),
-        { headers: { "content-type": "text/event-stream" } },
+        { headers },
       );
     },
   });
@@ -7352,6 +7371,110 @@ describe("acp: model-independent", () => {
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "Codex turn state is exact, turn-scoped, and origin-isolated",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-codex-turn-state-");
+      const gateway = startFakeGateway([finalText("ACP_GATEWAY_AFTER_CODEX_STATE")]);
+      const acceptedTurnState = "state.v1/+=opaque";
+      const replacementTurnState = "state.v2-must-not-replace";
+      let responseCount = 0;
+      const codex = startAcpFakeCodex({
+        responseTurnStates: [acceptedTurnState, replacementTurnState, null, null],
+        route() {
+          responseCount += 1;
+          if (responseCount === 1) {
+            return codexToolCall("turn_state_read_1", "read_file", {
+              path: "turn-state-fixture.txt",
+              line_count: 10,
+            });
+          }
+          if (responseCount === 2) {
+            return "data: " + JSON.stringify({
+              type: "response.metadata",
+              headers: { "x-codex-turn-state": replacementTurnState },
+            }) + "\n\n" + codexToolCall("turn_state_read_2", "read_file", {
+              path: "turn-state-fixture.txt",
+              line_count: 10,
+            });
+          }
+          return codexFinalText(
+            responseCount === 3
+              ? "ACP_CODEX_TURN_STATE_FIRST_DONE"
+              : "ACP_CODEX_TURN_STATE_SECOND_DONE",
+          );
+        },
+      });
+      writeFileSync(join(root.workspace, "turn-state-fixture.txt"), "turn state fixture\n");
+      writeSeededAcpChatGptLogin(root.home, codex.accessToken);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { mcpServers: [] }, 2) as any;
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "code" }, 3);
+        await client.request("session/set_config_option", {
+          configId: "provider",
+          value: "codex",
+        }, 4);
+
+        const first = await runPrompt(client, "Read the turn-state fixture twice.", TIMEOUT);
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(first.messages)).toContain("ACP_CODEX_TURN_STATE_FIRST_DONE");
+        const second = await runPrompt(client, "Answer the new turn directly.", TIMEOUT);
+        expect(second.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(second.messages)).toContain("ACP_CODEX_TURN_STATE_SECOND_DONE");
+        await client.request("session/set_config_option", {
+          configId: "provider",
+          value: "gateway",
+        }, 5);
+        const gatewayPrompt = await runPrompt(
+          client,
+          "Answer after switching origins.",
+          TIMEOUT,
+        );
+        expect(gatewayPrompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(gatewayPrompt.messages)).toContain("ACP_GATEWAY_AFTER_CODEX_STATE");
+
+        expect(codex.requests).toHaveLength(4);
+        expect(codex.requests.map((request) => request.turnState)).toEqual([
+          null,
+          acceptedTurnState,
+          acceptedTurnState,
+          null,
+        ]);
+        expect(codexLatestToolResult(codex.requests[1]!.body)?.callId)
+          .toBe("turn_state_read_1");
+        expect(codexLatestToolResult(codex.requests[2]!.body)?.callId)
+          .toBe("turn_state_read_2");
+        expect(codex.modelRequests.map((request) => request.turnState)).toEqual([null]);
+        for (const request of [...gateway.requests, ...gateway.modelRequests]) {
+          expect(request.headers.get("x-codex-turn-state")).toBeNull();
+        }
+        const sessionJson = readFileSync(
+          join(root.home, ".fx", "sessions", created.result.sessionId, "session.json"),
+          "utf8",
+        );
+        expect(sessionJson).not.toContain(acceptedTurnState);
+        expect(sessionJson).not.toContain(replacementTurnState);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        codex.stop();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
