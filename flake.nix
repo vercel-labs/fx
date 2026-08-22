@@ -18,7 +18,12 @@
               in
               pkgs.lib.removeSuffix "\";" (pkgs.lib.removePrefix "pub const version = \"" line);
             src = ./.;
+            # Build/install phases come from the nixpkgs zig setup hook, which
+            # runs `zig build` / `zig build install` when build.zig is present.
             nativeBuildInputs = [ pkgs.makeBinaryWrapper pkgs.zig ];
+            doInstallCheck = true;
+            nativeInstallCheckInputs = [ pkgs.versionCheckHook ];
+            versionCheckProgramArg = "--version";
             postInstall = ''
               install -Dm444 LICENSE "$out/share/licenses/fx/LICENSE"
               install -Dm444 THIRD_PARTY_NOTICES.md "$out/share/licenses/fx/THIRD_PARTY_NOTICES.md"
