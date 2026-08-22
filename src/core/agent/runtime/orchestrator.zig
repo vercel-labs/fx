@@ -2741,6 +2741,7 @@ fn processQueuedPromptLoop(
     defer interrupted_persisted_ptr.* = interrupted_persisted;
     var silent_tool_steps: usize = 0;
     var continuation_injected = false;
+    var final_verification_state: runtime_tool_batch.FinalVerificationState = .{};
     var last_step_ctx = finish_trace.ctx;
     var current_step_index: usize = 0;
     var last_tool_call_name: []const u8 = "none";
@@ -2845,7 +2846,13 @@ fn processQueuedPromptLoop(
             overlay_arena,
             &ephemeral_overlay,
         );
-        var gateway_messages = try runtime_prompt_context.buildGatewayMessages(overlay_arena, stable_prefix.items, ephemeral_overlay.items, history_messages.items, current_user_effective, within_turn_suffix.items);
+        const request_suffix = try runtime_tool_batch.finalVerificationRequestSuffix(
+            overlay_arena,
+            &final_verification_state,
+            step_ctx,
+            within_turn_suffix.items,
+        );
+        var gateway_messages = try runtime_prompt_context.buildGatewayMessages(overlay_arena, stable_prefix.items, ephemeral_overlay.items, history_messages.items, current_user_effective, request_suffix);
         last_gateway_message_count = gateway_messages.items.len;
         const history_start_index = stable_prefix.items.len + ephemeral_overlay.items.len;
         const current_user_message_index = history_start_index + history_messages.items.len;
@@ -3009,13 +3016,21 @@ fn processQueuedPromptLoop(
                     step_ctx,
                 );
             }
+            // Recompute from the live suffix: recovery paths append preserved
+            // tool evidence between builds, and the initial capture goes stale.
+            const retry_request_suffix = try runtime_tool_batch.finalVerificationRequestSuffix(
+                overlay_arena,
+                &final_verification_state,
+                step_ctx,
+                within_turn_suffix.items,
+            );
             gateway_messages = try runtime_prompt_context.buildGatewayMessages(
                 overlay_arena,
                 stable_prefix.items,
                 ephemeral_overlay.items,
                 history_messages.items,
                 current_user_effective,
-                within_turn_suffix.items,
+                retry_request_suffix,
             );
             debug_trace.eventf("gateway", "before_payload_build", step_ctx, "model={s} gateway_messages={d}", .{ gateway_model, gateway_messages.items.len });
             var vision_route: runtime_vision_contracts.VisionRoute = .native_images;
@@ -4150,6 +4165,10 @@ fn processQueuedPromptLoop(
             if (vision_mode != .required) configured_first_tool_choice_pending = false;
             break;
         }
+        runtime_tool_batch.consumeFinalVerification(
+            &final_verification_state,
+            step_ctx,
+        );
         defer if (stream_result_set) {
             if (stream_result.err_body) |b| mem_utils.free(arena, b);
         };
@@ -7006,10 +7025,10 @@ fn processQueuedPromptLoop(
             );
             pending_image_ids = transition.pending_ids;
         }
-        try runtime_tool_batch.appendReviewContinuationSuffix(
-            config.review_enabled,
-            arena,
-            &within_turn_suffix,
+        runtime_tool_batch.scheduleFinalVerification(
+            config.final_verification_enabled,
+            &final_verification_state,
+            step_ctx,
             &step_batch,
         );
         if (malformed_arguments_retry.finishBatch()) {
