@@ -24,7 +24,7 @@
   { "file": "tui-agent.test.ts", "weight": 1 },
   { "file": "tui-auth-source-selection.test.ts", "weight": 49 },
   { "file": "tui-command-permissions.test.ts", "weight": 153 },
-  { "file": "tui-composer-edit-contracts.test.ts", "weight": 168 },
+  { "file": "tui-composer-edit-contracts.test.ts", "weight": 192 },
   { "file": "tui-cost.test.ts", "weight": 16 },
   { "file": "tui-decision-prompts.test.ts", "weight": 174 },
   { "file": "tui-direct-write-audit.test.ts", "weight": 2 },

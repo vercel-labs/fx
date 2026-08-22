@@ -68,6 +68,8 @@ fx
 
 The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands.
 
+Press `Ctrl+T` to edit the current prompt with `VISUAL`, falling back to `EDITOR`, even while a response is streaming; drafts containing pasted blocks, images, or skills are left unchanged.
+
 The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
 
 ```json

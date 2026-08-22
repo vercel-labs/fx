@@ -111,6 +111,7 @@ test "composer shortcut table excludes app and terminal controls" {
         3,
         15,
         18,
+        20,
         22,
         24,
         '\r',
@@ -132,6 +133,7 @@ test "composer shortcut table excludes app and terminal controls" {
         .{ .remapped_byte = 3 },
         .{ .remapped_byte = 15 },
         .{ .remapped_byte = 18 },
+        .{ .remapped_byte = 20 },
         .{ .remapped_byte = 24 },
     };
     for (excluded_actions) |action| {

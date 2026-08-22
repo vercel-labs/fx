@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -15,7 +16,10 @@ import { FX_BIN } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewayToolCall,
+  heldFakeGatewayFinalText,
   startFakeGateway,
+  type FakeGatewayResponse,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
@@ -29,6 +33,35 @@ const PASTE_START = ["1b", "5b", "32", "30", "30", "7e"] as const;
 const PASTE_END = ["1b", "5b", "32", "30", "31", "7e"] as const;
 const MANAGED_REVIEW_BODY = "GROUP_C_MANAGED_REVIEW_BODY";
 const WORKSPACE_REVIEW_BODY = "GROUP_C_WORKSPACE_REVIEW_BODY";
+const EXTERNAL_EDITOR_SCRIPT = `#!/bin/sh
+set -eu
+next_path="$1.next"
+printf 'externally edited: ' > "$next_path"
+cat "$1" >> "$next_path"
+mv "$next_path" "$1"
+`;
+const BLOCKING_EXTERNAL_EDITOR_SCRIPT = `#!/bin/sh
+set -eu
+opened_path="$0.open"
+release_path="$0.release"
+stty -a > "$0.stty"
+: > "$opened_path"
+while [ ! -f "$release_path" ]; do
+  sleep 0.05
+done
+next_path="$1.next"
+printf 'externally edited: ' > "$next_path"
+cat "$1" >> "$next_path"
+mv "$next_path" "$1"
+`;
+const RESETTING_EXTERNAL_EDITOR_SCRIPT = `#!/bin/sh
+set -eu
+printf '\x1b[?2004l\x1b[<u\x1b[?7h' > /dev/tty
+next_path="$1.next"
+printf 'externally edited: ' > "$next_path"
+cat "$1" >> "$next_path"
+mv "$next_path" "$1"
+`;
 
 let session: TmuxSession | null = null;
 let root: string | null = null;
@@ -49,10 +82,23 @@ afterEach(async () => {
 
 async function startFx(
   withGateway: boolean,
-  responseCount = 1,
-  duplicateReview = false,
-  traceScopes?: string,
+  options: {
+    responseCount?: number;
+    duplicateReview?: boolean;
+    traceScopes?: string;
+    editorScript?: string;
+    gatewayResponses?: FakeGatewayResponse[];
+    settings?: Record<string, unknown>;
+  } = {},
 ): Promise<TmuxSession> {
+  const {
+    responseCount = 1,
+    duplicateReview = false,
+    traceScopes,
+    editorScript,
+    gatewayResponses,
+    settings = {},
+  } = options;
   root = realpathSync(mkdtempSync(join(tmpdir(), "fx-edit-contracts-")));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
@@ -60,12 +106,17 @@ async function startFx(
   mkdirSync(workspace);
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({}),
+    JSON.stringify({ ...settings }),
   );
   stderrPath = join(root, "stderr.log");
   writeFileSync(stderrPath, "");
   const tracePath = traceScopes ? join(root, "trace.log") : undefined;
   if (tracePath) writeFileSync(tracePath, "");
+  const editorPath = editorScript ? join(root, "editor.sh") : undefined;
+  if (editorPath) {
+    writeFileSync(editorPath, editorScript);
+    chmodSync(editorPath, 0o700);
+  }
   fixtureImagePath = join(workspace, "i.png");
   writeFileSync(
     fixtureImagePath,
@@ -89,10 +140,11 @@ async function startFx(
 
   if (withGateway) {
     gateway = startFakeGateway(
-      Array.from(
-        { length: responseCount },
-        () => fakeGatewayFinalText("edit contract complete"),
-      ),
+      gatewayResponses ??
+        Array.from(
+          { length: responseCount },
+          () => fakeGatewayFinalText("edit contract complete"),
+        ),
       {
         models: [{
           id: FAKE_GATEWAY_MODEL,
@@ -121,6 +173,7 @@ async function startFx(
       FX_AUTO_UPGRADE: "0",
       FX_TRACE_LOG: tracePath,
       FX_TRACE_SCOPES: traceScopes,
+      ...(editorPath ? { VISUAL: undefined, EDITOR: editorPath } : {}),
     },
     width: 112,
     height: 32,
@@ -160,6 +213,15 @@ async function waitForGatewayRequestWithin(
     await Bun.sleep(25);
   }
   throw new Error("Timed out waiting for fake Gateway request");
+}
+
+async function waitForPath(path: string): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < TIMEOUT) {
+    if (existsSync(path)) return;
+    await Bun.sleep(25);
+  }
+  throw new Error(`Timed out waiting for path: ${path}`);
 }
 
 async function waitForModelRequest(count = 1): Promise<void> {
@@ -256,9 +318,211 @@ async function selectReviewSkill(
 }
 
 tmuxTest(
+  "Ctrl+T round trips a plain-text draft through EDITOR",
+  async () => {
+    const active = await startFx(true, { editorScript: EXTERNAL_EDITOR_SCRIPT });
+    const seed = "original editor draft";
+    const edited = `externally edited: ${seed}`;
+
+    await active.sendLiteralText(seed);
+    await active.sendHexBytes(["14"]);
+    await active.waitForText(edited, TIMEOUT);
+    await active.sendKeys("Enter");
+    await waitForGatewayRequest();
+
+    expect(finalUserText()).toBe(edited);
+    expectCleanRuntime(active);
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "Ctrl+T keeps the active turn running while the editor owns the terminal",
+  async () => {
+    const held = heldFakeGatewayFinalText();
+    const backgroundDone = "BACKGROUND_TURN_COMPLETED_DURING_EDITOR";
+    try {
+      const active = await startFx(true, {
+        traceScopes: "worker",
+        editorScript: BLOCKING_EXTERNAL_EDITOR_SCRIPT,
+        gatewayResponses: [held.response],
+      });
+
+      await active.sendLiteralText("hold the active response");
+      await active.sendKeys("Enter");
+      await waitForGatewayRequest();
+      await active.waitForText("Thinking", TIMEOUT);
+
+      const seed = "draft composed during the active turn";
+      const edited = `externally edited: ${seed}`;
+      await active.sendLiteralText(seed);
+      await active.sendHexBytes(["14"]);
+
+      const editorPath = join(root!, "editor.sh");
+      await waitForPath(`${editorPath}.open`);
+      expect(readFileSync(`${editorPath}.stty`, "utf8"))
+        .toMatch(/(?:^|[ ;])icanon(?:[ ;]|$)/m);
+      held.release(backgroundDone);
+      await waitForTraceOrExit(active, "finish processing queued=0");
+
+      expect(active.isAlive()).toBe(true);
+      expect(existsSync(`${editorPath}.release`)).toBe(false);
+      expect(await active.capturePane()).not.toContain(backgroundDone);
+
+      writeFileSync(`${editorPath}.release`, "release\n");
+      await active.waitForText(edited, TIMEOUT);
+      await active.waitForText(backgroundDone, TIMEOUT);
+      expectCleanRuntime(active);
+    } finally {
+      held.dispose();
+    }
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "an approval wait survives external editing during the active turn",
+  async () => {
+    let releaseToolResponse: (response: Response) => void = undefined!;
+    const toolResponse = new Promise<Response>((resolve) => {
+      releaseToolResponse = resolve;
+    });
+    const active = await startFx(true, {
+      traceScopes: "permission,worker",
+      editorScript: BLOCKING_EXTERNAL_EDITOR_SCRIPT,
+      gatewayResponses: [
+        () => toolResponse,
+        fakeGatewayFinalText("APPROVAL_AFTER_EDITOR_COMPLETE"),
+      ],
+      settings: { permission_mode: "ask", sandbox: "none" },
+    });
+
+    await active.sendLiteralText("prepare a file change");
+    await active.sendKeys("Enter");
+    await waitForGatewayRequest();
+    await active.waitForText("Thinking", TIMEOUT);
+
+    const seed = "draft preserved through approval";
+    const edited = `externally edited: ${seed}`;
+    await active.sendLiteralText(seed);
+    await active.sendHexBytes(["14"]);
+
+    const editorPath = join(root!, "editor.sh");
+    await waitForPath(`${editorPath}.open`);
+    releaseToolResponse(fakeGatewayToolCall(
+      "approval_during_editor",
+      "write_file",
+      { path: "approval.txt", content: "approved\n" },
+    ));
+    await waitForTraceOrExit(active, "event=permission_requested");
+
+    expect(active.isAlive()).toBe(true);
+    expect(await active.capturePane()).not.toContain("Apply this change?");
+
+    writeFileSync(`${editorPath}.release`, "release\n");
+    await active.waitForText("Apply this change?", TIMEOUT);
+    await active.sendKeys("Enter");
+    await active.waitForText("APPROVAL_AFTER_EDITOR_COMPLETE", TIMEOUT);
+    await active.waitForText(edited, TIMEOUT);
+
+    expect(readFileSync(join(root!, "workspace", "approval.txt"), "utf8"))
+      .toBe("approved\n");
+    expectCleanRuntime(active);
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "external editor terminal resets are repaired before the next paste",
+  async () => {
+    const active = await startFx(true, {
+      editorScript: RESETTING_EXTERNAL_EDITOR_SCRIPT,
+    });
+    const seed = "terminal mode seed";
+    const edited = `externally edited: ${seed}`;
+    const pasted = "PASTE_AFTER_EDITOR_A\nPASTE_AFTER_EDITOR_B";
+
+    await active.sendLiteralText(seed);
+    await active.sendHexBytes(["14"]);
+    await active.waitForText(edited, TIMEOUT);
+    await active.pasteText(pasted);
+    await active.waitForText("PASTE_AFTER_EDITOR_B", TIMEOUT);
+
+    expect(gateway!.requestCount()).toBe(0);
+    await active.sendKeys("Enter");
+    await waitForGatewayRequest();
+    expect(finalUserText()).toBe(edited + pasted);
+    expectCleanRuntime(active);
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "Ctrl+T streaming guards never launch an editor for owned draft or screen state",
+  async () => {
+    let releaseToolResponse: (response: Response) => void = undefined!;
+    const toolResponse = new Promise<Response>((resolve) => {
+      releaseToolResponse = resolve;
+    });
+    const held = heldFakeGatewayFinalText();
+    try {
+      const active = await startFx(true, {
+        traceScopes: "permission",
+        editorScript: BLOCKING_EXTERNAL_EDITOR_SCRIPT,
+        gatewayResponses: [() => toolResponse, held.response],
+        settings: { permission_mode: "ask", sandbox: "none" },
+      });
+      const editorPath = join(root!, "editor.sh");
+      const editorOpenPath = `${editorPath}.open`;
+
+      await active.sendLiteralText("exercise streaming editor guards");
+      await active.sendKeys("Enter");
+      await waitForGatewayRequest();
+      await active.waitForText("Thinking", TIMEOUT);
+
+      await pasteExact(active, "P".repeat(1001));
+      await active.waitForText("[Pasted text #1, 1 line]", TIMEOUT);
+      await active.sendHexBytes(["14"]);
+      await active.waitForText(
+        "external editing is unavailable while the draft contains pasted blocks, images, or skills",
+        TIMEOUT,
+      );
+      expect(existsSync(editorOpenPath)).toBe(false);
+
+      await active.sendHexBytes(["15"]);
+      releaseToolResponse(fakeGatewayToolCall(
+        "guard_approval",
+        "write_file",
+        { path: "guarded.txt", content: "guarded\n" },
+      ));
+      await active.waitForText("Apply this change?", TIMEOUT);
+      await active.sendHexBytes(["14"]);
+      expect(existsSync(editorOpenPath)).toBe(false);
+
+      await active.sendKeys("Enter");
+      await waitForGatewayRequest(2);
+      await active.waitForText("Thinking", TIMEOUT);
+      await active.sendKeys("C-o");
+      await active.waitForText("ctrl o close", TIMEOUT);
+      await active.sendHexBytes(["14"]);
+      expect(existsSync(editorOpenPath)).toBe(false);
+
+      await active.sendKeys("C-o");
+      held.release("STREAMING_GUARDS_COMPLETE");
+      await active.waitForText("STREAMING_GUARDS_COMPLETE", TIMEOUT);
+      expect(existsSync(editorOpenPath)).toBe(false);
+      expectCleanRuntime(active);
+    } finally {
+      held.dispose();
+    }
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
   "composer shortcuts pressed immediately after Escape preserve input order",
   async () => {
-    const active = await startFx(true, 2);
+    const active = await startFx(true, { responseCount: 2 });
 
     await active.sendLiteralText("abc");
     await active.sendHexBytes(["1b", "01", "58"]);
@@ -295,7 +559,9 @@ tmuxTest(
 tmuxTest(
   "embedded paste terminator cannot execute its same-epoch suffix",
   async () => {
-    const active = await startFx(true, 1, false, "input,theme,resize,native_clear");
+    const active = await startFx(true, {
+      traceScopes: "input,theme,resize,native_clear",
+    });
     await active.sendLiteralText("PRESERVED_DRAFT");
 
     await active.sendHexBytes([
@@ -322,7 +588,9 @@ tmuxTest(
 tmuxTest(
   "active paste keeps a trailing escape sequence out of response parsers",
   async () => {
-    const active = await startFx(true, 1, false, "input,theme,resize,native_clear");
+    const active = await startFx(true, {
+      traceScopes: "input,theme,resize,native_clear",
+    });
     await active.sendLiteralText("ESCAPE_DRAFT");
 
     await active.sendHexBytes([
@@ -442,7 +710,7 @@ tmuxTest(
 tmuxTest(
   "multi-megabyte bracketed paste survives edits and resize byte-for-byte",
   async () => {
-    const active = await startFx(true, 1, false, "input");
+    const active = await startFx(true, { traceScopes: "input" });
     const prompt = `PASTE-BEGIN-${"x".repeat(4 * 1024 * 1024 + 1)}-PASTE-END`;
 
     await waitForModelRequest();
@@ -470,7 +738,7 @@ tmuxTest(
 tmuxTest(
   "expanded paste accepts the exact composer byte limit",
   async () => {
-    const active = await startFx(true, 1, false, "input");
+    const active = await startFx(true, { traceScopes: "input" });
     const rune = "🧪";
     const runeBytes = Buffer.byteLength(rune);
     const firstPasteBytes = COMPOSER_BYTE_LIMIT / 2 - runeBytes;
@@ -555,7 +823,7 @@ tmuxTest(
 tmuxTest(
   "Home End and control aliases stay on the current logical line",
   async () => {
-    const active = await startFx(true, 2);
+    const active = await startFx(true, { responseCount: 2 });
 
     await pasteExact(active, "FIRST\nSECOND\nTHIRD");
     await active.sendKeys("Up Home");
@@ -682,7 +950,7 @@ tmuxTest(
 tmuxTest(
   "Ctrl+U and Ctrl+Y preserve the selected duplicate skill source",
   async () => {
-    const active = await startFx(true, 1, true);
+    const active = await startFx(true, { duplicateReview: true });
 
     await selectReviewSkill(active, true);
     await active.sendLiteralText("inspect");
@@ -702,7 +970,7 @@ tmuxTest(
 tmuxTest(
   "history recall keeps an oversized paste compact and editable",
   async () => {
-    const active = await startFx(true, 2);
+    const active = await startFx(true, { responseCount: 2 });
     const pasted = "H".repeat(4138);
 
     await pasteExact(active, pasted);
@@ -733,7 +1001,7 @@ tmuxTest(
 tmuxTest(
   "history recall resubmits a real image under a fresh id",
   async () => {
-    const active = await startFx(true, 2);
+    const active = await startFx(true, { responseCount: 2 });
 
     await pasteExact(active, fixtureImagePath!);
     await active.waitForText("[Image 1]", TIMEOUT);
@@ -783,7 +1051,7 @@ for (
   tmuxTest(
     `history recall preserves the composer when an image snapshot is ${scenario.name}`,
     async () => {
-      const active = await startFx(true, 1, false, "prompt_history");
+      const active = await startFx(true, { traceScopes: "prompt_history" });
 
       await pasteExact(active, fixtureImagePath!);
       await active.waitForText("[Image 1]", TIMEOUT);
@@ -818,7 +1086,10 @@ for (
 tmuxTest(
   "history recall preserves the selected duplicate skill source",
   async () => {
-    const active = await startFx(true, 2, true);
+    const active = await startFx(true, {
+      responseCount: 2,
+      duplicateReview: true,
+    });
 
     await selectReviewSkill(active, true);
     await active.waitForText("review · workspace skills/", TIMEOUT);
@@ -941,7 +1212,7 @@ tmuxTest(
 tmuxTest(
   "skill entities survive file completion and stay atomic under word edits",
   async () => {
-    const active = await startFx(true, 4);
+    const active = await startFx(true, { responseCount: 4 });
 
     await selectReviewSkill(active);
     expect(await active.capturePane()).not.toContain("review ·");

@@ -80,7 +80,6 @@ const allowlist: AllowRule[] = [
   rule("tests/json-schema/corpus_runner.zig", "printLine", /stdio_acquisition/, "noninteractive_output", "JSON Schema corpus report output"),
   rule("src/main.zig", "(?:writeStdoutFast|writeStderrFast)", /(?:stdio_acquisition_write|fixed_fd_write|raw_fd_write)/, "noninteractive_output", "top-level help and CLI validation output"),
   rule("src/main.zig", "(?:stdoutIsTerminal|stdoutTerminalColumns)", /fixed_descriptor/, "terminal_probe", "top-level help terminal capability probe"),
-  rule("src/main.zig", "runExternalInteractive", /stdio_acquisition_write/, "initialization_teardown", "external CLI handoff spacing"),
   rule("benchmarks/activity_progress.zig", "main", /stdio_acquisition/, "benchmark_output", "benchmark report output"),
   rule("src/core/shell_command/command_effect.zig", "(?:expectDirect|expectNativePrintfEquivalent)", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/app/app_worker_runtime.zig", "(?:printModelTrace|printLifecycleDrainTrace)", /debug_print/, "tests", "test diagnostics"),

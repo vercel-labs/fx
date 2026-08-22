@@ -52,6 +52,72 @@ fn unavailableUrlOpen(
     return false;
 }
 
+pub const ExternalEditor = struct {
+    pub const FailureReason = enum {
+        unavailable,
+        missing_editor,
+        invalid_command,
+        editor_failed,
+        output_invalid,
+        output_too_large,
+    };
+
+    pub const Failure = struct {
+        reason: FailureReason,
+        kept_path: ?[]u8 = null,
+    };
+
+    pub const EditResult = union(enum) {
+        edited: []u8,
+        canceled,
+        failed: Failure,
+
+        pub fn deinit(self: *EditResult, alloc: std.mem.Allocator) void {
+            switch (self.*) {
+                .edited => |text| alloc.free(text),
+                .failed => |failure| if (failure.kept_path) |path| alloc.free(path),
+                .canceled => {},
+            }
+            self.* = .canceled;
+        }
+    };
+
+    context: ?*anyopaque = null,
+    edit_fn: *const fn (
+        ?*anyopaque,
+        std.mem.Allocator,
+        []const u8,
+        usize,
+    ) std.mem.Allocator.Error!EditResult,
+
+    /// Borrows `seed` for this call. The caller must quiesce terminal I/O, enter
+    /// cooked mode, and protect itself from terminal-generated signals while the
+    /// editor owns inherited stdio. Edited text is bounded, valid UTF-8 owned by
+    /// the caller, with temporary-file cleanup attempted on success. Release every
+    /// result with `EditResult.deinit`.
+    pub fn edit(
+        self: ExternalEditor,
+        alloc: std.mem.Allocator,
+        seed: []const u8,
+        max_bytes: usize,
+    ) std.mem.Allocator.Error!EditResult {
+        return self.edit_fn(self.context, alloc, seed, max_bytes);
+    }
+};
+
+pub const unavailable_external_editor: ExternalEditor = .{
+    .edit_fn = unavailableExternalEditorEdit,
+};
+
+fn unavailableExternalEditorEdit(
+    _: ?*anyopaque,
+    _: std.mem.Allocator,
+    _: []const u8,
+    _: usize,
+) std.mem.Allocator.Error!ExternalEditor.EditResult {
+    return .{ .failed = .{ .reason = .unavailable } };
+}
+
 pub const TerminalTitle = struct {
     context: ?*anyopaque = null,
     set_fn: *const fn (?*anyopaque, []const u8) void,

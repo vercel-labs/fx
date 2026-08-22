@@ -15,6 +15,7 @@ const credentials = @import("core/auth/credentials.zig");
 const secret = @import("core/auth/secret.zig");
 const model_cache_runtime = @import("core/app/model_cache_runtime.zig");
 const app_auth_runtime = @import("core/app/app_auth_runtime.zig");
+const app_external_editor_runtime = @import("core/app/app_external_editor_runtime.zig");
 const app_host_config_runtime = @import("core/app/app_host_config_runtime.zig");
 const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
 const acp_runner = @import("core/cli/acp_runner.zig");
@@ -69,6 +70,7 @@ const js_host_url_opener = @import("core/hosts/js_host_url_opener.zig");
 const js_host_workspace = @import("core/hosts/js_host_workspace.zig");
 const host_target = @import("core/hosts/target.zig");
 const native_host = @import("core/hosts/native.zig");
+const native_external_editor = @import("core/hosts/native_external_editor.zig");
 const debug_trace = @import("core/shared/debug_trace.zig");
 const display_width = @import("core/shared/display_width.zig");
 const file_index_mod = @import("core/workspace/file_index.zig");
@@ -375,6 +377,7 @@ const App = struct {
     const Self = @This();
     const AgentAppRuntime = app_agent_runtime.Runtime(Self);
     const AuthAppRuntime = app_auth_runtime.Runtime(Self);
+    const ExternalEditorAppRuntime = app_external_editor_runtime.Runtime(Self);
     const HostConfigAppRuntime = app_host_config_runtime.Runtime(Self);
     const BootstrapAppRuntime = app_bootstrap_runtime.Runtime(Self);
     const InputAppRuntime = app_input_runtime.Runtime(Self);
@@ -426,6 +429,13 @@ const App = struct {
             js_host_url_opener.opener
         else
             host.unavailable_url_opener;
+    }
+
+    pub fn externalEditor(_: *const Self) host.ExternalEditor {
+        return if (comptime host_profile.external_editor)
+            native_external_editor.external_editor
+        else
+            host.unavailable_external_editor;
     }
 
     pub fn creditsProvider(_: *const Self) gateway_provider.CreditsProvider {
@@ -877,37 +887,55 @@ const App = struct {
         );
     }
 
-    pub fn runExternalInteractive(self: *App, argv: []const []const u8) !void {
+    pub fn editComposerWithExternalEditor(self: *App, max_bytes: usize) !bool {
+        return ExternalEditorAppRuntime.editComposer(
+            self,
+            self.externalEditor(),
+            max_bytes,
+        );
+    }
+
+    pub fn runExternalInteractive(
+        self: *App,
+        editor: host.ExternalEditor,
+        seed: []const u8,
+        max_bytes: usize,
+    ) !host.ExternalEditor.EditResult {
         try self.flushBeforeBlockingExternalWork();
 
-        self.terminal.disableRawMode();
-        var raw_restored = false;
-        defer if (!raw_restored) {
-            self.terminal.enableRawMode() catch {};
+        const signal_guard = app_lifecycle.ExternalInteractiveSignalGuard.install();
+        defer signal_guard.deinit();
+        app_lifecycle.suspendForExternalInteractive(
+            &self.terminal,
+            &self.shell,
+            &self.metrics,
+        );
+        var terminal_restored = false;
+        defer if (!terminal_restored) {
+            app_lifecycle.resumeAfterExternalInteractive(
+                &self.terminal,
+                &self.shell,
+                &self.metrics,
+                footer_rows,
+            ) catch |err| {
+                debug_trace.logf(
+                    "input",
+                    "external editor terminal restore failed err={s}",
+                    .{@errorName(err)},
+                );
+            };
         };
 
-        const io = io_mod.getIo();
-        try std.Io.File.stdout().writeStreamingAll(io, "\n");
-        var child = std.process.spawn(io, .{
-            .argv = argv,
-            .stdin = .inherit,
-            .stdout = .inherit,
-            .stderr = .inherit,
-        }) catch return error.ExternalInteractiveFailed;
-        const term = child.wait(io) catch return error.ExternalInteractiveFailed;
-        try std.Io.File.stdout().writeStreamingAll(io, "\n");
-
-        try self.terminal.captureOriginalTermios();
-        try self.terminal.enableRawMode();
-        raw_restored = true;
-        self.shell.layout = self.terminal.queryLayout(footer_rows) catch self.shell.layout;
-        try self.shell.requestTerminalReset(&self.metrics);
-        self.shell.render_requests.request(.first_frame);
-
-        switch (term) {
-            .exited => |code| if (code != 0) return error.ExternalInteractiveFailed,
-            else => return error.ExternalInteractiveFailed,
-        }
+        var result = try editor.edit(self.alloc, seed, max_bytes);
+        errdefer result.deinit(self.alloc);
+        try app_lifecycle.resumeAfterExternalInteractive(
+            &self.terminal,
+            &self.shell,
+            &self.metrics,
+            footer_rows,
+        );
+        terminal_restored = true;
+        return result;
     }
 
     pub fn flushBeforeBlockingExternalWork(self: *App) !void {
@@ -3780,6 +3808,7 @@ test {
     _ = @import("core/app/app_callbacks.zig");
     _ = @import("core/app/app_commands.zig");
     _ = @import("core/app/app_entry_runtime.zig");
+    _ = @import("core/app/app_external_editor_runtime.zig");
     _ = @import("core/app/app_input_runtime.zig");
     _ = @import("core/app/app_lifecycle.zig");
     _ = @import("core/app/model_cache_runtime.zig");
@@ -3841,6 +3870,7 @@ test {
     _ = @import("core/github/github_publish.zig");
     _ = @import("core/github/github_workflows.zig");
     _ = @import("core/hosts/host.zig");
+    _ = @import("core/hosts/native_external_editor.zig");
     _ = @import("core/hooks/common.zig");
     _ = @import("core/hooks/definitions.zig");
     _ = @import("core/hooks/prompt.zig");

@@ -239,7 +239,7 @@ fn appendAction(
 fn shouldReplayControlAfterBareEscape(byte: u8) bool {
     if (shortcuts.fromControlByte(byte) != null) return true;
     return switch (byte) {
-        3, 7, 12, 15, 22, 24 => true,
+        3, 7, 12, 15, 20, 22, 24 => true,
         else => false,
     };
 }
@@ -261,23 +261,26 @@ test "plain byte carries composer fallback without consuming product routing" {
 }
 
 test "bare Escape control replay preserves event order" {
-    var decoder = Decoder{};
-    _ = decoder.feed(0x1b, .{
-        .now_ms = 1,
-        .paste_active = false,
-        .cancel_pending = true,
-        .child_route_active = false,
-    });
-    const ingress = decoder.feed(3, .{
-        .now_ms = 2,
-        .paste_active = false,
-        .cancel_pending = true,
-        .child_route_active = false,
-    });
+    const app_controls = [_]u8{ 3, 7, 20, 24 };
+    for (app_controls) |byte| {
+        var decoder = Decoder{};
+        _ = decoder.feed(0x1b, .{
+            .now_ms = 1,
+            .paste_active = false,
+            .cancel_pending = true,
+            .child_route_active = false,
+        });
+        const ingress = decoder.feed(byte, .{
+            .now_ms = 2,
+            .paste_active = false,
+            .cancel_pending = true,
+            .child_route_active = false,
+        });
 
-    try std.testing.expectEqual(input_action.Action.escape, ingress.event.?.action.action);
-    try std.testing.expect(ingress.event.?.action.cancel_pending);
-    try std.testing.expectEqual(@as(?u8, 3), ingress.replay_byte_after_routing);
+        try std.testing.expectEqual(input_action.Action.escape, ingress.event.?.action.action);
+        try std.testing.expect(ingress.event.?.action.cancel_pending);
+        try std.testing.expectEqual(@as(?u8, byte), ingress.replay_byte_after_routing);
+    }
 }
 
 test "escape timeout emits one semantic action" {

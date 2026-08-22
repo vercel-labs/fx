@@ -12,6 +12,7 @@ pub const Profile = struct {
     skills: bool,
     clipboard: bool,
     url_opening: bool,
+    external_editor: bool,
     web_search: bool,
     generation_usage: bool,
     tools: bool,
@@ -42,6 +43,7 @@ pub const native = Profile{
     .skills = true,
     .clipboard = true,
     .url_opening = true,
+    .external_editor = true,
     .web_search = true,
     .generation_usage = true,
     .tools = true,
@@ -65,6 +67,7 @@ pub const wasm = Profile{
     .skills = false,
     .clipboard = false,
     .url_opening = false,
+    .external_editor = false,
     .web_search = false,
     .generation_usage = false,
     .tools = false,
@@ -94,11 +97,13 @@ test "host profile capabilities are selected by field" {
 test "native and wasm profiles select distinct auth host effects" {
     try std.testing.expect(native.native_auth);
     try std.testing.expect(native.url_opening);
+    try std.testing.expect(native.external_editor);
     try std.testing.expect(!native.js_host_auth);
     try std.testing.expect(!native.js_host_url_open);
 
     try std.testing.expect(!wasm.native_auth);
     try std.testing.expect(!wasm.url_opening);
+    try std.testing.expect(!wasm.external_editor);
     try std.testing.expect(wasm.js_host_auth);
     try std.testing.expect(wasm.js_host_url_open);
 }
