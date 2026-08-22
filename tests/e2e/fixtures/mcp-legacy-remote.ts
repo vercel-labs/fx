@@ -10,6 +10,7 @@ export type LegacyRequest = {
   httpMethod: string;
   path: string;
   headers: Record<string, string>;
+  at?: number;
   message?: {
     id?: number;
     method?: string;
@@ -32,7 +33,10 @@ type StreamableMode =
   | "expire_session"
   | "elicitation_form"
   | "elicitation_url"
-  | "url_required_error";
+  | "url_required_error"
+  | "closed_listener"
+  | "retry_hint_listener"
+  | "resume_storm";
 
 export function startLegacyStreamableHttpFixture(
   version: LegacyStreamableVersion,
@@ -110,8 +114,50 @@ export function startLegacyStreamableHttpFixture(
           httpMethod: request.method,
           path: url.pathname,
           headers,
+          at: Date.now(),
         });
         resumeCalls += 1;
+        if (mode === "retry_hint_listener") {
+          // A server asking to be reconnected to almost immediately. The
+          // client is expected to treat its own floor as a minimum rather
+          // than honour a hint below it.
+          return new Response("retry: 1\n\n", {
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+        if (mode === "resume_storm") {
+          // A resumable close with no final response: the client resumes,
+          // and the server closes again the same way.
+          return sseResponse([{
+            id: `resume-${resumeCalls}`,
+            data: {
+              jsonrpc: "2.0",
+              method: "notifications/progress",
+              params: { progressToken: 4, progress: 1, total: 2 },
+            },
+          }]);
+        }
+        if (mode === "closed_listener") {
+          // A server that answers the notification GET with a well-formed but
+          // already-finished SSE body. The client must not treat that as a cue
+          // to reconnect without delay. From the second attempt on it closes
+          // the same way but delivers one notification first, so a test can
+          // tell "stopped storming" apart from "stopped listening".
+          if (resumeCalls === 1) {
+            return new Response("", {
+              headers: { "content-type": "text/event-stream" },
+            });
+          }
+          currentToolName = "fresh";
+          return new Response(
+            `id: closed-${resumeCalls}\ndata: ${JSON.stringify({
+              jsonrpc: "2.0",
+              method: "notifications/tools/list_changed",
+              params: {},
+            })}\n\n`,
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        }
         if (mode === "url_required_error") {
           let active = true;
           return new Response(
@@ -512,7 +558,7 @@ export function startLegacyStreamableHttpFixture(
             },
           }]);
         }
-        if (mode === "resume") {
+        if (mode === "resume" || mode === "resume_storm") {
           return sseResponse([
             {
               id: "call-event-1",
