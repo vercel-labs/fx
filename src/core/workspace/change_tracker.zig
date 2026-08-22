@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
@@ -16,12 +17,30 @@ pub const FileOperation = struct {
     previous_content: ?[]u8,
     new_path: ?[]u8 = null,
     timestamp_ms: i64,
+    /// Set when state required to reverse the mutation could not be retained. Such
+    /// an operation is still recorded, so undo consumes it and says so, rather than
+    /// silently undoing an older operation the user did not ask about.
+    preimage_unavailable: bool = false,
 };
 
 pub const UndoResult = union(enum) {
     restored: []const u8,
     deleted: []const u8,
+    /// The operation was consumed but could not be reversed, either because its
+    /// preimage was never captured or because restoring it failed. Undo must not
+    /// guess, and must not report this as a restore.
+    unavailable: []const u8,
     empty,
+};
+
+/// The state of a file before a mutation. `absent` means the file was proven not to
+/// exist, which is the only case that licenses undo to delete it again; `unavailable`
+/// means the state could not be read (too large, permissions, IO error) and nothing
+/// about the file may be assumed.
+pub const CaptureResult = union(enum) {
+    captured: []u8,
+    absent,
+    unavailable,
 };
 
 pub const ChangeTracker = struct {
@@ -53,17 +72,18 @@ pub const ChangeTracker = struct {
         const op = self.stack.pop().?;
         defer if (op.new_path) |new_path| alloc.free(new_path);
 
+        if (op.preimage_unavailable) {
+            if (op.previous_content) |content| alloc.free(content);
+            return .{ .unavailable = op.path };
+        }
+
         switch (op.kind) {
             .delete => {
                 if (op.previous_content) |content| {
-                    var file = std.Io.Dir.createFileAbsolute(io_mod.getIo(), op.path, .{ .truncate = true }) catch {
-                        alloc.free(content);
-                        alloc.free(op.path);
-                        return .empty;
+                    defer alloc.free(content);
+                    restoreContent(alloc, op.path, content) catch {
+                        return .{ .unavailable = op.path };
                     };
-                    defer file.close(io_mod.getIo());
-                    file.writeStreamingAll(io_mod.getIo(), content) catch {};
-                    alloc.free(content);
                     return .{ .restored = op.path };
                 }
                 alloc.free(op.path);
@@ -73,18 +93,18 @@ pub const ChangeTracker = struct {
                 if (op.new_path) |new_path| {
                     std.Io.Dir.renameAbsolute(new_path, op.path, io_mod.getIo()) catch {
                         if (op.previous_content) |content| alloc.free(content);
-                        alloc.free(op.path);
-                        return .empty;
+                        return .{ .unavailable = op.path };
                     };
                     // previous_content holds the overwritten destination preimage.
                     if (op.previous_content) |content| {
-                        var file = std.Io.Dir.createFileAbsolute(io_mod.getIo(), new_path, .{ .truncate = true }) catch {
-                            alloc.free(content);
-                            return .{ .restored = op.path };
+                        defer alloc.free(content);
+                        restoreContent(alloc, new_path, content) catch {
+                            // The rename back succeeded but the file it displaced could
+                            // not be put back. Undo the rename too, so the tree is left
+                            // as it was rather than half reversed under a success report.
+                            std.Io.Dir.renameAbsolute(op.path, new_path, io_mod.getIo()) catch {};
+                            return .{ .unavailable = op.path };
                         };
-                        defer file.close(io_mod.getIo());
-                        file.writeStreamingAll(io_mod.getIo(), content) catch {};
-                        alloc.free(content);
                     }
                     return .{ .restored = op.path };
                 }
@@ -93,27 +113,52 @@ pub const ChangeTracker = struct {
             },
             .write, .edit => {
                 if (op.previous_content) |content| {
-                    var file = std.Io.Dir.createFileAbsolute(io_mod.getIo(), op.path, .{ .truncate = true }) catch {
-                        alloc.free(content);
-                        alloc.free(op.path);
-                        return .empty;
+                    defer alloc.free(content);
+                    restoreContent(alloc, op.path, content) catch {
+                        return .{ .unavailable = op.path };
                     };
-                    defer file.close(io_mod.getIo());
-                    file.writeStreamingAll(io_mod.getIo(), content) catch {};
-                    alloc.free(content);
                     return .{ .restored = op.path };
                 }
 
-                std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), op.path) catch {};
+                std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), op.path) catch |err| {
+                    // An already-absent file has reached the requested state. Every
+                    // other failure leaves the file's state uncertain and must not
+                    // be reported as a successful deletion.
+                    if (err != error.FileNotFound) {
+                        return .{ .unavailable = op.path };
+                    }
+                };
                 return .{ .deleted = op.path };
             },
         }
     }
 
-    pub fn captureFileState(alloc: Allocator, absolute_path: []const u8) ?[]u8 {
-        var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), absolute_path, .{}) catch return null;
+    pub fn captureFileState(alloc: Allocator, absolute_path: []const u8) CaptureResult {
+        var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), absolute_path, .{}) catch |err| {
+            return if (err == error.FileNotFound) .absent else .unavailable;
+        };
         defer file.close(io_mod.getIo());
-        return io_mod.readFileToEnd(alloc, &file, 10 * 1024 * 1024) catch null;
+        const content = io_mod.readFileToEnd(alloc, &file, 10 * 1024 * 1024) catch return .unavailable;
+        return .{ .captured = content };
+    }
+
+    /// Restores `content` at `absolute_path` without destroying what is already there
+    /// until the replacement is durable. A failed restore leaves the current file
+    /// untouched and is reported to the caller rather than swallowed.
+    ///
+    /// Symlinks are resolved first, so undoing an edit to a linked file rewrites the
+    /// file the link points at instead of replacing the link with a regular file.
+    ///
+    /// There is no in-place fallback for a file whose directory denies writes. Such a
+    /// file cannot be replaced atomically, and writing the preimage over it directly
+    /// would leave a half-replaced file behind on any mid-write failure, which is the
+    /// damage undo exists to avoid. The caller reports the refusal instead.
+    fn restoreContent(alloc: Allocator, absolute_path: []const u8, content: []const u8) !void {
+        const resolved = io_mod.realpathAlloc(alloc, absolute_path) catch null;
+        defer if (resolved) |path| alloc.free(path);
+        const target = resolved orelse absolute_path;
+
+        try io_mod.writeFileAtomic(alloc, target, content);
     }
 
     fn freeOperation(alloc: Allocator, op: FileOperation) void {
@@ -296,6 +341,46 @@ test "undoLast reports deleted for a new write when the file is already absent" 
     try expectMissing(path);
 }
 
+test "undoLast reports unavailable when a new file cannot be deleted" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "locked");
+    const path = try tmpPath(alloc, tmp.dir, "locked/new.txt");
+    defer alloc.free(path);
+    try writeAbsolute(path, "new content");
+
+    const dir_path = try tmpPath(alloc, tmp.dir, "locked");
+    defer alloc.free(dir_path);
+    const dir_path_z = try alloc.dupeZ(u8, dir_path);
+    defer alloc.free(dir_path_z);
+    if (std.c.chmod(dir_path_z.ptr, 0o500) != 0) return error.SkipZigTest;
+    defer _ = std.c.chmod(dir_path_z.ptr, 0o700);
+
+    var tracker: ChangeTracker = .{};
+    defer tracker.deinit(alloc);
+    try tracker.pushOperation(alloc, .{
+        .kind = .write,
+        .path = try alloc.dupe(u8, path),
+        .previous_content = null,
+        .timestamp_ms = 1,
+    });
+
+    switch (tracker.undoLast(alloc)) {
+        .unavailable => |reported_path| {
+            defer alloc.free(reported_path);
+            try std.testing.expectEqualStrings(path, reported_path);
+        },
+        else => return error.ExpectedUnavailable,
+    }
+    try std.testing.expectEqual(@as(usize, 0), tracker.stack.items.len);
+
+    const survived = try readAbsolute(alloc, path);
+    defer alloc.free(survived);
+    try std.testing.expectEqualStrings("new content", survived);
+}
+
 test "undoLast restores deleted files when previous content exists" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -419,7 +504,7 @@ test "undoLast restores destination preimage after overwrite rename" {
     try std.testing.expectEqualStrings("dest-preimage", dest);
 }
 
-test "undoLast consumes rename operations when renaming back fails" {
+test "undoLast reports unavailable when renaming back fails" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -438,12 +523,18 @@ test "undoLast consumes rename operations when renaming back fails" {
         .timestamp_ms = 1,
     });
 
-    try std.testing.expect(tracker.undoLast(alloc) == .empty);
+    switch (tracker.undoLast(alloc)) {
+        .unavailable => |reported_path| {
+            defer alloc.free(reported_path);
+            try std.testing.expectEqualStrings(old_path, reported_path);
+        },
+        else => return error.ExpectedUnavailable,
+    }
     try std.testing.expectEqual(@as(usize, 0), tracker.stack.items.len);
     try std.testing.expect(tracker.undoLast(alloc) == .empty);
 }
 
-test "undoLast returns restored for rename operations without new_path" {
+test "undoLast refuses rename operations without the required new_path" {
     const alloc = std.testing.allocator;
     var tracker: ChangeTracker = .{};
     defer tracker.deinit(alloc);
@@ -453,19 +544,20 @@ test "undoLast returns restored for rename operations without new_path" {
         .path = try alloc.dupe(u8, "/workspace/original.txt"),
         .previous_content = try alloc.dupe(u8, "previous"),
         .timestamp_ms = 1,
+        .preimage_unavailable = true,
     });
 
     const result = tracker.undoLast(alloc);
     switch (result) {
-        .restored => |restored_path| {
-            defer alloc.free(restored_path);
-            try std.testing.expectEqualStrings("/workspace/original.txt", restored_path);
+        .unavailable => |reported_path| {
+            defer alloc.free(reported_path);
+            try std.testing.expectEqualStrings("/workspace/original.txt", reported_path);
         },
-        else => return error.ExpectedRestore,
+        else => return error.ExpectedUnavailable,
     }
 }
 
-test "undoLast pops before filesystem restore failures and does not create parents" {
+test "undoLast pops before filesystem restore failures, reports them, and does not create parents" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -481,9 +573,13 @@ test "undoLast pops before filesystem restore failures and does not create paren
         .timestamp_ms = 1,
     });
 
-    try std.testing.expect(tracker.undoLast(alloc) == .empty);
+    switch (tracker.undoLast(alloc)) {
+        .unavailable => |reported| alloc.free(reported),
+        else => return error.ExpectedUnavailable,
+    }
     try std.testing.expectEqual(@as(usize, 0), tracker.stack.items.len);
     try expectMissing(path);
+    // The stack is empty now, which is a different answer from a failed restore.
     try std.testing.expect(tracker.undoLast(alloc) == .empty);
 }
 
@@ -497,16 +593,19 @@ test "captureFileState captures existing files and returns null for missing file
 
     try writeAbsolute(path, "snapshot");
 
-    const captured = ChangeTracker.captureFileState(alloc, path) orelse return error.ExpectedCapture;
+    const captured = switch (ChangeTracker.captureFileState(alloc, path)) {
+        .captured => |content| content,
+        else => return error.ExpectedCapture,
+    };
     defer alloc.free(captured);
     try std.testing.expectEqualStrings("snapshot", captured);
 
     const missing_path = try tmpPath(alloc, tmp.dir, "missing.txt");
     defer alloc.free(missing_path);
-    try std.testing.expect(ChangeTracker.captureFileState(alloc, missing_path) == null);
+    try std.testing.expect(ChangeTracker.captureFileState(alloc, missing_path) == .absent);
 }
 
-test "captureFileState returns null for files at the size limit" {
+test "captureFileState reports unavailable for files at the size limit" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -518,10 +617,10 @@ test "captureFileState returns null for files at the size limit" {
     defer file.close(io_mod.getIo());
     try file.setLength(io_mod.getIo(), 10 * 1024 * 1024);
 
-    try std.testing.expect(ChangeTracker.captureFileState(alloc, path) == null);
+    try std.testing.expect(ChangeTracker.captureFileState(alloc, path) == .unavailable);
 }
 
-test "captureFileState returns null for files over the size limit" {
+test "captureFileState reports unavailable for files over the size limit" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -533,5 +632,269 @@ test "captureFileState returns null for files over the size limit" {
     defer file.close(io_mod.getIo());
     try file.setLength(io_mod.getIo(), 10 * 1024 * 1024 + 1);
 
-    try std.testing.expect(ChangeTracker.captureFileState(alloc, path) == null);
+    try std.testing.expect(ChangeTracker.captureFileState(alloc, path) == .unavailable);
+}
+
+test "undoLast leaves the original file intact when the restore write fails" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(alloc, tmp.dir, "restore-target.txt");
+    defer alloc.free(path);
+    defer std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), path) catch {};
+
+    const current = "bytes the user still has on disk";
+    try writeAbsolute(path, current);
+
+    const preimage = try alloc.alloc(u8, 64 * 1024);
+    defer alloc.free(preimage);
+    @memset(preimage, 'R');
+
+    var tracker: ChangeTracker = .{};
+    defer tracker.deinit(alloc);
+    try tracker.pushOperation(alloc, .{
+        .kind = .write,
+        .path = try alloc.dupe(u8, path),
+        .previous_content = try alloc.dupe(u8, preimage),
+        .timestamp_ms = 1,
+    });
+
+    // Fail every write past 4 KiB, without the file-size signal killing the test process.
+    std.posix.sigaction(std.posix.SIG.XFSZ, &.{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    }, null);
+    const saved_limit = try std.posix.getrlimit(.FSIZE);
+    try std.posix.setrlimit(.FSIZE, .{ .cur = 4096, .max = saved_limit.max });
+    defer std.posix.setrlimit(.FSIZE, saved_limit) catch {};
+
+    switch (tracker.undoLast(alloc)) {
+        .unavailable => |reported| alloc.free(reported),
+        else => return error.ExpectedUnavailable,
+    }
+
+    const survived = try readAbsolute(alloc, path);
+    defer alloc.free(survived);
+    try std.testing.expectEqualStrings(current, survived);
+}
+
+test "captureFileState separates absent from unavailable" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const missing_path = try tmpPath(alloc, tmp.dir, "missing.txt");
+    defer alloc.free(missing_path);
+    try std.testing.expect(ChangeTracker.captureFileState(alloc, missing_path) == .absent);
+
+    const oversized_path = try tmpPath(alloc, tmp.dir, "oversized.bin");
+    defer alloc.free(oversized_path);
+    defer std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), oversized_path) catch {};
+    {
+        var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), oversized_path, .{ .truncate = true });
+        defer file.close(io_mod.getIo());
+        try file.setLength(io_mod.getIo(), 10 * 1024 * 1024 + 1);
+    }
+    try std.testing.expect(ChangeTracker.captureFileState(alloc, oversized_path) == .unavailable);
+}
+
+test "undoLast refuses an operation whose preimage was never captured" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(alloc, tmp.dir, "uncaptured.txt");
+    defer alloc.free(path);
+    defer std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), path) catch {};
+
+    try writeAbsolute(path, "content the tool did not create");
+
+    var tracker: ChangeTracker = .{};
+    defer tracker.deinit(alloc);
+    try tracker.pushOperation(alloc, .{
+        .kind = .write,
+        .path = try alloc.dupe(u8, path),
+        .previous_content = null,
+        .timestamp_ms = 1,
+        .preimage_unavailable = true,
+    });
+
+    switch (tracker.undoLast(alloc)) {
+        .unavailable => |reported| alloc.free(reported),
+        else => return error.ExpectedUnavailable,
+    }
+
+    const survived = try readAbsolute(alloc, path);
+    defer alloc.free(survived);
+    try std.testing.expectEqualStrings("content the tool did not create", survived);
+}
+
+test "undo refuses a file whose directory denies writes and leaves it intact" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "locked");
+    const path = try tmpPath(alloc, tmp.dir, "locked/file.txt");
+    defer alloc.free(path);
+    try writeAbsolute(path, "current bytes");
+
+    const dir_path = try tmpPath(alloc, tmp.dir, "locked");
+    defer alloc.free(dir_path);
+    const dir_path_z = try alloc.dupeZ(u8, dir_path);
+    defer alloc.free(dir_path_z);
+    if (std.c.chmod(dir_path_z.ptr, 0o500) != 0) return error.SkipZigTest;
+    defer _ = std.c.chmod(dir_path_z.ptr, 0o700);
+
+    var tracker: ChangeTracker = .{};
+    defer tracker.deinit(alloc);
+    try tracker.pushOperation(alloc, .{
+        .kind = .edit,
+        .path = try alloc.dupe(u8, path),
+        .previous_content = try alloc.dupe(u8, "preimage bytes"),
+        .timestamp_ms = 1,
+    });
+
+    // The file cannot be replaced atomically here, and a direct overwrite could
+    // leave it half replaced, so undo reports that it could not act.
+    switch (tracker.undoLast(alloc)) {
+        .unavailable => |reported| alloc.free(reported),
+        else => return error.ExpectedUnavailable,
+    }
+    const survived = try readAbsolute(alloc, path);
+    defer alloc.free(survived);
+    try std.testing.expectEqualStrings("current bytes", survived);
+}
+
+test "undo rewrites the file a symlink points at rather than replacing the link" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const real_path = try tmpPath(alloc, tmp.dir, "real.txt");
+    defer alloc.free(real_path);
+    const link_path = try tmpPath(alloc, tmp.dir, "link.txt");
+    defer alloc.free(link_path);
+    try writeAbsolute(real_path, "current bytes");
+    tmp.dir.symLink(std.testing.io, real_path, "link.txt", .{ .is_directory = false }) catch return error.SkipZigTest;
+
+    var tracker: ChangeTracker = .{};
+    defer tracker.deinit(alloc);
+    try tracker.pushOperation(alloc, .{
+        .kind = .edit,
+        .path = try alloc.dupe(u8, link_path),
+        .previous_content = try alloc.dupe(u8, "preimage bytes"),
+        .timestamp_ms = 1,
+    });
+
+    switch (tracker.undoLast(alloc)) {
+        .restored => |restored| alloc.free(restored),
+        else => return error.ExpectedRestore,
+    }
+
+    const link_stat = try tmp.dir.statFile(io_mod.getIo(), "link.txt", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.sym_link, link_stat.kind);
+    const through_link = try readAbsolute(alloc, real_path);
+    defer alloc.free(through_link);
+    try std.testing.expectEqualStrings("preimage bytes", through_link);
+}
+
+test "undo rolls back a rename when the displaced file cannot be restored" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const old_path = try tmpPath(alloc, tmp.dir, "old.txt");
+    defer alloc.free(old_path);
+    const new_path = try tmpPath(alloc, tmp.dir, "new.txt");
+    defer alloc.free(new_path);
+    try writeAbsolute(new_path, "renamed content");
+
+    const preimage = try alloc.alloc(u8, 64 * 1024);
+    defer alloc.free(preimage);
+    @memset(preimage, 'D');
+
+    var tracker: ChangeTracker = .{};
+    defer tracker.deinit(alloc);
+    try tracker.pushOperation(alloc, .{
+        .kind = .rename,
+        .path = try alloc.dupe(u8, old_path),
+        .new_path = try alloc.dupe(u8, new_path),
+        .previous_content = try alloc.dupe(u8, preimage),
+        .timestamp_ms = 1,
+    });
+
+    std.posix.sigaction(std.posix.SIG.XFSZ, &.{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    }, null);
+    const saved_limit = try std.posix.getrlimit(.FSIZE);
+    try std.posix.setrlimit(.FSIZE, .{ .cur = 4096, .max = saved_limit.max });
+    defer std.posix.setrlimit(.FSIZE, saved_limit) catch {};
+
+    switch (tracker.undoLast(alloc)) {
+        .unavailable => |reported| alloc.free(reported),
+        else => return error.ExpectedUnavailable,
+    }
+
+    // The tree is left exactly as it was before the undo attempt.
+    const displaced = try readAbsolute(alloc, new_path);
+    defer alloc.free(displaced);
+    try std.testing.expectEqualStrings("renamed content", displaced);
+    try expectMissing(old_path);
+}
+
+test "a locked directory plus a failing write never leaves a half-replaced file" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "locked");
+    const path = try tmpPath(alloc, tmp.dir, "locked/file.txt");
+    defer alloc.free(path);
+
+    const current = "the bytes the user has right now";
+    try writeAbsolute(path, current);
+
+    // Large enough that any direct overwrite would be cut short by the limit
+    // below, which is what would leave a prefix of preimage bytes behind.
+    const preimage = try alloc.alloc(u8, 64 * 1024);
+    defer alloc.free(preimage);
+    @memset(preimage, 'R');
+
+    var tracker: ChangeTracker = .{};
+    defer tracker.deinit(alloc);
+    try tracker.pushOperation(alloc, .{
+        .kind = .edit,
+        .path = try alloc.dupe(u8, path),
+        .previous_content = try alloc.dupe(u8, preimage),
+        .timestamp_ms = 1,
+    });
+
+    const dir_path = try tmpPath(alloc, tmp.dir, "locked");
+    defer alloc.free(dir_path);
+    const dir_path_z = try alloc.dupeZ(u8, dir_path);
+    defer alloc.free(dir_path_z);
+    if (std.c.chmod(dir_path_z.ptr, 0o500) != 0) return error.SkipZigTest;
+    defer _ = std.c.chmod(dir_path_z.ptr, 0o700);
+
+    std.posix.sigaction(std.posix.SIG.XFSZ, &.{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    }, null);
+    const saved_limit = try std.posix.getrlimit(.FSIZE);
+    try std.posix.setrlimit(.FSIZE, .{ .cur = 4096, .max = saved_limit.max });
+    defer std.posix.setrlimit(.FSIZE, saved_limit) catch {};
+
+    switch (tracker.undoLast(alloc)) {
+        .unavailable => |reported| alloc.free(reported),
+        else => return error.ExpectedUnavailable,
+    }
+
+    // Not shortened, not partly rewritten: exactly the bytes that were there.
+    const survived = try readAbsolute(alloc, path);
+    defer alloc.free(survived);
+    try std.testing.expectEqualStrings(current, survived);
 }
