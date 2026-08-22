@@ -16,7 +16,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
@@ -5673,6 +5673,19 @@ describe("effect-aware command permissions", () => {
       );
       expect(gateway.classifierRequests[0]!.body).toContain("action: command");
       expect(gateway.classifierRequests[0]!.body).toContain("command: printf");
+      const configuredShell = userInfo().shell;
+      const reviewShell = configuredShell.endsWith("/bash") || configuredShell.endsWith("/zsh")
+        ? configuredShell
+        : process.platform === "darwin"
+          ? "/bin/zsh"
+          : "/bin/bash";
+      const expectedInvocation = reviewShell.endsWith("/zsh")
+        ? `'${reviewShell}' '-l' '-i' '-c'`
+        : `'${reviewShell}' '--login' '-O' 'expand_aliases' '-c'`;
+      const evidence = classifierEvidenceFromRequest(gateway.classifierRequests[0]!.body);
+      expect(evidence).toContain("environment: user");
+      expect(evidence).toContain(`environment_shell: ${reviewShell}`);
+      expect(evidence).toContain(`environment_invocation: ${expectedInvocation}`);
       expect(gateway.classifierRequests[0]!.body).toContain(
         '"enum":["allow","ask"]',
       );
