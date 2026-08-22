@@ -15,6 +15,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewayToolCall,
+  heldFakeGatewayFinalText,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -285,6 +286,63 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       expect(statusPane).toContain("permission_mode=ask");
       expect(statusPane).not.toContain("sandbox=");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    45_000,
+  );
+
+  test(
+    "permission footer keeps the active turn mode visible until the next turn",
+    async () => {
+      const fixture = createFixture("fx-permission-mode-snapshot-");
+      const stderrPath = join(fixture.root, "stderr.log");
+      writeFileSync(
+        fixture.settingsPath,
+        JSON.stringify({
+          permission_mode: "ask",
+          yolo_acknowledged: true,
+        }) + "\n",
+      );
+      writeFileSync(stderrPath, "");
+
+      const held = heldFakeGatewayFinalText();
+      try {
+        const fake = startFakeGateway([held.response]);
+        gateway = fake;
+        session = await TmuxSession.create({
+          cwd: fixture.workspace,
+          stderrPath,
+          width: 120,
+          height: 40,
+          env: {
+            HOME: fixture.home,
+            AI_GATEWAY_API_KEY: "fake-permission-snapshot-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTO_UPGRADE: "0",
+            FX_GATEWAY_BASE_URL: fake.baseUrl,
+            FX_GATEWAY_CHAT_URL: fake.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+            FX_PERMISSION_MODE: undefined,
+          },
+        });
+
+        await session.waitForText("ask · gpt-5", TIMEOUT);
+        await session.sendText("Hold this turn while I change permission mode.");
+        await session.waitForPane(() => fake.requests.length === 1, TIMEOUT);
+
+        await session.sendKeys("BTab");
+        const pendingPane = await session.waitForText("ask → auto next · gpt-5", TIMEOUT);
+        expect(pendingPane).toContain("ask → auto next · gpt-5");
+        expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).permission_mode)
+          .toBe("auto");
+
+        held.release("PERMISSION_SNAPSHOT_TURN_DONE");
+        await session.waitForText("PERMISSION_SNAPSHOT_TURN_DONE", TIMEOUT);
+        const idlePane = await session.waitForText("auto · gpt-5", TIMEOUT);
+        expect(idlePane).not.toContain("ask → auto next");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        held.dispose();
+      }
     },
     45_000,
   );

@@ -250,6 +250,46 @@ fn permissionModeStatusLabel(mode: types.PermissionMode, out: []u8) []const u8 {
     };
 }
 
+pub const PermissionModeDisplay = struct {
+    current: types.PermissionMode = .ask,
+    next: ?types.PermissionMode = null,
+
+    pub fn init(current: types.PermissionMode, selected: types.PermissionMode) PermissionModeDisplay {
+        return .{
+            .current = current,
+            .next = if (current == selected) null else selected,
+        };
+    }
+};
+
+fn permissionModeDisplayStatusLabel(display: PermissionModeDisplay, out: []u8) []const u8 {
+    const next = display.next orelse return permissionModeStatusLabel(display.current, out);
+    var current_buf: [64]u8 = undefined;
+    var next_buf: [64]u8 = undefined;
+    return std.fmt.bufPrint(
+        out,
+        "{s} → {s} next",
+        .{
+            permissionModeStatusLabel(display.current, &current_buf),
+            permissionModeStatusLabel(next, &next_buf),
+        },
+    ) catch permissionModeStatusLabel(display.current, out);
+}
+
+fn compactPermissionModeDisplayStatusLabel(display: PermissionModeDisplay, out: []u8) []const u8 {
+    const next = display.next orelse return permissionModeStatusLabel(display.current, out);
+    var current_buf: [64]u8 = undefined;
+    var next_buf: [64]u8 = undefined;
+    return std.fmt.bufPrint(
+        out,
+        "{s}→{s} next",
+        .{
+            permissionModeStatusLabel(display.current, &current_buf),
+            permissionModeStatusLabel(next, &next_buf),
+        },
+    ) catch permissionModeStatusLabel(display.current, out);
+}
+
 fn appendStatusSegment(out: []u8, end: *usize, segment: []const u8) void {
     if (segment.len == 0) return;
     const sep = " · ";
@@ -404,15 +444,61 @@ pub fn buildHintLine(
     width: u16,
     out: []u8,
 ) []const u8 {
+    return buildHintLineForPermissionDisplay(
+        stream_active,
+        awaiting_permission,
+        has_api_key,
+        model,
+        .{ .current = permission_mode },
+        queued_count,
+        active_label,
+        fast_mode,
+        model_supports_fast,
+        effort,
+        model_supports_effort,
+        statusline,
+        width,
+        out,
+    );
+}
+
+pub fn buildHintLineForPermissionDisplay(
+    stream_active: bool,
+    awaiting_permission: bool,
+    has_api_key: bool,
+    model: []const u8,
+    permission: PermissionModeDisplay,
+    queued_count: usize,
+    active_label: ?[]const u8,
+    fast_mode: bool,
+    model_supports_fast: bool,
+    effort: types.ReasoningEffort,
+    model_supports_effort: bool,
+    statusline: StatuslineItems,
+    width: u16,
+    out: []u8,
+) []const u8 {
     _ = active_label;
     _ = stream_active;
 
     var model_buf: [96]u8 = undefined;
     const model_label = compactModelLabel(model, &model_buf);
-    var permission_buf: [64]u8 = undefined;
-    const permission_label = permissionModeStatusLabel(permission_mode, &permission_buf);
+    var permission_buf: [160]u8 = undefined;
+    var compact_permission_buf: [160]u8 = undefined;
+    const full_permission_label = permissionModeDisplayStatusLabel(permission, &permission_buf);
+    const status_limit = @min(@as(usize, width), out.len);
+    const permission_label = if (permission.next != null and
+        display_width.visibleWidthIgnoringAnsi(full_permission_label) > status_limit)
+        compactPermissionModeDisplayStatusLabel(permission, &compact_permission_buf)
+    else
+        full_permission_label;
 
     var end: usize = 0;
+    const permission_transition_visible = permission.next != null and
+        display_width.visibleWidthIgnoringAnsi(permission_label) <= status_limit;
+    if (permission_transition_visible) {
+        appendStatusSegment(out, &end, permission_label);
+    }
     if (!awaiting_permission and !has_api_key) {
         appendStatusSegment(out, &end, "run /login");
     }
@@ -420,10 +506,11 @@ pub fn buildHintLine(
         var queued_buf: [32]u8 = undefined;
         appendStatusSegment(out, &end, std.fmt.bufPrint(&queued_buf, "queued {d}", .{queued_count}) catch "");
     }
-    const status_limit = @min(@as(usize, width), out.len);
     const show_effort = model_supports_effort and !effort.isDefault();
     const show_fast = model_supports_fast and fast_mode;
-    if (leadingPermissionModeFits(status_limit, permission_label, model_label)) {
+    if (!permission_transition_visible and
+        leadingPermissionModeFits(status_limit, permission_label, model_label))
+    {
         appendStatusSegment(out, &end, permission_label);
     }
     appendStatusSegment(out, &end, model_label);
@@ -948,6 +1035,67 @@ test "buildHintLine hides effort when it is auto" {
     var buf: [128]u8 = undefined;
     const line = buildHintLine(false, false, true, "anthropic/claude-opus-4.7", .ask, 0, null, false, true, .auto, true, .{}, 80, &buf);
     try std.testing.expectEqualStrings("ask · opus 4.7", line);
+}
+
+test "buildHintLine distinguishes the current turn from the next permission mode" {
+    initTheme(false, null);
+    defer initTheme(false, null);
+
+    var buf: [160]u8 = undefined;
+    const line = buildHintLineForPermissionDisplay(
+        true,
+        false,
+        true,
+        "openai/gpt-5",
+        PermissionModeDisplay.init(.ask, .auto),
+        0,
+        null,
+        false,
+        false,
+        .auto,
+        false,
+        .{},
+        80,
+        &buf,
+    );
+    const expected = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "ask → {s}auto{s} next · gpt-5",
+        .{ permission_auto_style, statusline_style },
+    );
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, line);
+}
+
+test "buildHintLine prioritizes a compact permission transition at narrow widths" {
+    initTheme(false, null);
+    defer initTheme(false, null);
+
+    var buf: [160]u8 = undefined;
+    const line = buildHintLineForPermissionDisplay(
+        true,
+        false,
+        true,
+        "openai/gpt-5",
+        PermissionModeDisplay.init(.ask, .auto),
+        0,
+        null,
+        false,
+        false,
+        .auto,
+        false,
+        .{},
+        13,
+        &buf,
+    );
+    const expected = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "ask→{s}auto{s} next",
+        .{ permission_auto_style, statusline_style },
+    );
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, line);
+    try std.testing.expectEqual(@as(usize, 13), display_width.visibleWidthIgnoringAnsi(line));
 }
 
 test "buildHintLine hides effort for models without effort support" {

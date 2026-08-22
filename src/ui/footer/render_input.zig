@@ -269,7 +269,7 @@ pub const RenderContext = struct {
     model: []const u8,
     pending_images: []const types.ImageAttachment = &.{},
     composer_visible: bool = true,
-    permission_mode: types.PermissionMode = .ask,
+    permission: ui_render.PermissionModeDisplay = .{},
     queued_count: usize,
     queued_paused: bool = false,
     queued_cancel_all_available: bool = false,

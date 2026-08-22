@@ -462,11 +462,27 @@ pub fn Runtime(comptime App: type) type {
             else
                 app.fast_mode;
 
+            const selected_permission_mode = if (comptime @hasField(App, "permission_engine"))
+                app.permission_engine.mode
+            else
+                types.PermissionMode.ask;
+            const current_permission_mode = if (comptime @hasDecl(@TypeOf(app.worker), "effectivePermissionSnapshot"))
+                app.worker.effectivePermissionSnapshot(.{
+                    .mode = selected_permission_mode,
+                }).mode
+            else
+                selected_permission_mode;
+            const permission_display = ui_render.PermissionModeDisplay.init(
+                current_permission_mode,
+                selected_permission_mode,
+            );
+
             const upgrade_label = app.upgrader.statusLabel(upgrade_status_buf);
             const yolo_warning_active =
                 if (comptime @hasField(App, "permission_state") and
                 @hasField(App, "permission_engine"))
-                    app_permission_runtime.Runtime(App).yoloWarningActive(app)
+                    current_permission_mode == .yolo and
+                        app_permission_runtime.Runtime(App).yoloWarningActive(app)
                 else
                     false;
             const settings_snapshot = app_commands.settingsCatalogSnapshot(app);
@@ -486,10 +502,7 @@ pub fn Runtime(comptime App: type) type {
                 .has_api_key = app.auth.credentialSource() != null,
                 .model = visible_model,
                 .pending_images = app.pending_images.items,
-                .permission_mode = if (comptime @hasField(App, "permission_engine"))
-                    app.permission_engine.mode
-                else
-                    .ask,
+                .permission = permission_display,
                 .queued_count = if (queued_cards.cards.len > 0) queued_cards.cards.len else queue_preview.count,
                 .queued_paused = if (comptime @hasField(@TypeOf(queue_preview), "paused"))
                     queue_preview.paused
@@ -1071,7 +1084,7 @@ pub fn Runtime(comptime App: type) type {
             ctx.model = visible_model;
             ctx.pending_images = &.{};
             ctx.composer_visible = chat.messageable();
-            ctx.permission_mode = .auto;
+            ctx.permission = .{ .current = .auto };
             ctx.queued_count = 0;
             ctx.queued_paused = false;
             ctx.queued_cancel_all_available = false;
@@ -4666,7 +4679,7 @@ test "core.app_render_runtime keeps configured controls visible while model capa
         false,
         ctx.has_api_key,
         ctx.model,
-        ctx.permission_mode,
+        ctx.permission.current,
         ctx.queued_count,
         null,
         ctx.fast_mode,

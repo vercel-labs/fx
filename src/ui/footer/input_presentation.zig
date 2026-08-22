@@ -307,12 +307,12 @@ pub fn composeHintRow(
         null;
     var hint_buf: [max_status_line_len]u8 = undefined;
     var hint_with_subagents_buf: [max_status_line_len + 128]u8 = undefined;
-    const base_hint_line = ui_render.buildHintLine(
+    const base_hint_line = ui_render.buildHintLineForPermissionDisplay(
         ctx.stream.active,
         approval_active,
         ctx.has_api_key or (ctx.auth_picker.active and ctx.auth_picker.include_skip),
         ctx.model,
-        ctx.permission_mode,
+        ctx.permission,
         ctx.queued_count,
         active_label,
         ctx.fast_mode,
@@ -1501,7 +1501,7 @@ test "compose hint row right-aligns upgrade status after styled auto mode" {
         .stream = .{},
         .has_api_key = true,
         .model = "openai/gpt-4o",
-        .permission_mode = .auto,
+        .permission = .{ .current = .auto },
         .queued_count = 0,
         .subagent_count = 0,
         .subagent_view_active = false,
