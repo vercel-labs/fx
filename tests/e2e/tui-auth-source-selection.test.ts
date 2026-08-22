@@ -2448,7 +2448,7 @@ test(
         { mode: 0o600 },
       );
       const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Read the README, then finish."],
+        ["ask", "--json", "--auto", "Read the README, then finish."],
         {
           env: {
             HOME: home,
@@ -2467,6 +2467,12 @@ test(
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
       expect(result.stdout).toContain("CODEX_TOOL_LOOP_OK");
       expect(codex.bodies).toHaveLength(2);
+      const output = JSON.parse(result.stdout) as { session_id: string };
+      expect(output.session_id.length).toBeGreaterThan(0);
+      const promptCacheKeys = codex.bodies.map(
+        (body) => (JSON.parse(body) as { prompt_cache_key?: string }).prompt_cache_key,
+      );
+      expect(promptCacheKeys).toEqual([output.session_id, output.session_id]);
       expect(codex.bodies[1]).toContain('"encrypted_content":"opaque-tool-loop"');
       expect(codex.bodies[1]).toContain('"type":"function_call_output"');
       for (const request of [...gateway.requests, ...gateway.modelRequests]) {

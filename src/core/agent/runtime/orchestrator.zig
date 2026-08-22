@@ -3086,6 +3086,7 @@ fn processQueuedPromptLoop(
                 overlay_arena,
                 .{
                     .model = gateway_model,
+                    .session_id = lifecycle.scope.session_id,
                     .tool_registry = deps.tool_registry,
                     .serialized_tools = config.gateway_tools_json,
                     .messages = request_messages,

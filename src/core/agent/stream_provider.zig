@@ -92,6 +92,8 @@ pub const StructuredResponseFormat = struct {
 
 pub const BuildRequest = struct {
     model: []const u8,
+    /// Borrowed for the duration of `Provider.build`.
+    session_id: ?[]const u8 = null,
     tool_registry: tool_dispatch.Registry = .{},
     serialized_tools: []const u8,
     messages: []const types.ChatMessage,
