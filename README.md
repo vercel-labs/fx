@@ -78,6 +78,14 @@ The status line hides the workspace path and Git branch by default. Enable the `
 }
 ```
 
+Replace the compiled system prompt for every session by writing your own to `~/.fx/SYSTEM.md`:
+
+```bash
+$EDITOR ~/.fx/SYSTEM.md
+```
+
+The file applies to the interactive TUI, `fx ask`, `fx acp`, and subagents. `fx ask --system` still overrides it for a single request, and `~/.fx/AGENTS.md` keeps adding instructions to the prompt instead of replacing it. fx keeps the compiled prompt when the file is missing, blank, larger than 64 KiB, symlinked, or not valid UTF-8. Run `fx doctor` to see which prompt is active and why a file was refused.
+
 List saved sessions with `fx sessions`. Resume the latest session for the current workspace, or select an exact session ID, through the same command group:
 
 ```bash
