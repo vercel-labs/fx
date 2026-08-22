@@ -5503,6 +5503,7 @@ pub const McpRuntime = struct {
                 removeServerToolNames(used_tool_names, server);
                 clearServerTools(self.alloc, server);
                 server.disconnect();
+                if (!startupFailureCanRestart(err)) return err;
                 if (server.restart_attempts >= server.config.restart_limit) return err;
                 server.restart_attempts += 1;
                 debug_trace.logf(
@@ -7368,6 +7369,16 @@ fn finishFetchedResourceRead(
     result.contents = &.{};
     result.deinit(alloc);
     return .{ .server_name = server_copy, .uri = uri_copy, .contents = contents };
+}
+
+fn startupFailureCanRestart(err: anyerror) bool {
+    return switch (err) {
+        error.Cancelled,
+        error.McpConnectionTimedOut,
+        error.McpRequestTimedOut,
+        => false,
+        else => true,
+    };
 }
 
 fn renderResourceCatalogForModel(
@@ -9776,9 +9787,7 @@ fn connectServer(
             .send_cancellation = false,
         },
     ) catch |err| switch (err) {
-        error.McpRequestTimedOut,
-        error.McpConnectionClosed,
-        => {
+        error.McpConnectionClosed => {
             try checkConnectionControl(control);
             return connectServerLegacy(
                 alloc,
@@ -15900,6 +15909,68 @@ fn shellMcpConfigWithModeForTest(
     alloc.free(config.args);
     config.args = args;
     return config;
+}
+
+fn readStartupLaunchesForTest(alloc: Allocator, path: []const u8) ![]u8 {
+    var file = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{});
+    defer file.close(std.testing.io);
+    return io_mod.readFileToEnd(alloc, &file, 4096);
+}
+
+test "stdio startup timeouts do not relaunch an outstanding process" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const launch_path = try std.fs.path.join(alloc, &.{ root, "launches" });
+    defer alloc.free(launch_path);
+
+    const shell_server =
+        \\printf 'launch\n' >> "$0"
+        \\sleep 60
+    ;
+    var config = try shellMcpConfigWithModeForTest(
+        alloc,
+        "authorization-bridge",
+        shell_server,
+        launch_path,
+    );
+    config.startup_timeout_ms = 50;
+    config.restart_limit = 3;
+
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(config);
+    const server = &runtime.servers.items[0];
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+
+    try std.testing.expectError(
+        error.McpRequestTimedOut,
+        runtime.connectServerBounded(server, &used, .{}),
+    );
+    const first = try readStartupLaunchesForTest(alloc, launch_path);
+    defer alloc.free(first);
+    try std.testing.expectEqualStrings("launch\n", first);
+    try std.testing.expectEqual(@as(u8, 0), server.restart_attempts);
+
+    try std.testing.expectError(
+        error.McpRequestTimedOut,
+        runtime.connectServerBounded(server, &used, .{}),
+    );
+    const retried = try readStartupLaunchesForTest(alloc, launch_path);
+    defer alloc.free(retried);
+    try std.testing.expectEqualStrings("launch\nlaunch\n", retried);
+    try std.testing.expectEqual(@as(u8, 0), server.restart_attempts);
+}
+
+test "stdio startup restart policy preserves explicit retry boundaries" {
+    try std.testing.expect(!startupFailureCanRestart(error.Cancelled));
+    try std.testing.expect(!startupFailureCanRestart(error.McpConnectionTimedOut));
+    try std.testing.expect(!startupFailureCanRestart(error.McpRequestTimedOut));
+    try std.testing.expect(startupFailureCanRestart(error.McpConnectionClosed));
+    try std.testing.expect(startupFailureCanRestart(error.McpInvalidJson));
 }
 
 const resource_resolution_shell_server =
