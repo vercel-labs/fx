@@ -12,15 +12,15 @@ describe("custom OpenAI-compatible provider", () => {
       fetch: async (request) => {
         const body = (await request.json()) as { model?: string };
         receivedModel = body.model ?? "";
-        return Response.json({
-          id: "mock-completion",
-          choices: [
-            {
-              finish_reason: "stop",
-              message: { role: "assistant", content: "custom provider works" },
-            },
-          ],
-          usage: { prompt_tokens: 2, completion_tokens: 3 },
+        const sse = [
+          `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: "thinking" } }] })}\n`,
+          `data: ${JSON.stringify({ choices: [{ delta: { content: "custom " } }] })}\n`,
+          `data: ${JSON.stringify({ choices: [{ delta: { content: "provider works" } }] })}\n`,
+          `data: ${JSON.stringify({ choices: [{ finish_reason: "stop" }], usage: { prompt_tokens: 2, completion_tokens: 3 } })}\n`,
+          "data: [DONE]\n",
+        ].join("");
+        return new Response(sse, {
+          headers: { "content-type": "text/event-stream" },
         });
       },
     });

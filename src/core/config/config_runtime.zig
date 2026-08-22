@@ -72,6 +72,13 @@ pub const Settings = struct {
     permission_rules: types.PermissionRuleSet = .{},
     has_permission_rules: bool = false,
 
+    pub fn customProviderConfig(self: *const Settings) ?custom_provider.CustomProviderConfig {
+        return .{
+            .base_url = self.custom_base_url orelse return null,
+            .api_key_env = self.custom_api_key_env orelse return null,
+        };
+    }
+
     pub fn deinit(self: *Settings, alloc: Allocator) void {
         if (self.model) |value| alloc.free(value);
         if (self.codex_model) |value| alloc.free(value);

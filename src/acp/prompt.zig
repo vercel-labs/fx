@@ -237,7 +237,10 @@ const AcpContext = struct {
             .gateway_team = self.state.gateway_team,
             .model = session.model,
             .gateway_retry_count = self.state.cfg.gateway_retry_count,
-            .gateway_chat_url = self.state.cfg.gateway_chat_url,
+            .gateway_chat_url = if (session.provider == .custom and self.state.custom_chat_url.len > 0)
+                self.state.custom_chat_url
+            else
+                self.state.cfg.gateway_chat_url,
             .gateway_models_path = self.state.cfg.gateway_models_path,
             .agent_step_limit = session.agent_step_limit,
             .fast_mode = session.fast_mode,

@@ -19,6 +19,7 @@ const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
+const openai_compat = @import("../gateway/openai_compat.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const hooks = @import("../core/hooks/hooks.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
@@ -225,6 +226,8 @@ pub const ServerState = struct {
     selected_model: []u8 = &.{},
     provider: model_provider.ProviderId = .gateway,
     configured_model: []u8 = &.{},
+    custom_chat_url: []u8 = &.{},
+    custom_api_key_env: []u8 = &.{},
     process_model_override: bool = false,
     permission_mode: types.PermissionMode = .ask,
     permission_rules: types.PermissionRuleSet = .{},
@@ -276,6 +279,8 @@ pub const ServerState = struct {
         if (self.account_id) |account_id| self.alloc.free(account_id);
         if (self.selected_model.len > 0) self.alloc.free(self.selected_model);
         if (self.configured_model.len > 0) self.alloc.free(self.configured_model);
+        if (self.custom_chat_url.len > 0) self.alloc.free(self.custom_chat_url);
+        if (self.custom_api_key_env.len > 0) self.alloc.free(self.custom_api_key_env);
         self.permission_rules.deinit(self.alloc);
         self.background.deinit(std.heap.c_allocator);
         self.skills.deinit(self.alloc);
@@ -357,7 +362,7 @@ pub fn selectCredentialForProvider(
             .refresh_if_needed,
             provider,
             state.credential_source,
-            null,
+            if (provider == .custom and state.custom_api_key_env.len > 0) state.custom_api_key_env else null,
         );
         break :blk resolution.credential orelse return false;
     };
@@ -374,20 +379,33 @@ pub fn streamProviderFor(
         .gateway => state.cfg.gateway_provider.agent_stream,
         .codex => state.cfg.codex_agent_stream orelse
             @import("../core/agent/stream_provider.zig").unavailable_provider,
-        .custom => @import("../core/agent/stream_provider.zig").unavailable_provider,
+        .custom => openai_compat.agent_stream_provider,
+    };
+}
+
+fn fetchCustomCatalog(
+    raw: ?*anyopaque,
+    alloc: Allocator,
+    input: model_catalog.FetchInput,
+) Allocator.Error!model_catalog.ProviderResult {
+    const state: *ServerState = @ptrCast(@alignCast(raw.?));
+    return openai_compat.fetchCatalog(alloc, state.custom_chat_url, input.access) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => .{ .failure = .{ .category = .transport } },
     };
 }
 
 pub fn catalogProviderFor(
-    state: *const ServerState,
+    state: *ServerState,
     provider: model_provider.ProviderId,
 ) ?@import("../core/gateway/model_catalog.zig").Provider {
     return switch (provider) {
         .gateway => state.cfg.gateway_provider.model_catalog,
         .codex => state.cfg.codex_model_catalog,
-        // The custom catalog arrives with model listing support; until then
-        // the picker relies on manual entry.
-        .custom => null,
+        .custom => if (state.custom_chat_url.len > 0)
+            .{ .context = state, .fetch_fn = fetchCustomCatalog }
+        else
+            null,
     };
 }
 
@@ -1360,6 +1378,8 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     }
     state.provider = startup.provider;
     state.configured_model = try alloc.dupe(u8, startup.configured_model);
+    state.custom_chat_url = startup.takeCustomChatUrl();
+    state.custom_api_key_env = startup.takeCustomApiKeyEnv();
 
     var startup_credential = startup.takeCredential();
     defer if (startup_credential) |*credential| credential.deinit(alloc);
@@ -1386,7 +1406,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             .refresh_if_needed,
             state.provider,
             preferred,
-            null,
+            if (state.provider == .custom and state.custom_api_key_env.len > 0) state.custom_api_key_env else null,
         );
         routed_credential = resolution.credential;
         if (routed_credential == null) {
@@ -1655,7 +1675,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .refresh_if_needed,
                     target,
                     null,
-                    null,
+                    if (target == .custom and state.custom_api_key_env.len > 0) state.custom_api_key_env else null,
                 );
                 break :credential resolution.credential orelse
                     return state.writer.writeError(alloc, msg.id, .{

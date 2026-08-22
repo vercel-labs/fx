@@ -295,7 +295,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .login, .usage = "login [vercel|codex]" },
         .{ .kind = .logout, .usage = "logout [vercel|codex]" },
         .{ .kind = .provider, .usage = "provider <gateway|codex|custom>" },
-        .{ .kind = .setup, .usage = "setup" },
+        .{ .kind = .setup, .usage = "setup [custom]" },
         .{ .kind = .teams, .usage = "teams" },
         .{ .kind = .credits, .usage = "credits|balance" },
         .{ .kind = .usage, .usage = "usage [--period <24h|7d|30d>]" },

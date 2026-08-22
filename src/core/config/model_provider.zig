@@ -40,10 +40,6 @@ pub fn usesGatewayAuxiliaries(provider: ProviderId) bool {
     return provider == .gateway;
 }
 
-pub fn usesCustomEndpoint(provider: ProviderId) bool {
-    return provider == .custom;
-}
-
 test "explicit providers authorize only their own credential origins" {
     try std.testing.expect(authorizesCredential(.gateway, .ai_gateway_api_key));
     try std.testing.expect(authorizesCredential(.gateway, .fx_login));

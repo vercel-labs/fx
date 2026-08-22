@@ -126,6 +126,7 @@ pub const StartupState = struct {
     selected_model: []u8 = &.{},
     configured_model: []u8 = &.{},
     custom_chat_url: []u8 = &.{},
+    custom_api_key_env: []u8 = &.{},
     model_source: config_runtime.ModelSource = .compiled_default,
     permission_mode: PermissionMode = default_permission_mode,
     yolo_acknowledged: bool = false,
@@ -163,6 +164,7 @@ pub const StartupState = struct {
         if (self.selected_model.len > 0) alloc.free(self.selected_model);
         if (self.configured_model.len > 0) alloc.free(self.configured_model);
         if (self.custom_chat_url.len > 0) alloc.free(self.custom_chat_url);
+        if (self.custom_api_key_env.len > 0) alloc.free(self.custom_api_key_env);
         self.permission_rules.deinit(alloc);
         if (self.config_diagnostics.len > 0) {
             for (self.config_diagnostics) |*diagnostic| diagnostic.deinit(alloc);
@@ -214,6 +216,12 @@ pub const StartupState = struct {
     pub fn takeCustomChatUrl(self: *StartupState) []u8 {
         const value = self.custom_chat_url;
         self.custom_chat_url = &.{};
+        return value;
+    }
+
+    pub fn takeCustomApiKeyEnv(self: *StartupState) []u8 {
+        const value = self.custom_api_key_env;
+        self.custom_api_key_env = &.{};
         return value;
     }
 
@@ -412,7 +420,9 @@ fn loadStartupStateFromOwnedWorkspace(
     const configured_selection = try configuredProviderSelection(default_model, settings);
     state.provider = configured_selection.provider;
     state.configured_model = try alloc.dupe(u8, configured_selection.model);
-    if (settings.custom_base_url) |base_url| {
+    if (settings.customProviderConfig()) |custom_config| {
+        state.custom_api_key_env = try alloc.dupe(u8, custom_config.api_key_env);
+        const base_url = custom_config.base_url;
         const trimmed = std.mem.trimEnd(u8, base_url, "/");
         const completion_suffix = "/chat/completions";
         const endpoint = if (std.mem.endsWith(u8, trimmed, completion_suffix))

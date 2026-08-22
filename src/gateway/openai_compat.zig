@@ -1,5 +1,6 @@
 const std = @import("std");
 const io_mod = @import("../core/shared/io.zig");
+const debug_trace = @import("../core/shared/debug_trace.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const types = @import("../core/shared/types.zig");
 const credentials = @import("../core/auth/credentials.zig");
@@ -507,12 +508,14 @@ fn parseFinishReason(value: []const u8) types.ProviderFinishReason {
     if (std.mem.eql(u8, value, "content_filter")) return .content_filter;
     if (std.mem.eql(u8, value, "length")) return .length;
     if (std.mem.eql(u8, value, "stop")) return .stop;
+    debug_trace.logf("custom_provider", "unknown_finish_reason={s}", .{value});
     return .other;
 }
 
 fn deinitCompletion(alloc: Allocator, completion: *types.GatewayCompletion) void {
     if (completion.content) |value| alloc.free(@constCast(value));
     if (completion.generation_id) |value| alloc.free(@constCast(value));
+    if (completion.provider_failure_detail) |value| alloc.free(@constCast(value));
     if (completion.provider_state_json) |value| alloc.free(@constCast(value));
     if (completion.tool_calls.len > 0) {
         for (completion.tool_calls) |call| {
@@ -550,6 +553,16 @@ test "parses OpenAI SSE content and finish reason" {
     try std.testing.expectEqualStrings("hi", completion.content.?);
     try std.testing.expectEqual(types.ProviderFinishReason.stop, completion.finish_reason.?);
     try std.testing.expectEqual(@as(u64, 2), completion.usage.input_tokens.?);
+}
+
+test "preserves reasoning and logs unknown SSE finish reasons" {
+    const sse = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n" ++
+        "data: {\"choices\":[{\"finish_reason\":\"provider_paused\"}]}\n" ++
+        "data: [DONE]\n";
+    var completion = try parseSseCompletion(std.testing.allocator, sse);
+    defer deinitCompletion(std.testing.allocator, &completion);
+    try std.testing.expectEqualStrings("think", completion.provider_failure_detail.?);
+    try std.testing.expectEqual(types.ProviderFinishReason.other, completion.finish_reason.?);
 }
 
 test "parses OpenAI tool calls and usage" {

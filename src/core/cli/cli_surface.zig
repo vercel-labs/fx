@@ -1733,8 +1733,12 @@ fn runCustomSetup(
         endpoint[0 .. endpoint.len - completion_suffix.len]
     else
         endpoint;
-    config_runtime.custom_provider.validate(endpoint_base, "OPENROUTER_API_KEY") catch {
-        try writeStderr(deps, "fx setup custom: endpoint must use HTTPS, or loopback HTTP for testing\n");
+    try writeStderr(deps, "API key environment variable [OPENROUTER_API_KEY]: ");
+    const env_input = readSetupLine(alloc) catch return false;
+    defer alloc.free(env_input);
+    const api_key_env = if (env_input.len == 0) "OPENROUTER_API_KEY" else env_input;
+    config_runtime.custom_provider.validate(endpoint_base, api_key_env) catch {
+        try writeStderr(deps, "fx setup custom: endpoint or API key environment variable is invalid\n");
         return false;
     };
 
@@ -1816,7 +1820,7 @@ fn runCustomSetup(
     var attempt = config_runtime.attemptUserPreferences(alloc, .{
         .provider = .custom,
         .custom_base_url = endpoint_base,
-        .custom_api_key_env = "OPENROUTER_API_KEY",
+        .custom_api_key_env = api_key_env,
         .custom_model = selected_model,
     });
     defer attempt.deinit(alloc);

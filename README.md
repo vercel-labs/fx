@@ -52,7 +52,7 @@ Run the interactive setup flow:
 fx setup custom
 ```
 
-Inside an interactive fx session, use `/setup custom` to launch the same wizard.
+Inside an interactive fx session, use `/setup`, then choose `OpenAI-compatible endpoint`.
 
 It prompts for the endpoint, securely reads the API key, fetches available models, and lets you choose one.
 
