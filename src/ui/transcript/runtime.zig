@@ -7101,6 +7101,21 @@ pub const TranscriptRuntime = struct {
         ));
     }
 
+    fn layoutForTranscriptProjection(
+        layout: Layout,
+        target_area: render_engine.frame_layout.FrameRect,
+    ) !Layout {
+        if (target_area.bottom > layout.rows) {
+            return error.InvalidTranscriptTransition;
+        }
+        var projection_layout = layout;
+        projection_layout.content_bottom = @max(
+            projection_layout.content_bottom,
+            target_area.bottom,
+        );
+        return projection_layout;
+    }
+
     const TransitionTarget = struct {
         body_disposition: TranscriptBodyDisposition = .paint,
         selection: ViewportSelection,
@@ -7168,11 +7183,12 @@ pub const TranscriptRuntime = struct {
             target_area: render_engine.frame_layout.FrameRect,
             visual_offset: u32,
         ) !void {
+            const projection_layout = try layoutForTranscriptProjection(layout, target_area);
             self.visual_offset = visual_offset;
             if (visual_offset == self.total_visual_rows) {
                 try transcript_painter.reprojectPreparedTranscriptForVisualOffset(
                     alloc,
-                    layout,
+                    projection_layout,
                     prepared,
                     target_area,
                     visual_offset,
@@ -7186,7 +7202,7 @@ pub const TranscriptRuntime = struct {
             } else {
                 const staged = try transcript_painter.stagePreparedTranscriptForVisualOffset(
                     alloc,
-                    layout,
+                    projection_layout,
                     prepared,
                     target_area,
                     visual_offset,
@@ -7449,11 +7465,9 @@ pub const TranscriptRuntime = struct {
                     // release: slide the window with an in-place repaint at
                     // the target offset. The rows passed over stay
                     // unreleased and settle later through the replay.
-                    var projection_layout = self.layout;
-                    projection_layout.content_bottom = target_layout.transcript_area.bottom;
                     try target.stagePreparedProjection(
                         alloc,
-                        projection_layout,
+                        self.layout,
                         prepared,
                         target_layout.transcript_area,
                         scroll_facts.target_visual_offset,
@@ -7470,11 +7484,9 @@ pub const TranscriptRuntime = struct {
                     );
                 }
                 if (self.stableHistoryFloor(target, anchor, scroll_facts)) |history_floor| {
-                    var projection_layout = self.layout;
-                    projection_layout.content_bottom = target_layout.transcript_area.bottom;
                     try target.stagePreparedProjection(
                         alloc,
-                        projection_layout,
+                        self.layout,
                         prepared,
                         target_layout.transcript_area,
                         history_floor,
@@ -7520,9 +7532,13 @@ pub const TranscriptRuntime = struct {
                             target.visual_offset,
                         );
                     } else {
+                        const projection_layout = try layoutForTranscriptProjection(
+                            self.layout,
+                            target_layout.transcript_area,
+                        );
                         try transcript_painter.reprojectPreparedTranscriptForVisualOffset(
                             alloc,
-                            self.layout,
+                            projection_layout,
                             prepared,
                             target_layout.transcript_area,
                             target.visual_offset,
@@ -10849,6 +10865,160 @@ test "oversized resume publication retains bounded recovery progress" {
         facts.target_visual_offset,
     )) orelse return error.TestExpectedResumeAppendBase;
     try std.testing.expectEqual(@as(usize, 0), append_base.flow_len);
+}
+
+test "pending resume projection accepts candidate row below base content through recovery" {
+    const alloc = std.testing.allocator;
+    const layout = invalidationTestLayout();
+    var runtime = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try runtime.enableShadowVt(alloc);
+
+    var flow: std.ArrayList(u8) = .empty;
+    defer flow.deinit(alloc);
+    for (0..100) |_| try flow.appendSlice(alloc, "row\n");
+    try runtime.transcript.appendSlice(alloc, flow.items);
+    runtime.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, flow.items),
+    );
+
+    const candidate = render_engine.frame_layout.solve(.{
+        .terminal = layout,
+        .owned_top = runtime.owned_top_row,
+        .footer = .{
+            .natural_rows = 3,
+            .min_rows = 3,
+            .max_rows = 3,
+        },
+        .transcript = runtime.pending_resume_source.?.preview,
+        .prior = runtime.committed_frame_layout,
+    });
+    try std.testing.expectEqual(
+        layout.content_bottom + 1,
+        candidate.transcript_area.bottom,
+    );
+    try std.testing.expectError(
+        error.InvalidTranscriptTransition,
+        TranscriptRuntime.layoutForTranscriptProjection(
+            layout,
+            .{ .top = 1, .bottom = layout.rows + 1 },
+        ),
+    );
+
+    const footer_rows = render_engine.footer_layout.resolve(.{
+        .footer_top_for_extra = candidate.footer_area.top,
+        .terminal_rows = layout.rows,
+        .activity_offset = 0,
+        .extra_input_rows = 0,
+        .input_extra = 0,
+        .composer_top_chrome_rows = 0,
+        .picker_rows = 0,
+        .banner_active = false,
+    });
+    var metrics: Metrics = .{};
+    var batches: usize = 0;
+    while (runtime.transcriptCommitDiagnostic().state != .stable) {
+        batches += 1;
+        if (batches > 3) return error.TestExpectedStableTranscript;
+
+        var owned_source: ?TranscriptPreparationSource = null;
+        const source = if (try runtime.pendingResumeSourceInterruptible(alloc, null)) |pending|
+            pending
+        else blk: {
+            owned_source = try runtime.prepareTranscriptSource(alloc, null);
+            break :blk &owned_source.?;
+        };
+        errdefer if (owned_source) |*owned| owned.deinit(alloc);
+        var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+            alloc,
+            &metrics,
+            source,
+            candidate.transcript_area,
+        );
+        errdefer prepared.deinit(alloc);
+        const facts = try runtime.prepareTranscriptScrollFactsForFrame(
+            alloc,
+            source,
+            &prepared,
+            false,
+            false,
+        );
+        if (batches == 1) {
+            try std.testing.expectEqual(
+                @as(u16, resume_publication_rows_per_frame),
+                facts.planned_rows,
+            );
+        } else if (batches == 2) {
+            try std.testing.expect(facts.semantic_progress_rows > 0);
+            try std.testing.expectEqual(
+                facts.semantic_progress_rows,
+                @as(u32, facts.planned_rows),
+            );
+        }
+        const scroll_plan = render_engine.frame_scroll_plan.merge(
+            layout.rows,
+            runtime.owned_top_row,
+            0,
+            facts.planned_rows,
+        );
+        var plan = candidate.toPaintPlan(.{
+            .footer_rows = footer_rows,
+            .viewport = prepared.selection,
+            .cursor_target = .{
+                .row = prepared.cursor.cursor_row,
+                .col = prepared.cursor.cursor_col,
+                .visible = true,
+            },
+        });
+        const resolved = try runtime.resolveTranscriptTransitionTargetForFrame(
+            alloc,
+            source,
+            &prepared,
+            render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(candidate),
+            scroll_plan,
+            facts,
+            false,
+            false,
+        );
+        try std.testing.expectEqual(
+            candidate.transcript_area.bottom,
+            resolved.selection().bottom_row,
+        );
+        resolved.applyToPaintPlan(&plan);
+        var transition = try runtime.sealTranscriptTransition(
+            alloc,
+            source,
+            &prepared,
+            &plan,
+            resolved,
+        );
+        prepared.deinit(alloc);
+        if (owned_source) |*owned| owned.deinit(alloc);
+        runtime.consumeTranscriptTransition(alloc, &transition, .{
+            .bytes_written = 1,
+            .changed_cells = 1,
+            .full_repaint = true,
+            .terminal_scroll_rows_committed = scroll_plan.terminal_scroll_rows,
+            .document_append_committed = !transition.document_append.isEmpty(),
+            .committed_cursor_row = transition.cursor_row,
+            .committed_cursor_col = transition.cursor_col,
+            .shadow_state = .committed,
+            .next_invalidation = render_engine.paint_plan.FrameInvalidationSet.empty(),
+        });
+        transition.deinit(alloc);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), batches);
+    try std.testing.expectEqual(
+        TranscriptCommitDiagnosticState.stable,
+        runtime.transcriptCommitDiagnostic().state,
+    );
+    try std.testing.expectEqualStrings(flow.items, runtime.transcript.items);
 }
 
 test "transition commit keeps unplanned physical scroll as recovery debt" {
