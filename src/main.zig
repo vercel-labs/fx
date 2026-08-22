@@ -118,6 +118,7 @@ const session_child_store = @import("core/session/session_child_store.zig");
 const session_log = @import("core/session/session_log.zig");
 const builtin_tools = @import("builtins/tools.zig");
 const browser_workspace_tools = @import("builtins/browser_workspace_tools.zig");
+const browser_capabilities = @import("core/hosts/browser_capabilities.zig");
 const tool_admission = @import("core/tooling/tool_admission.zig");
 const tool_advertisement = @import("core/tooling/tool_advertisement.zig");
 const command_output_content = @import("core/tooling/command_output_content.zig");
@@ -1887,6 +1888,12 @@ const App = struct {
 
     pub fn appendStaticContextMessage(self: *App, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
         try AgentAppRuntime.appendStaticContextMessage(self, arena, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+        if (comptime host_target.is_wasm) {
+            try messages.append(arena, .{
+                .role = .system,
+                .content = browser_capabilities.model_context,
+            });
+        }
     }
 
     fn runtimeContextSnapshot(self: *App, alloc: Allocator) !RuntimeContextSnapshot {
