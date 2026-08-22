@@ -445,6 +445,25 @@ const App = struct {
             .agent_stream_provider;
     }
 
+    pub fn modelCatalogProvider(self: *Self) model_catalog.Provider {
+        if (self.provider_selection.selection().provider == .custom) {
+            return .{ .context = self, .fetch_fn = fetchCustomModelCatalog };
+        }
+        return builtin_providers.modelCatalog(self.provider_selection.selection().provider);
+    }
+
+    fn fetchCustomModelCatalog(
+        raw_ctx: ?*anyopaque,
+        _: Allocator,
+        input: model_catalog.FetchInput,
+    ) Allocator.Error!model_catalog.ProviderResult {
+        const self: *Self = @ptrCast(@alignCast(raw_ctx.?));
+        return self.fetchProviderCatalog(.custom, input.access) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => .{ .failure = .{ .category = .transport } },
+        };
+    }
+
     pub fn fetchProviderCatalog(
         self: *Self,
         provider: model_provider.ProviderId,
@@ -1787,12 +1806,15 @@ const App = struct {
                 return;
             }
             self.model_cache.loadCooperative(
-                js_host_model_catalog.provider,
+                if (self.provider_selection.selection().provider == .custom)
+                    self.modelCatalogProvider()
+                else
+                    js_host_model_catalog.provider,
                 self.auth.modelCatalogAccess(),
             );
         } else {
             self.model_cache.startWarmup(
-                builtin_providers.modelCatalog(self.provider_selection.selection().provider),
+                self.modelCatalogProvider(),
                 self.auth.modelCatalogAccess(),
             );
         }
