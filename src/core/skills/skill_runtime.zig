@@ -38,6 +38,7 @@ pub const BoundedPromptSection = struct {
 
 pub const SkillDiagnosticCause = union(enum) {
     invalid_metadata: skill_contract.InvalidMetadataCause,
+    linked_candidate_unavailable,
     unreadable,
     oversized,
 };
@@ -146,6 +147,7 @@ pub fn writeDiagnosticSummary(alloc: Allocator, writer: *std.Io.Writer, diagnost
                         "its metadata is invalid ({s}); use one safe name and an optional inline description or a >, >-, or | block, then reload skills",
                         .{@tagName(cause)},
                     ),
+                    .linked_candidate_unavailable => try writer.writeAll("its linked skill directory could not be resolved to an authorized readable directory; repair or remove the link, or authorize its external location, then reload skills"),
                     .unreadable => try writer.writeAll("SKILL.md is unreadable or not a regular file; fix the file type or access, then reload skills"),
                     .oversized => try writer.print(
                         "its frontmatter exceeds the supported {d}-byte metadata header; shorten the name/description header, then reload skills",
@@ -186,6 +188,11 @@ pub fn traceDiagnostics(surface: []const u8, diagnostics: []const SkillDiagnosti
                 "skills",
                 "discovery_diagnostic surface={s} source={s} scope={s} kind=invalid_metadata cause={s} path=\"{f}\" path_bytes={d}",
                 .{ surface, @tagName(diagnostic.source), @tagName(diagnostic.scope), @tagName(cause), path, diagnostic.path.len },
+            ),
+            .linked_candidate_unavailable => debug_trace.logf(
+                "skills",
+                "discovery_diagnostic surface={s} source={s} scope={s} kind=io cause=linked_candidate_unavailable path=\"{f}\" path_bytes={d}",
+                .{ surface, @tagName(diagnostic.source), @tagName(diagnostic.scope), path, diagnostic.path.len },
             ),
             .unreadable => debug_trace.logf(
                 "skills",
@@ -661,7 +668,7 @@ fn appendSkillCandidate(
         const read_authority = root.read_authority orelse return;
         break :linked_candidate openContainedDir(alloc, candidate_path, read_authority, .{}) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
-            if (diagnostics) |items| try appendSkillDiagnostic(alloc, items, candidate_path, root.source, .candidate, .unreadable);
+            if (diagnostics) |items| try appendSkillDiagnostic(alloc, items, candidate_path, root.source, .candidate, .linked_candidate_unavailable);
             return;
         };
     } else root_dir.openDir(io_mod.getIo(), entry_name, .{ .follow_symlinks = false }) catch |err| {
@@ -3158,6 +3165,44 @@ test "loadVisibleSkills discovers and reopens a contained linked workspace candi
     }
 }
 
+test "loadVisibleSkills diagnoses an unavailable linked workspace candidate" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try createTempSymlinkOrSkip(
+        &tmp,
+        "../../skill-source/missing-skill",
+        "home/workspace/.codex/skills/missing-skill",
+    );
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+    defer alloc.free(workspace_root);
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(managed_root);
+    const logical_path = try std.fs.path.join(alloc, &.{ workspace_root, ".codex/skills/missing-skill" });
+    defer alloc.free(logical_path);
+
+    var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+    defer discovery.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), discovery.skills.len);
+    try std.testing.expectEqual(@as(usize, 1), discovery.diagnostics.len);
+    try std.testing.expectEqualStrings(logical_path, discovery.diagnostics[0].path);
+    try std.testing.expectEqual(SkillSource.workspace_codex, discovery.diagnostics[0].source);
+    try std.testing.expectEqual(SkillDiagnosticScope.candidate, discovery.diagnostics[0].scope);
+    try std.testing.expectEqual(SkillDiagnosticCause.linked_candidate_unavailable, discovery.diagnostics[0].cause);
+
+    var summary: std.Io.Writer.Allocating = .init(alloc);
+    defer summary.deinit();
+    try writeDiagnosticSummary(alloc, &summary.writer, discovery.diagnostics);
+    try std.testing.expect(std.mem.find(u8, summary.written(), "linked skill directory could not be resolved to an authorized readable directory") != null);
+    try std.testing.expect(std.mem.find(u8, summary.written(), "repair or remove the link") != null);
+}
+
 test "loadVisibleSkills discovers a contained linked workspace root" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3224,7 +3269,7 @@ test "loadVisibleSkills diagnoses an escaping linked workspace candidate" {
     try std.testing.expectEqual(@as(usize, 1), discovery.diagnostics.len);
     try std.testing.expectEqualStrings(logical_path, discovery.diagnostics[0].path);
     try std.testing.expectEqual(SkillDiagnosticScope.candidate, discovery.diagnostics[0].scope);
-    try std.testing.expectEqual(SkillDiagnosticCause.unreadable, discovery.diagnostics[0].cause);
+    try std.testing.expectEqual(SkillDiagnosticCause.linked_candidate_unavailable, discovery.diagnostics[0].cause);
 }
 
 fn checkContainedLinkedSkillAllocationFailures(
@@ -3818,5 +3863,5 @@ test "loadVisibleSkills still rejects external symlinks without an authority" {
     try std.testing.expectEqual(@as(usize, 1), discovery.diagnostics.len);
     try std.testing.expectEqualStrings(logical_path, discovery.diagnostics[0].path);
     try std.testing.expectEqual(SkillDiagnosticScope.candidate, discovery.diagnostics[0].scope);
-    try std.testing.expectEqual(SkillDiagnosticCause.unreadable, discovery.diagnostics[0].cause);
+    try std.testing.expectEqual(SkillDiagnosticCause.linked_candidate_unavailable, discovery.diagnostics[0].cause);
 }
