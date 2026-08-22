@@ -578,7 +578,8 @@ fn parseStore(alloc: Allocator, bytes: []const u8) !Store {
 /// `mcp_auth.tokenExpiresAt` treats a missing `expires_in`: the grant does not
 /// expire on its own and is replaced only when the server rejects it.
 fn parseExpiresAtMs(object: std.json.ObjectMap) !i64 {
-    const value = object.get("expires_at_ms") orelse return std.math.maxInt(i64);
+    const value = object.get("expires_at_ms") orelse
+        return error.InvalidMcpCredentialStore;
     if (value == .null) return std.math.maxInt(i64);
     if (value != .integer) return error.InvalidMcpCredentialStore;
     return value.integer;
@@ -881,6 +882,18 @@ test "credential store still rejects a non-numeric expiry" {
     const json =
         \\{"version":1,"credentials":[
         \\{"server_identity":"one","endpoint":"https://mcp.example/a","resource":"https://mcp.example/","issuer":"https://issuer.example","client_id":"client","client_secret":null,"access_token":"secret-one","refresh_token":"refresh-one","scope":"read","token_type":"Bearer","token_endpoint_auth_method":"none","expires_at_ms":"soon","authorization_endpoint":"https://issuer.example/authorize","token_endpoint":"https://issuer.example/token","revocation_endpoint":null}
+        \\]}
+    ;
+    try std.testing.expectError(
+        error.InvalidMcpCredentialStore,
+        parseStore(std.testing.allocator, json),
+    );
+}
+
+test "credential store still rejects a missing expiry" {
+    const json =
+        \\{"version":1,"credentials":[
+        \\{"server_identity":"one","endpoint":"https://mcp.example/a","resource":"https://mcp.example/","issuer":"https://issuer.example","client_id":"client","client_secret":null,"access_token":"secret-one","refresh_token":"refresh-one","scope":"read","token_type":"Bearer","token_endpoint_auth_method":"none","authorization_endpoint":"https://issuer.example/authorize","token_endpoint":"https://issuer.example/token","revocation_endpoint":null}
         \\]}
     ;
     try std.testing.expectError(
