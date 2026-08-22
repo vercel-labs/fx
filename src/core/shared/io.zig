@@ -481,7 +481,7 @@ pub fn readFileToEndSized(alloc: std.mem.Allocator, file: *std.Io.File, size: u6
     const len: usize = @intCast(size);
     const buf = try alloc.alloc(u8, len + 1);
     errdefer alloc.free(buf);
-    const read_len = try file.readPositional(getIo(), &.{buf}, 0);
+    const read_len = try file.readPositionalAll(getIo(), buf, 0);
     if (read_len > len) return error.StreamTooLong;
     return alloc.realloc(buf, read_len);
 }
@@ -1176,6 +1176,22 @@ test "readFileToEndSized: file over cap returns error.StreamTooLong" {
     try writeTempFile(tmp.dir, "sized-over.txt", "0123456789");
 
     if (readTempFileSized(alloc, tmp.dir, "sized-over.txt", 5)) |data| {
+        defer alloc.free(data);
+        try std.testing.expect(false);
+    } else |err| {
+        try std.testing.expectEqual(error.StreamTooLong, err);
+    }
+}
+
+test "readFileToEndSized: stale size detects file growth" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(tmp.dir, "sized-growth.txt", "0123456789");
+
+    var file = try tmp.dir.openFile(getIo(), "sized-growth.txt", .{});
+    defer file.close(getIo());
+    if (readFileToEndSized(alloc, &file, 5, 100)) |data| {
         defer alloc.free(data);
         try std.testing.expect(false);
     } else |err| {
