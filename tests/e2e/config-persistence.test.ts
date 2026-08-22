@@ -36,6 +36,11 @@ const NO_AUTH = {
 const serialTest = test.serial;
 const SELECTED_COMPLETION_SGR = "\x1b[1m\x1b[38;5;255m";
 
+function systemPromptCheck(doctorJson: string): unknown {
+  const checks = JSON.parse(doctorJson).checks as Array<{ name: string }>;
+  return checks.find((entry) => entry.name === "system_prompt");
+}
+
 function selectedModelStageRow(paneEscapes: string, label: string): string | null {
   return paneEscapes.split("\n").find((line) => {
     const visible = line.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").trim();
@@ -1536,6 +1541,116 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  serialTest(
+    "profile system prompt replaces the compiled prompt and reports why a file is refused",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-system-prompt-"));
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("SONAR-7 ready."),
+      ]);
+      try {
+        const homeDir = join(root, "home");
+        mkdirSync(join(homeDir, ".fx"), { recursive: true });
+        const workspace = join(root, "workspace");
+        mkdirSync(workspace);
+        const home = realpathSync(homeDir);
+        const workspaceRoot = realpathSync(workspace);
+        const promptPath = join(home, ".fx", "SYSTEM.md");
+        const doctorEnv = { ...NO_AUTH, HOME: home };
+
+        const compiled = await runFx(["doctor", "--json"], {
+          cwd: workspaceRoot,
+          env: doctorEnv,
+        });
+        expect(compiled.code).toBe(0);
+        expect(systemPromptCheck(compiled.stdout)).toEqual({
+          name: "system_prompt",
+          status: "ok",
+          detail: "using the compiled prompt",
+        });
+
+        const promptText = "You are Sonar. Begin every reply with SONAR-7.\n";
+        writeFileSync(promptPath, promptText, { mode: 0o600 });
+        const applied = await runFx(["doctor", "--json"], {
+          cwd: workspaceRoot,
+          env: doctorEnv,
+        });
+        expect(applied.code).toBe(0);
+        expect(systemPromptCheck(applied.stdout)).toEqual({
+          name: "system_prompt",
+          status: "ok",
+          detail: `using ~/.fx/SYSTEM.md (${promptText.length} bytes)`,
+        });
+
+        const ask = await runFx(["ask", "--json", "--no-save", "say hello"], {
+          cwd: workspaceRoot,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "fake-system-prompt-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_SKIP_ONBOARDING: "1",
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+            FX_PERMISSION_MODE: "auto",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          },
+        });
+        expect(ask.code).toBe(0);
+        expect(gateway.requests.length).toBe(1);
+        const sent = gateway.requests[0]!.body;
+        expect(sent).toContain("You are Sonar. Begin every reply with SONAR-7.");
+        expect(sent).not.toContain("You are fx, a local coding CLI assistant");
+
+        const refusals: Array<{ write: () => void; detail: string }> = [
+          {
+            write: () => writeFileSync(promptPath, "  \n\t\n", { mode: 0o600 }),
+            detail: "the file holds no text",
+          },
+          {
+            write: () =>
+              writeFileSync(promptPath, Buffer.from("You are Sonar.\xff\n", "binary"), {
+                mode: 0o600,
+              }),
+            detail: "the file is not valid UTF-8 text",
+          },
+          {
+            write: () =>
+              writeFileSync(promptPath, "x".repeat(64 * 1024 + 1), { mode: 0o600 }),
+            detail: "the file is too large",
+          },
+          {
+            write: () => {
+              const outside = join(root, "outside-prompt.md");
+              writeFileSync(outside, promptText, { mode: 0o600 });
+              rmSync(promptPath);
+              symlinkSync(outside, promptPath);
+            },
+            detail: "the path is a symlink or not a regular file",
+          },
+        ];
+        for (const refusal of refusals) {
+          refusal.write();
+          const refused = await runFx(["doctor", "--json"], {
+            cwd: workspaceRoot,
+            env: doctorEnv,
+          });
+          expect(refused.code).toBe(0);
+          expect(systemPromptCheck(refused.stdout)).toEqual({
+            name: "system_prompt",
+            status: "warn",
+            detail: `ignoring ~/.fx/SYSTEM.md because ${refusal.detail}; using the compiled prompt`,
+          });
+        }
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    45_000,
+  );
 
   serialTest(
     "concurrent global mutations preserve both values and unknown keys",
