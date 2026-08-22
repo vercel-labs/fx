@@ -10,7 +10,7 @@ const history_lock_file = "history.lock";
 const lock_deadline_ms: u64 = 2000;
 const default_scan_block_bytes: usize = 1024 * 1024;
 const max_record_bytes: usize = 256 * 1024;
-const compaction_threshold_bytes: u64 = 1024 * 1024;
+const compaction_threshold_bytes: u64 = 2 * 1024 * 1024;
 const compaction_record_limit: usize = 1000;
 const compaction_byte_limit: usize = 1024 * 1024;
 const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
@@ -1100,7 +1100,7 @@ test "oversized prompt history record is skipped without creating durable state"
     );
 }
 
-test "compaction retains newest one thousand valid records within one mebibyte" {
+test "compaction retains bounded records and leaves append headroom" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1109,7 +1109,7 @@ test "compaction retains newest one thousand valid records within one mebibyte" 
 
     var fixture: std.ArrayList(u8) = .empty;
     defer fixture.deinit(alloc);
-    for (0..1005) |index| {
+    for (0..2005) |index| {
         const text = try std.fmt.allocPrint(
             alloc,
             "{d:0>4}-{s}",
@@ -1126,16 +1126,33 @@ test "compaction retains newest one thousand valid records within one mebibyte" 
     defer store.deinit(alloc);
     try std.testing.expectEqual(
         AppendOutcome.appended,
-        try store.append(alloc, 2000, "/tmp/workspace", "newest"),
+        try store.append(alloc, 3000, "/tmp/workspace", "newest"),
     );
     const retained_count = try store.validRecordCountForTest();
     try std.testing.expect(retained_count > 0);
-    try std.testing.expect(retained_count <= 1000);
-    try std.testing.expect((try store.historyLengthForTest()) <= 1024 * 1024);
+    try std.testing.expect(retained_count <= compaction_record_limit);
+    const compacted_length = try store.historyLengthForTest();
+    try std.testing.expect(compacted_length <= compaction_byte_limit);
+
+    const follow_up_text = "y" ** (64 * 1024);
+    const follow_up_line = try serializeRecord(
+        alloc,
+        3001,
+        "/tmp/workspace",
+        follow_up_text,
+    );
+    defer alloc.free(follow_up_line);
+    try std.testing.expectEqual(
+        AppendOutcome.appended,
+        try store.append(alloc, 3001, "/tmp/workspace", follow_up_text),
+    );
+    const follow_up_length = try store.historyLengthForTest();
+    try std.testing.expectEqual(compacted_length + follow_up_line.len, follow_up_length);
+    try std.testing.expect(follow_up_length > compaction_byte_limit);
 
     const entries = try store.loadRecentForWorkspace(alloc, "/tmp/workspace", 100);
     defer freeLoadedEntries(alloc, entries);
-    try std.testing.expectEqualStrings("newest", entries[entries.len - 1].text);
+    try std.testing.expectEqualStrings(follow_up_text, entries[entries.len - 1].text);
 }
 
 test "compaction failure after append reports stale while keeping appended record" {
@@ -1147,7 +1164,7 @@ test "compaction failure after append reports stale while keeping appended recor
 
     var fixture: std.ArrayList(u8) = .empty;
     defer fixture.deinit(alloc);
-    for (0..5) |index| {
+    for (0..10) |index| {
         const line = try fixtureLine(
             alloc,
             @intCast(index),
