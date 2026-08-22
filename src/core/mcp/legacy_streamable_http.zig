@@ -10,7 +10,7 @@ const streamable_http = @import("streamable_http.zig");
 const Allocator = std.mem.Allocator;
 const max_sse_events: usize = 1024;
 const close_timeout_ms: i64 = 250;
-const min_reconnect_delay_ms: u32 = 1000;
+const min_reconnect_delay_ms: u32 = 500;
 
 pub const Version = enum {
     v2025_11_25,

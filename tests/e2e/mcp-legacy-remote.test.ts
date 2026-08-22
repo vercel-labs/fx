@@ -443,8 +443,8 @@ describe("version-scoped legacy MCP remote transports", () => {
     // passes just as well when the listener never runs at all. Before the
     // floor this fixture drew 13946 reconnects.
     // Spacing first: it is the property the floor actually guarantees, and a
-    // count in a window is satisfied by any floor at all. 800ms rather than
-    // 1000ms leaves room for scheduler jitter without admitting a storm.
+    // count in a window is satisfied by any floor at all. 400ms rather than
+    // 500ms leaves room for scheduler jitter without admitting a storm.
     const listenerGets = streamable.requests.filter((entry) =>
       entry.httpMethod === "GET" && entry.at !== undefined
     );
@@ -452,7 +452,7 @@ describe("version-scoped legacy MCP remote transports", () => {
       entry.at! - listenerGets[index]!.at!
     );
     expect(gaps.length).toBeGreaterThanOrEqual(1);
-    expect(Math.min(...gaps)).toBeGreaterThanOrEqual(800);
+    expect(Math.min(...gaps)).toBeGreaterThanOrEqual(400);
 
     expect(streamable.resumeCalls).toBeGreaterThanOrEqual(2);
     expect(streamable.resumeCalls).toBeLessThanOrEqual(10);
