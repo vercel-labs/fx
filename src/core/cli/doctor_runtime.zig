@@ -39,6 +39,7 @@ pub const Snapshot = struct {
     auth: auth_runtime.StatusSnapshot = .{},
     permission_mode: types.PermissionMode,
     agent_step_limit: usize,
+    effort: types.ReasoningEffort = .auto,
     checks: []Check,
 
     pub fn deinit(self: *Snapshot, alloc: Allocator) void {
@@ -130,7 +131,7 @@ pub fn collect(
         },
         .permission_mode = detailed.settings.permission_mode,
         .max_agent_steps = detailed.settings.max_agent_steps,
-    }, default_model, default_agent_step_limit);
+    }, detailed.settings.effort, default_model, default_agent_step_limit);
     try appendStateChecks(&checks, alloc, snapshot.workspace_root);
     try appendGitCheck(&checks, alloc, snapshot.workspace_root);
     try appendGhCheck(&checks, alloc);
@@ -219,6 +220,7 @@ fn appendResolvedStartupCheck(
     checks: *std.ArrayList(Check),
     alloc: Allocator,
     settings: config_runtime.StartupStatusSettings,
+    configured_effort: ?types.ReasoningEffort,
     default_model: []const u8,
     default_agent_step_limit: usize,
 ) !void {
@@ -228,11 +230,17 @@ fn appendResolvedStartupCheck(
     snapshot.owned_model = next_model.owned;
     snapshot.permission_mode = try resolvePermissionMode(settings.permission_mode);
     snapshot.agent_step_limit = try resolveAgentStepLimit(default_agent_step_limit, settings.max_agent_steps);
+    snapshot.effort = config_runtime.resolveEffort(configured_effort);
 
     const detail = try std.fmt.allocPrint(
         alloc,
-        "resolved model={s}, permission_mode={s}, agent_step_limit={d}",
-        .{ snapshot.model, permissionModeLabel(snapshot.permission_mode), snapshot.agent_step_limit },
+        "resolved model={s}, effort={s}, permission_mode={s}, agent_step_limit={d}",
+        .{
+            snapshot.model,
+            snapshot.effort.displayLabel(),
+            permissionModeLabel(snapshot.permission_mode),
+            snapshot.agent_step_limit,
+        },
     );
     try appendCheckOwned(checks, alloc, "startup", .ok, detail);
 }

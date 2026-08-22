@@ -11,7 +11,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, HAS_API_KEY } from "../evals/eval-helpers";
-import { hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import {
+  fakeGatewayFinalText,
+  hasEmptyComposer,
+  startFakeGateway,
+  TmuxSession,
+  tmuxAvailable,
+} from "./tmux-helpers";
 
 const SKIP = !tmuxAvailable() || !HAS_API_KEY;
 const SKIP_TMUX = !tmuxAvailable();
@@ -293,6 +299,98 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       }
     },
     TIMEOUT,
+  );
+});
+
+describe.skipIf(SKIP_TMUX)("tui: process effort override", () => {
+  test(
+    "FX_EFFORT wins at startup and on resume without being saved",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-effort-override-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const model = "provider/effort-override-model";
+      const overrideMarker = "EFFORT_OVERRIDE_REPLY";
+      const resumeMarker = "EFFORT_RESUME_REPLY";
+      mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(stderrPath, "");
+      const settingsPath = join(home, ".fx", "settings.json");
+      const settings = `${JSON.stringify({ model, effort: "low" })}\n`;
+      writeFileSync(settingsPath, settings, { mode: 0o600 });
+      const gateway = startFakeGateway(
+        [fakeGatewayFinalText(overrideMarker), fakeGatewayFinalText(resumeMarker)],
+        {
+          models: [{
+            id: model,
+            type: "language",
+            tags: ["reasoning", "tool-use"],
+            context_window: 750_000,
+            max_tokens: 64_000,
+            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+          }],
+        },
+      );
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-effort-override-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_AUTO_UPGRADE: "0",
+        FX_EFFORT: undefined,
+        NO_COLOR: "1",
+      };
+
+      try {
+        session = await TmuxSession.create({
+          cwd: workspace,
+          env: { ...env, FX_EFFORT: "high" },
+          stderrPath,
+          width: 100,
+          height: 30,
+        });
+        const startup = await session.waitForComposer(10_000);
+        expect(startup).toContain("· high");
+        expect(startup).not.toContain("· low");
+        await session.sendText("Reply with the override marker.");
+        await session.waitForText(overrideMarker, TIMEOUT);
+        expect(gateway.requests).toHaveLength(1);
+        expect(JSON.parse(gateway.requests[0]!.body)).toMatchObject({ reasoning: "high" });
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        await session.kill();
+        session = null;
+        expect(readFileSync(settingsPath, "utf8")).toBe(settings);
+
+        session = await TmuxSession.create({
+          cmd: `${FX_BIN} --resume-last`,
+          cwd: workspace,
+          env,
+          stderrPath,
+          width: 100,
+          height: 30,
+        });
+        const resumed = await session.waitForComposer(10_000);
+        expect(resumed).toContain("· low");
+        expect(resumed).not.toContain("· high");
+        await session.sendText("Reply with the resume marker.");
+        await session.waitForText(resumeMarker, TIMEOUT);
+        expect(gateway.requests).toHaveLength(2);
+        expect(JSON.parse(gateway.requests[1]!.body)).toMatchObject({ reasoning: "low" });
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
   );
 });
 

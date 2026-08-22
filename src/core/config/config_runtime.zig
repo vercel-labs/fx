@@ -123,6 +123,21 @@ pub fn resolveContextLimits(settings: *const Settings, command_line: []const con
     return values;
 }
 
+/// Reasoning effort requested through `FX_EFFORT`, or null when the variable is
+/// unset, blank, or not a valid effort name. An invalid value never blocks startup.
+pub fn processEffortOverride() ?types.ReasoningEffort {
+    const raw = io_mod.getenv("FX_EFFORT") orelse return null;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (types.ReasoningEffort.parse(trimmed)) |effort| return effort;
+    debug_trace.logf("config", "ignoring invalid FX_EFFORT value={s}", .{trimmed});
+    return null;
+}
+
+pub fn resolveEffort(configured: ?types.ReasoningEffort) types.ReasoningEffort {
+    return processEffortOverride() orelse configured orelse .auto;
+}
+
 pub const PermissionSourceViews = struct {
     user: types.PermissionRuleSet = .{},
     local: types.PermissionRuleSet = .{},
@@ -440,6 +455,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
             sources.model = .process_override;
         }
     }
+    if (processEffortOverride() != null) sources.effort = .process_override;
 
     return .{
         .settings = settings,
@@ -3287,6 +3303,60 @@ test "detailed settings report non-empty process model override as winning sourc
     try std.testing.expectEqual(ConfigSource.process_override, result.sources.model);
     try std.testing.expectEqual(ModelSource.process_override, result.model_source.?);
     try std.testing.expectEqualStrings("user/model", result.settings.model.?);
+}
+
+test "detailed settings report valid process effort override as winning source" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"effort\":\"low\"}\n");
+
+    const home = try TestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    try home.map.put("FX_EFFORT", " high ");
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(ConfigSource.process_override, result.sources.effort);
+    try std.testing.expect(result.settings.effort.?.eql(types.ReasoningEffort.literal("low")));
+    try std.testing.expect(processEffortOverride().?.eql(types.ReasoningEffort.literal("high")));
+    try std.testing.expect(resolveEffort(result.settings.effort).eql(types.ReasoningEffort.literal("high")));
+}
+
+test "blank or invalid process effort override is ignored" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"effort\":\"low\"}\n");
+
+    const home = try TestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+
+    inline for (&.{ "", "   ", "not valid!", "x" ** (types.ReasoningEffort.max_name_bytes + 1) }) |raw| {
+        try home.map.put("FX_EFFORT", raw);
+        var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(ConfigSource.user_global, result.sources.effort);
+        try std.testing.expect(processEffortOverride() == null);
+        try std.testing.expect(resolveEffort(result.settings.effort).eql(types.ReasoningEffort.literal("low")));
+    }
+
+    try home.map.put("FX_EFFORT", "default");
+    try std.testing.expectEqual(types.ReasoningEffort.auto, processEffortOverride().?);
+    try std.testing.expectEqual(types.ReasoningEffort.auto, resolveEffort(types.ReasoningEffort.literal("low")));
 }
 
 test "invalid user model emits typed diagnostic and project model is ignored" {

@@ -809,7 +809,7 @@ describe("cli: status", () => {
   );
 
   test(
-    "status and doctor apply an exact FX_MAX_AGENT_STEPS override",
+    "status and doctor apply exact FX_MAX_AGENT_STEPS and FX_EFFORT overrides",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-agent-step-limit-"));
       try {
@@ -821,6 +821,7 @@ describe("cli: status", () => {
           ...NO_GATEWAY_AUTH,
           HOME: realpathSync(home),
           FX_MAX_AGENT_STEPS: "3",
+          FX_EFFORT: "high",
         };
 
         const status = await runFx(["status", "--json"], {
@@ -837,10 +838,13 @@ describe("cli: status", () => {
           timeoutMs: TIMEOUT,
         });
         expect(doctor.code).toBe(0);
-        const startup = JSON.parse(doctor.stdout.trim()).checks.find(
+        const doctorJson = JSON.parse(doctor.stdout.trim());
+        expect(doctorJson.effort).toBe("high");
+        const startup = doctorJson.checks.find(
           (check: { name: string }) => check.name === "startup",
         );
         expect(startup.detail).toContain("agent_step_limit=3");
+        expect(startup.detail).toContain("effort=high");
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -4026,6 +4030,108 @@ describe("cli: ask success", () => {
       );
     },
     120_000,
+  );
+
+  test(
+    "FX_EFFORT overrides the configured effort for fx ask without saving it",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-effort-override-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const model = "provider/effort-override-model";
+      const gateway = startFakeGateway(
+        [
+          fakeGatewayFinalText("override complete"),
+          fakeGatewayFinalText("resume complete"),
+          fakeGatewayFinalText("override resume complete"),
+        ],
+        {
+          models: [{
+            id: model,
+            type: "language",
+            tags: ["reasoning", "tool-use"],
+            context_window: 750_000,
+            max_tokens: 64_000,
+            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+          }],
+        },
+      );
+      try {
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        writeFileSync(
+          join(home, ".fx", "settings.json"),
+          `${JSON.stringify({ model, effort: "low" })}\n`,
+        );
+        const env = {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-effort-override-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_AUTO_UPGRADE: "0",
+          FX_EFFORT: undefined,
+        };
+
+        const first = await runFx(
+          ["ask", "--json", "--auto", "Use the overridden effort."],
+          {
+            cwd: realpathSync(workspace),
+            env: { ...env, FX_EFFORT: " high " },
+            timeoutMs: 60_000,
+          },
+        );
+        expect(first.code).toBe(0);
+        const firstJson = JSON.parse(first.stdout.trim());
+        expect(firstJson.output.trim()).toBe("override complete");
+        expect(gateway.requests).toHaveLength(1);
+        expect(JSON.parse(gateway.requests[0]!.body)).toMatchObject({
+          reasoning: "high",
+        });
+        expect(
+          JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")),
+        ).toEqual({ model, effort: "low" });
+
+        const resumed = await runFx(
+          ["ask", "--json", "--auto", "--resume", "last", "Use the saved effort."],
+          {
+            cwd: realpathSync(workspace),
+            env,
+            timeoutMs: 60_000,
+          },
+        );
+        expect(resumed.code).toBe(0);
+        expect(JSON.parse(resumed.stdout.trim()).session_id).toBe(
+          firstJson.session_id,
+        );
+        expect(gateway.requests).toHaveLength(2);
+        expect(JSON.parse(gateway.requests[1]!.body)).toMatchObject({
+          reasoning: "low",
+        });
+
+        const overrideResumed = await runFx(
+          ["ask", "--json", "--auto", "--resume", "last", "Use the overridden effort again."],
+          {
+            cwd: realpathSync(workspace),
+            env: { ...env, FX_EFFORT: "high" },
+            timeoutMs: 60_000,
+          },
+        );
+        expect(overrideResumed.code).toBe(0);
+        expect(JSON.parse(overrideResumed.stdout.trim()).session_id).toBe(
+          firstJson.session_id,
+        );
+        expect(gateway.requests).toHaveLength(3);
+        expect(JSON.parse(gateway.requests[2]!.body)).toMatchObject({
+          reasoning: "high",
+        });
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    60_000,
   );
 
   test(

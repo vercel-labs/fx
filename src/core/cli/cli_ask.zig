@@ -552,6 +552,7 @@ const AskContext = struct {
     session_write_mutex: std.Io.Mutex = .init,
     requested_resume: ?ResumeTarget = null,
     seed_model: []const u8 = "",
+    seed_effort: types.ReasoningEffort = .auto,
     command_timeout_ms: ?usize = null,
     session: SessionRuntime,
     skills_dir: []u8 = &.{},
@@ -836,7 +837,7 @@ const AskContext = struct {
         const seed_preferences = session_codec.DurableSessionPreferences{
             .provider = self.provider,
             .model = @constCast(self.seed_model),
-            .effort = self.effort,
+            .effort = self.seed_effort,
             .fast_mode = self.fast_mode,
         };
         var writable = if (self.requested_resume) |target|
@@ -1488,6 +1489,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.model = startup.selected_model;
     ctx.provider = startup.provider;
     ctx.seed_model = startup.configured_model;
+    ctx.seed_effort = toCoreReasoningEffort(startup.configured_effort);
     ctx.requested_resume = options.resume_target;
     ctx.agent_step_limit = startup.agent_step_limit;
     ctx.max_tool_result_bytes = startup.max_tool_result_bytes;
@@ -1521,6 +1523,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         } else if (ctx.requested_resume != null) {
             owned_resumed_model = try alloc.dupe(u8, ctx.model);
             ctx.model = owned_resumed_model.?;
+        }
+        if (startup.effort_source == .process_override) {
+            ctx.effort = toCoreReasoningEffort(startup.effort);
         }
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     }

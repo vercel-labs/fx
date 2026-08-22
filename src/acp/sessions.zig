@@ -71,7 +71,7 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
         .agent_step_limit = state.agent_step_limit,
         .max_tool_result_bytes = state.max_tool_result_bytes,
         .fast_mode = state.fast_mode,
-        .effort = state.effort,
+        .effort = durable.preferences.effort,
         .first_call_tool_choice = state.first_call_tool_choice,
         .permission_mode = state.permission_mode,
         .permission_rules = state.permission_rules,
@@ -532,7 +532,7 @@ fn handleRestoreSession(
     const seed_preferences = session_codec.DurableSessionPreferences{
         .provider = state.provider,
         .model = state.configured_model,
-        .effort = state.effort,
+        .effort = state.configured_effort,
         .fast_mode = state.fast_mode,
     };
     var writable = subagent_resume_admission.resumeForExternalPrompt(
@@ -610,7 +610,7 @@ fn handleRestoreSession(
         .model = model_copy,
         .provider = effective_provider,
         .fast_mode = writable.state.preferences.fast_mode,
-        .effort = writable.state.preferences.effort,
+        .effort = if (state.process_effort_override) state.effort else writable.state.preferences.effort,
         .session_rt = session_rt,
         .mcp = session_mcp,
     }) catch
@@ -744,7 +744,7 @@ fn freshAcpState(
         .preferences = .{
             .provider = state.provider,
             .model = model,
-            .effort = state.effort,
+            .effort = state.configured_effort,
             .fast_mode = state.fast_mode,
         },
         .history = history,
