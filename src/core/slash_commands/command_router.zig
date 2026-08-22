@@ -6,6 +6,7 @@ const SlashRegistry = command_specs.SlashRegistry;
 
 pub const ParsedCommand = union(enum) {
     quit,
+    delete_session,
     clear_screen,
     new_session,
     reset_session,
@@ -51,6 +52,7 @@ pub const ParsedCommand = union(enum) {
 pub const CommandHandlers = struct {
     ctx: *anyopaque,
     quit: *const fn (ctx: *anyopaque) anyerror!void,
+    delete_session: *const fn (ctx: *anyopaque) anyerror!void,
     clear_screen: *const fn (ctx: *anyopaque) anyerror!void,
     new_session: *const fn (ctx: *anyopaque) anyerror!void,
     reset_session: *const fn (ctx: *anyopaque) anyerror!void,
@@ -100,6 +102,7 @@ fn command_payload(cmd: []const u8, prefix: []const u8) []const u8 {
 fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
     return switch (kind) {
         .quit => .quit,
+        .delete_session => .delete_session,
         .clear_screen => .clear_screen,
         .new_session => .new_session,
         .reset_session => .reset_session,
@@ -158,6 +161,7 @@ pub fn parse(registry: SlashRegistry, cmd: []const u8) ParsedCommand {
 pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []const u8) !void {
     switch (parse(registry, cmd)) {
         .quit => try handlers.quit(handlers.ctx),
+        .delete_session => try handlers.delete_session(handlers.ctx),
         .clear_screen => try handlers.clear_screen(handlers.ctx),
         .new_session => try handlers.new_session(handlers.ctx),
         .reset_session => try handlers.reset_session(handlers.ctx),
@@ -250,9 +254,10 @@ test "parse extracts sound command payload" {
     }
 }
 
-test "parse distinguishes new and reset lifecycle commands" {
+test "parse distinguishes session lifecycle commands" {
     try std.testing.expectEqual(ParsedCommand.new_session, parse(testSlashRegistry(), "/new"));
     try std.testing.expectEqual(ParsedCommand.reset_session, parse(testSlashRegistry(), "/reset"));
+    try std.testing.expectEqual(ParsedCommand.delete_session, parse(testSlashRegistry(), "/delete"));
 }
 
 test "parse recognizes interactive resume" {
@@ -506,6 +511,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
     return .{
         .ctx = ctx,
         .quit = unexpectedNoPayload,
+        .delete_session = unexpectedNoPayload,
         .clear_screen = unexpectedNoPayload,
         .new_session = unexpectedNoPayload,
         .reset_session = unexpectedNoPayload,

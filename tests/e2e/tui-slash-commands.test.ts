@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, HAS_API_KEY } from "../evals/eval-helpers";
@@ -38,6 +38,7 @@ async function launchAndWait(): Promise<TmuxSession> {
 async function launchNoKeyAndWait(): Promise<{
   terminal: TmuxSession;
   stderrPath: string;
+  home: string;
 }> {
   const root = mkdtempSync(join(tmpdir(), "fx-slash-commands-no-key-"));
   const home = join(root, "home");
@@ -60,10 +61,38 @@ async function launchNoKeyAndWait(): Promise<{
     },
   });
   await terminal.waitForComposer(10_000);
-  return { terminal, stderrPath };
+  return { terminal, stderrPath, home };
+}
+
+function savedSessionIds(home: string): string[] {
+  const sessionsDir = join(home, ".fx", "sessions");
+  if (!existsSync(sessionsDir)) return [];
+  return readdirSync(sessionsDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .filter((id) => existsSync(join(sessionsDir, id, "session.json")));
 }
 
 describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
+  test(
+    "/delete removes the current saved session and exits",
+    async () => {
+      const launched = await launchNoKeyAndWait();
+      session = launched.terminal;
+
+      const before = savedSessionIds(launched.home);
+      expect(before).toHaveLength(1);
+
+      await session.sendText("/delete");
+      expect(await session.waitForSessionEnd(5_000)).toBe(true);
+      session = null;
+
+      expect(savedSessionIds(launched.home)).toEqual([]);
+      expect(readFileSync(launched.stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
   test(
     "/undo reports the exact empty state",
     async () => {

@@ -85,7 +85,7 @@ fx session resume last
 fx session resume --id <id>
 ```
 
-Each interactive session names its terminal tab. The title prefers the session name, falls back to the workspace name, and keeps the active model as secondary context. Renaming or resuming a session updates the tab, and exiting clears the fx-owned title. Noninteractive commands do not emit terminal-title controls.
+Each interactive session names its terminal tab. The title prefers the session name, falls back to the workspace name, and keeps the active model as secondary context. Renaming or resuming a session updates the tab, and exiting clears the fx-owned title. After active and queued work finishes, run `/delete` to permanently delete the current saved session, stop its workspace background work, and exit. Noninteractive commands do not emit terminal-title controls.
 
 Run `/feedback` to open the feedback form at `fx.sh/feedback`. It does not create a diagnostic or change the clipboard.
 

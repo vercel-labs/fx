@@ -1013,6 +1013,7 @@ const JsHostSessionStore = struct {
     load_fn: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?js_host_session_store.Loaded = if (host_target.is_wasm) loadDefault else loadUnavailable,
     commit_fn: *const fn (?*anyopaque, Allocator, session_codec.DurableSessionState, ?[]const u8) anyerror![]u8 = if (host_target.is_wasm) commitDefault else commitUnavailable,
     list_fn: *const fn (?*anyopaque, Allocator) anyerror![]js_host_session_store.Metadata = if (host_target.is_wasm) listDefault else listUnavailable,
+    remove_fn: *const fn (?*anyopaque, []const u8) anyerror!void = if (host_target.is_wasm) removeDefault else removeUnavailable,
 
     fn load(self: JsHostSessionStore, alloc: Allocator, id: []const u8) !?js_host_session_store.Loaded {
         return self.load_fn(self.ctx, alloc, id);
@@ -1029,6 +1030,10 @@ const JsHostSessionStore = struct {
 
     fn list(self: JsHostSessionStore, alloc: Allocator) ![]js_host_session_store.Metadata {
         return self.list_fn(self.ctx, alloc);
+    }
+
+    fn remove(self: JsHostSessionStore, id: []const u8) !void {
+        return self.remove_fn(self.ctx, id);
     }
 
     fn loadDefault(_: ?*anyopaque, alloc: Allocator, id: []const u8) !?js_host_session_store.Loaded {
@@ -1048,6 +1053,10 @@ const JsHostSessionStore = struct {
         return js_host_session_store.list(alloc);
     }
 
+    fn removeDefault(_: ?*anyopaque, id: []const u8) !void {
+        return js_host_session_store.remove(id);
+    }
+
     fn loadUnavailable(_: ?*anyopaque, _: Allocator, _: []const u8) !?js_host_session_store.Loaded {
         return error.SessionStoreUnavailable;
     }
@@ -1062,6 +1071,10 @@ const JsHostSessionStore = struct {
     }
 
     fn listUnavailable(_: ?*anyopaque, _: Allocator) ![]js_host_session_store.Metadata {
+        return error.SessionStoreUnavailable;
+    }
+
+    fn removeUnavailable(_: ?*anyopaque, _: []const u8) !void {
         return error.SessionStoreUnavailable;
     }
 };
@@ -2934,6 +2947,70 @@ pub fn Runtime(comptime App: type) type {
             if (app.session_persistence.writable) |*loaded| return loaded.active_id;
             if (app.session_persistence.js_host_session) |*owner| return owner.state.id;
             return null;
+        }
+
+        /// Deletes the active saved session. The durable store consumes the exact
+        /// writer so a stale or foreign session cannot be removed by path alone.
+        pub fn deleteActiveSession(app: *App) !void {
+            if (comptime !@hasField(App, "session_persistence")) return error.NoActiveSession;
+
+            app.worker.waitUntilIdle();
+            app.session_persistence.resume_handoff_intent = .none;
+
+            if (comptime runtime_profile.allows(App, .durable_sessions)) {
+                if (comptime @hasField(@TypeOf(app.session), "usage")) {
+                    app.session.usage.cancelReconciliation();
+                    app.session.usage.finishProfilePublicationsBeforeShutdown();
+                    app.session.usage.configureCheckpointSink(null);
+                }
+
+                app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+                defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+                discardAnyPendingCancelledCommand(app, "writable_session_delete");
+                app.session_persistence.disabled_cancelled_command_capture = null;
+
+                const store = app.session_persistence.store orelse return error.NoActiveSession;
+                const loaded = if (app.session_persistence.writable) |*value|
+                    value
+                else
+                    return error.NoActiveSession;
+
+                app.background.stopAndForgetWorkspace(
+                    std.heap.c_allocator,
+                    app.workspace_root,
+                );
+                app.background.detachManagedPersistence(
+                    std.heap.c_allocator,
+                    loaded.active_id,
+                );
+                if (comptime @hasDecl(@TypeOf(app.session), "clearWebFetchArtifacts")) {
+                    app.session.clearWebFetchArtifacts();
+                }
+                disableSubagentHost(app);
+
+                const disposition = store.deleteCommittedSession(app.alloc, loaded);
+                app.session_persistence.writable = null;
+                invalidateSessionPickerCaches(app);
+                return switch (disposition) {
+                    .discarded => {},
+                    .retained => error.SessionDeletionRetained,
+                    .indeterminate => error.SessionDeletionIndeterminate,
+                };
+            }
+
+            if (comptime runtime_profile.allows(App, .js_host_sessions)) {
+                const owner = if (app.session_persistence.js_host_session) |*value|
+                    value
+                else
+                    return error.NoActiveSession;
+                try app.session_persistence.js_host_store.remove(owner.state.id);
+                owner.deinit(app.alloc);
+                app.session_persistence.js_host_session = null;
+                invalidateSessionPickerCaches(app);
+                return;
+            }
+
+            return error.NoActiveSession;
         }
 
         /// Replaces the cached footer title. App owns the copy. Keeps the
@@ -5502,8 +5579,10 @@ const FakeJsHostSessionStore = struct {
     list_error: ?anyerror = null,
     load_error: ?anyerror = null,
     commit_error: ?anyerror = null,
+    remove_error: ?anyerror = null,
     load_missing: bool = false,
     commit_count: usize = 0,
+    remove_count: usize = 0,
     committed_state: ?session_codec.DurableSessionState = null,
     expected_revision: ?[]u8 = null,
 
@@ -5520,6 +5599,7 @@ const FakeJsHostSessionStore = struct {
             .load_fn = load,
             .commit_fn = commit,
             .list_fn = list,
+            .remove_fn = remove,
         };
     }
 
@@ -5567,6 +5647,14 @@ const FakeJsHostSessionStore = struct {
             .updated_at_ms = self.updated_at_ms,
         };
         return entries;
+    }
+
+    fn remove(raw: ?*anyopaque, id: []const u8) !void {
+        const self: *FakeJsHostSessionStore = @ptrCast(@alignCast(raw.?));
+        self.remove_count += 1;
+        if (self.remove_error) |err| return err;
+        const state = self.state orelse return;
+        if (!std.mem.eql(u8, state.id, id)) return error.SessionNotFound;
     }
 };
 
