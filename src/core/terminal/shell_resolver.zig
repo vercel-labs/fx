@@ -24,12 +24,15 @@ fn shellKind(path: []const u8) ?ShellKind {
     return null;
 }
 
-fn shellExists(path: []const u8) bool {
-    std.Io.Dir.cwd().access(io_mod.getIo(), path, .{}) catch return false;
+fn shellIsExecutable(path: []const u8) bool {
+    const cwd = std.Io.Dir.cwd();
+    const stat = cwd.statFile(io_mod.getIo(), path, .{}) catch return false;
+    if (stat.kind != .file) return false;
+    cwd.access(io_mod.getIo(), path, .{ .execute = true }) catch return false;
     return true;
 }
 
-/// Platform-ordered fallback shells, filtered by on-disk existence so a
+/// Platform-ordered fallback shells, filtered to executable regular files so a
 /// missing interpreter surfaces as MissingLoginShell instead of a later
 /// spawn failure.
 fn fallbackLoginShell() ?[]const u8 {
@@ -38,7 +41,7 @@ fn fallbackLoginShell() ?[]const u8 {
     else
         &.{ "/bin/bash", "/bin/zsh" };
     for (candidates) |candidate| {
-        if (shellExists(candidate)) return candidate;
+        if (shellIsExecutable(candidate)) return candidate;
     }
     return null;
 }
@@ -47,7 +50,7 @@ fn supportedLoginShell(configured_login_shell: ?[]const u8) ResolveError![]const
     const path = configured_login_shell orelse
         return fallbackLoginShell() orelse error.MissingLoginShell;
     if (!std.fs.path.isAbsolute(path)) return error.RelativeShellPath;
-    if (shellKind(path) != null) return path;
+    if (shellKind(path) != null and shellIsExecutable(path)) return path;
     return fallbackLoginShell() orelse error.MissingLoginShell;
 }
 
@@ -173,7 +176,7 @@ fn passwdLoginShellInto(buffer: []u8) PasswdLoginShell {
 fn validatedShellValue(value: ?[]const u8, buffer: []u8) ?[]const u8 {
     const shell = value orelse return null;
     if (shell.len == 0 or shell.len > buffer.len) return null;
-    if (!std.fs.path.isAbsolute(shell) or !shellExists(shell)) return null;
+    if (!std.fs.path.isAbsolute(shell) or !shellIsExecutable(shell)) return null;
     @memcpy(buffer[0..shell.len], shell);
     return buffer[0..shell.len];
 }
@@ -432,7 +435,8 @@ test "SHELL fallback is limited to a missing passwd entry" {
     );
 }
 
-test "validated SHELL fallback accepts only existing absolute non-empty values" {
+test "validated SHELL fallback accepts only executable regular absolute values" {
+    const alloc = std.testing.allocator;
     var buffer: [4096]u8 = undefined;
     try std.testing.expect(validatedShellValue(null, &buffer) == null);
     try std.testing.expect(validatedShellValue("", &buffer) == null);
@@ -443,12 +447,34 @@ test "validated SHELL fallback accepts only existing absolute non-empty values" 
     const accepted = validatedShellValue("/bin/sh", &buffer) orelse
         return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("/bin/sh", accepted);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "zsh", .default_dir);
+    const directory_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "zsh");
+    defer alloc.free(directory_path);
+    try std.testing.expect(validatedShellValue(directory_path, &buffer) == null);
+
+    var file = try tmp.dir.createFile(std.testing.io, "bash", .{});
+    defer file.close(std.testing.io);
+    const file_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "bash");
+    defer alloc.free(file_path);
+    try std.testing.expect(validatedShellValue(file_path, &buffer) == null);
+
+    try file.setPermissions(
+        std.testing.io,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    try std.testing.expectEqualStrings(
+        file_path,
+        validatedShellValue(file_path, &buffer).?,
+    );
 }
 
 test "fallback login shell names an existing supported interpreter" {
     const fallback = fallbackLoginShell() orelse return error.SkipZigTest;
     try std.testing.expect(shellKind(fallback) != null);
-    try std.testing.expect(shellExists(fallback));
+    try std.testing.expect(shellIsExecutable(fallback));
 }
 
 test "login shell resolution falls back without accepting explicit unsupported shells" {
@@ -456,6 +482,10 @@ test "login shell resolution falls back without accepting explicit unsupported s
     const expected_fallback = fallbackLoginShell() orelse
         return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(expected_fallback, fallback.path);
+    try std.testing.expectEqualStrings(
+        expected_fallback,
+        (try resolve("/fx-no-such-shell/bash", .user_login)).path,
+    );
     if (builtin.os.tag == .macos) {
         try std.testing.expectEqualSlices(
             []const u8,
