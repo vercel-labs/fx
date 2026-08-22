@@ -88,6 +88,7 @@ pub fn inspect(
         null,
         &delivery,
         &attempt_evidence,
+        null,
         @ptrCast(&capture),
         onContentChunk,
         null,
