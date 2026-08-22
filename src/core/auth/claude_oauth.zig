@@ -1,5 +1,6 @@
 const std = @import("std");
-const grok_session = @import("grok_session.zig");
+const claude_code_store = @import("claude_code_store.zig");
+const claude_session = @import("claude_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
@@ -11,16 +12,26 @@ const secret = @import("secret.zig");
 
 const Allocator = std.mem.Allocator;
 
-const client_id = "b1a00492-073a-47ea-816f-4c329264a828";
-const token_url = "https://auth.x.ai/oauth2/token";
-const issuer_url = "https://auth.x.ai";
-const userinfo_url = "https://auth.x.ai/oauth2/userinfo";
-const revoke_url = "https://auth.x.ai/oauth2/revoke";
-const e2e_token_url_env = "FX_E2E_GROK_TOKEN_URL";
-const e2e_issuer_url_env = "FX_E2E_GROK_ISSUER_URL";
-const e2e_userinfo_url_env = "FX_E2E_GROK_USERINFO_URL";
-const e2e_revoke_url_env = "FX_E2E_GROK_REVOKE_URL";
-const browser_scope = "openid profile email offline_access grok-cli:access api:access";
+const client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const issuer_url = "https://claude.ai";
+const authorize_url = "https://claude.ai/oauth/authorize";
+const token_url = "https://console.anthropic.com/v1/oauth/token";
+const userinfo_url = "https://api.anthropic.com/api/oauth/profile";
+pub const anthropic_api_version = "2023-06-01";
+pub const oauth_beta = "oauth-2025-04-20";
+pub const messages_beta = claude_code_store.messages_beta;
+pub const messages_originator = claude_code_store.originator;
+pub const messages_user_agent = claude_code_store.user_agent;
+pub const oauth_api_headers = [_]std.http.Header{
+    .{ .name = "anthropic-version", .value = anthropic_api_version },
+    .{ .name = "anthropic-beta", .value = oauth_beta },
+};
+const e2e_issuer_url_env = "FX_E2E_CLAUDE_ISSUER_URL";
+const e2e_authorize_url_env = "FX_E2E_CLAUDE_AUTHORIZE_URL";
+const e2e_token_url_env = "FX_E2E_CLAUDE_TOKEN_URL";
+const e2e_userinfo_url_env = "FX_E2E_CLAUDE_USERINFO_URL";
+const browser_scope = "user:profile user:inference user:sessions:claude_code user:mcp_servers";
+const browser_redirect_uri = "https://console.anthropic.com/oauth/code/callback";
 const browser_login_timeout_seconds: i64 = 5 * 60;
 const browser_callback_poll_ms: i32 = 100;
 const browser_callback_io_timeout_seconds: i64 = 30;
@@ -61,13 +72,32 @@ const BrowserLoginContext = struct {
     code_verifier: []u8,
     state: []u8,
     transport: oauth_transport.Provider,
+    paste_mutex: std.Io.Mutex = .init,
+    pasted_code: ?[]u8 = null,
 
     fn deinit(self: *BrowserLoginContext, alloc: Allocator) void {
         self.listener.deinit(io_mod.getIo());
         alloc.free(self.redirect_uri);
         secret.zeroAndFree(alloc, self.code_verifier);
         secret.zeroAndFree(alloc, self.state);
+        if (self.pasted_code) |code| secret.zeroAndFree(alloc, code);
         self.* = undefined;
+    }
+
+    fn takePastedCode(self: *BrowserLoginContext) ?[]u8 {
+        self.paste_mutex.lockUncancelable(io_mod.getIo());
+        defer self.paste_mutex.unlock(io_mod.getIo());
+        const code = self.pasted_code;
+        self.pasted_code = null;
+        return code;
+    }
+
+    fn setPastedCode(self: *BrowserLoginContext, alloc: Allocator, code: []const u8) !void {
+        const owned = try alloc.dupe(u8, code);
+        self.paste_mutex.lockUncancelable(io_mod.getIo());
+        defer self.paste_mutex.unlock(io_mod.getIo());
+        if (self.pasted_code) |previous| secret.zeroAndFree(alloc, previous);
+        self.pasted_code = owned;
     }
 };
 
@@ -100,20 +130,23 @@ pub fn startSignIn(
 }
 
 fn prepareBrowserSignIn(alloc: Allocator, transport: oauth_transport.Provider) !PreparedBrowserLogin {
-    const configured_issuer = try configuredEndpoint(alloc, e2e_issuer_url_env, issuer_url);
-    defer alloc.free(configured_issuer);
+    const configured_authorize = try configuredEndpoint(alloc, e2e_authorize_url_env, authorize_url);
+    defer alloc.free(configured_authorize);
     const configured_token_endpoint = try configuredEndpoint(alloc, e2e_token_url_env, token_url);
     errdefer alloc.free(configured_token_endpoint);
 
     var listener = try bindBrowserCallback();
     var listener_owned = true;
     errdefer if (listener_owned) listener.deinit(io_mod.getIo());
-    const callback_port = listener.socket.address.getPort();
-    const redirect_uri = try std.fmt.allocPrint(
-        alloc,
-        "http://127.0.0.1:{d}/callback",
-        .{callback_port},
-    );
+    const e2e = io_mod.getenv(e2e_authorize_url_env) != null;
+    const redirect_uri = if (e2e)
+        try std.fmt.allocPrint(
+            alloc,
+            "http://127.0.0.1:{d}/callback",
+            .{listener.socket.address.getPort()},
+        )
+    else
+        try alloc.dupe(u8, browser_redirect_uri);
     errdefer alloc.free(redirect_uri);
     const code_verifier = try randomUrlSafeSecret(alloc);
     errdefer secret.zeroAndFree(alloc, code_verifier);
@@ -123,7 +156,7 @@ fn prepareBrowserSignIn(alloc: Allocator, transport: oauth_transport.Provider) !
     defer alloc.free(code_challenge);
     const authorization_url = try buildBrowserAuthorizationUrl(
         alloc,
-        configured_issuer,
+        configured_authorize,
         redirect_uri,
         code_challenge,
         state,
@@ -141,26 +174,22 @@ fn prepareBrowserSignIn(alloc: Allocator, transport: oauth_transport.Provider) !
     };
     listener_owned = false;
 
-    const owned_issuer = try alloc.dupe(u8, configured_issuer);
-    errdefer alloc.free(owned_issuer);
-    const authorization_endpoint = try std.fmt.allocPrint(
-        alloc,
-        "{s}/oauth2/authorize",
-        .{std.mem.trimEnd(u8, configured_issuer, "/")},
-    );
-    errdefer alloc.free(authorization_endpoint);
+    const owned_authorize = try alloc.dupe(u8, configured_authorize);
+    errdefer alloc.free(owned_authorize);
     const device_code = try alloc.dupe(u8, "");
     errdefer secret.zeroAndFree(alloc, device_code);
     const user_code = try alloc.dupe(u8, "");
     errdefer alloc.free(user_code);
     const owned_client_id = try alloc.dupe(u8, client_id);
     errdefer alloc.free(owned_client_id);
+    const owned_issuer = try alloc.dupe(u8, issuer_url);
+    errdefer alloc.free(owned_issuer);
 
     return .{
         .prepared = .{
             .metadata = .{
                 .issuer = owned_issuer,
-                .device_authorization_endpoint = authorization_endpoint,
+                .device_authorization_endpoint = owned_authorize,
                 .token_endpoint = configured_token_endpoint,
             },
             .device = .{
@@ -215,9 +244,39 @@ fn pollBrowserToken(
     cancel_flag: *std.atomic.Value(bool),
     deadline: std.Io.Clock.Timestamp,
 ) !oauth.PollResult {
-    if (comptime host_target.is_wasm) return error.GrokOAuthUnavailable;
+    if (comptime host_target.is_wasm) return error.ClaudeOAuthUnavailable;
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const context: *BrowserLoginContext = @ptrCast(@alignCast(raw.?));
+    if (context.takePastedCode()) |code| {
+        defer secret.zeroAndFree(alloc, code);
+        var token = try exchangeAuthorizationCodeForRedirectWithBounds(
+            alloc,
+            transport,
+            metadata.token_endpoint,
+            code,
+            context.code_verifier,
+            context.redirect_uri,
+            context.state,
+            cancel_flag,
+            deadline,
+        );
+        errdefer token.deinit(alloc);
+        const scope = try alloc.dupe(u8, "");
+        errdefer if (scope.len > 0) alloc.free(scope);
+        const token_type = try alloc.dupe(u8, "Bearer");
+        errdefer alloc.free(token_type);
+        const access_token = token.access_token;
+        token.access_token = &.{};
+        const refresh_token = token.refresh_token;
+        token.refresh_token = &.{};
+        return .{ .success = .{
+            .access_token = access_token,
+            .refresh_token = refresh_token,
+            .expires_in = token.expires_in,
+            .scope = scope,
+            .token_type = token_type,
+        } };
+    }
     if (!try browserCallbackReady(&context.listener, cancel_flag)) return .pending;
 
     var stream = try context.listener.accept(io_mod.getIo());
@@ -238,6 +297,7 @@ fn pollBrowserToken(
         callback.code,
         context.code_verifier,
         context.redirect_uri,
+        context.state,
         cancel_flag,
         deadline,
     ) catch |err| {
@@ -278,7 +338,7 @@ fn browserCallbackReady(
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     if (ready == 0) return false;
     if ((fds[0].revents & std.posix.POLL.IN) == 0) {
-        return error.InvalidGrokOAuthCallback;
+        return error.InvalidClaudeOAuthCallback;
     }
     return true;
 }
@@ -290,21 +350,21 @@ fn readBrowserCallbackTarget(alloc: Allocator, stream: std.Io.net.Stream) ![]u8 
     var request_len: usize = 0;
     while (request_len < request_bytes.len) {
         request_bytes[request_len] = reader.interface.takeByte() catch |err| switch (err) {
-            error.EndOfStream => return error.InvalidGrokOAuthCallback,
+            error.EndOfStream => return error.InvalidClaudeOAuthCallback,
             else => return err,
         };
         request_len += 1;
         if (std.mem.endsWith(u8, request_bytes[0..request_len], "\r\n\r\n")) break;
     }
-    if (request_len == request_bytes.len) return error.GrokOAuthCallbackTooLarge;
+    if (request_len == request_bytes.len) return error.ClaudeOAuthCallbackTooLarge;
     const line_end = std.mem.find(u8, request_bytes[0..request_len], "\r\n") orelse
-        return error.InvalidGrokOAuthCallback;
+        return error.InvalidClaudeOAuthCallback;
     const request_line = request_bytes[0..line_end];
     if (!std.mem.startsWith(u8, request_line, "GET ")) {
-        return error.InvalidGrokOAuthCallback;
+        return error.InvalidClaudeOAuthCallback;
     }
     const target_end = std.mem.findScalarPos(u8, request_line, 4, ' ') orelse
-        return error.InvalidGrokOAuthCallback;
+        return error.InvalidClaudeOAuthCallback;
     return alloc.dupe(u8, request_line[4..target_end]);
 }
 
@@ -326,10 +386,10 @@ fn setBrowserSocketTimeouts(socket: std.posix.socket_t) void {
     const timeout = std.posix.timeval{ .sec = browser_callback_io_timeout_seconds, .usec = 0 };
     const bytes = std.mem.asBytes(&timeout);
     std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, bytes) catch |err| {
-        debug_trace.logf("auth", "Grok callback receive timeout setup failed err={s}", .{@errorName(err)});
+        debug_trace.logf("auth", "Claude callback receive timeout setup failed err={s}", .{@errorName(err)});
     };
     std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, bytes) catch |err| {
-        debug_trace.logf("auth", "Grok callback send timeout setup failed err={s}", .{@errorName(err)});
+        debug_trace.logf("auth", "Claude callback send timeout setup failed err={s}", .{@errorName(err)});
     };
 }
 
@@ -341,14 +401,14 @@ fn completeSignIn(
     token: *oauth.TokenSet,
 ) !login_flow.SignInCompletion {
     const context: *BrowserLoginContext = @ptrCast(@alignCast(raw.?));
-    const refresh_token = token.refresh_token orelse return error.GrokRefreshTokenMissing;
+    const refresh_token = token.refresh_token orelse return error.ClaudeRefreshTokenMissing;
     const account_id = try fetchAccountId(alloc, context.transport, token.access_token);
     errdefer alloc.free(account_id);
     const duration_ms = std.math.mul(i64, token.expires_in, std.time.ms_per_s) catch
-        return error.InvalidGrokOAuthResponse;
+        return error.InvalidClaudeOAuthResponse;
     const expires_at_ms = std.math.add(i64, io_mod.milliTimestamp(), duration_ms) catch
-        return error.InvalidGrokOAuthResponse;
-    const completion: login_flow.SignInCompletion = .{ .grok = .{
+        return error.InvalidClaudeOAuthResponse;
+    const completion: login_flow.SignInCompletion = .{ .claude = .{
         .access_token = token.access_token,
         .refresh_token = refresh_token,
         .expires_at_ms = expires_at_ms,
@@ -361,10 +421,10 @@ fn completeSignIn(
 
 fn saveSignIn(_: ?*anyopaque, alloc: Allocator, completion: login_flow.SignInCompletion) !void {
     const session = switch (completion) {
-        .grok => |session| session,
-        .vercel, .chatgpt, .claude => return error.InvalidSignInCompletion,
+        .claude => |session| session,
+        .vercel, .chatgpt, .grok => return error.InvalidSignInCompletion,
     };
-    try grok_session.saveNewSession(alloc, session);
+    try claude_session.saveNewSession(alloc, session);
 }
 
 pub fn runLogin(
@@ -374,21 +434,44 @@ pub fn runLogin(
 ) !void {
     var runtime: login_flow.SignInRuntime = .{};
     defer runtime.deinit(alloc);
-    if (!try startSignIn(&runtime, alloc, transport)) return error.GrokLoginBusy;
+    if (!try startSignIn(&runtime, alloc, transport)) return error.ClaudeLoginBusy;
 
     const authorization_url = (try runtime.browserUrlAlloc(alloc)) orelse
-        return error.GrokAuthorizationUrlMissing;
+        return error.ClaudeAuthorizationUrlMissing;
     defer alloc.free(authorization_url);
-    try writeStdout("Open this URL to sign in with Grok:\n");
+    try writeStdout("Open this URL to sign in with Claude:\n");
     try writeStdout(authorization_url);
-    try writeStdout("\n\nWaiting for browser authorization...\n");
+    try writeStdout("\n\nAfter you authorize, paste the code from the browser and press Enter.\n");
     if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) {
         _ = url_opener.open(alloc, authorization_url) catch false;
     }
 
+    var paste_line: std.ArrayList(u8) = .empty;
+    defer {
+        if (paste_line.items.len > 0) std.crypto.secureZero(u8, @volatileCast(paste_line.items));
+        paste_line.deinit(alloc);
+    }
+    var stdin_buf: [1024]u8 = undefined;
     while (true) {
+        if (try stdinHasInput(50)) {
+            const n = std.posix.read(std.posix.STDIN_FILENO, &stdin_buf) catch 0;
+            if (n > 0) {
+                try paste_line.appendSlice(alloc, stdin_buf[0..n]);
+                if (std.mem.findScalar(u8, paste_line.items, '\n') != null) {
+                    const trimmed = std.mem.trim(u8, paste_line.items, " \t\r\n");
+                    if (trimmed.len > 0) {
+                        submitPastedAuthorizationInput(&runtime, alloc, trimmed) catch |err| {
+                            debug_trace.logf("auth", "Claude pasted authorization rejected err={s}", .{@errorName(err)});
+                            return err;
+                        };
+                    }
+                    std.crypto.secureZero(u8, @volatileCast(paste_line.items));
+                    paste_line.clearRetainingCapacity();
+                }
+            }
+        }
         switch (runtime.pollTransition(alloc)) {
-            .none => try io_mod.getIo().sleep(.fromMilliseconds(50), .awake),
+            .none => {},
             .succeeded => |completion| {
                 var owned = completion;
                 defer owned.deinit(alloc);
@@ -400,13 +483,30 @@ pub fn runLogin(
     }
 }
 
+fn submitPastedAuthorizationInput(runtime: *login_flow.SignInRuntime, alloc: Allocator, input: []const u8) !void {
+    const context: *BrowserLoginContext = @ptrCast(@alignCast(runtime.deps.ctx orelse return error.InvalidClaudeOAuthCallback));
+    var parsed = try parsePastedAuthorizationInput(alloc, input, context.state);
+    defer parsed.deinit(alloc);
+    try context.setPastedCode(alloc, parsed.code);
+}
+
+fn stdinHasInput(timeout_ms: i32) !bool {
+    var fds = [_]std.posix.pollfd{.{
+        .fd = std.posix.STDIN_FILENO,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try std.posix.poll(&fds, timeout_ms);
+    return ready > 0 and (fds[0].revents & std.posix.POLL.IN) != 0;
+}
+
 pub const LogoutResult = struct {
-    deletion: grok_session.DeleteOutcome,
+    deletion: claude_session.DeleteOutcome,
     revocation_failed: bool,
 };
 
 pub fn logout(alloc: Allocator, transport: oauth_transport.Provider) !LogoutResult {
-    var mutation = (try grok_session.beginExistingMutation()) orelse return .{
+    var mutation = (try claude_session.beginExistingMutation()) orelse return .{
         .deletion = .missing,
         .revocation_failed = false,
     };
@@ -426,7 +526,8 @@ pub fn logout(alloc: Allocator, transport: oauth_transport.Provider) !LogoutResu
 }
 
 pub fn sourceExists(alloc: Allocator) !bool {
-    var session = (try grok_session.load(alloc)) orelse return false;
+    if (try claude_code_store.hasCredentials(alloc)) return true;
+    var session = (try claude_session.load(alloc)) orelse return false;
     defer session.deinit(alloc);
     return true;
 }
@@ -436,13 +537,14 @@ pub fn loadAccess(
     transport: oauth_transport.Provider,
     mode: RefreshMode,
 ) !?Access {
+    if (try loadClaudeCodeAccess(alloc, transport, mode)) |access| return access;
     if (mode == .stored) {
-        var session = (try grok_session.load(alloc)) orelse return null;
+        var session = (try claude_session.load(alloc)) orelse return null;
         defer session.deinit(alloc);
         return takeAccess(&session);
     }
 
-    var mutation = (try grok_session.beginExistingMutation()) orelse return null;
+    var mutation = (try claude_session.beginExistingMutation()) orelse return null;
     defer mutation.deinit();
     var session = (try mutation.load(alloc)) orelse return null;
     defer session.deinit(alloc);
@@ -453,7 +555,78 @@ pub fn loadAccess(
     return takeAccess(&session);
 }
 
-fn takeAccess(session: *grok_session.Session) Access {
+fn loadClaudeCodeAccess(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    mode: RefreshMode,
+) !?Access {
+    var stored = (try claude_code_store.load(alloc)) orelse return null;
+    errdefer stored.deinit(alloc);
+    if (mode != .stored and (mode == .force or stored.expired(io_mod.milliTimestamp()))) {
+        refreshClaudeCodeSession(alloc, transport, &stored) catch |err| {
+            debug_trace.logf("auth", "Claude Code token refresh failed err={s}", .{@errorName(err)});
+            return null;
+        };
+        claude_code_store.save(alloc, stored) catch |err| {
+            debug_trace.logf("auth", "Claude Code token persist failed err={s}", .{@errorName(err)});
+        };
+    }
+    if (stored.account_id.len == 0 or !claude_session.validAccountId(stored.account_id)) {
+        const account_id = fetchAccountId(alloc, transport, stored.access_token) catch |err| {
+            debug_trace.logf("auth", "Claude Code account lookup failed err={s}", .{@errorName(err)});
+            return null;
+        };
+        alloc.free(stored.account_id);
+        stored.account_id = account_id;
+    }
+    if (try claude_code_store.findCli(alloc)) |cli| {
+        defer alloc.free(cli);
+        debug_trace.logf("auth", "Claude Code CLI detected", .{});
+    }
+    const access = Access{
+        .access_token = stored.access_token,
+        .account_id = stored.account_id,
+        .refresh_after_ms = claude_code_store.refreshDeadlineMs(stored.expires_at_ms),
+    };
+    secret.zeroAndFree(alloc, stored.refresh_token);
+    stored.access_token = &.{};
+    stored.refresh_token = &.{};
+    stored.account_id = &.{};
+    return access;
+}
+
+fn refreshClaudeCodeSession(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    stored: *claude_code_store.Stored,
+) !void {
+    const payload = try jsonObjectPayload(alloc, .{
+        .grant_type = "refresh_token",
+        .client_id = client_id,
+        .refresh_token = stored.refresh_token,
+    });
+    defer secret.zeroAndFree(alloc, payload);
+    var token = try requestRefreshToken(alloc, transport, payload);
+    defer token.deinit(alloc);
+    const access_token = token.access_token;
+    token.access_token = &.{};
+    errdefer secret.zeroAndFree(alloc, access_token);
+    const refresh_token = if (token.refresh_token) |rotated| rotated else try alloc.dupe(u8, stored.refresh_token);
+    if (token.refresh_token != null) token.refresh_token = null;
+    errdefer secret.zeroAndFree(alloc, refresh_token);
+    const expires_in = token.expires_in orelse return error.InvalidClaudeOAuthResponse;
+    const duration_ms = std.math.mul(i64, expires_in, std.time.ms_per_s) catch
+        return error.InvalidClaudeOAuthResponse;
+    const expires_at_ms = std.math.add(i64, io_mod.milliTimestamp(), duration_ms) catch
+        return error.InvalidClaudeOAuthResponse;
+    secret.zeroAndFree(alloc, stored.access_token);
+    secret.zeroAndFree(alloc, stored.refresh_token);
+    stored.access_token = access_token;
+    stored.refresh_token = refresh_token;
+    stored.expires_at_ms = expires_at_ms;
+}
+
+fn takeAccess(session: *claude_session.Session) Access {
     const access_token = session.access_token;
     session.access_token = &.{};
     const account_id = session.account_id;
@@ -461,40 +634,40 @@ fn takeAccess(session: *grok_session.Session) Access {
     return .{
         .access_token = access_token,
         .account_id = account_id,
-        .refresh_after_ms = grok_session.refreshDeadlineMs(session.expires_at_ms),
+        .refresh_after_ms = claude_session.refreshDeadlineMs(session.expires_at_ms),
     };
 }
 
 fn refreshSession(
     alloc: Allocator,
     transport: oauth_transport.Provider,
-    mutation: *grok_session.Mutation,
-    session: *grok_session.Session,
+    mutation: *claude_session.Mutation,
+    session: *claude_session.Session,
 ) !void {
-    var body: std.Io.Writer.Allocating = .init(alloc);
-    defer body.deinit();
-    var form: FormBody = .{};
-    try form.append(&body.writer, "grant_type", "refresh_token");
-    try form.append(&body.writer, "client_id", client_id);
-    try form.append(&body.writer, "refresh_token", session.refresh_token);
-    var token = try requestRefreshToken(alloc, transport, body.written());
+    const payload = try jsonObjectPayload(alloc, .{
+        .grant_type = "refresh_token",
+        .client_id = client_id,
+        .refresh_token = session.refresh_token,
+    });
+    defer secret.zeroAndFree(alloc, payload);
+    var token = try requestRefreshToken(alloc, transport, payload);
     defer token.deinit(alloc);
 
     const account_id = try fetchAccountId(alloc, transport, token.access_token);
     errdefer alloc.free(account_id);
     if (!std.mem.eql(u8, account_id, session.account_id)) {
-        return error.GrokAccountChanged;
+        return error.ClaudeAccountChanged;
     }
     const refresh_token = if (token.refresh_token) |rotated| rotated else try alloc.dupe(u8, session.refresh_token);
     if (token.refresh_token != null) token.refresh_token = null;
     errdefer secret.zeroAndFree(alloc, refresh_token);
     const expires_at_ms = if (token.expires_in) |expires_in| blk: {
         const duration_ms = std.math.mul(i64, expires_in, std.time.ms_per_s) catch
-            return error.InvalidGrokOAuthResponse;
+            return error.InvalidClaudeOAuthResponse;
         break :blk std.math.add(i64, io_mod.milliTimestamp(), duration_ms) catch
-            return error.InvalidGrokOAuthResponse;
-    } else return error.InvalidGrokOAuthResponse;
-    var replacement = grok_session.Session{
+            return error.InvalidClaudeOAuthResponse;
+    } else return error.InvalidClaudeOAuthResponse;
+    var replacement = claude_session.Session{
         .access_token = token.access_token,
         .refresh_token = refresh_token,
         .expires_at_ms = expires_at_ms,
@@ -533,24 +706,24 @@ fn requestRefreshToken(
     const bytes = try requestAccepted(
         alloc,
         transport,
-        .post_form,
+        .post_json,
         endpoint_url,
         payload,
     );
     defer secret.zeroAndFree(alloc, bytes);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidGrokOAuthResponse;
+    if (parsed.value != .object) return error.InvalidClaudeOAuthResponse;
     const object = parsed.value.object;
     const access_token = try dupeRequiredString(alloc, object, "access_token");
     errdefer secret.zeroAndFree(alloc, access_token);
     const refresh_token = if (object.get("refresh_token")) |value| blk: {
-        if (value != .string or value.string.len == 0) return error.InvalidGrokOAuthResponse;
+        if (value != .string or value.string.len == 0) return error.InvalidClaudeOAuthResponse;
         break :blk try alloc.dupe(u8, value.string);
     } else null;
     errdefer if (refresh_token) |token| secret.zeroAndFree(alloc, token);
     const expires_in = if (object.get("expires_in")) |value| blk: {
-        if (value != .integer or value.integer <= 0) return error.InvalidGrokOAuthResponse;
+        if (value != .integer or value.integer <= 0) return error.InvalidClaudeOAuthResponse;
         break :blk value.integer;
     } else null;
     return .{
@@ -567,18 +740,20 @@ fn exchangeAuthorizationCodeForRedirectWithBounds(
     authorization_code: []const u8,
     code_verifier: []const u8,
     redirect_uri: []const u8,
+    state: []const u8,
     cancel_flag: ?*std.atomic.Value(bool),
     deadline: ?std.Io.Clock.Timestamp,
 ) !TokenSet {
-    var form: FormBody = .{};
-    var body: std.Io.Writer.Allocating = .init(alloc);
-    defer body.deinit();
-    try form.append(&body.writer, "grant_type", "authorization_code");
-    try form.append(&body.writer, "client_id", client_id);
-    try form.append(&body.writer, "code", authorization_code);
-    try form.append(&body.writer, "code_verifier", code_verifier);
-    try form.append(&body.writer, "redirect_uri", redirect_uri);
-    return requestTokenAtWithBounds(alloc, transport, endpoint_url, body.written(), cancel_flag, deadline);
+    const payload = try jsonObjectPayload(alloc, .{
+        .grant_type = "authorization_code",
+        .code = authorization_code,
+        .state = state,
+        .code_verifier = code_verifier,
+        .redirect_uri = redirect_uri,
+        .client_id = client_id,
+    });
+    defer secret.zeroAndFree(alloc, payload);
+    return requestTokenAtWithBounds(alloc, transport, endpoint_url, payload, cancel_flag, deadline);
 }
 
 fn requestTokenAtWithBounds(
@@ -592,7 +767,7 @@ fn requestTokenAtWithBounds(
     const bytes = try requestAcceptedWithBounds(
         alloc,
         transport,
-        .post_form,
+        .post_json,
         endpoint_url,
         payload,
         cancel_flag,
@@ -601,7 +776,7 @@ fn requestTokenAtWithBounds(
     defer secret.zeroAndFree(alloc, bytes);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidGrokOAuthResponse;
+    if (parsed.value != .object) return error.InvalidClaudeOAuthResponse;
     const object = parsed.value.object;
     const access_token = try dupeRequiredString(alloc, object, "access_token");
     errdefer secret.zeroAndFree(alloc, access_token);
@@ -617,7 +792,7 @@ fn requestTokenAtWithBounds(
 fn configuredEndpoint(alloc: Allocator, env_name: []const u8, default_url: []const u8) ![]u8 {
     const candidate = io_mod.getenv(env_name) orelse default_url;
     if (io_mod.getenv(env_name) != null and !isLoopbackHttpUrl(candidate)) {
-        return error.InvalidE2EGrokEndpoint;
+        return error.InvalidE2EClaudeEndpoint;
     }
     return alloc.dupe(u8, candidate);
 }
@@ -662,18 +837,48 @@ fn fetchAccountId(
         .method = .get,
         .url = endpoint_url,
         .authorization = authorization,
+        .extra_headers = &oauth_api_headers,
     });
     defer response.deinit(alloc);
-    if (response.disposition != .accepted) return error.GrokUserInfoRequestFailed;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, response.body, .{}) catch
-        return error.InvalidGrokUserInfoResponse;
+    if (response.disposition != .accepted) {
+        debug_trace.logf("auth", "Claude userinfo request rejected", .{});
+        return error.ClaudeUserInfoRequestFailed;
+    }
+    return accountIdFromProfileJson(alloc, response.body) catch |err| {
+        debug_trace.logf("auth", "Claude userinfo parse failed err={s}", .{@errorName(err)});
+        return err;
+    };
+}
+
+fn accountIdFromProfileJson(alloc: Allocator, bytes: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch
+        return error.InvalidClaudeUserInfoResponse;
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidGrokUserInfoResponse;
-    const account_id = dupeRequiredString(alloc, parsed.value.object, "sub") catch
-        return error.InvalidGrokUserInfoResponse;
-    errdefer alloc.free(account_id);
-    if (!grok_session.validAccountId(account_id)) return error.InvalidGrokUserInfoResponse;
-    return account_id;
+    if (parsed.value != .object) return error.InvalidClaudeUserInfoResponse;
+    return accountIdFromProfileObject(alloc, parsed.value.object);
+}
+
+fn accountIdFromProfileObject(alloc: Allocator, object: std.json.ObjectMap) ![]u8 {
+    if (try nestedAccountId(alloc, object, "account")) |account_id| return account_id;
+    if (try optionalProfileId(alloc, object, "sub")) |account_id| return account_id;
+    if (try optionalProfileId(alloc, object, "uuid")) |account_id| return account_id;
+    if (try nestedAccountId(alloc, object, "organization")) |account_id| return account_id;
+    return error.InvalidClaudeUserInfoResponse;
+}
+
+fn nestedAccountId(alloc: Allocator, object: std.json.ObjectMap, key: []const u8) !?[]u8 {
+    const value = object.get(key) orelse return null;
+    if (value != .object) return error.InvalidClaudeUserInfoResponse;
+    if (try optionalProfileId(alloc, value.object, "uuid")) |account_id| return account_id;
+    if (try optionalProfileId(alloc, value.object, "id")) |account_id| return account_id;
+    return error.InvalidClaudeUserInfoResponse;
+}
+
+fn optionalProfileId(alloc: Allocator, object: std.json.ObjectMap, key: []const u8) !?[]u8 {
+    const value = object.get(key) orelse return null;
+    if (value != .string or value.string.len == 0) return error.InvalidClaudeUserInfoResponse;
+    if (!claude_session.validAccountId(value.string)) return error.InvalidClaudeUserInfoResponse;
+    return try alloc.dupe(u8, value.string);
 }
 
 fn revokeToken(
@@ -681,7 +886,7 @@ fn revokeToken(
     transport: oauth_transport.Provider,
     token: []const u8,
 ) !void {
-    const endpoint_url = try configuredEndpoint(alloc, e2e_revoke_url_env, revoke_url);
+    const endpoint_url = try configuredEndpoint(alloc, e2e_token_url_env, token_url);
     defer alloc.free(endpoint_url);
     var body: std.Io.Writer.Allocating = .init(alloc);
     defer body.deinit();
@@ -711,21 +916,38 @@ fn requestAcceptedWithBounds(
     });
     defer response.deinit(alloc);
     if (response.disposition != .accepted) {
-        debug_trace.logf("auth", "Grok OAuth request rejected url={s}", .{url});
-        return error.GrokOAuthRequestFailed;
+        logRejectedOAuthBody(url, response.body);
+        return error.ClaudeOAuthRequestFailed;
     }
     return response.takeBody();
 }
 
+fn jsonObjectPayload(alloc: Allocator, value: anytype) ![]u8 {
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    errdefer body.deinit();
+    try std.json.Stringify.value(value, .{}, &body.writer);
+    return body.toOwnedSlice();
+}
+
+fn logRejectedOAuthBody(url: []const u8, body: []const u8) void {
+    var snippet: [160]u8 = undefined;
+    const n = @min(body.len, snippet.len);
+    @memcpy(snippet[0..n], body[0..n]);
+    for (snippet[0..n]) |*byte| {
+        if (byte.* < 0x20 or byte.* == 0x7f) byte.* = ' ';
+    }
+    debug_trace.logf("auth", "Claude OAuth request rejected url={s} body={s}", .{ url, snippet[0..n] });
+}
+
 fn dupeRequiredString(alloc: Allocator, object: std.json.ObjectMap, key: []const u8) ![]u8 {
-    const value = object.get(key) orelse return error.InvalidGrokOAuthResponse;
-    if (value != .string or value.string.len == 0) return error.InvalidGrokOAuthResponse;
+    const value = object.get(key) orelse return error.InvalidClaudeOAuthResponse;
+    if (value != .string or value.string.len == 0) return error.InvalidClaudeOAuthResponse;
     return alloc.dupe(u8, value.string);
 }
 
 fn requiredPositiveInteger(object: std.json.ObjectMap, key: []const u8) !i64 {
-    const value = object.get(key) orelse return error.InvalidGrokOAuthResponse;
-    if (value != .integer or value.integer <= 0) return error.InvalidGrokOAuthResponse;
+    const value = object.get(key) orelse return error.InvalidClaudeOAuthResponse;
+    if (value != .integer or value.integer <= 0) return error.InvalidClaudeOAuthResponse;
     return value.integer;
 }
 
@@ -740,15 +962,16 @@ const BrowserCallback = struct {
 
 fn buildBrowserAuthorizationUrl(
     alloc: Allocator,
-    issuer: []const u8,
+    authorize: []const u8,
     redirect_uri: []const u8,
     code_challenge: []const u8,
     state: []const u8,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    try out.writer.print("{s}/oauth2/authorize?", .{std.mem.trimEnd(u8, issuer, "/")});
+    try out.writer.print("{s}?", .{std.mem.trimEnd(u8, authorize, "/")});
     var form: FormBody = .{};
+    try form.append(&out.writer, "code", "true");
     try form.append(&out.writer, "response_type", "code");
     try form.append(&out.writer, "client_id", client_id);
     try form.append(&out.writer, "redirect_uri", redirect_uri);
@@ -756,8 +979,35 @@ fn buildBrowserAuthorizationUrl(
     try form.append(&out.writer, "code_challenge", code_challenge);
     try form.append(&out.writer, "code_challenge_method", "S256");
     try form.append(&out.writer, "state", state);
-    try form.append(&out.writer, "referrer", "fx");
     return out.toOwnedSlice();
+}
+
+fn parsePastedAuthorizationInput(alloc: Allocator, input: []const u8, expected_state: []const u8) !BrowserCallback {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidClaudeOAuthCallback;
+
+    if (std.mem.find(u8, trimmed, "code=") != null) {
+        const query_start = if (std.mem.findScalar(u8, trimmed, '?')) |index| index + 1 else 0;
+        const query = trimmed[query_start..];
+        const query_only = if (std.mem.findScalar(u8, query, '#')) |index| query[0..index] else query;
+        const code = try queryValueAlloc(alloc, query_only, "code");
+        errdefer secret.zeroAndFree(alloc, code);
+        if (queryValueAlloc(alloc, query_only, "state")) |state| {
+            defer secret.zeroAndFree(alloc, state);
+            if (!std.mem.eql(u8, state, expected_state)) return error.ClaudeOAuthStateMismatch;
+        } else |_| {}
+        return .{ .code = code };
+    }
+
+    if (std.mem.findScalar(u8, trimmed, '#')) |index| {
+        const code_part = trimmed[0..index];
+        const state_part = trimmed[index + 1 ..];
+        if (code_part.len == 0) return error.InvalidClaudeOAuthCallback;
+        if (!std.mem.eql(u8, state_part, expected_state)) return error.ClaudeOAuthStateMismatch;
+        return .{ .code = try alloc.dupe(u8, code_part) };
+    }
+
+    return .{ .code = try alloc.dupe(u8, trimmed) };
 }
 
 fn parseBrowserCallbackTarget(
@@ -767,14 +1017,14 @@ fn parseBrowserCallbackTarget(
 ) !BrowserCallback {
     const prefix = "/callback?";
     if (!std.mem.startsWith(u8, target, prefix) or std.mem.findScalar(u8, target, '#') != null) {
-        return error.InvalidGrokOAuthCallback;
+        return error.InvalidClaudeOAuthCallback;
     }
     const query = target[prefix.len..];
     const code = try queryValueAlloc(alloc, query, "code");
     errdefer secret.zeroAndFree(alloc, code);
     const state = try queryValueAlloc(alloc, query, "state");
     defer secret.zeroAndFree(alloc, state);
-    if (!std.mem.eql(u8, state, expected_state)) return error.GrokOAuthStateMismatch;
+    if (!std.mem.eql(u8, state, expected_state)) return error.ClaudeOAuthStateMismatch;
     return .{ .code = code };
 }
 
@@ -785,7 +1035,7 @@ fn queryValueAlloc(alloc: Allocator, query: []const u8, key: []const u8) ![]u8 {
         if (!std.mem.eql(u8, pair[0..equals], key)) continue;
         return percentDecodeAlloc(alloc, pair[equals + 1 ..]);
     }
-    return error.InvalidGrokOAuthCallback;
+    return error.InvalidClaudeOAuthCallback;
 }
 
 fn percentDecodeAlloc(alloc: Allocator, value: []const u8) ![]u8 {
@@ -795,11 +1045,11 @@ fn percentDecodeAlloc(alloc: Allocator, value: []const u8) ![]u8 {
     var write_index: usize = 0;
     while (read_index < value.len) {
         if (value[read_index] == '%') {
-            if (read_index + 2 >= value.len) return error.InvalidGrokOAuthCallback;
+            if (read_index + 2 >= value.len) return error.InvalidClaudeOAuthCallback;
             const high = std.fmt.charToDigit(value[read_index + 1], 16) catch
-                return error.InvalidGrokOAuthCallback;
+                return error.InvalidClaudeOAuthCallback;
             const low = std.fmt.charToDigit(value[read_index + 2], 16) catch
-                return error.InvalidGrokOAuthCallback;
+                return error.InvalidClaudeOAuthCallback;
             out[write_index] = @as(u8, @intCast(high * 16 + low));
             read_index += 3;
         } else {
@@ -808,7 +1058,7 @@ fn percentDecodeAlloc(alloc: Allocator, value: []const u8) ![]u8 {
         }
         write_index += 1;
     }
-    if (write_index == 0) return error.InvalidGrokOAuthCallback;
+    if (write_index == 0) return error.InvalidClaudeOAuthCallback;
     return alloc.realloc(out, write_index);
 }
 
@@ -842,21 +1092,125 @@ fn writeStdout(text: []const u8) !void {
     try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
 }
 
-test "Grok E2E OAuth endpoint overrides accept only loopback HTTP" {
+test "Claude E2E OAuth endpoint overrides accept only loopback HTTP" {
     try std.testing.expect(isLoopbackHttpUrl("http://127.0.0.1:1234/token"));
     try std.testing.expect(isLoopbackHttpUrl("http://localhost:1234/token"));
     try std.testing.expect(!isLoopbackHttpUrl("https://127.0.0.1:1234/token"));
     try std.testing.expect(!isLoopbackHttpUrl("http://example.com:1234/token"));
 }
 
-test "Grok account identity comes from authenticated userinfo" {
+test "Claude browser authorization URL uses PKCE against the Claude authorize endpoint" {
+    const url = try buildBrowserAuthorizationUrl(
+        std.testing.allocator,
+        "https://claude.ai/oauth/authorize",
+        browser_redirect_uri,
+        "challenge-value",
+        "state-value",
+    );
+    defer std.testing.allocator.free(url);
+
+    try std.testing.expect(std.mem.startsWith(u8, url, "https://claude.ai/oauth/authorize?"));
+    try std.testing.expect(std.mem.find(u8, url, "code=true") != null);
+    try std.testing.expect(std.mem.find(u8, url, "response_type=code") != null);
+    try std.testing.expect(std.mem.find(u8, url, "code_challenge=challenge-value") != null);
+    try std.testing.expect(std.mem.find(u8, url, "code_challenge_method=S256") != null);
+    try std.testing.expect(std.mem.find(u8, url, "state=state-value") != null);
+    try std.testing.expect(std.mem.find(u8, url, "redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback") != null);
+    try std.testing.expect(std.mem.find(u8, url, "127.0.0.1") == null);
+    // Claude Code scopes are user-scoped; the issuer rejects OpenID scopes.
+    try std.testing.expect(std.mem.find(u8, url, "scope=user%3Aprofile") != null);
+    try std.testing.expect(std.mem.find(u8, url, "user%3Ainference") != null);
+    try std.testing.expect(std.mem.find(u8, url, "openid") == null);
+    try std.testing.expect(std.mem.find(u8, url, "email") == null);
+}
+
+test "Claude pasted authorization input accepts code#state and callback URLs" {
+    var from_pair = try parsePastedAuthorizationInput(
+        std.testing.allocator,
+        "  auth-code#state-value\n",
+        "state-value",
+    );
+    defer from_pair.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("auth-code", from_pair.code);
+
+    var from_url = try parsePastedAuthorizationInput(
+        std.testing.allocator,
+        "https://console.anthropic.com/oauth/code/callback?code=auth%20code&state=state-value",
+        "state-value",
+    );
+    defer from_url.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("auth code", from_url.code);
+
+    var from_raw = try parsePastedAuthorizationInput(
+        std.testing.allocator,
+        "raw-code",
+        "state-value",
+    );
+    defer from_raw.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("raw-code", from_raw.code);
+
+    try std.testing.expectError(
+        error.ClaudeOAuthStateMismatch,
+        parsePastedAuthorizationInput(
+            std.testing.allocator,
+            "auth-code#other",
+            "state-value",
+        ),
+    );
+}
+
+test "Claude browser callback requires the exact path and state" {
+    var callback = try parseBrowserCallbackTarget(
+        std.testing.allocator,
+        "/callback?code=auth%20code&state=expected",
+        "expected",
+    );
+    defer callback.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("auth code", callback.code);
+
+    try std.testing.expectError(
+        error.ClaudeOAuthStateMismatch,
+        parseBrowserCallbackTarget(
+            std.testing.allocator,
+            "/callback?code=auth&state=other",
+            "expected",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidClaudeOAuthCallback,
+        parseBrowserCallbackTarget(
+            std.testing.allocator,
+            "/other?code=auth&state=expected",
+            "expected",
+        ),
+    );
+}
+
+test "Claude account identity prefers nested profile uuid and sends oauth headers" {
     const State = struct {
         authorization_seen: bool = false,
+        saw_version: bool = false,
+        saw_beta: bool = false,
 
         fn execute(raw: ?*anyopaque, alloc: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.authorization_seen = std.mem.eql(u8, request.authorization orelse "", "Bearer access-token");
-            return .{ .disposition = .accepted, .body = try alloc.dupe(u8, "{\"sub\":\"acct_test\"}") };
+            for (request.extra_headers) |header| {
+                if (std.mem.eql(u8, header.name, "anthropic-version") and
+                    std.mem.eql(u8, header.value, anthropic_api_version))
+                {
+                    self.saw_version = true;
+                }
+                if (std.mem.eql(u8, header.name, "anthropic-beta") and
+                    std.mem.eql(u8, header.value, oauth_beta))
+                {
+                    self.saw_beta = true;
+                }
+            }
+            return .{
+                .disposition = .accepted,
+                .body = try alloc.dupe(u8, "{\"account\":{\"uuid\":\"acct_test\"},\"organization\":{\"uuid\":\"org_test\"}}"),
+            };
         }
     };
     var state = State{};
@@ -867,36 +1221,79 @@ test "Grok account identity comes from authenticated userinfo" {
     );
     defer std.testing.allocator.free(account_id);
     try std.testing.expect(state.authorization_seen);
+    try std.testing.expect(state.saw_version);
+    try std.testing.expect(state.saw_beta);
     try std.testing.expectEqualStrings("acct_test", account_id);
 }
 
-test "Grok account identity rejects unsafe userinfo bytes" {
+test "Claude account identity accepts OIDC sub when account uuid is absent" {
     const State = struct {
         fn execute(_: ?*anyopaque, alloc: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
-            return .{ .disposition = .accepted, .body = try alloc.dupe(u8, "{\"sub\":\"acct\\ninjected\"}") };
+            return .{ .disposition = .accepted, .body = try alloc.dupe(u8, "{\"sub\":\"acct_oidc\"}") };
         }
     };
-    try std.testing.expectError(
-        error.InvalidGrokUserInfoResponse,
-        fetchAccountId(
-            std.testing.allocator,
-            .{ .execute_fn = State.execute },
-            "access-token",
-        ),
+    const account_id = try fetchAccountId(
+        std.testing.allocator,
+        .{ .execute_fn = State.execute },
+        "access-token",
     );
+    defer std.testing.allocator.free(account_id);
+    try std.testing.expectEqualStrings("acct_oidc", account_id);
 }
 
-test "Grok refresh uses form encoding and accepts omitted token rotation" {
+test "Claude token exchange uses JSON with state and omits API headers" {
+    const State = struct {
+        method: ?oauth_transport.Method = null,
+        payload: [1024]u8 = undefined,
+        payload_len: usize = 0,
+        extra_header_count: usize = 0,
+
+        fn execute(raw: ?*anyopaque, alloc: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const payload = request.payload orelse &.{};
+            self.method = request.method;
+            self.payload_len = @min(payload.len, self.payload.len);
+            @memcpy(self.payload[0..self.payload_len], payload[0..self.payload_len]);
+            self.extra_header_count = request.extra_headers.len;
+            return .{
+                .disposition = .accepted,
+                .body = try alloc.dupe(u8, "{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_in\":3600}"),
+            };
+        }
+    };
+    var state = State{};
+    var token = try exchangeAuthorizationCodeForRedirectWithBounds(
+        std.testing.allocator,
+        .{ .context = &state, .execute_fn = State.execute },
+        "http://127.0.0.1:1/token",
+        "auth-code",
+        "verifier",
+        browser_redirect_uri,
+        "state-value",
+        null,
+        null,
+    );
+    defer token.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(oauth_transport.Method.post_json, state.method.?);
+    try std.testing.expectEqual(@as(usize, 0), state.extra_header_count);
+    const payload = state.payload[0..state.payload_len];
+    try std.testing.expect(std.mem.find(u8, payload, "\"grant_type\":\"authorization_code\"") != null);
+    try std.testing.expect(std.mem.find(u8, payload, "\"code\":\"auth-code\"") != null);
+    try std.testing.expect(std.mem.find(u8, payload, "\"state\":\"state-value\"") != null);
+    try std.testing.expect(std.mem.find(u8, payload, "\"client_id\":\"") != null);
+    try std.testing.expect(std.mem.find(u8, payload, "\"code_verifier\":\"verifier\"") != null);
+    try std.testing.expect(std.mem.find(u8, payload, "grant_type=authorization_code") == null);
+    try std.testing.expectEqualStrings("access", token.access_token);
+}
+
+test "Claude refresh uses JSON" {
     const State = struct {
         method: ?oauth_transport.Method = null,
         payload: [512]u8 = undefined,
         payload_len: usize = 0,
 
-        fn execute(
-            raw: ?*anyopaque,
-            alloc: Allocator,
-            request: oauth_transport.Request,
-        ) !oauth_transport.Response {
+        fn execute(raw: ?*anyopaque, alloc: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             const payload = request.payload orelse &.{};
             self.method = request.method;
@@ -912,59 +1309,28 @@ test "Grok refresh uses form encoding and accepts omitted token rotation" {
     var response = try requestRefreshToken(
         std.testing.allocator,
         .{ .context = &state, .execute_fn = State.execute },
-        "client_id=client&grant_type=refresh_token&refresh_token=refresh",
+        "{\"grant_type\":\"refresh_token\",\"client_id\":\"client\",\"refresh_token\":\"[redacted]\"}",
     );
     defer response.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(oauth_transport.Method.post_form, state.method.?);
-    try std.testing.expect(std.mem.find(u8, state.payload[0..state.payload_len], "grant_type=refresh_token") != null);
+    try std.testing.expectEqual(oauth_transport.Method.post_json, state.method.?);
+    try std.testing.expect(std.mem.find(u8, state.payload[0..state.payload_len], "\"grant_type\":\"refresh_token\"") != null);
     try std.testing.expect(response.refresh_token == null);
     try std.testing.expectEqual(@as(?i64, 3600), response.expires_in);
 }
 
-test "Grok browser authorization URL uses PKCE without device authentication" {
-    const url = try buildBrowserAuthorizationUrl(
-        std.testing.allocator,
-        "https://auth.x.ai",
-        "http://127.0.0.1:1455/callback",
-        "challenge-value",
-        "state-value",
-    );
-    defer std.testing.allocator.free(url);
-
-    try std.testing.expect(std.mem.startsWith(u8, url, "https://auth.x.ai/oauth2/authorize?"));
-    try std.testing.expect(std.mem.find(u8, url, "response_type=code") != null);
-    try std.testing.expect(std.mem.find(u8, url, "code_challenge=challenge-value") != null);
-    try std.testing.expect(std.mem.find(u8, url, "code_challenge_method=S256") != null);
-    try std.testing.expect(std.mem.find(u8, url, "state=state-value") != null);
-    try std.testing.expect(std.mem.find(u8, url, "referrer=fx") != null);
-    try std.testing.expect(std.mem.find(u8, url, "nonce") == null);
-    try std.testing.expect(std.mem.find(u8, url, "device") == null);
-}
-
-test "Grok browser callback requires the exact path and state" {
-    var callback = try parseBrowserCallbackTarget(
-        std.testing.allocator,
-        "/callback?code=auth%20code&state=expected",
-        "expected",
-    );
-    defer callback.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("auth code", callback.code);
-
+test "Claude account identity rejects unsafe userinfo bytes" {
+    const State = struct {
+        fn execute(_: ?*anyopaque, alloc: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
+            return .{ .disposition = .accepted, .body = try alloc.dupe(u8, "{\"account\":{\"uuid\":\"acct\\ninjected\"}}") };
+        }
+    };
     try std.testing.expectError(
-        error.GrokOAuthStateMismatch,
-        parseBrowserCallbackTarget(
+        error.InvalidClaudeUserInfoResponse,
+        fetchAccountId(
             std.testing.allocator,
-            "/callback?code=auth&state=other",
-            "expected",
-        ),
-    );
-    try std.testing.expectError(
-        error.InvalidGrokOAuthCallback,
-        parseBrowserCallbackTarget(
-            std.testing.allocator,
-            "/other?code=auth&state=expected",
-            "expected",
+            .{ .execute_fn = State.execute },
+            "access-token",
         ),
     );
 }

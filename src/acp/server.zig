@@ -371,6 +371,8 @@ pub fn streamProviderFor(
             @import("../core/agent/stream_provider.zig").unavailable_provider,
         .grok => state.cfg.grok_agent_stream orelse
             @import("../core/agent/stream_provider.zig").unavailable_provider,
+        .claude => state.cfg.claude_agent_stream orelse
+            @import("../core/agent/stream_provider.zig").unavailable_provider,
     };
 }
 
@@ -382,6 +384,7 @@ pub fn catalogProviderFor(
         .gateway => state.cfg.gateway_provider.model_catalog,
         .codex => state.cfg.codex_model_catalog,
         .grok => state.cfg.grok_model_catalog,
+        .claude => state.cfg.claude_model_catalog,
     };
 }
 
@@ -1714,6 +1717,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .gateway => settings.model,
                 .codex => settings.codex_model,
                 .grok => settings.grok_model,
+                .claude => settings.claude_model,
             };
             var selected_model = catalog.items[0].id;
             if (saved_model) |saved| {

@@ -58,7 +58,7 @@ fn executeOAuthRequest(
 ) !oauth_transport.Response {
     try checkRequestBounds(request);
     const Header = struct { name: []const u8, value: []const u8 };
-    var header_buf: [2]Header = undefined;
+    var header_buf: [8]Header = undefined;
     var header_count: usize = 0;
     switch (request.method) {
         .get => {},
@@ -73,6 +73,11 @@ fn executeOAuthRequest(
     }
     if (request.authorization) |value| {
         header_buf[header_count] = .{ .name = "authorization", .value = value };
+        header_count += 1;
+    }
+    if (header_count + request.extra_headers.len > header_buf.len) return error.OAuthRequestHeadersTooLarge;
+    for (request.extra_headers) |header| {
+        header_buf[header_count] = .{ .name = header.name, .value = header.value };
         header_count += 1;
     }
     var response = try executeRequest(

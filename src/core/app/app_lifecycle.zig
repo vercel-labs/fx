@@ -3,6 +3,7 @@ const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
+const claude_code_store = @import("../auth/claude_code_store.zig");
 const credentials = @import("../auth/credentials.zig");
 const host = @import("../hosts/host.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
@@ -313,6 +314,9 @@ pub fn loadStartupStatus(
     var detailed = try config_runtime.loadMergedSettingsDetailed(alloc, workspace_root);
     defer detailed.deinit(alloc);
     const settings = &detailed.settings;
+    if (settings.claude_code_tools) |enabled| {
+        claude_code_store.setClaudeCodeToolsFromSettings(enabled);
+    }
 
     const configured_selection = try configuredProviderSelection(default_model, settings);
     const selected_model = try loadStartupStatusModel(alloc, configured_selection.model, null);
@@ -384,6 +388,9 @@ fn loadStartupStateFromOwnedWorkspace(
         try config_runtime.loadMergedSettingsDetailed(alloc, state.workspace_root);
     defer detailed.deinit(alloc);
     const settings = &detailed.settings;
+    if (settings.claude_code_tools) |enabled| {
+        claude_code_store.setClaudeCodeToolsFromSettings(enabled);
+    }
 
     state.workspace_access = try workspace_access.WorkspaceAccess.init(
         alloc,
@@ -1113,6 +1120,7 @@ fn configuredProviderSelection(
         .gateway => settings.model orelse default_model,
         .codex => settings.codex_model orelse return error.CodexModelNotSelected,
         .grok => settings.grok_model orelse return error.GrokModelNotSelected,
+        .claude => settings.claude_model orelse return error.ClaudeModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const chatgpt_oauth = @import("chatgpt_oauth.zig");
+const claude_oauth = @import("claude_oauth.zig");
 const grok_oauth = @import("grok_oauth.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
@@ -22,6 +23,7 @@ pub const CatalogPublicOnly = union(enum) {
     authenticated_credential_rejected: Source,
     chatgpt_subscription,
     grok_subscription,
+    claude_subscription,
 
     fn credentialSource(self: CatalogPublicOnly) ?Source {
         return switch (self) {
@@ -31,6 +33,7 @@ pub const CatalogPublicOnly = union(enum) {
             .authenticated_credential_rejected => |source| source,
             .chatgpt_subscription => .chatgpt_subscription,
             .grok_subscription => .grok_subscription,
+            .claude_subscription => .claude_subscription,
         };
     }
 };
@@ -44,6 +47,7 @@ pub const CatalogAuthenticatedSource = enum {
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+    claude_subscription,
 
     fn credentialSource(self: CatalogAuthenticatedSource) Source {
         return switch (self) {
@@ -53,6 +57,7 @@ pub const CatalogAuthenticatedSource = enum {
             .stored_key => .stored_key,
             .chatgpt_subscription => .chatgpt_subscription,
             .grok_subscription => .grok_subscription,
+            .claude_subscription => .claude_subscription,
         };
     }
 };
@@ -91,7 +96,7 @@ pub const CatalogAccess = union(enum) {
     pub fn publicFallbackAfterRejection(self: CatalogAccess) ?CatalogAccess {
         return switch (self) {
             .public_only => null,
-            .authenticated => |access| if (access.source == .chatgpt_subscription or access.source == .grok_subscription)
+            .authenticated => |access| if (access.source == .chatgpt_subscription or access.source == .grok_subscription or access.source == .claude_subscription)
                 null
             else
                 .{
@@ -168,6 +173,7 @@ pub fn catalogAccessForCredentialAndAccount(
         .stored_key => .stored_key,
         .chatgpt_subscription => .chatgpt_subscription,
         .grok_subscription => .grok_subscription,
+        .claude_subscription => .claude_subscription,
         .fx_login => blk: {
             const team = team_context orelse
                 return .{ .public_only = .fx_login_team_required };
@@ -180,8 +186,8 @@ pub fn catalogAccessForCredentialAndAccount(
         .authenticated = .{
             .source = authenticated_source,
             .credential = credential,
-            .team_context = if (authenticated_source == .chatgpt_subscription or authenticated_source == .grok_subscription) null else team_context,
-            .account_id = if (authenticated_source == .grok_subscription) account_id else null,
+            .team_context = if (authenticated_source == .chatgpt_subscription or authenticated_source == .grok_subscription or authenticated_source == .claude_subscription) null else team_context,
+            .account_id = if (authenticated_source == .grok_subscription or authenticated_source == .claude_subscription) account_id else null,
         },
     };
 }
@@ -202,6 +208,8 @@ pub const missing_chatgpt_credential_message = "fx needs a Codex subscription lo
 pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login and choose Sign in with Codex.";
 pub const missing_grok_credential_message = "fx needs a Grok subscription login for this model. Run fx login grok.";
 pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login and choose Sign in with Grok.";
+pub const missing_claude_credential_message = "fx needs a Claude Code login for this model. Run claude auth login, then fx provider claude.";
+pub const missing_claude_interactive_credential_message = "Claude needs a Claude Code login. Run claude auth login, then choose the Claude provider.";
 pub const unreadable_store_message = "Fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 
 pub const Credential = struct {
@@ -291,6 +299,13 @@ pub fn resolveForProvider(
             };
             return .{ .credential = credential };
         },
+        .claude => {
+            const credential = switch (mode) {
+                .stored => try loadStoredClaudeCredential(alloc),
+                .refresh_if_needed => try loadClaudeCredential(alloc, transport, .if_needed),
+            };
+            return .{ .credential = credential };
+        },
         .gateway => {},
     }
     return resolvePreferring(
@@ -298,7 +313,7 @@ pub fn resolveForProvider(
         transport,
         secret_store,
         mode,
-        if (preferred == .chatgpt_subscription or preferred == .grok_subscription) null else preferred,
+        if (preferred == .chatgpt_subscription or preferred == .grok_subscription or preferred == .claude_subscription) null else preferred,
     );
 }
 
@@ -388,6 +403,10 @@ fn loadPreferredSource(
             .stored => loadStoredGrokCredential(alloc),
             .refresh_if_needed => loadGrokCredential(alloc, transport, .if_needed),
         },
+        .claude_subscription => switch (mode) {
+            .stored => loadStoredClaudeCredential(alloc),
+            .refresh_if_needed => loadClaudeCredential(alloc, transport, .if_needed),
+        },
         else => loadSource(alloc, transport, secret_store, source),
     };
 }
@@ -405,6 +424,7 @@ pub fn loadSource(
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
         .chatgpt_subscription => loadChatGptCredential(alloc, transport, .if_needed),
         .grok_subscription => loadGrokCredential(alloc, transport, .if_needed),
+        .claude_subscription => loadClaudeCredential(alloc, transport, .if_needed),
     };
 }
 
@@ -430,6 +450,7 @@ pub fn sourceExists(
         },
         .chatgpt_subscription => chatgpt_oauth.sourceExists(alloc),
         .grok_subscription => grok_oauth.sourceExists(alloc),
+        .claude_subscription => claude_oauth.sourceExists(alloc),
         .stored_key => blk: {
             if (secret_store.isDisabled()) break :blk false;
             const stored = secret_store.load(alloc) catch |err| switch (err) {
@@ -513,6 +534,29 @@ fn loadStoredGrokCredential(alloc: std.mem.Allocator) !?Credential {
     return loadGrokCredential(alloc, oauth_transport.unavailable_provider, .stored);
 }
 
+fn loadClaudeCredential(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mode: claude_oauth.RefreshMode,
+) !?Credential {
+    var access = (try claude_oauth.loadAccess(alloc, transport, mode)) orelse return null;
+    defer access.deinit(alloc);
+    const token = access.access_token;
+    access.access_token = &.{};
+    const account_id = access.account_id;
+    access.account_id = &.{};
+    return .{
+        .token = token,
+        .source = .claude_subscription,
+        .account_id = account_id,
+        .refresh_after_ms = access.refresh_after_ms,
+    };
+}
+
+fn loadStoredClaudeCredential(alloc: std.mem.Allocator) !?Credential {
+    return loadClaudeCredential(alloc, oauth_transport.unavailable_provider, .stored);
+}
+
 fn nonEmptyEnvValue(name: []const u8) ?[]const u8 {
     return nonEmptyValue(io_mod.getenv(name));
 }
@@ -562,6 +606,13 @@ pub fn refreshGrokCredential(
     transport: oauth_transport.Provider,
 ) !?Credential {
     return loadGrokCredential(alloc, transport, .force);
+}
+
+pub fn refreshClaudeCredential(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+) !?Credential {
+    return loadClaudeCredential(alloc, transport, .force);
 }
 
 fn refreshFxLoginCredentialLocked(
@@ -656,11 +707,12 @@ pub fn sourceLabel(source: Source) []const u8 {
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
         .chatgpt_subscription => "Codex subscription",
         .grok_subscription => "Grok subscription",
+        .claude_subscription => "Claude subscription",
     };
 }
 
 pub fn sourceRefreshable(source: Source) bool {
-    return source == .fx_login or source == .chatgpt_subscription or source == .grok_subscription;
+    return source == .fx_login or source == .chatgpt_subscription or source == .grok_subscription or source == .claude_subscription;
 }
 
 test "stored key label discloses the backend that answered" {

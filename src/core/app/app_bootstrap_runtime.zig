@@ -224,6 +224,11 @@ pub fn Runtime(comptime App: type) type {
                 app.auth.refreshChatGptSourceInventory(app.alloc) catch |err| {
                     debug_trace.logf("auth", "startup ChatGPT inventory refresh failed err={s}", .{@errorName(err)});
                 };
+                if (comptime @hasDecl(@TypeOf(app.auth), "refreshClaudeSourceInventory")) {
+                    app.auth.refreshClaudeSourceInventory(app.alloc) catch |err| {
+                        debug_trace.logf("auth", "startup Claude inventory refresh failed err={s}", .{@errorName(err)});
+                    };
+                }
             } else {
                 app.auth.refreshSourceInventory(app.alloc) catch |err| {
                     debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});

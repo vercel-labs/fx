@@ -39,6 +39,7 @@ pub const Settings = struct {
     provider: ?model_provider.ProviderId = null,
     codex_model: ?[]u8 = null,
     grok_model: ?[]u8 = null,
+    claude_model: ?[]u8 = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     yolo_acknowledged: ?bool = null,
@@ -48,6 +49,7 @@ pub const Settings = struct {
     first_call_tool_choice: ?types.ToolChoice = null,
     context: ?bool = null,
     fast_mode: ?bool = null,
+    claude_code_tools: ?bool = null,
     slash_menu_categories: ?bool = null,
     auto_upgrade: ?bool = null,
     update_channel: ?update_target.Channel = null,
@@ -67,6 +69,7 @@ pub const Settings = struct {
         if (self.model) |value| alloc.free(value);
         if (self.codex_model) |value| alloc.free(value);
         if (self.grok_model) |value| alloc.free(value);
+        if (self.claude_model) |value| alloc.free(value);
         self.permission_rules.deinit(alloc);
         self.* = .{};
     }
@@ -103,6 +106,7 @@ pub const ConfigSources = struct {
     provider: ConfigSource = .compiled_default,
     codex_model: ConfigSource = .compiled_default,
     grok_model: ConfigSource = .compiled_default,
+    claude_model: ConfigSource = .compiled_default,
     permission_mode: ConfigSource = .compiled_default,
     effort: ConfigSource = .compiled_default,
     fast_mode: ConfigSource = .compiled_default,
@@ -536,8 +540,10 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "provider",
         "codex_model",
         "grok_model",
+        "claude_model",
         "effort",
         "fast_mode",
+        "claude_code_tools",
         "slash_menu_categories",
         "startup_scrollback",
         "prompt_history",
@@ -581,6 +587,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.provider != null) sources.provider = source;
     if (settings.codex_model != null) sources.codex_model = source;
     if (settings.grok_model != null) sources.grok_model = source;
+    if (settings.claude_model != null) sources.claude_model = source;
     if (settings.permission_mode != null) sources.permission_mode = source;
     if (settings.effort != null) sources.effort = source;
     if (settings.fast_mode != null) sources.fast_mode = source;
@@ -1281,6 +1288,12 @@ fn parseProfileOnlyFields(
         settings.grok_model = try alloc.dupe(u8, model_value.string);
     }
 
+    if (root.object.get("claude_model")) |model_value| {
+        if (model_value != .string) return error.InvalidClaudeModelType;
+        settings_store.validateModel(model_value.string) catch return error.InvalidClaudeModelValue;
+        settings.claude_model = try alloc.dupe(u8, model_value.string);
+    }
+
     if (root.object.get("permission_mode")) |permission_mode_value| {
         const value = permission_mode_value;
         if (value != .string) return error.InvalidPermissionModeType;
@@ -1317,6 +1330,12 @@ fn parseProfileOnlyFields(
         const value = fast_mode_value;
         if (value != .bool) return error.InvalidFastModeType;
         settings.fast_mode = value.bool;
+    }
+
+    if (root.object.get("claude_code_tools")) |claude_code_tools_value| {
+        const value = claude_code_tools_value;
+        if (value != .bool) return error.InvalidClaudeCodeToolsType;
+        settings.claude_code_tools = value.bool;
     }
 
     if (root.object.get("slash_menu_categories")) |slash_menu_categories_value| {
@@ -1445,6 +1464,11 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
         if (target.grok_model) |current| alloc.free(current);
         target.grok_model = value;
         incoming.grok_model = null;
+    }
+    if (incoming.claude_model) |value| {
+        if (target.claude_model) |current| alloc.free(current);
+        target.claude_model = value;
+        incoming.claude_model = null;
     }
     if (incoming.permission_mode) |value| target.permission_mode = value;
     if (incoming.credential_source) |value| target.credential_source = value;

@@ -15,6 +15,8 @@ pub const Request = struct {
     payload: ?[]const u8 = null,
     /// Optional preformatted Authorization value, borrowed for this request.
     authorization: ?[]const u8 = null,
+    /// Optional extra headers borrowed for this request.
+    extra_headers: []const std.http.Header = &.{},
     cancel_flag: ?*std.atomic.Value(bool) = null,
     deadline: ?std.Io.Clock.Timestamp = null,
 };

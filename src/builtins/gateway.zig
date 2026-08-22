@@ -634,6 +634,7 @@ const OAuthHttpOperation = struct {
                 else
                     .default,
             },
+            .extra_headers = self.request.extra_headers,
             .redirect_behavior = .unhandled,
             .response_writer = &response_writer,
         }) catch |err| switch (err) {

@@ -226,6 +226,8 @@ pub const Config = struct {
     codex_model_catalog: ?model_catalog.Provider = null,
     grok_agent_stream: ?agent_stream_provider.Provider = null,
     grok_model_catalog: ?model_catalog.Provider = null,
+    claude_agent_stream: ?agent_stream_provider.Provider = null,
+    claude_model_catalog: ?model_catalog.Provider = null,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     secret_store: host.SecretStore,
@@ -244,6 +246,7 @@ pub const Config = struct {
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     codex_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     grok_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
+    claude_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
@@ -284,6 +287,10 @@ fn runAskChild(
             .grok = .{
                 .agent_stream_provider = ctx.cfg.grok_agent_stream orelse agent_stream_provider.unavailable_provider,
                 .permission_reviewer_provider = ctx.cfg.grok_permission_reviewer_provider,
+            },
+            .claude = .{
+                .agent_stream_provider = ctx.cfg.claude_agent_stream orelse agent_stream_provider.unavailable_provider,
+                .permission_reviewer_provider = ctx.cfg.claude_permission_reviewer_provider,
             },
         },
         .system_prompt = ctx.cfg.prompt_policy.system_prompt,
@@ -1061,6 +1068,7 @@ const AskContext = struct {
             .gateway => self.cfg.permission_reviewer_provider,
             .codex => self.cfg.codex_permission_reviewer_provider,
             .grok => self.cfg.grok_permission_reviewer_provider,
+            .claude => self.cfg.claude_permission_reviewer_provider,
         } orelse
             return permission_auto_classifier.Classifier.disabled();
         return permission_auto_classifier.Classifier.withProvider(provider, .{
@@ -1079,6 +1087,7 @@ const AskContext = struct {
             .gateway => self.cfg.gateway_provider.agent_stream,
             .codex => self.cfg.codex_agent_stream orelse agent_stream_provider.unavailable_provider,
             .grok => self.cfg.grok_agent_stream orelse agent_stream_provider.unavailable_provider,
+            .claude => self.cfg.claude_agent_stream orelse agent_stream_provider.unavailable_provider,
         };
     }
 
@@ -2005,6 +2014,7 @@ fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8
         ctx.cfg.gateway_provider.model_catalog,
         ctx.cfg.codex_model_catalog,
         ctx.cfg.grok_model_catalog,
+        ctx.cfg.claude_model_catalog,
     ) orelse return model_capabilities.capabilitiesForModel(model);
     return ctx.capability_resolver.resolve(
         ctx.alloc,
@@ -2023,11 +2033,13 @@ fn selectModelCatalog(
     gateway: model_catalog.Provider,
     codex: ?model_catalog.Provider,
     grok: ?model_catalog.Provider,
+    claude: ?model_catalog.Provider,
 ) ?model_catalog.Provider {
     return switch (provider) {
         .gateway => gateway,
         .codex => codex,
         .grok => grok,
+        .claude => claude,
     };
 }
 
@@ -2046,21 +2058,27 @@ test "provider catalog selection never falls back across origins" {
     var grok_tag: u8 = 0;
     var grok = test_builtin_gateway.model_catalog_provider;
     grok.context = &grok_tag;
+    var claude_tag: u8 = 0;
+    var claude = test_builtin_gateway.model_catalog_provider;
+    claude.context = &claude_tag;
     const cases = [_]struct {
         provider: model_provider.ProviderId,
         codex: ?model_catalog.Provider,
         grok: ?model_catalog.Provider,
+        claude: ?model_catalog.Provider,
         expected_context: ?*anyopaque,
     }{
-        .{ .provider = .gateway, .codex = codex, .grok = grok, .expected_context = &gateway_tag },
-        .{ .provider = .codex, .codex = codex, .grok = grok, .expected_context = &codex_tag },
-        .{ .provider = .codex, .codex = null, .grok = grok, .expected_context = null },
-        .{ .provider = .grok, .codex = codex, .grok = grok, .expected_context = &grok_tag },
-        .{ .provider = .grok, .codex = codex, .grok = null, .expected_context = null },
+        .{ .provider = .gateway, .codex = codex, .grok = grok, .claude = claude, .expected_context = &gateway_tag },
+        .{ .provider = .codex, .codex = codex, .grok = grok, .claude = claude, .expected_context = &codex_tag },
+        .{ .provider = .codex, .codex = null, .grok = grok, .claude = claude, .expected_context = null },
+        .{ .provider = .grok, .codex = codex, .grok = grok, .claude = claude, .expected_context = &grok_tag },
+        .{ .provider = .grok, .codex = codex, .grok = null, .claude = claude, .expected_context = null },
+        .{ .provider = .claude, .codex = codex, .grok = grok, .claude = claude, .expected_context = &claude_tag },
+        .{ .provider = .claude, .codex = codex, .grok = grok, .claude = null, .expected_context = null },
     };
 
     for (cases) |case| {
-        const selected = selectModelCatalog(case.provider, gateway, case.codex, case.grok);
+        const selected = selectModelCatalog(case.provider, gateway, case.codex, case.grok, case.claude);
         if (case.expected_context) |expected| {
             try std.testing.expect(selected != null);
             try std.testing.expect(selected.?.context.? == expected);

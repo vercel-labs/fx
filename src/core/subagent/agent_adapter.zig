@@ -40,12 +40,14 @@ pub const ProviderRoutes = struct {
     gateway: ProviderRoute,
     codex: ProviderRoute,
     grok: ProviderRoute,
+    claude: ProviderRoute,
 
     pub fn select(self: ProviderRoutes, provider: model_provider.ProviderId) ProviderRoute {
         return switch (provider) {
             .gateway => self.gateway,
             .codex => self.codex,
             .grok => self.grok,
+            .claude => self.claude,
         };
     }
 };
@@ -54,12 +56,15 @@ test "provider routes select independent streams and reviewers" {
     var gateway_tag: u8 = 0;
     var codex_tag: u8 = 0;
     var grok_tag: u8 = 0;
+    var claude_tag: u8 = 0;
     var gateway_stream = stream_provider.unavailable_provider;
     gateway_stream.context = &gateway_tag;
     var codex_stream = stream_provider.unavailable_provider;
     codex_stream.context = &codex_tag;
     var grok_stream = stream_provider.unavailable_provider;
     grok_stream.context = &grok_tag;
+    var claude_stream = stream_provider.unavailable_provider;
+    claude_stream.context = &claude_tag;
     const Reviewer = struct {
         fn review(
             _: ?*anyopaque,
@@ -73,10 +78,12 @@ test "provider routes select independent streams and reviewers" {
     const gateway_reviewer = auto_classifier.Provider{ .context = &gateway_tag, .review_fn = Reviewer.review };
     const codex_reviewer = auto_classifier.Provider{ .context = &codex_tag, .review_fn = Reviewer.review };
     const grok_reviewer = auto_classifier.Provider{ .context = &grok_tag, .review_fn = Reviewer.review };
+    const claude_reviewer = auto_classifier.Provider{ .context = &claude_tag, .review_fn = Reviewer.review };
     const routes = ProviderRoutes{
         .gateway = .{ .agent_stream_provider = gateway_stream, .permission_reviewer_provider = gateway_reviewer },
         .codex = .{ .agent_stream_provider = codex_stream, .permission_reviewer_provider = codex_reviewer },
         .grok = .{ .agent_stream_provider = grok_stream, .permission_reviewer_provider = grok_reviewer },
+        .claude = .{ .agent_stream_provider = claude_stream, .permission_reviewer_provider = claude_reviewer },
     };
 
     try std.testing.expect(routes.select(.gateway).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));

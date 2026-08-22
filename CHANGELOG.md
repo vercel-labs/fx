@@ -13,6 +13,7 @@
 
 - **Codex subscriptions:** Sign in with an eligible subscription through `fx login codex`, then use authenticated Codex models for interactive sessions, `fx ask`, native ACP, images, subagents, and automatic reviews
 - **Grok subscriptions:** Sign in with an eligible Grok subscription through `fx login grok`, then use authenticated xAI models, effort levels, images, local tools, persistent sessions, and automatic reviews
+- **Claude subscriptions:** Sign in with an eligible Claude subscription through `fx login claude`, then use authenticated Anthropic models through the Messages API for interactive sessions, `fx ask`, native ACP, images, subagents, and automatic reviews
 - **Workspace status line:** Opt in to the active workspace path and Git branch through `/settings`, `/statusline workspace`, or `statusLine.workspace`
 - **fx-native workspace skills:** Discover project skills from `.fx/skills` before other workspace and compatibility roots
 - **External skill authorities:** Allow symlinked skills under explicitly trusted external directories through `FX_SKILL_SYMLINK_AUTHORITIES`

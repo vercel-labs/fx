@@ -353,6 +353,7 @@ pub const SessionPreferencePatch = struct {
                 .gateway => patch.model = self.model,
                 .codex => patch.codex_model = self.model,
                 .grok => patch.grok_model = self.model,
+                .claude => patch.claude_model = self.model,
             }
         } else {
             patch.model = self.model;

@@ -52,6 +52,9 @@ pub const Config = struct {
     grok_agent_stream: ?agent_stream_provider.Provider = null,
     grok_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
     grok_model_catalog: ?model_catalog.Provider = null,
+    claude_agent_stream: ?agent_stream_provider.Provider = null,
+    claude_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
+    claude_model_catalog: ?model_catalog.Provider = null,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     url_opener: host.UrlOpener,
@@ -75,6 +78,7 @@ pub const Config = struct {
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     codex_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     grok_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
+    claude_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
 };
 
 pub fn run(comptime App: type, alloc: Allocator, args: []const [:0]const u8, cfg: Config) !void {
@@ -402,6 +406,9 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .grok_agent_stream = cfg.grok_agent_stream,
         .grok_cli_model_catalog = cfg.grok_cli_model_catalog,
         .grok_model_catalog = cfg.grok_model_catalog,
+        .claude_agent_stream = cfg.claude_agent_stream,
+        .claude_cli_model_catalog = cfg.claude_cli_model_catalog,
+        .claude_model_catalog = cfg.claude_model_catalog,
         .background_process_provider = cfg.background_process_provider,
         .url_opener = cfg.url_opener,
         .secret_store = cfg.secret_store,
@@ -424,6 +431,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .permission_reviewer_provider = cfg.permission_reviewer_provider,
         .codex_permission_reviewer_provider = cfg.codex_permission_reviewer_provider,
         .grok_permission_reviewer_provider = cfg.grok_permission_reviewer_provider,
+        .claude_permission_reviewer_provider = cfg.claude_permission_reviewer_provider,
     };
 }
 

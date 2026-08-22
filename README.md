@@ -47,11 +47,22 @@ fx login grok
 fx
 ```
 
-`fx login codex` and `fx login grok` select that provider and a model from its authenticated catalog. Inside fx, open `/setup` and choose **Switch provider** to move between Gateway, Codex, and Grok. `/model` lists the active provider's fetched models. Subscription model IDs are the raw IDs returned by each authenticated catalog. Use `/logout codex` or `/logout grok` to remove that subscription session without affecting other providers; choosing it again from **Switch provider** starts sign-in.
+Or, if Claude Code is already signed in on this machine, switch to that subscription:
+
+```bash
+fx provider claude
+fx
+```
+
+`fx login codex` and `fx login grok` select that provider and a model from its authenticated catalog. Claude uses the Claude Code login already on the machine (`~/.claude/credentials.json`); `fx login claude` remains a fallback when Claude Code is not signed in. Inside fx, open `/setup` and choose **Switch provider** to move between Gateway, Codex, Grok, and Claude. `/model` lists the active provider's fetched models. Subscription model IDs are the raw IDs returned by each authenticated catalog. Use `/logout codex` or `/logout grok` to remove that subscription session without affecting other providers. `/logout claude` clears only fx's own Claude session; it does not sign Claude Code out.
 
 The OpenAI Codex route uses ChatGPT subscription access directly and never sends its OAuth token to Vercel AI Gateway. The session is stored privately at `~/.fx/chatgpt-auth.json` and refreshed when needed. On supported Codex models, `/fast` requests OpenAI's priority service tier and consumes ChatGPT credits at the higher Fast mode rate.
 
 The Grok route uses subscription access directly at xAI and never sends its OAuth token to Vercel AI Gateway or OpenAI. Its session is stored privately at `~/.fx/grok-auth.json`, refreshed when needed, and used only with the authenticated xAI catalog and Responses API.
+
+The Claude route uses the Claude Code CLI Agent SDK (`claude -p --input-format stream-json --output-format stream-json --include-partial-messages`) and never sends its OAuth token to Vercel AI Gateway, OpenAI, or xAI. Chat runs as a long-lived stdio session against the local `claude` CLI so Max extra usage stays on that login. fx needs the CLI on PATH (`claude auth login`). A separate fx-owned session at `~/.fx/claude-auth.json` is used only as a fallback when Claude Code is not signed in. Catalog listing still uses the authenticated Anthropic models endpoint.
+
+Claude inference uses fx tools by default. User MCP servers from `~/.claude` are not attached. To let Claude Code keep its built-in tools, set `claude_code_tools` to `true` in `~/.fx/settings.json`, export `FX_CLAUDE_CODE_TOOLS=on`, or launch with `fx --claude-tools on`. fx `--tools` still limits the host tool set for every provider.
 
 To use an AI Gateway API key instead:
 
