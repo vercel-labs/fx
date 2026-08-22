@@ -287,6 +287,35 @@ Hosts may provide adapters for runtime state and external effects:
 | `openUrl` | Opens authentication and verification URLs |
 | `workspace` | Provides the constrained browser workspace adapter |
 
+Browser workspace hosts can inject the two launch-time instruction files without
+granting arbitrary filesystem access:
+
+```js
+workspace: {
+  info: {
+    version: 1,
+    root: "/workspace",
+    cwd: "/workspace",
+    home: "/home/visitor",
+    gitAvailable: false,
+    ephemeral: true,
+  },
+  permission: "allow-sandboxed",
+  instructions: {
+    version: 1,
+    global: "...", // optional: treated as <home>/.fx/AGENTS.md
+    project: "...", // optional: treated as <root>/AGENTS.md
+  },
+  exec,
+}
+```
+
+Omitting `global` or `project` means that source is missing. Omitting the
+`instructions` capability reports both sources as unavailable instead of
+silently treating them as absent. Instruction strings must be valid UTF-8 and
+at most 64 MiB each; the normal per-file and total project-instruction context
+limits still control what reaches the model.
+
 ## Security boundaries
 
 `nativeAddon` and `env.FX_GATEWAY_CHAT_URL` are trusted host configuration. Do

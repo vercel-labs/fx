@@ -1,5 +1,6 @@
 const std = @import("std");
 const command_contract = @import("../execution/command_contract.zig");
+const context_limits = @import("../config/context_limits.zig");
 const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
@@ -27,6 +28,13 @@ comptime {
 
 extern "fx" fn fx_workspace_available() i32;
 extern "fx" fn fx_workspace_info(out_ptr: [*]u8, out_cap: usize) i32;
+extern "fx" fn fx_workspace_instructions_available() i32;
+extern "fx" fn fx_workspace_instruction(
+    scope: u32,
+    out_ptr: [*]u8,
+    out_cap: usize,
+    required_len_ptr: *u32,
+) i32;
 extern "fx" fn fx_workspace_exec(
     command_ptr: [*]const u8,
     command_len: usize,
@@ -43,6 +51,19 @@ const ImportedHost = struct {
 
     fn workspaceInfo(out_ptr: [*]u8, out_cap: usize) i32 {
         return fx_workspace_info(out_ptr, out_cap);
+    }
+
+    fn workspaceInstructionsAvailable() i32 {
+        return fx_workspace_instructions_available();
+    }
+
+    fn workspaceInstruction(
+        scope: u32,
+        out_ptr: [*]u8,
+        out_cap: usize,
+        required_len_ptr: *u32,
+    ) i32 {
+        return fx_workspace_instruction(scope, out_ptr, out_cap, required_len_ptr);
     }
 
     fn workspaceExec(
@@ -95,6 +116,38 @@ pub const Executor = struct {
 pub const Permission = enum {
     allow_sandboxed,
     prompt,
+};
+
+pub const InstructionBody = struct {
+    storage: []u8,
+    text: []const u8,
+    observed_bytes: usize,
+};
+
+pub const Instruction = union(enum) {
+    missing,
+    blank,
+    body: InstructionBody,
+
+    fn deinit(self: *Instruction, alloc: Allocator) void {
+        switch (self.*) {
+            .missing, .blank => {},
+            .body => |body| alloc.free(body.storage),
+        }
+        self.* = .missing;
+    }
+};
+
+pub const InstructionSnapshot = struct {
+    available: bool = false,
+    global: Instruction = .missing,
+    project: Instruction = .missing,
+
+    pub fn deinit(self: *InstructionSnapshot, alloc: Allocator) void {
+        self.global.deinit(alloc);
+        self.project.deinit(alloc);
+        self.* = .{};
+    }
 };
 
 const PathSpan = struct {
@@ -160,6 +213,64 @@ pub fn Adapter(comptime Host: type) type {
                 1 => loadAvailableInfo(alloc),
                 else => error.InvalidContract,
             };
+        }
+
+        pub fn loadInstructions(alloc: Allocator, max_body_bytes: usize) !InstructionSnapshot {
+            return switch (Host.workspaceInstructionsAvailable()) {
+                0 => .{},
+                1 => loadAvailableInstructions(alloc, max_body_bytes),
+                else => error.InvalidContract,
+            };
+        }
+
+        fn loadAvailableInstructions(alloc: Allocator, max_body_bytes: usize) !InstructionSnapshot {
+            if (max_body_bytes > context_limits.emergency_ceiling_bytes) return error.InvalidContract;
+            var snapshot = InstructionSnapshot{ .available = true };
+            errdefer snapshot.deinit(alloc);
+            snapshot.global = try loadInstruction(alloc, 0, max_body_bytes);
+            snapshot.project = try loadInstruction(alloc, 1, max_body_bytes);
+            return snapshot;
+        }
+
+        fn loadInstruction(alloc: Allocator, scope: u32, max_body_bytes: usize) !Instruction {
+            var probe: [1]u8 = undefined;
+            var required_raw: u32 = 0;
+            const probe_result = Host.workspaceInstruction(
+                scope,
+                &probe,
+                0,
+                &required_raw,
+            );
+            if (probe_result == -2) return .missing;
+            if (probe_result == -5) return .blank;
+            if (probe_result != 0) return error.InvalidContract;
+
+            const required: usize = required_raw;
+            if (required > context_limits.emergency_ceiling_bytes) return error.InvalidContract;
+            const capacity = @min(
+                required,
+                @min(max_body_bytes +| 3, context_limits.emergency_ceiling_bytes),
+            );
+            const storage = try alloc.alloc(u8, capacity);
+            errdefer alloc.free(storage);
+            var confirmed_raw: u32 = 0;
+            const result = Host.workspaceInstruction(
+                scope,
+                storage.ptr,
+                storage.len,
+                &confirmed_raw,
+            );
+            if (result < 0 or confirmed_raw != required_raw) return error.InvalidContract;
+            const copied: usize = @intCast(result);
+            if (copied > storage.len or
+                (required <= storage.len and copied != required) or
+                (required > storage.len and copied + 3 < storage.len) or
+                !std.unicode.utf8ValidateSlice(storage[0..copied])) return error.InvalidContract;
+            return .{ .body = .{
+                .storage = storage,
+                .text = storage[0..copied],
+                .observed_bytes = required,
+            } };
         }
 
         fn loadAvailableInfo(alloc: Allocator) !Info {
@@ -320,6 +431,14 @@ pub fn HostRuntime(comptime Host: type) type {
 
 pub const Runtime = HostRuntime(ImportedHost);
 
+pub fn loadImportedInfo(alloc: Allocator) !Info {
+    return Adapter(ImportedHost).loadInfo(alloc);
+}
+
+pub fn loadImportedInstructions(alloc: Allocator, max_body_bytes: usize) !InstructionSnapshot {
+    return Adapter(ImportedHost).loadInstructions(alloc, max_body_bytes);
+}
+
 fn checkedOutputSlice(output: []const u8, offset_raw: u32, len_raw: u32) ![]const u8 {
     const offset: usize = offset_raw;
     const len: usize = len_raw;
@@ -418,6 +537,111 @@ test "workspace runtime keeps one validated metadata and executor snapshot" {
     try std.testing.expect(runtime.available());
     try std.testing.expectEqualStrings("/workspace", runtime.info().?.root());
     try std.testing.expect(runtime.executor() != null);
+}
+
+const FakeInstructionHost = struct {
+    var available_result: i32 = 1;
+    var global: ?[]const u8 = "GLOBAL-RULE";
+    var project: ?[]const u8 = "PROJECT-RULE";
+
+    fn workspaceInstructionsAvailable() i32 {
+        return available_result;
+    }
+
+    fn workspaceInstruction(
+        scope: u32,
+        out_ptr: [*]u8,
+        out_cap: usize,
+        required_len_ptr: *u32,
+    ) i32 {
+        const value = switch (scope) {
+            0 => global,
+            1 => project,
+            else => return -4,
+        } orelse return -2;
+        required_len_ptr.* = @intCast(value.len);
+        if (std.mem.trim(u8, value, " \t\r\n").len == 0) return -5;
+        const copied = @min(value.len, out_cap);
+        @memcpy(out_ptr[0..copied], value[0..copied]);
+        return @intCast(copied);
+    }
+};
+
+test "workspace instructions accept a bounded optional v1 snapshot" {
+    FakeInstructionHost.available_result = 1;
+    FakeInstructionHost.global = "GLOBAL-RULE";
+    FakeInstructionHost.project = "PROJECT-RULE";
+    var snapshot = try Adapter(FakeInstructionHost).loadInstructions(std.testing.allocator, 64 * 1024);
+    defer snapshot.deinit(std.testing.allocator);
+
+    try std.testing.expect(snapshot.available);
+    switch (snapshot.global) {
+        .body => |body| {
+            try std.testing.expectEqualStrings("GLOBAL-RULE", body.text);
+            try std.testing.expectEqual(@as(usize, 11), body.observed_bytes);
+        },
+        .missing, .blank => return error.TestExpectedEqual,
+    }
+    switch (snapshot.project) {
+        .body => |body| try std.testing.expectEqualStrings("PROJECT-RULE", body.text),
+        .missing, .blank => return error.TestExpectedEqual,
+    }
+}
+
+test "workspace instructions bound copied bodies while retaining observed bytes" {
+    FakeInstructionHost.available_result = 1;
+    FakeInstructionHost.global = "GLOBAL-RULE";
+    FakeInstructionHost.project = null;
+    defer FakeInstructionHost.project = "PROJECT-RULE";
+    var snapshot = try Adapter(FakeInstructionHost).loadInstructions(std.testing.allocator, 6);
+    defer snapshot.deinit(std.testing.allocator);
+
+    switch (snapshot.global) {
+        .body => |body| {
+            try std.testing.expectEqualStrings("GLOBAL-RU", body.text);
+            try std.testing.expectEqual(@as(usize, 9), body.storage.len);
+            try std.testing.expectEqual(@as(usize, 11), body.observed_bytes);
+        },
+        .missing, .blank => return error.TestExpectedEqual,
+    }
+    try std.testing.expect(snapshot.project == .missing);
+}
+
+test "workspace instructions distinguish an absent capability and missing source" {
+    FakeInstructionHost.available_result = 0;
+    var unavailable = try Adapter(FakeInstructionHost).loadInstructions(std.testing.allocator, 64 * 1024);
+    defer unavailable.deinit(std.testing.allocator);
+    try std.testing.expect(!unavailable.available);
+
+    FakeInstructionHost.available_result = 1;
+    FakeInstructionHost.global = null;
+    FakeInstructionHost.project = "PROJECT-RULE";
+    defer {
+        FakeInstructionHost.global = "GLOBAL-RULE";
+        FakeInstructionHost.project = "PROJECT-RULE";
+    }
+    var partial = try Adapter(FakeInstructionHost).loadInstructions(std.testing.allocator, 64 * 1024);
+    defer partial.deinit(std.testing.allocator);
+    try std.testing.expect(partial.available);
+    try std.testing.expect(partial.global == .missing);
+    switch (partial.project) {
+        .body => |body| try std.testing.expectEqualStrings("PROJECT-RULE", body.text),
+        .missing, .blank => return error.TestExpectedEqual,
+    }
+}
+
+test "workspace instructions distinguish blank and missing sources" {
+    FakeInstructionHost.available_result = 1;
+    FakeInstructionHost.global = " \t\r\n";
+    FakeInstructionHost.project = null;
+    defer {
+        FakeInstructionHost.global = "GLOBAL-RULE";
+        FakeInstructionHost.project = "PROJECT-RULE";
+    }
+    var snapshot = try Adapter(FakeInstructionHost).loadInstructions(std.testing.allocator, 64 * 1024);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expect(snapshot.global == .blank);
+    try std.testing.expect(snapshot.project == .missing);
 }
 
 test "workspace info rejects invalid host contracts and stable error codes" {

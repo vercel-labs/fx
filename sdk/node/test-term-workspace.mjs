@@ -23,6 +23,7 @@ const execCalls = [];
 let abortStarted = false;
 let abortObserved = false;
 let checkedToolProjection = false;
+let checkedInstructions = false;
 const truncatedOutput = `start\n${"🙂".repeat(17_000)}\nend\n`;
 const truncatedBytes = encoder.encode(truncatedOutput).length;
 
@@ -36,6 +37,11 @@ const workspace = {
     ephemeral: true,
   },
   permission: "allow-sandboxed",
+  instructions: {
+    version: 1,
+    global: "TERM-GLOBAL-INSTRUCTION",
+    project: "TERM-PROJECT-INSTRUCTION",
+  },
   exec({ command, cwd, signal, timeoutMs, outputLimitBytes }) {
     execCalls.push(command);
     if (cwd !== "/workspace" || timeoutMs !== 30_000 || outputLimitBytes !== 65_536) {
@@ -150,6 +156,18 @@ const fetch = async (_url, init = {}) => {
     return new Response(JSON.stringify(catalog), { status: 200, headers: { "content-type": "application/json" } });
   }
   const body = JSON.parse(requestDecoder.decode(init.body));
+  if (!checkedInstructions) {
+    const serializedPrompt = JSON.stringify(body.prompt || body.messages);
+    const globalIndex = serializedPrompt.indexOf("TERM-GLOBAL-INSTRUCTION");
+    const projectIndex = serializedPrompt.indexOf("TERM-PROJECT-INSTRUCTION");
+    if (globalIndex < 0 || projectIndex < 0 || globalIndex >= projectIndex) {
+      throw new Error(`workspace instructions were absent or out of precedence order: ${serializedPrompt}`);
+    }
+    for (const source of ["/home/visitor/.fx/AGENTS.md", "/workspace/AGENTS.md"]) {
+      if (!serializedPrompt.includes(source)) throw new Error(`workspace instruction provenance omitted ${source}`);
+    }
+    checkedInstructions = true;
+  }
   if (!checkedToolProjection) {
     if (body.tools?.length !== 1 || body.tools[0]?.name !== "terminal") {
       throw new Error(`workspace advertised unexpected tools: ${JSON.stringify(body.tools)}`);
@@ -258,7 +276,8 @@ const exitCode = await Promise.race([
 ]);
 if (exitCode !== 0) throw new Error(`fx-term exited with ${exitCode}`);
 if (!checkedToolProjection) throw new Error("workspace tool projection was not checked");
+if (!checkedInstructions) throw new Error("workspace instructions were not checked");
 if (execCalls.join(",") !== "printf adapter-success,generate-truncated-output,timeout-command,hold-command") {
   throw new Error(`unexpected workspace exec calls: ${execCalls.join(",")}`);
 }
-console.log("headless workspace passed: success, truncation, timeout, Ctrl-C abort, and strict invalid boundaries mapped through the host adapter");
+console.log("headless workspace passed: instructions, success, truncation, timeout, Ctrl-C abort, and strict invalid boundaries mapped through the host adapter");

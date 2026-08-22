@@ -2,6 +2,7 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const strictDecoder = new TextDecoder("utf-8", { fatal: true });
 const workspaceInfoLimit = 4 * 1024;
+const workspaceInstructionLimit = 64 * 1024 * 1024;
 const workspaceCommandLimit = 64 * 1024;
 const workspaceOutputLimit = 64 * 1024;
 const streamReadsPerTaskYield = 32;
@@ -35,12 +36,40 @@ function prepareWorkspaceAdapter(workspace) {
       ephemeral: true,
       permission,
     };
+    const instructions = prepareWorkspaceInstructions(workspace.instructions);
+    if (!instructions.valid) return { present: true, valid: false };
     const encoded = encoder.encode(JSON.stringify(value));
     if (encoded.length > workspaceInfoLimit) return { present: true, valid: false };
-    return { present: true, valid: true, adapter: workspace, info: value, encoded };
+    return { present: true, valid: true, adapter: workspace, info: value, encoded, instructions };
   } catch {
     return { present: true, valid: false };
   }
+}
+
+function prepareWorkspaceInstructions(value) {
+  if (value === undefined) return { present: false, valid: true };
+  if (!value || typeof value !== "object" || value.version !== 1) {
+    return { present: true, valid: false };
+  }
+  const keys = Object.keys(value);
+  if (keys.some((key) => key !== "version" && key !== "global" && key !== "project")) {
+    return { present: true, valid: false };
+  }
+  const prepared = { present: true, valid: true, global: null, project: null };
+  for (const scope of ["global", "project"]) {
+    const content = value[scope];
+    if (content === undefined || content === null) continue;
+    if (typeof content !== "string") return { present: true, valid: false };
+    const encoded = encoder.encode(content);
+    if (encoded.length > workspaceInstructionLimit || strictDecoder.decode(encoded) !== content) {
+      return { present: true, valid: false };
+    }
+    prepared[scope] = {
+      encoded,
+      blank: encoded.every((byte) => byte === 0x09 || byte === 0x0a || byte === 0x0d || byte === 0x20),
+    };
+  }
+  return prepared;
 }
 
 function utf8Prefix(value, limit) {
@@ -625,6 +654,27 @@ function createRuntime(options) {
     return workspace.encoded.length;
   }
 
+  function workspaceInstructionsAvailable() {
+    if (!workspace.present) return 0;
+    if (!workspace.valid) return -1;
+    return workspace.instructions.present ? 1 : 0;
+  }
+
+  function workspaceInstruction(scope, outPtr, outCap, requiredLenPtr) {
+    if (!workspace.present || !workspace.instructions?.present) return -2;
+    if (!workspace.valid) return -4;
+    const output = checkedBytes(outPtr, outCap);
+    const required = checkedBytes(requiredLenPtr, 4);
+    if (!output || !required || (scope !== 0 && scope !== 1)) return -4;
+    const instruction = scope === 0 ? workspace.instructions.global : workspace.instructions.project;
+    new DataView(memory().buffer).setUint32(requiredLenPtr, instruction?.encoded.length || 0, true);
+    if (instruction === null) return -2;
+    if (instruction.blank) return -5;
+    const copied = utf8Prefix(instruction.encoded, outCap);
+    output.set(copied);
+    return copied.length;
+  }
+
   function workspaceExec(commandPtr, commandLen, timeoutMs, outputPtr, outputCap, resultPtr) {
     if (!workspace.present) return Promise.resolve(-2);
     if (!workspace.valid) return Promise.resolve(-4);
@@ -768,6 +818,8 @@ function createRuntime(options) {
     fx_prompt_history_available() { return options.promptHistoryStore ? 1 : 0; },
     fx_workspace_available() { return workspace.present ? 1 : 0; },
     fx_workspace_info: workspaceInfo,
+    fx_workspace_instructions_available: workspaceInstructionsAvailable,
+    fx_workspace_instruction: workspaceInstruction,
     fx_workspace_exec: new WebAssembly.Suspending(workspaceExec),
     fx_http_stream_open: streamOpen,
     fx_http_stream_status: new WebAssembly.Suspending(streamStatus),
