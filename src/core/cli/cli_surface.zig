@@ -35,6 +35,7 @@ const prompt_policy = @import("../config/prompt_policy.zig");
 const session_store = @import("../session/session_store.zig");
 const usage_report = @import("../session/usage_report.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const test_builtin_gateway = if (builtin.is_test)
@@ -48,6 +49,7 @@ const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
+const worktree_commands = @import("../workspace/worktree_commands.zig");
 const usage_cli_runtime = @import("usage_cli_runtime.zig");
 
 const Allocator = std.mem.Allocator;
@@ -78,6 +80,7 @@ pub const Command = union(enum) {
     usage: []const [:0]const u8,
     upgrade: []const [:0]const u8,
     replay: []const [:0]const u8,
+    worktree: []const [:0]const u8,
     workspace: []const [:0]const u8,
     unknown: []const u8,
 };
@@ -511,6 +514,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             if (command_specs.matchesTopLevel(command_catalog, command, .upgrade)) return .{ .upgrade = args[1..] };
         },
         'w' => {
+            if (command_specs.matchesTopLevel(command_catalog, command, .worktree)) return .{ .worktree = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .workspace)) return .{ .workspace = args[1..] };
         },
         else => {},
@@ -1512,6 +1516,43 @@ fn runNonInteractiveWithDeps(
             try writeFormattedOutput(deps, text, opts.format);
             return .handled_success;
         },
+        .worktree => |rest| {
+            const parsed = worktree_commands.parse(rest) catch |err| {
+                try writeWorktreeCommandError(alloc, cfg.command_catalog, deps, rest, err);
+                return .handled_failure;
+            };
+            var outcome = worktree_commands.execute(alloc, parsed.action) catch |err| {
+                try writeWorktreeCommandError(alloc, cfg.command_catalog, deps, rest, err);
+                return .handled_failure;
+            };
+            defer outcome.deinit(alloc);
+
+            switch (outcome) {
+                .failure => |failure| {
+                    try writeWorktreeFailure(alloc, deps, failure, if (parsed.json) .json else .text);
+                    return .handled_failure;
+                },
+                .ready => |ready| {
+                    const format: output_contracts.OutputFormat = if (parsed.json) .json else .text;
+                    const text = try (output_contracts.WorktreeSnapshot{
+                        .snapshot = &ready.snapshot,
+                    }).render(alloc, format);
+                    defer alloc.free(text);
+                    try writeFormattedOutput(deps, text, format);
+                    if (ready.launch) |launch| {
+                        const launched = launchWorktreeSession(alloc, deps, launch) catch |err| {
+                            var message: std.Io.Writer.Allocating = .init(alloc);
+                            defer message.deinit();
+                            try message.writer.print("fx worktree: could not start fx in the selected worktree ({s})\n", .{@errorName(err)});
+                            try writeStderr(deps, message.written());
+                            return .handled_failure;
+                        };
+                        if (!launched) return .handled_failure;
+                    }
+                    return .handled_success;
+                },
+            }
+        },
         .workspace => |rest| {
             const opts = parseWorkspaceArgs(rest) catch |err| {
                 try writeWorkspaceCommandError(alloc, cfg.command_catalog, deps, rest, err);
@@ -2176,6 +2217,77 @@ fn writeWorkspaceCommandError(
     try std.json.Stringify.value(@errorName(err), .{}, &out.writer);
     try out.writer.writeByte('}');
     try writeJsonLine(deps, out.writer.buffered());
+}
+
+fn writeWorktreeCommandError(
+    alloc: Allocator,
+    command_catalog: CommandCatalog,
+    deps: RunDeps,
+    args: []const [:0]const u8,
+    err: anyerror,
+) !void {
+    const message = worktree_commands.parseErrorMessage(err) orelse "worktree command failed";
+    if (!argsContainJson(args)) {
+        try writeStderr(deps, "fx worktree: ");
+        try writeStderr(deps, message);
+        try writeStderr(deps, "\n");
+        try writeTopLevelUsage(command_catalog, deps, .worktree);
+        return;
+    }
+
+    const text = try (output_contracts.CommandFailureSnapshot{
+        .kind = "worktree",
+        .message = message,
+        .code = @errorName(err),
+    }).renderJson(alloc);
+    defer alloc.free(text);
+    try writeJsonLine(deps, text);
+}
+
+fn writeWorktreeFailure(
+    alloc: Allocator,
+    deps: RunDeps,
+    failure: worktree_commands.Failure,
+    format: output_contracts.OutputFormat,
+) !void {
+    if (format == .text) {
+        try writeStderr(deps, "fx worktree: ");
+        var safe = try text_utils.encodeTerminalSafe(alloc, failure.message, std.math.maxInt(usize));
+        defer safe.deinit(alloc);
+        try writeStderr(deps, safe.bytes);
+        try writeStderr(deps, "\n");
+        return;
+    }
+    const text = try (output_contracts.CommandFailureSnapshot{
+        .kind = "worktree",
+        .message = failure.message,
+        .code = @tagName(failure.code),
+    }).renderJson(alloc);
+    defer alloc.free(text);
+    try writeJsonLine(deps, text);
+}
+
+fn launchWorktreeSession(
+    alloc: Allocator,
+    deps: RunDeps,
+    launch: worktree_commands.Launch,
+) !bool {
+    const executable = try deps.self_exe_path(deps.self_exe_ctx, alloc);
+    defer alloc.free(executable);
+    const argv = [_][]const u8{ executable, "--resume" };
+    const launch_argv = argv[0..if (launch.resume_session) 2 else 1];
+    var child = try std.process.spawn(io_mod.getIo(), .{
+        .argv = launch_argv,
+        .cwd = .{ .path = launch.path },
+    });
+    var child_owned = true;
+    errdefer if (child_owned) child.kill(io_mod.getIo());
+    const term = try child.wait(io_mod.getIo());
+    child_owned = false;
+    return switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
 }
 
 fn writeWorkspaceIndeterminateError(
@@ -3545,6 +3657,14 @@ test "parse recognizes every top-level command and preserves unknown commands" {
     }
     switch (parse(command_catalog, &.{ @constCast("replay"), @constCast("tape") })) {
         .replay => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(command_catalog, &.{ @constCast("worktree"), @constCast("list") })) {
+        .worktree => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(command_catalog, &.{ @constCast("workspace"), @constCast("list") })) {
+        .workspace => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{@constCast("wat")})) {

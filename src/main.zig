@@ -3130,7 +3130,9 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "status") or
         std.mem.eql(u8, command, "doctor") or
         std.mem.eql(u8, command, "models") or
-        std.mem.eql(u8, command, "credits");
+        std.mem.eql(u8, command, "credits") or
+        // Worktree commands invoke Git and need PATH plus the inherited environment.
+        std.mem.eql(u8, command, "worktree");
 }
 
 test "auth and upgrade commands use early threaded io without full entry config" {
@@ -3150,6 +3152,10 @@ test "credential-reading commands use early threaded io without full entry confi
         try std.testing.expect(!needsFullEntryConfig(args));
         try std.testing.expect(needsEarlyThreadedIo(args));
     }
+}
+
+test "worktree commands initialize subprocess io" {
+    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "worktree")}));
 }
 
 test "early threaded io is resolved after global launch args" {

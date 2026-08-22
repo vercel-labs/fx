@@ -4937,3 +4937,153 @@ describe("cli: workspace access", () => {
     30_000,
   );
 });
+
+describe("cli: git worktrees", () => {
+  test(
+    "creates, identifies, and safely removes linked worktrees",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-worktree-cli-"));
+      const repository = join(root, "repository");
+      const linked = join(root, "feature-demo");
+
+      const git = (args: string[], cwd = repository) => {
+        const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+        if (result.status !== 0) {
+          throw new Error(
+            `git ${args.join(" ")} failed: ${result.stderr || result.stdout}`,
+          );
+        }
+        return result;
+      };
+
+      try {
+        mkdirSync(repository);
+        git(["init"]);
+        git(["config", "user.name", "Fx Worktree Test"]);
+        git(["config", "user.email", "fx-worktree@example.invalid"]);
+        writeFileSync(join(repository, "README.md"), "worktree fixture\n");
+        git(["add", "README.md"]);
+        git(["commit", "-m", "fixture"]);
+        git(["branch", "-M", "main"]);
+        const repositoryRoot = realpathSync(repository);
+
+        const initial = await runFx(["worktree", "list", "--json"], {
+          cwd: repositoryRoot,
+          env: NO_GATEWAY_AUTH,
+        });
+        expect(initial.code).toBe(0);
+        expect(JSON.parse(initial.stdout.trim())).toMatchObject({
+          kind: "worktree",
+          action: "list",
+          repository_root: repositoryRoot,
+          current_worktree: repositoryRoot,
+          worktrees: [
+            {
+              path: repositoryRoot,
+              branch: "main",
+              primary: true,
+              current: true,
+            },
+          ],
+        });
+
+        const created = await runFx(
+          [
+            "worktree",
+            "create",
+            "feature/demo",
+            linked,
+            "--base",
+            "HEAD",
+            "--json",
+          ],
+          { cwd: repositoryRoot, env: NO_GATEWAY_AUTH },
+        );
+        expect(created.code).toBe(0);
+        const linkedRoot = realpathSync(linked);
+        expect(JSON.parse(created.stdout.trim())).toMatchObject({
+          kind: "worktree",
+          action: "create",
+          changed: true,
+          path: linkedRoot,
+          branch: "feature/demo",
+          launch: null,
+        });
+
+        const selected = await runFx(["worktree", "status", "--json"], {
+          cwd: linkedRoot,
+          env: NO_GATEWAY_AUTH,
+        });
+        expect(selected.code).toBe(0);
+        const selectedJson = JSON.parse(selected.stdout.trim());
+        expect(selectedJson.repository_root).toBe(repositoryRoot);
+        expect(selectedJson.current_worktree).toBe(linkedRoot);
+        expect(selectedJson.worktrees).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              path: linkedRoot,
+              branch: "feature/demo",
+              primary: false,
+              current: true,
+            }),
+          ]),
+        );
+
+        const currentRemoval = await runFx(
+          ["worktree", "remove", "feature/demo", "--confirm", "--json"],
+          { cwd: linkedRoot, env: NO_GATEWAY_AUTH },
+        );
+        expect(currentRemoval.code).toBe(1);
+        expect(JSON.parse(currentRemoval.stdout.trim())).toMatchObject({
+          kind: "worktree",
+          code: "current_worktree",
+        });
+
+        const unconfirmed = await runFx(
+          ["worktree", "remove", "feature/demo", "--json"],
+          { cwd: repositoryRoot, env: NO_GATEWAY_AUTH },
+        );
+        expect(unconfirmed.code).toBe(1);
+        expect(JSON.parse(unconfirmed.stdout.trim())).toMatchObject({
+          kind: "worktree",
+          code: "WorktreeRemovalRequiresConfirmation",
+        });
+        expect(existsSync(linkedRoot)).toBe(true);
+
+        const primaryRemoval = await runFx(
+          ["worktree", "remove", repositoryRoot, "--confirm", "--json"],
+          { cwd: repositoryRoot, env: NO_GATEWAY_AUTH },
+        );
+        expect(primaryRemoval.code).toBe(1);
+        expect(JSON.parse(primaryRemoval.stdout.trim())).toMatchObject({
+          kind: "worktree",
+          code: "primary_worktree",
+        });
+
+        const removed = await runFx(
+          ["worktree", "remove", "feature/demo", "--confirm", "--json"],
+          { cwd: repositoryRoot, env: NO_GATEWAY_AUTH },
+        );
+        expect(removed.code).toBe(0);
+        expect(JSON.parse(removed.stdout.trim())).toMatchObject({
+          kind: "worktree",
+          action: "remove",
+          changed: true,
+          path: linkedRoot,
+          branch: "feature/demo",
+        });
+        expect(existsSync(linkedRoot)).toBe(false);
+        expect(
+          spawnSync(
+            "git",
+            ["show-ref", "--verify", "--quiet", "refs/heads/feature/demo"],
+            { cwd: repositoryRoot },
+          ).status,
+        ).toBe(0);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+});

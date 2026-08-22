@@ -13,6 +13,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
+const worktree_commands = @import("../workspace/worktree_commands.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -348,6 +349,137 @@ pub const WorkspaceSnapshot = struct {
                 entry.available,
                 entry.active,
             });
+        }
+        try out.writer.writeAll("]}");
+        return try out.toOwnedSlice();
+    }
+};
+
+pub const WorktreeSnapshot = struct {
+    snapshot: *const worktree_commands.Snapshot,
+
+    pub fn render(self: WorktreeSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    pub fn renderText(self: WorktreeSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+
+        if (self.snapshot.mutation) |mutation| {
+            try out.writer.print("[worktree] action={s} changed={}", .{ @tagName(mutation.action), mutation.changed });
+            if (mutation.branch) |branch| {
+                try out.writer.writeAll(" branch=");
+                try writeTerminalSafe(&out.writer, alloc, branch);
+            }
+            try out.writer.writeAll(" path=");
+            try writeTerminalSafe(&out.writer, alloc, mutation.path);
+            if (mutation.launch_resume) |resume_session| {
+                try out.writer.print(" launch={s}", .{if (resume_session) "resume" else "new"});
+            }
+            try out.writer.writeByte('\n');
+        }
+        try out.writer.writeAll("[worktree] repository=");
+        try writeTerminalSafe(&out.writer, alloc, self.snapshot.repository_root);
+        try out.writer.writeByte('\n');
+        try out.writer.writeAll("[worktree] current=");
+        try writeTerminalSafe(&out.writer, alloc, self.snapshot.current_worktree);
+        try out.writer.writeAll("\n[worktree] worktrees:\n");
+        for (self.snapshot.worktrees.items) |entry| {
+            try out.writer.writeAll(if (entry.current) " * " else "   ");
+            if (entry.branch) |branch| {
+                try writeTerminalSafe(&out.writer, alloc, branch);
+            } else if (entry.detached) {
+                try out.writer.writeAll("(detached)");
+            } else {
+                try out.writer.writeAll("(no branch)");
+            }
+            try out.writer.writeAll("  ");
+            try writeTerminalSafe(&out.writer, alloc, entry.path);
+            if (entry.head.len > 0) {
+                try out.writer.writeAll("  ");
+                try writeTerminalSafe(&out.writer, alloc, entry.head[0..@min(entry.head.len, 12)]);
+            }
+            if (entry.primary) try out.writer.writeAll("  [primary]");
+            if (entry.bare) try out.writer.writeAll("  [bare]");
+            if (entry.locked_reason) |reason| {
+                try out.writer.writeAll("  [locked: ");
+                try writeTerminalSafe(&out.writer, alloc, reason);
+                try out.writer.writeByte(']');
+            }
+            if (entry.prunable_reason) |reason| {
+                try out.writer.writeAll("  [prunable: ");
+                try writeTerminalSafe(&out.writer, alloc, reason);
+                try out.writer.writeByte(']');
+            }
+            try out.writer.writeByte('\n');
+        }
+        return try out.toOwnedSlice();
+    }
+
+    pub fn renderJson(self: WorktreeSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+
+        const mutation = self.snapshot.mutation;
+        try out.writer.writeAll("{\"kind\":\"worktree\",\"schema_version\":1,\"action\":");
+        try std.json.Stringify.value(if (mutation) |value| @tagName(value.action) else "list", .{}, &out.writer);
+        try out.writer.print(",\"changed\":{}", .{if (mutation) |value| value.changed else false});
+        try out.writer.writeAll(",\"repository_root\":");
+        try std.json.Stringify.value(self.snapshot.repository_root, .{}, &out.writer);
+        try out.writer.writeAll(",\"current_worktree\":");
+        try std.json.Stringify.value(self.snapshot.current_worktree, .{}, &out.writer);
+        if (mutation) |value| {
+            try out.writer.writeAll(",\"path\":");
+            try std.json.Stringify.value(value.path, .{}, &out.writer);
+            try out.writer.writeAll(",\"branch\":");
+            if (value.branch) |branch| {
+                try std.json.Stringify.value(branch, .{}, &out.writer);
+            } else {
+                try out.writer.writeAll("null");
+            }
+            try out.writer.writeAll(",\"launch\":");
+            if (value.launch_resume) |resume_session| {
+                try std.json.Stringify.value(if (resume_session) "resume" else "new", .{}, &out.writer);
+            } else {
+                try out.writer.writeAll("null");
+            }
+        }
+        try out.writer.writeAll(",\"worktrees\":[");
+        for (self.snapshot.worktrees.items, 0..) |entry, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("{\"path\":");
+            try std.json.Stringify.value(entry.path, .{}, &out.writer);
+            try out.writer.writeAll(",\"head\":");
+            try std.json.Stringify.value(entry.head, .{}, &out.writer);
+            try out.writer.writeAll(",\"branch\":");
+            if (entry.branch) |branch| {
+                try std.json.Stringify.value(branch, .{}, &out.writer);
+            } else {
+                try out.writer.writeAll("null");
+            }
+            try out.writer.print(",\"detached\":{},\"bare\":{},\"primary\":{},\"current\":{}", .{
+                entry.detached,
+                entry.bare,
+                entry.primary,
+                entry.current,
+            });
+            try out.writer.writeAll(",\"locked_reason\":");
+            if (entry.locked_reason) |reason| {
+                try std.json.Stringify.value(reason, .{}, &out.writer);
+            } else {
+                try out.writer.writeAll("null");
+            }
+            try out.writer.writeAll(",\"prunable_reason\":");
+            if (entry.prunable_reason) |reason| {
+                try std.json.Stringify.value(reason, .{}, &out.writer);
+            } else {
+                try out.writer.writeAll("null");
+            }
+            try out.writer.writeByte('}');
         }
         try out.writer.writeAll("]}");
         return try out.toOwnedSlice();
@@ -2994,6 +3126,51 @@ test "workspace text snapshot terminal-encodes paths" {
     try std.testing.expect(std.mem.find(u8, output, "project\\x0d") != null);
     try std.testing.expect(std.mem.findScalar(u8, output, 0x1b) == null);
     try std.testing.expect(std.mem.findScalar(u8, output, '\r') == null);
+}
+
+test "worktree snapshot identifies the active worktree in text and json" {
+    var worktrees: std.ArrayList(worktree_commands.Worktree) = .empty;
+    defer worktrees.deinit(std.testing.allocator);
+    try worktrees.append(std.testing.allocator, .{
+        .path = @constCast("/repo"),
+        .head = @constCast("0123456789abcdef"),
+        .branch = @constCast("main"),
+        .primary = true,
+    });
+    try worktrees.append(std.testing.allocator, .{
+        .path = @constCast("/repo-feature"),
+        .head = @constCast("fedcba9876543210"),
+        .branch = @constCast("feature/demo"),
+        .current = true,
+    });
+    const state = worktree_commands.Snapshot{
+        .repository_root = @constCast("/repo"),
+        .current_worktree = @constCast("/repo-feature"),
+        .worktrees = worktrees,
+        .mutation = .{
+            .action = .open,
+            .path = @constCast("/repo-feature"),
+            .branch = @constCast("feature/demo"),
+            .changed = false,
+            .launch_resume = true,
+        },
+    };
+    const snapshot = WorktreeSnapshot{ .snapshot = &state };
+
+    const text_output = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text_output);
+    try std.testing.expect(std.mem.find(u8, text_output, "action=open changed=false branch=feature/demo path=/repo-feature launch=resume") != null);
+    try std.testing.expect(std.mem.find(u8, text_output, "[worktree] current=/repo-feature") != null);
+    try std.testing.expect(std.mem.find(u8, text_output, " * feature/demo  /repo-feature  fedcba987654") != null);
+
+    const json_output = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json_output);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_output, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("worktree", parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("open", parsed.value.object.get("action").?.string);
+    try std.testing.expectEqualStrings("resume", parsed.value.object.get("launch").?.string);
+    try std.testing.expect(parsed.value.object.get("worktrees").?.array.items[1].object.get("current").?.bool);
 }
 
 test "usage text and JSON render the same optional and ordered facts" {
