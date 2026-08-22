@@ -28,6 +28,7 @@ const app_permission_runtime = @import("core/app/app_permission_runtime.zig");
 const app_process_runtime = @import("core/app/app_process_runtime.zig");
 const prompt_history_runtime = @import("core/app/prompt_history_runtime.zig");
 const app_agent_runtime = @import("core/app/app_agent_runtime.zig");
+const app_attached_api_runtime = if (host_target.is_wasm) @import("core/app/app_attached_api_runtime.zig") else struct {};
 const app_runtime_setup = @import("core/app/app_runtime_setup.zig");
 const app_render_runtime = @import("core/app/app_render_runtime.zig");
 const app_session_runtime = @import("core/app/app_session_runtime.zig");
@@ -374,6 +375,7 @@ const App = struct {
     pub const build_revision = build_options.git_commit;
     const Self = @This();
     const AgentAppRuntime = app_agent_runtime.Runtime(Self);
+    const AttachedApiRuntime = if (host_target.is_wasm) app_attached_api_runtime.Runtime(Self) else struct {};
     const AuthAppRuntime = app_auth_runtime.Runtime(Self);
     const HostConfigAppRuntime = app_host_config_runtime.Runtime(Self);
     const BootstrapAppRuntime = app_bootstrap_runtime.Runtime(Self);
@@ -453,6 +455,7 @@ const App = struct {
 
     pub fn cooperativeTransportPulse(self: *Self) !void {
         if (comptime !host_target.is_wasm) return;
+        AttachedApiRuntime.collect(self);
         if (try event_loop.pump_ready_input(
             self.terminal,
             &self.should_exit,
@@ -538,6 +541,7 @@ const App = struct {
 
     worker_thread: ?std.Thread = null,
     worker: WorkerRuntime = .{},
+    attached_api: if (host_target.is_wasm) app_attached_api_runtime.State else struct {} = .{},
     background: BackgroundRuntime = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
     terminal_direct: terminal_direct_runtime.Runtime = .{},
@@ -740,6 +744,9 @@ const App = struct {
         turn_id: u64,
         kind: hooks.AttentionKind,
     ) void {
+        if (comptime host_target.is_wasm) {
+            AttachedApiRuntime.publishAttentionRequired(self, turn_id, kind);
+        }
         NotificationAppRuntime.dispatchAttentionRequired(self, turn_id, kind);
     }
 
@@ -828,6 +835,7 @@ const App = struct {
         };
         self.background.deinit(std.heap.c_allocator);
         self.worker.deinit(std.heap.c_allocator);
+        if (comptime host_target.is_wasm) self.attached_api.deinit(self.alloc);
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         self.subagents.deinit(self.alloc);
@@ -1065,6 +1073,33 @@ const App = struct {
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
     ) !bool {
+        return self.enqueuePromptWithOptionalReviewAndTurnId(
+            prompt,
+            skill_tokens,
+            review_draft,
+            0,
+        );
+    }
+
+    pub fn enqueueAttachedPrompt(self: *App, prompt: []const u8, turn_id: u64) !bool {
+        std.debug.assert(turn_id != 0);
+        return self.enqueuePromptWithOptionalReviewAndTurnId(prompt, &.{}, null, turn_id);
+    }
+
+    fn enqueuePromptWithOptionalReviewAndTurnId(
+        self: *App,
+        prompt: []const u8,
+        skill_tokens: []const registered_entities.SkillTokenSpan,
+        review_draft: ?worker_runtime.QueueReviewDraft,
+        turn_id: u64,
+    ) !bool {
+        const effective_turn_id = if (comptime host_target.is_wasm)
+            if (turn_id == 0) AttachedApiRuntime.reserveTerminalTurnId(self) else turn_id
+        else
+            turn_id;
+        if (comptime host_target.is_wasm) {
+            AttachedApiRuntime.noteReservedTurnId(self, effective_turn_id);
+        }
         const context_targets = if (self.context_enabled)
             try context_contract.applicableTargetsForImages(self.alloc, self.pending_images.items)
         else
@@ -1084,10 +1119,12 @@ const App = struct {
                 debug_trace.preview(prompt, 120),
             },
         );
-        if (!try self.snapshotAndQueuePromptWithSkillBindings(
+        if (!try self.snapshotAndQueuePrompt(
             prompt,
             skill_tokens,
             review_draft,
+            null,
+            effective_turn_id,
         )) return false;
         WorkerAppRuntime.syncState(
             self,
@@ -1223,11 +1260,16 @@ const App = struct {
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
     ) !bool {
+        const turn_id = if (comptime host_target.is_wasm)
+            AttachedApiRuntime.reserveTerminalTurnId(self)
+        else
+            0;
         return self.snapshotAndQueuePrompt(
             prompt,
             skill_tokens,
             review_draft,
             null,
+            turn_id,
         );
     }
 
@@ -1244,6 +1286,7 @@ const App = struct {
             &.{},
             null,
             checkpoint,
+            checkpoint.turn_id,
         )) return false;
         WorkerAppRuntime.syncState(
             self,
@@ -1258,6 +1301,7 @@ const App = struct {
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
         recovery_checkpoint: ?*const session_codec.RecoveryCheckpoint,
+        turn_id: u64,
     ) !bool {
         try self.reloadSkills();
 
@@ -1345,7 +1389,7 @@ const App = struct {
             );
 
         try self.worker.enqueuePrompt(std.heap.c_allocator, .{
-            .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
+            .turn_id = turn_id,
             .prompt = prompt_copy,
             .images = images_copy,
             .authorized_image_catalog = authorized_image_catalog,
@@ -1845,6 +1889,12 @@ const App = struct {
         if (comptime host_profile.cooperative_agent) {
             try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).onTaskCompletion, app_callbacks.Bindings(App).workerEventHandlers(self));
             try self.flushRequestedFrame();
+        }
+    }
+
+    pub fn observeWorkerEvent(self: *App, event: worker_runtime.WorkerEvent) void {
+        if (comptime host_target.is_wasm) {
+            AttachedApiRuntime.publishWorkerEvent(self, event);
         }
     }
 
@@ -2504,6 +2554,7 @@ const App = struct {
             try AuthAppRuntime.collectApiKeySaveFacts(self);
             try app_terminal_runtime.Runtime(App).collectFacts(self);
         }
+        if (comptime host_target.is_wasm) AttachedApiRuntime.collect(self);
         try self.processNextCooperativePrompt();
 
         const cols_before_resize = self.shell.layout.cols;
@@ -3771,6 +3822,7 @@ test {
     _ = @import("core/agent/runtime/tool_admission.zig");
     _ = @import("core/agent/runtime/prompt_context.zig");
     _ = @import("core/app/app_agent_runtime.zig");
+    _ = @import("core/app/app_attached_api_runtime.zig");
     _ = @import("core/app/app_auth_runtime.zig");
     _ = @import("core/workspace/context_contract.zig");
     _ = @import("core/workspace/workspace_access.zig");

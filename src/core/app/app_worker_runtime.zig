@@ -688,6 +688,7 @@ pub fn Runtime(comptime App: type) type {
                             drain_owns_current = false;
                             break :events;
                         }
+                        observeWorkerEvent(app, event);
                         resetStream(app, true);
                         app.stream.active = true;
                         app.stream.turn_started_ms = io_mod.milliTimestamp();
@@ -701,6 +702,7 @@ pub fn Runtime(comptime App: type) type {
                             drain_owns_current = false;
                             break :events;
                         }
+                        observeWorkerEvent(app, event);
                         resetStream(app, true);
                         app.stream.active = true;
                         app.stream.turn_started_ms = io_mod.milliTimestamp();
@@ -713,6 +715,7 @@ pub fn Runtime(comptime App: type) type {
                         }
                     },
                     .append_user_feedback => |text| {
+                        observeWorkerEvent(app, event);
                         try handlers.write_user_prompt(handlers.ctx, .{ .text = text });
                     },
                     .assistant_presentation => |presentation| {
@@ -721,6 +724,7 @@ pub fn Runtime(comptime App: type) type {
                             drain_owns_current = false;
                             break :events;
                         }
+                        observeWorkerEvent(app, event);
                         switch (presentation) {
                             .text => |text| {
                                 app.stream = nextStreamAfterAssistantText(app.stream, text);
@@ -803,6 +807,7 @@ pub fn Runtime(comptime App: type) type {
                             drain_owns_current = false;
                             break :events;
                         }
+                        observeWorkerEvent(app, event);
                         try handlers.semantic_notice(handlers.ctx, notice);
                     },
                     .route_recovery_status => |status| {
@@ -811,6 +816,7 @@ pub fn Runtime(comptime App: type) type {
                             drain_owns_current = false;
                             break :events;
                         }
+                        observeWorkerEvent(app, event);
                         app.shell.worker_status_state().set_route_recovery(status, io_mod.milliTimestamp());
                         app.shell.render_requests.request(.footer);
                     },
@@ -825,6 +831,7 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     },
                     .command_output => |chunk| {
+                        observeWorkerEvent(app, event);
                         try handlers.command_output(handlers.ctx, chunk.lifecycle_id, chunk.stream, chunk.text);
                         if (comptime @hasField(App, "session_persistence")) {
                             app_session_runtime.Runtime(App).recordAppliedCommandOutput(
@@ -866,6 +873,7 @@ pub fn Runtime(comptime App: type) type {
                             },
                             .progress, .terminal, .turn_finished => {},
                         }
+                        observeWorkerEvent(app, event);
                         try applyToolLifecycle(app, handlers.tool_lifecycle, lifecycle);
                     },
                     .finish_prompt => |finished| {
@@ -883,6 +891,7 @@ pub fn Runtime(comptime App: type) type {
                             drain_owns_current = false;
                             break :events;
                         }
+                        observeWorkerEvent(app, event);
                         resetStream(app, false);
                         app.shell.render_requests.request(.footer);
                         defer app.shell.render_requests.finishSubmittedPromptTransition();
@@ -893,6 +902,12 @@ pub fn Runtime(comptime App: type) type {
 
             lifecycle_cleanup_attempted = true;
             try handlers.tool_lifecycle.finish_batch(app.alloc);
+        }
+
+        fn observeWorkerEvent(app: *App, event: worker_runtime.WorkerEvent) void {
+            if (comptime @hasDecl(App, "observeWorkerEvent")) {
+                app.observeWorkerEvent(event);
+            }
         }
 
         fn flushPendingCommandOutputAtTurnBoundary(

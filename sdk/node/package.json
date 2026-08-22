@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test:term": "node test-xterm-adapter.mjs && node --experimental-wasm-jspi test-term-config-restore.mjs && node --experimental-wasm-jspi test-term-headless.mjs && node --experimental-wasm-jspi test-term-table-stream.mjs && node --experimental-wasm-jspi test-term-lifecycle.mjs && node --experimental-wasm-jspi test-term-features.mjs && node --experimental-wasm-jspi test-term-history.mjs && node --experimental-wasm-jspi test-term-workspace.mjs"
+    "test:term": "node test-xterm-adapter.mjs && node --experimental-wasm-jspi test-term-config-restore.mjs && node --experimental-wasm-jspi test-term-headless.mjs && node --experimental-wasm-jspi test-term-shared-session.mjs && node --experimental-wasm-jspi test-term-table-stream.mjs && node --experimental-wasm-jspi test-term-lifecycle.mjs && node --experimental-wasm-jspi test-term-features.mjs && node --experimental-wasm-jspi test-term-history.mjs && node --experimental-wasm-jspi test-term-workspace.mjs"
   },
   "devDependencies": {
     "@xterm/headless": "6.0.0"
