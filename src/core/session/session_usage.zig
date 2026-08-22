@@ -146,6 +146,27 @@ pub const GatewayObservation = struct {
             );
             return;
         }
+        if (!types.validGatewayGenerationId(id)) {
+            // Subscription providers return their own response identifiers.
+            // The ledger only reconciles Gateway generation ids, so finish the
+            // invocation without identity tracking rather than pushing an
+            // unusable identity through the observed path. Ambiguous transport
+            // evidence stays the recorded reason.
+            try ledger.finishInvocationDurably(
+                self.sequence,
+                self.elapsedMs(),
+                if (delivery == .ambiguous_delivery)
+                    delivery
+                else
+                    .possibly_billed_without_identity,
+            );
+            debug_trace.logf(
+                "session",
+                "usage billing incomplete sequence={d} reason=generation_identity_unsupported",
+                .{self.sequence},
+            );
+            return;
+        }
         try ledger.finishObservedInvocationDurably(
             alloc,
             self.sequence,
@@ -561,9 +582,21 @@ pub const Usage = struct {
         origin: []const u8,
         team: ?[]const u8,
     ) !void {
-        try validateGenerationId(id);
-        try validateOrigin(origin);
-        if (team) |value| try validateTeam(value);
+        validateObservedIdentity(id, origin, team) catch |err| {
+            // A rejected identity must not strand the reservation: the
+            // invocation is finished before the failure surfaces so active
+            // capacity cannot drain across a session.
+            self.mutex.lockUncancelable(io_mod.getIo());
+            defer self.mutex.unlock(io_mod.getIo());
+            _ = self.finishInvocationUnlocked(
+                sequence,
+                duration_ms,
+                .possibly_billed_without_identity,
+            );
+            self.billing = .incomplete;
+            self.dirty = true;
+            return err;
+        };
 
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -2734,6 +2767,12 @@ fn validateGenerationId(id: []const u8) !void {
     if (!types.validGatewayGenerationId(id)) return error.InvalidGenerationId;
 }
 
+fn validateObservedIdentity(id: []const u8, origin: []const u8, team: ?[]const u8) !void {
+    try validateGenerationId(id);
+    try validateOrigin(origin);
+    if (team) |value| try validateTeam(value);
+}
+
 fn validateModel(model: []const u8) !void {
     if (model.len == 0 or model.len > max_model_bytes) {
         return error.InvalidModel;
@@ -3622,6 +3661,80 @@ test "active invocation capacity fails before Gateway admission" {
     defer snapshot.deinit(alloc);
     try std.testing.expectEqual(Availability.complete, snapshot.billing);
     try std.testing.expect(snapshot.api_duration_complete);
+}
+
+test "rejected generation identity releases the invocation slot" {
+    const alloc = std.testing.allocator;
+    var usage = Usage.initFresh();
+    defer usage.deinit(alloc);
+
+    for (0..max_active_invocations + 1) |_| {
+        const sequence = try usage.reserveInvocation();
+        try std.testing.expectError(
+            error.InvalidGenerationId,
+            usage.finishObservedInvocation(
+                alloc,
+                sequence,
+                1,
+                .observed_generation,
+                "resp_02dd7a185a8e269d016a89d27cbe7487d2ac741377",
+                "https://chatgpt.com/backend-api/codex",
+                null,
+            ),
+        );
+    }
+
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(Availability.incomplete, snapshot.billing);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.pending.len);
+    try std.testing.expect(snapshot.api_duration_complete);
+    try std.testing.expectEqual(
+        @as(u64, max_active_invocations + 1),
+        snapshot.api_duration_ms,
+    );
+}
+
+test "unsupported provider generation identity keeps invocation capacity" {
+    const alloc = std.testing.allocator;
+    var usage = Usage.initFresh();
+    defer usage.deinit(alloc);
+
+    for (0..max_active_invocations + 1) |_| {
+        const observation = try GatewayObservation.begin(&usage);
+        try observation.complete(
+            alloc,
+            .ok,
+            .{ .generation_id = "resp_02dd7a185a8e269d016a89d27cbe7487d2ac741377" },
+            "https://chatgpt.com/backend-api/codex",
+            null,
+        );
+    }
+
+    const ambiguous = try GatewayObservation.begin(&usage);
+    try ambiguous.complete(
+        alloc,
+        .ok,
+        .{
+            .generation_id = "resp_02dd7a185a8e269d016a89d27cbe7487d2ac741377",
+            .delivery_ambiguous = true,
+        },
+        "https://chatgpt.com/backend-api/codex",
+        null,
+    );
+
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(Availability.incomplete, snapshot.billing);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.pending.len);
+    try std.testing.expectEqual(
+        @as(u64, max_active_invocations + 2),
+        snapshot.next_sequence - 1,
+    );
+    try std.testing.expectEqual(
+        snapshot.next_sequence - 1,
+        snapshot.settled_through_sequence,
+    );
 }
 
 test "generation allocation failure marks billing incomplete before snapshot" {
