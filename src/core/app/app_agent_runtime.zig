@@ -1104,7 +1104,7 @@ pub fn Runtime(comptime App: type) type {
                 .agent_step_limit = app.agent_step_limit,
                 .max_tool_result_bytes = job.agent_settings.max_tool_result_bytes,
                 .cancel_flag = &app.worker.worker_cancel_requested,
-                .review_enabled = false,
+                .final_verification_enabled = false,
                 .fast_mode = job.agent_settings.fast_mode,
                 .effort = job.agent_settings.effort,
                 .first_call_tool_choice = job.agent_settings.first_call_tool_choice,
