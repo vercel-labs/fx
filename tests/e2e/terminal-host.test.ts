@@ -1687,6 +1687,38 @@ test("idle shutdown survives removal of the endpoint directory", async () => {
   });
 });
 
+test("fatal host drain timeout exits before shared-state teardown", async () => {
+  const home = makeHome();
+  const paths = hostPaths(home);
+  const failAccept = join(home, "fail-next-accept");
+  const host = startHost(home, undefined, 10_000, {
+    FX_TERMINAL_TEST_ACCEPT_FAILURE_PATH: failAccept,
+  });
+  await waitFor(() => existsSync(paths.socket) && existsSync(paths.identity));
+
+  const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
+  writeFileSync(failAccept, "fail\n");
+
+  expect(await waitForExit(host)).toBe(1);
+  expect(await streamText(host.stdout)).toBe("");
+  expect(await streamText(host.stderr)).toBe("");
+
+  // A normal unwind removes both files. Their presence proves the fatal path
+  // stopped the process before stack-owned host state and shared I/O teardown.
+  expect(existsSync(paths.socket)).toBe(true);
+  expect(existsSync(paths.identity)).toBe(true);
+  connected.client.close();
+
+  // The next host recognizes the dead identity, cleans the stale endpoint, and
+  // then follows the ordinary idle path, which still performs normal cleanup.
+  rmSync(failAccept);
+  const replacement = startHost(home, undefined, 100);
+  await waitFor(() => existsSync(paths.socket) && existsSync(paths.identity));
+  expect(await waitForExit(replacement)).toBe(0);
+  expect(existsSync(paths.socket)).toBe(false);
+  expect(existsSync(paths.identity)).toBe(false);
+}, 15_000);
+
 test("client reconciles an idle-retiring host before admitting a request", async () => {
   const home = makeHome();
   const paths = hostPaths(home);
