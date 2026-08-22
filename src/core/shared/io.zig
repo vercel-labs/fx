@@ -451,6 +451,18 @@ pub fn readFileToEndZ(alloc: std.mem.Allocator, file: *std.Io.File, max_bytes: u
     return result[0..data.len :0];
 }
 
+/// Reads an opened regular file with a verified size.
+/// The caller owns the returned memory. One extra byte detects file growth.
+pub fn readFileToEndSized(alloc: std.mem.Allocator, file: *std.Io.File, size: u64, max_bytes: usize) ![]u8 {
+    if (size >= max_bytes) return error.StreamTooLong;
+    const len: usize = @intCast(size);
+    const buf = try alloc.alloc(u8, len + 1);
+    errdefer alloc.free(buf);
+    const read_len = try file.readPositionalAll(getIo(), buf, 0);
+    if (read_len > len) return error.StreamTooLong;
+    return alloc.realloc(buf, read_len);
+}
+
 pub fn milliTimestamp() i64 {
     const ts = std.Io.Timestamp.now(getIo(), .real);
     return @intCast(@divFloor(ts.nanoseconds, 1_000_000));
@@ -962,6 +974,13 @@ fn readTempFile(alloc: std.mem.Allocator, dir: std.Io.Dir, name: []const u8, max
     return readFileToEnd(alloc, &file, max_bytes);
 }
 
+fn readTempFileSized(alloc: std.mem.Allocator, dir: std.Io.Dir, name: []const u8, max_bytes: usize) ![]u8 {
+    var file = try dir.openFile(getIo(), name, .{});
+    defer file.close(getIo());
+    const stat = try file.stat(getIo());
+    return readFileToEndSized(alloc, &file, stat.size, max_bytes);
+}
+
 test "getenv returns null before setEnvironMap" {
     const previous = global_environ;
     global_environ = null;
@@ -1023,6 +1042,90 @@ test "readFileToEnd: file at exact cap returns error.StreamTooLong" {
     } else |err| {
         try std.testing.expectEqual(error.StreamTooLong, err);
     }
+}
+
+test "readFileToEndSized: file under cap returns full content" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(tmp.dir, "sized-under.txt", "0123456789");
+
+    const data = try readTempFileSized(alloc, tmp.dir, "sized-under.txt", 100);
+    defer alloc.free(data);
+    try std.testing.expectEqual(@as(usize, 10), data.len);
+    try std.testing.expectEqualStrings("0123456789", data);
+}
+
+test "readFileToEndSized: empty file returns empty slice" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(tmp.dir, "sized-empty.txt", "");
+
+    const data = try readTempFileSized(alloc, tmp.dir, "sized-empty.txt", 100);
+    defer alloc.free(data);
+    try std.testing.expectEqual(@as(usize, 0), data.len);
+}
+
+test "readFileToEndSized: file at exact cap returns error.StreamTooLong" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(tmp.dir, "sized-exact.txt", "0123456789");
+
+    if (readTempFileSized(alloc, tmp.dir, "sized-exact.txt", 10)) |data| {
+        defer alloc.free(data);
+        try std.testing.expect(false);
+    } else |err| {
+        try std.testing.expectEqual(error.StreamTooLong, err);
+    }
+}
+
+test "readFileToEndSized: file over cap returns error.StreamTooLong" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(tmp.dir, "sized-over.txt", "0123456789");
+
+    if (readTempFileSized(alloc, tmp.dir, "sized-over.txt", 5)) |data| {
+        defer alloc.free(data);
+        try std.testing.expect(false);
+    } else |err| {
+        try std.testing.expectEqual(error.StreamTooLong, err);
+    }
+}
+
+test "readFileToEndSized: stale size detects file growth" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(tmp.dir, "sized-growth.txt", "0123456789");
+
+    var file = try tmp.dir.openFile(getIo(), "sized-growth.txt", .{});
+    defer file.close(getIo());
+    if (readFileToEndSized(alloc, &file, 5, 100)) |data| {
+        defer alloc.free(data);
+        try std.testing.expect(false);
+    } else |err| {
+        try std.testing.expectEqual(error.StreamTooLong, err);
+    }
+}
+
+test "readFileToEndSized: repeated reads return full content" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(tmp.dir, "sized-pos.txt", "0123456789");
+
+    var file = try tmp.dir.openFile(getIo(), "sized-pos.txt", .{});
+    defer file.close(getIo());
+    const stat = try file.stat(getIo());
+    const first_read = try readFileToEndSized(alloc, &file, stat.size, 100);
+    defer alloc.free(first_read);
+    const second_read = try readFileToEndSized(alloc, &file, stat.size, 100);
+    defer alloc.free(second_read);
+    try std.testing.expectEqualStrings("0123456789", first_read);
+    try std.testing.expectEqualStrings("0123456789", second_read);
 }
 
 test "readFileToEnd: file over cap returns error.StreamTooLong" {
