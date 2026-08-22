@@ -216,6 +216,13 @@ window.addEventListener("resize", () => {
 });
 ```
 
+The xterm adapter preserves browser-style composer editing for Shift+Enter,
+Command+A, Command+C, Command+X, Command+Z, and Command+Shift+Z. Shift+Enter
+inserts a newline without submitting. A click inside the visible composer moves
+its caret; pointer drags remain xterm terminal-output selections.
+When xterm already has an output selection, Command+C copies that selection
+instead of the composer selection.
+
 The terminal runtime provides:
 
 | Member | Description |
@@ -284,6 +291,7 @@ Hosts may provide adapters for runtime state and external effects:
 | `sessionStore` | Persists agent or terminal sessions |
 | `oauthSessionStore` | Persists browser device-login sessions |
 | `promptHistoryStore` | Stores terminal prompt history |
+| `clipboard` | Writes selected composer text through `writeText(text)`; defaults to `navigator.clipboard` |
 | `openUrl` | Opens authentication and verification URLs |
 | `workspace` | Provides the constrained browser workspace adapter |
 
@@ -303,7 +311,7 @@ The WebAssembly runtime intentionally does not provide:
 - Native MCP servers
 - Subagents or skills
 - Automatic upgrades
-- Clipboard integration
+- Native clipboard integration
 - Arbitrary WASI filesystem access
 - Web search
 

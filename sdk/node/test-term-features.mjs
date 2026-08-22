@@ -13,6 +13,7 @@ if (!supportsJspi()) process.exit(2);
 const terminal = new Terminal({ cols: 100, rows: 34, allowProposedApi: true, scrollback: 2000 });
 const config = new Map([["model", "test/feature-model"], ["mode", "ask"]]);
 const requests = [];
+const clipboardWrites = [];
 const catalog = {
   object: "list",
   data: [
@@ -51,6 +52,7 @@ const runtime = await createFxTerminal({
     FX_TRACE_SCOPES: "full_transcript,full_transcript_cache,frame_schedule",
   },
   fetch,
+  clipboard: { writeText(value) { clipboardWrites.push(value); } },
   configStore: { get(id) { return config.get(id) ?? null; }, set(id, value) { config.set(id, value); } },
   stderr(chunk) { stderrText += stderrDecoder.decode(chunk, { stream: true }); },
 });
@@ -77,10 +79,23 @@ async function command(text, expected) {
 }
 
 await waitFor(() => grid().includes("𝒇x"), "startup");
+runtime.write("clipboard draft");
+runtime.write("\x1b[97;9u\x1b[99;9u");
+await waitFor(() => clipboardWrites.length === 1, "composer copy");
+runtime.write("\x1b[120;9u");
+await waitFor(() => clipboardWrites.length === 2, "composer cut");
+if (clipboardWrites.some((value) => value !== "clipboard draft")) {
+  throw new Error(`unexpected clipboard writes: ${JSON.stringify(clipboardWrites)}`);
+}
+runtime.write("undo probe\x1b[122;9u");
 await command("first question", "first answer");
 await command("second question", "second answer");
 if (requests.length !== 2) throw new Error(`expected two gateway turns, got ${requests.length}`);
 const secondBody = JSON.stringify(requests[1]);
+const firstBody = JSON.stringify(requests[0]);
+for (const removed of ["clipboard draft", "undo probe"]) {
+  if (firstBody.includes(removed)) throw new Error(`composer edit survived cut or undo: ${firstBody}`);
+}
 for (const expected of ["first question", "first answer", "second question"]) {
   if (!secondBody.includes(expected)) throw new Error(`second turn omitted ${expected}: ${secondBody}`);
 }
@@ -105,4 +120,4 @@ await waitFor(() => terminal.buffer.active.type === "normal", "model catalog clo
 runtime.write("/exit\r");
 const code = await Promise.race([runtime.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("exit timeout")), 5000))]);
 if (code !== 0) throw new Error(`fx-term exited with ${code}`);
-console.log("headless features passed: history, transcript, catalog, and host degradation");
+console.log("headless features passed: clipboard, history, transcript, catalog, and host degradation");
