@@ -752,6 +752,79 @@ function startAcpFakeGrok(options: {
   };
 }
 
+function startAcpFakeOpenCodeGo() {
+  const modelRequests: Array<{ path: string; authorization: string | null }> = [];
+  const responseRequests: Array<{
+    path: string;
+    authorization: string | null;
+    body: string;
+  }> = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const path = new URL(request.url).pathname;
+      const authorization = request.headers.get("authorization");
+      if (path === "/models") {
+        modelRequests.push({ path, authorization });
+        return Response.json({
+          object: "list",
+          data: [{ id: "opencode/acp-model", object: "model", created: 1 }],
+        });
+      }
+      if (path !== "/responses") return new Response("not found", { status: 404 });
+      const body = await request.text();
+      responseRequests.push({ path, authorization, body });
+      return new Response(
+        'data: {"type":"response.output_text.delta","delta":"ACP_OPENCODE_RESPONSE"}\n\n' +
+          'data: {"type":"response.completed","response":{"id":"acp-opencode-generation","status":"completed","usage":{"input_tokens":3,"output_tokens":5}}}\n\n',
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
+  const baseUrl = `http://127.0.0.1:${server.port}`;
+  return {
+    modelsUrl: `${baseUrl}/models`,
+    responsesUrl: `${baseUrl}/responses`,
+    modelRequests,
+    responseRequests,
+    stop() {
+      server.stop(true);
+    },
+  };
+}
+
+type AcpConfigOption = {
+  id: string;
+  currentValue?: string;
+  options: unknown[];
+};
+
+function acpConfigOptions(value: object): AcpConfigOption[] {
+  if (!("result" in value) || typeof value.result !== "object" || value.result === null) {
+    throw new Error("ACP response did not contain a result object");
+  }
+  const result = value.result;
+  if (!("configOptions" in result) || !Array.isArray(result.configOptions)) {
+    throw new Error("ACP response did not contain config options");
+  }
+  const options: AcpConfigOption[] = [];
+  for (const item of result.configOptions) {
+    if (!item || typeof item !== "object" || !("id" in item) || typeof item.id !== "string") {
+      continue;
+    }
+    options.push({
+      id: item.id,
+      currentValue: "currentValue" in item && typeof item.currentValue === "string"
+        ? item.currentValue
+        : undefined,
+      options: "options" in item && Array.isArray(item.options) ? item.options : [],
+    });
+  }
+  return options;
+}
+
+
 class AcpReadTimeoutError extends Error {
   constructor() {
     super("ACP readLine timeout");
@@ -7456,6 +7529,73 @@ describe("acp: model catalog authentication", () => {
         expect(request).not.toHaveProperty("providerOptions.gateway.speed");
       } finally {
         await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+  test(
+    "session provider changes use OpenCode Go credentials without Gateway leakage",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-opencode-route-");
+      const gateway = startFakeGateway([], {
+        models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      const openCode = startAcpFakeOpenCodeGo();
+      const gatewayKey = "acp-gateway-secret";
+      const openCodeKey = "acp-opencode-secret";
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            AI_GATEWAY_API_KEY: gatewayKey,
+            VERCEL_OIDC_TOKEN: undefined,
+            OPENCODE_API_KEY: openCodeKey,
+            FX_MODEL: undefined,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_E2E_OPENCODE_GO_MODELS_URL: openCode.modelsUrl,
+            FX_E2E_OPENCODE_GO_RESPONSES_URL: openCode.responsesUrl,
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const createdOptions = acpConfigOptions(await client.request("session/new", { mcpServers: [] }, 2));
+        await client.readLine(); // consume session/update notification
+        await client.request("session/set_mode", { modeId: "code" }, 3);
+        const providerOption = createdOptions.find((option) => option.id === "provider");
+        expect(providerOption).toBeDefined();
+        expect(JSON.stringify(providerOption?.options)).toContain("opencode");
+
+        const changedOptions = acpConfigOptions(await client.request("session/set_config_option", {
+          configId: "provider",
+          value: "opencode",
+        }, 4));
+        expect(changedOptions.find((option) => option.id === "provider")?.currentValue)
+          .toBe("opencode");
+        expect(changedOptions.find((option) => option.id === "model")?.currentValue)
+          .toBe("opencode/acp-model");
+
+        const prompt = await runPrompt(client, "Answer directly.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(prompt.messages)).toContain("ACP_OPENCODE_RESPONSE");
+        expect(openCode.modelRequests.length).toBeGreaterThan(0);
+        for (const request of openCode.modelRequests) {
+          expect(request.authorization).toBe(`Bearer ${openCodeKey}`);
+        }
+        expect(openCode.responseRequests).toHaveLength(1);
+        expect(openCode.responseRequests[0]!.authorization).toBe(`Bearer ${openCodeKey}`);
+        const responseBody = JSON.parse(openCode.responseRequests[0]!.body) as { model?: unknown };
+        expect(responseBody.model).toBe("opencode/acp-model");
+        expect(gateway.modelRequests.length).toBeGreaterThan(0);
+        for (const request of gateway.modelRequests) {
+          expect(request.headers.get("authorization")).toBe(`Bearer ${gatewayKey}`);
+          expect(request.headers.get("authorization")).not.toContain(openCodeKey);
+        }
+        expect(gateway.requests).toHaveLength(0);
+      } finally {
+        await client?.close();
+        openCode.stop();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }

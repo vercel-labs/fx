@@ -10,9 +10,9 @@
 - **Interactive provider switching:** Move provider selection to `/setup` and remove the `/provider` slash command while keeping the top-level `fx provider` command
 
 ### New Features
-
 - **Codex subscriptions:** Sign in with an eligible subscription through `fx login codex`, then use authenticated Codex models for interactive sessions, `fx ask`, native ACP, images, subagents, and automatic reviews
 - **Grok subscriptions:** Sign in with an eligible Grok subscription through `fx login grok`, then use authenticated xAI models, effort levels, images, local tools, persistent sessions, and automatic reviews
+- **OpenCode Go provider:** Set `OPENCODE_API_KEY`, run `fx setup opencode`, and select raw model IDs from the authenticated catalog for direct requests to OpenCode Go; fx saves the provider and model choice without saving the key, and OpenCode Go is not an OAuth `fx login` or `fx logout` provider
 - **Workspace status line:** Opt in to the active workspace path and Git branch through `/settings`, `/statusline workspace`, or `statusLine.workspace`
 - **fx-native workspace skills:** Discover project skills from `.fx/skills` before other workspace and compatibility roots
 - **External skill authorities:** Allow symlinked skills under explicitly trusted external directories through `FX_SKILL_SYMLINK_AUTHORITIES`

@@ -183,6 +183,9 @@ pub const Config = struct {
     grok_agent_stream: ?agent_stream_provider.Provider = null,
     grok_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
     grok_model_catalog: ?model_catalog.Provider = null,
+    opencode_agent_stream: ?agent_stream_provider.Provider = null,
+    opencode_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
+    opencode_model_catalog: ?model_catalog.Provider = null,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     url_opener: host.UrlOpener,
@@ -215,7 +218,9 @@ const LocalSurfaceOptions = struct {
 fn parseLoginProvider(rest: []const [:0]const u8) !?provider_catalog.Id {
     if (rest.len == 0) return null;
     if (rest.len != 1) return error.InvalidLoginProviderArgs;
-    return provider_catalog.parse(rest[0]) orelse error.InvalidLoginProviderArgs;
+    const id = provider_catalog.parse(rest[0]) orelse return error.InvalidLoginProviderArgs;
+    if (!provider_catalog.find(id).login_available) return error.InvalidLoginProviderArgs;
+    return id;
 }
 
 fn selectCatalogModel(
@@ -645,6 +650,7 @@ fn runNoConfigIfRequestedWithDeps(
 const ProviderActivationCaller = enum {
     provider_command,
     provider_login,
+    setup,
 };
 
 fn writeProviderActivationError(
@@ -656,7 +662,14 @@ fn writeProviderActivationError(
     const message = try std.fmt.allocPrint(
         alloc,
         "{s}: {s}\n",
-        .{ if (caller == .provider_login) "fx login" else "fx provider", detail },
+        .{
+            switch (caller) {
+                .provider_login => "fx login",
+                .setup => "fx setup",
+                .provider_command => "fx provider",
+            },
+            detail,
+        },
     );
     defer alloc.free(message);
     try writeStderr(deps, message);
@@ -694,6 +707,7 @@ fn activateProviderSelection(
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
+            .opencode => "OpenCode Go is already selected.\n",
         });
         return true;
     }
@@ -740,6 +754,7 @@ fn activateProviderSelection(
             switch (target) {
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
+                .opencode => "OPENCODE_API_KEY is missing or empty",
                 .gateway => "configure a Gateway credential first",
             },
         );
@@ -754,10 +769,36 @@ fn activateProviderSelection(
             try writeProviderActivationError(alloc, deps, caller, "Grok model catalog is unavailable");
             return false;
         },
+        .opencode => cfg.opencode_model_catalog orelse {
+            try writeProviderActivationError(alloc, deps, caller, "OpenCode Go model catalog is unavailable");
+            return false;
+        },
         .gateway => cfg.gateway_provider.model_catalog,
     };
-    const fetch_result = model_catalog.fetchWithPublicFallback(catalog_provider, alloc, .{
-        .access = credentials.catalogAccessAt(credential.*, io_mod.milliTimestamp()),
+    const catalog_access = credentials.catalogAccessAt(credential.*, io_mod.milliTimestamp());
+    const fetch_result: model_catalog.FetchResult = if (target == .opencode) blk: {
+        const direct = catalog_provider.fetch(alloc, .{
+            .access = catalog_access,
+            .endpoint = cfg.models_path,
+            .view = .picker,
+        }) catch break :blk .{ .failed = .{
+            .access = .init(catalog_access),
+            .anonymous_fallback_used = false,
+            .failure = .{ .category = .resource_exhausted },
+        } };
+        break :blk switch (direct) {
+            .catalog => |catalog| .{ .loaded = .{
+                .catalog = catalog,
+                .provenance = .{ .access = .init(catalog_access) },
+            } },
+            .failure => |failure| .{ .failed = .{
+                .access = .init(catalog_access),
+                .anonymous_fallback_used = false,
+                .failure = failure,
+            } },
+        };
+    } else model_catalog.fetchWithPublicFallback(catalog_provider, alloc, .{
+        .access = catalog_access,
         .endpoint = cfg.models_path,
         .view = .picker,
     });
@@ -780,6 +821,7 @@ fn activateProviderSelection(
         .gateway => settings.model,
         .codex => settings.codex_model,
         .grok => settings.grok_model,
+        .opencode => settings.opencode_model,
     };
     const selected_model = selectCatalogModel(loaded.catalog.items, saved_model) orelse {
         try writeProviderActivationError(alloc, deps, caller, "target model catalog is empty");
@@ -789,6 +831,7 @@ fn activateProviderSelection(
         .gateway => .{ .provider = target, .model = selected_model },
         .codex => .{ .provider = target, .codex_model = selected_model },
         .grok => .{ .provider = target, .grok_model = selected_model },
+        .opencode => .{ .provider = target, .opencode_model = selected_model },
     });
     defer attempt.deinit(alloc);
     switch (attempt) {
@@ -802,13 +845,14 @@ fn activateProviderSelection(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
-        .gateway => unreachable,
+        .gateway, .opencode => unreachable,
     };
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
+            .opencode => "Provider set to OpenCode Go.\n",
         });
     }
     return true;
@@ -905,6 +949,8 @@ fn runNonInteractiveWithDeps(
                 .codex_model_catalog = cfg.codex_model_catalog,
                 .grok_agent_stream = cfg.grok_agent_stream,
                 .grok_model_catalog = cfg.grok_model_catalog,
+                .opencode_agent_stream = cfg.opencode_agent_stream,
+                .opencode_model_catalog = cfg.opencode_model_catalog,
                 .background_process_provider = cfg.background_process_provider,
                 .secret_store = cfg.secret_store,
                 .prompt_policy = cfg.prompt_policy,
@@ -987,6 +1033,7 @@ fn runNonInteractiveWithDeps(
                     }
                     try writeStdout(deps, "Signed in with Grok.\n");
                 },
+                .opencode => unreachable,
             }
             return .handled_success;
         },
@@ -1081,11 +1128,11 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <gateway|codex|grok>\n");
+                try writeStderr(deps, "usage: fx provider <gateway|codex|grok|opencode>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
+                try writeStderr(deps, "fx provider: expected gateway, codex, grok, or opencode\n");
                 return .handled_failure;
             };
             return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command))
@@ -1094,11 +1141,17 @@ fn runNonInteractiveWithDeps(
                 .handled_failure;
         },
         .setup => |rest| {
-            if (rest.len != 0) {
-                try writeTopLevelUsage(cfg.command_catalog, deps, .setup);
-                return .handled_failure;
+            if (rest.len == 0 or (rest.len == 1 and std.ascii.eqlIgnoreCase(rest[0], "gateway"))) {
+                return if (try runPasteSetup(alloc, cfg.secret_store, deps)) .handled_success else .handled_failure;
             }
-            return if (try runPasteSetup(alloc, cfg.secret_store, deps)) .handled_success else .handled_failure;
+            if (rest.len == 1 and std.ascii.eqlIgnoreCase(rest[0], "opencode")) {
+                return if (try activateProviderSelection(alloc, cfg, deps, .opencode, .setup))
+                    .handled_success
+                else
+                    .handled_failure;
+            }
+            try writeTopLevelUsage(cfg.command_catalog, deps, .setup);
+            return .handled_failure;
         },
         .status => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
@@ -1175,6 +1228,10 @@ fn runNonInteractiveWithDeps(
                 },
                 .grok => cfg.grok_cli_model_catalog orelse {
                     try writeStderr(deps, "fx models: Grok model catalog is unavailable\n");
+                    return .handled_failure;
+                },
+                .opencode => cfg.opencode_cli_model_catalog orelse {
+                    try writeStderr(deps, "fx models: OpenCode Go model catalog is unavailable\n");
                     return .handled_failure;
                 },
                 .gateway => cfg.gateway_provider.cli_model_catalog,
@@ -2993,6 +3050,8 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .codex_model_catalog = cfg.codex_model_catalog,
         .grok_agent_stream = cfg.grok_agent_stream,
         .grok_model_catalog = cfg.grok_model_catalog,
+        .opencode_agent_stream = cfg.opencode_agent_stream,
+        .opencode_model_catalog = cfg.opencode_model_catalog,
         .background_process_provider = cfg.background_process_provider,
         .secret_store = cfg.secret_store,
         .prompt_policy = cfg.prompt_policy,

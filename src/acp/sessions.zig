@@ -566,6 +566,8 @@ fn handleRestoreSession(
                 credentials.missing_chatgpt_credential_message
             else if (effective_provider == .grok)
                 credentials.missing_grok_credential_message
+            else if (effective_provider == .opencode)
+                credentials.missing_opencode_credential_message
             else
                 credentials.missing_credential_message,
         });
@@ -795,13 +797,13 @@ fn activateSession(
     };
     server.enableSubagentHost(state);
     state.active_session.?.session_rt.attachProfileUsagePublisher(state.alloc);
-    if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription) {
-        state.active_session.?.session_rt.usage.clearReconciliationCredential();
-    } else {
+    if (model_provider.authorizesCredential(.gateway, state.credential_source)) {
         state.active_session.?.session_rt.usage.startReconciliation(
             state.alloc,
             state.api_key,
         );
+    } else {
+        state.active_session.?.session_rt.usage.clearReconciliationCredential();
     }
     activateManagedBackground(state, store);
 }
@@ -1112,7 +1114,7 @@ pub fn writeProviderConfigOption(
     try writeJsonStr(@tagName(current), w);
     try w.writeAll(",\"options\":[{\"value\":\"gateway\",\"name\":\"Vercel AI Gateway\"},{\"value\":\"codex\",\"name\":\"Codex subscription\"}");
     if (comptime !host_target.is_wasm) {
-        try w.writeAll(",{\"value\":\"grok\",\"name\":\"Grok subscription\"}");
+        try w.writeAll(",{\"value\":\"grok\",\"name\":\"Grok subscription\"},{\"value\":\"opencode\",\"name\":\"OpenCode Go\"}");
     }
     try w.writeAll("]}");
 }

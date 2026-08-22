@@ -191,6 +191,60 @@ function startLogoutIssuer(
   };
 }
 
+function startFakeOpenCodeGo() {
+  const modelRequests: Array<{
+    method: string;
+    path: string;
+    authorization: string | null;
+  }> = [];
+  const responseRequests: Array<{
+    method: string;
+    path: string;
+    authorization: string | null;
+    body: string;
+  }> = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      const authorization = request.headers.get("authorization");
+      if (url.pathname === "/models") {
+        modelRequests.push({ method: request.method, path: url.pathname, authorization });
+        return Response.json({
+          object: "list",
+          data: [{ id: "opencode/muse-spark-test", object: "model", created: 1 }],
+        });
+      }
+      if (url.pathname !== "/responses") {
+        return new Response("not found", { status: 404 });
+      }
+      const body = await request.text();
+      responseRequests.push({
+        method: request.method,
+        path: url.pathname,
+        authorization,
+        body,
+      });
+      return new Response(
+        'data: {"type":"response.output_text.delta","delta":"OPENCODE_DIRECT_RESPONSE"}\n\n' +
+          'data: {"type":"response.completed","response":{"id":"opencode-generation","status":"completed","usage":{"input_tokens":3,"output_tokens":5}}}\n\n',
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
+  const baseUrl = `http://127.0.0.1:${server.port}`;
+  return {
+    modelsUrl: `${baseUrl}/models`,
+    responsesUrl: `${baseUrl}/responses`,
+    modelRequests,
+    responseRequests,
+    stop() {
+      server.stop(true);
+    },
+  };
+}
+
 function snapshotTree(root: string): string[] {
   const entries: string[] = [];
   const visit = (path: string, relative: string): void => {
@@ -256,6 +310,12 @@ describe("cli: help", () => {
       expect(r.stdout).toContain("Commands:\n");
       expect(r.stdout).toContain("Run one noninteractive request");
       expect(r.stdout).toContain("credits|balance");
+      expect(r.stdout).toContain("login [vercel|codex|grok]");
+      expect(r.stdout).toContain("logout [vercel|codex|grok]");
+      expect(r.stdout).toContain("setup [gateway|opencode]");
+      expect(r.stdout).toContain("provider <gateway|codex|grok|opencode>");
+      expect(r.stdout).not.toContain("login [vercel|codex|grok|opencode]");
+      expect(r.stdout).not.toContain("logout [vercel|codex|grok|opencode]");
       expect(r.stdout).toContain("Flags:\n");
       expect(r.stdout).toContain("--context-limit <spec>");
       expect(r.stdout).toContain("Set name=bytes|off; repeatable");
@@ -1877,6 +1937,36 @@ describe("cli: setup", () => {
   );
 
   test(
+    "fx setup opencode requires an environment API key",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-opencode-missing-key-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      try {
+        const result = await runFx(["setup", "opencode"], {
+          cwd: realpathSync(workspace),
+          env: {
+            ...NO_GATEWAY_AUTH,
+            HOME: realpathSync(home),
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            OPENCODE_API_KEY: undefined,
+          },
+          timeoutMs: TIMEOUT,
+        });
+        expect(result.code).toBe(1);
+        expect(result.stdout).toBe("");
+        expect(result.stderr).toContain("OPENCODE_API_KEY is missing or empty");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "fx setup never invokes the configured Vercel CLI",
     async () => {
       const runId = `${process.pid}-${Date.now()}`;
@@ -1909,6 +1999,99 @@ exit 99
         expect(existsSync(invocationLog)).toBe(false);
       } finally {
         rmSync(fakeDir, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+  test(
+    "fx setup opencode selects raw catalog models and isolates direct credentials",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-opencode-cli-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      const openCode = startFakeOpenCodeGo();
+      const gateway = startFakeGateway([], {
+        models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      const openCodeKey = "opencode-cli-secret";
+      const gatewayKey = "gateway-cli-secret";
+      const env = {
+        HOME: realpathSync(home),
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_AUTO_UPGRADE: "0",
+        AI_GATEWAY_API_KEY: gatewayKey,
+        VERCEL_OIDC_TOKEN: undefined,
+        OPENCODE_API_KEY: openCodeKey,
+        FX_MODEL: undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_E2E_GATEWAY_CHAT_URL: undefined,
+        FX_E2E_OPENCODE_GO_MODELS_URL: openCode.modelsUrl,
+        FX_E2E_OPENCODE_GO_RESPONSES_URL: openCode.responsesUrl,
+      };
+      const cwd = realpathSync(workspace);
+
+      try {
+        const setup = await runFx(["setup", "opencode"], { cwd, env, timeoutMs: TIMEOUT });
+        expect(setup.code).toBe(0);
+        expect(setup.stderr).toBe("");
+
+        const settingsPath = join(home, ".fx", "settings.json");
+        const settingsText = readFileSync(settingsPath, "utf8");
+        const settings = JSON.parse(settingsText) as Record<string, unknown>;
+        expect(settings.provider).toBe("opencode");
+        expect(settings.opencode_model).toBe("opencode/muse-spark-test");
+        expect(settingsText).not.toContain(openCodeKey);
+
+        const models = await runFx(["models", "--json"], { cwd, env, timeoutMs: TIMEOUT });
+        expect(models.code).toBe(0);
+        expect(models.stderr).toBe("");
+        expect(JSON.parse(models.stdout).ids).toEqual(["opencode/muse-spark-test"]);
+
+        const ask = await runFx(
+          ["ask", "--json", "--auto", "--no-save", "Answer directly."],
+          { cwd, env, timeoutMs: TIMEOUT },
+        );
+        expect(ask.code).toBe(0);
+        expect(ask.stderr).toBe("");
+        expect(JSON.parse(ask.stdout).output.trim()).toBe("OPENCODE_DIRECT_RESPONSE");
+        expect(openCode.responseRequests).toHaveLength(1);
+        expect(openCode.responseRequests[0]!.path).toBe("/responses");
+        expect(openCode.responseRequests[0]!.authorization).toBe(`Bearer ${openCodeKey}`);
+        expect(JSON.parse(openCode.responseRequests[0]!.body).model).toBe(
+          "opencode/muse-spark-test",
+        );
+        expect(openCode.modelRequests.length).toBeGreaterThan(0);
+        for (const request of openCode.modelRequests) {
+          expect(request.authorization).toBe(`Bearer ${openCodeKey}`);
+        }
+
+        const gatewaySwitch = await runFx(["provider", "gateway"], {
+          cwd,
+          env,
+          timeoutMs: TIMEOUT,
+        });
+        expect(gatewaySwitch.code).toBe(0);
+        expect(gatewaySwitch.stdout).toContain("Provider set to Gateway.");
+        expect(gateway.modelRequests.length).toBeGreaterThan(0);
+        for (const request of gateway.modelRequests) {
+          expect(request.headers.get("authorization")).toBe(`Bearer ${gatewayKey}`);
+          expect(request.headers.get("authorization")).not.toContain(openCodeKey);
+        }
+        expect(JSON.stringify(gateway.requests)).not.toContain(openCodeKey);
+
+        for (const command of ["login", "logout"] as const) {
+          const rejected = await runFx([command, "opencode"], { cwd, env, timeoutMs: TIMEOUT });
+          expect(rejected.code).toBe(1);
+          expect(rejected.stdout).toBe("");
+          expect(rejected.stderr).toContain(`usage: fx ${command} [vercel|codex|grok]`);
+        }
+      } finally {
+        openCode.stop();
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
       }
     },
     TIMEOUT,

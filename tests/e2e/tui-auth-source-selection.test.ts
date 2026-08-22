@@ -60,6 +60,30 @@ function grokModalityModel(id: string, vision: boolean) {
     output_modalities: ["text"],
   };
 }
+function startFakeOpenCodeGoCatalog() {
+  const modelRequests: Array<{ path: string; authorization: string | null }> = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      const path = new URL(request.url).pathname;
+      modelRequests.push({ path, authorization: request.headers.get("authorization") });
+      if (path !== "/models") return new Response("not found", { status: 404 });
+      return Response.json({
+        object: "list",
+        data: [{ id: "opencode/tui-model", object: "model", created: 1 }],
+      });
+    },
+  });
+  return {
+    modelsUrl: `http://127.0.0.1:${server.port}/models`,
+    modelRequests,
+    stop() {
+      server.stop(true);
+    },
+  };
+}
+
 
 let session: TmuxSession | null = null;
 let home: string | null = null;
@@ -1415,6 +1439,65 @@ tmuxTest(
 
     expect(session.isAlive()).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "setup provider picker exposes OpenCode Go without a login choice",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-opencode-provider-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const openCode = startFakeOpenCodeGoCatalog();
+    const openCodeKey = "opencode-tui-secret";
+    try {
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        OPENCODE_API_KEY: openCodeKey,
+        FX_MODEL: undefined,
+        FX_E2E_OPENCODE_GO_MODELS_URL: openCode.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/setup");
+      const root = await session.waitForPane(
+        (pane) => pane.includes("Setup") && pane.includes("Switch provider"),
+        TIMEOUT,
+      );
+      expect(root).toContain("Sign in with Grok");
+      expect(root).not.toContain("Sign in with OpenCode");
+
+      for (let index = 0; index < 4; index += 1) {
+        await session.sendKeys("Down");
+      }
+      await session.sendKeys("Enter");
+      const providerPane = await session.waitForText("OpenCode Go", TIMEOUT);
+      expect(providerPane).not.toContain("Sign in with OpenCode");
+
+      for (let index = 0; index < 3; index += 1) {
+        await session.sendKeys("Down");
+      }
+      await session.sendKeys("Enter");
+      await session.waitForText("Switched to OpenCode Go with opencode/tui-model.", TIMEOUT);
+
+      const settingsPath = join(home, ".fx", "settings.json");
+      const settingsText = readFileSync(settingsPath, "utf8");
+      const settings = JSON.parse(settingsText) as Record<string, unknown>;
+      expect(settings.provider).toBe("opencode");
+      expect(settings.opencode_model).toBe("opencode/tui-model");
+      expect(settingsText).not.toContain(openCodeKey);
+      expect(openCode.modelRequests.length).toBeGreaterThan(0);
+      for (const request of openCode.modelRequests) {
+        expect(request.path).toBe("/models");
+        expect(request.authorization).toBe(`Bearer ${openCodeKey}`);
+      }
+      for (const request of gateway.modelRequests) {
+        expect(request.headers.get("authorization")).not.toContain(openCodeKey);
+      }
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      openCode.stop();
+    }
   },
   60_000,
 );

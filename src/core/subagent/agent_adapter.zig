@@ -40,12 +40,14 @@ pub const ProviderRoutes = struct {
     gateway: ProviderRoute,
     codex: ProviderRoute,
     grok: ProviderRoute,
+    opencode: ProviderRoute,
 
     pub fn select(self: ProviderRoutes, provider: model_provider.ProviderId) ProviderRoute {
         return switch (provider) {
             .gateway => self.gateway,
             .codex => self.codex,
             .grok => self.grok,
+            .opencode => self.opencode,
         };
     }
 };
@@ -54,12 +56,15 @@ test "provider routes select independent streams and reviewers" {
     var gateway_tag: u8 = 0;
     var codex_tag: u8 = 0;
     var grok_tag: u8 = 0;
+    var opencode_tag: u8 = 0;
     var gateway_stream = stream_provider.unavailable_provider;
     gateway_stream.context = &gateway_tag;
     var codex_stream = stream_provider.unavailable_provider;
     codex_stream.context = &codex_tag;
     var grok_stream = stream_provider.unavailable_provider;
     grok_stream.context = &grok_tag;
+    var opencode_stream = stream_provider.unavailable_provider;
+    opencode_stream.context = &opencode_tag;
     const Reviewer = struct {
         fn review(
             _: ?*anyopaque,
@@ -77,6 +82,7 @@ test "provider routes select independent streams and reviewers" {
         .gateway = .{ .agent_stream_provider = gateway_stream, .permission_reviewer_provider = gateway_reviewer },
         .codex = .{ .agent_stream_provider = codex_stream, .permission_reviewer_provider = codex_reviewer },
         .grok = .{ .agent_stream_provider = grok_stream, .permission_reviewer_provider = grok_reviewer },
+        .opencode = .{ .agent_stream_provider = opencode_stream, .permission_reviewer_provider = null },
     };
 
     try std.testing.expect(routes.select(.gateway).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
@@ -85,6 +91,8 @@ test "provider routes select independent streams and reviewers" {
     try std.testing.expect(routes.select(.codex).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
     try std.testing.expect(routes.select(.grok).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&grok_tag)));
     try std.testing.expect(routes.select(.grok).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&grok_tag)));
+    try std.testing.expect(routes.select(.opencode).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&opencode_tag)));
+    try std.testing.expect(routes.select(.opencode).permission_reviewer_provider == null);
 }
 
 pub const Config = struct {

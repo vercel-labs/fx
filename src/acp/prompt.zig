@@ -248,6 +248,7 @@ const AcpContext = struct {
                 .gateway => self.state.cfg.permission_reviewer_provider,
                 .codex => self.state.cfg.codex_permission_reviewer_provider,
                 .grok => self.state.cfg.grok_permission_reviewer_provider,
+                .opencode => null,
             },
             .auto_classifier = self.auto_classifier,
             .subagent_host = self.state.subagent_host,
@@ -440,17 +441,6 @@ pub fn handlePrompt(
     const session = if (state.active_session) |*active| active else return .{
         .rpc_error = no_active_session_rpc_error,
     };
-    if (!try server.selectCredentialForProvider(state, session.provider)) {
-        return .{ .rpc_error = .{
-            .code = ErrorCode.invalid_request,
-            .message = if (session.provider == .codex)
-                credentials.missing_chatgpt_credential_message
-            else if (session.provider == .grok)
-                credentials.missing_grok_credential_message
-            else
-                credentials.missing_credential_message,
-        } };
-    }
 
     const params = msg.params_raw orelse return .{
         .rpc_error = .{
@@ -705,6 +695,10 @@ pub fn runSubagentChild(
             .grok = .{
                 .agent_stream_provider = server.streamProviderFor(state, .grok),
                 .permission_reviewer_provider = state.cfg.grok_permission_reviewer_provider,
+            },
+            .opencode = .{
+                .agent_stream_provider = server.streamProviderFor(state, .opencode),
+                .permission_reviewer_provider = null,
             },
         },
         .system_prompt = state.cfg.prompt_policy.system_prompt,
@@ -1098,9 +1092,11 @@ fn resolveModelCapabilities(
 ) model_capabilities.ResolveError!model_capabilities.Capabilities {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*active| active else return model_capabilities.capabilitiesForModel(model);
+    const catalog = server.catalogProviderFor(ctx.state, session.provider) orelse
+        return model_capabilities.capabilitiesForModel(model);
     return ctx.state.capability_resolver.resolve(
         ctx.state.alloc,
-        ctx.state.cfg.gateway_provider.model_catalog,
+        catalog,
         .{
             .access = credentials.catalogAccessForCredentialAndAccount(
                 session.credential_source,

@@ -1552,6 +1552,10 @@ test "rendered top-level help is a complete CLI navigation page" {
     try std.testing.expect(std.mem.find(u8, text, "Commands:") != null);
     try std.testing.expect(std.mem.find(u8, text, "ask <prompt>") != null);
     try std.testing.expect(std.mem.find(u8, text, "Run one noninteractive request") != null);
+    try std.testing.expect(std.mem.find(u8, text, "login [vercel|codex|grok]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "logout [vercel|codex|grok]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "setup [gateway|opencode]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "provider <gateway|codex|grok|opencode>") != null);
     try std.testing.expect(std.mem.find(u8, text, "Draft or publish a GitHub issue") != null);
     try std.testing.expect(std.mem.find(u8, text, "credits|balance") != null);
     try std.testing.expect(std.mem.find(u8, text, "Show the AI Gateway credit balance") != null);

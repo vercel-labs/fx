@@ -79,6 +79,7 @@ pub fn Runtime(comptime App: type) type {
                 const required_source: credentials.Source = switch (provider) {
                     .codex => .chatgpt_subscription,
                     .grok => .grok_subscription,
+                    .opencode => .opencode_api_key,
                     .gateway => app.auth.credentialSource() orelse .fx_login,
                 };
                 const route_change = app.auth.selectForProvider(app.alloc, provider) catch |err| switch (err) {
@@ -95,6 +96,8 @@ pub fn Runtime(comptime App: type) type {
                             credentials.missing_grok_interactive_credential_message
                         else if (provider == .codex)
                             credentials.missing_chatgpt_interactive_credential_message
+                        else if (provider == .opencode)
+                            credentials.missing_opencode_interactive_credential_message
                         else
                             credentials.missing_interactive_credential_message,
                     }, true);
@@ -834,6 +837,8 @@ pub fn Runtime(comptime App: type) type {
                         "Run fx login codex, then try switching again."
                     else if (target == .grok)
                         "Run fx login grok, then try switching again."
+                    else if (target == .opencode)
+                        credentials.missing_opencode_interactive_credential_message
                     else
                         credentials.missing_interactive_credential_message,
                 }, true);
@@ -920,6 +925,7 @@ pub fn Runtime(comptime App: type) type {
                 .gateway => settings.model,
                 .codex => settings.codex_model,
                 .grok => settings.grok_model,
+                .opencode => settings.opencode_model,
             };
             const current_model = if (intent == .post_oauth and current == target)
                 provider_runtime.model(app)
@@ -985,6 +991,7 @@ pub fn Runtime(comptime App: type) type {
                     .gateway => .{ .provider = .gateway, .model = provider_runtime.model(app) },
                     .codex => .{ .provider = .codex, .codex_model = provider_runtime.model(app) },
                     .grok => .{ .provider = .grok, .grok_model = provider_runtime.model(app) },
+                    .opencode => .{ .provider = .opencode, .opencode_model = provider_runtime.model(app) },
                 });
                 defer persistence.deinit(app.alloc);
                 switch (persistence) {
@@ -1185,6 +1192,14 @@ pub fn Runtime(comptime App: type) type {
 
         fn reconcileGatewayCredential(app: *App) void {
             if (comptime !runtime_profile.allows(App, .generation_usage)) return;
+            if (provider_runtime.provider(app) == .opencode) {
+                if (comptime @hasField(App, "session") and
+                    @hasField(@TypeOf(app.session), "usage"))
+                {
+                    app.session.usage.clearReconciliationCredential();
+                }
+                return;
+            }
             if (comptime @hasField(App, "session") and
                 @hasField(@TypeOf(app.session), "usage"))
             {
@@ -1411,7 +1426,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
             switch (provider) {
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
-                .gateway => unreachable,
+                .gateway, .opencode => unreachable,
             }
 
             try std.testing.expectEqual(@as(usize, 0), app.auth.start_count);
@@ -1621,6 +1636,7 @@ const TestUrlOpener = struct {
 const TestApp = struct {
     alloc: std.mem.Allocator = std.testing.allocator,
     auth: TestAuth = .{},
+    selected_provider: model_provider.ProviderId = .gateway,
     model_cache: TestModelCache = .{},
     session: struct {
         usage: TestUsage = .{},

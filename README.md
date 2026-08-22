@@ -47,7 +47,19 @@ fx login grok
 fx
 ```
 
-`fx login codex` and `fx login grok` select that provider and a model from its authenticated catalog. Inside fx, open `/setup` and choose **Switch provider** to move between Gateway, Codex, and Grok. `/model` lists the active provider's fetched models. Subscription model IDs are the raw IDs returned by each authenticated catalog. Use `/logout codex` or `/logout grok` to remove that subscription session without affecting other providers; choosing it again from **Switch provider** starts sign-in.
+Or use OpenCode Go with an API key:
+
+```bash
+export OPENCODE_API_KEY=...
+fx setup opencode
+fx
+```
+
+`fx login`, `fx login codex`, and `fx login grok` are OAuth or saved-session flows. OpenCode Go has no OAuth login or logout flow. Use `fx setup opencode`, or choose **OpenCode Go** from `/setup`, to validate `OPENCODE_API_KEY` against its authenticated model catalog and save the provider and model selection. fx does not save the OpenCode key in this flow. Use `fx provider opencode` for a noninteractive provider switch. `/model` lists the raw model IDs returned by the active authenticated catalog.
+
+Inside fx, open `/setup` and choose **Switch provider** to move between Gateway, Codex, Grok, and OpenCode Go. Use `/logout codex` or `/logout grok` to remove those subscription sessions without affecting other providers; OpenCode Go is not a `/login` or `/logout` choice.
+
+The OpenCode Go route sends requests directly to `https://opencode.ai/zen/go/v1` and never forwards `OPENCODE_API_KEY` to Vercel AI Gateway, OpenAI, or xAI. The key remains environment-only in this setup flow.
 
 The OpenAI Codex route uses ChatGPT subscription access directly and never sends its OAuth token to Vercel AI Gateway. The session is stored privately at `~/.fx/chatgpt-auth.json` and refreshed when needed. On supported Codex models, `/fast` requests OpenAI's priority service tier and consumes ChatGPT credits at the higher Fast mode rate.
 
@@ -58,6 +70,8 @@ To use an AI Gateway API key instead:
 ```bash
 fx setup
 ```
+
+`fx setup` without a provider argument remains the AI Gateway API-key setup flow.
 
 Run fx from a project:
 
