@@ -17,6 +17,7 @@ pub const mcp_credentials_file_name = "credentials.json";
 
 const settings_file_name = "settings.json";
 const mcp_config_file_name = "mcp.json";
+const acp_config_file_name = "acp.json";
 const managed_skills_dir_name = "skills";
 const memories_file_name = "memories.json";
 const logs_dir_name = "logs";
@@ -33,6 +34,10 @@ pub fn settingsPath(alloc: Allocator, home: []const u8) ![]u8 {
 
 pub fn mcpConfigPath(alloc: Allocator, home: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ home, root_dir_name, mcp_config_file_name });
+}
+
+pub fn acpConfigPath(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{ home, root_dir_name, acp_config_file_name });
 }
 
 pub fn mcpCredentialsDir(alloc: Allocator, home: []const u8) ![]u8 {
@@ -110,6 +115,10 @@ test "profile path helpers preserve current default locations" {
     const mcp = try mcpConfigPath(alloc, "/tmp/fake-home");
     defer alloc.free(mcp);
     try std.testing.expectEqualStrings("/tmp/fake-home/.fx/mcp.json", mcp);
+
+    const acp = try acpConfigPath(alloc, "/tmp/fake-home");
+    defer alloc.free(acp);
+    try std.testing.expectEqualStrings("/tmp/fake-home/.fx/acp.json", acp);
 
     const mcp_credentials_dir = try mcpCredentialsDir(alloc, "/tmp/fake-home");
     defer alloc.free(mcp_credentials_dir);

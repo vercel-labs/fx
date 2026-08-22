@@ -4,6 +4,7 @@ const registered_entities = @import("../input/registered_entities.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const io_mod = @import("../shared/io.zig");
+const provider_runtime = @import("provider_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
 const types = @import("../shared/types.zig");
@@ -118,6 +119,31 @@ pub fn SubmitRuntime(comptime App: type) type {
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 app.shell.render_requests.request(.footer);
                 return;
+            }
+
+            // While an ACP agent is the selected backend (model "acp/<name>"),
+            // plain prompts become /acp run turns instead of gateway requests.
+            if (comptime provider_runtime.supported(App)) {
+                const current_model = provider_runtime.model(app);
+                if (std.mem.startsWith(u8, current_model, "acp/")) {
+                    const agent = current_model["acp/".len..];
+                    // Echo the prompt as a normal user turn; the rewrite to
+                    // /acp run is an implementation detail the transcript
+                    // should not surface.
+                    if (comptime @hasDecl(App, "writeUserPromptCard")) {
+                        const prompt_copy = try app.alloc.dupe(u8, trimmed);
+                        defer app.alloc.free(prompt_copy);
+                        try app.writeUserPromptCard(.{ .text = prompt_copy });
+                    }
+                    const command_text = try std.fmt.allocPrint(
+                        app.alloc,
+                        "/acp run {s} {s}",
+                        .{ agent, trimmed },
+                    );
+                    defer app.alloc.free(command_text);
+                    try submitSlashCommand(app, command_text, null, max_prompt_history);
+                    return;
+                }
             }
 
             const first_image_id = try firstAvailableImageId(app.pending_images.items);

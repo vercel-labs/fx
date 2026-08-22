@@ -31,6 +31,7 @@ pub const ParsedCommand = union(enum) {
     usage,
     undo,
     mcp: []const u8,
+    acp: []const u8,
     skills: []const u8,
     copy,
     feedback,
@@ -76,6 +77,7 @@ pub const CommandHandlers = struct {
     show_usage: *const fn (ctx: *anyopaque) anyerror!void,
     undo_last: *const fn (ctx: *anyopaque) anyerror!void,
     handle_mcp: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    handle_acp: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_skills: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     copy_last: *const fn (ctx: *anyopaque) anyerror!void,
     submit_feedback: *const fn (ctx: *anyopaque) anyerror!void,
@@ -127,6 +129,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .usage => .usage,
         .undo => .undo,
         .mcp => .{ .mcp = payload },
+        .acp => .{ .acp = payload },
         .skills => .{ .skills = payload },
         .copy => .copy,
         .feedback => .feedback,
@@ -186,6 +189,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .usage => try handlers.show_usage(handlers.ctx),
         .undo => try handlers.undo_last(handlers.ctx),
         .mcp => |rest| try handlers.handle_mcp(handlers.ctx, rest),
+        .acp => |rest| try handlers.handle_acp(handlers.ctx, rest),
         .skills => |rest| try handlers.handle_skills(handlers.ctx, rest),
         .copy => try handlers.copy_last(handlers.ctx),
         .feedback => try handlers.submit_feedback(handlers.ctx),
@@ -320,6 +324,17 @@ test "parse extracts image commands" {
 test "parse extracts mcp command payload" {
     switch (parse(testSlashRegistry(), "/mcp add everything npx -y @modelcontextprotocol/server-everything")) {
         .mcp => |rest| try std.testing.expectEqualStrings("add everything npx -y @modelcontextprotocol/server-everything", rest),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "parse extracts acp command payload" {
+    switch (parse(testSlashRegistry(), "/acp add claude")) {
+        .acp => |rest| try std.testing.expectEqualStrings("add claude", rest),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/acp")) {
+        .acp => |rest| try std.testing.expectEqualStrings("", rest),
         else => return error.TestExpectedEqual,
     }
 }
@@ -563,6 +578,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .show_usage = unexpectedNoPayload,
         .undo_last = unexpectedNoPayload,
         .handle_mcp = unexpectedPayload,
+        .handle_acp = unexpectedPayload,
         .handle_skills = unexpectedPayload,
         .copy_last = unexpectedNoPayload,
         .submit_feedback = unexpectedNoPayload,

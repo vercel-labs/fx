@@ -397,6 +397,42 @@ pub fn environMap() ?*const std.process.Environ.Map {
     return global_environ;
 }
 
+/// Copies every visible environment variable into `map`, regardless of
+/// whether the environment was installed as a map, a block, or raw environ.
+pub fn copyEnviron(map: *std.process.Environ.Map) !void {
+    if (global_environ) |m| {
+        var it = m.iterator();
+        while (it.next()) |entry| try map.put(entry.key_ptr.*, entry.value_ptr.*);
+        return;
+    }
+    if (global_environ_block) |block| {
+        if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding or builtin.os.tag == .other) {
+            return;
+        }
+        if (comptime (builtin.os.tag == .wasi or builtin.os.tag == .emscripten) and !builtin.link_libc) {
+            return;
+        }
+        const view = block.view();
+        for (view.slice) |entry_z| {
+            const entry = std.mem.sliceTo(entry_z, 0);
+            const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+            if (eq == 0) continue;
+            try map.put(entry[0..eq], entry[eq + 1 ..]);
+        }
+        return;
+    }
+    if (global_raw_environ) |raw| {
+        @setRuntimeSafety(false);
+        var i: usize = 0;
+        while (raw[i]) |entry_z| : (i += 1) {
+            const entry = std.mem.sliceTo(entry_z, 0);
+            const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+            if (eq == 0) continue;
+            try map.put(entry[0..eq], entry[eq + 1 ..]);
+        }
+    }
+}
+
 fn getenvFromBlock(block: std.process.Environ.Block, key: []const u8) ?[]const u8 {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding or builtin.os.tag == .other) {
         return null;

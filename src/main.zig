@@ -19,6 +19,7 @@ const app_host_config_runtime = @import("core/app/app_host_config_runtime.zig");
 const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
 const acp_runner = @import("core/cli/acp_runner.zig");
 const acp_server = @import("acp/server.zig");
+const acp_turn_runner = @import("core/acp_client/turn_runner.zig");
 const app_input_runtime = @import("core/app/app_input_runtime.zig");
 const core_input_runtime = @import("core/input/runtime.zig");
 const input_queue_runtime = @import("core/app/input_queue_runtime.zig");
@@ -546,6 +547,9 @@ const App = struct {
     subagents: ui_subagents.Controller = .{},
     change_tracker: change_tracker_mod.ChangeTracker = .{},
     mcp: app_mcp_runtime.State = .{},
+    acp_turn: ?*acp_turn_runner.ActiveTurn = null,
+    /// Keeps the selected ACP agent's process and session alive across turns.
+    acp_session_store: acp_turn_runner.SessionStore = .{},
     skills: skill_runtime.Runtime = .{},
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     file_index: file_index_mod.FileIndex = .{},
@@ -801,6 +805,12 @@ const App = struct {
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
         self.stopStream();
+        if (self.acp_turn) |turn| {
+            turn.requestCancel();
+            turn.deinit();
+            self.acp_turn = null;
+        }
+        self.acp_session_store.deinit();
 
         self.worker.requestShutdown();
         self.background.requestStop();
@@ -1694,6 +1704,14 @@ const App = struct {
         try RenderAppRuntime.toggleSubagentView(self);
     }
 
+    pub fn drainAcpTurn(self: *App) !void {
+        try app_commands.Handlers(App).drainAcpTurn(self);
+    }
+
+    pub fn requestAcpCancel(self: *App) void {
+        app_commands.Handlers(App).requestAcpCancel(self);
+    }
+
     pub fn refreshSubagentManagerProjection(self: *App) !void {
         if (comptime !host_profile.subagents) return;
         try RenderAppRuntime.refreshSubagentManager(self, false);
@@ -1758,6 +1776,9 @@ const App = struct {
     }
 
     pub fn resolvedModelCapabilities(self: *App, model: []const u8) model_capabilities.Capabilities {
+        if (std.mem.startsWith(u8, model, "acp/")) {
+            return app_commands.Handlers(App).acpModelCapabilities(self, model);
+        }
         return model_capabilities.resolveCapabilities(model, self.model_cache.metadataForModel(model));
     }
 
@@ -1830,6 +1851,7 @@ const App = struct {
 
     pub fn modelCompletions(self: *App, query: []const u8, out: [][]const u8) usize {
         self.ensureModelCache();
+        app_commands.Handlers(App).refreshAcpModelEntries(self);
         return self.model_cache.modelCompletions(query, out);
     }
 
@@ -3810,6 +3832,11 @@ test {
     _ = @import("core/shared/collections.zig");
     _ = @import("core/slash_commands/command_router.zig");
     _ = @import("core/slash_commands/command_specs.zig");
+    _ = @import("core/acp_client/agent_catalog.zig");
+    _ = @import("core/acp_client/command_provider.zig");
+    _ = @import("core/acp_client/config.zig");
+    _ = @import("core/acp_client/runtime.zig");
+    _ = @import("core/shared/profile_paths.zig");
     _ = @import("core/config/config_runtime.zig");
     _ = @import("core/config/settings_store.zig");
     _ = @import("ui/footer/appearance_menu_presentation.zig");

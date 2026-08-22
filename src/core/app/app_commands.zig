@@ -1,5 +1,6 @@
 const std = @import("std");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
+const acp_turn_mod = @import("../acp_client/turn_runner.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const io_mod = @import("../shared/io.zig");
@@ -338,6 +339,7 @@ pub fn Handlers(comptime App: type) type {
                 .show_usage = commandShowUsage,
                 .undo_last = commandUndoLast,
                 .handle_mcp = commandHandleMcp,
+                .handle_acp = commandHandleAcp,
                 .handle_skills = commandHandleSkills,
                 .copy_last = commandCopyLast,
                 .submit_feedback = commandSubmitFeedback,
@@ -634,10 +636,54 @@ pub fn Handlers(comptime App: type) type {
         fn commandShowModels(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             app.ensureModelCache();
+            refreshAcpModelEntries(app);
             if (comptime @hasField(App, "skills")) app.skills.closeMenu();
             closeHelpMenuIfPresent(app);
             try app.model_cache.openMenu();
             app.shell.render_requests.request(.footer);
+        }
+
+        /// Capabilities for an "acp/<agent>[/model]" id: reasoning efforts
+        /// come from the agent's cached effort options in acp.json so the
+        /// /model picker offers an effort stage like any other provider.
+        pub fn acpModelCapabilities(app: *App, model: []const u8) model_capabilities.Capabilities {
+            var capabilities = model_capabilities.Capabilities{};
+            if (!std.mem.startsWith(u8, model, "acp/")) return capabilities;
+            const rest = model["acp/".len..];
+            const slash = std.mem.indexOfScalar(u8, rest, '/');
+            const agent = if (slash) |i| rest[0..i] else rest;
+            const builtin_acp = @import("../../builtins/acp.zig");
+            const labels = builtin_acp.agentEffortLabels(app.alloc, io_mod.getenv("HOME"), agent) catch
+                return capabilities;
+            defer builtin_acp.freeAgentNames(app.alloc, labels);
+            var efforts: [types.ReasoningEffort.max_options]types.ReasoningEffort = undefined;
+            var len: usize = 0;
+            for (labels) |label| {
+                if (len >= efforts.len) break;
+                const parsed = types.ReasoningEffort.parse(label) orelse continue;
+                // The picker prepends its own "default" row.
+                if (parsed.isDefault()) continue;
+                efforts[len] = parsed;
+                len += 1;
+            }
+            capabilities.supports_reasoning = len > 0;
+            capabilities.reasoning_efforts = model_capabilities.ReasoningEffortOptions.fromSlice(efforts[0..len]);
+            return capabilities;
+        }
+
+        /// Surfaces configured ACP agents in the model menu as acp/<name>
+        /// entries. Failures leave the menu without ACP rows.
+        pub fn refreshAcpModelEntries(app: *App) void {
+            const builtin_acp = @import("../../builtins/acp.zig");
+            const names = builtin_acp.enabledAgentNames(app.alloc, io_mod.getenv("HOME")) catch |err| {
+                debug_trace.logf("acp", "picker names failed err={s}", .{@errorName(err)});
+                return;
+            };
+            defer builtin_acp.freeAgentNames(app.alloc, names);
+            debug_trace.logf("acp", "picker names count={d}", .{names.len});
+            app.model_cache.setAcpAgentNames(names) catch |err| {
+                debug_trace.logf("acp", "picker set failed err={s}", .{@errorName(err)});
+            };
         }
 
         fn commandHandlePermissions(ctx: *anyopaque, rest: []const u8) !void {
@@ -1104,6 +1150,178 @@ pub fn Handlers(comptime App: type) type {
         fn summarizeMcpServers(ctx: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
             const app: *App = @ptrCast(@alignCast(ctx));
             return app.summarizeMcpServers(alloc);
+        }
+
+        fn commandHandleAcp(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime !runtime_profile.allows(App, .mcp)) {
+                try app.writeDomainNotice(.{
+                    .topic = "acp",
+                    .tone = .warning,
+                    .body = "ACP agents are unavailable in this host because process spawning is not provided.",
+                }, true);
+                return;
+            }
+
+            const builtin_acp = @import("../../builtins/acp.zig");
+            var result = try builtin_acp.command_provider.handle(app.alloc, rest, .{
+                .home = io_mod.getenv("HOME"),
+                .acp_run_ctx = @ptrCast(app),
+                .report_agent_update = acpReportAgentUpdate,
+                .request_permission = acpRequestPermission,
+                .worker = &app.worker,
+                .cwd = app.workspace_root,
+                .on_turn_started = acpTurnStarted,
+                .turn_started_ctx = @ptrCast(app),
+                .acp_session_store = if (comptime @hasField(App, "acp_session_store"))
+                    @ptrCast(&app.acp_session_store)
+                else
+                    null,
+                .effort_label = if (comptime @hasField(App, "effort"))
+                    app.effort.gatewayValue()
+                else
+                    null,
+            });
+            defer result.deinit(app.alloc);
+
+            const body = switch (result.display) {
+                .block => |text| text,
+                .line => |text| text,
+            };
+            try app.writeDomainNotice(.{
+                .topic = "acp",
+                .tone = if (result.warning) .warning else .neutral,
+                .body = body,
+            }, true);
+        }
+
+        /// Streams agent message chunks into the transcript as they arrive.
+        /// Streams agent message chunks into the transcript as they arrive.
+        /// Called from the turn's reader thread; the worker event queue makes
+        /// the write visible on the UI thread.
+        fn acpReportAgentUpdate(ctx: *anyopaque, agent_name: []const u8, update_text: []const u8) void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (update_text.len == 0) return;
+            const worker_runtime_mod = @import("app_worker_runtime.zig");
+            const line = std.fmt.allocPrint(app.alloc, "[{s}] {s}", .{ agent_name, update_text }) catch return;
+            defer app.alloc.free(line);
+            worker_runtime_mod.Runtime(App).pushSemanticNotice(app, .{
+                .topic = "acp",
+                .tone = .neutral,
+                .body = line,
+            }) catch {};
+        }
+
+        /// Bridges the child agent's session/request_permission into fx's
+        /// interactive approval UI. Returns "allow" or "reject" (resolved
+        /// against the agent's optionIds by the turn runner), or an empty
+        /// slice when the approval failed or was dismissed.
+        fn acpRequestPermission(ctx: *anyopaque, agent_name: []const u8, request_json: []const u8) []const u8 {
+            const app: *App = @ptrCast(@alignCast(ctx));
+
+            const permission_request_mod = @import("../permissions/permission_request.zig");
+            const tool_admission = @import("../tooling/tool_admission.zig");
+            const turn_runner = @import("../acp_client/turn_runner.zig");
+
+            var arena_state = std.heap.ArenaAllocator.init(app.alloc);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+
+            // Surface what the agent wants approved.
+            const parsed = turn_runner.parsePermissionRequest(arena, request_json) catch null;
+            const title = if (parsed) |value| value.title else null;
+            const label = if (title) |t|
+                std.fmt.allocPrint(arena, "ACP agent {s}: {s}", .{ agent_name, t }) catch
+                    "ACP agent permission request"
+            else
+                std.fmt.allocPrint(arena, "ACP agent {s} requests approval", .{agent_name}) catch
+                    "ACP agent permission request";
+
+            const request: permission_request_mod.PermissionRequest = .{
+                .label = label,
+                .origin = .active_session,
+                .explanation = "The ACP agent asks fx to approve this action.",
+                .confirmation_only = true,
+                .amendment_allowed = false,
+            };
+            const call: types.ToolCall = .{
+                .id = "acp-permission",
+                .name = "acp_request_permission",
+                .arguments_json = "{}",
+            };
+
+            const prompter = tool_admission.workerPrompter(&app.worker);
+            const response = prompter.request(app.alloc, request, call, null, null) catch {
+                return "";
+            };
+            var owned = response;
+            defer owned.deinit();
+
+            return switch (owned.decision) {
+                .once, .always => "allow",
+                else => "reject",
+            };
+        }
+
+        /// Receives the turn handle so the app can drain and cancel it.
+        fn acpTurnStarted(ctx: *anyopaque, turn: *anyopaque) void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            app.acp_turn = @ptrCast(@alignCast(turn));
+            app.stream.active = true;
+            app.stream.turn_started_ms = io_mod.milliTimestamp();
+            app.shell.render_requests.request(.footer);
+        }
+
+        /// Cancels the active ACP agent turn, if any. Wired to Escape.
+        pub fn requestAcpCancel(app: *App) void {
+            if (app.acp_turn) |turn| turn.requestCancel();
+        }
+
+        /// Drains one tick of the active ACP turn: flushes streamed updates,
+        /// publishes the result when the turn finishes, and frees the turn.
+        pub fn drainAcpTurn(app: *App) !void {
+            const turn = app.acp_turn orelse return;
+            if (try turn.takeUpdate(app.alloc)) |text| {
+                defer app.alloc.free(text);
+                try app.pacer.enqueue(app.alloc, text);
+                app.shell.render_requests.request(.transcript);
+            }
+            if (turn.finished) {
+                try app.pacer.flushPresentationAtBoundary(
+                    app.alloc,
+                    io_mod.nanoTimestamp(),
+                    app.pacerCallbacks(),
+                );
+                // Successful turns end like a normal provider reply; only
+                // failures surface as a notice.
+                if (turn.result_is_warning) {
+                    if (turn.result_text) |text| {
+                        try app.writeDomainNotice(.{
+                            .topic = "acp",
+                            .tone = .warning,
+                            .body = text,
+                        }, true);
+                    }
+                }
+                if (turn.model_values.len > 0) {
+                    cacheAcpModels(app, turn);
+                }
+                turn.deinit();
+                app.acp_turn = null;
+                app.stream = .{};
+                app.shell.render_requests.request(.footer);
+            }
+        }
+
+        fn cacheAcpModels(app: *App, turn: *acp_turn_mod.ActiveTurn) void {
+            const acp_config = @import("../acp_client/config.zig");
+            const profile_paths = @import("../shared/profile_paths.zig");
+            const home = io_mod.getenv("HOME") orelse return;
+            const config_path = profile_paths.acpConfigPath(app.alloc, home) catch return;
+            defer app.alloc.free(config_path);
+            acp_config.updateAgentModels(app.alloc, config_path, turn.agent_name, turn.model_values, turn.effort_values) catch |err| {
+                debug_trace.logf("acp", "caching models failed agent={s} err={s}", .{ turn.agent_name, @errorName(err) });
+            };
         }
 
         fn listMcpResources(
