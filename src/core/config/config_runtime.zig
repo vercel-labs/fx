@@ -12,6 +12,7 @@ const model_provider = @import("model_provider.zig");
 const model_preferences = @import("model_preferences.zig");
 const update_target = @import("../upgrade/update_target.zig");
 pub const context_limits = @import("context_limits.zig");
+pub const provider_routing = @import("provider_routing.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
@@ -63,10 +64,13 @@ pub const Settings = struct {
     notification_max: ?bool = null,
     permission_rules: types.PermissionRuleSet = .{},
     has_permission_rules: bool = false,
+    provider_routing: provider_routing.Map = .{},
+    has_provider_routing: bool = false,
 
     pub fn deinit(self: *Settings, alloc: Allocator) void {
         self.models.deinit(alloc);
         self.permission_rules.deinit(alloc);
+        self.provider_routing.deinit(alloc);
         self.* = .{};
     }
 };
@@ -1488,6 +1492,16 @@ fn parseProfileOnlyFields(
         }
     }
 
+    if (root.object.get("providerRouting")) |routing_value| {
+        if (routing_value != .object) {
+            if (!tolerate_non_object_user_containers) return error.InvalidProviderRoutingType;
+        } else {
+            settings.provider_routing.deinit(alloc);
+            settings.provider_routing = try provider_routing.parseJsonObject(routing_value, alloc);
+            settings.has_provider_routing = true;
+        }
+    }
+
     if (root.object.get("notifications")) |notifications_value| {
         if (notifications_value != .object) return error.InvalidNotificationsType;
         if (notifications_value.object.get("turn_end")) |value| {
@@ -1567,6 +1581,12 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
         incoming.permission_rules = .{};
         target.has_permission_rules = true;
         incoming.has_permission_rules = false;
+    }
+
+    if (incoming.has_provider_routing) {
+        target.provider_routing.merge(&incoming.provider_routing, alloc);
+        incoming.has_provider_routing = false;
+        target.has_provider_routing = true;
     }
 }
 
@@ -1937,6 +1957,57 @@ test "loadMergedSettings merges project defaults before profile layers" {
     try std.testing.expectEqualStrings("override-model", settings.models.get(.gateway).?);
     try std.testing.expectEqual(types.PermissionMode.auto, settings.permission_mode.?);
     try std.testing.expectEqual(@as(usize, 8), settings.max_agent_steps.?);
+}
+
+test "provider routing merges profile layers with exact match over default" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const user_settings = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"providerRouting\":{{\"default\":{{\"only\":[\"wafer\"]}}}},\"workspaces\":{{\"{s}\":{{\"providerRouting\":{{\"anthropic/claude-sonnet-5\":{{\"order\":[\"baseten\",\"bedrock\"]}}}}}}}}}}",
+        .{workspace_root},
+    );
+    defer std.testing.allocator.free(user_settings);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
+
+    var settings = try loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_root);
+    defer settings.deinit(std.testing.allocator);
+
+    try std.testing.expect(settings.has_provider_routing);
+    const exact = settings.provider_routing.lookup("anthropic/claude-sonnet-5").?;
+    try std.testing.expectEqual(@as(usize, 2), exact.order.len);
+    try std.testing.expectEqualStrings("bedrock", exact.order[1]);
+    const fallback = settings.provider_routing.lookup("openai/gpt-5").?;
+    try std.testing.expectEqualStrings("wafer", fallback.only[0]);
+}
+
+test "invalid provider routing settings fail parsing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"providerRouting\":{\"a/b\":{\"only\":\"wafer\"}}}",
+    );
+
+    const result = loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_root);
+    try std.testing.expectError(error.InvalidProviderRoutingSlugType, result);
 }
 
 test "context limits resolve command line over workspace and global profile values" {

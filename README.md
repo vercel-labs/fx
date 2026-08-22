@@ -80,6 +80,19 @@ The status line hides the workspace path and Git branch by default. Enable the `
 }
 ```
 
+Gateway requests can be routed to specific upstream providers per model with `providerRouting` in `~/.fx/settings.json`. Provider slugs follow the AI Gateway's provider filtering and ordering. An entry keyed by model ID applies to that model; the `default` entry applies to every other model:
+
+```json
+{
+  "providerRouting": {
+    "default": { "order": ["wafer"] },
+    "anthropic/claude-sonnet-5": { "only": ["baseten"], "order": ["baseten", "bedrock"] }
+  }
+}
+```
+
+`order` lists the providers to attempt in sequence and `only` restricts routing to the listed providers. Workspace overrides in `~/.fx/settings.json` layer over profile-global entries per model.
+
 List saved sessions with `fx sessions`. Resume the latest session for the current workspace, or select an exact session ID, through the same command group:
 
 ```bash

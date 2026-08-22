@@ -4,6 +4,7 @@ const tool_result_limits = @import("../../tooling/tool_result_limits.zig");
 const session_child_store = @import("../../session/session_child_store.zig");
 const command_replay_store = @import("../../session/command_replay_store.zig");
 const context_limits = @import("../../config/context_limits.zig");
+const provider_routing = @import("../../config/provider_routing.zig");
 const workspace_access = @import("../../workspace/workspace_access.zig");
 const model_response_recovery = @import("model_response_recovery.zig");
 const provider_set = @import("../../gateway/provider_set.zig");
@@ -65,4 +66,6 @@ pub const Config = struct {
     ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,
     subagent_id: u64 = 0,
     context_limits: context_limits.Values = .{},
+    /// Borrowed from App-owned state; must outlive every turn it configures.
+    gateway_provider_routing: ?*const provider_routing.Map = null,
 };

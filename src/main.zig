@@ -568,6 +568,7 @@ const App = struct {
     file_index: file_index_mod.FileIndex = .{},
     context_enabled: bool = true,
     context_limits: config_runtime.context_limits.Values = .{},
+    provider_routing: config_runtime.provider_routing.Map = .{},
     fast_mode: bool = false,
     auto_upgrade_enabled: bool = true,
     effort: ReasoningEffort = .auto,
@@ -890,6 +891,7 @@ const App = struct {
         self.skills.deinit(std.heap.c_allocator);
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
+        self.provider_routing.deinit(self.alloc);
         self.lifecycle_runtime.deinit();
 
         self.auth.deinit(self.alloc);
