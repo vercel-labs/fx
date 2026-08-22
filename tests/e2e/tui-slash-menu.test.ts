@@ -1439,7 +1439,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/help");
-      let grid = await waitForHelpMenu(session, 37);
+      let grid = await waitForHelpMenu(session, 46);
       let pane = grid.join("\n");
       expect(pane).not.toContain("𝒇x");
       expect(pane).not.toContain("Run /help for commands");
@@ -1459,11 +1459,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("/clear");
 
       await session.sendKeys("C-u");
-      await waitForHelpMenu(session, 37);
+      await waitForHelpMenu(session, 46);
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       pane = await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Commands 37"),
+        (current) => hasEmptyComposer(current) && !current.includes("Commands 46"),
         5_000,
       );
       expect(composerContains(pane, "/clear")).toBe(false);
@@ -1472,7 +1472,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 37);
+      await waitForHelpMenu(session, 46);
       await session.sendLiteralText("additional directories");
       await waitForHelpMenu(session, 1);
       await session.sendKeys("Enter");
@@ -1489,7 +1489,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 37);
+      await waitForHelpMenu(session, 46);
       await session.sendLiteralText("no command can match this query");
       await session.waitForText("No commands found.", 5_000);
       await session.sendKeys("Escape");
@@ -1600,7 +1600,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/help");
-      let pane = await session.waitForText("Commands 37", 5_000);
+      let pane = await session.waitForText("Commands 46", 5_000);
       expect(pane).toContain("/help");
       expect(pane).not.toContain("● /help");
       await session.sendKeys("Escape");
@@ -3350,6 +3350,68 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(session.isAlive()).toBe(true);
 
       await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "MCP subcommands are discoverable from slash completion and help search",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-mcp-command-help-")));
+      workDirs.push(root);
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(home, { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 30,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendKeys("-l '/mcp '");
+      let pane = await session.waitForText("Commands 9", 5_000);
+      expect(pane).toContain("/mcp list");
+      expect(pane).toContain("list configured servers, tools, and connection status");
+
+      await session.sendLiteralText("rel");
+      pane = await session.waitForText("/mcp reload", 5_000);
+      expect(pane).toContain("/mcp reload");
+
+      await session.sendKeys("C-u");
+      await session.sendKeys("-l '/mcp auth'");
+      pane = await session.waitForText("/mcp auth", 5_000);
+      expect(pane).toContain("/mcp auth");
+
+      await session.sendKeys("C-u");
+      await session.sendText("/help");
+      await waitForHelpMenu(session, 46);
+      await session.sendLiteralText("reload MCP");
+      pane = (await waitForHelpMenu(session, 1)).join("\n");
+      expect(pane).toContain("/mcp reload");
+      expect(pane).toContain("reload trusted MCP configuration");
+
+      await session.sendKeys("C-u");
+      await session.sendLiteralText("authenticate MCP browser");
+      pane = (await waitForHelpMenu(session, 1)).join("\n");
+      expect(pane).toContain("/mcp auth <name> [--open]");
+
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && !current.includes("Enter Open"),
+        5_000,
+      );
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       session = null;

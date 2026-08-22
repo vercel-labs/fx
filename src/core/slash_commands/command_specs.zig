@@ -168,6 +168,8 @@ pub const SlashSpec = struct {
     show_in_welcome: bool = false,
     has_args: bool = false,
     accepts_payload: bool = false,
+    dispatchable: bool = true,
+    completion_parent: ?[]const u8 = null,
     requires_prompt_credential: bool = false,
 };
 
@@ -258,7 +260,7 @@ pub fn matchesTopLevel(registry: TopLevelRegistry, token: []const u8, kind: TopL
 
 pub fn matchesSlashExact(registry: SlashRegistry, cmd: []const u8, kind: SlashKind) bool {
     const matched = registry.matchExact(cmd) orelse return false;
-    return matched.command.kind == kind;
+    return matched.command.dispatchable and matched.command.kind == kind;
 }
 
 pub fn matchedSlashPrefix(registry: SlashRegistry, cmd: []const u8, kind: SlashKind) ?[]const u8 {
@@ -480,6 +482,9 @@ fn completionCommandMatchRank(command: []const u8, prefix: []const u8) ?usize {
 }
 
 fn bestCompletionCommandMatch(spec: SlashSpec, prefix: []const u8) ?SlashCompletionCommandMatch {
+    if (spec.completion_parent) |parent| {
+        if (prefix.len < parent.len or !std.mem.startsWith(u8, prefix, parent)) return null;
+    }
     var best: ?SlashCompletionCommandMatch = if (completionCommandMatchRank(spec.command, prefix)) |rank|
         .{ .command = spec.command, .rank = rank }
     else
@@ -1252,7 +1257,7 @@ fn slashSpec(registry: SlashRegistry, kind: SlashKind) SlashSpec {
 
 fn slashSpecPtr(registry: SlashRegistry, kind: SlashKind) *const SlashSpec {
     for (registry.commands) |*spec| {
-        if (spec.kind == kind) return spec;
+        if (spec.dispatchable and spec.kind == kind) return spec;
     }
     unreachable;
 }
@@ -1748,11 +1753,13 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 37), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 46), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
     try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));
     try std.testing.expectEqualStrings("/paste", helpCatalogSpecAt(registry, "clipboard", 0).?.command);
+    try std.testing.expectEqualStrings("/mcp reload", helpCatalogSpecAt(registry, "reload MCP", 0).?.command);
+    try std.testing.expectEqualStrings("/mcp auth", helpCatalogSpecAt(registry, "authenticate MCP browser", 0).?.command);
 }
 
 test "help menu selection follows the filtered catalog without executing commands" {
@@ -1809,6 +1816,7 @@ test "slash specs cover every SlashKind" {
     var seen = [_]bool{false} ** std.meta.fields(SlashKind).len;
     const registry = testSlashRegistry();
     for (registry.commands) |spec| {
+        if (!spec.dispatchable) continue;
         const index = @intFromEnum(spec.kind);
         try std.testing.expect(!seen[index]);
         seen[index] = true;

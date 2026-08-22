@@ -1,5 +1,6 @@
 const std = @import("std");
 const command_specs = @import("../core/slash_commands/command_specs.zig");
+const mcp_command_catalog = @import("../core/mcp/command_catalog.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -411,7 +412,7 @@ pub fn topLevelUsage(kind: TopLevelKind) []const u8 {
     return command_specs.topLevelUsage(top_level_registry, kind);
 }
 
-pub const slash_specs = [_]SlashSpec{
+const top_level_slash_specs = [_]SlashSpec{
     .{ .kind = .help, .command = "/help", .help_entry = "/help", .completion_description = "show available slash commands", .presentation_category = .general, .show_in_welcome = true },
     .{ .kind = .clear_screen, .command = "/clear", .help_entry = "/clear", .completion_description = "start a fresh session and keep background processes", .presentation_category = .general, .show_in_welcome = true },
     .{ .kind = .new_session, .command = "/new", .help_entry = "/new", .completion_description = "start a fresh session", .presentation_category = .session, .show_in_welcome = true },
@@ -436,7 +437,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|yolo|reset]", .completion_description = "choose what fx is allowed to do", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .allowlist, .command = "/allowlist", .help_entry = "/allowlist [view [effective|local|user]|[local|user] add|remove|reset ...]", .completion_description = "manage trusted commands, tools, and URLs", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .undo, .command = "/undo", .help_entry = "/undo", .completion_description = "undo the latest tracked file operation", .presentation_category = .session },
-    .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|resource|prompt|add|remove|path|reload|auth|logout]", .completion_description = "manage MCP servers, resources, and prompts", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
+    .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp", .completion_description = "manage MCP servers, resources, and prompts", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .skills, .command = "/skills", .help_entry = "/skills [list|add|install|show|create|remove|path] [name|url|path] ($ opens skill search)", .completion_description = "browse and manage skills", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .copy, .command = "/copy", .help_entry = "/copy", .completion_description = "copy the last assistant response", .presentation_category = .session },
     .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "open the fx feedback form", .presentation_category = .product, .show_in_welcome = true },
@@ -453,6 +454,8 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .version, .command = "/version", .help_entry = "/version", .completion_description = "show the fx version", .presentation_category = .general },
     .{ .kind = .quit, .command = "/quit", .aliases = &.{"/exit"}, .help_entry = "/quit", .completion_description = "exit the interactive shell", .presentation_category = .general, .show_in_welcome = true },
 };
+
+pub const slash_specs = top_level_slash_specs ++ mcp_command_catalog.slash_specs;
 
 pub const slash_registry = SlashRegistry{ .commands = slash_specs[0..] };
 
@@ -511,7 +514,7 @@ pub const statuslineArgCompletionPrefix = command_specs.statuslineArgCompletionP
 pub const notificationsArgCompletionPrefix = command_specs.notificationsArgCompletionPrefix;
 pub const permissionsArgCompletionPrefix = command_specs.permissionsArgCompletionPrefix;
 
-test "built-in slash commands register exact active order" {
+test "built-in slash commands register exact catalog order" {
     const expected_commands = [_][]const u8{
         "/help",
         "/clear",
@@ -553,6 +556,15 @@ test "built-in slash commands register exact active order" {
         "/workspace",
         "/version",
         "/quit",
+        "/mcp list",
+        "/mcp resource",
+        "/mcp prompt",
+        "/mcp add",
+        "/mcp remove",
+        "/mcp path",
+        "/mcp reload",
+        "/mcp auth",
+        "/mcp logout",
     };
 
     try std.testing.expectEqual(expected_commands.len, slash_specs.len);
@@ -613,4 +625,32 @@ test "built-in statusline help and completion include workspace" {
         "/statusline workspace",
         nthSlashCompletion("/statusline w", 0).?,
     );
+}
+
+test "built-in MCP help and completion use the supported subcommand catalog" {
+    const help = try renderSlashHelp(std.testing.allocator);
+    defer std.testing.allocator.free(help);
+
+    const top_level = slash_registry.lookup("/mcp") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings(
+        "manage MCP servers, resources, and prompts",
+        top_level.completion_description.?,
+    );
+    try std.testing.expect(std.mem.find(u8, help, "/mcp list") != null);
+    try std.testing.expect(std.mem.find(u8, help, "/mcp reload") != null);
+    try std.testing.expect(std.mem.find(u8, help, "/mcp auth <name> [--open]") != null);
+
+    try std.testing.expectEqual(mcp_command_catalog.specs.len, slashCompletionCount("/mcp "));
+    try std.testing.expectEqualStrings("/mcp list", nthSlashCompletion("/mcp ", 0).?);
+    try std.testing.expectEqualStrings("/mcp reload", nthSlashCompletion("/mcp rel", 0).?);
+    try std.testing.expectEqualStrings("/mcp auth", nthSlashCompletion("/mcp au", 0).?);
+    try std.testing.expectEqualStrings(
+        "authenticate an MCP server in the browser",
+        nthSlashCompletionDescription("/mcp au", 0).?,
+    );
+    try std.testing.expect(slashCompletionHasArgs("/mcp auth"));
+    try std.testing.expect(!slashCompletionHasArgs("/mcp reload"));
+
+    const auth = slash_registry.lookup("/mcp auth") orelse return error.TestExpectedEqual;
+    try std.testing.expect(!auth.dispatchable);
 }

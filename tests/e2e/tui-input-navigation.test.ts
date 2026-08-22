@@ -322,7 +322,7 @@ tmuxTest(
     await waitForExactComposerRow(active, "┃ /");
 
     await active.sendKeys("Enter");
-    await active.waitForText("Commands 37", READY_TIMEOUT);
+    await active.waitForText("Commands 46", READY_TIMEOUT);
     await active.sendKeys("Escape");
     await active.waitForText("Run /help for commands", READY_TIMEOUT);
     expect(active.isAlive()).toBe(true);

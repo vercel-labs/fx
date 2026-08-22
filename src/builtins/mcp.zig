@@ -4,6 +4,7 @@ const builtin_tools = @import("tools.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const command_provider_contract = @import("../core/mcp/command_provider.zig");
+const mcp_command_catalog = @import("../core/mcp/command_catalog.zig");
 const mcp_contract = @import("../core/mcp/mcp_contract.zig");
 const mcp_auth = @import("../core/mcp/mcp_auth.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
@@ -39,179 +40,179 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
             },
         };
     }
-    if (std.mem.eql(u8, trimmed, "list")) {
-        return .{
-            .display = .{
-                .block = try command_request.list_servers_and_tools(command_request.list_ctx, alloc),
-            },
-        };
-    }
 
-    if (std.mem.startsWith(u8, trimmed, "resource ")) {
-        return handleResourceCommand(alloc, std.mem.trimStart(u8, trimmed[9..], " \t"), command_request);
-    }
-    if (std.mem.startsWith(u8, trimmed, "prompt ")) {
-        return handlePromptCommand(alloc, std.mem.trimStart(u8, trimmed[7..], " \t"), command_request);
+    const parsed = mcp_command_catalog.parse(trimmed) orelse return usageResult(alloc);
+    switch (parsed.kind) {
+        .list => {
+            if (parsed.args.len != 0) return usageResult(alloc);
+            return .{
+                .display = .{
+                    .block = try command_request.list_servers_and_tools(command_request.list_ctx, alloc),
+                },
+            };
+        },
+        .resource => return handleResourceCommand(alloc, parsed.args, command_request),
+        .prompt => return handlePromptCommand(alloc, parsed.args, command_request),
+        else => {},
     }
 
     const home = command_request.home orelse return lineLiteral(alloc, "HOME is not available.", false);
     const config_path = try configPathFromHome(alloc, home);
     defer alloc.free(config_path);
 
-    if (std.mem.eql(u8, trimmed, "path")) {
-        return lineParts(alloc, &.{config_path}, false);
-    }
+    return switch (parsed.kind) {
+        .list, .resource, .prompt => unreachable,
+        .path => if (parsed.args.len == 0)
+            lineParts(alloc, &.{config_path}, false)
+        else
+            usageResult(alloc),
+        .reload => if (parsed.args.len == 0)
+            .{
+                .display = .{
+                    .line = try alloc.dupe(u8, "Evaluating trusted profile MCP configuration."),
+                },
+                .reload = true,
+                .report_reload = true,
+            }
+        else
+            usageResult(alloc),
+        .auth => handleAuthCommand(alloc, parsed.args, command_request),
+        .logout => handleLogoutCommand(alloc, parsed.args, command_request),
+        .remove => handleRemoveCommand(alloc, config_path, parsed.args),
+        .add => handleAddCommand(alloc, config_path, parsed.args),
+    };
+}
 
-    if (std.mem.eql(u8, trimmed, "reload")) {
-        return .{
-            .display = .{
-                .line = try alloc.dupe(u8, "Evaluating trusted profile MCP configuration."),
-            },
-            .reload = true,
-            .report_reload = true,
-        };
+fn handleAuthCommand(alloc: Allocator, args: []const u8, command_request: CommandRequest) !CommandResult {
+    var tokens = std.mem.tokenizeAny(u8, args, " \t");
+    const name = tokens.next() orelse
+        return lineLiteral(alloc, "Usage: /mcp auth <name> [--open]", false);
+    const confirmation = tokens.next();
+    if (tokens.next() != null or
+        (confirmation != null and !std.mem.eql(u8, confirmation.?, "--open")))
+    {
+        return lineLiteral(alloc, "Usage: /mcp auth <name> [--open]", false);
     }
-
-    if (std.mem.startsWith(u8, trimmed, "auth ")) {
-        var tokens = std.mem.tokenizeAny(u8, trimmed[5..], " \t");
-        const name = tokens.next() orelse
-            return lineLiteral(alloc, "Usage: /mcp auth <name> [--open]", false);
-        const confirmation = tokens.next();
-        if (tokens.next() != null or
-            (confirmation != null and !std.mem.eql(u8, confirmation.?, "--open")))
-        {
-            return lineLiteral(alloc, "Usage: /mcp auth <name> [--open]", false);
-        }
-        const validate = command_request.validate_authentication_server orelse
-            return lineLiteral(
-                alloc,
-                "Interactive MCP authentication is unavailable here.",
-                false,
-            );
-        validate(command_request.auth_ctx orelse command_request.list_ctx, name) catch |err| {
-            return lineParts(
-                alloc,
-                &.{ "MCP authentication for '", name, "' failed: ", @errorName(err), "." },
-                false,
-            );
-        };
-        if (confirmation == null) {
-            return lineParts(
-                alloc,
-                &.{ "Run /mcp auth ", name, " --open to confirm opening your browser." },
-                false,
-            );
-        }
-        const authenticate = command_request.authenticate_server orelse
-            return lineLiteral(
-                alloc,
-                "Interactive MCP authentication is unavailable here.",
-                false,
-            );
-        var authentication = authenticate(
-            command_request.auth_ctx orelse command_request.list_ctx,
+    const validate = command_request.validate_authentication_server orelse
+        return lineLiteral(
+            alloc,
+            "Interactive MCP authentication is unavailable here.",
+            false,
+        );
+    validate(command_request.auth_ctx orelse command_request.list_ctx, name) catch |err| {
+        return lineParts(
+            alloc,
+            &.{ "MCP authentication for '", name, "' failed: ", @errorName(err), "." },
+            false,
+        );
+    };
+    if (confirmation == null) {
+        return lineParts(
+            alloc,
+            &.{ "Run /mcp auth ", name, " --open to confirm opening your browser." },
+            false,
+        );
+    }
+    const authenticate = command_request.authenticate_server orelse
+        return lineLiteral(
+            alloc,
+            "Interactive MCP authentication is unavailable here.",
+            false,
+        );
+    var authentication = authenticate(
+        command_request.auth_ctx orelse command_request.list_ctx,
+        name,
+    ) catch |err| {
+        return lineParts(
+            alloc,
+            &.{ "MCP authentication for '", name, "' failed: ", @errorName(err), "." },
+            false,
+        );
+    };
+    defer authentication.deinit();
+    return switch (authentication) {
+        .authenticated => lineParts(
+            alloc,
+            &.{ "Authenticated MCP server '", name, "'." },
+            true,
+        ),
+        .issuer_mismatch => |mismatch| issuerMismatchResult(
+            alloc,
             name,
-        ) catch |err| {
-            return lineParts(
-                alloc,
-                &.{ "MCP authentication for '", name, "' failed: ", @errorName(err), "." },
-                false,
-            );
-        };
-        defer authentication.deinit();
-        return switch (authentication) {
-            .authenticated => lineParts(
-                alloc,
-                &.{ "Authenticated MCP server '", name, "'." },
-                true,
-            ),
-            .issuer_mismatch => |mismatch| issuerMismatchResult(
-                alloc,
-                name,
-                mismatch,
-            ),
-        };
+            mismatch,
+        ),
+    };
+}
+
+fn handleLogoutCommand(alloc: Allocator, args: []const u8, command_request: CommandRequest) !CommandResult {
+    if (args.len == 0 or std.mem.indexOfAny(u8, args, " \t") != null) {
+        return lineLiteral(alloc, "Usage: /mcp logout <name>", false);
+    }
+    const logout = command_request.logout_server orelse
+        return lineLiteral(alloc, "MCP logout is unavailable here.", false);
+    const result = logout(
+        command_request.auth_ctx orelse command_request.list_ctx,
+        args,
+    ) catch |err| {
+        return lineParts(
+            alloc,
+            &.{ "MCP logout for '", args, "' failed: ", @errorName(err), "." },
+            false,
+        );
+    };
+    if (!result.removed) {
+        return lineParts(
+            alloc,
+            &.{ "No stored MCP credentials found for '", args, "'." },
+            false,
+        );
+    }
+    if (result.revocation_failed) {
+        return lineParts(
+            alloc,
+            &.{ "Logged out of MCP server '", args, "' locally; remote revocation failed." },
+            true,
+        );
+    }
+    return lineParts(alloc, &.{ "Logged out of MCP server '", args, "'." }, true);
+}
+
+fn handleRemoveCommand(alloc: Allocator, config_path: []const u8, name: []const u8) !CommandResult {
+    if (name.len == 0) return lineLiteral(alloc, "Usage: /mcp remove <name>", false);
+
+    const removed = removeServerFromPath(alloc, config_path, name) catch |err| {
+        return lineParts(
+            alloc,
+            &.{ "Failed to remove MCP server '", name, "': ", @errorName(err), "." },
+            false,
+        );
+    };
+    if (!removed) return lineParts(alloc, &.{ "MCP server '", name, "' not found." }, false);
+    return lineParts(alloc, &.{ "Removed MCP server '", name, "'." }, true);
+}
+
+fn handleAddCommand(alloc: Allocator, config_path: []const u8, args: []const u8) !CommandResult {
+    var tokens: std.ArrayList([]const u8) = .empty;
+    defer tokens.deinit(alloc);
+
+    var it = std.mem.tokenizeAny(u8, args, " \t");
+    while (it.next()) |token| try tokens.append(alloc, token);
+    if (tokens.items.len < 2) {
+        return lineLiteral(alloc, "Usage: /mcp add <name> <command> [args...]", false);
     }
 
-    if (std.mem.startsWith(u8, trimmed, "logout ")) {
-        const name = std.mem.trim(u8, trimmed[7..], " \t");
-        if (name.len == 0 or std.mem.indexOfAny(u8, name, " \t") != null) {
-            return lineLiteral(alloc, "Usage: /mcp logout <name>", false);
-        }
-        const logout = command_request.logout_server orelse
-            return lineLiteral(alloc, "MCP logout is unavailable here.", false);
-        const result = logout(
-            command_request.auth_ctx orelse command_request.list_ctx,
-            name,
-        ) catch |err| {
-            return lineParts(
-                alloc,
-                &.{ "MCP logout for '", name, "' failed: ", @errorName(err), "." },
-                false,
-            );
-        };
-        if (!result.removed) {
-            return lineParts(
-                alloc,
-                &.{ "No stored MCP credentials found for '", name, "'." },
-                false,
-            );
-        }
-        if (result.revocation_failed) {
-            return lineParts(
-                alloc,
-                &.{ "Logged out of MCP server '", name, "' locally; remote revocation failed." },
-                true,
-            );
-        }
-        return lineParts(alloc, &.{ "Logged out of MCP server '", name, "'." }, true);
-    }
+    addOrReplaceLocalServer(alloc, config_path, tokens.items[0], tokens.items[1..]) catch |err| {
+        return lineParts(
+            alloc,
+            &.{ "Failed to save MCP server config: ", @errorName(err), "." },
+            false,
+        );
+    };
+    return lineParts(alloc, &.{ "Saved MCP server '", tokens.items[0], "'." }, true);
+}
 
-    if (std.mem.startsWith(u8, trimmed, "remove ")) {
-        const name = std.mem.trim(u8, trimmed[7..], " \t");
-        if (name.len == 0) {
-            return lineLiteral(alloc, "Usage: /mcp remove <name>", false);
-        }
-
-        const removed = removeServerFromPath(alloc, config_path, name) catch |err| {
-            return lineParts(
-                alloc,
-                &.{ "Failed to remove MCP server '", name, "': ", @errorName(err), "." },
-                false,
-            );
-        };
-        if (!removed) {
-            return lineParts(alloc, &.{ "MCP server '", name, "' not found." }, false);
-        }
-        return lineParts(alloc, &.{ "Removed MCP server '", name, "'." }, true);
-    }
-
-    if (std.mem.startsWith(u8, trimmed, "add ")) {
-        var tokens: std.ArrayList([]const u8) = .empty;
-        defer tokens.deinit(alloc);
-
-        var it = std.mem.tokenizeAny(u8, trimmed[4..], " \t");
-        while (it.next()) |token| try tokens.append(alloc, token);
-
-        if (tokens.items.len < 2) {
-            return lineLiteral(alloc, "Usage: /mcp add <name> <command> [args...]", false);
-        }
-
-        addOrReplaceLocalServer(alloc, config_path, tokens.items[0], tokens.items[1..]) catch |err| {
-            return lineParts(
-                alloc,
-                &.{ "Failed to save MCP server config: ", @errorName(err), "." },
-                false,
-            );
-        };
-        return lineParts(alloc, &.{ "Saved MCP server '", tokens.items[0], "'." }, true);
-    }
-
-    return lineLiteral(
-        alloc,
-        "Usage: /mcp [list|resource|prompt|add|remove|path|reload|auth|logout]",
-        false,
-    );
+fn usageResult(alloc: Allocator) !CommandResult {
+    return .{ .display = .{ .line = try mcp_command_catalog.renderUsage(alloc) } };
 }
 
 fn handleResourceCommand(alloc: Allocator, rest: []const u8, command_request: CommandRequest) !CommandResult {
