@@ -39,7 +39,7 @@ zig build run
 
 Keep the local development loop focused: run the narrowest test that covers the changed path, build fx, and exercise the change using `./zig-out/bin/fx`. The installed `fx` on `PATH` is not valid development evidence.
 
-Once the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. The **Full CI** workflow runs the complete deterministic suite on native Linux x86_64, Linux aarch64, macOS x86_64, and macOS aarch64 runners. The native matrix builds, tests, and smoke-tests ReleaseSafe on every platform; formatting and the public-surface audit run in those ReleaseSafe jobs. Four duration-balanced, isolated ReleaseSafe E2E shards per platform use checked-in weights to assign every Bun test file once; files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one bounded retry after tmux is reset.
+Once the focused tests, build, and local binary exercise pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. The **Full CI** workflow runs the complete deterministic suite on native Linux x86_64, Linux aarch64, macOS x86_64, and macOS aarch64 runners. The native matrix builds, tests, and smoke-tests ReleaseSafe on every platform; formatting and the public-surface audit run in those ReleaseSafe jobs. Four duration-balanced, isolated ReleaseSafe E2E shards per platform use checked-in weights to assign every Bun test file once; files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one bounded retry after tmux is reset.
 
 Standard PR CI reports ReleaseSafe Build & Test and deterministic E2E results. Do not mark the draft PR ready until all four Full CI jobs and the final ship gate have succeeded for the exact current commit. Each platform aggregate requires its ReleaseSafe native check and all four ReleaseSafe E2E shards. A result from an older commit does not count. Live model evals are separate from this gate because they require credentials and are not deterministic.
 
@@ -119,13 +119,28 @@ duplicate, stale, and unclassified files without running the full PGSO gate.
 
 Config precedence (highest wins):
 
-1. Environment variables such as `FX_MODEL`, `FX_PERMISSION_MODE`, and `FX_MAX_AGENT_STEPS`
+1. Environment variables listed below
 2. `~/.fx/settings.json` → `workspaces["<workspace_path>"]` (profile workspace overrides)
 3. `~/.fx/settings.json` top-level (profile global settings)
 4. `<workspace>/.fx.json` (committed project defaults)
 5. Built-in defaults
 
-Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `update_channel`, `permission_mode`, and `permission` are ignored from project config before their values are parsed.
+Supported user-facing `FX_` environment variables:
+
+| Name | Accepted values | Override or effect |
+| --- | --- | --- |
+| `FX_MODEL` | Non-empty model ID | Overrides the configured model for the current process without saving it. |
+| `FX_PERMISSION_MODE` | `ask`, `auto`, or `yolo` | Overrides `permission_mode` for the current process. |
+| `FX_MAX_AGENT_STEPS` | Non-negative integer; `0` is unbounded | Overrides `max_agent_steps` for the current process. |
+| `FX_SOUND` | `0`, `false`, or `off`; `max`; any other non-empty value enables ordinary sounds | Overrides saved notification sound settings for the current process. |
+| `FX_SKIP_ONBOARDING` | Any non-empty value except `0` or `false` | Skips credential onboarding. |
+| `FX_DISABLE_KEYCHAIN` | `1` or `true` | Uses the portable credential file instead of macOS Keychain. |
+| `FX_AUTO_UPGRADE` | `0` or `false` | Disables automatic upgrades for the current process, even when enabled in profile config. |
+| `FX_TRACE` | `1`, `true`, `yes`, or `on` | Writes a diagnostic trace to the default trace log. |
+| `FX_RECORD` | Non-empty tape path | Records terminal output, resizes, and interrupts to a deterministic replay tape. |
+| `FX_SKILL_SYMLINK_AUTHORITIES` | Colon-separated absolute paths without `..` components | Adds trusted roots for skill symlinks that resolve outside the workspace or home directory. |
+
+Project `.fx.json` accepts only repo-safe defaults: `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `update_channel`, `permission_mode`, and `permission` are ignored from project config before their values are parsed.
 
 Runtime state lives under `~/.fx/`:
 
@@ -250,8 +265,6 @@ Security is permission-first.
 * the main agent may pass that exact request ID through `ask_user_question` to open the existing permission screen; generic question text cannot authorize an action, and the resulting once or always approval is revalidated and consumed only by the exact bound action
 
 * bounded consecutive all-blocked response groups end the turn with ordinary blocker text and never open the human approval path automatically; any completed successful tool resets that recovery count, and configured and saved-session rules remain authoritative
-
-* the sandbox backend is configured independently; yolo uses an effective backend of `none` without rewriting the saved sandbox setting
 
 Do not add new sensitive tool behavior without integrating it into `src/core/permissions/permissions.zig`.
 
