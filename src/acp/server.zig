@@ -21,6 +21,7 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const hooks = @import("../core/hooks/hooks.zig");
+const user_hooks = @import("../builtins/hooks/user.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
@@ -248,6 +249,7 @@ pub const ServerState = struct {
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{}),
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
+    user_hooks: user_hooks.Runtime = user_hooks.Runtime.init(std.heap.c_allocator),
     outbound_mutex: std.Io.Mutex = .init,
     outbound_cond: std.Io.Condition = .init,
     next_outbound_request_id: u64 = 1,
@@ -280,6 +282,7 @@ pub const ServerState = struct {
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         self.lifecycle_runtime.deinit();
+        self.user_hooks.deinit();
         self.capability_resolver.deinit(self.alloc);
         var pending = self.pending_outbound.valueIterator();
         while (pending.next()) |entry| {
@@ -654,8 +657,7 @@ pub fn runWithTransport(
         try debug_trace.configure(.{ .file_path = path });
     }
 
-    var lifecycle_runtime = hooks.Runtime.init(alloc);
-    const lifecycle_view = lifecycle_runtime.freeze();
+    const lifecycle_runtime = hooks.Runtime.init(alloc);
     var state = ServerState{
         .alloc = alloc,
         .cfg = cfg,
@@ -670,7 +672,8 @@ pub fn runWithTransport(
             cfg.background_process_provider,
         ),
         .lifecycle_runtime = lifecycle_runtime,
-        .lifecycle_view = lifecycle_view,
+        .lifecycle_view = hooks.RuntimeView.empty(),
+        .user_hooks = user_hooks.Runtime.init(alloc),
     };
     defer state.deinit();
 
@@ -1447,6 +1450,9 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.client_fs_write = request.client_fs_write;
     state.client_terminal = request.client_terminal;
     state.client_elicitation = request.client_elicitation;
+    state.user_hooks.adopt(startup.takeHooks());
+    try state.user_hooks.configure(&state.lifecycle_runtime);
+    state.lifecycle_view = state.lifecycle_runtime.freeze();
     state.initialized = true;
 
     var out: std.Io.Writer.Allocating = .init(alloc);

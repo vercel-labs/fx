@@ -28,6 +28,7 @@ const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const hooks = @import("../hooks/hooks.zig");
 const notification_sound = @import("../notifications/sound.zig");
+const user_hooks = @import("../../builtins/hooks/user.zig");
 const io_mod = @import("../shared/io.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -582,6 +583,7 @@ const AskContext = struct {
     capability_resolver: gateway_provider.CapabilityResolver = .{},
     lifecycle_runtime: hooks.Runtime,
     lifecycle_view: hooks.RuntimeView,
+    user_hooks: user_hooks.Runtime,
     active_turn_id: u64 = 0,
     notification_player: ?notification_sound.Player = null,
     image_snapshot_temp_dir: ?[]u8 = null,
@@ -613,6 +615,7 @@ const AskContext = struct {
             ),
             .lifecycle_runtime = lifecycle_runtime,
             .lifecycle_view = hooks.RuntimeView.empty(),
+            .user_hooks = user_hooks.Runtime.init(alloc),
         };
     }
 
@@ -621,6 +624,7 @@ const AskContext = struct {
         turn_end: bool,
         attention_required: bool,
     ) !void {
+        try self.user_hooks.configure(&self.lifecycle_runtime);
         self.notification_player = notification_sound.Player.init(.{
             .ctx = self,
             .emit = emitAskNotificationBell,
@@ -722,6 +726,7 @@ const AskContext = struct {
         self.web_search_runtime.deinit();
         self.capability_resolver.deinit(self.alloc);
         self.lifecycle_runtime.deinit();
+        self.user_hooks.deinit();
         if (self.writable) |*writable| writable.deinit(self.alloc);
         self.writable = null;
         if (self.store) |*store| store.deinit(self.alloc);
@@ -1467,6 +1472,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer if (owned_resumed_model) |model| alloc.free(model);
     var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
     defer ctx.deinit();
+    ctx.user_hooks.adopt(startup.takeHooks());
     if (options.save_session) {
         _ = try ctx.session.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
         ctx.session.attachProfileUsagePublisher(alloc);

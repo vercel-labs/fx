@@ -13,6 +13,7 @@ const record_tape = @import("../workspace/record_tape.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const notification_sound = @import("../notifications/sound.zig");
+const hook_config = @import("../hooks/config.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
 const ui_render = @import("../../ui/render.zig");
@@ -147,6 +148,7 @@ pub const StartupState = struct {
     notification_turn_end: bool = false,
     notification_attention_required: bool = false,
     notification_max: bool = false,
+    hooks: hook_config.Config = .{},
     theme_monitor_enabled: bool = false,
 
     pub fn deinit(self: *StartupState, alloc: Allocator) void {
@@ -156,6 +158,7 @@ pub const StartupState = struct {
         if (self.selected_model.len > 0) alloc.free(self.selected_model);
         if (self.configured_model.len > 0) alloc.free(self.configured_model);
         self.permission_rules.deinit(alloc);
+        self.hooks.deinit(alloc);
         if (self.config_diagnostics.len > 0) {
             for (self.config_diagnostics) |*diagnostic| diagnostic.deinit(alloc);
             alloc.free(self.config_diagnostics);
@@ -206,6 +209,12 @@ pub const StartupState = struct {
     pub fn takePermissionRules(self: *StartupState) types.PermissionRuleSet {
         const value = self.permission_rules;
         self.permission_rules = .{};
+        return value;
+    }
+
+    pub fn takeHooks(self: *StartupState) hook_config.Config {
+        const value = self.hooks;
+        self.hooks = .{};
         return value;
     }
 };
@@ -440,6 +449,8 @@ fn loadStartupStateFromOwnedWorkspace(
     state.notification_turn_end = sound_on_override orelse settings.notification_turn_end orelse notification_sound.default_enabled;
     state.notification_attention_required = sound_on_override orelse settings.notification_attention_required orelse notification_sound.default_enabled;
     state.notification_max = max_override orelse settings.notification_max orelse false;
+    state.hooks = settings.hooks;
+    settings.hooks = .{};
 
     return state;
 }

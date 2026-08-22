@@ -76,6 +76,9 @@ pub const Scope = struct {
 pub const Invocation = struct {
     scope: Scope,
     turn_id: ?u64 = null,
+    /// Internal execution signal for adapters that own blocking resources.
+    /// It is deliberately excluded from public serialized hook payloads.
+    cancel_flag: ?*const std.atomic.Value(bool) = null,
 };
 
 pub const Limits = struct {
@@ -146,6 +149,13 @@ pub const PreToolUseHandler = struct {
         ctx: *anyopaque,
         input: PreToolUseInput,
     ) HandlerError!PreToolUseAction,
+    /// Called after the runtime has copied or consumed a successful action.
+    /// Handlers returning borrowed/static data leave this null; adapters that
+    /// allocate action payloads use it to release those bytes deterministically.
+    release_action: ?*const fn (
+        ctx: *anyopaque,
+        action: PreToolUseAction,
+    ) void = null,
 };
 
 pub const StopInput = struct {
@@ -181,6 +191,10 @@ pub const StopHandler = struct {
         ctx: *anyopaque,
         input: StopInput,
     ) HandlerError!StopAction,
+    release_action: ?*const fn (
+        ctx: *anyopaque,
+        action: StopAction,
+    ) void = null,
 };
 
 pub const PostTurnEndInput = struct {

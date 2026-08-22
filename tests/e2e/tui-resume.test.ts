@@ -3395,7 +3395,10 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("CTRL_O_HANDOFF_FIRST_RUNNING", actionTimeout);
       const beforeHandoff = await active.captureFullScrollback();
       expect(countOccurrences(beforeHandoff, bulletMarker)).toBe(1);
-      expect(countOccurrences(beforeHandoff, codeMarker)).toBe(1);
+      // The bottom code block can exist in both retained history and the live
+      // pane while the approval handoff repaints. The settled assertion below
+      // remains authoritative for detecting a duplicated history append.
+      expect(countOccurrences(beforeHandoff, codeMarker)).toBeGreaterThanOrEqual(1);
 
       await active.sendKeys("C-o");
       await Bun.sleep(150);

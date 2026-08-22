@@ -1835,29 +1835,24 @@ test.skipIf(!tmuxAvailable())("explicit tmux backend is isolated and reports exa
   await waitFor(() => existsSync(paths.socket));
   const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
 
-  const tmuxResource = rememberPrivateTmuxServer(home);
   const started = await finishStartupObservation(
     connected.client,
     connected.revision!,
     111,
-    success(
-      await requestAction(connected.client, connected.revision!, 110, "start", {
-        cwd: home,
-        command: "pwd; printf '\\ntmux-ready\\n'; exit 23",
-        shell: { executable: { path: "/bin/zsh", clean_start: true } },
-        backend: "tmux",
-        return_when: { exit: {} },
-        wait_ceiling_ms: TMUX_INITIAL_STARTUP_OBSERVATION_BUDGET_MS,
-        dimensions: { rows: 17, columns: 61 },
-        initial_monitors: [],
-      }),
-      "start",
-    ),
+    await startCommand(connected.client, connected.revision!, 110, {
+      cwd: home,
+      command: "pwd; printf '\\ntmux-ready\\n'; exit 23",
+      shell: { executable: { path: "/bin/zsh", clean_start: true } },
+      backend: "tmux",
+      returnWhen: { exit: {} },
+      waitMs: TMUX_INITIAL_STARTUP_OBSERVATION_BUDGET_MS,
+      dimensions: { rows: 17, columns: 61 },
+      startupAttempts: 2,
+    }),
     "tmux",
     { exit: {} },
     TMUX_COMMAND_STARTUP_OBSERVATION_BUDGET_MS,
   );
-  rememberPrivateTmuxIdentities(tmuxResource);
   expect(started).toMatchObject({
     outcome: { exited: 23 },
     session: { lifecycle: "exited", backend: "tmux" },
@@ -8335,6 +8330,7 @@ test.skipIf(!tmuxAvailable())(
       backend: "tmux",
       returnWhen: { match: "checked-sibling-ready" },
       waitMs: 8_000,
+      startupAttempts: 2,
     });
     const closing = await startCommand(first.client, first.revision!, 331, {
       cwd: home,
@@ -8343,6 +8339,7 @@ test.skipIf(!tmuxAvailable())(
       backend: "tmux",
       returnWhen: { match: "checked-close-ready" },
       waitMs: 8_000,
+      startupAttempts: 2,
     });
     const siblingId = (sibling.session as { session_id: string }).session_id;
     const closingId = (closing.session as { session_id: string }).session_id;

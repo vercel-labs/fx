@@ -208,6 +208,9 @@ pub fn Runtime(comptime App: type) type {
             defer startup.deinit(app.alloc);
 
             app.workspace_root = startup.takeWorkspaceRoot();
+            if (comptime @hasDecl(App, "adoptLifecycleHooks")) {
+                app.adoptLifecycleHooks(startup.takeHooks());
+            }
             if (comptime @hasDecl(App, "adoptWorkspaceAccess")) {
                 app.adoptWorkspaceAccess(startup.takeWorkspaceAccess());
             }

@@ -510,6 +510,7 @@ const App = struct {
     web_search_models_path: []const u8 = builtin_gateway.models_path,
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
+    user_hooks: builtin_hooks.user.Runtime = builtin_hooks.user.Runtime.init(std.heap.c_allocator),
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
 
@@ -580,6 +581,7 @@ const App = struct {
             .alloc = alloc,
             .subagents = ui_subagents.Controller.init(),
             .lifecycle_runtime = hooks.Runtime.init(alloc),
+            .user_hooks = builtin_hooks.user.Runtime.init(alloc),
             .background = BackgroundRuntime.init(if (comptime host_target.is_wasm)
                 background_process_provider.unavailable_provider
             else
@@ -669,10 +671,15 @@ const App = struct {
     }
 
     pub fn configureNotifications(self: *App) !void {
-        // Register herdr hooks before NotificationAppRuntime.configure freezes
-        // the lifecycle runtime (its call to freeze() is the sole freeze site).
+        // User hooks are ordered before built-in observers. Notification setup
+        // remains the sole freeze site for the lifecycle registry.
+        try self.user_hooks.configure(&self.lifecycle_runtime);
         try HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
         try NotificationAppRuntime.configure(self);
+    }
+
+    pub fn adoptLifecycleHooks(self: *App, config: hooks.config.Config) void {
+        self.user_hooks.adopt(config);
     }
 
     pub fn rebindAfterInit(self: *App) void {
@@ -859,6 +866,7 @@ const App = struct {
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
         self.lifecycle_runtime.deinit();
+        self.user_hooks.deinit();
 
         self.auth.deinit(self.alloc);
         WorkspaceAppRuntime.deinit(self);

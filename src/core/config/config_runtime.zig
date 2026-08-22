@@ -3,6 +3,7 @@ const agent_steps = @import("agent_steps.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const hook_config = @import("../hooks/config.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
@@ -60,6 +61,7 @@ pub const Settings = struct {
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
     notification_max: ?bool = null,
+    hooks: hook_config.Config = .{},
     permission_rules: types.PermissionRuleSet = .{},
     has_permission_rules: bool = false,
 
@@ -67,6 +69,7 @@ pub const Settings = struct {
         if (self.model) |value| alloc.free(value);
         if (self.codex_model) |value| alloc.free(value);
         if (self.grok_model) |value| alloc.free(value);
+        self.hooks.deinit(alloc);
         self.permission_rules.deinit(alloc);
         self.* = .{};
     }
@@ -543,6 +546,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "prompt_history",
         "statusLine",
         "notifications",
+        "hooks",
         "context_limits",
         "skill_match_fuzzy",
         "first_call_tool_choice",
@@ -634,6 +638,7 @@ fn mergeDetailedSettingsLayer(
         });
         if (source == .user_workspace) {
             incoming.update_channel = null;
+            incoming.hooks.retag(.workspace);
         }
         updateConfigSources(state.sources, incoming, source);
         if (incoming.has_permission_rules) {
@@ -1017,6 +1022,7 @@ fn mergeWorkspaceOverridesFromValue(target: *Settings, alloc: Allocator, root_va
     defer override_settings.deinit(alloc);
     override_settings.update_channel = null;
     override_settings.context_limits.retag(.user_workspace);
+    override_settings.hooks.retag(.workspace);
     mergeSettings(target, &override_settings, alloc);
 }
 
@@ -1399,6 +1405,10 @@ fn parseProfileOnlyFields(
         }
     }
 
+    if (root.object.get("hooks")) |hooks_value| {
+        settings.hooks = try hook_config.parse(alloc, hooks_value);
+    }
+
     if (root.object.get("permission")) |permission_value| {
         const value = permission_value;
         settings.permission_rules.deinit(alloc);
@@ -1468,6 +1478,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
     if (incoming.notification_turn_end) |value| target.notification_turn_end = value;
     if (incoming.notification_attention_required) |value| target.notification_attention_required = value;
     if (incoming.notification_max) |value| target.notification_max = value;
+    target.hooks.mergeMove(alloc, &incoming.hooks);
 
     if (incoming.has_permission_rules) {
         target.permission_rules.deinit(alloc);
@@ -3144,6 +3155,45 @@ test "notification settings merge global and workspace while project values are 
     try std.testing.expectEqual(ConfigSource.user_global, detailed.sources.notification_turn_end);
     try std.testing.expectEqual(ConfigSource.user_workspace, detailed.sources.notification_attention_required);
     try expectIgnoredProjectKey(detailed.diagnostics, "notifications");
+}
+
+test "hook settings resolve private workspace event overrides and ignore project executables" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const user_settings = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"hooks\":{{\"PreToolUse\":[{{\"command\":[\"global-pre\"]}}],\"Stop\":[{{\"command\":[\"global-stop\"]}}]}},\"workspaces\":{{\"{s}\":{{\"hooks\":{{\"PreToolUse\":[{{\"command\":[\"workspace-pre\"]}}]}}}}}}}}",
+        .{workspace_root},
+    );
+    defer std.testing.allocator.free(user_settings);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
+    try writeFixtureFile(
+        tmp.dir,
+        "workspace/.fx.json",
+        "{\"hooks\":{\"PostTurnEnd\":[{\"command\":[\"project-command\"]}]}}",
+    );
+
+    var ordinary = try loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_root);
+    defer ordinary.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("workspace-pre", ordinary.hooks.pre_tool_use.?[0].command[0]);
+    try std.testing.expectEqual(hook_config.Source.workspace, ordinary.hooks.pre_tool_use.?[0].source);
+    try std.testing.expectEqualStrings("global-stop", ordinary.hooks.stop.?[0].command[0]);
+    try std.testing.expectEqual(hook_config.Source.user, ordinary.hooks.stop.?[0].source);
+    try std.testing.expect(ordinary.hooks.post_turn_end == null);
+
+    var detailed = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer detailed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("workspace-pre", detailed.settings.hooks.pre_tool_use.?[0].command[0]);
+    try std.testing.expectEqualStrings("global-stop", detailed.settings.hooks.stop.?[0].command[0]);
+    try std.testing.expect(detailed.settings.hooks.post_turn_end == null);
+    try expectIgnoredProjectKey(detailed.diagnostics, "hooks");
 }
 
 test "detailed settings diagnose legacy workspace preferences" {

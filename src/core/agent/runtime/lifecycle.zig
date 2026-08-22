@@ -178,6 +178,7 @@ pub fn dispatchStopCheckpoint(
             .invocation = .{
                 .scope = lifecycle.scope,
                 .turn_id = checkpoint.turn_id,
+                .cancel_flag = cancel_flag,
             },
             .step_index = checkpoint.step_index,
             .assistant_text = checkpoint.assistant_text,
@@ -225,7 +226,7 @@ fn dispatchPreToolUseCheckpoint(
     if (cancelRequested(cancel_flag)) return error.Cancelled;
     return lifecycle.view.runPreToolUse(
         lifecycle.outcome_allocator,
-        preToolUseInputFromCheckpoint(lifecycle.scope, checkpoint),
+        preToolUseInputFromCheckpoint(lifecycle.scope, cancel_flag, checkpoint),
     ) catch |err| {
         if (cancelRequested(cancel_flag)) return error.Cancelled;
         return switch (err) {
@@ -239,11 +240,16 @@ fn dispatchPreToolUseCheckpoint(
     };
 }
 
-fn preToolUseInputFromCheckpoint(scope: hooks.Scope, checkpoint: PreToolUseCheckpoint) hooks.PreToolUseInput {
+fn preToolUseInputFromCheckpoint(
+    scope: hooks.Scope,
+    cancel_flag: ?*std.atomic.Value(bool),
+    checkpoint: PreToolUseCheckpoint,
+) hooks.PreToolUseInput {
     return .{
         .invocation = .{
             .scope = scope,
             .turn_id = checkpoint.turn_id,
+            .cancel_flag = cancel_flag,
         },
         .step_index = checkpoint.step_index,
         .call_id = checkpoint.call.id,

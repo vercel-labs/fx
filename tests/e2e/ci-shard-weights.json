@@ -10,6 +10,7 @@
   { "file": "file-tool-paths.test.ts", "weight": 6 },
   { "file": "file-tool-permissions.test.ts", "weight": 2 },
   { "file": "gateway-stream-lifecycle.test.ts", "weight": 98 },
+  { "file": "hooks.test.ts", "weight": 1 },
   { "file": "mcp-auth.test.ts", "weight": 105 },
   { "file": "mcp-http.test.ts", "weight": 10 },
   { "file": "mcp-legacy-remote.test.ts", "weight": 19 },
