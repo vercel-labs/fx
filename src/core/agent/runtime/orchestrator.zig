@@ -4352,9 +4352,7 @@ fn processQueuedPromptLoop(
         preserved_tool_evidence = .none;
 
         if (deps.report_usage) |report_fn| {
-            if (completion.usage.input_tokens != null or completion.usage.output_tokens != null) {
-                report_fn(deps.ctx, completion.usage);
-            }
+            report_fn(deps.ctx, completion.usage);
         }
 
         if (disposition == .completed and completion.tool_calls.len > 0) {
