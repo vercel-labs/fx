@@ -14,7 +14,6 @@ pub const SecondarySinkOutcome = runtime_tool_contracts.SecondarySinkOutcome;
 pub const SecondaryPublicationReport = runtime_tool_contracts.SecondaryPublicationReport;
 pub const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 pub const unavailableHostToolResult = runtime_tool_contracts.unavailableHostToolResult;
-pub const SandboxScopeRequired = runtime_tool_contracts.SandboxScopeRequired;
 pub const LiveToolAuthority = runtime_tool_contracts.LiveToolAuthority;
 pub const LivePermissionRevalidation = runtime_tool_contracts.LivePermissionRevalidation;
 pub const ToolExecutionRequest = runtime_tool_contracts.ToolExecutionRequest;

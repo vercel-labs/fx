@@ -39,7 +39,16 @@ pub const Completion = struct {
     kind: CompletionKind,
     correlation_id: ?contracts.CorrelationId = null,
     incompatibility: ?contracts.ProtocolIncompatibility = null,
+    missing_capabilities: u64 = 0,
     frame: ?protocol.DecodedFrame = null,
+
+    pub fn is_missing_capability(
+        self: Completion,
+        capability: u64,
+    ) bool {
+        return self.kind == .unavailable and
+            self.missing_capabilities & capability != 0;
+    }
 
     pub fn deinit(self: *Completion) void {
         if (self.frame) |*frame| frame.deinit();
@@ -610,12 +619,25 @@ fn exchangeConnected(
     intent: *const Intent,
     connected: Connected,
 ) !Completion {
+    const required_capabilities = contracts.required_capabilities(
+        intent.request.value,
+    );
+    const missing_capabilities = required_capabilities &
+        ~connected.negotiated.capabilities;
+    if (missing_capabilities != 0) {
+        return .{
+            .kind = .unavailable,
+            .correlation_id = intent.correlation_id,
+            .missing_capabilities = missing_capabilities,
+        };
+    }
+
     var write_buffer: [4096]u8 = undefined;
     var writer = connected.stream.writer(io_mod.getIo(), &write_buffer);
     var request_frame = try protocol.encodeFrame(
         alloc,
         connected.negotiated.revision,
-        contracts.protocol_capability_authority_generations,
+        required_capabilities,
         intent.correlation_id,
         .{ .request = intent.request.value },
     );

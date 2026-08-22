@@ -11,7 +11,6 @@ const types = @import("../../core/shared/types.zig");
 const activity_runtime = @import("../../core/output/activity_runtime.zig");
 const footer_viewport = @import("viewport.zig");
 const approval_ui = @import("approval_ui.zig");
-const appearance_menu_presentation = @import("appearance_menu_presentation.zig");
 const compact_command_menu_presentation = @import("compact_command_menu_presentation.zig");
 const input_presentation = @import("input_presentation.zig");
 const interaction_state = @import("interaction_state.zig");
@@ -345,18 +344,17 @@ fn buildFooterSurfaceProjection(
         .reservation => null,
         .measurement, .frame => if (!viewer_active and !approval_active) ctx.question else null,
     };
-    const appearance_active = !viewer_active and !approval_active and question_projection == null and ctx.appearance_menu.active;
-    const compact_command_menu = if (!viewer_active and !approval_active and question_projection == null and !appearance_active)
+    const compact_command_menu = if (!viewer_active and !approval_active and question_projection == null)
         render_input.activeCompactCommandMenu(ctx)
     else
         null;
     const compact_command_active = compact_command_menu != null;
     const modal_active = !viewer_active and switch (mode) {
-        .reservation => approval_active or appearance_active or compact_command_active,
-        .measurement, .frame => approval_active or question_projection != null or appearance_active or compact_command_active,
+        .reservation => approval_active or compact_command_active,
+        .measurement, .frame => approval_active or question_projection != null or compact_command_active,
     };
     const input_visible = ctx.composer_visible and !modal_active and !viewer_active;
-    const composer_top_chrome_rows = footer_paint_plan.composerTopChromeRows(input_visible, ctx.input_appearance, ctx.maxxing_mode);
+    const composer_top_chrome_rows = footer_paint_plan.composerTopChromeRows();
     const show_auth_picker = !viewer_active and !modal_active and !ctx.stream.active and ctx.auth_picker.active;
     const stream_suppresses_file_query = ctx.stream.active and !ctx.queued_editor_active;
     const show_model_query = !viewer_active and !show_auth_picker and !modal_active and !ctx.stream.active and ctx.model_query_active;
@@ -457,8 +455,6 @@ fn buildFooterSurfaceProjection(
             )
     else if (question_projection) |projection|
         try question_ui.questionPanelRowsForLayout(alloc, projection, shell.layout.cols)
-    else if (appearance_active)
-        @min(appearance_menu_presentation.row_count, shell.layout.rows -| 3)
     else if (compact_command_menu) |menu|
         @min(compact_command_menu_presentation.desiredRowCount(menu), shell.layout.rows -| 3)
     else if (show_auth_picker)
@@ -1090,7 +1086,7 @@ pub noinline fn resolveSurfaceFooterReservation(
     var bottom_reservation = BottomReservationState{};
     const input_visible_for_transient =
         ctx.composer_visible and approval == null;
-    const composer_top_chrome_rows_for_transient = footer_paint_plan.composerTopChromeRows(input_visible_for_transient, ctx.input_appearance, ctx.maxxing_mode);
+    const composer_top_chrome_rows_for_transient = footer_paint_plan.composerTopChromeRows();
     const banner_rows_for_transient = queuedBannerRowsForLayout(
         ctx,
         shell.layout.rows,
@@ -1188,7 +1184,7 @@ fn prepareSurfaceFooterFrameInternal(
     if (!reservation.precomputed) {
         const input_visible_for_transient =
             ctx.composer_visible and approval == null;
-        const composer_top_chrome_rows_for_transient = footer_paint_plan.composerTopChromeRows(input_visible_for_transient, ctx.input_appearance, ctx.maxxing_mode);
+        const composer_top_chrome_rows_for_transient = footer_paint_plan.composerTopChromeRows();
         const banner_rows_for_transient = queuedBannerRowsForLayout(
             ctx,
             shell.layout.rows,
@@ -1991,8 +1987,7 @@ test "measured footer preparation skips stale off-screen invalidation and stays 
     shell.footer_viewport.has_frame = true;
     shell.footer_viewport.geometry.top = 9;
 
-    var ctx = surfaceTestContext(&input);
-    ctx.input_appearance = .tint;
+    const ctx = surfaceTestContext(&input);
     var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
     defer measurement.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 0), measurement.footer_extra);
@@ -2060,8 +2055,7 @@ test "measured footer preparation propagates invalid zero geometry" {
     shell.footer_viewport.has_frame = true;
     shell.footer_viewport.geometry.top = 0;
 
-    var ctx = surfaceTestContext(&input);
-    ctx.input_appearance = .tint;
+    const ctx = surfaceTestContext(&input);
     var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
     defer measurement.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 0), measurement.footer_extra);
@@ -2129,8 +2123,7 @@ test "surface footer reservation rejects zero invalidation geometry before mutat
     shell.footer_viewport.geometry.top = 0;
 
     var force_redraw = false;
-    var ctx = surfaceTestContext(&input);
-    ctx.input_appearance = .tint;
+    const ctx = surfaceTestContext(&input);
     try std.testing.expectError(
         error.InvalidFooterInvalidationGeometry,
         resolveSurfaceFooterReservation(
@@ -2178,8 +2171,7 @@ test "surface footer preparation rejects zero invalidation geometry before mutat
 
     var metrics = Metrics{};
     var force_redraw = false;
-    var ctx = surfaceTestContext(&input);
-    ctx.input_appearance = .tint;
+    const ctx = surfaceTestContext(&input);
     const result = prepareSurfaceFooterFrameWithReservation(
         alloc,
         &shell,
@@ -2250,7 +2242,7 @@ test "surface footer preparation retains stale and current footer invalidations"
         frame.paint.invalidation,
         .external_clear,
         1,
-        4,
+        3,
     ));
     try std.testing.expect(surfaceHasInvalidation(
         frame.paint.invalidation,
@@ -2439,8 +2431,7 @@ test "command approval footer sizing paths use the complete command" {
         0,
     ));
 
-    var ctx = surfaceTestContext(&input);
-    ctx.input_appearance = .tint;
+    const ctx = surfaceTestContext(&input);
     var measured = try measureSurfaceFooter(
         alloc,
         &shell,

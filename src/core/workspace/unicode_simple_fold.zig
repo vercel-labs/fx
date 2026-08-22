@@ -1530,7 +1530,116 @@ const mappings = [_]Mapping{
     .{ .from = 0x1E921, .to = 0x1E943 },
 };
 
+const CompactMapping = packed struct(u64) {
+    first: u21,
+    last: u21,
+    delta: i17,
+    step_two: bool,
+    padding: u4 = 0,
+};
+
+const Run = struct {
+    len: usize,
+    step_two: bool,
+};
+
+fn run_length(start: usize, step: u2) usize {
+    const first = mappings[start];
+    const delta = @as(i22, @intCast(first.to)) -
+        @as(i22, @intCast(first.from));
+    var len: usize = 1;
+    while (start + len < mappings.len) : (len += 1) {
+        const prior = mappings[start + len - 1];
+        const next = mappings[start + len];
+        if (next.from != prior.from + step) break;
+        if (next.to != prior.to + step) break;
+        const next_delta = @as(i22, @intCast(next.to)) -
+            @as(i22, @intCast(next.from));
+        if (next_delta != delta) break;
+    }
+    return len;
+}
+
+fn best_run(start: usize) Run {
+    const step_one = run_length(start, 1);
+    const step_two = run_length(start, 2);
+    if (step_two > step_one) return .{ .len = step_two, .step_two = true };
+    return .{ .len = step_one, .step_two = false };
+}
+
+const compact_mapping_count: usize = blk: {
+    @setEvalBranchQuota(2_000_000);
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index < mappings.len) {
+        if (mappings[index].from < 0x80) {
+            index += 1;
+            continue;
+        }
+        const run = best_run(index);
+        index += if (run.len >= 3) run.len else 1;
+        count += 1;
+    }
+    break :blk count;
+};
+
+const compact_mappings: [compact_mapping_count]CompactMapping = blk: {
+    @setEvalBranchQuota(2_000_000);
+    var result: [compact_mapping_count]CompactMapping = undefined;
+    var result_index: usize = 0;
+    var index: usize = 0;
+    while (index < mappings.len) {
+        const first = mappings[index];
+        if (first.from < 0x80) {
+            index += 1;
+            continue;
+        }
+        const run = best_run(index);
+        const len = if (run.len >= 3) run.len else 1;
+        const last = mappings[index + len - 1];
+        const delta = @as(i22, @intCast(first.to)) -
+            @as(i22, @intCast(first.from));
+        result[result_index] = .{
+            .first = first.from,
+            .last = last.from,
+            .delta = @intCast(delta),
+            .step_two = run.step_two and len >= 3,
+        };
+        result_index += 1;
+        index += len;
+    }
+    if (result_index != compact_mapping_count) {
+        @compileError("Unicode fold mapping compression count mismatch");
+    }
+    break :blk result;
+};
+
+const runtime_mapping_bytes = @sizeOf(@TypeOf(compact_mappings));
+
 pub fn fold(codepoint: u21) u21 {
+    if (codepoint >= 'A' and codepoint <= 'Z') return codepoint + ('a' - 'A');
+    if (codepoint < 0x80) return codepoint;
+
+    var low: usize = 0;
+    var high: usize = compact_mappings.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (codepoint < compact_mappings[mid].first) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    if (low == 0) return codepoint;
+    const mapping = compact_mappings[low - 1];
+    if (codepoint > mapping.last) return codepoint;
+    const step: u21 = if (mapping.step_two) 2 else 1;
+    if ((codepoint - mapping.first) % step != 0) return codepoint;
+    const mapped = @as(i22, @intCast(codepoint)) + mapping.delta;
+    return @intCast(mapped);
+}
+
+fn reference_fold(codepoint: u21) u21 {
     if (codepoint >= 'A' and codepoint <= 'Z') return codepoint + ('a' - 'A');
     if (codepoint < 0x80) return codepoint;
 
@@ -1548,6 +1657,18 @@ pub fn fold(codepoint: u21) u21 {
         }
     }
     return codepoint;
+}
+
+test "Unicode simple fold matches the reference for every codepoint" {
+    var value: u32 = 0;
+    while (value <= 0x10FFFF) : (value += 1) {
+        const codepoint: u21 = @intCast(value);
+        try std.testing.expectEqual(reference_fold(codepoint), fold(codepoint));
+    }
+}
+
+test "Unicode simple fold runtime data stays within budget" {
+    try std.testing.expect(runtime_mapping_bytes <= 1_840);
 }
 
 test "Unicode simple fold covers representative C and S mappings" {

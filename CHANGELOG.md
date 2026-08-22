@@ -1,8 +1,68 @@
 # fx
 
-## 0.0.4
+## 0.0.5
 
 <!-- release:start -->
+
+### Breaking Changes
+
+- **Host command execution:** Run approved captured, background, and monitor commands as ordinary host subprocesses, and retire sandbox configuration, status fields, and commands
+- **Interactive provider switching:** Move provider selection to `/setup` and remove the `/provider` slash command while keeping the top-level `fx provider` command
+
+### New Features
+
+- **Codex subscriptions:** Sign in with an eligible subscription through `fx login codex`, then use authenticated Codex models for interactive sessions, `fx ask`, native ACP, images, subagents, and automatic reviews
+- **Grok subscriptions:** Sign in with an eligible Grok subscription through `fx login grok`, then use authenticated xAI models, effort levels, images, local tools, persistent sessions, and automatic reviews
+- **Workspace status line:** Opt in to the active workspace path and Git branch through `/settings`, `/statusline workspace`, or `statusLine.workspace`
+- **fx-native workspace skills:** Discover project skills from `.fx/skills` before other workspace and compatibility roots
+- **External skill authorities:** Allow symlinked skills under explicitly trusted external directories through `FX_SKILL_SYMLINK_AUTHORITIES`
+
+### Improvements
+
+- **Provider setup:** Activate a catalog-valid model after subscription login, reauthenticate logged-out providers through `/setup`, and show Codex authorization as a clickable terminal link
+- **Provider model catalogs:** Show provider-advertised models, context windows, and effort levels in `/model` and the status line
+- **Session listings:** Show saved session names, readable UTC timestamps, language names, and singular turn counts while preserving the existing JSON fields
+- **Session cache reads:** Keep session listings and latest-session resume responsive while another session defers cache publication
+- **Terminal tab titles:** Label interactive tabs with the session or workspace and active model, keep them current across rename, resume, and model changes, and clear them on exit
+- **Terminal activity:** Keep each command or shell attached to its terminal activity row through completion, distinguish graceful close from force close, and hide no-op `cd . &&` prefixes
+- **Terminal action arguments:** Advertise only the fields relevant to the selected action and limit unsaved `fx ask` sessions to `terminal.exec`
+- **Auto mode reads:** Run routine read-only commands and hardened Git inspection directly without automatic review
+- **Automatic denial recovery:** Return destructive actions to the agent for replanning and finish repeated no-progress denials as normal assistant output instead of opening a permission prompt
+- **One-off subagents:** Keep active one-off subagents visible, deliver one final result, and retire them after completion while leaving persistent subagents reusable
+- **Startup preferences:** Show saved reasoning effort and Fast mode immediately while model capabilities load
+- **Dev build identity:** Add the commit and `[dev]` marker to dev-channel welcome headers without changing stable release headers
+- **MCP reload feedback:** Replace internal health details with concise server availability and recovery guidance
+- **Help layout:** Keep command descriptions close to command names on wide terminals
+- **Native binary size:** Reduce the macOS arm64 release footprint while preserving existing behavior
+- **Stable upgrades:** Restore forward-only version ordering across manual, automatic, and Ctrl+G upgrades
+
+### Bug Fixes
+
+- **Oversized images:** Normalize large macOS image snapshots without changing the originals and reject attachments locally when a bounded snapshot cannot be prepared
+- **Corrupt memory stores:** Report malformed, oversized, or unreadable stores and preserve their original bytes instead of overwriting them
+- **Non-regular file reads:** Reject FIFOs and other non-regular `read_file` targets before they can block
+- **Malformed tool loops:** End a turn after three consecutive malformed-only tool batches and reset recovery after a valid batch
+- **Terminal null placeholders:** Treat textual `"null"` values as absent for unused terminal fields while preserving real command text that contains the word
+- **Terminal keyboard input:** Ignore unknown completed escape sequences and handle Ghostty kitty Escape reports with Caps Lock, Num Lock, and event suffixes
+- **Credential fallback:** Continue to a stored API key when saved `fx login` credentials cannot load or refresh while keeping the login failure available for diagnostics
+- **Vision recovery:** Retry replay-safe requests once after a post-Vision assistant-prefill rejection
+- **Thinking status:** Keep the Thinking indicator and elapsed timer visible while automatic command review runs
+- **Terminal helper compatibility:** Reject unsupported start, signal, and force-close requests from stale terminal helpers without losing unrelated sessions
+- **WASM project context:** Skip unavailable local project-instruction probes in browser hosts while preserving host-supplied context
+- **Idle terminal traffic:** Stop polling the terminal theme while idle and continue retinting after supported theme notifications
+
+### Security
+
+- **Command approval patterns:** Restrict wildcard command allows to static shell words and keep destructive shell commands and file deletion outside automatic review
+- **macOS login storage:** Store native `fx login` sessions in Keychain with verified migration, refresh, restart, and logout behavior
+- **MCP configuration writes:** Save `~/.fx/mcp.json` atomically with private permissions, reject linked targets, and preserve the previous configuration when a write fails
+- **MCP session retirement:** Keep retired HTTP session IDs alive until in-flight requests drain
+- **Provider response limits:** Reject oversized Codex and Grok catalogs, streams, tool data, and replay state while keeping later input usable
+- **ACP permission validation:** Validate permission input before writing JSON-RPC frames
+
+<!-- release:end -->
+
+## 0.0.4
 
 ### New Features
 
@@ -29,8 +89,6 @@
 - **Process cleanup:** Cancel and reap headless terminal commands on SIGTERM, preserve signal status, and tolerate short-lived Linux processes disappearing during cleanup
 - **Model output limits:** Omit invalid limits that consume a model's full context window
 - **Terminal lease transitions:** Reject write payloads on lease acquisition, release, and revocation before session state changes
-
-<!-- release:end -->
 
 ## 0.0.3
 

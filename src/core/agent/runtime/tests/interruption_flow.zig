@@ -259,7 +259,7 @@ test "processQueuedPrompt cancellation after valid tool finish settles streamed 
     });
 }
 
-test "processQueuedPrompt in-stream cancellation settles every provisional start" {
+test "processQueuedPrompt in-stream cancellation settles every eligible provisional start" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
         toolCall("call_command", "terminal", "{}"),
@@ -283,7 +283,6 @@ test "processQueuedPrompt in-stream cancellation settles every provisional start
     try std.testing.expectEqual(@as(usize, 1), hooks.interrupted_event_count);
     try std.testing.expectEqual(@as(usize, 1), hooks.finish_event_count);
     try expectToolTerminalsBeforeTurnFinished(&hooks, &.{
-        .{ .call_id = "call_command", .kind = .cancelled },
         .{ .call_id = "call_read", .kind = .cancelled },
     });
 }
@@ -499,7 +498,7 @@ test "processQueuedPrompt retains cancelled command artifact for presentation on
     const artifact_handle = "fx-command-cancelled.log";
     const result_output = "RESULT-ONLY-OUTPUT-SENTINEL\nTERM-TAIL-SENTINEL\n";
     const result_json =
-        "{\"kind\":\"foreground\",\"command\":\"sleep 5\",\"cwd\":\"/tmp/RESULT-JSON-ONLY-SENTINEL\",\"exit_code\":null,\"signal\":15,\"timed_out\":false,\"duration_ms\":7,\"stdout_bytes\":49,\"stderr_bytes\":0,\"truncated\":false,\"output_file\":\"" ++ artifact_path ++ "\",\"stdout_file\":null,\"stderr_file\":null,\"sandbox_denied\":false}";
+        "{\"kind\":\"foreground\",\"command\":\"sleep 5\",\"cwd\":\"/tmp/RESULT-JSON-ONLY-SENTINEL\",\"exit_code\":null,\"signal\":15,\"timed_out\":false,\"duration_ms\":7,\"stdout_bytes\":49,\"stderr_bytes\":0,\"truncated\":false,\"output_file\":\"" ++ artifact_path ++ "\",\"stdout_file\":null,\"stderr_file\":null}";
     const calls = [_]ToolCall{toolCall("call_cancelled_command", "terminal", "{\"action\":\"exec\",\"command\":\"sleep 5\"}")};
     const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
     var gateway = FakeGateway.init(alloc, &completions);

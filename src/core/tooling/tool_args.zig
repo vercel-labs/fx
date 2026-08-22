@@ -20,6 +20,21 @@ pub fn optionalStringArg(args: std.json.ObjectMap, key: []const u8) ?[]const u8 
     return value.string;
 }
 
+/// Tool schemas that require every field tell the model to send null for the
+/// fields its selected action does not use. Models routinely serialize that null
+/// as the literal text "null", so readers treat it as the absence it expresses.
+pub fn isNullPlaceholderText(text: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, text, &std.ascii.whitespace), "null");
+}
+
+/// Reads an optional string argument from a schema whose unused fields arrive as
+/// nulls, so textual null placeholders read as absent instead of as a value.
+pub fn nullablePlaceholderStringArg(args: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const text = optionalStringArg(args, key) orelse return null;
+    if (isNullPlaceholderText(text)) return null;
+    return text;
+}
+
 pub fn optionalBoolArg(args: std.json.ObjectMap, key: []const u8) ?bool {
     const value = args.get(key) orelse return null;
     if (value != .bool) return null;
@@ -80,4 +95,23 @@ test "optional typed args return payloads only for matching tags" {
     try std.testing.expectEqual(@as(i64, 3), optionalIntArg(args, "count").?);
     try std.testing.expect(optionalIntArg(args, "missing") == null);
     try std.testing.expect(optionalIntArg(args, "other") == null);
+}
+
+test "null placeholder reads treat textual nulls as absent" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try parseToolArgsObject(
+        arena,
+        "{\"cwd\":\"null\",\"profile\":\" NULL \",\"shell\":null,\"command\":\"echo null\",\"dir\":\"nullify\"}",
+    );
+
+    try std.testing.expect(nullablePlaceholderStringArg(args, "cwd") == null);
+    try std.testing.expect(nullablePlaceholderStringArg(args, "profile") == null);
+    try std.testing.expect(nullablePlaceholderStringArg(args, "shell") == null);
+    try std.testing.expect(nullablePlaceholderStringArg(args, "missing") == null);
+    try std.testing.expectEqualStrings("echo null", nullablePlaceholderStringArg(args, "command").?);
+    try std.testing.expectEqualStrings("nullify", nullablePlaceholderStringArg(args, "dir").?);
+    try std.testing.expectEqualStrings("null", optionalStringArg(args, "cwd").?);
 }

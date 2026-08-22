@@ -66,23 +66,7 @@ fn spawnPrepared(
         blocked_background_wrapper_command,
         "fx-background",
     };
-    var sandbox_argv: [7][]const u8 = undefined;
-    const argv: []const []const u8 = switch (request.isolation) {
-        .none => &direct_argv,
-        .macos_profile => |profile_path| blk: {
-            if (builtin.os.tag != .macos) return error.Unsupported;
-            sandbox_argv = .{
-                "/usr/bin/sandbox-exec",
-                "-f",
-                profile_path,
-                "sh",
-                "-lc",
-                blocked_background_wrapper_command,
-                "fx-background",
-            };
-            break :blk &sandbox_argv;
-        },
-    };
+    const argv: []const []const u8 = &direct_argv;
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = argv,
         .cwd = .{ .path = request.cwd },

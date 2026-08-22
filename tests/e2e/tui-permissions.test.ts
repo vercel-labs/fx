@@ -78,7 +78,6 @@ function createIsolatedRoot(): IsolatedRoot {
       sandbox: "none",
       permission_mode: "ask",
       permission: {},
-      maxxing_mode: "legacy",
     }),
   );
   roots.push(root);
@@ -172,7 +171,7 @@ function expectAtomicApprovalExit(tapePath: string, frameStart: number) {
   const syncStart = payload.indexOf("\x1b[?2026h");
   const syncEnd = payload.indexOf("\x1b[?2026l");
   const cursorHide = payload.indexOf("\x1b[?25l");
-  const resetClear = payload.indexOf("\x1b[0m\x1b[3J\x1b[2J\x1b[H");
+  const resetClear = payload.indexOf("\x1b[0m\x1b[2J\x1b[3J\x1b[H");
   expect(syncStart).toBeGreaterThanOrEqual(0);
   expect(cursorHide).toBeGreaterThan(syncStart);
   if (resetClear >= 0) {
@@ -379,6 +378,8 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       });
       expect(approval).toContain(marker);
       expect(approval).not.toContain(plainMarker);
+      expect(approval).toContain("┃ Create the combining fixture");
+      expect(approval).not.toContain("❯ Create the combining fixture");
       expect(gateway.requests[0]!.body).toContain(marker);
       expect(gateway.requests[0]!.body).not.toContain(plainMarker);
 
@@ -388,6 +389,8 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       });
       expect(approval).toContain(marker);
       expect(approval).not.toContain(plainMarker);
+      expect(approval).toContain("┃ Create the combining fixture");
+      expect(approval).not.toContain("❯ Create the combining fixture");
       expect(session.paneStatus()).toEqual({ dead: false, status: null });
 
       await decide(session, 1);
@@ -1039,15 +1042,12 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
   );
 
   test(
-    "denied and cancelled file tools use terminal markers",
+    "denied and cancelled file tools use current compact outcomes",
     async () => {
       const cases = [
         {
           name: "denied",
-          marker: "⊘",
-          markerStyle: "\x1b[38;5;252m",
-          hasStandaloneCancellationNotice: false,
-          status: "Denied",
+          outcome: "1 denied",
           resolve: async (session: TmuxSession) => {
             await decide(session, 3);
           },
@@ -1061,10 +1061,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         },
         {
           name: "cancelled",
-          marker: "■",
-          markerStyle: "\x1b[38;5;252m",
-          hasStandaloneCancellationNotice: true,
-          status: "Cancelled",
+          outcome: "■ Cancelled",
           resolve: async (session: TmuxSession) => {
             await session.sendKeys("Escape");
           },
@@ -1093,13 +1090,11 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
           required: [target.split("/").at(-1)!],
         });
         await testCase.resolve(launched.session);
-        await launched.session.waitForText(testCase.status, TIMEOUT);
+        await launched.session.waitForText(testCase.outcome, TIMEOUT);
 
-        const escapes = await launched.session.capturePaneEscapes();
-        expect(escapes).toContain(`${testCase.markerStyle}${testCase.marker}`);
-        if (testCase.hasStandaloneCancellationNotice) {
-          expect(escapes).not.toContain("\x1b[38;5;245mcancelled\x1b[39m");
-        }
+        const compact = await launched.session.captureFullScrollback();
+        expect(compact).toContain(testCase.outcome);
+        expect(compact).not.toContain("⊘");
         expect(existsSync(target)).toBe(false);
         expectCleanStderr(launched.stderrPath);
 
@@ -1382,7 +1377,8 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
       const compactGrid = await session.capturePaneGrid();
       const compactScrollback = await session.captureFullScrollback();
-      expect(compactScrollback).toContain("⋯ +");
+      expect(compactScrollback).toContain("Wrote first.txt +120");
+      expect(compactScrollback).toContain("Wrote second.txt +60");
       expect(compactScrollback).not.toContain("CTRL_O_FIRST_060");
 
       await session.sendKeys("C-o");
@@ -1407,7 +1403,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(fullFirst).not.toContain('"content":"CTRL_O_FIRST');
 
       await session.sendKeys("C-o");
-      await session.waitForText("⋯ +", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
       expect(normalizeVolatileStatusRows(
         await session.waitForStableGrid(compactGrid, normalizeVolatileStatusRows, TIMEOUT),
       )).toEqual(
@@ -1460,8 +1456,8 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(readFileSync(target, "utf8")).toBe(newLine);
 
       const inline = await session.captureFullScrollback();
-      expectDiffSentinelOnRail(inline, "OLD_WRAP_TAIL");
-      expectDiffSentinelOnRail(inline, "NEW_WRAP_TAIL");
+      expect(inline).not.toContain("OLD_WRAP_TAIL");
+      expect(inline).not.toContain("NEW_WRAP_TAIL");
 
       await session.sendKeys("C-o");
       await session.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);

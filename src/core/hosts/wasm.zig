@@ -1,6 +1,5 @@
 const std = @import("std");
 
-pub const os_sandbox = false;
 pub const background_processes = false;
 
 pub fn isTarget(arch: std.Target.Cpu.Arch) bool {
@@ -19,7 +18,6 @@ test "WASM targets expose no native process capabilities" {
     try std.testing.expect(isTarget(.wasm32));
     try std.testing.expect(isTarget(.wasm64));
     try std.testing.expect(!isTarget(.x86_64));
-    try std.testing.expect(!os_sandbox);
     try std.testing.expect(!background_processes);
 }
 

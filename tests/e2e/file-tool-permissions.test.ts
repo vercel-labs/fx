@@ -123,7 +123,7 @@ describe("external file permissions", () => {
         );
 
         expect(result.stderr).toContain(
-          "YOLO enabled: permissions and sandboxing disabled",
+          "YOLO enabled: fx permission checks disabled",
         );
         const output = parseFxJson(result);
         expect(

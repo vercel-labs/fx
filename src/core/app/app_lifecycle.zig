@@ -7,18 +7,16 @@ const credentials = @import("../auth/credentials.zig");
 const provider_id = @import("../providers/provider_id.zig");
 const host = @import("../hosts/host.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
-const input_appearance = @import("../config/input_appearance.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const record_tape = @import("../workspace/record_tape.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const update_target = @import("../upgrade/update_target.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
 const ui_render = @import("../../ui/render.zig");
-const presentation_mode = @import("../config/presentation_mode.zig");
 const transcript_presentation = @import("../output/transcript_presentation.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const ui_terminal = @import("../../ui/terminal/terminal.zig");
@@ -122,6 +120,7 @@ pub const StartupState = struct {
     credential: ?credentials.Credential = null,
     credential_onboarding_skipped: bool = false,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
+    provider: model_provider.ProviderId = .gateway,
     selected_model: []u8 = &.{},
     configured_model: []u8 = &.{},
     model_source: config_runtime.ModelSource = .compiled_default,
@@ -133,8 +132,7 @@ pub const StartupState = struct {
     context_limits: config_runtime.context_limits.Values = .{},
     context_enabled: bool = true,
     fast_mode: bool = false,
-    input_appearance: input_appearance.InputAppearance = .default,
-    maxxing_mode: presentation_mode.MaxxingMode = presentation_mode.MaxxingMode.default,
+    fast_mode_source: config_runtime.ConfigSource = .compiled_default,
     slash_menu_categories: bool = true,
     auto_upgrade: bool = true,
     update_channel: update_target.Channel = .stable,
@@ -144,10 +142,9 @@ pub const StartupState = struct {
     config_diagnostics: []config_runtime.ConfigDiagnostic = &.{},
     effort: types.ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
-    sandbox_backend: sandbox.BackendKind = .none,
-    statusline_sandbox: bool = false,
     statusline_context: bool = false,
     statusline_session: bool = false,
+    statusline_workspace: bool = false,
     notification_turn_end: bool = false,
     notification_attention_required: bool = false,
     notification_max: bool = false,
@@ -216,11 +213,11 @@ pub const StartupState = struct {
 
 pub const StartupStatus = struct {
     workspace_root: []u8,
+    provider: model_provider.ProviderId = .gateway,
     selected_model: []const u8,
     owned_selected_model: ?[]u8 = null,
     auth: auth_runtime.StatusSnapshot = .{},
     permission_mode: PermissionMode,
-    sandbox_backend: sandbox.BackendKind = .none,
     agent_step_limit: usize,
     update_channel: update_target.Channel = .stable,
     config_diagnostics: []config_runtime.ConfigDiagnostic = &.{},
@@ -319,19 +316,25 @@ pub fn loadStartupStatus(
     defer detailed.deinit(alloc);
     const settings = &detailed.settings;
 
-    const selected_model = try loadStartupStatusModel(alloc, default_model, settings.model);
+    const configured_selection = try configuredProviderSelection(default_model, settings);
+    const selected_model = try loadStartupStatusModel(alloc, configured_selection.model, null);
     errdefer if (selected_model.owned) |model| alloc.free(model);
 
-    var auth_status = try auth_runtime.loadStatusSnapshot(alloc, secret_store, settings.credential_source);
+    var auth_status = try auth_runtime.loadStatusSnapshotForProvider(
+        alloc,
+        secret_store,
+        configured_selection.provider,
+        settings.credential_source,
+    );
     errdefer auth_status.deinit(alloc);
 
     const result = StartupStatus{
         .workspace_root = workspace_root,
+        .provider = configured_selection.provider,
         .selected_model = selected_model.value,
         .owned_selected_model = selected_model.owned,
         .auth = auth_status,
         .permission_mode = loadPermissionMode(settings.permission_mode),
-        .sandbox_backend = sandbox.backendFromConfig(settings.sandbox),
         .agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps),
         .update_channel = settings.update_channel orelse .stable,
         .config_diagnostics = detailed.diagnostics,
@@ -392,16 +395,30 @@ fn loadStartupStateFromOwnedWorkspace(
         false,
     );
 
-    state.configured_model = try alloc.dupe(u8, settings.model orelse default_model);
+    const configured_selection = try configuredProviderSelection(default_model, settings);
+    state.provider = configured_selection.provider;
+    state.configured_model = try alloc.dupe(u8, configured_selection.model);
     state.model_source = detailed.model_source orelse .compiled_default;
-    state.selected_model = try loadInitialModel(alloc, default_model, settings.model);
+    state.selected_model = try loadInitialModel(alloc, configured_selection.model, null);
+    if (std.mem.startsWith(u8, state.selected_model, provider_id.opencode_go_prefix)) {
+        // An explicit opencode-go/ model id routes through the OpenCode Go
+        // transport regardless of the configured provider default.
+        state.provider = .opencode_go;
+    }
     if (hasProcessModelOverride()) state.model_source = .process_override;
     state.config_diagnostics = detailed.diagnostics;
     detailed.diagnostics = &.{};
     state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
     if (credential_mode) |mode| {
-        const resolution = try credentials.resolvePreferring(alloc, transport, secret_store, mode, settings.credential_source);
+        const resolution = try credentials.resolveForProvider(
+            alloc,
+            transport,
+            secret_store,
+            mode,
+            state.provider,
+            settings.credential_source,
+        );
         state.credential = resolution.credential;
         state.stored_key_status = resolution.stored_key_status;
     }
@@ -412,19 +429,18 @@ fn loadStartupStateFromOwnedWorkspace(
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});
     state.context_enabled = settings.context orelse true;
-    state.fast_mode = settings.fast_mode orelse false;
-    state.input_appearance = initialInputAppearance(settings.input_appearance);
-    state.maxxing_mode = initialMaxxingMode(settings.maxxing_mode);
+    state.fast_mode = settings.fast_mode orelse
+        (state.provider == .gateway and state.model_source == .compiled_default);
+    state.fast_mode_source = detailed.sources.fast_mode;
     state.slash_menu_categories = settings.slash_menu_categories orelse true;
     state.auto_upgrade = settings.auto_upgrade orelse true;
     state.update_channel = settings.update_channel orelse .stable;
     state.startup_scrollback = settings.startup_scrollback orelse true;
     state.effort = settings.effort orelse .auto;
     state.first_call_tool_choice = settings.first_call_tool_choice orelse .auto;
-    state.sandbox_backend = sandbox.backendFromConfig(settings.sandbox);
-    state.statusline_sandbox = settings.statusline_sandbox orelse false;
     state.statusline_context = settings.statusline_context orelse false;
     state.statusline_session = settings.statusline_session orelse false;
+    state.statusline_workspace = settings.statusline_workspace orelse false;
     const sound_override = soundEnvOverride();
     const sound_on_override: ?bool = if (sound_override) |level| level != .off else null;
     const max_override: ?bool = if (sound_override) |level| level == .max else null;
@@ -1103,32 +1119,67 @@ fn loadAgentStepLimit(fallback: usize, configured: ?usize) usize {
     );
 }
 
+fn configuredProviderSelection(
+    default_model: []const u8,
+    settings: *const config_runtime.Settings,
+) !model_provider.ProviderSelection {
+    const provider = settings.provider orelse .gateway;
+    const model = switch (provider) {
+        .gateway => settings.model orelse default_model,
+        .codex => settings.codex_model orelse return error.CodexModelNotSelected,
+        .grok => settings.grok_model orelse return error.GrokModelNotSelected,
+        .opencode_go => blk: {
+            if (settings.model) |saved| {
+                if (std.mem.startsWith(u8, saved, provider_id.opencode_go_prefix)) break :blk saved;
+            }
+            break :blk provider_id.opencode_go_prefix ++ "deepseek-v4-flash";
+        },
+    };
+    return .{ .provider = provider, .model = model };
+}
+
 fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8 {
     const model = io_mod.getenv("FX_MODEL") orelse return configured orelse default_model;
     const trimmed = std.mem.trim(u8, model, " \t\r\n");
     return if (trimmed.len > 0) trimmed else configured orelse default_model;
 }
 
+test "startup provider chooses only its provider-scoped model" {
+    const gateway_settings = config_runtime.Settings{
+        .model = @constCast("gateway/model"),
+        .provider = .gateway,
+        .codex_model = @constCast("gpt-model"),
+    };
+    const gateway = try configuredProviderSelection("default/model", &gateway_settings);
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.provider);
+    try std.testing.expectEqualStrings("gateway/model", gateway.model);
+
+    const codex_settings = config_runtime.Settings{
+        .model = @constCast("gateway/model"),
+        .provider = .codex,
+        .codex_model = @constCast("gpt-model"),
+    };
+    const codex = try configuredProviderSelection("default/model", &codex_settings);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, codex.provider);
+    try std.testing.expectEqualStrings("gpt-model", codex.model);
+
+    const missing_codex = config_runtime.Settings{ .provider = .codex };
+    try std.testing.expectError(
+        error.CodexModelNotSelected,
+        configuredProviderSelection("default/model", &missing_codex),
+    );
+
+    const grok_settings = config_runtime.Settings{
+        .provider = .grok,
+        .grok_model = @constCast("grok-model"),
+    };
+    const grok = try configuredProviderSelection("default/model", &grok_settings);
+    try std.testing.expectEqual(model_provider.ProviderId.grok, grok.provider);
+    try std.testing.expectEqualStrings("grok-model", grok.model);
+}
+
 fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) ![]u8 {
     return alloc.dupe(u8, initialModelId(default_model, configured));
-}
-
-fn initialInputAppearance(configured: ?[]const u8) input_appearance.InputAppearance {
-    return input_appearance.InputAppearance.parse(
-        configured orelse input_appearance.InputAppearance.default.label(),
-    ) orelse .default;
-}
-
-fn initialMaxxingMode(configured: ?[]const u8) presentation_mode.MaxxingMode {
-    const value = configured orelse return presentation_mode.MaxxingMode.default;
-    return presentation_mode.MaxxingMode.parse(value) orelse presentation_mode.MaxxingMode.default;
-}
-
-test "maxxing mode defaults to minimal and accepts legacy settings" {
-    try std.testing.expectEqual(presentation_mode.MaxxingMode.default, initialMaxxingMode(null));
-    try std.testing.expectEqual(presentation_mode.MaxxingMode.minimal, initialMaxxingMode("minimal"));
-    try std.testing.expectEqual(presentation_mode.MaxxingMode.legacy, initialMaxxingMode("legacy"));
-    try std.testing.expectEqual(presentation_mode.MaxxingMode.legacy, initialMaxxingMode("normal"));
 }
 
 fn hasProcessModelOverride() bool {
@@ -1989,17 +2040,17 @@ test "loadStartupState applies core env overrides" {
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, state.credential.?.source);
     try std.testing.expectEqual(PermissionMode.auto, state.permission_mode);
     try std.testing.expectEqual(@as(usize, 37), state.agent_step_limit);
-    try std.testing.expectEqual(sandbox.BackendKind.none, state.sandbox_backend);
 }
 
-test "loadStartupState defaults fast mode off and preserves explicit preferences" {
+test "loadStartupState defaults fast mode on only for the compiled Gateway default and preserves explicit preferences" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "absent");
     try tmp.dir.createDirPath(io_mod.getIo(), "configured");
-    try tmp.dir.createDirPath(io_mod.getIo(), "enabled");
+    try tmp.dir.createDirPath(io_mod.getIo(), "disabled");
+    try tmp.dir.createDirPath(io_mod.getIo(), "codex");
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_root);
@@ -2007,13 +2058,15 @@ test "loadStartupState defaults fast mode off and preserves explicit preferences
     defer std.testing.allocator.free(absent_root);
     const configured_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "configured");
     defer std.testing.allocator.free(configured_root);
-    const enabled_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "enabled");
-    defer std.testing.allocator.free(enabled_root);
+    const disabled_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "disabled");
+    defer std.testing.allocator.free(disabled_root);
+    const codex_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "codex");
+    defer std.testing.allocator.free(codex_root);
 
     const fixture = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"workspaces\":{{\"{s}\":{{\"model\":\"openai/gpt-5\"}},\"{s}\":{{\"fast_mode\":true}}}}}}\n",
-        .{ configured_root, enabled_root },
+        "{{\"workspaces\":{{\"{s}\":{{\"model\":\"openai/gpt-5\"}},\"{s}\":{{\"fast_mode\":false}},\"{s}\":{{\"provider\":\"codex\",\"codex_model\":\"gpt-5.4-mini\"}}}}}}\n",
+        .{ configured_root, disabled_root, codex_root },
     );
     defer std.testing.allocator.free(fixture);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
@@ -2025,7 +2078,7 @@ test "loadStartupState defaults fast mode off and preserves explicit preferences
     defer absent.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("zai/glm-5.2", absent.selected_model);
     try std.testing.expectEqualStrings("zai/glm-5.2", absent.configured_model);
-    try std.testing.expect(!absent.fast_mode);
+    try std.testing.expect(absent.fast_mode);
 
     var configured = try loadStartupStateForWorkspace(std.testing.allocator, configured_root, "zai/glm-5.2", 25);
     defer configured.deinit(std.testing.allocator);
@@ -2033,11 +2086,15 @@ test "loadStartupState defaults fast mode off and preserves explicit preferences
     try std.testing.expectEqualStrings("openai/gpt-5", configured.configured_model);
     try std.testing.expect(!configured.fast_mode);
 
-    var enabled = try loadStartupStateForWorkspace(std.testing.allocator, enabled_root, "zai/glm-5.2", 25);
-    defer enabled.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("zai/glm-5.2", enabled.selected_model);
-    try std.testing.expectEqualStrings("zai/glm-5.2", enabled.configured_model);
-    try std.testing.expect(enabled.fast_mode);
+    var disabled = try loadStartupStateForWorkspace(std.testing.allocator, disabled_root, "zai/glm-5.2", 25);
+    defer disabled.deinit(std.testing.allocator);
+    try std.testing.expect(!disabled.fast_mode);
+
+    var codex = try loadStartupStateForWorkspace(std.testing.allocator, codex_root, "zai/glm-5.2", 25);
+    defer codex.deinit(std.testing.allocator);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, codex.provider);
+    try std.testing.expectEqualStrings("gpt-5.4-mini", codex.selected_model);
+    try std.testing.expect(!codex.fast_mode);
 }
 
 test "loadStartupState resolves startup scrollback default and explicit false" {
@@ -2069,46 +2126,10 @@ test "loadStartupState resolves startup scrollback default and explicit false" {
     var absent = try loadStartupStateForWorkspace(std.testing.allocator, absent_root, "default-model", 25);
     defer absent.deinit(std.testing.allocator);
     try std.testing.expect(absent.startup_scrollback);
-    try std.testing.expectEqual(input_appearance.InputAppearance.tint, absent.input_appearance);
 
     var disabled = try loadStartupStateForWorkspace(std.testing.allocator, disabled_root, "default-model", 25);
     defer disabled.deinit(std.testing.allocator);
     try std.testing.expect(!disabled.startup_scrollback);
-}
-
-test "loadStartupState resolves input appearance default and explicit lines" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "absent");
-    try tmp.dir.createDirPath(io_mod.getIo(), "lines");
-
-    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
-    defer std.testing.allocator.free(home_root);
-    const absent_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "absent");
-    defer std.testing.allocator.free(absent_root);
-    const lines_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "lines");
-    defer std.testing.allocator.free(lines_root);
-
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{{\"workspaces\":{{\"{s}\":{{\"input_appearance\":\"lines\"}}}}}}\n",
-        .{lines_root},
-    );
-    defer std.testing.allocator.free(fixture);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
-
-    var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
-    defer env.deinit();
-
-    var absent = try loadStartupStateForWorkspace(std.testing.allocator, absent_root, "default-model", 25);
-    defer absent.deinit(std.testing.allocator);
-    try std.testing.expectEqual(input_appearance.InputAppearance.tint, absent.input_appearance);
-
-    var lines = try loadStartupStateForWorkspace(std.testing.allocator, lines_root, "default-model", 25);
-    defer lines.deinit(std.testing.allocator);
-    try std.testing.expectEqual(input_appearance.InputAppearance.lines, lines.input_appearance);
 }
 
 test "loadStartupState resolves slash menu categories default and explicit false" {

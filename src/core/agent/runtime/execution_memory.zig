@@ -138,7 +138,7 @@ test "interrupted execution memory retains marked feedback through mixed user ta
         .{ .role = .tool, .content = "first command completed", .tool_call_id = calls[0].id, .tool_name = calls[0].name, .tool_result_status = .success },
         .{ .role = .tool, .content = "second command completed", .tool_call_id = calls[1].id, .tool_name = calls[1].name, .tool_result_status = .success },
         .{ .role = .user, .content = "first command feedback marker", .tool_call_id = calls[0].id, .permission_feedback = true },
-        .{ .role = .user, .content = "sandbox hint", .permission_feedback = false },
+        .{ .role = .user, .content = "custom hint", .permission_feedback = false },
         .{ .role = .user, .content = "second command feedback marker", .tool_call_id = calls[1].id, .permission_feedback = true },
     };
 

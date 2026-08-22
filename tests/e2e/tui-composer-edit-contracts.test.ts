@@ -60,7 +60,7 @@ async function startFx(
   mkdirSync(workspace);
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({ maxxing_mode: "legacy" }),
+    JSON.stringify({}),
   );
   stderrPath = join(root, "stderr.log");
   writeFileSync(stderrPath, "");
@@ -359,7 +359,7 @@ tmuxTest(
     const submitted = (await active.captureFullScrollback())
       .split("\n")
       .find((line) => line.includes("if True:"));
-    expect(submitted).toContain("❯     if True:");
+    expect(submitted).toContain("┃     if True:");
     expectCleanRuntime(active);
   },
   TIMEOUT,
@@ -712,7 +712,7 @@ tmuxTest(
     await active.waitForPane(
       (pane) =>
         pane.includes("edit contract complete") &&
-        pane.includes("❯") &&
+        pane.includes("┃") &&
         !pane.includes("Thinking"),
       TIMEOUT,
     );
@@ -743,7 +743,7 @@ tmuxTest(
     await active.waitForPane(
       (pane) =>
         pane.includes("edit contract complete") &&
-        pane.includes("❯") &&
+        pane.includes("┃") &&
         !pane.includes("Thinking"),
       TIMEOUT,
     );
@@ -793,7 +793,7 @@ for (
       await active.waitForPane(
         (pane) =>
           pane.includes("edit contract complete") &&
-          pane.includes("❯") &&
+          pane.includes("┃") &&
           !pane.includes("Thinking"),
         TIMEOUT,
       );
@@ -828,7 +828,7 @@ tmuxTest(
     await active.waitForPane(
       (pane) =>
         pane.includes("edit contract complete") &&
-        pane.includes("❯") &&
+        pane.includes("┃") &&
         !pane.includes("Thinking"),
       TIMEOUT,
     );

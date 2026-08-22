@@ -2834,7 +2834,6 @@ pub const LiveAuthority = struct {
     generation: u64,
     root_id: []const u8,
     tools: []const []const u8,
-    sandbox_backend: types.BackendKind,
     integrations: []const []const u8,
     rules: types.PermissionRuleSet,
     grants: []const types.PermissionGrant,
@@ -3407,6 +3406,64 @@ pub fn retentionGapThrough(
         };
     }
     return 0;
+}
+
+pub fn parentTurnDeliveryFullyAcknowledged(
+    ledger: Ledger,
+    consumer_id: []const u8,
+    target_id: []const u8,
+    delivery_id: []const u8,
+) bool {
+    const cursor = findCursor(
+        ledger.cursors,
+        consumer_id,
+        target_id,
+        .parent_turn,
+    ) orelse return false;
+    if (cursor.stale or cursor.partial_message_sequence != 0 or
+        retentionGapThrough(ledger, target_id, .parent_turn) != 0)
+    {
+        return false;
+    }
+    for (ledger.deliveries) |delivery| {
+        if (!std.mem.eql(u8, delivery.id, delivery_id) or
+            !std.mem.eql(u8, delivery.target_id, target_id) or
+            delivery.payload != .message)
+        {
+            continue;
+        }
+        return cursor.acknowledged_sequence >= delivery.sequence;
+    }
+    return false;
+}
+
+pub fn stableFinalResultFullyAcknowledged(
+    ledger: Ledger,
+    consumer_id: []const u8,
+    target_id: []const u8,
+    delivery_id: []const u8,
+) bool {
+    for (ledger.deliveries) |delivery| {
+        if (!std.mem.eql(u8, delivery.id, delivery_id) or
+            delivery.payload != .message)
+        {
+            continue;
+        }
+        const work_id = delivery.work_id orelse return false;
+        const stable_id = stableDeliveryId(
+            delivery.source_id,
+            work_id,
+            "final-result",
+        );
+        if (!std.mem.eql(u8, &stable_id, delivery.id)) return false;
+        return parentTurnDeliveryFullyAcknowledged(
+            ledger,
+            consumer_id,
+            target_id,
+            delivery_id,
+        );
+    }
+    return false;
 }
 
 const DeliveryOperationIdentity = union(enum) {
@@ -5620,7 +5677,6 @@ test "live authority applies deny revocation and sibling grant isolation" {
         .generation = 2,
         .root_id = "root",
         .tools = &tools,
-        .sandbox_backend = .macos,
         .integrations = &.{},
         .rules = .{ .rules = &rules_buf },
         .grants = &allowed_grants,

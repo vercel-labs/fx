@@ -21,7 +21,7 @@ import {
 } from "./tmux-helpers";
 import { expectPermissionModeContext } from "./permission-mode-context";
 
-const WARNING = "YOLO enabled: permissions and sandboxing disabled";
+const WARNING = "YOLO enabled: fx permission checks disabled";
 const COMPACT_WARNING = "YOLO: unrestricted";
 const QUIT_HINT = "press ctrl+c again to exit";
 const TIMEOUT = 30_000;
@@ -135,7 +135,7 @@ describe("yolo permission mode", () => {
   );
 
   test(
-    "status reports the effective sandbox while preserving the configured value",
+    "status omits sandbox while preserving the legacy configured value",
     async () => {
       const fixture = createFixture("fx-yolo-status-");
       writeFileSync(
@@ -158,13 +158,62 @@ describe("yolo permission mode", () => {
       });
 
       expect(result.code).toBe(0);
-      expect(JSON.parse(result.stdout.trim())).toMatchObject({
-        permission_mode: "yolo",
-        sandbox: "none",
-      });
+      const status = JSON.parse(result.stdout.trim());
+      expect(status).toMatchObject({ permission_mode: "yolo" });
+      expect(status).not.toHaveProperty("sandbox");
       expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).sandbox).toBe(
         CONFIGURED_SANDBOX,
       );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "legacy sandbox config is inert and ps executes once",
+    async () => {
+      const fixture = createFixture("fx-legacy-sandbox-ps-");
+      const psPath = join(fixture.workspace, "ps.txt");
+      const attemptsPath = join(fixture.workspace, "attempts.txt");
+      writeFileSync(
+        fixture.settingsPath,
+        JSON.stringify({
+          permission_mode: "yolo",
+          sandbox: "os",
+          yolo_acknowledged: true,
+        }) + "\n",
+      );
+
+      const fake = startFakeGateway([
+        fakeGatewayToolCall("legacy_ps", "terminal", {
+          action: "exec",
+          command: `ps -p $$ -o pid= > ${JSON.stringify(psPath)}; printf x >> ${JSON.stringify(attemptsPath)}`,
+        }),
+        fakeGatewayFinalText("LEGACY_PS_DONE"),
+      ]);
+      gateway = fake;
+
+      const result = await runFx(
+        ["ask", "--yolo", "--json", "--no-save", "Run the ps fixture once."],
+        {
+          cwd: fixture.workspace,
+          env: {
+            HOME: fixture.home,
+            AI_GATEWAY_API_KEY: "fake-yolo-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTO_UPGRADE: "0",
+            FX_GATEWAY_BASE_URL: fake.baseUrl,
+            FX_GATEWAY_CHAT_URL: fake.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(readFileSync(psPath, "utf8").trim()).toMatch(/^\d+$/);
+      expect(readFileSync(attemptsPath, "utf8")).toBe("x");
+      expect(fake.classifierRequests).toHaveLength(0);
+      expect(fake.requests).toHaveLength(2);
     },
     TIMEOUT,
   );
@@ -210,7 +259,7 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       await session.sendText("/settings");
       const settingsPane = await session.waitForText("←→ Change", TIMEOUT);
       expect(settingsPane).toContain("Permission mode");
-      expect(settingsPane).toContain("Command sandbox");
+      expect(settingsPane).not.toContain("Command sandbox");
       await Bun.sleep(4_300);
       expect(await session.capturePane()).toContain("←→ Change");
 
@@ -218,14 +267,6 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       const resumedWarning = await session.waitForText(WARNING, TIMEOUT);
       expect(resumedWarning).toContain("YOLO ·");
 
-      await session.sendText("/sandbox");
-      const sandboxPane = await session.waitForText("←→ Change", TIMEOUT);
-      expect(sandboxPane).toContain("Command sandbox");
-      expect(sandboxPane).not.toContain(WARNING);
-      await Bun.sleep(4_300);
-
-      await session.sendKeys("Escape");
-      await session.waitForText(WARNING, TIMEOUT);
       await Bun.sleep(1_500);
       expect(await session.capturePane()).toContain(WARNING);
       await session.waitForPane((pane) => !pane.includes(WARNING), 3_500);
@@ -240,11 +281,9 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       await session.sendKeys("BTab");
       await session.waitForText("ask ·", TIMEOUT);
       await session.sendText("/status");
-      const statusPane = await session.waitForText(
-        `sandbox=${CONFIGURED_SANDBOX}`,
-        TIMEOUT,
-      );
+      const statusPane = await session.waitForText("agent_step_limit=", TIMEOUT);
       expect(statusPane).toContain("permission_mode=ask");
+      expect(statusPane).not.toContain("sandbox=");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     45_000,

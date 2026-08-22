@@ -40,7 +40,7 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
       session = await TmuxSession.create();
       await session.waitForComposer(10_000);
       await session.sendText("/help");
-      const pane = await session.waitForText("Commands 39", 5_000);
+      const pane = await session.waitForText("Commands 37", 5_000);
       expect(pane).toContain("General");
       expect(pane).toContain("Enter Open");
       expect(pane).not.toContain("Run /help for commands");
@@ -62,6 +62,49 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
 });
 
 describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
+  test(
+    "statusline hides the workspace identity by default",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-statusline-default-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace-default-hidden");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home, { recursive: true });
+      mkdirSync(join(workspace, ".git"), { recursive: true });
+      writeFileSync(join(workspace, ".git", "HEAD"), "ref: refs/heads/default-hidden-branch\n");
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await TmuxSession.create({
+          cwd: workspace,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_SKIP_ONBOARDING: "1",
+          },
+          stderrPath,
+          width: 100,
+          height: 30,
+        });
+
+        const pane = await session.waitForComposer(10_000);
+        expect(pane).not.toContain("workspace-default-hidden");
+        expect(pane).not.toContain("default-hidden-branch");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   test(
     "/help keeps command descriptions close after a wide-to-narrow resize",
     async () => {
@@ -107,6 +150,79 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         );
         expect(narrowHelp).toBeDefined();
         expect(narrowHelp!.indexOf("show available")).toBe(40);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "statusline refreshes the working directory and Git branch",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-statusline-")));
+      const home = join(root, "home");
+      const repository = join(root, "repository");
+      const workspace = join(repository, "packages", "status-root");
+      const headPath = join(repository, ".git", "HEAD");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(repository, ".git"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(headPath, "ref: refs/heads/initial-branch\n");
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        `${JSON.stringify({ statusLine: { workspace: true }, fast_mode: false })}\n`,
+      );
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await TmuxSession.create({
+          cwd: workspace,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_SKIP_ONBOARDING: "1",
+          },
+          stderrPath,
+          width: 100,
+          height: 30,
+        });
+
+        await session.waitForPane(
+          (pane) => pane.includes("status-root") && pane.includes("initial-branch"),
+          10_000,
+        );
+
+        writeFileSync(headPath, "ref: refs/heads/refreshed-branch\n");
+        await session.resizeWindow(101, 30);
+        await session.waitForPane(
+          (pane) => pane.includes("status-root") && pane.includes("refreshed-branch"),
+          5_000,
+        );
+
+        writeFileSync(headPath, "0123456789abcdef0123456789abcdef01234567\n");
+        await session.resizeWindow(100, 30);
+        await session.waitForText("detached:0123456789ab", 5_000);
+
+        await session.resizeWindow(50, 30);
+        const narrow = await session.waitForPane(
+          (pane) => pane.includes("s-root") && pane.includes("detached:"),
+          5_000,
+        );
+        expect(narrow).not.toContain("initial-branch");
+        expect(session.isAlive()).toBe(true);
+
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(5_000)).toBe(true);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         if (session) {
@@ -251,7 +367,7 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
 
 describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
   test(
-    "/setup opens the four-action setup hub without source rows",
+    "/setup opens account and provider actions without source rows",
     async () => {
       const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-direct-setup-")));
       session = await TmuxSession.create({
@@ -271,9 +387,10 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
         (pane) =>
           pane.includes("Setup") &&
           pane.includes("Sign in with Vercel") &&
+          pane.includes("Sign in with Codex") &&
+          pane.includes("Sign in with Grok") &&
           pane.includes("API key") &&
-          pane.includes("Change team") &&
-          pane.includes("Switch credential"),
+          pane.includes("Switch provider"),
         TIMEOUT,
       );
       expect(setup).not.toContain("AI_GATEWAY_API_KEY");

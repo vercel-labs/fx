@@ -179,7 +179,10 @@ pub const Store = struct {
 
 fn labelFromRequest(request: contracts.ActionRequest) ?[]const u8 {
     return switch (request) {
-        .start => |value| value.command,
+        .start => |value| value.command orelse switch (value.shell) {
+            .user_login => "interactive shell",
+            .executable => |shell| shell.path,
+        },
         else => null,
     };
 }

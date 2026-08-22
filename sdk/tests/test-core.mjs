@@ -109,6 +109,7 @@ checkpoint("agent initialized");
 const session = await agent.createSession();
 checkpoint("session created");
 if (!session.id) throw new Error("session/new did not return a session id");
+if (session.configOptions?.some((option) => option.id === "provider")) throw new Error("WASM session/new advertised unsupported provider switching");
 if (!session.modes?.currentModeId) throw new Error("session/new did not return a mode snapshot");
 const modeOption = session.configOptions?.find((option) => option.id === "mode");
 if (modeOption?.options.find((option) => option.value === "code")?.permissionMode !== "auto") throw new Error("code mode did not advertise auto permission mode");
@@ -121,6 +122,7 @@ for (const model of catalogModels) {
 if (modelOption.currentValue !== "sdk/catalog-alpha") throw new Error(`stored model was not restored through ACP: ${modelOption.currentValue}`);
 if (session.modes.currentModeId !== "code") throw new Error(`stored mode was not restored through ACP: ${session.modes.currentModeId}`);
 await session.setModel("sdk/browser-test-model");
+if (session.configOptions.some((option) => option.id === "provider")) throw new Error("WASM model update advertised unsupported provider switching");
 if (session.configOptions.find((option) => option.id === "model")?.currentValue !== "sdk/browser-test-model") throw new Error("model option did not update");
 if (persistedConfig.get("model") !== "sdk/browser-test-model") throw new Error("accepted model was not persisted");
 failNextCommit = true;
@@ -174,6 +176,7 @@ const sessions = await agent.listSessions();
 if (!sessions.some((entry) => entry.sessionId === session.id)) throw new Error("persisted session was not listed");
 const restored = await agent.openSession(session.id);
 if (restored.id !== session.id) throw new Error("opened session id did not match");
+if (restored.configOptions?.some((option) => option.id === "provider")) throw new Error("WASM session/load advertised unsupported provider switching");
 if (!restored.history.some((update) => update.sessionUpdate === "agent_message_chunk" && update.content.text.includes("hello world"))) {
   throw new Error("restored session did not replay prior assistant history");
 }

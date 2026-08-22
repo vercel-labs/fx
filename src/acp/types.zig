@@ -270,7 +270,7 @@ test "writeToolCallUpdate can include structured command result" {
         "call_002",
         .completed,
         "exit_code=0\n<stdout>\nok\n</stdout>\n",
-        "{\"kind\":\"foreground\",\"command\":\"printf ok\",\"cwd\":\"/tmp\",\"exit_code\":0,\"signal\":null,\"timed_out\":false,\"stdout_bytes\":2,\"stderr_bytes\":0,\"truncated\":false,\"sandbox_denied\":false}",
+        "{\"kind\":\"foreground\",\"command\":\"printf ok\",\"cwd\":\"/tmp\",\"exit_code\":0,\"signal\":null,\"timed_out\":false,\"stdout_bytes\":2,\"stderr_bytes\":0,\"truncated\":false}",
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
     defer parsed.deinit();

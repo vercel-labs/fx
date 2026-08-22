@@ -34,9 +34,8 @@ pub const ProviderError = Allocator.Error ||
     InvalidPid,
 };
 
-pub const Isolation = union(enum) {
+pub const Isolation = enum {
     none,
-    macos_profile: []const u8,
 };
 
 pub const OutputCapability = struct {
@@ -405,36 +404,4 @@ test "provider routes lifecycle operations through one injected owner" {
     try std.testing.expectEqual(@as(usize, 1), fake.spawns);
     try std.testing.expectEqual(@as(usize, 1), fake.releases);
     try std.testing.expectEqual(@as(usize, 1), fake.waits);
-}
-
-test "provider preserves macos isolation as typed request data" {
-    const Fake = struct {
-        fn spawn(
-            _: ?*anyopaque,
-            _: Allocator,
-            request: SpawnRequest,
-        ) ProviderError!PreparedProcess {
-            switch (request.isolation) {
-                .macos_profile => |path| if (!std.mem.eql(
-                    u8,
-                    path,
-                    "/private/tmp/fx.sb",
-                )) return error.SpawnFailed,
-                .none => return error.Unsupported,
-            }
-            return error.Unsupported;
-        }
-    };
-
-    var provider = unavailable_provider;
-    provider.spawn_prepared_fn = Fake.spawn;
-    var output_marker: u8 = 0;
-    try std.testing.expectError(error.Unsupported, provider.spawnPrepared(
-        std.testing.allocator,
-        .{
-            .cwd = "/workspace",
-            .output = .{ .context = &output_marker },
-            .isolation = .{ .macos_profile = "/private/tmp/fx.sb" },
-        },
-    ));
 }

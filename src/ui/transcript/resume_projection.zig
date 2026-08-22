@@ -498,7 +498,7 @@ test "resume projection finalizes complete flow before one retained-tail pass" {
     try std.testing.expect(projection.runtime.entries.items.len < 13);
 }
 
-test "empty resume projection keeps presentation policy without source conversation" {
+test "empty resume projection keeps layout without source conversation" {
     const alloc = std.testing.allocator;
     var source: TranscriptRuntime = .{};
     source.layout = .{
@@ -510,13 +510,11 @@ test "empty resume projection keeps presentation policy without source conversat
         .divider_bottom_row = 23,
         .hint_row = 24,
     };
-    source.maxxing_mode = .minimal;
     defer source.deinit(alloc);
     _ = try source.appendRawTranscriptEntry(alloc, "main-only marker\n");
 
     var projection = try ResumeProjection.initEmpty(alloc, &source, 42, 1);
     defer projection.deinit();
-    try std.testing.expectEqual(source.maxxing_mode, projection.runtime.maxxing_mode);
     try std.testing.expectEqual(source.layout.cols, projection.runtime.layout.cols);
     try std.testing.expectEqual(@as(usize, 0), projection.runtime.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), projection.runtime.transcript.items.len);
@@ -674,7 +672,6 @@ test "live resume projection preserves an incomplete command block" {
     const alloc = std.testing.allocator;
     var source: TranscriptRuntime = .{};
     source.layout.cols = 80;
-    source.maxxing_mode = .legacy;
     defer source.deinit(alloc);
 
     const lifecycle_id = types.ToolLifecycleId{
@@ -693,7 +690,11 @@ test "live resume projection preserves an incomplete command block" {
         projection.runtime.command_output_display.open_command_block != null,
     );
     try std.testing.expect(
-        std.mem.find(u8, projection.publication_source.?.bytes, "partial output") != null,
+        std.mem.find(u8, projection.publication_source.?.bytes, "partial output") == null,
+    );
+    try std.testing.expectEqualStrings(
+        "partial output",
+        projection.runtime.command_output_blocks.items[0].lines.items[0].text,
     );
 
     var runtime = projection.intoRuntime();

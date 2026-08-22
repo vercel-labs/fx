@@ -331,7 +331,7 @@ test "help menu keeps descriptions close at wide widths without changing narrow 
 test "help menu keeps a gutter between long commands and descriptions" {
     const alloc = std.testing.allocator;
     const long_specs = [_]command_specs.SlashSpec{
-        .{ .kind = .appearance, .command = "/appearance", .help_entry = "/appearance [input lines|tint|presentation normal|minimal] [theme system|light|dark]", .completion_description = "choose presentation", .presentation_category = .appearance },
+        .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|remember|revoke|yolo|reset]", .completion_description = "choose permission behavior", .presentation_category = .security },
     };
     const projection: render_input.HelpMenuProjection = .{
         .active = true,
@@ -341,7 +341,7 @@ test "help menu keeps a gutter between long commands and descriptions" {
     var item = try composeHelpMenuRow(alloc, projection, 3, 160, rows);
     defer item.deinit(alloc);
 
-    const description_start = std.mem.find(u8, item.items, "choose presentation").?;
+    const description_start = std.mem.find(u8, item.items, "choose permission behavior").?;
     const description_col = display_width.visibleWidthIgnoringAnsi(item.items[0..description_start]);
     try std.testing.expectEqual(maximum_description_column, description_col);
     try std.testing.expect(std.mem.find(u8, item.items[0..description_start], "…") != null);

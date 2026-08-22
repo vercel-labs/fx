@@ -11,31 +11,40 @@ pub const JsonType = enum {
     array,
 };
 
+const no_u32_bound = std.math.maxInt(u32);
+const no_u64_bound = std.math.maxInt(u64);
+
+const PropertyShape = union(enum) {
+    enum_values: []const []const u8,
+    object: *const ObjectSchema,
+    array_values: struct {
+        json_type: JsonType,
+        enum_values: []const []const u8 = &.{},
+    },
+    array_objects: *const ObjectSchema,
+};
+
 pub const Property = struct {
     name: []const u8,
     json_type: JsonType,
     description: []const u8 = "",
     nullable: bool = false,
     nullable_description: []const u8 = "",
-    enum_values: []const []const u8 = &.{},
-    min_length: ?usize = null,
-    max_length: ?usize = null,
-    minimum: ?u64 = null,
-    maximum: ?u64 = null,
-    min_items: ?usize = null,
-    max_items: ?usize = null,
-    item_json_type: ?JsonType = null,
-    item_enum_values: []const []const u8 = &.{},
-    items: ?*const ObjectSchema = null,
-    object_schema: ?*const ObjectSchema = null,
+    shape: ?*const PropertyShape = null,
+    min_length: u32 = no_u32_bound,
+    max_length: u32 = no_u32_bound,
+    minimum: u64 = no_u64_bound,
+    maximum: u64 = no_u64_bound,
+    min_items: u32 = no_u32_bound,
+    max_items: u32 = no_u32_bound,
 };
 
 pub const ObjectSchema = struct {
     properties: []const Property = &.{},
     required: []const []const u8 = &.{},
     additional_properties: ?bool = null,
-    min_properties: ?usize = null,
-    max_properties: ?usize = null,
+    min_properties: u32 = no_u32_bound,
+    max_properties: u32 = no_u32_bound,
     one_of: []const ObjectSchema = &.{},
 };
 
@@ -44,6 +53,10 @@ pub const FunctionSchema = struct {
     description: []const u8,
     input_schema: ObjectSchema = .{},
 };
+
+test "static property representation stays within the measured size budget" {
+    try std.testing.expect(@sizeOf(Property) <= 96);
+}
 
 fn cappedDescriptionAlloc(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
     if (text.len <= description_max_bytes) return alloc.dupe(u8, text);
@@ -123,8 +136,8 @@ fn writeObjectSchema(
         if (schema.properties.len > 0 or
             schema.required.len > 0 or
             schema.additional_properties != null or
-            schema.min_properties != null or
-            schema.max_properties != null)
+            schema.min_properties != no_u32_bound or
+            schema.max_properties != no_u32_bound)
         {
             return error.InvalidObjectSchema;
         }
@@ -149,8 +162,8 @@ fn writeObjectSchema(
         try writer.writeAll(",\"additionalProperties\":");
         try writer.writeAll(if (value) "true" else "false");
     }
-    if (schema.min_properties) |value| try writer.print(",\"minProperties\":{d}", .{value});
-    if (schema.max_properties) |value| try writer.print(",\"maxProperties\":{d}", .{value});
+    if (schema.min_properties != no_u32_bound) try writer.print(",\"minProperties\":{d}", .{schema.min_properties});
+    if (schema.max_properties != no_u32_bound) try writer.print(",\"maxProperties\":{d}", .{schema.max_properties});
     if (schema.required.len > 0) {
         try writer.writeAll(",\"required\":[");
         for (schema.required, 0..) |name, index| {
@@ -185,45 +198,61 @@ fn writePropertySchema(
         try writer.writeByte('}');
         return;
     }
-    if (property.object_schema) |object_schema| {
-        try writeObjectSchema(alloc, writer, object_schema.*);
-        return;
+    if (property.shape) |shape| {
+        switch (shape.*) {
+            .object => |object_schema| {
+                try writeObjectSchema(alloc, writer, object_schema.*);
+                return;
+            },
+            else => {},
+        }
     }
     try writer.writeAll("{\"type\":");
     try std.json.Stringify.value(@tagName(property.json_type), .{}, writer);
-    if (property.enum_values.len > 0) {
-        try writer.writeAll(",\"enum\":[");
-        for (property.enum_values, 0..) |value, index| {
-            if (index > 0) try writer.writeByte(',');
-            try std.json.Stringify.value(value, .{}, writer);
+    if (property.shape) |shape| {
+        switch (shape.*) {
+            .enum_values => |values| {
+                try writer.writeAll(",\"enum\":[");
+                for (values, 0..) |value, index| {
+                    if (index > 0) try writer.writeByte(',');
+                    try std.json.Stringify.value(value, .{}, writer);
+                }
+                try writer.writeByte(']');
+            },
+            else => {},
         }
-        try writer.writeByte(']');
     }
-    if (property.min_length) |value| try writer.print(",\"minLength\":{d}", .{value});
-    if (property.max_length) |value| try writer.print(",\"maxLength\":{d}", .{value});
-    if (property.minimum) |value| try writer.print(",\"minimum\":{d}", .{value});
-    if (property.maximum) |value| try writer.print(",\"maximum\":{d}", .{value});
+    if (property.min_length != no_u32_bound) try writer.print(",\"minLength\":{d}", .{property.min_length});
+    if (property.max_length != no_u32_bound) try writer.print(",\"maxLength\":{d}", .{property.max_length});
+    if (property.minimum != no_u64_bound) try writer.print(",\"minimum\":{d}", .{property.minimum});
+    if (property.maximum != no_u64_bound) try writer.print(",\"maximum\":{d}", .{property.maximum});
     if (property.description.len > 0) {
         try writer.writeAll(",\"description\":");
         try writeCappedDescriptionJsonString(alloc, writer, property.description);
     }
-    if (property.min_items) |value| try writer.print(",\"minItems\":{d}", .{value});
-    if (property.max_items) |value| try writer.print(",\"maxItems\":{d}", .{value});
-    if (property.item_json_type) |item_json_type| {
-        try writer.writeAll(",\"items\":{\"type\":");
-        try std.json.Stringify.value(@tagName(item_json_type), .{}, writer);
-        if (property.item_enum_values.len > 0) {
-            try writer.writeAll(",\"enum\":[");
-            for (property.item_enum_values, 0..) |value, index| {
-                if (index > 0) try writer.writeByte(',');
-                try std.json.Stringify.value(value, .{}, writer);
-            }
-            try writer.writeByte(']');
+    if (property.min_items != no_u32_bound) try writer.print(",\"minItems\":{d}", .{property.min_items});
+    if (property.max_items != no_u32_bound) try writer.print(",\"maxItems\":{d}", .{property.max_items});
+    if (property.shape) |shape| {
+        switch (shape.*) {
+            .array_values => |values| {
+                try writer.writeAll(",\"items\":{\"type\":");
+                try std.json.Stringify.value(@tagName(values.json_type), .{}, writer);
+                if (values.enum_values.len > 0) {
+                    try writer.writeAll(",\"enum\":[");
+                    for (values.enum_values, 0..) |value, index| {
+                        if (index > 0) try writer.writeByte(',');
+                        try std.json.Stringify.value(value, .{}, writer);
+                    }
+                    try writer.writeByte(']');
+                }
+                try writer.writeByte('}');
+            },
+            .array_objects => |items| {
+                try writer.writeAll(",\"items\":");
+                try writeObjectSchema(alloc, writer, items.*);
+            },
+            else => {},
         }
-        try writer.writeByte('}');
-    } else if (property.items) |items| {
-        try writer.writeAll(",\"items\":");
-        try writeObjectSchema(alloc, writer, items.*);
     }
     try writer.writeByte('}');
 }
@@ -246,14 +275,14 @@ test "nullable properties preserve concrete constraints and add one null branch"
                     .description = "Concrete choice.",
                     .nullable = true,
                     .nullable_description = "Concrete choice. Set null when unused.",
-                    .enum_values = &.{ "one", "two" },
+                    .shape = &.{ .enum_values = &.{ "one", "two" } },
                 },
                 .{
                     .name = "config",
                     .json_type = .object,
                     .nullable = true,
                     .nullable_description = "Set null when unused.",
-                    .object_schema = &object_value_schema,
+                    .shape = &.{ .object = &object_value_schema },
                 },
             },
             .required = &.{ "choice", "config" },
@@ -286,11 +315,11 @@ test "nullable properties preserve concrete constraints and add one null branch"
 test "nested object schema serializes exact property bounds" {
     const alloc = std.testing.allocator;
     const nested = ObjectSchema{
-        .properties = &.{.{ .name = "create", .json_type = .object, .object_schema = &.{
+        .properties = &.{.{ .name = "create", .json_type = .object, .shape = &.{ .object = &.{
             .properties = &.{.{ .name = "name", .json_type = .string }},
             .required = &.{"name"},
             .additional_properties = false,
-        } }},
+        } } }},
         .additional_properties = false,
         .min_properties = 1,
         .max_properties = 1,
@@ -315,7 +344,7 @@ test "object alternatives serialize as exclusive object branches" {
     const alternatives = [_]ObjectSchema{
         .{
             .properties = &.{
-                .{ .name = "action", .json_type = .string, .enum_values = &.{"read"} },
+                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"read"} } },
                 .{ .name = "path", .json_type = .string },
             },
             .required = &.{ "action", "path" },
@@ -323,7 +352,7 @@ test "object alternatives serialize as exclusive object branches" {
         },
         .{
             .properties = &.{
-                .{ .name = "action", .json_type = .string, .enum_values = &.{"list"} },
+                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"list"} } },
             },
             .required = &.{"action"},
             .additional_properties = false,
@@ -431,22 +460,21 @@ test "builtinFunctionSchemaJsonAlloc serializes every supported property shape" 
                     .name = "text",
                     .json_type = .string,
                     .description = "bounded choice",
-                    .enum_values = &.{ "alpha", "beta" },
+                    .shape = &.{ .enum_values = &.{ "alpha", "beta" } },
                     .min_length = 1,
                     .max_length = 8,
                 },
                 .{ .name = "count", .json_type = .integer, .minimum = 2, .maximum = 9 },
                 .{ .name = "enabled", .json_type = .boolean },
-                .{ .name = "config", .json_type = .object, .object_schema = &object_value_schema },
+                .{ .name = "config", .json_type = .object, .shape = &.{ .object = &object_value_schema } },
                 .{
                     .name = "tags",
                     .json_type = .array,
                     .min_items = 1,
                     .max_items = 3,
-                    .item_json_type = .string,
-                    .item_enum_values = &.{ "red", "blue" },
+                    .shape = &.{ .array_values = .{ .json_type = .string, .enum_values = &.{ "red", "blue" } } },
                 },
-                .{ .name = "records", .json_type = .array, .items = &array_item_schema },
+                .{ .name = "records", .json_type = .array, .shape = &.{ .array_objects = &array_item_schema } },
             },
             .required = &.{ "text", "count", "enabled", "config", "tags", "records" },
             .additional_properties = false,

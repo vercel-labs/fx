@@ -26,6 +26,10 @@ pub const Controller = struct {
     view_active: bool = false,
     last_refresh_ms: i64 = 0,
 
+    pub noinline fn init() Controller {
+        return .{ .runtime = subagent_runtime.Runtime.init() };
+    }
+
     pub fn deinit(self: *Controller, alloc: Allocator) void {
         self.runtime.deinit(alloc);
         self.view_active = false;

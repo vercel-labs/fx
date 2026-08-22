@@ -69,7 +69,7 @@ async function startFx(
   mkdirSync(join(testHome, ".fx"), { recursive: true });
   writeFileSync(
     join(testHome, ".fx", "settings.json"),
-    JSON.stringify({ maxxing_mode: "legacy" }),
+    JSON.stringify({ sandbox: "none" }),
   );
   if (withGateway) {
     gateway = startFakeGateway(
@@ -194,7 +194,7 @@ function rowHasBackgroundSgr(row: string): boolean {
 
 test("selected slash row ignores the welcome header help hint", () => {
   const header = `${SELECTED_COMPLETION_SGR}𝒇x\x1b[0m\x1b[38;5;245m v0.3.27 · Run /help for commands`;
-  const composer = `${SELECTED_COMPLETION_SGR}❯ /\x1b[39m`;
+  const composer = `${SELECTED_COMPLETION_SGR}┃ /\x1b[39m`;
   const selected = `${SELECTED_COMPLETION_SGR}  /clear\x1b[38;5;245m Clear the conversation`;
 
   expect(selectedSlashRow(`${header}\n${composer}\n${selected}`)).toBe(selected);
@@ -248,7 +248,7 @@ async function setupMultilinePromptHistory(active: TmuxSession): Promise<void> {
   await active.waitForPane(
     (pane) =>
       gateway?.requests.length === 2 &&
-      pane.includes("❯") &&
+      pane.includes("┃") &&
       !pane.includes("Thinking"),
     READY_TIMEOUT,
   );
@@ -315,14 +315,14 @@ tmuxTest(
 
     await active.sendHexBytes(["0a"]);
     await waitForSelectedSlashLabel(active, "/clear", READY_TIMEOUT);
-    await waitForExactComposerRow(active, "❯ /");
+    await waitForExactComposerRow(active, "┃ /");
 
     await active.sendHexBytes(["0b"]);
     await waitForSelectedSlashLabel(active, "/help", READY_TIMEOUT);
-    await waitForExactComposerRow(active, "❯ /");
+    await waitForExactComposerRow(active, "┃ /");
 
     await active.sendKeys("Enter");
-    await active.waitForText("Commands 39", READY_TIMEOUT);
+    await active.waitForText("Commands 37", READY_TIMEOUT);
     await active.sendKeys("Escape");
     await active.waitForText("Run /help for commands", READY_TIMEOUT);
     expect(active.isAlive()).toBe(true);
@@ -428,7 +428,7 @@ tmuxTest(
 tmuxTest(
   "typed sentences wrap by word and continuation rows never start with a space",
   async () => {
-    // 20 cols, prefix "❯ " = 18 content cells per row.
+    // 20 cols, prefix "┃ " = 18 content cells per row.
     const active = await startFx(20, 24);
 
     // "wrapping" (8 cells) does not fit after "hello world " (12 cells),
@@ -454,7 +454,7 @@ tmuxTest(
       active,
       (text) =>
         text.includes("abcdefghijklmnopqr") &&
-        text.split("\n").some((line) => line.trim() === "st"),
+        text.split("\n").some((line) => line.trim() === "┃ st"),
     );
     rows = footer.split("\n");
     const full = rowContaining(rows, "abcdefghijklmnopqr");
@@ -501,7 +501,7 @@ tmuxTest(
       active,
       (text) =>
         text.includes(`${margin_prefix}👩‍💻`) &&
-        text.split("\n").some((line) => line.trim() === "Z"),
+        text.split("\n").some((line) => line.trim() === "┃ Z"),
     );
     let rows = footer.split("\n");
     const margin = rowContaining(rows, `${margin_prefix}👩‍💻`);
@@ -568,7 +568,7 @@ tmuxTest(
     await active.waitForText("[Pasted text #1, 11 lines]", READY_TIMEOUT);
     await active.sendKeys("Enter");
     await active.waitForPane(
-      (pane) => pane.includes("history prompt complete") && pane.includes("❯"),
+      (pane) => pane.includes("history prompt complete") && pane.includes("┃"),
       READY_TIMEOUT,
     );
 
@@ -677,7 +677,7 @@ tmuxTest(
     await active.sendKeys("Up");
     await active.waitForCursor((position) => position.col === 2, READY_TIMEOUT);
     await active.sendKeys("Up");
-    footer = await waitForActiveFooter(active, (text) => text.includes("❯ older"));
+    footer = await waitForActiveFooter(active, (text) => text.includes("┃ older"));
     expect(footer).not.toContain("newer top");
     expect(footer).not.toContain("newer bottom");
     await active.waitForCursor(
@@ -754,7 +754,7 @@ tmuxTest(
     await setupPromptHistory(active);
     await typeLiteral(active, "draft");
     await active.sendHexBytes(["10"]);
-    await active.waitForPane((pane) => pane.includes("❯ zz-history"), READY_TIMEOUT);
+    await active.waitForPane((pane) => pane.includes("┃ zz-history"), READY_TIMEOUT);
     await active.sendHexBytes(["0e"]);
     await active.waitForPane((pane) => pane.includes("draft"), READY_TIMEOUT);
     await active.sendKeys("C-u");
@@ -798,12 +798,12 @@ tmuxTest(
     await active.sendKeys("Up");
     await active.waitForCursor((position) => position.col === 2, READY_TIMEOUT);
     await active.sendKeys("Up");
-    await active.waitForPane((pane) => pane.includes("❯ zz-history"), READY_TIMEOUT);
+    await active.waitForPane((pane) => pane.includes("┃ zz-history"), READY_TIMEOUT);
     await active.sendHexBytes(["17"]);
     await active.waitForCursor((position) => position.col === 2, READY_TIMEOUT);
 
     await active.sendKeys("Down");
-    await waitForActiveFooter(active, (footer) => footer === "❯ draft");
+    await waitForActiveFooter(active, (footer) => footer === "┃ draft");
     await active.waitForCursor(
       (position) => position.col === 2 + "draft".length,
       READY_TIMEOUT,
@@ -821,14 +821,14 @@ tmuxTest(
     await setupPromptHistory(active);
     const draft = "CTRL_L_UNSENT_DRAFT";
     await typeLiteral(active, draft);
-    await waitForActiveFooter(active, (footer) => footer === `❯ ${draft}`);
+    await waitForActiveFooter(active, (footer) => footer === `┃ ${draft}`);
 
     await active.sendKeys("C-l");
     const footer = await waitForActiveFooter(
       active,
-      (visible) => visible === `❯ ${draft}`,
+      (visible) => visible === `┃ ${draft}`,
     );
-    expect(footer).toBe(`❯ ${draft}`);
+    expect(footer).toBe(`┃ ${draft}`);
     await delay(100);
     expect(readFileSync(join(testHome!, "trace.log"), "utf8")).toContain(
       "visual_epoch_reset_requested trigger=ctrl_l",
@@ -860,25 +860,25 @@ tmuxTest(
     await typeLiteral(active, "(");
     await active.sendHexBytes(hexSeq("\x1b[1;9C"));
     await typeLiteral(active, ")");
-    await waitForActiveFooter(active, (footer) => footer === "❯ (alpha beta)");
+    await waitForActiveFooter(active, (footer) => footer === "┃ (alpha beta)");
 
     await active.sendHexBytes(hexSeq("\x1b[1;4D"));
     await typeLiteral(active, "X");
-    await waitForActiveFooter(active, (footer) => footer === "❯ (alpha X");
+    await waitForActiveFooter(active, (footer) => footer === "┃ (alpha X");
 
     await active.sendHexBytes(hexSeq("\x1b[97;9u"));
     await typeLiteral(active, "Y");
-    await waitForActiveFooter(active, (footer) => footer === "❯ Y");
+    await waitForActiveFooter(active, (footer) => footer === "┃ Y");
     await active.sendHexBytes(hexSeq("\x1b[122;9u"));
-    await waitForActiveFooter(active, (footer) => footer === "❯ (alpha X");
+    await waitForActiveFooter(active, (footer) => footer === "┃ (alpha X");
     await active.sendHexBytes(hexSeq("\x1b[122;10u"));
-    await waitForActiveFooter(active, (footer) => footer === "❯ Y");
+    await waitForActiveFooter(active, (footer) => footer === "┃ Y");
     await typeLiteral(active, "Z");
     await active.sendHexBytes(hexSeq("\x1b[95;5u"));
-    await waitForActiveFooter(active, (footer) => footer === "❯ Y");
+    await waitForActiveFooter(active, (footer) => footer === "┃ Y");
     await typeLiteral(active, "Q");
     await active.sendHexBytes(hexSeq("\x1b[27;5;95~"));
-    await waitForActiveFooter(active, (footer) => footer === "❯ Y");
+    await waitForActiveFooter(active, (footer) => footer === "┃ Y");
 
     expect(active.isAlive()).toBe(true);
     expectCleanStderr();
@@ -1569,40 +1569,29 @@ tmuxTest(
 );
 
 tmuxTest(
-  "positive slash argument picker uses exact rendered columns",
+  "permission argument picker uses exact rendered columns",
   async () => {
     const active = await startFx(80, 24);
-    await typeLiteral(active, "  /sandbox ");
-    await expectOptionColumn(active, "os", 13);
-
-    // Margin spaces hang on row 0 while the slash command wraps below them.
-    await active.resizeWindow(8, 6, 300);
-    await active.sendKeys("C-u");
-    await typeLiteral(active, "       /sandbox ");
-    await expectOptionColumn(active, "non", 5);
+    await typeLiteral(active, "  /permissions ");
+    await expectOptionColumn(active, "ask", 17);
   },
   TIMEOUT,
 );
 
 tmuxTest(
-  "maxxing minimal connects the composer and submitted prompt rails without changing input appearance",
+  "current composer and submitted prompt use connected rails",
   async () => {
-    testHome = mkdtempSync(join(tmpdir(), "fx-tui-input-"));
+    testHome = mkdtempSync(join(tmpdir(), "fx-tui-current-rails-"));
     mkdirSync(join(testHome, ".fx"), { recursive: true });
-    writeFileSync(
-      join(testHome, ".fx", "settings.json"),
-      JSON.stringify({ maxxing_mode: "legacy" }),
-    );
     const localGateway = startFakeGateway([
-      fakeGatewayFinalText("INPUT_TINT_MOCK_OK"),
-      fakeGatewayFinalText("MINIMAL_MAXXING_MOCK_OK"),
+      fakeGatewayFinalText("CURRENT_RAIL_MOCK_OK"),
     ]);
     gateway = localGateway;
     const active = await TmuxSession.create({
       cmd: FX_BIN,
       env: {
         HOME: testHome,
-        AI_GATEWAY_API_KEY: "fake-input-appearance-key",
+        AI_GATEWAY_API_KEY: "fake-current-rail-key",
         VERCEL_OIDC_TOKEN: undefined,
         FX_GATEWAY_BASE_URL: localGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: localGateway.chatUrl,
@@ -1615,157 +1604,59 @@ tmuxTest(
     session = active;
     await active.waitForComposer(READY_TIMEOUT);
 
-    await active.sendText("/input");
-    await active.waitForPane(
-      (pane) =>
-        pane.includes("Appearance") &&
-        pane.includes("Input appearance") &&
-        pane.includes("lines  tint"),
-      READY_TIMEOUT,
-    );
-    await active.sendKeys("Escape");
-    await active.waitForComposer(READY_TIMEOUT);
-
-    await active.sendText("/input lines");
-    await active.waitForPane((pane) => pane.includes("● Input: switched to lines"), READY_TIMEOUT);
-    await active.sendText("/input tint");
-    await active.waitForPane((pane) => pane.includes("● Input: switched to tint"), READY_TIMEOUT);
-    await typeLiteral(active, "tinted draft");
-    await active.waitForPane((pane) => pane.includes("tinted draft"), READY_TIMEOUT);
-    const tintedInputRow = rowWithVisiblePredicate(
-      await active.capturePaneEscapes(),
-      (visible) => visible.includes("❯ tinted draft"),
-    );
-    expect(rowHasBackgroundSgr(tintedInputRow)).toBe(true);
-    const tintedGrid = await active.capturePaneGrid();
-    const tintedPosition = rowContaining(tintedGrid, "❯ tinted draft");
-    const rowAboveTint = tintedGrid[tintedPosition.index - 1] ?? "";
-    expect(rowAboveTint.includes("─")).toBe(false);
-    expect(rowAboveTint.trim()).toBe("");
-    expect(tintedGrid[tintedPosition.index + 1]?.includes("─")).toBe(true);
-
-    await active.sendKeys("C-u");
-    await typeLiteral(active, "/input ");
-    await active.waitForPane((pane) => pane.includes("lines") && pane.includes("tint"), READY_TIMEOUT);
-    const pickerRow = selectedArgumentLabelRow(await active.capturePaneEscapes(), "tint");
-    expect(rowHasBackgroundSgr(pickerRow)).toBe(false);
-
-    await active.sendKeys("C-u");
-    await active.sendText("submit while tinted");
-    await active.waitForPane(
-      (pane) => pane.includes("INPUT_TINT_MOCK_OK") && pane.includes("❯"),
-      20_000,
-    );
-    expect(localGateway.requests.length).toBe(1);
-    expect(localGateway.requests[0]?.body).toContain("submit while tinted");
-    const submittedPromptRow = rowWithVisiblePredicate(
-      await active.capturePaneEscapes(),
-      (visible) => visible.includes("❯ submit while tinted"),
-    );
-    expect(rowHasBackgroundSgr(submittedPromptRow)).toBe(true);
-
-    await active.sendText("/maxxing minimal");
-    await active.waitForPane((pane) => pane.includes("● Maxxing: switched to minimal"), READY_TIMEOUT);
-    await typeLiteral(active, "minimal draft");
-    await active.waitForPane((pane) => pane.includes("minimal draft"), READY_TIMEOUT);
-    const minimalInputRow = rowWithVisiblePredicate(
-      await active.capturePaneEscapes(),
-      (visible) => visible.includes("┃ minimal draft"),
-    );
-    expect(rowHasBackgroundSgr(minimalInputRow)).toBe(false);
-    expect(minimalInputRow).toContain("\x1b[38;5;255m┃\x1b[39m minimal draft");
-    const minimalGrid = await active.capturePaneGrid();
-    const minimalPosition = rowContaining(minimalGrid, "┃ minimal draft");
-    expect(minimalGrid[minimalPosition.index - 1]?.includes("─")).toBe(false);
-    expect(minimalGrid[minimalPosition.index + 1]?.includes("─")).toBe(false);
-
-    await active.sendKeys("C-u");
-    const minimalLines = Array.from(
+    const lines = Array.from(
       { length: 10 },
       (_, index) => `COMPOSER_RAIL_${String(index + 1).padStart(2, "0")}`,
     );
-    for (const [index, line] of minimalLines.entries()) {
+    for (const [index, line] of lines.entries()) {
       if (index > 0) await active.sendKeys("M-Enter");
       await typeLiteral(active, line);
     }
-    await active.waitForPane((pane) => pane.includes(minimalLines.at(-1)!), READY_TIMEOUT);
+    await active.waitForPane((pane) => pane.includes(lines.at(-1)!), READY_TIMEOUT);
     const composerRows = await active.capturePaneEscapes();
-    for (const line of minimalLines) {
-      const composerRow = rowWithVisiblePredicate(
+    for (const line of lines) {
+      const row = rowWithVisiblePredicate(
         composerRows,
         (visible) => visible.includes(`┃ ${line}`),
       );
-      expect(rowHasBackgroundSgr(composerRow)).toBe(false);
-      expect(composerRow).toContain(`\x1b[38;5;255m┃\x1b[39m ${line}`);
+      expect(rowHasBackgroundSgr(row)).toBe(false);
+      expect(row).toContain(`\x1b[38;5;255m┃\x1b[39m ${line}`);
     }
 
-    const minimalSubmission = minimalLines.join("\n");
+    const submission = lines.join("\n");
     await active.sendKeys("Enter");
     await active.waitForPane(
-      (pane) => pane.includes("MINIMAL_MAXXING_MOCK_OK") && pane.includes("┃"),
+      (pane) => pane.includes("CURRENT_RAIL_MOCK_OK") && pane.includes("┃"),
       20_000,
     );
-    expect(localGateway.requests.length).toBe(2);
-    const minimalRequest = JSON.parse(localGateway.requests[1]!.body).prompt as Array<{
+    expect(localGateway.requests.length).toBe(1);
+    const request = JSON.parse(localGateway.requests[0]!.body).prompt as Array<{
       role: string;
       content: Array<{ type: string; text?: string }>;
     }>;
-    const minimalUser = minimalRequest.findLast((message) => message.role === "user");
-    expect(minimalUser?.content[0]?.text).toBe(minimalSubmission);
-    const minimalTranscript = await active.capturePaneEscapes();
-    const minimalPromptFirstRow = rowWithVisiblePredicate(
-      minimalTranscript,
-      (visible) => visible.includes(`┃ ${minimalLines[0]}`),
+    const user = request.findLast((message) => message.role === "user");
+    expect(user?.content[0]?.text).toBe(submission);
+
+    const transcript = await active.capturePaneEscapes();
+    const first = rowWithVisiblePredicate(
+      transcript,
+      (visible) => visible.includes(`┃ ${lines[0]}`),
     );
-    const minimalPromptLastRow = rowWithVisiblePredicate(
-      minimalTranscript,
-      (visible) => visible.includes(minimalLines.at(-1)!),
+    const last = rowWithVisiblePredicate(
+      transcript,
+      (visible) => visible.includes(lines.at(-1)!),
     );
-    expect(rowHasBackgroundSgr(minimalPromptFirstRow)).toBe(false);
-    expect(rowHasBackgroundSgr(minimalPromptLastRow)).toBe(false);
-    expect(minimalPromptFirstRow).toContain(`\x1b[38;5;255m┃\x1b[39m \x1b[1m${minimalLines[0]}`);
-    expect(minimalPromptLastRow).toContain("\x1b[38;5;255m┃\x1b[39m \x1b[1m");
-    expect(stripAnsi(minimalPromptLastRow).trimStart().startsWith("┃ ")).toBe(true);
+    expect(rowHasBackgroundSgr(first)).toBe(false);
+    expect(rowHasBackgroundSgr(last)).toBe(false);
+    expect(first).toContain(`\x1b[38;5;255m┃\x1b[39m \x1b[1m${lines[0]}`);
+    expect(stripAnsi(last).trimStart().startsWith("┃ ")).toBe(true);
 
-    await active.sendText("/input lines");
-    await active.waitForPane((pane) => pane.includes("● Input: switched to lines"), READY_TIMEOUT);
-    await typeLiteral(active, "/input ");
-    await active.waitForPane((pane) => pane.includes("lines") && pane.includes("tint"), READY_TIMEOUT);
-    const selectedLinesRow = selectedArgumentLabelRow(await active.capturePaneEscapes(), "lines");
-    expect(rowHasBackgroundSgr(selectedLinesRow)).toBe(false);
-    await active.sendKeys("C-u");
-
-    await typeLiteral(active, "plain draft");
-    await active.waitForPane((pane) => pane.includes("plain draft"), READY_TIMEOUT);
-    const stillMinimalInputRow = rowWithVisiblePredicate(
-      await active.capturePaneEscapes(),
-      (visible) => visible.includes("┃ plain draft"),
-    );
-    expect(rowHasBackgroundSgr(stillMinimalInputRow)).toBe(false);
-    expect(stillMinimalInputRow).toContain("\x1b[38;5;255m┃\x1b[39m plain draft");
-    const stillMinimalGrid = await active.capturePaneGrid();
-    const stillMinimalPosition = rowContaining(stillMinimalGrid, "┃ plain draft");
-    expect(stillMinimalGrid[stillMinimalPosition.index - 1]?.includes("─")).toBe(false);
-    expect(stillMinimalGrid[stillMinimalPosition.index + 1]?.includes("─")).toBe(false);
-
-    await active.sendKeys("C-u");
-    await active.sendText("/maxxing legacy");
-    await active.waitForPane((pane) => pane.includes("● Maxxing: switched to legacy"), READY_TIMEOUT);
-    await typeLiteral(active, "restored lines draft");
-    await active.waitForPane((pane) => pane.includes("restored lines draft"), READY_TIMEOUT);
-    const lineGrid = await active.capturePaneGrid();
-    const linePosition = rowContaining(lineGrid, "❯ restored lines draft");
-    expect(lineGrid[linePosition.index - 1]?.includes("─")).toBe(true);
-    expect(lineGrid[linePosition.index + 1]?.includes("─")).toBe(true);
-
-    await active.sendKeys("C-u");
     await active.sendText("/quit");
   },
   60_000,
 );
-
 tmuxTest(
-  "wrapped slash prefix keeps plain-arrow composer precedence and preserves selection",
+  "wrapped slash prefix keeps current rail composer precedence and preserves selection",
   async () => {
     const active = await startFx(8, 10);
     await typeLiteral(active, "       /");

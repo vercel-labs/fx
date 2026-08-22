@@ -61,6 +61,7 @@ pub const CliModelCatalogProvider = struct {
 
 pub const CreditsLookupInput = struct {
     credential: ?[]const u8,
+    credential_source: ?credentials.Source = null,
     tenant: ?[]const u8,
 };
 
@@ -228,6 +229,17 @@ pub const CapabilityResolver = struct {
     pub fn catalogEntries(self: *const CapabilityResolver) ?[]const model_catalog.ModelCatalogEntry {
         if (self.state != .ready) return null;
         return self.catalog.items;
+    }
+
+    pub fn adoptOwnedCatalog(
+        self: *CapabilityResolver,
+        alloc: Allocator,
+        owned_catalog: *std.ArrayList(model_catalog.ModelCatalogEntry),
+    ) void {
+        model_catalog.freeModelCatalog(alloc, &self.catalog);
+        self.catalog = owned_catalog.*;
+        owned_catalog.* = .empty;
+        self.state = .ready;
     }
 };
 

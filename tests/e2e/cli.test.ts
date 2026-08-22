@@ -249,6 +249,7 @@ describe("cli: help", () => {
       expect(r.code).toBe(0);
       expect(r.stderr).toBe("");
       expect(r.stdout).not.toContain("\x1b[");
+      expect(r.stdout).not.toContain("\x1b]2;");
       expect(r.stdout).toStartWith(
         `𝒇x v${sourceVersion()}\nFast, native coding agent for the terminal.\n`,
       );
@@ -313,7 +314,7 @@ Usage:
 
 Options:
   --auto                Automatically review unresolved permission requests
-  --yolo                Disable permission checks and command sandboxing
+  --yolo                Disable fx permission checks
   --image PATH          Attach an image file; repeat for multiple images
   --json                Emit machine-readable JSON instead of text
   --quiet               Suppress assistant output
@@ -569,6 +570,7 @@ describe("cli: status", () => {
           auth_refreshable: false,
           auth_help: MISSING_AUTH_MESSAGE,
         });
+        expect(statusJson).not.toHaveProperty("sandbox");
         expect(doctorJson).toMatchObject({
           auth: "missing",
           auth_refreshable: false,
@@ -3424,6 +3426,7 @@ describe("cli: models", () => {
   test(
     "fx models rejects E2E gateway redirects without contacting the target",
     async () => {
+      const home = createIsolatedTestHome();
       const captureRequests: string[] = [];
       const captureServer = Bun.serve({
         hostname: "127.0.0.1",
@@ -3446,6 +3449,8 @@ describe("cli: models", () => {
       try {
         const r = await runFx(["models", "--json"], {
           env: {
+            HOME: home,
+            FX_DISABLE_KEYCHAIN: "1",
             AI_GATEWAY_API_KEY: "redirect-proof-key",
             VERCEL_OIDC_TOKEN: undefined,
             FX_E2E_GATEWAY_MODELS_URL: `http://127.0.0.1:${redirectServer.port}/v1/models`,
@@ -3463,6 +3468,7 @@ describe("cli: models", () => {
       } finally {
         redirectServer.stop(true);
         captureServer.stop(true);
+        cleanupIsolatedTestHome(home);
       }
     },
     TIMEOUT,
@@ -4293,7 +4299,9 @@ describe("cli: ask success", () => {
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       const lockReady = join(root, "latest-lock-ready");
+      const unrelatedReply = `unrelated saved turn ${"x".repeat(64 * 1024)}`;
       const gateway = startFakeGateway([
+        fakeGatewayFinalText(unrelatedReply),
         fakeGatewayFinalText("first saved turn"),
         fakeGatewayFinalText("contended exact turn"),
         fakeGatewayFinalText("contended latest turn"),
@@ -4314,6 +4322,16 @@ describe("cli: ask success", () => {
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_AUTO_UPGRADE: "0",
         };
+
+        const unrelated = await runFx(
+          ["ask", "--json", "--auto", "Save an unrelated long turn."],
+          { cwd: workspaceRoot, env, timeoutMs: 60_000 },
+        );
+        expect(unrelated.code).toBe(0);
+        expect(unrelated.stderr).toBe("");
+        const unrelatedJson = JSON.parse(unrelated.stdout);
+        const unrelatedSessionId = unrelatedJson.session_id as string;
+        expect(unrelatedJson.output).toBe(unrelatedReply);
 
         const first = await runFx(
           ["ask", "--json", "--auto", "Reply with the first saved turn."],
@@ -4375,10 +4393,16 @@ describe("cli: ask success", () => {
         });
         expect(listed.code).toBe(0);
         expect(listed.stderr).toBe("");
-        expect(JSON.parse(listed.stdout).sessions[0]).toMatchObject({
+        const listedSessions = JSON.parse(listed.stdout).sessions;
+        expect(listedSessions[0]).toMatchObject({
           id: sessionId,
           history_len: 2,
         });
+        expect(listedSessions[1]).toMatchObject({
+          id: unrelatedSessionId,
+          history_len: 1,
+        });
+        expect(existsSync(tokenPath)).toBe(true);
 
         const latest = await runFx(
           [
@@ -4395,6 +4419,7 @@ describe("cli: ask success", () => {
         expect(latest.stderr).toBe("");
         expect(JSON.parse(latest.stdout).session_id).toBe(sessionId);
         expect(JSON.parse(latest.stdout).output.trim()).toBe("contended latest turn");
+        expect(existsSync(tokenPath)).toBe(true);
 
         lockHolder.kill();
         await lockHolder.exited;
@@ -4414,7 +4439,21 @@ describe("cli: ask success", () => {
         expect(repaired.stderr).toBe("");
         expect(JSON.parse(repaired.stdout).output.trim()).toBe("repairing turn");
         expect(existsSync(tokenPath)).toBe(false);
-        expect(gateway.requests).toHaveLength(4);
+        const targetDetail = await runFx(
+          ["session", "--id", sessionId, "--json"],
+          { cwd: workspaceRoot, env: { HOME: home }, timeoutMs: 60_000 },
+        );
+        expect(targetDetail.code).toBe(0);
+        expect(targetDetail.stderr).toBe("");
+        expect(JSON.parse(targetDetail.stdout).history_len).toBe(4);
+        const unrelatedDetail = await runFx(
+          ["session", "--id", unrelatedSessionId, "--json"],
+          { cwd: workspaceRoot, env: { HOME: home }, timeoutMs: 60_000 },
+        );
+        expect(unrelatedDetail.code).toBe(0);
+        expect(unrelatedDetail.stderr).toBe("");
+        expect(JSON.parse(unrelatedDetail.stdout).history_len).toBe(1);
+        expect(gateway.requests).toHaveLength(5);
       } finally {
         if (lockHolder) {
           lockHolder.kill();

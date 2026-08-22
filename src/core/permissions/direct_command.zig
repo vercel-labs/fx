@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const command_effect = @import("../shell_command/command_effect.zig");
 const command_contract = @import("../execution/command_contract.zig");
-const sandbox = @import("sandbox.zig");
+const command_runner = @import("../execution/command_runner.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
@@ -156,7 +156,7 @@ const DirectOutputBudget = struct {
 };
 
 pub fn executeDirectReadOnly(
-    cfg: sandbox.Config,
+    cfg: command_runner.Config,
     alloc: std.mem.Allocator,
     plan: command_effect.DirectReadOnlyPlan,
 ) !command_contract.RunCommandResult {
@@ -164,7 +164,7 @@ pub fn executeDirectReadOnly(
 }
 
 fn executeDirectReadOnlyWithLimit(
-    cfg: sandbox.Config,
+    cfg: command_runner.Config,
     alloc: std.mem.Allocator,
     plan: command_effect.DirectReadOnlyPlan,
     output_limit: usize,
@@ -178,7 +178,7 @@ const DirectExecutionTestControls = struct {
 };
 
 fn executeDirectReadOnlyWithLimitAndTestControls(
-    cfg: sandbox.Config,
+    cfg: command_runner.Config,
     alloc: std.mem.Allocator,
     plan: command_effect.DirectReadOnlyPlan,
     output_limit: usize,
@@ -194,14 +194,7 @@ fn executeDirectReadOnlyWithLimitAndTestControls(
     }
     try checkControl(execution_cfg);
 
-    const backend = sandbox.resolveBackend(execution_cfg.backend);
-    if (backend != .none and backend != .macos) {
-        return error.UnsupportedDirectBackend;
-    }
     if (builtin.os.tag != .macos and builtin.os.tag != .linux) {
-        return error.UnsupportedDirectPlatform;
-    }
-    if (backend == .macos and builtin.os.tag != .macos) {
         return error.UnsupportedDirectPlatform;
     }
 
@@ -224,12 +217,8 @@ fn executeDirectReadOnlyWithLimitAndTestControls(
         var environment = try environmentForProfile(scratch, stage.environment_profile);
         defer environment.deinit();
 
-        const argv = if (backend == .macos)
-            try sandbox.buildDirectMacOSArgv(scratch, execution_cfg, stage.argv)
-        else
-            stage.argv;
         const child = std.process.spawn(io_mod.getIo(), .{
-            .argv = argv,
+            .argv = stage.argv,
             .cwd = .{ .path = plan.cwd },
             .environ_map = &environment,
             .stdin = if (child_count == 0) .ignore else .pipe,
@@ -448,7 +437,7 @@ const DirectTerminationCause = enum {
 };
 
 const SharedExecution = struct {
-    cfg: sandbox.Config,
+    cfg: command_runner.Config,
     budget: DirectOutputBudget,
     output: *DirectOutput,
     lock: std.Io.Mutex = .init,
@@ -605,7 +594,7 @@ const OutputWorker = struct {
 
 const DirectOutput = struct {
     alloc: std.mem.Allocator,
-    cfg: sandbox.Config,
+    cfg: command_runner.Config,
     lock: std.Io.Mutex = .init,
     stdout: std.ArrayList(u8) = .empty,
     stderr: std.ArrayList(u8) = .empty,
@@ -616,7 +605,7 @@ const DirectOutput = struct {
     escaped_controls: usize = 0,
     escaped_invalid: usize = 0,
 
-    fn init(alloc: std.mem.Allocator, cfg: sandbox.Config) DirectOutput {
+    fn init(alloc: std.mem.Allocator, cfg: command_runner.Config) DirectOutput {
         return .{ .alloc = alloc, .cfg = cfg };
     }
 
@@ -723,14 +712,14 @@ fn allWorkersDone(workers: []const OutputWorker) bool {
     return true;
 }
 
-fn checkControl(cfg: sandbox.Config) !void {
+fn checkControl(cfg: command_runner.Config) !void {
     if (cfg.cancel_flag) |flag| {
         if (flag.load(.seq_cst)) return error.Cancelled;
     }
     if (deadlineExpired(cfg)) return error.TimeoutExpired;
 }
 
-fn deadlineExpired(cfg: sandbox.Config) bool {
+fn deadlineExpired(cfg: command_runner.Config) bool {
     const timeout_ms = cfg.timeout_ms orelse return false;
     const started_ms = cfg.timeout_started_ms orelse return false;
     return io_mod.milliTimestamp() - started_ms >= @as(i64, @intCast(timeout_ms));
@@ -898,8 +887,6 @@ test "direct output budget synchronizes concurrent producers and has one trip ow
 
 test "direct termination arbiter gives cancellation and timeout precedence" {
     var output = DirectOutput.init(std.testing.allocator, .{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1,
     });
     defer output.deinit();
@@ -907,8 +894,6 @@ test "direct termination arbiter gives cancellation and timeout precedence" {
     var cancel = std.atomic.Value(bool).init(true);
     var cancelled: SharedExecution = .{
         .cfg = .{
-            .backend = .none,
-            .workspace_root = "/tmp",
             .max_command_output_bytes = 1,
             .cancel_flag = &cancel,
         },
@@ -920,8 +905,6 @@ test "direct termination arbiter gives cancellation and timeout precedence" {
 
     var timed_out: SharedExecution = .{
         .cfg = .{
-            .backend = .none,
-            .workspace_root = "/tmp",
             .max_command_output_bytes = 1,
             .timeout_ms = 1,
             .timeout_started_ms = io_mod.milliTimestamp() - 10,
@@ -934,8 +917,6 @@ test "direct termination arbiter gives cancellation and timeout precedence" {
 
     var first_failure: SharedExecution = .{
         .cfg = .{
-            .backend = .none,
-            .workspace_root = "/tmp",
             .max_command_output_bytes = 1,
         },
         .budget = .{ .limit = 1 },
@@ -956,8 +937,6 @@ test "direct executor runs fixed argv with sanitized environment and no artifact
         .environment_profile = .basic_read_only,
     }};
     const result = executeDirectReadOnly(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1,
     }, std.testing.allocator, .{
         .command = "/usr/bin/env",
@@ -995,15 +974,12 @@ test "direct executor runs a supported pipeline and reports final output" {
         "printf x | wc -c",
         "/tmp",
         false,
-        .none,
         @import("builtin").os.tag,
     );
     defer admission.deinit(std.testing.allocator);
     const plan = admission.direct_read_only;
 
     const result = executeDirectReadOnly(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1,
     }, std.testing.allocator, plan) catch |err| {
         std.debug.print("pipeline execution failed: {s}\n", .{@errorName(err)});
@@ -1035,8 +1011,6 @@ test "direct executor rejects plans above the pipeline stage limit" {
     try std.testing.expectError(
         error.InvalidDirectPlan,
         executeDirectReadOnly(.{
-            .backend = .none,
-            .workspace_root = "/tmp",
             .max_command_output_bytes = 1,
         }, std.testing.allocator, injectedPlan("/tmp", &stages)),
     );
@@ -1106,13 +1080,10 @@ test "direct executor enforces canonical capacity with native large ls output" {
             case.command,
             cwd,
             false,
-            .none,
             builtin.os.tag,
         );
         defer admission.deinit(alloc);
         const result = try executeDirectReadOnly(.{
-            .backend = .none,
-            .workspace_root = cwd,
             .max_command_output_bytes = 1,
         }, alloc, admission.direct_read_only);
         defer alloc.free(result.output);
@@ -1135,15 +1106,12 @@ test "direct executor enforces canonical capacity with native large ls output" {
         "ls above-64k",
         cwd,
         false,
-        .none,
         builtin.os.tag,
     );
     defer over_admission.deinit(alloc);
     try std.testing.expectError(
         error.DirectOutputLimitExceeded,
         executeDirectReadOnly(.{
-            .backend = .none,
-            .workspace_root = cwd,
             .max_command_output_bytes = std.math.maxInt(usize),
         }, alloc, over_admission.direct_read_only),
     );
@@ -1168,8 +1136,6 @@ test "direct executor admits exact output limit and rejects limit plus one witho
         .environment_profile = .basic_read_only,
     }};
     const exact = try executeDirectReadOnlyWithLimit(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1,
     }, std.testing.allocator, injectedPlan("/tmp", &exact_stages), 8);
     defer std.testing.allocator.free(exact.output);
@@ -1185,8 +1151,6 @@ test "direct executor admits exact output limit and rejects limit plus one witho
     try std.testing.expectError(
         error.DirectOutputLimitExceeded,
         executeDirectReadOnlyWithLimit(.{
-            .backend = .none,
-            .workspace_root = "/tmp",
             .max_command_output_bytes = 1_000_000,
         }, std.testing.allocator, injectedPlan("/tmp", &over_stages), 8),
     );
@@ -1205,8 +1169,6 @@ test "direct executor canonical limit covers stderr and counted pipeline relays"
         .environment_profile = .basic_read_only,
     }};
     const exact_stderr = try executeDirectReadOnly(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1,
     }, std.testing.allocator, injectedPlan("/tmp", &exact_stderr_stages));
     defer std.testing.allocator.free(exact_stderr.output);
@@ -1231,8 +1193,6 @@ test "direct executor canonical limit covers stderr and counted pipeline relays"
     try std.testing.expectError(
         error.DirectOutputLimitExceeded,
         executeDirectReadOnly(.{
-            .backend = .none,
-            .workspace_root = "/tmp",
             .max_command_output_bytes = std.math.maxInt(usize),
         }, std.testing.allocator, injectedPlan("/tmp", &over_stderr_stages)),
     );
@@ -1256,8 +1216,6 @@ test "direct executor canonical limit covers stderr and counted pipeline relays"
         },
     };
     const exact_relay = try executeDirectReadOnly(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1,
     }, std.testing.allocator, injectedPlan("/tmp", &exact_pipeline));
     defer std.testing.allocator.free(exact_relay.output);
@@ -1285,8 +1243,6 @@ test "direct executor canonical limit covers stderr and counted pipeline relays"
     try std.testing.expectError(
         error.DirectOutputLimitExceeded,
         executeDirectReadOnly(.{
-            .backend = .none,
-            .workspace_root = "/tmp",
             .max_command_output_bytes = std.math.maxInt(usize),
         }, std.testing.allocator, injectedPlan("/tmp", &over_pipeline)),
     );
@@ -1310,8 +1266,6 @@ test "direct executor charges non-final pipeline bytes before relay" {
     try std.testing.expectError(
         error.DirectOutputLimitExceeded,
         executeDirectReadOnlyWithLimit(.{
-            .backend = .none,
-            .workspace_root = "/tmp",
             .max_command_output_bytes = 1_000_000,
         }, std.testing.allocator, injectedPlan("/tmp", &stages), 8),
     );
@@ -1331,8 +1285,6 @@ test "direct executor enforces one budget across concurrent stdout and stderr" {
         .environment_profile = .basic_read_only,
     }};
     const exact = try executeDirectReadOnlyWithLimit(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1_000_000,
     }, std.testing.allocator, injectedPlan("/tmp", &exact_stages), 16);
     defer std.testing.allocator.free(exact.output);
@@ -1352,8 +1304,6 @@ test "direct executor enforces one budget across concurrent stdout and stderr" {
     try std.testing.expectError(
         error.DirectOutputLimitExceeded,
         executeDirectReadOnlyWithLimit(.{
-            .backend = .none,
-            .workspace_root = "/tmp",
             .max_command_output_bytes = 1_000_000,
         }, std.testing.allocator, injectedPlan("/tmp", &over_stages), 16),
     );
@@ -1403,8 +1353,6 @@ test "direct executor reaps partial spawn and output-limit process groups" {
         error.DirectExecutableUnavailable,
         executeDirectReadOnlyWithLimitAndTestControls(
             .{
-                .backend = .none,
-                .workspace_root = "/tmp",
                 .max_command_output_bytes = 1,
             },
             std.testing.allocator,
@@ -1430,8 +1378,6 @@ test "direct executor reaps partial spawn and output-limit process groups" {
         error.DirectOutputLimitExceeded,
         executeDirectReadOnlyWithLimitAndTestControls(
             .{
-                .backend = .none,
-                .workspace_root = "/tmp",
                 .max_command_output_bytes = 1_000_000,
             },
             std.testing.allocator,
@@ -1478,8 +1424,6 @@ test "direct executor cleans up cancellation after the first pipeline spawn" {
         error.Cancelled,
         executeDirectReadOnlyWithLimitAndTestControls(
             .{
-                .backend = .none,
-                .workspace_root = "/tmp",
                 .max_command_output_bytes = 1,
                 .cancel_flag = &cancel,
             },
@@ -1510,8 +1454,6 @@ test "direct executor projects hostile final stdout and stderr" {
         .environment_profile = .basic_read_only,
     }};
     const stdout_result = try executeDirectReadOnly(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1,
     }, std.testing.allocator, injectedPlan("/tmp", &stdout_stages));
     defer std.testing.allocator.free(stdout_result.output);
@@ -1529,8 +1471,6 @@ test "direct executor projects hostile final stdout and stderr" {
         .environment_profile = .basic_read_only,
     }};
     const stderr_result = try executeDirectReadOnly(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1,
     }, std.testing.allocator, injectedPlan("/tmp", &stderr_stages));
     defer std.testing.allocator.free(stderr_result.output);
@@ -1587,8 +1527,6 @@ test "direct executor callbacks receive only bounded projected output" {
     }};
     var capture = CallbackCapture{};
     const result = try executeDirectReadOnly(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1,
         .output_chunk_ctx = &capture,
         .on_output_chunk = CallbackCapture.onChunk,
@@ -1623,8 +1561,6 @@ test "direct executor raw callback projection keeps projected result isolated" {
     }};
     var capture = CallbackCapture{};
     const result = try executeDirectReadOnly(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1,
         .output_chunk_ctx = &capture,
         .on_output_chunk = CallbackCapture.onChunk,
@@ -1655,8 +1591,6 @@ test "direct executor accepted callbacks preserve repeated newline-free stream o
     }};
     var capture = CallbackCapture{};
     const result = try executeDirectReadOnly(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 4096,
         .accepted_output_chunk_ctx = &capture,
         .on_accepted_output_chunk = CallbackCapture.onChunk,
@@ -1698,8 +1632,6 @@ test "direct executor keeps stderr projector state independent per child" {
         },
     };
     const result = executeDirectReadOnly(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1,
     }, std.testing.allocator, injectedPlan("/tmp", &stages)) catch |err| {
         std.debug.print("downstream pipe closure failed: {s}\n", .{@errorName(err)});
@@ -1720,8 +1652,6 @@ test "direct executor reports final stage status without pipefail" {
         .environment_profile = .basic_read_only,
     }};
     const result = try executeDirectReadOnly(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1,
     }, std.testing.allocator, injectedPlan("/tmp", &stages));
     defer std.testing.allocator.free(result.output);
@@ -1771,8 +1701,6 @@ test "direct executor treats downstream pipe closure as normal pipeline completi
         },
     };
     const result = try executeDirectReadOnly(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1,
     }, std.testing.allocator, injectedPlan("/tmp", &stages));
     defer std.testing.allocator.free(result.output);
@@ -1799,8 +1727,6 @@ test "direct executor fails closed for missing executable" {
     try std.testing.expectError(
         error.DirectExecutableUnavailable,
         executeDirectReadOnly(.{
-            .backend = .none,
-            .workspace_root = "/tmp",
             .max_command_output_bytes = 1,
         }, std.testing.allocator, injectedPlan("/tmp", &missing_stages)),
     );
@@ -1826,8 +1752,6 @@ test "direct executor cancellation and timeout terminate and reap the process gr
     try std.testing.expectError(
         error.Cancelled,
         executeDirectReadOnly(.{
-            .backend = .none,
-            .workspace_root = "/tmp",
             .max_command_output_bytes = 1,
             .cancel_flag = &cancel,
         }, std.testing.allocator, injectedPlan("/tmp", &stages)),
@@ -1836,8 +1760,6 @@ test "direct executor cancellation and timeout terminate and reap the process gr
     try std.testing.expectError(
         error.TimeoutExpired,
         executeDirectReadOnly(.{
-            .backend = .none,
-            .workspace_root = "/tmp",
             .max_command_output_bytes = 1,
             .timeout_ms = 1,
             .timeout_started_ms = io_mod.milliTimestamp() - 10,
@@ -1863,8 +1785,6 @@ test "direct executor flushes partial callback output before timeout" {
     try std.testing.expectError(
         error.TimeoutExpired,
         executeDirectReadOnly(.{
-            .backend = .none,
-            .workspace_root = "/tmp",
             .max_command_output_bytes = 1,
             .timeout_ms = 500,
             .timeout_started_ms = io_mod.milliTimestamp(),

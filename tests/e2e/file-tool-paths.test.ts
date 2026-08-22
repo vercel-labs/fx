@@ -15,7 +15,6 @@ import { EVAL_MODEL, HAS_API_KEY, runFx } from "../evals/eval-helpers";
 
 const TIMEOUT = 20_000;
 const MODEL = "openai/gpt-5";
-const darwinTest = test.skipIf(process.platform !== "darwin");
 const liveTest = test.skipIf(
   !HAS_API_KEY || process.env.FX_E2E_REAL_API !== "1",
 );
@@ -601,19 +600,18 @@ describe("filesystem path handling", () => {
     TIMEOUT,
   );
 
-  darwinTest(
-    "macOS sandbox grants command writes only through an active added root",
+  test(
+    "captured commands write through an active added root",
     async () => {
       const root = createIsolatedRoot();
-      const marker = join(root.external, "sandbox-proof.txt");
-      writeFileSync(join(root.workspace, ".fx.json"), JSON.stringify({ sandbox: "os" }));
+      const marker = join(root.external, "command-proof.txt");
       const gateway = startFakeGateway([
-        toolCall("added_sandbox_write_1", "terminal", {
+        toolCall("added_command_write_1", "terminal", {
           action: "exec",
-          command: "printf SANDBOX_ADDED_WRITE > sandbox-proof.txt",
+          command: "printf COMMAND_ADDED_WRITE > command-proof.txt",
           cwd: root.external,
         }),
-        finalText("sandbox write complete"),
+        finalText("command write complete"),
       ]);
       try {
         const result = await runFx(
@@ -634,7 +632,7 @@ describe("filesystem path handling", () => {
           },
         );
         const json = parseFxJson(result);
-        expect(readFileSync(marker, "utf8")).toBe("SANDBOX_ADDED_WRITE");
+        expect(readFileSync(marker, "utf8")).toBe("COMMAND_ADDED_WRITE");
         expect(json.tool_calls.map(({ name, status }) => ({ name, status }))).toEqual([
           { name: "terminal", status: "success" },
         ]);
@@ -751,6 +749,10 @@ describe("filesystem path handling", () => {
     async () => {
       const root = createIsolatedRoot();
       try {
+        writeFileSync(
+          join(root.home, ".fx", "settings.json"),
+          JSON.stringify({ sandbox: "none" }),
+        );
         const cases = [
           { id: "cwd_absolute", cwd: root.external, canonical: root.external },
           { id: "cwd_relative", cwd: "../external", canonical: root.external },
@@ -966,7 +968,7 @@ describe("filesystem path handling", () => {
         (body) => {
           const resultOutput = toolResultOutput(body, "write_large_review");
           expect(resultOutput).toContain('"reason":"auto_denied"');
-          expect(resultOutput).toContain("Permission denied by auto mode classifier");
+          expect(resultOutput).toContain("Blocked by automatic safety policy");
           return finalText("large reviewed write blocked");
         },
       ], { classifierDecision: "ask" });
@@ -1479,7 +1481,7 @@ describe("filesystem path handling", () => {
   );
 
   test(
-    "external delete_file review receives exact action and canonical target",
+    "external delete_file replans before review and preserves the target",
     async () => {
       const root = createIsolatedRoot();
       try {
@@ -1487,17 +1489,23 @@ describe("filesystem path handling", () => {
         mkdirSync(desktop, { recursive: true });
         const target = join(desktop, "test.txt");
         writeFileSync(target, "delete\n");
-        const gateway = startFakeGateway(firstCallToolResponses({
-          id: "delete_external_1",
-          name: "delete_file",
-          input: {
-            path: target,
+        const gateway = startFakeGateway([
+          (body) => {
+            expect(body).toContain("Execute the requested file tool once.");
+            expect(existsSync(target)).toBe(true);
+            return toolCall("delete_external_1", "delete_file", {
+              path: target,
+            });
           },
-          expectedResultRequest: [target],
-          expectedResultOutput: [target],
-          finalMessage: "classified external delete complete",
-          beforeToolCall: () => expect(existsSync(target)).toBe(true),
-        }));
+          (body) => {
+            const resultOutput = toolResultOutput(body, "delete_external_1");
+            expect(body).toContain(target);
+            expect(resultOutput).toContain("auto_denied");
+            expect(resultOutput).toContain("Blocked by automatic safety policy");
+            expect(existsSync(target)).toBe(true);
+            return finalText("external delete replanned");
+          },
+        ], { classifierDecision: "allow" });
         try {
           const result = await runFx(
             [
@@ -1515,28 +1523,12 @@ describe("filesystem path handling", () => {
           );
           const json = parseFxJson(result);
           expect(gateway.requests).toHaveLength(2);
-          expect(gateway.classifierRequests).toHaveLength(1);
+          expect(gateway.classifierRequests).toHaveLength(0);
           expect(gateway.remainingResponseCount()).toBe(0);
-          expect(gateway.classifierRequests[0]!.body).toContain(
-            "Execute the requested file tool once.",
-          );
-          expect(gateway.classifierRequests[0]!.body).toContain(
-            "action: tool",
-          );
-          expect(gateway.classifierRequests[0]!.body).toContain(
-            "tool: delete_file",
-          );
-          expect(gateway.classifierRequests[0]!.body).toContain(
-            `target[target]: ${target}`,
-          );
-          expect(gateway.classifierRequests[0]!.body).toContain(
-            `arguments_json: {\\\"path\\\":\\\"${target}`,
-          );
           expect(json.tool_calls).toEqual([
-            { name: "delete_file", status: "success" },
+            { name: "delete_file", status: "error" },
           ]);
-          expect(occurrenceCount(result.stderr, `Deleting ${target}\n`)).toBe(1);
-          expect(existsSync(target)).toBe(false);
+          expect(readFileSync(target, "utf8")).toBe("delete\n");
         } finally {
           gateway.stop();
         }

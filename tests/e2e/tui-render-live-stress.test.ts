@@ -79,6 +79,24 @@ async function waitForScrollbackText(
   );
 }
 
+async function waitForScrollbackOccurrences(
+  activeSession: TmuxSession,
+  text: string,
+  minimum: number,
+  timeoutMs: number,
+): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  let scrollback = "";
+  while (Date.now() < deadline) {
+    scrollback = await activeSession.captureFullScrollback();
+    if (scrollback.split(text).length - 1 >= minimum) return scrollback;
+    await sleep(100);
+  }
+  throw new Error(
+    `Timed out waiting for ${minimum} durable occurrences of ${JSON.stringify(text)}.\nScrollback:\n${scrollback}`,
+  );
+}
+
 describe.skipIf(SKIP)("tui: live render stress", () => {
   test(
     "live streaming, tool activity, and resize preserve prompts and keep the footer visible",
@@ -90,15 +108,15 @@ describe.skipIf(SKIP)("tui: live render stress", () => {
       for (let step = 0; step < 3; step++) {
         const { prompt, marker, visible } = livePrompt(0, step);
         await session.sendText(prompt);
-        await session.waitForText(visible, 10_000);
+        await waitForScrollbackText(session, visible, 10_000);
         await sleep(1_500);
 
         await session.resizeWindow(64, 24);
         await session.resizeWindow(118, 36);
         await session.resizeWindow(84, 30);
 
-        const pane = await session.waitForText(marker, 120_000);
-        const scrollback = await waitForScrollbackText(session, visible, 10_000);
+        const scrollback = await waitForScrollbackOccurrences(session, marker, 2, 120_000);
+        const pane = await session.capturePane();
         assertPaneContains(scrollback, visible, failures, `step ${step} scrollback`);
         assertPaneContains(pane, marker, failures, `step ${step}`);
         const grid = await session.capturePaneGrid();

@@ -331,6 +331,7 @@ fn composeEmptyRow(
 fn skillSourceScopeLabel(source: skill_runtime.SkillSource) []const u8 {
     return switch (source) {
         .global_fx => "Fx · Global",
+        .workspace_fx => "fx · Workspace",
         .workspace_shared => "Fx · Workspace",
         .workspace_opencode => "OpenCode · Workspace",
         .global_opencode => "OpenCode · Global",
@@ -355,6 +356,10 @@ fn cloneClippedRow(alloc: Allocator, text: []const u8, width: u16) !std.ArrayLis
 
 fn visibleSkillCount(projection: SkillsMenuProjection) usize {
     return skill_runtime.skillMenuFilterQueryCount(projection.items, projection.source_filter, projection.query);
+}
+
+test "skills menu labels native workspace skills with lowercase product name" {
+    try std.testing.expectEqualStrings("fx · Workspace", skillSourceScopeLabel(.workspace_fx));
 }
 
 test "skills menu renders source tabs and single-line results" {

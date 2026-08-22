@@ -8,6 +8,7 @@ const control_store = @import("control_store.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
 const manager_mod = @import("manager.zig");
+const resume_admission = @import("resume_admission.zig");
 const tool_result = @import("tool_result.zig");
 const activity_runtime = @import("../output/activity_runtime.zig");
 const io_mod = @import("../shared/io.zig");
@@ -236,10 +237,12 @@ pub const AttachCandidate = struct {
 pub const AttachPage = struct {
     candidates: []AttachCandidate,
     has_more: bool,
+    continuation: ?resume_admission.ActionableContinuation = null,
 
     pub fn deinit(self: *AttachPage, alloc: Allocator) void {
         for (self.candidates) |*candidate| candidate.deinit(alloc);
         alloc.free(self.candidates);
+        if (self.continuation) |*continuation| continuation.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -252,10 +255,13 @@ pub fn loadAttachPage(
     source: Source,
     continuation: ?session_store.ResumableSessionContinuation,
 ) !AttachPage {
-    var page = try source.sessions.listResumablePage(
+    var page = try resume_admission.listActionablePage(
+        source.sessions.*,
         alloc,
+        .all_workspaces,
         source.root_id,
         continuation,
+        session_store.default_resume_page_limit,
     );
     defer page.deinit(alloc);
 
@@ -269,7 +275,13 @@ pub fn loadAttachPage(
         candidates[built] = try projectAttachCandidate(alloc, source, summary);
         built += 1;
     }
-    return .{ .candidates = candidates, .has_more = page.has_more };
+    const next_continuation = page.continuation;
+    page.continuation = null;
+    return .{
+        .candidates = candidates,
+        .has_more = page.has_more,
+        .continuation = next_continuation,
+    };
 }
 
 fn projectAttachCandidate(
@@ -743,6 +755,7 @@ fn loadPageWithTreeLimit(
         .root_id = source.root_id,
         .cursor = cursor,
         .limit = tree_limit,
+        .hide_terminal_one_off = true,
     });
     var restarted = false;
 
@@ -758,6 +771,7 @@ fn loadPageWithTreeLimit(
                 .root_id = source.root_id,
                 .anchor_id = anchor_id,
                 .limit = tree_limit,
+                .hide_terminal_one_off = true,
             });
         },
     }
@@ -1552,8 +1566,16 @@ fn cloneDiagnostics(
         alloc.free(out);
     }
     for (diagnostics) |diagnostic| {
+        const session_id = try alloc.dupe(u8, diagnostic.session_id);
+        errdefer alloc.free(session_id);
+        const parent_id = if (diagnostic.parent_id) |value|
+            try alloc.dupe(u8, value)
+        else
+            null;
+        errdefer if (parent_id) |value| alloc.free(value);
         out[built] = .{
-            .session_id = try alloc.dupe(u8, diagnostic.session_id),
+            .session_id = session_id,
+            .parent_id = parent_id,
             .code = diagnostic.code,
         };
         built += 1;
@@ -1657,6 +1679,7 @@ fn snapshotContentHash(
     }
     for (tree.diagnostics) |diagnostic| {
         hash.update(diagnostic.session_id);
+        if (diagnostic.parent_id) |parent_id| hash.update(parent_id);
         hashValue(&hash, diagnostic.code);
     }
     hashValue(&hash, tree.diagnostics_truncated);
@@ -2015,6 +2038,82 @@ test "authoritative bounded pages relocate a later configured child after a stal
     try std.testing.expect(missing.snapshot.restart_required);
     try std.testing.expect(missing.snapshot.page_cursor == null);
     try std.testing.expectEqual(tree_limit, missing.snapshot.nodes.len);
+}
+
+test "visible manager hides terminal one offs without removing canonical descendants" {
+    const alloc = std.testing.allocator;
+    var env = try ProjectionTestEnvironment.init(alloc);
+    defer env.deinit(alloc);
+    for ([_][]const u8{ "root-id", "one-off", "descendant", "persistent" }) |id| {
+        try env.createSession(alloc, id);
+    }
+    var manager = manager_mod.Manager{ .sessions = &env.store };
+
+    var one_off = try domain.validateCommand(alloc, .{ .create = .{
+        .name = "temporary",
+        .mode = .one_off,
+        .prompt = "temporary work",
+    } });
+    defer one_off.deinit(alloc);
+    var created_one_off = try manager.execute(alloc, one_off, .{
+        .actor_id = "root-id",
+        .operation_id = "create-one-off",
+        .created_child_id = "one-off",
+        .timestamp_ms = 1,
+    });
+    defer created_one_off.deinit(alloc);
+
+    for ([_]struct {
+        actor_id: []const u8,
+        child_id: []const u8,
+        operation_id: []const u8,
+    }{
+        .{ .actor_id = "one-off", .child_id = "descendant", .operation_id = "create-descendant" },
+        .{ .actor_id = "root-id", .child_id = "persistent", .operation_id = "create-persistent" },
+    }) |entry| {
+        var create = try domain.validateCommand(alloc, .{ .create = .{
+            .name = entry.child_id,
+            .mode = .persistent,
+        } });
+        defer create.deinit(alloc);
+        var created = try manager.execute(alloc, create, .{
+            .actor_id = entry.actor_id,
+            .operation_id = entry.operation_id,
+            .created_child_id = entry.child_id,
+            .timestamp_ms = 2,
+        });
+        defer created.deinit(alloc);
+        try std.testing.expect(created == .receipt);
+    }
+
+    var cancel = try domain.validateCommand(alloc, .{ .lifecycle = .{
+        .id = "one-off",
+        .action = .cancel,
+    } });
+    defer cancel.deinit(alloc);
+    var cancelled = try manager.execute(alloc, cancel, .{
+        .actor_id = "root-id",
+        .operation_id = "cancel-one-off",
+        .timestamp_ms = 3,
+    });
+    defer cancelled.deinit(alloc);
+    try std.testing.expect(cancelled == .receipt);
+
+    const source = Source{
+        .root_id = "root-id",
+        .manager = &manager,
+        .sessions = &env.store,
+    };
+    var visible = try loadPageWithTreeLimit(alloc, source, null, null, 2);
+    defer visible.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), visible.snapshot.nodes.len);
+    try std.testing.expectEqualStrings("descendant", visible.snapshot.nodes[0].child_id);
+    try std.testing.expectEqualStrings("persistent", visible.snapshot.nodes[1].child_id);
+
+    var canonical = try manager.snapshot(alloc, .{ .root_id = "root-id", .limit = 3 });
+    defer canonical.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), canonical.snapshot.nodes.len);
+    try std.testing.expectEqualStrings("one-off", canonical.snapshot.nodes[0].child_id);
 }
 
 test "pending approval pages reach beyond eight independently of the bounded tree page" {

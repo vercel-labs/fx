@@ -426,6 +426,7 @@ async function launch(
   size = { width: 120, height: 30 },
 ) {
   const session = await TmuxSession.create({
+    isolated: true,
     cmd,
     cwd: fixture.workspace,
     env: {
@@ -539,6 +540,23 @@ function toolResultText(body: string, callId: string): string {
     part.type === "tool-result" && part.toolCallId === callId
   );
   return result ? contentText(result.output) : `<missing ${callId}>`;
+}
+
+function toolCallInput(body: string, callId: string): Record<string, unknown> {
+  const request = JSON.parse(body) as {
+    prompt: Array<{ content: unknown }>;
+  };
+  const parts = request.prompt.flatMap((message) =>
+    Array.isArray(message.content) ? message.content : []
+  ) as Array<Record<string, unknown>>;
+  const call = parts.find((part) =>
+    part.type === "tool-call" && part.toolCallId === callId
+  );
+  const input = call?.input;
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new Error(`missing tool call input for ${callId}`);
+  }
+  return input as Record<string, unknown>;
 }
 
 function fakeTerminalToolBatch(
@@ -1230,29 +1248,31 @@ test.skipIf(!tmuxAvailable())(
     let terminalSessionId = "";
     const gateway = startFakeGateway([
       fakeGatewayToolCall("terminal_mixed_start", "terminal", {
-        action: "start",
-        cwd: fixture.workspace,
-        command: `printf SHOULD_NOT_RUN > ${JSON.stringify(mixedMarker)}`,
-        backend: "native",
-        session_id: "terminal-foreign",
-        cursor_segment: 1,
-        cursor_offset: 0,
-        after_event_id: 0,
-        acknowledge_event_id: 1,
-        max_events: 1,
-        write: { kind: "text", text: "wrong action" },
-        lease: "use",
-        monitor: { kind: "remove", monitor_id: "monitor-foreign" },
-        task_id: "task-foreign",
-        workspace_root: fixture.workspace,
-        rows: 24,
-        columns: 80,
-        signal: "terminate",
-        close_policy: "force",
-        profile: "user",
-        shell: { kind: "user_login" },
-        sections: null,
-        unknown_zeta: true,
+        request: {
+          action: "start",
+          cwd: fixture.workspace,
+          command: `printf SHOULD_NOT_RUN > ${JSON.stringify(mixedMarker)}`,
+          backend: "native",
+          session_id: "terminal-foreign",
+          cursor_segment: 1,
+          cursor_offset: 0,
+          after_event_id: 0,
+          acknowledge_event_id: 1,
+          max_events: 1,
+          write: { kind: "text", text: "wrong action" },
+          lease: "use",
+          monitor: { kind: "remove", monitor_id: "monitor-foreign" },
+          task_id: "task-foreign",
+          workspace_root: fixture.workspace,
+          rows: 24,
+          columns: 80,
+          signal: "terminate",
+          close_policy: "force",
+          profile: "user",
+          shell: { kind: "user_login" },
+          sections: null,
+          unknown_zeta: true,
+        },
       }),
       (body) => {
         const correction = JSON.parse(
@@ -1308,35 +1328,22 @@ test.skipIf(!tmuxAvailable())(
         expect(terminalRecords(fixture.home)).toEqual([]);
         expect(existsSync(mixedMarker)).toBe(false);
         return fakeGatewayToolCall("terminal_valid_start", "terminal", {
-          action: "start",
-          session_id: null,
-          cwd: fixture.workspace,
-          command: "printf ACTION_SCHEMA_OK",
-          profile: null,
-          shell: {
-            kind: "executable",
-            path: TERMINAL_FIXTURE_SHELL,
-            clean_start: true,
+          request: {
+            action: "start",
+            cwd: fixture.workspace,
+            command: "printf ACTION_SCHEMA_OK",
+            profile: null,
+            shell: {
+              kind: "executable",
+              path: TERMINAL_FIXTURE_SHELL,
+              clean_start: true,
+            },
+            backend: "native",
+            return_when: { kind: "exit" },
+            wait_ceiling_ms: 20_000,
+            dimensions: null,
+            initial_monitors: null,
           },
-          backend: "native",
-          return_when: { kind: "exit" },
-          wait_ceiling_ms: 20_000,
-          dimensions: null,
-          initial_monitors: null,
-          cursor_segment: null,
-          cursor_offset: null,
-          after_event_id: null,
-          acknowledge_event_id: null,
-          max_events: null,
-          write: null,
-          lease: null,
-          monitor: null,
-          task_id: null,
-          workspace_root: null,
-          rows: null,
-          columns: null,
-          signal: null,
-          close_policy: null,
         });
       },
       (body) => {
@@ -1347,9 +1354,11 @@ test.skipIf(!tmuxAvailable())(
         terminalSessionId = result.success.start.session.session_id;
         expect(terminalSessionId.length).toBeGreaterThan(0);
         return fakeGatewayToolCall("terminal_valid_close", "terminal", {
-          action: "close",
-          session_id: terminalSessionId,
-          close_policy: "force",
+          request: {
+            action: "close",
+            session_id: terminalSessionId,
+            close_policy: "force",
+          },
         });
       },
       (body) => {
@@ -1366,21 +1375,20 @@ test.skipIf(!tmuxAvailable())(
     await active.waitForText("Terminal action schema verified", TIMEOUT);
     expect(gateway.requests).toHaveLength(4);
 
+    type JsonSchema = {
+      type?: string;
+      properties?: Record<string, JsonSchema>;
+      enum?: string[];
+      anyOf?: JsonSchema[];
+      oneOf?: JsonSchema[];
+      required?: string[];
+      additionalProperties?: boolean;
+      description?: string;
+    };
     const firstRequest = JSON.parse(gateway.requests[0]!.body) as {
       tools: Array<{
         name?: string;
-        inputSchema?: {
-          type?: string;
-          properties?: Record<string, {
-            type?: string;
-            enum?: string[];
-            anyOf?: Array<{ type?: string }>;
-            description?: string;
-          }>;
-          required?: string[];
-          additionalProperties?: boolean;
-          oneOf?: unknown[];
-        };
+        inputSchema?: JsonSchema;
       }>;
     };
     const terminalSchema = firstRequest.tools.find(
@@ -1391,68 +1399,78 @@ test.skipIf(!tmuxAvailable())(
     expect(terminalSchema!.oneOf).toBeUndefined();
     expect(terminalSchema!.additionalProperties).toBe(false);
     const properties = terminalSchema!.properties ?? {};
-    const propertyNames = [
-      "action",
-      "session_id",
-      "cwd",
-      "command",
-      "profile",
-      "shell",
-      "backend",
-      "return_when",
-      "wait_ceiling_ms",
-      "dimensions",
-      "initial_monitors",
-      "cursor_segment",
-      "cursor_offset",
-      "after_event_id",
-      "acknowledge_event_id",
-      "max_events",
-      "write",
-      "lease",
-      "monitor",
-      "task_id",
-      "workspace_root",
-      "rows",
-      "columns",
-      "signal",
-      "close_policy",
-    ];
-    expect(Object.keys(properties)).toEqual(propertyNames);
-    expect(terminalSchema!.required).toEqual(propertyNames);
-    expect(properties.action!.enum).toEqual([
+    expect(Object.keys(properties)).toEqual(["request"]);
+    expect(terminalSchema!.required).toEqual(["request"]);
+    const branches = properties.request!.oneOf ?? [];
+    expect(branches).toHaveLength(12);
+    const branchByAction = new Map(branches.map((branch) => [
+      branch.properties?.action?.enum?.[0],
+      branch,
+    ]));
+    expect([...branchByAction.keys()]).toEqual([
       "exec", "start", "read", "screen", "write", "wait",
       "monitor", "inspect", "list", "resize", "signal", "close",
     ]);
-    expect(properties.action!.type).toBe("string");
-    for (const name of propertyNames.slice(1)) {
-      expect(properties[name]!.anyOf).toHaveLength(2);
-      expect(properties[name]!.anyOf![1]!.type).toBe("null");
-      expect(properties[name]!.description).toContain(
-        "Set null when the selected action does not use this field.",
-      );
+    for (const branch of branches) {
+      expect(branch.type).toBe("object");
+      expect(branch.additionalProperties).toBe(false);
     }
-    expect(properties.wait_ceiling_ms!.anyOf![0]!.type).toBe("integer");
-    expect(properties.shell!.anyOf![0]!.type).toBe("object");
-    expect(properties.initial_monitors!.anyOf![0]!.type).toBe("array");
-    expect(properties.return_when!.description).toContain(
+    const startProperties = branchByAction.get("start")!.properties!;
+    expect(startProperties.wait_ceiling_ms!.anyOf![0]!.type).toBe("integer");
+    expect(startProperties.shell!.anyOf![0]!.type).toBe("object");
+    expect(startProperties.initial_monitors!.anyOf![0]!.type).toBe("array");
+    expect(startProperties.return_when!.description).toContain(
       "required for every wait",
     );
-    expect(properties.return_when!.description).toContain(
+    expect(startProperties.return_when!.description).toContain(
       "output_contains is monitor-only",
     );
-    expect(properties.cursor_segment!.description).toContain(
+    const readProperties = branchByAction.get("read")!.properties!;
+    expect(Object.keys(readProperties)).toEqual([
+      "action", "session_id", "cursor_segment", "cursor_offset",
+    ]);
+    expect(readProperties.cwd).toBeUndefined();
+    expect(readProperties.cursor_segment!.description).toContain(
       "required for every read",
     );
-    expect(properties.cursor_segment!.description).toContain(
+    expect(readProperties.cursor_segment!.description).toContain(
       "raw_gap.available_from",
     );
-    expect(properties.close_policy!.description).toContain("Close is final");
+    const closeProperties = branchByAction.get("close")!.properties!;
+    expect(closeProperties.close_policy!.type).toBe("string");
+    expect(closeProperties.close_policy!.description).toContain("Close is final");
+
+    const mixedInput = toolCallInput(
+      gateway.requests[1]!.body,
+      "terminal_mixed_start",
+    );
+    expect(mixedInput.request).toBeUndefined();
+    expect(mixedInput.action).toBe("start");
+    expect(mixedInput.session_id).toBe("terminal-foreign");
+    const validStartInput = toolCallInput(
+      gateway.requests[2]!.body,
+      "terminal_valid_start",
+    );
+    expect(validStartInput.request).toBeUndefined();
+    expect(validStartInput.action).toBe("start");
+    const validCloseInput = toolCallInput(
+      gateway.requests[3]!.body,
+      "terminal_valid_close",
+    );
+    expect(validCloseInput).toEqual({
+      action: "close",
+      session_id: terminalSessionId,
+      close_policy: "force",
+    });
 
     const scrollback = await active.captureFullScrollback();
-    expect(scrollback).toContain("Failed start · 17 invalid fields");
-    expect(countOccurrences(scrollback, "Used terminal start")).toBe(1);
-    expect(scrollback).toContain("Used terminal close");
+    expect(scrollback).toContain("Failed printf SHOULD_NOT_RUN");
+    expect(scrollback).toContain("17 inv");
+    expect(countOccurrences(scrollback, "Started printf ACTION_SCHEMA_OK")).toBe(1);
+    expect(scrollback).toContain("Killed printf ACTION_SCHEMA_OK");
+    expect(scrollback).not.toContain("Using terminal");
+    expect(scrollback).not.toContain("Used terminal");
+    expect(scrollback).not.toContain("Preparing command");
     await active.sendKeys("C-o");
     await active.sendKeys("PPage");
     const expanded = await active.waitForText("missing_fields", TIMEOUT);
@@ -1468,6 +1486,61 @@ test.skipIf(!tmuxAvailable())(
     const terminalPid = Number(records[0]!.pid);
     expect(Number.isSafeInteger(terminalPid) && terminalPid > 0).toBe(true);
     await waitForOwnedProcessExit([terminalPid]);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "terminal exec treats textual null placeholders as absent fields",
+  async () => {
+    const fixture = createFixture("fx-tui-terminal-null-placeholder-");
+    const marker = join(fixture.workspace, "null-placeholder-ran");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("terminal_null_placeholder_exec", "terminal", {
+        action: "exec",
+        command: `printf NULL_PLACEHOLDER_OK > ${JSON.stringify(marker)}`,
+        cwd: "null",
+        profile: "null",
+        session_id: "null",
+        shell: "null",
+        backend: "null",
+        return_when: "null",
+        wait_ceiling_ms: "null",
+        dimensions: "null",
+        initial_monitors: "null",
+        cursor_segment: "null",
+        cursor_offset: "null",
+        after_event_id: "null",
+        acknowledge_event_id: "null",
+        max_events: "null",
+        write: "null",
+        lease: "null",
+        monitor: "null",
+        task_id: "NULL",
+        workspace_root: " null ",
+        rows: "null",
+        columns: "null",
+        signal: "null",
+        close_policy: "null",
+      }),
+      (body) => {
+        const result = toolResultText(body, "terminal_null_placeholder_exec");
+        expect(result).not.toContain("invalid_action_fields");
+        expect(readFileSync(marker, "utf8")).toBe("NULL_PLACEHOLDER_OK");
+        return fakeGatewayFinalText("Terminal null placeholders verified");
+      },
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("Run the fixture command exactly once.");
+    await active.waitForText("Terminal null placeholders verified", TIMEOUT);
+    expect(gateway.requests).toHaveLength(2);
+
+    const scrollback = await active.captureFullScrollback();
+    expect(countOccurrences(scrollback, "Ran printf NULL_PLACEHOLDER_OK")).toBe(1);
+    expect(scrollback).not.toContain("invalid field");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,
@@ -1547,7 +1620,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "TUI starts an interactive terminal when the command is exact empty",
+  "TUI starts and gracefully closes an interactive terminal when the command is exact empty",
   async () => {
     const fixture = createFixture("fx-tui-terminal-empty-command-");
     let terminalSessionId = "";
@@ -1567,7 +1640,7 @@ test.skipIf(!tmuxAvailable())(
         return fakeGatewayToolCall("tui_terminal_empty_close", "terminal", {
           action: "close",
           session_id: terminalSessionId,
-          close_policy: "force",
+          close_policy: "graceful",
         });
       },
       (body) => {
@@ -1585,8 +1658,8 @@ test.skipIf(!tmuxAvailable())(
       "Interactive terminal started and closed",
       TIMEOUT,
     );
-    expect(pane).toContain("Used terminal start");
-    expect(pane).toContain("Used terminal close");
+    expect(pane).toContain("Started interactive shell");
+    expect(pane).toContain("Closed interactive shell");
     expect(pane).not.toContain("InvalidCommand");
     expect(pane).not.toContain("Failed start");
     expect(gateway.requests).toHaveLength(3);
@@ -1719,10 +1792,10 @@ test.skipIf(!tmuxAvailable())(
       "Terminal monitor path scope verified",
       TIMEOUT,
     );
-    expect(pane).toContain("Failed start: path is outside the workspace");
-    expect(pane).toContain("Used terminal start");
-    expect(pane).toContain("Used terminal inspect");
-    expect(pane).toContain("Used terminal close");
+    expect(pane).toContain("Failed printf SHOULD_NOT_RUN");
+    expect(pane).toContain("Started while [ ! -e");
+    expect(pane).toContain("Inspected while [ ! -e");
+    expect(pane).toContain("Killed while [ ! -e");
     expect(gateway.requests).toHaveLength(5);
     expect(gateway.requests[1]!.body).toContain("path_outside_workspace");
     expect(existsSync(rejectedMarker)).toBe(false);
@@ -1785,15 +1858,15 @@ test.skipIf(!tmuxAvailable())(
 
     await active.sendText("Run and list the native terminal fixture.");
     const pane = await active.waitForText("TUI public terminal complete", TIMEOUT);
-    if (pane.includes("Failed start") || pane.includes("Failed list")) {
+    if (pane.includes("Failed printf TUI_PUBLIC_TERMINAL_NATIVE") || pane.includes("Failed terminal sessions")) {
       throw new Error(
         `start=${toolResultText(gateway.requests[1]!.body, "tui_terminal_start")}\n` +
           `list=${toolResultText(gateway.requests[2]!.body, "tui_terminal_list")}\n` +
           `TRACE\n${readFileSync(fixture.tracePath, "utf8")}`,
       );
     }
-    expect(pane).toContain("Used terminal start");
-    expect(pane).toContain("Used terminal list");
+    expect(pane).toContain("Started printf TUI_PUBLIC_TERMINAL_NATIVE");
+    expect(pane).toContain("Listed terminal sessions");
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[1]!.body).toContain("tui_terminal_start");
     expect(gateway.requests[1]!.body).toContain('\\"backend\\":\\"native\\"');
@@ -1945,8 +2018,11 @@ test.skipIf(!tmuxAvailable())(
       "TUI terminal lease payload complete",
       TIMEOUT,
     );
-    expect(pane).toContain("Failed write");
-    expect(pane).toContain("Used terminal write");
+    expect(pane).toContain("Failed printf 'TUI_PUBLIC_LEASE_PAYLOAD_READY");
+    expect(pane).toContain("Acquired control of");
+    expect(pane).toContain("Sent input to");
+    expect(pane).toContain("Finished waiting for");
+    expect(pane).toContain("Killed printf 'TUI_PUBLIC_LEASE_PAYLOAD_READY");
     expect(gateway.requests).toHaveLength(9);
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
@@ -2047,8 +2123,10 @@ test.skipIf(!tmuxAvailable())(
       "TUI public terminal controls complete",
       TIMEOUT,
     );
-    expect(pane).toContain("Failed write");
-    expect(pane).toContain("Used terminal write");
+    expect(pane).toContain("Failed printf 'TUI_PUBLIC_CONTROLS_READY");
+    expect(pane).toContain("Acquired control of");
+    expect(pane).toContain("Sent input to");
+    expect(pane).toContain("Killed printf 'TUI_PUBLIC_CONTROLS_READY");
     expect(gateway.requests).toHaveLength(6);
     expect(readFileSync(bytePath, "utf8").trim()).toBe("12");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
@@ -2140,8 +2218,9 @@ ${holdUntilCleanup(fixture.root)}
       "TUI public terminal signal complete",
       TIMEOUT,
     );
-    expect(pane).toContain("Used terminal start");
-    expect(pane).toContain("Used terminal signal");
+    expect(pane).toContain("Started");
+    expect(pane).toContain("foreground-signal.sh");
+    expect(pane).toContain("Sent terminate to");
     expect(gateway.requests).toHaveLength(3);
     await waitForSignalMarker(termPath);
     await waitForOwnedProcessExit([targetPid]);
@@ -2237,16 +2316,18 @@ test.skipIf(!tmuxAvailable())(
     await active.sendText("Exercise the public terminal wait contract.");
     await active.waitForText("TUI public terminal wait complete", TIMEOUT);
     expect(gateway.requests).toHaveLength(6);
+    type WaitSchema = {
+      type?: string;
+      properties?: Record<string, WaitSchema>;
+      enum?: string[];
+      oneOf?: WaitSchema[];
+      required?: string[];
+      additionalProperties?: boolean;
+    };
     const request = JSON.parse(gateway.requests[0]!.body) as {
       tools: Array<{
         name?: string;
-        inputSchema?: {
-          type?: string;
-          properties?: Record<string, { enum?: string[] }>;
-          required?: string[];
-          additionalProperties?: boolean;
-          oneOf?: unknown[];
-        };
+        inputSchema?: WaitSchema;
       }>;
     };
     const terminalSchema = request.tools.find(
@@ -2256,16 +2337,20 @@ test.skipIf(!tmuxAvailable())(
     expect(terminalSchema!.type).toBe("object");
     expect(terminalSchema!.oneOf).toBeUndefined();
     expect(terminalSchema!.additionalProperties).toBe(false);
-    expect(terminalSchema!.properties?.action?.enum).toContain("wait");
-    const terminalProperties = Object.keys(terminalSchema!.properties ?? {});
-    expect(terminalProperties).toHaveLength(25);
-    expect(terminalSchema!.required).toEqual(terminalProperties);
-    expect(
-      terminalProperties.filter((name) => name === "wait_ceiling_ms"),
-    ).toHaveLength(1);
-    expect(terminalProperties).not.toContain("safety_ceiling_ms");
-    expect(terminalProperties).not.toContain("authority");
-    expect(terminalProperties).not.toContain("proof");
+    expect(terminalSchema!.required).toEqual(["request"]);
+    const branches = terminalSchema!.properties?.request?.oneOf ?? [];
+    const waitBranch = branches.find((branch) =>
+      branch.properties?.action?.enum?.[0] === "wait"
+    );
+    expect(waitBranch).toBeDefined();
+    const waitProperties = Object.keys(waitBranch!.properties ?? {});
+    expect(waitProperties).toEqual([
+      "action", "session_id", "return_when", "wait_ceiling_ms",
+    ]);
+    expect(waitBranch!.required).toEqual(waitProperties);
+    expect(waitProperties).not.toContain("safety_ceiling_ms");
+    expect(waitProperties).not.toContain("authority");
+    expect(waitProperties).not.toContain("proof");
     expect(gateway.requests[4]!.body).toContain('"wait_ceiling_ms":20000');
     expect(gateway.requests[4]!.body).not.toContain("safety_ceiling_ms");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
@@ -2437,15 +2522,16 @@ test.skipIf(!tmuxAvailable())(
       "TUI public terminal monitor complete",
       TIMEOUT,
     );
-    for (const action of [
-      "start",
-      "monitor",
-      "write",
-      "wait",
-      "inspect",
-      "close",
+    for (const label of [
+      "Started",
+      "Added monitor to",
+      "Acquired control of",
+      "Sent input to",
+      "Finished waiting for",
+      "Inspected",
+      "Killed",
     ]) {
-      expect(pane).toContain(`Used terminal ${action}`);
+      expect(pane).toContain(label);
     }
     expect(gateway.requests).toHaveLength(9);
     expect(gateway.requests[2]!.body).toContain(
@@ -2530,8 +2616,8 @@ test.skipIf(!tmuxAvailable())(
       "LONG HOME public terminal complete",
       TIMEOUT,
     );
-    for (const action of ["start", "inspect", "read", "close"]) {
-      expect(pane).toContain(`Used terminal ${action}`);
+    for (const label of ["Started", "Inspected", "Read output from", "Killed"]) {
+      expect(pane).toContain(label);
     }
     expect(gateway.requests).toHaveLength(5);
     const inspectResult = toolResultText(

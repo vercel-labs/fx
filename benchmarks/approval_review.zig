@@ -13,11 +13,13 @@ const transcript_blocks = fx.transcript_blocks;
 const vt_emulator = fx.vt_emulator;
 
 const Allocator = std.mem.Allocator;
+const TranscriptRuntime = fx.TranscriptRuntime;
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
 const seed: u64 = 0xF17ED1FF20260805;
 const standard_cols: u16 = 120;
 const standard_rows: u16 = 40;
 const spaced_chrome_rows: usize = 11;
+const compact_chrome_rows: usize = 8;
 const separator_rows: usize = 2;
 const max_runs: usize = 1_000;
 
@@ -102,63 +104,47 @@ const FixtureStats = struct {
 
 const Fixture = struct {
     scenario: Scenario,
-    entries: std.ArrayList(TranscriptEntry),
+    runtime: TranscriptRuntime,
     after_text: []u8,
     review: diff_mod.FileReview,
     stats: FixtureStats,
-    transcript_middle_row: usize,
-    review_start_row: usize,
-    diff_middle_row: usize,
 
     fn init(alloc: Allocator, scenario: Scenario) !Fixture {
         const config = scenarioConfig(scenario);
-        var entries: std.ArrayList(TranscriptEntry) = .empty;
-        errdefer deinitEntries(alloc, &entries);
+        var runtime = TranscriptRuntime{ .layout = layout(standard_cols, standard_rows) };
+        errdefer runtime.deinit(alloc);
 
         var stats = FixtureStats{};
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        try generateTranscript(alloc, config, &entries, &stats, &hasher);
+        try generateTranscript(alloc, config, &runtime.entries, &stats, &hasher);
 
         const after_text = try generateDiff(alloc, config.diff_lines, &stats, &hasher);
         errdefer alloc.free(after_text);
         var review = try diff_mod.FileReview.init(alloc, "", after_text);
         errdefer review.deinit(alloc);
 
-        const rendered = try transcript_blocks.renderEntriesToBytes(
-            alloc,
-            entries.items,
-            standard_cols,
-            .{},
-        );
-        defer alloc.free(rendered);
-        stats.transcript_rows = visualRowCount(rendered, standard_cols);
+        var transcript = try runtime.prepareTranscriptSource(alloc, null);
+        defer transcript.deinit(alloc);
+        stats.transcript_rows = visualRowCount(transcript.bytes, standard_cols);
         stats.review_rows = review.rowCount();
         stats.rendered_lines = stats.transcript_rows + separator_rows +
             stats.review_rows + spaced_chrome_rows;
-        stats.record_count = entries.items.len;
+        stats.record_count = runtime.entries.items.len;
         stats.diff_bytes = after_text.len;
         stats.total_bytes += after_text.len;
         hasher.update("\x00DIFF\x00");
         hasher.update(after_text);
         hasher.final(&stats.digest);
 
-        const transcript_middle_row = visualRowForMarker(
-            rendered,
-            standard_cols,
-            transcript_middle,
-        ) orelse return error.MissingTranscriptMiddleSentinel;
-        const review_start_row = stats.transcript_rows + separator_rows;
-        const diff_middle_row = review_start_row + config.diff_lines / 2;
+        _ = visualRowForMarker(transcript.bytes, standard_cols, transcript_middle) orelse
+            return error.MissingTranscriptMiddleSentinel;
 
         return .{
             .scenario = scenario,
-            .entries = entries,
+            .runtime = runtime,
             .after_text = after_text,
             .review = review,
             .stats = stats,
-            .transcript_middle_row = transcript_middle_row,
-            .review_start_row = review_start_row,
-            .diff_middle_row = diff_middle_row,
         };
     }
 
@@ -178,15 +164,10 @@ const Fixture = struct {
     fn deinit(self: *Fixture, alloc: Allocator) void {
         self.review.deinit(alloc);
         alloc.free(self.after_text);
-        deinitEntries(alloc, &self.entries);
+        self.runtime.deinit(alloc);
         self.* = undefined;
     }
 };
-
-fn deinitEntries(alloc: Allocator, entries: *std.ArrayList(TranscriptEntry)) void {
-    for (entries.items) |*entry| entry.deinit(alloc);
-    entries.deinit(alloc);
-}
 
 const raw_classes = [_]transcript_blocks.RawEntryClass{
     .welcome,
@@ -446,6 +427,55 @@ fn scrollToDocumentRow(
     state.document_scroll_rows = tail_start -| target_row;
 }
 
+const DocumentTarget = enum {
+    tail,
+    transcript_head,
+    transcript_middle,
+    diff_head,
+    diff_middle,
+};
+
+fn setDocumentTarget(
+    fixture: *const Fixture,
+    state: *interaction_state.ApprovalScreenState,
+    transcript: []const u8,
+    active_layout: fx.types.Layout,
+    target: DocumentTarget,
+) !void {
+    if (target == .tail) {
+        state.document_scroll_rows = 0;
+        return;
+    }
+
+    const transcript_rows = visualRowCount(transcript, active_layout.cols);
+    const review_rows = fixture.review.rowCount();
+    const review_start = transcript_rows + if (transcript_rows > 0 and review_rows > 0)
+        separator_rows
+    else
+        0;
+    const chrome_rows = if (active_layout.rows >= 15)
+        spaced_chrome_rows
+    else
+        compact_chrome_rows;
+    const document_rows = review_start + review_rows + chrome_rows;
+    const target_row = switch (target) {
+        .tail => unreachable,
+        .transcript_head => visualRowForMarker(
+            transcript,
+            active_layout.cols,
+            transcript_head,
+        ) orelse return error.MissingTranscriptHeadSentinel,
+        .transcript_middle => visualRowForMarker(
+            transcript,
+            active_layout.cols,
+            transcript_middle,
+        ) orelse return error.MissingTranscriptMiddleSentinel,
+        .diff_head => review_start,
+        .diff_middle => review_start + scenarioConfig(fixture.scenario).diff_lines / 2,
+    };
+    scrollToDocumentRow(state, document_rows, active_layout.rows, target_row);
+}
+
 const PhaseResult = struct {
     paint_ns: u64,
     vt_ns: u64,
@@ -460,16 +490,33 @@ fn runPhase(
     state: *interaction_state.ApprovalScreenState,
     active_layout: fx.types.Layout,
     clear_display: bool,
+    target: DocumentTarget,
     expected_marker: ?[]const u8,
     require_ready: bool,
 ) !PhaseResult {
     const paint_started = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    fixture.runtime.layout = active_layout;
+    var transcript_source: ?fx.TranscriptPreparationSource = null;
+    defer if (transcript_source) |*source| source.deinit(alloc);
+    const transcript_document: approval_screen.TranscriptDocument = switch (try approval_screen.transcriptDocumentPlan(
+        fixture.projection(),
+        state,
+        fixture.runtime.entries.items,
+        active_layout,
+    )) {
+        .none => .none,
+        .progressive => |present| .{ .progressive = present },
+        .projected => blk: {
+            transcript_source = try fixture.runtime.prepareTranscriptSource(alloc, null);
+            try setDocumentTarget(fixture, state, transcript_source.?.bytes, active_layout, target);
+            break :blk .{ .projected = transcript_source.?.bytes };
+        },
+    };
     var painted = try approval_screen.paint(
         alloc,
         fixture.projection(),
         state,
-        fixture.entries.items,
-        .{},
+        transcript_document,
         active_layout,
         clear_display,
     );
@@ -551,12 +598,12 @@ fn runCycle(
         &state,
         layout(standard_cols, standard_rows),
         true,
+        .tail,
         if (verify) diff_tail else null,
         true,
     );
     if (writer) |out| try emitPhase(out, fixture.scenario, run_index, "cold_tail_ready", result);
 
-    scrollToDocumentRow(&state, fixture.stats.rendered_lines, standard_rows, 0);
     result = try runPhase(
         io,
         alloc,
@@ -564,17 +611,12 @@ fn runCycle(
         &state,
         layout(standard_cols, standard_rows),
         false,
+        .transcript_head,
         if (verify) transcript_head else null,
         false,
     );
     if (writer) |out| try emitPhase(out, fixture.scenario, run_index, "navigate_transcript_head", result);
 
-    scrollToDocumentRow(
-        &state,
-        fixture.stats.rendered_lines,
-        standard_rows,
-        fixture.transcript_middle_row,
-    );
     result = try runPhase(
         io,
         alloc,
@@ -582,17 +624,12 @@ fn runCycle(
         &state,
         layout(standard_cols, standard_rows),
         false,
+        .transcript_middle,
         if (verify) transcript_middle else null,
         false,
     );
     if (writer) |out| try emitPhase(out, fixture.scenario, run_index, "navigate_transcript_middle", result);
 
-    scrollToDocumentRow(
-        &state,
-        fixture.stats.rendered_lines,
-        standard_rows,
-        fixture.review_start_row,
-    );
     result = try runPhase(
         io,
         alloc,
@@ -600,17 +637,12 @@ fn runCycle(
         &state,
         layout(standard_cols, standard_rows),
         false,
+        .diff_head,
         if (verify) diff_head else null,
         false,
     );
     if (writer) |out| try emitPhase(out, fixture.scenario, run_index, "navigate_diff_head", result);
 
-    scrollToDocumentRow(
-        &state,
-        fixture.stats.rendered_lines,
-        standard_rows,
-        fixture.diff_middle_row,
-    );
     result = try runPhase(
         io,
         alloc,
@@ -618,6 +650,7 @@ fn runCycle(
         &state,
         layout(standard_cols, standard_rows),
         false,
+        .diff_middle,
         if (verify) diff_middle else null,
         false,
     );
@@ -631,6 +664,7 @@ fn runCycle(
         &state,
         layout(48, 12),
         false,
+        .tail,
         null,
         false,
     );
@@ -644,6 +678,7 @@ fn runCycle(
         &state,
         layout(180, 50),
         false,
+        .tail,
         if (verify) diff_tail else null,
         true,
     );

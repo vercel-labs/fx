@@ -272,7 +272,7 @@ pub const TerminalState = struct {
         const pane = io_mod.getenv("TMUX_PANE") orelse return;
 
         var stdout_file = std.Io.File.stdout();
-        stdout_file.writeStreamingAll(io_mod.getIo(), "\x1b[0m\x1b[3J\x1b[2J\x1b[H") catch |err| {
+        stdout_file.writeStreamingAll(io_mod.getIo(), "\x1b[0m\x1b[2J\x1b[3J\x1b[H") catch |err| {
             debug_trace.logf("resize", "tmux_clear_screen_failed pane={s} err={s}", .{ pane, @errorName(err) });
             return;
         };

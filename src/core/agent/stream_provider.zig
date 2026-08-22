@@ -107,6 +107,9 @@ pub const BuildRequest = struct {
 
 pub const Request = struct {
     api_key: []const u8,
+    credential_source: ?types.CredentialSource = null,
+    /// Borrowed provider account identity captured with the admitted credential.
+    account_id: ?[]const u8 = null,
     team: ?[]const u8,
     /// Borrowed for the duration of `Provider.stream`.
     session_id: ?[]const u8 = null,
@@ -116,6 +119,9 @@ pub const Request = struct {
     payload: []const u8,
     trace_ctx: debug_trace.TraceContext,
     content_capture_limit: ?usize,
+    /// Optional absolute provider deadline. Transports that support bounded
+    /// execution must stop in-flight I/O before returning `error.Timeout`.
+    deadline: ?std.Io.Clock.Timestamp = null,
     cooperative_pulse: ?CooperativePulse = null,
     delivery: *DeliveryCertainty,
     attempt_evidence: *AttemptEvidence,
@@ -155,6 +161,7 @@ pub const Result = struct {
             if (self.completion.billing) |billing| alloc.free(@constCast(billing.model));
             types.freeToolCallSlice(alloc, @constCast(self.completion.tool_calls));
             if (self.completion.provider_failure_detail) |detail| alloc.free(@constCast(detail));
+            if (self.completion.provider_state_json) |state| alloc.free(@constCast(state));
             if (self.failure_schema) |schema| alloc.free(schema);
             if (self.failure_request_shape) |shape| alloc.free(shape);
         }

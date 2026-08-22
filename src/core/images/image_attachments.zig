@@ -9,10 +9,16 @@ const types = @import("../shared/types.zig");
 const pathing = @import("../workspace/pathing.zig");
 
 pub const max_image_bytes: usize = 20 * 1024 * 1024;
+const max_encoded_image_bytes: usize = 5 * 1024 * 1024;
 pub const image_too_large_notice = "image exceeds the 20 MiB limit";
+pub const image_preparation_failed_notice = "Unable to prepare this image for upload. Use a smaller image.";
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const snapshot_digest_hex_len = Sha256.digest_length * 2;
 const transfer_buffer_bytes = 64 * 1024;
+const image_normalization_timeout = std.Io.Clock.Duration{
+    .clock = .awake,
+    .raw = .fromSeconds(5),
+};
 
 pub fn findById(
     attachments: []const types.ImageAttachment,
@@ -237,6 +243,7 @@ pub const CaptureAdmissionResult = enum {
 fn captureRejectionNotice(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.ImageTooLarge => image_too_large_notice,
+        error.ImagePreparationFailed => image_preparation_failed_notice,
         else => null,
     };
 }
@@ -487,7 +494,7 @@ fn captureImageSnapshotFromOpenFileWithBudget(
         deleteSnapshotFile(snapshot_dir_handle, source_temp_name, "capture_source_temp");
     };
 
-    const metadata = try streamSourceToFile(
+    const source_metadata = try streamSourceToFile(
         source,
         snapshot_dir_handle,
         source_temp_name,
@@ -495,6 +502,65 @@ fn captureImageSnapshotFromOpenFileWithBudget(
         budget,
     );
     try budget.check();
+
+    var selected_temp_name: []const u8 = source_temp_name;
+    var metadata = source_metadata;
+    var candidate_temp_name: ?[]u8 = null;
+    defer if (candidate_temp_name) |name| alloc.free(name);
+    var cleanup_candidate_temp = false;
+    defer if (cleanup_candidate_temp) {
+        deleteSnapshotFile(
+            snapshot_dir_handle,
+            candidate_temp_name.?,
+            "capture_candidate_temp",
+        );
+    };
+
+    if (!fitsEncodedLimit(source_metadata.size_bytes)) {
+        if (comptime builtin.os.tag != .macos) return error.ImagePreparationFailed;
+
+        var candidate_suffix: u64 = undefined;
+        io_mod.getIo().random(std.mem.asBytes(&candidate_suffix));
+        candidate_temp_name = try std.fmt.allocPrint(
+            alloc,
+            "image-{d}.candidate.{x}",
+            .{ attachment.id, candidate_suffix },
+        );
+        cleanup_candidate_temp = true;
+        var candidate_placeholder = try snapshot_dir_handle.createFile(
+            io_mod.getIo(),
+            candidate_temp_name.?,
+            .{
+                .truncate = false,
+                .exclusive = true,
+                .permissions = std.Io.File.Permissions.fromMode(0o600),
+                .resolve_beneath = true,
+            },
+        );
+        candidate_placeholder.close(io_mod.getIo());
+
+        const source_temp_path = try std.fs.path.join(
+            alloc,
+            &.{ snapshot_dir, source_temp_name },
+        );
+        defer alloc.free(source_temp_path);
+        const candidate_temp_path = try std.fs.path.join(
+            alloc,
+            &.{ snapshot_dir, candidate_temp_name.? },
+        );
+        defer alloc.free(candidate_temp_path);
+
+        prepareImageCandidate(source_temp_path, candidate_temp_path, budget) catch |err| switch (err) {
+            error.FileNotFound => return error.ImagePreparationFailed,
+            else => return err,
+        };
+        metadata = try inspectImageCandidate(
+            snapshot_dir_handle,
+            candidate_temp_name.?,
+            budget,
+        );
+        selected_temp_name = candidate_temp_name.?;
+    }
 
     const media_type = try alloc.dupe(u8, metadata.media_type);
     errdefer alloc.free(media_type);
@@ -509,12 +575,16 @@ fn captureImageSnapshotFromOpenFileWithBudget(
     errdefer alloc.free(final_path);
     try budget.check();
     try snapshot_dir_handle.rename(
-        source_temp_name,
+        selected_temp_name,
         snapshot_dir_handle,
         final_name,
         io_mod.getIo(),
     );
-    cleanup_source_temp = false;
+    if (std.mem.eql(u8, selected_temp_name, source_temp_name)) {
+        cleanup_source_temp = false;
+    } else {
+        cleanup_candidate_temp = false;
+    }
     var cleanup_final = true;
     errdefer if (cleanup_final) {
         deleteSnapshotFile(snapshot_dir_handle, final_name, "capture_final");
@@ -589,13 +659,203 @@ fn streamSourceToFile(
     return .{
         .digest_hex = std.fmt.bytesToHex(digest, .lower),
         .media_type = media_type,
+        .size_bytes = written,
     };
 }
 
 const SnapshotMetadata = struct {
     digest_hex: [snapshot_digest_hex_len]u8,
     media_type: []const u8,
+    size_bytes: usize,
 };
+
+fn fitsEncodedLimit(raw_bytes: usize) bool {
+    const rounded = std.math.add(usize, raw_bytes, 2) catch return false;
+    const groups = @divTrunc(rounded, 3);
+    const encoded_bytes = std.math.mul(usize, groups, 4) catch return false;
+    return encoded_bytes <= max_encoded_image_bytes;
+}
+
+const ImageNormalizerEvent = union(enum) {
+    wait: anyerror!std.process.Child.Term,
+    timeout: anyerror!void,
+    cancelled: anyerror!void,
+};
+
+fn waitForImageNormalizerChild(child: *std.process.Child) anyerror!std.process.Child.Term {
+    return child.wait(io_mod.getIo());
+}
+
+fn waitForImageNormalizerTimeout(deadline: std.Io.Clock.Timestamp) anyerror!void {
+    return std.Io.Timeout.sleep(.{ .deadline = deadline }, io_mod.getIo());
+}
+
+fn waitForImageNormalizerCancellation(
+    cancel_flag: *const std.atomic.Value(bool),
+) anyerror!void {
+    while (!cancel_flag.load(.acquire)) {
+        try io_mod.getIo().sleep(.fromMilliseconds(5), .awake);
+    }
+}
+
+fn waitForImageNormalizer(
+    child: *std.process.Child,
+    deadline: std.Io.Clock.Timestamp,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) !std.process.Child.Term {
+    var select_buffer: [3]ImageNormalizerEvent = undefined;
+    var select: std.Io.Select(ImageNormalizerEvent) = .init(
+        io_mod.getIo(),
+        &select_buffer,
+    );
+    select.concurrent(.wait, waitForImageNormalizerChild, .{child}) catch |err|
+        return err;
+    select.concurrent(
+        .timeout,
+        waitForImageNormalizerTimeout,
+        .{deadline},
+    ) catch |err| {
+        select.cancelDiscard();
+        return err;
+    };
+    if (cancel_flag) |flag| {
+        select.concurrent(
+            .cancelled,
+            waitForImageNormalizerCancellation,
+            .{flag},
+        ) catch |err| {
+            select.cancelDiscard();
+            return err;
+        };
+    }
+
+    const event = select.await() catch |err| {
+        select.cancelDiscard();
+        return err;
+    };
+    return switch (event) {
+        .wait => |result| blk: {
+            select.cancelDiscard();
+            break :blk result catch |err| return err;
+        },
+        .timeout => |result| {
+            result catch |err| {
+                select.cancelDiscard();
+                return err;
+            };
+            select.cancelDiscard();
+            return error.TimedOut;
+        },
+        .cancelled => |result| {
+            result catch |err| {
+                select.cancelDiscard();
+                return err;
+            };
+            select.cancelDiscard();
+            return error.Cancelled;
+        },
+    };
+}
+
+fn runImageNormalizerProcess(
+    argv: []const []const u8,
+    budget: CaptureBudget,
+) !void {
+    try budget.check();
+    var child = try std.process.spawn(io_mod.getIo(), .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer child.kill(io_mod.getIo());
+
+    const deadline = budget.deadline orelse
+        std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), image_normalization_timeout);
+    const term = try waitForImageNormalizer(&child, deadline, budget.cancel_flag);
+    switch (term) {
+        .exited => |code| if (code != 0) return error.ImagePreparationFailed,
+        .signal, .stopped, .unknown => return error.ImagePreparationFailed,
+    }
+}
+
+fn prepareImageCandidate(
+    source_path: []const u8,
+    candidate_path: []const u8,
+    budget: CaptureBudget,
+) !void {
+    const argv = [_][]const u8{
+        "/usr/bin/sips",
+        "-s",
+        "format",
+        "jpeg",
+        "-s",
+        "formatOptions",
+        "85",
+        "-Z",
+        "2000",
+        source_path,
+        "--out",
+        candidate_path,
+    };
+    try runImageNormalizerProcess(&argv, budget);
+}
+
+fn inspectImageCandidate(
+    snapshot_dir: std.Io.Dir,
+    candidate_name: []const u8,
+    budget: CaptureBudget,
+) !SnapshotMetadata {
+    try budget.check();
+    var candidate = snapshot_dir.openFile(io_mod.getIo(), candidate_name, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound, error.IsDir, error.NotDir, error.SymLinkLoop => return error.ImagePreparationFailed,
+        else => return err,
+    };
+    defer candidate.close(io_mod.getIo());
+    const stat = try candidate.stat(io_mod.getIo());
+    if (stat.kind != .file or stat.nlink != 1) return error.ImagePreparationFailed;
+    const size_bytes = std.math.cast(usize, stat.size) orelse
+        return error.ImagePreparationFailed;
+    if (size_bytes > max_image_bytes or !fitsEncodedLimit(size_bytes)) {
+        return error.ImagePreparationFailed;
+    }
+
+    var hasher = Sha256.init(.{});
+    var header: [64]u8 = undefined;
+    var header_len: usize = 0;
+    var read_buffer: [8192]u8 = undefined;
+    var reader = candidate.readerStreaming(io_mod.getIo(), &read_buffer);
+    var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
+    var read_bytes: usize = 0;
+    while (true) {
+        try budget.check();
+        const n = try reader.interface.readSliceShort(&transfer_buffer);
+        if (n == 0) break;
+        if (n > max_image_bytes - read_bytes) return error.ImagePreparationFailed;
+        const header_bytes = @min(n, header.len - header_len);
+        @memcpy(header[header_len..][0..header_bytes], transfer_buffer[0..header_bytes]);
+        header_len += header_bytes;
+        hasher.update(transfer_buffer[0..n]);
+        read_bytes += n;
+    }
+    if (read_bytes != size_bytes or !fitsEncodedLimit(read_bytes)) {
+        return error.ImagePreparationFailed;
+    }
+
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const media_type = detectMediaTypeFromBytes(header[0..header_len]) orelse
+        return error.ImagePreparationFailed;
+    return .{
+        .digest_hex = std.fmt.bytesToHex(digest, .lower),
+        .media_type = media_type,
+        .size_bytes = read_bytes,
+    };
+}
 
 fn syncSnapshotDirectory(snapshot_dir: std.Io.Dir) !void {
     if (comptime @import("builtin").os.tag == .windows) {
@@ -2439,7 +2699,63 @@ test "snapshot directory handle syncs after create and after reopen" {
     try syncSnapshotDirectory(reopened);
 }
 
-test "capture rejects provider limit plus one without snapshot residue" {
+test "encoded image limit uses exact padded base64 length" {
+    const largest_fitting_raw_image = (max_encoded_image_bytes / 4) * 3;
+
+    try std.testing.expect(fitsEncodedLimit(largest_fitting_raw_image));
+    try std.testing.expect(!fitsEncodedLimit(largest_fitting_raw_image + 1));
+}
+
+test "capture rejection distinguishes source size from preparation failure" {
+    try std.testing.expectEqualStrings(
+        image_too_large_notice,
+        captureRejectionNotice(error.ImageTooLarge).?,
+    );
+    try std.testing.expectEqualStrings(
+        image_preparation_failed_notice,
+        captureRejectionNotice(error.ImagePreparationFailed).?,
+    );
+    try std.testing.expect(captureRejectionNotice(error.Cancelled) == null);
+    try std.testing.expect(captureRejectionNotice(error.TimedOut) == null);
+}
+
+test "image normalizer process requires success and preserves operational errors" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const success_argv = [_][]const u8{ "/bin/sh", "-c", "exit 0" };
+    try runImageNormalizerProcess(&success_argv, .{});
+
+    const failure_argv = [_][]const u8{ "/bin/sh", "-c", "exit 7" };
+    try std.testing.expectError(
+        error.ImagePreparationFailed,
+        runImageNormalizerProcess(&failure_argv, .{}),
+    );
+
+    const signaled_argv = [_][]const u8{ "/bin/sh", "-c", "kill -TERM $$" };
+    try std.testing.expectError(
+        error.ImagePreparationFailed,
+        runImageNormalizerProcess(&signaled_argv, .{}),
+    );
+
+    const sleeping_argv = [_][]const u8{ "/bin/sh", "-c", "sleep 10" };
+    try std.testing.expectError(
+        error.TimedOut,
+        runImageNormalizerProcess(&sleeping_argv, .{
+            .deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(10),
+            }),
+        }),
+    );
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Cancelled,
+        runImageNormalizerProcess(&sleeping_argv, .{ .cancel_flag = &cancelled }),
+    );
+}
+
+test "capture rejects source limit plus one without snapshot residue" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2466,7 +2782,7 @@ test "capture rejects provider limit plus one without snapshot residue" {
     try std.testing.expectEqual(@as(usize, 0), try countSnapshotFiles(snapshot_dir));
 }
 
-test "attachment admission rejects provider limit plus one" {
+test "attachment admission rejects source limit plus one" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2569,15 +2885,16 @@ test "cancelled capture removes every partial artifact" {
     try std.testing.expect(attachment.snapshot_path == null);
 }
 
-test "capture accepts the exact serialized byte limit" {
+test "capture preserves a source at the exact encoded byte limit" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    const largest_fitting_raw_image = (max_encoded_image_bytes / 4) * 3;
     {
         var file = try tmp.dir.createFile(std.testing.io, "exact.png", .{});
         defer file.close(std.testing.io);
         try file.writeStreamingAll(std.testing.io, "\x89PNG\r\n\x1a\n");
-        try file.setLength(std.testing.io, max_image_bytes);
+        try file.setLength(std.testing.io, largest_fitting_raw_image);
     }
     const image_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "exact.png");
     defer alloc.free(image_path);
@@ -2598,10 +2915,94 @@ test "capture accepts the exact serialized byte limit" {
         .{},
     );
     defer snapshot.close(std.testing.io);
-    try std.testing.expectEqual(@as(u64, max_image_bytes), (try snapshot.stat(std.testing.io)).size);
+    try std.testing.expectEqual(
+        @as(u64, largest_fitting_raw_image),
+        (try snapshot.stat(std.testing.io)).size,
+    );
 }
 
-test "capture rejects a file that grows past the provider limit while streaming" {
+test "capture normalizes an oversized encoded image on macOS or rejects locally" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const largest_fitting_raw_image = (max_encoded_image_bytes / 4) * 3;
+    const source_size = largest_fitting_raw_image + 1;
+    const encoded_png = "iVBORw0KGgoAAAANSUhEUgAAAQAAAACQBAMAAAAVTaiiAAAAMFBMVEUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABaPxwLAAAAD3RSTlMA3yCAQMAQ759gUDBwkK/koHcMAAABqElEQVR42u3YvUozURAG4Dcnuvoln3w/hSAWuxaCnQFFywRsBYM34IIXoChY2ETtBMGAjY2od2DuwMLCW/AqdP3HwvFEg6ybbUSYAX0fmOY0Oww77J4XREREREREREREREREXxOcX8Sw1BIZhiHXEHmIYKdfvDrs9Im3DDt/xLvCJ3y3CQyItwE7LhRJIhgaEZmHqZkzGCo14fWcwErhMQLcwiCsVKUCFOUGRgJJ4IUJrIw9wZsz3IMavDJ+qmIFHYunsDCeHOFVOVyBhV3pNNAjdzDgwkd0XCYxDBTfBz8yBRMxLAXWzfRvIWW0Dm2H0sS7UuMW2sL0hcQ11Pcg2L1BSvU5grJSHSm9NfwwLkZGEEFTYQgZx4PQVJUjfPBL98/QSZK3loqmn5AxtwpNromM3xH0zE4ix8wklIyK/EeXVvtUhQvbyVReXqXzQegkU7mnFWgoiLeWGxf9hYK3R11jbyJK17heXtUn3j0WpJauJb0JDIhXzzbQq5dXtd93qWHz34cqi15e1RJZR5djxdz6YCdGF7e/HYOIiIiIiIiIiIiIiOjzXgA1X7Msl1OuJQAAAABJRU5ErkJggg==";
+    const png = try alloc.alloc(
+        u8,
+        try std.base64.standard.Decoder.calcSizeForSlice(encoded_png),
+    );
+    defer alloc.free(png);
+    try std.base64.standard.Decoder.decode(png, encoded_png);
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "normalize.png", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, png);
+        try file.setLength(std.testing.io, source_size);
+    }
+    const image_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "normalize.png");
+    defer alloc.free(image_path);
+    const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+    defer alloc.free(snapshot_dir);
+    var attachment = types.ImageAttachment{
+        .id = 1,
+        .path = try alloc.dupe(u8, image_path),
+        .media_type = try alloc.dupe(u8, "image/png"),
+    };
+    defer types.freeImageAttachment(alloc, attachment);
+
+    if (comptime builtin.os.tag != .macos) {
+        try std.testing.expectError(
+            error.ImagePreparationFailed,
+            captureImageSnapshot(alloc, &attachment, snapshot_dir),
+        );
+        try std.testing.expectEqual(@as(usize, 0), try countSnapshotFiles(snapshot_dir));
+        try std.testing.expect(attachment.snapshot_path == null);
+        return;
+    }
+
+    try captureImageSnapshot(alloc, &attachment, snapshot_dir);
+    try std.testing.expectEqualStrings("image/jpeg", attachment.media_type);
+    var verified = try loadVerifiedSnapshot(alloc, attachment, .{});
+    defer verified.deinit(alloc);
+    try std.testing.expect(fitsEncodedLimit(verified.bytes.len));
+    try std.testing.expectEqual(
+        @as(u64, source_size),
+        (try std.Io.Dir.cwd().statFile(std.testing.io, image_path, .{})).size,
+    );
+    try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
+}
+
+test "capture rejects invalid normalization output without snapshot residue" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const largest_fitting_raw_image = (max_encoded_image_bytes / 4) * 3;
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "invalid-large.png", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "\x89PNG\r\n\x1a\n");
+        try file.setLength(std.testing.io, largest_fitting_raw_image + 1);
+    }
+    const image_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "invalid-large.png");
+    defer alloc.free(image_path);
+    const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+    defer alloc.free(snapshot_dir);
+    var attachment = types.ImageAttachment{
+        .id = 1,
+        .path = @constCast(image_path),
+        .media_type = @constCast("image/png"),
+    };
+
+    try std.testing.expectError(
+        error.ImagePreparationFailed,
+        captureImageSnapshot(alloc, &attachment, snapshot_dir),
+    );
+    try std.testing.expectEqual(@as(usize, 0), try countSnapshotFiles(snapshot_dir));
+    try std.testing.expect(attachment.snapshot_path == null);
+}
+
+test "capture rejects a file that grows past the source limit while streaming" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

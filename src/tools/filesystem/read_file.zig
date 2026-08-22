@@ -129,8 +129,12 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     };
 
     const zio = io_mod.getIo();
-    var file = std.Io.Dir.openFileAbsolute(zio, target, .{}) catch |err| {
-        return readFileFailure(ctx.allocator, err, target);
+    var file = io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), target, .no_follow) catch |err| {
+        return readFileFailure(
+            ctx.allocator,
+            if (err == error.DurablePathUnsafe) error.NotRegularFile else err,
+            target,
+        );
     };
     defer file.close(zio);
 
@@ -178,6 +182,19 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
 fn readFileFailure(alloc: Allocator, err: anyerror, path: []const u8) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     if (tool_result_errors.isFilesystemAccessDenied(err)) {
         return .{ .failure = try tool_result_errors.filesystemAccessDeniedJson(alloc, "read_file", path, err) };
+    }
+    if (err == error.NotRegularFile) {
+        const details = [_]tool_result_errors.Detail{
+            .{ .name = "field", .value = .{ .string = "path" } },
+            .{ .name = "path", .value = .{ .string = path } },
+            .{ .name = "error", .value = .{ .string = @errorName(err) } },
+        };
+        return .{ .failure = try tool_result_errors.toolExecutionFailureJson(alloc, .{
+            .tool_name = "read_file",
+            .message = "read_file requires a regular file",
+            .details = &details,
+            .suggestion = "Run file_info to inspect the path, then choose a regular file.",
+        }) };
     }
     const details = [_]tool_result_errors.Detail{
         .{ .name = "field", .value = .{ .string = "path" } },
@@ -594,6 +611,24 @@ test "read_file access denial returns structured recovery" {
             try std.testing.expect(std.mem.find(u8, body, "/tmp/blocked/read.txt") != null);
             try std.testing.expect(std.mem.find(u8, body, "AccessDenied") != null);
             try std.testing.expect(std.mem.find(u8, body, "symlink") != null);
+        },
+        .success => |body| {
+            defer alloc.free(body);
+            try std.testing.expect(false);
+        },
+    }
+}
+
+test "read_file non-regular paths return structured recovery" {
+    const alloc = std.testing.allocator;
+    const result = try readFileFailure(alloc, error.NotRegularFile, "/tmp/search-pipe");
+    switch (result) {
+        .failure => |body| {
+            defer alloc.free(body);
+            try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(body));
+            try std.testing.expect(std.mem.find(u8, body, "read_file requires a regular file") != null);
+            try std.testing.expect(std.mem.find(u8, body, "NotRegularFile") != null);
+            try std.testing.expect(std.mem.find(u8, body, "file_info") != null);
         },
         .success => |body| {
             defer alloc.free(body);

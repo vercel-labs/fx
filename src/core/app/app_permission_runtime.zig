@@ -4,7 +4,6 @@ const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const permissions = @import("../permissions/permissions.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const render_request = @import("../../ui/render_request.zig");
 const session_commands = @import("../session/session_commands.zig");
 const types = @import("../shared/types.zig");
@@ -12,7 +11,6 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 
 pub const State = struct {
     authority_mutex: std.Io.Mutex = .init,
-    sandbox_backend: sandbox.BackendKind = .none,
     yolo_acknowledged: bool = false,
     yolo_acknowledgment_attempted: bool = false,
     yolo_warning: YoloWarning = .{},
@@ -72,8 +70,7 @@ const YoloWarning = struct {
 pub fn Runtime(comptime App: type) type {
     return struct {
         /// Session-scoped mode change: applies the mode and syncs queued
-        /// prompts without touching the persisted preference. The configured
-        /// sandbox backend remains independent of the permission mode.
+        /// prompts without touching the persisted preference.
         pub fn setMode(app: *App, mode: types.PermissionMode) void {
             app.permission_engine.mode = mode;
             updateYoloWarningForMode(app);
@@ -112,27 +109,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn livePermissionSnapshot(app: *App) worker_runtime.PermissionSnapshot {
             return .{
                 .mode = app.permission_engine.mode,
-                .sandbox_backend = sandbox.effectiveBackend(
-                    app.permission_engine.mode,
-                    app.permission_state.sandbox_backend,
-                ),
             };
-        }
-
-        /// Process-local sandbox selection: synchronizes prompts that have
-        /// not started yet. Persistence remains with the caller that owns
-        /// the user-facing command result.
-        pub fn setSandboxBackend(app: *App, backend: sandbox.BackendKind) bool {
-            if (comptime @hasField(@TypeOf(app.permission_state), "authority_mutex")) {
-                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
-            }
-            defer if (comptime @hasField(@TypeOf(app.permission_state), "authority_mutex")) {
-                app.permission_state.authority_mutex.unlock(io_mod.getIo());
-            };
-            const changed = backend != app.permission_state.sandbox_backend;
-            app.permission_state.sandbox_backend = backend;
-            syncQueuedPermissionSnapshot(app);
-            return changed;
         }
 
         pub fn selectMode(app: *App, mode: types.PermissionMode) !void {
@@ -282,7 +259,6 @@ pub fn Runtime(comptime App: type) type {
 
 const TestWorker = struct {
     synced_mode: ?types.PermissionMode = null,
-    synced_backend: ?sandbox.BackendKind = null,
     mode_sync_count: usize = 0,
     synced_state_mode: ?types.PermissionMode = null,
     synced_state_grant_count: usize = 0,
@@ -290,7 +266,6 @@ const TestWorker = struct {
 
     pub fn syncQueuedPromptPermissionSnapshot(self: *TestWorker, snapshot: worker_runtime.PermissionSnapshot) void {
         self.synced_mode = snapshot.mode;
-        self.synced_backend = snapshot.sandbox_backend;
         self.mode_sync_count += 1;
     }
 
@@ -308,10 +283,8 @@ const TestWorker = struct {
 
 const PermissionCommitSnapshot = struct {
     engine_mode: types.PermissionMode,
-    sandbox_backend: sandbox.BackendKind,
     engine_grant_count: usize,
     synced_mode: ?types.PermissionMode,
-    synced_backend: ?sandbox.BackendKind,
     mode_sync_count: usize,
     synced_state_mode: ?types.PermissionMode,
     synced_state_grant_count: usize,
@@ -341,10 +314,8 @@ const TestApp = struct {
         self.last_preference_permission_mode = mode;
         self.permission_commit_snapshot = .{
             .engine_mode = self.permission_engine.mode,
-            .sandbox_backend = self.permission_state.sandbox_backend,
             .engine_grant_count = self.permission_engine.grants.items.len,
             .synced_mode = self.worker.synced_mode,
-            .synced_backend = self.worker.synced_backend,
             .mode_sync_count = self.worker.mode_sync_count,
             .synced_state_mode = self.worker.synced_state_mode,
             .synced_state_grant_count = self.worker.synced_state_grant_count,
@@ -366,9 +337,6 @@ fn expectPersistentModeSelection(mode: types.PermissionMode) !void {
 
     try std.testing.expectEqual(mode, app.permission_engine.mode);
     try std.testing.expectEqual(@as(?types.PermissionMode, mode), app.worker.synced_mode);
-    const expected_backend: sandbox.BackendKind = .none;
-    try std.testing.expectEqual(expected_backend, app.permission_state.sandbox_backend);
-    try std.testing.expectEqual(@as(?sandbox.BackendKind, expected_backend), app.worker.synced_backend);
     try std.testing.expectEqual(@as(usize, 1), app.worker.mode_sync_count);
     try std.testing.expectEqual(@as(usize, 1), app.permission_mode_preference_commit_count);
     try std.testing.expectEqual(@as(?types.PermissionMode, mode), app.last_preference_permission_mode);
@@ -376,10 +344,8 @@ fn expectPersistentModeSelection(mode: types.PermissionMode) !void {
 
     const snapshot = app.permission_commit_snapshot.?;
     try std.testing.expectEqual(mode, snapshot.engine_mode);
-    try std.testing.expectEqual(expected_backend, snapshot.sandbox_backend);
     try std.testing.expectEqual(@as(usize, 0), snapshot.engine_grant_count);
     try std.testing.expectEqual(@as(?types.PermissionMode, mode), snapshot.synced_mode);
-    try std.testing.expectEqual(@as(?sandbox.BackendKind, expected_backend), snapshot.synced_backend);
     try std.testing.expectEqual(@as(usize, 1), snapshot.mode_sync_count);
     try std.testing.expectEqual(@as(?types.PermissionMode, null), snapshot.synced_state_mode);
     try std.testing.expectEqual(@as(usize, 0), snapshot.state_sync_count);
@@ -499,49 +465,6 @@ test "app_permission_runtime setMode syncs queued prompts without persisting" {
     try std.testing.expectEqual(@as(usize, 1), app.worker.mode_sync_count);
     try std.testing.expectEqual(@as(usize, 0), app.permission_mode_preference_commit_count);
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
-}
-
-test "app_permission_runtime mode changes never touch the sandbox backend" {
-    var implicit = TestApp{ .alloc = std.testing.allocator };
-    defer implicit.deinit();
-
-    Runtime(TestApp).setMode(&implicit, .auto);
-    try std.testing.expectEqual(sandbox.BackendKind.none, implicit.permission_state.sandbox_backend);
-    Runtime(TestApp).setMode(&implicit, .ask);
-    try std.testing.expectEqual(sandbox.BackendKind.none, implicit.permission_state.sandbox_backend);
-
-    var explicit_os = TestApp{
-        .alloc = std.testing.allocator,
-        .permission_state = .{ .sandbox_backend = .macos },
-    };
-    defer explicit_os.deinit();
-    Runtime(TestApp).setMode(&explicit_os, .ask);
-    try std.testing.expectEqual(sandbox.BackendKind.macos, explicit_os.permission_state.sandbox_backend);
-    Runtime(TestApp).setMode(&explicit_os, .auto);
-    try std.testing.expectEqual(sandbox.BackendKind.macos, explicit_os.permission_state.sandbox_backend);
-    Runtime(TestApp).setMode(&explicit_os, .yolo);
-    try std.testing.expectEqual(sandbox.BackendKind.macos, explicit_os.permission_state.sandbox_backend);
-    try std.testing.expectEqual(
-        sandbox.BackendKind.none,
-        Runtime(TestApp).livePermissionSnapshot(&explicit_os).sandbox_backend,
-    );
-}
-
-test "app_permission_runtime sandbox selection syncs queued prompts" {
-    var app = TestApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-    app.permission_engine.mode = .auto;
-
-    try std.testing.expect(!Runtime(TestApp).setSandboxBackend(&app, .none));
-    try std.testing.expectEqual(sandbox.BackendKind.none, app.permission_state.sandbox_backend);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.mode_sync_count);
-    try std.testing.expectEqual(@as(?types.PermissionMode, .auto), app.worker.synced_mode);
-    try std.testing.expectEqual(@as(?sandbox.BackendKind, .none), app.worker.synced_backend);
-
-    try std.testing.expect(Runtime(TestApp).setSandboxBackend(&app, .macos));
-    try std.testing.expectEqual(sandbox.BackendKind.macos, app.permission_state.sandbox_backend);
-    try std.testing.expectEqual(@as(usize, 2), app.worker.mode_sync_count);
-    try std.testing.expectEqual(@as(?sandbox.BackendKind, .macos), app.worker.synced_backend);
 }
 
 test "app_permission_runtime reset clears grants before syncing permission state" {

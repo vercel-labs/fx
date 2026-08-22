@@ -1083,7 +1083,7 @@ test "findReusableRunningTask matches trimmed command and cwd only for live serv
 
     try std.testing.expect((try supervisor.findReusableRunningTask(alloc, "/tmp/other", "npm run dev", true)) == null);
     try std.testing.expect((try supervisor.findReusableRunningTask(alloc, "/tmp/app", "pnpm dev", true)) == null);
-    try std.testing.expect((try supervisor.findReusableRunningTask(alloc, "/tmp/app", "/usr/bin/sandbox-exec -p profile sh -lc 'npm run dev'", true)) == null);
+    try std.testing.expect((try supervisor.findReusableRunningTask(alloc, "/tmp/app", "env WRAPPED=1 sh -lc 'npm run dev'", true)) == null);
 }
 
 test "snapshotServerUrl selects the requested id without falling back" {

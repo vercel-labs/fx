@@ -1,7 +1,6 @@
 const std = @import("std");
 const background_runtime = @import("../background/background_runtime.zig");
 const change_tracker = @import("change_tracker.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const session_runtime = @import("../session/session.zig");
 const types = @import("../shared/types.zig");
 const context_limits = @import("../config/context_limits.zig");
@@ -253,7 +252,6 @@ pub const TransientContextInput = struct {
     access_scope: ?workspace_access.AccessScope = null,
     interactive: bool,
     permission_mode: types.PermissionMode,
-    sandbox_backend: sandbox.BackendKind,
     tracker: ?*change_tracker.ChangeTracker,
     background: *background_runtime.BackgroundRuntime,
     session: *session_runtime.SessionRuntime,
@@ -402,7 +400,7 @@ pub const Fragment = enum {
             .scoped_instructions => "bounded global, workspace, and nested scoped rules plus the bounded visible skill catalog",
             .available_tools => "gateway-advertised tool schemas after permission, deferred MCP discovery, and entrypoint filtering",
             .permission_mode => "captured ask, auto, or yolo baseline for the active turn without rule or grant contents",
-            .environment_metadata => "OS, shell, date, home directory, sandbox, and live/non-live background runtime hints",
+            .environment_metadata => "OS, shell, date, home directory, and live/non-live background runtime hints",
             .session_metadata => "model, step budget, max tool-result bytes, conversation history, grants, loaded skills, and persisted session id when present",
         };
     }
@@ -465,7 +463,7 @@ const current_inventory = [_]EntrypointInventory{
         .entrypoint = .interactive,
         .assembly_path = "main.App.enqueuePrompt -> app_agent_runtime.processQueuedPrompt -> agent_runtime dependencies",
         .static_context = "builtins/context captures one global/root/ancestor/applicable AGENTS.md snapshot before enqueue, then adds scoped deltas from effective structured tool targets",
-        .transient_context = "tool_runtime transient context each model step: env_context, captured permission mode, sandbox, background runtime, non-live background history",
+        .transient_context = "tool_runtime transient context each model step: env_context, captured permission mode, background runtime, non-live background history",
         .tools = "App.snapshotGatewayToolProjection pairs full tool advertisement with included custom-provider guidance after permission and deferred MCP discovery",
         .permission = "PermissionEngine mode, persistent rules, and session grants are enforced by interactive permission prompts",
         .session = "live SessionRuntime history plus persisted session/log/artifact stores when enabled",
@@ -500,7 +498,7 @@ const current_inventory = [_]EntrypointInventory{
         .static_context = "reuses the launching surface's project-context snapshot bytes and its system and skill prompt sections; child delivery state starts empty so scoped tool-target deltas are re-evaluated for the child",
         .transient_context = "tool_runtime transient context each model step over the child SessionRuntime with noninteractive output callbacks and no live user question path",
         .tools = "identical to the launching surface's own gateway tool advertisement: permission-filtered builtins, deferred MCP discovery tools, and the subagent tool for nested children",
-        .permission = "per-child ask/auto/yolo mode (new children default to yolo) resolves live host authority per action for tools, roots, sandbox, integrations, rules, and grants, revalidating the retained action identity whenever the authority generation advances before the effect",
+        .permission = "per-child ask/auto/yolo mode (new children default to yolo) resolves live host authority per action for tools, roots, integrations, rules, and grants, revalidating the retained action identity whenever the authority generation advances before the effect",
         .session = "ordinary child session resumed for write from the shared session store for one-off and persistent children, canonical child history restored from and committed back to that session, and per-child model and effort from the stored child configuration",
         .drift_status = .intentional,
         .drift = "separate child session and history, noninteractive child callbacks, approvals projected to the parent and human surfaces, and bounded parent/child delivery instead of transcript merging",
@@ -637,7 +635,7 @@ test "minimum shared model context contract snapshot" {
         \\- scoped_instructions: bounded global, workspace, and nested scoped rules plus the bounded visible skill catalog
         \\- available_tools: gateway-advertised tool schemas after permission, deferred MCP discovery, and entrypoint filtering
         \\- permission_mode: captured ask, auto, or yolo baseline for the active turn without rule or grant contents
-        \\- environment_metadata: OS, shell, date, home directory, sandbox, and live/non-live background runtime hints
+        \\- environment_metadata: OS, shell, date, home directory, and live/non-live background runtime hints
         \\- session_metadata: model, step budget, max tool-result bytes, conversation history, grants, loaded skills, and persisted session id when present
         \\
     ,
@@ -655,7 +653,7 @@ test "entrypoint context inventory snapshot documents current deltas" {
         \\- entrypoint: interactive
         \\  assembly_path: main.App.enqueuePrompt -> app_agent_runtime.processQueuedPrompt -> agent_runtime dependencies
         \\  static_context: builtins/context captures one global/root/ancestor/applicable AGENTS.md snapshot before enqueue, then adds scoped deltas from effective structured tool targets
-        \\  transient_context: tool_runtime transient context each model step: env_context, captured permission mode, sandbox, background runtime, non-live background history
+        \\  transient_context: tool_runtime transient context each model step: env_context, captured permission mode, background runtime, non-live background history
         \\  tools: App.snapshotGatewayToolProjection pairs full tool advertisement with included custom-provider guidance after permission and deferred MCP discovery
         \\  permission: PermissionEngine mode, persistent rules, and session grants are enforced by interactive permission prompts
         \\  session: live SessionRuntime history plus persisted session/log/artifact stores when enabled
@@ -684,7 +682,7 @@ test "entrypoint context inventory snapshot documents current deltas" {
         \\  static_context: reuses the launching surface's project-context snapshot bytes and its system and skill prompt sections; child delivery state starts empty so scoped tool-target deltas are re-evaluated for the child
         \\  transient_context: tool_runtime transient context each model step over the child SessionRuntime with noninteractive output callbacks and no live user question path
         \\  tools: identical to the launching surface's own gateway tool advertisement: permission-filtered builtins, deferred MCP discovery tools, and the subagent tool for nested children
-        \\  permission: per-child ask/auto/yolo mode (new children default to yolo) resolves live host authority per action for tools, roots, sandbox, integrations, rules, and grants, revalidating the retained action identity whenever the authority generation advances before the effect
+        \\  permission: per-child ask/auto/yolo mode (new children default to yolo) resolves live host authority per action for tools, roots, integrations, rules, and grants, revalidating the retained action identity whenever the authority generation advances before the effect
         \\  session: ordinary child session resumed for write from the shared session store for one-off and persistent children, canonical child history restored from and committed back to that session, and per-child model and effort from the stored child configuration
         \\  drift_status: intentional
         \\  drift: separate child session and history, noninteractive child callbacks, approvals projected to the parent and human surfaces, and bounded parent/child delivery instead of transcript merging
@@ -781,7 +779,6 @@ test "context registry routes the default provider" {
         .workspace_root = "/workspace",
         .interactive = true,
         .permission_mode = .ask,
-        .sandbox_backend = sandbox.BackendKind.none,
         .tracker = &tracker,
         .background = &background,
         .session = &session,

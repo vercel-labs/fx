@@ -141,12 +141,16 @@ function classifierTrustContext(body: string): string {
   return evidence.slice(start, end);
 }
 
-function subagentCreateCall(toolCallId: string, prompt: string) {
+function subagentCreateCall(
+  toolCallId: string,
+  prompt: string,
+  mode: "one_off" | "persistent" = "one_off",
+) {
   return gatewayToolCall("subagent", {
     command: {
       create: {
         name: "bounded-child",
-        mode: "one_off",
+        mode,
         prompt,
       },
     },
@@ -909,7 +913,7 @@ function createIsolatedRoot(baseDir = tmpdir()): IsolatedRoot {
   mkdirSync(hostileBin, { recursive: true });
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({ sandbox: "none", permission: {}, maxxing_mode: "legacy" }),
+    JSON.stringify({ sandbox: "none", permission: {} }),
   );
   writeFileSync(join(home, ".profile"), `printf profile > ${JSON.stringify(profileMarker)}\n`);
   writeFileSync(join(home, ".zprofile"), `printf zprofile > ${JSON.stringify(profileMarker)}\n`);
@@ -1038,7 +1042,7 @@ function expectUserProfileTrace(tracePath: string) {
     "terminal.exec authority=shell_allowed source=yolo " +
       "route=approved_shell environment=user",
   );
-  expect(trace).toContain("sandbox explicit command environment=user shell=");
+  expect(trace).toContain("command runner explicit environment=user shell=");
   expect(trace).not.toContain("authority=direct_only route=direct_read_only");
 }
 
@@ -1178,11 +1182,11 @@ describe("effect-aware command permissions", () => {
 
       const scrollback = await activeSession.captureFullScrollback();
       expect(scrollback.indexOf("first command completed")).toBeGreaterThanOrEqual(0);
-      expect(scrollback.indexOf(feedback)).toBeGreaterThan(
+      expect(scrollback.indexOf("second command completed")).toBeGreaterThan(
         scrollback.indexOf("first command completed"),
       );
-      expect(scrollback.indexOf("second command completed")).toBeGreaterThan(
-        scrollback.indexOf(feedback),
+      expect(scrollback.indexOf(feedback)).toBeGreaterThan(
+        scrollback.indexOf("second command completed"),
       );
       const rawAnsiScrollback = await activeSession.captureFullScrollbackEscapes();
       expect(rawAnsiScrollback).toContain(feedback);
@@ -1352,7 +1356,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI yolo user-profile command keeps its provisional row before following transcript text",
+    "TUI yolo user-profile command waits for authoritative arguments after streamed text",
     async () => {
       const root = createIsolatedRoot();
       const streamText = "DIRECT_NO_NOTICE_STREAM_TEXT";
@@ -1395,10 +1399,12 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForText("direct auto complete", TIMEOUT);
 
       const scrollback = await activeSession.captureFullScrollback();
-      const completedIndex = scrollback.indexOf("● Ran");
+      const completedIndex = scrollback.indexOf("└ Ran pwd");
       const streamTextIndex = scrollback.indexOf(streamText);
       expect(completedIndex).toBeGreaterThanOrEqual(0);
-      expect(streamTextIndex).toBeGreaterThan(completedIndex);
+      expect(streamTextIndex).toBeGreaterThanOrEqual(0);
+      expect(completedIndex).toBeGreaterThan(streamTextIndex);
+      expect(scrollback).not.toContain("Preparing command");
       expect(scrollback).not.toContain("Auto agent approved this request");
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(0);
@@ -1412,18 +1418,17 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI Minimal keeps command output exclusive to Ctrl-O through resize and resume",
+    "TUI keeps command output exclusive to Ctrl-O through resize and resume",
     async () => {
       const root = createIsolatedRoot();
-      const stderrPath = join(root.root, "minimal-command-output-stderr.log");
-      const resumedStderrPath = join(root.root, "minimal-command-output-resumed-stderr.log");
+      const stderrPath = join(root.root, "current-command-output-stderr.log");
+      const resumedStderrPath = join(root.root, "current-command-output-resumed-stderr.log");
       writeFileSync(
         join(root.home, ".fx", "settings.json"),
         JSON.stringify({
           sandbox: "none",
           permission_mode: "auto",
           permission: {},
-          maxxing_mode: "minimal",
         }),
       );
       writeFileSync(stderrPath, "");
@@ -1570,7 +1575,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI user-profile printf keeps compact output bounded and Ctrl-O complete",
+    "TUI user-profile printf keeps compact output hidden and Ctrl-O complete",
     async () => {
       const root = createIsolatedRoot();
       const tracePath = join(root.root, "direct-printf-trace.log");
@@ -1609,12 +1614,6 @@ describe("effect-aware command permissions", () => {
       writeFileSync(resumedStderrPath, "");
       const commandOutputText = (text: string): string =>
         text.split("\n").filter((line) => line.trimStart().startsWith("│ ")).join("\n");
-      const expectCommandHeaderImmediatelyBefore = (text: string, output: string): void => {
-        const lines = text.split("\n");
-        const outputIndex = lines.findIndex((line) => line.includes(output));
-        expect(outputIndex).toBeGreaterThan(0);
-        expect(lines[outputIndex - 1]).toContain("● Ran");
-      };
       const toolResultValue = (body: string, toolCallId: string): string => {
         const request = JSON.parse(body) as {
           prompt?: Array<{ content?: Array<Record<string, any>> }>;
@@ -1650,13 +1649,9 @@ describe("effect-aware command permissions", () => {
 
       const losslessCompact = await activeSession.captureFullScrollback();
       const losslessCompactOutput = commandOutputText(losslessCompact);
-      for (const row of losslessRows.slice(0, 5)) {
-        expect(losslessCompactOutput).toContain(`│ ${row}`);
-      }
-      expect(losslessCompactOutput).not.toContain(losslessRows[5]!);
-      expect(losslessCompactOutput).not.toContain(losslessRows[6]!);
-      expect(losslessCompactOutput).toContain("│ … 2 lines more (ctrl o to view)");
-      expectCommandHeaderImmediatelyBefore(losslessCompact, `│ ${losslessRows[0]}`);
+      expect(losslessCompactOutput).toBe("");
+      expect(losslessCompact).toContain("Ran printf");
+      for (const row of losslessRows) expect(losslessCompact).not.toContain(`│ ${row}`);
       expect(commandReplayFiles(root)).toEqual([]);
       const losslessGrid = await activeSession.capturePaneGrid();
 
@@ -1684,14 +1679,9 @@ describe("effect-aware command permissions", () => {
       );
       const lossyCompact = await activeSession.captureFullScrollback();
       const lossyCompactOutput = commandOutputText(lossyCompact);
-      expect(lossyCompactOutput).toContain("│   DIRECT_PADDED");
-      expect(lossyCompactOutput).toContain(`│ ${lossyRows[1]}`);
-      expect(lossyCompactOutput).toContain(`│ ${lossyRows[2]}`);
-      expect(lossyCompactOutput).toContain(`│ ${lossyRows[3]}`);
-      expect(lossyCompactOutput).not.toContain(lossyRows[4]!);
-      expect(lossyCompactOutput).not.toContain(lossyRows[7]!);
-      expect(lossyCompactOutput).toContain("│ … 4 lines more (ctrl o to view)");
-      expectCommandHeaderImmediatelyBefore(lossyCompact, "│   DIRECT_PADDED");
+      expect(lossyCompactOutput).toBe("");
+      expect(lossyCompact).toContain("Ran printf");
+      for (const row of lossyRows) expect(lossyCompact).not.toContain(`│ ${row}`);
       expect(commandReplayFiles(root)).toHaveLength(1);
       const lossyGrid = await activeSession.capturePaneGrid();
 
@@ -1759,12 +1749,12 @@ describe("effect-aware command permissions", () => {
         width: 72,
         height: 30,
       });
-      await activeSession.waitForText("│ … 4 lines more (ctrl o to view)", TIMEOUT);
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.waitForText("Ran printf", TIMEOUT);
       const resumedCompact = await activeSession.capturePane();
       const resumedCompactOutput = commandOutputText(resumedCompact);
-      expect(resumedCompactOutput).toContain(lossyRows[1]!);
-      expect(resumedCompactOutput).not.toContain(lossyRows[7]!);
-      expectCommandHeaderImmediatelyBefore(resumedCompact, "│   DIRECT_PADDED");
+      expect(resumedCompactOutput).toBe("");
+      for (const row of lossyRows) expect(resumedCompact).not.toContain(`│ ${row}`);
       await activeSession.sendKeys("C-o");
       await activeSession.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
       await activeSession.sendKeys("Right");
@@ -1807,7 +1797,6 @@ describe("effect-aware command permissions", () => {
         JSON.stringify({
           sandbox: "none",
           permission: {},
-          maxxing_mode: "legacy",
           output_level: { legacy: true },
           workspaces: {
             [root.workspace]: { output_level: ["quiet", 7] },
@@ -1831,10 +1820,8 @@ describe("effect-aware command permissions", () => {
       expect(promptText(gateway.requests[0]!.body)).toContain("/output quiet");
       expect(gateway.requests).toHaveLength(2);
       const compact = await activeSession.captureFullScrollback();
-      for (const row of commandRows.slice(0, 5)) expect(compact).toContain(`│ ${row}`);
-      expect(compact).not.toContain(commandRows[5]!);
-      expect(compact).not.toContain(commandRows[6]!);
-      expect(compact).toContain("│ … 2 lines more (ctrl o to view)");
+      expect(compact).toContain("Ran printf");
+      for (const row of commandRows) expect(compact).not.toContain(`│ ${row}`);
 
       await activeSession.sendKeys("C-o");
       await activeSession.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
@@ -1866,7 +1853,10 @@ describe("effect-aware command permissions", () => {
       expect(afterSlashCommands.indexOf("● Sound: on")).toBeGreaterThan(
         afterSlashCommands.indexOf(responseRows.at(-1)!),
       );
-      expect(afterSlashCommands).toContain(`│ ${commandRows[0]}`);
+      expect(afterSlashCommands).toContain("Ran printf");
+      for (const row of commandRows) {
+        expect(afterSlashCommands).not.toContain(`│ ${row}`);
+      }
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).output_level).toEqual({
         legacy: true,
       });
@@ -2143,7 +2133,7 @@ describe("effect-aware command permissions", () => {
       expect(compactScrollback).not.toContain(
         "Auto agent approved this request: Running command.",
       );
-      expect(compactScrollback).toContain("● Ran");
+      expect(compactScrollback).toContain("└ Ran");
       const compactGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
@@ -2187,7 +2177,7 @@ describe("effect-aware command permissions", () => {
       const secondPrompt = "Run seq 1 1.";
       const finalResponse = "AUTO_COMMAND_SCROLLBACK_COMPLETE";
       const hasComposer = (pane: string) =>
-        pane.split("\n").some((line) => line.trim() === "❯");
+        pane.split("\n").some((line) => line.trim() === "┃");
       let releaseClassifier!: (response: Response) => void;
       const heldClassifier = new Promise<Response>((resolve) => {
         releaseClassifier = resolve;
@@ -2261,7 +2251,7 @@ describe("effect-aware command permissions", () => {
         (pane) => pane.includes(finalResponse) && hasComposer(pane),
         TIMEOUT,
       );
-      expect(finalPane.split("\n").filter((line) => line.trim() === "❯")).toHaveLength(1);
+      expect(finalPane.split("\n").filter((line) => line.trim() === "┃")).toHaveLength(1);
 
       const afterScrollback = await activeSession.captureFullScrollback();
       expect(extractMarkers(afterScrollback)).toEqual(expectedMarkers);
@@ -2270,7 +2260,7 @@ describe("effect-aware command permissions", () => {
         line.includes(expectedMarkers.at(-1)!)
       );
       const secondPromptLine = afterLines.findIndex((line) => line.includes(secondPrompt));
-      const completedLine = afterLines.findIndex((line) => line.includes("● Ran seq 1 1"));
+      const completedLine = afterLines.findIndex((line) => line.includes("Ran seq 1 1"));
       const outputLine = afterLines.findIndex((line, index) =>
         index > completedLine && line.trim() === "│ 1"
       );
@@ -2278,8 +2268,8 @@ describe("effect-aware command permissions", () => {
       expect(secondPromptLine).toBeGreaterThan(lastMarkerLine);
       expect(afterScrollback).not.toContain("Auto agent approved this request");
       expect(completedLine).toBeGreaterThan(secondPromptLine);
-      expect(outputLine).toBeGreaterThan(completedLine);
-      expect(finalLine).toBeGreaterThan(outputLine);
+      expect(outputLine).toBe(-1);
+      expect(finalLine).toBeGreaterThan(completedLine);
       expect(gateway.requests).toHaveLength(3);
       expect(gateway.classifierRequests).toHaveLength(1);
       expect(activeSession.isAlive()).toBe(true);
@@ -2307,9 +2297,7 @@ describe("effect-aware command permissions", () => {
     "TUI isolates approved foreground commands from terminal ownership",
     async () => {
       const binary = process.env.FX_COMMAND_SESSION_TEST_BIN ?? FX_BIN;
-      const sandboxModes = process.platform === "darwin"
-        ? (["none", "os"] as const)
-        : (["none"] as const);
+      const sandboxModes = ["legacy-sandbox-key"] as const;
 
       for (const sandbox of sandboxModes) {
         const root = createIsolatedRoot();
@@ -2340,7 +2328,7 @@ describe("effect-aware command permissions", () => {
         writeTerminalOwnershipFixture(fixturePath);
         writeFileSync(
           join(root.home, ".fx", "settings.json"),
-          JSON.stringify({ sandbox, permission: {}, maxxing_mode: "legacy" }),
+          JSON.stringify({ sandbox: "os", permission: {} }),
         );
         writeFileSync(join(root.home, ".profile"), "");
         writeFileSync(join(root.home, ".zprofile"), "");
@@ -2391,9 +2379,9 @@ describe("effect-aware command permissions", () => {
           foregroundFxRow(ttyPath, binary);
           process.kill(fixture.pid, 0);
 
-          await activeSession.waitForText("TTY_SESSION_STDOUT_BEGIN", TIMEOUT);
+          await activeSession.waitForText("Running exec python3", TIMEOUT);
           await activeSession.sendLiteralText("q");
-          await activeSession.waitForPane((pane) => pane.includes("❯ q"), TIMEOUT);
+          await activeSession.waitForPane((pane) => pane.includes("┃ q"), TIMEOUT);
           foregroundFxRow(ttyPath, binary);
           process.kill(fixture.pid, 0);
           await activeSession.sendKeys("C-u");
@@ -2437,27 +2425,36 @@ describe("effect-aware command permissions", () => {
         expect(pwdResult).toContain(`\n${root.workspace}\n`);
 
         const scrollback = await activeSession.captureFullScrollback();
-        const completedIndex = scrollback.indexOf("● Ran");
-        const stdoutBeginIndex = scrollback.indexOf("TTY_SESSION_STDOUT_BEGIN");
-        const stdoutEndIndex = scrollback.indexOf("TTY_SESSION_STDOUT_END");
+        const completedIndex = scrollback.indexOf("Ran exec python3");
         const finalIndex = scrollback.indexOf(`TTY_SESSION_FINAL_${sandbox}`);
         const followupIndex = scrollback.indexOf("Run pwd through the user profile.");
         const pwdFinalIndex = scrollback.indexOf(`TTY_SESSION_PWD_FINAL_${sandbox}`);
         expect(completedIndex).toBeGreaterThanOrEqual(0);
-        expect(stdoutBeginIndex).toBeGreaterThan(completedIndex);
-        expect(stdoutEndIndex).toBeGreaterThan(stdoutBeginIndex);
-        expect(finalIndex).toBeGreaterThan(stdoutEndIndex);
+        expect(scrollback).not.toContain("TTY_SESSION_STDOUT_BEGIN");
+        expect(scrollback).not.toContain("TTY_SESSION_STDOUT_END");
+        expect(finalIndex).toBeGreaterThan(completedIndex);
         expect(followupIndex).toBeGreaterThan(finalIndex);
         expect(pwdFinalIndex).toBeGreaterThan(followupIndex);
         expect(scrollback).not.toContain("suspended (tty input)");
         expect(scrollback).not.toContain("FX_FOREGROUND_EXEC_FAILED");
+
+        await activeSession.sendKeys("C-o");
+        await activeSession.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
+        await activeSession.sendKeys("Right");
+        await activeSession.waitForText("TTY_SESSION_STDERR", TIMEOUT);
+        const full = await activeSession.capturePane();
+        expect(full).toContain("TTY_SESSION_STDOUT_BEGIN");
+        expect(full).toContain("TTY_SESSION_STDOUT_END");
+        expect(full).toContain("TTY_SESSION_STDERR");
+        await activeSession.sendKeys("C-o");
+        await activeSession.waitForComposer(TIMEOUT);
 
         const trace = readFileSync(tracePath, "utf8");
         expect(trace).toContain(
           "terminal.exec authority=shell_allowed source=auto_classifier " +
             "route=approved_shell environment=user",
         );
-        expect(trace).toContain("sandbox explicit command environment=user shell=");
+        expect(trace).toContain("command runner explicit environment=user shell=");
         expect(trace).not.toContain("authority=direct_only route=direct_read_only");
         expectTraceOrder(trace, [
           "event=permission_decision turn_id=1 step_id=1 call_id=terminal_session_command",
@@ -2530,7 +2527,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Run the classifier ask fixture.");
       const pane = await activeSession.waitForPane(
-        (value) => value.includes("classifier automatic ask complete") && value.includes("❯"),
+        (value) => value.includes("classifier automatic ask complete") && value.includes("┃"),
         TIMEOUT,
       );
       expect(pane).not.toContain(COMMAND_APPROVAL_PROMPT);
@@ -2682,7 +2679,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI auto mode reuses one invalid review before human escalation",
+    "TUI auto mode reuses one invalid review and finishes without human escalation",
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.workspace, "classifier-fallback-approved.txt");
@@ -2695,9 +2692,8 @@ describe("effect-aware command permissions", () => {
           (body) => {
             expect(body).not.toContain('"tools":[]');
             expect(body).not.toContain('"toolChoice":{"type":"none"}');
-            return toolCall(command, {}, "human_approval_4");
+            return toolCall(command, {}, "invalid_review_4");
           },
-          finalText("post-threshold approval complete"),
         ],
         {
           classifierResponses: [finalText("accept")],
@@ -2722,366 +2718,18 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Run the reviewer fallback fixture.");
-      const pane = await activeSession.waitForText(COMMAND_APPROVAL_PROMPT, TIMEOUT);
+      const pane = await activeSession.waitForText(
+        "I couldn't continue because the required actions were blocked by automatic safety checks.",
+        TIMEOUT,
+      );
 
-      expect(pane).toContain("classifier-fallback-approved.txt");
+      expect(pane).not.toContain(COMMAND_APPROVAL_PROMPT);
       expect(existsSync(marker)).toBe(false);
       expect(gateway.requests).toHaveLength(4);
       expect(gateway.classifierRequests).toHaveLength(1);
-      await activeSession.sendKeys("1");
-      await activeSession.sendKeys("Enter");
-      await activeSession.waitForText("post-threshold approval complete", TIMEOUT);
-
-      expect(existsSync(marker)).toBe(true);
-      expect(gateway.requests).toHaveLength(5);
-      expect(gateway.classifierRequests).toHaveLength(1);
       const trace = readFileSync(tracePath, "utf8");
       expect(trace.match(/denial_reason=auto_denied/g)).toHaveLength(1);
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-    },
-    TIMEOUT,
-  );
-
-  test.skipIf(!tmuxAvailable() || process.platform !== "darwin")(
-    "auto sandbox widening ask returns a recoverable denial without prompting",
-    async () => {
-      const root = createIsolatedRoot("/Users/Shared");
-      writeFileSync(
-        join(root.home, ".fx", "settings.json"),
-        JSON.stringify({ sandbox: "os", permission: {}, maxxing_mode: "legacy" }),
-      );
-      const marker = join(root.workspace, "preflight-command-ran.txt");
-      const command = `npm install && printf 'preflight-ran' > ${shellQuote(marker)}`;
-      const gateway = startFakeGateway(
-        [
-          toolCall(command),
-          finalText("preflight sandbox widening denied"),
-        ],
-        {
-          classifierResponses: [
-            permissionDecision("allow", "initial_command_review"),
-            permissionDecision("ask", "sandbox_widening_review"),
-          ],
-        },
-      );
-      const tracePath = join(root.root, "trace.log");
-      const stderrPath = join(root.root, "stderr.log");
-      writeFileSync(stderrPath, "");
-
-      activeSession = await TmuxSession.create({
-        cmd: FX_BIN,
-        cwd: root.workspace,
-        env: gatewayEnv(root, gateway, {
-          FX_PERMISSION_MODE: "auto",
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "permission,tool",
-          TMPDIR: "/private/tmp",
-        }),
-        stderrPath,
-        width: 120,
-        height: 40,
-      });
-      await activeSession.waitForComposer(TIMEOUT);
-      await activeSession.sendText("Install dependencies for this workspace.");
-      const pane = await activeSession.waitForPane(
-        (value) => value.includes("preflight sandbox widening denied") && value.includes("❯"),
-        TIMEOUT,
-      );
-
-      expect(pane).toContain("preflight sandbox widening denied");
-      expect(pane).not.toContain(COMMAND_APPROVAL_PROMPT);
-      expect(existsSync(marker)).toBe(false);
-      expect(gateway.requests).toHaveLength(2);
-      expect(gateway.classifierRequests).toHaveLength(2);
-      expect(classifierTrustContext(gateway.classifierRequests[1]!.body)).toBe(
-        classifierTrustContext(gateway.classifierRequests[0]!.body),
-      );
-      expect(gateway.classifierRequests[0]!.body).toContain("phase: initial");
-      expect(gateway.classifierRequests[0]!.body).toContain("action: command");
-      expect(gateway.classifierRequests[0]!.body).toContain("sandbox_scope: restricted");
-      const wideningReview = gateway.classifierRequests[1]!.body;
-      expect(wideningReview).toContain("phase: preflight");
-      expect(wideningReview).toContain("action: sandbox_widening");
-      expect(wideningReview).toContain(`cwd: ${root.workspace}`);
-      expect(wideningReview).toContain("background: false");
-      expect(wideningReview).toContain("backend: macos");
-      expect(wideningReview).toContain("target_os: macos");
-      expect(wideningReview).toContain("prior_scope: restricted");
-      expect(wideningReview).toContain("requested_scope: broader");
-      expect(wideningReview).not.toContain("restricted_result:");
-      const denied = JSON.parse(toolResultText(gateway.requests[1]!.body, "command_1"));
-      expect(denied.error.type).toBe("tool_permission_denied");
-      expect(denied.error.reason).toBe("auto_denied");
-      expect(denied.error.suggestion).toContain("The tool did not run.");
-      expect(denied.error.details).toBeUndefined();
-      const trace = readFileSync(tracePath, "utf8");
-      expect(trace).toContain("event=sandbox_widening_requested");
-      expect(trace).toContain("phase=preflight");
-      expect(trace).toContain("event=sandbox_widening_decision");
-      expect(trace).toContain("decision=deny");
-      expect(trace).not.toContain("event=sandbox_widening_retry_start");
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-
-      await activeSession.sendText("/quit");
-      expect(await activeSession.waitForSessionEnd()).toBe(true);
-      await activeSession.kill();
-      activeSession = null;
-    },
-    90_000,
-  );
-
-  test.skipIf(!tmuxAvailable() || process.platform !== "darwin")(
-    "reactive sandbox auto denial preserves restricted result and partial effect",
-    async () => {
-      const root = createIsolatedRoot("/Users/Shared");
-      writeFileSync(
-        join(root.home, ".fx", "settings.json"),
-        JSON.stringify({ sandbox: "os", permission: {}, maxxing_mode: "legacy" }),
-      );
-      const workspaceMarker = join(root.workspace, "reactive-workspace-effect.txt");
-      const outsideDir = join(root.home, ".cache");
-      const outsideMarker = join(outsideDir, "reactive-outside-effect.txt");
-      const restrictedResult = "FX_RESTRICTED_RESULT_RETAINED";
-      const restrictedStderr = "FX_RESTRICTED_STDERR_RETAINED";
-      const resumedStderrPath = join(root.root, "resumed-stderr.log");
-      mkdirSync(outsideDir, { recursive: true });
-      const command = [
-        `printf 'workspace-effect' > ${shellQuote(workspaceMarker)}`,
-        `printf '  ${restrictedResult}\\n'`,
-        `printf '${restrictedStderr}\\n' >&2`,
-        `printf 'outside-effect' > ${shellQuote(outsideMarker)}`,
-      ].join("; ");
-      const gateway = startFakeGateway(
-        [
-          toolCall(command),
-          finalText("reactive sandbox denial complete"),
-        ],
-        {
-          classifierResponses: [
-            permissionDecision("allow", "initial_command_review"),
-            permissionDecision("ask", "sandbox_widening_review"),
-          ],
-        },
-      );
-      const tracePath = join(root.root, "trace.log");
-      const stderrPath = join(root.root, "stderr.log");
-      writeFileSync(stderrPath, "");
-      writeFileSync(resumedStderrPath, "");
-
-      activeSession = await TmuxSession.create({
-        cmd: FX_BIN,
-        cwd: root.workspace,
-        env: gatewayEnv(root, gateway, {
-          FX_PERMISSION_MODE: "auto",
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "permission,tool",
-          TMPDIR: "/private/tmp",
-        }),
-        stderrPath,
-        width: 120,
-        height: 40,
-      });
-      await activeSession.waitForComposer(TIMEOUT);
-      await activeSession.sendText("Run the reactive sandbox denial fixture.");
-      const pane = await activeSession.waitForPane(
-        (value) => value.includes("reactive sandbox denial complete") && value.includes("❯"),
-        TIMEOUT,
-      );
-
-      expect(pane).toContain("reactive sandbox denial complete");
-      expect(pane).not.toContain(COMMAND_APPROVAL_PROMPT);
-      expect(readFileSync(workspaceMarker, "utf8")).toBe("workspace-effect");
-      expect(existsSync(outsideMarker)).toBe(false);
-      expect(gateway.requests).toHaveLength(2);
-      expect(gateway.classifierRequests).toHaveLength(2);
-      const wideningReview = gateway.classifierRequests[1]!.body;
-      expect(wideningReview).toContain("phase: reactive");
-      expect(wideningReview).toContain("action: sandbox_widening");
-      expect(wideningReview).toContain(`cwd: ${root.workspace}`);
-      expect(wideningReview).toContain("backend: macos");
-      expect(wideningReview).toContain("target_os: macos");
-      expect(wideningReview).toContain("prior_scope: restricted");
-      expect(wideningReview).toContain("requested_scope: broader");
-      expect(wideningReview).toContain("restricted_result:");
-      expect(wideningReview).toContain("restricted_command_result:");
-      expect(wideningReview).toContain("sandbox_denied");
-      expect(wideningReview).toContain(restrictedResult);
-      const retained = JSON.parse(toolResultText(gateway.requests[1]!.body, "command_1"));
-      expect(retained.error.type).toBe("tool_execution_failed");
-      expect(retained.error.details.phase).toBe("reactive");
-      expect(retained.error.details.restricted_attempt_ran).toBe(true);
-      expect(retained.error.details.broader_retry_ran).toBe(false);
-      expect(retained.error.details.restricted_result).toContain(restrictedResult);
-      expect(retained.error.details.restricted_result).toContain(restrictedStderr);
-      expect(retained.error.message).toContain("may have partial effects");
-      const trace = readFileSync(tracePath, "utf8");
-      expect(trace).toContain("event=sandbox_widening_requested");
-      expect(trace).toContain("phase=reactive");
-      expect(trace).toContain("event=sandbox_widening_decision");
-      expect(trace).toContain("decision=deny");
-      expect(trace).not.toContain("event=sandbox_widening_retry_start");
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(commandReplayFiles(root)).toHaveLength(1);
-
-      await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
-      await activeSession.sendKeys("Right");
-      await activeSession.waitForText(restrictedStderr, TIMEOUT);
-      const fullOutput = await activeSession.capturePane();
-      expect(fullOutput).toContain(`│   ${restrictedResult}`);
-      expect(fullOutput).toContain(`│ ${restrictedStderr}`);
-      expect(fullOutput).not.toContain("<stdout>");
-      expect(fullOutput).not.toContain("<stderr>");
-      await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("reactive sandbox denial complete", TIMEOUT);
-
-      await activeSession.sendText("/quit");
-      expect(await activeSession.waitForSessionEnd()).toBe(true);
-      await activeSession.kill();
-      activeSession = null;
-
-      const resumedGateway = startFakeGateway([]);
-      activeSession = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
-        cwd: root.workspace,
-        env: gatewayEnv(root, resumedGateway, { TMPDIR: "/private/tmp" }),
-        stderrPath: resumedStderrPath,
-        width: 120,
-        height: 40,
-      });
-      await activeSession.waitForText(restrictedResult, TIMEOUT);
-      await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
-      await activeSession.sendKeys("Right");
-      await activeSession.waitForText(restrictedStderr, TIMEOUT);
-      const resumedFullOutput = await activeSession.capturePane();
-      expect(resumedFullOutput).toContain(`│   ${restrictedResult}`);
-      expect(resumedFullOutput).toContain(`│ ${restrictedStderr}`);
-      expect(resumedFullOutput).not.toContain("<stdout>");
-      expect(resumedFullOutput).not.toContain("<stderr>");
-      expect(resumedGateway.requests).toHaveLength(0);
-      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
-    },
-    TIMEOUT,
-  );
-
-  test.skipIf(!tmuxAvailable() || process.platform !== "darwin")(
-    "reactive sandbox cancellation preserves restricted result and partial effect",
-    async () => {
-      const root = createIsolatedRoot("/Users/Shared");
-      writeFileSync(
-        join(root.home, ".fx", "settings.json"),
-        JSON.stringify({ sandbox: "os", permission: {}, maxxing_mode: "legacy" }),
-      );
-      const workspaceMarker = join(root.workspace, "cancelled-workspace-effect.txt");
-      const outsideDir = join(root.home, ".cache");
-      const outsideMarker = join(outsideDir, "cancelled-outside-effect.txt");
-      const restrictedResult = "FX_CANCELLED_RESTRICTED_RESULT_RETAINED";
-      mkdirSync(outsideDir, { recursive: true });
-      const command = [
-        `printf 'workspace-effect' > ${shellQuote(workspaceMarker)}`,
-        `printf '${restrictedResult}\\n'`,
-        `printf 'outside-effect' > ${shellQuote(outsideMarker)}`,
-      ].join("; ");
-      let releaseWideningReview!: (response: Response) => void;
-      const heldWideningReview = new Promise<Response>((resolve) => {
-        releaseWideningReview = resolve;
-      });
-      const gateway = startFakeGateway(
-        [
-          toolCall(command),
-          finalText("follow-up after sandbox widening cancellation"),
-        ],
-        {
-          classifierResponses: [
-            permissionDecision("allow", "initial_command_review"),
-            () => heldWideningReview,
-          ],
-        },
-      );
-      const tracePath = join(root.root, "trace.log");
-      const stderrPath = join(root.root, "stderr.log");
-      writeFileSync(stderrPath, "");
-
-      activeSession = await TmuxSession.create({
-        cmd: FX_BIN,
-        cwd: root.workspace,
-        env: gatewayEnv(root, gateway, {
-          FX_PERMISSION_MODE: "auto",
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "permission,interrupt,tool",
-          TMPDIR: "/private/tmp",
-        }),
-        stderrPath,
-        width: 120,
-        height: 40,
-      });
-      await activeSession.waitForComposer(TIMEOUT);
-      await activeSession.sendText("Run the cancellable reactive sandbox fixture.");
-      const reviewDeadline = Date.now() + TIMEOUT;
-      while (
-        (gateway.classifierRequests.length < 2 || !existsSync(workspaceMarker)) &&
-        Date.now() < reviewDeadline
-      ) {
-        await Bun.sleep(10);
-      }
-      expect(gateway.classifierRequests).toHaveLength(2);
-      expect(readFileSync(workspaceMarker, "utf8")).toBe("workspace-effect");
-      expect(existsSync(outsideMarker)).toBe(false);
-      expect(gateway.classifierRequests[1]!.body).toContain("phase: reactive");
-      expect(gateway.classifierRequests[1]!.body).toContain(restrictedResult);
-      expect(gateway.classifierRequests[1]!.body).toContain(
-        "restricted_command_result:",
-      );
-
-      await activeSession.sendKeys("Escape");
-      const cancelDeadline = Date.now() + 10_000;
-      while (
-        (!existsSync(tracePath) ||
-          !readFileSync(tracePath, "utf8").includes("event=finish_event_emitted")) &&
-        Date.now() < cancelDeadline
-      ) {
-        await Bun.sleep(10);
-      }
-      expect(readFileSync(tracePath, "utf8")).toContain("event=finish_event_emitted");
-      expect(readFileSync(tracePath, "utf8")).toContain("outcome_kind=interrupted");
-      const cancelledPane = await activeSession.waitForText("■ Cancelled", TIMEOUT);
-      expect(cancelledPane).toContain("■ Cancelled");
-      releaseWideningReview(permissionDecision("allow", "late_widening_review"));
-
-      const sessionId = sessionIdFromHome(root);
-      const savedResult = await runFx(
-        ["session", "--id", sessionId, "--json"],
-        { cwd: root.workspace, env: { HOME: root.home } },
-      );
-      expect(savedResult.code).toBe(0);
-      const saved = JSON.parse(savedResult.stdout) as any;
-      const interrupted = saved.history.find((turn: any) => turn.kind === "interrupted");
-      expect(interrupted).toBeDefined();
-      const retainedResult = interrupted.execution.tool_steps
-        .flatMap((step: any) => step.tool_results)
-        .find((result: any) => result.tool_name === "terminal");
-      expect(retainedResult).toBeDefined();
-      expect(retainedResult.status).toBe("failure");
-      const retained = JSON.parse(retainedResult.output);
-      expect(retained.error.details.phase).toBe("reactive");
-      expect(retained.error.details.restricted_attempt_ran).toBe(true);
-      expect(retained.error.details.broader_retry_ran).toBe(false);
-      expect(retained.error.details.restricted_result).toContain(restrictedResult);
-      const trace = readFileSync(tracePath, "utf8");
-      expect(trace).not.toContain("event=sandbox_widening_retry_start");
-      expect(existsSync(outsideMarker)).toBe(false);
-
-      await activeSession.sendText("Confirm the next prompt works.");
-      const pane = await activeSession.waitForPane(
-        (value) =>
-          value.includes("follow-up after sandbox widening cancellation") && value.includes("❯"),
-        TIMEOUT,
-      );
-      expect(pane).toContain("follow-up after sandbox widening cancellation");
-      expect(gateway.requests).toHaveLength(2);
-      expect(gateway.classifierRequests).toHaveLength(2);
-      expect(existsSync(outsideMarker)).toBe(false);
+      expect(trace).toContain("event=automatic_recovery_exhausted");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");
@@ -3193,7 +2841,7 @@ describe("effect-aware command permissions", () => {
         "follow-up after review cancellation",
         TIMEOUT,
       );
-      expect(pane).toContain("❯");
+      expect(pane).toContain("┃");
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(1);
       expect(readFileSync(tracePath, "utf8")).not.toContain("decision=allow");
@@ -4371,7 +4019,7 @@ describe("effect-aware command permissions", () => {
         }, "nested_create_1");
       };
       const gateway = startFakeGateway([
-        subagentCreateCall("root_create_1", childPrompt),
+        subagentCreateCall("root_create_1", childPrompt, "persistent"),
         route,
         route,
         route,
@@ -5072,7 +4720,7 @@ describe("effect-aware command permissions", () => {
             command: {
               create: {
                 name: "interactive-approval-child",
-                mode: "one_off",
+                mode: "persistent",
                 prompt: childPrompt,
                 permission_mode: "ask",
               },
@@ -5104,6 +4752,10 @@ describe("effect-aware command permissions", () => {
         TIMEOUT,
       );
       expect(approvalPane).toContain("touch");
+      const approvalDeadline = Date.now() + TIMEOUT;
+      while (approval === null && Date.now() < approvalDeadline) {
+        await Bun.sleep(20);
+      }
       expect(approval).not.toBeNull();
       expect(subagentState(root, childId)).toBe("awaiting_approval");
       expect(gateway.classifierRequests).toHaveLength(0);
@@ -5123,11 +4775,11 @@ describe("effect-aware command permissions", () => {
       );
       expect(existsSync(markerPath)).toBe(false);
       const childDeadline = Date.now() + TIMEOUT;
-      while (subagentState(root, childId) !== "completed" &&
+      while (subagentState(root, childId) !== "idle" &&
              Date.now() < childDeadline) {
         await Bun.sleep(20);
       }
-      expect(subagentState(root, childId)).toBe("completed");
+      expect(subagentState(root, childId)).toBe("idle");
       const stored = JSON.parse(readFileSync(
         join(root.home, ".fx", "sessions", childId, "subagent", "communication.json"),
         "utf8",
@@ -5156,7 +4808,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "interactive fx routes a child's post-threshold action to parent approval",
+    "interactive fx lets a child finish automatic recovery without parent approval",
     async () => {
       const root = createIsolatedRoot();
       const stderrPath = join(root.root, "interactive-child-auto-approval-stderr.log");
@@ -5179,10 +4831,7 @@ describe("effect-aware command permissions", () => {
               command: `/usr/bin/touch ${shellQuote(markerPath)}`,
             }, `child_auto_command_${childRequestCount}`);
           }
-          expect(toolResultText(body, "child_auto_command_4")).not.toContain(
-            "tool_permission_denied",
-          );
-          return finalText("INTERACTIVE_AUTO_APPROVAL_CHILD_COMPLETE");
+          throw new Error(`Unexpected fifth child recovery request: ${body}`);
         }
         if (body.includes(`\"toolCallId\":\"${rootCreateCallId}\"`) &&
             body.includes('"type":"tool-result"')) {
@@ -5226,27 +4875,27 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      const approvalPane = await activeSession.waitForText(COMMAND_APPROVAL_PROMPT, TIMEOUT);
-
-      expect(approvalPane).toContain(
-        "Subagent interactive-auto-approval-child needs permission",
-      );
-      expect(approvalPane).toContain("/usr/bin/touch");
+      await activeSession.waitForText("INTERACTIVE_AUTO_APPROVAL_PARENT_CREATED", TIMEOUT);
       expect(childId).not.toBe("");
-      expect(subagentState(root, childId)).toBe("awaiting_approval");
-      expect(existsSync(markerPath)).toBe(false);
-      expect(gateway.classifierRequests).toHaveLength(1);
-      await activeSession.sendKeys("1");
-      await activeSession.sendKeys("Enter");
 
       const deadline = Date.now() + TIMEOUT;
       while (subagentState(root, childId) !== "completed" && Date.now() < deadline) {
         await Bun.sleep(20);
       }
       expect(subagentState(root, childId)).toBe("completed");
-      expect(childRequestCount).toBe(5);
+      expect(childRequestCount).toBe(4);
       expect(gateway.classifierRequests).toHaveLength(1);
-      expect(existsSync(markerPath)).toBe(true);
+      expect(existsSync(markerPath)).toBe(false);
+      const scrollback = await activeSession.captureFullScrollback();
+      expect(scrollback).not.toContain(COMMAND_APPROVAL_PROMPT);
+      expect(scrollback).not.toContain(
+        "Subagent interactive-auto-approval-child needs permission",
+      );
+      const stored = JSON.parse(readFileSync(
+        join(root.home, ".fx", "sessions", childId, "subagent", "communication.json"),
+        "utf8",
+      )) as { ledger: { approvals: Array<Record<string, unknown>> } };
+      expect(stored.ledger.approvals).toHaveLength(0);
 
       await activeSession.sendText("/quit");
       expect(await activeSession.waitForSessionEnd(5_000)).toBe(true);
@@ -6003,7 +5652,10 @@ describe("effect-aware command permissions", () => {
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(1);
       expect(gateway.classifierRequests[0]!.headers.get("ai-language-model-id")).toBe(
-        "zai/glm-5.2",
+        "moonshotai/kimi-k3",
+      );
+      expect(JSON.parse(gateway.classifierRequests[0]!.body)).not.toHaveProperty(
+        "providerOptions.gateway.speed",
       );
       expect(gateway.classifierRequests[0]!.body).toContain("\"permission_decision\"");
       expect(gateway.classifierRequests[0]!.body).toContain("\"toolChoice\":{\"type\":\"required\"}");
@@ -6344,166 +5996,6 @@ describe("effect-aware command permissions", () => {
     TIMEOUT,
   );
 
-  test.skipIf(process.platform !== "darwin")(
-    "fx ask and ACP publish one final preflight sandbox denial",
-    async () => {
-      const cliRoot = createIsolatedRoot("/Users/Shared");
-      writeFileSync(
-        join(cliRoot.home, ".fx", "settings.json"),
-        JSON.stringify({ sandbox: "os", permission: {}, maxxing_mode: "legacy" }),
-      );
-      const cliMarker = join(cliRoot.workspace, "cli-preflight-must-not-run.txt");
-      const cliCommand = `npm install && printf preflight > ${shellQuote(cliMarker)}`;
-      const cliGateway = startFakeGateway(
-        [toolCall(cliCommand), finalText("CLI preflight denial complete")],
-        {
-          classifierResponses: [
-            permissionDecision("allow", "cli_initial_review"),
-            permissionDecision("ask", "cli_widening_review"),
-          ],
-        },
-      );
-      const cliResult = await runFx(
-        ["ask", "--auto", "--quiet", "--json", "--no-save", "Install the CLI fixture."],
-        {
-          cwd: cliRoot.workspace,
-          env: gatewayEnv(cliRoot, cliGateway, { TMPDIR: "/private/tmp" }),
-          timeoutMs: TIMEOUT,
-        },
-      );
-
-      expect(cliResult.code).toBe(0);
-      const cliJson = JSON.parse(cliResult.stdout.trim()) as any;
-      expect(cliJson.output).toContain("CLI preflight denial complete");
-      expect(cliJson.tool_calls).toHaveLength(1);
-      expect(cliJson.tool_calls[0]).toEqual(
-        expect.objectContaining({ name: "terminal", status: "error" }),
-      );
-      expect(cliResult.stdout).not.toContain("sandbox_scope_required");
-      expect(existsSync(cliMarker)).toBe(false);
-      expect(cliGateway.classifierRequests).toHaveLength(2);
-      expect(cliGateway.requests).toHaveLength(2);
-
-      const acpRoot = createIsolatedRoot("/Users/Shared");
-      writeFileSync(
-        join(acpRoot.home, ".fx", "settings.json"),
-        JSON.stringify({ sandbox: "os", permission: {}, maxxing_mode: "legacy" }),
-      );
-      const acpMarker = join(acpRoot.workspace, "acp-preflight-must-not-run.txt");
-      const acpCommand = `npm install && printf preflight > ${shellQuote(acpMarker)}`;
-      const acpGateway = startFakeGateway(
-        [toolCall(acpCommand), finalText("ACP preflight denial complete")],
-        {
-          classifierResponses: [
-            permissionDecision("allow", "acp_initial_review"),
-            permissionDecision("ask", "acp_widening_review"),
-          ],
-        },
-      );
-      activeClient = AcpClient.create(
-        acpRoot.workspace,
-        gatewayEnv(acpRoot, acpGateway, { TMPDIR: "/private/tmp" }),
-      );
-      await startAcpSession(activeClient, "code");
-      const acpMessages = await runAcpPrompt(activeClient, "Install the ACP fixture.");
-      await activeClient.close();
-      activeClient = null;
-
-      const serialized = JSON.stringify(acpMessages);
-      expect(serialized).toContain("ACP preflight denial complete");
-      expect((serialized.match(/\"status\":\"failed\"/g) ?? [])).toHaveLength(1);
-      expect((serialized.match(/\"status\":\"completed\"/g) ?? [])).toHaveLength(0);
-      expect(serialized).not.toContain("sandbox_scope_required");
-      expect(existsSync(acpMarker)).toBe(false);
-      expect(acpGateway.classifierRequests).toHaveLength(2);
-      expect(acpGateway.requests).toHaveLength(2);
-    },
-    90_000,
-  );
-
-  test.skipIf(process.platform !== "darwin")(
-    "fx ask and ACP retain reactive sandbox command evidence",
-    async () => {
-      const runSurface = async (surface: "cli" | "acp") => {
-        const root = createIsolatedRoot("/Users/Shared");
-        writeFileSync(
-          join(root.home, ".fx", "settings.json"),
-          JSON.stringify({ sandbox: "os", permission: {}, maxxing_mode: "legacy" }),
-        );
-        const workspaceMarker = join(root.workspace, `${surface}-reactive-effect.txt`);
-        const outsideDir = join(root.home, ".cache");
-        const outsideMarker = join(outsideDir, `${surface}-outside-must-not-exist.txt`);
-        const retainedOutput = `FX_${surface.toUpperCase()}_REACTIVE_RESULT_RETAINED`;
-        mkdirSync(outsideDir, { recursive: true });
-        const command = [
-          `printf workspace > ${shellQuote(workspaceMarker)}`,
-          `printf '${retainedOutput}\\n'`,
-          `printf outside > ${shellQuote(outsideMarker)}`,
-        ].join("; ");
-        const gateway = startFakeGateway(
-          [toolCall(command), finalText(`${surface} reactive denial complete`)],
-          {
-            classifierResponses: [
-              permissionDecision("allow", `${surface}_initial_review`),
-              permissionDecision("ask", `${surface}_widening_review`),
-            ],
-          },
-        );
-
-        if (surface === "cli") {
-          const result = await runFx(
-            ["ask", "--auto", "--quiet", "--json", "--no-save", "Run the reactive CLI fixture."],
-            {
-              cwd: root.workspace,
-              env: gatewayEnv(root, gateway, { TMPDIR: "/private/tmp" }),
-              timeoutMs: TIMEOUT,
-            },
-          );
-          expect(result.code).toBe(0);
-          const json = JSON.parse(result.stdout.trim()) as any;
-          expect(json.tool_calls).toHaveLength(1);
-          expect(json.tool_calls[0]).toEqual(
-            expect.objectContaining({
-              name: "terminal",
-              status: "error",
-              command_result: expect.objectContaining({
-                kind: "foreground",
-                exit_code: 1,
-                stdout_bytes: Buffer.byteLength(retainedOutput) + 1,
-              }),
-            }),
-          );
-        } else {
-          activeClient = AcpClient.create(
-            root.workspace,
-            gatewayEnv(root, gateway, { TMPDIR: "/private/tmp" }),
-          );
-          await startAcpSession(activeClient, "code");
-          const messages = await runAcpPrompt(activeClient, "Run the reactive ACP fixture.");
-          await activeClient.close();
-          activeClient = null;
-          const serialized = JSON.stringify(messages);
-          expect((serialized.match(/\"status\":\"failed\"/g) ?? [])).toHaveLength(1);
-          expect(serialized).toContain('"command_result"');
-          expect(serialized).toContain('"exit_code":1');
-          expect(serialized).toContain(
-            `"stdout_bytes":${Buffer.byteLength(retainedOutput) + 1}`,
-          );
-        }
-
-        expect(readFileSync(workspaceMarker, "utf8")).toBe("workspace");
-        expect(existsSync(outsideMarker)).toBe(false);
-        expect(gateway.classifierRequests).toHaveLength(2);
-        expect(gateway.requests).toHaveLength(2);
-        expect(gateway.requests[1]!.body).toContain(retainedOutput);
-      };
-
-      await runSurface("cli");
-      await runSurface("acp");
-    },
-    90_000,
-  );
-
   test(
     "fx ask and ACP send large automatic review packets before execution",
     async () => {
@@ -6752,7 +6244,6 @@ describe("effect-aware command permissions", () => {
         JSON.stringify({
           sandbox: "none",
           permission: { bash: { pwd: "allow" } },
-          maxxing_mode: "legacy",
         }),
       );
       const gateway = startFakeGateway([

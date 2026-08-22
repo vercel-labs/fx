@@ -101,53 +101,6 @@ pub const Foreground = struct {
     }
 };
 
-pub const Sandbox = struct {
-    pub fn retryUnavailableFailure(
-        arena: Allocator,
-        command: []const u8,
-        cwd: []const u8,
-        result: command_contract.RunCommandResult,
-    ) !ToolExecutionResult {
-        const output = try std.fmt.allocPrint(
-            arena,
-            "sandbox_denied=true\n" ++
-                "mode=headless\n" ++
-                "sandbox_retry_available=false\n" ++
-                "reason=no_permission_ui\n" ++
-                "permission=sandbox\n" ++
-                "message=OS sandbox denied the command. Broader file access cannot be requested in noninteractive mode; rerun in the interactive shell to approve a sandbox retry or adjust sandbox configuration.\n" ++
-                "original_result:\n{s}",
-            .{result.output},
-        );
-        return .{
-            .status = .failure,
-            .model_output = output,
-            .command_result_json = try deniedCommandResult(command, cwd, result.command_result).toJson(arena),
-        };
-    }
-
-    pub fn preflightUnavailableFailure(
-        arena: Allocator,
-        command: []const u8,
-        cwd: []const u8,
-    ) !ToolExecutionResult {
-        const output = try arena.dupe(
-            u8,
-            "sandbox_permission_required=true\n" ++
-                "mode=headless\n" ++
-                "sandbox_retry_available=false\n" ++
-                "reason=no_permission_ui\n" ++
-                "permission=sandbox\n" ++
-                "message=This command needs broader file access before running. Noninteractive mode cannot ask for that sandbox approval; rerun in the interactive shell to approve it or adjust sandbox configuration.\n",
-        );
-        return .{
-            .status = .failure,
-            .model_output = output,
-            .command_result_json = try deniedCommandResult(command, cwd, null).toJson(arena),
-        };
-    }
-};
-
 pub const Background = struct {
     pub fn persistenceUnavailableFailure(arena: Allocator) !ToolExecutionResult {
         const output = try arena.dupe(
@@ -359,26 +312,6 @@ fn extractEnvelope(output: []const u8, open: []const u8, close: []const u8) []co
     return body[0..end];
 }
 
-fn deniedCommandResult(
-    command: []const u8,
-    cwd: []const u8,
-    result: ?command_contract.CommandResult,
-) command_contract.CommandResult {
-    const existing = result orelse return .{ .foreground = .{
-        .command = command,
-        .cwd = cwd,
-        .sandbox_denied = true,
-    } };
-    return switch (existing) {
-        .foreground => |foreground| blk: {
-            var denied = foreground;
-            denied.sandbox_denied = true;
-            break :blk .{ .foreground = denied };
-        },
-        .background => existing,
-    };
-}
-
 fn elapsedMs(started_ms: i64, finished_ms: i64) u64 {
     return if (finished_ms > started_ms) @intCast(finished_ms - started_ms) else 0;
 }
@@ -433,7 +366,7 @@ test "cancelled command mapping survives metadata serialization failure" {
     );
 }
 
-test "command result mapping preserves timeout and headless sandbox JSON" {
+test "command result mapping preserves timeout JSON" {
     const alloc = std.testing.allocator;
     const timeout = try Foreground.timeoutFailure(
         alloc,
@@ -449,19 +382,6 @@ test "command result mapping preserves timeout and headless sandbox JSON" {
         timeout.model_output,
     );
     try expectContains(timeout.command_result_json.?, "\"timed_out\":true");
-
-    const sandbox = try Sandbox.retryUnavailableFailure(alloc, "npm test", "/tmp/workspace", .{
-        .output = "Operation not permitted",
-        .command_result = .{ .foreground = .{
-            .command = "npm test",
-            .cwd = "/tmp/workspace",
-            .exit_code = 1,
-        } },
-    });
-    defer alloc.free(sandbox.model_output);
-    defer alloc.free(sandbox.command_result_json.?);
-    try expectContains(sandbox.model_output, "sandbox_retry_available=false\n");
-    try expectContains(sandbox.command_result_json.?, "\"sandbox_denied\":true");
 }
 
 test "command result mapping projects background reuse output and JSON" {

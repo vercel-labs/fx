@@ -29,9 +29,23 @@ USE_FLAGS = (
     "--disable-vp",
     "-pgo-kind=pgo-instr-use-pipeline",
     "-pgo-cold-func-opt=minsize",
-    "-profile-summary-cutoff-cold=990000",
-    "-passes=default<O2>",
+    "-profile-summary-cutoff-cold=600000",
+    "-passes=default<O2>,mergefunc,iroutliner",
 )
+
+BENCHMARK_USE_FLAGS = (
+    "--disable-vp",
+    "-pgo-kind=pgo-instr-use-pipeline",
+    "-pgo-cold-func-opt=minsize",
+    "-profile-summary-cutoff-cold=990000",
+    "-passes=default<O2>,mergefunc,iroutliner",
+)
+
+FX_MACHINE_OUTLINER_FLAGS = (
+    "-machine-outliner-reruns=1",
+)
+
+CANDIDATE_SIGNING_PAGE_SIZE = 16 * 1024
 
 PROFILE_SECTION_ALIGNMENTS = (
     "-Wl,-sectalign,__DATA,__llvm_prf_cnts,0x4000",
@@ -302,9 +316,10 @@ def profile_use_argv(
     profile_path: pathlib.Path | None = None,
 ) -> tuple[str, ...]:
     profile = profile_path or paths.merged_profile
+    flags = USE_FLAGS if paths.selector == "fx" else BENCHMARK_USE_FLAGS
     return (
         str(toolchain.opt),
-        *USE_FLAGS,
+        *flags,
         f"-profile-file={profile}",
         str(paths.bitcode),
         "-o",
@@ -359,6 +374,24 @@ def candidate_link_argv(
         "-o",
         str(paths.candidate_binary),
         "-lc",
+    )
+
+
+def candidate_object_argv(
+    toolchain: Toolchain,
+    paths: PipelinePaths,
+) -> tuple[str, ...]:
+    # A second AArch64 outliner pass can fold sequences exposed by the first.
+    # Keep benchmark artifacts on their established code-generation contract.
+    outliner_flags = FX_MACHINE_OUTLINER_FLAGS if paths.selector == "fx" else ()
+    return (
+        str(toolchain.llc),
+        "-filetype=obj",
+        "-O=2",
+        *outliner_flags,
+        str(paths.profile_use_bitcode),
+        "-o",
+        str(paths.profile_use_object),
     )
 
 
@@ -766,14 +799,7 @@ def link_candidate(
         verify_release_safe_ir(paths.profile_use_ir)
 
     run_checked(
-        (
-            str(toolchain.llc),
-            "-filetype=obj",
-            "-O=2",
-            str(paths.profile_use_bitcode),
-            "-o",
-            str(paths.profile_use_object),
-        ),
+        candidate_object_argv(toolchain, paths),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,
@@ -804,6 +830,25 @@ def link_candidate(
         require_empty_stderr=True,
     )
     _require_nonempty_file(paths.candidate_binary, "stripped candidate executable")
+    run_checked(
+        (
+            str(toolchain.codesign),
+            "--force",
+            "--sign",
+            "-",
+            "--options",
+            "linker-signed",
+            "--pagesize",
+            str(CANDIDATE_SIGNING_PAGE_SIZE),
+            str(paths.candidate_binary),
+        ),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=120,
+        log_path=paths.logs / "resign-candidate.json",
+        require_empty_stderr=False,
+    )
+    _require_nonempty_file(paths.candidate_binary, "re-signed candidate executable")
     return paths.candidate_binary
 
 

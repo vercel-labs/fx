@@ -58,7 +58,7 @@ function createIsolatedRoot(baseDir = tmpdir()): IsolatedRoot {
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({ sandbox: "none", permission: {}, maxxing_mode: "legacy" }),
+    JSON.stringify({ sandbox: "none", permission: {} }),
   );
   roots.push(root);
   return { root, home, workspace: realpathSync(workspace) };
@@ -83,6 +83,53 @@ function gatewayEnv(
 
 function commandCall(command: string, id: string) {
   return fakeGatewayToolCall(id, "terminal", { action: "exec", command });
+}
+
+function cleanCommandCall(command: string, id: string) {
+  return fakeGatewayToolCall(id, "terminal", {
+    action: "exec",
+    command,
+    profile: "clean",
+  });
+}
+
+function toolResultText(body: string, toolCallId: string): string {
+  const request = JSON.parse(body) as {
+    prompt?: Array<{ content?: Array<Record<string, unknown>> }>;
+  };
+  const result = (request.prompt ?? [])
+    .flatMap((message) => message.content ?? [])
+    .find((part) => part.type === "tool-result" && part.toolCallId === toolCallId);
+  expect(result).toBeDefined();
+  const output = result!.output as Record<string, unknown>;
+  expect(output.type).toBe("text");
+  expect(typeof output.value).toBe("string");
+  return output.value as string;
+}
+
+function installRecorder(root: IsolatedRoot, name: string, marker: string) {
+  const bin = join(root.root, "bin");
+  mkdirSync(bin, { recursive: true });
+  const executable = join(bin, name);
+  writeFileSync(
+    executable,
+    `#!/bin/sh\nprintf '%s:%s\\n' ${JSON.stringify(name)} "$*" >> ${JSON.stringify(marker)}\n`,
+  );
+  chmodSync(executable, 0o755);
+  return bin;
+}
+
+function runGit(cwd: string, args: string[]) {
+  const result = Bun.spawnSync(["/usr/bin/git", ...args], {
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  expect(
+    result.exitCode,
+    `git ${args.join(" ")} failed: ${result.stderr.toString()}`,
+  ).toBe(0);
+  return result.stdout.toString();
 }
 
 function startGateway(
@@ -121,7 +168,6 @@ describe("lean auto mode reliability", () => {
         JSON.stringify({
           sandbox: "none",
           permission: { bash: { pwd: "allow" } },
-          maxxing_mode: "legacy",
         }),
       );
       const gateway = startGateway(
@@ -148,6 +194,66 @@ describe("lean auto mode reliability", () => {
       expect(json.tool_calls).toContainEqual(
         expect.objectContaining({ name: "terminal", status: "success" }),
       );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "configured wildcard commands cannot absorb shell operators or substitutions",
+    async () => {
+      const root = createIsolatedRoot();
+      const operatorMarker = join(root.workspace, "operator-bypass-must-not-run");
+      const substitutionMarker = join(
+        root.workspace,
+        "substitution-bypass-must-not-run",
+      );
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          sandbox: "none",
+          permission: { "*": { "printf *": "allow" } },
+        }),
+      );
+      const gateway = startGateway(
+        [
+          commandCall(
+            `printf safe && touch ${JSON.stringify(operatorMarker)}`,
+            "operator_bypass",
+          ),
+          (body) => {
+            expect(body).toContain("auto_denied");
+            return commandCall(
+              `printf "$(touch ${substitutionMarker})"`,
+              "substitution_bypass",
+            );
+          },
+          (body) => {
+            expect(body).toContain("auto_denied");
+            return commandCall("printf safe", "static_command");
+          },
+          fakeGatewayFinalText("static command complete"),
+        ],
+        [
+          fakeGatewayPermissionDecision("ask", "operator_requires_review"),
+          fakeGatewayPermissionDecision("ask", "substitution_requires_review"),
+        ],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Exercise configured commands safely."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(existsSync(operatorMarker)).toBe(false);
+      expect(existsSync(substitutionMarker)).toBe(false);
+      expect(gateway.classifierRequests).toHaveLength(2);
+      expect(gateway.requests).toHaveLength(4);
+      expect(result.stdout).toContain("static command complete");
     },
     TIMEOUT,
   );
@@ -186,6 +292,423 @@ describe("lean auto mode reliability", () => {
       expect(json.tool_calls).toContainEqual(
         expect.objectContaining({ name: "terminal", status: "success" }),
       );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "clean direct reads bypass review and PATH while destructive commands stay blocked",
+    async () => {
+      const root = createIsolatedRoot();
+      runGit(root.workspace, ["init", "--quiet"]);
+      const shadowMarker = join(root.root, "shadow-git-must-not-run");
+      const shadowBin = installRecorder(root, "git", shadowMarker);
+      const gateway = startGateway(
+        [
+          fakeGatewaySse([
+            {
+              type: "tool-call",
+              toolCallId: "clean_direct_pwd",
+              toolName: "terminal",
+              input: { action: "exec", command: "pwd", profile: "clean" },
+            },
+            {
+              type: "tool-call",
+              toolCallId: "clean_direct_git_status",
+              toolName: "terminal",
+              input: {
+                action: "exec",
+                command: "git status --short",
+                profile: "clean",
+              },
+            },
+            {
+              type: "tool-call",
+              toolCallId: "clean_blocked_reset",
+              toolName: "terminal",
+              input: {
+                action: "exec",
+                command: "git reset --hard",
+                profile: "clean",
+              },
+            },
+            {
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool-calls" },
+            },
+          ]),
+          (body) => {
+            expect(toolResultText(body, "clean_direct_pwd")).toContain("exit_code=0");
+            expect(toolResultText(body, "clean_direct_git_status")).toContain("exit_code=0");
+            expect(toolResultText(body, "clean_blocked_reset")).toContain("auto_denied");
+            return fakeGatewayFinalText("Clean command group complete.");
+          },
+        ],
+        [fakeGatewayPermissionDecision("ask", "must_not_review_clean_reads")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Run the mixed clean command group."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${shadowBin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(
+        result.code,
+        `stdout: ${result.stdout}\nstderr: ${result.stderr}`,
+      ).toBe(0);
+      expect(result.stderr).not.toContain("panic");
+      expect(result.stderr).not.toContain("error:");
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.classifierRequests).toHaveLength(0);
+      expect(existsSync(shadowMarker)).toBe(false);
+      const json = JSON.parse(result.stdout.trim()) as {
+        tool_calls: Array<{ name: string; status: string }>;
+      };
+      const terminalStatuses = json.tool_calls
+        .filter(({ name }) => name === "terminal")
+        .map(({ status }) => status);
+      expect(terminalStatuses.filter((status) => status === "success")).toHaveLength(2);
+      expect(terminalStatuses.filter((status) => status === "error")).toHaveLength(1);
+      expect(result.stdout).toContain("Clean command group complete.");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "direct destructive commands replan before reviewer allow",
+    async () => {
+      for (const [name, command] of [
+        ["rm", "rm disposable.txt"],
+        ["rmdir", "rmdir disposable-dir"],
+        ["unlink", "unlink disposable-link"],
+        ["shred", "shred disposable.txt"],
+        ["git_clean", "git clean -fd"],
+        ["git_rm", "git rm tracked.txt"],
+        ["git_rm_separator", "git rm -- -n"],
+        ["git_clean_separator", "git clean -f -- -n"],
+        ["git_clean_exclude_short", "git clean -f -e --dry-run"],
+        ["git_clean_exclude_long", "git clean -f --exclude --dry-run"],
+        ["git_reset", "git reset --hard HEAD~1"],
+        ["git_reset_boundary", "git reset --hard; printf ok"],
+        ["compound_rm", "pwd && rm compound.txt"],
+        ["rm_boundary", "rm victim; printf ok"],
+        ["escaped_space_rm", "printf foo\\ #bar; rm victim"],
+      ] as const) {
+        const root = createIsolatedRoot();
+        const marker = join(root.root, `${name}-must-not-run`);
+        let bin = installRecorder(root, "rm", marker);
+        for (const executable of ["rmdir", "unlink", "shred", "git"]) {
+          bin = installRecorder(root, executable, marker);
+        }
+        const gateway = startGateway(
+          [
+            cleanCommandCall(command, `deterministic_${name}`),
+            (body) => {
+              expect(body).toContain("auto_denied");
+              return fakeGatewayFinalText(`${name} replanned`);
+            },
+          ],
+          [fakeGatewayPermissionDecision("allow", `must_not_review_${name}`)],
+        );
+
+        const result = await runFx(
+          ["ask", "--quiet", "--json", "--no-save", `Exercise ${name} safely.`],
+          {
+            cwd: root.workspace,
+            env: {
+              ...gatewayEnv(root, gateway),
+              PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+            },
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(
+          result.code,
+          `command: ${command}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+        ).toBe(0);
+        expect(result.stdout).toContain(`${name} replanned`);
+        expect(gateway.classifierRequests).toHaveLength(0);
+        expect(gateway.requests).toHaveLength(2);
+        expect(existsSync(marker)).toBe(false);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "delete_file replans before reviewer allow and preserves the file",
+    async () => {
+      const root = createIsolatedRoot();
+      const target = join(root.workspace, "keep.txt");
+      writeFileSync(target, "keep\n");
+      const gateway = startGateway(
+        [
+          fakeGatewayToolCall("deterministic_delete", "delete_file", {
+            path: target,
+          }),
+          (body) => {
+            expect(body).toContain("auto_denied");
+            return fakeGatewayFinalText("delete replanned");
+          },
+        ],
+        [fakeGatewayPermissionDecision("allow", "must_not_review_delete")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Keep the file intact."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("delete replanned");
+      expect(gateway.classifierRequests).toHaveLength(0);
+      expect(readFileSync(target, "utf8")).toBe("keep\n");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "git checkout hooks remain reviewer owned",
+    async () => {
+      for (const hookMode of ["default", "configured"] as const) {
+        const root = createIsolatedRoot();
+        runGit(root.workspace, ["init", "--quiet", "--initial-branch=main"]);
+        runGit(root.workspace, ["config", "user.name", "Fixture"]);
+        runGit(root.workspace, ["config", "user.email", "fixture@example.com"]);
+        writeFileSync(join(root.workspace, "tracked.txt"), "main\n");
+        runGit(root.workspace, ["add", "tracked.txt"]);
+        runGit(root.workspace, ["commit", "--quiet", "-m", "initial"]);
+        runGit(root.workspace, ["branch", "feature/repro"]);
+
+        const marker = join(root.root, `${hookMode}-checkout-hook-must-not-run`);
+        const hooks = hookMode === "default"
+          ? join(root.workspace, ".git", "hooks")
+          : join(root.root, "configured-hooks");
+        mkdirSync(hooks, { recursive: true });
+        if (hookMode === "configured") {
+          runGit(root.workspace, ["config", "core.hooksPath", hooks]);
+        }
+        const hook = join(hooks, "post-checkout");
+        writeFileSync(
+          hook,
+          `#!/bin/sh\nprintf hook > ${JSON.stringify(marker)}\n`,
+        );
+        chmodSync(hook, 0o755);
+
+        const gateway = startGateway(
+          [
+            cleanCommandCall("git checkout feature/repro", `${hookMode}_checkout`),
+            (body) => {
+              expect(body).toContain("auto_denied");
+              return fakeGatewayFinalText("checkout remained blocked");
+            },
+          ],
+          [fakeGatewayPermissionDecision("ask", `${hookMode}_checkout_review`)],
+        );
+        const result = await runFx(
+          ["ask", "--quiet", "--json", "--no-save", "Do not run repository hooks."],
+          {
+            cwd: root.workspace,
+            env: gatewayEnv(root, gateway),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+        expect(gateway.classifierRequests).toHaveLength(1);
+        expect(existsSync(marker)).toBe(false);
+        expect(runGit(root.workspace, ["branch", "--show-current"]).trim()).toBe("main");
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "git pull post-merge hook remains reviewer owned",
+    async () => {
+      const root = createIsolatedRoot();
+      const remote = join(root.root, "remote.git");
+      const seed = join(root.root, "seed");
+      const probe = join(root.root, "probe");
+      mkdirSync(seed);
+      runGit(root.root, ["init", "--quiet", "--bare", remote]);
+      runGit(seed, ["init", "--quiet", "--initial-branch=main"]);
+      runGit(seed, ["config", "user.name", "Fixture"]);
+      runGit(seed, ["config", "user.email", "fixture@example.com"]);
+      writeFileSync(join(seed, "tracked.txt"), "initial\n");
+      runGit(seed, ["add", "tracked.txt"]);
+      runGit(seed, ["commit", "--quiet", "-m", "initial"]);
+      runGit(seed, ["remote", "add", "origin", remote]);
+      runGit(seed, ["push", "--quiet", "-u", "origin", "main"]);
+      runGit(root.root, [
+        `--git-dir=${remote}`,
+        "symbolic-ref",
+        "HEAD",
+        "refs/heads/main",
+      ]);
+      runGit(root.root, ["clone", "--quiet", remote, root.workspace]);
+      runGit(root.root, ["clone", "--quiet", remote, probe]);
+
+      const blockedMarker = join(root.root, "pull-hook-must-not-run");
+      const probeMarker = join(root.root, "pull-hook-qualification-ran");
+      for (const [repository, marker] of [
+        [root.workspace, blockedMarker],
+        [probe, probeMarker],
+      ] as const) {
+        const hook = join(repository, ".git", "hooks", "post-merge");
+        writeFileSync(
+          hook,
+          `#!/bin/sh\nprintf hook > ${JSON.stringify(marker)}\n`,
+        );
+        chmodSync(hook, 0o755);
+      }
+
+      writeFileSync(join(seed, "tracked.txt"), "updated\n");
+      runGit(seed, ["add", "tracked.txt"]);
+      runGit(seed, ["commit", "--quiet", "-m", "update"]);
+      runGit(seed, ["push", "--quiet", "origin", "main"]);
+      runGit(probe, ["pull", "--quiet", "--ff-only"]);
+      expect(existsSync(probeMarker)).toBe(true);
+
+      const gateway = startGateway(
+        [
+          cleanCommandCall("git pull --ff-only", "pull_with_hook"),
+          (body) => {
+            expect(body).toContain("auto_denied");
+            return fakeGatewayFinalText("pull remained blocked");
+          },
+        ],
+        [fakeGatewayPermissionDecision("ask", "pull_hook_review")],
+      );
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Do not run pull hooks."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(existsSync(blockedMarker)).toBe(false);
+      expect(readFileSync(join(root.workspace, "tracked.txt"), "utf8")).toBe(
+        "initial\n",
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "rtk remains reviewer owned as an unresolved executable boundary",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "rtk-must-not-run");
+      const bin = installRecorder(root, "rtk", marker);
+      const gateway = startGateway(
+        [
+          cleanCommandCall("rtk git status --short", "review_rtk"),
+          (body) => {
+            expect(body).toContain("auto_denied");
+            return fakeGatewayFinalText("rtk remained blocked");
+          },
+        ],
+        [fakeGatewayPermissionDecision("ask", "rtk_review")],
+      );
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Do not run unresolved wrappers."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "existing replacement and startup targets remain reviewer owned",
+    async () => {
+      const root = createIsolatedRoot();
+      const copySource = join(root.root, "copy-source.txt");
+      const copyDestination = join(root.root, "copy-destination.txt");
+      const renameSource = join(root.root, "rename-source.txt");
+      const renameDestination = join(root.root, "rename-destination.txt");
+      const startup = join(root.home, ".zshrc");
+      writeFileSync(copySource, "copy source\n");
+      writeFileSync(copyDestination, "copy destination\n");
+      writeFileSync(renameSource, "rename source\n");
+      writeFileSync(renameDestination, "rename destination\n");
+      writeFileSync(startup, "startup before\n");
+
+      const gateway = startGateway(
+        [
+          fakeGatewayToolCall("review_copy", "copy_file", {
+            source: copySource,
+            destination: copyDestination,
+          }),
+          (body) => {
+            expect(body).toContain("auto_denied");
+            return fakeGatewayToolCall("review_rename", "rename_file", {
+              old_path: renameSource,
+              new_path: renameDestination,
+            });
+          },
+          (body) => {
+            expect(body).toContain("auto_denied");
+            return fakeGatewayToolCall("review_startup", "write_file", {
+              path: startup,
+              content: "startup after\n",
+            });
+          },
+          (body) => {
+            expect(body).toContain("auto_denied");
+            return fakeGatewayFinalText("replacement effects stayed blocked");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("ask", "copy_review"),
+          fakeGatewayPermissionDecision("ask", "rename_review"),
+          fakeGatewayPermissionDecision("ask", "startup_review"),
+        ],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Preserve every existing target."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(3);
+      expect(readFileSync(copySource, "utf8")).toBe("copy source\n");
+      expect(readFileSync(copyDestination, "utf8")).toBe("copy destination\n");
+      expect(readFileSync(renameSource, "utf8")).toBe("rename source\n");
+      expect(readFileSync(renameDestination, "utf8")).toBe("rename destination\n");
+      expect(readFileSync(startup, "utf8")).toBe("startup before\n");
     },
     TIMEOUT,
   );
@@ -275,7 +798,6 @@ describe("lean auto mode reliability", () => {
         JSON.stringify({
           sandbox: "none",
           permission: { bash: { pwd: "allow" } },
-          maxxing_mode: "legacy",
         }),
       );
       const rejectedMarker = join(root.workspace, "rejected-action-must-not-run");
@@ -316,7 +838,7 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
-    "headless auto mode requires approval for the next action after three blocks",
+    "headless auto mode finishes normally after four blocked response groups",
     async () => {
       const root = createIsolatedRoot();
       const markers = Array.from(
@@ -335,7 +857,7 @@ describe("lean auto mode reliability", () => {
           }),
         ],
         Array.from(
-          { length: 3 },
+          { length: 4 },
           (_, index) => fakeGatewayPermissionDecision("ask", `blocked_review_${index + 1}`),
         ),
       );
@@ -349,12 +871,57 @@ describe("lean auto mode reliability", () => {
         },
       );
 
-      expect(result.code).toBe(1);
-      expect(result.stderr).toContain("permission required");
-      expect(result.stderr).toContain("noninteractive_permission_prompt_unavailable");
+      expect(result.code).toBe(0);
+      expect(result.stderr).not.toContain("permission required");
+      expect(result.stderr).not.toContain("noninteractive_permission_prompt_unavailable");
       expect(gateway.requests).toHaveLength(4);
-      expect(gateway.classifierRequests).toHaveLength(3);
+      expect(gateway.classifierRequests).toHaveLength(4);
+      const json = JSON.parse(result.stdout.trim()) as {
+        output: string;
+        steps: number;
+      };
+      expect(json.output).toContain(
+        "I couldn't continue because the required actions were blocked by automatic safety checks.",
+      );
+      expect(json.steps).toBe(4);
       for (const marker of markers) expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "standalone quiet stays silent after automatic recovery exhaustion",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.workspace, "quiet-recovery-must-not-run");
+      const command = `touch ${JSON.stringify(marker)}`;
+      const gateway = startGateway(
+        Array.from({ length: 4 }, (_, index) => (body?: string) => {
+          if (index > 0) expect(body).toContain("auto_denied");
+          return commandCall(command, `quiet_blocked_${index + 1}`);
+        }),
+        [fakeGatewayPermissionDecision("ask", "quiet_blocked_review")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--no-save", "Try the blocked action safely."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).not.toContain("permission required");
+      expect(result.stderr).not.toContain("NonInteractivePermissionRequired");
+      expect(result.stderr).not.toContain(
+        "I couldn't continue because the required actions were blocked by automatic safety checks.",
+      );
+      expect(gateway.requests).toHaveLength(4);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(existsSync(marker)).toBe(false);
     },
     TIMEOUT,
   );
@@ -408,7 +975,6 @@ describe("lean auto mode reliability", () => {
         JSON.stringify({
           sandbox: "none",
           permission: { bash: { pwd: "allow" } },
-          maxxing_mode: "legacy",
         }),
       );
       const markers = Array.from(
@@ -468,58 +1034,6 @@ describe("lean auto mode reliability", () => {
     TIMEOUT,
   );
 
-  test.skipIf(process.platform !== "darwin")(
-    "headless sandbox widening requires approval after three blocks",
-    async () => {
-      const root = createIsolatedRoot("/Users/Shared");
-      const marker = join(root.workspace, "sandbox-widening-must-not-run");
-      const command = `npm install && printf blocked > ${JSON.stringify(marker)}`;
-      writeFileSync(
-        join(root.home, ".fx", "settings.json"),
-        JSON.stringify({
-          sandbox: "os",
-          permission: { bash: { [command]: "allow" } },
-          maxxing_mode: "legacy",
-        }),
-      );
-      const gateway = startGateway(
-        [
-          ...Array.from({ length: 4 }, (_, index) => (body?: string) => {
-            if (index > 0) expect(body).toContain("auto_denied");
-            if (index === 3) expect(body).not.toContain('"tools":[]');
-            return commandCall(command, `sandbox_widening_${index + 1}`);
-          }),
-        ],
-        [
-          fakeGatewayPermissionDecision("ask", "sandbox_review_1"),
-          fakeGatewayFinalText("malformed reviewer output"),
-          fakeGatewayPermissionDecision("ask", "sandbox_review_3"),
-        ],
-      );
-
-      const result = await runFx(
-        ["ask", "--quiet", "--json", "--no-save", "Install the dependencies."],
-        {
-          cwd: root.workspace,
-          env: { ...gatewayEnv(root, gateway), TMPDIR: "/private/tmp" },
-          timeoutMs: TIMEOUT,
-        },
-      );
-
-      expect(result.code).toBe(1);
-      expect(result.stderr).toContain("permission required");
-      expect(result.stderr).toContain("noninteractive_permission_prompt_unavailable");
-      expect(gateway.requests).toHaveLength(4);
-      expect(gateway.classifierRequests).toHaveLength(3);
-      for (const request of gateway.classifierRequests) {
-        expect(request.body).toContain("phase: preflight");
-        expect(request.body).toContain("action: sandbox_widening");
-      }
-      expect(existsSync(marker)).toBe(false);
-    },
-    TIMEOUT,
-  );
-
   test.skipIf(!tmuxAvailable())(
     "a prompt-capable host also lets the agent recover before asking the user",
     async () => {
@@ -529,7 +1043,6 @@ describe("lean auto mode reliability", () => {
         JSON.stringify({
           sandbox: "none",
           permission: { bash: { pwd: "allow" } },
-          maxxing_mode: "legacy",
         }),
       );
       const rejectedMarker = join(root.workspace, "tui-rejected-action-must-not-run");
@@ -589,7 +1102,6 @@ describe("lean auto mode reliability", () => {
         JSON.stringify({
           sandbox: "none",
           permission: { bash: { [allowedCommand]: "ask" } },
-          maxxing_mode: "legacy",
         }),
       );
       const gateway = startGateway([
@@ -805,7 +1317,6 @@ describe("lean auto mode reliability", () => {
         JSON.stringify({
           sandbox: "none",
           permission: { bash: { [blockedCommand]: "allow", pwd: "allow" } },
-          maxxing_mode: "legacy",
         }),
       );
       const gateway = startGateway([

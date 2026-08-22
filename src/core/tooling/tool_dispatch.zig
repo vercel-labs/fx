@@ -4,7 +4,6 @@ const command_admission = @import("../permissions/command_admission.zig");
 const core_permissions = @import("../permissions/permissions.zig");
 const core_types = @import("../shared/types.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
-const devbox_executor = @import("../execution/devbox_executor.zig");
 const command_environment = @import("../execution/command_environment.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
 const io_mod = @import("../shared/io.zig");
@@ -14,7 +13,7 @@ const permission_gate = @import("../permissions/permission_gate.zig");
 const change_tracker = @import("../workspace/change_tracker.zig");
 const read_tracker_mod = @import("../workspace/read_tracker.zig");
 const session_child_store = @import("../session/session_child_store.zig");
-const sandbox = @import("../permissions/sandbox.zig");
+const command_runner = @import("../execution/command_runner.zig");
 const subagent_tool_provider = @import("../subagent/tool_provider.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const web_fetch_runtime = @import("web_fetch_runtime.zig");
@@ -52,6 +51,10 @@ pub const web_search_unavailable_message = "web_search is unavailable: no local 
 pub const web_fetch_unavailable_message = "web_fetch is unavailable: no local WebFetch runtime is installed";
 pub const terminal_unavailable_message =
     "{\"error\":{\"tool\":\"terminal\",\"code\":\"unsupported_host\",\"retryable\":false}}";
+const terminal_saved_session_required_message =
+    "Durable terminal actions require a saved fx session.";
+const terminal_saved_session_required_suggestion =
+    "Use terminal.exec, or rerun without --no-save.";
 
 pub const ToolCapabilities = struct {
     web_search_runtime_ready: bool = false,
@@ -211,7 +214,7 @@ pub const DispatchContext = struct {
     cancel_flag: ?*std.atomic.Value(bool) = null,
     output_chunk_lifecycle_id: ?core_types.ToolLifecycleId = null,
     output_chunk_ctx: ?*anyopaque = null,
-    on_output_chunk: ?sandbox.CommandOutputCallback = null,
+    on_output_chunk: ?command_runner.CommandOutputCallback = null,
     background_ctx: ?*background_runtime.BackgroundRuntime = null,
     background_url_ctx: ?*anyopaque = null,
     on_background_url_ready: ?*const fn (*anyopaque, []const u8, []const u8) void = null,
@@ -224,8 +227,6 @@ pub const DispatchContext = struct {
     terminal_transport_role: terminal_contracts.TransportRole = .interactive,
     background_lifecycle_allocator: Allocator = std.heap.c_allocator,
     command_timeout_ms: ?usize = null,
-    sandbox_backend: sandbox.BackendKind = .none,
-    devbox_provider: ?devbox_executor.Provider = null,
     captured_command_host: command_environment.Host = .native,
     run_command_backend: ?RunCommandBackend = null,
     subagent_provider: ?subagent_tool_provider.Provider = null,
@@ -358,6 +359,7 @@ pub const LabelArgKind = enum {
     action,
     query,
     selector,
+    session_id,
 };
 
 pub const PermissionTargetKind = core_permissions.PermissionTargetKind;
@@ -584,6 +586,7 @@ fn labelValueForKind(kind: LabelArgKind, args: std.json.ObjectMap) ?[]const u8 {
         .action => optionalStringArg(args, "action"),
         .query => optionalStringArg(args, "query"),
         .selector => optionalStringArg(args, "selector"),
+        .session_id => optionalStringArg(args, "session_id"),
     };
 }
 
@@ -937,10 +940,16 @@ pub fn localToolAvailabilityFailure(
             try ctx.allocator.dupe(u8, web_search_unavailable_message),
         .terminal => if (tool.captured_command_fn != null and tool.captured_command_fn.?(input))
             null
-        else if (ctx.tool_capabilities.terminalAvailable())
+        else if (!ctx.tool_capabilities.terminalAvailable())
+            try ctx.allocator.dupe(u8, terminal_unavailable_message)
+        else if (ctx.session_child_capability != null)
             null
         else
-            try ctx.allocator.dupe(u8, terminal_unavailable_message),
+            try tool_result_errors.toolExecutionFailureJson(ctx.allocator, .{
+                .tool_name = tool.name,
+                .message = terminal_saved_session_required_message,
+                .suggestion = terminal_saved_session_required_suggestion,
+            }),
         else => null,
     };
 }
@@ -1459,7 +1468,6 @@ test "DispatchContext command runner fields default to inactive values" {
     try std.testing.expect(ctx.background_log_dir == null);
     try std.testing.expect(ctx.command_artifact_dir == null);
     try std.testing.expect(ctx.command_timeout_ms == null);
-    try std.testing.expectEqual(sandbox.BackendKind.none, ctx.sandbox_backend);
     try std.testing.expect(ctx.run_command_backend == null);
     try std.testing.expect(ctx.subagent_provider == null);
     try std.testing.expect(ctx.ask_question_ctx == null);

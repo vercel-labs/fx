@@ -1,5 +1,6 @@
 const std = @import("std");
 const app_permission_runtime = @import("app_permission_runtime.zig");
+const provider_runtime = @import("provider_runtime.zig");
 const js_host_config_store = @import("../config/js_host_config_store.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
@@ -18,8 +19,7 @@ pub fn Runtime(comptime App: type) type {
             if (try loadValue(app, "model")) |model| {
                 defer app.alloc.free(model);
                 if (session_codec.validateModelPreference(model)) |_| {
-                    app.selected_model.clearRetainingCapacity();
-                    try app.selected_model.appendSlice(app.alloc, model);
+                    try provider_runtime.replaceModel(app, model);
                     try app.worker.syncQueuedPromptModel(std.heap.c_allocator, model);
                 } else |err| {
                     debug_trace.logf(

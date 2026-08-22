@@ -6,12 +6,15 @@ const Allocator = std.mem.Allocator;
 pub const Method = enum {
     get,
     post_form,
+    post_json,
 };
 
 pub const Request = struct {
     method: Method,
     url: []const u8,
     payload: ?[]const u8 = null,
+    /// Optional preformatted Authorization value, borrowed for this request.
+    authorization: ?[]const u8 = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     deadline: ?std.Io.Clock.Timestamp = null,
 };

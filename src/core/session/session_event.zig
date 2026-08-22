@@ -3,6 +3,7 @@ const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
 const session_usage = @import("session_usage.zig");
 const types = @import("../shared/types.zig");
+const model_provider = @import("../config/model_provider.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -52,6 +53,7 @@ pub const SessionStarted = struct {
 };
 
 pub const PreferencesChanged = struct {
+    provider: ?model_provider.ProviderId = null,
     model: ?[]u8 = null,
     effort: ?types.ReasoningEffort = null,
     fast_mode: ?bool = null,
@@ -904,6 +906,7 @@ fn applyDelta(
         .preferences_changed => |payload| {
             var current = &(state.* orelse return error.MissingSessionStarted);
             var proposed = current.*;
+            if (payload.provider) |provider| proposed.preferences.provider = provider;
             if (payload.model) |model| proposed.preferences.model = model;
             if (payload.effort) |effort| proposed.preferences.effort = effort;
             if (payload.fast_mode) |fast_mode| proposed.preferences.fast_mode = fast_mode;
@@ -917,6 +920,7 @@ fn applyDelta(
                 alloc.free(current.preferences.model);
                 current.preferences.model = copy;
             }
+            if (payload.provider) |provider| current.preferences.provider = provider;
             if (payload.effort) |effort| current.preferences.effort = effort;
             if (payload.fast_mode) |fast_mode| current.preferences.fast_mode = fast_mode;
             current.updated_at_ms = envelope.timestamp_ms;
@@ -1019,7 +1023,7 @@ fn validateEnvelope(envelope: Envelope) !void {
             try session_codec.validateState(state);
         },
         .preferences_changed => |payload| {
-            if (payload.model == null and payload.effort == null and payload.fast_mode == null) {
+            if (payload.provider == null and payload.model == null and payload.effort == null and payload.fast_mode == null) {
                 return error.InvalidEventFrame;
             }
             if (payload.model) |model| {
@@ -1116,7 +1120,13 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
         .preferences_changed => |payload| {
             try writer.writeByte('{');
             var wrote = false;
+            if (payload.provider) |provider| {
+                try writer.writeAll("\"provider\":");
+                try writeJsonString(writer, @tagName(provider));
+                wrote = true;
+            }
             if (payload.model) |model| {
+                if (wrote) try writer.writeByte(',');
                 try writer.writeAll("\"model\":");
                 try writeJsonString(writer, model);
                 wrote = true;
@@ -1255,8 +1265,12 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
         },
         .preferences_changed => blk: {
             const object = try requireObject(value);
-            if (object.count() == 0 or object.count() > 3) return error.InvalidEventFrame;
-            try rejectUnknownKeys(object, &.{ "model", "effort", "fast_mode" });
+            if (object.count() == 0 or object.count() > 4) return error.InvalidEventFrame;
+            try rejectUnknownKeys(object, &.{ "provider", "model", "effort", "fast_mode" });
+            const provider = if (object.get("provider")) |provider_value| provider_blk: {
+                if (provider_value != .string) return error.InvalidEventFrame;
+                break :provider_blk model_provider.parse(provider_value.string) orelse return error.InvalidEventFrame;
+            } else null;
             const model = if (object.get("model")) |_| try dupeString(alloc, object, "model") else null;
             errdefer if (model) |owned| alloc.free(owned);
             const effort = if (object.get("effort")) |_|
@@ -1266,6 +1280,7 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
                 null;
             const fast_mode = if (object.get("fast_mode")) |_| try requireBool(object, "fast_mode") else null;
             break :blk .{ .preferences_changed = .{
+                .provider = provider,
                 .model = model,
                 .effort = effort,
                 .fast_mode = fast_mode,
@@ -1428,10 +1443,18 @@ fn readFrameLine(alloc: Allocator, source: *std.Io.Reader) ![]u8 {
 }
 
 fn parsePreferences(alloc: Allocator, value: std.json.Value) !session_codec.DurableSessionPreferences {
-    const object = try exactObject(value, &.{ "model", "effort", "fast_mode" });
+    const raw_object = try requireObject(value);
+    const object = if (raw_object.get("provider") != null)
+        try exactObject(value, &.{ "provider", "model", "effort", "fast_mode" })
+    else
+        try exactObject(value, &.{ "model", "effort", "fast_mode" });
     const model = try dupeString(alloc, object, "model");
     errdefer alloc.free(model);
     return .{
+        .provider = if (object.get("provider")) |provider_value| blk: {
+            if (provider_value != .string) return error.InvalidEventFrame;
+            break :blk model_provider.parse(provider_value.string) orelse return error.InvalidEventFrame;
+        } else .gateway,
         .model = model,
         .effort = types.ReasoningEffort.parse(
             try requireString(object, "effort"),
@@ -1448,9 +1471,11 @@ fn writePreferences(
     try writeJsonString(writer, preferences.model);
     try writer.writeAll(",\"effort\":");
     try writeJsonString(writer, preferences.effort.label());
-    try writer.print(",\"fast_mode\":{s}}}", .{
+    try writer.print(",\"fast_mode\":{s},\"provider\":", .{
         if (preferences.fast_mode) "true" else "false",
     });
+    try writeJsonString(writer, @tagName(preferences.provider));
+    try writer.writeByte('}');
 }
 
 fn exactObject(value: std.json.Value, keys: []const []const u8) !std.json.ObjectMap {

@@ -1438,6 +1438,88 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
   );
 
   test(
+    "persistent auto child replans a direct delete before review",
+    async () => {
+      const fixture = createFixture();
+      writeFileSync(
+        join(fixture.home, ".fx", "settings.json"),
+        JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      );
+      const childPrompt = "AUTO_DELETE_CHILD_PROMPT";
+      const marker = join(fixture.workspace, "auto-child-keep.txt");
+      writeFileSync(marker, "keep\n");
+      const gateway = startDynamicFakeGateway((body) => {
+        if (body.includes('"toolCallId":"auto_delete_create"')) {
+          return fakeGatewayFinalText("AUTO_DELETE_PARENT_READY");
+        }
+        if (body.includes('"toolCallId":"auto_delete_file"')) {
+          return fakeGatewayFinalText("AUTO_DELETE_CHILD_COMPLETE");
+        }
+        if (body.includes(childPrompt)) {
+          return fakeGatewayToolCall("auto_delete_file", "delete_file", {
+            path: marker,
+          });
+        }
+        return fakeGatewayToolCall("auto_delete_create", "subagent", {
+          command: {
+            create: {
+              name: "auto-delete-child",
+              mode: "persistent",
+              prompt: childPrompt,
+              permission_mode: "auto",
+            },
+          },
+        });
+      }, {
+        classifierDecision: "allow",
+        models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      try {
+        session = await TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: fixture.workspace,
+          env: {
+            HOME: fixture.home,
+            AI_GATEWAY_API_KEY: "auto-delete-child-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_SKIP_ONBOARDING: "1",
+            FX_SOUND: "0",
+            NO_COLOR: "1",
+          },
+          width: 112,
+          height: 32,
+          stderrPath: fixture.stderrPath,
+        });
+        const active = session;
+        await active.waitForComposer(TIMEOUT);
+        await active.sendText("Create the auto-delete child.");
+        await active.waitForText("AUTO_DELETE_PARENT_READY", TIMEOUT);
+        const denialDeadline = Date.now() + TIMEOUT;
+        while (
+          !gateway.requests.some((request) => request.body.includes("auto_denied")) &&
+          Date.now() < denialDeadline
+        ) {
+          await Bun.sleep(25);
+        }
+        expect(gateway.requests.some((request) =>
+          request.body.includes("auto_denied")
+        )).toBe(true);
+        expect(readFileSync(marker, "utf8")).toBe("keep\n");
+        expect(gateway.classifierRequests).toHaveLength(0);
+        expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      } finally {
+        gateway.stop();
+      }
+    },
+    60_000,
+  );
+
+  test(
     "child file always approval reuses canonical scope and keeps external writes governed",
     async () => {
       const fixture = createFixture();
@@ -3962,80 +4044,77 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
   );
 
   test(
-    "completed one-off child stays read-only across direct resume and restart",
+    "terminal one-off delivers once retires and leaves persistent controls intact",
     async () => {
       const fixture = createFixture();
-      const childName = "readonly-history";
-      const persistentName = "resume-control";
-      const persistentInitial = "PERSISTENT_RESUME_CONTROL_INITIAL";
-      const persistentReady = "PERSISTENT_RESUME_CONTROL_READY";
-      const persistentResume = "PERSISTENT_RESUME_CONTROL_SECOND";
-      const persistentResumed = "PERSISTENT_RESUME_CONTROL_RESUMED";
-      const ordinaryResume = "ORDINARY_RESUME_CONTROL_SECOND";
-      const ordinaryResumed = "ORDINARY_RESUME_CONTROL_RESUMED";
-      const illegalResume = "ONEOFF_ILLEGAL_SECOND_TURN";
-      const mainPrompt = "ONEOFF_READONLY_HISTORY_MAIN";
-      const childPrompt = "ONEOFF_READONLY_HISTORY_CHILD";
-      const childDone = "ONEOFF_READONLY_HISTORY_DONE";
-      const markdown = [
-        "# Read-only history",
-        "",
-        "| a | b |",
-        "| --- | --- |",
-        "| one | two |",
-        "",
-        "```diff",
-        "- before",
-        "+ after",
-        "```",
-        "",
-        ...Array.from(
-          { length: 48 },
-          (_, index) => `history-${String(index + 1).padStart(2, "0")}`,
-        ),
-        "",
-        childDone,
-      ].join("\n");
-      const visibleHistoryRows = (pane: string) =>
-        pane.match(/history-\d{2}/g)?.join("|") ?? "";
+      const childName = "temporary-result";
+      const persistentName = "persistent-control";
+      const persistentInitial = "PERSISTENT_CONTROL_INITIAL";
+      const persistentReady = "PERSISTENT_CONTROL_READY";
+      const persistentResume = "PERSISTENT_CONTROL_SECOND";
+      const persistentResumed = "PERSISTENT_CONTROL_RESUMED";
+      const mainPrompt = "ONEOFF_RETIREMENT_MAIN";
+      const childPrompt = "ONEOFF_RETIREMENT_CHILD";
+      const childDone = "ONEOFF_RETIREMENT_RESULT";
+      const parentAck = "ONEOFF_RETIREMENT_ACK";
+      const parentAckDone = "ONEOFF_RETIREMENT_ACK_DONE";
+      const childStream = controlledTextResponse("ONEOFF_RETIREMENT_STREAM_");
       const gateway = startDynamicFakeGateway((body) => {
-        if (body.includes(persistentResume)) {
-          return fakeGatewayFinalText(persistentResumed);
+        if (body.includes(persistentResume)) return fakeGatewayFinalText(persistentResumed);
+        if (body.includes(parentAck) && body.includes(childDone)) {
+          return fakeGatewayFinalText(parentAckDone);
         }
-        if (body.includes(ordinaryResume)) {
-          return fakeGatewayFinalText(ordinaryResumed);
+        if (body.includes(persistentInitial)) return fakeGatewayFinalText(persistentReady);
+        if (body.includes('"toolCallId":"create_temporary_result"')) {
+          return fakeGatewayFinalText("ONEOFF_RETIREMENT_MAIN_DONE");
         }
-        if (body.includes(persistentInitial)) {
-          return fakeGatewayFinalText(persistentReady);
-        }
-        if (body.includes('"toolCallId":"create_readonly_history"')) {
-          return fakeGatewayFinalText("ONEOFF_READONLY_HISTORY_MAIN_DONE");
-        }
-        if (body.includes(childPrompt)) return fakeGatewayFinalText(markdown);
+        if (body.includes(childPrompt)) return childStream.response;
         if (body.includes(mainPrompt)) {
-          return fakeGatewayToolCall(
-            "create_readonly_history",
-            "subagent",
-            {
-              command: {
-                create: {
-                  name: childName,
-                  mode: "one_off",
-                  prompt: childPrompt,
-                },
+          return fakeGatewayToolCall("create_temporary_result", "subagent", {
+            command: {
+              create: {
+                name: childName,
+                mode: "one_off",
+                prompt: childPrompt,
               },
             },
-          );
+          });
         }
-        return fakeGatewayFinalText("unexpected one-off history request");
+        return fakeGatewayFinalText("unexpected retirement request");
       }, {
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
-      const env = relationshipTestEnv(
-        fixture,
-        gateway,
-        "oneoff-readonly-history",
-      );
+      const env = relationshipTestEnv(fixture, gateway, "oneoff-retirement");
+
+      type ResumeControl = {
+        child_id: string;
+        parent_id: string;
+        mode: "persistent" | "one_off";
+        state: string;
+        configuration: { name: string };
+      };
+      const sessionsDir = join(fixture.home, ".fx", "sessions");
+      const readControls = () =>
+        readdirSync(sessionsDir)
+          .map((id) => join(sessionsDir, id, "subagent", "control.json"))
+          .filter((path) => existsSync(path))
+          .map((path) => ({
+            path,
+            value: JSON.parse(readFileSync(path, "utf8")) as ResumeControl,
+          }));
+
+      async function waitForControl(name: string, state: string) {
+        const deadline = Date.now() + TIMEOUT;
+        while (Date.now() < deadline) {
+          const found = readControls().find((entry) =>
+            entry.value.configuration.name === name &&
+            entry.value.state === state
+          );
+          if (found) return found;
+          await Bun.sleep(25);
+        }
+        throw new Error(`control did not reach ${name}:${state}`);
+      }
 
       async function runAsk(args: string[]) {
         const child = Bun.spawn([FX_BIN, "ask", ...args], {
@@ -4052,50 +4131,14 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         return { stdout, stderr, exitCode };
       }
 
-      async function selectManagerChild(
-        active: TmuxSession,
-        managerPane: string,
-        name: string,
-      ) {
-        const visibleChildren = managerPane
-          .split("\n")
-          .filter((line) =>
-            line.includes(childName) || line.includes(persistentName)
-          );
-        const selectedIndex = visibleChildren.findIndex((line) =>
-          line.startsWith("› ")
-        );
-        const targetIndex = visibleChildren.findIndex((line) =>
-          line.includes(name)
-        );
-        if (selectedIndex < 0 || targetIndex < 0) {
-          throw new Error("manager did not expose deterministic child selection");
-        }
-        const direction = selectedIndex < targetIndex ? "j" : "k";
-        for (
-          let index = 0;
-          index < Math.abs(targetIndex - selectedIndex);
-          index += 1
-        ) {
-          await active.sendLiteralText(direction);
-        }
-        await active.waitForPane(
-          (pane) => pane.split("\n").some((line) =>
-            line.startsWith("› ") && line.includes(name)
-          ),
-          TIMEOUT,
-        );
-      }
-
       try {
         session = await TmuxSession.create({
           cmd: FX_BIN,
           cwd: fixture.workspace,
           env,
-          width: 60,
-          height: 12,
+          width: 80,
+          height: 24,
           stderrPath: fixture.stderrPath,
-          minimumHistoryLines: 100_000,
         });
         const active = session;
         await active.waitForComposer(TIMEOUT);
@@ -4109,175 +4152,82 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await pasteVisibleText(active, persistentInitial);
         await active.sendKeys("Enter");
         await active.waitForPane(
-          (pane) =>
-            pane.includes(persistentReady) && pane.includes("status: idle"),
+          (pane) => pane.includes(persistentReady) && pane.includes("status: idle"),
           TIMEOUT,
         );
         await active.sendKeys("Escape");
         await active.waitForText("Agents & processes", TIMEOUT);
         await active.sendKeys("C-x");
         await active.waitForComposer(TIMEOUT);
+
         await active.sendText(mainPrompt);
         await active.waitForPane(
-          (pane) =>
-            pane.includes("ONEOFF_READONLY_HISTORY_MAIN_DONE") &&
-            !pane.includes("Streaming ("),
+          (pane) => pane.includes("ONEOFF_RETIREMENT_MAIN_DONE") && !pane.includes("Streaming ("),
           TIMEOUT,
         );
-        const mainGrid = await active.capturePaneGrid();
-        const mainCursor = active.cursorPosition();
-
-        await active.sendKeys("C-x");
-        const manager = await active.waitForPane(
-          (pane) => pane.includes(childName) && pane.includes(persistentName),
-          TIMEOUT,
-        );
-        await selectManagerChild(active, manager, childName);
-        await active.sendKeys("Enter");
-        const tail = await active.waitForText(childDone, TIMEOUT);
-        expect(tail).toContain("Read-only child");
-        expect(tail).not.toContain("Enter Send");
-        const tailGrid = await active.capturePaneGrid();
-
-        await active.pasteText("SHOULD_NOT_ROUTE");
-        await active.sendKeys("Enter");
-
-        let compactGrid = tailGrid;
-        const compactInitial = compactGrid.join("\n");
-        let compactIdentity = compactInitial.includes(childName);
-        let compactProvenance = compactInitial.includes("Parent agent");
-        let compactHeading = compactInitial.includes("Read-only history");
-        for (
-          let page = 0;
-          page < 12 &&
-          !(compactIdentity && compactProvenance && compactHeading);
-          page += 1
+        const childStartedDeadline = Date.now() + TIMEOUT;
+        while (
+          !gateway.requests.some((request) => request.body.includes(childPrompt)) &&
+          Date.now() < childStartedDeadline
         ) {
-          const before = compactGrid.join("\n");
-          const beforeHistoryRows = visibleHistoryRows(before);
-          await active.sendKeys("PageUp");
-          const pane = await active.waitForPane(
-            (value) =>
-              value.includes("Read-only history") ||
-              visibleHistoryRows(value) !== beforeHistoryRows,
-            TIMEOUT,
-          );
-          compactGrid = await active.capturePaneGrid();
-          compactIdentity ||= pane.includes(childName);
-          compactProvenance ||= pane.includes("Parent agent");
-          compactHeading ||= pane.includes("Read-only history");
+          await Bun.sleep(25);
         }
-        expect(compactGrid).not.toEqual(tailGrid);
-        expect(compactIdentity).toBe(true);
-        expect(compactProvenance).toBe(true);
-        expect(compactHeading).toBe(true);
-
-        await active.sendKeys("C-o");
+        expect(gateway.requests.some((request) => request.body.includes(childPrompt))).toBe(true);
+        await active.sendKeys("C-x");
         await active.waitForPane(
           (pane) =>
-            pane.includes("Read-only child") &&
-            pane !== compactGrid.join("\n"),
+            pane.includes(childName) &&
+            pane.includes("running") &&
+            pane.includes(persistentName),
           TIMEOUT,
         );
-        await active.sendKeys("Right");
-        await active.waitForText("Full detail · ←/→ switch · ctrl o close", TIMEOUT);
-        let fullGrid = await active.capturePaneGrid();
-        const fullInitial = fullGrid.join("\n");
-        let fullIdentity = fullInitial.includes(childName);
-        let fullProvenance = fullInitial.includes("Parent agent");
-        let fullHeading = fullInitial.includes("Read-only history");
-        for (
-          let page = 0;
-          page < 12 && !(fullIdentity && fullProvenance && fullHeading);
-          page += 1
-        ) {
-          const before = fullGrid.join("\n");
-          const beforeHistoryRows = visibleHistoryRows(before);
-          await active.sendKeys("PageUp");
-          const pane = await active.waitForPane(
-            (value) =>
-              value.includes("Read-only history") ||
-              visibleHistoryRows(value) !== beforeHistoryRows,
-            TIMEOUT,
-          );
-          fullGrid = await active.capturePaneGrid();
-          fullIdentity ||= pane.includes(childName);
-          fullProvenance ||= pane.includes("Parent agent");
-          fullHeading ||= pane.includes("Read-only history");
-        }
-        expect(fullIdentity).toBe(true);
-        expect(fullProvenance).toBe(true);
-        expect(fullHeading).toBe(true);
-
-        await active.sendKeys("C-o");
-        await active.waitForText("Read-only child", TIMEOUT);
-        await active.sendKeys("Escape");
-        await active.waitForText("Agents & processes", TIMEOUT);
         await active.sendKeys("C-x");
-        await active.waitForText("ONEOFF_READONLY_HISTORY_MAIN_DONE", TIMEOUT);
-        const restoredMainGrid = await active.capturePaneGrid();
-        expect(normalizeVolatileTokenRows(restoredMainGrid.slice(0, -1))).toEqual(
-          normalizeVolatileTokenRows(mainGrid.slice(0, -1)),
-        );
-        expect(restoredMainGrid.at(-1)).not.toContain("ctrl+x manager");
-        expect(active.cursorPosition()).toEqual(mainCursor);
-        expect(gateway.requests).toHaveLength(4);
-        expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+        await active.waitForComposer(TIMEOUT);
+        childStream.release(childDone);
+        const oneOff = await waitForControl(childName, "completed");
+        const persistent = await waitForControl(persistentName, "idle");
 
-        type ResumeControl = {
-          child_id: string;
-          parent_id: string;
-          mode: "persistent" | "one_off";
-          state: string;
-          configuration: { name: string };
-        };
-        const sessionsDir = join(fixture.home, ".fx", "sessions");
-        const controls = readdirSync(sessionsDir)
-          .map((id) => join(sessionsDir, id, "subagent", "control.json"))
-          .filter((path) => existsSync(path))
-          .map((path) => ({
-            path,
-            value: JSON.parse(readFileSync(path, "utf8")) as ResumeControl,
-          }));
-        const oneOff = controls.find((entry) =>
-          entry.value.configuration.name === childName
+        await active.sendKeys("C-x");
+        const managerPane = await active.waitForPane(
+          (pane) => pane.includes(persistentName) && !pane.includes(childName),
+          TIMEOUT,
         );
-        const persistent = controls.find((entry) =>
-          entry.value.configuration.name === persistentName
-        );
-        if (!oneOff || !persistent) {
-          throw new Error("resume controls were not persisted");
+        expect(managerPane).not.toContain(childName);
+        await active.sendKeys("C-x");
+        await active.waitForComposer(TIMEOUT);
+
+        await active.sendText(parentAck);
+        await active.waitForText(parentAckDone, TIMEOUT);
+        expect(
+          gateway.requests.some((request) =>
+            request.body.includes(parentAck) && request.body.includes(childDone)
+          ),
+        ).toBe(true);
+
+        const childDir = join(sessionsDir, oneOff.value.child_id);
+        const retirementDeadline = Date.now() + TIMEOUT;
+        while (existsSync(childDir) && Date.now() < retirementDeadline) {
+          await Bun.sleep(25);
         }
-        expect(oneOff.value).toMatchObject({
-          mode: "one_off",
-          state: "completed",
-        });
-        expect(persistent.value).toMatchObject({
-          mode: "persistent",
-          state: "idle",
-        });
-        const controlBefore = readFileSync(oneOff.path, "utf8");
-        const requestsBeforeDenial = gateway.requests.length;
+        expect(existsSync(childDir)).toBe(false);
 
         await active.sendText("/quit");
         expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
         session = null;
 
-        const denied = await runAsk([
+        const retired = await runAsk([
           "--json",
           "--auto",
           "--resume-id",
           oneOff.value.child_id,
-          illegalResume,
+          "must not resume",
         ]);
-        expect(denied.exitCode).toBe(1);
-        expect(denied.stderr).toBe("");
-        expect(JSON.parse(denied.stdout)).toMatchObject({
+        expect(retired.exitCode).toBe(1);
+        expect(retired.stderr).toBe("");
+        expect(JSON.parse(retired.stdout)).toMatchObject({
           exit_code: 1,
-          error: "OneOffSessionNotResumable",
+          error: "SessionNotFound",
         });
-        expect(gateway.requests).toHaveLength(requestsBeforeDenial);
-        expect(readFileSync(oneOff.path, "utf8")).toBe(controlBefore);
 
         const persistentControl = await runAsk([
           "--json",
@@ -4292,80 +4242,18 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           exit_code: 0,
           output: persistentResumed,
         });
-
-        const ordinaryControl = await runAsk([
-          "--json",
-          "--auto",
-          "--resume-id",
-          oneOff.value.parent_id,
-          ordinaryResume,
-        ]);
-        expect(ordinaryControl.exitCode).toBe(0);
-        expect(ordinaryControl.stderr).toBe("");
-        expect(JSON.parse(ordinaryControl.stdout)).toMatchObject({
-          exit_code: 0,
-          output: ordinaryResumed,
-        });
-        expect(gateway.requests).toHaveLength(requestsBeforeDenial + 2);
-        expect(readFileSync(oneOff.path, "utf8")).toBe(controlBefore);
-        expect(
-          gateway.requests.some((request) => request.body.includes(illegalResume)),
-        ).toBe(false);
-
-        const deniedStderr = join(root!, "one-off-interactive-denied.stderr");
-        writeFileSync(deniedStderr, "");
-        session = await TmuxSession.create({
-          cmd: `${FX_BIN} resume --id ${oneOff.value.child_id}`,
-          cwd: fixture.workspace,
-          env,
-          width: 80,
-          height: 20,
-          stderrPath: deniedStderr,
-          remainOnExit: true,
-        });
-        await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
-        expect(paneExitMatches(session.paneStatus(), 1)).toBe(true);
-        expect(readFileSync(deniedStderr, "utf8")).toBe(
-          "fx: one-off child sessions cannot accept additional prompts; create a persistent child to continue the conversation\n",
-        );
-        await session.kill();
-        session = null;
-        expect(gateway.requests).toHaveLength(requestsBeforeDenial + 2);
-        expect(readFileSync(oneOff.path, "utf8")).toBe(controlBefore);
-
-        session = await TmuxSession.create({
-          cmd: `${FX_BIN} resume --id ${oneOff.value.parent_id}`,
-          cwd: fixture.workspace,
-          env,
-          width: 80,
-          height: 20,
-          stderrPath: fixture.stderrPath,
-        });
-        const restarted = session;
-        await restarted.waitForComposer(TIMEOUT);
-        await restarted.sendKeys("C-x");
-        const restartedManager = await restarted.waitForPane(
-          (pane) =>
-            pane.includes(childName) &&
-            pane.includes(persistentName) &&
-            pane.includes("completed") &&
-            pane.includes("idle"),
-          TIMEOUT,
-        );
-        await selectManagerChild(restarted, restartedManager, childName);
-        await restarted.sendKeys("Enter");
-        const restartedChild = await restarted.waitForText(childDone, TIMEOUT);
-        expect(restartedChild).toContain("Read-only child");
-        expect(restartedChild).not.toContain(illegalResume);
-        expect(readFileSync(oneOff.path, "utf8")).toBe(controlBefore);
         expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
       } finally {
+        if (!childStream.released()) {
+          try {
+            childStream.release("CLEANUP");
+          } catch {}
+        }
         gateway.stop();
       }
     },
     60_000,
   );
-
   test(
     "persistent child quit exits locally without sending a model turn",
     async () => {
@@ -6045,7 +5933,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
   );
 
   test(
-    "assembled TTY tree shows model persistent, one-off, nested, and notification config",
+    "assembled TTY tree keeps persistent configuration and hides settled one-offs",
     async () => {
       const fixture = createFixture();
       const persistentPrompt = "CHECKPOINT3_PERSISTENT_CREATES_NESTED";
@@ -6131,45 +6019,14 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         const tree = await active.waitForPane(
           (pane) =>
             pane.includes("assembled-persistent") &&
-            pane.includes("assembled-one-off") &&
             pane.includes("idle") &&
-            pane.includes("completed"),
+            !pane.includes("assembled-one-off") &&
+            !pane.includes("assembled-nested"),
           TIMEOUT,
         );
         expect(tree).toContain("Agents & processes");
-        const assembledNames = [
-          "assembled-persistent",
-          "assembled-nested",
-          "assembled-one-off",
-        ];
-        const selectedAssembledName = (pane: string) => {
-          const selectedLine = pane.split("\n").find((line) =>
-            line.startsWith("› ")
-          );
-          return assembledNames.find((name) => selectedLine?.includes(name)) ?? null;
-        };
-        let nestedTree = await active.waitForPane(
-          (pane) => assembledNames.every((name) => pane.includes(name)),
-          TIMEOUT,
-        );
-        expect(nestedTree).toContain("assembled-persistent");
-        expect(nestedTree).toContain("assembled-one-off");
-        for (let moves = 0; moves < assembledNames.length; moves += 1) {
-          const selected = selectedAssembledName(nestedTree);
-          if (selected === "assembled-persistent") break;
-          if (!selected) {
-            throw new Error("assembled tree did not expose a deterministic selection");
-          }
-          await active.sendLiteralText("k");
-          nestedTree = await active.waitForPane(
-            (pane) => {
-              const next = selectedAssembledName(pane);
-              return next !== null && next !== selected;
-            },
-            TIMEOUT,
-          );
-        }
-        expect(selectedAssembledName(nestedTree)).toBe("assembled-persistent");
+        expect(tree).not.toContain("assembled-one-off");
+        expect(tree).not.toContain("assembled-nested");
 
         type Control = {
           child_id: string;
@@ -6187,36 +6044,19 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           .map((id) => join(sessionsDir, id, "subagent", "control.json"))
           .filter((path) => existsSync(path))
           .map((path) => JSON.parse(readFileSync(path, "utf8")) as Control);
-        let controls = readControls();
+        let persistent: Control | undefined;
         const controlsDeadline = Date.now() + TIMEOUT;
         while (Date.now() < controlsDeadline) {
-          const states = new Map(
-            controls.map((control) => [control.configuration.name, control.state]),
+          persistent = readControls().find(
+            (control) => control.configuration.name === "assembled-persistent" &&
+              control.state === "idle",
           );
-          if (states.get("assembled-persistent") === "idle" &&
-              states.get("assembled-nested") === "completed" &&
-              states.get("assembled-one-off") === "completed") break;
+          if (persistent) break;
           await Bun.sleep(25);
-          controls = readControls();
         }
-        const byName = new Map(
-          controls.map((control) => [control.configuration.name, control]),
-        );
-        const persistent = byName.get("assembled-persistent");
-        const nested = byName.get("assembled-nested");
-        const oneOff = byName.get("assembled-one-off");
-        expect(persistent).toBeDefined();
-        expect(nested).toBeDefined();
-        expect(oneOff).toBeDefined();
+        if (!persistent) throw new Error("assembled persistent control did not settle");
         expect(persistent!.mode).toBe("persistent");
         expect(persistent!.state).toBe("idle");
-        expect(nested).toMatchObject({
-          parent_id: persistent!.child_id,
-          mode: "one_off",
-          state: "completed",
-        });
-        expect(oneOff).toMatchObject({ mode: "one_off", state: "completed" });
-        expect(oneOff!.parent_id).toBe(persistent!.parent_id);
         expect(persistent!.configuration.notifications).toMatchObject({
           milestones: ["assembled-checkpoint"],
           stop_conditions: ["terminal", "duration_elapsed"],
@@ -6982,8 +6822,12 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForText("MANAGER_HUMAN_TWO_LIVE_", TIMEOUT);
         await Bun.sleep(1_500);
         const idleReopenFrames = stdoutFrames(tapePath).slice(idleReopenFrameStart);
+        const identityFrameAllowance = Buffer.byteLength(fixture.workspace) +
+          Buffer.byteLength(" · ");
         expect(
-          idleReopenFrames.filter((frame) => frame.payload.length >= 1_024),
+          idleReopenFrames.filter(
+            (frame) => frame.payload.length >= 1_024 + identityFrameAllowance,
+          ),
         ).toHaveLength(0);
         expect(
           idleReopenFrames.reduce((total, frame) => total + frame.payload.length, 0),

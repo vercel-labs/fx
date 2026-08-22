@@ -540,7 +540,7 @@ function createRoot(
   mkdirSync(bin, { recursive: true });
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({ maxxing_mode: "minimal" }),
+    JSON.stringify({}),
   );
   writeFileSync(
     join(home, ".fx", "mcp.json"),

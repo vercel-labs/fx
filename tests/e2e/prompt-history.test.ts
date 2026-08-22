@@ -52,7 +52,7 @@ async function disablePromptHistory(
 ): Promise<void> {
   await session.sendText("/settings");
   await session.waitForText("←→ Change", TIMEOUT);
-  for (let index = 0; index < 13; index += 1) {
+  for (let index = 0; index < 10; index += 1) {
     await session.sendKeys("Down");
   }
   await session.sendKeys("Left");
@@ -109,7 +109,7 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
         await session.sendText("PLAN10_PROMPT_HISTORY_SENTINEL");
         await session.waitForText("HTTP 401", TIMEOUT);
         await session.sendText("/help");
-        await session.waitForText("Commands 39", TIMEOUT);
+        await session.waitForText("Commands 37", TIMEOUT);
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes("Enter Open"), TIMEOUT);
         await session.sendText("/quit");

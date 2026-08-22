@@ -50,12 +50,19 @@ const OwnedCatalogAccess = struct {
                     null;
                 errdefer if (team_context) |team| alloc.free(team);
 
+                const account_id = if (access.accountId()) |account|
+                    try alloc.dupe(u8, account)
+                else
+                    null;
+                errdefer if (account_id) |account| alloc.free(account);
+
                 break :blk .{
                     .access = .{
                         .authenticated = .{
                             .source = authenticated.source,
                             .credential = credential,
                             .team_context = team_context,
+                            .account_id = account_id,
                         },
                     },
                 };
@@ -69,6 +76,7 @@ const OwnedCatalogAccess = struct {
             .authenticated => |access| {
                 secret.zeroAndFree(alloc, @constCast(access.credential));
                 if (access.team_context) |team| alloc.free(@constCast(team));
+                if (access.account_id) |account| alloc.free(@constCast(account));
             },
         }
         self.* = undefined;
@@ -83,6 +91,7 @@ pub const ModelMenuLoadState = enum {
 
 pub const ModelMenuCatalogState = struct {
     access_level: ?model_catalog.AccessLevel = null,
+    source: ?credentials.Source = null,
     public_only_reason: ?credentials.CatalogPublicOnlyReason = null,
     private_models_hidden: bool = false,
     failure: ?Failure = null,
@@ -459,6 +468,31 @@ pub const Runtime = struct {
         self.cancel_requested.store(false, .seq_cst);
     }
 
+    /// Installs a catalog that was completely fetched and validated before the
+    /// caller's publication boundary. Ownership transfers without allocation.
+    pub fn adoptOwnedCatalog(
+        self: *Self,
+        access: credentials.CatalogAccess,
+        owned_catalog: *std.ArrayList(model_catalog.ModelCatalogEntry),
+    ) void {
+        self.cancelAndJoin();
+
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.menu.deinit(self.alloc);
+        model_catalog.freeModelCatalog(self.alloc, &self.catalog);
+        self.catalog = owned_catalog.*;
+        owned_catalog.* = .empty;
+        self.outcome = .{ .loaded = .{
+            .access = model_catalog.AccessMetadata.init(access),
+        } };
+        self.state = .ready;
+        self.completion_pending = true;
+        self.last_attempt_ms = io_mod.milliTimestamp();
+        self.requested_access = model_catalog.AccessMetadata.init(access);
+        self.cancel_requested.store(false, .seq_cst);
+    }
+
     pub fn isLoading(self: *Self) bool {
         self.finishThreadIfDone();
         self.mutex.lockUncancelable(io_mod.getIo());
@@ -707,6 +741,7 @@ fn modelMenuCatalogState(outcome: CatalogOutcome) ModelMenuCatalogState {
         null;
     return .{
         .access_level = access.level,
+        .source = access.source,
         .public_only_reason = access.public_only_reason,
         .private_models_hidden = access.private_models_may_be_hidden,
         .failure = if (failure) |failed| .{
@@ -1171,6 +1206,31 @@ test "model cache access copies clean up every induced allocation failure" {
         try std.testing.expect(failing.has_induced_failure);
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
+}
+
+test "model cache access owns Grok account identity with its credential" {
+    const access = credentials.catalogAccessForCredentialAndAccount(
+        .grok_subscription,
+        "copied-secret",
+        null,
+        "acct_grok",
+    );
+    for (0..2) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        try std.testing.expectError(
+            error.OutOfMemory,
+            OwnedCatalogAccess.init(failing.allocator(), access),
+        );
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+
+    var owned = try OwnedCatalogAccess.init(std.testing.allocator, access);
+    defer owned.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("acct_grok", owned.access.accountId().?);
 }
 
 fn runRepeatedAuthChangeCycle(iteration: usize) !void {

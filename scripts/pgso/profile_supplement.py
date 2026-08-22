@@ -14,8 +14,8 @@ from scripts.pgso.runner import run_checked
 from scripts.pgso.toolchain import Toolchain
 
 
-PROFILE_SUMMARY_CUTOFF_COLD = 990_000
-SUPPLEMENT_COLD_THRESHOLD_MULTIPLIER = 8
+PROFILE_SUMMARY_CUTOFF_COLD = 600_000
+SUPPLEMENT_COLD_THRESHOLD_MULTIPLIER = 2
 
 
 @dataclasses.dataclass(frozen=True)

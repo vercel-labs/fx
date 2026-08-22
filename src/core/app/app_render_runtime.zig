@@ -14,17 +14,18 @@ const picker_state = @import("../input/picker_state.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const model_cache_runtime = @import("model_cache_runtime.zig");
+const provider_runtime = @import("provider_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const permission_request = @import("../permissions/permission_request.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const types = @import("../shared/types.zig");
 const subagent_domain = @import("../subagent/domain.zig");
 const subagent_projection = @import("../subagent/ui_projection.zig");
 const file_index = @import("../workspace/file_index.zig");
+const statusline_identity = @import("../workspace/statusline_identity.zig");
 const activity_runtime = @import("../output/activity_runtime.zig");
 const transcript_presentation = @import("../output/transcript_presentation.zig");
 const event_loop = @import("../../ui/event_loop.zig");
@@ -172,14 +173,6 @@ const QueuedCardProjection = struct {
     }
 };
 
-fn composerInputAppearance(comptime App: type, app: *App) render_input.InputAppearance {
-    return if (app.shell.maxxing_mode == .minimal) .lines else app.input_runtime.input_appearance;
-}
-
-fn composerPrefixStyle(comptime App: type, app: *App) input_presentation.ComposerPrefixStyle {
-    return if (app.shell.maxxing_mode == .minimal) .rail else .arrow;
-}
-
 // Queued prompts stay collapsed behind their summary row until the review is
 // opened; only then does the banner expand into one card per queued prompt.
 fn buildQueuedCardProjection(comptime App: type, app: *App) !QueuedCardProjection {
@@ -259,8 +252,6 @@ fn buildQueuedCardProjection(comptime App: type, app: *App) !QueuedCardProjectio
                 .image_tokens = review_entries[built].image_tokens.items,
                 .skill_tokens = skill_tokens,
             },
-            composerInputAppearance(App, app),
-            composerPrefixStyle(App, app),
         );
         const row_count: u16 = @intCast(@min(
             std.mem.count(u8, bytes, "\n"),
@@ -415,7 +406,7 @@ pub fn Runtime(comptime App: type) type {
                         picker_window_start = input_completion_runtime.CompletionRuntime(App).modelPickerWindowStart(app, count, picker_index);
                     },
                     .effort => {
-                        const target = if (app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else app.selected_model.items;
+                        const target = if (app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else provider_runtime.model(app);
                         const capabilities = model_capabilities.resolveForApp(App, app, target);
                         const effort_count = model_capabilities.reasoningEffortOptionCount(capabilities);
                         for (0..effort_count) |i| {
@@ -453,13 +444,16 @@ pub fn Runtime(comptime App: type) type {
             const inline_completion =
                 input_completion_runtime.CompletionRuntime(App).visibleInlineCompletion(app);
 
-            const visible_model = pending_model orelse app.selected_model.items;
+            const visible_model = pending_model orelse provider_runtime.model(app);
             const visible_capabilities = model_capabilities.resolveForApp(App, app, visible_model);
-            const model_supports_fast = visible_capabilities.supports_fast_mode;
-            const model_supports_effort = visible_capabilities.reasoning_efforts.len > 0;
+            const active_capabilities_pending = pending_model == null and app.isModelCacheLoading();
+            const model_supports_fast = visible_capabilities.supports_fast_mode or
+                (active_capabilities_pending and app.fast_mode);
+            const model_supports_effort = visible_capabilities.reasoning_efforts.len > 0 or
+                (active_capabilities_pending and !app.effort.isDefault());
             const visible_effort = if (pending_model != null and model_supports_effort)
                 pendingPickerEffort(app, visible_model, model_query, app.input_runtime.picker.model_picker_effort_index)
-            else if (model_capabilities.reasoningEffortSupported(visible_capabilities, app.effort))
+            else if (active_capabilities_pending or model_capabilities.reasoningEffortSupported(visible_capabilities, app.effort))
                 app.effort
             else
                 .auto;
@@ -492,8 +486,6 @@ pub fn Runtime(comptime App: type) type {
                 .has_api_key = app.auth.credentialSource() != null,
                 .model = visible_model,
                 .pending_images = app.pending_images.items,
-                .input_appearance = app.input_runtime.input_appearance,
-                .maxxing_mode = app.shell.maxxing_mode,
                 .permission_mode = if (comptime @hasField(App, "permission_engine"))
                     app.permission_engine.mode
                 else
@@ -575,18 +567,9 @@ pub fn Runtime(comptime App: type) type {
                     .now_ms = now_ms,
                     .selection_failure = app.session_persistence.session_picker.selection_failure,
                 } else .{},
-                .appearance_menu = render_input.appearanceMenuProjection(
-                    &app.input_runtime.appearance_menu,
-                    settings_snapshot,
-                ),
                 .statusline_menu = render_input.statuslineMenuProjection(
                     &app.input_runtime.statusline_menu,
                     settings_snapshot,
-                ),
-                .sandbox_menu = render_input.sandboxMenuProjection(
-                    &app.input_runtime.sandbox_menu,
-                    settings_snapshot,
-                    sandbox.osSandboxAvailable(),
                 ),
                 .usage_menu = render_input.usageMenuProjection(
                     &app.input_runtime.usage_menu,
@@ -1078,7 +1061,7 @@ pub fn Runtime(comptime App: type) type {
             slash_registry: command_specs.SlashRegistry,
         ) render_input.RenderContext {
             const chat = view.chat;
-            const visible_model = chat.configuration.model orelse app.selected_model.items;
+            const visible_model = chat.configuration.model orelse provider_runtime.model(app);
             const capabilities = model_capabilities.resolveForApp(App, app, visible_model);
             var ctx = base;
             ctx.slash_registry = slash_registry;
@@ -1088,8 +1071,6 @@ pub fn Runtime(comptime App: type) type {
             ctx.model = visible_model;
             ctx.pending_images = &.{};
             ctx.composer_visible = chat.messageable();
-            ctx.input_appearance = app.input_runtime.input_appearance;
-            ctx.maxxing_mode = app.shell.maxxing_mode;
             ctx.permission_mode = .auto;
             ctx.queued_count = 0;
             ctx.queued_paused = false;
@@ -1118,9 +1099,7 @@ pub fn Runtime(comptime App: type) type {
             else
                 .{};
             ctx.session_menu = .{};
-            ctx.appearance_menu = .{};
             ctx.statusline_menu = .{};
-            ctx.sandbox_menu = .{};
             ctx.usage_menu = .{};
             ctx.workspace_menu = .{};
             ctx.upgrade_status = "";
@@ -1129,7 +1108,8 @@ pub fn Runtime(comptime App: type) type {
             ctx.esc_clear_armed = view.editor.gestures.escapeClearArmed();
             ctx.question = null;
             ctx.statusline = .{
-                .sandbox_label = base.statusline.sandbox_label,
+                .workspace_label = base.statusline.workspace_label,
+                .git_branch = base.statusline.git_branch,
             };
             const worker_status_projection = if (app.subagents.childConversationRuntime()) |child_runtime|
                 child_runtime.worker_status_state().projection()
@@ -1215,15 +1195,15 @@ pub fn Runtime(comptime App: type) type {
             visible_model: []const u8,
         ) ui_render.StatuslineItems {
             var items: ui_render.StatuslineItems = .{};
-            if (app.statusline_sandbox) {
-                const permission_mode: types.PermissionMode = if (comptime @hasField(App, "permission_engine"))
-                    app.permission_engine.mode
-                else
-                    .auto;
-                items.sandbox_label = sandbox.publicModeForBackend(sandbox.effectiveBackend(
-                    permission_mode,
-                    app.permission_state.sandbox_backend,
-                )).label();
+            if (comptime @hasField(App, "workspace_identity") and
+                @hasField(App, "workspace_root"))
+            {
+                const identity = app.workspace_identity.refresh(
+                    app.alloc,
+                    app.workspace_root,
+                ) catch app.workspace_identity.snapshot();
+                items.workspace_label = identity.workspace_label;
+                items.git_branch = identity.git_branch;
             }
             if (app.statusline_context) {
                 items.context_used = app.total_input_tokens;
@@ -1762,20 +1742,12 @@ pub fn Runtime(comptime App: type) type {
                     )) |source| {
                         transcript_source = source;
                     } else if (omitted_entry_id) |entry_id| {
-                        owned_transcript_source = if (presentation_shell.maxxing_mode == .minimal)
-                            try presentation_shell.prepareTranscriptSourceForFrameInterruptible(
-                                app.alloc,
-                                entry_id,
-                                null,
-                                checkpoint,
-                            )
-                        else
-                            try presentation_shell.prepareTranscriptSourceForFrameInterruptible(
-                                app.alloc,
-                                null,
-                                entry_id,
-                                checkpoint,
-                            );
+                        owned_transcript_source = try presentation_shell.prepareTranscriptSourceForFrameInterruptible(
+                            app.alloc,
+                            entry_id,
+                            null,
+                            checkpoint,
+                        );
                     } else {
                         owned_transcript_source = try presentation_shell.cachedTranscriptSourceInterruptible(
                             app.alloc,
@@ -2252,12 +2224,28 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
+            var transcript_source: ?transcript_runtime.TranscriptPreparationSource = null;
+            defer if (transcript_source) |*source| source.deinit(app.alloc);
+            const transcript_document: approval_screen.TranscriptDocument = switch (approval_screen.transcriptDocumentPlan(
+                approval,
+                &app.approval_screen,
+                app.shell.entries.items,
+                app.shell.layout,
+            ) catch |err| return failApprovalScreen(app, request.id, err)) {
+                .none => .none,
+                .progressive => |present| .{ .progressive = present },
+                .projected => blk: {
+                    transcript_source = app.shell.cachedTranscriptSource(app.alloc) catch |err|
+                        return failApprovalScreen(app, request.id, err);
+                    break :blk .{ .projected = transcript_source.?.bytes };
+                },
+            };
+
             var screen = approval_screen.paint(
                 app.alloc,
                 approval,
                 &app.approval_screen,
-                app.shell.entries.items,
-                app.shell.retainedTranscriptStyles(),
+                transcript_document,
                 app.shell.layout,
                 clear_display,
             ) catch |err| return failApprovalScreen(app, request.id, err);
@@ -2327,8 +2315,6 @@ pub fn Runtime(comptime App: type) type {
                     .pasted_blocks = ctx.input.entities.pasted_blocks.items,
                     .image_tokens = ctx.input.entities.image_tokens.items,
                     .skill_tokens = ctx.input.entities.skill_tokens.items,
-                    .appearance = if (ctx.maxxing_mode == .minimal) .lines else ctx.input_appearance,
-                    .prefix_style = if (ctx.maxxing_mode == .minimal) .rail else .arrow,
                 },
                 .ctrl_c_pending = ctx.ctrl_c_pending,
                 .clear_display = clear_display,
@@ -2365,8 +2351,6 @@ pub fn Runtime(comptime App: type) type {
                     .pasted_blocks = ctx.input.entities.pasted_blocks.items,
                     .image_tokens = ctx.input.entities.image_tokens.items,
                     .skill_tokens = ctx.input.entities.skill_tokens.items,
-                    .appearance = if (ctx.maxxing_mode == .minimal) .lines else ctx.input_appearance,
-                    .prefix_style = if (ctx.maxxing_mode == .minimal) .rail else .arrow,
                 },
                 .ctrl_c_pending = ctx.ctrl_c_pending,
                 .clear_display = clear_display,
@@ -2403,8 +2387,6 @@ pub fn Runtime(comptime App: type) type {
                     .pasted_blocks = ctx.input.entities.pasted_blocks.items,
                     .image_tokens = ctx.input.entities.image_tokens.items,
                     .skill_tokens = ctx.input.entities.skill_tokens.items,
-                    .appearance = if (ctx.maxxing_mode == .minimal) .lines else ctx.input_appearance,
-                    .prefix_style = if (ctx.maxxing_mode == .minimal) .rail else .arrow,
                 },
                 .ctrl_c_pending = ctx.ctrl_c_pending,
                 .clear_display = true,
@@ -2441,8 +2423,6 @@ pub fn Runtime(comptime App: type) type {
                     .pasted_blocks = ctx.input.entities.pasted_blocks.items,
                     .image_tokens = ctx.input.entities.image_tokens.items,
                     .skill_tokens = ctx.input.entities.skill_tokens.items,
-                    .appearance = if (ctx.maxxing_mode == .minimal) .lines else ctx.input_appearance,
-                    .prefix_style = if (ctx.maxxing_mode == .minimal) .rail else .arrow,
                 },
                 .ctrl_c_pending = ctx.ctrl_c_pending,
                 .clear_display = true,
@@ -2483,8 +2463,6 @@ pub fn Runtime(comptime App: type) type {
                     .pasted_blocks = ctx.input.entities.pasted_blocks.items,
                     .image_tokens = ctx.input.entities.image_tokens.items,
                     .skill_tokens = ctx.input.entities.skill_tokens.items,
-                    .appearance = if (ctx.maxxing_mode == .minimal) .lines else ctx.input_appearance,
-                    .prefix_style = if (ctx.maxxing_mode == .minimal) .rail else .arrow,
                 },
                 .ctrl_c_pending = ctx.ctrl_c_pending,
                 .clear_display = clear_display,
@@ -2525,8 +2503,6 @@ pub fn Runtime(comptime App: type) type {
                     .pasted_blocks = ctx.input.entities.pasted_blocks.items,
                     .image_tokens = ctx.input.entities.image_tokens.items,
                     .skill_tokens = ctx.input.entities.skill_tokens.items,
-                    .appearance = if (ctx.maxxing_mode == .minimal) .lines else ctx.input_appearance,
-                    .prefix_style = if (ctx.maxxing_mode == .minimal) .rail else .arrow,
                 },
                 .ctrl_c_pending = ctx.ctrl_c_pending,
                 .clear_display = clear_display,
@@ -2573,8 +2549,6 @@ pub fn Runtime(comptime App: type) type {
                     .pasted_blocks = ctx.input.entities.pasted_blocks.items,
                     .image_tokens = ctx.input.entities.image_tokens.items,
                     .skill_tokens = ctx.input.entities.skill_tokens.items,
-                    .appearance = if (ctx.maxxing_mode == .minimal) .lines else ctx.input_appearance,
-                    .prefix_style = if (ctx.maxxing_mode == .minimal) .rail else .arrow,
                 },
                 .ctrl_c_pending = ctx.ctrl_c_pending,
                 .clear_display = clear_display,
@@ -2798,11 +2772,11 @@ pub fn Runtime(comptime App: type) type {
                 };
             }
             if (comptime @hasDecl(@TypeOf(app.subagents), "setDefaults") and
-                @hasField(App, "selected_model") and @hasField(App, "effort"))
+                provider_runtime.supported(App) and @hasField(App, "effort"))
             {
                 try app.subagents.setDefaults(
                     app.alloc,
-                    app.selected_model.items,
+                    provider_runtime.model(app),
                     app.effort,
                 );
             }
@@ -3120,7 +3094,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             if (comptime !@hasField(App, "session") or
-                !@hasField(App, "selected_model") or !@hasField(App, "effort"))
+                !provider_runtime.supported(App) or !@hasField(App, "effort"))
             {
                 app.subagents.mutationRejected(app.alloc, .{
                     .code = .store_failure,
@@ -3165,7 +3139,8 @@ pub fn Runtime(comptime App: type) type {
             var result = host.executeHumanCommand(app.alloc, &mutation.command, .{
                 .invocation_id = mutation.invocation_id,
                 .defaults = .{
-                    .model = app.selected_model.items,
+                    .provider = provider_runtime.provider(app),
+                    .model = provider_runtime.model(app),
                     .effort = app.effort,
                     .fast_mode = if (comptime @hasField(App, "fast_mode")) app.fast_mode else false,
                     .conversation_language = app.session.languageSnapshot(),
@@ -3785,7 +3760,7 @@ test "core.app_render_runtime gives all transient activity the turn-summary foot
 }
 
 test "core.app_render_runtime connects minimal focused tools to the transcript block" {
-    var shell = transcript_runtime.TranscriptRuntime{ .maxxing_mode = .minimal };
+    var shell = transcript_runtime.TranscriptRuntime{};
     defer shell.deinit(std.testing.allocator);
 
     const active_tool = surface_frame.SurfaceFooterMeasurement{
@@ -4516,15 +4491,17 @@ const CoordinatorTestApp = struct {
     worker: CoordinatorTestWorker = .{},
     subagents: ui_subagents.Controller = .{},
     selected_model: std.ArrayList(u8) = .empty,
+    workspace_root: []const u8 = "",
+    workspace_identity: statusline_identity.Runtime = .{},
     pacer: CoordinatorTestPacer = .{},
     auth: auth_runtime.Runtime = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     skills: skill_runtime.Runtime = .{},
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.testing.allocator, "/v1/models"),
+    model_cache_loading: bool = false,
     stream: types.StreamState = .{},
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
-    statusline_sandbox: bool = false,
     statusline_context: bool = false,
     total_input_tokens: u64 = 0,
     gateway_metadata_model: ?[]const u8 = null,
@@ -4545,6 +4522,7 @@ const CoordinatorTestApp = struct {
         self.question_prompt.deinit(self.alloc);
         self.subagents.deinit(self.alloc);
         self.selected_model.deinit(self.alloc);
+        self.workspace_identity.deinit(self.alloc);
         self.pending_images.deinit(self.alloc);
         self.model_cache.deinit();
     }
@@ -4563,8 +4541,8 @@ const CoordinatorTestApp = struct {
         return 0;
     }
 
-    fn isModelCacheLoading(_: *CoordinatorTestApp) bool {
-        return false;
+    fn isModelCacheLoading(self: *CoordinatorTestApp) bool {
+        return self.model_cache_loading;
     }
 
     fn isModelCacheFailed(_: *CoordinatorTestApp) bool {
@@ -4659,6 +4637,50 @@ test "core.app_render_runtime keeps final token progress during paced response t
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
+}
+
+test "core.app_render_runtime keeps configured controls visible while model capabilities load" {
+    const alloc = std.testing.allocator;
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{},
+        .model_cache_loading = true,
+        .fast_mode = true,
+        .effort = types.ReasoningEffort.literal("xhigh"),
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(alloc, "anthropic/claude-opus-4.8");
+
+    var upgrade_status_buf: [64]u8 = undefined;
+    const queued_cards: QueuedCardProjection = .{};
+    const ctx = Runtime(CoordinatorTestApp).footerContext(
+        &app,
+        &upgrade_status_buf,
+        0,
+        &queued_cards,
+    );
+
+    var hint_buf: [128]u8 = undefined;
+    const line = ui_render.buildHintLine(
+        ctx.stream.active,
+        false,
+        ctx.has_api_key,
+        ctx.model,
+        ctx.permission_mode,
+        ctx.queued_count,
+        null,
+        ctx.fast_mode,
+        ctx.model_supports_fast,
+        ctx.effort,
+        ctx.model_supports_effort,
+        ctx.statusline,
+        80,
+        &hint_buf,
+    );
+    try std.testing.expectEqualStrings(
+        "run /login · ask · opus 4.8 · xhigh · ⚡︎",
+        line,
+    );
 }
 
 test "core.app_render_runtime projects only the visible inline completion suffix" {

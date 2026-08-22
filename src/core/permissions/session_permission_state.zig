@@ -2,7 +2,8 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
-pub const schema_version: u8 = 1;
+const legacy_schema_version: u8 = 1;
+pub const schema_version: u8 = 2;
 pub const max_rules: usize = 1024;
 pub const max_identity_bytes: usize = 4096;
 pub const max_display_identity_bytes: usize = 4096;
@@ -80,7 +81,11 @@ pub const State = struct {
 };
 
 pub fn validate(state: State) !void {
-    if (state.version != schema_version or
+    return validateSchema(state, schema_version);
+}
+
+pub fn validateSchema(state: State, expected_version: u8) !void {
+    if (state.version != expected_version or
         state.next_generation == 0 or
         state.rules.items.len > max_rules)
     {
@@ -110,6 +115,191 @@ pub fn validate(state: State) !void {
             }
         }
     }
+}
+
+const V1CommandIdentity = struct {
+    command: []const u8,
+    cwd: []const u8,
+    background: []const u8,
+    backend: []const u8,
+    target_os: []const u8,
+};
+
+fn readIdentityField(canonical: []const u8, offset: *usize) ![]const u8 {
+    const length_end = std.math.add(usize, offset.*, @sizeOf(u64)) catch
+        return error.InvalidPermissionIdentity;
+    if (length_end > canonical.len) return error.InvalidPermissionIdentity;
+    var length_bytes: [@sizeOf(u64)]u8 = undefined;
+    @memcpy(&length_bytes, canonical[offset.*..length_end]);
+    const length_u64 = std.mem.readInt(u64, &length_bytes, .big);
+    const length = std.math.cast(usize, length_u64) orelse
+        return error.InvalidPermissionIdentity;
+    const value_end = std.math.add(usize, length_end, length) catch
+        return error.InvalidPermissionIdentity;
+    if (value_end > canonical.len) return error.InvalidPermissionIdentity;
+    offset.* = value_end;
+    return canonical[length_end..value_end];
+}
+
+fn parseV1CommandIdentity(canonical: []const u8) !V1CommandIdentity {
+    var offset: usize = 0;
+    if (!std.mem.eql(u8, try readIdentityField(canonical, &offset), "fx-permission-state-v1")) {
+        return error.InvalidPermissionIdentity;
+    }
+    const command = try readIdentityField(canonical, &offset);
+    const cwd = try readIdentityField(canonical, &offset);
+    const background = try readIdentityField(canonical, &offset);
+    const backend = try readIdentityField(canonical, &offset);
+    const target_os = try readIdentityField(canonical, &offset);
+    _ = try readIdentityField(canonical, &offset);
+    if (offset != canonical.len or command.len == 0 or cwd.len == 0 or
+        target_os.len == 0 or
+        (!std.mem.eql(u8, background, "foreground") and
+            !std.mem.eql(u8, background, "background")))
+    {
+        return error.InvalidPermissionIdentity;
+    }
+    return .{
+        .command = command,
+        .cwd = cwd,
+        .background = background,
+        .backend = backend,
+        .target_os = target_os,
+    };
+}
+
+fn writeIdentityField(writer: *std.Io.Writer, value: []const u8) !void {
+    const value_len = std.math.cast(u64, value.len) orelse
+        return error.InvalidPermissionIdentity;
+    var length: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &length, value_len, .big);
+    try writer.writeAll(&length);
+    try writer.writeAll(value);
+}
+
+/// Returns a command key whose canonical bytes belong to `alloc`.
+pub fn commandKeyV2(
+    alloc: Allocator,
+    command: []const u8,
+    cwd: []const u8,
+    background: []const u8,
+    target_os: []const u8,
+) !RuleKey {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writeIdentityField(&out.writer, "fx-permission-state-v2");
+    try writeIdentityField(&out.writer, command);
+    try writeIdentityField(&out.writer, cwd);
+    try writeIdentityField(&out.writer, background);
+    try writeIdentityField(&out.writer, target_os);
+    const canonical = try out.toOwnedSlice();
+    errdefer alloc.free(canonical);
+    return RuleKey.init(.command, canonical);
+}
+
+fn migrationRuleIndex(state: State, key: RuleKey) ?usize {
+    for (state.rules.items, 0..) |rule, index| {
+        if (RuleKey.eql(rule.key, key)) return index;
+    }
+    return null;
+}
+
+fn candidateSuppliesDisplay(candidate: Rule, current: Rule) bool {
+    return candidate.generation > current.generation or
+        (candidate.generation == current.generation and
+            std.mem.order(
+                u8,
+                candidate.display_identity,
+                current.display_identity,
+            ) == .lt);
+}
+
+fn mergeMigrationCandidate(
+    alloc: Allocator,
+    migrated: *State,
+    source: Rule,
+    key: RuleKey,
+) !void {
+    if (migrationRuleIndex(migrated.*, key)) |index| {
+        alloc.free(@constCast(key.canonical));
+        const current = &migrated.rules.items[index];
+        if (current.decision == .deny and source.decision == .allow) return;
+        if (current.decision == .allow and source.decision == .deny) {
+            const display_identity = try alloc.dupe(u8, source.display_identity);
+            alloc.free(current.display_identity);
+            current.display_identity = display_identity;
+            current.id = source.id;
+            current.generation = source.generation;
+            current.decision = .deny;
+            return;
+        }
+        if (candidateSuppliesDisplay(source, current.*)) {
+            const display_identity = try alloc.dupe(u8, source.display_identity);
+            alloc.free(current.display_identity);
+            current.display_identity = display_identity;
+        }
+        if (source.id.value < current.id.value) current.id = source.id;
+        if (source.generation > current.generation) current.generation = source.generation;
+        return;
+    }
+
+    errdefer alloc.free(@constCast(key.canonical));
+    const display_identity = try alloc.dupe(u8, source.display_identity);
+    errdefer alloc.free(display_identity);
+    try migrated.rules.append(alloc, .{
+        .id = source.id,
+        .key = key,
+        .display_identity = display_identity,
+        .decision = source.decision,
+        .generation = source.generation,
+    });
+}
+
+fn ruleIdLessThan(_: void, left: Rule, right: Rule) bool {
+    return left.id.value < right.id.value;
+}
+
+/// Projects provenance-bearing schema-1 command rules into schema 2.
+/// Schema-2 input is cloned unchanged so repeated migration is idempotent.
+pub fn migrateV1ToV2(alloc: Allocator, state: State) !State {
+    if (state.version == schema_version) {
+        try validateSchema(state, schema_version);
+        return cloneState(alloc, state);
+    }
+    try validateSchema(state, legacy_schema_version);
+
+    var migrated: State = .{
+        .version = schema_version,
+        .next_generation = state.next_generation,
+    };
+    errdefer migrated.deinit(alloc);
+    try migrated.rules.ensureTotalCapacity(alloc, state.rules.items.len);
+
+    for (state.rules.items) |rule| {
+        if (rule.key.kind != .command) {
+            try appendRuleCopy(alloc, &migrated, rule);
+            continue;
+        }
+        const identity = parseV1CommandIdentity(rule.key.canonical) catch
+            return error.InvalidPermissionState;
+        if (rule.decision == .allow and
+            !std.mem.eql(u8, identity.backend, "none"))
+        {
+            continue;
+        }
+        const key = try commandKeyV2(
+            alloc,
+            identity.command,
+            identity.cwd,
+            identity.background,
+            identity.target_os,
+        );
+        try mergeMigrationCandidate(alloc, &migrated, rule, key);
+    }
+
+    std.mem.sort(Rule, migrated.rules.items, {}, ruleIdLessThan);
+    try validateSchema(migrated, schema_version);
+    return migrated;
 }
 
 pub const SetEvent = struct {
@@ -636,4 +826,172 @@ test "capacity rejects insertion while preserving replacement" {
     try std.testing.expectEqual(@as(usize, max_rules), replaced.rules.items.len);
     try std.testing.expectEqual(existing.id, replaced.rules.items[0].id);
     try std.testing.expectEqual(Decision.allow, replaced.rules.items[0].decision);
+}
+
+fn fixtureIdentity(
+    alloc: Allocator,
+    fields: []const []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    for (fields) |field| {
+        var length: [@sizeOf(u64)]u8 = undefined;
+        std.mem.writeInt(u64, &length, @intCast(field.len), .big);
+        try out.writer.writeAll(&length);
+        try out.writer.writeAll(field);
+    }
+    return out.toOwnedSlice();
+}
+
+fn appendFixtureRule(
+    alloc: Allocator,
+    state: *State,
+    id: u64,
+    generation: u64,
+    kind: RuleKey.Kind,
+    canonical: []u8,
+    display_identity: []const u8,
+    decision: Decision,
+) !void {
+    errdefer alloc.free(canonical);
+    try state.rules.append(alloc, .{
+        .id = .{ .value = id },
+        .key = try RuleKey.init(kind, canonical),
+        .display_identity = try alloc.dupe(u8, display_identity),
+        .decision = decision,
+        .generation = generation,
+    });
+}
+
+test "v1 command migration is deny dominant stable and idempotent" {
+    const alloc = std.testing.allocator;
+    const command = "git status";
+    const cwd = "/workspace";
+    const foreground = "foreground";
+    const macos = "macos";
+    const none = "none";
+    const target_os = "macos";
+    const restricted = "restricted";
+
+    var v1: State = .{ .version = 1, .next_generation = 9 };
+    defer v1.deinit(alloc);
+    try appendFixtureRule(
+        alloc,
+        &v1,
+        1,
+        1,
+        .command,
+        try fixtureIdentity(alloc, &.{ "fx-permission-state-v1", command, cwd, foreground, none, target_os, restricted }),
+        "none allow",
+        .allow,
+    );
+    try appendFixtureRule(
+        alloc,
+        &v1,
+        2,
+        2,
+        .command,
+        try fixtureIdentity(alloc, &.{ "fx-permission-state-v1", command, cwd, foreground, macos, target_os, restricted }),
+        "macos deny",
+        .deny,
+    );
+    try appendFixtureRule(
+        alloc,
+        &v1,
+        4,
+        4,
+        .command,
+        try fixtureIdentity(alloc, &.{ "fx-permission-state-v1", "git diff", cwd, foreground, macos, target_os, restricted }),
+        "older deny",
+        .deny,
+    );
+    try appendFixtureRule(
+        alloc,
+        &v1,
+        3,
+        5,
+        .command,
+        try fixtureIdentity(alloc, &.{ "fx-permission-state-v1", "git diff", cwd, foreground, none, target_os, restricted }),
+        "newer deny",
+        .deny,
+    );
+    try appendFixtureRule(
+        alloc,
+        &v1,
+        6,
+        6,
+        .command,
+        try fixtureIdentity(alloc, &.{ "fx-permission-state-v1", "pwd", cwd, foreground, none, target_os, restricted }),
+        "eligible allow",
+        .allow,
+    );
+    try appendFixtureRule(
+        alloc,
+        &v1,
+        7,
+        7,
+        .command,
+        try fixtureIdentity(alloc, &.{ "fx-permission-state-v1", "ps", cwd, foreground, macos, target_os, restricted }),
+        "ineligible allow",
+        .allow,
+    );
+    const tool_canonical = try alloc.dupe(u8, "structured-tool-v1");
+    try appendFixtureRule(
+        alloc,
+        &v1,
+        8,
+        8,
+        .structured_tool,
+        tool_canonical,
+        "unchanged tool",
+        .deny,
+    );
+
+    var migrated = try migrateV1ToV2(alloc, v1);
+    defer migrated.deinit(alloc);
+    try validateSchema(migrated, 2);
+    try std.testing.expectEqual(@as(u8, 2), migrated.version);
+    try std.testing.expectEqual(@as(u64, 9), migrated.next_generation);
+    try std.testing.expectEqual(@as(usize, 4), migrated.rules.items.len);
+    try std.testing.expectEqualSlices(u64, &.{ 2, 3, 6, 8 }, &.{
+        migrated.rules.items[0].id.value,
+        migrated.rules.items[1].id.value,
+        migrated.rules.items[2].id.value,
+        migrated.rules.items[3].id.value,
+    });
+
+    const status_key_bytes = try fixtureIdentity(alloc, &.{ "fx-permission-state-v2", command, cwd, foreground, target_os });
+    defer alloc.free(status_key_bytes);
+    const status_key = try RuleKey.init(.command, status_key_bytes);
+    const status_rule = ruleForKey(migrated, status_key) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(Decision.deny, status_rule.decision);
+    try std.testing.expectEqualStrings("macos deny", status_rule.display_identity);
+
+    const diff_key_bytes = try fixtureIdentity(alloc, &.{ "fx-permission-state-v2", "git diff", cwd, foreground, target_os });
+    defer alloc.free(diff_key_bytes);
+    const diff_key = try RuleKey.init(.command, diff_key_bytes);
+    const diff_rule = ruleForKey(migrated, diff_key) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(Decision.deny, diff_rule.decision);
+    try std.testing.expectEqual(@as(u64, 3), diff_rule.id.value);
+    try std.testing.expectEqual(@as(u64, 5), diff_rule.generation);
+    try std.testing.expectEqualStrings("newer deny", diff_rule.display_identity);
+
+    const pwd_key_bytes = try fixtureIdentity(alloc, &.{ "fx-permission-state-v2", "pwd", cwd, foreground, target_os });
+    defer alloc.free(pwd_key_bytes);
+    const pwd_key = try RuleKey.init(.command, pwd_key_bytes);
+    try std.testing.expectEqual(StateDecision.allow, decide(migrated, pwd_key));
+    try std.testing.expectEqual(RuleKey.Kind.structured_tool, migrated.rules.items[3].key.kind);
+    try std.testing.expectEqualStrings("structured-tool-v1", migrated.rules.items[3].key.canonical);
+
+    var second = try migrateV1ToV2(alloc, migrated);
+    defer second.deinit(alloc);
+    try validateSchema(second, 2);
+    try std.testing.expectEqual(@as(usize, migrated.rules.items.len), second.rules.items.len);
+    for (migrated.rules.items, second.rules.items) |expected, actual| {
+        try std.testing.expectEqual(expected.id, actual.id);
+        try std.testing.expectEqual(expected.generation, actual.generation);
+        try std.testing.expectEqual(expected.decision, actual.decision);
+        try std.testing.expect(RuleKey.eql(expected.key, actual.key));
+        try std.testing.expectEqualStrings(expected.display_identity, actual.display_identity);
+    }
 }

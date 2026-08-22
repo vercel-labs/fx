@@ -2,7 +2,6 @@ const std = @import("std");
 const session_child_store = @import("../session/session_child_store.zig");
 const session_store = @import("../session/session_store.zig");
 const types = @import("../shared/types.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const communication = @import("communication.zig");
 const communication_store = @import("communication_store.zig");
 const control_store = @import("control_store.zig");
@@ -88,7 +87,6 @@ pub const Error = error{
 pub const HostAuthority = struct {
     generation: u64,
     tools: [][]u8,
-    sandbox_backend: types.BackendKind,
     integrations: [][]u8,
     rules: types.PermissionRuleSet,
     grants: []types.PermissionGrant,
@@ -98,7 +96,6 @@ pub const HostAuthority = struct {
     pub fn capture(
         alloc: Allocator,
         tools: []const []const u8,
-        sandbox_backend: types.BackendKind,
         integrations: []const []const u8,
         rules: types.PermissionRuleSet,
         grants: []const types.PermissionGrant,
@@ -106,7 +103,6 @@ pub const HostAuthority = struct {
         return captureWithPermissionStateAndMcpView(
             alloc,
             tools,
-            sandbox_backend,
             integrations,
             rules,
             grants,
@@ -118,7 +114,6 @@ pub const HostAuthority = struct {
     pub fn captureWithPermissionStateAndMcpView(
         alloc: Allocator,
         tools: []const []const u8,
-        sandbox_backend: types.BackendKind,
         integrations: []const []const u8,
         rules: types.PermissionRuleSet,
         grants: []const types.PermissionGrant,
@@ -145,7 +140,6 @@ pub const HostAuthority = struct {
         return .{
             .generation = hostGeneration(
                 tools,
-                sandbox_backend,
                 integrations,
                 rules,
                 grants,
@@ -153,7 +147,6 @@ pub const HostAuthority = struct {
                 mcp_view,
             ),
             .tools = owned_tools,
-            .sandbox_backend = sandbox_backend,
             .integrations = owned_integrations,
             .rules = owned_rules,
             .grants = try types.dupePermissionGrantSlice(alloc, grants),
@@ -209,7 +202,6 @@ test "host authority preserves session denies and filters undelegated allows" {
     var host = try HostAuthority.captureWithPermissionStateAndMcpView(
         alloc,
         &.{"run_command"},
-        .none,
         &.{},
         .{},
         &.{},
@@ -239,7 +231,6 @@ test "host authority preserves session denies and filters undelegated allows" {
 
 fn hostGeneration(
     tools: []const []const u8,
-    sandbox_backend: types.BackendKind,
     integrations: []const []const u8,
     rules: types.PermissionRuleSet,
     grants: []const types.PermissionGrant,
@@ -247,8 +238,7 @@ fn hostGeneration(
     mcp_view: ?*const mcp_access.View,
 ) u64 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("fx.subagent.host-authority.v1\x00");
-    hashString(&hash, @tagName(sandbox_backend));
+    hash.update("fx.subagent.host-authority.v2\x00");
     hashU64(&hash, tools.len);
     for (tools) |tool| hashString(&hash, tool);
     hashU64(&hash, integrations.len);
@@ -324,7 +314,6 @@ pub const Snapshot = struct {
     root_id: []u8,
     generation: u64,
     tools: [][]u8,
-    sandbox_backend: types.BackendKind,
     integrations: [][]u8,
     rules: types.PermissionRuleSet,
     grants: []types.PermissionGrant,
@@ -349,7 +338,6 @@ pub const Snapshot = struct {
             .generation = self.generation,
             .root_id = self.root_id,
             .tools = self.tools,
-            .sandbox_backend = self.sandbox_backend,
             .integrations = self.integrations,
             .rules = self.rules,
             .grants = self.grants,
@@ -509,10 +497,6 @@ pub const Resolver = struct {
                 durable_generation,
             ),
             .tools = tools,
-            .sandbox_backend = sandbox.effectiveBackend(
-                permission_mode,
-                host.sandbox_backend,
-            ),
             .integrations = integrations,
             .rules = rules,
             .grants = grants,
@@ -723,14 +707,14 @@ fn checkGrantMergeResolutionAllocationFailures(alloc: Allocator) !void {
     };
     const durable = [_]types.PermissionGrant{
         .{ .tool_name = @constCast("read"), .target_path = @constCast("src/**") },
-        .{ .tool_name = @constCast("sandbox"), .target_path = @constCast("zig build*") },
+        .{ .tool_name = @constCast("custom"), .target_path = @constCast("zig build*") },
     };
     const merged = try mergeGrants(alloc, &host, &durable);
     defer types.freePermissionGrantSlice(alloc, merged);
     try std.testing.expectEqual(@as(usize, 3), merged.len);
     try std.testing.expectEqualStrings("read", merged[0].tool_name);
     try std.testing.expectEqualStrings("bash", merged[1].tool_name);
-    try std.testing.expectEqualStrings("sandbox", merged[2].tool_name);
+    try std.testing.expectEqualStrings("custom", merged[2].tool_name);
 }
 
 test "grant merge resolution cleans every failing allocation path" {

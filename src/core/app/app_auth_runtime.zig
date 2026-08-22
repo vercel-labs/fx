@@ -3,10 +3,17 @@ const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
+const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
 const credentials = @import("../auth/credentials.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const login_flow = @import("../auth/login_flow.zig");
+const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
+const grok_oauth = @import("../auth/grok_oauth.zig");
+const provider_catalog = @import("../auth/provider_catalog.zig");
+const model_provider = @import("../config/model_provider.zig");
+const model_catalog = @import("../gateway/model_catalog.zig");
+const provider_runtime = @import("provider_runtime.zig");
 const types = @import("../shared/types.zig");
 
 fn oauthAuthEnabled(comptime App: type) bool {
@@ -14,9 +21,88 @@ fn oauthAuthEnabled(comptime App: type) bool {
         runtime_profile.allows(App, .js_host_auth);
 }
 
+const ProviderSwitchDecision = enum {
+    no_change,
+    busy,
+    prepare,
+};
+
+const ProviderSwitchIntent = enum {
+    manual,
+    post_oauth,
+};
+
+const ProviderSwitchFacts = struct {
+    current: model_provider.ProviderId,
+    target: model_provider.ProviderId,
+    target_credential_ready: bool,
+    intent: ProviderSwitchIntent,
+    stream_active: bool,
+    queued_prompts: usize,
+};
+
+fn decideProviderSwitch(facts: ProviderSwitchFacts) ProviderSwitchDecision {
+    if (facts.intent == .manual and facts.current == facts.target and facts.target_credential_ready) return .no_change;
+    if (facts.stream_active or facts.queued_prompts > 0) return .busy;
+    return .prepare;
+}
+
+fn providerFailureMessage(
+    intent: ProviderSwitchIntent,
+    ordinary: []const u8,
+    after_oauth: []const u8,
+) []const u8 {
+    return if (intent == .post_oauth) after_oauth else ordinary;
+}
+
+fn selectCatalogModel(
+    entries: []const model_catalog.ModelCatalogEntry,
+    primary: ?[]const u8,
+    secondary: ?[]const u8,
+) ?[]const u8 {
+    for ([_]?[]const u8{ primary, secondary }) |maybe_candidate| {
+        const candidate = maybe_candidate orelse continue;
+        for (entries) |entry| {
+            if (std.mem.eql(u8, candidate, entry.id)) return entry.id;
+        }
+    }
+    return if (entries.len > 0) entries[0].id else null;
+}
+
 pub fn Runtime(comptime App: type) type {
     return struct {
         fn ensurePromptCredential(app: *App) !bool {
+            if (comptime provider_runtime.supported(App) and
+                @hasDecl(@TypeOf(app.auth), "selectForProvider"))
+            {
+                const provider = provider_runtime.provider(app);
+                const required_source: credentials.Source = switch (provider) {
+                    .codex => .chatgpt_subscription,
+                    .grok => .grok_subscription,
+                    .opencode_go => .opencode_go,
+                    .gateway => app.auth.credentialSource() orelse .fx_login,
+                };
+                const route_change = app.auth.selectForProvider(app.alloc, provider) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return recoverCredentialFailure(app, required_source, err),
+                };
+                if (route_change) |changed| {
+                    applyCredentialChange(app, changed);
+                } else if (!model_provider.authorizesCredential(provider, app.auth.credentialSource())) {
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .warning,
+                        .body = if (provider == .grok)
+                            credentials.missing_grok_interactive_credential_message
+                        else if (provider == .codex)
+                            credentials.missing_chatgpt_interactive_credential_message
+                        else
+                            credentials.missing_interactive_credential_message,
+                    }, true);
+                    app.shell.render_requests.request(.footer);
+                    return false;
+                }
+            }
             if (app.auth.credentialSource() != null) return true;
 
             const auth_view = app.auth.view();
@@ -68,10 +154,16 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
-            try beginSignIn(app, false);
+            if (comptime host_target.is_wasm) {
+                try beginSignIn(app, false);
+                return;
+            }
+            try app.auth.refreshSourceInventory(app.alloc);
+            app.auth.openPicker(app.alloc);
+            app.shell.render_requests.request(.footer);
         }
 
-        pub fn runLogoutCommand(app: *App) !void {
+        pub fn runLogoutCommand(app: *App, target: []const u8) !void {
             if (comptime !oauthAuthEnabled(App)) {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -80,7 +172,97 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
+            const requested_provider = if (std.mem.trim(u8, target, " \t\r\n").len == 0)
+                null
+            else
+                provider_catalog.parse(std.mem.trim(u8, target, " \t\r\n")) orelse {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .warning,
+                        .body = "Usage: /logout [vercel|codex|grok]",
+                    });
+                    return;
+                };
             try app.flushBeforeBlockingExternalWork();
+            const selected_model_uses_chatgpt = if (comptime provider_runtime.supported(App))
+                provider_runtime.provider(app) == .codex
+            else
+                false;
+            const selected_model_uses_grok = if (comptime provider_runtime.supported(App))
+                provider_runtime.provider(app) == .grok
+            else
+                false;
+            const provider_inventory = if (comptime @hasDecl(@TypeOf(app.auth), "pickerView")) inventory: {
+                try app.auth.refreshSourceInventory(app.alloc);
+                break :inventory app.auth.pickerView().available_sources;
+            } else @as(auth_runtime.SourceSet, .empty);
+            const chatgpt_is_only_logout_session = provider_inventory.contains(.chatgpt_subscription) and
+                !provider_inventory.contains(.fx_login) and
+                !provider_inventory.contains(.grok_subscription);
+            const grok_is_only_logout_session = provider_inventory.contains(.grok_subscription) and
+                !provider_inventory.contains(.fx_login) and
+                !provider_inventory.contains(.chatgpt_subscription);
+            const logout_grok = if (requested_provider) |provider|
+                provider == .grok
+            else
+                selected_model_uses_grok or
+                    app.auth.credentialSource() == .grok_subscription or
+                    grok_is_only_logout_session;
+            if (logout_grok) {
+                const outcome = grok_oauth.logout(app.alloc, app.auth.oauthTransport()) catch {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Could not durably sign out of Grok. The current source is unchanged.",
+                    });
+                    return;
+                };
+                const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterGrokLogout"))
+                    try app.auth.reconcileAfterGrokLogout(app.alloc)
+                else
+                    false;
+                applyCredentialChange(app, changed);
+                try writeAuthNotice(app, switch (outcome.deletion) {
+                    .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of Grok." },
+                    .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Grok login session found." },
+                    .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Grok, but could not confirm the profile directory update." },
+                });
+                if (outcome.revocation_failed) {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .warning,
+                        .body = "The local Grok session was removed, but remote revocation could not be confirmed.",
+                    });
+                }
+                return;
+            }
+            const logout_chatgpt = if (requested_provider) |provider|
+                provider == .codex
+            else
+                selected_model_uses_chatgpt or
+                    app.auth.credentialSource() == .chatgpt_subscription or
+                    chatgpt_is_only_logout_session;
+            if (logout_chatgpt) {
+                const outcome = chatgpt_oauth.logout() catch {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Could not durably sign out of Codex. The current source is unchanged.",
+                    });
+                    return;
+                };
+                const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterChatGptLogout"))
+                    try app.auth.reconcileAfterChatGptLogout(app.alloc)
+                else
+                    false;
+                applyCredentialChange(app, changed);
+                try writeAuthNotice(app, switch (outcome) {
+                    .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of Codex." },
+                    .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Codex login session found." },
+                    .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Codex, but could not confirm the profile directory update." },
+                });
+                return;
+            }
             const result = login_flow.logout(app.alloc, app.auth.oauthTransport()) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
                     try writeAuthNotice(app, .{
@@ -153,9 +335,12 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             switch (choice) {
+                .provider => |provider| try switchProvider(app, provider, true, .manual),
                 .source => |source| try applySourceChoice(app, source),
                 .action => |action| switch (action) {
                     .login => try beginSignIn(app, true),
+                    .chatgpt_login => try beginChatGptSignIn(app),
+                    .grok_login => try beginGrokSignIn(app),
                     .setup => {
                         if (comptime !runtime_profile.allows(App, .native_auth)) {
                             try app.writeDomainNotice(.{
@@ -182,6 +367,7 @@ pub fn Runtime(comptime App: type) type {
                     },
                     .change_team => try beginTeamPicker(app),
                     .switch_credential => app.auth.openSwitchCredentialPicker(app.alloc),
+                    .switch_provider => app.auth.openProviderPicker(app.alloc, provider_runtime.provider(app)),
                     .automatic => try applyAutomaticCredential(app),
                 },
                 .team => |index| try applyTeamChoice(app, index),
@@ -229,40 +415,103 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn collectSignInFacts(app: *App) !void {
             if (comptime !oauthAuthEnabled(App)) return;
+            const sign_in_source: credentials.Source = if (comptime @hasDecl(@TypeOf(app.auth), "pickerView"))
+                app.auth.pickerView().sign_in_source
+            else
+                .fx_login;
             app.auth.pulseSignIn(app.alloc);
             switch (app.auth.pollSignInTransition(app.alloc)) {
                 .none => {},
                 .cancelled => app.shell.render_requests.request(.footer),
                 .failed => |err| {
-                    debug_trace.logf("auth", "login failed err={s}", .{@errorName(err)});
+                    debug_trace.logf("auth", "login failed source={t} err={s}", .{ sign_in_source, @errorName(err) });
                     _ = app.auth.popPickerStage(app.alloc);
-                    try writeLoginError(app, err);
+                    try writeLoginError(app, sign_in_source, err);
                 },
                 .succeeded => |completed| {
-                    var selection = completed;
-                    defer selection.deinit(app.alloc);
+                    var owned = completed;
+                    defer owned.deinit(app.alloc);
+                    switch (owned) {
+                        .vercel => |*selection| {
+                            if (!try selectCredentialSource(app, .fx_login)) {
+                                _ = app.auth.popPickerStage(app.alloc);
+                                try writeAuthNotice(app, .{
+                                    .topic = "auth",
+                                    .tone = .@"error",
+                                    .body = "Signed in, but the fx login credential could not be loaded.",
+                                });
+                                return;
+                            }
+                            rememberCredentialSource(app, .fx_login);
 
-                    if (!try selectCredentialSource(app, .fx_login)) {
-                        _ = app.auth.popPickerStage(app.alloc);
-                        try writeAuthNotice(app, .{
-                            .topic = "auth",
-                            .tone = .@"error",
-                            .body = "Signed in, but the fx login credential could not be loaded.",
-                        });
-                        return;
+                            if (selection.teams.items.len > 0) {
+                                app.auth.openTeamPicker(app.alloc, selection);
+                            } else {
+                                app.auth.closePicker(app.alloc);
+                            }
+                            try writeAuthNotice(app, .{
+                                .topic = "auth",
+                                .tone = .neutral,
+                                .body = "Signed in to Vercel.",
+                            });
+                        },
+                        .chatgpt => {
+                            try app.auth.refreshSourceInventory(app.alloc);
+                            if (comptime provider_runtime.supported(App)) {
+                                app.auth.closePicker(app.alloc);
+                                try switchProvider(app, .codex, false, .post_oauth);
+                                return;
+                            }
+                            if (!try selectCredentialSource(app, .chatgpt_subscription)) {
+                                _ = app.auth.popPickerStage(app.alloc);
+                                try writeAuthNotice(app, .{
+                                    .topic = "auth",
+                                    .tone = .@"error",
+                                    .body = "Signed in, but the Codex subscription credential could not be loaded.",
+                                });
+                                return;
+                            }
+                            app.auth.closePicker(app.alloc);
+                            try writeAuthNotice(app, .{
+                                .topic = "auth",
+                                .tone = .neutral,
+                                .body = "Signed in with Codex.",
+                            });
+                        },
+                        .grok => {
+                            try app.auth.refreshSourceInventory(app.alloc);
+                            if (comptime provider_runtime.supported(App)) {
+                                app.auth.closePicker(app.alloc);
+                                try switchProvider(app, .grok, false, .post_oauth);
+                                return;
+                            }
+                            const selected_model_uses_grok = if (comptime provider_runtime.supported(App))
+                                provider_runtime.provider(app) == .grok
+                            else
+                                false;
+                            if (selected_model_uses_grok and
+                                !try selectCredentialSource(app, .grok_subscription))
+                            {
+                                _ = app.auth.popPickerStage(app.alloc);
+                                try writeAuthNotice(app, .{
+                                    .topic = "auth",
+                                    .tone = .@"error",
+                                    .body = "Signed in, but the Grok subscription credential could not be loaded.",
+                                });
+                                return;
+                            }
+                            if (!selected_model_uses_grok) {
+                                app.model_cache.reset();
+                                if (comptime @hasDecl(App, "startModelCacheWarmup")) app.startModelCacheWarmup();
+                            }
+                            app.auth.closePicker(app.alloc);
+                            try writeAuthNotice(app, .{
+                                .topic = "auth",
+                                .tone = .neutral,
+                                .body = "Signed in with Grok.",
+                            });
+                        },
                     }
-                    rememberCredentialSource(app, .fx_login);
-
-                    if (selection.teams.items.len > 0) {
-                        app.auth.openTeamPicker(app.alloc, &selection);
-                    } else {
-                        _ = app.auth.popPickerStage(app.alloc);
-                    }
-                    try writeAuthNotice(app, .{
-                        .topic = "auth",
-                        .tone = .neutral,
-                        .body = "Signed in to Vercel.",
-                    });
                 },
             }
         }
@@ -423,6 +672,9 @@ pub fn Runtime(comptime App: type) type {
         /// leaves the source active for this run rather than refusing a working
         /// credential the user already selected.
         fn rememberCredentialSource(app: *App, source: credentials.Source) void {
+            // ChatGPT is selected by model route, not as a global Gateway
+            // credential preference. Its saved session coexists independently.
+            if (source == .chatgpt_subscription or source == .grok_subscription) return;
             if (comptime @hasDecl(App, "persistCredentialSourcePreference")) {
                 app.persistCredentialSourcePreference(source);
                 return;
@@ -441,6 +693,372 @@ pub fn Runtime(comptime App: type) type {
                     .{ source, @errorName(failure.err) },
                 ),
             }
+        }
+
+        fn beginChatGptSignIn(app: *App) !void {
+            if (comptime provider_runtime.supported(App)) {
+                const decision = decideProviderSwitch(.{
+                    .current = provider_runtime.provider(app),
+                    .target = .codex,
+                    .target_credential_ready = false,
+                    .intent = .post_oauth,
+                    .stream_active = app.stream.active,
+                    .queued_prompts = app.worker.queuedPromptCount(),
+                });
+                if (decision == .busy) {
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .warning,
+                        .body = "Codex sign-in is unavailable until active and queued work finishes.",
+                    }, true);
+                    return;
+                }
+            }
+            try app.flushBeforeBlockingExternalWork();
+            const started = app.auth.openChatGptSignInPickerFromRoot(app.alloc);
+            if (started catch |err| {
+                debug_trace.logf("auth", "ChatGPT login failed err={s}", .{@errorName(err)});
+                try writeLoginError(app, .chatgpt_subscription, err);
+                return;
+            }) {
+                app.shell.render_requests.request(.footer);
+                if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
+            }
+        }
+
+        fn beginGrokSignIn(app: *App) !void {
+            if (comptime provider_runtime.supported(App)) {
+                const decision = decideProviderSwitch(.{
+                    .current = provider_runtime.provider(app),
+                    .target = .grok,
+                    .target_credential_ready = false,
+                    .intent = .post_oauth,
+                    .stream_active = app.stream.active,
+                    .queued_prompts = app.worker.queuedPromptCount(),
+                });
+                if (decision == .busy) {
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .warning,
+                        .body = "Grok sign-in is unavailable until active and queued work finishes.",
+                    }, true);
+                    return;
+                }
+            }
+            try app.flushBeforeBlockingExternalWork();
+            const started = app.auth.openGrokSignInPickerFromRoot(app.alloc);
+            if (started catch |err| {
+                debug_trace.logf("auth", "Grok login failed err={s}", .{@errorName(err)});
+                try writeLoginError(app, .grok_subscription, err);
+                return;
+            }) {
+                app.shell.render_requests.request(.footer);
+                if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
+            }
+        }
+
+        fn beginCodexSignInForProviderSwitch(app: *App) !void {
+            try app.flushBeforeBlockingExternalWork();
+            const started = app.auth.openChatGptSignInPickerForProviderSwitch(app.alloc);
+            if (started catch |err| {
+                debug_trace.logf("auth", "Codex login failed err={s}", .{@errorName(err)});
+                try writeLoginError(app, .chatgpt_subscription, err);
+                return;
+            }) {
+                app.shell.render_requests.request(.footer);
+                if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
+            }
+        }
+
+        fn beginGrokSignInForProviderSwitch(app: *App) !void {
+            try app.flushBeforeBlockingExternalWork();
+            const started = app.auth.openGrokSignInPickerForProviderSwitch(app.alloc);
+            if (started catch |err| {
+                debug_trace.logf("auth", "Grok login failed err={s}", .{@errorName(err)});
+                try writeLoginError(app, .grok_subscription, err);
+                return;
+            }) {
+                app.shell.render_requests.request(.footer);
+                if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
+            }
+        }
+
+        fn switchProvider(
+            app: *App,
+            target: model_provider.ProviderId,
+            allow_login: bool,
+            intent: ProviderSwitchIntent,
+        ) !void {
+            if (comptime !provider_runtime.supported(App) or
+                !@hasDecl(App, "fetchProviderCatalog") or
+                !@hasDecl(@TypeOf(app.model_cache), "adoptOwnedCatalog"))
+            {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .warning,
+                    .body = "Provider switching is unavailable in this host.",
+                }, true);
+                return;
+            }
+            if (comptime host_target.is_wasm) {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .warning,
+                    .body = "Subscription provider switching is unavailable in this WASM session.",
+                }, true);
+                return;
+            }
+
+            const current = provider_runtime.provider(app);
+            const active_source = app.auth.credentialSource();
+            const target_credential_ready = if (active_source) |source|
+                model_provider.authorizesCredential(target, source)
+            else
+                false;
+            switch (decideProviderSwitch(.{
+                .current = current,
+                .target = target,
+                .target_credential_ready = target_credential_ready,
+                .intent = intent,
+                .stream_active = app.stream.active,
+                .queued_prompts = app.worker.queuedPromptCount(),
+            })) {
+                .prepare => {},
+                .no_change => {
+                    const body = try std.fmt.allocPrint(
+                        app.alloc,
+                        "Already using {s}.",
+                        .{model_provider.label(target)},
+                    );
+                    defer app.alloc.free(body);
+                    try app.writeDomainNotice(.{ .topic = "provider", .tone = .neutral, .body = body }, true);
+                    return;
+                },
+                .busy => {
+                    try app.writeDomainNotice(.{
+                        .topic = "provider",
+                        .tone = .warning,
+                        .body = providerFailureMessage(
+                            intent,
+                            "Provider switching is unavailable until active and queued work finishes.",
+                            "Subscription sign-in completed, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged.",
+                        ),
+                    }, true);
+                    return;
+                },
+            }
+            try app.flushBeforeBlockingExternalWork();
+
+            const resolution = credentials.resolveForProvider(
+                app.alloc,
+                app.auth.oauthTransport(),
+                app.auth.secretStore(),
+                .refresh_if_needed,
+                target,
+                null,
+            ) catch |err| {
+                debug_trace.logf("provider", "credential preparation failed provider={t} err={s}", .{ target, @errorName(err) });
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .@"error",
+                    .body = providerFailureMessage(
+                        intent,
+                        "Could not prepare the target provider credential. The current provider is unchanged.",
+                        "Subscription sign-in completed, but its credential could not be prepared. The current provider is unchanged.",
+                    ),
+                }, true);
+                return;
+            };
+            var credential = resolution.credential orelse {
+                if (target == .codex and allow_login) {
+                    try beginCodexSignInForProviderSwitch(app);
+                    return;
+                }
+                if (target == .grok and allow_login) {
+                    try beginGrokSignInForProviderSwitch(app);
+                    return;
+                }
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .warning,
+                    .body = if (intent == .post_oauth)
+                        "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged."
+                    else if (target == .codex)
+                        "Run fx login codex, then try switching again."
+                    else if (target == .grok)
+                        "Run fx login grok, then try switching again."
+                    else
+                        credentials.missing_interactive_credential_message,
+                }, true);
+                return;
+            };
+            defer credential.deinit(app.alloc);
+            if (!model_provider.authorizesCredential(target, credential.source)) {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .@"error",
+                    .body = providerFailureMessage(
+                        intent,
+                        "The target credential cannot authorize that provider. The current provider is unchanged.",
+                        "Subscription sign-in completed, but its credential cannot authorize the provider. The current provider is unchanged.",
+                    ),
+                }, true);
+                return;
+            }
+
+            const access = credentials.catalogAccessForCredentialAndAccount(
+                credential.source,
+                credential.token,
+                credential.gatewayTeam(),
+                credential.accountId(),
+            );
+            const fetched = app.fetchProviderCatalog(target, access) catch |err| {
+                debug_trace.logf("provider", "catalog preparation failed provider={t} err={s}", .{ target, @errorName(err) });
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .@"error",
+                    .body = providerFailureMessage(
+                        intent,
+                        "Could not load the target provider catalog. The current provider is unchanged.",
+                        "Subscription sign-in completed, but its model catalog could not be loaded. The current provider is unchanged.",
+                    ),
+                }, true);
+                return;
+            };
+            var catalog = switch (fetched) {
+                .catalog => |catalog| catalog,
+                .failure => |failure| {
+                    debug_trace.logf("provider", "catalog rejected provider={t} category={t}", .{ target, failure.category });
+                    try app.writeDomainNotice(.{
+                        .topic = "provider",
+                        .tone = .@"error",
+                        .body = providerFailureMessage(
+                            intent,
+                            "The target provider catalog could not be validated. The current provider is unchanged.",
+                            "Subscription sign-in completed, but its model catalog could not be validated. The current provider is unchanged.",
+                        ),
+                    }, true);
+                    return;
+                },
+            };
+            defer model_catalog.freeModelCatalog(app.alloc, &catalog);
+            if (catalog.items.len == 0) {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .@"error",
+                    .body = providerFailureMessage(
+                        intent,
+                        "The target provider returned no supported models. The current provider is unchanged.",
+                        "Subscription sign-in completed, but its model catalog returned no supported models. The current provider is unchanged.",
+                    ),
+                }, true);
+                return;
+            }
+
+            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
+                debug_trace.logf("provider", "settings load failed err={s}", .{@errorName(err)});
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .@"error",
+                    .body = providerFailureMessage(
+                        intent,
+                        "Could not load the saved provider model. The current provider is unchanged.",
+                        "Subscription sign-in completed, but its saved provider model could not be loaded. The current provider is unchanged.",
+                    ),
+                }, true);
+                return;
+            };
+            defer settings.deinit(app.alloc);
+            const saved_model = switch (target) {
+                .gateway => settings.model,
+                .codex => settings.codex_model,
+                .grok => settings.grok_model,
+                .opencode_go => blk: {
+                    if (settings.model) |saved| {
+                        if (std.mem.startsWith(u8, saved, "opencode-go/")) break :blk saved;
+                    }
+                    break :blk @as(?[]const u8, null);
+                },
+            };
+            const current_model = if (intent == .post_oauth and current == target)
+                provider_runtime.model(app)
+            else
+                null;
+            const preferred_model = if (intent == .post_oauth)
+                saved_model
+            else
+                io_mod.getenv("FX_MODEL") orelse saved_model;
+            const selected_model = selectCatalogModel(catalog.items, current_model, preferred_model) orelse unreachable;
+            var owned_model = try app.alloc.dupe(u8, selected_model);
+            errdefer app.alloc.free(owned_model);
+
+            if (app.stream.active or app.worker.queuedPromptCount() > 0) {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .warning,
+                    .body = providerFailureMessage(
+                        intent,
+                        "Provider switching is unavailable until active and queued work finishes.",
+                        "Subscription sign-in completed, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged.",
+                    ),
+                }, true);
+                return;
+            }
+
+            app.model_cache.adoptOwnedCatalog(access, &catalog);
+            app.provider_selection.adoptOwned(target, &owned_model);
+            _ = app.auth.adoptCredential(app.alloc, &credential);
+            reconcileGatewayCredential(app);
+
+            const body = try std.fmt.allocPrint(
+                app.alloc,
+                "Switched to {s} with {s}.",
+                .{ model_provider.label(target), provider_runtime.model(app) },
+            );
+            defer app.alloc.free(body);
+            if (comptime @hasDecl(App, "persistRuntimePreferences")) {
+                var persistence = app.persistRuntimePreferences(.{
+                    .provider = target,
+                    .model = provider_runtime.model(app),
+                });
+                defer persistence.deinit(app.alloc);
+                if (persistence.settings_error != null or persistence.session_error != null) {
+                    debug_trace.logf(
+                        "provider",
+                        "runtime switch persistence failed settings={s} session={s}",
+                        .{
+                            if (persistence.settings_error) |err| @errorName(err) else "none",
+                            if (persistence.session_error) |err| @errorName(err) else "none",
+                        },
+                    );
+                    try app.writeDomainNotice(.{
+                        .topic = "provider",
+                        .tone = .warning,
+                        .body = "Provider switched for this run, but the selection could not be saved.",
+                    }, true);
+                } else {
+                    try app.writeDomainNotice(.{ .topic = "provider", .tone = .neutral, .body = body }, true);
+                }
+            } else {
+                var persistence = config_runtime.attemptUserPreferences(app.alloc, switch (target) {
+                    .gateway => .{ .provider = .gateway, .model = provider_runtime.model(app) },
+                    .codex => .{ .provider = .codex, .codex_model = provider_runtime.model(app) },
+                    .grok => .{ .provider = .grok, .grok_model = provider_runtime.model(app) },
+                });
+                defer persistence.deinit(app.alloc);
+                switch (persistence) {
+                    .outcome => try app.writeDomainNotice(.{ .topic = "provider", .tone = .neutral, .body = body }, true),
+                    .failure => |failure| {
+                        debug_trace.logf("provider", "runtime switch persistence failed err={s}", .{@errorName(failure.err)});
+                        try app.writeDomainNotice(.{
+                            .topic = "provider",
+                            .tone = .warning,
+                            .body = "Provider switched for this run, but the selection could not be saved.",
+                        }, true);
+                    },
+                }
+            }
+            app.shell.render_requests.request(.footer);
         }
 
         fn beginTeamPicker(app: *App) !void {
@@ -520,7 +1138,7 @@ pub fn Runtime(comptime App: type) type {
                 app.auth.openSignInPicker(app.alloc);
             if (started catch |err| {
                 debug_trace.logf("auth", "login failed err={s}", .{@errorName(err)});
-                try writeLoginError(app, err);
+                try writeLoginError(app, .fx_login, err);
                 return;
             }) {
                 app.shell.render_requests.request(.footer);
@@ -581,12 +1199,21 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn recoverPromptCredentialRefreshFailure(app: *App, err: anyerror) !bool {
-            debug_trace.logf("auth", "prompt credential refresh failed source=fx_login err={s}", .{@errorName(err)});
-            app.auth.recordCredentialRefreshFailure(.fx_login);
+            const active_source = app.auth.credentialSource();
+            const source = if (active_source) |active|
+                if (credentials.sourceRefreshable(active)) active else .fx_login
+            else
+                .fx_login;
+            return recoverCredentialFailure(app, source, err);
+        }
+
+        fn recoverCredentialFailure(app: *App, source: credentials.Source, err: anyerror) !bool {
+            debug_trace.logf("auth", "prompt credential refresh failed source={t} err={s}", .{ source, @errorName(err) });
+            if (app.auth.credentialSource() == source) app.auth.recordCredentialRefreshFailure(source);
             try app.auth.refreshSourceInventory(app.alloc);
             app.auth.openPicker(app.alloc);
             const failure = auth_runtime.FailureSnapshot{
-                .source = .fx_login,
+                .source = source,
                 .reason = .credential_refresh_failed,
             };
             const failure_text = try failure.renderText(app.alloc);
@@ -621,18 +1248,38 @@ pub fn Runtime(comptime App: type) type {
                 @hasField(@TypeOf(app.session), "usage"))
             {
                 if (app.auth.gatewayCredential()) |credential| {
-                    app.session.usage.replaceReconciliationCredential(
-                        app.alloc,
-                        credential.api_key,
-                    );
+                    const subscription = if (comptime @hasField(@TypeOf(credential), "source"))
+                        credential.source == .chatgpt_subscription or credential.source == .grok_subscription
+                    else
+                        false;
+                    if (subscription) {
+                        app.session.usage.clearReconciliationCredential();
+                    } else {
+                        app.session.usage.replaceReconciliationCredential(
+                            app.alloc,
+                            credential.api_key,
+                        );
+                    }
                 } else {
                     app.session.usage.clearReconciliationCredential();
                 }
             }
         }
 
-        fn writeLoginError(app: *App, err: anyerror) !void {
-            const notice: types.SemanticNotice = switch (err) {
+        fn writeLoginError(app: *App, source: credentials.Source, err: anyerror) !void {
+            const notice: types.SemanticNotice = if (source == .chatgpt_subscription)
+                switch (err) {
+                    error.ChatGptAuthorizationFailed => .{ .topic = "auth", .tone = .@"error", .body = "Codex sign-in was denied. The current credential is unchanged." },
+                    error.ChatGptLoginTimedOut, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "Codex sign-in expired. The current credential is unchanged; run /login to try again." },
+                    else => .{ .topic = "auth", .tone = .@"error", .body = "Codex sign-in failed. The current credential is unchanged." },
+                }
+            else if (source == .grok_subscription)
+                switch (err) {
+                    error.GrokAuthorizationFailed => .{ .topic = "auth", .tone = .@"error", .body = "Grok sign-in was denied. The current credential is unchanged." },
+                    error.GrokLoginTimedOut, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "Grok sign-in expired. The current credential is unchanged; run /login to try again." },
+                    else => .{ .topic = "auth", .tone = .@"error", .body = "Grok sign-in failed. The current credential is unchanged." },
+                }
+            else switch (err) {
                 error.ClientIdMissing => .{ .topic = "auth", .tone = .@"error", .body = "fx login is not configured yet. The current credential is unchanged." },
                 error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in was denied. The current credential is unchanged." },
                 error.ExpiredToken, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "The Vercel sign-in code expired. The current credential is unchanged; run /login to try again." },
@@ -649,6 +1296,99 @@ pub fn Runtime(comptime App: type) type {
     };
 }
 
+test "provider switch state machine no-ops rejects busy work and prepares only idle changes" {
+    try std.testing.expectEqual(
+        ProviderSwitchDecision.no_change,
+        decideProviderSwitch(.{
+            .current = .gateway,
+            .target = .gateway,
+            .target_credential_ready = true,
+            .intent = .manual,
+            .stream_active = true,
+            .queued_prompts = 2,
+        }),
+    );
+    try std.testing.expectEqual(
+        ProviderSwitchDecision.prepare,
+        decideProviderSwitch(.{
+            .current = .codex,
+            .target = .codex,
+            .target_credential_ready = false,
+            .intent = .manual,
+            .stream_active = false,
+            .queued_prompts = 0,
+        }),
+    );
+    try std.testing.expectEqual(
+        ProviderSwitchDecision.busy,
+        decideProviderSwitch(.{
+            .current = .codex,
+            .target = .codex,
+            .target_credential_ready = false,
+            .intent = .manual,
+            .stream_active = true,
+            .queued_prompts = 0,
+        }),
+    );
+    try std.testing.expectEqual(
+        ProviderSwitchDecision.busy,
+        decideProviderSwitch(.{
+            .current = .gateway,
+            .target = .codex,
+            .target_credential_ready = false,
+            .intent = .manual,
+            .stream_active = false,
+            .queued_prompts = 1,
+        }),
+    );
+    try std.testing.expectEqual(
+        ProviderSwitchDecision.prepare,
+        decideProviderSwitch(.{
+            .current = .codex,
+            .target = .codex,
+            .target_credential_ready = true,
+            .intent = .post_oauth,
+            .stream_active = false,
+            .queued_prompts = 0,
+        }),
+    );
+    try std.testing.expectEqual(
+        ProviderSwitchDecision.busy,
+        decideProviderSwitch(.{
+            .current = .codex,
+            .target = .codex,
+            .target_credential_ready = true,
+            .intent = .post_oauth,
+            .stream_active = false,
+            .queued_prompts = 1,
+        }),
+    );
+    try std.testing.expectEqual(
+        ProviderSwitchDecision.prepare,
+        decideProviderSwitch(.{
+            .current = .gateway,
+            .target = .codex,
+            .target_credential_ready = false,
+            .intent = .manual,
+            .stream_active = false,
+            .queued_prompts = 0,
+        }),
+    );
+}
+
+test "post OAuth catalog selection keeps valid current then saved then first" {
+    const entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("first"), .model_type = @constCast("language") },
+        .{ .id = @constCast("current"), .model_type = @constCast("language") },
+        .{ .id = @constCast("saved"), .model_type = @constCast("language") },
+    };
+
+    try std.testing.expectEqualStrings("current", selectCatalogModel(&entries, "current", "saved").?);
+    try std.testing.expectEqualStrings("saved", selectCatalogModel(&entries, "missing", "saved").?);
+    try std.testing.expectEqualStrings("first", selectCatalogModel(&entries, "missing", "also-missing").?);
+    try std.testing.expect(selectCatalogModel(&.{}, "current", "saved") == null);
+}
+
 const TestModelCache = struct {
     reset_count: usize = 0,
 
@@ -656,6 +1396,89 @@ const TestModelCache = struct {
         self.reset_count += 1;
     }
 };
+
+const BusySignInAuth = struct {
+    start_count: usize = 0,
+
+    fn openChatGptSignInPickerFromRoot(self: *BusySignInAuth, _: std.mem.Allocator) !bool {
+        self.start_count += 1;
+        return true;
+    }
+
+    fn openGrokSignInPickerFromRoot(self: *BusySignInAuth, _: std.mem.Allocator) !bool {
+        self.start_count += 1;
+        return true;
+    }
+
+    fn signInBrowserUrlAlloc(_: *BusySignInAuth, _: std.mem.Allocator) !?[]u8 {
+        return null;
+    }
+};
+
+const BusySignInApp = struct {
+    pub const host_profile = runtime_profile.native;
+
+    alloc: std.mem.Allocator = std.testing.allocator,
+    selected_provider: model_provider.ProviderId = .gateway,
+    selected_model: std.ArrayList(u8) = .empty,
+    auth: BusySignInAuth = .{},
+    stream: struct { active: bool = false } = .{},
+    worker: struct {
+        queued_prompts: usize = 0,
+
+        fn queuedPromptCount(self: @This()) usize {
+            return self.queued_prompts;
+        }
+    } = .{},
+    shell: struct { render_requests: TestRenderRequests = .{} } = .{},
+    notice_count: usize = 0,
+    flush_count: usize = 0,
+
+    fn deinit(self: *BusySignInApp) void {
+        self.selected_model.deinit(self.alloc);
+    }
+
+    fn writeDomainNotice(self: *BusySignInApp, _: types.SemanticNotice, _: bool) !void {
+        self.notice_count += 1;
+    }
+
+    fn flushBeforeBlockingExternalWork(self: *BusySignInApp) !void {
+        self.flush_count += 1;
+    }
+
+    fn urlOpener(_: *BusySignInApp) host.UrlOpener {
+        return host.unavailable_url_opener;
+    }
+};
+
+test "interactive subscription sign-in rejects active and queued work before OAuth" {
+    const cases = [_]struct {
+        stream_active: bool,
+        queued_prompts: usize,
+    }{
+        .{ .stream_active = true, .queued_prompts = 0 },
+        .{ .stream_active = false, .queued_prompts = 1 },
+    };
+
+    for (cases) |case| {
+        inline for ([_]model_provider.ProviderId{ .codex, .grok }) |provider| {
+            var app: BusySignInApp = .{};
+            defer app.deinit();
+            app.stream.active = case.stream_active;
+            app.worker.queued_prompts = case.queued_prompts;
+
+            switch (provider) {
+                .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
+                .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
+                .gateway => unreachable,
+            }
+
+            try std.testing.expectEqual(@as(usize, 0), app.auth.start_count);
+            try std.testing.expectEqual(@as(usize, 0), app.flush_count);
+            try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+        }
+    }
+}
 
 const TestTeam = struct {
     name: []const u8,
@@ -1063,7 +1886,7 @@ test "successful direct login remembers fx login after activation" {
     var app: TestApp = .{};
     defer app.deinit();
     app.auth.select_result = true;
-    app.auth.sign_in_transition = .{ .succeeded = .{} };
+    app.auth.sign_in_transition = .{ .succeeded = .{ .vercel = .{} } };
 
     try Runtime(TestApp).collectSignInFacts(&app);
 
@@ -1077,7 +1900,7 @@ test "direct login source load failure leaves the environment preference unchang
     var app: TestApp = .{};
     defer app.deinit();
     app.auth.select_result = null;
-    app.auth.sign_in_transition = .{ .succeeded = .{} };
+    app.auth.sign_in_transition = .{ .succeeded = .{ .vercel = .{} } };
 
     try Runtime(TestApp).collectSignInFacts(&app);
 
@@ -1091,7 +1914,7 @@ test "failed preference persistence keeps a successful direct login active" {
     var app: TestApp = .{};
     defer app.deinit();
     app.auth.select_result = true;
-    app.auth.sign_in_transition = .{ .succeeded = .{} };
+    app.auth.sign_in_transition = .{ .succeeded = .{ .vercel = .{} } };
     app.preference_write_succeeds = false;
 
     try Runtime(TestApp).collectSignInFacts(&app);
@@ -1228,7 +2051,7 @@ test "prompt credential refresh failure is recoverable and detail-free" {
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "OAuthRequestFailed") == null);
     try std.testing.expect(app.shell.render_requests.footer_requested);
     try std.testing.expectEqual(@as(usize, 1), app.auth.source_inventory_refresh_count);
-    try std.testing.expectEqual(credentials.Source.fx_login, app.auth.refresh_failure_source.?);
+    try std.testing.expect(app.auth.refresh_failure_source == null);
     try std.testing.expect(app.auth.picker_opened);
     try std.testing.expectEqual(@as(usize, 0), app.model_cache.reset_count);
 }

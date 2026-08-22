@@ -37,7 +37,7 @@ const Request = web_search_contract.ProviderRequest;
 const Response = web_search_contract.ProviderResponse;
 const ProgressFn = web_search_contract.ProgressFn;
 
-pub const default_model = "zai/glm-5.2";
+pub const default_model = "moonshotai/kimi-k3";
 pub const default_chat_url = "https://ai-gateway.vercel.sh/v3/ai/language-model";
 pub const models_path = "/coding-agent/v1/models";
 const credits_path = "/coding-agent/v1/credits";
@@ -425,6 +425,9 @@ fn streamAgentCompletion(
     alloc: Allocator,
     request: agent_stream_provider_contract.Request,
 ) anyerror!agent_stream_provider_contract.Result {
+    if (request.credential_source == .chatgpt_subscription or request.credential_source == .grok_subscription) {
+        return error.SubscriptionCredentialCannotAuthorizeGateway;
+    }
     const result = gateway_client.streamGatewayCompletion(
         alloc,
         .{
@@ -478,6 +481,12 @@ fn fetchCredits(
     alloc: Allocator,
     input: gateway_provider.CreditsLookupInput,
 ) output_contracts.CreditsSnapshot {
+    if (input.credential_source == .chatgpt_subscription) {
+        return creditsErrorSnapshot(alloc, "AI Gateway credits are unavailable for a ChatGPT subscription.");
+    }
+    if (input.credential_source == .grok_subscription) {
+        return creditsErrorSnapshot(alloc, "AI Gateway credits are unavailable for a Grok subscription.");
+    }
     return fetchCreditsWithFetch(
         alloc,
         input.credential,
@@ -609,17 +618,23 @@ const OAuthHttpOperation = struct {
             .location = .{ .url = self.request.url },
             .method = switch (self.request.method) {
                 .get => .GET,
-                .post_form => .POST,
+                .post_form, .post_json => .POST,
             },
             .payload = self.request.payload,
             .headers = .{
-                .content_type = if (self.request.method == .post_form)
-                    .{ .override = "application/x-www-form-urlencoded" }
-                else
-                    .default,
+                .content_type = switch (self.request.method) {
+                    .get => .default,
+                    .post_form => .{ .override = "application/x-www-form-urlencoded" },
+                    .post_json => .{ .override = "application/json" },
+                },
                 .user_agent = .{ .override = gateway_client.user_agent },
                 .accept_encoding = .omit,
+                .authorization = if (self.request.authorization) |value|
+                    .{ .override = value }
+                else
+                    .default,
             },
+            .redirect_behavior = .unhandled,
             .response_writer = &response_writer,
         }) catch |err| switch (err) {
             error.WriteFailed => return error.OAuthResponseTooLarge,
@@ -1643,7 +1658,7 @@ test "possibly sent web search failure marks billing incomplete" {
 }
 
 test "built-in gateway defaults preserve active provider policy" {
-    try std.testing.expectEqualStrings("zai/glm-5.2", default_model);
+    try std.testing.expectEqualStrings("moonshotai/kimi-k3", default_model);
     try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/v3/ai/language-model", default_chat_url);
     try std.testing.expectEqualStrings("/coding-agent/v1/models", models_path);
     try std.testing.expectEqual(@as(usize, 3), retry_count);
@@ -1708,6 +1723,19 @@ fn stubFetchForbiddenCredits(
         .status = .forbidden,
         .body = try alloc.dupe(u8, "{\"error\":{\"code\":\"credit_card_required\",\"message\":\"Buy credits to use AI Gateway.\"}}"),
     };
+}
+
+test "built-in credits provider rejects ChatGPT credentials before Gateway I/O" {
+    var snapshot = fetchCredits(null, std.testing.allocator, .{
+        .credential = "chatgpt-secret",
+        .credential_source = .chatgpt_subscription,
+        .tenant = null,
+    });
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "AI Gateway credits are unavailable for a ChatGPT subscription.",
+        snapshot.err_message.?,
+    );
 }
 
 test "built-in credits provider names the team query only when valid" {
@@ -2017,18 +2045,21 @@ fn fetchCatalogForProvider(
         input.access,
         input.endpoint,
         input.cancel_flag,
-    ) catch |err| return .{ .failure = catalogRequestFailure(err) };
+    ) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .failure = catalogRequestFailure(err) };
+    };
     const json_text = switch (response) {
         .success => |body| body,
-        .http_status => |status| return .{ .failure = model_catalog.failureForHttpStatus(status) },
+        .http_status => |status| return .{
+            .failure = model_catalog.failureForHttpStatus(status),
+        },
     };
     defer alloc.free(json_text);
 
-    const catalog = parseModelCatalogForView(alloc, json_text, input.view) catch |err| return .{
-        .failure = .{
-            .category = if (err == error.OutOfMemory) .resource_exhausted else .malformed_response,
-            .http_status = .ok,
-        },
+    const catalog = parseModelCatalogForView(alloc, json_text, input.view) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
     return .{ .catalog = catalog };
 }

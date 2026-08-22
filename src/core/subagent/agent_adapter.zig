@@ -1,6 +1,10 @@
 const std = @import("std");
 const agent_runtime = @import("../agent/agent_runtime.zig");
+const stream_provider = @import("../agent/stream_provider.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
+const auth_runtime = @import("../auth/auth_runtime.zig");
+const credentials = @import("../auth/credentials.zig");
+const model_provider = @import("../config/model_provider.zig");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
@@ -27,9 +31,71 @@ const tool_host = @import("tool_host.zig");
 
 const Allocator = std.mem.Allocator;
 
+pub const ProviderRoute = struct {
+    agent_stream_provider: stream_provider.Provider,
+    permission_reviewer_provider: ?auto_classifier.Provider,
+};
+
+pub const ProviderRoutes = struct {
+    gateway: ProviderRoute,
+    codex: ProviderRoute,
+    grok: ProviderRoute,
+    opencode_go: ProviderRoute = .{
+        .agent_stream_provider = stream_provider.unavailable_provider,
+        .permission_reviewer_provider = null,
+    },
+
+    pub fn select(self: ProviderRoutes, provider: model_provider.ProviderId) ProviderRoute {
+        return switch (provider) {
+            .gateway => self.gateway,
+            .codex => self.codex,
+            .grok => self.grok,
+            .opencode_go => self.opencode_go,
+        };
+    }
+};
+
+test "provider routes select independent streams and reviewers" {
+    var gateway_tag: u8 = 0;
+    var codex_tag: u8 = 0;
+    var grok_tag: u8 = 0;
+    var gateway_stream = stream_provider.unavailable_provider;
+    gateway_stream.context = &gateway_tag;
+    var codex_stream = stream_provider.unavailable_provider;
+    codex_stream.context = &codex_tag;
+    var grok_stream = stream_provider.unavailable_provider;
+    grok_stream.context = &grok_tag;
+    const Reviewer = struct {
+        fn review(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: auto_classifier.ProviderInput,
+            _: auto_classifier.ReviewRequest,
+        ) anyerror!auto_classifier.ParseOutcome {
+            return .invalid;
+        }
+    };
+    const gateway_reviewer = auto_classifier.Provider{ .context = &gateway_tag, .review_fn = Reviewer.review };
+    const codex_reviewer = auto_classifier.Provider{ .context = &codex_tag, .review_fn = Reviewer.review };
+    const grok_reviewer = auto_classifier.Provider{ .context = &grok_tag, .review_fn = Reviewer.review };
+    const routes = ProviderRoutes{
+        .gateway = .{ .agent_stream_provider = gateway_stream, .permission_reviewer_provider = gateway_reviewer },
+        .codex = .{ .agent_stream_provider = codex_stream, .permission_reviewer_provider = codex_reviewer },
+        .grok = .{ .agent_stream_provider = grok_stream, .permission_reviewer_provider = grok_reviewer },
+    };
+
+    try std.testing.expect(routes.select(.gateway).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
+    try std.testing.expect(routes.select(.gateway).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
+    try std.testing.expect(routes.select(.codex).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
+    try std.testing.expect(routes.select(.codex).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
+    try std.testing.expect(routes.select(.grok).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&grok_tag)));
+    try std.testing.expect(routes.select(.grok).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&grok_tag)));
+}
+
 pub const Config = struct {
     host: *tool_host.Runtime,
     tool_context: tool_runtime.Context,
+    provider_routes: ProviderRoutes,
     system_prompt: []const u8,
     model_prompt_overlay: ?[]const u8 = null,
     skills_prompt_section: []const u8 = "",
@@ -61,7 +127,6 @@ const Context = struct {
         result.session_grants = self.admission.grants;
         result.permission_rules = self.admission.rules;
         result.permission_state_override = &self.admission.permission_state;
-        result.sandbox_backend = self.admission.sandbox_backend;
         result.advertised_dynamic_tool_names = self.admission.integration_names;
         result.mcp_access = if (self.admission.mcp_view) |*view|
             .{ .scoped = .{
@@ -120,8 +185,49 @@ pub fn run(
     var arena_state = std.heap.ArenaAllocator.init(turn.alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var routed_credential: ?credentials.Credential = null;
+    defer if (routed_credential) |*credential| credential.deinit(turn.alloc);
+    var routed_config = config;
+    const route = config.provider_routes.select(admission.provider);
+    routed_config.tool_context.agent_stream_provider = route.agent_stream_provider;
+    routed_config.tool_context.permission_reviewer_provider = route.permission_reviewer_provider;
+    routed_config.tool_context.auto_classifier = auto_classifier.Classifier.disabled();
+    if (!model_provider.authorizesCredential(
+        admission.provider,
+        config.tool_context.credential_source,
+    )) {
+        const resolution = credentials.resolveForProvider(
+            turn.alloc,
+            config.tool_context.oauth_transport,
+            config.tool_context.secret_store,
+            .refresh_if_needed,
+            admission.provider,
+            config.tool_context.credential_source,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            turn.setFailureDiagnostic("model_credential_resolution_failed", @errorName(err)) catch
+                return error.OutOfMemory;
+            return error.ProviderFailed;
+        };
+        routed_credential = resolution.credential;
+        const credential = if (routed_credential) |*value| value else {
+            turn.setFailureDiagnostic("model_credential_missing", admission.model) catch
+                return error.OutOfMemory;
+            return error.ProviderFailed;
+        };
+        routed_config.tool_context.api_key = credential.token;
+        routed_config.tool_context.gateway_team = credential.gatewayTeam();
+        routed_config.tool_context.credential_source = credential.source;
+        routed_config.tool_context.account_id = credential.accountId();
+    }
+    routed_config.tool_context.model = admission.model;
+    routed_config.tool_context.provider = admission.provider;
+    if (!model_provider.usesGatewayAuxiliaries(admission.provider)) {
+        routed_config.tool_context.web_search_backend = null;
+        routed_config.tool_context.web_search_runtime_ready = false;
+    }
     var context = Context{
-        .config = config,
+        .config = routed_config,
         .turn = turn,
         .admission = admission,
         .cancel = cancel,
@@ -134,14 +240,18 @@ pub fn run(
         .prompt = arena.dupe(u8, message.content) catch return error.OutOfMemory,
         .images = &.{},
         .model = arena.dupe(u8, admission.model) catch return error.OutOfMemory,
-        .api_key = arena.dupe(u8, config.tool_context.api_key) catch return error.OutOfMemory,
-        .gateway_team = if (config.tool_context.gateway_team) |team|
+        .provider = admission.provider,
+        .api_key = arena.dupe(u8, routed_config.tool_context.api_key) catch return error.OutOfMemory,
+        .gateway_team = if (routed_config.tool_context.gateway_team) |team|
             arena.dupe(u8, team) catch return error.OutOfMemory
         else
             null,
-        .credential_source = config.tool_context.credential_source,
+        .credential_source = routed_config.tool_context.credential_source,
+        .account_id = if (routed_config.tool_context.account_id) |account_id|
+            arena.dupe(u8, account_id) catch return error.OutOfMemory
+        else
+            null,
         .permission_mode = admission.permission_mode,
-        .sandbox_backend = admission.sandbox_backend,
         .history = history,
         .root_user_intent_context = if (message.root_user_intent_context.len > 0)
             arena.dupe(u8, message.root_user_intent_context) catch return error.OutOfMemory
@@ -228,7 +338,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermission,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermission,
-        .request_sandbox_widening = requestSandboxWidening,
+        .resolve_tool_action_display_target = resolveToolActionDisplayTarget,
         .describe_tool_action = describeToolAction,
         .describe_tool_action_completed = describeToolAction,
         .describe_tool_action_denied = describeToolActionDenied,
@@ -248,11 +358,29 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .push_route_recovery_status = pushLiveRouteRecoveryStatus,
         .push_command_output_complete = pushLiveCommandOutputComplete,
         .push_http_error = captureHttpError,
+        .refresh_gateway_credential = refreshGatewayCredential,
         .format_tool_execution_error = formatToolExecutionError,
         .report_usage = reportUsage,
         .usage = &context.turn.sessionRuntime().usage,
         .usage_allocator = context.turn.alloc,
     };
+}
+
+fn refreshGatewayCredential(
+    raw: *anyopaque,
+    alloc: Allocator,
+    source: types.CredentialSource,
+    mode: auth_runtime.CredentialRefreshMode,
+    expected_account_id: ?[]const u8,
+) !?[]u8 {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return auth_runtime.refreshCredentialTokenForAccount(
+        context.config.tool_context.oauth_transport,
+        alloc,
+        source,
+        mode,
+        expected_account_id,
+    );
 }
 
 fn finalizeTurn(
@@ -285,12 +413,16 @@ fn acknowledgeParentTurnContext(
     acknowledgements: []const agent_runtime.ParentTurnDeliveryAck,
 ) void {
     const context: *Context = @ptrCast(@alignCast(raw));
-    parent_delivery_projector.acknowledge(
+    const retirement_ready = parent_delivery_projector
+        .acknowledgeWithRetirementSignal(
         arena,
         context.config.host.sessions,
         context.config.host.manager.options.child_store,
         acknowledgements,
     );
+    if (retirement_ready) {
+        context.config.host.requestRetirementSweep(io_mod.milliTimestamp());
+    }
 }
 
 fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(types.ChatMessage)) !void {
@@ -301,7 +433,6 @@ fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayL
         .access_scope = tool_ctx.access_scope,
         .interactive = false,
         .permission_mode = context.admission.permission_mode,
-        .sandbox_backend = context.admission.sandbox_backend,
         .tracker = null,
         .background = tool_ctx.background,
         .session = context.turn.sessionRuntime(),
@@ -427,16 +558,6 @@ fn requestToolPermission(
             action.authority,
             action.human_approval,
         ),
-        .sandbox_widening => |widening| tool_admission.revalidateLiveSandboxWideningOutcome(
-            tool_ctx.admissionInputWithLiveAuthority(live),
-            arena,
-            call,
-            mode,
-            grants,
-            widening.authority,
-            widening.required.wideningInput(),
-            widening.human_approval,
-        ),
     };
     return tool_admission.requestPermissionOutcome(
         tool_ctx.admissionInputWithLiveAuthority(live),
@@ -470,37 +591,25 @@ fn requestPreparedFileMutationPermission(
     );
 }
 
-fn requestSandboxWidening(
-    raw: *anyopaque,
-    arena: Allocator,
-    call: types.ToolCall,
-    review: auto_classifier.ReviewTurnContext,
-    mode: types.PermissionMode,
-    grants: []const types.PermissionGrant,
-    live: ?agent_runtime.LiveToolAuthority,
-    dynamic_names: []const []const u8,
-    required: agent_runtime.SandboxScopeRequired,
-) !command_admission.PermissionOutcome {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    const tool_ctx = admissionContext(context, dynamic_names, review);
-    return tool_admission.requestSandboxWideningOutcome(
-        tool_ctx.admissionInputWithLiveAuthority(live),
-        arena,
-        call,
-        mode,
-        grants,
-        required.wideningInput(),
-    );
-}
-
 fn describeToolAction(raw: *anyopaque, arena: Allocator, call: types.ToolCall, file_path: ?[]const u8, _: []const []const u8) ![]const u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
     return tool_presentation.formatPlainAction(arena, .{
         .tool_registry = context.config.tool_context.tool_registry,
         .call = call,
         .workspace_root = context.config.tool_context.workspace_root,
-        .file_display_path = file_path,
+        .display_target = file_path,
     });
+}
+
+fn resolveToolActionDisplayTarget(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !?[]const u8 {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return tool_presentation.resolveTerminalDisplayTarget(
+        arena,
+        context.config.tool_context.tool_registry,
+        context.config.tool_context.workspace_root,
+        context.config.tool_context.terminal_client,
+        call,
+    );
 }
 
 fn describeToolActionDenied(raw: *anyopaque, arena: Allocator, call: types.ToolCall, file_path: ?[]const u8, label: []const u8, dynamic_names: []const []const u8) ![]const u8 {

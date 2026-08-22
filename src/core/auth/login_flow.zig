@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const credentials = @import("credentials.zig");
+const chatgpt_session = @import("chatgpt_session.zig");
+const grok_session = @import("grok_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
@@ -132,19 +134,40 @@ pub const SignInSnapshot = struct {
     user_code: []const u8 = "",
 };
 
+pub const SignInCompletion = union(enum) {
+    vercel: TeamSelection,
+    chatgpt: chatgpt_session.Session,
+    grok: grok_session.Session,
+
+    pub fn deinit(self: *SignInCompletion, alloc: Allocator) void {
+        switch (self.*) {
+            .vercel => |*selection| selection.deinit(alloc),
+            .chatgpt => |*session| session.deinit(alloc),
+            .grok => |*session| session.deinit(alloc),
+        }
+        self.* = .{ .vercel = .{} };
+    }
+
+    pub fn take(self: *SignInCompletion) SignInCompletion {
+        const completion = self.*;
+        self.* = .{ .vercel = .{} };
+        return completion;
+    }
+};
+
 pub const SignInTransition = union(enum) {
     none,
-    succeeded: TeamSelection,
+    succeeded: SignInCompletion,
     failed: anyerror,
     cancelled,
 };
 
-const PreparedLogin = struct {
+pub const PreparedLogin = struct {
     metadata: oauth.Metadata,
     device: oauth.DeviceAuthorization,
     client_id: []u8,
 
-    fn deinit(self: *PreparedLogin, alloc: Allocator) void {
+    pub fn deinit(self: *PreparedLogin, alloc: Allocator) void {
         self.metadata.deinit(alloc);
         self.device.deinit(alloc);
         alloc.free(self.client_id);
@@ -152,17 +175,19 @@ const PreparedLogin = struct {
     }
 };
 
-const CompleteSignInFn = *const fn (
+pub const CompleteSignInFn = *const fn (
     ?*anyopaque,
     Allocator,
     []const u8,
     []const u8,
     *oauth.TokenSet,
-) anyerror!TeamSelection;
-const SaveSignInFn = *const fn (?*anyopaque, Allocator, oauth_session.Session) anyerror!void;
+) anyerror!SignInCompletion;
+pub const SaveSignInFn = *const fn (?*anyopaque, Allocator, SignInCompletion) anyerror!void;
+pub const DeinitSignInContextFn = *const fn (?*anyopaque, Allocator) void;
 
-const SignInRuntimeDeps = struct {
+pub const SignInRuntimeDeps = struct {
     ctx: ?*anyopaque = null,
+    deinit_ctx: ?DeinitSignInContextFn = null,
     oauth_transport: oauth_transport.Provider = oauth_transport.unavailable_provider,
     poll: LoginPollDeps = .{},
     complete: CompleteSignInFn = completeSignIn,
@@ -177,7 +202,7 @@ pub const SignInRuntime = struct {
     cancel_requested: std.atomic.Value(bool) = .init(false),
     state: SignInState = .idle,
     flow: ?PreparedLogin = null,
-    completion: ?TeamSelection = null,
+    completion: ?SignInCompletion = null,
     failure: ?anyerror = null,
     poll_state: ?LoginPollState = null,
     deps: SignInRuntimeDeps = .{},
@@ -193,7 +218,7 @@ pub const SignInRuntime = struct {
         });
     }
 
-    fn startPrepared(
+    pub fn startPrepared(
         self: *Self,
         alloc: Allocator,
         prepared: PreparedLogin,
@@ -222,6 +247,7 @@ pub const SignInRuntime = struct {
             LoginPollState.init(deps.poll, prepared.device) catch |err| {
                 var rejected = prepared;
                 rejected.deinit(alloc);
+                if (deps.deinit_ctx) |deinit_ctx| deinit_ctx(deps.ctx, alloc);
                 return err;
             }
         else
@@ -231,6 +257,7 @@ pub const SignInRuntime = struct {
             self.mutex.unlock(io_mod.getIo());
             var rejected = prepared;
             rejected.deinit(alloc);
+            if (deps.deinit_ctx) |deinit_ctx| deinit_ctx(deps.ctx, alloc);
             return false;
         }
         self.state = .polling;
@@ -415,12 +442,7 @@ pub const SignInRuntime = struct {
             debug_trace.logf("auth", "sign-in discarded session after cancel state={t}", .{self.state});
             return;
         }
-        const session = completion.session orelse {
-            self.failure = LoginError.NoSession;
-            self.state = .failed;
-            return;
-        };
-        self.deps.save(self.deps.ctx, alloc, session) catch |err| {
+        self.deps.save(self.deps.ctx, alloc, completion) catch |err| {
             debug_trace.logf("auth", "sign-in session save failed err={s}", .{@errorName(err)});
             self.failure = err;
             self.state = .failed;
@@ -452,10 +474,13 @@ pub const SignInRuntime = struct {
     fn clearFlow(self: *Self, alloc: Allocator) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         var flow = self.flow;
+        const deps = self.deps;
         self.flow = null;
         self.poll_state = null;
+        self.deps = .{};
         self.mutex.unlock(io_mod.getIo());
         if (flow) |*prepared| prepared.deinit(alloc);
+        if (deps.deinit_ctx) |deinit_ctx| deinit_ctx(deps.ctx, alloc);
     }
 };
 
@@ -491,18 +516,22 @@ fn completeSignIn(
     issuer_url: []const u8,
     client_id: []const u8,
     token: *oauth.TokenSet,
-) !TeamSelection {
+) !SignInCompletion {
     var teams = fetchTeams(alloc, token.access_token, issuer_url) catch std.ArrayList(Team).empty;
     errdefer freeTeams(alloc, &teams);
     const now_ms = io_mod.milliTimestamp();
     const session = try take_login_session(alloc, issuer_url, client_id, token, null, now_ms);
-    return .{
+    return .{ .vercel = .{
         .session = session,
         .teams = teams,
-    };
+    } };
 }
 
-fn saveSignIn(_: ?*anyopaque, alloc: Allocator, session: oauth_session.Session) !void {
+fn saveSignIn(_: ?*anyopaque, alloc: Allocator, completion: SignInCompletion) !void {
+    const session = switch (completion) {
+        .vercel => |selection| selection.session orelse return LoginError.NoSession,
+        .chatgpt, .grok => return error.InvalidSignInCompletion,
+    };
     try oauth_session.saveNewSession(alloc, session);
 }
 
@@ -656,7 +685,7 @@ pub fn logout(
     var session: ?oauth_session.Session = null;
     var session_load_failed = false;
     defer if (session) |*loaded| loaded.deinit(alloc);
-    const delete_outcome = blk: {
+    const delete_result = blk: {
         var mutation = (oauth_session.beginExistingMutation() catch {
             return LogoutError.SessionDeleteFailed;
         }) orelse return .{};
@@ -665,12 +694,13 @@ pub fn logout(
             session_load_failed = true;
             break :load null;
         };
-        break :blk mutation.delete() catch return LogoutError.SessionDeleteFailed;
+        break :blk mutation.delete(alloc) catch oauth_session.DeleteResult{
+            .local_cleanup_failed = true,
+        };
     };
 
-    const local_durability_failed = delete_outcome == .deleted_not_durable;
-    var remote_revocation_failed = session_load_failed or local_durability_failed;
-    if (!local_durability_failed and session != null) {
+    var remote_revocation_failed = session_load_failed;
+    if (session != null) {
         const loaded = session.?;
         revokeLogoutSession(alloc, transport, loaded) catch {
             remote_revocation_failed = true;
@@ -678,8 +708,8 @@ pub fn logout(
     }
 
     return .{
-        .session_deleted = delete_outcome != .missing,
-        .local_durability_failed = local_durability_failed,
+        .session_deleted = delete_result.session_deleted,
+        .local_durability_failed = delete_result.local_cleanup_failed,
         .remote_revocation_failed = remote_revocation_failed,
     };
 }
@@ -727,7 +757,7 @@ fn pollForTokenWithPrompt(
     });
 }
 
-const LoginPollDeps = struct {
+pub const LoginPollDeps = struct {
     ctx: ?*anyopaque = null,
     now_ms: *const fn (?*anyopaque) i64 = realNowMs,
     poll_device_token: *const fn (
@@ -1603,10 +1633,10 @@ const SignInTestState = struct {
         issuer_url: []const u8,
         client_id: []const u8,
         token: *oauth.TokenSet,
-    ) !TeamSelection {
+    ) !SignInCompletion {
         const self = state(raw);
         _ = self.complete_count.fetchAdd(1, .seq_cst);
-        return .{
+        return .{ .vercel = .{
             .session = try take_login_session(
                 alloc,
                 issuer_url,
@@ -1615,10 +1645,10 @@ const SignInTestState = struct {
                 null,
                 0,
             ),
-        };
+        } };
     }
 
-    fn save(raw: ?*anyopaque, _: Allocator, _: oauth_session.Session) !void {
+    fn save(raw: ?*anyopaque, _: Allocator, _: SignInCompletion) !void {
         const self = state(raw);
         _ = self.save_count.fetchAdd(1, .seq_cst);
     }
@@ -1657,20 +1687,20 @@ const CooperativeSignInTestState = struct {
         issuer_url: []const u8,
         client_id: []const u8,
         token: *oauth.TokenSet,
-    ) !TeamSelection {
+    ) !SignInCompletion {
         const self = state(raw);
         self.complete_count += 1;
-        return .{ .session = try take_login_session(
+        return .{ .vercel = .{ .session = try take_login_session(
             alloc,
             issuer_url,
             client_id,
             token,
             null,
             0,
-        ) };
+        ) } };
     }
 
-    fn save(raw: ?*anyopaque, _: Allocator, _: oauth_session.Session) !void {
+    fn save(raw: ?*anyopaque, _: Allocator, _: SignInCompletion) !void {
         const self = state(raw);
         self.save_count += 1;
         if (self.fail_save) return error.TestStoreCommitFailed;
@@ -1725,6 +1755,30 @@ fn waitForSignInTransition(
         blockingSleep(1);
     }
     return runtime.pollTransition(alloc);
+}
+
+test "sign-in runtime releases an owned provider context exactly once" {
+    const Cleanup = struct {
+        fn run(raw: ?*anyopaque, _: Allocator) void {
+            const count: *usize = @ptrCast(@alignCast(raw.?));
+            count.* += 1;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var cleanup_count: usize = 0;
+    var runtime: SignInRuntime = .{};
+    try std.testing.expect(try runtime.startPreparedCooperative(
+        alloc,
+        try makeTestPreparedLogin(alloc),
+        .{
+            .ctx = &cleanup_count,
+            .deinit_ctx = Cleanup.run,
+        },
+    ));
+    try std.testing.expect(runtime.cancel(alloc));
+    runtime.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), cleanup_count);
 }
 
 const WithholdingTokenFixture = struct {

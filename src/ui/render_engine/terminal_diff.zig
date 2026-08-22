@@ -594,7 +594,7 @@ fn composeWireFrame(
     if (input.synchronized_update) try wire_frame.writer.writeAll("\x1b[?2026h");
     try wire_frame.writer.writeAll("\x1b[?25l");
     if (input.surface.plan.reset_terminal) {
-        try wire_frame.writer.writeAll("\x1b[0m\x1b[3J\x1b[2J\x1b[H");
+        try wire_frame.writer.writeAll("\x1b[0m\x1b[2J\x1b[3J\x1b[H");
     }
     const prefix_len = wire_frame.written().len;
     try wire_frame.writer.writeAll(terminal_scroll_bytes);
@@ -1778,7 +1778,7 @@ test "normal-screen restore preserves saved modes through reset replay" {
     );
     const sync_start = std.mem.find(u8, sink.bytes.items, "\x1b[?2026h") orelse
         return error.TestExpectedSyncStart;
-    const reset_clear = std.mem.find(u8, sink.bytes.items, "\x1b[0m\x1b[3J\x1b[2J\x1b[H") orelse
+    const reset_clear = std.mem.find(u8, sink.bytes.items, "\x1b[0m\x1b[2J\x1b[3J\x1b[H") orelse
         return error.TestExpectedResetClear;
     const cursor_hide = std.mem.find(u8, sink.bytes.items, "\x1b[?25l") orelse
         return error.TestExpectedCursorHide;
@@ -2294,7 +2294,7 @@ test "flushFrame restores visible cursor after synchronized update" {
     try std.testing.expect(std.mem.find(u8, sink.bytes.items, "\x1b[3J") == null);
 }
 
-test "flushFrame resets terminal inside synchronized repaint" {
+test "flushFrame clears display before scrollback inside synchronized repaint" {
     var previous = try vt_emulator.Grid.init(std.testing.allocator, 8, 4);
     defer previous.deinit();
     try previous.feed("\x1b[1;1Hshell");
@@ -2325,9 +2325,9 @@ test "flushFrame resets terminal inside synchronized repaint" {
     const home = std.mem.find(u8, sink.bytes.items, "\x1b[H") orelse return error.TestExpectedHome;
     try std.testing.expect(sync_begin < cursor_hide);
     try std.testing.expect(cursor_hide < reset_style);
-    try std.testing.expect(reset_style < clear_scrollback);
-    try std.testing.expect(clear_scrollback < clear_display);
-    try std.testing.expect(clear_display < home);
+    try std.testing.expect(reset_style < clear_display);
+    try std.testing.expect(clear_display < clear_scrollback);
+    try std.testing.expect(clear_scrollback < home);
     try std.testing.expect(result.full_repaint);
     const sync_end = std.mem.find(u8, sink.bytes.items, "\x1b[?2026l") orelse return error.TestExpectedSyncEnd;
     const cursor_show = std.mem.find(u8, sink.bytes.items, "\x1b[?25h") orelse return error.TestExpectedCursorShow;

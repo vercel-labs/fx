@@ -58,21 +58,31 @@ fn executeOAuthRequest(
 ) !oauth_transport.Response {
     try checkRequestBounds(request);
     const Header = struct { name: []const u8, value: []const u8 };
-    const headers: []const Header = switch (request.method) {
-        .get => &.{},
-        .post_form => &.{.{
-            .name = "content-type",
-            .value = "application/x-www-form-urlencoded",
-        }},
-    };
+    var header_buf: [2]Header = undefined;
+    var header_count: usize = 0;
+    switch (request.method) {
+        .get => {},
+        .post_form => {
+            header_buf[header_count] = .{ .name = "content-type", .value = "application/x-www-form-urlencoded" };
+            header_count += 1;
+        },
+        .post_json => {
+            header_buf[header_count] = .{ .name = "content-type", .value = "application/json" };
+            header_count += 1;
+        },
+    }
+    if (request.authorization) |value| {
+        header_buf[header_count] = .{ .name = "authorization", .value = value };
+        header_count += 1;
+    }
     var response = try executeRequest(
         alloc,
         switch (request.method) {
             .get => "GET",
-            .post_form => "POST",
+            .post_form, .post_json => "POST",
         },
         request.url,
-        headers,
+        header_buf[0..header_count],
         request.payload orelse "",
     );
     errdefer response.deinit(alloc);

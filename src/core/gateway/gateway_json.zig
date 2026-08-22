@@ -215,6 +215,38 @@ pub fn buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
     cancel_flag: *std.atomic.Value(bool),
 ) ![]u8 {
     const budget = BuildBudget{ .deadline = deadline, .cancel_flag = cancel_flag };
+    const expanded = try expandPendingToolReviewMessages(
+        alloc,
+        messages,
+        target_call_id,
+        deadline,
+        cancel_flag,
+    );
+    defer alloc.free(expanded);
+
+    return buildGatewayRequestBodyValidated(
+        alloc,
+        tools_json,
+        expanded,
+        options,
+        "required",
+        max_output_tokens,
+        budget,
+        null,
+        null,
+    );
+}
+
+/// Returns an owned message slice that closes the pending tool call before the
+/// reviewer instruction. Message contents remain borrowed from `messages`.
+pub fn expandPendingToolReviewMessages(
+    alloc: std.mem.Allocator,
+    messages: []const ChatMessage,
+    target_call_id: []const u8,
+    deadline: std.Io.Clock.Timestamp,
+    cancel_flag: *std.atomic.Value(bool),
+) ![]ChatMessage {
+    const budget = BuildBudget{ .deadline = deadline, .cancel_flag = cancel_flag };
     try budget.check();
     try validatePendingToolReviewMessages(alloc, messages, target_call_id, budget);
     try budget.check();
@@ -223,7 +255,7 @@ pub fn buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
     const pending = messages[pending_index];
     const expanded_len = try std.math.add(usize, messages.len, pending.tool_calls.len);
     const expanded = try alloc.alloc(ChatMessage, expanded_len);
-    defer alloc.free(expanded);
+    errdefer alloc.free(expanded);
 
     @memcpy(expanded[0 .. pending_index + 1], messages[0 .. pending_index + 1]);
     for (pending.tool_calls, 0..) |call, i| {
@@ -239,17 +271,7 @@ pub fn buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
     try budget.check();
     try validateToolMessageHistory(alloc, expanded);
     try budget.check();
-    return buildGatewayRequestBodyValidated(
-        alloc,
-        tools_json,
-        expanded,
-        options,
-        "required",
-        max_output_tokens,
-        budget,
-        null,
-        null,
-    );
+    return expanded;
 }
 
 fn buildGatewayRequestBodyWithSettings(
@@ -849,6 +871,7 @@ pub fn freeGatewayCompletion(alloc: std.mem.Allocator, completion: GatewayComple
         alloc.free(tool_call.arguments_json);
     }
     if (completion.tool_calls.len > 0) alloc.free(completion.tool_calls);
+    if (completion.provider_state_json) |state| alloc.free(state);
 }
 
 fn checkParseGatewayCompletionAllocFailures(alloc: std.mem.Allocator) !void {

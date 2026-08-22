@@ -32,6 +32,7 @@ const legacy_x10_row_stage: u8 = 12;
 const discarded_sgr_mouse_stage: u8 = 13;
 const discarded_x10_mouse_stage: u8 = 14;
 const control_sequence_discard_stage: u8 = 15;
+const kitty_escape_event_type_stage: u8 = 16;
 const sgr_mouse_max_bytes: u8 = 18;
 const control_sequence_discard_max_bytes: u16 = 32;
 const kitty_up_key: u16 = 57352;
@@ -95,60 +96,62 @@ fn ctrlOKeyAction(meta_prefixed: bool, modifiers: u16) InputEscapeAction {
 // single-parameter and modifier stages, and never returns null so the leading
 // ESC's pending-cancel is always cleared.
 fn kittyUnicodeKeyAction(keycode: u16, modifiers: u16, meta_prefixed: bool) InputEscapeAction {
-    if (keycode == 27 and modifiers == 0) return .escape;
+    // Strip Caps Lock (bit 6) and Num Lock (bit 7) — lock states, not modifiers.
+    const mods = modifiers & 0x3F;
+    if (keycode == 27 and mods == 0) return .escape;
     if (keycode == kitty_up_key or keycode == kitty_down_key) {
-        if (meta_prefixed or modifiers != 0) {
+        if (meta_prefixed or mods != 0) {
             return modifiedArrowAction(
                 if (keycode == kitty_up_key) 'A' else 'B',
-                modifiers,
+                mods,
                 meta_prefixed,
             ) orelse .ignore;
         }
         return if (keycode == kitty_up_key) .cursor_up else .cursor_down;
     }
-    if (keycode == 13 and (modifiers & (shift_modifier | alt_modifier)) != 0) {
+    if (keycode == 13 and (mods & (shift_modifier | alt_modifier)) != 0) {
         return .insert_newline;
     }
-    if (keycode == ' ' and modifiers == shift_modifier and !meta_prefixed) return .{ .remapped_byte = ' ' };
-    if ((keycode == 'a' or keycode == 'A') and (modifiers & super_modifier) != 0) {
+    if (keycode == ' ' and mods == shift_modifier and !meta_prefixed) return .{ .remapped_byte = ' ' };
+    if ((keycode == 'a' or keycode == 'A') and (mods & super_modifier) != 0) {
         return .{ .composer_shortcut = .select_all };
     }
-    if ((keycode == 'c' or keycode == 'C') and (modifiers & super_modifier) != 0) {
+    if ((keycode == 'c' or keycode == 'C') and (mods & super_modifier) != 0) {
         return .{ .composer_shortcut = .copy_selection };
     }
-    if ((keycode == 'x' or keycode == 'X') and (modifiers & super_modifier) != 0) {
+    if ((keycode == 'x' or keycode == 'X') and (mods & super_modifier) != 0) {
         return .{ .composer_shortcut = .cut_selection };
     }
-    if ((keycode == 'z' or keycode == 'Z') and (modifiers & super_modifier) != 0) {
-        return .{ .composer_shortcut = if ((modifiers & shift_modifier) != 0) .redo else .undo };
+    if ((keycode == 'z' or keycode == 'Z') and (mods & super_modifier) != 0) {
+        return .{ .composer_shortcut = if ((mods & shift_modifier) != 0) .redo else .undo };
     }
-    if ((modifiers & (shift_modifier | ctrl_modifier)) ==
+    if ((mods & (shift_modifier | ctrl_modifier)) ==
         (shift_modifier | ctrl_modifier))
     {
-        if (keycode == 'a' or keycode == 'A') return composerMove(.line_start, modifiers);
-        if (keycode == 'b' or keycode == 'B') return composerMove(.character_left, modifiers);
-        if (keycode == 'e' or keycode == 'E') return composerMove(.line_end, modifiers);
-        if (keycode == 'f' or keycode == 'F') return composerMove(.character_right, modifiers);
+        if (keycode == 'a' or keycode == 'A') return composerMove(.line_start, mods);
+        if (keycode == 'b' or keycode == 'B') return composerMove(.character_left, mods);
+        if (keycode == 'e' or keycode == 'E') return composerMove(.line_end, mods);
+        if (keycode == 'f' or keycode == 'F') return composerMove(.character_right, mods);
     }
-    if (keycode == 'b' and (modifiers & alt_modifier) != 0) {
-        if ((modifiers & shift_modifier) != 0) return composerMove(.word_left, modifiers);
+    if (keycode == 'b' and (mods & alt_modifier) != 0) {
+        if ((mods & shift_modifier) != 0) return composerMove(.word_left, mods);
         return .word_left;
     }
-    if (keycode == 'f' and (modifiers & alt_modifier) != 0) {
-        if ((modifiers & shift_modifier) != 0) return composerMove(.word_right, modifiers);
+    if (keycode == 'f' and (mods & alt_modifier) != 0) {
+        if ((mods & shift_modifier) != 0) return composerMove(.word_right, mods);
         return .word_right;
     }
-    if ((keycode == 'd' or keycode == 'D') and (meta_prefixed or (modifiers & 0x02) != 0)) return .delete_word_right;
-    if (keycode == 'o' or keycode == 'O') return ctrlOKeyAction(meta_prefixed, modifiers);
-    if ((keycode == 'r' or keycode == 'R') and (modifiers & 0x08) != 0) return .open_all_sessions;
-    if (keycode == 9 and (modifiers & 0x01) != 0) return .toggle_permission_mode;
-    if ((modifiers & 0x04) != 0) {
+    if ((keycode == 'd' or keycode == 'D') and (meta_prefixed or (mods & 0x02) != 0)) return .delete_word_right;
+    if (keycode == 'o' or keycode == 'O') return ctrlOKeyAction(meta_prefixed, mods);
+    if ((keycode == 'r' or keycode == 'R') and (mods & 0x08) != 0) return .open_all_sessions;
+    if (keycode == 9 and (mods & 0x01) != 0) return .toggle_permission_mode;
+    if ((mods & 0x04) != 0) {
         if (keycode == '_') return .{ .remapped_byte = 31 };
         if (keycode >= 'a' and keycode <= 'z') return .{ .remapped_byte = @intCast(keycode - 96) };
         if (keycode >= 'A' and keycode <= 'Z') return .{ .remapped_byte = @intCast(keycode - 64) };
     }
-    if (keycode == 127 and (modifiers & 0x08) != 0) return .delete_to_line_start;
-    if (keycode == 127 and (modifiers & 0x02) != 0) return .delete_word_left;
+    if (keycode == 127 and (mods & 0x08) != 0) return .delete_to_line_start;
+    if (keycode == 127 and (mods & 0x02) != 0) return .delete_word_left;
     if (keycode == 13) return .{ .remapped_byte = '\r' };
     if (keycode == 9) return .{ .remapped_byte = '\t' };
     if (keycode == 127) return .{ .remapped_byte = 127 };
@@ -562,6 +565,15 @@ pub fn consumeInputEscapeByteWithMouse(
                 return null;
             }
 
+            // Ghostty can report a Kitty key event type as a colon-qualified
+            // modifier, e.g. `ESC[27;1:1u` for an Escape key press.
+            if (byte == ':' and param2.* == 27) {
+                param2.* = if (param.* > 0) param.* - 1 else 0;
+                param.* = 0;
+                setBaseEscapeStage(stage, kitty_escape_event_type_stage);
+                return null;
+            }
+
             if (byte == 'u') {
                 const meta_prefixed = hasMetaPrefix(stage.*);
                 const keycode = param2.*;
@@ -641,6 +653,24 @@ pub fn consumeInputEscapeByteWithMouse(
                 return kittyUnicodeKeyAction(keycode, modifiers, meta_prefixed);
             }
 
+            return beginControlSequenceDiscard(stage, param, param2, mouse, byte);
+        },
+        // Kitty key reports with an event type: `ESC[27;modifier:event-type u`.
+        // Only press and repeat are actionable; release must not close a panel.
+        kitty_escape_event_type_stage => {
+            if (byte >= '0' and byte <= '9') {
+                appendCsiDigitSaturating(param, byte);
+                return null;
+            }
+            if (byte == 'u') {
+                const modifiers = param2.*;
+                const event_type = param.*;
+                resetMouseEscapeDecode(stage, param, param2, mouse);
+                if (event_type == 1 or event_type == 2) {
+                    return kittyUnicodeKeyAction(27, modifiers, false);
+                }
+                return .ignore;
+            }
             return beginControlSequenceDiscard(stage, param, param2, mouse, byte);
         },
         // SGR mouse: ESC [ < button ; column ; row M/m.

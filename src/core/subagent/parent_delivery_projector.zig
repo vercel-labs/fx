@@ -269,6 +269,20 @@ pub fn acknowledge(
     child_store_options: session_child_store.Options,
     acknowledgements: []const runtime_deps.ParentTurnDeliveryAck,
 ) void {
+    _ = acknowledgeWithRetirementSignal(
+        alloc,
+        sessions,
+        child_store_options,
+        acknowledgements,
+    );
+}
+
+pub fn acknowledgeWithRetirementSignal(
+    alloc: Allocator,
+    sessions: *session_store.Store,
+    child_store_options: session_child_store.Options,
+    acknowledgements: []const runtime_deps.ParentTurnDeliveryAck,
+) bool {
     var delivery_manager = communication_manager.Manager{
         .sessions = sessions,
         .child_store_options = child_store_options,
@@ -277,8 +291,10 @@ pub fn acknowledge(
     var discovery_start_offset: ?u64 = null;
     var discovery_next_offset: ?u64 = null;
     var all_acknowledged = true;
+    var final_result_acknowledged = false;
     for (acknowledgements) |ack| {
-        delivery_manager.acknowledgeParentBoundary(
+        const signals_retirement = delivery_manager
+            .acknowledgeParentBoundaryWithFinalResultSignal(
             alloc,
             ack.child_id,
             consumer_id,
@@ -297,7 +313,16 @@ pub fn acknowledge(
                 "parent delivery acknowledgement failed child_id={s} parent_id={s} sequence={d} outcome={s}",
                 .{ ack.child_id, ack.target_session_id, ack.through_sequence, @errorName(err) },
             );
+            continue;
         };
+        final_result_acknowledged = signals_retirement or final_result_acknowledged;
+        if (signals_retirement) {
+            debug_trace.logf(
+                "subagent",
+                "final result acknowledgement committed child_id={s} parent_id={s}",
+                .{ ack.child_id, ack.target_session_id },
+            );
+        }
         const start = ack.discovery_start_offset orelse {
             all_acknowledged = false;
             continue;
@@ -323,15 +348,16 @@ pub fn acknowledge(
         relationship_index.advanceDelivery(
             alloc,
             sessions,
-            discovery_parent_id orelse return,
+            discovery_parent_id orelse return final_result_acknowledged,
             child_store_options,
-            discovery_start_offset orelse return,
-            discovery_next_offset orelse return,
+            discovery_start_offset orelse return final_result_acknowledged,
+            discovery_next_offset orelse return final_result_acknowledged,
         ) catch |err| traceDiscoveryAdvanceFailure(
-            discovery_parent_id orelse return,
+            discovery_parent_id orelse return final_result_acknowledged,
             err,
         );
     }
+    return final_result_acknowledged;
 }
 
 pub fn deinitPrepared(
@@ -694,6 +720,45 @@ test "parent delivery projector prepares one trusted envelope and acknowledges a
     var loaded_parent = try env.store.loadReadOnly(alloc, "parent");
     defer loaded_parent.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), loaded_parent.history.len);
+}
+
+test "parent delivery acknowledgement reports stable final result" {
+    const alloc = std.testing.allocator;
+    var env = try TestEnvironment.init(alloc);
+    defer env.deinit(alloc);
+    try env.createSession(alloc, "parent");
+    try preparePersistentChild(alloc, &env, "parent", "child", "child");
+    var capability = try env.store.openSubagentControlCapabilityWritable(
+        alloc,
+        "child",
+        .{},
+    );
+    defer capability.deinit();
+    const communication_state = communication_store.Store{
+        .capability = &capability,
+        .expected_session_id = "child",
+    };
+    try std.testing.expect(try communication_manager.reconcileFinalResultLocked(
+        alloc,
+        communication_state,
+        .{
+            .child_id = "child",
+            .parent_id = "parent",
+            .work_id = "work",
+            .timestamp_ms = 2,
+            .content = "final result",
+        },
+    ));
+
+    var prepared = (try prepare(alloc, &env.store, "parent", .{})).?;
+    defer deinitPrepared(alloc, &prepared);
+    try std.testing.expect(acknowledgeWithRetirementSignal(
+        alloc,
+        &env.store,
+        .{},
+        prepared.acknowledgements,
+    ));
+    try expectNoPrepared(alloc, &env, "parent");
 }
 
 test "parent delivery projector acknowledges bounded approval before later delivery" {

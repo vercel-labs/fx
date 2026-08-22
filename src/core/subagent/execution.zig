@@ -17,6 +17,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const session = @import("../session/session.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const session_codec = @import("../session/session_codec.zig");
+const model_provider = @import("../config/model_provider.zig");
 const session_event = @import("../session/session_event.zig");
 const session_store = @import("../session/session_store.zig");
 const permissions = @import("../permissions/permissions.zig");
@@ -48,6 +49,7 @@ else
 const Allocator = std.mem.Allocator;
 
 pub const TurnPreferences = struct {
+    provider: model_provider.ProviderId = .gateway,
     model: []const u8,
     effort: types.ReasoningEffort,
 };
@@ -59,9 +61,30 @@ pub fn resolveTurnPreferences(
     persisted: session_codec.DurableSessionPreferences,
 ) TurnPreferences {
     return .{
+        .provider = persisted.provider,
         .model = configuration.model orelse persisted.model,
         .effort = configuration.effort orelse persisted.effort,
     };
+}
+
+test "turn preference overrides preserve the persisted provider" {
+    var command = try domain.validateCommand(std.testing.allocator, .{ .create = .{
+        .name = "child",
+        .mode = .persistent,
+        .model = "gpt-5.4-mini",
+    } });
+    defer command.deinit(std.testing.allocator);
+    const preferences = resolveTurnPreferences(
+        command.create.configuration,
+        .{
+            .provider = .codex,
+            .model = @constCast("gpt-5.6-sol"),
+            .effort = types.ReasoningEffort.literal("high"),
+            .fast_mode = false,
+        },
+    );
+    try std.testing.expectEqual(model_provider.ProviderId.codex, preferences.provider);
+    try std.testing.expectEqualStrings("gpt-5.4-mini", preferences.model);
 }
 
 pub const WorkOutcome = enum {
@@ -604,7 +627,7 @@ pub const TurnContext = struct {
     }
 
     /// Returns an owned current authority snapshot. Normal-agent permission,
-    /// availability, sandbox, and integration adapters call this for every
+    /// availability and integration adapters call this for every
     /// child tool action rather than retaining the admission-time copy.
     pub fn resolveLiveAuthority(
         self: *TurnContext,
@@ -715,7 +738,6 @@ pub const TurnContext = struct {
                 .generation = snapshot.generation,
                 .root_id = snapshot.root_id,
                 .tools = snapshot.tools,
-                .sandbox_backend = snapshot.sandbox_backend,
                 .integrations = snapshot.integrations,
                 .rules = snapshot.rules,
                 .grants = snapshot.grants,
@@ -1361,6 +1383,12 @@ pub const Owner = struct {
     approval_registry: ?*approval_registry_mod.Registry = null,
     notification_clock: ?NotificationClock = null,
     notification_poller: ?NotificationPoller = null,
+    /// Borrowed from the host and valid until `deinit` joins the reaper.
+    retirement_root_id: ?[]const u8 = null,
+    retirement_cursor: ?[]u8 = null,
+    retirement_scan_pending: bool = false,
+    retirement_due_ms: ?i64 = null,
+    retirement_retry_after_scan: bool = false,
     max_history_turns: usize = 8,
     mutex: std.Io.Mutex = .init,
     reaper_cond: std.Io.Condition = .init,
@@ -1453,6 +1481,18 @@ pub const Owner = struct {
             self.mutex.unlock(io_mod.getIo());
             return result;
         }
+    }
+
+    pub fn requestRetirementSweep(
+        self: *Owner,
+        timestamp_ms: i64,
+    ) StartError!void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.closed) return error.OwnerClosed;
+        if (self.retirement_root_id == null) return;
+        try self.ensureReaperLocked();
+        self.scheduleRetirementSweepLocked(timestamp_ms);
     }
 
     /// Returns the latest in-memory execution outcome without consuming it.
@@ -1726,6 +1766,12 @@ pub const Owner = struct {
 
     pub fn deinit(self: *Owner) void {
         self.mutex.lockUncancelable(io_mod.getIo());
+        if (self.retirement_scan_pending and self.retirement_root_id != null) {
+            self.retirement_due_ms = reaperNowMs(self);
+            self.mutex.unlock(io_mod.getIo());
+            self.runRetirementSweep(reaperNowMs(self));
+            self.mutex.lockUncancelable(io_mod.getIo());
+        }
         self.closed = true;
         for (self.slots.items) |slot| {
             slot.shutdown.store(true, .seq_cst);
@@ -1786,6 +1832,7 @@ pub const Owner = struct {
             schedule.deinit(self.alloc);
         }
         self.notification_schedules.deinit(self.alloc);
+        if (self.retirement_cursor) |cursor| self.alloc.free(cursor);
         self.slots.deinit(self.alloc);
         self.* = undefined;
     }
@@ -1898,6 +1945,15 @@ pub const Owner = struct {
         if (self.reaper_thread != null) return;
         self.reaper_thread = std.Thread.spawn(.{}, reaperMain, .{self}) catch
             return error.ThreadSpawnFailed;
+    }
+
+    fn scheduleRetirementSweepLocked(self: *Owner, due_ms: i64) void {
+        self.retirement_scan_pending = true;
+        self.retirement_due_ms = if (self.retirement_due_ms) |current|
+            @min(current, due_ms)
+        else
+            due_ms;
+        self.reaper_wake.set(io_mod.getIo());
     }
 
     fn registerNotificationSchedule(
@@ -2237,6 +2293,16 @@ pub const Owner = struct {
             "terminal reconciliation deferred child_id={s} outcome={s}",
             .{ child_id, @errorName(err) },
         );
+        _ = reconcileOneOffFinalResultLocked(
+            self.alloc,
+            communication_state,
+            record,
+            &.{},
+        ) catch |err| debug_trace.logf(
+            "subagent",
+            "final result reconciliation deferred child_id={s} outcome={s}",
+            .{ child_id, @errorName(err) },
+        );
         return count;
     }
 
@@ -2350,6 +2416,12 @@ pub const Owner = struct {
             communication_state,
             record,
         ) catch return error.ControlStoreFailed;
+        _ = reconcileOneOffFinalResultLocked(
+            self.alloc,
+            communication_state,
+            record,
+            loaded.state.history,
+        ) catch return error.ControlStoreFailed;
         return changed;
     }
 
@@ -2379,7 +2451,353 @@ pub const Owner = struct {
         report.work_interrupted += changed.interrupted;
         report.work_completed += changed.completed;
     }
+
+    fn runRetirementSweep(self: *Owner, now_ms: i64) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        if (!self.retirement_scan_pending or
+            (self.retirement_due_ms orelse now_ms) > now_ms)
+        {
+            self.mutex.unlock(io_mod.getIo());
+            return;
+        }
+        self.retirement_scan_pending = false;
+        self.retirement_due_ms = null;
+        const root_id = self.retirement_root_id orelse {
+            self.mutex.unlock(io_mod.getIo());
+            return;
+        };
+        const owned_root = self.alloc.dupe(u8, root_id) catch {
+            self.scheduleRetirementSweepLocked(now_ms + retirement_retry_delay_ms);
+            self.mutex.unlock(io_mod.getIo());
+            return;
+        };
+        const cursor = self.retirement_cursor;
+        self.retirement_cursor = null;
+        self.mutex.unlock(io_mod.getIo());
+        defer self.alloc.free(owned_root);
+        defer if (cursor) |value| self.alloc.free(value);
+
+        var result = self.manager.snapshot(self.alloc, .{
+            .root_id = owned_root,
+            .cursor = cursor,
+            .limit = domain.default_page_limit,
+        }) catch |err| {
+            debug_trace.logf(
+                "subagent",
+                "retirement sweep deferred root_id={s} outcome={s}",
+                .{ owned_root, @errorName(err) },
+            );
+            self.finishRetirementSweep(null, true, now_ms);
+            return;
+        };
+        defer result.deinit(self.alloc);
+        const snapshot = switch (result) {
+            .failure => |failure| {
+                const retry = failure.code == .store_failure or
+                    failure.code == .graph_changed;
+                debug_trace.logf(
+                    "subagent",
+                    "retirement sweep retained root_id={s} reason={s} retryable={}",
+                    .{ owned_root, @tagName(failure.code), retry },
+                );
+                self.finishRetirementSweep(null, retry, now_ms);
+                return;
+            },
+            .snapshot => |*value| value,
+        };
+        if (snapshot.restart_required) {
+            self.finishRetirementSweep(null, true, now_ms);
+            return;
+        }
+
+        var retry = false;
+        for (snapshot.nodes) |node| {
+            if (!isTerminalOneOff(node.mode, node.state)) continue;
+            retry = self.tryRetireOneOff(node.child_id) or retry;
+        }
+        for (snapshot.diagnostics) |diagnostic| {
+            if (diagnostic.code != .session_unavailable) continue;
+            const parent_id = diagnostic.parent_id orelse continue;
+            _ = relationship_index.removeChild(
+                self.alloc,
+                self.sessions,
+                parent_id,
+                diagnostic.session_id,
+                self.child_store_options,
+            ) catch |err| {
+                traceRetirementRetain(
+                    diagnostic.session_id,
+                    "stale_relationship_remove",
+                    err,
+                );
+                retry = shouldScheduleRetirementRetry(err) or retry;
+            };
+        }
+        const next_cursor = if (snapshot.next_cursor) |next|
+            self.alloc.dupe(u8, next) catch {
+                self.finishRetirementSweep(null, true, now_ms);
+                return;
+            }
+        else
+            null;
+        self.finishRetirementSweep(next_cursor, retry, now_ms);
+    }
+
+    fn finishRetirementSweep(
+        self: *Owner,
+        next_cursor: ?[]u8,
+        retry: bool,
+        now_ms: i64,
+    ) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.closed) {
+            if (next_cursor) |cursor| self.alloc.free(cursor);
+            return;
+        }
+        if (self.retirement_scan_pending) {
+            self.retirement_retry_after_scan =
+                self.retirement_retry_after_scan or retry;
+            if (next_cursor) |cursor| self.alloc.free(cursor);
+            return;
+        }
+        if (self.retirement_cursor) |cursor| self.alloc.free(cursor);
+        self.retirement_cursor = next_cursor;
+        if (next_cursor != null) {
+            self.retirement_retry_after_scan =
+                self.retirement_retry_after_scan or retry;
+            self.scheduleRetirementSweepLocked(now_ms);
+        } else {
+            const should_retry = retry or self.retirement_retry_after_scan;
+            self.retirement_retry_after_scan = false;
+            if (should_retry) {
+                self.scheduleRetirementSweepLocked(
+                    now_ms + retirement_retry_delay_ms,
+                );
+            }
+        }
+    }
+
+    /// Returns true only when another automatic bounded attempt is warranted.
+    fn tryRetireOneOff(self: *Owner, child_id: []const u8) bool {
+        _ = relationship_index.migrateLegacyPage(
+            self.alloc,
+            self.sessions,
+            child_id,
+            self.child_store_options,
+        ) catch |err| {
+            if (err == error.StoreUnavailable) {
+                var page = self.sessions.listResumablePage(
+                    self.alloc,
+                    null,
+                    null,
+                ) catch |backfill_err| {
+                    traceRetirementRetain(
+                        child_id,
+                        "migration_backfill",
+                        backfill_err,
+                    );
+                    return shouldScheduleRetirementRetry(backfill_err);
+                };
+                page.deinit(self.alloc);
+                return true;
+            }
+            traceRetirementRetain(child_id, "migration", err);
+            return shouldScheduleRetirementRetry(err);
+        };
+
+        var loaded = self.sessions.resumeTargetForWrite(
+            self.alloc,
+            .{ .id = child_id },
+            self.sessions.workspace_root,
+            self.session_resume_options,
+        ) catch |err| {
+            traceRetirementRetain(child_id, "writer", err);
+            return shouldScheduleRetirementRetry(err);
+        };
+        var loaded_consumed = false;
+        defer if (!loaded_consumed) loaded.deinit(self.alloc);
+
+        var capability = self.sessions.openSubagentControlCapabilityWritable(
+            self.alloc,
+            child_id,
+            self.child_store_options,
+        ) catch |err| {
+            traceRetirementRetain(child_id, "control_open", err);
+            return shouldScheduleRetirementRetry(err);
+        };
+        defer capability.deinit();
+        const control = control_store.Store{
+            .capability = &capability,
+            .expected_child_id = child_id,
+        };
+        var lock = control.acquireLock() catch |err| {
+            traceRetirementRetain(child_id, "control_lock", err);
+            return shouldScheduleRetirementRetry(err);
+        };
+        defer lock.release();
+        var record = control.load(self.alloc) catch |err| {
+            traceRetirementRetain(child_id, "control_load", err);
+            return shouldScheduleRetirementRetry(err);
+        };
+        defer record.deinit(self.alloc);
+        if (!isTerminalOneOff(record.mode, record.state)) return false;
+        const parent_id = record.parent_id orelse return false;
+
+        var communication_capability = self.sessions.openSubagentControlCapabilityWritable(
+            self.alloc,
+            child_id,
+            self.communication_store_options,
+        ) catch |err| {
+            traceRetirementRetain(child_id, "communication_open", err);
+            return shouldScheduleRetirementRetry(err);
+        };
+        defer communication_capability.deinit();
+        const communication_state = communication_store.Store{
+            .capability = &communication_capability,
+            .expected_session_id = child_id,
+        };
+        _ = reconcileOneOffFinalResultLocked(
+            self.alloc,
+            communication_state,
+            record,
+            loaded.state.history,
+        ) catch |err| {
+            traceRetirementRetain(child_id, "result_reconcile", err);
+            return shouldScheduleRetirementRetry(err);
+        };
+        var ledger = communication_state.loadOptional(self.alloc) catch |err| {
+            traceRetirementRetain(child_id, "communication_load", err);
+            return shouldScheduleRetirementRetry(err);
+        } orelse return true;
+        defer ledger.deinit(self.alloc);
+        const work_id = terminalOneOffWorkId(record) orelse return false;
+        const delivery_id = communication.stableDeliveryId(
+            child_id,
+            work_id,
+            "final-result",
+        );
+        const result_acknowledged = communication.parentTurnDeliveryFullyAcknowledged(
+            ledger,
+            "parent-model",
+            parent_id,
+            &delivery_id,
+        );
+        if (!result_acknowledged) return false;
+
+        const active_count = relationship_index.activeCountIfMigrationComplete(
+            self.alloc,
+            self.sessions,
+            child_id,
+            self.child_store_options,
+        ) catch |err| {
+            traceRetirementRetain(child_id, "descendant_proof", err);
+            return shouldScheduleRetirementRetry(err);
+        };
+        const facts = OneOffRetirementFacts{
+            .mode = record.mode,
+            .state = record.state,
+            .result_acknowledged = result_acknowledged,
+            .migration_complete = active_count != null,
+            .active_count = active_count,
+        };
+        if (!canRetireOneOff(facts)) return active_count == null;
+
+        const disposition = self.sessions.deleteCommittedSession(
+            self.alloc,
+            &loaded,
+        );
+        loaded_consumed = true;
+        switch (disposition) {
+            .retained => return false,
+            .indeterminate => return true,
+            .discarded => {},
+        }
+        _ = relationship_index.removeChild(
+            self.alloc,
+            self.sessions,
+            parent_id,
+            child_id,
+            self.child_store_options,
+        ) catch |err| {
+            traceRetirementRetain(child_id, "relationship_remove", err);
+            return shouldScheduleRetirementRetry(err);
+        };
+        debug_trace.logf(
+            "subagent",
+            "one-off retirement committed child_id={s} parent_id={s}",
+            .{ child_id, parent_id },
+        );
+        return false;
+    }
 };
+
+const retirement_retry_delay_ms: i64 = 100;
+
+fn isTerminalOneOff(mode: domain.Mode, state: domain.State) bool {
+    if (mode != .one_off) return false;
+    return switch (state) {
+        .completed, .failed, .cancelled => true,
+        else => false,
+    };
+}
+
+const OneOffRetirementFacts = struct {
+    mode: domain.Mode,
+    state: domain.State,
+    result_acknowledged: bool,
+    migration_complete: bool,
+    active_count: ?u64,
+};
+
+fn canRetireOneOff(facts: OneOffRetirementFacts) bool {
+    return isTerminalOneOff(facts.mode, facts.state) and
+        facts.result_acknowledged and
+        facts.migration_complete and
+        facts.active_count != null and
+        facts.active_count.? == 0;
+}
+
+fn terminalOneOffWorkId(record: control_store.Record) ?[]const u8 {
+    var index = record.queue.len;
+    while (index > 0) {
+        index -= 1;
+        switch (record.queue[index].status) {
+            .completed, .failed, .cancelled => return record.queue[index].id,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn shouldScheduleRetirementRetry(err: anyerror) bool {
+    return switch (err) {
+        error.SessionBusy,
+        error.ExternalBusy,
+        error.ControlLockBusy,
+        error.LockBusy,
+        error.SessionStoreUnavailable,
+        error.StoreUnavailable,
+        error.CommitIndeterminate,
+        error.RecoveryRequired,
+        error.StaleCursor,
+        error.OutOfMemory,
+        => true,
+        else => false,
+    };
+}
+
+fn traceRetirementRetain(
+    child_id: []const u8,
+    stage: []const u8,
+    err: anyerror,
+) void {
+    debug_trace.logf(
+        "subagent",
+        "one-off retirement retained child_id={s} stage={s} outcome={s} retryable={}",
+        .{ child_id, stage, @errorName(err), shouldScheduleRetirementRetry(err) },
+    );
+}
 
 fn isRetryableNotificationPollError(err: communication_manager.Error) bool {
     return switch (err) {
@@ -2416,11 +2834,23 @@ fn reaperMain(owner: *Owner) void {
             break;
         }
         const slot = selected orelse {
-            const next_check_ms = owner.nextNotificationCheckLocked();
-            const now_ms = if (owner.notification_clock) |clock|
-                clock.now_ms()
+            const now_ms = reaperNowMs(owner);
+            if (owner.retirement_scan_pending and
+                (owner.retirement_due_ms orelse now_ms) <= now_ms)
+            {
+                owner.mutex.unlock(io_mod.getIo());
+                owner.runRetirementSweep(now_ms);
+                owner.mutex.lockUncancelable(io_mod.getIo());
+                continue;
+            }
+            const notification_check_ms = owner.nextNotificationCheckLocked();
+            const next_check_ms = if (owner.retirement_scan_pending)
+                if (notification_check_ms) |notification_due|
+                    @min(notification_due, owner.retirement_due_ms orelse now_ms)
+                else
+                    owner.retirement_due_ms
             else
-                0;
+                notification_check_ms;
             if (next_check_ms != null and next_check_ms.? <= now_ms) {
                 owner.mutex.unlock(io_mod.getIo());
                 _ = owner.pollNotifications() catch |err| {
@@ -2459,12 +2889,22 @@ fn reaperMain(owner: *Owner) void {
         }
         owner.removeSlotLocked(slot);
         owner.cacheCompletionLocked(slot.child_id, slot.result);
+        if (owner.retirement_root_id != null) {
+            owner.scheduleRetirementSweepLocked(reaperNowMs(owner));
+        }
         owner.reaper_cond.broadcast(io_mod.getIo());
         owner.mutex.unlock(io_mod.getIo());
         slot.live.deinit(owner.alloc);
         owner.alloc.destroy(slot);
         owner.mutex.lockUncancelable(io_mod.getIo());
     }
+}
+
+fn reaperNowMs(owner: *const Owner) i64 {
+    return if (owner.notification_clock) |clock|
+        clock.now_ms()
+    else
+        io_mod.milliTimestamp();
 }
 
 fn appendSlotLiveText(raw: *anyopaque, value: []const u8) void {
@@ -2755,6 +3195,12 @@ fn runOne(slot: *Slot) OneResult {
         communication_state,
         record,
     ) catch return .control_failed;
+    _ = reconcileOneOffFinalResultLocked(
+        owner.alloc,
+        communication_state,
+        record,
+        loaded.state.history,
+    ) catch return .control_failed;
     const index = nextRunnableIndex(record.queue, slot.retry_interrupted) orelse
         return if (record.mode == .one_off and record.state == .completed)
             .completed
@@ -2778,7 +3224,8 @@ fn runOne(slot: *Slot) OneResult {
         return .admission_failed;
     };
     defer admission.deinit(owner.alloc);
-    if (admission.permission_mode != record.configuration.permission_mode or
+    if (admission.provider != preferences.provider or
+        admission.permission_mode != record.configuration.permission_mode or
         !std.mem.eql(u8, admission.parent_id, parent_id) or
         !std.mem.eql(u8, admission.source_id, record.queue[index].source_id) or
         !std.mem.eql(u8, admission.model, preferences.model) or
@@ -2896,6 +3343,15 @@ fn runOne(slot: *Slot) OneResult {
         owner.wakeNotificationSchedules(slot.child_id, completed_at_ms);
         return .control_failed;
     };
+    _ = reconcileOneOffFinalResultLocked(
+        owner.alloc,
+        communication_state,
+        current,
+        loaded.state.history,
+    ) catch {
+        owner.wakeNotificationSchedules(slot.child_id, completed_at_ms);
+        return .control_failed;
+    };
     owner.wakeNotificationSchedules(slot.child_id, completed_at_ms);
     if (outcome == .failed) return .failed;
     if (current.mode == .one_off) return .completed;
@@ -2986,6 +3442,158 @@ fn completedWorkIdForRecovery(
     return work_id;
 }
 
+const TerminalTransition = struct {
+    timestamp_ms: i64,
+    reason: ?[]const u8,
+};
+
+fn terminalTransitionForWork(
+    events: []const domain.Event,
+    work_id: []const u8,
+    status: domain.QueueStatus,
+) ?TerminalTransition {
+    var index = events.len;
+    while (index > 0) {
+        index -= 1;
+        const transition = switch (events[index].kind) {
+            .work_transition => |value| value,
+            else => continue,
+        };
+        if (transition.current != status or
+            !std.mem.eql(u8, transition.work_item_id, work_id))
+        {
+            continue;
+        }
+        return .{
+            .timestamp_ms = events[index].timestamp_ms,
+            .reason = transition.reason,
+        };
+    }
+    return null;
+}
+
+fn assistantTextForWork(
+    history: []const types.HistoryTurn,
+    work_id: []const u8,
+) ?[]const u8 {
+    var index = history.len;
+    while (index > 0) {
+        index -= 1;
+        const candidate = history[index];
+        const candidate_work_id = session.historyTurnWorkId(candidate) orelse continue;
+        if (!std.mem.eql(u8, candidate_work_id, work_id)) continue;
+        return switch (candidate) {
+            .assistant => |value| value.assistant,
+            .background_command => |value| value.assistant orelse "",
+            .interrupted => |value| value.assistant orelse "",
+            .compacted_summary => null,
+        };
+    }
+    return null;
+}
+
+fn boundedFinalResultAlloc(
+    alloc: Allocator,
+    content: []const u8,
+) Allocator.Error![]u8 {
+    if (content.len <= communication.max_delivery_content_bytes) {
+        return alloc.dupe(u8, content);
+    }
+    const suffix = try std.fmt.allocPrint(
+        alloc,
+        "\n\n[truncated; original_bytes={d}]",
+        .{content.len},
+    );
+    defer alloc.free(suffix);
+    std.debug.assert(suffix.len < communication.max_delivery_content_bytes);
+    const prefix = text_utils.utf8PrefixByBytes(
+        content,
+        communication.max_delivery_content_bytes - suffix.len,
+    );
+    return std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, suffix });
+}
+
+fn oneOffFinalResultAlloc(
+    alloc: Allocator,
+    work: domain.QueuedMessage,
+    transition: TerminalTransition,
+    history: []const types.HistoryTurn,
+) (Allocator.Error || error{InvalidRecord})![]u8 {
+    const fallback_completed = "One-off subagent completed without a final text response.";
+    var formatted: ?[]u8 = null;
+    defer if (formatted) |value| alloc.free(value);
+    const raw = switch (work.status) {
+        .completed => blk: {
+            const assistant = assistantTextForWork(history, work.id) orelse
+                fallback_completed;
+            break :blk if (assistant.len != 0 and text_utils.isModelSafeText(assistant))
+                assistant
+            else
+                fallback_completed;
+        },
+        .failed => blk: {
+            formatted = try std.fmt.allocPrint(
+                alloc,
+                "One-off subagent failed: {s}",
+                .{transition.reason orelse "unknown failure"},
+            );
+            break :blk formatted.?;
+        },
+        .cancelled => blk: {
+            formatted = try std.fmt.allocPrint(
+                alloc,
+                "One-off subagent cancelled: {s}",
+                .{work.cancellation_reason orelse transition.reason orelse "cancelled"},
+            );
+            break :blk formatted.?;
+        },
+        .pending, .running, .awaiting_approval, .interrupted => return error.InvalidRecord,
+    };
+    return boundedFinalResultAlloc(alloc, raw);
+}
+
+fn reconcileOneOffFinalResultLocked(
+    alloc: Allocator,
+    store: communication_store.Store,
+    record: control_store.Record,
+    history: []const types.HistoryTurn,
+) communication_manager.Error!bool {
+    if (record.mode != .one_off) return false;
+    var index = record.queue.len;
+    while (index > 0) {
+        index -= 1;
+        const work = record.queue[index];
+        switch (work.status) {
+            .completed, .failed, .cancelled => {},
+            else => continue,
+        }
+        const parent_id = record.parent_id orelse return error.InvalidRecord;
+        const transition = terminalTransitionForWork(
+            record.events,
+            work.id,
+            work.status,
+        ) orelse return error.InvalidRecord;
+        const content = oneOffFinalResultAlloc(
+            alloc,
+            work,
+            transition,
+            history,
+        ) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidRecord => error.InvalidRecord,
+        };
+        defer alloc.free(content);
+        return communication_manager.reconcileFinalResultLocked(alloc, store, .{
+            .child_id = record.child_id,
+            .parent_id = parent_id,
+            .work_id = work.id,
+            .timestamp_ms = transition.timestamp_ms,
+            .content = content,
+        });
+    }
+    return false;
+}
+
 fn findDeliveryById(
     deliveries: []const communication.Delivery,
     id: []const u8,
@@ -3027,6 +3635,104 @@ fn serviceFailureReason(err: ServiceError) []const u8 {
         error.ProviderFailed => "provider_failed",
         error.Cancelled => "cancelled",
     };
+}
+
+test "one off terminal results and retry classification stay bounded" {
+    const alloc = std.testing.allocator;
+    const transition = TerminalTransition{ .timestamp_ms = 2, .reason = "provider_failed" };
+    const failed = domain.QueuedMessage{
+        .id = @constCast("failed-work"),
+        .source_id = @constCast("parent"),
+        .content = @constCast("work"),
+        .status = .failed,
+        .created_at_ms = 1,
+    };
+    const failed_result = try oneOffFinalResultAlloc(alloc, failed, transition, &.{});
+    defer alloc.free(failed_result);
+    try std.testing.expectEqualStrings(
+        "One-off subagent failed: provider_failed",
+        failed_result,
+    );
+
+    const cancelled = domain.QueuedMessage{
+        .id = @constCast("cancelled-work"),
+        .source_id = @constCast("parent"),
+        .content = @constCast("work"),
+        .status = .cancelled,
+        .cancellation_reason = @constCast("user cancelled"),
+        .created_at_ms = 1,
+    };
+    const cancelled_result = try oneOffFinalResultAlloc(
+        alloc,
+        cancelled,
+        .{ .timestamp_ms = 2, .reason = "user cancelled" },
+        &.{},
+    );
+    defer alloc.free(cancelled_result);
+    try std.testing.expectEqualStrings(
+        "One-off subagent cancelled: user cancelled",
+        cancelled_result,
+    );
+
+    const oversized = try alloc.alloc(u8, communication.max_delivery_content_bytes + 100);
+    defer alloc.free(oversized);
+    @memset(oversized, 'a');
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("work"), .work_id = @constCast("completed-work") },
+        .assistant = oversized,
+    } }};
+    const completed = domain.QueuedMessage{
+        .id = @constCast("completed-work"),
+        .source_id = @constCast("parent"),
+        .content = @constCast("work"),
+        .status = .completed,
+        .created_at_ms = 1,
+    };
+    const completed_result = try oneOffFinalResultAlloc(
+        alloc,
+        completed,
+        .{ .timestamp_ms = 2, .reason = null },
+        &history,
+    );
+    defer alloc.free(completed_result);
+    try std.testing.expectEqual(
+        communication.max_delivery_content_bytes,
+        completed_result.len,
+    );
+    try std.testing.expect(std.mem.endsWith(u8, completed_result, "]"));
+
+    try std.testing.expect(shouldScheduleRetirementRetry(error.LockBusy));
+    try std.testing.expect(shouldScheduleRetirementRetry(error.CommitIndeterminate));
+    try std.testing.expect(!shouldScheduleRetirementRetry(error.LockUnsupported));
+    try std.testing.expect(!shouldScheduleRetirementRetry(error.PathUnsafe));
+    try std.testing.expect(!shouldScheduleRetirementRetry(error.InvalidRecord));
+
+    const eligible = OneOffRetirementFacts{
+        .mode = .one_off,
+        .state = .completed,
+        .result_acknowledged = true,
+        .migration_complete = true,
+        .active_count = 0,
+    };
+    try std.testing.expect(canRetireOneOff(eligible));
+    var rejected = eligible;
+    rejected.mode = .persistent;
+    try std.testing.expect(!canRetireOneOff(rejected));
+    rejected = eligible;
+    rejected.state = .running;
+    try std.testing.expect(!canRetireOneOff(rejected));
+    rejected = eligible;
+    rejected.result_acknowledged = false;
+    try std.testing.expect(!canRetireOneOff(rejected));
+    rejected = eligible;
+    rejected.migration_complete = false;
+    try std.testing.expect(!canRetireOneOff(rejected));
+    rejected = eligible;
+    rejected.active_count = null;
+    try std.testing.expect(!canRetireOneOff(rejected));
+    rejected = eligible;
+    rejected.active_count = 1;
+    try std.testing.expect(!canRetireOneOff(rejected));
 }
 
 fn mapOpenControlError(err: session_store.OpenSubagentControlError) ControlError {
@@ -3207,7 +3913,6 @@ test "admission snapshot is isolated owned and preserves configured permission m
         .model = "test/model",
         .effort = types.ReasoningEffort.literal("high"),
         .permission_mode = .ask,
-        .sandbox_backend = .macos,
         .tool_names = &.{ "read_file", "write_file" },
         .rules = .{ .rules = &rules },
         .grants = &grants,
@@ -3490,7 +4195,6 @@ const Observation = struct {
     content: []u8,
     model: []u8,
     effort: types.ReasoningEffort,
-    sandbox_backend: types.BackendKind,
     tool_name: []u8,
     rule_pattern: []u8,
     grant_target: []u8,
@@ -3556,7 +4260,6 @@ const FakeExecution = struct {
             .source_id = request.source_id,
             .model = request.preferences.model,
             .effort = request.preferences.effort,
-            .sandbox_backend = if (current == 0) .macos else .vercel,
             .tool_names = if (current == 0) &.{"read_file"} else &.{"write_file"},
             .rules = .{ .rules = &rules },
             .grants = &grants,
@@ -3677,7 +4380,6 @@ const ApprovalBlockingExecution = struct {
             .source_id = request.source_id,
             .model = request.preferences.model,
             .effort = request.preferences.effort,
-            .sandbox_backend = .none,
             .tool_names = &.{"create_folder"},
             .rules = .{ .rules = &.{} },
             .grants = &.{},
@@ -3759,7 +4461,6 @@ fn makeObservation(
         .content = owned_content,
         .model = model,
         .effort = admission.effort,
-        .sandbox_backend = admission.sandbox_backend,
         .tool_name = tool_name,
         .rule_pattern = rule_pattern,
         .grant_target = grant_target,
@@ -5081,13 +5782,11 @@ test "authority snapshots isolate siblings and refresh only at turn admission" {
     const first = findObservation(fake.observations.items, "authority-a", "a-old").?;
     const second = findObservation(fake.observations.items, "authority-a", "a-new").?;
     const sibling = findObservation(fake.observations.items, "authority-b", "b-new").?;
-    try std.testing.expectEqual(types.BackendKind.macos, first.sandbox_backend);
     try std.testing.expectEqualStrings("read_file", first.tool_name);
     try std.testing.expectEqualStrings("old.txt", first.rule_pattern);
     try std.testing.expectEqualStrings("/tmp/old.txt", first.grant_target);
     try std.testing.expectEqualStrings("mcp:old", first.integration_name);
     for ([_]Observation{ second, sibling }) |observation| {
-        try std.testing.expectEqual(types.BackendKind.vercel, observation.sandbox_backend);
         try std.testing.expectEqualStrings("write_file", observation.tool_name);
         try std.testing.expectEqualStrings("new.txt", observation.rule_pattern);
         try std.testing.expectEqualStrings("/tmp/new.txt", observation.grant_target);
@@ -5856,7 +6555,6 @@ test "canonical approval wait refreshes revoked authority and races reject relat
             return .{
                 .generation = if (revoked) 2 else 1,
                 .tools = tools,
-                .sandbox_backend = if (revoked) .none else .macos,
                 .integrations = integrations,
                 .rules = .{ .rules = rules },
                 .grants = grants,
@@ -5961,7 +6659,6 @@ test "canonical approval wait refreshes revoked authority and races reject relat
         .worker = &turn.worker,
         .permission_prompter = turn.permissionPrompter(),
         .background = &background,
-        .sandbox_backend = .macos,
         .advertised_dynamic_tool_names = &.{},
         .mcp_runtime = .{},
     }, .start = &registration_start, .ready = &registration_ready };
@@ -6111,7 +6808,6 @@ test "canonical approval wait refreshes revoked authority and races reject relat
     try std.testing.expectEqual(runtime_deps.LiveToolAuthorityDecision.unavailable, refreshed.decision);
     try std.testing.expect(refreshed.authority.generation != initial_authority_generation);
     try std.testing.expectEqual(@as(usize, 0), refreshed.authority.tools.len);
-    try std.testing.expectEqual(types.BackendKind.none, refreshed.authority.sandbox_backend);
     var resumed = try env.loadControl(alloc, "approval-child");
     defer resumed.deinit(alloc);
     try std.testing.expectEqual(domain.State.running, resumed.state);
@@ -6191,7 +6887,6 @@ const ToolEffectExecution = struct {
             .source_id = request.source_id,
             .model = request.preferences.model,
             .effort = request.preferences.effort,
-            .sandbox_backend = .none,
             .tool_names = &.{"create_folder"},
         }) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
@@ -6268,7 +6963,6 @@ const ToolEffectAuthority = struct {
         return .{
             .generation = 1,
             .tools = tools,
-            .sandbox_backend = .none,
             .integrations = integrations,
             .rules = .{ .rules = rules },
             .grants = grants,
@@ -6701,7 +7395,6 @@ const ProcessBoundaryExecution = struct {
             .source_id = request.source_id,
             .model = request.preferences.model,
             .effort = request.preferences.effort,
-            .sandbox_backend = .none,
         }) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.AdmissionFailed,
@@ -7295,10 +7988,6 @@ const LiveRevalidationHost = struct {
     tool_name: []const u8,
     source_pattern: ?[]const u8 = null,
     destination_pattern: ?[]const u8 = null,
-    sandbox_command: ?[]const u8 = null,
-    command_action: types.PermissionAction = .allow,
-    changed_command_action: ?types.PermissionAction = null,
-    initial_sandbox_grant: bool = false,
 
     fn action(code: u8) ?types.PermissionAction {
         return switch (code) {
@@ -7329,15 +8018,8 @@ const LiveRevalidationHost = struct {
             null
         else
             action(self.changed_action.load(.seq_cst));
-        const command_action = if (generation == 1)
-            self.command_action
-        else
-            self.changed_command_action orelse self.command_action;
-        const rule_count: usize = if (self.sandbox_command != null)
-            1 + @as(usize, @intFromBool(changed_action != null))
-        else
-            @as(usize, @intFromBool(self.source_pattern != null)) +
-                @as(usize, @intFromBool(changed_action != null));
+        const rule_count: usize = @as(usize, @intFromBool(self.source_pattern != null)) +
+            @as(usize, @intFromBool(changed_action != null));
         const rules = try alloc.alloc(types.PermissionRule, rule_count);
         errdefer alloc.free(rules);
         var initialized: usize = 0;
@@ -7346,60 +8028,34 @@ const LiveRevalidationHost = struct {
             alloc.free(rule.pattern);
         };
 
-        if (self.sandbox_command != null) {
+        if (self.source_pattern) |source| {
             rules[initialized] = try ownLiveRevalidationRule(
                 alloc,
-                "bash",
-                "*",
-                command_action,
+                self.tool_name,
+                source,
+                .allow,
             );
             initialized += 1;
-            if (changed_action) |value| {
-                rules[initialized] = try ownLiveRevalidationRule(
-                    alloc,
-                    "sandbox",
-                    self.sandbox_command.?,
-                    value,
-                );
-                initialized += 1;
-            }
-        } else {
-            if (self.source_pattern) |source| {
-                rules[initialized] = try ownLiveRevalidationRule(
-                    alloc,
-                    self.tool_name,
-                    source,
-                    .allow,
-                );
-                initialized += 1;
-            }
-            if (changed_action) |value| {
-                rules[initialized] = try ownLiveRevalidationRule(
-                    alloc,
-                    self.tool_name,
-                    self.destination_pattern.?,
-                    value,
-                );
-                initialized += 1;
-            }
+        }
+        if (changed_action) |value| {
+            rules[initialized] = try ownLiveRevalidationRule(
+                alloc,
+                self.tool_name,
+                self.destination_pattern.?,
+                value,
+            );
+            initialized += 1;
         }
 
         const tools = try cloneTestStrings(alloc, &.{self.tool_name});
         errdefer freeTestStrings(alloc, tools);
         const integrations = try alloc.alloc([]u8, 0);
         errdefer alloc.free(integrations);
-        const grants = if (self.initial_sandbox_grant and generation == 1)
-            try types.dupePermissionGrantSlice(alloc, &.{.{
-                .tool_name = @constCast("sandbox"),
-                .target_path = @constCast(self.sandbox_command.?),
-            }})
-        else
-            try alloc.alloc(types.PermissionGrant, 0);
+        const grants = try alloc.alloc(types.PermissionGrant, 0);
         errdefer types.freePermissionGrantSlice(alloc, grants);
         return .{
             .generation = generation,
             .tools = tools,
-            .sandbox_backend = .macos,
             .integrations = integrations,
             .rules = .{ .rules = rules },
             .grants = grants,
@@ -7428,7 +8084,6 @@ const ProductionPermissionAdapter = struct {
             .worker = &self.turn.worker,
             .permission_prompter = self.turn.permissionPrompter(),
             .background = self.background,
-            .sandbox_backend = authority.sandbox_backend,
             .advertised_dynamic_tool_names = &.{},
             .mcp_runtime = .{},
         };
@@ -7457,44 +8112,12 @@ const ProductionPermissionAdapter = struct {
                 action_request.authority,
                 action_request.human_approval,
             ),
-            .sandbox_widening => |widening| tooling_tool_admission.revalidateLiveSandboxWideningOutcome(
-                admission,
-                arena,
-                call,
-                permission_mode,
-                local_grants,
-                widening.authority,
-                widening.required.wideningInput(),
-                widening.human_approval,
-            ),
         } else tooling_tool_admission.requestPermissionOutcome(
             admission,
             arena,
             call,
             permission_mode,
             local_grants,
-        );
-    }
-
-    fn requestSandboxWidening(
-        raw: *anyopaque,
-        arena: Allocator,
-        call: types.ToolCall,
-        review_turn: permission_auto_classifier.ReviewTurnContext,
-        permission_mode: types.PermissionMode,
-        local_grants: []const types.PermissionGrant,
-        live_authority: ?agent_runtime.LiveToolAuthority,
-        _: []const []const u8,
-        required: agent_runtime.SandboxScopeRequired,
-    ) !command_admission.PermissionOutcome {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        return tooling_tool_admission.requestSandboxWideningOutcome(
-            try self.input(review_turn, live_authority),
-            arena,
-            call,
-            permission_mode,
-            local_grants,
-            required.wideningInput(),
         );
     }
 };
@@ -7824,411 +8447,6 @@ test "production child action revalidation checks changed copy and rename destin
     }
 }
 
-fn runProductionSandboxGenerationCase(
-    changed_action: types.PermissionAction,
-    approval_decision: types.ToolPermissionDecision,
-) !void {
-    const alloc = std.testing.allocator;
-    var env = try TestEnvironment.init(alloc);
-    defer env.deinit(alloc);
-    try env.createSession(alloc, "parent");
-    try env.createSession(alloc, "sandbox-child");
-    try env.installControl(
-        alloc,
-        "sandbox-child",
-        .persistent,
-        "model/sandbox",
-        types.ReasoningEffort.literal("medium"),
-        &.{"sandbox-work"},
-    );
-    try env.setPermissionMode(alloc, "sandbox-child", .ask);
-    {
-        var capability = try env.store.openSubagentControlCapabilityWritable(
-            alloc,
-            "sandbox-child",
-            .{},
-        );
-        defer capability.deinit();
-        const store = control_store.Store{
-            .capability = &capability,
-            .expected_child_id = "sandbox-child",
-        };
-        var lock = try store.acquireLock();
-        defer lock.release();
-        var record = try store.load(alloc);
-        defer record.deinit(alloc);
-        try admitWork(alloc, &record, 0, 2);
-        try store.save(alloc, record);
-    }
-
-    var host = LiveRevalidationHost{
-        .tool_name = "terminal",
-        .sandbox_command = "npm test",
-    };
-    var login_shell_buffer: [4096]u8 = undefined;
-    const login_shell = shell_resolver.configuredLoginShellInto(&login_shell_buffer) orelse
-        return error.SkipZigTest;
-    var authority = authority_mod.Resolver{
-        .sessions = &env.store,
-        .host = .{ .context = &host, .resolve_fn = LiveRevalidationHost.resolve },
-    };
-    var durable = approval_persistence.DurableRegistry{
-        .alloc = alloc,
-        .sessions = &env.store,
-    };
-    var registry = approval_registry_mod.Registry{
-        .alloc = alloc,
-        .persistence = durable.interface(),
-    };
-    defer registry.deinit();
-    var loaded = try env.store.resumeForWrite(alloc, "sandbox-child");
-    defer {
-        loaded.log.park();
-        loaded.deinit(alloc);
-    }
-    var turn = try TurnContext.init(alloc, &loaded, 8);
-    defer turn.deinit();
-    turn.live_authority = &authority;
-    turn.approval_registry = &registry;
-    turn.child_id = "sandbox-child";
-    turn.active_work_id = "sandbox-work";
-    turn.worker.worker_processing = true;
-    var background: background_runtime.BackgroundRuntime = .{};
-    defer background.deinit(alloc);
-    var hooks = agent_test_support.FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.live_tool_authority = turn.liveToolAuthorityProvider();
-    hooks.permission_target = env.workspace;
-    hooks.workspace_root = env.workspace;
-    hooks.exec_plans = &.{
-        .{ .result = .{
-            .status = .failure,
-            .model_output = "",
-            .sandbox_scope_required = .{
-                .phase = .preflight,
-                .restricted_fingerprint = .{
-                    .command = "npm test",
-                    .resolved_cwd = env.workspace,
-                    .background = false,
-                    .resolved_backend = .macos,
-                    .target_os = builtin.os.tag,
-                    .environment = .{ .user = login_shell },
-                    .scope = .restricted,
-                },
-            },
-        } },
-        .{ .result = .{ .model_output = "broader effect" } },
-    };
-    var adapter = ProductionPermissionAdapter{
-        .turn = &turn,
-        .background = &background,
-        .workspace_root = env.workspace,
-        .tool_registry = hooks.tool_registry,
-    };
-    hooks.permission_request_override = .{
-        .context = &adapter,
-        .request_fn = ProductionPermissionAdapter.requestPermission,
-    };
-    hooks.sandbox_widening_request_override = .{
-        .context = &adapter,
-        .request_fn = ProductionPermissionAdapter.requestSandboxWidening,
-    };
-
-    const calls = [_]types.ToolCall{.{
-        .id = "generation-bound-sandbox",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"npm test\"}",
-    }};
-    const completions = [_]agent_test_support.FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .content = "done" },
-    };
-    var gateway = agent_test_support.FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var fixture = agent_test_support.PromptFixture{ .workspace_root = env.workspace };
-    var job = fixture.job();
-    // This fixture exercises human-approved sandbox revalidation. Keep it in
-    // ask mode so automatic recovery does not intentionally bypass the prompt.
-    job.permission_mode = .ask;
-    var config = fixture.config();
-    config.origin = .subagent;
-    config.session_child_capability = try turn.childCapability();
-    var prompt = ProductionPromptThread{
-        .gateway = &gateway,
-        .hooks = &hooks,
-        .config = config,
-        .job = job,
-    };
-    const thread = try std.Thread.spawn(.{}, ProductionPromptThread.run, .{&prompt});
-    var joined = false;
-    defer if (!joined) {
-        turn.worker.requestCancel();
-        thread.join();
-    };
-    const approval_id = try waitForPendingToolApproval(alloc, &env, "sandbox-child");
-    defer alloc.free(approval_id);
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        hooks.successful_effect_count.load(.seq_cst),
-    );
-    host.change(changed_action);
-    try std.testing.expectEqual(
-        approval_registry_mod.ResolveResult.accepted,
-        try registry.resolve(
-            approval_id,
-            "sandbox-child",
-            approval_decision,
-            null,
-            3,
-        ),
-    );
-    thread.join();
-    joined = true;
-    try std.testing.expect(!prompt.failed.load(.seq_cst));
-    const expected_effects: usize = if (changed_action == .ask) 1 else 0;
-    try std.testing.expectEqual(
-        expected_effects,
-        hooks.successful_effect_count.load(.seq_cst),
-    );
-    var ledger = try env.loadCommunication(alloc, "sandbox-child");
-    defer ledger.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), ledger.approvals.len);
-    try std.testing.expectEqual(
-        if (approval_decision == .always)
-            communication.ApprovalStatus.allowed_always
-        else
-            communication.ApprovalStatus.allowed_once,
-        ledger.approvals[0].status,
-    );
-}
-
-test "production child sandbox revalidation checks changed widening rules" {
-    try runProductionSandboxGenerationCase(.ask, .always);
-    try runProductionSandboxGenerationCase(.deny, .once);
-}
-
-test "production child sandbox grant revocation requires a separate widening approval" {
-    const alloc = std.testing.allocator;
-    var env = try TestEnvironment.init(alloc);
-    defer env.deinit(alloc);
-    try env.createSession(alloc, "parent");
-    try env.createSession(alloc, "grant-child");
-    try env.installControl(
-        alloc,
-        "grant-child",
-        .persistent,
-        "model/grant",
-        types.ReasoningEffort.literal("medium"),
-        &.{"grant-work"},
-    );
-    try env.setPermissionMode(alloc, "grant-child", .auto);
-    {
-        var capability = try env.store.openSubagentControlCapabilityWritable(
-            alloc,
-            "grant-child",
-            .{},
-        );
-        defer capability.deinit();
-        const store = control_store.Store{
-            .capability = &capability,
-            .expected_child_id = "grant-child",
-        };
-        var lock = try store.acquireLock();
-        defer lock.release();
-        var record = try store.load(alloc);
-        defer record.deinit(alloc);
-        try admitWork(alloc, &record, 0, 2);
-        try store.save(alloc, record);
-    }
-
-    var host = LiveRevalidationHost{
-        .tool_name = "terminal",
-        .sandbox_command = "npm test",
-        .command_action = .ask,
-        .changed_command_action = .allow,
-        .initial_sandbox_grant = true,
-    };
-    var login_shell_buffer: [4096]u8 = undefined;
-    const login_shell = shell_resolver.configuredLoginShellInto(&login_shell_buffer) orelse
-        return error.SkipZigTest;
-    var authority = authority_mod.Resolver{
-        .sessions = &env.store,
-        .host = .{ .context = &host, .resolve_fn = LiveRevalidationHost.resolve },
-    };
-    var durable = ObservedDurableApprovalRegistry{
-        .durable = .{
-            .alloc = alloc,
-            .sessions = &env.store,
-        },
-    };
-    var registry = approval_registry_mod.Registry{
-        .alloc = alloc,
-        .persistence = durable.interface(),
-    };
-    defer registry.deinit();
-    var loaded = try env.store.resumeForWrite(alloc, "grant-child");
-    defer {
-        loaded.log.park();
-        loaded.deinit(alloc);
-    }
-    var turn = try TurnContext.init(alloc, &loaded, 8);
-    defer turn.deinit();
-    turn.live_authority = &authority;
-    turn.approval_registry = &registry;
-    turn.child_id = "grant-child";
-    turn.active_work_id = "grant-work";
-    turn.worker.worker_processing = true;
-    var background: background_runtime.BackgroundRuntime = .{};
-    defer background.deinit(alloc);
-    var hooks = agent_test_support.FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.live_tool_authority = turn.liveToolAuthorityProvider();
-    hooks.permission_target = env.workspace;
-    hooks.workspace_root = env.workspace;
-    hooks.exec_plans = &.{
-        .{ .result = .{
-            .status = .failure,
-            .model_output = "",
-            .sandbox_scope_required = .{
-                .phase = .preflight,
-                .restricted_fingerprint = .{
-                    .command = "npm test",
-                    .resolved_cwd = env.workspace,
-                    .background = false,
-                    .resolved_backend = .macos,
-                    .target_os = builtin.os.tag,
-                    .environment = .{ .user = login_shell },
-                    .scope = .restricted,
-                },
-            },
-        } },
-        .{ .result = .{ .model_output = "broader effect" } },
-    };
-    var adapter = ProductionPermissionAdapter{
-        .turn = &turn,
-        .background = &background,
-        .workspace_root = env.workspace,
-        .tool_registry = hooks.tool_registry,
-    };
-    hooks.permission_request_override = .{
-        .context = &adapter,
-        .request_fn = ProductionPermissionAdapter.requestPermission,
-    };
-    hooks.sandbox_widening_request_override = .{
-        .context = &adapter,
-        .request_fn = ProductionPermissionAdapter.requestSandboxWidening,
-    };
-
-    const calls = [_]types.ToolCall{.{
-        .id = "revoked-sandbox-grant",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"npm test\"}",
-    }};
-    const completions = [_]agent_test_support.FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .content = "done" },
-    };
-    var gateway = agent_test_support.FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var fixture = agent_test_support.PromptFixture{ .workspace_root = env.workspace };
-    var job = fixture.job();
-    job.permission_mode = .auto;
-    var config = fixture.config();
-    config.origin = .subagent;
-    config.session_child_capability = try turn.childCapability();
-    var prompt = ProductionPromptThread{
-        .gateway = &gateway,
-        .hooks = &hooks,
-        .config = config,
-        .job = job,
-    };
-    const thread = try std.Thread.spawn(.{}, ProductionPromptThread.run, .{&prompt});
-    var joined = false;
-    defer if (!joined) {
-        turn.worker.requestShutdown();
-        thread.join();
-    };
-
-    const action_approval_id = try waitForObservedToolApproval(
-        alloc,
-        &env,
-        "grant-child",
-        &durable,
-        1,
-        &prompt.finished,
-    );
-    defer alloc.free(action_approval_id);
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        hooks.successful_effect_count.load(.seq_cst),
-    );
-    host.change(.ask);
-    try std.testing.expectEqual(
-        approval_registry_mod.ResolveResult.accepted,
-        try registry.resolve(
-            action_approval_id,
-            "grant-child",
-            .once,
-            null,
-            3,
-        ),
-    );
-
-    const widening_approval_id = try waitForObservedToolApproval(
-        alloc,
-        &env,
-        "grant-child",
-        &durable,
-        2,
-        &prompt.finished,
-    );
-    defer alloc.free(widening_approval_id);
-    try std.testing.expect(!std.mem.eql(
-        u8,
-        action_approval_id,
-        widening_approval_id,
-    ));
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        hooks.successful_effect_count.load(.seq_cst),
-    );
-    {
-        var ledger = try env.loadCommunication(alloc, "grant-child");
-        defer ledger.deinit(alloc);
-        const widening = communication.findApproval(
-            ledger.approvals,
-            widening_approval_id,
-        ) orelse return error.TestApprovalNotRegistered;
-        try std.testing.expect(std.mem.startsWith(
-            u8,
-            widening.label,
-            "broader file access: # terminal.exec profile=user shell=",
-        ));
-        try std.testing.expect(std.mem.endsWith(u8, widening.label, "\\x0anpm test"));
-        try std.testing.expectEqual(
-            communication.ApprovalStatus.pending,
-            widening.status,
-        );
-    }
-    try std.testing.expectEqual(
-        approval_registry_mod.ResolveResult.accepted,
-        try registry.resolve(
-            widening_approval_id,
-            "grant-child",
-            .once,
-            null,
-            4,
-        ),
-    );
-    thread.join();
-    joined = true;
-    try std.testing.expect(!prompt.failed.load(.seq_cst));
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        hooks.successful_effect_count.load(.seq_cst),
-    );
-}
-
 const GatewayExecution = struct {
     calls: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
@@ -8266,7 +8484,6 @@ const GatewayExecution = struct {
         return .{
             .generation = 1,
             .tools = tools,
-            .sandbox_backend = .macos,
             .integrations = integrations,
             .rules = .{ .rules = rules },
             .grants = grants,
@@ -8296,7 +8513,6 @@ const GatewayExecution = struct {
             .source_id = request.source_id,
             .model = request.preferences.model,
             .effort = request.preferences.effort,
-            .sandbox_backend = .none,
             .tool_names = &.{ "read_file", "grep_files", "mcp_select_tool" },
             .rules = .{ .rules = &rules },
             .grants = &grants,
@@ -8331,7 +8547,7 @@ const GatewayExecution = struct {
         cancel: *std.atomic.Value(bool),
     ) !RunOutcome {
         const self: *GatewayExecution = @ptrCast(@alignCast(raw.?));
-        if (admission.permission_mode != .yolo or admission.sandbox_backend != .none or
+        if (admission.permission_mode != .yolo or
             admission.tool_names.len != 3 or admission.integration_names.len != 1 or
             !std.mem.eql(u8, admission.parent_id, "parent") or
             !std.mem.eql(u8, admission.source_id, "parent")) return error.InvalidAdmissionSnapshot;
@@ -8403,7 +8619,6 @@ const GatewayExecution = struct {
         job.prompt = message.content;
         job.model = admission.model;
         job.permission_mode = admission.permission_mode;
-        job.sandbox_backend = admission.sandbox_backend;
         job.history = history;
         job.grants = admission.grants;
         var config = fixture.config();
@@ -8430,7 +8645,6 @@ const GatewayExecution = struct {
         )) return error.GrantNotInherited;
         if (hooks.last_live_authority_generation == null or
             hooks.last_live_authority_generation.? == 0 or
-            hooks.last_live_authority_sandbox != .none or
             hooks.last_live_authority_tool_count != 4 or
             hooks.last_live_authority_integration_count != 1 or
             hooks.last_live_authority_rule_count != 1 or
@@ -8582,13 +8796,166 @@ test "session-backed owner executes through deterministic gateway and normal age
     try std.testing.expect(saw_pending and saw_running and saw_completed);
 }
 
+test "completed one off reconciles one stable final result message" {
+    const alloc = std.testing.allocator;
+    var env = try TestEnvironment.init(alloc);
+    defer env.deinit(alloc);
+    try env.createSession(alloc, "parent");
+    try env.createSession(alloc, "one-off-child");
+    try env.installControl(
+        alloc,
+        "one-off-child",
+        .one_off,
+        "anthropic/claude-opus-4.6",
+        types.ReasoningEffort.literal("high"),
+        &.{"one-off-work"},
+    );
+    _ = try relationship_index.ensureChild(
+        alloc,
+        &env.store,
+        "parent",
+        "one-off-child",
+        .{},
+    );
+    var gateway_execution: GatewayExecution = .{};
+    var manager = manager_mod.Manager{ .sessions = &env.store };
+    var live_authority = authority_mod.Resolver{
+        .sessions = &env.store,
+        .host = .{ .resolve_fn = GatewayExecution.resolveHostAuthority },
+    };
+    var owner = Owner{
+        .alloc = alloc,
+        .sessions = &env.store,
+        .manager = &manager,
+        .services = gateway_execution.services(),
+        .live_authority = &live_authority,
+        .retirement_root_id = "parent",
+    };
+    defer owner.deinit();
+    try std.testing.expectEqual(StartResult.started, try owner.start("one-off-child", false));
+    try std.testing.expectEqual(ChildResult.completed, try owner.join("one-off-child"));
+    var indexed = try env.store.listResumablePage(alloc, null, null);
+    indexed.deinit(alloc);
+
+    var communication_query = communication_manager.Manager{ .sessions = &env.store };
+    var page = try communication_query.page(
+        alloc,
+        "one-off-child",
+        "parent-model",
+        "parent",
+        null,
+        16,
+    );
+    defer page.deinit(alloc);
+    var result_count: usize = 0;
+    for (page.deliveries) |delivery| switch (delivery.payload) {
+        .message => |message| {
+            result_count += 1;
+            try std.testing.expectEqualStrings("gateway child reply", message);
+            try std.testing.expectEqualStrings("one-off-work", delivery.work_id.?);
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), result_count);
+
+    _ = try owner.recover(20);
+    var repeated = try communication_query.page(
+        alloc,
+        "one-off-child",
+        "parent-model",
+        "parent",
+        null,
+        16,
+    );
+    defer repeated.deinit(alloc);
+    var repeated_count: usize = 0;
+    for (repeated.deliveries) |delivery| {
+        if (delivery.payload == .message) repeated_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), repeated_count);
+
+    while (true) {
+        var pending = try communication_query.prepareParentBoundary(
+            alloc,
+            "one-off-child",
+            "parent-model",
+            "parent",
+            .turn_boundary,
+            null,
+        );
+        defer pending.deinit(alloc);
+        if (pending == .wait) break;
+        try communication_query.acknowledgeParentBoundary(
+            alloc,
+            "one-off-child",
+            "parent-model",
+            "parent",
+            .{
+                .sequence = pending.inject.through_sequence,
+                .delivery_id = pending.inject.delivery_id,
+                .start_offset = pending.inject.start_offset,
+                .end_offset = pending.inject.end_offset,
+                .total_bytes = pending.inject.total_bytes,
+            },
+        );
+    }
+    var canonical = try manager.snapshot(alloc, .{ .root_id = "parent" });
+    defer canonical.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), canonical.snapshot.nodes.len);
+    {
+        var communication_capability = try env.store.openSubagentControlCapabilityReadOnly(
+            alloc,
+            "one-off-child",
+            .{},
+        );
+        defer communication_capability.deinit();
+        const communication_state = communication_store.Store{
+            .capability = &communication_capability,
+            .expected_session_id = "one-off-child",
+        };
+        var acknowledged = try communication_state.load(alloc);
+        defer acknowledged.deinit(alloc);
+        const result_id = communication.stableDeliveryId(
+            "one-off-child",
+            "one-off-work",
+            "final-result",
+        );
+        try std.testing.expect(communication.parentTurnDeliveryFullyAcknowledged(
+            acknowledged,
+            "parent-model",
+            "parent",
+            &result_id,
+        ));
+    }
+    try std.testing.expectEqual(
+        @as(?u64, 0),
+        try relationship_index.activeCountIfMigrationComplete(
+            alloc,
+            &env.store,
+            "one-off-child",
+            .{},
+        ),
+    );
+    try std.testing.expect(!owner.tryRetireOneOff("one-off-child"));
+    try std.testing.expectError(
+        error.SessionNotFound,
+        env.store.loadReadOnly(alloc, "one-off-child"),
+    );
+    try std.testing.expect((try relationship_index.lookupSlot(
+        alloc,
+        &env.store,
+        "parent",
+        "one-off-child",
+        .{},
+    )) == null);
+}
+
 fn checkAdmissionAllocationFailures(alloc: Allocator) !void {
     var snapshot = try domain.captureAdmission(alloc, .{
         .parent_id = "parent",
         .source_id = "source",
         .model = "model",
         .effort = types.ReasoningEffort.literal("high"),
-        .sandbox_backend = .macos,
         .tool_names = &.{ "read_file", "write_file" },
         .integration_names = &.{"mcp:test"},
     });

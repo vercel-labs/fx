@@ -4,6 +4,8 @@ import unittest
 
 from scripts.pgso.model import PgsoError
 from scripts.pgso.profile_supplement import (
+    PROFILE_SUMMARY_CUTOFF_COLD,
+    SUPPLEMENT_COLD_THRESHOLD_MULTIPLIER,
     extract_compatible_profile,
     map_production_profile,
     speed_shaped_functions,
@@ -28,6 +30,10 @@ def profile_text(*records: tuple[str, int, tuple[int, ...]]) -> str:
 
 
 class ProfileSupplementTests(unittest.TestCase):
+    def test_supplements_follow_the_production_cold_cutoff(self) -> None:
+        self.assertEqual(600_000, PROFILE_SUMMARY_CUTOFF_COLD)
+        self.assertEqual(2, SUPPLEMENT_COLD_THRESHOLD_MULTIPLIER)
+
     def test_reads_speed_shaped_functions_from_profile_use_ir(self) -> None:
         ir = """
 define internal void @core.output.diff.hot() #3 {
@@ -119,7 +125,7 @@ attributes #4 = { cold minsize nounwind }
             ("fx;core.workspace.file_index.scoreAsciiRange",),
             supplement.function_names,
         )
-        self.assertEqual(10, supplement.total_counter_value)
+        self.assertEqual(3, supplement.total_counter_value)
         self.assertIn(
             "fx;core.workspace.file_index.scoreAsciiRange",
             supplement.text,
@@ -179,8 +185,8 @@ attributes #4 = { cold minsize nounwind }
             speed_functions=("core.output.diff.compute",),
         )
 
-        self.assertIn("\n200\n100\n0\n50\n", supplement.text)
-        self.assertEqual(350, supplement.total_counter_value)
+        self.assertIn("\n100\n50\n0\n25\n", supplement.text)
+        self.assertEqual(175, supplement.total_counter_value)
 
     def test_raises_a_low_workload_count_above_the_production_cold_cutoff(self) -> None:
         production = profile_text(
@@ -199,8 +205,8 @@ attributes #4 = { cold minsize nounwind }
             speed_functions=("core.output.diff.compute",),
         )
 
-        self.assertIn("\n200\n100\n0\n20\n", supplement.text)
-        self.assertEqual(320, supplement.total_counter_value)
+        self.assertIn("\n100\n50\n0\n10\n", supplement.text)
+        self.assertEqual(160, supplement.total_counter_value)
 
     def test_rejects_malformed_counter_count(self) -> None:
         production = profile_text(("fx;core.output.diff.compute", 7, (1,)))

@@ -268,7 +268,7 @@ test "processQueuedPrompt returns a final response after repeated tool failures"
     try std.testing.expectEqual(@as(usize, 3), hooks.executed_names.items.len);
 }
 
-test "processQueuedPrompt returns a final response after repeated malformed calls" {
+test "processQueuedPrompt stops repeated malformed calls before another provider request" {
     const alloc = std.testing.allocator;
     const call_one = [_]ToolCall{.{
         .id = "call_1",
@@ -292,23 +292,27 @@ test "processQueuedPrompt returns a final response after repeated malformed call
         .{ .tool_calls = &call_one },
         .{ .tool_calls = &call_two },
         .{ .tool_calls = &call_three },
-        .{ .content = "Recovered after malformed arguments." },
+        .{ .content = "must not be requested" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.agent_step_limit = 0;
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    try std.testing.expect(!textContains(&hooks, "Agent stopped: 3 consecutive steps with all-error tool calls."));
+    const notice = "Repeated malformed tool arguments stopped the agent loop. The invalid calls were not executed. Continue with a follow-up prompt if needed.";
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try std.testing.expect(textContains(&hooks, notice));
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
     try std.testing.expectEqual(@as(usize, 1), hooks.finish_event_count);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
-    try std.testing.expectEqualStrings("Recovered after malformed arguments.", hooks.history_assistant_text.?);
-    try std.testing.expectEqualStrings("Recovered after malformed arguments.", hooks.finish_assistant_text.?);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    try std.testing.expectEqualStrings(notice, hooks.history_assistant_text.?);
+    try std.testing.expectEqualStrings(notice, hooks.finish_assistant_text.?);
     try std.testing.expect(
         logIndex(&hooks, "event:turn_finished").? <
             logIndex(&hooks, "event:finish_prompt").?,
@@ -985,6 +989,67 @@ test "common Stop step limit retains candidate and current-turn execution" {
     try std.testing.expectEqual(
         types.PersistedToolStatus.success,
         turn.execution.tool_steps[0].tool_results[0].status,
+    );
+}
+
+test "common Stop automatic recovery fallback retains candidate and current-turn execution" {
+    const alloc = std.testing.allocator;
+    const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch blocked\"}")};
+    const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch blocked\"}")};
+    const third = [_]ToolCall{toolCall("blocked-3", "run_command", "{\"command\":\"touch blocked\"}")};
+    const fourth = [_]ToolCall{toolCall("blocked-4", "run_command", "{\"command\":\"touch blocked\"}")};
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .content = "candidate" },
+        .{ .tool_calls = &first },
+        .{ .tool_calls = &second },
+        .{ .tool_calls = &third },
+        .{ .tool_calls = &fourth },
+        .{ .content = "must not be requested" },
+    });
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    deps.permission_decisions = &.{.deny};
+    deps.permission_denial_reasons = &.{.auto_denied};
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.agent_step_limit = 0;
+    var job = fixture.job();
+    job.permission_mode = .auto;
+    var lifecycle_runtime = lifecycle_hooks.Runtime.init(alloc);
+    defer lifecycle_runtime.deinit();
+    var handler = StopTestHandler{
+        .alloc = alloc,
+        .action = .{ .continue_once = "verify" },
+    };
+    defer handler.deinit();
+    const view = try registerStopTestHandler(&lifecycle_runtime, &handler);
+
+    try runFakePromptWithLifecycle(
+        &gateway,
+        &deps,
+        config,
+        job,
+        testLifecycleContext(view, alloc, fixture.workspace_root),
+    );
+
+    try std.testing.expectEqual(@as(usize, 5), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), handler.calls);
+    try std.testing.expectEqual(@as(usize, 1), deps.permission_names.items.len);
+    try std.testing.expectEqual(@as(usize, 1), deps.finish_event_count);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, deps.finalized_outcome.?);
+    const turn = deps.history_turns.items[0].assistant;
+    try std.testing.expectEqualStrings(
+        "candidate\nI couldn't continue because the required actions were blocked by automatic safety checks. I need a different approach or explicit direction from you.",
+        turn.assistant,
+    );
+    try std.testing.expectEqual(@as(usize, 4), turn.execution.tool_steps.len);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countText(
+            &deps,
+            "I couldn't continue because the required actions were blocked by automatic safety checks. I need a different approach or explicit direction from you.",
+        ),
     );
 }
 

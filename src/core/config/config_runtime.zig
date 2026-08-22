@@ -2,14 +2,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const agent_steps = @import("agent_steps.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
-const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const settings_store = @import("settings_store.zig");
+const model_provider = @import("model_provider.zig");
 const update_target = @import("../upgrade/update_target.zig");
 pub const context_limits = @import("context_limits.zig");
 
@@ -38,6 +37,9 @@ pub const Paths = struct {
 
 pub const Settings = struct {
     model: ?[]u8 = null,
+    provider: ?model_provider.ProviderId = null,
+    codex_model: ?[]u8 = null,
+    grok_model: ?[]u8 = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     yolo_acknowledged: ?bool = null,
@@ -47,18 +49,15 @@ pub const Settings = struct {
     first_call_tool_choice: ?types.ToolChoice = null,
     context: ?bool = null,
     fast_mode: ?bool = null,
-    input_appearance: ?[]u8 = null,
-    maxxing_mode: ?[]u8 = null,
     slash_menu_categories: ?bool = null,
     auto_upgrade: ?bool = null,
     update_channel: ?update_target.Channel = null,
     startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
     effort: ?types.ReasoningEffort = null,
-    sandbox: ?[]u8 = null,
-    statusline_sandbox: ?bool = null,
     statusline_context: ?bool = null,
     statusline_session: ?bool = null,
+    statusline_workspace: ?bool = null,
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
     notification_max: ?bool = null,
@@ -67,9 +66,8 @@ pub const Settings = struct {
 
     pub fn deinit(self: *Settings, alloc: Allocator) void {
         if (self.model) |value| alloc.free(value);
-        if (self.input_appearance) |value| alloc.free(value);
-        if (self.maxxing_mode) |value| alloc.free(value);
-        if (self.sandbox) |value| alloc.free(value);
+        if (self.codex_model) |value| alloc.free(value);
+        if (self.grok_model) |value| alloc.free(value);
         self.permission_rules.deinit(alloc);
         self.* = .{};
     }
@@ -78,12 +76,10 @@ pub const Settings = struct {
 pub const StartupStatusSettings = struct {
     model: ?[]u8 = null,
     permission_mode: ?types.PermissionMode = null,
-    sandbox: ?[]u8 = null,
     max_agent_steps: ?usize = null,
 
     pub fn deinit(self: *StartupStatusSettings, alloc: Allocator) void {
         if (self.model) |value| alloc.free(value);
-        if (self.sandbox) |value| alloc.free(value);
         self.* = .{};
     }
 };
@@ -105,21 +101,20 @@ pub const ModelSource = ConfigSource;
 
 pub const ConfigSources = struct {
     model: ConfigSource = .compiled_default,
+    provider: ConfigSource = .compiled_default,
+    codex_model: ConfigSource = .compiled_default,
+    grok_model: ConfigSource = .compiled_default,
     permission_mode: ConfigSource = .compiled_default,
     effort: ConfigSource = .compiled_default,
     fast_mode: ConfigSource = .compiled_default,
-    input_appearance: ConfigSource = .compiled_default,
-    maxxing_mode: ConfigSource = .compiled_default,
     slash_menu_categories: ConfigSource = .compiled_default,
     startup_scrollback: ConfigSource = .compiled_default,
     prompt_history_enabled: ConfigSource = .compiled_default,
-    statusline_sandbox: ConfigSource = .compiled_default,
     statusline_context: ConfigSource = .compiled_default,
     statusline_session: ConfigSource = .compiled_default,
     notification_turn_end: ConfigSource = .compiled_default,
     notification_attention_required: ConfigSource = .compiled_default,
     notification_max: ConfigSource = .compiled_default,
-    sandbox: ConfigSource = .compiled_default,
 };
 
 pub fn resolveContextLimits(settings: *const Settings, command_line: []const context_limits.Override) context_limits.Values {
@@ -516,8 +511,6 @@ fn hasLegacyWorkspacePreferences(root: std.json.Value) bool {
             "model",
             "effort",
             "fast_mode",
-            "input_appearance",
-            "maxxing_mode",
             "slash_menu_categories",
             "startup_scrollback",
         }) |key| {
@@ -528,8 +521,7 @@ fn hasLegacyWorkspacePreferences(root: std.json.Value) bool {
         }
         if (workspace.get("statusLine")) |value| {
             if (value == .object and
-                (value.object.contains("sandbox") or
-                    value.object.contains("context") or
+                (value.object.contains("context") or
                     value.object.contains("session")))
             {
                 return true;
@@ -542,10 +534,11 @@ fn hasLegacyWorkspacePreferences(root: std.json.Value) bool {
 fn isProfileOnlySettingKey(key: []const u8) bool {
     inline for (&.{
         "model",
+        "provider",
+        "codex_model",
+        "grok_model",
         "effort",
         "fast_mode",
-        "input_appearance",
-        "maxxing_mode",
         "slash_menu_categories",
         "startup_scrollback",
         "prompt_history",
@@ -586,21 +579,20 @@ fn appendIgnoredProjectProfileSettingDiagnostics(
 
 fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: ConfigSource) void {
     if (settings.model != null) sources.model = source;
+    if (settings.provider != null) sources.provider = source;
+    if (settings.codex_model != null) sources.codex_model = source;
+    if (settings.grok_model != null) sources.grok_model = source;
     if (settings.permission_mode != null) sources.permission_mode = source;
     if (settings.effort != null) sources.effort = source;
     if (settings.fast_mode != null) sources.fast_mode = source;
-    if (settings.input_appearance != null) sources.input_appearance = source;
-    if (settings.maxxing_mode != null) sources.maxxing_mode = source;
     if (settings.slash_menu_categories != null) sources.slash_menu_categories = source;
     if (settings.startup_scrollback != null) sources.startup_scrollback = source;
     if (settings.prompt_history_enabled != null) sources.prompt_history_enabled = source;
-    if (settings.statusline_sandbox != null) sources.statusline_sandbox = source;
     if (settings.statusline_context != null) sources.statusline_context = source;
     if (settings.statusline_session != null) sources.statusline_session = source;
     if (settings.notification_turn_end != null) sources.notification_turn_end = source;
     if (settings.notification_attention_required != null) sources.notification_attention_required = source;
     if (settings.notification_max != null) sources.notification_max = source;
-    if (settings.sandbox != null) sources.sandbox = source;
 }
 
 const DetailedPermissionSource = enum {
@@ -627,7 +619,13 @@ fn mergeDetailedSettingsLayer(
     source: ConfigSource,
     permission_source: DetailedPermissionSource,
 ) !void {
-    if (parseSettingsValueForLayer(alloc, value, settings_layer, tolerate_non_object_user_containers)) |layer_settings| {
+    if (parseSettingsValueForLayer(
+        alloc,
+        value,
+        settings_layer,
+        tolerate_non_object_user_containers,
+        source != .user_workspace,
+    )) |layer_settings| {
         var incoming = layer_settings;
         defer incoming.deinit(alloc);
         incoming.context_limits.retag(switch (source) {
@@ -635,7 +633,9 @@ fn mergeDetailedSettingsLayer(
             .user_workspace => .user_workspace,
             else => .compiled_default,
         });
-        if (source == .user_workspace) incoming.update_channel = null;
+        if (source == .user_workspace) {
+            incoming.update_channel = null;
+        }
         updateConfigSources(state.sources, incoming, source);
         if (incoming.has_permission_rules) {
             switch (permission_source) {
@@ -743,9 +743,9 @@ pub fn userSettingsPath(alloc: Allocator) !?[]u8 {
 pub const AllowlistResetScope = settings_store.AllowlistResetScope;
 pub const PermissionMutation = settings_store.PermissionMutation;
 pub const PermissionScope = settings_store.PermissionScope;
+pub const StatuslineItem = settings_store.StatuslineItem;
 pub const UserSettingsPatch = settings_store.UserSettingsPatch;
 pub const WorkspaceDirectoryMutation = settings_store.WorkspaceDirectoryMutation;
-pub const WorkspaceSettingsPatch = settings_store.WorkspaceSettingsPatch;
 pub const CommitOutcome = settings_store.CommitOutcome;
 pub const LegacyCleanup = settings_store.LegacyCleanup;
 
@@ -800,17 +800,6 @@ pub fn setUserPreferences(
     return store.applyUserPatch(alloc, patch);
 }
 
-pub fn setWorkspacePreferences(
-    alloc: Allocator,
-    workspace_root: []const u8,
-    patch: WorkspaceSettingsPatch,
-) !CommitOutcome {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-    var store = try settings_store.Store.initFromHome(alloc, home, .writable);
-    defer store.deinit(alloc);
-    return store.applyWorkspacePatch(alloc, workspace_root, patch);
-}
-
 pub fn mutateWorkspaceDirectory(
     alloc: Allocator,
     mutation: WorkspaceDirectoryMutation,
@@ -829,12 +818,6 @@ pub fn mutatePermission(
     var store = try settings_store.Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
     return store.applyPermissionPatch(alloc, mutation);
-}
-
-pub fn setSandbox(alloc: Allocator, workspace_root: []const u8, backend_label: []const u8) !CommitOutcome {
-    const mode = sandbox.PublicMode.parse(backend_label) orelse return error.InvalidSandboxValue;
-    if (mode == .os and !sandbox.osSandboxAvailable()) return error.UnsupportedSandboxValue;
-    return setWorkspacePreferences(alloc, workspace_root, .{ .sandbox = mode.label() });
 }
 
 pub fn addPermissionRule(
@@ -930,7 +913,7 @@ pub fn loadMergedSettingsFromPaths(alloc: Allocator, paths: Paths) !Settings {
 
         try mergeSettingsFile(&settings, alloc, paths.workspace_settings);
 
-        var user_settings = try parseSettingsValueForLayer(alloc, parsed.value, .profile, false);
+        var user_settings = try parseSettingsValueForLayer(alloc, parsed.value, .profile, false, true);
         defer user_settings.deinit(alloc);
         user_settings.context_limits.retag(.user_global);
         mergeSettings(&settings, &user_settings, alloc);
@@ -1008,7 +991,6 @@ fn startupStatusSettingsFromSettings(alloc: Allocator, settings: Settings) !Star
     return .{
         .model = if (settings.model) |model| try alloc.dupe(u8, model) else null,
         .permission_mode = settings.permission_mode,
-        .sandbox = if (settings.sandbox) |value| try alloc.dupe(u8, value) else null,
         .max_agent_steps = settings.max_agent_steps,
     };
 }
@@ -1020,11 +1002,6 @@ fn mergeStartupStatusSettings(target: *StartupStatusSettings, incoming: *Startup
         incoming.model = null;
     }
     if (incoming.permission_mode) |value| target.permission_mode = value;
-    if (incoming.sandbox) |value| {
-        if (target.sandbox) |current| alloc.free(current);
-        target.sandbox = value;
-        incoming.sandbox = null;
-    }
     if (incoming.max_agent_steps) |value| target.max_agent_steps = value;
 }
 
@@ -1037,7 +1014,7 @@ fn mergeWorkspaceOverridesFromValue(target: *Settings, alloc: Allocator, root_va
     const override_val = workspaces_val.object.get(workspace_root) orelse return;
     if (override_val != .object) return;
 
-    var override_settings = try parseSettingsValueForLayer(alloc, override_val, .profile, true);
+    var override_settings = try parseSettingsValueForLayer(alloc, override_val, .profile, true, false);
     defer override_settings.deinit(alloc);
     override_settings.update_channel = null;
     override_settings.context_limits.retag(.user_workspace);
@@ -1076,7 +1053,7 @@ fn parseSettingsJson(alloc: Allocator, json_text: []const u8) !Settings {
 fn parseSettingsJsonForLayer(alloc: Allocator, json_text: []const u8, layer: SettingsLayer) !Settings {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_text, .{});
     defer parsed.deinit();
-    return parseSettingsValueForLayer(alloc, parsed.value, layer, false);
+    return parseSettingsValueForLayer(alloc, parsed.value, layer, false, true);
 }
 
 const JsonStringToken = struct {
@@ -1138,8 +1115,6 @@ fn parseStartupStatusObject(
                     try readStartupStatusModel(scanner, alloc, &settings);
                 } else if (layer == .profile and std.mem.eql(u8, key.text, "permission_mode")) {
                     settings.permission_mode = try readStartupStatusPermissionMode(scanner);
-                } else if (std.mem.eql(u8, key.text, "sandbox")) {
-                    try readStartupStatusSandbox(scanner, alloc, &settings);
                 } else if (std.mem.eql(u8, key.text, "max_agent_steps")) {
                     settings.max_agent_steps = try readStartupStatusUsize(scanner);
                 } else {
@@ -1210,35 +1185,6 @@ fn readStartupStatusPermissionMode(scanner: *std.json.Scanner) !types.Permission
     }
 }
 
-fn readStartupStatusSandbox(
-    scanner: *std.json.Scanner,
-    alloc: Allocator,
-    settings: *StartupStatusSettings,
-) !void {
-    const token = try scanner.nextAlloc(alloc, .alloc_if_needed);
-    switch (token) {
-        .string, .allocated_string => {
-            const value = try configJsonStringFromToken(token);
-            defer value.deinit(alloc);
-            const trimmed = std.mem.trim(u8, value.text, " \t\r\n");
-            if (trimmed.len == 0) return;
-            const label = switch (sandbox.parseConfigMode(trimmed)) {
-                .mode => |mode| mode.label(),
-                .invalid => return error.InvalidSandboxValue,
-                .retired => return error.RetiredSandboxValue,
-                .unsupported_os => return error.UnsupportedSandboxValue,
-            };
-            const owned = try alloc.dupe(u8, label);
-            if (settings.sandbox) |current| alloc.free(current);
-            settings.sandbox = owned;
-        },
-        else => {
-            freeConfigJsonToken(alloc, token);
-            return error.InvalidSandboxType;
-        },
-    }
-}
-
 fn readStartupStatusUsize(scanner: *std.json.Scanner) !usize {
     const token = try scanner.next();
     switch (token) {
@@ -1284,14 +1230,21 @@ fn parseSettingsValueForLayer(
     root: std.json.Value,
     layer: SettingsLayer,
     tolerate_non_object_user_containers: bool,
+    parse_workspace_statusline: bool,
 ) !Settings {
     if (root != .object) return error.InvalidSettingsShape;
 
     var settings = Settings{};
     errdefer settings.deinit(alloc);
 
-    if (layer == .profile) try parseProfileOnlyFields(&settings, alloc, root, tolerate_non_object_user_containers);
-    try parseProjectSafeFields(&settings, alloc, root);
+    if (layer == .profile) try parseProfileOnlyFields(
+        &settings,
+        alloc,
+        root,
+        tolerate_non_object_user_containers,
+        parse_workspace_statusline,
+    );
+    try parseProjectSafeFields(&settings, root);
 
     return settings;
 }
@@ -1301,6 +1254,7 @@ fn parseProfileOnlyFields(
     alloc: Allocator,
     root: std.json.Value,
     tolerate_non_object_user_containers: bool,
+    parse_workspace_statusline: bool,
 ) !void {
     if (root.object.contains("skill_match_fuzzy")) return error.RetiredSkillMatchFuzzy;
     if (root.object.get("model")) |model_value| {
@@ -1308,6 +1262,24 @@ fn parseProfileOnlyFields(
         if (value != .string) return error.InvalidModelType;
         settings_store.validateModel(value.string) catch return error.InvalidModelValue;
         settings.model = try alloc.dupe(u8, value.string);
+    }
+
+    if (root.object.get("provider")) |provider_value| {
+        if (provider_value != .string) return error.InvalidProviderType;
+        settings.provider = model_provider.parse(provider_value.string) orelse
+            return error.InvalidProviderValue;
+    }
+
+    if (root.object.get("codex_model")) |model_value| {
+        if (model_value != .string) return error.InvalidCodexModelType;
+        settings_store.validateModel(model_value.string) catch return error.InvalidCodexModelValue;
+        settings.codex_model = try alloc.dupe(u8, model_value.string);
+    }
+
+    if (root.object.get("grok_model")) |model_value| {
+        if (model_value != .string) return error.InvalidGrokModelType;
+        settings_store.validateModel(model_value.string) catch return error.InvalidGrokModelValue;
+        settings.grok_model = try alloc.dupe(u8, model_value.string);
     }
 
     if (root.object.get("permission_mode")) |permission_mode_value| {
@@ -1346,20 +1318,6 @@ fn parseProfileOnlyFields(
         const value = fast_mode_value;
         if (value != .bool) return error.InvalidFastModeType;
         settings.fast_mode = value.bool;
-    }
-
-    if (root.object.get("input_appearance")) |input_appearance_value| {
-        const value = input_appearance_value;
-        if (value != .string) return error.InvalidInputAppearanceType;
-        settings_store.validateInputAppearance(value.string) catch return error.InvalidInputAppearanceValue;
-        settings.input_appearance = try alloc.dupe(u8, value.string);
-    }
-
-    if (root.object.get("maxxing_mode")) |maxxing_mode_value| {
-        const value = maxxing_mode_value;
-        if (value != .string) return error.InvalidMaxxingModeType;
-        settings_store.validateMaxxingMode(value.string) catch return error.InvalidMaxxingModeValue;
-        settings.maxxing_mode = try alloc.dupe(u8, value.string);
     }
 
     if (root.object.get("slash_menu_categories")) |slash_menu_categories_value| {
@@ -1409,10 +1367,6 @@ fn parseProfileOnlyFields(
         if (value != .object) {
             if (!tolerate_non_object_user_containers) return error.InvalidStatusLineType;
         } else {
-            if (value.object.get("sandbox")) |v| {
-                if (v != .bool) return error.InvalidStatusLineSandboxType;
-                settings.statusline_sandbox = v.bool;
-            }
             if (value.object.get("context")) |v| {
                 if (v != .bool) return error.InvalidStatusLineContextType;
                 settings.statusline_context = v.bool;
@@ -1420,6 +1374,12 @@ fn parseProfileOnlyFields(
             if (value.object.get("session")) |v| {
                 if (v != .bool) return error.InvalidStatusLineSessionType;
                 settings.statusline_session = v.bool;
+            }
+            if (parse_workspace_statusline) {
+                if (value.object.get("workspace")) |v| {
+                    if (v != .bool) return error.InvalidStatusLineWorkspaceType;
+                    settings.statusline_workspace = v.bool;
+                }
             }
         }
     }
@@ -1448,7 +1408,7 @@ fn parseProfileOnlyFields(
     }
 }
 
-fn parseProjectSafeFields(settings: *Settings, alloc: Allocator, root: std.json.Value) !void {
+fn parseProjectSafeFields(settings: *Settings, root: std.json.Value) !void {
     if (root.object.get("max_agent_steps")) |max_agent_steps_value| {
         const value = max_agent_steps_value;
         if (value != .integer) return error.InvalidMaxAgentStepsType;
@@ -1468,20 +1428,6 @@ fn parseProjectSafeFields(settings: *Settings, alloc: Allocator, root: std.json.
         if (value != .bool) return error.InvalidContextType;
         settings.context = value.bool;
     }
-
-    if (root.object.get("sandbox")) |sandbox_value| {
-        const value = sandbox_value;
-        if (value != .string) return error.InvalidSandboxType;
-        const trimmed = std.mem.trim(u8, value.string, " \t\r\n");
-        if (trimmed.len > 0) {
-            switch (sandbox.parseConfigMode(trimmed)) {
-                .mode => |mode| settings.sandbox = try alloc.dupe(u8, mode.label()),
-                .invalid => return error.InvalidSandboxValue,
-                .retired => return error.RetiredSandboxValue,
-                .unsupported_os => return error.UnsupportedSandboxValue,
-            }
-        }
-    }
 }
 
 fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void {
@@ -1489,6 +1435,17 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
         if (target.model) |current| alloc.free(current);
         target.model = value;
         incoming.model = null;
+    }
+    if (incoming.provider) |value| target.provider = value;
+    if (incoming.codex_model) |value| {
+        if (target.codex_model) |current| alloc.free(current);
+        target.codex_model = value;
+        incoming.codex_model = null;
+    }
+    if (incoming.grok_model) |value| {
+        if (target.grok_model) |current| alloc.free(current);
+        target.grok_model = value;
+        incoming.grok_model = null;
     }
     if (incoming.permission_mode) |value| target.permission_mode = value;
     if (incoming.credential_source) |value| target.credential_source = value;
@@ -1499,16 +1456,6 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
     if (incoming.first_call_tool_choice) |value| target.first_call_tool_choice = value;
     if (incoming.context) |value| target.context = value;
     if (incoming.fast_mode) |value| target.fast_mode = value;
-    if (incoming.input_appearance) |value| {
-        if (target.input_appearance) |current| alloc.free(current);
-        target.input_appearance = value;
-        incoming.input_appearance = null;
-    }
-    if (incoming.maxxing_mode) |value| {
-        if (target.maxxing_mode) |current| alloc.free(current);
-        target.maxxing_mode = value;
-        incoming.maxxing_mode = null;
-    }
     if (incoming.slash_menu_categories) |value| target.slash_menu_categories = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
     if (incoming.update_channel) |value| target.update_channel = value;
@@ -1516,18 +1463,12 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
     if (incoming.prompt_history_enabled) |value| target.prompt_history_enabled = value;
     if (incoming.effort) |value| target.effort = value;
 
-    if (incoming.statusline_sandbox) |value| target.statusline_sandbox = value;
     if (incoming.statusline_context) |value| target.statusline_context = value;
     if (incoming.statusline_session) |value| target.statusline_session = value;
+    if (incoming.statusline_workspace) |value| target.statusline_workspace = value;
     if (incoming.notification_turn_end) |value| target.notification_turn_end = value;
     if (incoming.notification_attention_required) |value| target.notification_attention_required = value;
     if (incoming.notification_max) |value| target.notification_max = value;
-
-    if (incoming.sandbox) |value| {
-        if (target.sandbox) |current| alloc.free(current);
-        target.sandbox = value;
-        incoming.sandbox = null;
-    }
 
     if (incoming.has_permission_rules) {
         target.permission_rules.deinit(alloc);
@@ -1979,7 +1920,6 @@ test "loadStartupStatusSettings merges project defaults before profile layers" {
 
     try std.testing.expectEqualStrings("override-model", settings.model.?);
     try std.testing.expectEqual(types.PermissionMode.yolo, settings.permission_mode.?);
-    try std.testing.expectEqualStrings("none", settings.sandbox.?);
     try std.testing.expectEqual(@as(usize, 8), settings.max_agent_steps.?);
 }
 
@@ -2031,6 +1971,18 @@ test "max_agent_steps absence and explicit values resolve distinctly" {
     try std.testing.expectEqual(@as(usize, 50), agent_steps.resolveMaxAgentSteps(positive.max_agent_steps, 25));
 }
 
+test "provider settings keep independent provider models" {
+    var settings = try parseSettingsJson(
+        std.testing.allocator,
+        "{\"provider\":\"grok\",\"model\":\"gateway/model\",\"codex_model\":\"gpt-5.4-mini\",\"grok_model\":\"grok-4.20-0309-non-reasoning\"}",
+    );
+    defer settings.deinit(std.testing.allocator);
+    try std.testing.expectEqual(model_provider.ProviderId.grok, settings.provider.?);
+    try std.testing.expectEqualStrings("gateway/model", settings.model.?);
+    try std.testing.expectEqualStrings("gpt-5.4-mini", settings.codex_model.?);
+    try std.testing.expectEqualStrings("grok-4.20-0309-non-reasoning", settings.grok_model.?);
+}
+
 test "max_agent_steps explicit zero survives serialization round trip" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"max_agent_steps\":0}", .{});
     defer parsed.deinit();
@@ -2078,6 +2030,15 @@ test "skill_match_fuzzy returns a migration-specific parse error" {
         error.RetiredSkillMatchFuzzy,
         parseSettingsJson(std.testing.allocator, "{\"skill_match_fuzzy\":true}"),
     );
+}
+
+test "retired presentation settings are ignored regardless of type" {
+    var settings = try parseSettingsJson(
+        std.testing.allocator,
+        "{\"model\":\"openai/gpt-5.4\",\"input_appearance\":false,\"maxxing_mode\":7}",
+    );
+    defer settings.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("openai/gpt-5.4", settings.model.?);
 }
 
 test "startup_scrollback parses merges rejects invalid type and round trips" {
@@ -2879,118 +2840,6 @@ test "user startup scrollback preference writes bool and preserves unrelated key
     try std.testing.expect((try workspaceOverrideObject(&parsed.value, workspace_root)).get("startup_scrollback") == null);
 }
 
-test "settings sandbox canonicalizes public and legacy values" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
-    defer std.testing.allocator.free(home_root);
-    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
-    defer std.testing.allocator.free(workspace_root);
-
-    const home = try TestHome.install(std.testing.allocator, home_root);
-    defer home.deinit();
-
-    const os_sandbox_available = host.current().os_sandbox;
-    const auto_expected = if (os_sandbox_available) "os" else "none";
-    inline for (&.{ .{ "auto", auto_expected }, .{ "none", "none" } }) |case| {
-        const fixture = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "{{\"workspaces\":{{\"{s}\":{{\"sandbox\":\"{s}\"}}}}}}",
-            .{ workspace_root, case[0] },
-        );
-        defer std.testing.allocator.free(fixture);
-        try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
-
-        var settings = try loadMergedSettings(std.testing.allocator, workspace_root);
-        defer settings.deinit(std.testing.allocator);
-        try std.testing.expectEqualStrings(case[1], settings.sandbox.?);
-    }
-
-    inline for (&.{ "os", "macos" }) |value| {
-        const fixture = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "{{\"workspaces\":{{\"{s}\":{{\"sandbox\":\"{s}\"}}}}}}",
-            .{ workspace_root, value },
-        );
-        defer std.testing.allocator.free(fixture);
-        try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
-
-        if (os_sandbox_available) {
-            var settings = try loadMergedSettings(std.testing.allocator, workspace_root);
-            defer settings.deinit(std.testing.allocator);
-            try std.testing.expectEqualStrings("os", settings.sandbox.?);
-        } else {
-            try std.testing.expectError(error.UnsupportedSandboxValue, loadMergedSettings(std.testing.allocator, workspace_root));
-        }
-    }
-}
-
-test "settings sandbox rejects retired explicit values" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
-    defer std.testing.allocator.free(home_root);
-    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
-    defer std.testing.allocator.free(workspace_root);
-
-    const home = try TestHome.install(std.testing.allocator, home_root);
-    defer home.deinit();
-
-    inline for (&.{ "vercel", "just-bash" }) |value| {
-        const fixture = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "{{\"workspaces\":{{\"{s}\":{{\"sandbox\":\"{s}\"}}}}}}",
-            .{ workspace_root, value },
-        );
-        defer std.testing.allocator.free(fixture);
-        try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
-        try std.testing.expectError(error.RetiredSandboxValue, loadMergedSettings(std.testing.allocator, workspace_root));
-    }
-}
-
-test "setSandbox rejects invalid labels and persists canonical public labels" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
-    defer std.testing.allocator.free(home_root);
-    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
-    defer std.testing.allocator.free(workspace_root);
-
-    const home = try TestHome.install(std.testing.allocator, home_root);
-    defer home.deinit();
-
-    try std.testing.expectError(error.InvalidSandboxValue, setSandbox(std.testing.allocator, workspace_root, "not-a-backend"));
-
-    const os_sandbox_available = host.current().os_sandbox;
-    const expected_label = if (os_sandbox_available) "os" else "none";
-    if (os_sandbox_available) {
-        var outcome = try setSandbox(std.testing.allocator, workspace_root, "os");
-        defer outcome.deinit(std.testing.allocator);
-    } else {
-        try std.testing.expectError(error.UnsupportedSandboxValue, setSandbox(std.testing.allocator, workspace_root, "os"));
-        var outcome = try setSandbox(std.testing.allocator, workspace_root, "none");
-        defer outcome.deinit(std.testing.allocator);
-    }
-
-    const bytes = try readSettingsBytesForTest(std.testing.allocator, home_root);
-    defer std.testing.allocator.free(bytes);
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{});
-    defer parsed.deinit();
-
-    const workspace_obj = try workspaceOverrideObject(&parsed.value, workspace_root);
-    const sandbox_value = workspace_obj.get("sandbox") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings(expected_label, sandbox_value.string);
-}
-
 test "project profile-only settings are ignored and diagnosed by key" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3019,21 +2868,18 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try std.testing.expectEqual(types.PermissionMode.auto, result.settings.permission_mode.?);
     try std.testing.expectEqual(@as(usize, 17), result.settings.max_agent_steps.?);
     try std.testing.expectEqual(true, result.settings.prompt_history_enabled.?);
-    try std.testing.expectEqual(true, result.settings.statusline_sandbox.?);
     try std.testing.expectEqual(false, result.settings.statusline_context.?);
     try std.testing.expectEqual(types.ToolChoice.none, result.settings.first_call_tool_choice.?);
     try std.testing.expectEqual(false, result.settings.auto_upgrade.?);
     try std.testing.expectEqual(update_target.Channel.dev, result.settings.update_channel.?);
     try std.testing.expectEqual(false, result.settings.fast_mode.?);
-    try std.testing.expectEqualStrings("tint", result.settings.input_appearance.?);
-    try std.testing.expectEqualStrings("minimal", result.settings.maxxing_mode.?);
     try std.testing.expectEqual(false, result.settings.slash_menu_categories.?);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), result.settings.effort.?);
     try std.testing.expectEqual(false, result.settings.startup_scrollback.?);
     try std.testing.expectEqual(@as(usize, 1), result.settings.permission_rules.rules.len);
     try expectPermissionRule(result.settings.permission_rules.rules[0], "bash", "profile *", .allow);
 
-    try std.testing.expectEqual(@as(usize, 15), result.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 13), result.diagnostics.len);
     inline for (&.{
         "model",
         "permission_mode",
@@ -3045,8 +2891,6 @@ test "project profile-only settings are ignored and diagnosed by key" {
         "auto_upgrade",
         "update_channel",
         "fast_mode",
-        "input_appearance",
-        "maxxing_mode",
         "slash_menu_categories",
         "effort",
         "startup_scrollback",
@@ -3101,20 +2945,20 @@ test "malformed project profile-only settings are ignored before value parsing" 
 test "global statusline fields parse and merge independently" {
     var target = try parseSettingsJson(
         std.testing.allocator,
-        "{\"statusLine\":{\"sandbox\":false,\"context\":true,\"session\":false}}",
+        "{\"statusLine\":{\"sandbox\":false,\"context\":true,\"session\":false,\"workspace\":false}}",
     );
     defer target.deinit(std.testing.allocator);
     var incoming = try parseSettingsJson(
         std.testing.allocator,
-        "{\"statusLine\":{\"session\":true}}",
+        "{\"statusLine\":{\"session\":true,\"workspace\":true}}",
     );
     defer incoming.deinit(std.testing.allocator);
 
     mergeSettings(&target, &incoming, std.testing.allocator);
 
-    try std.testing.expectEqual(false, target.statusline_sandbox.?);
     try std.testing.expectEqual(true, target.statusline_context.?);
     try std.testing.expectEqual(true, target.statusline_session.?);
+    try std.testing.expectEqual(true, target.statusline_workspace.?);
 }
 
 test "global statusline rejects malformed containers and fields" {
@@ -3122,13 +2966,11 @@ test "global statusline rejects malformed containers and fields" {
         error.InvalidStatusLineType,
         parseSettingsJson(std.testing.allocator, "{\"statusLine\":7}"),
     );
-    try std.testing.expectError(
-        error.InvalidStatusLineSandboxType,
-        parseSettingsJson(
-            std.testing.allocator,
-            "{\"statusLine\":{\"sandbox\":\"yes\"}}",
-        ),
+    var legacy = try parseSettingsJson(
+        std.testing.allocator,
+        "{\"statusLine\":{\"sandbox\":\"yes\"}}",
     );
+    legacy.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.InvalidStatusLineContextType,
         parseSettingsJson(
@@ -3143,6 +2985,51 @@ test "global statusline rejects malformed containers and fields" {
             "{\"statusLine\":{\"session\":1}}",
         ),
     );
+    try std.testing.expectError(
+        error.InvalidStatusLineWorkspaceType,
+        parseSettingsJson(
+            std.testing.allocator,
+            "{\"statusLine\":{\"workspace\":1}}",
+        ),
+    );
+}
+
+test "legacy sandbox keys are inert unknown data" {
+    var settings = try parseSettingsJson(
+        std.testing.allocator,
+        "{\"sandbox\":{\"legacy\":true},\"statusLine\":{\"sandbox\":\"legacy\",\"context\":true}}",
+    );
+    defer settings.deinit(std.testing.allocator);
+    try std.testing.expectEqual(true, settings.statusline_context.?);
+}
+
+test "workspace statusline is global only in ordinary and detailed loads" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const user_settings = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"statusLine\":{{\"workspace\":true}},\"workspaces\":{{\"{s}\":{{\"statusLine\":{{\"workspace\":\"ignored\"}}}}}}}}\n",
+        .{workspace_root},
+    );
+    defer std.testing.allocator.free(user_settings);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
+
+    var ordinary = try loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_root);
+    defer ordinary.deinit(std.testing.allocator);
+    try std.testing.expectEqual(true, ordinary.statusline_workspace.?);
+
+    var detailed = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer detailed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(true, detailed.settings.statusline_workspace.?);
+    try std.testing.expectEqual(@as(usize, 0), detailed.diagnostics.len);
 }
 
 test "ordinary and detailed loads agree on workspace overrides with legacy statusline containers" {
@@ -3175,7 +3062,6 @@ test "ordinary and detailed loads agree on workspace overrides with legacy statu
     try std.testing.expectEqual(false, detailed.settings.startup_scrollback.?);
     try std.testing.expectEqual(@as(usize, 42), detailed.settings.max_agent_steps.?);
     try std.testing.expectEqual(ConfigSource.user_workspace, detailed.sources.startup_scrollback);
-    try std.testing.expectEqual(ConfigSource.compiled_default, detailed.sources.statusline_sandbox);
     try std.testing.expectEqual(@as(usize, 2), detailed.diagnostics.len);
     try expectIgnoredProjectKey(detailed.diagnostics, "startup_scrollback");
     try std.testing.expectEqual(
@@ -3361,16 +3247,12 @@ test "detailed settings expose target sources and permission views" {
     try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.permission_mode);
     try std.testing.expectEqual(ConfigSource.compiled_default, result.sources.effort);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.fast_mode);
-    try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.input_appearance);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.startup_scrollback);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.prompt_history_enabled);
-    try std.testing.expectEqual(ConfigSource.user_global, result.sources.statusline_sandbox);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.statusline_context);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.statusline_session);
     try std.testing.expectEqual(true, result.settings.statusline_session.?);
-    try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.sandbox);
     try std.testing.expectEqual(@as(usize, 33), result.settings.max_agent_steps.?);
-    try std.testing.expectEqualStrings("lines", result.settings.input_appearance.?);
 
     try std.testing.expectEqual(@as(usize, 1), result.permission_sources.user.rules.len);
     try expectPermissionRule(result.permission_sources.user.rules[0], "bash", "user *", .allow);

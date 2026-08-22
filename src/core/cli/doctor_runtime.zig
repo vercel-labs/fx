@@ -6,9 +6,9 @@ const agent_steps = @import("../config/agent_steps.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const host = @import("../hosts/host.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const session_store = @import("../session/session_store.zig");
 const types = @import("../shared/types.zig");
+const model_provider = @import("../config/model_provider.zig");
 
 const Allocator = std.mem.Allocator;
 const default_session_diagnostics_limit: usize = 64;
@@ -34,6 +34,7 @@ pub const Check = struct {
 pub const Snapshot = struct {
     workspace_root: []u8,
     model: []const u8,
+    provider: model_provider.ProviderId = .gateway,
     owned_model: ?[]u8 = null,
     auth: auth_runtime.StatusSnapshot = .{},
     permission_mode: types.PermissionMode,
@@ -108,10 +109,12 @@ pub fn collect(
         return snapshot;
     };
     defer detailed.deinit(alloc);
+    snapshot.provider = detailed.settings.provider orelse .gateway;
 
-    snapshot.auth = try auth_runtime.loadStatusSnapshot(
+    snapshot.auth = try auth_runtime.loadStatusSnapshotForProvider(
         alloc,
         secret_store,
+        snapshot.provider,
         detailed.settings.credential_source,
     );
 
@@ -120,7 +123,15 @@ pub fn collect(
     try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
     try appendAuthCheck(&checks, alloc, snapshot.auth);
     try appendResolvedStartupCheck(&snapshot, &checks, alloc, .{
-        .model = detailed.settings.model,
+        .model = switch (snapshot.provider) {
+            .gateway => detailed.settings.model,
+            .codex => detailed.settings.codex_model,
+            .grok => detailed.settings.grok_model,
+            .opencode_go => if (detailed.settings.model) |saved|
+                if (std.mem.startsWith(u8, saved, "opencode-go/")) saved else null
+            else
+                null,
+        },
         .permission_mode = detailed.settings.permission_mode,
         .max_agent_steps = detailed.settings.max_agent_steps,
     }, default_model, default_agent_step_limit);
@@ -236,7 +247,7 @@ fn appendConfigLoadFailureCheck(checks: *std.ArrayList(Check), alloc: Allocator,
 }
 
 fn formatConfigLoadFailure(alloc: Allocator, prefix: []const u8, err: anyerror) ![]u8 {
-    return std.fmt.allocPrint(alloc, "{s}: {s}", .{ prefix, sandbox.configErrorMessage(err) orelse @errorName(err) });
+    return std.fmt.allocPrint(alloc, "{s}: {s}", .{ prefix, @errorName(err) });
 }
 
 fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, workspace_root: []const u8) !void {

@@ -1,7 +1,6 @@
 const std = @import("std");
 const assistant_presentation = @import("../core/agent/assistant_presentation.zig");
 const diff_mod = @import("../core/output/diff.zig");
-const presentation_mode = @import("../core/config/presentation_mode.zig");
 const types = @import("../core/shared/types.zig");
 const io_mod = @import("../core/shared/io.zig");
 const render_engine = @import("render_engine.zig");
@@ -64,7 +63,6 @@ pub const Runtime = struct {
                 .sync_updates_enabled = sync_updates_enabled,
                 .history_reset_uses_ris = shell_runtime.detectHistoryResetUsesRis(alloc),
                 .layout = layout,
-                .maxxing_mode = presentation_mode.MaxxingMode.minimal,
                 .transcript_release = .{ .policy = .append_only },
             },
             .no_color = no_color,
@@ -483,7 +481,6 @@ test "ask presentation paints Minimal prompt and assistant into a footerless fra
     try runtime.pushText("\x1b[1manswer\x1b[22m\n");
     try runtime.finish();
 
-    try std.testing.expectEqual(presentation_mode.MaxxingMode.minimal, runtime.shell.maxxing_mode);
     try std.testing.expect(runtime.shell.entries.items.len >= 3);
     try std.testing.expect(runtime.shell.entries.items[0] == .raw_bytes);
     try std.testing.expectEqual(

@@ -25,7 +25,6 @@ pub const Admission = struct {
     profile_user: []const u8,
     durable_session_id: []const u8,
     workspace_root: []const u8,
-    sandbox_backend: @FieldType(contracts.Principal, "sandbox_backend"),
     command: []const u8,
 };
 
@@ -155,7 +154,6 @@ pub const Runtime = struct {
             .workspace_root = input.workspace_root,
             .cwd = input.workspace_root,
             .transport_role = .interactive,
-            .sandbox_backend = input.sandbox_backend,
             .backend = .native,
             .actor = .human,
             .controls = .full(),
@@ -252,6 +250,15 @@ pub const Runtime = struct {
 
 fn finalNotice(pending: *const Pending) ?Notice {
     const completion = &pending.completion.?;
+    if (completion.is_missing_capability(
+        contracts.protocol_capability_complete_process_tree_signals,
+    )) {
+        return .{ .failed = .{
+            .correlation_id = pending.correlation_id,
+            .command = pending.command,
+            .code = .unsupported_host,
+        } };
+    }
     if (completion.kind != .response) return null;
     if (completion.frame) |*frame| {
         switch (frame.message().payload) {
@@ -363,6 +370,58 @@ test "direct lifecycle retains indeterminate completion without fabricating fail
         client.CompletionKind.disconnected,
         runtime.pending[0].?.completion.?.kind,
     );
+}
+
+test "direct lifecycle finalizes complete signal capability misses" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinitAbnormal(alloc, "test_cleanup");
+    var terminal_client: client.Runtime = .{};
+    defer terminal_client.deinit();
+
+    runtime.pending[0] = .{
+        .correlation_id = .{ .value = 7 },
+        .command = try alloc.dupe(u8, "zig build test"),
+        .starting_pending = false,
+        .completion = .{
+            .kind = .unavailable,
+            .correlation_id = .{ .value = 7 },
+            .missing_capabilities = contracts.protocol_capability_complete_process_tree_signals,
+        },
+    };
+    runtime.len = 1;
+
+    const failed = runtime.nextNotice(&terminal_client) orelse
+        return error.TestExpectedResult;
+    switch (failed) {
+        .failed => |notice| {
+            try std.testing.expectEqual(
+                contracts.StructuredErrorCode.unsupported_host,
+                notice.code,
+            );
+            try std.testing.expectEqualStrings("zig build test", notice.command);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    runtime.acknowledgeNotice(
+        alloc,
+        failed.correlationId(),
+        failed.phase(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), runtime.pendingCount());
+
+    runtime.pending[0] = .{
+        .correlation_id = .{ .value = 8 },
+        .command = try alloc.dupe(u8, "ordinary unavailable"),
+        .starting_pending = false,
+        .completion = .{
+            .kind = .unavailable,
+            .correlation_id = .{ .value = 8 },
+        },
+    };
+    runtime.len = 1;
+    try std.testing.expect(runtime.nextNotice(&terminal_client) == null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.pendingCount());
 }
 
 test "indeterminate completion does not starve a later authoritative result" {

@@ -1,6 +1,80 @@
 const std = @import("std");
 const unicode_data = @import("unicode_display_data.zig");
 
+const RgiNode = packed struct(u32) {
+    edge_start: u13,
+    edge_len: u8,
+    terminal: bool,
+    padding: u10 = 0,
+};
+
+const rgi_codepoint_count: usize = blk: {
+    @setEvalBranchQuota(2_000_000);
+    var unique: [unicode_data.rgi_trie_edges.len]u21 = undefined;
+    var count: usize = 0;
+    for (unicode_data.rgi_trie_edges) |edge| {
+        var seen = false;
+        for (unique[0..count]) |codepoint| {
+            if (codepoint == edge.codepoint) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            unique[count] = edge.codepoint;
+            count += 1;
+        }
+    }
+    break :blk count;
+};
+
+const RgiData = struct {
+    nodes: [unicode_data.rgi_trie_nodes.len]RgiNode,
+    edge_codepoint_ids: [unicode_data.rgi_trie_edges.len]u8,
+    codepoints: [rgi_codepoint_count]u21,
+};
+
+const rgi_data: RgiData = blk: {
+    @setEvalBranchQuota(2_000_000);
+    if (rgi_codepoint_count > std.math.maxInt(u8) + 1) {
+        @compileError("RGI trie edge alphabet no longer fits in u8");
+    }
+
+    var data: RgiData = undefined;
+    var codepoint_count: usize = 0;
+    for (unicode_data.rgi_trie_edges, 0..) |edge, edge_index| {
+        if (edge.child != edge_index + 1) {
+            @compileError("RGI trie child numbering is no longer implicit");
+        }
+
+        var codepoint_id: ?u8 = null;
+        for (data.codepoints[0..codepoint_count], 0..) |codepoint, index| {
+            if (codepoint == edge.codepoint) {
+                codepoint_id = @intCast(index);
+                break;
+            }
+        }
+        if (codepoint_id == null) {
+            codepoint_id = @intCast(codepoint_count);
+            data.codepoints[codepoint_count] = edge.codepoint;
+            codepoint_count += 1;
+        }
+        data.edge_codepoint_ids[edge_index] = codepoint_id.?;
+    }
+    if (codepoint_count != rgi_codepoint_count) {
+        @compileError("RGI trie edge alphabet count mismatch");
+    }
+
+    for (unicode_data.rgi_trie_nodes, 0..) |node, index| {
+        data.nodes[index] = .{
+            .edge_start = @intCast(node.edge_start),
+            .edge_len = @intCast(node.edge_len),
+            .terminal = node.terminal,
+        };
+    }
+    break :blk data;
+};
+
 pub const DecodedRune = struct {
     len: usize,
     codepoint: u21,
@@ -314,7 +388,7 @@ fn matchRgiSequence(text: []const u8, index: usize) usize {
         const rune = decodeNextRune(text, cursor);
         node_index = findTrieChild(node_index, rune.codepoint) orelse break;
         cursor += rune.len;
-        const node = unicode_data.rgi_trie_nodes[node_index];
+        const node = rgi_data.nodes[node_index];
         if (node.terminal) longest = cursor - index;
     }
 
@@ -322,22 +396,26 @@ fn matchRgiSequence(text: []const u8, index: usize) usize {
 }
 
 fn findTrieChild(node_index: u32, codepoint: u21) ?u32 {
-    const node = unicode_data.rgi_trie_nodes[node_index];
+    const node = rgi_data.nodes[node_index];
     const edge_start: usize = node.edge_start;
     var low = edge_start;
     var high = edge_start + node.edge_len;
     while (low < high) {
         const middle = low + (high - low) / 2;
-        const edge = unicode_data.rgi_trie_edges[middle];
-        if (codepoint < edge.codepoint) {
+        const edge_codepoint = rgi_data.codepoints[rgi_data.edge_codepoint_ids[middle]];
+        if (codepoint < edge_codepoint) {
             high = middle;
-        } else if (codepoint > edge.codepoint) {
+        } else if (codepoint > edge_codepoint) {
             low = middle + 1;
         } else {
-            return edge.child;
+            return @intCast(middle + 1);
         }
     }
     return null;
+}
+
+test "RGI runtime lookup data stays within the measured size budget" {
+    try std.testing.expect(@sizeOf(RgiData) <= 22_272);
 }
 
 test "prefixByWidth avoids cutting emoji bytes" {

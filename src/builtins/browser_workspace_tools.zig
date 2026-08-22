@@ -17,7 +17,7 @@ fn buildTerminalSpec() tool_dispatch.Tool {
         .description = terminal_description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "action", .json_type = .string, .enum_values = &.{"exec"} },
+                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"exec"} } },
                 .{
                     .name = "command",
                     .json_type = .string,
@@ -82,6 +82,7 @@ fn expectDecodeFailure(arguments_json: []const u8) !void {
 
 test "browser workspace rejects missing action native fields and unknown arguments" {
     try expectDecodeFailure("{\"command\":\"pwd\"}");
+    try expectDecodeFailure("{\"request\":{\"action\":\"exec\",\"command\":\"pwd\"}}");
     try expectDecodeFailure("{\"action\":\"start\",\"command\":\"pwd\"}");
     try expectDecodeFailure("{\"action\":\"exec\",\"command\":\"pwd\",\"cwd\":\"/tmp\"}");
     try expectDecodeFailure("{\"action\":\"exec\",\"command\":\"pwd\",\"profile\":\"clean\"}");

@@ -459,6 +459,33 @@ pub fn migrateLegacyPage(
     parent_id: []const u8,
     options: session_child_store.Options,
 ) Error!MigrationStats {
+    var parent_capability = sessions.openSubagentControlCapabilityWritable(
+        alloc,
+        parent_id,
+        options,
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidSessionId, error.SessionNotFound => error.SessionNotFound,
+        error.SessionPathUnsafe,
+        error.PrivateStatePermissionsUnsupported,
+        => error.PathUnsafe,
+        else => error.StoreUnavailable,
+    };
+    defer parent_capability.deinit();
+    const parent_store = control_store.Store{
+        .capability = &parent_capability,
+        .expected_child_id = parent_id,
+    };
+    var parent_lock = parent_store.acquireLock() catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ControlLockBusy => error.LockBusy,
+        error.ControlLockUnsupported => error.LockUnsupported,
+        error.ControlPathUnsafe,
+        error.PrivateStatePermissionsUnsupported,
+        => error.PathUnsafe,
+        error.ControlStoreFailed => error.StoreUnavailable,
+    };
+    defer parent_lock.release();
     const continuation = try migrationCursor(
         alloc,
         sessions,
@@ -518,6 +545,46 @@ pub fn migrateLegacyPage(
         migration_page.cursor,
     );
     return stats;
+}
+
+/// Returns the indexed child count only when the existing migration cursor
+/// proves that the current session-index snapshot has been exhausted. The
+/// caller must separately serialize relationship writers through the parent
+/// control lock when using this as a destructive leaf proof.
+pub fn activeCountIfMigrationComplete(
+    alloc: Allocator,
+    sessions: *session_store.Store,
+    parent_id: []const u8,
+    options: session_child_store.Options,
+) Error!?u64 {
+    var opened = try Opened.initReadOnly(alloc, sessions, parent_id, options);
+    defer opened.deinit();
+    const header = try opened.loadStableHeader();
+    const continuation = session_store.RelationshipMigrationCursor{
+        .inode = header.migration_inode,
+        .size = header.migration_size,
+        .mtime_ns = header.migration_mtime_ns,
+        .offset = header.migration_offset,
+    };
+    var migration_page = sessions.listRelationshipMigrationCandidates(
+        alloc,
+        continuation,
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.SessionStoreUnavailable => error.StoreUnavailable,
+    };
+    defer migration_page.deinit(alloc);
+    try opened.verifyStableHeader(header);
+    if (!header.active_count_known or migration_page.has_more or
+        migration_page.ids.items.len != 0 or
+        migration_page.cursor.inode != continuation.inode or
+        migration_page.cursor.size != continuation.size or
+        migration_page.cursor.mtime_ns != continuation.mtime_ns or
+        migration_page.cursor.offset != continuation.offset)
+    {
+        return null;
+    }
+    return header.active_count;
 }
 
 pub fn deliveryPage(

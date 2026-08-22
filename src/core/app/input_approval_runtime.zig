@@ -619,7 +619,6 @@ const ApprovalBridgeAuthority = struct {
         return subagent_authority.HostAuthority.capture(
             alloc,
             &.{"run_command"},
-            .none,
             &.{},
             .{ .rules = &.{} },
             &.{},

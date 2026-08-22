@@ -56,7 +56,6 @@ const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const Config = runtime_config.Config;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 const ToolExecutionRequest = runtime_tool_contracts.ToolExecutionRequest;
-const SandboxScopeRequired = runtime_tool_contracts.SandboxScopeRequired;
 const ToolCallValidationResult = runtime_tool_contracts.ToolCallValidationResult;
 const DiffEntryPayload = runtime_tool_contracts.DiffEntryPayload;
 const SecondaryPublicationReport = runtime_tool_contracts.SecondaryPublicationReport;
@@ -188,22 +187,13 @@ const test_tools = [_]tool_dispatch.Tool{
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 
 fn testExecutionAuthority(call: ToolCall) command_admission.ToolExecutionAuthority {
-    return testExecutionAuthorityWithScope(call, .restricted);
-}
-
-fn testExecutionAuthorityWithScope(
-    call: ToolCall,
-    scope: permission_auto_classifier.SandboxScope,
-) command_admission.ToolExecutionAuthority {
     if (!std.mem.eql(u8, call.name, "terminal")) return .ordinary;
     return .{ .run_command = .{ .shell_allowed = .{
         .fingerprint = .{
             .command = call.arguments_json,
             .resolved_cwd = "",
             .background = false,
-            .resolved_backend = .none,
             .target_os = builtin.os.tag,
-            .scope = scope,
         },
         .source = .interactive_once,
     } } };
@@ -410,21 +400,6 @@ pub const PermissionRequestOverride = struct {
     ) anyerror!command_admission.PermissionOutcome,
 };
 
-pub const SandboxWideningRequestOverride = struct {
-    context: *anyopaque,
-    request_fn: *const fn (
-        *anyopaque,
-        Allocator,
-        ToolCall,
-        permission_auto_classifier.ReviewTurnContext,
-        PermissionMode,
-        []const PermissionGrant,
-        ?runtime_tool_contracts.LiveToolAuthority,
-        []const []const u8,
-        SandboxScopeRequired,
-    ) anyerror!command_admission.PermissionOutcome,
-};
-
 pub const ToolExecutionOverride = struct {
     context: *anyopaque,
     execute_fn: *const fn (
@@ -471,7 +446,6 @@ pub const FakeAgentRuntimeDeps = struct {
     permission_review_root_authority_counts: std.ArrayList(usize) = .empty,
     permission_review_feedback_counts: std.ArrayList(usize) = .empty,
     permission_review_pending_call_counts: std.ArrayList(usize) = .empty,
-    sandbox_widening_user_intent_contexts: std.ArrayList([]u8) = .empty,
     executed_names: std.ArrayList([]u8) = .empty,
     executed_call_ids: std.ArrayList([]u8) = .empty,
     rejected_names: std.ArrayList([]u8) = .empty,
@@ -490,7 +464,6 @@ pub const FakeAgentRuntimeDeps = struct {
     event_grants: std.ArrayList(PermissionGrant) = .empty,
     last_execute_grants: std.ArrayList(PermissionGrant) = .empty,
     last_live_authority_generation: ?u64 = null,
-    last_live_authority_sandbox: ?types.BackendKind = null,
     last_live_authority_tool_count: usize = 0,
     last_live_authority_integration_count: usize = 0,
     last_live_authority_rule_count: usize = 0,
@@ -506,25 +479,19 @@ pub const FakeAgentRuntimeDeps = struct {
     permission_wait_index: ?usize = null,
     permission_waiting: ?*std.atomic.Value(bool) = null,
     permission_release: ?*std.atomic.Value(bool) = null,
-    sandbox_widening_decisions: []const ToolPermissionDecision = &.{},
-    sandbox_widening_human_approvals: []const command_admission.HumanApprovalProvenance = &.{},
-    sandbox_widening_denial_reasons: []const types.ToolPermissionDenialReason = &.{},
-    sandbox_widening_auto_review_results: []const ?permission_auto_classifier.Result = &.{},
-    sandbox_widening_tool_failures: []const []const u8 = &.{},
-    sandbox_widening_request_override: ?SandboxWideningRequestOverride = null,
     tool_execution_override: ?ToolExecutionOverride = null,
-    sandbox_widening_index: usize = 0,
-    cancel_on_sandbox_widening: ?*std.atomic.Value(bool) = null,
     permission_failure_names: []const []const u8 = &.{},
     permission_index: usize = 0,
     exec_plans: []const FakeExecPlan = &.{},
     execute_delegate: ?ExecuteDelegate = null,
     exec_index: usize = 0,
     successful_effect_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    execute_authority_scopes: std.ArrayList(permission_auto_classifier.SandboxScope) = .empty,
     execute_timeout_started_ms: std.ArrayList(?i64) = .empty,
     permission_target: []const u8 = "/tmp/workspace/file.txt",
     resolve_permission_target: bool = false,
+    tool_display_target: ?[]const u8 = null,
+    tool_display_target_after_execute: ?[]const u8 = null,
+    tool_display_target_resolve_count: usize = 0,
     swap_link_on_permission: ?[]const u8 = null,
     swap_link_target_on_permission: ?[]const u8 = null,
     swap_link_on_execute_name: ?[]const u8 = null,
@@ -622,6 +589,7 @@ pub const FakeAgentRuntimeDeps = struct {
     credential_refresh_sources: std.ArrayList(types.CredentialSource) = .empty,
     credential_refresh_modes: std.ArrayList(runtime_deps.CredentialRefreshMode) = .empty,
     credential_refresh_error: ?anyerror = null,
+    last_credential_refresh_expected_account: ?[]const u8 = null,
     enable_interactive_notices: bool = false,
     enable_recovery_checkpoint: bool = false,
     recovery_checkpoints: std.ArrayList(session_codec.RecoveryCheckpoint) = .empty,
@@ -652,7 +620,6 @@ pub const FakeAgentRuntimeDeps = struct {
         self.permission_review_root_authority_counts.deinit(self.alloc);
         self.permission_review_feedback_counts.deinit(self.alloc);
         self.permission_review_pending_call_counts.deinit(self.alloc);
-        freeStringList(self.alloc, &self.sandbox_widening_user_intent_contexts);
         freeStringList(self.alloc, &self.executed_names);
         freeStringList(self.alloc, &self.executed_call_ids);
         freeStringList(self.alloc, &self.rejected_names);
@@ -670,7 +637,6 @@ pub const FakeAgentRuntimeDeps = struct {
         freeGrantList(self.alloc, &self.event_grants);
         freeGrantList(self.alloc, &self.last_execute_grants);
         freeGrantList(self.alloc, &self.last_frozen_file_grants);
-        self.execute_authority_scopes.deinit(self.alloc);
         self.execute_timeout_started_ms.deinit(self.alloc);
         if (self.finish_assistant_text) |value| self.alloc.free(value);
         if (self.history_assistant_text) |value| self.alloc.free(value);
@@ -710,7 +676,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .validate_tool_call = validateToolCall,
             .check_tool_availability = checkToolAvailability,
             .request_tool_permission = requestPermission,
-            .request_sandbox_widening = requestSandboxWidening,
+            .resolve_tool_action_display_target = resolveToolActionDisplayTarget,
             .describe_tool_action = describeAction,
             .describe_tool_action_completed = describeCompleted,
             .describe_tool_action_denied = describeDenied,
@@ -786,10 +752,11 @@ pub const FakeAgentRuntimeDeps = struct {
         return model_capabilities.capabilitiesForModel(model);
     }
 
-    fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: runtime_deps.CredentialRefreshMode) !?[]u8 {
+    fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: runtime_deps.CredentialRefreshMode, expected_account_id: ?[]const u8) !?[]u8 {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.credential_refresh_sources.append(self.alloc, source);
         try self.credential_refresh_modes.append(self.alloc, mode);
+        self.last_credential_refresh_expected_account = expected_account_id;
         if (self.credential_refresh_error) |err| return err;
         if (self.credential_refresh_index >= self.credential_refresh_tokens.len) return null;
         const token = self.credential_refresh_tokens[self.credential_refresh_index];
@@ -1040,7 +1007,6 @@ pub const FakeAgentRuntimeDeps = struct {
         }
         const execution_authority = if (decision.isDenied()) null else if (revalidation) |request| switch (request) {
             .action => |action| action.authority,
-            .sandbox_widening => |widening| widening.authority,
         } else if (file_mutation_contract.isToolName(call.name))
             command_admission.ToolExecutionAuthority{
                 .file_mutation = try self.fileMutationAuthorization(
@@ -1086,81 +1052,6 @@ pub const FakeAgentRuntimeDeps = struct {
                 .none,
             .denial_reason = denial_reason,
             .feedback = if (feedback.len == 0) null else try arena.dupe(u8, feedback),
-            .auto_review_result = auto_review_result,
-        };
-    }
-
-    fn requestSandboxWidening(
-        raw: *anyopaque,
-        arena: Allocator,
-        call: ToolCall,
-        review_turn: permission_auto_classifier.ReviewTurnContext,
-        permission_mode: PermissionMode,
-        local_grants: []const PermissionGrant,
-        live_authority: ?runtime_tool_contracts.LiveToolAuthority,
-        advertised_dynamic_tool_names: []const []const u8,
-        required: SandboxScopeRequired,
-    ) !command_admission.PermissionOutcome {
-        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        if (self.sandbox_widening_request_override) |override| {
-            return override.request_fn(
-                override.context,
-                arena,
-                call,
-                review_turn,
-                permission_mode,
-                local_grants,
-                live_authority,
-                advertised_dynamic_tool_names,
-                required,
-            );
-        }
-        try self.sandbox_widening_user_intent_contexts.append(
-            self.alloc,
-            try captureReviewAuthority(self.alloc, review_turn),
-        );
-        const widening_index = self.sandbox_widening_index;
-        self.sandbox_widening_index += 1;
-        try self.record("sandbox_widening:{s}", .{@tagName(required.phase)});
-        if (self.cancel_on_sandbox_widening) |flag| {
-            flag.store(true, .seq_cst);
-        }
-        if (widening_index < self.sandbox_widening_tool_failures.len) {
-            return .{ .tool_failure = try arena.dupe(
-                u8,
-                self.sandbox_widening_tool_failures[widening_index],
-            ) };
-        }
-
-        const decision = if (widening_index < self.sandbox_widening_decisions.len)
-            self.sandbox_widening_decisions[widening_index]
-        else
-            ToolPermissionDecision.permission_required;
-        const denial_reason = if (decision.isDenied() and
-            widening_index < self.sandbox_widening_denial_reasons.len)
-            self.sandbox_widening_denial_reasons[widening_index]
-        else
-            null;
-        const auto_review_result = try scriptedAutoReview(
-            arena,
-            self.sandbox_widening_auto_review_results,
-            widening_index,
-        );
-        return .{
-            .decision = decision,
-            .execution_authority = if (decision.isDenied())
-                null
-            else
-                testExecutionAuthorityWithScope(call, .broader),
-            .human_approval = if (widening_index < self.sandbox_widening_human_approvals.len)
-                self.sandbox_widening_human_approvals[widening_index]
-            else if (decision == .once)
-                .once
-            else if (decision == .always)
-                .always
-            else
-                .none,
-            .denial_reason = denial_reason,
             .auto_review_result = auto_review_result,
         };
     }
@@ -1289,12 +1180,25 @@ pub const FakeAgentRuntimeDeps = struct {
         return authorization;
     }
 
-    fn describeAction(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, _: []const []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "start {s}", .{call.name});
+    fn resolveToolActionDisplayTarget(raw: *anyopaque, arena: Allocator, _: ToolCall) !?[]const u8 {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.tool_display_target_resolve_count += 1;
+        const value = self.tool_display_target orelse return null;
+        return try arena.dupe(u8, value);
     }
 
-    fn describeCompleted(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, _: []const []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "done {s}", .{call.name});
+    fn describeAction(_: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, _: []const []const u8) ![]const u8 {
+        return if (display_target) |target|
+            std.fmt.allocPrint(arena, "start {s} {s}", .{ call.name, target })
+        else
+            std.fmt.allocPrint(arena, "start {s}", .{call.name});
+    }
+
+    fn describeCompleted(_: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, _: []const []const u8) ![]const u8 {
+        return if (display_target) |target|
+            std.fmt.allocPrint(arena, "done {s} {s}", .{ call.name, target })
+        else
+            std.fmt.allocPrint(arena, "done {s}", .{call.name});
     }
 
     fn describeDenied(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
@@ -1343,16 +1247,6 @@ pub const FakeAgentRuntimeDeps = struct {
                 self.alloc,
                 request.command_timeout_started_ms,
             );
-            switch (request.authority) {
-                .run_command => |command_authority| {
-                    const scope = switch (command_authority) {
-                        .direct_only => |fingerprint| fingerprint.scope,
-                        .shell_allowed => |allowed| allowed.fingerprint.scope,
-                    };
-                    try self.execute_authority_scopes.append(self.alloc, scope);
-                },
-                .ordinary, .file_mutation, .vision_paths => {},
-            }
             if (self.last_executed_arguments) |value| self.alloc.free(value);
             self.last_executed_arguments = try self.alloc.dupe(u8, call.arguments_json);
             if (self.last_execute_root_user_intent_context) |value| self.alloc.free(value);
@@ -1385,14 +1279,12 @@ pub const FakeAgentRuntimeDeps = struct {
             }
             if (request.live_authority) |live| {
                 self.last_live_authority_generation = live.generation;
-                self.last_live_authority_sandbox = live.sandbox_backend;
                 self.last_live_authority_tool_count = live.tools.len;
                 self.last_live_authority_integration_count = live.integrations.len;
                 self.last_live_authority_rule_count = live.rules.rules.len;
                 self.last_live_authority_grant_count = live.grants.len;
             } else {
                 self.last_live_authority_generation = null;
-                self.last_live_authority_sandbox = null;
                 self.last_live_authority_tool_count = 0;
                 self.last_live_authority_integration_count = 0;
                 self.last_live_authority_rule_count = 0;
@@ -1460,11 +1352,7 @@ pub const FakeAgentRuntimeDeps = struct {
             );
             capture.appendAccepted(request.result_allocator, .stdout, output);
             capture.seal(request.result_allocator);
-            if (result.sandbox_scope_required) |*required| {
-                required.command_replay_capture = capture;
-            } else {
-                result.command_replay_capture = capture;
-            }
+            result.command_replay_capture = capture;
         }
         if (result.committed_file_handoff != null) {
             self.last_file_request_allocators_distinct =
@@ -1489,11 +1377,11 @@ pub const FakeAgentRuntimeDeps = struct {
                 }
             }
         }
-        if (result.status == .success and
-            !result.cancelled and
-            result.sandbox_scope_required == null)
-        {
+        if (result.status == .success and !result.cancelled) {
             _ = self.successful_effect_count.fetchAdd(1, .seq_cst);
+        }
+        if (self.tool_display_target_after_execute) |target| {
+            self.tool_display_target = target;
         }
         return result;
     }

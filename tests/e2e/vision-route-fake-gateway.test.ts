@@ -113,6 +113,15 @@ function filePartCount(body: string) {
   return body.match(/"type":"file"/g)?.length ?? 0;
 }
 
+function nativeFileParts(body: string) {
+  return promptParts(body).filter(
+    (part): part is Record<string, unknown> & { data: string; mediaType: string } =>
+      part.type === "file" &&
+      typeof part.data === "string" &&
+      typeof part.mediaType === "string",
+  );
+}
+
 function expectVisionResponseFormat(body: string, imageCount: number) {
   const request = JSON.parse(body) as {
     responseFormat?: {
@@ -1044,6 +1053,80 @@ describe("Vision route fake Gateway", () => {
         expect(gateway.chatRequests[0].body).toContain('"type":"file"');
         expectScopedImageContext(gateway.chatRequests[0].body, fixture);
         expect(gateway.chatRequests[0].body).not.toContain(fixture.imagePath);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask normalizes encoded-oversized native images on macOS and rejects elsewhere",
+    async () => {
+      const root = createIsolatedRoot();
+      const oversizedPath = join(root.workspace, "encoded-oversized.png");
+      copyFileSync(IMAGE_PATH, oversizedPath);
+      truncateSync(oversizedPath, (5 * 1024 * 1024 * 3) / 4 + 1);
+      const notice = "Unable to prepare this image for upload. Use a smaller image.";
+      const gateway = startImageGateway(
+        process.platform === "darwin" ? [sseText("Normalized native image answer")] : [],
+      );
+      try {
+        if (process.platform === "darwin") {
+          const result = await runFx(
+            [
+              "ask",
+              "--json",
+              "--no-save",
+              "--no-color",
+              "--image",
+              oversizedPath,
+              "Describe the attached image.",
+            ],
+            {
+              cwd: root.workspace,
+              env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
+              timeoutMs: TIMEOUT,
+            },
+          );
+
+          const json = parseFxJson(result);
+          expect(json.output).toContain("Normalized native image answer");
+          expect(json.tool_calls).toHaveLength(0);
+          expect(result.stderr).toBe("");
+          expect(gateway.chatRequests).toHaveLength(1);
+          const parts = nativeFileParts(gateway.chatRequests[0]!.body);
+          expect(parts).toHaveLength(1);
+          expect(parts[0]!.mediaType).toBe("image/jpeg");
+          expect(parts[0]!.data.length).toBeLessThanOrEqual(5 * 1024 * 1024);
+          return;
+        }
+
+        const textResult = await runFx(
+          ["ask", "--no-save", "--image", oversizedPath, "Describe the image."],
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
+            timeoutMs: TIMEOUT,
+          },
+        );
+        expect(textResult.code).toBe(1);
+        expect(textResult.stdout).toBe("");
+        expect(textResult.stderr).toContain(notice);
+
+        const jsonResult = await runFx(
+          ["ask", "--json", "--no-save", "--image", oversizedPath, "Describe the image."],
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
+            timeoutMs: TIMEOUT,
+          },
+        );
+        const errorJson = parseFxErrorJson(jsonResult);
+        expect(errorJson.error).toBe("ImagePreparationFailed");
+        expect(jsonResult.stderr).toBe("");
+        expect(gateway.chatRequests).toHaveLength(0);
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });

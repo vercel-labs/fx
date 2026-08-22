@@ -1,6 +1,5 @@
 const std = @import("std");
 const command_lex = @import("command_lex.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 
 const max_command_bytes = 8 * 1024;
 const max_ls_operands = 64;
@@ -253,7 +252,6 @@ pub const ApprovalReason = enum {
     background_process,
     dynamic_shell,
     unsupported_shell,
-    unsupported_backend,
     unsupported_platform,
     unsupported_input_redirect,
     unsupported_argument,
@@ -308,13 +306,9 @@ pub fn plan(
     command: []const u8,
     resolved_cwd: []const u8,
     background: bool,
-    backend: sandbox.BackendKind,
     target_os: std.Target.Os.Tag,
 ) std.mem.Allocator.Error!Admission {
     if (background) return .{ .approval_required = .background_process };
-    if (backend != .none and backend != .macos) {
-        return .{ .approval_required = .unsupported_backend };
-    }
     if (target_os != .macos and target_os != .linux) {
         return .{ .approval_required = .unsupported_platform };
     }
@@ -963,7 +957,6 @@ test "planner canonicalizes pwd to a fixed physical path" {
         "pwd",
         "/workspace",
         false,
-        .none,
         .macos,
     );
     defer admission.deinit(std.testing.allocator);
@@ -991,7 +984,6 @@ fn expectDirect(command: []const u8, target_os: std.Target.Os.Tag) !Admission {
         command,
         "/workspace",
         false,
-        .none,
         target_os,
     );
     if (admission == .approval_required) {
@@ -1009,7 +1001,6 @@ fn expectDirect(command: []const u8, target_os: std.Target.Os.Tag) !Admission {
 fn expectApproval(
     command: []const u8,
     background: bool,
-    backend: sandbox.BackendKind,
     target_os: std.Target.Os.Tag,
     expected: ApprovalReason,
 ) !void {
@@ -1018,7 +1009,6 @@ fn expectApproval(
         command,
         "/workspace",
         background,
-        backend,
         target_os,
     );
     defer admission.deinit(std.testing.allocator);
@@ -1142,7 +1132,6 @@ test "planner admits the reviewed direct command matrix" {
     try expectApproval(
         "wc -c < input.txt",
         false,
-        .none,
         .linux,
         .unsupported_input_redirect,
     );
@@ -1240,7 +1229,7 @@ test "planner returns stable reasons for approval-bearing forms" {
     };
 
     for (cases) |case| {
-        try expectApproval(case.command, false, .none, case.target_os, case.reason);
+        try expectApproval(case.command, false, case.target_os, case.reason);
     }
 }
 
@@ -1267,17 +1256,14 @@ test "planner preserves quoted shell metacharacters as literal argv" {
     try expectApproval(
         "wc -c '<' /etc/passwd",
         false,
-        .none,
         .linux,
         .unsupported_argument,
     );
 }
 
-test "planner enforces background backend and platform boundaries" {
-    try expectApproval("pwd", true, .none, .macos, .background_process);
-    try expectApproval("pwd", false, .vercel, .macos, .unsupported_backend);
-    try expectApproval("pwd", false, .just_bash, .macos, .unsupported_backend);
-    try expectApproval("pwd", false, .none, .windows, .unsupported_platform);
+test "planner enforces background and platform boundaries" {
+    try expectApproval("pwd", true, .macos, .background_process);
+    try expectApproval("pwd", false, .windows, .unsupported_platform);
 }
 
 test "planner bounds direct pipelines at eight stages" {
@@ -1286,7 +1272,7 @@ test "planner bounds direct pipelines at eight stages" {
     direct.deinit(std.testing.allocator);
 
     const rejected = accepted ++ " | wc -c";
-    try expectApproval(rejected, false, .none, .linux, .process_or_system);
+    try expectApproval(rejected, false, .linux, .process_or_system);
 }
 
 test "planner canonicalizes target policies and per-stage environments" {
@@ -1417,7 +1403,7 @@ test "planner accepts every reviewed wc flag and rejects every operand" {
         "wc --bytes",
     };
     for (operands) |command| {
-        try expectApproval(command, false, .none, .linux, .unsupported_argument);
+        try expectApproval(command, false, .linux, .unsupported_argument);
     }
 }
 
@@ -1463,7 +1449,7 @@ test "planner implements the total portable printf grammar" {
         "printf '\\'",
     };
     for (rejected) |command| {
-        try expectApproval(command, false, .none, .macos, .unsupported_argument);
+        try expectApproval(command, false, .macos, .unsupported_argument);
     }
 }
 
@@ -1492,7 +1478,7 @@ test "planner generated printf grammar accepts only exact productions and data c
 
         const surplus = try buildPrintfCommand(alloc, format, &.{data_classes[0]});
         defer alloc.free(surplus);
-        try expectApproval(surplus, false, .none, .macos, .unsupported_argument);
+        try expectApproval(surplus, false, .macos, .unsupported_argument);
     }
 
     const one_data_formats = [_][]const u8{
@@ -1511,14 +1497,14 @@ test "planner generated printf grammar accepts only exact productions and data c
 
         const missing = try buildPrintfCommand(alloc, format, &.{});
         defer alloc.free(missing);
-        try expectApproval(missing, false, .none, .linux, .unsupported_argument);
+        try expectApproval(missing, false, .linux, .unsupported_argument);
         const surplus = try buildPrintfCommand(
             alloc,
             format,
             &.{ data_classes[0], data_classes[1] },
         );
         defer alloc.free(surplus);
-        try expectApproval(surplus, false, .none, .linux, .unsupported_argument);
+        try expectApproval(surplus, false, .linux, .unsupported_argument);
     }
 
     for (data_classes) |first| {
@@ -1549,7 +1535,7 @@ test "planner generated printf grammar accepts only exact productions and data c
     }) |format| {
         const command = try buildPrintfCommand(alloc, format, &.{"x"});
         defer alloc.free(command);
-        try expectApproval(command, false, .none, .macos, .unsupported_argument);
+        try expectApproval(command, false, .macos, .unsupported_argument);
     }
 }
 
@@ -1758,5 +1744,5 @@ test "planner bounds ls operands at sixty four" {
     direct.deinit(std.testing.allocator);
 
     try accepted.appendSlice(std.testing.allocator, " overflow");
-    try expectApproval(accepted.items, false, .none, .linux, .unsupported_argument);
+    try expectApproval(accepted.items, false, .linux, .unsupported_argument);
 }

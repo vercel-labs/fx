@@ -31,8 +31,8 @@ pub const monitor_transaction_bytes_limit: usize =
     monitor_set_bytes_limit + monitor_event_transaction_headroom;
 const event_retention_limit: u64 = 256;
 const record_schema_version: u16 = 1;
-const authority_schema_version: u16 = 1;
-const owner_catalog_authority_schema_version: u16 = 1;
+const authority_schema_version: u16 = 2;
+const owner_catalog_authority_schema_version: u16 = 2;
 const event_schema_version: u16 = 1;
 const monitor_transaction_schema_version: u16 = 1;
 const close_transaction_schema_version: u16 = 2;
@@ -1950,12 +1950,11 @@ fn proof_verifier(
     direct_human_model_read_only: bool,
 ) contracts.CheckpointChecksum {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("fx.terminal.holder-proof.v1\x00");
+    hash.update("fx.terminal.holder-proof.v2\x00");
     hash.update(&proof.bytes);
     hash_u64(&hash, grant.generation.value);
     hash.update(@tagName(grant.actor));
     hash.update(@tagName(grant.principal.transport_role));
-    hash.update(@tagName(grant.principal.sandbox_backend));
     hash.update(@tagName(grant.principal.backend));
     hash.update(@tagName(grant.principal.lifetime));
     hash.update(if (direct_human_model_read_only) "\x01" else "\x00");
@@ -1981,12 +1980,11 @@ fn close_initiator_verifier(
     claim: contracts.AuthorityClaim,
 ) contracts.CheckpointChecksum {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("fx.terminal.close-initiator.v1\x00");
+    hash.update("fx.terminal.close-initiator.v2\x00");
     hash.update(&claim.proof.bytes);
     hash_u64(&hash, claim.generation.value);
     hash_text(&hash, @tagName(claim.actor));
     hash_text(&hash, @tagName(claim.principal.transport_role));
-    hash_text(&hash, @tagName(claim.principal.sandbox_backend));
     hash_text(&hash, @tagName(claim.principal.backend));
     hash_text(&hash, @tagName(claim.principal.lifetime));
     hash_text(&hash, claim.principal.profile_user);
@@ -2010,10 +2008,9 @@ fn owner_catalog_key(
     actor: contracts.ActorRole,
 ) [64]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("fx.terminal.owner-catalog-key.v1\x00");
+    hash.update("fx.terminal.owner-catalog-key.v2\x00");
     hash.update(@tagName(actor));
     hash.update(@tagName(principal.transport_role));
-    hash.update(@tagName(principal.sandbox_backend));
     hash_text(&hash, principal.profile_user);
     hash_text(&hash, principal.durable_session_id);
     hash_text(&hash, principal.workspace_root);
@@ -2026,11 +2023,10 @@ fn owner_catalog_verifier(
     claim: contracts.OwnerCatalogAuthorityClaim,
 ) contracts.CheckpointChecksum {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("fx.terminal.owner-catalog-proof.v1\x00");
+    hash.update("fx.terminal.owner-catalog-proof.v2\x00");
     hash.update(&claim.proof.bytes);
     hash.update(@tagName(claim.actor));
     hash.update(@tagName(claim.principal.transport_role));
-    hash.update(@tagName(claim.principal.sandbox_backend));
     hash_text(&hash, claim.principal.profile_user);
     hash_text(&hash, claim.principal.durable_session_id);
     hash_text(&hash, claim.principal.workspace_root);
@@ -2085,8 +2081,7 @@ fn owner_catalog_scope_matches(
     return std.mem.eql(u8, owner.profile_user, terminal.profile_user) and
         std.mem.eql(u8, owner.durable_session_id, terminal.durable_session_id) and
         std.mem.eql(u8, owner.workspace_root, terminal.workspace_root) and
-        owner.transport_role == terminal.transport_role and
-        owner.sandbox_backend == terminal.sandbox_backend;
+        owner.transport_role == terminal.transport_role;
 }
 
 fn catalog_authorization(
@@ -2280,7 +2275,6 @@ pub const OwnerAuthorityReload = struct {
     durable_session_id: []const u8,
     workspace_root: []const u8,
     transport_role: contracts.TransportRole,
-    sandbox_backend: @FieldType(contracts.Principal, "sandbox_backend"),
     actor: contracts.ActorRole,
 };
 
@@ -2289,7 +2283,6 @@ pub const OwnerCatalogAuthorityReload = struct {
     durable_session_id: []const u8,
     workspace_root: []const u8,
     transport_role: contracts.TransportRole,
-    sandbox_backend: @FieldType(contracts.OwnerCatalogPrincipal, "sandbox_backend"),
     actor: contracts.ActorRole,
 };
 
@@ -2303,7 +2296,6 @@ pub fn loadOrCreateOwnerCatalogClaim(
         .durable_session_id = input.durable_session_id,
         .workspace_root = input.workspace_root,
         .transport_role = input.transport_role,
-        .sandbox_backend = input.sandbox_backend,
     };
     try principal.validate();
     const key = owner_catalog_key(principal, input.actor);
@@ -2373,8 +2365,7 @@ pub fn loadOrCreateOwnerCatalogClaim(
 
 /// Reloads authority for the current fx owner without trusting caller-supplied
 /// cwd, backend, or generation. Those facts are recovered from durable state;
-/// the active profile/session/workspace/transport/sandbox identity must still
-/// match exactly.
+/// the active profile/session/workspace/transport identity must still match.
 pub fn reloadOwnerAuthorityClaim(
     alloc: Allocator,
     owner: *session_child_store.SessionChildCapability,
@@ -2394,7 +2385,6 @@ pub fn reloadOwnerAuthorityClaim(
         !std.mem.eql(u8, principal.durable_session_id, input.durable_session_id) or
         !std.mem.eql(u8, principal.workspace_root, input.workspace_root) or
         principal.transport_role != input.transport_role or
-        principal.sandbox_backend != input.sandbox_backend or
         !std.mem.eql(u8, principal.cwd, record.cwd) or
         principal.backend != record.backend or
         principal.lifetime != .session)
@@ -2433,7 +2423,6 @@ pub fn reloadHumanTakeoverAuthorityClaim(
         !std.mem.eql(u8, principal.durable_session_id, input.durable_session_id) or
         !std.mem.eql(u8, principal.workspace_root, input.workspace_root) or
         principal.transport_role != input.transport_role or
-        principal.sandbox_backend != input.sandbox_backend or
         !std.mem.eql(u8, principal.cwd, record.cwd) or
         principal.backend != record.backend or
         principal.lifetime != .session or
@@ -2455,7 +2444,6 @@ pub fn reloadHumanTakeoverAuthorityClaim(
         .durable_session_id = input.durable_session_id,
         .workspace_root = input.workspace_root,
         .transport_role = input.transport_role,
-        .sandbox_backend = input.sandbox_backend,
         .actor = .human,
     });
     defer catalog.deinit();
@@ -2537,7 +2525,6 @@ pub fn reloadAuthorityClaim(
 
 pub const RecoveredExecutionScope = struct {
     workspace_root: []u8,
-    sandbox_backend: types.BackendKind,
 
     pub fn deinit(self: *RecoveredExecutionScope, alloc: Allocator) void {
         alloc.free(self.workspace_root);
@@ -2764,7 +2751,6 @@ pub const DurableSession = struct {
                 u8,
                 authority.value.grant.principal.workspace_root,
             ),
-            .sandbox_backend = authority.value.grant.principal.sandbox_backend,
         };
     }
 
@@ -4987,7 +4973,6 @@ pub const DurableSession = struct {
                     .durable_session_id = claim.principal.durable_session_id,
                     .workspace_root = claim.principal.workspace_root,
                     .transport_role = claim.principal.transport_role,
-                    .sandbox_backend = claim.principal.sandbox_backend,
                 },
                 .actor = .human,
                 .proof = .{ .bytes = claim.proof.bytes },
@@ -6127,7 +6112,7 @@ fn load_owner_catalog_authority(
     };
     errdefer parsed.deinit();
     if (parsed.value.schema_version != owner_catalog_authority_schema_version) {
-        return error.InvalidAuthorityRecord;
+        return error.TerminalAuthorityRetired;
     }
     parsed.value.principal.validate() catch return error.InvalidAuthorityRecord;
     return parsed;
@@ -6243,9 +6228,10 @@ fn load_authority(
         else => return error.InvalidAuthorityRecord,
     };
     errdefer parsed.deinit();
-    if (parsed.value.schema_version != authority_schema_version or
-        !std.mem.eql(u8, parsed.value.session_id, session_id))
-    {
+    if (parsed.value.schema_version != authority_schema_version) {
+        return error.TerminalAuthorityRetired;
+    }
+    if (!std.mem.eql(u8, parsed.value.session_id, session_id)) {
         return error.InvalidAuthorityRecord;
     }
     parsed.value.grant.validate() catch return error.InvalidAuthorityRecord;
@@ -7150,7 +7136,6 @@ fn checkRecoveryExecutionScopeAllocationFailures(alloc: Allocator) !void {
     defer fixture.deinit();
     var persistence = test_persistence();
     persistence.grant.principal.workspace_root = "/saved-workspace";
-    persistence.grant.principal.sandbox_backend = .macos;
     var session = try fixture.create_with_persistence(
         "terminal-recovery-scope-allocation",
         .{ .rows = 24, .columns = 80 },
@@ -7171,7 +7156,6 @@ fn test_persistence() contracts.StartPersistence {
                 .workspace_root = "/workspace",
                 .cwd = "/workspace",
                 .transport_role = .interactive,
-                .sandbox_backend = .none,
                 .backend = .native,
             },
             .actor = .agent,
@@ -7276,7 +7260,6 @@ test "owner catalog enumerates the exact durable owner without a terminal anchor
         .durable_session_id = "terminal-store-owner",
         .workspace_root = "/workspace",
         .transport_role = .interactive,
-        .sandbox_backend = .none,
         .actor = .agent,
     });
     defer claim.deinit();
@@ -7742,12 +7725,6 @@ test "authority proof is principal bound generation checked and revocable" {
         session.verify_claim(foreign, .read),
     );
     foreign = claim;
-    foreign.principal.sandbox_backend = .macos;
-    try std.testing.expectError(
-        error.PrincipalMismatch,
-        session.verify_claim(foreign, .read),
-    );
-    foreign = claim;
     foreign.principal.backend = .tmux;
     try std.testing.expectError(
         error.PrincipalMismatch,
@@ -7916,7 +7893,6 @@ test "recovery execution scope reloads the exact durable authority" {
     defer fixture.deinit();
     var persistence = test_persistence();
     persistence.grant.principal.workspace_root = "/saved-workspace";
-    persistence.grant.principal.sandbox_backend = .macos;
     var session = try fixture.create_with_persistence(
         "terminal-recovery-scope",
         .{ .rows = 24, .columns = 80 },
@@ -7928,44 +7904,27 @@ test "recovery execution scope reloads the exact durable authority" {
     var scope = try session.load_recovery_execution_scope(alloc);
     defer scope.deinit(alloc);
     try std.testing.expectEqualStrings("/saved-workspace", scope.workspace_root);
-    try std.testing.expectEqual(types.BackendKind.macos, scope.sandbox_backend);
     try std.testing.expect(!std.mem.eql(u8, scope.workspace_root, session.record.cwd));
     try std.testing.expect(!@hasField(RecoveredExecutionScope, "proof"));
 }
 
-test "recovery execution scope authenticates workspace and sandbox" {
+test "recovery execution scope authenticates workspace" {
     const alloc = std.testing.allocator;
     var fixture = try TestStoreFixture.init(alloc, test_options());
     defer fixture.deinit();
-    const cases = [_]struct {
-        session_id: []const u8,
-        tamper_workspace: bool,
-    }{
-        .{
-            .session_id = "terminal-recovery-workspace-tamper",
-            .tamper_workspace = true,
-        },
-        .{
-            .session_id = "terminal-recovery-sandbox-tamper",
-            .tamper_workspace = false,
-        },
-    };
+    const cases = [_][]const u8{"terminal-recovery-workspace-tamper"};
 
-    for (cases) |case| {
-        var session = try fixture.create(case.session_id);
+    for (cases) |session_id| {
+        var session = try fixture.create(session_id);
         defer session.deinit();
         const parsed = try load_authority(
             alloc,
             try session.state_capability(),
-            case.session_id,
+            session_id,
         );
         defer parsed.deinit();
         var authority = parsed.value;
-        if (case.tamper_workspace) {
-            authority.grant.principal.workspace_root = "/tampered-workspace";
-        } else {
-            authority.grant.principal.sandbox_backend = .macos;
-        }
+        authority.grant.principal.workspace_root = "/tampered-workspace";
         try replace_test_authority(alloc, &session, authority);
         try std.testing.expectError(
             error.InvalidHolderProof,
@@ -8461,12 +8420,6 @@ test "authority reload requires owner capability and exact durable scope" {
         reloadAuthorityClaim(alloc, &owner, foreign),
     );
     foreign = input;
-    foreign.principal.sandbox_backend = .macos;
-    try std.testing.expectError(
-        error.PrincipalMismatch,
-        reloadAuthorityClaim(alloc, &owner, foreign),
-    );
-    foreign = input;
     foreign.principal.backend = .tmux;
     try std.testing.expectError(
         error.PrincipalMismatch,
@@ -8696,6 +8649,47 @@ test "authority reload rejects malformed state proof lifetime and revocation" {
         reloadAuthorityClaim(alloc, &writable_owner, malformed_lifetime_input),
     );
 
+    var retired = try fixture.create("terminal-retired-authority");
+    defer retired.deinit();
+    const retired_authority = try render_json(alloc, AuthorityWire{
+        .session_id = "terminal-retired-authority",
+        .grant = persistence.grant,
+        .direct_human_model_read_only = false,
+        .verifier = proof_verifier(
+            persistence.proof,
+            persistence.grant,
+            false,
+        ),
+        .revoked = false,
+    });
+    defer alloc.free(retired_authority);
+    const legacy_authority = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        retired_authority,
+        "\"schema_version\":2",
+        "\"schema_version\":1",
+    );
+    defer alloc.free(legacy_authority);
+    const retired_authority_file = try authority_name(
+        alloc,
+        "terminal-retired-authority",
+    );
+    defer alloc.free(retired_authority_file);
+    var retired_authority_write = try writable_owner.atomicReplace(
+        alloc,
+        .terminal_state,
+        retired_authority_file,
+        legacy_authority,
+    );
+    retired_authority_write.deinit(alloc);
+    var retired_input = input;
+    retired_input.terminal_session_id = "terminal-retired-authority";
+    try std.testing.expectError(
+        error.TerminalAuthorityRetired,
+        reloadAuthorityClaim(alloc, &writable_owner, retired_input),
+    );
+
     var revoked = try fixture.create("terminal-revoked-reload");
     defer revoked.deinit();
     try revoked.revoke(5);
@@ -8785,7 +8779,6 @@ test "human owner takeover proof is narrow and excludes agent writes" {
         .durable_session_id = "terminal-store-owner",
         .workspace_root = "/workspace",
         .transport_role = .interactive,
-        .sandbox_backend = .none,
         .actor = .human,
     });
     defer takeover.deinit();
@@ -8868,7 +8861,6 @@ test "human takeover lease is reclaimable only after its Fx process owner is gon
         .durable_session_id = "terminal-store-owner",
         .workspace_root = "/workspace",
         .transport_role = .interactive,
-        .sandbox_backend = .none,
         .actor = .human,
     });
     defer takeover.deinit();

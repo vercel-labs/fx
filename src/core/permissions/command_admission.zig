@@ -9,30 +9,24 @@ pub const CommandContext = struct {
     command: []const u8,
     resolved_cwd: []const u8,
     background: bool,
-    resolved_backend: types.BackendKind,
     target_os: std.Target.Os.Tag,
     environment: command_environment.Environment = .legacy,
-    scope: auto_classifier.SandboxScope = .restricted,
 };
 
 pub const AdmissionFingerprint = struct {
     command: []const u8,
     resolved_cwd: []const u8,
     background: bool,
-    resolved_backend: types.BackendKind,
     target_os: std.Target.Os.Tag,
     environment: command_environment.Environment = .legacy,
-    scope: auto_classifier.SandboxScope,
 
     pub fn init(ctx: CommandContext) AdmissionFingerprint {
         return .{
             .command = ctx.command,
             .resolved_cwd = ctx.resolved_cwd,
             .background = ctx.background,
-            .resolved_backend = ctx.resolved_backend,
             .target_os = ctx.target_os,
             .environment = ctx.environment,
-            .scope = ctx.scope,
         };
     }
 
@@ -40,10 +34,8 @@ pub const AdmissionFingerprint = struct {
         return std.mem.eql(u8, self.command, ctx.command) and
             std.mem.eql(u8, self.resolved_cwd, ctx.resolved_cwd) and
             self.background == ctx.background and
-            self.resolved_backend == ctx.resolved_backend and
             self.target_os == ctx.target_os and
-            self.environment.eql(ctx.environment) and
-            self.scope == ctx.scope;
+            self.environment.eql(ctx.environment);
     }
 
     pub fn eql(self: AdmissionFingerprint, other: AdmissionFingerprint) bool {
@@ -51,10 +43,8 @@ pub const AdmissionFingerprint = struct {
             .command = other.command,
             .resolved_cwd = other.resolved_cwd,
             .background = other.background,
-            .resolved_backend = other.resolved_backend,
             .target_os = other.target_os,
             .environment = other.environment,
-            .scope = other.scope,
         });
     }
 };
@@ -68,7 +58,7 @@ pub const ShellAuthorizationSource = enum {
     auto_mode,
     auto_classifier,
     yolo,
-    js_host_workspace_sandbox,
+    js_host,
 };
 
 pub const CommandExecutionAuthority = union(enum) {
@@ -117,7 +107,6 @@ pub const PermissionOutcome = struct {
 pub const PermissionRequirement = enum {
     configured_rule,
     approval_required,
-    sandbox_widening,
 };
 
 pub const DefaultApproval = union(enum) {
@@ -128,8 +117,14 @@ pub const DefaultApproval = union(enum) {
 pub fn defaultForRunCommand(
     alloc: std.mem.Allocator,
     command_ctx: CommandContext,
+    permission_mode: types.PermissionMode,
 ) DefaultApproval {
-    if (command_ctx.environment.requiresShellRoute()) {
+    const requires_shell_authority = switch (command_ctx.environment) {
+        .user => true,
+        .clean => permission_mode != .auto,
+        .legacy, .workspace_clean => false,
+    };
+    if (requires_shell_authority) {
         return .{ .approval_required = .dynamic_shell };
     }
     var admission = command_effect.plan(
@@ -137,7 +132,6 @@ pub fn defaultForRunCommand(
         command_ctx.command,
         command_ctx.resolved_cwd,
         command_ctx.background,
-        command_ctx.resolved_backend,
         command_ctx.target_os,
     ) catch return .{ .approval_required = .planning_failure };
     defer admission.deinit(alloc);
@@ -153,10 +147,9 @@ test "normalized default emits direct-only only for a direct plan" {
         .command = "pwd",
         .resolved_cwd = "/workspace",
         .background = false,
-        .resolved_backend = .none,
         .target_os = .macos,
     };
-    const direct = defaultForRunCommand(std.testing.allocator, direct_ctx);
+    const direct = defaultForRunCommand(std.testing.allocator, direct_ctx, .ask);
     switch (direct) {
         .direct_only => |fingerprint| try std.testing.expect(fingerprint.matches(direct_ctx)),
         .approval_required => return error.TestExpectedDirectOnly,
@@ -166,12 +159,11 @@ test "normalized default emits direct-only only for a direct plan" {
         .command = "touch created.txt",
         .resolved_cwd = "/workspace",
         .background = false,
-        .resolved_backend = .none,
         .target_os = .macos,
     };
     try std.testing.expectEqual(
         command_effect.ApprovalReason.filesystem_write,
-        defaultForRunCommand(std.testing.allocator, write_ctx).approval_required,
+        defaultForRunCommand(std.testing.allocator, write_ctx, .ask).approval_required,
     );
 }
 
@@ -180,12 +172,38 @@ test "explicit user environment always requires shell authority" {
         .command = "pwd",
         .resolved_cwd = "/workspace",
         .background = false,
-        .resolved_backend = .none,
         .target_os = .macos,
         .environment = .{ .user = "/bin/zsh" },
     };
+    for ([_]types.PermissionMode{ .auto, .ask }) |permission_mode| {
+        try std.testing.expectEqual(
+            command_effect.ApprovalReason.dynamic_shell,
+            defaultForRunCommand(std.testing.allocator, user_ctx, permission_mode).approval_required,
+        );
+    }
+}
+
+test "explicit clean environment is direct only in automatic mode" {
+    const clean_ctx = CommandContext{
+        .command = "pwd",
+        .resolved_cwd = "/workspace",
+        .background = false,
+        .target_os = .macos,
+        .environment = .{ .clean = "/bin/zsh" },
+    };
+    const automatic = defaultForRunCommand(std.testing.allocator, clean_ctx, .auto);
+    switch (automatic) {
+        .direct_only => |fingerprint| try std.testing.expect(fingerprint.matches(clean_ctx)),
+        .approval_required => return error.TestExpectedDirectOnly,
+    }
     try std.testing.expectEqual(
         command_effect.ApprovalReason.dynamic_shell,
-        defaultForRunCommand(std.testing.allocator, user_ctx).approval_required,
+        defaultForRunCommand(std.testing.allocator, clean_ctx, .ask).approval_required,
+    );
+    var write_ctx = clean_ctx;
+    write_ctx.command = "touch created.txt";
+    try std.testing.expectEqual(
+        command_effect.ApprovalReason.filesystem_write,
+        defaultForRunCommand(std.testing.allocator, write_ctx, .auto).approval_required,
     );
 }

@@ -55,7 +55,7 @@ fn teamQueryProjection(query: []const u8, width: u16) TeamQueryProjection {
 pub fn authPickerRowCount(view: auth_runtime.PickerView) u16 {
     if (view.stage == .sign_in) return 7;
     if (view.stage == .api_key) return 4;
-    if (view.stage == .root and view.include_skip) return 17;
+    if (view.stage == .root and view.include_skip) return 18;
     return @intCast(1 + @max(view.choiceCount(), 1));
 }
 
@@ -67,7 +67,7 @@ pub noinline fn composeAuthPickerRow(
     width: u16,
 ) !std.ArrayList(u8) {
     if (view.stage == .sign_in) {
-        return composeSignInPickerRow(alloc, view.sign_in, row_index, width);
+        return composeSignInPickerRow(alloc, view.sign_in, view.sign_in_source, row_index, width);
     }
     if (view.stage == .api_key) {
         return composeApiKeyPickerRow(
@@ -98,6 +98,7 @@ pub noinline fn composeAuthPickerRow(
         }
         const header = switch (view.stage) {
             .root => "   Setup",
+            .provider => "   Switch provider",
             .sign_in => unreachable,
             .api_key => unreachable,
             .change_team => unreachable,
@@ -120,6 +121,7 @@ pub noinline fn composeAuthPickerRow(
         try row.appendSlice(alloc, ui_render.dim_style);
         try row_text.appendClipped(alloc, &row, switch (view.stage) {
             .root => "",
+            .provider => "     No providers available",
             .sign_in => unreachable,
             .api_key => unreachable,
             .change_team => if (view.team_query.len == 0)
@@ -161,14 +163,13 @@ const onboarding_note = "   ⚠︎ Note: fx is experimental and defaults to auto
 const onboarding_note_link = onboarding_note ++ " \x1b]8;id=fx-onboarding;https://fx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\";
 
 fn onboardingProjectedRowIndex(view: auth_runtime.PickerView, row_index: u16, row_count: u16) u16 {
-    if (row_count >= 17) return row_index;
+    if (row_count >= 18) return row_index;
 
-    const selected_row: u16 = if (view.selectedIndex() == 0) 8 else 9;
-    const other_row: u16 = if (selected_row == 8) 9 else 8;
-    const priority = [_]u16{ selected_row, other_row, 14, 7, 11, 5, 0, 2, 3, 6, 10, 12, 13, 1, 4, 15, 16 };
+    const selected_row: u16 = 8 + @as(u16, @intCast(view.selectedIndex()));
+    const priority = [_]u16{ selected_row, 11, 9, 10, 8, 15, 7, 12, 5, 0, 2, 3, 6, 13, 14, 1, 4, 16, 17 };
 
     var projected_index: u16 = 0;
-    for (0..17) |source_row| {
+    for (0..18) |source_row| {
         for (priority[0..@min(row_count, priority.len)]) |included_row| {
             if (source_row != included_row) continue;
             if (projected_index == row_index) return @intCast(source_row);
@@ -176,7 +177,7 @@ fn onboardingProjectedRowIndex(view: auth_runtime.PickerView, row_index: u16, ro
             break;
         }
     }
-    return 16;
+    return 17;
 }
 
 fn composeOnboardingPickerRow(
@@ -194,6 +195,8 @@ fn composeOnboardingPickerRow(
     const maybe_choice_index: ?usize = switch (source_row_index) {
         8 => 0,
         9 => 1,
+        10 => 2,
+        11 => 3,
         else => null,
     };
     if (maybe_choice_index) |choice_index| {
@@ -221,12 +224,10 @@ fn composeOnboardingPickerRow(
         5 => "   You can change this anytime with /setup.",
         6 => "",
         7 => "   Get started",
-        10 => "",
-        11 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
-        12 => "",
-        13 => "",
-        14 => "   Esc to set up later · Explore all commands with /help",
-        15, 16 => "",
+        12 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
+        13, 14 => "",
+        15 => "   Esc to set up later · Explore all commands with /help",
+        16, 17 => "",
         else => "",
     };
     try row_text.appendClipped(alloc, &row, label, width);
@@ -237,6 +238,7 @@ fn composeOnboardingPickerRow(
 fn composeSignInPickerRow(
     alloc: Allocator,
     snapshot: login_flow.SignInSnapshot,
+    source: credentials.Source,
     row_index: u16,
     width: u16,
 ) !std.ArrayList(u8) {
@@ -251,20 +253,48 @@ fn composeSignInPickerRow(
         else
             ui_render.dim_style,
     );
+    if (row_index == 2 and source == .chatgpt_subscription) {
+        const prefix = "   Open   ";
+        try row_text.appendClipped(alloc, &row, prefix, width);
+        const used: u16 = @intCast(@min(display_width.visibleWidth(prefix), width));
+        const remaining = width -| used;
+        if (remaining > 0) {
+            try row.appendSlice(alloc, "\x1b]8;id=fx-codex-auth;");
+            try row.appendSlice(alloc, snapshot.verification_uri);
+            try row.appendSlice(alloc, "\x1b\\\x1b[4m");
+            try row_text.appendClipped(alloc, &row, "Authorize with Codex", remaining);
+            try row.appendSlice(alloc, "\x1b[24m\x1b]8;;\x1b\\");
+        }
+        try row.appendSlice(alloc, ui_render.reset_style);
+        return row;
+    }
     var label_buf: [512]u8 = undefined;
     const label = switch (row_index) {
-        0 => "   Sign in with Vercel",
+        0 => if (source == .chatgpt_subscription)
+            "   Sign in with Codex"
+        else if (source == .grok_subscription)
+            "   Sign in with Grok"
+        else
+            "   Sign in with Vercel",
         1, 4 => "",
         2 => std.fmt.bufPrint(
             &label_buf,
             "   Open   {s}",
             .{snapshot.verification_uri},
-        ) catch "   Open the Vercel device authorization page",
-        3 => std.fmt.bufPrint(
-            &label_buf,
-            "   Code   {s}",
-            .{snapshot.user_code},
-        ) catch "   Code unavailable",
+        ) catch if (source == .chatgpt_subscription)
+            "   Open the Codex authorization page"
+        else if (source == .grok_subscription)
+            "   Open the Grok authorization page"
+        else
+            "   Open the Vercel device authorization page",
+        3 => if (snapshot.user_code.len == 0)
+            ""
+        else
+            std.fmt.bufPrint(
+                &label_buf,
+                "   Code   {s}",
+                .{snapshot.user_code},
+            ) catch "   Code unavailable",
         5 => switch (snapshot.state) {
             .idle => "   Preparing sign-in…",
             .polling => "   Waiting for authorization…",
@@ -988,7 +1018,7 @@ const picker_test_slash_specs = [_]command_specs.SlashSpec{
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true },
     .{ .kind = .models, .command = "/models", .help_entry = "/models", .completion_description = "browse available models", .presentation_category = .model },
     .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|resource|prompt|add|remove]", .completion_description = "manage MCP servers, resources, and prompts", .presentation_category = .extensions, .has_args = true },
-    .{ .kind = .sandbox, .command = "/sandbox", .help_entry = "/sandbox [os|none]", .completion_description = "choose command sandbox behavior", .presentation_category = .security, .has_args = true },
+    .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|remember|revoke|yolo|reset]", .completion_description = "choose permission behavior", .presentation_category = .security, .has_args = true },
     .{ .kind = .credits, .command = "/credits", .aliases = &.{"/balance"}, .help_entry = "/credits (/balance)", .completion_description = "show gateway credits balance", .presentation_category = .account },
 };
 const picker_test_slash_registry = command_specs.SlashRegistry{ .commands = picker_test_slash_specs[0..] };
@@ -1094,7 +1124,7 @@ test "slash menu hides metadata for commands and skills" {
     var command = try composeSlashMenuOptionRow(std.testing.allocator, picker_test_slash_registry, "/m", &.{}, 0, true, command_widths, 60, false);
     defer command.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, command.items, "/model") != null);
-    try std.testing.expect(std.mem.find(u8, command.items, "reasoning effort to use") != null);
+    try std.testing.expect(std.mem.find(u8, command.items, "choose what model") != null);
     try std.testing.expect(std.mem.find(u8, command.items, "Model") == null);
 
     const skills = [_]skill_runtime.Skill{.{
@@ -1150,12 +1180,12 @@ test "slash completion option row clips styled descriptions safely" {
 
 test "slash completion option row aligns argument labels without command prefix" {
     const alloc = std.testing.allocator;
-    var row = try composeSlashCompletionOptionRow(alloc, picker_test_slash_registry, "/sandbox ", 0, false, 12, 8, 40);
+    var row = try composeSlashCompletionOptionRow(alloc, picker_test_slash_registry, "/permissions ", 0, false, 12, 8, 40);
     defer row.deinit(alloc);
 
     try std.testing.expect(std.mem.startsWith(u8, row.items, "\x1b[12G"));
-    try std.testing.expect(std.mem.find(u8, row.items, "os") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "/sandbox") == null);
+    try std.testing.expect(std.mem.find(u8, row.items, "ask") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "/permissions") == null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 40);
 }
 
@@ -1264,18 +1294,18 @@ test "registry-aware slash presentation preserves aliases" {
 
 test "mixed slash completion keeps skills out of argument completions" {
     const skills = [_]skill_runtime.Skill{.{
-        .name = "sandbox-helper",
-        .description = "sandbox help",
-        .path = "/tmp/.codex/skills/sandbox-helper",
+        .name = "permissions-helper",
+        .description = "permissions help",
+        .path = "/tmp/.codex/skills/permissions-helper",
         .source = .global_codex,
     }};
 
-    const command_count = command_specs.slashCompletionCount(picker_test_slash_registry, "/sandbox ");
+    const command_count = command_specs.slashCompletionCount(picker_test_slash_registry, "/permissions ");
     try std.testing.expect(command_count > 0);
-    try std.testing.expectEqual(command_count, mixedSlashCompletionCount(picker_test_slash_registry, "/sandbox ", &skills));
-    try std.testing.expect(!mixedSlashCompletionIsSkill(picker_test_slash_registry, "/sandbox ", &skills, command_count));
-    try std.testing.expect(nthMixedSlashCompletionSkill(picker_test_slash_registry, "/sandbox ", &skills, command_count) == null);
-    try std.testing.expectEqualStrings("/sandbox os", nthMixedSlashCompletionText(picker_test_slash_registry, "/sandbox ", &skills, 0).?);
+    try std.testing.expectEqual(command_count, mixedSlashCompletionCount(picker_test_slash_registry, "/permissions ", &skills));
+    try std.testing.expect(!mixedSlashCompletionIsSkill(picker_test_slash_registry, "/permissions ", &skills, command_count));
+    try std.testing.expect(nthMixedSlashCompletionSkill(picker_test_slash_registry, "/permissions ", &skills, command_count) == null);
+    try std.testing.expectEqualStrings("/permissions ask", nthMixedSlashCompletionText(picker_test_slash_registry, "/permissions ", &skills, 0).?);
 }
 
 test "edge-scroll picker window lets selection reach bottom before scrolling" {
@@ -1533,6 +1563,16 @@ test "typed file picker tiny directory row retains kind identity" {
     try std.testing.expect(std.mem.find(u8, row.items, "/") != null);
 }
 
+test "compose model picker rows render raw catalog model ids" {
+    var codex = try composePickerOptionRow(std.testing.allocator, .model_stage, 1, "gpt-5.4", true, 80);
+    defer codex.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, codex.items, "gpt-5.4") != null);
+
+    var gateway = try composePickerOptionRow(std.testing.allocator, .model_stage, 1, "anthropic/claude-sonnet-4.6", false, 80);
+    defer gateway.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, gateway.items, "anthropic/claude-sonnet-4.6") != null);
+}
+
 test "compose model picker status row aligns to active token" {
     var row = try composePickerStatusRow(std.testing.allocator, .model_stage, .fast, false, false, 23, 48);
     defer row.deinit(std.testing.allocator);
@@ -1551,7 +1591,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
         .include_skip = true,
     };
 
-    try std.testing.expectEqual(@as(u16, 17), authPickerRowCount(view));
+    try std.testing.expectEqual(@as(u16, 18), authPickerRowCount(view));
     var screen: std.ArrayList(u8) = .empty;
     defer screen.deinit(alloc);
     for (0..authPickerRowCount(view)) |row_index| {
@@ -1582,11 +1622,19 @@ test "auth onboarding composes the welcome copy and setup choices" {
     defer selected_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, selected_row.items, "› Sign in with Vercel") != null);
 
-    var unselected_row = try composeAuthPickerRow(alloc, view, 9, authPickerRowCount(view), 100);
+    var chatgpt_row = try composeAuthPickerRow(alloc, view, 9, authPickerRowCount(view), 100);
+    defer chatgpt_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, chatgpt_row.items, "Sign in with Codex") != null);
+
+    var grok_row = try composeAuthPickerRow(alloc, view, 10, authPickerRowCount(view), 100);
+    defer grok_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, grok_row.items, "Sign in with Grok") != null);
+
+    var unselected_row = try composeAuthPickerRow(alloc, view, 11, authPickerRowCount(view), 100);
     defer unselected_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, unselected_row.items, "Add an API key") != null);
 
-    var narrow_note = try composeAuthPickerRow(alloc, view, 11, authPickerRowCount(view), 58);
+    var narrow_note = try composeAuthPickerRow(alloc, view, 12, authPickerRowCount(view), 58);
     defer narrow_note.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, narrow_note.items, "https://fx.sh/docs/stability") == null);
 
@@ -1600,7 +1648,8 @@ test "auth onboarding composes the welcome copy and setup choices" {
     }
     try std.testing.expect(std.mem.find(u8, compact_screen.items, "Sign in with Vercel") != null);
     try std.testing.expect(std.mem.find(u8, compact_screen.items, "Add an API key") != null);
-    try std.testing.expect(std.mem.find(u8, compact_screen.items, "Esc to set up later") != null);
+    try std.testing.expect(std.mem.find(u8, compact_screen.items, "Sign in with Codex") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Grok") != null);
 }
 
 test "auth picker composes only detected credential sources" {
@@ -1613,7 +1662,7 @@ test "auth picker composes only detected credential sources" {
         .include_skip = false,
     };
     const row_count = authPickerRowCount(view);
-    try std.testing.expectEqual(@as(u16, 6), row_count);
+    try std.testing.expectEqual(@as(u16, 9), row_count);
 
     var header = try composeAuthPickerRow(alloc, view, 0, row_count, 80);
     defer header.deinit(alloc);
@@ -1623,20 +1672,28 @@ test "auth picker composes only detected credential sources" {
     defer sign_in.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, sign_in.items, "Sign in with Vercel") != null);
 
-    var setup = try composeAuthPickerRow(alloc, view, 2, row_count, 80);
+    var chatgpt = try composeAuthPickerRow(alloc, view, 2, row_count, 80);
+    defer chatgpt.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, chatgpt.items, "Sign in with Codex") != null);
+
+    var grok = try composeAuthPickerRow(alloc, view, 3, row_count, 80);
+    defer grok.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, grok.items, "Sign in with Grok") != null);
+
+    var setup = try composeAuthPickerRow(alloc, view, 4, row_count, 80);
     defer setup.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, setup.items, "API key") != null);
 
-    var opencode_go = try composeAuthPickerRow(alloc, view, 3, row_count, 80);
+    var opencode_go = try composeAuthPickerRow(alloc, view, 4, row_count, 80);
     defer opencode_go.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, opencode_go.items, "OpenCode Go API key") != null);
 
-    var change_team = try composeAuthPickerRow(alloc, view, 4, row_count, 80);
+    var change_team = try composeAuthPickerRow(alloc, view, 6, row_count, 80);
     defer change_team.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, change_team.items, "Change team") != null);
     try std.testing.expect(std.mem.find(u8, change_team.items, "sign in first") != null);
 
-    var switch_credential = try composeAuthPickerRow(alloc, view, 5, row_count, 80);
+    var switch_credential = try composeAuthPickerRow(alloc, view, 7, row_count, 80);
     defer switch_credential.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, switch_credential.items, "Switch credential") != null);
 }
@@ -1819,6 +1876,33 @@ test "sign-in stage renders the complete device authorization screen" {
     }) |expected| {
         try std.testing.expect(std.mem.find(u8, screen.items, expected) != null);
     }
+}
+
+test "Codex sign-in stage renders a bounded clickable authorization action" {
+    const alloc = std.testing.allocator;
+    const url = "https://auth.openai.test/oauth/authorize?response_type=code&client_id=test&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=full-state";
+    const view = auth_runtime.PickerView{
+        .active = true,
+        .available_sources = .empty,
+        .selected_choice = null,
+        .active_source = null,
+        .include_skip = false,
+        .stage = .sign_in,
+        .sign_in_source = .chatgpt_subscription,
+        .sign_in = .{
+            .state = .polling,
+            .verification_uri = url,
+        },
+    };
+
+    var row = try composeAuthPickerRow(alloc, view, 2, authPickerRowCount(view), 40);
+    defer row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, row.items, "   Open   ") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "Authorize with Codex") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "\x1b]8;") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, url) != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "\x1b]8;;\x1b\\") != null);
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 40);
 }
 
 test "partially visible auth picker shows a source window without duplicates" {

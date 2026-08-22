@@ -238,7 +238,7 @@ describe("generic permission typed errors", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "JSON prompt-permissions reaches approval after three automatic review denials",
+    "JSON prompt-permissions does not prompt after automatic recovery exhaustion",
     async () => {
       const root = createIsolatedRoot("fx-json-auto-prompt-permissions-");
       const markers = Array.from(
@@ -260,11 +260,10 @@ describe("generic permission typed errors", () => {
               command: `touch ${JSON.stringify(marker)}`,
             });
           }),
-          fakeGatewayFinalText("automatic threshold approval complete"),
         ],
         {
           classifierResponses: Array.from(
-            { length: 3 },
+            { length: 4 },
             (_, index) => fakeGatewayPermissionDecision(
               "ask",
               `auto_review_${index + 1}`,
@@ -280,24 +279,22 @@ describe("generic permission typed errors", () => {
           env: permissionEnv(root.home, gateway),
           remainOnExit: true,
         });
-        await session.waitForText("Approve? [y/N]", TIMEOUT);
-        for (const marker of markers) expect(existsSync(marker)).toBe(false);
-        expect(gateway.classifierRequests).toHaveLength(3);
-        await session.sendText("y");
         await waitForPaneExit(session, 0);
+        const scrollback = await session.captureFullScrollback();
+        expect(scrollback).not.toContain("Approve? [y/N]");
+        for (const marker of markers) expect(existsSync(marker)).toBe(false);
+        expect(gateway.classifierRequests).toHaveLength(4);
 
         const stdout = readFileSync(stdoutPath, "utf8");
         expect(stdout).not.toContain("Approve? [y/N]");
         const json = JSON.parse(stdout) as FxJson;
-        expect(json.output).toContain("automatic threshold approval complete");
-        expect(json.tool_calls.filter((call) => call.status === "error")).toHaveLength(3);
-        expect(json.tool_calls.filter((call) => call.status === "success")).toHaveLength(1);
-        for (const marker of markers.slice(0, 3)) {
-          expect(existsSync(marker)).toBe(false);
-        }
-        expect(existsSync(markers[3]!)).toBe(true);
-        expect(gateway.requests).toHaveLength(5);
-        expect(gateway.classifierRequests).toHaveLength(3);
+        expect(json.output).toContain(
+          "I couldn't continue because the required actions were blocked by automatic safety checks.",
+        );
+        expect(json.tool_calls.filter((call) => call.status === "error")).toHaveLength(4);
+        expect(json.tool_calls.filter((call) => call.status === "success")).toHaveLength(0);
+        expect(gateway.requests).toHaveLength(4);
+        expect(gateway.classifierRequests).toHaveLength(4);
       } finally {
         if (session) await session.kill();
         gateway.stop();

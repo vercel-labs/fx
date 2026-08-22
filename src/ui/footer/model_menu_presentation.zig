@@ -284,7 +284,10 @@ fn appendCompactFacts(
 
 fn compactFactsWidth(capabilities: model_capabilities.Capabilities) usize {
     var width: usize = 0;
-    if (capabilities.context_window) |tokens| width += tokenFactWidth(tokens, "context");
+    if (capabilities.context_window) |tokens| {
+        if (width > 0) width += display_width.visibleWidth(" · ");
+        width += tokenFactWidth(tokens, "context");
+    }
     if (capabilities.max_output_tokens) |tokens| {
         if (width > 0) width += display_width.visibleWidth(" · ");
         width += tokenFactWidth(tokens, "output");
@@ -342,6 +345,21 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
             .fx_login_refresh_required => "Vercel sign-in must refresh before team-private models can load.",
             .credential_refresh_failed => "Vercel sign-in refresh failed; using the public model catalog.",
             .authenticated_credential_rejected => "Your Gateway credential was rejected; using the public model catalog.",
+            .chatgpt_subscription => "Codex models require an authenticated Codex catalog.",
+            .grok_subscription => "Grok models require an authenticated Grok catalog.",
+            .opencode_go => "OpenCode Go models require an OPENCODE_API_KEY credential.",
+        };
+    }
+    if (state.access_level == .authenticated) {
+        const source = state.source orelse return "Using an authenticated AI Gateway catalog.";
+        return switch (source) {
+            .fx_login => "Gateway catalog: authenticated with fx login.",
+            .ai_gateway_api_key => "Gateway catalog: authenticated with an API key.",
+            .vercel_oidc_token => "Gateway catalog: authenticated with the Vercel session.",
+            .stored_key => "Gateway catalog: authenticated with the stored API key.",
+            .chatgpt_subscription => "Codex catalog: authenticated with a subscription.",
+            .grok_subscription => "Grok catalog: authenticated with a subscription.",
+            .opencode_go => "OpenCode Go catalog: authenticated with an API key.",
         };
     }
     return null;
@@ -507,7 +525,10 @@ test "model menu states and navigation budget stay bounded" {
 }
 
 test "model menu status follows provenance and retryable failure precedence" {
-    try std.testing.expect(loadedCatalogStatusText(.{ .access_level = .authenticated }) == null);
+    try std.testing.expectEqualStrings(
+        "Gateway catalog: authenticated with fx login.",
+        loadedCatalogStatusText(.{ .access_level = .authenticated, .source = .fx_login }).?,
+    );
 
     const cases = [_]struct {
         state: model_cache_runtime.ModelMenuCatalogState,

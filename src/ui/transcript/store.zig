@@ -1790,7 +1790,6 @@ fn cloneMutationState(self: anytype, alloc: Allocator) !@TypeOf(self.*) {
         .max_retained_transcript_bytes = self.max_retained_transcript_bytes,
         .command_output_display = self.command_output_display,
         .command_output_render = self.command_output_render,
-        .maxxing_mode = self.maxxing_mode,
         .full_transcript = self.full_transcript,
         .replaceable_last_line = self.replaceable_last_line,
         .replaceable_row = self.replaceable_row,
@@ -2462,7 +2461,6 @@ pub fn writeUserPromptCard(
         user.images,
         shadow.layout.cols,
         skill_tokens,
-        .legacy,
     );
     defer alloc.free(card);
     try shadow.writeTranscriptBytes(alloc, metrics, card, true);

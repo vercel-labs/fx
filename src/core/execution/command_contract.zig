@@ -30,7 +30,6 @@ pub const ForegroundCommandResult = struct {
     output_file: ?[]const u8 = null,
     stdout_file: ?[]const u8 = null,
     stderr_file: ?[]const u8 = null,
-    sandbox_denied: bool = false,
 };
 
 pub const BackgroundCommandResult = struct {
@@ -165,7 +164,6 @@ fn writeForegroundJson(result: ForegroundCommandResult, writer: *std.Io.Writer) 
     try writeOptionalStringField(writer, "output_file", result.output_file);
     try writeOptionalStringField(writer, "stdout_file", result.stdout_file);
     try writeOptionalStringField(writer, "stderr_file", result.stderr_file);
-    try writeBoolField(writer, "sandbox_denied", result.sandbox_denied);
     try writer.writeByte('}');
 }
 
@@ -243,7 +241,7 @@ test "foreground result preserves envelopes metadata and json" {
     const json = try result.command_result.?.toJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"foreground\",\"command\":\"printf hello\",\"cwd\":\"/tmp\",\"exit_code\":7,\"signal\":null,\"timed_out\":false,\"duration_ms\":12,\"stdout_bytes\":7,\"stderr_bytes\":6,\"truncated\":false,\"output_file\":null,\"stdout_file\":null,\"stderr_file\":null,\"sandbox_denied\":false}",
+        "{\"kind\":\"foreground\",\"command\":\"printf hello\",\"cwd\":\"/tmp\",\"exit_code\":7,\"signal\":null,\"timed_out\":false,\"duration_ms\":12,\"stdout_bytes\":7,\"stderr_bytes\":6,\"truncated\":false,\"output_file\":null,\"stdout_file\":null,\"stderr_file\":null}",
         json,
     );
 }

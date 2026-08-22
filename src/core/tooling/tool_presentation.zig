@@ -5,6 +5,9 @@ const file_mutation_contract = @import("file_mutation_contract.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("tool_args.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
+const terminal_contracts = @import("../terminal/contracts.zig");
+const terminal_client_runtime = @import("../terminal/client.zig");
+const terminal_ui_projection = @import("../terminal/ui_projection.zig");
 const types = @import("../shared/types.zig");
 const test_builtin_tools = if (builtin.is_test)
     @import("../../builtins/tools.zig")
@@ -21,7 +24,7 @@ pub const ToolActionInput = struct {
     tool_registry: tool_dispatch.Registry,
     call: ToolCall,
     workspace_root: []const u8 = "",
-    file_display_path: ?[]const u8 = null,
+    display_target: ?[]const u8 = null,
     is_available_dynamic_mcp_tool: bool = false,
 };
 
@@ -134,25 +137,6 @@ pub fn formatRunCommandPermissionLabel(
     return std.fmt.allocPrint(alloc, "terminal.exec {s}{s}", .{ encoded.bytes, suffix });
 }
 
-/// The caller owns the returned allocation and must free it with `alloc`.
-pub fn formatSandboxWideningPermissionLabel(
-    alloc: Allocator,
-    reactive: bool,
-    command: []const u8,
-) ![]const u8 {
-    var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
-    const encoded = try text_utils.encodeTerminalSafe(
-        scratch_state.allocator(),
-        command,
-        max_run_command_activity_bytes,
-    );
-    return std.fmt.allocPrint(alloc, "{s}broader file access: {s}", .{
-        if (reactive) "retry with " else "",
-        encoded.bytes,
-    });
-}
-
 pub fn isAdvertisedDynamicMcpName(registry: tool_dispatch.Registry, name: []const u8, advertised: []const []const u8) bool {
     if (registry.lookup(name) != null) return false;
     for (advertised) |advertised_name| {
@@ -185,6 +169,122 @@ pub fn formatRunCommandActivity(
 }
 
 /// The caller owns the returned allocation and must free it with `alloc`.
+fn resolveTerminalDisplayTargetFromRows(
+    alloc: Allocator,
+    registry: tool_dispatch.Registry,
+    workspace_root: []const u8,
+    call: ToolCall,
+    rows: []const terminal_ui_projection.Row,
+) !?[]const u8 {
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    const session_id = terminalDisplayTargetSessionId(
+        scratch_state.allocator(),
+        registry,
+        call,
+    ) orelse return null;
+    return @as(?[]const u8, try resolveTerminalSessionTargetFromRows(
+        alloc,
+        workspace_root,
+        session_id,
+        rows,
+    ));
+}
+
+fn terminalDisplayTargetSessionId(
+    scratch: Allocator,
+    registry: tool_dispatch.Registry,
+    call: ToolCall,
+) ?[]const u8 {
+    const spec = registry.lookup(call.name) orelse return null;
+    if (spec.executor_kind != .terminal) return null;
+    const args = tool_args.parseToolArgsObject(
+        scratch,
+        call.arguments_json,
+    ) catch return null;
+    const presentation = tool_dispatch.presentationForArgs(spec.*, args);
+    if (presentation.label_arg_kind != .session_id) return null;
+    return tool_args.optionalStringArg(args, "session_id");
+}
+
+/// The caller owns the returned allocation and must free it with `alloc`.
+fn resolveTerminalSessionTargetFromRows(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    session_id: []const u8,
+    rows: []const terminal_ui_projection.Row,
+) ![]const u8 {
+    for (rows) |row| {
+        if (!std.mem.eql(u8, row.session_id, session_id)) continue;
+        if (row.label.len == 0 or std.mem.eql(u8, row.label, session_id)) break;
+        return try formatTerminalDisplayTarget(
+            alloc,
+            workspace_root,
+            row.label,
+        );
+    }
+
+    var encoded = try text_utils.encodeTerminalSafe(
+        alloc,
+        session_id,
+        max_run_command_activity_bytes - "session ".len,
+    );
+    defer encoded.deinit(alloc);
+    return try std.fmt.allocPrint(alloc, "session {s}", .{encoded.bytes});
+}
+
+/// The caller owns the returned allocation and must free it with `alloc`.
+pub fn resolveTerminalDisplayTarget(
+    alloc: Allocator,
+    registry: tool_dispatch.Registry,
+    workspace_root: []const u8,
+    terminal_client: ?*terminal_client_runtime.Runtime,
+    call: ToolCall,
+) !?[]const u8 {
+    var scratch_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer scratch_state.deinit();
+    const session_id = terminalDisplayTargetSessionId(
+        scratch_state.allocator(),
+        registry,
+        call,
+    ) orelse return null;
+    const runtime = terminal_client orelse return @as(?[]const u8, try resolveTerminalSessionTargetFromRows(
+        alloc,
+        workspace_root,
+        session_id,
+        &.{},
+    ));
+    var snapshot = try runtime.terminalProjection(std.heap.c_allocator);
+    defer snapshot.deinit();
+    return @as(?[]const u8, try resolveTerminalSessionTargetFromRows(
+        alloc,
+        workspace_root,
+        session_id,
+        snapshot.rows,
+    ));
+}
+
+/// The caller owns the returned allocation and must free it with `alloc`.
+fn formatTerminalDisplayTarget(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    raw: []const u8,
+) ![]u8 {
+    var projected_storage: [max_run_command_activity_bytes + 1]u8 = undefined;
+    const projected = projectRunCommandActivitySource(
+        raw,
+        workspace_root,
+        &projected_storage,
+    );
+    const encoded = try text_utils.encodeTerminalSafe(
+        alloc,
+        projected,
+        max_run_command_activity_bytes,
+    );
+    return encoded.bytes;
+}
+
+/// The caller owns the returned allocation and must free it with `alloc`.
 pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     const call = input.call;
     if (file_mutation_contract.isToolName(call.name)) {
@@ -193,7 +293,7 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
         return std.fmt.allocPrint(
             alloc,
             "{s} {s}",
-            .{ spec.action_label, input.file_display_path orelse spec.label_arg_default },
+            .{ spec.action_label, input.display_target orelse spec.label_arg_default },
         );
     }
 
@@ -228,7 +328,9 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     if (try copyRenameLabel(scratch, call.name, args)) |value| {
         return std.fmt.allocPrint(alloc, "{s} {s}", .{ presentation.action_label, value });
     }
-    const value = tool_dispatch.presentationLabelValue(presentation, args) orelse presentation.label_arg_default;
+    const value = input.display_target orelse
+        tool_dispatch.presentationLabelValue(presentation, args) orelse
+        presentation.label_arg_default;
     return std.fmt.allocPrint(alloc, "{s} {s}", .{ presentation.action_label, value });
 }
 
@@ -723,21 +825,6 @@ test "tool presentation bounds a large multiline run command activity" {
     try std.testing.expect(std.mem.endsWith(u8, label, "..."));
 }
 
-test "sandbox widening permission label bounds oversized commands" {
-    const alloc = std.testing.allocator;
-    const oversized = "x" ** 5_000;
-    const label = try formatSandboxWideningPermissionLabel(alloc, true, oversized);
-    defer alloc.free(label);
-
-    try std.testing.expect(std.mem.startsWith(u8, label, "retry with broader file access: "));
-    try std.testing.expect(label.len <= 160);
-    try std.testing.expect(std.mem.endsWith(u8, label, "..."));
-
-    const short = try formatSandboxWideningPermissionLabel(alloc, false, "npm install");
-    defer alloc.free(short);
-    try std.testing.expectEqualStrings("broader file access: npm install", short);
-}
-
 test "tool presentation formats permission labels" {
     const alloc = std.testing.allocator;
     const cwd = try formatPermissionLabel(alloc, test_tool_registry, .{
@@ -780,6 +867,71 @@ test "tool presentation preserves plain action fallbacks" {
         defer alloc.free(label);
         try std.testing.expectEqualStrings(case.expected, label);
     }
+}
+
+test "terminal display target is call-local across a cold inspect projection update" {
+    const alloc = std.testing.allocator;
+    const session_id = "terminal-cold-session";
+    const facts = terminal_contracts.SessionFacts{
+        .session_id = session_id,
+        .lifecycle = .running,
+        .attention = .{},
+        .backend = .native,
+        .output_cursor = .{ .segment = 1, .offset = 0 },
+        .screen_recovery = .{ .unavailable = .missing },
+    };
+    var projection: terminal_ui_projection.Store = .{};
+    defer projection.deinit(alloc);
+    try projection.observe(
+        alloc,
+        .{ .list = .{} },
+        .{ .success = .{ .list = .{ .sessions = &.{facts} } } },
+    );
+
+    const inspect_call = ToolCall{
+        .id = "inspect",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"inspect\",\"session_id\":\"terminal-cold-session\"}",
+    };
+    var cold_snapshot = try projection.snapshot(alloc);
+    const current_target = try resolveTerminalDisplayTargetFromRows(
+        alloc,
+        test_tool_registry,
+        "/tmp/workspace",
+        inspect_call,
+        cold_snapshot.rows,
+    ) orelse return error.TestExpectedEqual;
+    cold_snapshot.deinit();
+    defer alloc.free(current_target);
+    try std.testing.expectEqualStrings("session terminal-cold-session", current_target);
+
+    try projection.observe(
+        alloc,
+        .{ .inspect = .{ .session_id = session_id } },
+        .{ .success = .{ .inspect = .{
+            .session = facts,
+            .shell = "/bin/zsh",
+            .cwd = "/tmp/workspace",
+            .command = "npm run dev",
+        } } },
+    );
+    try std.testing.expectEqualStrings("session terminal-cold-session", current_target);
+
+    var learned_snapshot = try projection.snapshot(alloc);
+    defer learned_snapshot.deinit();
+    const next_target = try resolveTerminalDisplayTargetFromRows(
+        alloc,
+        test_tool_registry,
+        "/tmp/workspace",
+        .{
+            .id = "read",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"read\",\"session_id\":\"terminal-cold-session\"}",
+        },
+        learned_snapshot.rows,
+    ) orelse return error.TestExpectedEqual;
+    defer alloc.free(next_target);
+    try std.testing.expectEqualStrings("npm run dev", next_target);
 }
 
 test "tool presentation frees all formatted output with a normal allocator" {

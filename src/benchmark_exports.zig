@@ -1,4 +1,5 @@
 pub const TranscriptRuntime = @import("ui/transcript/runtime.zig").TranscriptRuntime;
+pub const TranscriptPreparationSource = @import("ui/transcript/runtime.zig").TranscriptPreparationSource;
 pub const approval_prompt = @import("core/permissions/approval_prompt.zig");
 pub const approval_screen = @import("ui/approval_screen.zig");
 pub const diff = @import("core/output/diff.zig");

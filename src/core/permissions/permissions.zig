@@ -94,7 +94,7 @@ pub const PermissionTargetKind = enum {
 
 pub const web_search_permission = "web_search";
 pub const web_fetch_permission = "web_fetch";
-pub const yolo_warning_text = "YOLO enabled: permissions and sandboxing disabled";
+pub const yolo_warning_text = "YOLO enabled: fx permission checks disabled";
 
 pub fn isWebSearchToolName(tool_name: []const u8) bool {
     return std.mem.eql(u8, tool_name, web_search_permission);
@@ -244,7 +244,7 @@ fn resolveCommandCwdFromArgs(
     workspace_root: []const u8,
     args: std.json.ObjectMap,
 ) ![]const u8 {
-    const cwd_input = tool_args.optionalStringArg(args, "cwd") orelse ".";
+    const cwd_input = tool_args.nullablePlaceholderStringArg(args, "cwd") orelse ".";
     if (std.mem.eql(u8, cwd_input, ".")) return arena.dupe(u8, workspace_root);
     return pathing.resolveWorkspaceOrExternalPath(arena, workspace_root, cwd_input);
 }
@@ -254,7 +254,7 @@ fn resolveCommandCwdFromArgsInScope(
     scope: workspace_access.AccessScope,
     args: std.json.ObjectMap,
 ) ![]const u8 {
-    const cwd_input = tool_args.optionalStringArg(args, "cwd") orelse ".";
+    const cwd_input = tool_args.nullablePlaceholderStringArg(args, "cwd") orelse ".";
     if (std.mem.eql(u8, cwd_input, ".")) return arena.dupe(u8, scope.primary_directory);
     return pathing.resolveWorkspaceOrExternalPath(arena, scope.primary_directory, cwd_input);
 }
@@ -1247,7 +1247,7 @@ pub fn sessionGrantAllowed(grants: []const types.PermissionGrant, tool_name: []c
 
     for (grants) |grant| {
         if (!permissionPatternMatchesTool(grant.tool_name, permission, tool_name)) continue;
-        if (std.mem.eql(u8, permission, "bash") or std.mem.eql(u8, permission, "sandbox")) {
+        if (std.mem.eql(u8, permission, "bash")) {
             if (!std.mem.eql(u8, grant.target_path, pattern)) continue;
         } else if (!permissionPatternMatchesTarget(grant.target_path, pattern)) continue;
         return true;
@@ -1279,7 +1279,6 @@ pub fn suggestedSessionGrants(alloc: std.mem.Allocator, workspace_root: []const 
         const command = patternForSessionGrantMatch(tool_name, target_path);
 
         try appendOwnedGrant(alloc, &grants, "bash", command);
-        try appendOwnedGrant(alloc, &grants, "sandbox", command);
         return grants.toOwnedSlice(alloc);
     }
 
@@ -1525,8 +1524,7 @@ pub fn permissionRulePatternForGrant(alloc: std.mem.Allocator, workspace_root: [
     }
 
     if (std.mem.eql(u8, permission, "url") or
-        std.mem.eql(u8, permission, "skill") or
-        std.mem.eql(u8, permission, "sandbox"))
+        std.mem.eql(u8, permission, "skill"))
     {
         return alloc.dupe(u8, pattern);
     }
@@ -1559,10 +1557,6 @@ fn patternForRuleMatch(alloc: std.mem.Allocator, workspace_root: []const u8, too
             target_path;
         return alloc.dupe(u8, command_environment.commandFromPermissionIdentity(identity));
     }
-    if (std.mem.eql(u8, permission, "sandbox")) {
-        return alloc.dupe(u8, command_environment.commandFromPermissionIdentity(target_path));
-    }
-
     return displayTargetForPolicy(alloc, workspace_root, tool_name, target_path, target_kind);
 }
 
@@ -1622,12 +1616,13 @@ fn evaluateRulesetForTool(rules: []const types.PermissionRule, permission: []con
     var matched: ?RuleDecision = null;
     for (rules) |rule| {
         if (!ruleMatchesPermission(rule.permission, permission, tool_name)) continue;
-        if (!permissionPatternMatchesTarget(rule.pattern, pattern)) continue;
-        matched = switch (rule.action) {
+        const action: RuleDecision = switch (rule.action) {
             .allow => .allow,
             .ask => .ask,
             .deny => .deny,
         };
+        if (!ruleTargetMatches(permission, action, rule.pattern, pattern)) continue;
+        matched = action;
     }
     return matched;
 }
@@ -1675,6 +1670,116 @@ fn permissionPatternMatchesTarget(pattern: []const u8, candidate: []const u8) bo
     return wildcardMatch(pattern, candidate);
 }
 
+fn ruleTargetMatches(permission: []const u8, action: RuleDecision, pattern: []const u8, candidate: []const u8) bool {
+    if (action != .allow or
+        !std.mem.eql(u8, permission, "bash"))
+    {
+        return permissionPatternMatchesTarget(pattern, candidate);
+    }
+
+    if (!containsWildcard(pattern)) return std.mem.eql(u8, pattern, candidate);
+    if (!isStaticCommand(pattern, true) or !isStaticCommand(candidate, false)) return false;
+    return staticCommandWildcardMatch(pattern, candidate);
+}
+
+fn containsWildcard(pattern: []const u8) bool {
+    return std.mem.findScalar(u8, pattern, '*') != null or
+        std.mem.findScalar(u8, pattern, '?') != null;
+}
+
+fn isStaticCommand(command: []const u8, allow_wildcards: bool) bool {
+    if (command.len == 0) return false;
+    if (firstWordIsAssignment(command)) return false;
+
+    var index: usize = 0;
+    var in_word = false;
+    while (index < command.len) {
+        const char = command[index];
+        if (char == ' ' or char == '\t') {
+            if (!in_word) return false;
+            while (index < command.len and (command[index] == ' ' or command[index] == '\t')) : (index += 1) {}
+            if (index == command.len) return false;
+            in_word = false;
+            continue;
+        }
+
+        if (char == '\'') {
+            const literal_start = index + 1;
+            const literal_end = std.mem.findScalarPos(u8, command, literal_start, '\'') orelse return false;
+            const literal = command[literal_start..literal_end];
+            if (!std.unicode.utf8ValidateSlice(literal)) return false;
+            if (std.mem.findScalar(u8, literal, 0) != null or
+                std.mem.findScalar(u8, literal, '\r') != null or
+                std.mem.findScalar(u8, literal, '\n') != null)
+            {
+                return false;
+            }
+            in_word = true;
+            index = literal_end + 1;
+            continue;
+        }
+
+        if (!isStaticUnquotedByte(char) and !(allow_wildcards and (char == '*' or char == '?'))) return false;
+        in_word = true;
+        index += 1;
+    }
+    return in_word;
+}
+
+fn firstWordIsAssignment(command: []const u8) bool {
+    const first_word_end = std.mem.findAny(u8, command, " \t") orelse command.len;
+    const first_word = command[0..first_word_end];
+    const equals = std.mem.findScalar(u8, first_word, '=') orelse return false;
+    const name = first_word[0..equals];
+    if (name.len == 0 or (!std.ascii.isAlphabetic(name[0]) and name[0] != '_')) return false;
+    for (name[1..]) |char| {
+        if (!std.ascii.isAlphanumeric(char) and char != '_') return false;
+    }
+    return true;
+}
+
+fn isStaticUnquotedByte(char: u8) bool {
+    return std.ascii.isAlphanumeric(char) or switch (char) {
+        '_', '.', '/', ',', ':', '+', '=', '%', '@', '-' => true,
+        else => false,
+    };
+}
+
+fn staticCommandWildcardMatch(pattern: []const u8, candidate: []const u8) bool {
+    var pattern_index: usize = 0;
+    var candidate_index: usize = 0;
+    var in_single_quote = false;
+    var star_index: ?usize = null;
+    var star_candidate_index: usize = 0;
+
+    while (candidate_index < candidate.len) {
+        if (pattern_index < pattern.len) {
+            const char = pattern[pattern_index];
+            if (!in_single_quote and char == '*') {
+                star_index = pattern_index;
+                pattern_index += 1;
+                star_candidate_index = candidate_index;
+                continue;
+            }
+            if ((!in_single_quote and char == '?') or char == candidate[candidate_index]) {
+                if (char == '\'') in_single_quote = !in_single_quote;
+                pattern_index += 1;
+                candidate_index += 1;
+                continue;
+            }
+        }
+
+        const star = star_index orelse return false;
+        star_candidate_index += 1;
+        candidate_index = star_candidate_index;
+        pattern_index = star + 1;
+        in_single_quote = false;
+    }
+
+    while (pattern_index < pattern.len and !in_single_quote and pattern[pattern_index] == '*') : (pattern_index += 1) {}
+    return pattern_index == pattern.len;
+}
+
 fn directoryTreePatternMatches(pattern: []const u8, candidate: []const u8) bool {
     if (!std.mem.endsWith(u8, pattern, "/**")) return false;
     if (std.mem.eql(u8, pattern, "/**")) return std.mem.startsWith(u8, candidate, "/");
@@ -1687,18 +1792,34 @@ fn directoryTreePatternMatches(pattern: []const u8, candidate: []const u8) bool 
 }
 
 fn wildcardMatch(pattern: []const u8, candidate: []const u8) bool {
-    if (pattern.len == 0) return candidate.len == 0;
-    if (pattern[0] == '*') {
-        if (wildcardMatch(pattern[1..], candidate)) return true;
-        if (candidate.len == 0) return false;
-        return wildcardMatch(pattern, candidate[1..]);
+    var pattern_index: usize = 0;
+    var candidate_index: usize = 0;
+    var star_index: ?usize = null;
+    var star_candidate_index: usize = 0;
+
+    while (candidate_index < candidate.len) {
+        if (pattern_index < pattern.len and
+            (pattern[pattern_index] == '?' or pattern[pattern_index] == candidate[candidate_index]))
+        {
+            pattern_index += 1;
+            candidate_index += 1;
+            continue;
+        }
+        if (pattern_index < pattern.len and pattern[pattern_index] == '*') {
+            star_index = pattern_index;
+            pattern_index += 1;
+            star_candidate_index = candidate_index;
+            continue;
+        }
+
+        const star = star_index orelse return false;
+        star_candidate_index += 1;
+        candidate_index = star_candidate_index;
+        pattern_index = star + 1;
     }
-    if (pattern[0] == '?') {
-        if (candidate.len == 0) return false;
-        return wildcardMatch(pattern[1..], candidate[1..]);
-    }
-    if (candidate.len == 0 or pattern[0] != candidate[0]) return false;
-    return wildcardMatch(pattern[1..], candidate[1..]);
+
+    while (pattern_index < pattern.len and pattern[pattern_index] == '*') : (pattern_index += 1) {}
+    return pattern_index == pattern.len;
 }
 
 fn isGlobalTargetPattern(pattern: []const u8) bool {
@@ -1966,13 +2087,10 @@ test "sessionGrantAllowed maps tool categories and matches command grants exactl
 test "session command grants treat wildcard bytes literally" {
     const grants = [_]types.PermissionGrant{
         .{ .tool_name = @constCast("bash"), .target_path = @constCast("printf '*?'") },
-        .{ .tool_name = @constCast("sandbox"), .target_path = @constCast("printf '*?'") },
     };
 
     try std.testing.expect(sessionGrantAllowed(&grants, "run_command", "/tmp/workspace::printf '*?'"));
     try std.testing.expect(!sessionGrantAllowed(&grants, "run_command", "/tmp/workspace::printf 'file?'"));
-    try std.testing.expect(sessionGrantAllowed(&grants, "sandbox", "printf '*?'"));
-    try std.testing.expect(!sessionGrantAllowed(&grants, "sandbox", "printf 'file?'"));
 }
 
 test "permissionTargetForCall preserves run_command cwd targets" {
@@ -2499,6 +2617,94 @@ test "ruleDecisionForPermissionPattern matches direct inputs and fallback" {
     try std.testing.expectEqual(RuleDecision.ask, ruleDecisionForPermissionPattern(rules, "read", "README.md", .ask));
 }
 
+test "configured wildcard command allows only static command grammar" {
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("*"), .pattern = @constCast("printf *"), .action = .allow },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.allow, ruleDecisionForPermissionPattern(rules, "bash", "printf safe", .none));
+    try std.testing.expectEqual(RuleDecision.allow, ruleDecisionForPermissionPattern(rules, "bash", "printf 'safe value'", .none));
+    try std.testing.expectEqual(RuleDecision.none, ruleDecisionForPermissionPattern(rules, "bash", "printf safe && touch /tmp/fx-marker", .none));
+    try std.testing.expectEqual(RuleDecision.none, ruleDecisionForPermissionPattern(rules, "bash", "printf \"$(touch /tmp/fx-marker)\"", .none));
+}
+
+test "configured command rules require exact matching outside static grammar" {
+    var exact_rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("printf \"$(date)\""), .action = .allow },
+    };
+    const exact_rules: types.PermissionRuleSet = .{ .rules = &exact_rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.allow, ruleDecisionForPermissionPattern(exact_rules, "bash", "printf \"$(date)\"", .none));
+    try std.testing.expectEqual(RuleDecision.none, ruleDecisionForPermissionPattern(exact_rules, "bash", "printf \"$(touch /tmp/fx-marker)\"", .none));
+
+    var dynamic_pattern_rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("printf \"*\""), .action = .allow },
+    };
+    try std.testing.expectEqual(
+        RuleDecision.none,
+        ruleDecisionForPermissionPattern(.{ .rules = &dynamic_pattern_rules_buf }, "bash", "printf \"safe\"", .none),
+    );
+}
+
+test "configured command deny and ask retain generic wildcard matching" {
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("printf *"), .action = .deny },
+        .{ .permission = @constCast("custom"), .pattern = @constCast("printf *"), .action = .ask },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.deny, ruleDecisionForPermissionPattern(rules, "bash", "printf safe && touch /tmp/fx-marker", .none));
+    try std.testing.expectEqual(RuleDecision.ask, ruleDecisionForPermissionPattern(rules, "custom", "printf \"$(touch /tmp/fx-marker)\"", .none));
+}
+
+test "static command grammar is an explicit allowlist" {
+    for ([_][]const u8{
+        "git status --short",
+        "printf 'safe value'",
+        "printf ''",
+        "tool foo/bar:baz,+qux=value%@host",
+        "printf 'Grüße'",
+    }) |command| {
+        try std.testing.expect(isStaticCommand(command, false));
+    }
+
+    for ([_][]const u8{
+        "",
+        " leading",
+        "trailing ",
+        "FOO=bar command",
+        "FOO='bar' command",
+        "echo \"dynamic\"",
+        "echo $HOME",
+        "echo `pwd`",
+        "echo ~",
+        "echo [ab]",
+        "echo #comment",
+        "echo foo\\bar",
+        "echo one && echo two",
+        "echo one | cat",
+        "echo one > out",
+        "(echo one)",
+        "echo one\necho two",
+        "echo 'unterminated",
+    }) |command| {
+        try std.testing.expect(!isStaticCommand(command, false));
+    }
+
+    try std.testing.expect(isStaticCommand("git * --?", true));
+    try std.testing.expect(!isStaticCommand("git * --?", false));
+    try std.testing.expect(isStaticCommand("printf '*'", false));
+}
+
+test "generic wildcard matching remains total for maximum command-sized input" {
+    const candidate = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(candidate);
+    @memset(candidate, 'x');
+    try std.testing.expect(wildcardMatch("*", candidate));
+    try std.testing.expect(!wildcardMatch("?", candidate));
+}
+
 test "rulesDenyAllTargetsForPermission honors last matching overrides" {
     var later_allow_rules = [_]types.PermissionRule{
         .{ .permission = @constCast("edit"), .pattern = @constCast("*"), .action = .deny },
@@ -2516,6 +2722,20 @@ test "rulesDenyAllTargetsForPermission honors last matching overrides" {
         .{ .permission = @constCast("edit"), .pattern = @constCast("src/*"), .action = .deny },
     };
     try std.testing.expect(!rulesDenyAllTargetsForPermission(.{ .rules = &target_deny_rules }, "edit"));
+}
+
+test "command permission target treats a textual null cwd as absent" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const target = try permissionTargetForCall(arena, "/tmp/workspace", .{
+        .id = "terminal",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"ls\",\"cwd\":\" NULL \"}",
+    }, .command_cwd);
+
+    try std.testing.expectEqualStrings("/tmp/workspace::ls", target);
 }
 
 test "web_fetch permission target is canonical domain rather than full url" {
@@ -2668,21 +2888,6 @@ test "configured command rules match explicit environments by command" {
         RuleDecision.allow,
         try ruleDecisionFor(alloc, rules, "/tmp/workspace", "run_command", target, .command_cwd),
     );
-
-    var sandbox_rules_buf = [_]types.PermissionRule{
-        .{ .permission = @constCast("sandbox"), .pattern = @constCast("zig *"), .action = .deny },
-    };
-    try std.testing.expectEqual(
-        RuleDecision.deny,
-        try ruleDecisionFor(
-            alloc,
-            .{ .rules = &sandbox_rules_buf },
-            "/tmp/workspace",
-            "sandbox",
-            identity,
-            .none,
-        ),
-    );
 }
 
 test "directory tree permission patterns match directory and descendants only" {
@@ -2702,9 +2907,8 @@ test "suggestedSessionGrants returns exact command suggestions with stripped cwd
     const grants = try suggestedSessionGrants(alloc, "/tmp/workspace", "run_command", "/tmp/workspace::git status --short", .command_cwd);
     defer freeGrants(alloc, grants);
 
-    try std.testing.expectEqual(@as(usize, 2), grants.len);
+    try std.testing.expectEqual(@as(usize, 1), grants.len);
     try expectGrant(grants[0], "bash", "git status --short");
-    try expectGrant(grants[1], "sandbox", "git status --short");
 }
 
 test "suggestedSessionGrants returns exact broad workspace path suggestions" {

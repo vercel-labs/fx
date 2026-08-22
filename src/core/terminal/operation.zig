@@ -13,7 +13,6 @@ pub const AuthorityPreparation = struct {
     workspace_root: []const u8,
     cwd: []const u8,
     transport_role: contracts.TransportRole,
-    sandbox_backend: @FieldType(contracts.Principal, "sandbox_backend"),
     backend: contracts.Backend,
     actor: contracts.ActorRole,
     controls: contracts.AllowedControls,
@@ -119,7 +118,6 @@ fn construct_start_persistence(
                 .workspace_root = input.workspace_root,
                 .cwd = input.cwd,
                 .transport_role = input.transport_role,
-                .sandbox_backend = input.sandbox_backend,
                 .backend = input.backend,
                 .lifetime = input.lifetime,
             },
@@ -252,7 +250,6 @@ fn dupe_principal(
         .workspace_root = workspace_root,
         .cwd = cwd,
         .transport_role = principal.transport_role,
-        .sandbox_backend = principal.sandbox_backend,
         .backend = principal.backend,
         .lifetime = principal.lifetime,
     };
@@ -278,7 +275,6 @@ fn dupe_owner_catalog_principal(
         .durable_session_id = durable_session_id,
         .workspace_root = try alloc.dupe(u8, principal.workspace_root),
         .transport_role = principal.transport_role,
-        .sandbox_backend = principal.sandbox_backend,
     };
 }
 
@@ -431,7 +427,6 @@ fn test_preparation() AuthorityPreparation {
         .workspace_root = "/workspace",
         .cwd = "/workspace/project",
         .transport_role = .interactive,
-        .sandbox_backend = .none,
         .backend = .native,
         .actor = .agent,
         .controls = .full(),

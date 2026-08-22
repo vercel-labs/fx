@@ -53,6 +53,13 @@ const vision_and_read_file_tools = [_]tool_dispatch.Tool{
     builtin_tools.vision,
     builtin_tools.read_file,
 };
+const vision_read_and_terminal_tools = [_]tool_dispatch.Tool{
+    builtin_tools.vision,
+    builtin_tools.read_file,
+    builtin_tools.terminal,
+};
+const terminal_nested_tools_json =
+    "[{\"type\":\"function\",\"name\":\"terminal\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"request\":{\"oneOf\":[{\"type\":\"object\"}]}},\"required\":[\"request\"],\"additionalProperties\":false}}]";
 
 const VisionAndReadExecutor = struct {
     vision: ExecuteDelegate,
@@ -914,10 +921,12 @@ test "required Vision rejects non-Vision before effects and stays required until
     defer types.freeImageAttachment(alloc, image);
     var images = [_]types.ImageAttachment{image};
 
+    const wrapped_terminal_arguments =
+        "{\"request\":{\"action\":\"exec\",\"command\":\"printf must-not-run\"}}";
     const blocked_calls = [_]ToolCall{toolCall(
-        "call_read_while_vision_required",
-        "read_file",
-        "{\"path\":\"must-not-read.txt\"}",
+        "call_terminal_while_vision_required",
+        "terminal",
+        wrapped_terminal_arguments,
     )};
     const vision_calls = [_]ToolCall{toolCall(
         "call_required_vision",
@@ -941,7 +950,7 @@ test "required Vision rejects non-Vision before effects and stays required until
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.tool_registry = .{ .tools = vision_and_read_file_tools[0..] };
+    hooks.tool_registry = .{ .tools = vision_read_and_terminal_tools[0..] };
     defer hooks.deinit();
     var vision_runtime = VisionAgentToolRuntime{
         .alloc = alloc,
@@ -968,7 +977,8 @@ test "required Vision rejects non-Vision before effects and stays required until
     job.authorized_image_catalog = &images;
     job.permission_mode = .ask;
 
-    const config = fixture.config();
+    var config = fixture.config();
+    config.gateway_tools_json = terminal_nested_tools_json;
     var lifecycle = test_support.testLifecycleContext(
         lifecycle_view,
         alloc,
@@ -990,7 +1000,7 @@ test "required Vision rejects non-Vision before effects and stays required until
     }
     try expectBodyContains(&gateway, 0, "\"toolChoice\":{\"type\":\"required\"}");
     try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"required\"}");
-    try expectBodyContains(&gateway, 1, "call_read_while_vision_required");
+    try expectBodyContains(&gateway, 1, "call_terminal_while_vision_required");
     try expectBodyContains(&gateway, 1, "Only Vision can be called while attached images are pending.");
     try expectBodyNotContains(&gateway, 3, "\"toolChoice\":{\"type\":\"required\"}");
     try expectBodyContains(&gateway, 2, "\"type\":\"file\"");
@@ -1013,11 +1023,29 @@ test "required Vision rejects non-Vision before effects and stays required until
     try std.testing.expectEqualStrings("call_read_after_vision", hooks.executed_call_ids.items[1]);
     try expectNoLifecycleForCall(
         hooks.lifecycle_events.items,
-        "call_read_while_vision_required",
+        "call_terminal_while_vision_required",
     );
     try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
-    try std.testing.expectEqualStrings("read_file", hooks.rejected_names.items[0]);
+    try std.testing.expectEqualStrings("terminal", hooks.rejected_names.items[0]);
     try std.testing.expectEqual(@as(usize, 1), vision_runtime.execution_count);
+    var persisted_arguments: ?[]const u8 = null;
+    for (hooks.history_turns.items) |turn| {
+        const assistant = switch (turn) {
+            .assistant => |value| value,
+            else => continue,
+        };
+        for (assistant.execution.tool_steps) |step| {
+            for (step.tool_calls) |call| {
+                if (std.mem.eql(u8, call.id, "call_terminal_while_vision_required")) {
+                    persisted_arguments = call.arguments_json;
+                }
+            }
+        }
+    }
+    try std.testing.expectEqualStrings(
+        wrapped_terminal_arguments,
+        persisted_arguments orelse return error.TestExpectedEqual,
+    );
     try std.testing.expectEqualStrings("Final after ordinary read", hooks.finish_assistant_text.?);
 }
 
@@ -2275,6 +2303,40 @@ test "processQueuedPrompt keeps native image parts for vision route model" {
     try expectBodyNotContains(&gateway, 0, "<image_context>");
     try expectBodyNotContains(&gateway, 0, "\"name\":\"vision\"");
     try std.testing.expectEqualStrings("Native image answer", hooks.finish_assistant_text.?);
+}
+
+test "processQueuedPrompt never uses the vision fallback for Codex" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const image_path = try writeTestImagePath(alloc, &tmp);
+    defer alloc.free(image_path);
+    const image = try testCapturedImage(alloc, &tmp, image_path, 1);
+    defer types.freeImageAttachment(alloc, image);
+    var images = [_]types.ImageAttachment{image};
+    const capability_overrides = [_]ModelCapabilityOverride{.{
+        .model = "gpt-5.6-sol",
+        .capabilities = .{},
+    }};
+    var gateway = FakeGateway.init(alloc, &.{});
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.capability_overrides = &capability_overrides;
+    hooks.tool_registry = .{ .tools = test_support.vision_agent_test_tools[0..] };
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.provider = .codex;
+    job.model = @constCast("gpt-5.6-sol");
+    job.prompt = @constCast("Describe the attached image.");
+    job.images = &images;
+    job.authorized_image_catalog = &images;
+
+    try std.testing.expectError(
+        error.SubscriptionNativeImageUnavailable,
+        runFakePrompt(&gateway, &hooks, fixture.config(), job),
+    );
+    try std.testing.expectEqual(@as(usize, 0), gateway.request_bodies.items.len);
 }
 
 test "processQueuedPrompt routes images natively only when vision and file input are both supported" {
@@ -5634,6 +5696,61 @@ test "processQueuedPrompt does not retry a second fx login 401" {
     try std.testing.expectEqualStrings("still-stale", gateway.request_api_keys.items[0]);
     try std.testing.expectEqualStrings("fresh-after-401", gateway.request_api_keys.items[1]);
     try std.testing.expectEqual(@as(usize, 2), hooks.credential_refresh_modes.items.len);
+    try std.testing.expectEqual(std.http.Status.unauthorized, hooks.http_status.?);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+}
+
+test "Codex 401 replay keeps payload and semantic recovery unchanged for the captured account" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = "expired" },
+        .{ .content = "Done." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.credential_refresh_tokens = &.{ "stale-loaded", "fresh-token" };
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.provider = .codex;
+    job.credential_source = .chatgpt_subscription;
+    job.account_id = @constCast("acct-a");
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqualSlices(u8, gateway.request_bodies.items[0], gateway.request_bodies.items[1]);
+    try std.testing.expectEqualStrings("stale-loaded", gateway.request_api_keys.items[0]);
+    try std.testing.expectEqualStrings("fresh-token", gateway.request_api_keys.items[1]);
+    try std.testing.expectEqualStrings("acct-a", hooks.last_credential_refresh_expected_account.?);
+    try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_count);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+test "Codex 401 account change makes no second provider request" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = "expired" },
+        .{ .content = "must not be requested" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.credential_refresh_error = error.ChatGptAccountChanged;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.provider = .codex;
+    job.credential_source = .chatgpt_subscription;
+    job.account_id = @constCast("acct-a");
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expectEqualStrings("acct-a", hooks.last_credential_refresh_expected_account.?);
+    try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_count);
     try std.testing.expectEqual(std.http.Status.unauthorized, hooks.http_status.?);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
 }

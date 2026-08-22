@@ -29,7 +29,6 @@ const ChoiceView = struct {
 pub fn desiredRowCount(projection: CompactCommandMenuProjection) u16 {
     const count: usize = switch (projection) {
         .statusline => settings_row_offset + settings_catalog.statuslineChoiceCount(),
-        .sandbox => settings_row_offset + 1,
         .usage => |usage| usageDesiredRowCount(usage),
         .workspace => |workspace| workspace_pinned_rows +
             workspace_menu.State.rowCount(workspace.entries),
@@ -47,7 +46,7 @@ pub noinline fn composeCompactCommandMenuRow(
     const empty: std.ArrayList(u8) = .empty;
     if (width == 0 or row_index >= visible_rows) return empty;
     return switch (projection) {
-        .statusline, .sandbox => composeSettingsRow(alloc, projection, row_index, width),
+        .statusline => composeSettingsRow(alloc, projection, row_index, width),
         .usage => |usage| composeUsageRow(alloc, usage, row_index, visible_rows, width),
         .workspace => |workspace| composeWorkspaceRow(alloc, workspace, row_index, visible_rows, width),
     };
@@ -71,7 +70,6 @@ fn composeSettingsRow(
 fn title(projection: CompactCommandMenuProjection) []const u8 {
     return switch (projection) {
         .statusline => "Status line",
-        .sandbox => "Sandbox",
         .usage => "Usage:",
         .workspace => "Workspace:",
     };
@@ -86,15 +84,6 @@ fn choiceView(projection: CompactCommandMenuProjection, choice_index: usize) ?Ch
                 .setting = choice.setting,
                 .snapshot = statusline.snapshot,
                 .selected = choice_index == statusline.selected_index % settings_catalog.statuslineChoiceCount(),
-            };
-        },
-        .sandbox => |sandbox| {
-            if (choice_index != 0) return null;
-            return .{
-                .label = settings_catalog.specFor(.sandbox).label,
-                .setting = .sandbox,
-                .snapshot = sandbox.snapshot,
-                .selected = true,
             };
         },
         .usage, .workspace => null,
@@ -745,23 +734,9 @@ fn composeChoiceRow(
     if (indent > 0) try row.appendSlice(alloc, "  ");
     try row.appendSlice(alloc, if (choice.selected) ui_render.selected_completion_style else ui_render.dim_style);
     const value_col = settingsValueColumn(choice.snapshot, choice.setting, width);
-    const description_col: usize = if (choice.setting == .sandbox and width >= 48)
-        @max(@as(usize, width) / 3, indent + 18)
-    else
-        value_col;
+    const description_col = value_col;
     try row_text.appendSingleLineEllipsized(alloc, &row, choice.label, description_col -| indent -| 2);
     try row.appendSlice(alloc, ui_render.reset_style);
-    if (description_col < value_col) {
-        try row_text.appendSpacesToColumn(alloc, &row, description_col);
-        try row.appendSlice(alloc, ui_render.dim_style);
-        try row_text.appendSingleLineEllipsized(
-            alloc,
-            &row,
-            settings_catalog.specFor(.sandbox).description,
-            value_col - description_col -| 2,
-        );
-        try row.appendSlice(alloc, ui_render.reset_style);
-    }
     try row_text.appendSpacesToColumn(alloc, &row, value_col);
 
     const option_count = settings_catalog.optionCount(&choice.snapshot, choice.setting);
@@ -815,9 +790,9 @@ test "compact status line menu renders toggled items without choose copy" {
         .active = true,
         .selected_index = 0,
         .snapshot = .{
-            .statusline_sandbox = true,
             .statusline_context = false,
             .statusline_session = true,
+            .statusline_workspace = false,
         },
     } };
 
@@ -833,39 +808,20 @@ test "compact status line menu renders toggled items without choose copy" {
     try std.testing.expect(std.mem.find(u8, header.items, "Status line") != null);
     try std.testing.expect(std.mem.find(u8, header.items, "Choose") == null);
 
-    var sandbox = try composeCompactCommandMenuRow(std.testing.allocator, projection, 2, rows, 80);
-    defer sandbox.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, sandbox.items, "Sandbox") != null);
-    try std.testing.expect(std.mem.find(u8, sandbox.items, "on") != null);
-    try std.testing.expect(std.mem.find(u8, sandbox.items, "❯") == null);
+    var workspace = try composeCompactCommandMenuRow(std.testing.allocator, projection, 4, rows, 80);
+    defer workspace.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, workspace.items, "Workspace") != null);
+    try std.testing.expect(std.mem.find(u8, workspace.items, "off") != null);
 
-    var context = try composeCompactCommandMenuRow(std.testing.allocator, projection, 3, rows, 80);
+    var context = try composeCompactCommandMenuRow(std.testing.allocator, projection, 2, rows, 80);
     defer context.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, context.items, "Context") != null);
     try std.testing.expect(std.mem.find(u8, context.items, "off") != null);
 
-    var session = try composeCompactCommandMenuRow(std.testing.allocator, projection, 4, rows, 80);
+    var session = try composeCompactCommandMenuRow(std.testing.allocator, projection, 3, rows, 80);
     defer session.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, session.items, "Session") != null);
     try std.testing.expect(std.mem.find(u8, session.items, "on") != null);
-}
-
-test "compact sandbox menu renders settings columns without markers" {
-    const projection: CompactCommandMenuProjection = .{ .sandbox = .{
-        .active = true,
-        .selected_index = 0,
-        .snapshot = .{ .sandbox = "none" },
-        .os_sandbox_available = false,
-    } };
-
-    var row = try composeCompactCommandMenuRow(std.testing.allocator, projection, 2, 3, 100);
-    defer row.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, row.items, "Command sandbox") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "Choose command process isolation") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "os") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "none") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "❯") == null);
-    try std.testing.expect(std.mem.find(u8, row.items, "✓") == null);
 }
 
 test "usage menu renders token-first totals and selectable model rows" {
@@ -1178,9 +1134,8 @@ test "workspace menu keeps launch-only roots visible but not selectable" {
 }
 
 test "compact command menu rows stay single-line and width safe" {
-    const projection: CompactCommandMenuProjection = .{ .sandbox = .{
+    const projection: CompactCommandMenuProjection = .{ .statusline = .{
         .active = true,
-        .snapshot = .{ .sandbox = "none" },
     } };
     for ([_]u16{ 1, 4, 18 }) |width| {
         var row = try composeCompactCommandMenuRow(std.testing.allocator, projection, 2, 4, width);

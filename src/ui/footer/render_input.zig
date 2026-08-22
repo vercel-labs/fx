@@ -20,7 +20,6 @@ const activity_runtime = @import("../../core/output/activity_runtime.zig");
 const transcript_presentation = @import("../../core/output/transcript_presentation.zig");
 const usage_menu = @import("../../core/session/usage_menu.zig");
 const core_input_runtime = @import("../../core/input/runtime.zig");
-const presentation_mode = @import("../../core/config/presentation_mode.zig");
 const ui_render = @import("../render.zig");
 const render_engine = @import("../render_engine.zig");
 const render_request = @import("../render_request.zig");
@@ -130,23 +129,6 @@ pub const SettingsMenuProjection = struct {
     }
 };
 
-pub const AppearanceMenuProjection = struct {
-    active: bool = false,
-    selected_index: usize = 0,
-    snapshot: settings_catalog.Snapshot = .{},
-};
-
-pub fn appearanceMenuProjection(
-    menu: *const settings_catalog.AppearanceMenu,
-    snapshot: settings_catalog.Snapshot,
-) AppearanceMenuProjection {
-    return .{
-        .active = menu.active,
-        .selected_index = menu.selected_index,
-        .snapshot = snapshot,
-    };
-}
-
 pub const StatuslineMenuProjection = struct {
     active: bool = false,
     selected_index: usize = 0,
@@ -161,26 +143,6 @@ pub fn statuslineMenuProjection(
         .active = menu.active,
         .selected_index = menu.selected_index,
         .snapshot = snapshot,
-    };
-}
-
-pub const SandboxMenuProjection = struct {
-    active: bool = false,
-    selected_index: usize = 0,
-    snapshot: settings_catalog.Snapshot = .{},
-    os_sandbox_available: bool = true,
-};
-
-pub fn sandboxMenuProjection(
-    menu: *const settings_catalog.SandboxMenu,
-    snapshot: settings_catalog.Snapshot,
-    os_sandbox_available: bool,
-) SandboxMenuProjection {
-    return .{
-        .active = menu.active,
-        .selected_index = menu.selected_index,
-        .snapshot = snapshot,
-        .os_sandbox_available = os_sandbox_available,
     };
 }
 
@@ -232,7 +194,6 @@ pub fn workspaceMenuProjection(
 
 pub const CompactCommandMenuProjection = union(enum) {
     statusline: StatuslineMenuProjection,
-    sandbox: SandboxMenuProjection,
     usage: UsageMenuProjection,
     workspace: WorkspaceMenuProjection,
 };
@@ -292,9 +253,6 @@ pub fn modelMenuProjection(cache: *const model_cache_runtime.Runtime) ModelMenuP
 
 const max_static_status_activity_rows: u16 = 3;
 
-pub const InputAppearance = core_input_runtime.InputAppearance;
-pub const MaxxingMode = presentation_mode.MaxxingMode;
-
 pub const QueuedPromptCard = struct {
     bytes: []const u8,
     row_count: u16,
@@ -311,8 +269,6 @@ pub const RenderContext = struct {
     model: []const u8,
     pending_images: []const types.ImageAttachment = &.{},
     composer_visible: bool = true,
-    input_appearance: InputAppearance = .lines,
-    maxxing_mode: MaxxingMode = .legacy,
     permission_mode: types.PermissionMode = .ask,
     queued_count: usize,
     queued_paused: bool = false,
@@ -360,9 +316,7 @@ pub const RenderContext = struct {
     skills_menu: SkillsMenuProjection = .{},
     model_menu: ModelMenuProjection = .{},
     session_menu: SessionMenuProjection = .{},
-    appearance_menu: AppearanceMenuProjection = .{},
     statusline_menu: StatuslineMenuProjection = .{},
-    sandbox_menu: SandboxMenuProjection = .{},
     usage_menu: UsageMenuProjection = .{},
     workspace_menu: WorkspaceMenuProjection = .{},
     upgrade_status: []const u8 = "",
@@ -378,7 +332,6 @@ pub const RenderContext = struct {
 
 pub fn activeCompactCommandMenu(ctx: RenderContext) ?CompactCommandMenuProjection {
     if (ctx.statusline_menu.active) return .{ .statusline = ctx.statusline_menu };
-    if (ctx.sandbox_menu.active) return .{ .sandbox = ctx.sandbox_menu };
     if (ctx.usage_menu.active) return .{ .usage = ctx.usage_menu };
     if (ctx.workspace_menu.active) return .{ .workspace = ctx.workspace_menu };
     return null;
@@ -417,7 +370,7 @@ pub fn queuedBannerRows(ctx: RenderContext) u16 {
 }
 
 pub fn transientActivityGapRows(shell: *const TranscriptRuntime, tool_before_activity: bool) u16 {
-    if (tool_before_activity and shell.maxxing_mode == .minimal) return 0;
+    if (tool_before_activity) return 0;
     return shell.transientAssistantGapRows();
 }
 
@@ -791,11 +744,11 @@ test "frame-owned activity keeps active tools out of the turn status row" {
     }
 }
 
-test "minimal frame-owned activity leaves the focused tool in the transcript" {
+test "current frame-owned activity leaves the focused tool in the transcript" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
 
-    var shell = TranscriptRuntime{ .maxxing_mode = .minimal };
+    var shell = TranscriptRuntime{};
     defer shell.deinit(std.testing.allocator);
     const ctx: RenderContext = .{
         .stream = .{

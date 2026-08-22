@@ -535,7 +535,7 @@ fn fetchGatewayJsonAtUrlCore(
 
     var cancel_watch_done = std.atomic.Value(bool).init(false);
     const cancel_watcher = if (req.connection) |conn|
-        try spawn_gateway_cancel_watcher(&cancel_watch_done, cancel_flag, null, conn.stream_writer.stream)
+        try spawn_gateway_cancel_watcher(&cancel_watch_done, cancel_flag, null, null, conn.stream_writer.stream)
     else
         null;
     defer {
@@ -1281,7 +1281,7 @@ fn streamGatewayCompletionCoreWithOptions(
         var system_resumed = std.atomic.Value(bool).init(false);
         const cancel_watcher = if (watch_connected_socket)
             if (req.connection) |conn|
-                spawn_gateway_cancel_watcher(&cancel_watch_done, cancel_flag, &system_resumed, conn.stream_writer.stream) catch |err| {
+                spawn_gateway_cancel_watcher(&cancel_watch_done, cancel_flag, &system_resumed, null, conn.stream_writer.stream) catch |err| {
                     debug_trace.eventf("gateway", "cancel_watcher_spawn_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
                     return @as(anyerror!StreamResult, err);
                 }
@@ -1714,6 +1714,7 @@ const GatewayCancelWatcher = struct {
         done: *std.atomic.Value(bool),
         cancel_flag: *std.atomic.Value(bool),
         system_resumed: ?*std.atomic.Value(bool),
+        deadline: ?std.Io.Clock.Timestamp,
         stream: std.Io.net.Stream,
     ) void {
         var previous = SuspendClockSample.now();
@@ -1721,6 +1722,13 @@ const GatewayCancelWatcher = struct {
             if (cancel_flag.load(.seq_cst)) {
                 stream.shutdown(io_mod.getIo(), .both) catch {};
                 return;
+            }
+            if (deadline) |limit| {
+                const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+                if (!std.Io.Clock.Timestamp.compare(now, .lt, limit)) {
+                    stream.shutdown(io_mod.getIo(), .both) catch {};
+                    return;
+                }
             }
             io_mod.sleep(10 * std.time.ns_per_ms);
             const current = SuspendClockSample.now();
@@ -1760,16 +1768,40 @@ fn suspendGapDetected(previous: SuspendClockSample, current: SuspendClockSample)
     return boot_elapsed - awake_elapsed > suspend_gap_tolerance_ns;
 }
 
+pub fn spawnHttpCancelWatcher(
+    done: *std.atomic.Value(bool),
+    cancel_flag: *std.atomic.Value(bool),
+    stream: std.Io.net.Stream,
+) !std.Thread {
+    return spawn_gateway_cancel_watcher(done, cancel_flag, null, null, stream);
+}
+
+pub fn spawnHttpCancelWatcherBounded(
+    done: *std.atomic.Value(bool),
+    cancel_flag: *std.atomic.Value(bool),
+    deadline: std.Io.Clock.Timestamp,
+    stream: std.Io.net.Stream,
+) !std.Thread {
+    return spawn_gateway_cancel_watcher(done, cancel_flag, null, deadline, stream);
+}
+
 fn spawn_gateway_cancel_watcher(
     done: *std.atomic.Value(bool),
     cancel_flag: *std.atomic.Value(bool),
     system_resumed: ?*std.atomic.Value(bool),
+    deadline: ?std.Io.Clock.Timestamp,
     stream: std.Io.net.Stream,
 ) !std.Thread {
     if (builtin.is_test) {
         if (test_cancel_watcher_spawn_error) |err| return err;
     }
-    return std.Thread.spawn(.{}, GatewayCancelWatcher.run, .{ done, cancel_flag, system_resumed, stream });
+    return std.Thread.spawn(.{}, GatewayCancelWatcher.run, .{
+        done,
+        cancel_flag,
+        system_resumed,
+        deadline,
+        stream,
+    });
 }
 
 test "suspend gap classification compares boot and awake clocks" {

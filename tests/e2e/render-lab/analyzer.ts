@@ -1,5 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import {
+  findFooterBlocks,
+  isInputRow as isRenderedInputRow,
+} from "../tui-render-assertions";
 import { stdoutFrames } from "./tape";
 import type {
   RenderLabFailure,
@@ -56,7 +60,7 @@ export function analyzeRun(manifest: RenderLabManifest) {
       frame.cursor,
       multilineInputMarkers,
     );
-    const input_rows = findInputRows(frame.grid).filter((rowIndex) => {
+    const input_rows = footers.map((footer) => footer.input).filter((rowIndex) => {
       const row = frame.grid[rowIndex] ?? "";
       return !manifest.markers.submitted.some((marker) => row.includes(marker));
     });
@@ -125,7 +129,7 @@ export function analyzeRun(manifest: RenderLabManifest) {
 
       const dividerRows = footer.hasTopDivider
         ? [footer.topDivider, footer.bottomDivider]
-        : [footer.bottomDivider];
+        : [];
       const widthFailures = dividerRows.filter((rowIndex) => {
         const width = visibleWidth(frame.grid[rowIndex] ?? "");
         return width > frame.width || width < Math.max(8, Math.floor(frame.width * 0.55));
@@ -305,27 +309,11 @@ export function findFooters(
   cursor: RenderLabFrame["cursor"] = null,
   multilineInputMarkers: string[] = [],
 ): Footer[] {
-  const footers: Footer[] = [];
-  for (let i = 0; i < grid.length; i += 1) {
-    if (!isInputRow(grid[i] ?? "")) continue;
-    const footer = {
-      topDivider: i - 1,
-      input: i,
-      bottomDivider: i + 1,
-      hint: i + 2,
-      multiline: false,
-      hasTopDivider: true,
-    };
-    if (footer.bottomDivider >= grid.length || footer.hint >= grid.length) continue;
-    if (!isDividerRow(grid[footer.bottomDivider] ?? "")) continue;
-    if (!isFooterHintRow(grid[footer.hint] ?? "")) continue;
-    if (!grid.slice(i + 1, footer.bottomDivider).every(isInputContinuationRow)) continue;
-    if (!isDividerRow(grid[footer.topDivider] ?? "")) {
-      footer.topDivider = i;
-      footer.hasTopDivider = false;
-    }
-    footers.push(footer);
-  }
+  const footers: Footer[] = findFooterBlocks(grid).map((footer) => ({
+    ...footer,
+    hint: footer.bottomDivider + 1,
+    multiline: false,
+  }));
   if (footers.length === 0) {
     for (let bottomDivider = 1; bottomDivider + 1 < grid.length; bottomDivider += 1) {
       if (!isDividerRow(grid[bottomDivider] ?? "")) continue;
@@ -372,15 +360,6 @@ function isMultilineInputBand(
   if (!inputMarkers.some((marker) => rows.some((row) => row.includes(marker)))) return false;
   if (!rows.some((row) => row.trim().length > 0)) return false;
   return rows.every((row) => row.trim().length === 0 || isInputRow(row) || row.startsWith("  "));
-}
-
-function findInputRows(grid: string[]): number[] {
-  const rows: number[] = [];
-  for (let i = 0; i < grid.length; i += 1) {
-    if (!isInputRow(grid[i] ?? "")) continue;
-    rows.push(i);
-  }
-  return rows;
 }
 
 export function findLogoRows(grid: string[]): number[] {
@@ -478,11 +457,11 @@ function assertActiveToolPlacementScenario(
         "active-tool-terminal-scrollback-once",
       );
     }
-    if (commandMoreCount(grid) === null) {
-      push(failures, "active-tool-folded-summary", frame, "compact command frame has no summary");
+    if (commandMoreCount(grid) !== null) {
+      push(failures, "active-tool-compact-output-preview", frame, "compact command frame exposed an output preview");
     }
     if (grid.includes("ACTIVE_TOOL_LINE_06") || grid.includes("ACTIVE_TOOL_LINE_32")) {
-      push(failures, "active-tool-folded-output-hidden", frame, "compact command frame exposes output beyond the five-row preview");
+      push(failures, "active-tool-folded-output-hidden", frame, "compact command frame exposes raw output");
     }
     if (frame.event === "active-tool-final-update") {
       assertScrollbackMarkerCount(
@@ -586,33 +565,37 @@ function assertActiveActivitySequence(
   const submittedRows = lines.flatMap((line, row) =>
     line.includes(submittedMarker) ? [row] : []
   );
+  const groupRows = lines.flatMap((line, row) =>
+    line.includes("tool call") && row < lines.length - 1 ? [row] : []
+  );
   const activityRows = lines.flatMap((line, row) =>
     line.includes(activeMarker) ? [row] : []
   );
-  if (submittedRows.length !== 1 || activityRows.length !== 1) {
+  if (submittedRows.length !== 1 || groupRows.length !== 1 || activityRows.length !== 1) {
     push(
       failures,
       "active-tool-activity-marker-count",
       frame,
-      `expected one submitted row and one activity row, found ${submittedRows.length} and ${activityRows.length}`,
+      `expected one submitted row, group row, and activity row, found ${submittedRows.length}, ${groupRows.length}, and ${activityRows.length}`,
     );
     return;
   }
 
   const submittedRow = submittedRows[0]!;
+  const groupRow = groupRows[0]!;
   const activityRow = activityRows[0]!;
-  if (submittedRow >= activityRow) {
+  if (submittedRow >= groupRow || groupRow >= activityRow) {
     push(
       failures,
       "active-tool-activity-marker-order",
       frame,
-      "activity row did not follow the submitted prompt",
+      "grouped activity did not follow the submitted prompt",
     );
     return;
   }
 
   let blankRows = 0;
-  for (let row = activityRow - 1; row > submittedRow; row -= 1) {
+  for (let row = groupRow - 1; row > submittedRow; row -= 1) {
     if ((lines[row] ?? "").trim().length !== 0) break;
     blankRows += 1;
   }
@@ -1059,6 +1042,9 @@ function expectsFxChrome(
     frame.event.startsWith("shell-") ||
     frame.event.startsWith("native-shell-") ||
     frame.event.startsWith("observability-permission-") ||
+    frame.event.includes("help-visible") ||
+    frame.event.includes("slash-menu-expanded") ||
+    frame.event.includes("final-third-launch-state") ||
     frame.event.includes("fx-quit-requested") ||
     frame.event.includes("post-quit-shell-prompt")
   ) {
@@ -1092,7 +1078,7 @@ function hasLogoGlyphs(row: string): boolean {
 }
 
 function isInputRow(line: string): boolean {
-  return /^[❯>](\s|$)/.test(line) || /^\[\d+\/\d+\]\s[❯>](\s|$)/.test(line);
+  return isRenderedInputRow(line);
 }
 
 function isFooterHintRow(line: string): boolean {
@@ -1114,11 +1100,6 @@ function hasTranscriptViewerFooter(grid: string[]): boolean {
     }
   }
   return false;
-}
-
-function isInputContinuationRow(line: string): boolean {
-  const text = semanticText(line);
-  return text.trim().length === 0 || text.startsWith("  ");
 }
 
 function isDividerRow(line: string): boolean {
@@ -1218,7 +1199,10 @@ function assertStartupOverflowSubmittedTransition(
       push(failures, "submitted-prompt-tail-visible", frame, `submitted prompt marker ${marker} is missing from the active grid`);
     }
   }
-  if (!frame.grid.some((row) => /^❯\s*$/.test(semanticText(row)))) {
+  if (!frame.grid.some((row) => {
+    const text = semanticText(row);
+    return isInputRow(text) && text.trim().length === 1;
+  })) {
     push(failures, "submitted-empty-input-visible", frame, "submitted frame has no empty footer prompt");
   }
 }

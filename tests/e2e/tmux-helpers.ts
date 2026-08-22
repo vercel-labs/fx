@@ -869,6 +869,25 @@ export class TmuxSession {
   }
 
   /**
+   * Current pane title, which is what a terminal renders as the tab label.
+   * fx sets it through OSC 2, so this reads back what the user would see.
+   */
+  async paneTitle(): Promise<string> {
+    try {
+      return execFileSync(
+        "tmux",
+        this.tmuxArgs(["display-message", "-p", "-t", this.name, "#{pane_title}"]),
+        {
+          stdio: "pipe",
+          encoding: "utf-8",
+        },
+      ).trimEnd();
+    } catch {
+      return "";
+    }
+  }
+
+  /**
    * Resize the tmux window. Delivers a real SIGWINCH to fx, exercising the
    * resize pipeline end-to-end. Default post-resize sleep covers the 100 ms
    * debounce in src/main.zig.

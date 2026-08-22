@@ -1710,7 +1710,6 @@ test "valid mixed irreducible state cannot exceed the communication record" {
                 .generation = ledger.authority_generation,
                 .root_id = "root",
                 .tools = &tools,
-                .sandbox_backend = .macos,
                 .integrations = &.{},
                 .rules = .{ .rules = &.{} },
                 .grants = ledger.authority_grants,

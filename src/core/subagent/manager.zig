@@ -280,10 +280,12 @@ pub const TreeDiagnosticCode = enum {
 
 pub const TreeDiagnostic = struct {
     session_id: []u8,
+    parent_id: ?[]u8 = null,
     code: TreeDiagnosticCode,
 
     pub fn deinit(self: *TreeDiagnostic, alloc: Allocator) void {
         alloc.free(self.session_id);
+        if (self.parent_id) |parent_id| alloc.free(parent_id);
         self.* = undefined;
     }
 };
@@ -293,6 +295,7 @@ pub const TreeQuery = struct {
     cursor: ?[]const u8 = null,
     anchor_id: ?[]const u8 = null,
     limit: usize = domain.default_page_limit,
+    hide_terminal_one_off: bool = false,
 };
 
 pub const TreeNode = struct {
@@ -667,6 +670,7 @@ pub const Manager = struct {
             var record = self.loadIndexedTreeRecord(
                 alloc,
                 candidate.child_id,
+                traversal.frames.items[frame_index].parent_id,
                 &diagnostics,
                 &diagnostics_truncated,
             ) catch |err| return switch (err) {
@@ -681,11 +685,15 @@ pub const Manager = struct {
                 traversal.frames.items[frame_index].parent_id,
             )) continue;
 
-            var node = try treeNodeFromRecord(alloc, value, depth);
-            var node_appended = false;
-            errdefer if (!node_appended) node.deinit(alloc);
-            try nodes.append(alloc, node);
-            node_appended = true;
+            if (!query.hide_terminal_one_off or
+                !isTerminalOneOff(value.mode, value.state))
+            {
+                var node = try treeNodeFromRecord(alloc, value, depth);
+                var node_appended = false;
+                errdefer if (!node_appended) node.deinit(alloc);
+                try nodes.append(alloc, node);
+                node_appended = true;
+            }
 
             if (migration_pages < max_snapshot_migration_pages) {
                 relationship_index.recoverForQuery(
@@ -1051,6 +1059,7 @@ pub const Manager = struct {
         self: *Manager,
         alloc: Allocator,
         child_id: []const u8,
+        parent_id: []const u8,
         diagnostics: *std.ArrayList(TreeDiagnostic),
         diagnostics_truncated: *bool,
     ) error{OutOfMemory}!?control_store.Record {
@@ -1074,6 +1083,7 @@ pub const Manager = struct {
                 diagnostics,
                 diagnostics_truncated,
                 child_id,
+                if (err == error.SessionNotFound) parent_id else null,
                 code,
             );
             return null;
@@ -1100,6 +1110,7 @@ pub const Manager = struct {
                 diagnostics,
                 diagnostics_truncated,
                 child_id,
+                null,
                 code,
             );
             return null;
@@ -3520,6 +3531,9 @@ fn reduceRelationship(
         );
     };
     defer if (next) |*record| record.deinit(alloc);
+    if (!canMutateRelationship(next.?.mode, command.action)) {
+        return .{ .reject = .invalid_state };
+    }
     for (next.?.queue) |work| switch (work.status) {
         .running, .awaiting_approval => return .{ .reject = .invalid_state },
         else => {},
@@ -3563,6 +3577,28 @@ fn reduceRelationship(
         event_kind,
         context.timestamp_ms,
     );
+}
+
+fn canMutateRelationship(
+    target_mode: domain.Mode,
+    action: domain.RelationshipAction,
+) bool {
+    return target_mode != .one_off or
+        (action != .detach and action != .reparent);
+}
+
+fn isTerminalOneOff(mode: domain.Mode, state: domain.State) bool {
+    if (mode != .one_off) return false;
+    return switch (state) {
+        .completed, .failed, .cancelled => true,
+        .idle,
+        .queued,
+        .running,
+        .awaiting_approval,
+        .interrupted,
+        .archived,
+        => false,
+    };
 }
 
 fn reduceConfigure(
@@ -4596,6 +4632,7 @@ fn appendTreeDiagnostic(
     diagnostics: *std.ArrayList(TreeDiagnostic),
     truncated: *bool,
     session_id: []const u8,
+    parent_id: ?[]const u8,
     code: TreeDiagnosticCode,
 ) Allocator.Error!void {
     if (diagnostics.items.len == max_snapshot_diagnostics) {
@@ -4604,8 +4641,11 @@ fn appendTreeDiagnostic(
     }
     const owned_id = try alloc.dupe(u8, session_id);
     errdefer alloc.free(owned_id);
+    const owned_parent = if (parent_id) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (owned_parent) |value| alloc.free(value);
     try diagnostics.append(alloc, .{
         .session_id = owned_id,
+        .parent_id = owned_parent,
         .code = code,
     });
 }
@@ -6387,6 +6427,76 @@ test "detach and reparent reject running or approval-blocked work" {
     try std.testing.expectEqual(FailureCode.invalid_state, approval_rejected.failure.code);
 }
 
+test "detach and reparent reject canonical one off targets" {
+    const alloc = std.testing.allocator;
+    var env = try TestEnvironment.init(alloc);
+    defer env.deinit(alloc);
+    try env.createSession(alloc, "parent-a");
+    try env.createSession(alloc, "parent-b");
+    try env.createSession(alloc, "child-id");
+    var manager = Manager{ .sessions = &env.store };
+    var create = try domain.validateCommand(alloc, .{ .create = .{
+        .name = "temporary worker",
+        .mode = .one_off,
+        .prompt = "temporary work",
+    } });
+    defer create.deinit(alloc);
+    var created = try manager.execute(alloc, create, .{
+        .actor_id = "parent-a",
+        .operation_id = "create-one-off",
+        .created_child_id = "child-id",
+        .timestamp_ms = 1,
+    });
+    defer created.deinit(alloc);
+    try std.testing.expect(created == .receipt);
+
+    for ([_]struct {
+        action: domain.RelationshipAction,
+        operation_id: []const u8,
+        parent_id: ?[]const u8,
+    }{
+        .{ .action = .detach, .operation_id = "detach-one-off", .parent_id = null },
+        .{ .action = .reparent, .operation_id = "reparent-one-off", .parent_id = "parent-b" },
+    }) |case| {
+        var command = try domain.validateCommand(alloc, .{ .relationship = .{
+            .action = case.action,
+            .id = "child-id",
+            .parent_id = case.parent_id,
+        } });
+        defer command.deinit(alloc);
+        var rejected = try manager.execute(alloc, command, .{
+            .actor_id = "parent-a",
+            .operation_id = case.operation_id,
+            .relationship_authorization = if (case.action == .detach) .none else .direct,
+            .timestamp_ms = 2,
+        });
+        defer rejected.deinit(alloc);
+        try std.testing.expect(rejected == .failure);
+        try std.testing.expectEqual(FailureCode.invalid_state, rejected.failure.code);
+    }
+
+    var capability = try env.store.openSubagentControlCapabilityReadOnly(
+        alloc,
+        "child-id",
+        .{},
+    );
+    defer capability.deinit();
+    const store = control_store.Store{
+        .capability = &capability,
+        .expected_child_id = "child-id",
+    };
+    var record = try store.load(alloc);
+    defer record.deinit(alloc);
+    try std.testing.expectEqualStrings("parent-a", record.parent_id.?);
+    try std.testing.expect((try relationship_index.lookupSlot(
+        alloc,
+        &env.store,
+        "parent-a",
+        "child-id",
+        .{},
+    )) != null);
+}
+
 test "stored snapshot polling uses fake clock coalesces ticks and stops without model work" {
     const alloc = std.testing.allocator;
     var env = try TestEnvironment.init(alloc);
@@ -7638,7 +7748,6 @@ test "live authority resolver refreshes deny rules before the next child action"
             return .{
                 .generation = self.generation,
                 .tools = tools,
-                .sandbox_backend = .macos,
                 .integrations = integrations,
                 .rules = .{ .rules = rules },
                 .grants = try output_alloc.alloc(types.PermissionGrant, 0),
@@ -7679,7 +7788,6 @@ test "live authority resolver refreshes deny rules before the next child action"
     var first = try resolver.resolve(alloc, "child-id");
     defer first.deinit(alloc);
     try std.testing.expectEqual(types.PermissionMode.auto, first.permission_mode);
-    try std.testing.expectEqual(types.BackendKind.macos, first.sandbox_backend);
     try std.testing.expectEqualStrings("run_command", first.tools[0]);
     try std.testing.expectEqualStrings("mcp:test", first.integrations[0]);
     try std.testing.expectEqual(
@@ -8141,6 +8249,142 @@ test "manager snapshot migrates legacy control edges without global discovery" {
         relationship_index.max_candidate_reads +
             session_store.relationship_migration_candidate_limit *
                 (max_snapshot_migration_pages - 1));
+}
+
+test "descendant count remains unknown until legacy migration completes" {
+    const alloc = std.testing.allocator;
+    var env = try TestEnvironment.init(alloc);
+    defer env.deinit(alloc);
+    try env.createSession(alloc, "root-id");
+    try env.createSession(alloc, "legacy-child");
+    var manager = Manager{ .sessions = &env.store };
+    try executeRelationshipForTest(
+        alloc,
+        &manager,
+        "root-id",
+        "legacy-attach",
+        .attach,
+        "legacy-child",
+        "root-id",
+    );
+    try env.commitSession(alloc, "legacy-child", 2);
+    try std.testing.expect(try relationship_index.removeChild(
+        alloc,
+        &env.store,
+        "root-id",
+        "legacy-child",
+        .{},
+    ));
+
+    for (0..session_store.relationship_migration_candidate_limit + 1) |index| {
+        var id_buffer: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buffer, "newer-{d:0>3}", .{index});
+        try env.createSession(alloc, id);
+        try env.commitSession(alloc, id, @intCast(100 + index));
+    }
+
+    try std.testing.expect((try relationship_index.activeCountIfMigrationComplete(
+        alloc,
+        &env.store,
+        "root-id",
+        .{},
+    )) == null);
+    _ = try relationship_index.migrateLegacyPage(alloc, &env.store, "root-id", .{});
+    try std.testing.expect((try relationship_index.activeCountIfMigrationComplete(
+        alloc,
+        &env.store,
+        "root-id",
+        .{},
+    )) == null);
+
+    var active_count: ?u64 = null;
+    for (0..8) |_| {
+        _ = try relationship_index.migrateLegacyPage(alloc, &env.store, "root-id", .{});
+        active_count = try relationship_index.activeCountIfMigrationComplete(
+            alloc,
+            &env.store,
+            "root-id",
+            .{},
+        );
+        if (active_count != null) break;
+    }
+    try std.testing.expectEqual(@as(?u64, 1), active_count);
+}
+
+test "legacy migration participates in the parent control lock boundary" {
+    const alloc = std.testing.allocator;
+    var env = try TestEnvironment.init(alloc);
+    defer env.deinit(alloc);
+    try env.createSession(alloc, "root-id");
+    try env.indexSession(alloc, "root-id");
+    var capability = try env.store.openSubagentControlCapabilityWritable(
+        alloc,
+        "root-id",
+        .{},
+    );
+    defer capability.deinit();
+    const store = control_store.Store{
+        .capability = &capability,
+        .expected_child_id = "root-id",
+    };
+    var lock = try store.acquireLock();
+    defer lock.release();
+
+    try std.testing.expectError(
+        error.LockBusy,
+        relationship_index.migrateLegacyPage(
+            alloc,
+            &env.store,
+            "root-id",
+            .{},
+        ),
+    );
+}
+
+test "missing child diagnostic retains the exact stale parent edge" {
+    const alloc = std.testing.allocator;
+    var env = try TestEnvironment.init(alloc);
+    defer env.deinit(alloc);
+    try env.createSession(alloc, "root-id");
+    try env.createSession(alloc, "missing-child");
+    var manager = Manager{ .sessions = &env.store };
+    try executeRelationshipForTest(
+        alloc,
+        &manager,
+        "root-id",
+        "attach-missing",
+        .attach,
+        "missing-child",
+        "root-id",
+    );
+    var writer = try env.store.resumeForWrite(alloc, "missing-child");
+    try std.testing.expectEqual(
+        session_store.PristineDiscardDisposition.discarded,
+        env.store.deleteCommittedSession(alloc, &writer),
+    );
+
+    var snapshot = try manager.snapshot(alloc, .{ .root_id = "root-id" });
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.snapshot.nodes.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.snapshot.diagnostics.len);
+    const diagnostic = snapshot.snapshot.diagnostics[0];
+    try std.testing.expectEqual(TreeDiagnosticCode.session_unavailable, diagnostic.code);
+    try std.testing.expectEqualStrings("missing-child", diagnostic.session_id);
+    try std.testing.expectEqualStrings("root-id", diagnostic.parent_id.?);
+    try std.testing.expect(try relationship_index.removeChild(
+        alloc,
+        &env.store,
+        diagnostic.parent_id.?,
+        diagnostic.session_id,
+        .{},
+    ));
+    try std.testing.expect((try relationship_index.lookupSlot(
+        alloc,
+        &env.store,
+        "root-id",
+        "missing-child",
+        .{},
+    )) == null);
 }
 
 test "manager snapshot recovers every pending free boundary without exposing the edge" {

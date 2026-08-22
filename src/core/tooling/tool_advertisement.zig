@@ -138,7 +138,7 @@ const test_memory = blk: {
         .description = spec.description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "action", .json_type = .string, .enum_values = &.{ "save", "list", "clear" } },
+                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "save", "list", "clear" } } },
                 .{ .name = "fact", .json_type = .string },
             },
             .required = &.{"action"},
@@ -457,7 +457,7 @@ const test_terminal = blk: {
         .description = spec.description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "action", .json_type = .string, .enum_values = &.{"exec"} },
+                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"exec"} } },
                 .{ .name = "command", .json_type = .string },
             },
             .required = &.{ "action", "command" },

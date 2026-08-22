@@ -27,7 +27,6 @@ const terminal_action_decoder = @import("terminal_action_decoder.zig");
 
 const ImageBlocks = kill_ring.ImageBlocks;
 const InputRuntime = core_input_runtime.Runtime;
-const InputAppearance = core_input_runtime.InputAppearance;
 
 const Allocator = std.mem.Allocator;
 const InsertResult = composer_insertion.InsertResult;
@@ -2306,6 +2305,15 @@ test "input escape parser separates plain up down from history arrows" {
 test "input escape parser recognizes unmodified kitty Escape" {
     try expectEscapeAction("[27u", .escape);
     try expectEscapeAction("[27;1u", .escape);
+    try expectEscapeAction("[27;1:1u", .escape);
+    try expectEscapeAction("[27;1:2u", .escape);
+    try expectEscapeAction("[27;1:3u", .ignore);
+    // Ghostty with Num Lock active sends modifier 128 (bit 7).
+    try expectEscapeAction("[27;129u", .escape);
+    try expectEscapeAction("[27;129:1u", .escape);
+    // Caps Lock (bit 6) should also be ignored.
+    try expectEscapeAction("[27;65u", .escape);
+    try expectEscapeAction("[27;65:1u", .escape);
 }
 
 test "input escape parser resolves unmodified kitty Backspace to a delete byte" {

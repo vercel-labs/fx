@@ -64,7 +64,7 @@ async function disablePromptHistory(
 ): Promise<void> {
   await session.sendText("/settings");
   await session.waitForText("←→ Change", TIMEOUT);
-  for (let index = 0; index < 13; index += 1) {
+  for (let index = 0; index < 10; index += 1) {
     await session.sendKeys("Down");
   }
   await session.sendKeys("Left");
@@ -124,77 +124,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
   });
 
   serialTest(
-    "appearance settings persist independently across launches",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-input-appearance-persistence-"));
-      try {
-        const home = join(root, "home");
-        const workspace = join(root, "workspace");
-        const stderrAPath = join(root, "stderr-a.log");
-        const stderrBPath = join(root, "stderr-b.log");
-        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
-        mkdirSync(workspace);
-        const workspaceRoot = realpathSync(workspace);
-
-        session = await TmuxSession.create({
-          cwd: workspaceRoot,
-          env: { ...NO_AUTH, HOME: home },
-          stderrPath: stderrAPath,
-        });
-        await session.waitForText("Run /help", TIMEOUT);
-        await session.sendText("/appearance");
-        await session.waitForText("Input appearance", TIMEOUT);
-        expect(await session.capturePane()).toContain("lines  tint");
-        expect(await session.capturePane()).toContain("minimal  legacy");
-        await session.sendKeys("Escape");
-        await session.waitForComposer(TIMEOUT);
-        await session.sendText("/appearance input lines");
-        await session.waitForText("● Input: switched to lines", TIMEOUT);
-        await session.sendText("/appearance presentation normal");
-        await session.waitForText("● Maxxing: switched to legacy", TIMEOUT);
-        await session.waitForStableComposer(TIMEOUT);
-        await session.sendText("/quit");
-        await session.waitForSessionEnd(TIMEOUT);
-        session = null;
-
-        let stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
-        expect(stored.input_appearance).toBe("lines");
-        expect(stored.maxxing_mode).toBe("legacy");
-
-        secondSession = await TmuxSession.create({
-          cwd: workspaceRoot,
-          env: { ...NO_AUTH, HOME: home },
-          stderrPath: stderrBPath,
-        });
-        await secondSession.waitForText("Run /help", TIMEOUT);
-        await secondSession.sendText("/appearance");
-        await secondSession.waitForText("Input appearance", TIMEOUT);
-        expect(await secondSession.capturePane()).toContain("lines  tint");
-        expect(await secondSession.capturePane()).toContain("minimal  legacy");
-        await secondSession.sendKeys("Escape");
-        await secondSession.waitForComposer(TIMEOUT);
-        await secondSession.sendText("/appearance input tint");
-        await secondSession.waitForText("● Input: switched to tint", TIMEOUT);
-        await secondSession.sendText("/appearance presentation minimal");
-        await secondSession.waitForText("● Maxxing: switched to minimal", TIMEOUT);
-        await secondSession.waitForStableComposer(TIMEOUT);
-        await secondSession.sendText("/quit");
-        await secondSession.waitForSessionEnd(TIMEOUT);
-        secondSession = null;
-
-        stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
-        expect(stored.input_appearance).toBe("tint");
-        expect(stored.maxxing_mode).toBe("minimal");
-        expect(readFileSync(stderrAPath, "utf8")).toBe("");
-        expect(readFileSync(stderrBPath, "utf8")).toBe("");
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    },
-    60_000,
-  );
-
-  serialTest(
     "user preferences migrate globally and load in another project",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-config-persistence-"));
@@ -238,6 +167,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
                   sandbox: false,
                   context: false,
                   session: false,
+                  workspace: false,
                   future: "keep-a-status",
                 },
                 future_workspace: { nested: "a" },
@@ -253,6 +183,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
                   sandbox: false,
                   context: false,
                   session: false,
+                  workspace: false,
                   future: "keep-b-status",
                 },
                 future_workspace: { nested: "b" },
@@ -284,14 +215,12 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.waitForText("● Switched to anthropic/claude-opus-4.7", TIMEOUT);
         await session.sendText("/fast");
         await session.waitForText("● Fast: on", TIMEOUT);
-        await session.sendText("/sandbox none");
-        await session.waitForText("● Sandbox: already set to none", TIMEOUT);
-        await session.sendText("/statusline sandbox");
-        await session.waitForText("● Statusline: sandbox:", TIMEOUT);
         await session.sendText("/statusline context");
         await session.waitForText("● Statusline: context:", TIMEOUT);
         await session.sendText("/statusline session");
         await session.waitForText("● Statusline: session:", TIMEOUT);
+        await session.sendText("/statusline workspace");
+        await session.waitForText("● Statusline: workspace:", TIMEOUT);
         await session.sendText("/settings startup-scrollback off");
         await session.waitForText("startup_scrollback: off", TIMEOUT);
         await disablePromptHistory(session, join(home, ".fx", "settings.json"));
@@ -307,9 +236,9 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(stored.startup_scrollback).toBe(false);
         expect(stored.prompt_history).toMatchObject({ enabled: false });
         expect(stored.statusLine).toMatchObject({
-          sandbox: true,
           context: true,
           session: true,
+          workspace: true,
         });
         expect(stored.future_global).toEqual({ nested: "preserve-me" });
         for (const [workspaceRoot, futureWorkspace, historyFuture, statusFuture] of [
@@ -323,7 +252,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           expect(override).not.toHaveProperty("fast_mode");
           expect(override).not.toHaveProperty("startup_scrollback");
           expect(override.prompt_history).toEqual({ future: historyFuture });
-          expect(override.statusLine).toEqual({ future: statusFuture });
+          expect(override.statusLine).toEqual({ sandbox: false, workspace: false, future: statusFuture });
           expect(override.future_workspace).toEqual({ nested: futureWorkspace });
         }
         expect(readFileSync(join(workspaceA, ".fx.json"), "utf8")).toBe(projectABytes);
@@ -336,7 +265,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           "fast_mode",
           "startup_scrollback",
           "prompt_history_enabled",
-          "statusline_sandbox",
           "statusline_context",
           "statusline_session",
         ].map((field) => migrationSnapshotPath(home, field));
@@ -368,9 +296,9 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           TIMEOUT,
         );
         await session.sendText("/statusline");
-        const statusline = await session.waitForText("Sandbox  ", TIMEOUT);
+        const statusline = await session.waitForText("Context  ", TIMEOUT);
         expect(statusline).toContain("Status line");
-        expect(statusline).toContain("Sandbox");
+        expect(statusline).not.toContain("Sandbox");
         expect(statusline).toContain("Context");
         expect(statusline).toContain("Session");
         expect(statusline).toContain("off  on");
@@ -408,7 +336,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
   );
 
   serialTest(
-    "sandbox and unscoped allowlist stay local while explicit user rules cross projects",
+    "unscoped allowlist stays local while explicit user rules cross projects",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-config-permission-scopes-"));
       try {
@@ -440,8 +368,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           stderrPath: stderrAPath,
         });
         await session.waitForText("Run /help", TIMEOUT);
-        await session.sendText("/sandbox none");
-        await session.waitForText("● Sandbox: already set to none", TIMEOUT);
         await session.sendText('/allowlist add command "local-a *"');
         await session.waitForText("(scope=local)", TIMEOUT);
         await session.sendText('/allowlist user add command "user *"');
@@ -454,7 +380,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           readFileSync(join(home, ".fx", "settings.json"), "utf8"),
         );
         expect(afterA.permission.bash["user *"]).toBe("allow");
-        expect(afterA.workspaces[workspaceARoot].sandbox).toBe("none");
         expect(afterA.workspaces[workspaceARoot].permission.bash["local-a *"]).toBe(
           "allow",
         );
@@ -466,14 +391,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           stderrPath: stderrBPath,
         });
         await session.waitForText("Run /help", TIMEOUT);
-        await session.sendText("/sandbox");
-        const sandbox = await session.waitForText("←→ Change", TIMEOUT);
-        expect(sandbox).toContain("Sandbox");
-        expect(sandbox).toContain("Command sandbox");
-        expect(sandbox).toContain("os  none");
-        expect(sandbox).not.toContain("✓");
-        await session.sendKeys("Escape");
-        await session.waitForComposer(TIMEOUT);
         await session.sendText("/allowlist view local");
         await session.waitForText(
           "● Allowlist: local persistent allow rules: (none)",
@@ -679,6 +596,74 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         session = null;
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  test(
+    "configured effort and Fast are visible before model catalog resolves",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-startup-preferences-"));
+      let releaseCatalog: (() => void) | null = null;
+      const catalogRelease = new Promise<void>((resolve) => {
+        releaseCatalog = resolve;
+      });
+      const gateway = startFakeGateway([], {
+        models: async () => {
+          await catalogRelease;
+          return [{
+            id: "anthropic/claude-opus-4.8",
+            type: "language",
+            released: 1,
+            tags: ["fast", "tool-use"],
+            reasoning_options: [{ type: "effort", values: ["high", "xhigh"] }],
+            pricing: {
+              fast: { input: "0.1", output: "0.2" },
+            },
+          }];
+        },
+      });
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        const stderrPath = join(root, "stderr.log");
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        writeFileSync(
+          join(home, ".fx", "settings.json"),
+          JSON.stringify({
+            model: "anthropic/claude-opus-4.8",
+            permission_mode: "auto",
+            effort: "xhigh",
+            fast_mode: true,
+          }) + "\n",
+          { mode: 0o600 },
+        );
+
+        session = await TmuxSession.create({
+          cwd: realpathSync(workspace),
+          env: {
+            ...NO_AUTH,
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          },
+          stderrPath,
+        });
+        const pane = await session.waitForText("auto · opus 4.8", TIMEOUT);
+        expect(pane).toContain("auto · opus 4.8 · xhigh · ⚡︎");
+        releaseCatalog?.();
+        releaseCatalog = null;
+
+        await session.sendText("/quit");
+        await session.waitForSessionEnd(TIMEOUT);
+        session = null;
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        releaseCatalog?.();
         gateway.stop();
         rmSync(root, { recursive: true, force: true });
       }
@@ -1416,6 +1401,50 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
     30_000,
   );
 
+  serialTest(
+    "workspace statusline stays active when user settings cannot be saved",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-statusline-write-failure-"));
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace-write-failure-visible");
+        const settingsPath = join(home, ".fx", "settings.json");
+        const externalSettings = join(root, "external-settings.json");
+        const stderrPath = join(root, "stderr.log");
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        writeFileSync(settingsPath, '{"statusLine":{"workspace":false}}\n', { mode: 0o600 });
+        writeFileSync(externalSettings, '{"statusLine":{"workspace":false}}\n', { mode: 0o600 });
+
+        session = await TmuxSession.create({
+          cwd: realpathSync(workspace),
+          env: { ...NO_AUTH, HOME: home },
+          stderrPath,
+        });
+        await session.waitForText("Run /help", TIMEOUT);
+        expect(await session.capturePane()).not.toContain("workspace-write-failure-visible");
+
+        rmSync(settingsPath);
+        symlinkSync(externalSettings, settingsPath);
+        await session.sendText("/statusline workspace");
+        await session.waitForText("active for this process but not saved to user settings", TIMEOUT);
+        await session.waitForPane(
+          (pane) => pane.includes("workspace-write-failure-visible"),
+          TIMEOUT,
+        );
+        expect(JSON.parse(readFileSync(externalSettings, "utf8")).statusLine.workspace).toBe(false);
+
+        await session.sendText("/quit");
+        await session.waitForSessionEnd(TIMEOUT);
+        session = null;
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
   serialTest("config diagnostics preserve invalid, oversized, and unsafe primaries", async () => {
     const root = mkdtempSync(join(tmpdir(), "fx-config-diagnostics-"));
     try {
@@ -1550,11 +1579,11 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         ]);
         await Promise.all([
           session.sendText("/settings startup-scrollback off"),
-          secondSession.sendText("/statusline sandbox"),
+          secondSession.sendText("/statusline context"),
         ]);
         await Promise.all([
           session.waitForText("startup_scrollback: off", TIMEOUT),
-          secondSession.waitForText("● Statusline: sandbox:", TIMEOUT),
+          secondSession.waitForText("● Statusline: context:", TIMEOUT),
         ]);
         await Promise.all([
           session.sendText("/quit"),
@@ -1572,7 +1601,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         );
         expect(stored.future_global).toEqual({ nested: "keep-global" });
         expect(stored.startup_scrollback).toBe(false);
-        expect(stored.statusLine).toMatchObject({ sandbox: true });
+        expect(stored.statusLine).toMatchObject({ context: true });
         expect(stored.workspaces[workspaceRoot]).toMatchObject({
           future_workspace: {
             nested: { keep: true },

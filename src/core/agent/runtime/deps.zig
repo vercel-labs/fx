@@ -27,7 +27,6 @@ const DiffEntryPayload = tool_contracts.DiffEntryPayload;
 const ToolCallValidationResult = tool_contracts.ToolCallValidationResult;
 const ToolExecutionRequest = tool_contracts.ToolExecutionRequest;
 const ToolExecutionResult = tool_contracts.ToolExecutionResult;
-const SandboxScopeRequired = tool_contracts.SandboxScopeRequired;
 const TransportPublicationOutcome = tool_contracts.TransportPublicationOutcome;
 pub const LiveToolAuthority = tool_contracts.LiveToolAuthority;
 
@@ -110,24 +109,6 @@ fn localModelCapabilities(_: *anyopaque, _: Allocator, model: []const u8) !model
     return model_capabilities.capabilitiesForModel(model);
 }
 
-fn sandboxWideningUnavailable(
-    _: *anyopaque,
-    _: Allocator,
-    _: ToolCall,
-    _: permission_auto_classifier.ReviewTurnContext,
-    _: PermissionMode,
-    _: []const PermissionGrant,
-    _: ?LiveToolAuthority,
-    _: []const []const u8,
-    _: SandboxScopeRequired,
-) !command_admission.PermissionOutcome {
-    return .{
-        .decision = .permission_required,
-        .denial_reason = .permission_required,
-        .requirement = .sandbox_widening,
-    };
-}
-
 pub const RouteRecoveryDecision = enum {
     disable_fast,
     switch_model,
@@ -203,10 +184,10 @@ pub const AgentRuntimeDeps = struct {
     request_tool_permission: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?LiveToolAuthority, revalidation: ?tool_contracts.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) anyerror!command_admission.PermissionOutcome,
     /// Admission consumes `prepared`; callers must not retry the same value through the raw callback.
     request_prepared_file_mutation_permission: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) anyerror!command_admission.PermissionOutcome = null,
-    request_sandbox_widening: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8, required: SandboxScopeRequired) anyerror!command_admission.PermissionOutcome = sandboxWideningUnavailable,
-    describe_tool_action: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
-    describe_tool_action_completed: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
-    describe_tool_action_denied: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
+    resolve_tool_action_display_target: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!?[]const u8 = null,
+    describe_tool_action: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
+    describe_tool_action_completed: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
+    describe_tool_action_denied: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
     permission_target_for_call: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
     execute_tool_call: *const fn (ctx: *anyopaque, request: ToolExecutionRequest) anyerror!ToolExecutionResult,
     publish_committed_file_handoff: *const fn (ctx: *anyopaque, handoff: file_mutation.CommittedFileHandoff) tool_contracts.SecondaryPublicationReport,
@@ -226,7 +207,7 @@ pub const AgentRuntimeDeps = struct {
     push_route_recovery_status: *const fn (ctx: *anyopaque, status: types.RouteRecoveryStatus) anyerror!void = discardRouteRecoveryStatus,
     push_command_output_complete: *const fn (ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) anyerror!void,
     push_http_error: *const fn (ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) anyerror!void,
-    refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode) anyerror!?[]u8 = null,
+    refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode, expected_account_id: ?[]const u8) anyerror!?[]u8 = null,
     request_route_recovery: ?*const fn (ctx: *anyopaque, arena: Allocator, request: RouteRecoveryRequest) anyerror!RouteRecoveryDecision = null,
     available_model_capabilities: *const fn (ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities = localAvailableModelCapabilities,
     resolve_model_capabilities: *const fn (ctx: *anyopaque, arena: Allocator, model: []const u8) anyerror!model_capabilities.Capabilities = localModelCapabilities,

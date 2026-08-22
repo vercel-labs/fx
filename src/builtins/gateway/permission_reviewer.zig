@@ -276,7 +276,7 @@ const FakeStream = struct {
         const self: *FakeStream = @ptrCast(@alignCast(raw_ctx));
         if (self.calls < self.deadlines.len) self.deadlines[self.calls] = deadline;
         self.saw_single_attempt_only = self.saw_single_attempt_only and retry_count == 1;
-        self.saw_expected_model_only = self.saw_expected_model_only and std.mem.eql(u8, model, "zai/glm-5.2");
+        self.saw_expected_model_only = self.saw_expected_model_only and std.mem.eql(u8, model, "moonshotai/kimi-k3");
         self.saw_required_tool_payload = self.saw_required_tool_payload and
             std.mem.find(u8, payload, "permission_decision") != null;
         const outcome = self.outcomes[@min(self.calls, self.outcomes.len - 1)];

@@ -15,12 +15,15 @@ const builtin_skills = @import("../builtins/skills.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const provider_id = @import("../core/providers/provider_id.zig");
+const secret = @import("../core/auth/secret.zig");
+const auth_runtime = @import("../core/auth/auth_runtime.zig");
+const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
+const model_catalog = @import("../core/gateway/model_catalog.zig");
 const hooks = @import("../core/hooks/hooks.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
-const sandbox = @import("../core/permissions/sandbox.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
@@ -148,17 +151,18 @@ pub const ActiveSessionState = struct {
     wasm_revision: ?[]u8 = null,
     session_write_mutex: std.Io.Mutex = .init,
     model: []u8,
+    provider: model_provider.ProviderId = .gateway,
     mode: []const u8,
     workspace_root: []const u8,
     api_key: []const u8,
     credential_source: ?types.CredentialSource = null,
+    account_id: ?[]const u8 = null,
     agent_step_limit: usize,
     max_tool_result_bytes: usize,
     fast_mode: bool,
     effort: types.ReasoningEffort,
     first_call_tool_choice: types.ToolChoice,
     permission_mode: types.PermissionMode,
-    sandbox_backend: sandbox.BackendKind,
     permission_rules: types.PermissionRuleSet,
     /// Runtime-only "allow for this session" grants. Never persisted to
     /// profile or project configuration.
@@ -197,7 +201,6 @@ const ActivePrompt = struct {
     /// Mid-turn mode changes apply to the next prompt, never the running one.
     mode: []const u8,
     permission_mode: types.PermissionMode,
-    sandbox_backend: sandbox.BackendKind,
     thread: if (host_target.is_wasm) void else std.Thread = if (host_target.is_wasm) {} else undefined,
     reapable: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
@@ -214,13 +217,12 @@ pub const ServerState = struct {
     workspace_root: []u8 = &.{},
     workspace_access: workspace_access.WorkspaceAccess = .{},
     /// Borrowed from one of the provider-owned credential buffers below.
-    api_key: []const u8 = &.{},
+    api_key: []u8 = &.{},
     credential_source: ?types.CredentialSource = null,
-    gateway_api_key: []u8 = &.{},
-    gateway_credential_source: ?types.CredentialSource = null,
-    opencode_go_api_key: []u8 = &.{},
+    account_id: ?[]u8 = null,
     gateway_team: ?[]u8 = null,
     selected_model: []u8 = &.{},
+    provider: model_provider.ProviderId = .gateway,
     configured_model: []u8 = &.{},
     process_model_override: bool = false,
     permission_mode: types.PermissionMode = .ask,
@@ -232,7 +234,6 @@ pub const ServerState = struct {
     effort: types.ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
     context_enabled: bool = true,
-    sandbox_backend: sandbox.BackendKind = .none,
     active_session: ?ActiveSessionState = null,
     active_prompt: ?*ActivePrompt = null,
     subagent_authority_mutex: std.Io.Mutex = .init,
@@ -268,9 +269,9 @@ pub const ServerState = struct {
         };
         self.workspace_access.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
-        if (self.gateway_api_key.len > 0) self.alloc.free(self.gateway_api_key);
-        if (self.opencode_go_api_key.len > 0) self.alloc.free(self.opencode_go_api_key);
+        if (self.api_key.len > 0) secret.zeroAndFree(self.alloc, self.api_key);
         if (self.gateway_team) |team| self.alloc.free(team);
+        if (self.account_id) |account_id| self.alloc.free(account_id);
         if (self.selected_model.len > 0) self.alloc.free(self.selected_model);
         if (self.configured_model.len > 0) self.alloc.free(self.configured_model);
         self.permission_rules.deinit(self.alloc);
@@ -292,6 +293,156 @@ pub const ServerState = struct {
     }
 };
 
+fn credentialMatchesProvider(
+    source: ?types.CredentialSource,
+    provider: model_provider.ProviderId,
+) bool {
+    return model_provider.authorizesCredential(provider, source);
+}
+
+fn adoptServerCredential(state: *ServerState, credential: *credentials.Credential) void {
+    if (state.active_session) |*active| active.api_key = &.{};
+    if (state.api_key.len > 0) secret.zeroAndFree(state.alloc, state.api_key);
+    if (state.gateway_team) |team| state.alloc.free(team);
+    if (state.account_id) |account_id| state.alloc.free(account_id);
+
+    state.api_key = credential.token;
+    credential.token = &.{};
+    state.credential_source = credential.source;
+    state.account_id = credential.account_id;
+    credential.account_id = null;
+    state.gateway_team = if (credential.team_id) |team| team else credential.team_slug;
+    if (credential.team_id != null) {
+        credential.team_id = null;
+        if (credential.team_slug) |slug| state.alloc.free(slug);
+        credential.team_slug = null;
+    } else {
+        credential.team_slug = null;
+    }
+    if (state.active_session) |*active| {
+        active.api_key = state.api_key;
+        active.credential_source = state.credential_source;
+        active.account_id = state.account_id;
+        if (comptime !host_target.is_wasm) {
+            if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription) {
+                active.session_rt.usage.clearReconciliationCredential();
+            }
+        }
+    }
+}
+
+/// Ensures the process and active ACP session use a credential authorized for
+/// the final model route. Returns false when that route has no credential.
+pub fn selectCredentialForProvider(
+    state: *ServerState,
+    provider: model_provider.ProviderId,
+) !bool {
+    if (state.active_session) |active| {
+        if (credentialMatchesProvider(active.credential_source, provider)) return true;
+    }
+    if (credentialMatchesProvider(state.credential_source, provider) and state.api_key.len > 0) return true;
+
+    var credential = if (provider == .gateway and state.cfg.credential_override != null)
+        credentials.Credential{
+            .token = try state.alloc.dupe(u8, state.cfg.credential_override.?),
+            .source = .ai_gateway_api_key,
+        }
+    else if (provider == .opencode_go) go: {
+        const loaded = try credentials.loadOpenCodeGoCredential(
+            state.alloc,
+            state.cfg.opencode_go_secret_store,
+        );
+        break :go loaded orelse return false;
+    } else blk: {
+        const resolution = try credentials.resolveForProvider(
+            state.alloc,
+            state.cfg.gateway_provider.oauth_transport,
+            state.cfg.secret_store,
+            .refresh_if_needed,
+            provider,
+            state.credential_source,
+        );
+        break :blk resolution.credential orelse return false;
+    };
+    defer credential.deinit(state.alloc);
+    adoptServerCredential(state, &credential);
+    return true;
+}
+
+pub fn streamProviderFor(
+    state: *const ServerState,
+    provider: model_provider.ProviderId,
+) @import("../core/agent/stream_provider.zig").Provider {
+    return switch (provider) {
+        .gateway => state.cfg.gateway_provider.agent_stream,
+        .codex => state.cfg.codex_agent_stream orelse
+            @import("../core/agent/stream_provider.zig").unavailable_provider,
+        .grok => state.cfg.grok_agent_stream orelse
+            @import("../core/agent/stream_provider.zig").unavailable_provider,
+        .opencode_go => state.cfg.opencode_go_agent_stream orelse
+            @import("../core/agent/stream_provider.zig").unavailable_provider,
+    };
+}
+
+pub fn catalogProviderFor(
+    state: *const ServerState,
+    provider: model_provider.ProviderId,
+) ?@import("../core/gateway/model_catalog.zig").Provider {
+    return switch (provider) {
+        .gateway => state.cfg.gateway_provider.model_catalog,
+        .codex => state.cfg.codex_model_catalog,
+        .grok => state.cfg.grok_model_catalog,
+        .opencode_go => state.cfg.opencode_go_model_catalog,
+    };
+}
+
+pub fn refreshModelCredential(
+    raw: *anyopaque,
+    alloc: Allocator,
+    source: types.CredentialSource,
+    mode: auth_runtime.CredentialRefreshMode,
+    expected_account_id: ?[]const u8,
+) !?[]u8 {
+    const state: *ServerState = @ptrCast(@alignCast(raw));
+    const refreshed = try auth_runtime.refreshCredentialTokenForAccount(
+        state.cfg.gateway_provider.oauth_transport,
+        alloc,
+        source,
+        mode,
+        expected_account_id,
+    ) orelse return null;
+    errdefer secret.zeroAndFree(alloc, refreshed);
+    if (source == .chatgpt_subscription or source == .grok_subscription) {
+        try publishRefreshedSubscriptionToken(state, refreshed, source, expected_account_id);
+    }
+    return refreshed;
+}
+
+fn publishRefreshedSubscriptionToken(
+    state: *ServerState,
+    refreshed: []const u8,
+    source: types.CredentialSource,
+    expected_account_id: ?[]const u8,
+) !void {
+    const expected = expected_account_id orelse return error.ChatGptAccountChanged;
+    const state_account = state.account_id orelse return error.ChatGptAccountChanged;
+    if (!std.mem.eql(u8, expected, state_account)) return error.ChatGptAccountChanged;
+    if (state.active_session) |active| {
+        const active_account = active.account_id orelse return error.ChatGptAccountChanged;
+        if (!std.mem.eql(u8, expected, active_account)) return error.ChatGptAccountChanged;
+    }
+
+    const owned = try state.alloc.dupe(u8, refreshed);
+    if (state.active_session) |*active| active.api_key = &.{};
+    if (state.api_key.len > 0) secret.zeroAndFree(state.alloc, state.api_key);
+    state.api_key = owned;
+    state.credential_source = source;
+    if (state.active_session) |*active| {
+        active.api_key = state.api_key;
+        active.credential_source = source;
+    }
+}
+
 pub fn releaseActiveSession(state: *ServerState) !void {
     clearPendingLegacyUrls(state);
     const active = if (state.active_session) |*session| session else return;
@@ -300,10 +451,14 @@ pub fn releaseActiveSession(state: *ServerState) !void {
         active.session_rt.usage.cancelReconciliation();
         active.session_rt.usage.finishProfilePublicationsBeforeShutdown();
         flushActiveSessionUsage(state) catch |err| {
-            active.session_rt.usage.startReconciliation(
-                state.alloc,
-                state.api_key,
-            );
+            if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription) {
+                active.session_rt.usage.clearReconciliationCredential();
+            } else {
+                active.session_rt.usage.startReconciliation(
+                    state.alloc,
+                    state.api_key,
+                );
+            }
             return err;
         };
         active.session_rt.usage.configurePublicationSink(null);
@@ -432,7 +587,6 @@ fn resolveSubagentAuthority(
                 },
             },
         },
-        active.sandbox_backend,
         owned_integrations,
         active.permission_rules,
         active.session_grants,
@@ -1012,10 +1166,6 @@ fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Messag
         .msg = try cloneMessage(alloc, msg),
         .mode = session.mode,
         .permission_mode = session.permission_mode,
-        .sandbox_backend = sandbox.effectiveBackend(
-            session.permission_mode,
-            session.sandbox_backend,
-        ),
     };
     errdefer jsonrpc.freeMessage(alloc, &active.msg);
 
@@ -1037,7 +1187,6 @@ fn promptWorkerMain(active: *ActivePrompt) void {
         &active.msg,
         active.mode,
         active.permission_mode,
-        active.sandbox_backend,
     ) catch |err| .{
         .rpc_error = .{
             .code = ErrorCode.internal_error,
@@ -1171,10 +1320,10 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         });
     };
 
-    var startup = loadConfiguredStartupState(state, alloc) catch |err| {
+    var startup = loadConfiguredStartupState(state, alloc) catch {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
-            .message = sandbox.configErrorMessage(err) orelse "Failed to load startup state",
+            .message = "Failed to load startup state",
         });
     };
     defer startup.deinit(alloc);
@@ -1208,46 +1357,73 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.selected_model = startup.takeSelectedModel();
         state.process_model_override = startup.model_source == .process_override;
     }
+    state.provider = startup.provider;
     state.configured_model = try alloc.dupe(u8, startup.configured_model);
 
-    var gateway_credential = if (state.cfg.credential_override) |override| credentials.Credential{
-        .token = try alloc.dupe(u8, override),
-        .source = .ai_gateway_api_key,
-    } else startup.takeCredential();
-    defer if (gateway_credential) |*credential| credential.deinit(alloc);
-    if (gateway_credential) |*credential| {
-        state.gateway_credential_source = credential.source;
-        state.gateway_api_key = credential.token;
-        credential.token = &.{};
-        if (credential.team_id) |team| {
-            state.gateway_team = team;
-            credential.team_id = null;
-        } else if (credential.team_slug) |team| {
-            state.gateway_team = team;
-            credential.team_slug = null;
+    var startup_credential = startup.takeCredential();
+    defer if (startup_credential) |*credential| credential.deinit(alloc);
+    var routed_credential: ?credentials.Credential = null;
+    defer if (routed_credential) |*credential| credential.deinit(alloc);
+    const startup_matches_model = if (startup_credential) |credential|
+        credentialMatchesProvider(credential.source, state.provider)
+    else
+        false;
+    const credential: *credentials.Credential = if (state.provider == .opencode_go) go: {
+        routed_credential = try credentials.loadOpenCodeGoCredential(
+            alloc,
+            state.cfg.opencode_go_secret_store,
+        );
+        if (routed_credential == null) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = credentials.missing_opencode_go_credential_message,
+            });
         }
-    }
-
-    var opencode_go_credential = try credentials.loadOpenCodeGoCredential(
-        alloc,
-        state.cfg.opencode_go_secret_store,
-    );
-    defer if (opencode_go_credential) |*credential| credential.deinit(alloc);
-    if (opencode_go_credential) |*credential| {
-        state.opencode_go_api_key = credential.token;
-        credential.token = &.{};
-    }
-
-    if (!activateCredentialForModel(state, state.selected_model)) {
-        const missing_credential_message = switch (provider_id.fromModel(state.selected_model)) {
-            .vercel_ai_gateway => credentials.missing_credential_message,
-            .opencode_go => credentials.missing_opencode_go_credential_message,
+        break :go &routed_credential.?;
+    } else if (state.provider == .gateway and state.cfg.credential_override != null) override: {
+        routed_credential = .{
+            .token = try alloc.dupe(u8, state.cfg.credential_override.?),
+            .source = .ai_gateway_api_key,
         };
+        break :override &routed_credential.?;
+    } else if (startup_matches_model)
+        &startup_credential.?
+    else routed: {
+        const preferred = if (startup_credential) |value| value.source else null;
+        const resolution = try credentials.resolveForProvider(
+            alloc,
+            state.cfg.gateway_provider.oauth_transport,
+            state.cfg.secret_store,
+            .refresh_if_needed,
+            state.provider,
+            preferred,
+        );
+        routed_credential = resolution.credential;
+        if (routed_credential == null) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = if (state.provider == .codex)
+                    credentials.missing_chatgpt_credential_message
+                else if (state.provider == .grok)
+                    credentials.missing_grok_credential_message
+                else
+                    credentials.missing_credential_message,
+            });
+        }
+        break :routed &routed_credential.?;
+    };
+    if (credential.token.len == 0) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
-            .message = missing_credential_message,
+            .message = if (state.provider == .codex)
+                credentials.missing_chatgpt_credential_message
+            else if (state.provider == .grok)
+                credentials.missing_grok_credential_message
+            else
+                credentials.missing_credential_message,
         });
     }
+    adoptServerCredential(state, credential);
 
     state.permission_mode = startup.permission_mode;
     state.permission_rules = startup.takePermissionRules();
@@ -1255,11 +1431,11 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.max_tool_result_bytes = startup.max_tool_result_bytes;
     state.context_limits = startup.context_limits;
     state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);
-    state.fast_mode = startup.fast_mode;
+    state.fast_mode = startup.fast_mode and
+        (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
     state.effort = startup.effort;
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
-    state.sandbox_backend = startup.sandbox_backend;
 
     if (comptime !host_target.is_wasm) {
         const loaded_skills = try app_runtime_setup.loadSkills(alloc, state.workspace_root, builtin_skills.root_policy);
@@ -1268,11 +1444,21 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     }
 
     var catalog_cancel_flag = std.atomic.Value(bool).init(false);
+    const startup_catalog = catalogProviderFor(state, state.provider) orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "Selected provider is unavailable in this host",
+        });
     _ = try state.capability_resolver.resolve(
         state.alloc,
-        state.cfg.gateway_provider.model_catalog,
+        startup_catalog,
         .{
-            .access = credentials.catalogAccessForCredential(state.credential_source, state.api_key, state.gateway_team),
+            .access = credentials.catalogAccessForCredentialAndAccount(
+                state.credential_source,
+                state.api_key,
+                state.gateway_team,
+                state.account_id,
+            ),
             .endpoint = state.cfg.gateway_models_path,
             .cancel_flag = &catalog_cancel_flag,
         },
@@ -1354,50 +1540,6 @@ fn handleCloseSession(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messa
     try state.writer.writeResponse(alloc, msg.id, "{}");
 }
 
-fn hasCredentialForModel(state: *const ServerState, model: []const u8) bool {
-    return switch (provider_id.fromModel(model)) {
-        .vercel_ai_gateway => state.gateway_api_key.len > 0,
-        .opencode_go => state.opencode_go_api_key.len > 0,
-    };
-}
-
-fn activateCredentialForModel(state: *ServerState, model: []const u8) bool {
-    if (!hasCredentialForModel(state, model)) return false;
-    switch (provider_id.fromModel(model)) {
-        .vercel_ai_gateway => {
-            state.api_key = state.gateway_api_key;
-            state.credential_source = state.gateway_credential_source;
-        },
-        .opencode_go => {
-            state.api_key = state.opencode_go_api_key;
-            state.credential_source = .opencode_go;
-        },
-    }
-    if (state.active_session) |*session| {
-        session.api_key = state.api_key;
-        session.credential_source = state.credential_source;
-    }
-    return true;
-}
-
-test "ACP OpenCode Go model switches select only the matching credential" {
-    var state: ServerState = undefined;
-    state.api_key = &.{};
-    state.credential_source = null;
-    state.gateway_api_key = @constCast("gateway-secret");
-    state.gateway_credential_source = .ai_gateway_api_key;
-    state.opencode_go_api_key = @constCast("go-secret");
-    state.active_session = null;
-
-    try std.testing.expect(activateCredentialForModel(&state, "opencode-go/glm-5"));
-    try std.testing.expectEqualStrings("go-secret", state.api_key);
-    try std.testing.expectEqual(types.CredentialSource.opencode_go, state.credential_source.?);
-
-    try std.testing.expect(activateCredentialForModel(&state, "openai/gpt-5"));
-    try std.testing.expectEqualStrings("gateway-secret", state.api_key);
-    try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, state.credential_source.?);
-}
-
 fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
@@ -1435,15 +1577,33 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .code = ErrorCode.invalid_params,
                 .message = "Invalid session model",
             });
-        if (!hasCredentialForModel(state, value)) {
-            const message = switch (provider_id.fromModel(value)) {
-                .vercel_ai_gateway => credentials.missing_credential_message,
-                .opencode_go => credentials.missing_opencode_go_credential_message,
-            };
-            return state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.invalid_request,
-                .message = message,
-            });
+        if (comptime !host_target.is_wasm) {
+            if (session.provider != .gateway) {
+                var model_available = false;
+                if (state.capability_resolver.catalogEntries()) |entries| {
+                    for (entries) |entry| {
+                        if (std.mem.eql(u8, entry.id, value)) {
+                            model_available = true;
+                            break;
+                        }
+                    }
+                }
+                if (!model_available) {
+                    return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.invalid_params,
+                        .message = "Model is not available for the active provider",
+                    });
+                }
+                if (!try selectCredentialForProvider(state, session.provider)) {
+                    return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.invalid_request,
+                        .message = if (session.provider == .codex)
+                            credentials.missing_chatgpt_credential_message
+                        else
+                            credentials.missing_grok_credential_message,
+                    });
+                }
+            }
         }
         if (host_target.is_wasm and session.writable == null) {
             const next_model = alloc.dupe(u8, value) catch
@@ -1487,7 +1647,129 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     "Failed to persist session model",
             });
         };
-        _ = activateCredentialForModel(state, value);
+    } else if (std.mem.eql(u8, config_id, "provider")) {
+        const target = model_provider.parse(value) orelse
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Invalid provider",
+            });
+        const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "No active session",
+        });
+        if (target != session.provider) {
+            if (host_target.is_wasm) {
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = "Subscription provider switching is unavailable in this WASM runtime",
+                });
+            }
+            var staged_credential = if (target == .gateway and state.cfg.credential_override != null)
+                credentials.Credential{
+                    .token = try alloc.dupe(u8, state.cfg.credential_override.?),
+                    .source = .ai_gateway_api_key,
+                }
+            else credential: {
+                const resolution = try credentials.resolveForProvider(
+                    alloc,
+                    state.cfg.gateway_provider.oauth_transport,
+                    state.cfg.secret_store,
+                    .refresh_if_needed,
+                    target,
+                    null,
+                );
+                break :credential resolution.credential orelse
+                    return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.invalid_request,
+                        .message = if (target == .codex)
+                            credentials.missing_chatgpt_credential_message
+                        else if (target == .grok)
+                            credentials.missing_grok_credential_message
+                        else
+                            credentials.missing_credential_message,
+                    });
+            };
+            defer staged_credential.deinit(alloc);
+            if (!model_provider.authorizesCredential(target, staged_credential.source)) {
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = "Credential cannot authorize the selected provider",
+                });
+            }
+            const catalog_provider = catalogProviderFor(state, target) orelse
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = "Selected provider is unavailable in this host",
+                });
+            const access = credentials.catalogAccessForCredentialAndAccount(
+                staged_credential.source,
+                staged_credential.token,
+                staged_credential.gatewayTeam(),
+                staged_credential.accountId(),
+            );
+            const fetched = try catalog_provider.fetch(alloc, .{
+                .access = access,
+                .endpoint = state.cfg.gateway_models_path,
+                .cancel_flag = &session.cancel_flag,
+                .view = .picker,
+            });
+            var catalog = switch (fetched) {
+                .catalog => |catalog| catalog,
+                .failure => return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = "Failed to load provider model catalog",
+                }),
+            };
+            defer model_catalog.freeModelCatalog(alloc, &catalog);
+            if (catalog.items.len == 0) {
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = "Provider returned no supported models",
+                });
+            }
+            var settings = if (state.cfg.home_override) |home|
+                try config_runtime.loadMergedSettingsFromHome(alloc, home, state.workspace_root)
+            else
+                try config_runtime.loadMergedSettings(alloc, state.workspace_root);
+            defer settings.deinit(alloc);
+            const saved_model = switch (target) {
+                .gateway => settings.model,
+                .codex => settings.codex_model,
+                .grok => settings.grok_model,
+                .opencode_go => blk: {
+                    if (settings.model) |saved| {
+                        if (std.mem.startsWith(u8, saved, provider_id.opencode_go_prefix)) break :blk saved;
+                    }
+                    break :blk @as(?[]u8, null);
+                },
+            };
+            var selected_model = catalog.items[0].id;
+            if (saved_model) |saved| {
+                for (catalog.items) |entry| {
+                    if (std.mem.eql(u8, entry.id, saved)) {
+                        selected_model = entry.id;
+                        break;
+                    }
+                }
+            }
+            commitActiveSessionProvider(
+                alloc,
+                session,
+                target,
+                selected_model,
+                session_test_controls.logOptions(),
+            ) catch |err| {
+                if (modelCommitFailureTerminatesConnection(err)) {
+                    state.terminate_connection = true;
+                }
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.internal_error,
+                    .message = "Failed to persist session provider",
+                });
+            };
+            state.capability_resolver.adoptOwnedCatalog(alloc, &catalog);
+            adoptServerCredential(state, &staged_credential);
+        }
     } else if (std.mem.eql(u8, config_id, "mode")) {
         if (state.active_session) |*session| {
             state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
@@ -1502,6 +1784,13 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"configOptions\":[");
+    if (comptime !host_target.is_wasm) {
+        try sessions.writeProviderConfigOption(
+            &out.writer,
+            if (state.active_session) |session| session.provider else state.provider,
+        );
+        try out.writer.writeAll(",");
+    }
     try sessions.writeModelConfigOption(
         &out.writer,
         current_model,
@@ -1511,6 +1800,36 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     try sessions.writeModeConfigOption(&out.writer, state.cfg.mode_registry, current_mode);
     try out.writer.writeAll("]}");
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+}
+
+fn commitActiveSessionProvider(
+    alloc: Allocator,
+    session: *ActiveSessionState,
+    provider: model_provider.ProviderId,
+    model: []const u8,
+    options: session_log.Options,
+) !void {
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (session.writable) |*active|
+        active
+    else
+        return error.SessionPersistenceUnavailable;
+    const staged_model = try alloc.dupe(u8, model);
+    errdefer alloc.free(staged_model);
+    _ = try writable.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{
+            .provider = provider,
+            .model = @constCast(model),
+        } },
+        io_mod.milliTimestamp(),
+        .rollback_before_adapter_continue,
+        options,
+    );
+    alloc.free(session.model);
+    session.model = staged_model;
+    session.provider = provider;
 }
 
 fn commitActiveSessionModel(
@@ -1611,7 +1930,6 @@ test "applySessionMode uses registered mode policy and ignores unknown modes" {
         .effort = .auto,
         .first_call_tool_choice = .auto,
         .permission_mode = .ask,
-        .sandbox_backend = .none,
         .permission_rules = .{},
         .session_rt = .{ .max_history_turns = 0 },
         .cancel_flag = std.atomic.Value(bool).init(false),
@@ -1621,7 +1939,6 @@ test "applySessionMode uses registered mode policy and ignores unknown modes" {
     applySessionMode(registry, &session, "apply");
     try std.testing.expectEqualStrings("apply", session.mode);
     try std.testing.expectEqual(types.PermissionMode.auto, session.permission_mode);
-    try std.testing.expectEqual(sandbox.BackendKind.none, session.sandbox_backend);
 
     applySessionMode(registry, &session, "inspect");
     try std.testing.expectEqualStrings("inspect", session.mode);
@@ -1631,13 +1948,10 @@ test "applySessionMode uses registered mode policy and ignores unknown modes" {
     try std.testing.expectEqualStrings("inspect", session.mode);
     try std.testing.expectEqual(types.PermissionMode.ask, session.permission_mode);
 
-    session.sandbox_backend = .macos;
     applySessionMode(registry, &session, "apply");
     try std.testing.expectEqual(types.PermissionMode.auto, session.permission_mode);
-    try std.testing.expectEqual(sandbox.BackendKind.macos, session.sandbox_backend);
     applySessionMode(registry, &session, "inspect");
     try std.testing.expectEqual(types.PermissionMode.ask, session.permission_mode);
-    try std.testing.expectEqual(sandbox.BackendKind.macos, session.sandbox_backend);
 }
 
 test "ACP notifications with absent id are not response targets" {
@@ -2192,6 +2506,51 @@ test "ACP model commits honor the active session write boundary" {
         error.SessionPersistenceUnavailable,
         worker.failure.?,
     );
+}
+
+test "ACP publishes an account-bound refreshed Codex token for later prompts" {
+    const alloc = std.testing.allocator;
+    var state: ServerState = undefined;
+    state.alloc = alloc;
+    state.api_key = try alloc.dupe(u8, "stale-token");
+    state.account_id = try alloc.dupe(u8, "acct-1");
+    state.credential_source = .chatgpt_subscription;
+    var active: ActiveSessionState = undefined;
+    active.api_key = state.api_key;
+    active.account_id = state.account_id;
+    active.credential_source = .chatgpt_subscription;
+    state.active_session = active;
+    defer {
+        secret.zeroAndFree(alloc, state.api_key);
+        alloc.free(state.account_id.?);
+    }
+
+    try publishRefreshedSubscriptionToken(&state, "fresh-token", .chatgpt_subscription, "acct-1");
+
+    try std.testing.expectEqualStrings("fresh-token", state.api_key);
+    try std.testing.expectEqualStrings("fresh-token", state.active_session.?.api_key);
+    try std.testing.expectEqualStrings("acct-1", state.account_id.?);
+    try std.testing.expectEqualStrings("acct-1", state.active_session.?.account_id.?);
+}
+
+test "ACP rejects refreshed Codex tokens for another account" {
+    const alloc = std.testing.allocator;
+    var state: ServerState = undefined;
+    state.alloc = alloc;
+    state.api_key = try alloc.dupe(u8, "stale-token");
+    state.account_id = try alloc.dupe(u8, "acct-1");
+    state.credential_source = .chatgpt_subscription;
+    state.active_session = null;
+    defer {
+        secret.zeroAndFree(alloc, state.api_key);
+        alloc.free(state.account_id.?);
+    }
+
+    try std.testing.expectError(
+        error.ChatGptAccountChanged,
+        publishRefreshedSubscriptionToken(&state, "wrong-token", .chatgpt_subscription, "acct-2"),
+    );
+    try std.testing.expectEqualStrings("stale-token", state.api_key);
 }
 
 test "ACP usage flush preserves snapshot ownership on allocation failure" {

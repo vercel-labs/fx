@@ -691,6 +691,43 @@ pub fn parseAuthorizationRedirect(
     return .{ .code = code, .state = state, .issuer = issuer };
 }
 
+fn encodeBase64UrlNoPad(output: []u8, input: []const u8) []const u8 {
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const complete_groups = input.len / 3;
+    const remainder = input.len % 3;
+    const tail_len: usize = switch (remainder) {
+        0 => 0,
+        1 => 2,
+        2 => 3,
+        else => unreachable,
+    };
+    const encoded_len = complete_groups * 4 + tail_len;
+    std.debug.assert(output.len >= encoded_len);
+
+    var input_index: usize = 0;
+    var output_index: usize = 0;
+    while (input_index + 3 <= input.len) : (input_index += 3) {
+        const value = (@as(u24, input[input_index]) << 16) |
+            (@as(u24, input[input_index + 1]) << 8) |
+            input[input_index + 2];
+        output[output_index] = alphabet[(value >> 18) & 0x3f];
+        output[output_index + 1] = alphabet[(value >> 12) & 0x3f];
+        output[output_index + 2] = alphabet[(value >> 6) & 0x3f];
+        output[output_index + 3] = alphabet[value & 0x3f];
+        output_index += 4;
+    }
+    if (remainder != 0) {
+        const value = @as(u24, input[input_index]) << 16 |
+            (if (remainder == 2) @as(u24, input[input_index + 1]) << 8 else 0);
+        output[output_index] = alphabet[(value >> 18) & 0x3f];
+        output[output_index + 1] = alphabet[(value >> 12) & 0x3f];
+        if (remainder == 2) {
+            output[output_index + 2] = alphabet[(value >> 6) & 0x3f];
+        }
+    }
+    return output[0..encoded_len];
+}
+
 pub fn generatePkce(
     verifier_buf: *[64]u8,
     challenge_buf: *[43]u8,
@@ -698,11 +735,28 @@ pub fn generatePkce(
 ) struct { verifier: []const u8, challenge: []const u8 } {
     var entropy: [48]u8 = undefined;
     random.bytes(&entropy);
-    const verifier = std.base64.url_safe_no_pad.Encoder.encode(verifier_buf, &entropy);
+    const verifier = encodeBase64UrlNoPad(verifier_buf, &entropy);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(verifier, &digest, .{});
-    const challenge = std.base64.url_safe_no_pad.Encoder.encode(challenge_buf, &digest);
+    const challenge = encodeBase64UrlNoPad(challenge_buf, &digest);
     return .{ .verifier = verifier, .challenge = challenge };
+}
+
+test "PKCE base64url encoding covers complete and partial groups" {
+    const cases = .{
+        .{ "", "" },
+        .{ "f", "Zg" },
+        .{ "fo", "Zm8" },
+        .{ "foo", "Zm9v" },
+        .{ &[_]u8{ 0xfb, 0xef, 0xff }, "--__" },
+    };
+    inline for (cases) |case| {
+        var output: [64]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            case[1],
+            encodeBase64UrlNoPad(&output, case[0]),
+        );
+    }
 }
 
 pub fn bearerHeaderAlloc(alloc: Allocator, access_token: []const u8) ![]u8 {
@@ -1044,21 +1098,21 @@ fn authorizeWithRedirect(
     var verifier_entropy: [48]u8 = undefined;
     try io_mod.getIo().randomSecure(&verifier_entropy);
     var verifier_buf: [64]u8 = undefined;
-    const verifier = std.base64.url_safe_no_pad.Encoder.encode(
+    const verifier = encodeBase64UrlNoPad(
         &verifier_buf,
         &verifier_entropy,
     );
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(verifier, &digest, .{});
     var challenge_buf: [43]u8 = undefined;
-    const code_challenge = std.base64.url_safe_no_pad.Encoder.encode(
+    const code_challenge = encodeBase64UrlNoPad(
         &challenge_buf,
         &digest,
     );
     var state_entropy: [32]u8 = undefined;
     try io_mod.getIo().randomSecure(&state_entropy);
     var state_buf: [43]u8 = undefined;
-    const state = std.base64.url_safe_no_pad.Encoder.encode(
+    const state = encodeBase64UrlNoPad(
         &state_buf,
         &state_entropy,
     );

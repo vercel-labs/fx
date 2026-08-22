@@ -1,7 +1,6 @@
 const std = @import("std");
 const direct_runtime = @import("../terminal/direct_runtime.zig");
 const identity = @import("../terminal/identity.zig");
-const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -40,8 +39,6 @@ pub fn Runtime(comptime App: type) type {
                 .profile_user = profile_user,
                 .durable_session_id = durable_session_id,
                 .workspace_root = app.workspace_root,
-                .sandbox_backend = app_permission_runtime.Runtime(App)
-                    .livePermissionSnapshot(app).sandbox_backend,
                 .command = command,
             }) catch |err| {
                 try writeAdmissionFailure(app, @errorName(err));
@@ -394,6 +391,7 @@ const ShutdownTestDirectRuntime = struct {
     accepted_pending: bool = true,
     starting_pending: bool = true,
     final_pending: bool = false,
+    final_failure_pending: bool = false,
     acknowledgements: usize = 0,
 
     fn hasAcceptedPending(self: *const ShutdownTestDirectRuntime) bool {
@@ -413,11 +411,18 @@ const ShutdownTestDirectRuntime = struct {
             .correlation_id = .{ .value = 17 },
             .command = "shutdown command",
         } };
-        if (self.final_pending) return .{ .running = .{
-            .correlation_id = .{ .value = 17 },
-            .command = "shutdown command",
-            .session_id = "terminal-17",
-        } };
+        if (self.final_pending) {
+            if (self.final_failure_pending) return .{ .failed = .{
+                .correlation_id = .{ .value = 17 },
+                .command = "shutdown command",
+                .code = .unsupported_host,
+            } };
+            return .{ .running = .{
+                .correlation_id = .{ .value = 17 },
+                .command = "shutdown command",
+                .session_id = "terminal-17",
+            } };
+        }
         return null;
     }
 
@@ -492,6 +497,30 @@ test "graceful exit commits an authoritative result after transcript retry" {
     try std.testing.expectEqualStrings(
         "Running terminal-17: shutdown command",
         app.bodies.items[1],
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.flush_attempts);
+}
+
+test "unsupported direct start publishes failure and does not defer graceful exit" {
+    var app = ShutdownTestApp{
+        .terminal_direct = .{
+            .starting_pending = false,
+            .final_pending = true,
+            .final_failure_pending = true,
+        },
+    };
+    defer app.deinit();
+
+    try std.testing.expectEqual(
+        ExitPreparation.ready,
+        Runtime(ShutdownTestApp).prepareGracefulExitWithCeiling(&app, 0),
+    );
+    try std.testing.expect(!app.terminal_direct.accepted_pending);
+    try std.testing.expectEqual(@as(usize, 1), app.terminal_direct.acknowledgements);
+    try std.testing.expectEqual(@as(usize, 1), app.bodies.items.len);
+    try std.testing.expectEqualStrings(
+        "Failed unsupported_host: shutdown command",
+        app.bodies.items[0],
     );
     try std.testing.expectEqual(@as(usize, 1), app.flush_attempts);
 }

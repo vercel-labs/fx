@@ -313,6 +313,23 @@ pub const Manager = struct {
         target_session_id: []const u8,
         acknowledgement: communication.ParentAcknowledgement,
     ) Error!void {
+        _ = try self.acknowledgeParentBoundaryWithFinalResultSignal(
+            alloc,
+            owner_session_id,
+            consumer_id,
+            target_session_id,
+            acknowledgement,
+        );
+    }
+
+    pub fn acknowledgeParentBoundaryWithFinalResultSignal(
+        self: *Manager,
+        alloc: Allocator,
+        owner_session_id: []const u8,
+        consumer_id: []const u8,
+        target_session_id: []const u8,
+        acknowledgement: communication.ParentAcknowledgement,
+    ) Error!bool {
         var locked = try AuthorizedLocks.acquire(
             alloc,
             self.sessions,
@@ -337,6 +354,12 @@ pub const Manager = struct {
             acknowledgement,
         ) catch |err| return mapMutation(err);
         if (ledger.generation != prior_generation) try save(store, alloc, ledger);
+        return communication.stableFinalResultFullyAcknowledged(
+            ledger,
+            consumer_id,
+            target_session_id,
+            acknowledgement.delivery_id,
+        );
     }
 
     fn acknowledgeProjection(
@@ -828,6 +851,47 @@ pub fn reconcileTerminalsLocked(
         );
     }
     return repaired;
+}
+
+pub const FinalResultInput = struct {
+    child_id: []const u8,
+    parent_id: []const u8,
+    work_id: []const u8,
+    timestamp_ms: i64,
+    content: []const u8,
+};
+
+/// Appends the mandatory one-off result through the existing message ledger.
+/// The stable ID makes normal completion, restart recovery, and retries
+/// idempotent. The caller retains ownership of every input slice.
+pub fn reconcileFinalResultLocked(
+    alloc: Allocator,
+    store: communication_store.Store,
+    input: FinalResultInput,
+) Error!bool {
+    var ledger = try loadOrInit(alloc, store, input.child_id);
+    defer ledger.deinit(alloc);
+    const id = communication.stableDeliveryId(
+        input.child_id,
+        input.work_id,
+        "final-result",
+    );
+    const appended = communication.appendDelivery(alloc, &ledger, .{
+        .id = &id,
+        .source_id = input.child_id,
+        .target_id = input.parent_id,
+        .work_id = input.work_id,
+        .timestamp_ms = input.timestamp_ms,
+        .payload = .{ .message = @constCast(input.content) },
+    }) catch |err| return mapMutation(err);
+    if (appended == .duplicate) return false;
+    try save(store, alloc, ledger);
+    debug_trace.logf(
+        "subagent",
+        "final result reconciliation committed child_id={s} work_id={s} outcome=ok",
+        .{ input.child_id, input.work_id },
+    );
+    return true;
 }
 
 /// Reconciles unresolved tool approvals from canonical work state. This is
