@@ -10,7 +10,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
@@ -26,6 +26,13 @@ import {
 const TIMEOUT = 30_000;
 const MODEL = "openai/gpt-5";
 const COMMAND_APPROVAL_PROMPT = "Would you like to run the following command?";
+const configuredLoginShell = userInfo().shell ?? "";
+const capturedUserShell =
+  configuredLoginShell.endsWith("/bash") || configuredLoginShell.endsWith("/zsh")
+    ? configuredLoginShell
+    : process.platform === "darwin"
+      ? "/bin/zsh"
+      : "/bin/bash";
 
 type IsolatedRoot = {
   root: string;
@@ -93,6 +100,26 @@ function cleanCommandCall(command: string, id: string) {
   });
 }
 
+function installUserCommandRedefinition(
+  root: IsolatedRoot,
+  command: string,
+): Record<string, string> {
+  if (capturedUserShell.endsWith("/bash")) {
+    const bashEnv = join(root.home, "bash_env");
+    writeFileSync(
+      bashEnv,
+      `${command}() { touch SHELL_DEFINITION_EXECUTED; }\n`,
+    );
+    return { SHELL: capturedUserShell, BASH_ENV: bashEnv };
+  }
+
+  writeFileSync(
+    join(root.home, ".zshrc"),
+    `alias ${command}='touch SHELL_DEFINITION_EXECUTED'\n`,
+  );
+  return { SHELL: capturedUserShell, ZDOTDIR: root.home };
+}
+
 function toolResultText(body: string, toolCallId: string): string {
   const request = JSON.parse(body) as {
     prompt?: Array<{ content?: Array<Record<string, unknown>> }>;
@@ -155,10 +182,92 @@ async function waitForEither(
     if (expected.some((value) => scrollback.includes(value))) return scrollback;
     await Bun.sleep(25);
   }
-  throw new Error(`Timed out waiting for ${expected.map(JSON.stringify).join(" or ")}`);
+  throw new Error(
+    `Timed out waiting for ${expected.map((value) => JSON.stringify(value)).join(" or ")}`,
+  );
 }
 
 describe("lean auto mode reliability", () => {
+  test(
+    "a reviewed command still runs under the operator's shell definitions",
+    async () => {
+      const root = createIsolatedRoot();
+      const shellEnv = installUserCommandRedefinition(root, "deploy");
+      const gateway = startGateway(
+        [commandCall("deploy", "reviewed_alias"), fakeGatewayFinalText("done")],
+        [fakeGatewayPermissionDecision("allow", "reviewed and allowed")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Deploy it."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            ...shellEnv,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      // This command is not on the allowlist, so the reviewer saw it. Approvals
+      // that read the command keep the operator's own shell definitions.
+      expect(gateway.classifierRequests.length).toBeGreaterThan(0);
+      expect(
+        existsSync(join(root.workspace, "SHELL_DEFINITION_EXECUTED")),
+      ).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    `an allowlisted command runs as parsed, not as the operator redefined it in ${capturedUserShell}`,
+    async () => {
+      const root = createIsolatedRoot();
+      // Auto mode approves `git status` from a parse of the command string. A
+      // user startup definition must not get a second chance to redefine it.
+      const shellEnv = installUserCommandRedefinition(root, "git");
+      const gateway = startGateway(
+        [
+          commandCall("git status", "definition_shadowed"),
+          fakeGatewayFinalText("done"),
+        ],
+        [
+          fakeGatewayPermissionDecision(
+            "ask",
+            "not consulted for an allowlisted command",
+          ),
+        ],
+      );
+
+      const result = await runFx(
+        [
+          "ask",
+          "--quiet",
+          "--json",
+          "--no-save",
+          "Check the repository status.",
+        ],
+        {
+          cwd: root.workspace,
+          env: { ...gatewayEnv(root, gateway), ...shellEnv },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      const call = JSON.parse(result.stdout).tool_calls?.[0];
+      expect(gateway.classifierRequests).toHaveLength(0);
+      // git itself ran: the workspace is not a repository, so it fails that way.
+      expect(call?.command_result?.exit_code).toBe(128);
+      expect(
+        existsSync(join(root.workspace, "SHELL_DEFINITION_EXECUTED")),
+      ).toBe(false);
+    },
+    TIMEOUT,
+  );
+
   test(
     "a configured safe command bypasses automatic review",
     async () => {
