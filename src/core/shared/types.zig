@@ -877,6 +877,63 @@ pub const ChatMessage = struct {
     cache_policy: ChatCachePolicy = .default,
 };
 
+/// Rejects message fields that would be serialized by `std.json` as byte
+/// arrays instead of strings. Tool output content is the one exception: each
+/// provider serializer replaces unsafe tool bytes with a bounded text notice.
+pub fn validateProviderMessageText(messages: []const ChatMessage) error{InvalidProviderMessageText}!void {
+    for (messages) |message| {
+        if (message.content) |content| {
+            if (message.role != .tool and !text_utils.isModelSafeText(content)) {
+                return error.InvalidProviderMessageText;
+            }
+        }
+        if (message.tool_call_id) |tool_call_id| {
+            if (!text_utils.isModelSafeText(tool_call_id)) return error.InvalidProviderMessageText;
+        }
+        if (message.tool_name) |tool_name| {
+            if (!text_utils.isModelSafeText(tool_name)) return error.InvalidProviderMessageText;
+        }
+        for (message.tool_calls) |call| {
+            if (!text_utils.isModelSafeText(call.id) or
+                !text_utils.isModelSafeText(call.name) or
+                !text_utils.isModelSafeText(call.arguments_json))
+            {
+                return error.InvalidProviderMessageText;
+            }
+        }
+    }
+}
+
+test "provider message validation permits normalizable tool output only" {
+    const calls = [_]ToolCall{.{
+        .id = "call_1",
+        .name = "run_command",
+        .arguments_json = "{\"command\":\"printf ok\"}",
+    }};
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .content = "bad\xff", .tool_call_id = "call_1", .tool_name = "run_command" },
+    };
+    try validateProviderMessageText(&messages);
+
+    const invalid_user = [_]ChatMessage{.{ .role = .user, .content = "bad\xff" }};
+    try std.testing.expectError(
+        error.InvalidProviderMessageText,
+        validateProviderMessageText(&invalid_user),
+    );
+
+    const invalid_identity = [_]ChatMessage{.{
+        .role = .tool,
+        .content = "ok",
+        .tool_call_id = "bad\xff",
+        .tool_name = "run_command",
+    }};
+    try std.testing.expectError(
+        error.InvalidProviderMessageText,
+        validateProviderMessageText(&invalid_identity),
+    );
+}
+
 pub const Usage = struct {
     input_tokens: ?u64 = null,
     output_tokens: ?u64 = null,

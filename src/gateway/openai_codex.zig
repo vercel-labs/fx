@@ -4,6 +4,7 @@ const image_attachments = @import("../core/images/image_attachments.zig");
 const secret = @import("../core/auth/secret.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 
@@ -66,6 +67,7 @@ pub fn buildRequest(
     request: stream_provider.BuildRequest,
 ) ![]u8 {
     try validateModel(request.model);
+    try types.validateProviderMessageText(request.messages);
     if (request.budget) |budget| {
         if (budget.cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
         _ = budget.deadline;
@@ -194,7 +196,7 @@ fn writeInput(
                 try writer.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
                 try std.json.Stringify.value(message.tool_call_id orelse "", .{}, writer);
                 try writer.writeAll(",\"output\":");
-                try std.json.Stringify.value(message.content orelse "", .{}, writer);
+                try text_utils.writeModelSafeTextJson(writer, message.content orelse "");
                 try writer.writeByte('}');
             },
         }
@@ -833,6 +835,29 @@ test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning\":{\"effort\":\"high\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"service_tier\":\"priority\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"max_output_tokens\"") == null);
+}
+
+test "OpenAI Codex request normalizes unsafe tool output to a string" {
+    const messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "call_1", .name = "run_command", .arguments_json = "{}" }} },
+        .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "run_command", .content = "bad\xff" },
+    };
+    const body = try buildOpenAICodexReplay(&messages);
+    defer std.testing.allocator.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const output = parsed.value.object.get("input").?.array.items[1].object.get("output").?;
+    try std.testing.expect(output == .string);
+    try std.testing.expectEqualStrings(
+        "binary or non-utf8 tool output omitted (4 bytes)",
+        output.string,
+    );
+}
+
+test "OpenAI Codex request rejects unsafe user text locally" {
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "bad\xff" }};
+    try expectOpenAICodexReplayError(error.InvalidProviderMessageText, &messages);
 }
 
 fn makeSizedProviderState(alloc: Allocator, size: usize) ![]u8 {

@@ -3,6 +3,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const types = @import("../shared/types.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 pub const ChatRole = types.ChatRole;
 pub const ChatMessage = types.ChatMessage;
@@ -465,6 +466,7 @@ pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.
 }
 
 pub fn validateToolMessageHistory(alloc: std.mem.Allocator, messages: []const ChatMessage) !void {
+    try types.validateProviderMessageText(messages);
     var i: usize = 0;
     while (i < messages.len) {
         const msg = messages[i];
@@ -642,7 +644,7 @@ fn writeChatMessageJsonInner(
             }
             try writer.writeAll(",\"output\":{\"type\":\"text\",\"value\":");
             if (message.content) |content| {
-                try std.json.Stringify.value(content, .{}, writer);
+                try text_utils.writeModelSafeTextJson(writer, content);
             } else {
                 try writer.writeAll("\"\"");
             }
@@ -1029,6 +1031,37 @@ test "writeChatMessageJson serializes tool-result fallbacks and escaped output" 
     try std.testing.expect(std.mem.find(u8, json, "\"toolCallId\":\"\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"toolName\":\"unknown\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"value\":\"line\\n\\ttext\"") != null);
+}
+
+test "writeChatMessageJson normalizes unsafe tool-result bytes to text" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+
+    try writeChatMessageJson(alloc, &out.writer, .{
+        .role = .tool,
+        .content = "bad\xff",
+        .tool_call_id = "call_1",
+        .tool_name = "run_command",
+    });
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+    defer parsed.deinit();
+    const content = parsed.value.object.get("content").?.array.items[0];
+    const value = content.object.get("output").?.object.get("value").?;
+    try std.testing.expect(value == .string);
+    try std.testing.expectEqualStrings(
+        "binary or non-utf8 tool output omitted (4 bytes)",
+        value.string,
+    );
+}
+
+test "gateway request rejects unsafe non-tool text before serialization" {
+    const messages = [_]ChatMessage{.{ .role = .user, .content = "bad\xff" }};
+    try std.testing.expectError(
+        error.InvalidProviderMessageText,
+        buildGatewayRequestBody(std.testing.allocator, "[]", &messages),
+    );
 }
 
 test "writeChatMessageJsonCached adds provider options and non-cached omits them" {

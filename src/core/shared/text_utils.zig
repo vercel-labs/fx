@@ -427,6 +427,16 @@ pub fn sanitizeModelText(arena: std.mem.Allocator, text: []const u8) ![]const u8
     return std.fmt.allocPrint(arena, "binary or non-utf8 tool output omitted ({d} bytes)", .{text.len});
 }
 
+/// Writes a model-facing tool result as a JSON string. Invalid UTF-8 and NUL
+/// bytes are represented by the same explicit omission notice used during
+/// tool-result preparation, so `std.json` can never turn them into an array.
+pub fn writeModelSafeTextJson(writer: *std.Io.Writer, text: []const u8) !void {
+    if (isModelSafeText(text)) return std.json.Stringify.value(text, .{}, writer);
+    try writer.writeAll("\"binary or non-utf8 tool output omitted (");
+    try writer.print("{d}", .{text.len});
+    try writer.writeAll(" bytes)\"");
+}
+
 pub fn maskSecrets(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     defer out.deinit();
@@ -860,6 +870,17 @@ test "sanitizeModelText returns replacement text for unsafe input" {
     const unsafe = try sanitizeModelText(alloc, "bad\xff");
     defer alloc.free(unsafe);
     try std.testing.expectEqualStrings("binary or non-utf8 tool output omitted (4 bytes)", unsafe);
+}
+
+test "writeModelSafeTextJson always emits a string" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try writeModelSafeTextJson(&out.writer, "bad\xff");
+    try std.testing.expectEqualStrings(
+        "\"binary or non-utf8 tool output omitted (4 bytes)\"",
+        out.written(),
+    );
 }
 
 test "maskSecrets masks env-style secrets" {

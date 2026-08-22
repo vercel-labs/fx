@@ -10,6 +10,7 @@ const io_mod = @import("../../shared/io.zig");
 const file_mutation = @import("../../tooling/file_mutation.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const tool_result_limits = @import("../../tooling/tool_result_limits.zig");
+const text_utils = @import("../../shared/text_utils.zig");
 
 const runtime_config = @import("config.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
@@ -167,9 +168,10 @@ pub fn prepareToolModelOutput(arena: Allocator, config: Config, tool_call: ToolC
     if ((config.session_child_capability != null or config.tool_result_dir != null) and
         raw_output.len > result_store.large_result_threshold_bytes)
     {
+        const safe_output = try text_utils.sanitizeModelText(arena, raw_output);
         const redacted_output = try execution_memory_helpers.redactText(
             arena,
-            raw_output,
+            safe_output,
         );
         if (config.session_child_capability != null) {
             return result_store.prepareManaged(
@@ -800,6 +802,58 @@ test "large result storage redacts secret-bearing output before preview and disk
     defer alloc.free(stored);
     try std.testing.expect(std.mem.find(u8, stored, "super-secret-value") == null);
     try std.testing.expect(std.mem.find(u8, stored, "api_key=[redacted]") != null);
+}
+
+test "300 KiB unsafe result stores a model-safe omission preview" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+
+    const raw = try alloc.alloc(u8, 300 * 1024);
+    defer alloc.free(raw);
+    @memset(raw, 'x');
+    raw[raw.len / 2] = 0xff;
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const prepared = try prepareToolModelOutput(arena, .{
+        .system_prompt = "",
+        .gateway_retry_count = 0,
+        .gateway_chat_url = "",
+        .gateway_tools_json = "[]",
+        .agent_step_limit = 1,
+        .cancel_flag = &cancel_flag,
+        .tool_result_dir = dir,
+    }, toolCall("call_unsafe_large", "run_command", "{}"), raw);
+
+    try std.testing.expect(prepared.memory.output_handle != null);
+    try std.testing.expect(prepared.memory.truncated);
+    try std.testing.expectEqual(raw.len, prepared.memory.output_bytes);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(prepared.model_output));
+    try std.testing.expect(std.mem.find(
+        u8,
+        prepared.model_output,
+        "binary or non-utf8 tool output omitted (307200 bytes)",
+    ) != null);
+
+    const stored = try result_store.readByRange(
+        alloc,
+        dir,
+        prepared.memory.output_handle.?,
+        1,
+        512,
+    );
+    defer alloc.free(stored);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(stored));
+    try std.testing.expect(std.mem.find(
+        u8,
+        stored,
+        "binary or non-utf8 tool output omitted (307200 bytes)",
+    ) != null);
 }
 
 test "transcript does not mark native web_search as provider resource placeholder" {

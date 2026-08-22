@@ -759,6 +759,65 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
+  test("saved ask normalizes 300 KiB unsafe terminal output before continuation", async () => {
+    const root = createFixtureRoot("unsafe-large-terminal-output");
+    const tracePath = join(root.root, "trace.log");
+    const commandPath = join(root.workspace, "emit-large-output.sh");
+    writeFileSync(
+      commandPath,
+      "#!/bin/sh\nawk 'BEGIN { for (i = 0; i < 307200; i++) printf \"x\" }'\nprintf '\\377'\n",
+    );
+    chmodSync(commandPath, 0o755);
+
+    const callId = "unsafe_large_output_1";
+    const responses = [
+      fakeGatewayToolCall(callId, "terminal", {
+        action: "exec",
+        command: "./emit-large-output.sh",
+      }),
+      fakeGatewayFinalText("LARGE_OUTPUT_CONTINUATION_COMPLETE"),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "Run the large-output fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 30_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain(
+        "LARGE_OUTPUT_CONTINUATION_COMPLETE",
+      );
+      expect(result.stderr).toContain("Running ./emit-large-output.sh");
+      expect(gateway.requests).toHaveLength(2);
+
+      const continuation = gatewayRequest(gateway.requests[1]!.body);
+      const parts = continuation.prompt.flatMap((message) =>
+        Array.isArray(message.content) ? message.content : []
+      ) as Array<Record<string, unknown>>;
+      const resultPart = parts.find((part) =>
+        part.type === "tool-result" && part.toolCallId === callId
+      );
+      expect(resultPart).toBeDefined();
+      const output = resultPart!.output as Record<string, unknown>;
+      expect(output.type).toBe("text");
+      expect(typeof output.value).toBe("string");
+      expect(output.value).toContain("<tool_result_preview");
+      expect(output.value).toContain("stdout_bytes=307201");
+      expect(output.value).toContain("<tool_result_handle>");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("memory clear deletion failure remains failed and preserves state", async () => {
     const root = createFixtureRoot("memory-clear-failure");
     const tracePath = join(root.root, "trace.log");

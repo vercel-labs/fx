@@ -2897,7 +2897,10 @@ test "git worktree falls back to unknown for missing invalid locked and oversize
 
 fn appendStatic(input: StaticContextInput, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
     if (input.project_context.len > 0) {
-        try messages.append(arena, .{ .role = .system, .content = input.project_context });
+        try messages.append(arena, .{
+            .role = .system,
+            .content = try arena.dupe(u8, input.project_context),
+        });
     }
 }
 
@@ -3240,6 +3243,23 @@ test "runtime context ordering and background snapshot" {
     try std.testing.expectEqual(@as(usize, 3), starting_messages.items.len);
     try expectContains(starting_messages.items[0].content.?, "<fx-turn-context>");
     try expectContains(starting_messages.items[2].content.?, "url=pending");
+}
+
+test "static project context remains owned by the turn arena" {
+    const alloc = std.testing.allocator;
+    const source = try alloc.dupe(u8, "project facts");
+    defer alloc.free(source);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var messages: std.ArrayList(ChatMessage) = .empty;
+
+    try appendStatic(.{ .project_context = source }, arena, &messages);
+    @memset(source, 'x');
+
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    try std.testing.expectEqualStrings("project facts", messages.items[0].content.?);
 }
 
 test "runtime context keeps live background metadata inside line fields" {
