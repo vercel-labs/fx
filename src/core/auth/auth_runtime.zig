@@ -152,6 +152,7 @@ pub const AcquisitionAction = enum {
     chatgpt_login,
     grok_login,
     setup,
+    opencode_go,
     change_team,
     switch_credential,
     switch_provider,
@@ -181,6 +182,7 @@ pub const ApiKeySaveStart = enum {
 pub const ApiKeySaveResult = union(enum) {
     empty,
     saved: bool,
+    opencode_go_saved,
     gateway_refused,
     gateway_unavailable,
     store_failed,
@@ -212,26 +214,30 @@ const ApiKeySaveDeps = struct {
     validator: api_key_validator.Provider = api_key_validator.unavailable_provider,
     store: StoredKeyStoreFn = storeUnavailableSecret,
     loader: CredentialLoaderFn = loadCredentialSource,
+    expected_source: credentials.Source = .stored_key,
+    validate: bool = true,
 };
 
 /// The whole save sequence with no runtime state, so outcome behaviour can be
 /// tested synchronously while the worker owns only threading.
 fn performApiKeySave(alloc: Allocator, key: []const u8, deps: ApiKeySaveDeps) ApiKeySaveOutcome {
-    switch (deps.validator.validate(alloc, key)) {
-        .accepted => {},
-        .refused => return .gateway_refused,
-        .unavailable => return .gateway_unavailable,
+    if (deps.validate) {
+        switch (deps.validator.validate(alloc, key)) {
+            .accepted => {},
+            .refused => return .gateway_refused,
+            .unavailable => return .gateway_unavailable,
+        }
     }
     deps.store(deps.ctx, alloc, key) catch |err| {
         debug_trace.logf("auth", "api key save failed step=store err={s}", .{@errorName(err)});
         return .store_failed;
     };
-    const loaded = deps.loader(deps.ctx, alloc, .stored_key) catch |err| {
+    const loaded = deps.loader(deps.ctx, alloc, deps.expected_source) catch |err| {
         debug_trace.logf("auth", "api key save failed step=reload err={s}", .{@errorName(err)});
         return .reload_failed;
     };
     const credential = loaded orelse return .reload_failed;
-    if (credential.source != .stored_key) {
+    if (credential.source != deps.expected_source) {
         var wrong = credential;
         wrong.deinit(alloc);
         return .reload_failed;
@@ -379,6 +385,7 @@ pub const PickerView = struct {
     sign_in: login_flow.SignInSnapshot = .{},
     sign_in_source: credentials.Source = .fx_login,
     api_key_mask_count: usize = 0,
+    api_key_provider: ApiKeyProvider = .vercel_ai_gateway,
 
     pub fn activeSourceLabel(self: PickerView) []const u8 {
         return sourceLabelOrMissing(self.active_source);
@@ -391,7 +398,7 @@ pub const PickerView = struct {
             else if (comptime host_target.is_wasm)
                 4
             else
-                7,
+                8,
             .provider => if (comptime host_target.is_wasm) 2 else 3,
             .sign_in, .api_key => 0,
             .change_team => blk: {
@@ -434,9 +441,10 @@ pub const PickerView = struct {
                 1 => .{ .action = .chatgpt_login },
                 2 => .{ .action = .grok_login },
                 3 => .{ .action = .setup },
-                4 => .{ .action = .switch_provider },
-                5 => .{ .action = .change_team },
-                6 => .{ .action = .switch_credential },
+                4 => .{ .action = .opencode_go },
+                5 => .{ .action = .switch_provider },
+                6 => .{ .action = .change_team },
+                7 => .{ .action = .switch_credential },
                 else => null,
             },
             .provider => switch (index) {
@@ -487,6 +495,7 @@ pub const PickerView = struct {
                 .chatgpt_login => "Sign in with Codex",
                 .grok_login => "Sign in with Grok",
                 .setup => if (self.include_skip) "Add an API key" else "API key",
+                .opencode_go => "OpenCode Go API key",
                 .change_team => "Change team",
                 .switch_credential => "Switch credential",
                 .switch_provider => "Switch provider",
@@ -504,7 +513,7 @@ pub const PickerView = struct {
                 .login => if (self.fx_login_session_available) "connected" else "",
                 .chatgpt_login => if (self.available_sources.contains(.chatgpt_subscription)) "connected" else "",
                 .grok_login => if (self.available_sources.contains(.grok_subscription)) "connected" else "",
-                .setup, .switch_credential, .switch_provider => "",
+                .setup, .opencode_go, .switch_credential, .switch_provider => "",
                 .automatic => "use normal precedence",
                 .change_team => if (self.fx_login_session_available) "choose a team" else "sign in first",
             },
@@ -527,6 +536,11 @@ pub const PickerView = struct {
         const team = self.teams[index];
         return std.mem.eql(u8, current, team.id) or std.mem.eql(u8, current, team.slug);
     }
+};
+
+pub const ApiKeyProvider = enum {
+    vercel_ai_gateway,
+    opencode_go,
 };
 
 fn teamMatchesQuery(team: login_flow.Team, query: []const u8) bool {
@@ -748,6 +762,7 @@ pub const Runtime = struct {
     api_key_validator: api_key_validator.Provider = api_key_validator.unavailable_provider,
     oauth_transport: oauth_transport.Provider = oauth_transport.unavailable_provider,
     secret_store: host.SecretStore = host.unavailable_secret_store,
+    opencode_go_secret_store: host.SecretStore = host.unavailable_secret_store,
     selected_credential: ?credentials.Credential = null,
     credential_refresh_failure_source: ?credentials.Source = null,
     source_inventory: SourceSet = .empty,
@@ -766,17 +781,20 @@ pub const Runtime = struct {
     sign_in_returns_to_root: bool = false,
     api_key_input: std.ArrayList(u8) = .empty,
     api_key_returns_to_root: bool = false,
+    api_key_provider: ApiKeyProvider = .vercel_ai_gateway,
     api_key_save: ApiKeySaveRuntime = .{},
 
     pub fn init(
         validator: api_key_validator.Provider,
         transport: oauth_transport.Provider,
         secret_store: host.SecretStore,
+        opencode_go_secret_store: host.SecretStore,
     ) Self {
         return .{
             .api_key_validator = validator,
             .oauth_transport = transport,
             .secret_store = secret_store,
+            .opencode_go_secret_store = opencode_go_secret_store,
         };
     }
 
@@ -977,6 +995,7 @@ pub const Runtime = struct {
             .sign_in = self.sign_in_flow.snapshot(),
             .sign_in_source = self.sign_in_source,
             .api_key_mask_count = @min(self.api_key_input.items.len, max_api_key_mask_glyphs),
+            .api_key_provider = self.api_key_provider,
         };
     }
 
@@ -1062,14 +1081,27 @@ pub const Runtime = struct {
     }
 
     pub fn openApiKeyPicker(self: *Self, alloc: Allocator) void {
-        self.openApiKeyPickerWithParent(alloc, false);
+        self.openApiKeyPickerWithParent(alloc, false, .vercel_ai_gateway);
     }
 
     pub fn openApiKeyPickerFromRoot(self: *Self, alloc: Allocator) void {
-        self.openApiKeyPickerWithParent(alloc, true);
+        self.openApiKeyPickerWithParent(alloc, true, .vercel_ai_gateway);
     }
 
-    fn openApiKeyPickerWithParent(self: *Self, alloc: Allocator, returns_to_root: bool) void {
+    pub fn openOpenCodeGoApiKeyPicker(self: *Self, alloc: Allocator) void {
+        self.openApiKeyPickerWithParent(alloc, false, .opencode_go);
+    }
+
+    pub fn openOpenCodeGoApiKeyPickerFromRoot(self: *Self, alloc: Allocator) void {
+        self.openApiKeyPickerWithParent(alloc, true, .opencode_go);
+    }
+
+    fn openApiKeyPickerWithParent(
+        self: *Self,
+        alloc: Allocator,
+        returns_to_root: bool,
+        provider: ApiKeyProvider,
+    ) void {
         self.exitSignInStage(alloc);
         self.exitApiKeyStage(alloc, .screen_replacement);
         self.clearTeamSelection(alloc);
@@ -1077,6 +1109,7 @@ pub const Runtime = struct {
         self.picker_stage = .api_key;
         self.picker_selection = null;
         self.api_key_returns_to_root = returns_to_root;
+        self.api_key_provider = provider;
     }
 
     pub fn openSignInPicker(self: *Self, alloc: Allocator) !bool {
@@ -1177,12 +1210,21 @@ pub const Runtime = struct {
     /// store write can block for seconds on a locked keychain, and the gateway
     /// check is a network round trip; neither may run on the event loop.
     pub fn beginApiKeySave(self: *Self, alloc: Allocator) ApiKeySaveStart {
-        return self.beginApiKeySaveWithDeps(alloc, .{
-            .ctx = self,
-            .validator = self.api_key_validator,
-            .store = storeRuntimeSecret,
-            .loader = loadRuntimeCredentialSource,
-        });
+        return switch (self.api_key_provider) {
+            .vercel_ai_gateway => self.beginApiKeySaveWithDeps(alloc, .{
+                .ctx = self,
+                .validator = self.api_key_validator,
+                .store = storeRuntimeSecret,
+                .loader = loadRuntimeCredentialSource,
+            }),
+            .opencode_go => self.beginApiKeySaveWithDeps(alloc, .{
+                .ctx = self,
+                .store = storeRuntimeOpenCodeGoSecret,
+                .loader = loadRuntimeCredentialSource,
+                .expected_source = .opencode_go,
+                .validate = false,
+            }),
+        };
     }
 
     fn beginApiKeySaveWithDeps(self: *Self, alloc: Allocator, deps: ApiKeySaveDeps) ApiKeySaveStart {
@@ -1218,6 +1260,7 @@ pub const Runtime = struct {
                 var owned = credential.*;
                 outcome = .reload_failed;
                 defer owned.deinit(alloc);
+                if (owned.source == .opencode_go) break :blk .opencode_go_saved;
                 break :blk .{ .saved = self.adoptCredential(alloc, &owned) };
             },
         };
@@ -1270,7 +1313,7 @@ pub const Runtime = struct {
                 .grok_login
             else
                 .login,
-            .api_key => .setup,
+            .api_key => if (self.api_key_provider == .opencode_go) .opencode_go else .setup,
             .change_team => .change_team,
             .switch_credential => .switch_credential,
         } };
@@ -1309,6 +1352,7 @@ pub const Runtime = struct {
                         return null;
                     },
                     .setup => {},
+                    .opencode_go => {},
                     // Only reachable from the switch screen, never the root.
                     .automatic => unreachable,
                     .login, .chatgpt_login, .grok_login => self.closePicker(alloc),
@@ -1431,6 +1475,15 @@ pub const Runtime = struct {
                     probeCredentialSource,
                     loadRuntimeCredentialSource,
                 )),
+            .opencode_go => if (self.credentialSource() == .opencode_go)
+                false
+            else
+                self.selectSourceWithLoader(
+                    alloc,
+                    .opencode_go,
+                    self,
+                    loadRuntimeCredentialSource,
+                ),
         };
     }
 
@@ -1594,12 +1647,20 @@ fn loadCredentialSource(_: ?*anyopaque, alloc: Allocator, source: credentials.So
 
 fn loadRuntimeCredentialSource(raw: ?*anyopaque, alloc: Allocator, source: credentials.Source) !?credentials.Credential {
     const self: *Runtime = @ptrCast(@alignCast(raw.?));
+    if (source == .opencode_go) {
+        return credentials.loadOpenCodeGoCredential(alloc, self.opencode_go_secret_store);
+    }
     return credentials.loadSource(alloc, self.oauth_transport, self.secret_store, source);
 }
 
 fn storeRuntimeSecret(raw: ?*anyopaque, alloc: Allocator, value: []const u8) !void {
     const self: *Runtime = @ptrCast(@alignCast(raw.?));
     return self.secret_store.store(alloc, value);
+}
+
+fn storeRuntimeOpenCodeGoSecret(raw: ?*anyopaque, alloc: Allocator, value: []const u8) !void {
+    const self: *Runtime = @ptrCast(@alignCast(raw.?));
+    return self.opencode_go_secret_store.store(alloc, value);
 }
 
 fn storeUnavailableSecret(_: ?*anyopaque, _: Allocator, _: []const u8) !void {
@@ -2581,6 +2642,7 @@ test "auth runtime saves and reloads through its injected secret store" {
         fixture.validator(),
         oauth_transport.unavailable_provider,
         fixture.secretStore(),
+        host.unavailable_secret_store,
     );
     defer runtime.deinit(alloc);
 
@@ -2597,6 +2659,35 @@ test "auth runtime saves and reloads through its injected secret store" {
     try std.testing.expectEqual(@as(usize, 1), fixture.load_calls);
     try std.testing.expectEqual(credentials.Source.stored_key, runtime.credentialSource().?);
     try std.testing.expectEqualStrings("loaded-key", runtime.apiKey().?);
+}
+
+test "OpenCode Go login skips Gateway validation and uses its own secret store" {
+    const alloc = std.testing.allocator;
+    var gateway_fixture: ApiKeySaveFixture = .{};
+    var opencode_fixture: ApiKeySaveFixture = .{};
+    var runtime = Runtime.init(
+        gateway_fixture.validator(),
+        oauth_transport.unavailable_provider,
+        gateway_fixture.secretStore(),
+        opencode_fixture.secretStore(),
+    );
+    defer runtime.deinit(alloc);
+
+    runtime.openOpenCodeGoApiKeyPicker(alloc);
+    try std.testing.expectEqual(ApiKeyProvider.opencode_go, runtime.pickerView().api_key_provider);
+    for ("ocg_test_key") |byte| try std.testing.expect(try runtime.appendApiKeyByte(alloc, byte));
+    try std.testing.expectEqual(ApiKeySaveStart.started, runtime.beginApiKeySave(alloc));
+
+    const result = while (true) {
+        if (runtime.takeApiKeySaveResult(alloc)) |value| break value;
+    };
+
+    try std.testing.expect(result == .opencode_go_saved);
+    try std.testing.expectEqual(@as(usize, 0), gateway_fixture.validate_calls);
+    try std.testing.expectEqual(@as(usize, 0), gateway_fixture.store_calls);
+    try std.testing.expectEqual(@as(usize, 1), opencode_fixture.store_calls);
+    try std.testing.expectEqual(@as(usize, 1), opencode_fixture.load_calls);
+    try std.testing.expect(runtime.credentialSource() == null);
 }
 
 test "an empty api key entry starts no save worker" {

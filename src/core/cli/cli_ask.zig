@@ -7,6 +7,7 @@ const app_lifecycle = @import("../app/app_lifecycle.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+const provider_id = @import("../providers/provider_id.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const background_runtime = @import("../background/background_runtime.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
@@ -226,9 +227,12 @@ pub const Config = struct {
     codex_model_catalog: ?model_catalog.Provider = null,
     grok_agent_stream: ?agent_stream_provider.Provider = null,
     grok_model_catalog: ?model_catalog.Provider = null,
+    opencode_go_agent_stream: ?agent_stream_provider.Provider = null,
+    opencode_go_model_catalog: ?model_catalog.Provider = null,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     secret_store: host.SecretStore,
+    opencode_go_secret_store: host.SecretStore = host.unavailable_secret_store,
     prompt_policy: prompt_policy.Policy,
     skill_root_policy: skill_contract.RootPolicy,
     ignored_list_entries: []const []const u8,
@@ -284,6 +288,10 @@ fn runAskChild(
             .grok = .{
                 .agent_stream_provider = ctx.cfg.grok_agent_stream orelse agent_stream_provider.unavailable_provider,
                 .permission_reviewer_provider = ctx.cfg.grok_permission_reviewer_provider,
+            },
+            .opencode_go = .{
+                .agent_stream_provider = ctx.cfg.opencode_go_agent_stream orelse agent_stream_provider.unavailable_provider,
+                .permission_reviewer_provider = null,
             },
         },
         .system_prompt = ctx.cfg.prompt_policy.system_prompt,
@@ -1015,7 +1023,10 @@ const AskContext = struct {
             .web_fetch_progress_ctx = @ptrCast(self),
             .on_web_fetch_progress = onWebFetchProgress,
             .web_search_runtime_ready = false,
-            .web_search_backend = if (gateway_features_allowed) self.web_search_runtime.dispatchBackend() else null,
+            .web_search_backend = if (gateway_features_allowed and self.credential_source != .opencode_go)
+                self.web_search_runtime.dispatchBackend()
+            else
+                null,
             .web_search_progress_ctx = @ptrCast(self),
             .on_web_search_progress = onWebSearchProgress,
             .model_capability_resolver = .{
@@ -1061,6 +1072,7 @@ const AskContext = struct {
             .gateway => self.cfg.permission_reviewer_provider,
             .codex => self.cfg.codex_permission_reviewer_provider,
             .grok => self.cfg.grok_permission_reviewer_provider,
+            .opencode_go => null,
         } orelse
             return permission_auto_classifier.Classifier.disabled();
         return permission_auto_classifier.Classifier.withProvider(provider, .{
@@ -1079,6 +1091,7 @@ const AskContext = struct {
             .gateway => self.cfg.gateway_provider.agent_stream,
             .codex => self.cfg.codex_agent_stream orelse agent_stream_provider.unavailable_provider,
             .grok => self.cfg.grok_agent_stream orelse agent_stream_provider.unavailable_provider,
+            .opencode_go => self.cfg.opencode_go_agent_stream orelse agent_stream_provider.unavailable_provider,
         };
     }
 
@@ -1398,12 +1411,12 @@ fn missingCredentialResult(
     options: RunOptions,
     provider: model_provider.ProviderId,
 ) !PromptRunResult {
-    const message = if (provider == .codex)
-        credentials.missing_chatgpt_credential_message
-    else if (provider == .grok)
-        credentials.missing_grok_credential_message
-    else
-        credentials.missing_credential_message;
+    const message = switch (provider) {
+        .codex => credentials.missing_chatgpt_credential_message,
+        .grok => credentials.missing_grok_credential_message,
+        .opencode_go => credentials.missing_opencode_go_credential_message,
+        else => credentials.missing_credential_message,
+    };
     try options.deps.write_stderr(options.deps.stderr_ctx, "fx ask: ");
     try options.deps.write_stderr(options.deps.stderr_ctx, message);
     try options.deps.write_stderr(options.deps.stderr_ctx, "\n");
@@ -1459,7 +1472,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     );
     try checkHeadlessCancellation(options.deps);
 
-    if (!options.continue_recovery and options.resume_target == null and startup.credential == null) {
+    if (!options.continue_recovery and options.resume_target == null and
+        startup.credential == null and startup.provider != .opencode_go)
+    {
         return missingCredentialResult(alloc, options, startup.provider);
     }
 
@@ -1543,7 +1558,13 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         model_provider.authorizesCredential(ctx.provider, credential.source)
     else
         false;
-    const credential: *const credentials.Credential = if (startup_matches_final_model)
+    const credential: *const credentials.Credential = if (ctx.provider == .opencode_go) go: {
+        routed_credential = try credentials.loadOpenCodeGoCredential(alloc, cfg.opencode_go_secret_store);
+        if (routed_credential == null) {
+            return missingCredentialResult(alloc, options, ctx.provider);
+        }
+        break :go &routed_credential.?;
+    } else if (startup_matches_final_model)
         &startup.credential.?
     else routed: {
         const preferred = if (startup.credential) |value| value.source else null;
@@ -2005,6 +2026,7 @@ fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8
         ctx.cfg.gateway_provider.model_catalog,
         ctx.cfg.codex_model_catalog,
         ctx.cfg.grok_model_catalog,
+        ctx.cfg.opencode_go_model_catalog,
     ) orelse return model_capabilities.capabilitiesForModel(model);
     return ctx.capability_resolver.resolve(
         ctx.alloc,
@@ -2023,11 +2045,13 @@ fn selectModelCatalog(
     gateway: model_catalog.Provider,
     codex: ?model_catalog.Provider,
     grok: ?model_catalog.Provider,
+    opencode_go: ?model_catalog.Provider,
 ) ?model_catalog.Provider {
     return switch (provider) {
         .gateway => gateway,
         .codex => codex,
         .grok => grok,
+        .opencode_go => opencode_go,
     };
 }
 
@@ -3012,7 +3036,10 @@ fn pushCommandOutputComplete(raw_ctx: *anyopaque, _: ?types.ToolLifecycleId) !vo
 fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.failed = true;
-    const auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
+    const auth_failure = if (gateway_error_format.detailIndicatesServerModelError(ctx.alloc, detail))
+        null
+    else
+        auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
     ctx.auth_failure = auth_failure;
     const message = if (auth_failure) |failure|
         try failure.renderText(ctx.alloc)
@@ -7592,7 +7619,7 @@ test "saved ask ignores existing legacy task files" {
         tasks_path,
         .{
             .truncate = true,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
+            .permissions = (if (std_builtin.os.tag == .windows) std.Io.File.Permissions.default_file else std.Io.File.Permissions.fromMode(0o600)),
         },
     );
     tasks_file.close(io_mod.getIo());

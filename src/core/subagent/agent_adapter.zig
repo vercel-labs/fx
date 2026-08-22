@@ -40,12 +40,17 @@ pub const ProviderRoutes = struct {
     gateway: ProviderRoute,
     codex: ProviderRoute,
     grok: ProviderRoute,
+    opencode_go: ProviderRoute = .{
+        .agent_stream_provider = stream_provider.unavailable_provider,
+        .permission_reviewer_provider = null,
+    },
 
     pub fn select(self: ProviderRoutes, provider: model_provider.ProviderId) ProviderRoute {
         return switch (provider) {
             .gateway => self.gateway,
             .codex => self.codex,
             .grok => self.grok,
+            .opencode_go => self.opencode_go,
         };
     }
 };

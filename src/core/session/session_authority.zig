@@ -510,7 +510,7 @@ pub fn openSessionFile(
     name: []const u8,
     mode: session_log.OpenMode,
 ) !std.Io.File {
-    const file = session_dir.dir.openFile(io_mod.getIo(), name, .{
+    const file = io_mod.openFile(session_dir.dir, name, .{
         .mode = if (mode == .writable) .read_write else .read_only,
         .allow_directory = false,
         .follow_symlinks = false,
@@ -643,7 +643,7 @@ pub fn eventFileStat(
         .device = device,
         .inode = @intCast(stat.inode),
         .kind = .regular,
-        .mode = stat.permissions.toMode(),
+        .mode = (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else stat.permissions.toMode()),
         .link_count = @intCast(stat.nlink),
         .size = stat.size,
         .mtime_ns = stat.mtime.nanoseconds,

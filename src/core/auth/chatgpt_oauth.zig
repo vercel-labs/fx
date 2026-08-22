@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const chatgpt_session = @import("chatgpt_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
@@ -275,6 +276,11 @@ fn browserCallbackReady(
     cancel_flag: *std.atomic.Value(bool),
 ) !bool {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    if (comptime builtin.os.tag == .windows) {
+        // std.posix.poll has no Windows backend in this toolchain; the
+        // accept below blocks instead of polling the deadline.
+        return true;
+    }
     var fds = [_]std.posix.pollfd{.{
         .fd = listener.socket.handle,
         .events = std.posix.POLL.IN,
@@ -329,6 +335,11 @@ fn writeBrowserCallbackResponse(stream: std.Io.net.Stream, success: bool) !void 
 }
 
 fn setBrowserSocketTimeouts(socket: std.posix.socket_t) void {
+    if (comptime builtin.os.tag == .windows) {
+        // posix setsockopt/timeval has no Windows backend in this toolchain;
+        // the callback socket keeps default timeouts there.
+        return;
+    }
     const timeout = std.posix.timeval{ .sec = browser_callback_io_timeout_seconds, .usec = 0 };
     const bytes = std.mem.asBytes(&timeout);
     std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, bytes) catch |err| {

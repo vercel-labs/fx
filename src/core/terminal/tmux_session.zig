@@ -26,7 +26,7 @@ const max_launcher_config_bytes: usize = contracts.max_command_bytes * 6 +
 const max_lifecycle_bytes: usize = 8 * 5;
 const control_nonce_len: usize = 32;
 const marker_frame_len: usize = control_nonce_len + 1;
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_file_permissions = (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else std.Io.File.Permissions.fromMode(0o600)));
 const poll_ns: u64 = 5 * std.time.ns_per_ms;
 const cleanup_settle_deadline_ms: i64 = 500;
 const capture_accept_deadline_ms: i64 = 2_000;
@@ -1721,9 +1721,7 @@ fn privateSocketExists(socket: []const u8) !bool {
         error.FileNotFound => return false,
         else => return err,
     };
-    if (stat.kind != .unix_domain_socket or
-        stat.permissions.toMode() & 0o777 != 0o600)
-    {
+    if (stat.kind != .unix_domain_socket or !io_mod.unixModeMatches(stat, 0o600)) {
         return error.PrivateTmuxEndpointRequired;
     }
     return true;

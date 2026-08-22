@@ -394,8 +394,8 @@ pub fn readLatestSnapshotToken(
     defer latest.close(io_mod.getIo());
 
     var name: [69]u8 = undefined;
-    var file = latest.openFile(
-        io_mod.getIo(),
+    var file = io_mod.openFile(
+        latest,
         latestPointerFilename(workspace_root, &name),
         .{
             .mode = .read_only,
@@ -706,7 +706,7 @@ fn readLatestPointerJsonFromSessions(
     defer latest.close(io_mod.getIo());
 
     var name: [69]u8 = undefined;
-    var file = latest.openFile(io_mod.getIo(), latestPointerFilename(workspace_root, &name), .{
+    var file = io_mod.openFile(latest, latestPointerFilename(workspace_root, &name), .{
         .mode = .read_only,
         .allow_directory = false,
         .follow_symlinks = false,

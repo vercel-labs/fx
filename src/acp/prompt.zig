@@ -7,6 +7,7 @@ const model_provider = @import("../core/config/model_provider.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const io_mod = @import("../core/shared/io.zig");
+const gateway_error_format = @import("../core/shared/gateway_error_format.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const server = @import("server.zig");
@@ -248,6 +249,7 @@ const AcpContext = struct {
                 .gateway => self.state.cfg.permission_reviewer_provider,
                 .codex => self.state.cfg.codex_permission_reviewer_provider,
                 .grok => self.state.cfg.grok_permission_reviewer_provider,
+                .opencode_go => null,
             },
             .auto_classifier = self.auto_classifier,
             .subagent_host = self.state.subagent_host,
@@ -281,7 +283,10 @@ const AcpContext = struct {
             .web_fetch_artifact_store = session.session_rt.webFetchArtifactStore(),
             .web_fetch_artifact_error = session.session_rt.webFetchArtifactError(),
             .web_search_runtime_ready = false,
-            .web_search_backend = if (gateway_features_allowed) self.state.web_search_runtime.dispatchBackend() else null,
+            .web_search_backend = if (gateway_features_allowed and session.credential_source != .opencode_go)
+                self.state.web_search_runtime.dispatchBackend()
+            else
+                null,
             .model_capability_resolver = .{
                 .ctx = @ptrCast(self),
                 .resolve_fn = resolveModelCapabilities,
@@ -1929,7 +1934,10 @@ fn pushCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
 fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     var buf: [1024]u8 = undefined;
-    const auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
+    const auth_failure = if (gateway_error_format.detailIndicatesServerModelError(ctx.alloc, detail))
+        null
+    else
+        auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
     const owned_message = if (auth_failure) |failure|
         try failure.renderText(ctx.alloc)
     else

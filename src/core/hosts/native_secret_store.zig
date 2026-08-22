@@ -26,6 +26,14 @@ pub const provider: host.SecretStore = .{
     .store_interactive_fn = storeInteractiveCallback,
 };
 
+pub const opencode_go_provider: host.SecretStore = .{
+    .backend_label = backend_label,
+    .is_disabled_fn = isDisabledCallback,
+    .load_fn = loadOpenCodeGoCallback,
+    .store_fn = storeOpenCodeGoCallback,
+    .store_interactive_fn = unavailableInteractiveCallback,
+};
+
 /// The disable switch is named for the macOS backend, so its reader stays there.
 fn isDisabled() bool {
     return keychain.isDisabled();
@@ -77,6 +85,34 @@ fn storeInteractiveCallback(_: ?*anyopaque) StoreError!bool {
     return storeInteractive();
 }
 
+fn loadOpenCodeGoCallback(_: ?*anyopaque, alloc: Allocator) LoadError!?[]u8 {
+    if (comptime builtin.os.tag == .macos) {
+        return keychain.loadOpenCodeGo(alloc) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.KeychainItemNotFound => null,
+            else => error.StoredKeyUnreadable,
+        };
+    }
+    return loadFromProfileNamed(alloc, profile_paths.opencode_go_api_key_file_name);
+}
+
+fn storeOpenCodeGoCallback(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    value: []const u8,
+) StoreError!void {
+    if (value.len == 0) return error.StoredKeyWriteFailed;
+    if (comptime builtin.os.tag == .macos) {
+        keychain.storeOpenCodeGoValue(value) catch |err| return writeFailed("opencode_go_keychain", err);
+        return;
+    }
+    return storeInProfileNamed(alloc, profile_paths.opencode_go_api_key_file_name, value);
+}
+
+fn unavailableInteractiveCallback(_: ?*anyopaque) StoreError!bool {
+    return false;
+}
+
 fn loadFromKeychain(alloc: Allocator) LoadError!?[]u8 {
     return keychain.load(alloc) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -86,6 +122,10 @@ fn loadFromKeychain(alloc: Allocator) LoadError!?[]u8 {
 }
 
 fn loadFromProfile(alloc: Allocator) LoadError!?[]u8 {
+    return loadFromProfileNamed(alloc, profile_paths.api_key_file_name);
+}
+
+fn loadFromProfileNamed(alloc: Allocator, file_name: []const u8) LoadError!?[]u8 {
     const home = io_mod.getenv("HOME") orelse {
         debug_trace.logf("stored_key", "load failed step=home err=HomeNotSet", .{});
         return error.StoredKeyUnreadable;
@@ -108,11 +148,15 @@ fn loadFromProfile(alloc: Allocator) LoadError!?[]u8 {
     };
     defer fx_dir.close(io_mod.getIo());
 
-    return loadFromDir(alloc, &fx_dir);
+    return loadFromDirNamed(alloc, &fx_dir, file_name);
 }
 
 fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) LoadError!?[]u8 {
-    var file = fx_dir.openFile(io_mod.getIo(), profile_paths.api_key_file_name, .{
+    return loadFromDirNamed(alloc, fx_dir, profile_paths.api_key_file_name);
+}
+
+fn loadFromDirNamed(alloc: Allocator, fx_dir: *std.Io.Dir, file_name: []const u8) LoadError!?[]u8 {
+    var file = io_mod.openFile(fx_dir.*, file_name, .{
         .mode = .read_only,
         .allow_directory = false,
         .follow_symlinks = false,
@@ -130,7 +174,7 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) LoadError!?[]u8 {
         debug_trace.logf("stored_key", "load failed step=stat err={s}", .{@errorName(err)});
         return error.StoredKeyUnreadable;
     };
-    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) {
+    if (comptime builtin.os.tag != .windows and (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0)) {
         debug_trace.logf("stored_key", "load failed step=permissions err=StoredKeyInsecure", .{});
         return error.StoredKeyInsecure;
     }
@@ -155,6 +199,10 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) LoadError!?[]u8 {
 }
 
 fn storeInProfile(alloc: Allocator, value: []const u8) StoreError!void {
+    return storeInProfileNamed(alloc, profile_paths.api_key_file_name, value);
+}
+
+fn storeInProfileNamed(alloc: Allocator, file_name: []const u8, value: []const u8) StoreError!void {
     const home = io_mod.getenv("HOME") orelse return writeFailed("home", error.HomeNotSet);
     var home_dir = io_mod.VerifiedDir{
         .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
@@ -168,13 +216,17 @@ fn storeInProfile(alloc: Allocator, value: []const u8) StoreError!void {
     };
     defer fx_dir.close();
 
-    return storeInDir(alloc, &fx_dir, value);
+    return storeInDirNamed(alloc, &fx_dir, file_name, value);
 }
 
 /// `durableReplaceVerified` creates the file at 0600 and re-stats it after the rename,
 /// so the mode this store depends on is enforced rather than assumed.
 fn storeInDir(alloc: Allocator, fx_dir: *io_mod.VerifiedDir, value: []const u8) StoreError!void {
-    io_mod.durableReplaceVerified(alloc, fx_dir, profile_paths.api_key_file_name, value) catch |err| switch (err) {
+    return storeInDirNamed(alloc, fx_dir, profile_paths.api_key_file_name, value);
+}
+
+fn storeInDirNamed(alloc: Allocator, fx_dir: *io_mod.VerifiedDir, file_name: []const u8, value: []const u8) StoreError!void {
+    io_mod.durableReplaceVerified(alloc, fx_dir, file_name, value) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return writeFailed("replace", err),
     };
@@ -206,12 +258,34 @@ test "stored key file round-trips byte-identically at mode 0600" {
     try storeInDir(std.testing.allocator, &fx_dir, written);
 
     const stat = try tmp.dir.statFile(std.testing.io, profile_paths.api_key_file_name, .{});
-    try std.testing.expect(stat.permissions.toMode() & 0o777 == 0o600);
+    try std.testing.expect((if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else stat.permissions.toMode()) & 0o777 == 0o600);
 
     const read_back = (try loadFromDir(std.testing.allocator, &fx_dir.dir)) orelse
         return error.TestUnexpectedMissingStoredKey;
     defer secret.zeroAndFree(std.testing.allocator, read_back);
     try std.testing.expectEqualStrings(written, read_back);
+}
+
+test "OpenCode Go and Gateway keys use separate profile files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fx_dir = io_mod.VerifiedDir{
+        .dir = try tmp.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true, .follow_symlinks = false }),
+    };
+    defer fx_dir.close();
+
+    try storeInDirNamed(std.testing.allocator, &fx_dir, profile_paths.api_key_file_name, "gateway-key");
+    try storeInDirNamed(std.testing.allocator, &fx_dir, profile_paths.opencode_go_api_key_file_name, "opencode-key");
+
+    const gateway = (try loadFromDirNamed(std.testing.allocator, &fx_dir.dir, profile_paths.api_key_file_name)) orelse
+        return error.TestUnexpectedMissingStoredKey;
+    defer secret.zeroAndFree(std.testing.allocator, gateway);
+    const opencode = (try loadFromDirNamed(std.testing.allocator, &fx_dir.dir, profile_paths.opencode_go_api_key_file_name)) orelse
+        return error.TestUnexpectedMissingStoredKey;
+    defer secret.zeroAndFree(std.testing.allocator, opencode);
+
+    try std.testing.expectEqualStrings("gateway-key", gateway);
+    try std.testing.expectEqualStrings("opencode-key", opencode);
 }
 
 test "stored key file refusal stays distinguishable from absence" {

@@ -79,6 +79,7 @@ pub fn Runtime(comptime App: type) type {
                 const required_source: credentials.Source = switch (provider) {
                     .codex => .chatgpt_subscription,
                     .grok => .grok_subscription,
+                    .opencode_go => .opencode_go,
                     .gateway => app.auth.credentialSource() orelse .fx_login,
                 };
                 const route_change = app.auth.selectForProvider(app.alloc, provider) catch |err| switch (err) {
@@ -119,7 +120,32 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
-        pub fn runLoginCommand(app: *App) !void {
+        pub fn runLoginCommand(app: *App, rest: []const u8) !void {
+            const provider = std.mem.trim(u8, rest, " \t");
+            if (std.ascii.eqlIgnoreCase(provider, "opencode-go") or
+                std.ascii.eqlIgnoreCase(provider, "opencode"))
+            {
+                if (comptime !runtime_profile.allows(App, .native_auth)) {
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .warning,
+                        .body = "OpenCode Go API key setup is unavailable in this WASM session.",
+                    }, true);
+                    return;
+                }
+                prepareApiKeyInputBoundary(app);
+                app.auth.openOpenCodeGoApiKeyPicker(app.alloc);
+                app.shell.render_requests.request(.footer);
+                return;
+            }
+            if (provider.len > 0 and !std.ascii.eqlIgnoreCase(provider, "vercel")) {
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = "Use /login vercel or /login opencode-go.",
+                }, true);
+                return;
+            }
             if (comptime !oauthAuthEnabled(App)) {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -327,6 +353,18 @@ pub fn Runtime(comptime App: type) type {
                         prepareApiKeyInputBoundary(app);
                         app.auth.openApiKeyPickerFromRoot(app.alloc);
                     },
+                    .opencode_go => {
+                        if (comptime !runtime_profile.allows(App, .native_auth)) {
+                            try app.writeDomainNotice(.{
+                                .topic = "auth",
+                                .tone = .warning,
+                                .body = "OpenCode Go API key setup is unavailable in this WASM session.",
+                            }, true);
+                            return;
+                        }
+                        prepareApiKeyInputBoundary(app);
+                        app.auth.openOpenCodeGoApiKeyPickerFromRoot(app.alloc);
+                    },
                     .change_team => try beginTeamPicker(app),
                     .switch_credential => app.auth.openSwitchCredentialPicker(app.alloc),
                     .switch_provider => app.auth.openProviderPicker(app.alloc, provider_runtime.provider(app)),
@@ -513,6 +551,21 @@ pub fn Runtime(comptime App: type) type {
                     const body = try std.fmt.allocPrint(
                         app.alloc,
                         "Saved the API key to {s} and made it active.",
+                        .{credentials.stored_key_backend_label},
+                    );
+                    defer app.alloc.free(body);
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .neutral,
+                        .body = body,
+                    }, true);
+                },
+                .opencode_go_saved => {
+                    app.model_cache.reset();
+                    app.startModelCacheWarmup();
+                    const body = try std.fmt.allocPrint(
+                        app.alloc,
+                        "Saved the OpenCode Go API key to {s}.",
                         .{credentials.stored_key_backend_label},
                     );
                     defer app.alloc.free(body);
@@ -920,6 +973,12 @@ pub fn Runtime(comptime App: type) type {
                 .gateway => settings.model,
                 .codex => settings.codex_model,
                 .grok => settings.grok_model,
+                .opencode_go => blk: {
+                    if (settings.model) |saved| {
+                        if (std.mem.startsWith(u8, saved, "opencode-go/")) break :blk saved;
+                    }
+                    break :blk @as(?[]const u8, null);
+                },
             };
             const current_model = if (intent == .post_oauth and current == target)
                 provider_runtime.model(app)

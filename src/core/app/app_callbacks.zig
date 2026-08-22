@@ -894,7 +894,10 @@ pub fn Bindings(comptime App: type) type {
 
         fn agentPushHttpError(ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            const auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
+            const auth_failure = if (gateway_error_format.detailIndicatesServerModelError(std.heap.c_allocator, detail))
+                null
+            else
+                auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
             const message = if (auth_failure) |failure|
                 try failure.renderText(std.heap.c_allocator)
             else

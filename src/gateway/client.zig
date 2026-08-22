@@ -988,6 +988,11 @@ test "connection setup policy bounds retry by deadline attempts and delivery" {
     }
 }
 
+pub const WireFormat = enum {
+    ai_sdk_v4,
+    openai_responses,
+};
+
 pub const StreamRequest = struct {
     api_key: []const u8,
     model: []const u8,
@@ -1003,6 +1008,7 @@ pub const StreamRequest = struct {
     on_reasoning_chunk: ?StreamCallback = null,
     on_tool_input_chunk: ?StreamCallback = null,
     provider_attempt_owner: ProviderAttemptOwner = .transport,
+    wire_format: WireFormat = .ai_sdk_v4,
 };
 
 pub fn streamGatewayCompletion(
@@ -1178,12 +1184,15 @@ fn streamGatewayCompletionCoreWithOptions(
     defer alloc.free(auth_header);
 
     var extra_headers_buf: [9]std.http.Header = undefined;
-    const extra_headers = gatewayExtraHeaders(
-        &extra_headers_buf,
-        model,
-        request.team,
-        request.session_id,
-    );
+    const extra_headers: []const std.http.Header = switch (request.wire_format) {
+        .ai_sdk_v4 => gatewayExtraHeaders(
+            &extra_headers_buf,
+            model,
+            request.team,
+            request.session_id,
+        ),
+        .openai_responses => &.{},
+    };
 
     var attempt: usize = 0;
     var delivery_ambiguous = false;
@@ -1387,19 +1396,32 @@ fn streamGatewayCompletionCoreWithOptions(
         var transfer_buf: [gateway_transfer_buffer_bytes]u8 = undefined;
         const body_reader = response.reader(&transfer_buf);
         debug_trace.eventf("gateway", "before_sse_consume", trace_ctx, "attempt={d}", .{attempt + 1});
-        var completion = consumeSseStreamTraced(
-            alloc,
-            body_reader,
-            callback_ctx,
-            on_content_chunk,
-            on_tool_start,
-            request.on_reasoning_chunk,
-            request.on_tool_input_chunk,
-            cancel_flag,
-            .{ .requested_model = model, .ctx = trace_ctx },
-            expected_provider_tool_name,
-            request.content_capture_limit,
-        ) catch |err| {
+        var completion = switch (request.wire_format) {
+            .ai_sdk_v4 => consumeSseStreamTraced(
+                alloc,
+                body_reader,
+                callback_ctx,
+                on_content_chunk,
+                on_tool_start,
+                request.on_reasoning_chunk,
+                request.on_tool_input_chunk,
+                cancel_flag,
+                .{ .requested_model = model, .ctx = trace_ctx },
+                expected_provider_tool_name,
+                request.content_capture_limit,
+            ),
+            .openai_responses => consumeResponsesSseStream(
+                alloc,
+                body_reader,
+                callback_ctx,
+                on_content_chunk,
+                on_tool_start,
+                request.on_reasoning_chunk,
+                request.on_tool_input_chunk,
+                cancel_flag,
+                request.content_capture_limit,
+            ),
+        } catch |err| {
             debug_trace.eventf("gateway", "sse_consume_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
             return @as(anyerror!StreamResult, connectedIoFailure(
                 cancel_flag.load(.seq_cst),
@@ -2709,6 +2731,232 @@ const SseEventReader = struct {
         }
     }
 };
+
+fn responsesStringField(value: std.json.Value, name: []const u8) ?[]const u8 {
+    if (value != .object) return null;
+    const field = value.object.get(name) orelse return null;
+    return if (field == .string) field.string else null;
+}
+
+fn captureResponsesUsage(value: std.json.Value, usage: *types.Usage) void {
+    if (value != .object) return;
+    const response = value.object.get("response") orelse return;
+    if (response != .object) return;
+    const usage_value = response.object.get("usage") orelse return;
+    if (usage_value != .object) return;
+    if (usage_value.object.get("input_tokens")) |token_value| switch (token_value) {
+        .integer => |count| if (count >= 0) {
+            usage.input_tokens = @intCast(count);
+        },
+        else => {},
+    };
+    if (usage_value.object.get("output_tokens")) |token_value| switch (token_value) {
+        .integer => |count| if (count >= 0) {
+            usage.output_tokens = @intCast(count);
+        },
+        else => {},
+    };
+}
+
+fn appendResponsesToolCall(
+    alloc: std.mem.Allocator,
+    calls: *std.ArrayList(types.ToolCall),
+    item: std.json.Value,
+) !void {
+    if (item != .object) return;
+    const item_type = responsesStringField(item, "type") orelse return;
+    if (!std.mem.eql(u8, item_type, "function_call")) return;
+    const call_id = responsesStringField(item, "call_id") orelse
+        responsesStringField(item, "id") orelse return;
+    const name = responsesStringField(item, "name") orelse return;
+    const arguments = responsesStringField(item, "arguments") orelse "{}";
+    for (calls.items) |existing| {
+        if (std.mem.eql(u8, existing.id, call_id)) return;
+    }
+
+    const id_copy = try alloc.dupe(u8, call_id);
+    errdefer alloc.free(id_copy);
+    const name_copy = try alloc.dupe(u8, name);
+    errdefer alloc.free(name_copy);
+    const arguments_copy = try alloc.dupe(u8, arguments);
+    errdefer alloc.free(arguments_copy);
+    try calls.append(alloc, .{
+        .id = id_copy,
+        .name = name_copy,
+        .arguments_json = arguments_copy,
+        .argument_integrity = try types.ToolArgumentIntegrity.classifySerialized(alloc, arguments),
+    });
+}
+
+fn consumeResponsesSseStream(
+    alloc: std.mem.Allocator,
+    reader: anytype,
+    callback_ctx: *anyopaque,
+    on_content_chunk: StreamCallback,
+    on_tool_start: ?ToolStartCallback,
+    on_reasoning_chunk: ?StreamCallback,
+    on_tool_input_chunk: ?StreamCallback,
+    cancel_flag: *std.atomic.Value(bool),
+    content_capture_limit: ?usize,
+) !types.GatewayCompletion {
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(alloc);
+    var calls: std.ArrayList(types.ToolCall) = .empty;
+    defer {
+        for (calls.items) |call| types.freeToolCall(alloc, call);
+        calls.deinit(alloc);
+    }
+    var provider_failure_detail: ?[]u8 = null;
+    defer if (provider_failure_detail) |detail| alloc.free(detail);
+    var finish_reason: ?types.ProviderFinishReason = null;
+    var usage: types.Usage = .{};
+
+    var event_reader = SseEventReader{ .max_line_bytes = max_sse_event_line_bytes };
+    defer event_reader.deinit(alloc);
+    while (true) {
+        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+        const event = try event_reader.next(alloc, reader);
+        defer event_reader.releaseLine();
+        const json_text = switch (event) {
+            .data => |data| data,
+            .done, .eof => break,
+            .ignored => continue,
+            .read_failed => return error.ReadFailed,
+        };
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        defer parsed.deinit();
+        const root = parsed.value;
+        const event_type = responsesStringField(root, "type") orelse continue;
+
+        if (std.mem.eql(u8, event_type, "response.output_text.delta")) {
+            const delta = responsesStringField(root, "delta") orelse continue;
+            const retained = if (content_capture_limit) |limit|
+                delta[0..@min(delta.len, limit -| content.items.len)]
+            else
+                delta;
+            try content.appendSlice(alloc, retained);
+            on_content_chunk(callback_ctx, delta);
+        } else if (std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta") or
+            std.mem.eql(u8, event_type, "response.reasoning_text.delta"))
+        {
+            if (on_reasoning_chunk) |callback| {
+                if (responsesStringField(root, "delta")) |delta| callback(callback_ctx, delta);
+            }
+        } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.delta")) {
+            if (on_tool_input_chunk) |callback| {
+                if (responsesStringField(root, "delta")) |delta| callback(callback_ctx, delta);
+            }
+        } else if (std.mem.eql(u8, event_type, "response.output_item.added")) {
+            const item = if (root == .object) root.object.get("item") orelse continue else continue;
+            const item_type = responsesStringField(item, "type") orelse continue;
+            if (std.mem.eql(u8, item_type, "function_call")) {
+                const call_id = responsesStringField(item, "call_id") orelse
+                    responsesStringField(item, "id") orelse continue;
+                const name = responsesStringField(item, "name") orelse continue;
+                if (on_tool_start) |callback| callback(callback_ctx, call_id, name, null);
+            }
+        } else if (std.mem.eql(u8, event_type, "response.output_item.done")) {
+            const item = if (root == .object) root.object.get("item") orelse continue else continue;
+            try appendResponsesToolCall(alloc, &calls, item);
+        } else if (std.mem.eql(u8, event_type, "response.completed")) {
+            captureResponsesUsage(root, &usage);
+            finish_reason = if (calls.items.len > 0) .tool_calls else .stop;
+            break;
+        } else if (std.mem.eql(u8, event_type, "response.incomplete")) {
+            captureResponsesUsage(root, &usage);
+            finish_reason = .length;
+            break;
+        } else if (std.mem.eql(u8, event_type, "response.failed") or
+            std.mem.eql(u8, event_type, "error"))
+        {
+            if (root == .object) {
+                const response = root.object.get("response") orelse root;
+                const error_value = if (response == .object)
+                    response.object.get("error") orelse response
+                else
+                    response;
+                if (responsesStringField(error_value, "message")) |message| {
+                    provider_failure_detail = try alloc.dupe(u8, message);
+                }
+            }
+            finish_reason = .provider_error;
+            break;
+        }
+    }
+
+    const owned_content = if (content.items.len > 0) try content.toOwnedSlice(alloc) else null;
+    errdefer if (owned_content) |value| alloc.free(value);
+    const owned_calls = try calls.toOwnedSlice(alloc);
+    errdefer types.freeToolCallSlice(alloc, owned_calls);
+    const owned_failure = provider_failure_detail;
+    provider_failure_detail = null;
+    return .{
+        .content = owned_content,
+        .tool_calls = owned_calls,
+        .provider_failure_detail = owned_failure,
+        .finish_reason = finish_reason orelse if (owned_calls.len > 0) .tool_calls else .stop,
+        .usage = usage,
+    };
+}
+
+test "OpenCode Responses SSE preserves text usage and function calls" {
+    const payload =
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n" ++
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"item_1\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"\"}}\n\n" ++
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"path\\\":\\\"README.md\\\"}\"}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"item_1\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}\n\n" ++
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":5}}}\n\n";
+    const Capture = struct {
+        text_chunks: usize = 0,
+        tool_starts: usize = 0,
+        argument_chunks: usize = 0,
+
+        fn onText(raw: *anyopaque, _: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.text_chunks += 1;
+        }
+
+        fn onToolStart(raw: *anyopaque, id: []const u8, name: []const u8, _: ?[]const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.eql(u8, id, "call_1") and std.mem.eql(u8, name, "read_file")) self.tool_starts += 1;
+        }
+
+        fn onArguments(raw: *anyopaque, _: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.argument_chunks += 1;
+        }
+    };
+    var capture: Capture = .{};
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var completion = try consumeResponsesSseStream(
+        std.testing.allocator,
+        &reader,
+        &capture,
+        Capture.onText,
+        Capture.onToolStart,
+        null,
+        Capture.onArguments,
+        &cancel_flag,
+        null,
+    );
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+
+    try std.testing.expectEqualStrings("hello", completion.content.?);
+    try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
+    try std.testing.expectEqual(@as(?u64, 12), completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 5), completion.usage.output_tokens);
+    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
+    try std.testing.expectEqualStrings("call_1", completion.tool_calls[0].id);
+    try std.testing.expectEqualStrings("read_file", completion.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", completion.tool_calls[0].arguments_json);
+    try std.testing.expectEqual(@as(usize, 1), capture.text_chunks);
+    try std.testing.expectEqual(@as(usize, 1), capture.tool_starts);
+    try std.testing.expectEqual(@as(usize, 1), capture.argument_chunks);
+}
 
 fn captureGenerationMetadata(
     alloc: std.mem.Allocator,

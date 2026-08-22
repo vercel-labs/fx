@@ -123,7 +123,7 @@ fn signalE2ELockContention(fx_dir: std.Io.Dir) void {
     if (!std.mem.eql(u8, enabled, "1")) return;
     var file = fx_dir.createFile(io_mod.getIo(), e2e_lock_contention_file_name, .{
         .truncate = true,
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else std.Io.File.Permissions.fromMode(0o600))),
     }) catch return;
     defer file.close(io_mod.getIo());
     file.writeStreamingAll(io_mod.getIo(), "contended\n") catch {};
@@ -264,9 +264,15 @@ fn observeAuthFile(alloc: Allocator, fx_dir: *std.Io.Dir) !FileObservation {
         debug_trace.logf("auth", "session load failed source=file step=stat err={s}", .{@errorName(err)});
         return .unusable;
     };
-    if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) {
+    if (stat.kind != .file or stat.nlink != 1) {
         debug_trace.logf("auth", "session load failed source=file step=permissions err=InsecureAuthFile", .{});
         return .unusable;
+    }
+    if (comptime builtin.os.tag != .windows) {
+        if (stat.permissions.toMode() & 0o077 != 0) {
+            debug_trace.logf("auth", "session load failed source=file step=permissions err=InsecureAuthFile", .{});
+            return .unusable;
+        }
     }
 
     const bytes = io_mod.readFileToEnd(alloc, &file, max_auth_file_bytes) catch |err| switch (err) {
@@ -614,7 +620,7 @@ fn loadFromHost(alloc: Allocator, store: js_host_auth.SessionStore) !?Session {
 }
 
 fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, mode: LoadMode) !?Session {
-    var file = fx_dir.openFile(io_mod.getIo(), auth_file_name, .{
+    var file = io_mod.openFile(fx_dir.*, auth_file_name, .{
         .mode = .read_only,
         .allow_directory = false,
         .follow_symlinks = false,
@@ -629,7 +635,7 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, mode: LoadMode) !?Session 
     defer file.close(io_mod.getIo());
 
     const stat = try file.stat(io_mod.getIo());
-    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) {
+    if (comptime builtin.os.tag != .windows and (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0)) {
         debug_trace.logf("auth", "session load failed step=permissions err=InsecureAuthFile", .{});
         return null;
     }
@@ -767,15 +773,15 @@ fn openExistingPrivateFxDir(home_dir: *io_mod.VerifiedDir) !io_mod.VerifiedDir {
 
     const initial_stat = try dir.stat(io_mod.getIo());
     if (initial_stat.kind != .directory) return error.DurablePathUnsafe;
-    if (initial_stat.permissions.toMode() & 0o200 == 0) {
+    if (comptime builtin.os.tag != .windows and (initial_stat.permissions.toMode() & 0o200 == 0)) {
         return error.PrivateStatePermissionsUnsupported;
     }
-    dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700)) catch {
+    io_mod.applyDirPermissions(dir, (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))) catch {
         return error.PrivateStatePermissionsUnsupported;
     };
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory) return error.DurablePathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o700) {
+    if (comptime builtin.os.tag != .windows and (stat.permissions.toMode() & 0o777 != 0o700)) {
         return error.PrivateStatePermissionsUnsupported;
     }
     return .{ .dir = dir };
@@ -1276,7 +1282,7 @@ test "oauth session loading propagates allocation failures" {
     defer tmp.cleanup();
 
     var file = try tmp.dir.createFile(std.testing.io, auth_file_name, .{
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else std.Io.File.Permissions.fromMode(0o600))),
     });
     try file.writeStreamingAll(
         std.testing.io,

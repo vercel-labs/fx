@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const session_event = @import("session_event.zig");
 const session_layout = @import("session_layout.zig");
@@ -193,8 +194,7 @@ pub fn loadMatching(
 }
 
 fn safeFile(stat: std.Io.File.Stat) bool {
-    return stat.kind == .file and stat.nlink == 1 and
-        stat.permissions.toMode() & 0o777 == 0o600;
+    return stat.kind == .file and stat.nlink == 1 and io_mod.unixModeMatches(stat, 0o600);
 }
 
 fn validVisibleText(text: []const u8) bool {

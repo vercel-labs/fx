@@ -22,6 +22,7 @@ pub const CatalogPublicOnly = union(enum) {
     authenticated_credential_rejected: Source,
     chatgpt_subscription,
     grok_subscription,
+    opencode_go,
 
     fn credentialSource(self: CatalogPublicOnly) ?Source {
         return switch (self) {
@@ -31,6 +32,7 @@ pub const CatalogPublicOnly = union(enum) {
             .authenticated_credential_rejected => |source| source,
             .chatgpt_subscription => .chatgpt_subscription,
             .grok_subscription => .grok_subscription,
+            .opencode_go => .opencode_go,
         };
     }
 };
@@ -166,6 +168,7 @@ pub fn catalogAccessForCredentialAndAccount(
         .vercel_oidc_token => .vercel_oidc_token,
         .ai_gateway_api_key => .ai_gateway_api_key,
         .stored_key => .stored_key,
+        .opencode_go => return .{ .public_only = .no_credential },
         .chatgpt_subscription => .chatgpt_subscription,
         .grok_subscription => .grok_subscription,
         .fx_login => blk: {
@@ -198,6 +201,7 @@ const FxLoginRefreshMode = enum { if_needed, force };
 
 pub const missing_credential_message = "Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_interactive_credential_message = "Fx needs access to Vercel AI Gateway. Run /login to sign in, /setup to use an API key, or set AI_GATEWAY_API_KEY.";
+pub const missing_opencode_go_credential_message = "OpenCode Go needs an API key. Run /login opencode-go or set OPENCODE_API_KEY after creating a key at opencode.ai/auth.";
 pub const missing_chatgpt_credential_message = "fx needs a Codex subscription login for this model. Run fx login codex.";
 pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login and choose Sign in with Codex.";
 pub const missing_grok_credential_message = "fx needs a Grok subscription login for this model. Run fx login grok.";
@@ -292,6 +296,9 @@ pub fn resolveForProvider(
             return .{ .credential = credential };
         },
         .gateway => {},
+        // OpenCode Go credentials live in a separate store; callers that can
+        // reach it load the credential before falling back to this resolver.
+        .opencode_go => return .{ .credential = null },
     }
     return resolvePreferring(
         alloc,
@@ -403,9 +410,22 @@ pub fn loadSource(
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
         .fx_login => loadFxLoginCredential(alloc, transport),
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
+        .opencode_go => loadEnvCredential(alloc, "OPENCODE_API_KEY", source),
         .chatgpt_subscription => loadChatGptCredential(alloc, transport, .if_needed),
         .grok_subscription => loadGrokCredential(alloc, transport, .if_needed),
     };
+}
+
+pub fn loadOpenCodeGoCredential(
+    alloc: std.mem.Allocator,
+    secret_store: host.SecretStore,
+) !?Credential {
+    if (try loadEnvCredential(alloc, "OPENCODE_API_KEY", .opencode_go)) |credential| {
+        return credential;
+    }
+    if (secret_store.isDisabled()) return null;
+    const value = (try secret_store.load(alloc)) orelse return null;
+    return .{ .token = value, .source = .opencode_go };
 }
 
 pub fn sourceExists(
@@ -443,6 +463,7 @@ pub fn sourceExists(
             secret.zeroAndFree(alloc, value);
             break :blk true;
         },
+        .opencode_go => nonEmptyEnvValue("OPENCODE_API_KEY") != null,
     };
 }
 
@@ -654,6 +675,7 @@ pub fn sourceLabel(source: Source) []const u8 {
         .ai_gateway_api_key => "AI_GATEWAY_API_KEY",
         .fx_login => "fx login",
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
+        .opencode_go => "OPENCODE_API_KEY",
         .chatgpt_subscription => "Codex subscription",
         .grok_subscription => "Grok subscription",
     };
@@ -685,6 +707,24 @@ test "missing credential messages use surface commands in preferred order" {
 
     try std.testing.expect(tui_login < tui_setup);
     try std.testing.expect(tui_setup < tui_env);
+}
+
+test "OpenCode Go credential is isolated to OPENCODE_API_KEY" {
+    const alloc = std.testing.allocator;
+    const env = try CredentialTestEnv.install(alloc, &.{
+        .{ "AI_GATEWAY_API_KEY", "gateway-key" },
+        .{ "OPENCODE_API_KEY", "go-key" },
+    });
+    defer env.deinit();
+
+    var credential = (try loadOpenCodeGoCredential(alloc, host.unavailable_secret_store)) orelse
+        return error.TestExpectedCredential;
+    defer credential.deinit(alloc);
+    try std.testing.expectEqual(Source.opencode_go, credential.source);
+    try std.testing.expectEqualStrings("go-key", credential.token);
+    const access = catalogAccessAt(credential, 0);
+    try std.testing.expectEqual(CatalogPublicOnlyReason.no_credential, access.publicOnlyReason().?);
+    try std.testing.expect(access.authorizationCredential() == null);
 }
 
 test "credential gateway team prefers team id" {

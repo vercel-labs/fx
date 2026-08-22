@@ -70,6 +70,22 @@ pub fn formatHttpErrorMessage(alloc: Allocator, status: std.http.Status, detail:
     return formatHttpDiagnostic(alloc, status, detail, title, max_published_error_bytes);
 }
 
+/// Some upstreams report model-availability errors under HTTP 401 even though
+/// the credential was accepted. Callers use this to keep such responses out of
+/// the auth-failure path so the real server message reaches the user.
+pub fn detailIndicatesServerModelError(alloc: Allocator, detail: []const u8) bool {
+    if (detail.len == 0) return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, detail, .{}) catch
+        return false;
+    defer parsed.deinit();
+
+    const root = objectValue(parsed.value) orelse return false;
+    const error_value = root.get("error") orelse return false;
+    const error_object = objectValue(error_value) orelse return false;
+    const message = stringField(error_object, "message") orelse return false;
+    return std.mem.find(u8, message, "not supported") != null;
+}
+
 pub fn formatHttpRecoveryDiagnostic(alloc: Allocator, status: std.http.Status, detail: []const u8) ![]u8 {
     return formatHttpDiagnostic(alloc, status, detail, null, max_recovery_diagnostic_bytes);
 }
@@ -398,6 +414,28 @@ test "formatHttpErrorMessage renders API key and credits setup bodies" {
         "API access denied · HTTP 403 · credit_card_required: Buy credits to use AI Gateway.",
         credits_line,
     );
+}
+
+test "detailIndicatesServerModelError detects misreported model availability errors" {
+    const alloc = std.testing.allocator;
+
+    const opencode_go_body =
+        \\{"type":"error","error":{"type":"error","message":"Model kimi-k3 is not supported for format openai"}}
+    ;
+    try std.testing.expect(detailIndicatesServerModelError(alloc, opencode_go_body));
+
+    const short_body =
+        \\{"type":"error","error":{"type":"error","message":"Model qwen3-coder is not supported"}}
+    ;
+    try std.testing.expect(detailIndicatesServerModelError(alloc, short_body));
+
+    // A real credential rejection must stay classified as an auth failure.
+    const auth_body =
+        \\{"error":{"code":"invalid_api_key","message":"Invalid API key provided."}}
+    ;
+    try std.testing.expect(!detailIndicatesServerModelError(alloc, auth_body));
+    try std.testing.expect(!detailIndicatesServerModelError(alloc, ""));
+    try std.testing.expect(!detailIndicatesServerModelError(alloc, "not json"));
 }
 
 test "formatHttpErrorMessage masks structured and fallback secrets" {

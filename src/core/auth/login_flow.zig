@@ -987,24 +987,32 @@ fn unavailableWaitForEnter(_: ?*anyopaque, _: u64) bool {
 }
 
 fn realWaitForEnter(_: ?*anyopaque, timeout_ms: u64) bool {
-    var fds = [_]std.posix.pollfd{.{
-        .fd = std.posix.STDIN_FILENO,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
-    const timeout: i32 = @intCast(@min(timeout_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
-    const ready = std.posix.poll(&fds, timeout) catch return false;
-    if (ready == 0 or (fds[0].revents & std.posix.POLL.IN) == 0) return false;
-    discardStdinLine();
-    return true;
+    if (comptime @import("builtin").os.tag == .windows) {
+        return false;
+    } else {
+        var fds = [_]std.posix.pollfd{.{
+            .fd = std.posix.STDIN_FILENO,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const timeout: i32 = @intCast(@min(timeout_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
+        const ready = std.posix.poll(&fds, timeout) catch return false;
+        if (ready == 0 or (fds[0].revents & std.posix.POLL.IN) == 0) return false;
+        discardStdinLine();
+        return true;
+    }
 }
 
 fn discardStdinLine() void {
-    var buf: [256]u8 = undefined;
-    while (true) {
-        const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch return;
-        if (n == 0) return;
-        if (std.mem.findScalar(u8, buf[0..n], '\n') != null) return;
+    if (comptime @import("builtin").os.tag == .windows) {
+        return;
+    } else {
+        var buf: [256]u8 = undefined;
+        while (true) {
+            const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch return;
+            if (n == 0) return;
+            if (std.mem.findScalar(u8, buf[0..n], '\n') != null) return;
+        }
     }
 }
 
@@ -1170,6 +1178,7 @@ fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: u
 
 fn canUseInteractiveTeamPicker() bool {
     const stdin_tty = std.Io.File.stdin().isTty(io_mod.getIo()) catch false;
+    if (comptime @import("builtin").os.tag == .windows) return stdin_tty;
     return stdin_tty and std.c.isatty(std.posix.STDOUT_FILENO) != 0;
 }
 
@@ -1204,28 +1213,32 @@ const TeamPickerKey = union(enum) {
 };
 
 fn readTeamPickerKey() !TeamPickerKey {
-    var buf: [8]u8 = undefined;
-    const first_read = try std.posix.read(std.posix.STDIN_FILENO, buf[0..1]);
-    if (first_read == 0) return .ignored;
+    if (comptime @import("builtin").os.tag == .windows) {
+        return .ignored;
+    } else {
+        var buf: [8]u8 = undefined;
+        const first_read = try std.posix.read(std.posix.STDIN_FILENO, buf[0..1]);
+        if (first_read == 0) return .ignored;
 
-    var len = first_read;
-    if (buf[0] == 0x1b) {
-        while (len < buf.len) {
-            if (escapeSequenceComplete(buf[0..len])) break;
-            var fds = [_]std.posix.pollfd{.{
-                .fd = std.posix.STDIN_FILENO,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            }};
-            const ready = try std.posix.poll(&fds, 25);
-            if (ready == 0 or (fds[0].revents & std.posix.POLL.IN) == 0) break;
-            const n = try std.posix.read(std.posix.STDIN_FILENO, buf[len .. len + 1]);
-            if (n == 0) break;
-            len += n;
+        var len = first_read;
+        if (buf[0] == 0x1b) {
+            while (len < buf.len) {
+                if (escapeSequenceComplete(buf[0..len])) break;
+                var fds = [_]std.posix.pollfd{.{
+                    .fd = std.posix.STDIN_FILENO,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                }};
+                const ready = try std.posix.poll(&fds, 25);
+                if (ready == 0 or (fds[0].revents & std.posix.POLL.IN) == 0) break;
+                const n = try std.posix.read(std.posix.STDIN_FILENO, buf[len .. len + 1]);
+                if (n == 0) break;
+                len += n;
+            }
         }
-    }
 
-    return parseTeamPickerKey(buf[0..len]);
+        return parseTeamPickerKey(buf[0..len]);
+    }
 }
 
 fn escapeSequenceComplete(bytes: []const u8) bool {
@@ -1258,10 +1271,11 @@ fn parseEscapeTeamPickerKey(bytes: []const u8) TeamPickerKey {
 }
 
 const TeamPickerRawMode = struct {
-    original: std.posix.termios = undefined,
+    original: if (@import("builtin").os.tag == .windows) u8 else std.posix.termios = undefined,
     active: bool = false,
 
     fn enable() !TeamPickerRawMode {
+        if (comptime @import("builtin").os.tag == .windows) return error.NotATerminal;
         if (std.c.isatty(std.posix.STDIN_FILENO) == 0 or std.c.isatty(std.posix.STDOUT_FILENO) == 0) {
             return error.NotATerminal;
         }
@@ -1291,13 +1305,18 @@ const TeamPickerRawMode = struct {
             raw.cc[vtime_idx] = 0;
         }
 
-        try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
+        const stdin_fd = if (comptime @import("builtin").os.tag == .windows) @as(std.posix.fd_t, @ptrFromInt(0)) else std.posix.STDIN_FILENO;
+        try std.posix.tcsetattr(stdin_fd, .FLUSH, raw);
         self.active = true;
         return self;
     }
 
     fn disable(self: *TeamPickerRawMode) void {
         if (!self.active) return;
+        if (comptime @import("builtin").os.tag == .windows) {
+            self.active = false;
+            return;
+        }
         std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
         self.active = false;
     }

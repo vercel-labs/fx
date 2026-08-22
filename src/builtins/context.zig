@@ -546,14 +546,14 @@ fn loadRule(arena: Allocator, path: []const u8, limit: context_limits.Resolved) 
             return .{ .omitted = .symlink };
         };
         defer parent_dir.close(io_mod.getIo());
-        break :blk parent_dir.openFile(io_mod.getIo(), target_name, .{
+        break :blk io_mod.openFile(parent_dir, target_name, .{
             .allow_directory = false,
             .follow_symlinks = false,
         }) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return .{ .omitted = .symlink };
         };
-    } else std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{
+    } else io_mod.openFileAbsolute(path, .{
         .allow_directory = false,
         .follow_symlinks = false,
     }) catch |err| {
@@ -579,7 +579,7 @@ fn loadRule(arena: Allocator, path: []const u8, limit: context_limits.Resolved) 
         @min(limit.effectiveBytes() +| 3, context_limits.emergency_ceiling_bytes),
     );
     const content = try arena.alloc(u8, read_len);
-    const bytes_read = file.readPositionalAll(io_mod.getIo(), content, 0) catch
+    const bytes_read = io_mod.readPositionalAll(file, content, 0) catch
         return .{ .omitted = .unreadable };
     if (bytes_read != read_len) return .{ .omitted = .unreadable };
     const prefix_len = context_limits.lineSafePrefixLength(content, limit.effectiveBytes());
@@ -595,7 +595,7 @@ fn validateRuleUtf8(file: *std.Io.File, byte_count: usize) !bool {
 
     while (read_offset < byte_count) {
         const wanted = @min(chunk.len, byte_count - read_offset);
-        const bytes_read = try file.readPositionalAll(io_mod.getIo(), chunk[0..wanted], read_offset);
+        const bytes_read = try io_mod.readPositionalAll(file.*, chunk[0..wanted], read_offset);
         if (bytes_read != wanted) return error.UnexpectedEndOfFile;
         if (std.mem.trim(u8, chunk[0..bytes_read], trim_chars).len != 0) has_content = true;
         try validator.append(chunk[0..bytes_read]);

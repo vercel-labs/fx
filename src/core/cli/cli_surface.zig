@@ -183,10 +183,14 @@ pub const Config = struct {
     grok_agent_stream: ?agent_stream_provider.Provider = null,
     grok_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
     grok_model_catalog: ?model_catalog.Provider = null,
+    opencode_go_agent_stream: ?agent_stream_provider.Provider = null,
+    opencode_go_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
+    opencode_go_model_catalog: ?model_catalog.Provider = null,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     url_opener: host.UrlOpener,
     secret_store: host.SecretStore,
+    opencode_go_secret_store: host.SecretStore = host.unavailable_secret_store,
     prompt_policy: prompt_policy.Policy,
     skill_root_policy: skill_contract.RootPolicy,
     ignored_list_entries: []const []const u8,
@@ -694,6 +698,7 @@ fn activateProviderSelection(
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
+            .opencode_go => "OpenCode Go is already selected.\n",
         });
         return true;
     }
@@ -740,6 +745,7 @@ fn activateProviderSelection(
             switch (target) {
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
+                .opencode_go => "OpenCode Go credential is unavailable",
                 .gateway => "configure a Gateway credential first",
             },
         );
@@ -752,6 +758,10 @@ fn activateProviderSelection(
         },
         .grok => cfg.grok_model_catalog orelse {
             try writeProviderActivationError(alloc, deps, caller, "Grok model catalog is unavailable");
+            return false;
+        },
+        .opencode_go => cfg.opencode_go_model_catalog orelse {
+            try writeProviderActivationError(alloc, deps, caller, "OpenCode Go model catalog is unavailable");
             return false;
         },
         .gateway => cfg.gateway_provider.model_catalog,
@@ -780,6 +790,10 @@ fn activateProviderSelection(
         .gateway => settings.model,
         .codex => settings.codex_model,
         .grok => settings.grok_model,
+        .opencode_go => if (settings.model) |saved|
+            if (std.mem.startsWith(u8, saved, "opencode-go/")) saved else null
+        else
+            null,
     };
     const selected_model = selectCatalogModel(loaded.catalog.items, saved_model) orelse {
         try writeProviderActivationError(alloc, deps, caller, "target model catalog is empty");
@@ -789,6 +803,7 @@ fn activateProviderSelection(
         .gateway => .{ .provider = target, .model = selected_model },
         .codex => .{ .provider = target, .codex_model = selected_model },
         .grok => .{ .provider = target, .grok_model = selected_model },
+        .opencode_go => .{ .provider = target, .model = selected_model },
     });
     defer attempt.deinit(alloc);
     switch (attempt) {
@@ -802,13 +817,14 @@ fn activateProviderSelection(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
-        .gateway => unreachable,
+        .opencode_go, .gateway => unreachable,
     };
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
+            .opencode_go => "Provider set to OpenCode Go.\n",
         });
     }
     return true;
@@ -905,8 +921,11 @@ fn runNonInteractiveWithDeps(
                 .codex_model_catalog = cfg.codex_model_catalog,
                 .grok_agent_stream = cfg.grok_agent_stream,
                 .grok_model_catalog = cfg.grok_model_catalog,
+                .opencode_go_agent_stream = cfg.opencode_go_agent_stream,
+                .opencode_go_model_catalog = cfg.opencode_go_model_catalog,
                 .background_process_provider = cfg.background_process_provider,
                 .secret_store = cfg.secret_store,
+                .opencode_go_secret_store = cfg.opencode_go_secret_store,
                 .prompt_policy = cfg.prompt_policy,
                 .ignored_list_entries = cfg.ignored_list_entries,
                 .max_list_entries = cfg.max_list_entries,
@@ -1175,6 +1194,10 @@ fn runNonInteractiveWithDeps(
                 },
                 .grok => cfg.grok_cli_model_catalog orelse {
                     try writeStderr(deps, "fx models: Grok model catalog is unavailable\n");
+                    return .handled_failure;
+                },
+                .opencode_go => cfg.opencode_go_cli_model_catalog orelse {
+                    try writeStderr(deps, "fx models: OpenCode Go model catalog is unavailable\n");
                     return .handled_failure;
                 },
                 .gateway => cfg.gateway_provider.cli_model_catalog,
@@ -1841,6 +1864,7 @@ fn runPasteSetup(
 }
 
 fn setupTerminalAvailableDefault(_: ?*anyopaque) bool {
+    if (comptime @import("builtin").os.tag == .windows) return true;
     return std.c.isatty(std.posix.STDIN_FILENO) != 0 and
         std.c.isatty(std.posix.STDERR_FILENO) != 0;
 }
@@ -1851,89 +1875,102 @@ fn readMaskedKeyDefault(
     write_mask: WriteFn,
     write_ctx: ?*anyopaque,
 ) ![]u8 {
-    var raw = try MaskedKeyRawMode.enable();
-    defer raw.disable();
+    if (comptime @import("builtin").os.tag == .windows) {
+        return error.NotATerminal;
+    } else {
+        var raw = try MaskedKeyRawMode.enable();
+        defer raw.disable();
 
-    var input: std.ArrayList(u8) = .empty;
-    errdefer {
-        if (input.capacity > 0) secret.zeroAndFree(alloc, input.allocatedSlice());
-    }
-
-    while (input.items.len < 8 * 1024) {
-        var byte: [1]u8 = undefined;
-        if (try std.posix.read(std.posix.STDIN_FILENO, &byte) == 0) return error.SetupCancelled;
-        switch (byte[0]) {
-            '\r', '\n' => {
-                if (input.items.len == 0) continue;
-                // toOwnedSlice shrinks through realloc, which may move the buffer
-                // and free the original without zeroing it. Copy out and wipe the
-                // source so no unzeroed key is left behind in freed memory.
-                const owned = try alloc.dupe(u8, input.items);
-                secret.zeroAndFree(alloc, input.allocatedSlice());
-                input = .empty;
-                return owned;
-            },
-            3, 4, 0x1b => return error.SetupCancelled,
-            8, 127 => if (input.items.len > 0) {
-                _ = input.pop();
-                try write_mask(write_ctx, "\x08 \x08");
-            },
-            0x20...0x7e => {
-                try input.append(alloc, byte[0]);
-                try write_mask(write_ctx, "•");
-            },
-            else => {},
+        var input: std.ArrayList(u8) = .empty;
+        errdefer {
+            if (input.capacity > 0) secret.zeroAndFree(alloc, input.allocatedSlice());
         }
+
+        while (input.items.len < 8 * 1024) {
+            var byte: [1]u8 = undefined;
+            if (try std.posix.read(std.posix.STDIN_FILENO, &byte) == 0) return error.SetupCancelled;
+            switch (byte[0]) {
+                '\r', '\n' => {
+                    if (input.items.len == 0) continue;
+                    // toOwnedSlice shrinks through realloc, which may move the buffer
+                    // and free the original without zeroing it. Copy out and wipe the
+                    // source so no unzeroed key is left behind in freed memory.
+                    const owned = try alloc.dupe(u8, input.items);
+                    secret.zeroAndFree(alloc, input.allocatedSlice());
+                    input = .empty;
+                    return owned;
+                },
+                3, 4, 0x1b => return error.SetupCancelled,
+                8, 127 => if (input.items.len > 0) {
+                    _ = input.pop();
+                    try write_mask(write_ctx, "\x08 \x08");
+                },
+                0x20...0x7e => {
+                    try input.append(alloc, byte[0]);
+                    try write_mask(write_ctx, "•");
+                },
+                else => {},
+            }
+        }
+        return error.SetupKeyTooLong;
     }
-    return error.SetupKeyTooLong;
 }
 
 const MaskedKeyRawMode = struct {
-    original: std.posix.termios = undefined,
+    original: if (@import("builtin").os.tag == .windows) u8 else std.posix.termios = undefined,
     active: bool = false,
 
     fn enable() !MaskedKeyRawMode {
-        if (std.c.isatty(std.posix.STDIN_FILENO) == 0 or
-            std.c.isatty(std.posix.STDERR_FILENO) == 0)
-        {
+        if (comptime @import("builtin").os.tag == .windows) {
             return error.NotATerminal;
-        }
+        } else {
+            if (std.c.isatty(std.posix.STDIN_FILENO) == 0 or
+                std.c.isatty(std.posix.STDERR_FILENO) == 0)
+            {
+                return error.NotATerminal;
+            }
 
-        var self: MaskedKeyRawMode = .{};
-        self.original = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
-        var raw = self.original;
-        raw.iflag.BRKINT = false;
-        raw.iflag.ICRNL = false;
-        raw.iflag.INPCK = false;
-        raw.iflag.ISTRIP = false;
-        raw.iflag.IXON = false;
-        raw.iflag.IXOFF = false;
-        raw.cflag.CSIZE = .CS8;
-        raw.lflag.ECHO = false;
-        raw.lflag.ICANON = false;
-        raw.lflag.IEXTEN = false;
-        raw.lflag.ISIG = false;
-        const vmin_idx = switch (builtin.os.tag) {
-            .linux => 6,
-            else => 16,
-        };
-        const vtime_idx = switch (builtin.os.tag) {
-            .linux => 5,
-            else => 17,
-        };
-        if (vmin_idx < raw.cc.len and vtime_idx < raw.cc.len) {
-            raw.cc[vmin_idx] = 1;
-            raw.cc[vtime_idx] = 0;
+            var self: MaskedKeyRawMode = .{};
+            self.original = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
+            var raw = self.original;
+            raw.iflag.BRKINT = false;
+            raw.iflag.ICRNL = false;
+            raw.iflag.INPCK = false;
+            raw.iflag.ISTRIP = false;
+            raw.iflag.IXON = false;
+            raw.iflag.IXOFF = false;
+            raw.cflag.CSIZE = .CS8;
+            raw.lflag.ECHO = false;
+            raw.lflag.ICANON = false;
+            raw.lflag.IEXTEN = false;
+            raw.lflag.ISIG = false;
+            const vmin_idx = switch (builtin.os.tag) {
+                .linux => 6,
+                else => 16,
+            };
+            const vtime_idx = switch (builtin.os.tag) {
+                .linux => 5,
+                else => 17,
+            };
+            if (vmin_idx < raw.cc.len and vtime_idx < raw.cc.len) {
+                raw.cc[vmin_idx] = 1;
+                raw.cc[vtime_idx] = 0;
+            }
+            try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
+            self.active = true;
+            return self;
         }
-        try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
-        self.active = true;
-        return self;
     }
 
     fn disable(self: *MaskedKeyRawMode) void {
         if (!self.active) return;
-        std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
-        self.active = false;
+        if (comptime @import("builtin").os.tag == .windows) {
+            self.active = false;
+            return;
+        } else {
+            std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+            self.active = false;
+        }
     }
 };
 
@@ -2993,8 +3030,11 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .codex_model_catalog = cfg.codex_model_catalog,
         .grok_agent_stream = cfg.grok_agent_stream,
         .grok_model_catalog = cfg.grok_model_catalog,
+        .opencode_go_agent_stream = cfg.opencode_go_agent_stream,
+        .opencode_go_model_catalog = cfg.opencode_go_model_catalog,
         .background_process_provider = cfg.background_process_provider,
         .secret_store = cfg.secret_store,
+        .opencode_go_secret_store = cfg.opencode_go_secret_store,
         .prompt_policy = cfg.prompt_policy,
         .skill_root_policy = cfg.skill_root_policy,
         .ignored_list_entries = cfg.ignored_list_entries,

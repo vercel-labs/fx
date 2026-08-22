@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session_usage = @import("session_usage.zig");
@@ -95,15 +96,13 @@ pub fn capture(
         if (err == error.FileNotFound) return .missing;
         return .{ .invalid = @errorName(err) };
     };
-    if (initial.kind != .file or initial.nlink != 1 or
-        initial.permissions.toMode() & 0o777 != 0o600)
-    {
+    if (initial.kind != .file or initial.nlink != 1 or !io_mod.unixModeMatches(initial, 0o600)) {
         return .{ .invalid = "unsafe_initial_shape" };
     }
     if (initial.size == 0) return .{ .invalid = "empty" };
     if (initial.size > max_sidecar_bytes) return .{ .invalid = "oversized" };
 
-    var file = session_dir.dir.openFile(io_mod.getIo(), sidecar_file, .{
+    var file = io_mod.openFile(session_dir.dir, sidecar_file, .{
         .mode = .read_only,
         .allow_directory = false,
         .follow_symlinks = false,
@@ -116,9 +115,7 @@ pub fn capture(
     defer file.close(io_mod.getIo());
     const verified = file.stat(io_mod.getIo()) catch |err|
         return .{ .invalid = @errorName(err) };
-    if (verified.kind != .file or verified.nlink != 1 or
-        verified.permissions.toMode() & 0o777 != 0o600)
-    {
+    if (verified.kind != .file or verified.nlink != 1 or !io_mod.unixModeMatches(verified, 0o600)) {
         return .{ .invalid = "unsafe_verified_shape" };
     }
     if (verified.size != initial.size) return .{ .invalid = "changed_during_open" };

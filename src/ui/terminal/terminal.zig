@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("../../core/shared/types.zig");
 
 pub const interactive_mode_enable_sequence = "\x1b[>4;2m\x1b[>1u\x1b[?2004h\x1b[?7l";
@@ -34,6 +35,7 @@ pub fn interactiveModeEnableSequence(tmux: ?[]const u8) []const u8 {
 }
 
 pub fn queryLayout(fd: std.posix.fd_t, footer_rows: u16) !types.Layout {
+    if (comptime builtin.os.tag == .windows) return queryWindowsLayout(footer_rows);
     var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
 
     const req: c_int = @intCast(std.c.T.IOCGWINSZ);
@@ -42,6 +44,37 @@ pub fn queryLayout(fd: std.posix.fd_t, footer_rows: u16) !types.Layout {
         return error.UnableToReadTerminalSize;
     }
     return layoutFromSize(ws.row, ws.col, footer_rows);
+}
+
+fn queryWindowsLayout(footer_rows: u16) !types.Layout {
+    if (comptime builtin.os.tag == .windows) {
+        const k32 = struct {
+            const COORD = extern struct { X: i16, Y: i16 };
+            const SMALL_RECT = extern struct { Left: i16, Top: i16, Right: i16, Bottom: i16 };
+            const CONSOLE_SCREEN_BUFFER_INFO = extern struct {
+                dwSize: COORD,
+                dwCursorPosition: COORD,
+                wAttributes: u16,
+                srWindow: SMALL_RECT,
+                dwMaximumWindowSize: COORD,
+            };
+
+            extern "kernel32" fn GetConsoleScreenBufferInfo(
+                hConsoleOutput: std.os.windows.HANDLE,
+                lpConsoleScreenBufferInfo: *CONSOLE_SCREEN_BUFFER_INFO,
+            ) callconv(.winapi) std.os.windows.BOOL;
+        };
+
+        var info: k32.CONSOLE_SCREEN_BUFFER_INFO = undefined;
+        if (!k32.GetConsoleScreenBufferInfo(std.Io.File.stdout().handle, &info).toBool()) {
+            return layoutFromSize(24, 80, footer_rows);
+        }
+        const cols_i = @as(i32, info.srWindow.Right) - @as(i32, info.srWindow.Left) + 1;
+        const rows_i = @as(i32, info.srWindow.Bottom) - @as(i32, info.srWindow.Top) + 1;
+        if (cols_i <= 0 or rows_i <= 0) return layoutFromSize(24, 80, footer_rows);
+        return layoutFromSize(@intCast(rows_i), @intCast(cols_i), footer_rows);
+    }
+    return error.UnableToReadTerminalSize;
 }
 
 pub fn layoutFromSize(rows: u16, cols: u16, footer_rows: u16) !types.Layout {

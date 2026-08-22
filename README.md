@@ -59,6 +59,23 @@ To use an AI Gateway API key instead:
 fx setup
 ```
 
+### OpenCode Go
+
+fx also supports [OpenCode Go](https://dev.opencode.ai/docs/go/) through its native Responses API. Create a key at [opencode.ai/auth](https://opencode.ai/auth), then enter it through the masked provider login inside fx:
+
+```text
+/login opencode-go
+```
+
+You can also choose **OpenCode Go API key** from `/setup`. fx saves it in a provider-specific credential slot, separate from Vercel AI Gateway credentials. For automation, `OPENCODE_API_KEY` overrides the stored OpenCode Go key:
+
+```bash
+export OPENCODE_API_KEY="your-key"
+FX_MODEL="opencode-go/deepseek-v4-flash" fx
+```
+
+Run `fx models` to discover the models currently offered by OpenCode Go. In the interactive model picker they appear under the dedicated `OpenCode Go` tab. The `opencode-go/` namespace selects the OpenCode Go transport; other model names continue to use Vercel AI Gateway.
+
 Run fx from a project:
 
 ```bash

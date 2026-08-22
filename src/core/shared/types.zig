@@ -92,6 +92,7 @@ pub const CredentialSource = enum {
     ai_gateway_api_key,
     fx_login,
     stored_key,
+    opencode_go,
     chatgpt_subscription,
     grok_subscription,
 };

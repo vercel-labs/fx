@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
@@ -121,9 +122,11 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, report_open_failure: bool)
     defer file.close(io_mod.getIo());
 
     const stat = try file.stat(io_mod.getIo());
-    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) {
-        debug_trace.logf("auth", "Grok session load failed step=permissions err=InsecureAuthFile", .{});
-        return null;
+    if (comptime builtin.os.tag != .windows) {
+        if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) {
+            debug_trace.logf("auth", "Grok session load failed step=permissions err=InsecureAuthFile", .{});
+            return null;
+        }
     }
 
     const bytes = try io_mod.readFileToEnd(alloc, &file, max_auth_file_bytes);
@@ -183,23 +186,7 @@ fn lockMutation(open_fx_dir: io_mod.VerifiedDir) !Mutation {
 }
 
 fn openExistingPrivateFxDir(home_dir: *io_mod.VerifiedDir) !io_mod.VerifiedDir {
-    var dir = try home_dir.dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
-        .iterate = true,
-        .follow_symlinks = false,
-    });
-    errdefer dir.close(io_mod.getIo());
-
-    const initial_stat = try dir.stat(io_mod.getIo());
-    if (initial_stat.kind != .directory) return error.DurablePathUnsafe;
-    if (initial_stat.permissions.toMode() & 0o200 == 0) return error.PrivateStatePermissionsUnsupported;
-    dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700)) catch {
-        return error.PrivateStatePermissionsUnsupported;
-    };
-    const stat = try dir.stat(io_mod.getIo());
-    if (stat.kind != .directory or stat.permissions.toMode() & 0o777 != 0o700) {
-        return error.PrivateStatePermissionsUnsupported;
-    }
-    return .{ .dir = dir };
+    return io_mod.openOrCreateVerifiedPrivateDir(home_dir, profile_paths.root_dir_name);
 }
 
 pub fn parse(alloc: Allocator, bytes: []const u8) !Session {

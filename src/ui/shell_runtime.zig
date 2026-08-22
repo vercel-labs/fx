@@ -19,6 +19,52 @@ const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 const TmuxHistoryClearRunner = *const fn (Allocator, []const u8) anyerror!void;
 var tmux_history_clear_test_runner: if (builtin.is_test) ?TmuxHistoryClearRunner else void = if (builtin.is_test) null else {};
 
+const windows_console = if (builtin.os.tag == .windows) struct {
+    const DWORD = std.os.windows.DWORD;
+    const BOOL = std.os.windows.BOOL;
+    const HANDLE = std.os.windows.HANDLE;
+    const UINT = std.os.windows.UINT;
+
+    const ENABLE_PROCESSED_INPUT: DWORD = 0x0001;
+    const ENABLE_LINE_INPUT: DWORD = 0x0002;
+    const ENABLE_ECHO_INPUT: DWORD = 0x0004;
+    const ENABLE_WINDOW_INPUT: DWORD = 0x0008;
+    const ENABLE_EXTENDED_FLAGS: DWORD = 0x0080;
+    const ENABLE_VIRTUAL_TERMINAL_INPUT: DWORD = 0x0200;
+    const ENABLE_PROCESSED_OUTPUT: DWORD = 0x0001;
+    const ENABLE_WRAP_AT_EOL_OUTPUT: DWORD = 0x0002;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: DWORD = 0x0004;
+    const CP_UTF8: UINT = 65001;
+
+    const Restore = struct {
+        stdin_mode: DWORD = 0,
+        stdout_mode: DWORD = 0,
+        input_cp: UINT = 0,
+        output_cp: UINT = 0,
+        captured: bool = false,
+    };
+
+    extern "kernel32" fn WaitForSingleObject(
+        hHandle: HANDLE,
+        dwMilliseconds: DWORD,
+    ) callconv(.winapi) DWORD;
+
+    extern "kernel32" fn GetConsoleMode(
+        hConsoleHandle: HANDLE,
+        lpMode: *DWORD,
+    ) callconv(.winapi) BOOL;
+
+    extern "kernel32" fn SetConsoleMode(
+        hConsoleHandle: HANDLE,
+        dwMode: DWORD,
+    ) callconv(.winapi) BOOL;
+
+    extern "kernel32" fn GetConsoleCP() callconv(.winapi) UINT;
+    extern "kernel32" fn GetConsoleOutputCP() callconv(.winapi) UINT;
+    extern "kernel32" fn SetConsoleCP(wCodePageID: UINT) callconv(.winapi) BOOL;
+    extern "kernel32" fn SetConsoleOutputCP(wCodePageID: UINT) callconv(.winapi) BOOL;
+} else struct {};
+
 const supports_test_pty = switch (builtin.os.tag) {
     .linux,
     .macos,
@@ -35,7 +81,7 @@ extern "c" fn unlockpt(fd: c_int) c_int;
 extern "c" fn ptsname(fd: c_int) ?[*:0]u8;
 
 pub const supports_resize_signal = resize_runtime.supports_resize_signal;
-pub const ResizeHandler = if (builtin.os.tag == .wasi)
+pub const ResizeHandler = if (builtin.os.tag == .wasi or builtin.os.tag == .windows)
     *const fn () callconv(.c) void
 else
     std.posix.Sigaction.handler_fn;
@@ -64,14 +110,14 @@ pub const AlternateScreenOwner = enum {
 };
 
 pub const TerminalState = struct {
-    stdin_fd: std.posix.fd_t = std.posix.STDIN_FILENO,
-    original_termios: std.posix.termios = undefined,
+    stdin_fd: std.posix.fd_t = if (@import("builtin").os.tag == .windows) undefined else std.posix.STDIN_FILENO,
+    original_termios: if (@import("builtin").os.tag == .windows) windows_console.Restore else std.posix.termios = if (@import("builtin").os.tag == .windows) .{} else undefined,
     raw_enabled: bool = false,
     alternate_screen_owner: AlternateScreenOwner = .none,
     alternate_frame_layout: frame_layout.CommittedLayoutSnapshot = .{},
     alternate_mouse_tracking_active: bool = false,
     signal_handler_installed: bool = false,
-    old_winch_action: ?std.posix.Sigaction = null,
+    old_winch_action: if (@import("builtin").os.tag == .windows) ?u8 else ?std.posix.Sigaction = null,
 
     pub fn fileApprovalScreenActive(self: TerminalState) bool {
         return self.alternate_screen_owner == .file_approval;
@@ -94,7 +140,7 @@ pub const TerminalState = struct {
     }
 
     pub fn ensureInteractive(self: TerminalState) !void {
-        if (comptime builtin.os.tag == .wasi) return;
+        if (comptime builtin.os.tag == .wasi or builtin.os.tag == .windows) return;
         if (std.c.isatty(self.stdin_fd) == 0 or std.c.isatty(std.posix.STDOUT_FILENO) == 0) {
             return error.NotATerminal;
         }
@@ -102,12 +148,20 @@ pub const TerminalState = struct {
 
     pub fn captureOriginalTermios(self: *TerminalState) !void {
         if (comptime builtin.os.tag == .wasi) return;
+        if (comptime builtin.os.tag == .windows) {
+            captureWindowsConsole(self);
+            return;
+        }
         self.original_termios = try std.posix.tcgetattr(self.stdin_fd);
     }
 
     pub fn enableRawMode(self: *TerminalState) !void {
         if (comptime builtin.os.tag == .wasi) {
             self.raw_enabled = true;
+            return;
+        }
+        if (comptime builtin.os.tag == .windows) {
+            try enableWindowsRawMode(self);
             return;
         }
         var raw = self.original_termios;
@@ -139,6 +193,11 @@ pub const TerminalState = struct {
 
     pub fn disableRawMode(self: *TerminalState) void {
         if (!self.raw_enabled) return;
+        if (comptime builtin.os.tag == .windows) {
+            restoreWindowsConsole(self);
+            self.raw_enabled = false;
+            return;
+        }
         if (comptime builtin.os.tag != .wasi) {
             std.posix.tcsetattr(self.stdin_fd, .FLUSH, self.original_termios) catch {};
         }
@@ -176,9 +235,11 @@ pub const TerminalState = struct {
     }
 
     pub fn queryCursorPosition(self: TerminalState) !CursorPosition {
-        if (comptime builtin.os.tag == .wasi) {
+        if (comptime builtin.os.tag == .wasi or builtin.os.tag == .windows) {
             // JavaScript hosts provide a fresh terminal surface rather than an
             // existing shell viewport, so there are no launch rows to preserve.
+            // Windows pollInput cannot yet consume CSI replies, so do not emit
+            // a cursor query that would leak into the shell.
             return .{ .row = 1, .col = 1 };
         }
         var stdout_file = std.Io.File.stdout();
@@ -248,10 +309,11 @@ pub const TerminalState = struct {
     }
 
     pub fn read(self: TerminalState, out: []u8) !usize {
-        if (comptime builtin.os.tag == .wasi) {
+        if (comptime builtin.os.tag == .wasi or builtin.os.tag == .windows) {
             return std.Io.File.stdin().readStreaming(io_mod.getIo(), &.{out});
+        } else {
+            return std.posix.read(self.stdin_fd, out);
         }
-        return std.posix.read(self.stdin_fd, out);
     }
 
     pub fn pollInput(self: TerminalState, timeout_ms: i32) !PollResult {
@@ -261,22 +323,86 @@ pub const TerminalState = struct {
                 -1 => .{ .hung_up = true },
                 else => .{},
             };
-        }
-        var fds = [_]std.posix.pollfd{.{
-            .fd = self.stdin_fd,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
+        } else if (comptime builtin.os.tag == .windows) {
+            const handle = std.Io.File.stdin().handle;
+            const wait_ms: u32 = if (timeout_ms < 0) 0xffffffff else @as(u32, @intCast(timeout_ms));
+            const rc = windows_console.WaitForSingleObject(handle, wait_ms);
+            return switch (rc) {
+                0 => .{ .readable = true },
+                258 => .{},
+                else => .{ .has_error = true },
+            };
+        } else {
+            var fds = [_]std.posix.pollfd{.{
+                .fd = self.stdin_fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
 
-        _ = try std.posix.poll(&fds, timeout_ms);
-        const revents = fds[0].revents;
-        return .{
-            .readable = (revents & std.posix.POLL.IN) != 0,
-            .hung_up = (revents & std.posix.POLL.HUP) != 0,
-            .has_error = (revents & std.posix.POLL.ERR) != 0,
-        };
+            _ = try std.posix.poll(&fds, timeout_ms);
+            const revents = fds[0].revents;
+            return .{
+                .readable = (revents & std.posix.POLL.IN) != 0,
+                .hung_up = (revents & std.posix.POLL.HUP) != 0,
+                .has_error = (revents & std.posix.POLL.ERR) != 0,
+            };
+        }
     }
 };
+
+fn captureWindowsConsole(self: *TerminalState) void {
+    if (comptime builtin.os.tag == .windows) {
+        var restore = windows_console.Restore{ .captured = true };
+        _ = windows_console.GetConsoleMode(std.Io.File.stdin().handle, &restore.stdin_mode);
+        _ = windows_console.GetConsoleMode(std.Io.File.stdout().handle, &restore.stdout_mode);
+        restore.input_cp = windows_console.GetConsoleCP();
+        restore.output_cp = windows_console.GetConsoleOutputCP();
+        self.original_termios = restore;
+    }
+}
+
+fn enableWindowsRawMode(self: *TerminalState) !void {
+    if (comptime builtin.os.tag == .windows) {
+        if (!self.original_termios.captured) captureWindowsConsole(self);
+
+        _ = windows_console.SetConsoleCP(windows_console.CP_UTF8);
+        _ = windows_console.SetConsoleOutputCP(windows_console.CP_UTF8);
+
+        const stdout = std.Io.File.stdout();
+        stdout.enableAnsiEscapeCodes(io_mod.getIo()) catch {};
+
+        var stdout_mode: windows_console.DWORD = 0;
+        if (windows_console.GetConsoleMode(stdout.handle, &stdout_mode).toBool()) {
+            stdout_mode |= windows_console.ENABLE_PROCESSED_OUTPUT |
+                windows_console.ENABLE_WRAP_AT_EOL_OUTPUT |
+                windows_console.ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+            _ = windows_console.SetConsoleMode(stdout.handle, stdout_mode);
+        }
+
+        var stdin_mode: windows_console.DWORD = 0;
+        if (windows_console.GetConsoleMode(std.Io.File.stdin().handle, &stdin_mode).toBool()) {
+            stdin_mode &= ~(windows_console.ENABLE_ECHO_INPUT |
+                windows_console.ENABLE_LINE_INPUT |
+                windows_console.ENABLE_PROCESSED_INPUT);
+            stdin_mode |= windows_console.ENABLE_WINDOW_INPUT |
+                windows_console.ENABLE_VIRTUAL_TERMINAL_INPUT |
+                windows_console.ENABLE_EXTENDED_FLAGS;
+            _ = windows_console.SetConsoleMode(std.Io.File.stdin().handle, stdin_mode);
+        }
+    }
+    self.raw_enabled = true;
+}
+
+fn restoreWindowsConsole(self: *TerminalState) void {
+    if (comptime builtin.os.tag == .windows) {
+        if (!self.original_termios.captured) return;
+        const restore = self.original_termios;
+        _ = windows_console.SetConsoleMode(std.Io.File.stdin().handle, restore.stdin_mode);
+        _ = windows_console.SetConsoleMode(std.Io.File.stdout().handle, restore.stdout_mode);
+        if (restore.input_cp != 0) _ = windows_console.SetConsoleCP(restore.input_cp);
+        if (restore.output_cp != 0) _ = windows_console.SetConsoleOutputCP(restore.output_cp);
+    }
+}
 
 fn clearTmuxHistoryForPane(alloc: Allocator, pane: []const u8) void {
     runTmuxHistoryClear(alloc, pane) catch |err| {

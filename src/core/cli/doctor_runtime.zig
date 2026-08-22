@@ -127,6 +127,10 @@ pub fn collect(
             .gateway => detailed.settings.model,
             .codex => detailed.settings.codex_model,
             .grok => detailed.settings.grok_model,
+            .opencode_go => if (detailed.settings.model) |saved|
+                if (std.mem.startsWith(u8, saved, "opencode-go/")) saved else null
+            else
+                null,
         },
         .permission_mode = detailed.settings.permission_mode,
         .max_agent_steps = detailed.settings.max_agent_steps,

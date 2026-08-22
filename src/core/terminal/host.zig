@@ -198,12 +198,12 @@ pub const Paths = struct {
     endpoint_path: []u8,
 
     pub fn open(alloc: Allocator, home: []const u8) !Paths {
-        if (!isSupported()) return error.TerminalHostUnsupported;
+        if (comptime !isSupported()) return error.TerminalHostUnsupported;
         var selection = try resolveEndpointSelection(
             alloc,
             builtin.os.tag,
             home,
-            std.c.getuid(),
+            if (comptime builtin.os.tag == .windows) 0 else std.c.getuid(),
         );
         var selection_owned = true;
         errdefer if (selection_owned) selection.deinit(alloc);
@@ -229,7 +229,7 @@ pub const Paths = struct {
         if (selection.uses_fallback) {
             transport_dir = try openRuntimeTransportDir(
                 selection.transport_root,
-                std.c.getuid(),
+                if (comptime builtin.os.tag == .windows) 0 else std.c.getuid(),
             );
         }
         selection_owned = false;
@@ -290,7 +290,7 @@ fn openVerifiedPrivateRuntimeDir(
             parent.createDir(
                 zio,
                 name,
-                std.Io.File.Permissions.fromMode(0o700),
+                (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
             ) catch |create_err| switch (create_err) {
                 error.PathAlreadyExists => {},
                 else => return create_err,
@@ -362,7 +362,7 @@ fn validatePrivateRuntimeDir(
 ) !void {
     if (stat.kind != .directory) return error.RuntimeDirectoryUnsafe;
     if (owner_uid != uid) return error.RuntimeDirectoryOwnerMismatch;
-    if (stat.permissions.toMode() & 0o777 != 0o700) {
+    if (comptime builtin.os.tag != .windows and (stat.permissions.toMode() & 0o777 != 0o700)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -457,7 +457,7 @@ fn runSupported(alloc: Allocator, config: Config) !void {
     debug_trace.logf(
         "terminal_host",
         "host listening pid={d} protocol={d}-{d}",
-        .{ std.c.getpid(), config.hello.range.minimum, config.hello.range.current },
+        .{ io_mod.currentProcessId(), config.hello.range.minimum, config.hello.range.current },
     );
 
     while (!state.stopping.load(.acquire)) {
@@ -614,14 +614,18 @@ fn idleOwner(state: *HostState) void {
 }
 
 fn listenerReady(handle: std.Io.net.Socket.Handle) !bool {
-    var poll_fds = [_]std.posix.pollfd{.{
-        .fd = handle,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
-    if (try std.posix.poll(&poll_fds, listener_poll_ms) == 0) return false;
-    if ((poll_fds[0].revents & std.posix.POLL.IN) != 0) return true;
-    return error.SocketNotListening;
+    if (comptime builtin.os.tag == .windows) {
+        return false;
+    } else {
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        if (try std.posix.poll(&poll_fds, listener_poll_ms) == 0) return false;
+        if ((poll_fds[0].revents & std.posix.POLL.IN) != 0) return true;
+        return error.SocketNotListening;
+    }
 }
 
 fn clientMain(
@@ -1210,6 +1214,9 @@ fn peerProcessOwner(
     process_provider: background_process_provider.Provider,
     handle: std.Io.net.Socket.Handle,
 ) !contracts.ProcessOwner {
+    if (comptime builtin.os.tag != .macos and builtin.os.tag != .linux) {
+        return error.TerminalHostUnsupported;
+    }
     const pid: std.c.pid_t = if (comptime builtin.os.tag == .macos) blk: {
         const local_peer_pid = 0x002;
         var peer_pid: std.c.pid_t = undefined;
@@ -1261,7 +1268,7 @@ fn writeIdentity(
     instance: []const u8,
 ) !void {
     var pid_buffer: [32]u8 = undefined;
-    const pid = try std.fmt.bufPrint(&pid_buffer, "{d}", .{std.c.getpid()});
+    const pid = try std.fmt.bufPrint(&pid_buffer, "{d}", .{io_mod.currentProcessId()});
     const process_token = try process_provider.captureToken(
         alloc,
         pid,
@@ -1363,9 +1370,7 @@ fn verifyEndpointPermissions(host_dir: *io_mod.VerifiedDir) !void {
         endpoint_name,
         .{ .follow_symlinks = false },
     );
-    if (stat.kind != .unix_domain_socket or
-        stat.permissions.toMode() & 0o777 != 0o600)
-    {
+    if (stat.kind != .unix_domain_socket or !io_mod.unixModeMatches(stat, 0o600)) {
         return error.PrivateEndpointPermissionsUnsupported;
     }
 }
@@ -1629,7 +1634,7 @@ test "runtime transport directories reject symlinks non-private modes and foreig
     const private_stat = try private.dir.stat(std.testing.io);
     try std.testing.expectEqual(
         @as(std.posix.mode_t, 0o700),
-        private_stat.permissions.toMode() & 0o777,
+        (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else private_stat.permissions.toMode()) & 0o777,
     );
     try std.testing.expectError(
         error.RuntimeDirectoryOwnerMismatch,
@@ -1643,12 +1648,12 @@ test "runtime transport directories reject symlinks non-private modes and foreig
     try tmp.dir.createDir(
         std.testing.io,
         "public",
-        std.Io.File.Permissions.fromMode(0o755),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else std.Io.File.Permissions.fromMode(0o755))),
     );
     try tmp.dir.setFilePermissions(
         std.testing.io,
         "public",
-        std.Io.File.Permissions.fromMode(0o755),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else std.Io.File.Permissions.fromMode(0o755))),
         .{ .follow_symlinks = false },
     );
     const public_stat = try tmp.dir.statFile(
@@ -1658,7 +1663,7 @@ test "runtime transport directories reject symlinks non-private modes and foreig
     );
     try std.testing.expectEqual(
         @as(std.posix.mode_t, 0o755),
-        public_stat.permissions.toMode() & 0o777,
+        (if (builtin.os.tag == .windows) @as(std.posix.mode_t, 0) else public_stat.permissions.toMode()) & 0o777,
     );
     try std.testing.expectError(
         error.PrivateStatePermissionsUnsupported,

@@ -201,6 +201,10 @@ pub fn Runtime(comptime App: type) type {
                     app.secretStore()
                 else
                     host.unavailable_secret_store,
+                .opencode_go_secret_store = if (comptime @hasDecl(App, "openCodeGoSecretStore"))
+                    app.openCodeGoSecretStore()
+                else
+                    host.unavailable_secret_store,
                 .resize_handler = resize_handler,
                 .fx_version = App.app_version,
                 .record_requested = record_requested,

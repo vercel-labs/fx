@@ -750,6 +750,7 @@ pub const ModelListSnapshot = struct {
             .gateway => "gateway",
             .codex => model_provider.label(.codex),
             .grok => model_provider.label(.grok),
+            .opencode_go => model_provider.label(.opencode_go),
         };
     }
 
@@ -764,6 +765,7 @@ pub const ModelListSnapshot = struct {
             .authenticated_credential_rejected => "Your Gateway credential was rejected; using the public model catalog.",
             .chatgpt_subscription => "Codex models require an authenticated Codex catalog.",
             .grok_subscription => "Grok models require an authenticated Grok catalog.",
+            .opencode_go => "OpenCode Go models require an OPENCODE_API_KEY credential or /login opencode-go.",
         };
     }
 };

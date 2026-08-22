@@ -85,7 +85,7 @@ fn spawnPrepared(
     };
 
     const child_id = child.id orelse return error.SpawnFailed;
-    const pid = try std.fmt.allocPrint(alloc, "{d}", .{child_id});
+    const pid = if (comptime @import("builtin").os.tag == .windows) try std.fmt.allocPrint(alloc, "{d}", .{@as(usize, @intFromPtr(child_id))}) else try std.fmt.allocPrint(alloc, "{d}", .{child_id});
     var pid_owned = true;
     errdefer if (pid_owned) alloc.free(pid);
 
@@ -245,7 +245,10 @@ fn captureToken(
     alloc: Allocator,
     pid_text: []const u8,
 ) background_process_provider.ProviderError!process_supervisor.ProcessInstanceToken {
-    const pid = std.fmt.parseInt(std.posix.pid_t, pid_text, 10) catch
+    const pid = if (comptime @import("builtin").os.tag == .windows) blk: {
+        const n = std.fmt.parseInt(usize, pid_text, 10) catch return error.InvalidPid;
+        break :blk @as(std.posix.pid_t, @ptrFromInt(n));
+    } else std.fmt.parseInt(std.posix.pid_t, pid_text, 10) catch
         return error.InvalidPid;
     return switch (builtin.os.tag) {
         .linux => captureLinuxToken(alloc, pid) catch |err| switch (err) {
@@ -482,8 +485,10 @@ fn signalProcess(
         },
     }
     if (!host.current().background_processes) return error.Unsupported;
-    const pid = std.fmt.parseInt(std.posix.pid_t, pid_text, 10) catch
-        return error.InvalidPid;
+    const pid = if (comptime @import("builtin").os.tag == .windows) blk: {
+        const n = std.fmt.parseInt(usize, pid_text, 10) catch return error.InvalidPid;
+        break :blk @as(std.posix.pid_t, @ptrFromInt(n));
+    } else std.fmt.parseInt(std.posix.pid_t, pid_text, 10) catch return error.InvalidPid;
     try signalPidTree(pid);
 }
 
@@ -492,10 +497,11 @@ fn signalPidTree(root_pid: std.posix.pid_t) std.posix.KillError!void {
         std.heap.page_allocator,
         root_pid,
     ) catch |err| fallback: {
+        const pid_val = if (comptime @import("builtin").os.tag == .windows) @as(usize, @intFromPtr(root_pid)) else @as(usize, @intCast(root_pid));
         debug_trace.logf(
             "background",
             "could not inspect background process descendants pid={d} err={s}",
-            .{ root_pid, @errorName(err) },
+            .{ pid_val, @errorName(err) },
         );
         break :fallback &[_]std.posix.pid_t{};
     };
@@ -505,7 +511,8 @@ fn signalPidTree(root_pid: std.posix.pid_t) std.posix.KillError!void {
 
     var signaled = false;
     var first_error: ?std.posix.KillError = null;
-    sendSignal(-root_pid, std.posix.SIG.TERM, &signaled, &first_error);
+    const term_pid = if (comptime @import("builtin").os.tag == .windows) root_pid else -root_pid;
+    sendSignal(term_pid, std.posix.SIG.TERM, &signaled, &first_error);
     for (descendants) |pid| {
         sendSignal(pid, std.posix.SIG.TERM, &signaled, &first_error);
     }
@@ -516,12 +523,12 @@ fn signalPidTree(root_pid: std.posix.pid_t) std.posix.KillError!void {
     var force_killed = false;
     for (descendants) |pid| {
         if (!isPidRunningRaw(pid)) continue;
-        sendSignal(pid, std.posix.SIG.KILL, &force_killed, &first_error);
+        sendSignal(pid, if (comptime @import("builtin").os.tag == .windows) std.posix.SIG.TERM else std.posix.SIG.KILL, &force_killed, &first_error);
     }
     if (isPidRunningRaw(root_pid)) {
         sendSignal(
             root_pid,
-            std.posix.SIG.KILL,
+            if (comptime @import("builtin").os.tag == .windows) std.posix.SIG.TERM else std.posix.SIG.KILL,
             &force_killed,
             &first_error,
         );
@@ -530,7 +537,7 @@ fn signalPidTree(root_pid: std.posix.pid_t) std.posix.KillError!void {
         debug_trace.logf(
             "background",
             "force-killed lingering background process tree pid={d}",
-            .{root_pid},
+            .{if (comptime @import("builtin").os.tag == .windows) @as(usize, @intFromPtr(root_pid)) else @as(usize, @intCast(root_pid))},
         );
     }
 }
@@ -541,13 +548,18 @@ fn sendSignal(
     signaled: *bool,
     first_error: *?std.posix.KillError,
 ) void {
-    std.posix.kill(pid, signal) catch |err| {
-        if (err != error.ProcessNotFound and first_error.* == null) {
-            first_error.* = err;
-        }
+    if (comptime @import("builtin").os.tag == .windows) {
+        first_error.* = first_error.* orelse error.PermissionDenied;
         return;
-    };
-    signaled.* = true;
+    } else {
+        std.posix.kill(pid, signal) catch |err| {
+            if (err != error.ProcessNotFound and first_error.* == null) {
+                first_error.* = err;
+            }
+            return;
+        };
+        signaled.* = true;
+    }
 }
 
 fn waitForProcessTreeExit(
@@ -574,11 +586,15 @@ fn anyProcessTreeMemberRunning(
 }
 
 fn isPidRunningRaw(pid: std.posix.pid_t) bool {
-    std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
-        error.ProcessNotFound => return false,
-        else => return true,
-    };
-    return true;
+    if (comptime @import("builtin").os.tag == .windows) {
+        return false;
+    } else {
+        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+            error.ProcessNotFound => return false,
+            else => return true,
+        };
+        return true;
+    }
 }
 
 fn collectDescendantPids(
@@ -604,16 +620,14 @@ fn collectDescendantPids(
         var fields = std.mem.tokenizeAny(u8, line, " \t\r");
         const pid_text = fields.next() orelse continue;
         const ppid_text = fields.next() orelse continue;
-        const pid = std.fmt.parseInt(
-            std.posix.pid_t,
-            pid_text,
-            10,
-        ) catch continue;
-        const ppid = std.fmt.parseInt(
-            std.posix.pid_t,
-            ppid_text,
-            10,
-        ) catch continue;
+        const pid = if (comptime @import("builtin").os.tag == .windows) blk: {
+            const n = std.fmt.parseInt(usize, pid_text, 10) catch continue;
+            break :blk @as(std.posix.pid_t, @ptrFromInt(n));
+        } else std.fmt.parseInt(std.posix.pid_t, pid_text, 10) catch continue;
+        const ppid = if (comptime @import("builtin").os.tag == .windows) blk: {
+            const n = std.fmt.parseInt(usize, ppid_text, 10) catch continue;
+            break :blk @as(std.posix.pid_t, @ptrFromInt(n));
+        } else std.fmt.parseInt(std.posix.pid_t, ppid_text, 10) catch continue;
         try pairs.append(alloc, .{ .pid = pid, .ppid = ppid });
     }
 
@@ -798,20 +812,20 @@ fn waitForProcessExit(
 }
 
 fn processExists(pid_text: []const u8) bool {
-    switch (builtin.os.tag) {
-        .windows, .wasi => return true,
-        else => {},
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return true;
+    } else {
+        const pid = std.fmt.parseInt(
+            std.posix.pid_t,
+            pid_text,
+            10,
+        ) catch return false;
+        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+            error.ProcessNotFound => return false,
+            else => return true,
+        };
+        return true;
     }
-    const pid = std.fmt.parseInt(
-        std.posix.pid_t,
-        pid_text,
-        10,
-    ) catch return false;
-    std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
-        error.ProcessNotFound => return false,
-        else => return true,
-    };
-    return true;
 }
 
 fn expectBlockedWrapperDoesNotExecute(

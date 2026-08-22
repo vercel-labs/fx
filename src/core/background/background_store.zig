@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const process_supervisor = @import("process_supervisor.zig");
 const session_child_store = @import("../session/session_child_store.zig");
@@ -194,12 +195,12 @@ test "legacy log path maps to managed only for exact display parent" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session-logs",
-        std.Io.File.Permissions.fromMode(0o700),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
     );
     try tmp.dir.createDir(
         io_mod.getIo(),
         "external-logs",
-        std.Io.File.Permissions.fromMode(0o700),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
     );
     const managed_dir = try io_mod.dirRealpathAlloc(
         alloc,
@@ -281,7 +282,7 @@ test "managed background read only absence does not create route" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_dir else std.Io.File.Permissions.fromMode(0o700))),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,

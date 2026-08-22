@@ -11,6 +11,7 @@ pub const clipboard = host.Clipboard{
 };
 
 pub const secret_store = native_secret_store.provider;
+pub const opencode_go_secret_store = native_secret_store.opencode_go_provider;
 
 fn copyToClipboard(_: ?*anyopaque, text: []const u8) host.ClipboardError!bool {
     const argv = clipboardCommand(builtin.os.tag) orelse return false;
@@ -116,11 +117,15 @@ fn try_reap_clipboard_process(child: *std.process.Child) error{WaitFailed}!?std.
 
 fn kill_and_wait_clipboard_process(child: *std.process.Child) !std.process.Child.Term {
     const pid = child.id orelse return error.WaitFailed;
-    std.posix.kill(pid, .KILL) catch |err| switch (err) {
-        error.ProcessNotFound => {},
-        else => |kill_err| return kill_err,
-    };
-    return child.wait(io_mod.getIo());
+    if (comptime @import("builtin").os.tag == .windows) {
+        return child.wait(io_mod.getIo());
+    } else {
+        std.posix.kill(pid, .KILL) catch |err| switch (err) {
+            error.ProcessNotFound => {},
+            else => |kill_err| return kill_err,
+        };
+        return child.wait(io_mod.getIo());
+    }
 }
 
 fn wait_for_clipboard_process(

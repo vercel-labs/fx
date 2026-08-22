@@ -25,9 +25,12 @@ pub const Config = struct {
     codex_model_catalog: ?model_catalog.Provider = null,
     grok_agent_stream: ?agent_stream_provider.Provider = null,
     grok_model_catalog: ?model_catalog.Provider = null,
+    opencode_go_agent_stream: ?agent_stream_provider.Provider = null,
+    opencode_go_model_catalog: ?model_catalog.Provider = null,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     secret_store: host.SecretStore,
+    opencode_go_secret_store: host.SecretStore = host.unavailable_secret_store,
     prompt_policy: prompt_policy.Policy,
     ignored_list_entries: []const []const u8,
     max_list_entries: usize,

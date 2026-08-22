@@ -108,6 +108,7 @@ pub const ModelProviderFilter = enum {
     openai,
     xai,
     zai,
+    opencode_go,
     others,
 };
 
@@ -259,13 +260,31 @@ fn providerMatchesFilter(provider: []const u8, filter: ModelProviderFilter) bool
         .xai
     else if (std.ascii.eqlIgnoreCase(provider, "zai"))
         .zai
+    else if (std.ascii.eqlIgnoreCase(provider, "opencode-go"))
+        .opencode_go
     else
         null;
     return switch (filter) {
         .all => true,
-        .anthropic, .openai, .xai, .zai => known_filter == filter,
+        .anthropic, .openai, .xai, .zai, .opencode_go => known_filter == filter,
         .others => known_filter == null,
     };
+}
+
+test "OpenCode Go models have a dedicated provider filter" {
+    const items = [_]ModelMenuItem{
+        .{ .id = @constCast("opencode-go/glm-5.2"), .provider = "opencode-go", .capabilities = .{} },
+        .{ .id = @constCast("zai/glm-5.2"), .provider = "zai", .capabilities = .{} },
+    };
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        modelMenuFilteredItemCount(&items, .opencode_go, ""),
+    );
+    try std.testing.expectEqualStrings(
+        "opencode-go/glm-5.2",
+        modelMenuItemAt(&items, .opencode_go, "", 0).?.id,
+    );
+    try std.testing.expectEqual(@as(usize, 0), modelMenuFilteredItemCount(&items, .others, ""));
 }
 
 pub const Runtime = struct {

@@ -14,6 +14,7 @@ const app_runtime_setup = @import("../core/app/app_runtime_setup.zig");
 const builtin_skills = @import("../builtins/skills.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const credentials = @import("../core/auth/credentials.zig");
+const provider_id = @import("../core/providers/provider_id.zig");
 const secret = @import("../core/auth/secret.zig");
 const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const model_provider = @import("../core/config/model_provider.zig");
@@ -215,6 +216,7 @@ pub const ServerState = struct {
     client_elicitation: elicitation.Capabilities = .{},
     workspace_root: []u8 = &.{},
     workspace_access: workspace_access.WorkspaceAccess = .{},
+    /// Borrowed from one of the provider-owned credential buffers below.
     api_key: []u8 = &.{},
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]u8 = null,
@@ -345,7 +347,13 @@ pub fn selectCredentialForProvider(
             .token = try state.alloc.dupe(u8, state.cfg.credential_override.?),
             .source = .ai_gateway_api_key,
         }
-    else blk: {
+    else if (provider == .opencode_go) go: {
+        const loaded = try credentials.loadOpenCodeGoCredential(
+            state.alloc,
+            state.cfg.opencode_go_secret_store,
+        );
+        break :go loaded orelse return false;
+    } else blk: {
         const resolution = try credentials.resolveForProvider(
             state.alloc,
             state.cfg.gateway_provider.oauth_transport,
@@ -371,6 +379,8 @@ pub fn streamProviderFor(
             @import("../core/agent/stream_provider.zig").unavailable_provider,
         .grok => state.cfg.grok_agent_stream orelse
             @import("../core/agent/stream_provider.zig").unavailable_provider,
+        .opencode_go => state.cfg.opencode_go_agent_stream orelse
+            @import("../core/agent/stream_provider.zig").unavailable_provider,
     };
 }
 
@@ -382,6 +392,7 @@ pub fn catalogProviderFor(
         .gateway => state.cfg.gateway_provider.model_catalog,
         .codex => state.cfg.codex_model_catalog,
         .grok => state.cfg.grok_model_catalog,
+        .opencode_go => state.cfg.opencode_go_model_catalog,
     };
 }
 
@@ -1338,7 +1349,6 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
 
     state.workspace_root = startup.takeWorkspaceRoot();
     state.workspace_access = startup.takeWorkspaceAccess();
-
     if (state.cfg.model_override) |override| {
         state.selected_model = try alloc.dupe(u8, override);
         alloc.free(startup.takeSelectedModel());
@@ -1358,7 +1368,19 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         credentialMatchesProvider(credential.source, state.provider)
     else
         false;
-    const credential: *credentials.Credential = if (state.provider == .gateway and state.cfg.credential_override != null) override: {
+    const credential: *credentials.Credential = if (state.provider == .opencode_go) go: {
+        routed_credential = try credentials.loadOpenCodeGoCredential(
+            alloc,
+            state.cfg.opencode_go_secret_store,
+        );
+        if (routed_credential == null) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = credentials.missing_opencode_go_credential_message,
+            });
+        }
+        break :go &routed_credential.?;
+    } else if (state.provider == .gateway and state.cfg.credential_override != null) override: {
         routed_credential = .{
             .token = try alloc.dupe(u8, state.cfg.credential_override.?),
             .source = .ai_gateway_api_key,
@@ -1714,6 +1736,12 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .gateway => settings.model,
                 .codex => settings.codex_model,
                 .grok => settings.grok_model,
+                .opencode_go => blk: {
+                    if (settings.model) |saved| {
+                        if (std.mem.startsWith(u8, saved, provider_id.opencode_go_prefix)) break :blk saved;
+                    }
+                    break :blk @as(?[]u8, null);
+                },
             };
             var selected_model = catalog.items[0].id;
             if (saved_model) |saved| {

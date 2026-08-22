@@ -1,8 +1,9 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../core/shared/io.zig");
 const session_log = @import("../core/session/session_log.zig");
 
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_file_permissions = (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else (if (builtin.os.tag == .windows) std.Io.File.Permissions.default_file else std.Io.File.Permissions.fromMode(0o600)));
 
 pub fn logOptions() session_log.Options {
     return logOptionsFromEnv(
