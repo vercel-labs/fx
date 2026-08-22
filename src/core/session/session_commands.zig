@@ -753,7 +753,8 @@ pub fn Commands(comptime App: type) type {
         }
 
         pub fn selectEffortFromSettings(app: *App, effort: types.ReasoningEffort) !void {
-            try applyEffort(app, effort, false, true);
+            // Announcing drops the redundant "saved" line, matching /sound.
+            try applyEffort(app, effort, true, true);
         }
 
         pub fn selectModelFromPicker(app: *App, model: []const u8, effort: types.ReasoningEffort, fast_mode: bool) !void {

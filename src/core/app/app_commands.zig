@@ -131,6 +131,8 @@ fn persistUserPreferences(
     label: []const u8,
     patch: config_runtime.UserSettingsPatch,
     runtime_changed: bool,
+    // False when the caller announces state; failures still report.
+    announce_commit: bool,
 ) !void {
     var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
     defer attempt.deinit(app.alloc);
@@ -148,7 +150,7 @@ fn persistUserPreferences(
             patch,
             outcome,
             null,
-            true,
+            announce_commit,
         ),
     }
 }
@@ -2999,7 +3001,7 @@ fn applyStatuslineItem(
     };
     switch (feedback) {
         .announce => {
-            try persistUserPreferences(app, "statusline", patch, runtime_changed);
+            try persistUserPreferences(app, "statusline", patch, runtime_changed, false);
             const message = try std.fmt.allocPrint(
                 app.alloc,
                 "{s}: {s}",
@@ -3084,27 +3086,7 @@ fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {
         .notification_attention_required = sound_on,
         .notification_max = max,
     };
-    var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
-    defer attempt.deinit(app.alloc);
-    switch (attempt) {
-        .failure => |failure| try session_commands.reportUserSettingsFailure(
-            app,
-            "sound",
-            failure.err,
-            failure.cleanup,
-            runtime_changed,
-        ),
-        // announce_commit=false drops the routine "saved" line (the state
-        // notice below covers it, matching /fast) but keeps warnings.
-        .outcome => |outcome| _ = try session_commands.reportUserSettingsCommit(
-            app,
-            "sound",
-            patch,
-            outcome,
-            null,
-            false,
-        ),
-    }
+    try persistUserPreferences(app, "sound", patch, runtime_changed, false);
 
     try app.writeDomainNotice(.{
         .topic = "sound",
@@ -3204,6 +3186,7 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
                 "slash menu categories",
                 .{ .slash_menu_categories = enabled },
                 runtime_changed,
+                true,
             );
         },
         .effort => {
