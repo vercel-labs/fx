@@ -7286,6 +7286,17 @@ pub const TranscriptRuntime = struct {
         });
     }
 
+    fn projectionLayout(
+        self: *const TranscriptRuntime,
+        target_layout: render_engine.frame_layout.CommittedLayoutSnapshot,
+    ) Layout {
+        var layout = self.layout;
+        if (!target_layout.transcript_area.isEmpty()) {
+            layout.content_bottom = target_layout.transcript_area.bottom;
+        }
+        return layout;
+    }
+
     fn paintedStableTargetWouldRewind(
         self: *const TranscriptRuntime,
         target: TransitionTarget,
@@ -7365,6 +7376,12 @@ pub const TranscriptRuntime = struct {
         activity_overlay_active: bool,
     ) !TransitionTarget {
         var target = TransitionTarget.init(prepared, scroll_facts);
+        // Staging measures against the rows this frame granted the transcript,
+        // which need not match the app layout's content bottom: a frame that
+        // reserves fewer footer rows hands the transcript an area reaching
+        // past it, and measuring against the stale bottom rejects the
+        // transition outright.
+        const projection_layout = self.projectionLayout(target_layout);
         switch (self.transcript_commit_state) {
             .stable => |anchor| {
                 target.history_visual_offset = @min(
@@ -7410,7 +7427,7 @@ pub const TranscriptRuntime = struct {
                 )) {
                     try target.stagePreparedProjection(
                         alloc,
-                        self.layout,
+                        projection_layout,
                         prepared,
                         target_layout.transcript_area,
                         scroll_facts.source_visual_offset + accepted_semantic_progress_rows,
@@ -7422,7 +7439,7 @@ pub const TranscriptRuntime = struct {
                 {
                     try target.stagePreparedHistoryProjection(
                         alloc,
-                        self.layout,
+                        projection_layout,
                         prepared,
                         target_layout.transcript_area,
                     );
@@ -7449,8 +7466,6 @@ pub const TranscriptRuntime = struct {
                     // release: slide the window with an in-place repaint at
                     // the target offset. The rows passed over stay
                     // unreleased and settle later through the replay.
-                    var projection_layout = self.layout;
-                    projection_layout.content_bottom = target_layout.transcript_area.bottom;
                     try target.stagePreparedProjection(
                         alloc,
                         projection_layout,
@@ -7470,8 +7485,6 @@ pub const TranscriptRuntime = struct {
                     );
                 }
                 if (self.stableHistoryFloor(target, anchor, scroll_facts)) |history_floor| {
-                    var projection_layout = self.layout;
-                    projection_layout.content_bottom = target_layout.transcript_area.bottom;
                     try target.stagePreparedProjection(
                         alloc,
                         projection_layout,
@@ -7514,7 +7527,7 @@ pub const TranscriptRuntime = struct {
                     {
                         try target.stagePreparedProjection(
                             alloc,
-                            self.layout,
+                            projection_layout,
                             prepared,
                             target_layout.transcript_area,
                             target.visual_offset,
@@ -7522,7 +7535,7 @@ pub const TranscriptRuntime = struct {
                     } else {
                         try transcript_painter.reprojectPreparedTranscriptForVisualOffset(
                             alloc,
-                            self.layout,
+                            projection_layout,
                             prepared,
                             target_layout.transcript_area,
                             target.visual_offset,
@@ -7538,7 +7551,7 @@ pub const TranscriptRuntime = struct {
             )) {
                 try target.stagePreparedProjection(
                     alloc,
-                    self.layout,
+                    projection_layout,
                     prepared,
                     target_layout.transcript_area,
                     accepted_semantic_progress_rows,
@@ -11489,6 +11502,99 @@ test "measured recovery rebases from accepted projection before retiring resize 
     const retry = runtime.planTranscriptScroll(&retry_prepared);
     try std.testing.expectEqual(@as(u16, 0), retry.resize_reflow_rows);
     try std.testing.expectEqual(@as(u16, 2), retry.semantic_rows);
+}
+
+test "frame transcript rows past the layout content bottom still stage" {
+    const alloc = std.testing.allocator;
+    const flow =
+        "row-01\n" ++
+        "row-02\n" ++
+        "row-03\n" ++
+        "row-04\n" ++
+        "row-05\n" ++
+        "row-06\n";
+    // The app layout reserves four footer rows, so its content bottom is 4.
+    const layout: Layout = .{
+        .rows = 8,
+        .cols = 10,
+        .content_bottom = 4,
+        .divider_top_row = 5,
+        .input_row = 6,
+        .divider_bottom_row = 7,
+        .hint_row = 8,
+    };
+    // This frame reserves one row less, so the transcript area reaches row 5.
+    const transcript_area: render_engine.frame_layout.FrameRect = .{ .top = 1, .bottom = 5 };
+    var runtime = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 1,
+        .committed_frame_layout = .{
+            .layout_id = 23,
+            .owned_top = 1,
+            .owned_band = .{ .top = 1, .bottom = 8 },
+            .body_area = transcript_area,
+            .transcript_area = transcript_area,
+            .footer_area = .{ .top = 6, .bottom = 8 },
+            .solved_frame_height = 8,
+            .terminal_rows = 8,
+            .terminal_cols = 10,
+        },
+    };
+    defer runtime.deinit(alloc);
+    try runtime.transcript.appendSlice(alloc, flow);
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    var metrics: Metrics = .{};
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        &source,
+        transcript_area,
+    );
+    defer prepared.deinit(alloc);
+
+    const target_layout: render_engine.frame_layout.CommittedLayoutSnapshot = .{
+        .layout_id = 24,
+        .owned_top = 1,
+        .owned_band = .{ .top = 1, .bottom = 8 },
+        .body_area = transcript_area,
+        .transcript_area = transcript_area,
+        .footer_area = .{ .top = 6, .bottom = 8 },
+        .solved_frame_height = 8,
+        .terminal_rows = 8,
+        .terminal_cols = 10,
+    };
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+        0,
+        0,
+    );
+    // Semantic progress the frame may not release yet: the transition stages a
+    // projection instead of advancing, which measures against the frame area.
+    const scroll_facts: TranscriptScrollFacts = .{
+        .semantic_rows = 1,
+        .semantic_progress_rows = 1,
+        .source_compatible = true,
+        .recovery_tracks_semantic_progress = true,
+    };
+
+    const resolved = try runtime.resolveTranscriptTransitionTargetForFrame(
+        alloc,
+        &source,
+        &prepared,
+        target_layout,
+        scroll_plan,
+        scroll_facts,
+        false,
+        false,
+    );
+    try std.testing.expectEqual(
+        transcript_area.bottom,
+        resolved.target.selection.bottom_row,
+    );
+    try std.testing.expect(resolved.target.projection_staged);
 }
 
 test "source rewrite replays unchanged history prefix after footer projection rebase" {
