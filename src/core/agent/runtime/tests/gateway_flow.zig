@@ -4385,11 +4385,23 @@ test "processQueuedPrompt reserves and settles durable attempts before history c
     try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 2), hooks.recovery_checkpoints.items.len);
     const reserved = hooks.recovery_checkpoints.items[0];
+    try std.testing.expectEqual(
+        session_codec.RecoveryCheckpointPhase.request_reservation,
+        reserved.phase,
+    );
     try std.testing.expect(reserved.outstanding_reservation);
     try std.testing.expectEqual(@as(usize, 0), reserved.consumed_provider_attempts);
+    try std.testing.expect(reserved.cause == null);
+    try std.testing.expect(reserved.action == null);
     const settled = hooks.recovery_checkpoints.items[1];
+    try std.testing.expectEqual(
+        session_codec.RecoveryCheckpointPhase.request_settlement,
+        settled.phase,
+    );
     try std.testing.expect(!settled.outstanding_reservation);
     try std.testing.expectEqual(@as(usize, 1), settled.consumed_provider_attempts);
+    try std.testing.expect(settled.cause == null);
+    try std.testing.expect(settled.action == null);
     try std.testing.expectEqual(@as(usize, 1), hooks.history_propagation_count);
 }
 
@@ -4436,14 +4448,102 @@ test "processQueuedPrompt carries one durable budget across transport recovery" 
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 4), hooks.recovery_checkpoints.items.len);
+    try std.testing.expectEqual(
+        session_codec.RecoveryCheckpointPhase.request_reservation,
+        hooks.recovery_checkpoints.items[0].phase,
+    );
     try std.testing.expectEqual(@as(usize, 0), hooks.recovery_checkpoints.items[0].consumed_provider_attempts);
     try std.testing.expect(hooks.recovery_checkpoints.items[0].outstanding_reservation);
+    try std.testing.expectEqual(
+        session_codec.RecoveryCheckpointPhase.recovery,
+        hooks.recovery_checkpoints.items[1].phase,
+    );
+    try std.testing.expectEqual(
+        types.ModelRecoveryCause.network_interrupted,
+        hooks.recovery_checkpoints.items[1].cause,
+    );
+    try std.testing.expectEqual(
+        types.ModelRecoveryAction.retrying_request,
+        hooks.recovery_checkpoints.items[1].action,
+    );
     try std.testing.expectEqual(@as(usize, 1), hooks.recovery_checkpoints.items[1].consumed_provider_attempts);
     try std.testing.expect(!hooks.recovery_checkpoints.items[1].outstanding_reservation);
+    try std.testing.expectEqual(
+        session_codec.RecoveryCheckpointPhase.request_reservation,
+        hooks.recovery_checkpoints.items[2].phase,
+    );
     try std.testing.expectEqual(@as(usize, 1), hooks.recovery_checkpoints.items[2].consumed_provider_attempts);
     try std.testing.expect(hooks.recovery_checkpoints.items[2].outstanding_reservation);
+    try std.testing.expectEqual(
+        session_codec.RecoveryCheckpointPhase.request_settlement,
+        hooks.recovery_checkpoints.items[3].phase,
+    );
     try std.testing.expectEqual(@as(usize, 2), hooks.recovery_checkpoints.items[3].consumed_provider_attempts);
     try std.testing.expectEqual(@as(usize, 1), hooks.history_propagation_count);
+}
+
+test "processQueuedPrompt records mixed DNS and provider failures monotonically per turn" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .stream_error = error.NameServerFailure },
+        .{ .status = .service_unavailable, .err_body = "provider unavailable" },
+        .{ .content = "Recovered" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.max_provider_attempts = 3;
+    var job = fixture.job();
+    job.turn_id = 230;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 7), hooks.recovery_checkpoints.items.len);
+    var previous_consumed: usize = 0;
+    var recovery_index: usize = 0;
+    const expected_causes = [_]types.ModelRecoveryCause{
+        .network_interrupted,
+        .provider_unavailable,
+    };
+    for (hooks.recovery_checkpoints.items) |checkpoint| {
+        try std.testing.expectEqual(job.turn_id, checkpoint.turn_id);
+        try std.testing.expect(checkpoint.consumed_provider_attempts >= previous_consumed);
+        previous_consumed = checkpoint.consumed_provider_attempts;
+        try std.testing.expectEqual(
+            checkpoint.phase == .request_reservation,
+            checkpoint.outstanding_reservation,
+        );
+        if (checkpoint.phase != .recovery) continue;
+        try std.testing.expectEqual(expected_causes[recovery_index], checkpoint.cause);
+        try std.testing.expectEqual(
+            types.ModelRecoveryAction.retrying_request,
+            checkpoint.action,
+        );
+        try std.testing.expectEqual(recovery_index + 1, checkpoint.consumed_provider_attempts);
+        recovery_index += 1;
+    }
+    try std.testing.expectEqual(expected_causes.len, recovery_index);
+    try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_statuses.items[0].failed_attempt);
+    try std.testing.expectEqual(
+        types.ModelRecoveryCause.network_interrupted,
+        hooks.route_recovery_statuses.items[0].cause,
+    );
+    try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items[1].failed_attempt);
+    try std.testing.expectEqual(
+        types.ModelRecoveryCause.provider_unavailable,
+        hooks.route_recovery_statuses.items[1].cause,
+    );
+    try std.testing.expectEqual(
+        types.RouteRecoveryStatus.Kind.auto_recovered,
+        hooks.route_recovery_statuses.items[2].kind,
+    );
+    try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items[2].succeeded_attempt);
 }
 
 test "processQueuedPrompt preserves fallback route and budget until selection changes" {

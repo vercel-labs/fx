@@ -3479,7 +3479,7 @@ describe("gateway stream lifecycle", () => {
         throw new Error("missing mixed retry fixture address");
       }
       const result = await runFx(
-        ["ask", "--auto", "--no-save", "Recover after mixed provider and network failures."],
+        ["ask", "--auto", "Recover after mixed provider and network failures."],
         {
           cwd: root.workspace,
           env: {
@@ -3514,6 +3514,30 @@ describe("gateway stream lifecycle", () => {
       expect(trace).toContain("event=receive_head_error");
       expect(trace).toContain("provider_attempts=6/10");
       expect(trace).toContain("recovery=retry_request");
+      const checkpoints = trace.split("\n").filter((line) =>
+        line.includes("recovery_checkpoint_set")
+      );
+      const reservations = checkpoints.filter((line) =>
+        line.includes("phase=request_reservation")
+      );
+      const settlements = checkpoints.filter((line) =>
+        line.includes("phase=request_settlement")
+      );
+      const recoveries = checkpoints.filter((line) =>
+        line.includes("phase=recovery")
+      );
+      expect(reservations).toHaveLength(7);
+      expect(settlements).toHaveLength(6);
+      expect(recoveries).toHaveLength(6);
+      expect([...reservations, ...settlements].every((line) =>
+        line.includes("action=none")
+      )).toBe(true);
+      expect(recoveries.filter((line) =>
+        line.includes("cause=provider_unavailable action=retry_request")
+      )).toHaveLength(5);
+      expect(recoveries.filter((line) =>
+        line.includes("cause=transport_interrupted action=retry_request")
+      )).toHaveLength(1);
     } finally {
       for (const socket of sockets) socket.destroy();
       if (server.listening) {

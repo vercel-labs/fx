@@ -666,13 +666,15 @@ fn sendPendingRecoveryUpdate(
         .kind = .terminal_provider_error,
         .failed_attempt = attempt,
         .attempt_limit = recovery.max_provider_attempts,
-        .cause = recovery.cause,
+        .cause = recovery.cause orelse .network_interrupted,
         .action = .paused,
         .required_action = if (recovery.tool_state == .uncertain)
             .inspect_uncertain_tool
         else
             .continue_later,
-        .diagnostic = types.ModelFailureDiagnostic.forCause(recovery.cause),
+        .diagnostic = types.ModelFailureDiagnostic.forCause(
+            recovery.cause orelse .network_interrupted,
+        ),
     }, true);
     try out.writer.writeByte('}');
     try state.writer.writeNotification(

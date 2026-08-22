@@ -12,7 +12,10 @@ const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const max_models: usize = 32;
-const max_pending_generations: usize = 16;
+// A tool-heavy turn can produce one generation for every Gateway round trip.
+// Keep enough unresolved identities to cover the bounded request burst while
+// retaining a hard snapshot limit for corrupt or permanently unsettled data.
+const max_pending_generations: usize = 64;
 const max_publication_backlog: usize = 16;
 const max_usage_incidents: usize = 16;
 const max_model_bytes: usize = 1024;
@@ -4059,22 +4062,81 @@ test "usage records committed lines once and restores a bounded snapshot" {
     try std.testing.expectEqual(@as(u64, 2), round_trip.lines_removed);
 }
 
-test "sixteenth pending generation is the capacity boundary" {
+test "tool-heavy burst reconciles fifty observed generation ids" {
     const alloc = std.testing.allocator;
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
 
-    // Every suffix is a valid Crockford identifier character, so each id is a
-    // distinct, well-formed generation id.
-    const suffixes = "ABCDEFGHJKMNPQRST";
-    try std.testing.expect(suffixes.len > max_pending_generations);
-
-    for (suffixes[0..max_pending_generations]) |suffix| {
+    const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    const generation_count: usize = 50;
+    for (0..generation_count) |index| {
         var id_buf: [30]u8 = undefined;
         const id = try std.fmt.bufPrint(
             &id_buf,
-            "gen_01ARZ3NDEKTSV4RRFFQ69G5FA{c}",
-            .{suffix},
+            "gen_01ARZ3NDEKTSV4RRFFQ69G5F{c}{c}",
+            .{ alphabet[index / alphabet.len], alphabet[index % alphabet.len] },
+        );
+        const sequence = try usage.reserveInvocation();
+        try usage.finishObservedInvocation(
+            alloc,
+            sequence,
+            1,
+            .observed_generation,
+            id,
+            "https://ai-gateway.vercel.sh",
+            null,
+        );
+    }
+
+    var pending = try usage.snapshot(alloc);
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(Availability.pending, pending.billing);
+    try std.testing.expectEqual(generation_count, pending.pending.len);
+
+    for (0..generation_count) |index| {
+        var id_buf: [30]u8 = undefined;
+        const id = try std.fmt.bufPrint(
+            &id_buf,
+            "gen_01ARZ3NDEKTSV4RRFFQ69G5F{c}{c}",
+            .{ alphabet[index / alphabet.len], alphabet[index % alphabet.len] },
+        );
+        try usage.applyGeneration(alloc, .{
+            .id = id,
+            .model = "anthropic/claude-opus-4.8",
+            .total_cost = 0.001,
+            .input_tokens = 2,
+            .output_tokens = 1,
+            .cache_read_tokens = 0,
+            .cache_write_tokens = 0,
+            .billable_web_search_calls = 0,
+        });
+    }
+
+    var reconciled = try usage.snapshot(alloc);
+    defer reconciled.deinit(alloc);
+    try std.testing.expectEqual(Availability.complete, reconciled.billing);
+    try std.testing.expectEqual(@as(usize, 0), reconciled.pending.len);
+    try std.testing.expectEqual(@as(?u64, generation_count), reconciled.request_count);
+    try std.testing.expectEqual(@as(u64, generation_count * 2), reconciled.input_tokens);
+    try std.testing.expectEqual(@as(u64, generation_count), reconciled.output_tokens);
+}
+
+test "sixty-fourth pending generation is the capacity boundary" {
+    const alloc = std.testing.allocator;
+    var usage = Usage.initFresh();
+    defer usage.deinit(alloc);
+
+    // Every suffix pair uses Crockford characters, so each id is a distinct,
+    // well-formed generation id.
+    const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    try std.testing.expect(alphabet.len * alphabet.len > max_pending_generations);
+
+    for (0..max_pending_generations) |index| {
+        var id_buf: [30]u8 = undefined;
+        const id = try std.fmt.bufPrint(
+            &id_buf,
+            "gen_01ARZ3NDEKTSV4RRFFQ69G5F{c}{c}",
+            .{ alphabet[index / alphabet.len], alphabet[index % alphabet.len] },
         );
         const sequence = try usage.reserveInvocation();
         try usage.finishObservedInvocation(
@@ -4097,10 +4159,14 @@ test "sixteenth pending generation is the capacity boundary" {
     );
 
     var overflow_id_buf: [30]u8 = undefined;
+    const overflow_index = max_pending_generations;
     const overflow_id = try std.fmt.bufPrint(
         &overflow_id_buf,
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FA{c}",
-        .{suffixes[max_pending_generations]},
+        "gen_01ARZ3NDEKTSV4RRFFQ69G5F{c}{c}",
+        .{
+            alphabet[overflow_index / alphabet.len],
+            alphabet[overflow_index % alphabet.len],
+        },
     );
     const overflow_sequence = try usage.reserveInvocation();
     try std.testing.expectError(
