@@ -310,7 +310,7 @@ describe("cli: help", () => {
 Run one noninteractive request
 
 Usage:
-  fx ask [--auto|--yolo] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
+  fx ask [--auto|--yolo] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--prompt-file PATH] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
 
 Options:
   --auto                Automatically review unresolved permission requests
@@ -320,13 +320,14 @@ Options:
   --quiet               Suppress assistant output
   --prompt-permissions  Prompt for Y/N permission approval when stdin is a TTY
   --no-save             Do not save the session; incompatible with --resume and --resume-id
+  --prompt-file PATH    Read the prompt from a file instead of arguments or stdin
   --no-color            Render TTY output without colors or hyperlinks
   --resume <last|id>    Continue the last session or a session by id
   --resume-id <id>      Continue a session by exact id
   --continue-recovery   Resume the paused model response in the selected session
   --                    Treat every following argument as prompt text
 
-The prompt may be passed as arguments or piped on stdin when no prompt args are given.
+The prompt may be passed as arguments, piped on stdin when no prompt args are given, or read from a file with --prompt-file.
 TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.
 Operational progress and diagnostics are written to stderr. JSON output keeps raw Markdown in \`output\`.
 With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
@@ -4026,6 +4027,105 @@ describe("cli: ask success", () => {
       );
     },
     120_000,
+  );
+
+  test(
+    "fx ask --prompt-file reads prompt text from a file",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-prompt-file-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const promptFile = join(root, "prompt.txt");
+      const gateway = startFakeGateway([fakeGatewayFinalText("from prompt file")]);
+      try {
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        writeFileSync(join(home, ".fx", "settings.json"), "{}\n");
+        writeFileSync(promptFile, "explain the changes in this repository\n");
+
+        const result = await runFx(
+          ["ask", "--json", "--auto", "--no-save", "--prompt-file", promptFile],
+          {
+            cwd: realpathSync(workspace),
+            env: {
+              HOME: home,
+              AI_GATEWAY_API_KEY: "fake-prompt-file-key",
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_GATEWAY_BASE_URL: gateway.baseUrl,
+              FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_MODEL: FAKE_GATEWAY_MODEL,
+              FX_AUTO_UPGRADE: "0",
+            },
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(result.code).toBe(0);
+        expect(JSON.parse(result.stdout).output.trim()).toBe("from prompt file");
+        const request = JSON.parse(gateway.requests[0]!.body) as {
+          prompt: Array<{ role: string; content: Array<{ type: string; text?: string }> }>;
+        };
+        const user = request.prompt.findLast((message) => message.role === "user");
+        expect(user?.content.find((part) => part.type === "text")?.text).toBe(
+          "explain the changes in this repository",
+        );
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask --prompt-file missing file has distinct text and JSON errors",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-prompt-file-missing-"));
+      const missingPath = join(root, "does-not-exist.txt");
+      try {
+        const textResult = await runFx(
+          ["ask", "--auto", "--no-save", "--prompt-file", missingPath],
+          { env: { ...NO_GATEWAY_AUTH, FX_DISABLE_KEYCHAIN: "1" }, timeoutMs: TIMEOUT },
+        );
+        expect(textResult.code).toBe(1);
+        expect(textResult.stdout).toBe("");
+        expect(textResult.stderr).toBe("fx ask: --prompt-file: file not found\n");
+
+        const jsonResult = await runFx(
+          ["ask", "--json", "--auto", "--no-save", "--prompt-file", missingPath],
+          { env: { ...NO_GATEWAY_AUTH, FX_DISABLE_KEYCHAIN: "1" }, timeoutMs: TIMEOUT },
+        );
+        expect(jsonResult.code).toBe(1);
+        expect(jsonResult.stderr).toBe("");
+        expect(jsonResult.stdout).toBe(
+          '{"output":"","exit_code":1,"model":"","session_id":"","steps":0,"tool_calls":[],"error":"PromptFileNotFound"}\n',
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask --prompt-file rejects a positional prompt given at the same time",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-prompt-file-conflict-"));
+      const promptFile = join(root, "prompt.txt");
+      writeFileSync(promptFile, "file prompt\n");
+      try {
+        const result = await runFx(
+          ["ask", "--auto", "--no-save", "--prompt-file", promptFile, "also a positional prompt"],
+          { env: { ...NO_GATEWAY_AUTH, FX_DISABLE_KEYCHAIN: "1" }, timeoutMs: TIMEOUT },
+        );
+        expect(result.code).toBe(1);
+        expect(result.stdout).toBe("");
+        expect(result.stderr).toContain("usage: fx ask");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
   );
 
   test(
