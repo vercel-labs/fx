@@ -1,7 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
+const host = @import("../hosts/host.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
+const mcp_auth = @import("../mcp/mcp_auth.zig");
+const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const mcp_health = @import("../mcp/health.zig");
@@ -157,12 +161,78 @@ const PendingReload = struct {
     }
 };
 
+pub const AuthenticationCompletion = struct {
+    server_name: []u8,
+    result: anyerror!mcp_auth.AuthenticationResult,
+
+    pub fn deinit(self: *AuthenticationCompletion, alloc: Allocator) void {
+        alloc.free(self.server_name);
+        deinitAuthenticationResult(self.result);
+        self.* = undefined;
+    }
+};
+
+const PendingAuthentication = struct {
+    alloc: Allocator,
+    server_name: []u8,
+    lease: Lease,
+    opener: host.UrlOpener,
+    cancel_requested: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+    result: ?(anyerror!mcp_auth.AuthenticationResult) = null,
+
+    fn run(self: *PendingAuthentication) void {
+        self.result = self.lease.runtime.authenticateServerControlled(
+            self.server_name,
+            self,
+            openUrl,
+            &self.cancel_requested,
+        );
+        self.done.store(true, .release);
+    }
+
+    fn openUrl(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+        url: []const u8,
+    ) anyerror!bool {
+        const self: *PendingAuthentication = @ptrCast(@alignCast(raw.?));
+        return self.opener.open(alloc, url);
+    }
+
+    fn join(self: *PendingAuthentication) void {
+        if (comptime builtin.single_threaded) {
+            std.debug.assert(self.thread == null);
+            return;
+        }
+        if (self.thread) |thread| {
+            self.thread = null;
+            thread.join();
+        }
+    }
+
+    fn deinit(self: *PendingAuthentication) void {
+        self.join();
+        if (self.result) |result| deinitAuthenticationResult(result);
+        self.lease.deinit();
+        self.alloc.free(self.server_name);
+        self.alloc.destroy(self);
+    }
+};
+
+fn deinitAuthenticationResult(result: anyerror!mcp_auth.AuthenticationResult) void {
+    var owned = result catch return;
+    owned.deinit();
+}
+
 /// Owns the native profile MCP runtime. All transport work and retirement happen
 /// after releasing this state lock; the lock protects only pointer publication.
 pub const State = struct {
     lock: std.Io.RwLock = .init,
     runtime: ?*mcp_runtime.McpRuntime = null,
     pending_reload: ?*PendingReload = null,
+    pending_authentication: ?*PendingAuthentication = null,
 
     pub fn installInitial(self: *State, runtime: ?*mcp_runtime.McpRuntime) void {
         std.debug.assert(self.runtime == null);
@@ -342,6 +412,96 @@ pub const State = struct {
         return lease.runtime.requiredStartupFailure(alloc, captured_at_ms);
     }
 
+    pub fn startAuthentication(
+        self: *State,
+        alloc: Allocator,
+        server_name: []const u8,
+        opener: host.UrlOpener,
+    ) !mcp_command_provider.AuthenticationStart {
+        const pending = try alloc.create(PendingAuthentication);
+        var pending_owned = true;
+        errdefer if (pending_owned) alloc.destroy(pending);
+        const owned_name = try alloc.dupe(u8, server_name);
+        var name_owned = true;
+        errdefer if (name_owned) alloc.free(owned_name);
+
+        self.lock.lockUncancelable(io_mod.getIo());
+        if (self.pending_authentication != null or self.pending_reload != null) {
+            self.lock.unlock(io_mod.getIo());
+            alloc.free(owned_name);
+            alloc.destroy(pending);
+            return .busy;
+        }
+        const runtime = self.runtime orelse {
+            self.lock.unlock(io_mod.getIo());
+            return error.McpServerNotFound;
+        };
+        if (!runtime.acquireUse()) {
+            self.lock.unlock(io_mod.getIo());
+            return error.McpServerNotFound;
+        }
+        runtime.validateAuthenticationServer(server_name) catch |err| {
+            runtime.releaseUse();
+            self.lock.unlock(io_mod.getIo());
+            return err;
+        };
+        pending.* = .{
+            .alloc = alloc,
+            .server_name = owned_name,
+            .lease = .{ .runtime = runtime },
+            .opener = opener,
+        };
+        pending_owned = false;
+        name_owned = false;
+        self.pending_authentication = pending;
+        self.lock.unlock(io_mod.getIo());
+
+        if (comptime builtin.single_threaded) {
+            pending.run();
+        } else {
+            pending.thread = std.Thread.spawn(.{}, PendingAuthentication.run, .{pending}) catch |err| {
+                self.lock.lockUncancelable(io_mod.getIo());
+                if (self.pending_authentication == pending) self.pending_authentication = null;
+                self.lock.unlock(io_mod.getIo());
+                pending.deinit();
+                return err;
+            };
+        }
+        return .started;
+    }
+
+    pub fn takeAuthenticationCompletion(self: *State) ?AuthenticationCompletion {
+        self.lock.lockUncancelable(io_mod.getIo());
+        const pending = self.pending_authentication orelse {
+            self.lock.unlock(io_mod.getIo());
+            return null;
+        };
+        if (!pending.done.load(.acquire)) {
+            self.lock.unlock(io_mod.getIo());
+            return null;
+        }
+        self.pending_authentication = null;
+        self.lock.unlock(io_mod.getIo());
+
+        pending.join();
+        const result = pending.result.?;
+        pending.result = null;
+        const server_name = pending.server_name;
+        pending.lease.deinit();
+        pending.alloc.destroy(pending);
+        return .{
+            .server_name = server_name,
+            .result = result,
+        };
+    }
+
+    pub fn authenticationPending(self: *State, server_name: []const u8) bool {
+        self.lock.lockSharedUncancelable(io_mod.getIo());
+        defer self.lock.unlockShared(io_mod.getIo());
+        const pending = self.pending_authentication orelse return false;
+        return std.mem.eql(u8, pending.server_name, server_name);
+    }
+
     pub fn reload(
         self: *State,
         alloc: Allocator,
@@ -383,8 +543,11 @@ pub const State = struct {
         };
         self.lock.lockUncancelable(io_mod.getIo());
         std.debug.assert(self.pending_reload == null);
+        const authentication = self.pending_authentication;
+        self.pending_authentication = null;
         self.pending_reload = pending;
         self.lock.unlock(io_mod.getIo());
+        if (authentication) |task| cancelAndDeinitAuthentication(task, "reload");
 
         if (comptime builtin.single_threaded) {
             pending.run();
@@ -430,6 +593,14 @@ pub const State = struct {
         self.pending_reload = null;
         self.lock.unlock(io_mod.getIo());
         if (pending) |task| task.deinit();
+    }
+
+    fn cancelPendingAuthentication(self: *State, reason: []const u8) void {
+        self.lock.lockUncancelable(io_mod.getIo());
+        const pending = self.pending_authentication;
+        self.pending_authentication = null;
+        self.lock.unlock(io_mod.getIo());
+        if (pending) |task| cancelAndDeinitAuthentication(task, reason);
     }
 
     fn reloadControlled(
@@ -486,6 +657,7 @@ pub const State = struct {
     }
 
     pub fn deinit(self: *State, alloc: Allocator) void {
+        self.cancelPendingAuthentication("shutdown");
         self.cancelPendingReload();
         self.lock.lockUncancelable(io_mod.getIo());
         const previous = self.runtime;
@@ -495,6 +667,19 @@ pub const State = struct {
         self.* = .{};
     }
 };
+
+fn cancelAndDeinitAuthentication(
+    pending: *PendingAuthentication,
+    reason: []const u8,
+) void {
+    debug_trace.logf(
+        "mcp",
+        "discarding pending authentication server={s} reason={s}",
+        .{ pending.server_name, reason },
+    );
+    pending.cancel_requested.store(true, .release);
+    pending.deinit();
+}
 
 pub fn buildGatewayToolProjection(
     state: *State,
@@ -691,6 +876,62 @@ test "pending reload returns immediately and publishes one completion" {
     }
     try std.testing.expect(state.takeReloadCompletion() == null);
     try std.testing.expect(state.acquire() == null);
+}
+
+test "authentication admission is busy while reload is pending" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    test_reload_mode = .delayed_empty;
+    try state.beginReload(alloc, .{}, loadTestReloadRuntime, .{}, 55);
+    try std.testing.expectEqual(
+        mcp_command_provider.AuthenticationStart.busy,
+        try state.startAuthentication(
+            alloc,
+            "fixture",
+            host.unavailable_url_opener,
+        ),
+    );
+
+    var completion: ?ReloadCompletion = null;
+    const deadline = io_mod.milliTimestamp() + 2_000;
+    while (completion == null and io_mod.milliTimestamp() < deadline) {
+        io_mod.sleep(std.time.ns_per_ms);
+        completion = state.takeReloadCompletion();
+    }
+    var loaded = completion orelse return error.TestUnexpectedResult;
+    loaded.deinit(alloc);
+}
+
+test "authentication completion releases its lease and is taken once" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    const runtime = try alloc.create(mcp_runtime.McpRuntime);
+    runtime.* = mcp_runtime.McpRuntime.init(alloc);
+    state.installInitial(runtime);
+
+    const pending = try alloc.create(PendingAuthentication);
+    pending.* = .{
+        .alloc = alloc,
+        .server_name = try alloc.dupe(u8, "fixture"),
+        .lease = state.acquire() orelse return error.TestUnexpectedResult,
+        .opener = host.unavailable_url_opener,
+        .done = .init(true),
+        .result = error.Cancelled,
+    };
+    state.pending_authentication = pending;
+    try std.testing.expect(state.authenticationPending("fixture"));
+    try std.testing.expect(!state.authenticationPending("other"));
+
+    var completion = state.takeAuthenticationCompletion() orelse
+        return error.TestUnexpectedResult;
+    defer completion.deinit(alloc);
+    try std.testing.expectEqualStrings("fixture", completion.server_name);
+    try std.testing.expectError(error.Cancelled, completion.result);
+    try std.testing.expect(!state.authenticationPending("fixture"));
+    try std.testing.expect(state.takeAuthenticationCompletion() == null);
 }
 
 test "superseding and deinitializing a stalled pending reload cancel before join" {

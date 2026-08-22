@@ -528,6 +528,7 @@ function createRoot(
   configureOauth = true,
   transport: "http" | "sse" = "http",
   serverUrl = activeAuth.url,
+  followAuthorization = true,
 ) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-mcp-auth-")));
   cleanupRoot = root;
@@ -535,6 +536,8 @@ function createRoot(
   const workspace = join(root, "workspace");
   const bin = join(root, "bin");
   const trace = join(root, "trace.log");
+  const openLog = join(root, "open.log");
+  const stderr = join(root, "stderr.log");
   mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
   mkdirSync(workspace, { recursive: true });
   mkdirSync(bin, { recursive: true });
@@ -563,14 +566,17 @@ function createRoot(
       },
     }),
   );
+  const follow = followAuthorization
+    ? "nohup curl --location --silent --show-error \"$1\" >/dev/null 2>&1 &\n"
+    : "";
   const opener =
-    "#!/bin/sh\nnohup curl --location --silent --show-error \"$1\" >/dev/null 2>&1 &\nexit 0\n";
+    `#!/bin/sh\nprintf '%s\\n' "$1" > '${openLog}'\n${follow}exit 0\n`;
   for (const name of ["open", "xdg-open"]) {
     const path = join(bin, name);
     writeFileSync(path, opener);
     chmodSync(path, 0o700);
   }
-  return { root, home, workspace, bin, trace };
+  return { root, home, workspace, bin, trace, openLog, stderr };
 }
 
 function baseEnv(root: ReturnType<typeof createRoot>) {
@@ -1450,6 +1456,85 @@ describe("MCP remote authentication lifecycle", () => {
   }
 
   test(
+    "fx ask isolates failed-server authentication from healthy tool search",
+    async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url);
+      const root = createRoot(auth);
+      writeFileSync(
+        join(root.home, ".fx", "mcp.json"),
+        JSON.stringify({
+          mcp: {
+            linear: {
+              type: "http",
+              url: upstream.url,
+              startup_timeout_ms: 5_000,
+              operation_timeout_ms: 5_000,
+            },
+            slack: {
+              type: "http",
+              url: auth.url,
+              oauth: {
+                client_id: "fx-mcp-auth-test",
+                scopes: ["tools.read"],
+              },
+              startup_timeout_ms: 5_000,
+              operation_timeout_ms: 5_000,
+            },
+          },
+        }),
+      );
+      gateway = startFakeGateway([
+        fakeGatewayToolCall("search_exact", "mcp_search_tools", {
+          query: "Please use mcp_linear_echo for this request",
+        }),
+        fakeGatewayToolCall("search_unrelated", "mcp_search_tools", {
+          query: "linear issue",
+        }),
+        fakeGatewayToolCall("search_targeted", "mcp_search_tools", {
+          query: "authenticate slack now",
+        }),
+        fakeGatewayToolCall("search_healthy", "mcp_search_tools", {
+          query: "linear echo",
+        }),
+        fakeGatewayFinalText("MCP search isolation observed."),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Exercise mixed MCP search."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...baseEnv(root),
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          },
+          timeoutMs: 20_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      const finalBody = gateway.requests.at(-1)?.body ?? "";
+      const exact = toolResultText(finalBody, "search_exact");
+      expect(exact).toContain("mcp_linear_echo");
+      expect(exact).not.toContain("authentication_required");
+      const unrelated = toolResultText(finalBody, "search_unrelated");
+      expect(unrelated).toContain('\"tools\":[],\"count\":0');
+      expect(unrelated).not.toContain("authentication_required");
+      const targeted = toolResultText(finalBody, "search_targeted");
+      expect(targeted).toContain("authentication_required");
+      expect(targeted).toContain('\"server\":\"slack\"');
+      expect(toolResultText(finalBody, "search_healthy")).toContain(
+        "mcp_linear_echo",
+      );
+      expect(auth.authorizationRequests).toBe(0);
+    },
+    30_000,
+  );
+
+  test(
     "fx ask reports an actionable auth requirement without opening a browser",
     async () => {
       upstream = startModernMcpHttpFixture("json");
@@ -1600,6 +1685,81 @@ describe("MCP remote authentication lifecycle", () => {
       }
     },
     45_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "pending browser authentication keeps input responsive and cancels on exit",
+    async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url);
+      const root = createRoot(auth, true, "http", auth.url, false);
+      gateway = startFakeGateway([], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        env: {
+          ...baseEnv(root),
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        },
+        width: 110,
+        height: 34,
+        stderrPath: root.stderr,
+      });
+      await tui.waitForComposer(15_000);
+
+      await tui.sendText("/mcp auth fixture --open");
+      await tui.waitForText(
+        "Waiting for MCP authentication for 'fixture'.",
+        5_000,
+      );
+      expect(await waitForFile(root.openLog, 5_000)).toBe(true);
+      expect(auth.authorizationRequests).toBe(0);
+
+      await tui.sendText("/mcp logout fixture");
+      await tui.waitForText(
+        "MCP authentication for 'fixture' is still in progress. Wait for it to finish before logging out.",
+        5_000,
+      );
+      await tui.sendText("/mcp list");
+      await tui.waitForText("auth=required", 5_000);
+
+      await tui.sendText("/mcp reload");
+      await tui.waitForText("MCP reconnection started.", 5_000);
+      await tui.waitForText("MCP configuration reloaded", 10_000);
+      expect(readFileSync(root.trace, "utf8")).toContain(
+        "discarding pending authentication server=fixture reason=reload",
+      );
+
+      rmSync(root.openLog, { force: true });
+      await tui.sendText("/mcp auth fixture --open");
+      expect(await waitForFile(root.openLog, 5_000)).toBe(true);
+
+      await tui.sendKeys("C-c");
+      await tui.waitForText("press ctrl+c again to exit", 5_000);
+      await tui.sendKeys("C-c");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+
+      const trace = readFileSync(root.trace, "utf8");
+      expect(trace).toContain(
+        "discarding pending authentication server=fixture reason=shutdown",
+      );
+      for (const secretMarker of [
+        "redirect_uri=",
+        "code_verifier",
+        "access_token",
+        "refresh_token",
+      ]) {
+        expect(trace).not.toContain(secretMarker);
+      }
+      expect(
+        existsSync(join(root.home, ".fx", "mcp-credentials", "credentials.json")),
+      ).toBe(false);
+      expect(readFileSync(root.stderr, "utf8")).toBe("");
+    },
+    30_000,
   );
 
   test.skipIf(!tmuxAvailable())(

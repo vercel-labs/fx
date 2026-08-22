@@ -1413,6 +1413,30 @@ const App = struct {
         );
     }
 
+    pub fn startMcpAuthentication(
+        self: *App,
+        server_name: []const u8,
+    ) !mcp_command_provider.AuthenticationStart {
+        return self.mcp.startAuthentication(
+            self.alloc,
+            server_name,
+            self.urlOpener(),
+        );
+    }
+
+    pub fn takeMcpAuthenticationCompletion(
+        self: *App,
+    ) !?app_mcp_runtime.AuthenticationCompletion {
+        return self.mcp.takeAuthenticationCompletion();
+    }
+
+    pub fn mcpAuthenticationPending(
+        self: *App,
+        server_name: []const u8,
+    ) bool {
+        return self.mcp.authenticationPending(server_name);
+    }
+
     pub fn takeMcpReloadCompletion(self: *App) !?app_mcp_runtime.ReloadCompletion {
         return self.mcp.takeReloadCompletion();
     }
@@ -2496,6 +2520,7 @@ const App = struct {
         if (try self.model_cache.pollLoadTransition()) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
+        try app_commands.Handlers(App).collectMcpAuthenticationFacts(self);
         try app_commands.Handlers(App).collectMcpReloadFacts(self);
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {
             try AuthAppRuntime.collectSignInFacts(self);

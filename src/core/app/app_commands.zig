@@ -126,6 +126,28 @@ fn formatMcpPublishedReload(
     return out.toOwnedSlice();
 }
 
+fn formatMcpIssuerMismatch(
+    alloc: std.mem.Allocator,
+    server_name: []const u8,
+    mismatch: mcp_auth.IssuerMismatch,
+) ![]u8 {
+    var expected = try text_utils.encodeTerminalSafe(alloc, mismatch.expected, 1024);
+    defer expected.deinit(alloc);
+    var returned = try text_utils.encodeTerminalSafe(alloc, mismatch.returned, 1024);
+    defer returned.deinit(alloc);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.print("MCP authentication for '{s}' was rejected: expected issuer ", .{server_name});
+    try std.json.Stringify.value(expected.bytes, .{}, &out.writer);
+    try out.writer.writeAll(" but metadata returned ");
+    try std.json.Stringify.value(returned.bytes, .{}, &out.writer);
+    try out.writer.writeAll(". Add \"oauth\":{\"issuer\":");
+    try std.json.Stringify.value(returned.bytes, .{}, &out.writer);
+    try out.writer.writeAll("} to this server's entry in ~/.fx/mcp.json and retry.");
+    return out.toOwnedSlice();
+}
+
 fn persistUserPreferences(
     app: anytype,
     label: []const u8,
@@ -421,6 +443,67 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (warning) .warning else .neutral,
                 .body = body,
             }, true);
+        }
+
+        pub fn collectMcpAuthenticationFacts(app: *App) !void {
+            if (comptime !@hasDecl(App, "takeMcpAuthenticationCompletion")) return;
+            var completion = (try app.takeMcpAuthenticationCompletion()) orelse return;
+            defer completion.deinit(app.alloc);
+
+            if (completion.result) |authentication| {
+                switch (authentication) {
+                    .authenticated => {
+                        const success = try std.fmt.allocPrint(
+                            app.alloc,
+                            "Authenticated MCP server '{s}'.",
+                            .{completion.server_name},
+                        );
+                        defer app.alloc.free(success);
+                        app.beginMcpReload() catch |err| {
+                            const body = try std.fmt.allocPrint(
+                                app.alloc,
+                                "{s}\nMCP configuration could not be reloaded. Your existing MCP servers are still active. Check the configuration and run /mcp list for details before trying again.",
+                                .{success},
+                            );
+                            defer app.alloc.free(body);
+                            debug_trace.logf("mcp", "profile reload retained current runtime err={s}", .{@errorName(err)});
+                            try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = body }, true);
+                            return;
+                        };
+                        const body = try std.fmt.allocPrint(
+                            app.alloc,
+                            "{s}\nMCP reconnection started. Your existing MCP servers will stay active while the new configuration is checked.",
+                            .{success},
+                        );
+                        defer app.alloc.free(body);
+                        try app.writeDomainNotice(.{ .topic = "mcp", .tone = .neutral, .body = body }, true);
+                    },
+                    .issuer_mismatch => |mismatch| {
+                        const body = try formatMcpIssuerMismatch(
+                            app.alloc,
+                            completion.server_name,
+                            mismatch,
+                        );
+                        defer app.alloc.free(body);
+                        try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = body }, true);
+                    },
+                }
+            } else |err| {
+                const body = if (err == error.Cancelled)
+                    try std.fmt.allocPrint(
+                        app.alloc,
+                        "MCP authentication for '{s}' was cancelled.",
+                        .{completion.server_name},
+                    )
+                else
+                    try std.fmt.allocPrint(
+                        app.alloc,
+                        "MCP authentication for '{s}' failed: {s}.",
+                        .{ completion.server_name, @errorName(err) },
+                    );
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = body }, true);
+            }
         }
 
         fn handleFeedback(app: *App) !void {
@@ -1315,16 +1398,12 @@ pub fn Handlers(comptime App: type) type {
         fn authenticateMcpServer(
             ctx: *anyopaque,
             name: []const u8,
-        ) !mcp_auth.AuthenticationResult {
-            if (comptime !@hasDecl(App, "acquireMcpRuntime") or
-                !@hasDecl(App, "urlOpener"))
-            {
+        ) !mcp_command_provider.AuthenticationStart {
+            if (comptime !@hasDecl(App, "startMcpAuthentication")) {
                 return error.McpAuthenticationUnavailable;
             }
             const app: *App = @ptrCast(@alignCast(ctx));
-            var lease = app.acquireMcpRuntime() orelse return error.McpServerNotFound;
-            defer lease.deinit();
-            return lease.runtime.authenticateServer(name, app, openMcpAuthUrl);
+            return app.startMcpAuthentication(name);
         }
 
         fn validateMcpAuthenticationServer(ctx: *anyopaque, name: []const u8) !void {
@@ -1337,16 +1416,6 @@ pub fn Handlers(comptime App: type) type {
             try lease.runtime.validateAuthenticationServer(name);
         }
 
-        fn openMcpAuthUrl(
-            ctx: ?*anyopaque,
-            alloc: std.mem.Allocator,
-            url: []const u8,
-        ) anyerror!bool {
-            if (comptime !@hasDecl(App, "urlOpener")) return false;
-            const app: *App = @ptrCast(@alignCast(ctx.?));
-            return app.urlOpener().open(alloc, url);
-        }
-
         fn logoutMcpServer(
             ctx: *anyopaque,
             name: []const u8,
@@ -1355,6 +1424,9 @@ pub fn Handlers(comptime App: type) type {
                 return error.McpAuthenticationUnavailable;
             }
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "mcpAuthenticationPending")) {
+                if (app.mcpAuthenticationPending(name)) return .{ .busy = true };
+            }
             var lease = app.acquireMcpRuntime() orelse return error.McpServerNotFound;
             defer lease.deinit();
             const result = try lease.runtime.logoutServer(name);
@@ -3323,6 +3395,7 @@ const McpCommandFakeApp = struct {
     last_tone: ?types.NoticeTone = null,
     reload_behavior: ReloadBehavior = .published_empty,
     reload_pending: bool = false,
+    authentication_pending: bool = false,
 
     fn deinit(self: *McpCommandFakeApp) void {
         self.notice_body.deinit(self.alloc);
@@ -3337,7 +3410,6 @@ const McpCommandFakeApp = struct {
         rest: []const u8,
         request: mcp_command_provider.Request,
     ) !mcp_command_provider.Result {
-        _ = request;
         if (std.mem.eql(u8, rest, "reload")) {
             return .{
                 .display = .{
@@ -3348,11 +3420,15 @@ const McpCommandFakeApp = struct {
             };
         }
         try std.testing.expectEqualStrings("auth fixture --open", rest);
+        const self: *McpCommandFakeApp = @ptrCast(@alignCast(request.list_ctx));
+        self.authentication_pending = true;
         return .{
             .display = .{
-                .line = try alloc.dupe(u8, "Authenticated MCP server 'fixture'."),
+                .line = try alloc.dupe(
+                    u8,
+                    "Waiting for MCP authentication for 'fixture'. You can continue using fx while the browser flow completes.",
+                ),
             },
-            .reload = true,
         };
     }
 
@@ -3408,6 +3484,17 @@ const McpCommandFakeApp = struct {
             } },
             .completion_failed => .{ .failed = error.TestReloadFailed },
             .begin_failed => unreachable,
+        };
+    }
+
+    fn takeMcpAuthenticationCompletion(
+        self: *McpCommandFakeApp,
+    ) !?app_mcp_runtime.AuthenticationCompletion {
+        if (!self.authentication_pending) return null;
+        self.authentication_pending = false;
+        return .{
+            .server_name = try self.alloc.dupe(u8, "fixture"),
+            .result = .authenticated,
         };
     }
 
@@ -3972,16 +4059,24 @@ test "app_commands preserves command display after implicit MCP reload" {
 
     try Handlers(McpCommandFakeApp).commandHandleMcp(@ptrCast(&app), "auth fixture --open");
 
-    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
+    try std.testing.expectEqual(@as(usize, 0), app.reload_count);
     try std.testing.expectEqual(@as(usize, 1), app.notice_count);
     try std.testing.expectEqualStrings("mcp", app.last_topic.?);
     try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
     try std.testing.expectEqualStrings(
-        "Authenticated MCP server 'fixture'.\nMCP reconnection started. Your existing MCP servers will stay active while the new configuration is checked.",
+        "Waiting for MCP authentication for 'fixture'. You can continue using fx while the browser flow completes.",
         app.notice_body.items,
     );
-    try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
+    try Handlers(McpCommandFakeApp).collectMcpAuthenticationFacts(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
     try std.testing.expectEqual(@as(usize, 2), app.notice_count);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        app.notice_body.items,
+        "Authenticated MCP server 'fixture'.\nMCP reconnection started. Your existing MCP servers will stay active while the new configuration is checked.",
+    ));
+    try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
+    try std.testing.expectEqual(@as(usize, 3), app.notice_count);
 }
 
 test "app_commands warns when implicit MCP reload cannot replace the active servers" {
@@ -3994,13 +4089,16 @@ test "app_commands warns when implicit MCP reload cannot replace the active serv
 
         try Handlers(McpCommandFakeApp).commandHandleMcp(@ptrCast(&app), "auth fixture --open");
 
-        try std.testing.expectEqual(@as(usize, 1), app.reload_count);
+        try std.testing.expectEqual(@as(usize, 0), app.reload_count);
         try std.testing.expectEqual(@as(usize, 1), app.notice_count);
         try std.testing.expectEqualStrings("mcp", app.last_topic.?);
+        try Handlers(McpCommandFakeApp).collectMcpAuthenticationFacts(&app);
+        try std.testing.expectEqual(@as(usize, 1), app.reload_count);
+        try std.testing.expectEqual(@as(usize, 2), app.notice_count);
         if (behavior != .begin_failed) {
             try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
             try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
-            try std.testing.expectEqual(@as(usize, 2), app.notice_count);
+            try std.testing.expectEqual(@as(usize, 3), app.notice_count);
             try std.testing.expectEqual(types.NoticeTone.warning, app.last_tone.?);
             try std.testing.expect(std.mem.find(
                 u8,

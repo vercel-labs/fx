@@ -457,8 +457,15 @@ fn modernRequestInfo(value: std.json.Value) !RequestInfo {
     if (capabilities != .object) return error.InvalidModernRequest;
 
     const method = method_value.string;
-    const name = if (std.mem.eql(u8, method, "tools/call")) blk: {
-        const name_value = params_value.object.get("name") orelse return error.InvalidModernRequest;
+    const identity_field: ?[]const u8 = if (std.mem.eql(u8, method, "tools/call") or
+        std.mem.eql(u8, method, "prompts/get"))
+        "name"
+    else if (std.mem.eql(u8, method, "resources/read"))
+        "uri"
+    else
+        null;
+    const name = if (identity_field) |field| blk: {
+        const name_value = params_value.object.get(field) orelse return error.InvalidModernRequest;
         if (name_value != .string) return error.InvalidModernRequest;
         break :blk name_value.string;
     } else null;
@@ -1128,6 +1135,55 @@ test "modern MCP request headers include protocol metadata and direct scalar pro
     try expectHeader(headers, "Mcp-Param-Empty", "");
     try std.testing.expect(findHeader(headers, "Mcp-Param-Ignored") == null);
     try std.testing.expect(findHeader(headers, "Mcp-Param-Nullable") == null);
+}
+
+test "modern MCP request headers include feature identities" {
+    const alloc = std.testing.allocator;
+    const meta =
+        \\{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"fx","version":"test"},"io.modelcontextprotocol/clientCapabilities":{}}
+    ;
+    const cases = [_]struct {
+        body: []const u8,
+        method: []const u8,
+        name: []const u8,
+    }{
+        .{
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\",\"params\":{\"_meta\":" ++ meta ++ ",\"uri\":\"Hello, 世界\"}}",
+            .method = "resources/read",
+            .name = "=?base64?SGVsbG8sIOS4lueVjA==?=",
+        },
+        .{
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"prompts/get\",\"params\":{\"_meta\":" ++ meta ++ ",\"name\":\"review\",\"arguments\":{}}}",
+            .method = "prompts/get",
+            .name = "review",
+        },
+    };
+    for (cases) |case| {
+        var prepared = try prepareRequest(alloc, &.{}, case.body, null);
+        defer prepared.deinit(alloc);
+        try expectHeader(&prepared.headers, "Mcp-Method", case.method);
+        try expectHeader(&prepared.headers, "Mcp-Name", case.name);
+    }
+
+    const list_body =
+        \\{"jsonrpc":"2.0","id":3,"method":"resources/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"fx","version":"test"},"io.modelcontextprotocol/clientCapabilities":{}}}}
+    ;
+    var list = try prepareRequest(alloc, &.{}, list_body, null);
+    defer list.deinit(alloc);
+    try std.testing.expect(findHeader(&list.headers, "Mcp-Name") == null);
+
+    const invalid_bodies = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"fx","version":"test"},"io.modelcontextprotocol/clientCapabilities":{}}}}
+        ,
+        \\{"jsonrpc":"2.0","id":5,"method":"prompts/get","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"fx","version":"test"},"io.modelcontextprotocol/clientCapabilities":{}},"name":7}}
+        ,
+    };
+    for (invalid_bodies) |body| {
+        try std.testing.expectError(
+            error.InvalidModernRequest,
+            prepareRequest(alloc, &.{}, body, null),
+        );
+    }
 }
 
 test "HTTP discovery carries required protocol metadata" {
