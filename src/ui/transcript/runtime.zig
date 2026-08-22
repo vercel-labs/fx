@@ -6909,7 +6909,13 @@ pub const TranscriptRuntime = struct {
             target_total_visual_rows > anchor.total_visual_rows;
         const width_stable = self.committed_frame_layout.terminal_cols == 0 or
             self.committed_frame_layout.terminal_cols == self.layout.cols;
-        const geometry_rebase = footer_reservation_changed and
+        const pending_resume_geometry_rebase = self.pending_resume_source != null and
+            !std.meta.eql(
+                self.committed_frame_layout.transcript_area,
+                prepared.projectionArea(),
+            );
+        const geometry_rebase = (footer_reservation_changed or
+            pending_resume_geometry_rebase) and
             width_stable and
             self.resize_history_row_delta == null;
         const displaced_history_replay = if (geometry_rebase and
@@ -10920,6 +10926,116 @@ fn frameInlineScrollBudget(resize_reflow_rows: u16, semantic_rows: u32) u16 {
         semantic_rows,
         std.math.maxInt(u32),
     );
+}
+
+test "pending resume publication rebases when the candidate gains one transcript row" {
+    const alloc = std.testing.allocator;
+    const layout: Layout = .{
+        .rows = 73,
+        .cols = 80,
+        .content_bottom = 69,
+        .divider_top_row = 70,
+        .input_row = 71,
+        .divider_bottom_row = 72,
+        .hint_row = 73,
+    };
+    var runtime = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .has_painted_transcript = true,
+        .committed_frame_layout = .{
+            .layout_id = 17,
+            .owned_top = 1,
+            .owned_band = .{ .top = 1, .bottom = 73 },
+            .body_area = .{ .top = 1, .bottom = 68 },
+            .transcript_area = .{ .top = 1, .bottom = 68 },
+            .footer_area = .{ .top = 69, .bottom = 73 },
+            .solved_frame_height = 73,
+            .terminal_rows = 73,
+            .terminal_cols = 80,
+        },
+    };
+    defer runtime.deinit(alloc);
+
+    var flow: std.ArrayList(u8) = .empty;
+    defer flow.deinit(alloc);
+    for (0..980) |_| try flow.appendSlice(alloc, "row\n");
+    runtime.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try flow.toOwnedSlice(alloc),
+    );
+    const source = &runtime.pending_resume_source.?;
+
+    var metrics: Metrics = .{};
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        source,
+        .{ .top = 1, .bottom = 69 },
+    );
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 980), prepared.sourceTotalVisualRows());
+    try std.testing.expectEqual(@as(u32, 911), prepared.sourceVisualOffset());
+
+    runtime.transcript_commit_state = .{ .stable = .{
+        .selection = .{
+            .top_row = 1,
+            .bottom_row = 68,
+            .start_line = 912,
+            .partial_skip_rows = 0,
+            .line_count = 980,
+            .last_visible_row = 68,
+        },
+        .visual_offset = 912,
+        .history_visual_offset = 0,
+        .total_visual_rows = 980,
+        .flow = try alloc.dupe(u8, source.bytes),
+        .cursor_row = 68,
+        .cursor_col = 1,
+        .occupied_last_row = 68,
+        .occupied_last_row_blank = false,
+        .layout_id = 17,
+    } };
+
+    const facts = try runtime.prepareTranscriptScrollFactsForFrame(
+        alloc,
+        source,
+        &prepared,
+        false,
+        false,
+    );
+    try std.testing.expectEqual(@as(u32, 911), facts.target_visual_offset);
+
+    const target_layout: render_engine.frame_layout.CommittedLayoutSnapshot = .{
+        .layout_id = 18,
+        .owned_top = 1,
+        .owned_band = .{ .top = 1, .bottom = 73 },
+        .body_area = .{ .top = 1, .bottom = 69 },
+        .transcript_area = .{ .top = 1, .bottom = 69 },
+        .footer_area = .{ .top = 70, .bottom = 73 },
+        .solved_frame_height = 73,
+        .terminal_rows = 73,
+        .terminal_cols = 80,
+    };
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    _ = try runtime.resolveTranscriptTransitionTargetForFrame(
+        alloc,
+        source,
+        &prepared,
+        target_layout,
+        scroll_plan,
+        facts,
+        false,
+        false,
+    );
+    try std.testing.expect(facts.geometry_rebase);
 }
 
 test "pending resume publication yields after a bounded row batch" {
