@@ -1013,12 +1013,26 @@ pub fn Handlers(comptime App: type) type {
                     defer display_path.deinit(app.alloc);
                     break :blk try std.fmt.allocPrint(app.alloc, "Deleted {s} (was newly created)", .{display_path.bytes});
                 },
+                .unavailable => |path| blk: {
+                    var display_path = try text_utils.encodeTerminalSafe(
+                        app.alloc,
+                        path,
+                        std.Io.Dir.max_path_bytes,
+                    );
+                    defer display_path.deinit(app.alloc);
+                    break :blk try std.fmt.allocPrint(
+                        app.alloc,
+                        "Could not undo {s}",
+                        .{display_path.bytes},
+                    );
+                },
                 .empty => try app.alloc.dupe(u8, "Nothing to undo."),
             };
             defer app.alloc.free(msg);
             switch (result) {
                 .restored => |path| std.heap.c_allocator.free(path),
                 .deleted => |path| std.heap.c_allocator.free(path),
+                .unavailable => |path| std.heap.c_allocator.free(path),
                 .empty => {},
             }
             try app.writeDomainNotice(.{
