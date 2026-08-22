@@ -739,7 +739,7 @@ describe("gateway stream lifecycle", () => {
       expect(request.prompt[1]?.role).toBe("system");
       expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
       expect(toolByName(oracleRequest, "terminal")?.description).toBe(
-        "Run one captured command and return its result.",
+        "Run one captured command and return its result. Use timeout_ms to bound foreground execution; use a durable terminal session for intentionally long-running work.",
       );
       expect(toolByName(oracleRequest, "skill")?.description).toContain(
         "the task clearly matches one",

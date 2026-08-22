@@ -28,8 +28,9 @@ pub fn decode(
     if (command != .string) {
         return failure(ctx.allocator, "browser terminal field \"command\" must be a string");
     }
-    if (parsed.value.object.count() != 2) {
-        return failure(ctx.allocator, "browser terminal accepts only the \"action\" and \"command\" fields");
+    const expected_field_count: usize = if (parsed.value.object.contains("timeout_ms")) 3 else 2;
+    if (parsed.value.object.count() != expected_field_count) {
+        return failure(ctx.allocator, "browser terminal accepts only the \"action\", \"command\", and optional \"timeout_ms\" fields");
     }
     if (command.string.len > js_host_workspace.max_command_bytes) {
         return failure(ctx.allocator, "browser terminal field \"command\" exceeds 65536 bytes");

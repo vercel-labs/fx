@@ -38,7 +38,10 @@ const workspace = {
   permission: "allow-sandboxed",
   exec({ command, cwd, signal, timeoutMs, outputLimitBytes }) {
     execCalls.push(command);
-    if (cwd !== "/workspace" || timeoutMs !== 30_000 || outputLimitBytes !== 65_536) {
+    const timeoutMatches = command === "timeout-command"
+      ? timeoutMs >= 1 && timeoutMs <= 125
+      : timeoutMs === 30_000;
+    if (cwd !== "/workspace" || !timeoutMatches || outputLimitBytes !== 65_536) {
       throw new Error(`unexpected workspace exec contract: cwd=${cwd} timeout=${timeoutMs} outputLimit=${outputLimitBytes}`);
     }
     if (command === "printf adapter-success") {
@@ -70,9 +73,18 @@ function sse(events) {
   );
 }
 
-function toolCall(id, command) {
+function toolCall(id, command, timeoutMs) {
   return sse([
-    { type: "tool-call", toolCallId: id, toolName: "terminal", input: { action: "exec", command } },
+    {
+      type: "tool-call",
+      toolCallId: id,
+      toolName: "terminal",
+      input: {
+        action: "exec",
+        command,
+        ...(timeoutMs === undefined ? {} : { timeout_ms: timeoutMs }),
+      },
+    },
     { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
   ]);
 }
@@ -158,7 +170,10 @@ const fetch = async (_url, init = {}) => {
     if (JSON.stringify(schema?.required) !== JSON.stringify(["action", "command"]) ||
         schema?.properties?.action?.enum?.[0] !== "exec" ||
         schema?.properties?.command?.maxLength !== 65_536 ||
-        Object.keys(schema?.properties || {}).join(",") !== "action,command" ||
+        schema?.properties?.timeout_ms?.type !== "integer" ||
+        schema?.properties?.timeout_ms?.minimum !== 1 ||
+        schema?.properties?.timeout_ms?.maximum !== 4_294_967_295 ||
+        Object.keys(schema?.properties || {}).join(",") !== "action,command,timeout_ms" ||
         schema?.additionalProperties !== false) {
       throw new Error(`workspace advertised unexpected terminal schema: ${JSON.stringify(schema)}`);
     }
@@ -176,7 +191,7 @@ const fetch = async (_url, init = {}) => {
     return textResponse("truncation record checked");
   }
   if (toolResult(body, "workspace-timeout")) {
-    requireResult(body, "workspace-timeout", ["timeout_ms=30000"]);
+    requireResult(body, "workspace-timeout", ["timeout_ms=125"]);
     return textResponse("timeout mapping checked");
   }
   if (toolResult(body, "workspace-abort")) {
@@ -193,7 +208,7 @@ const fetch = async (_url, init = {}) => {
   const prompt = latestUserText(body);
   if (prompt.includes("workspace success")) return toolCall("workspace-success", "printf adapter-success");
   if (prompt.includes("workspace truncation")) return toolCall("workspace-truncated", "generate-truncated-output");
-  if (prompt.includes("workspace timeout")) return toolCall("workspace-timeout", "timeout-command");
+  if (prompt.includes("workspace timeout")) return toolCall("workspace-timeout", "timeout-command", 125);
   if (prompt.includes("workspace abort")) return toolCall("workspace-abort", "hold-command");
   if (prompt.includes("workspace invalid boundaries")) {
     return terminalToolCalls([

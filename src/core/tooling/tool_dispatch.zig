@@ -171,6 +171,7 @@ pub const RunCommandRequest = struct {
     command: []const u8,
     resolved_cwd: []const u8,
     environment: command_environment.Environment,
+    timeout_ms: ?usize = null,
 };
 
 pub const RunCommandBackendFn = *const fn (

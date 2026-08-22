@@ -289,7 +289,7 @@ describe("fx ask presentation", () => {
     };
     const terminalTool = firstRequest.tools.find(({ name }) => name === "terminal");
     expect(terminalTool?.description).toBe(
-      "Run one captured command and return its result.",
+      "Run one captured command and return its result. Use timeout_ms to bound foreground execution; use a durable terminal session for intentionally long-running work.",
     );
     const terminalSchema = terminalTool?.inputSchema;
     expect(terminalSchema?.properties?.action?.enum).toEqual(["exec"]);
@@ -298,8 +298,15 @@ describe("fx ask presentation", () => {
       "command",
       "cwd",
       "profile",
+      "timeout_ms",
     ]);
-    expect(terminalSchema?.required).toEqual(["action", "command", "cwd", "profile"]);
+    expect(terminalSchema?.required).toEqual([
+      "action",
+      "command",
+      "cwd",
+      "profile",
+      "timeout_ms",
+    ]);
     expect(terminalSchema?.additionalProperties).toBe(false);
     expect(terminalSchema?.properties?.command?.description).toBe(
       "Command to run. Set null when the selected action does not use this field.",
@@ -310,10 +317,13 @@ describe("fx ask presentation", () => {
     expect(terminalSchema?.properties?.profile?.description).toBe(
       "Profile for exec; omission defaults to user, while clean skips user initialization files. User execution supports the configured Bash or zsh login shell. Bash login execution reads login initialization files; .bashrc is available only when sourced by the login profile. Set null when the selected action does not use this field.",
     );
+    expect(terminalSchema?.properties?.timeout_ms?.description).toBe(
+      "Optional foreground execution timeout in milliseconds. On expiry, Fx terminates the command process tree and returns a timeout result. Set null when the selected action does not use this field.",
+    );
     const serializedTerminalTool = JSON.stringify(terminalTool);
     expect(serializedTerminalTool).not.toContain("Use start");
     expect(serializedTerminalTool).not.toContain("Other actions");
-    expect(serializedTerminalTool).not.toContain("durable");
+    expect(serializedTerminalTool).toContain("durable terminal session");
 
     for (const requestIndex of [1, 3]) {
       expect(gateway.requests[requestIndex]!.body).toContain("mode=login:rc:path-user:");

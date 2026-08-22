@@ -1,11 +1,12 @@
 const std = @import("std");
 const builtin_tools = @import("tools.zig");
 const browser_terminal = @import("../tools/terminal/browser_terminal.zig");
+const terminal_impl = @import("../tools/terminal/terminal.zig");
 const tool_set = @import("../core/tooling/tool_set.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 
 const terminal_description =
-    "Run a foreground command inside the browser workspace with action=exec. This clean root-fixed shell is the workspace interface: use commands such as rg, sed, awk, find, jq, mkdir, mv, and redirection to inspect and modify files. Native host paths, git, Node, npm, Python, background processes, durable terminal actions, and operating-system access are unavailable.";
+    "Run a foreground command inside the browser workspace with action=exec and an optional timeout_ms bound. This clean root-fixed shell is the workspace interface: use commands such as rg, sed, awk, find, jq, mkdir, mv, and redirection to inspect and modify files. Native host paths, git, Node, npm, Python, background processes, durable terminal actions, and operating-system access are unavailable.";
 
 const terminal = buildTerminalSpec();
 
@@ -23,6 +24,13 @@ fn buildTerminalSpec() tool_dispatch.Tool {
                     .json_type = .string,
                     .max_length = 64 * 1024,
                     .description = "Foreground command to run in the browser workspace.",
+                },
+                .{
+                    .name = "timeout_ms",
+                    .json_type = .integer,
+                    .minimum = 1,
+                    .maximum = terminal_impl.maximum_exec_timeout_ms,
+                    .description = "Optional foreground execution bound in milliseconds.",
                 },
             },
             .required = &.{ "action", "command" },
@@ -58,10 +66,13 @@ test "browser workspace projects exactly one command-only terminal" {
     try std.testing.expectEqual(@as(usize, 0), advertisement_set.read_only_tool_names.len);
 
     const schema = registry.tools[0].gateway_schema;
-    try std.testing.expectEqual(@as(usize, 2), schema.input_schema.properties.len);
+    try std.testing.expectEqual(@as(usize, 3), schema.input_schema.properties.len);
     try std.testing.expectEqualStrings("action", schema.input_schema.properties[0].name);
     try std.testing.expectEqualStrings("command", schema.input_schema.properties[1].name);
     try std.testing.expectEqual(@as(?usize, 64 * 1024), schema.input_schema.properties[1].max_length);
+    try std.testing.expectEqualStrings("timeout_ms", schema.input_schema.properties[2].name);
+    try std.testing.expectEqual(@as(u64, 1), schema.input_schema.properties[2].minimum);
+    try std.testing.expectEqual(@as(u64, terminal_impl.maximum_exec_timeout_ms), schema.input_schema.properties[2].maximum);
     try std.testing.expectEqual(false, schema.input_schema.additional_properties.?);
     try std.testing.expect(std.mem.find(u8, schema.description, "shell is the workspace interface") != null);
     try std.testing.expect(std.mem.find(u8, schema.description, "clean root-fixed") != null);
@@ -86,6 +97,35 @@ test "browser workspace rejects missing action native fields and unknown argumen
     try expectDecodeFailure("{\"action\":\"start\",\"command\":\"pwd\"}");
     try expectDecodeFailure("{\"action\":\"exec\",\"command\":\"pwd\",\"cwd\":\"/tmp\"}");
     try expectDecodeFailure("{\"action\":\"exec\",\"command\":\"pwd\",\"profile\":\"clean\"}");
+}
+
+test "browser workspace accepts a bounded foreground timeout" {
+    const decoded = try registry.tools[0].decode(.{
+        .allocator = std.testing.allocator,
+    }, "{\"action\":\"exec\",\"command\":\"pwd\",\"timeout_ms\":125}");
+    switch (decoded) {
+        .input => |input| input.deinit(std.testing.allocator),
+        .failure => |body| {
+            defer std.testing.allocator.free(body);
+            return error.TestExpectedDecodeSuccess;
+        },
+    }
+    const rejected = try tool_dispatch.validateRegisteredToolCall(.{
+        .allocator = std.testing.allocator,
+        .workspace_root = "/virtual/workspace",
+    }, registry, .{
+        .id = "browser-invalid-timeout",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\",\"timeout_ms\":0}",
+    });
+    defer switch (rejected) {
+        .failure => |reason| std.testing.allocator.free(reason),
+        else => {},
+    };
+    switch (rejected) {
+        .failure => |reason| try std.testing.expect(std.mem.find(u8, reason, "InvalidTimeout") != null),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "tool set selection preserves native and gates the browser projection" {

@@ -32,6 +32,7 @@ pub const Action = enum {
     signal,
     close,
 };
+pub const maximum_exec_timeout_ms: u64 = std.math.maxInt(u32);
 const ReturnKind = enum { started, exit, quiet, match };
 const PayloadKind = enum { text, keys, controls, paste };
 const MonitorConditionKind = enum {
@@ -139,6 +140,7 @@ pub const Input = struct {
     cwd: ?[]const u8 = null,
     command: ?[]const u8 = null,
     profile: ?command_environment.Profile = null,
+    timeout_ms: ?u64 = null,
     shell: ?ShellInput = null,
     backend: ?contracts.Backend = null,
     return_when: ?ReturnInput = null,
@@ -180,7 +182,7 @@ pub const ActionFieldContract = struct {
 pub fn actionFieldContract(action: Action) ActionFieldContract {
     return switch (action) {
         .exec => .{
-            .allowed = &.{ "action", "command", "cwd", "profile" },
+            .allowed = &.{ "action", "command", "cwd", "profile", "timeout_ms" },
             .required = &.{ "action", "command" },
         },
         .start => .{
@@ -492,6 +494,11 @@ pub fn validate(
         if (input.command.?.len > contracts.max_command_bytes) {
             return try ctx.allocator.dupe(u8, "terminal exec arguments are invalid: InvalidCommand");
         }
+        if (input.timeout_ms) |timeout_ms| {
+            if (timeout_ms == 0 or timeout_ms > maximum_exec_timeout_ms) {
+                return try ctx.allocator.dupe(u8, "terminal exec arguments are invalid: InvalidTimeout");
+            }
+        }
         _ = resolveCwd(arena, ctx, input.cwd) catch |err| {
             return try std.fmt.allocPrint(
                 ctx.allocator,
@@ -678,6 +685,10 @@ fn callExec(
         .command = command,
         .resolved_cwd = cwd,
         .environment = environment_value,
+        .timeout_ms = if (input.timeout_ms) |timeout_ms|
+            @intCast(timeout_ms)
+        else
+            null,
     });
 }
 
@@ -1475,7 +1486,7 @@ test "terminal action field ownership is exact for every public action" {
         required: []const []const u8,
         conflicts: []const tool_result_errors.TerminalActionFieldConflict = &.{},
     }{
-        .{ .action = .exec, .fields = &.{ "action", "command", "cwd", "profile" }, .required = &.{ "action", "command" } },
+        .{ .action = .exec, .fields = &.{ "action", "command", "cwd", "profile", "timeout_ms" }, .required = &.{ "action", "command" } },
         .{ .action = .start, .fields = &.{ "action", "cwd", "command", "profile", "shell", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors" }, .required = &.{"action"}, .conflicts = &.{.{ "profile", "shell" }} },
         .{ .action = .read, .fields = &.{ "action", "session_id", "cursor_segment", "cursor_offset" }, .required = &.{ "action", "session_id", "cursor_segment" } },
         .{ .action = .screen, .fields = &.{ "action", "session_id" }, .required = &.{ "action", "session_id" } },
@@ -2021,6 +2032,7 @@ test "registered terminal validation enforces action-specific input before execu
     };
 
     inline for (&.{
+        "{\"action\":\"exec\",\"command\":\"sleep 1\",\"timeout_ms\":1000}",
         "{\"action\":\"start\",\"command\":\"\"}",
         "{\"action\":\"read\",\"session_id\":\"terminal-a\",\"cursor_segment\":1}",
         "{\"action\":\"screen\",\"session_id\":\"terminal-a\"}",
@@ -2044,6 +2056,34 @@ test "registered terminal validation enforces action-specific input before execu
             else => {},
         };
         try std.testing.expectEqual(.valid, accepted);
+    }
+
+    inline for (&.{
+        "{\"action\":\"exec\",\"command\":\"sleep 1\",\"timeout_ms\":0}",
+        std.fmt.comptimePrint(
+            "{{\"action\":\"exec\",\"command\":\"sleep 1\",\"timeout_ms\":{d}}}",
+            .{maximum_exec_timeout_ms + 1},
+        ),
+    }) |arguments_json| {
+        const rejected_timeout = try tool_dispatch.validateRegisteredToolCall(
+            ctx,
+            registry,
+            .{
+                .id = "terminal-invalid-timeout",
+                .name = "terminal",
+                .arguments_json = arguments_json,
+            },
+        );
+        defer switch (rejected_timeout) {
+            .failure => |reason| std.testing.allocator.free(reason),
+            else => {},
+        };
+        switch (rejected_timeout) {
+            .failure => |reason| try std.testing.expect(
+                std.mem.find(u8, reason, "InvalidTimeout") != null,
+            ),
+            else => return error.TestUnexpectedResult,
+        }
     }
 
     inline for (&.{

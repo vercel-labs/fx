@@ -199,6 +199,64 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "a terminal exec timeout stops the foreground process tree",
+    async () => {
+      const root = createIsolatedRoot();
+      const childPidPath = join(root.workspace, "timeout-child-pid");
+      const command =
+        `(while :; do sleep 1; done) & child=$!; ` +
+        `printf '%s' "$child" > ${JSON.stringify(childPidPath)}; wait`;
+      const gateway = startGateway([
+        fakeGatewayToolCall("bounded_foreground", "terminal", {
+          action: "exec",
+          command,
+          profile: "clean",
+          timeout_ms: 500,
+        }),
+        (body) => {
+          const output = toolResultText(body, "bounded_foreground");
+          expect(output).toContain("timeout=true");
+          expect(output).toContain("timeout_ms=500");
+          expect(output).toContain("command timed out and was terminated");
+          return fakeGatewayFinalText("Bounded foreground command stopped.");
+        },
+      ]);
+
+      const result = await runFx(
+        ["ask", "--yolo", "--quiet", "--json", "--no-save", "Run the bounded command."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(result.stderr).not.toContain("panic");
+      expect(result.stderr).not.toContain("error:");
+      expect(gateway.requests).toHaveLength(2);
+      const json = JSON.parse(result.stdout.trim()) as {
+        tool_calls: Array<{ name: string; status: string }>;
+      };
+      expect(json.tool_calls).toContainEqual(
+        expect.objectContaining({ name: "terminal", status: "error" }),
+      );
+      const childPid = Number.parseInt(readFileSync(childPidPath, "utf8"), 10);
+      expect(Number.isSafeInteger(childPid)).toBe(true);
+      let childAlive = true;
+      try {
+        process.kill(childPid, 0);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+        childAlive = false;
+      }
+      if (childAlive) process.kill(childPid, "SIGKILL");
+      expect(childAlive).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "configured wildcard commands cannot absorb shell operators or substitutions",
     async () => {
       const root = createIsolatedRoot();

@@ -1177,8 +1177,13 @@ fn toolRunCommand(
         .target_os = builtin.os.tag,
         .environment = request.environment,
     };
-    const timeout_started_ms = ctx.command_timeout_started_ms orelse
-        if (ctx.command_timeout_ms != null) io_mod.milliTimestamp() else null;
+    const timeout = resolveCommandTimeout(
+        ctx.command_timeout_ms,
+        ctx.command_timeout_started_ms,
+        request.timeout_ms,
+    );
+    const timeout_ms = if (timeout) |value| value.timeout_ms else null;
+    const timeout_started_ms = if (timeout) |value| value.started_ms else null;
 
     if (comptime builtin.os.tag == .wasi or builtin.is_test) {
         if (ctx.workspace_executor) |executor| {
@@ -1188,7 +1193,7 @@ fn toolRunCommand(
                 command_ctx,
                 authority,
                 executor,
-                ctx.command_timeout_ms,
+                timeout,
             );
         }
     }
@@ -1289,7 +1294,7 @@ fn toolRunCommand(
         .accepted_output_chunk_ctx = if (ctx.interactive) @ptrCast(&replay_callback) else null,
         .on_accepted_output_chunk = if (ctx.interactive) CommandReplayCaptureCallback.onChunk else null,
         .callback_projection = if (ctx.interactive) .raw else .model_safe,
-        .timeout_ms = ctx.command_timeout_ms,
+        .timeout_ms = timeout_ms,
         .timeout_started_ms = timeout_started_ms,
         .command_artifact_capability = ctx.session_child_capability,
         .command_artifact_dir = ctx.command_artifact_dir,
@@ -1304,7 +1309,7 @@ fn toolRunCommand(
                 arena,
                 command,
                 cwd,
-                ctx.command_timeout_ms,
+                timeout_ms,
                 timeout_started_ms,
             ),
         );
@@ -1340,13 +1345,58 @@ fn toolRunCommand(
     );
 }
 
+const ResolvedCommandTimeout = struct {
+    timeout_ms: usize,
+    started_ms: i64,
+};
+
+fn resolveCommandTimeout(
+    configured_timeout_ms: ?usize,
+    configured_started_ms: ?i64,
+    requested_timeout_ms: ?usize,
+) ?ResolvedCommandTimeout {
+    return resolveCommandTimeoutAt(
+        io_mod.milliTimestamp(),
+        configured_timeout_ms,
+        configured_started_ms,
+        requested_timeout_ms,
+    );
+}
+
+fn resolveCommandTimeoutAt(
+    now_ms: i64,
+    configured_timeout_ms: ?usize,
+    configured_started_ms: ?i64,
+    requested_timeout_ms: ?usize,
+) ?ResolvedCommandTimeout {
+    var selected: ?ResolvedCommandTimeout = if (configured_timeout_ms) |timeout_ms| .{
+        .timeout_ms = timeout_ms,
+        .started_ms = configured_started_ms orelse now_ms,
+    } else null;
+
+    if (requested_timeout_ms) |timeout_ms| {
+        const requested = ResolvedCommandTimeout{
+            .timeout_ms = timeout_ms,
+            .started_ms = now_ms,
+        };
+        if (selected == null or timeoutDeadline(requested) < timeoutDeadline(selected.?)) {
+            selected = requested;
+        }
+    }
+    return selected;
+}
+
+fn timeoutDeadline(timeout: ResolvedCommandTimeout) i128 {
+    return @as(i128, timeout.started_ms) + @as(i128, @intCast(timeout.timeout_ms));
+}
+
 fn executeWorkspaceRunCommand(
     arena: Allocator,
     request: tool_dispatch.RunCommandRequest,
     command_ctx: command_admission.CommandContext,
     authority: command_admission.CommandExecutionAuthority,
     executor: js_host_workspace.Executor,
-    configured_timeout_ms: ?usize,
+    timeout: ?ResolvedCommandTimeout,
 ) !ToolExecutionResult {
     if (std.meta.activeTag(request.environment) != .workspace_clean) return error.InvalidWorkspaceInput;
     var route = try execution_router.prepareAuthorizedRoute(
@@ -1356,11 +1406,19 @@ fn executeWorkspaceRunCommand(
     );
     defer route.deinit(arena);
 
-    const timeout_ms: u32 = @intCast(@min(
-        @max(configured_timeout_ms orelse js_host_workspace.max_timeout_ms, js_host_workspace.min_timeout_ms),
-        js_host_workspace.max_timeout_ms,
-    ));
     const started_ms = io_mod.milliTimestamp();
+    if (timeout) |value| {
+        if (timeoutElapsedMs(value, started_ms) >= value.timeout_ms) {
+            return command_result_mapping.Foreground.timeoutFailure(
+                arena,
+                request.command,
+                request.resolved_cwd,
+                value.timeout_ms,
+                value.started_ms,
+            );
+        }
+    }
+    const timeout_ms = workspaceTimeoutMs(timeout, started_ms);
     const result = executor.execute(
         arena,
         request.command,
@@ -1368,12 +1426,26 @@ fn executeWorkspaceRunCommand(
         timeout_ms,
     ) catch |err| {
         if (err == error.WorkspaceDeadline) {
+            const reported_timeout_ms = if (timeout) |value|
+                if (value.timeout_ms <= js_host_workspace.max_timeout_ms)
+                    value.timeout_ms
+                else
+                    timeout_ms
+            else
+                timeout_ms;
+            const reported_started_ms = if (timeout) |value|
+                if (value.timeout_ms <= js_host_workspace.max_timeout_ms)
+                    value.started_ms
+                else
+                    started_ms
+            else
+                started_ms;
             return command_result_mapping.Foreground.timeoutFailure(
                 arena,
                 request.command,
                 request.resolved_cwd,
-                timeout_ms,
-                started_ms,
+                reported_timeout_ms,
+                reported_started_ms,
             );
         }
         return err;
@@ -1410,6 +1482,25 @@ fn executeWorkspaceRunCommand(
                 null,
         },
     );
+}
+
+fn workspaceTimeoutMs(
+    timeout: ?ResolvedCommandTimeout,
+    now_ms: i64,
+) u32 {
+    const remaining_ms: usize = if (timeout) |value| blk: {
+        const elapsed_ms = timeoutElapsedMs(value, now_ms);
+        break :blk value.timeout_ms - elapsed_ms;
+    } else js_host_workspace.max_timeout_ms;
+    return @intCast(@min(
+        @max(remaining_ms, js_host_workspace.min_timeout_ms),
+        js_host_workspace.max_timeout_ms,
+    ));
+}
+
+fn timeoutElapsedMs(timeout: ResolvedCommandTimeout, now_ms: i64) usize {
+    if (now_ms <= timeout.started_ms) return 0;
+    return @intCast(now_ms - timeout.started_ms);
 }
 
 const CommandReplayCaptureCallback = struct {
@@ -6206,6 +6297,43 @@ test "run_command timeout returns model-visible failure" {
     try std.testing.expectEqualStrings(terminal_stderr.items, resumed_stderr.items);
 }
 
+test "terminal exec timeout argument returns model-visible failure" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    var rt = TestRuntime{};
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
+        .id = "bounded-terminal-exec",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"sleep 5\",\"profile\":\"clean\",\"timeout_ms\":120}",
+    });
+
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+    try expectContains(result.model_output, "timeout=true\n");
+    try expectContains(result.model_output, "timeout_ms=120\n");
+    try expectContains(result.model_output, "command timed out and was terminated\n");
+    const structured = result.command_result_json orelse return error.TestExpectedEqual;
+    try expectCommandResultBool(structured, "timed_out", true);
+}
+
+test "terminal exec uses the earliest configured or requested deadline" {
+    const requested = resolveCommandTimeoutAt(100, 1000, 0, 500).?;
+    try std.testing.expectEqual(@as(usize, 500), requested.timeout_ms);
+    try std.testing.expectEqual(@as(i64, 100), requested.started_ms);
+
+    const configured = resolveCommandTimeoutAt(100, 400, 0, 500).?;
+    try std.testing.expectEqual(@as(usize, 400), configured.timeout_ms);
+    try std.testing.expectEqual(@as(i64, 0), configured.started_ms);
+
+    const only_requested = resolveCommandTimeoutAt(100, null, null, 250).?;
+    try std.testing.expectEqual(@as(usize, 250), only_requested.timeout_ms);
+    try std.testing.expectEqual(@as(i64, 100), only_requested.started_ms);
+    try std.testing.expect(resolveCommandTimeoutAt(100, null, null, null) == null);
+}
+
 test "interactive command replay capture allocation fails open" {
     var failing = std.testing.FailingAllocator.init(
         std.testing.allocator,
@@ -6474,6 +6602,16 @@ fn fakeWorkspaceDeadline(
     return error.WorkspaceDeadline;
 }
 
+fn fakeWorkspaceRequestedDeadline(
+    _: Allocator,
+    _: []const u8,
+    _: []const u8,
+    timeout_ms: u32,
+) js_host_workspace.ExecuteError!command_contract.RunCommandResult {
+    if (timeout_ms == 0 or timeout_ms > 125) return error.InvalidWorkspaceResult;
+    return error.WorkspaceDeadline;
+}
+
 test "browser run_command uses only the admitted host executor for nonzero and truncated results" {
     var rt = TestRuntime{
         .workspace_root = "/virtual/workspace",
@@ -6544,6 +6682,18 @@ test "browser run_command maps host cancellation and deadline without signal or 
     const timeout_json = timed_out.command_result_json orelse return error.TestExpectedEqual;
     try expectCommandResultBool(timeout_json, "timed_out", true);
     try expectCommandResultNull(timeout_json, "signal");
+
+    rt.workspace_executor = .{ .execute_fn = fakeWorkspaceRequestedDeadline };
+    const requested_timeout = try executeTestRunCommand(rt.context(), arena, .{
+        .id = "browser-requested-timeout",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"long command\",\"timeout_ms\":125}",
+    });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, requested_timeout.status);
+    try expectContains(requested_timeout.model_output, "timeout_ms=125\n");
+    const requested_timeout_json = requested_timeout.command_result_json orelse
+        return error.TestExpectedEqual;
+    try expectCommandResultBool(requested_timeout_json, "timed_out", true);
 }
 
 test "run_command propagates output callback failure" {
