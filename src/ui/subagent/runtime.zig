@@ -1723,7 +1723,6 @@ pub const Runtime = struct {
             .finish => {},
         }
 
-        const available = formFieldMaxBytes(field) -| editor.edit_state.input.items.len;
         if (editor.paste.owner == .decision_prompt) {
             debug_trace.logf(
                 "subagent",
@@ -1734,7 +1733,10 @@ pub const Runtime = struct {
             self.form.attempt.failure = .{ .validation = .field_too_large };
             return true;
         }
+        const normalized = text_utils.normalizeLineEndingsInPlace(editor.paste.buffer.items);
+        editor.paste.buffer.items.len = normalized.len;
         const pasted = editor.paste.buffer.items;
+        const available = formFieldMaxBytes(field) -| editor.edit_state.input.items.len;
         if (pasted.len > available) {
             debug_trace.logf(
                 "subagent",
@@ -8172,6 +8174,37 @@ test "child paste replaces selection and remains undoable" {
     try std.testing.expect(runtime.child.editor.edit_state.selectionRange() == null);
     try std.testing.expect(try runtime.child.editor.undoState().undo(alloc));
     try std.testing.expectEqualStrings("abcde", runtime.child.editor.edit_state.input.items);
+}
+
+test "manager create form paste normalizes carriage return line endings" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime{};
+    defer runtime.deinit(alloc);
+    try runtime.setDefaults(alloc, "test/model", types.ReasoningEffort.literal("high"));
+    try std.testing.expect(try runtime.replaceSnapshot(
+        alloc,
+        try testSnapshot(alloc, 1, &.{}),
+    ));
+    _ = try runtime.handleByte(alloc, 'c', null);
+    try runtime.form.replaceEditor(alloc, .name, "normalized-worker");
+    runtime.form.field_index = 2;
+
+    runtime.beginManagerPaste();
+    for ("first\r\nsecond\rthird\x1b[201~") |byte| {
+        try std.testing.expect(try runtime.consumeManagerPasteByte(alloc, byte));
+    }
+    try std.testing.expect(runtime.settleManagerPasteDeliveryEpoch(alloc));
+    try std.testing.expectEqualStrings(
+        "first\nsecond\nthird",
+        runtime.form.editors[2].edit_state.input.items,
+    );
+
+    var prepared = (try runtime.prepareManagerMutation(alloc, 100)).?;
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "first\nsecond\nthird",
+        prepared.command.create.prompt.?,
+    );
 }
 
 test "child and form paste settlement reject unsafe suffixes without mutating drafts" {

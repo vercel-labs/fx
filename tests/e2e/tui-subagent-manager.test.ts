@@ -109,6 +109,19 @@ function persistedCommunicationText(value: unknown): string {
   return Buffer.from(wire.data, "base64").toString("utf8");
 }
 
+function nestedTextValues(value: unknown): string[] {
+  if (typeof value === "string") return [value];
+  if (!value || typeof value !== "object") return [];
+  const record = value as Record<string, unknown>;
+  const decoded = record.encoding === "base64" && typeof record.data === "string"
+    ? [Buffer.from(record.data, "base64").toString("utf8")]
+    : [];
+  return [
+    ...decoded,
+    ...Object.values(record).flatMap((entry) => nestedTextValues(entry)),
+  ];
+}
+
 test("volatile token rows normalize before restored subagent comparison", () => {
   expect(normalizeVolatileTokenRows(["  (↑7 ↓5)"])).toEqual(["<status>"]);
   expect(normalizeVolatileTokenRows(["  0s (↑7 ↓5)"])).toEqual(["<status>"]);
@@ -2110,6 +2123,108 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         expect(control.events).toHaveLength(1);
         expect(control.queue).toHaveLength(0);
         expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      } finally {
+        gateway.stop();
+      }
+    },
+    60_000,
+  );
+
+  test(
+    "create-form paste normalizes carriage returns before dispatch and persistence",
+    async () => {
+      const fixture = createFixture();
+      const resumedStderrPath = join(root!, "resumed-stderr.log");
+      writeFileSync(resumedStderrPath, "");
+      const rawPrompt = "FXC163_FIRST\rFXC163_SECOND\rFXC163_THIRD";
+      const normalizedPrompt = "FXC163_FIRST\nFXC163_SECOND\nFXC163_THIRD";
+      const childName = "fxc-163-normalized-child";
+      const gateway = startDynamicFakeGateway(
+        () => fakeGatewayFinalText("FXC163_CHILD_COMPLETE"),
+        {
+          classifierDecision: "allow",
+          models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
+        },
+      );
+      const env = relationshipTestEnv(fixture, gateway, "fxc-163-key");
+      try {
+        session = await TmuxSession.create({
+          cwd: fixture.workspace,
+          env,
+          width: 96,
+          height: 28,
+          stderrPath: fixture.stderrPath,
+        });
+        const active = session;
+        await active.waitForComposer(TIMEOUT);
+        await active.sendKeys("C-x");
+        await active.waitForText("Agents & processes", TIMEOUT);
+        await active.sendLiteralText("c");
+        await active.waitForText("Create persistent agent", TIMEOUT);
+        await pasteVisibleText(active, childName);
+        await active.sendKeys("Tab");
+        await active.sendKeys("Tab");
+        await active.pasteText(rawPrompt);
+        await active.waitForText("FXC163_THIRD", TIMEOUT);
+        await active.sendKeys("Enter");
+        await active.waitForPane(
+          (pane) =>
+            pane.includes(childName) &&
+            pane.includes("FXC163_CHILD_COMPLETE") &&
+            pane.includes("status: idle"),
+          TIMEOUT,
+        );
+
+        const requestText = gateway.requests.flatMap((request) =>
+          nestedTextValues(JSON.parse(request.body))
+        );
+        expect(requestText).toContain(normalizedPrompt);
+        expect(requestText).not.toContain(rawPrompt);
+
+        type Control = { parent_id: string | null };
+        const controlPath = configurationControlPath(fixture);
+        const control = JSON.parse(readFileSync(controlPath, "utf8")) as Control;
+        const persistedText = nestedTextValues(control);
+        expect(persistedText).toContain(normalizedPrompt);
+        expect(persistedText).not.toContain(rawPrompt);
+        if (!control.parent_id) throw new Error("normalized child lost its root");
+        expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+        await active.sendKeys("C-x");
+        await active.waitForComposer(TIMEOUT);
+        await active.sendText("/quit");
+        expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+
+        session = await TmuxSession.create({
+          cmd: `${FX_BIN} resume ${control.parent_id}`,
+          cwd: fixture.workspace,
+          env,
+          width: 96,
+          height: 28,
+          stderrPath: resumedStderrPath,
+        });
+        const resumed = session;
+        await resumed.waitForComposer(TIMEOUT);
+        await resumed.sendKeys("C-x");
+        await resumed.waitForPane(
+          (pane) =>
+            pane.includes("Agents & processes") &&
+            pane.includes(childName) &&
+            pane.includes("idle"),
+          TIMEOUT,
+        );
+        await resumed.sendKeys("Enter");
+        const restored = await resumed.waitForPane(
+          (pane) =>
+            pane.includes("FXC163_FIRST") &&
+            pane.includes("FXC163_SECOND") &&
+            pane.includes("FXC163_THIRD") &&
+            pane.includes("FXC163_CHILD_COMPLETE"),
+          TIMEOUT,
+        );
+        expect(restored).not.toContain("FXC163_THIRDD");
+        expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
       } finally {
         gateway.stop();
       }
