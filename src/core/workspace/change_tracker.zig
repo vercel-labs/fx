@@ -92,9 +92,12 @@ pub const ChangeTracker = struct {
             .rename => {
                 if (op.new_path) |new_path| {
                     std.Io.Dir.renameAbsolute(new_path, op.path, io_mod.getIo()) catch {
+                        // The operation was consumed and the file is still under its
+                        // new name, so this is a failed undo rather than an empty
+                        // stack. Reporting `.empty` here would print "Nothing to
+                        // undo" over an I/O failure.
                         if (op.previous_content) |content| alloc.free(content);
-                        alloc.free(op.path);
-                        return .empty;
+                        return .{ .unavailable = op.path };
                     };
                     // previous_content holds the overwritten destination preimage.
                     if (op.previous_content) |content| {
@@ -109,8 +112,11 @@ pub const ChangeTracker = struct {
                     }
                     return .{ .restored = op.path };
                 }
+                // `new_path` is dropped when duplicating it fails, so there is no
+                // name to rename back from. Nothing was reversed, and saying
+                // `.restored` would report a successful undo that never happened.
                 if (op.previous_content) |content| alloc.free(content);
-                return .{ .restored = op.path };
+                return .{ .unavailable = op.path };
             },
             .write, .edit => {
                 if (op.previous_content) |content| {
@@ -121,7 +127,15 @@ pub const ChangeTracker = struct {
                     return .{ .restored = op.path };
                 }
 
-                std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), op.path) catch {};
+                // The file did not exist before the write, so undo removes it.
+                // A file that is already gone is the end state undo wants, so
+                // that stays a delete. Every other error leaves the file on
+                // disk, and the swallowed catch reported `.deleted` for it,
+                // which is the contract violation in the loudest direction: a
+                // failure rendered as success.
+                std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), op.path) catch |err| {
+                    if (err != error.FileNotFound) return .{ .unavailable = op.path };
+                };
                 return .{ .deleted = op.path };
             },
         }
@@ -458,7 +472,7 @@ test "undoLast restores destination preimage after overwrite rename" {
     try std.testing.expectEqualStrings("dest-preimage", dest);
 }
 
-test "undoLast consumes rename operations when renaming back fails" {
+test "undoLast reports a rename it could not reverse rather than an empty stack" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -477,12 +491,22 @@ test "undoLast consumes rename operations when renaming back fails" {
         .timestamp_ms = 1,
     });
 
-    try std.testing.expect(tracker.undoLast(alloc) == .empty);
+    // The operation is consumed and the file never moved back, so this is a
+    // failed undo. `.empty` would print "Nothing to undo" over an I/O failure.
+    switch (tracker.undoLast(alloc)) {
+        .unavailable => |reported| {
+            defer alloc.free(reported);
+            try std.testing.expectEqualStrings(old_path, reported);
+        },
+        else => return error.ExpectedUnavailable,
+    }
     try std.testing.expectEqual(@as(usize, 0), tracker.stack.items.len);
+    // And the stack really is empty afterwards, so the first result was about
+    // the failure and not about an exhausted stack.
     try std.testing.expect(tracker.undoLast(alloc) == .empty);
 }
 
-test "undoLast returns restored for rename operations without new_path" {
+test "undoLast reports a rename recorded without its new path as unavailable" {
     const alloc = std.testing.allocator;
     var tracker: ChangeTracker = .{};
     defer tracker.deinit(alloc);
@@ -494,13 +518,14 @@ test "undoLast returns restored for rename operations without new_path" {
         .timestamp_ms = 1,
     });
 
-    const result = tracker.undoLast(alloc);
-    switch (result) {
-        .restored => |restored_path| {
-            defer alloc.free(restored_path);
-            try std.testing.expectEqualStrings("/workspace/original.txt", restored_path);
+    // `new_path` is dropped when duplicating it fails, so nothing can be renamed
+    // back. Claiming `.restored` would report an undo that never ran.
+    switch (tracker.undoLast(alloc)) {
+        .unavailable => |reported| {
+            defer alloc.free(reported);
+            try std.testing.expectEqualStrings("/workspace/original.txt", reported);
         },
-        else => return error.ExpectedRestore,
+        else => return error.ExpectedUnavailable,
     }
 }
 
@@ -844,4 +869,48 @@ test "a locked directory plus a failing write never leaves a half-replaced file"
     const survived = try readAbsolute(alloc, path);
     defer alloc.free(survived);
     try std.testing.expectEqualStrings(current, survived);
+}
+
+test "undo reports a new file it could not delete rather than claiming it deleted it" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "locked");
+    const path = try tmpPath(alloc, tmp.dir, "locked/created.txt");
+    defer alloc.free(path);
+    try writeAbsolute(path, "bytes the tool created");
+
+    const dir_path = try tmpPath(alloc, tmp.dir, "locked");
+    defer alloc.free(dir_path);
+    const dir_path_z = try alloc.dupeZ(u8, dir_path);
+    defer alloc.free(dir_path_z);
+    if (std.c.chmod(dir_path_z.ptr, 0o500) != 0) return error.SkipZigTest;
+    defer _ = std.c.chmod(dir_path_z.ptr, 0o700);
+
+    var tracker: ChangeTracker = .{};
+    defer tracker.deinit(alloc);
+    // No preimage: the file did not exist before the write, so undo removes it.
+    try tracker.pushOperation(alloc, .{
+        .kind = .write,
+        .path = try alloc.dupe(u8, path),
+        .previous_content = null,
+        .timestamp_ms = 1,
+    });
+
+    // The unlink cannot succeed in a directory that denies writes. Reporting
+    // `.deleted` here would tell the user a file was removed while it is still
+    // on disk, which is a failure rendered as success.
+    switch (tracker.undoLast(alloc)) {
+        .unavailable => |reported| {
+            defer alloc.free(reported);
+            try std.testing.expectEqualStrings(path, reported);
+        },
+        else => return error.ExpectedUnavailable,
+    }
+
+    // And the file really is still there, so the report matches the disk.
+    const survived = try readAbsolute(alloc, path);
+    defer alloc.free(survived);
+    try std.testing.expectEqualStrings("bytes the tool created", survived);
 }
