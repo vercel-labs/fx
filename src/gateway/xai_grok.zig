@@ -569,7 +569,11 @@ fn consumeSse(
     var saw_content_delta = false;
     var event_count: usize = 0;
 
-    while (try sse.next(alloc, reader)) |json_text| {
+    stream: while (true) {
+        const json_text = sse.next(alloc, reader) catch |err| switch (err) {
+            error.ReadFailed => break :stream,
+            else => return err,
+        } orelse break :stream;
         defer sse.release();
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
         event_count = try checkedAccumulatedSize(event_count, 1, max_sse_events);
@@ -685,7 +689,9 @@ fn consumeSse(
         }
     }
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-    if (!terminal_seen) return error.XaiGrokStreamIncomplete;
+    if (!terminal_seen and !streamHasUsableOutput(alloc, content.items.len, tools.items)) {
+        return error.XaiGrokStreamIncomplete;
+    }
 
     const owned_content = if (content.items.len > 0) try content.toOwnedSlice(alloc) else null;
     if (owned_content != null) content = .empty;
@@ -732,6 +738,29 @@ fn consumeSse(
         .finish_reason = finish_reason orelse if (owned_tools.len > 0) .tool_calls else .stop,
         .usage = usage,
     };
+}
+
+/// Grok's proxy sometimes closes after tool or text deltas without
+/// `response.completed`. Salvage only when every tool already has parseable
+/// arguments, or when the stream delivered visible text and no tools.
+fn streamHasUsableOutput(
+    alloc: Allocator,
+    content_len: usize,
+    tools: []const ToolAccumulator,
+) bool {
+    if (tools.len == 0) return content_len > 0;
+    for (tools) |tool| {
+        if (tool.id.len == 0 or tool.name.len == 0) return false;
+        if (!jsonObjectOrArray(alloc, tool.arguments.items)) return false;
+    }
+    return true;
+}
+
+fn jsonObjectOrArray(alloc: Allocator, bytes: []const u8) bool {
+    if (bytes.len == 0) return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value == .object or parsed.value == .array;
 }
 
 fn appendTool(
@@ -1424,6 +1453,44 @@ fn buildProviderStateSse(alloc: Allocator, provider_state_bytes: usize) ![]u8 {
     }
     try out.writer.writeAll(terminal);
     return out.toOwnedSlice();
+}
+
+test "xAI Grok SSE completes tools or text when the terminal event is missing" {
+    const tools_without_terminal =
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}\n\n" ++
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\\\"README.md\\\"}\"}\n\n" ++
+        "data: [DONE]\n\n";
+    var tools_completion = try consumeTestSse(tools_without_terminal);
+    defer deinitTestCompletion(&tools_completion);
+    try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, tools_completion.finish_reason.?);
+    try std.testing.expectEqual(@as(usize, 1), tools_completion.tool_calls.len);
+    try std.testing.expectEqualStrings("call_1", tools_completion.tool_calls[0].id);
+    try std.testing.expectEqualStrings("read_file", tools_completion.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", tools_completion.tool_calls[0].arguments_json);
+
+    const text_without_terminal =
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hello\"}\n\n";
+    var text_completion = try consumeTestSse(text_without_terminal);
+    defer deinitTestCompletion(&text_completion);
+    try std.testing.expectEqual(types.ProviderFinishReason.stop, text_completion.finish_reason.?);
+    try std.testing.expectEqualStrings("hello", text_completion.content.?);
+}
+
+test "xAI Grok SSE still rejects empty or truncated streams without a terminal event" {
+    try expectTestSseError(error.XaiGrokStreamIncomplete, "");
+    try expectTestSseError(
+        error.XaiGrokStreamIncomplete,
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking\"}\n\n",
+    );
+    try expectTestSseError(
+        error.XaiGrokStreamIncomplete,
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}\n\n",
+    );
+    try expectTestSseError(
+        error.XaiGrokStreamIncomplete,
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}\n\n" ++
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\"}\n\n",
+    );
 }
 
 test "xAI Grok SSE reader accepts the exact line bound and rejects one beyond" {
