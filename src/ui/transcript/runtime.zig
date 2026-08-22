@@ -708,6 +708,33 @@ test "appendTurnSummaryEntry leaves terminal route status visible" {
     try std.testing.expect(std.mem.find(u8, runtime.entries.items[0].raw_bytes.bytes, "  2m 10s (↑10k ↓5k)") != null);
 }
 
+test "terminal worker status is retained as transcript history" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    runtime.worker_status.set_route_recovery(.{ .kind = .content_filter }, 0);
+    try std.testing.expect(try runtime.retainTerminalWorkerStatus(alloc));
+
+    try std.testing.expect(runtime.activityProjection() == .none);
+    try std.testing.expectEqual(@as(usize, 1), runtime.entries.items.len);
+    try std.testing.expect(runtime.entries.items[0] == .raw_bytes);
+    try std.testing.expectEqual(RawEntryClass.worker_status, runtime.entries.items[0].raw_bytes.class);
+    try std.testing.expect(std.mem.find(u8, runtime.entries.items[0].raw_bytes.bytes, "⚠ blocked · content filter") != null);
+    try std.testing.expect(std.mem.find(u8, runtime.entries.items[0].raw_bytes.bytes, ui_render.red_style) != null);
+}
+
 test "full transcript projection opens without folded command output" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
@@ -4473,6 +4500,41 @@ pub const TranscriptRuntime = struct {
 
     pub fn worker_status_state(self: *TranscriptRuntime) *worker_status.State {
         return &self.worker_status;
+    }
+
+    /// Moves a completed failure out of the replaceable activity row and into
+    /// transcript history. Call this as soon as the status becomes terminal so
+    /// later notices cannot repaint it after newer output.
+    pub fn retainTerminalWorkerStatus(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+    ) !bool {
+        const projection = self.worker_status.retained_projection() orelse return false;
+        const activity = switch (projection) {
+            .turn_thinking => |thinking| thinking,
+            .none, .tool_slot => return false,
+        };
+        const style = switch (activity.tone) {
+            .thinking, .neutral => ui_render.dim_style,
+            .warning => ui_render.warning_style,
+            .success => ui_render.green_style,
+            .danger => ui_render.red_style,
+        };
+        const line = try std.fmt.allocPrint(
+            alloc,
+            "{s}{s}{s}\n",
+            .{ style, activity.label, ui_render.reset_style },
+        );
+        defer alloc.free(line);
+        _ = try transcript_store.appendRawTranscriptEntryClassified(
+            self,
+            alloc,
+            line,
+            .worker_status,
+        );
+        _ = self.worker_status.clear();
+        self.render_requests.request(.footer);
+        return true;
     }
 
     pub fn focusedToolEntryId(self: *const TranscriptRuntime) ?u32 {

@@ -688,6 +688,7 @@ pub fn Runtime(comptime App: type) type {
                             drain_owns_current = false;
                             break :events;
                         }
+                        try retainWorkerStatusAtPromptBoundary(app);
                         resetStream(app, true);
                         app.stream.active = true;
                         app.stream.turn_started_ms = io_mod.milliTimestamp();
@@ -701,6 +702,7 @@ pub fn Runtime(comptime App: type) type {
                             drain_owns_current = false;
                             break :events;
                         }
+                        try retainWorkerStatusAtPromptBoundary(app);
                         resetStream(app, true);
                         app.stream.active = true;
                         app.stream.turn_started_ms = io_mod.milliTimestamp();
@@ -812,7 +814,9 @@ pub fn Runtime(comptime App: type) type {
                             break :events;
                         }
                         app.shell.worker_status_state().set_route_recovery(status, io_mod.milliTimestamp());
-                        app.shell.render_requests.request(.footer);
+                        if (!try app.shell.retainTerminalWorkerStatus(app.alloc)) {
+                            app.shell.render_requests.request(.footer);
+                        }
                     },
                     .clear_route_recovery_status => {
                         if (app.shell.worker_status_state().clear_route_recovery()) {
@@ -822,7 +826,9 @@ pub fn Runtime(comptime App: type) type {
                     .api_status_text => |text| {
                         resetStream(app, false);
                         app.shell.worker_status_state().set_api(text, .danger);
-                        app.shell.render_requests.request(.footer);
+                        if (!try app.shell.retainTerminalWorkerStatus(app.alloc)) {
+                            app.shell.render_requests.request(.footer);
+                        }
                     },
                     .command_output => |chunk| {
                         try handlers.command_output(handlers.ctx, chunk.lifecycle_id, chunk.stream, chunk.text);
@@ -995,6 +1001,19 @@ pub fn Runtime(comptime App: type) type {
                 app.shell.render_requests.request(.footer);
             }
             app.shell.resetCommandOutputDisplay(app.alloc, "worker inactive");
+        }
+
+        fn retainWorkerStatusAtPromptBoundary(app: *App) !void {
+            if (comptime !@hasDecl(@TypeOf(app.shell), "retainTerminalWorkerStatus")) return;
+            if (try app.shell.retainTerminalWorkerStatus(app.alloc)) {
+                debug_trace.eventf(
+                    "worker",
+                    "worker_status_retained",
+                    .{},
+                    "boundary=begin_prompt",
+                    .{},
+                );
+            }
         }
 
         fn applyToolActivity(stream: *types.StreamState, kind: types.ToolActivityKind) void {
@@ -1446,6 +1465,13 @@ const FakeShell = struct {
 
     pub fn worker_status_state(self: *FakeShell) *worker_status.State {
         return self.lifecycle.worker_status_state();
+    }
+
+    pub fn retainTerminalWorkerStatus(
+        self: *FakeShell,
+        alloc: std.mem.Allocator,
+    ) !bool {
+        return self.lifecycle.retainTerminalWorkerStatus(alloc);
     }
 
     pub fn focusedToolEntryId(self: *const FakeShell) ?u32 {
@@ -2282,10 +2308,17 @@ test "core.app_worker_runtime clears route recovery activity on clear event but 
         .body = "request failed",
     } });
     try tickNoop(&app);
-    switch (app.shell.activityProjection()) {
-        .turn_thinking => |thinking| try std.testing.expectEqualStrings("⚠ Provider unavailable · recovery paused after 3/3 attempts", thinking.label),
-        .none, .tool_slot => return error.TestUnexpectedResult,
+    try std.testing.expect(app.shell.activityProjection() == .none);
+    var found_terminal_status = false;
+    for (app.shell.lifecycle.entries.items) |entry| {
+        if (entry != .raw_bytes or entry.raw_bytes.class != .worker_status) continue;
+        found_terminal_status = std.mem.find(
+            u8,
+            entry.raw_bytes.bytes,
+            "⚠ Provider unavailable · recovery paused after 3/3 attempts",
+        ) != null;
     }
+    try std.testing.expect(found_terminal_status);
 }
 
 test "core.app_worker_runtime recovery pause replaces cancelled waiting status" {
@@ -2312,13 +2345,18 @@ test "core.app_worker_runtime recovery pause replaces cancelled waiting status" 
     try queueTurnFinished(&app, 1, .paused);
     try tickNoop(&app);
 
-    switch (app.shell.activityProjection()) {
-        .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt 2/10 · /continue to resume",
-            thinking.label,
-        ),
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
+    try std.testing.expect(app.shell.activityProjection() == .none);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.entries.items.len);
+    try std.testing.expect(app.shell.lifecycle.entries.items[0] == .raw_bytes);
+    try std.testing.expectEqual(
+        transcript_runtime.RawEntryClass.worker_status,
+        app.shell.lifecycle.entries.items[0].raw_bytes.class,
+    );
+    try std.testing.expect(std.mem.find(
+        u8,
+        app.shell.lifecycle.entries.items[0].raw_bytes.bytes,
+        "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt 2/10 · /continue to resume",
+    ) != null);
 }
 
 test "core.app_worker_runtime summary append clears recovered route status without recovered summary" {
@@ -2362,24 +2400,29 @@ test "core.app_worker_runtime summary append clears recovered route status witho
     try std.testing.expect(std.mem.find(u8, app.shell.lifecycle.entries.items[0].raw_bytes.bytes, "✓ recovered") == null);
 }
 
-test "core.app_worker_runtime projects API status text as sticky status row" {
+test "core.app_worker_runtime commits terminal API status as transcript history" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
     try app.worker.pushEvent(std.heap.c_allocator, .{ .api_status_text = try std.heap.c_allocator.dupe(u8, "⚠ API access denied · HTTP 403 · Provider: wafer") });
     try tickNoop(&app);
 
-    switch (app.shell.activityProjection()) {
-        .turn_thinking => |thinking| {
-            try std.testing.expectEqual(activity_runtime.ActivityProjection.Tone.danger, thinking.tone);
-            try std.testing.expectEqualStrings("⚠ API access denied · HTTP 403 · Provider: wafer", thinking.label);
-        },
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
+    try std.testing.expect(app.shell.activityProjection() == .none);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.entries.items.len);
+    try std.testing.expect(app.shell.lifecycle.entries.items[0] == .raw_bytes);
+    try std.testing.expectEqual(
+        transcript_runtime.RawEntryClass.worker_status,
+        app.shell.lifecycle.entries.items[0].raw_bytes.class,
+    );
+    try std.testing.expect(std.mem.find(
+        u8,
+        app.shell.lifecycle.entries.items[0].raw_bytes.bytes,
+        "⚠ API access denied · HTTP 403 · Provider: wafer",
+    ) != null);
 
     try app.worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = try types.dupeUserTurn(std.heap.c_allocator, .{ .text = @constCast("next"), .images = &.{} }) });
     try tickNoop(&app);
-    try std.testing.expect(app.shell.activityProjection() == .none);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.entries.items.len);
 }
 
 test "core.app_worker_runtime suppresses route recovery activity while question is active" {

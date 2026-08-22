@@ -949,7 +949,9 @@ pub fn Runtime(comptime App: type) type {
                 },
                 .route_recovery_status => |status| {
                     runtime.worker_status_state().set_route_recovery(status, io_mod.milliTimestamp());
-                    runtime.render_requests.request(.footer);
+                    if (!try runtime.retainTerminalWorkerStatus(alloc)) {
+                        runtime.render_requests.request(.footer);
+                    }
                 },
                 .clear_route_recovery_status => {
                     if (runtime.worker_status_state().clear_route_recovery()) {
@@ -958,7 +960,9 @@ pub fn Runtime(comptime App: type) type {
                 },
                 .api_status_text => |text| {
                     runtime.worker_status_state().set_api(text, .danger);
-                    runtime.render_requests.request(.footer);
+                    if (!try runtime.retainTerminalWorkerStatus(alloc)) {
+                        runtime.render_requests.request(.footer);
+                    }
                 },
                 .begin_prompt,
                 .begin_prompt_with_skill_bindings,

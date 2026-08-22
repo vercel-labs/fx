@@ -100,6 +100,27 @@ pub const State = union(enum) {
         };
     }
 
+    /// Returns the terminal status that must be committed to transcript
+    /// history. Retry and recovered statuses are intentionally transient.
+    pub fn retained_projection(self: *const State) ?activity_runtime.ActivityProjection {
+        return switch (self.*) {
+            .none => null,
+            .route_recovery => |*status| switch (status.status.kind) {
+                .terminal_provider_error,
+                .unsafe_assistant_output,
+                .unsafe_tool_start,
+                .content_filter,
+                => status.projection(),
+                .auto_retry,
+                .auto_recovered,
+                .manual_retry_without_fast,
+                .manual_recovered_without_fast,
+                => null,
+            },
+            .api => |*status| status.projection(),
+        };
+    }
+
     pub fn set_route_recovery(
         self: *State,
         status: types.RouteRecoveryStatus,
@@ -226,6 +247,42 @@ test "worker status API state is sticky until explicitly cleared" {
     }
     try std.testing.expect(state.clear());
     try std.testing.expect(state.projection() == null);
+}
+
+test "worker status retains only terminal failures for the next prompt" {
+    var state: State = .none;
+
+    state.set_route_recovery(.{
+        .kind = .auto_retry,
+        .failed_attempt = 1,
+        .attempt_limit = 3,
+    }, 0);
+    try std.testing.expect(state.retained_projection() == null);
+
+    state.set_route_recovery(.{
+        .kind = .auto_recovered,
+        .succeeded_attempt = 2,
+        .attempt_limit = 3,
+    }, 0);
+    try std.testing.expect(state.retained_projection() == null);
+
+    state.set_route_recovery(.{ .kind = .content_filter }, 0);
+    switch (state.retained_projection().?) {
+        .turn_thinking => |projection| try std.testing.expectEqualStrings(
+            "⚠ blocked · content filter",
+            projection.label,
+        ),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+
+    state.set_api("⚠ API access denied", .danger);
+    switch (state.retained_projection().?) {
+        .turn_thinking => |projection| try std.testing.expectEqualStrings(
+            "⚠ API access denied",
+            projection.label,
+        ),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
 }
 
 test "worker status route recovery labels expose required controls" {

@@ -1672,27 +1672,51 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   test(
     "HTTP restricted provider error renders sticky status row",
     async () => {
+      const recoveryModel = "openai/gpt-5-mini";
+      const statusText = "⚠ API access denied · HTTP 403 · Provider: wafer";
+      const laterText = "Restricted provider history remains before later output.";
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-route-http-403-",
-        [restrictedProviderResponse()],
+        [restrictedProviderResponse(), fakeGatewayFinalText(laterText)],
+        {
+          models: [
+            { id: MODEL, type: "language", tags: ["tool-use"] },
+            { id: recoveryModel, type: "language", tags: ["tool-use"] },
+          ],
+        },
       );
 
       await session!.sendText("Trigger restricted provider.");
-      await session!.waitForText(
-        "⚠ API access denied · HTTP 403 · Provider: wafer",
-        TIMEOUT,
-      );
+      await session!.waitForText(statusText, TIMEOUT);
       const scrollback = await session!.captureFullScrollback();
 
-      expect(queuedGateway.requests.length).toBe(1);
-      expect(scrollback).toContain(
-        "⚠ API access denied · HTTP 403 · Provider: wafer",
+      await session!.sendText(`/model ${recoveryModel}`);
+      await session!.waitForText(`Switched to ${recoveryModel}`, TIMEOUT);
+      const switchedScrollback = await session!.captureFullScrollback();
+
+      await session!.sendText("Produce a later successful response.");
+      await session!.waitForText(laterText, TIMEOUT);
+      const finalScrollback = await session!.captureFullScrollback();
+
+      expect(queuedGateway.requests.length).toBe(2);
+      expect(scrollback).toContain(statusText);
+      expect(switchedScrollback.indexOf(statusText)).toBeLessThan(
+        switchedScrollback.indexOf(`Switched to ${recoveryModel}`),
       );
-      expect(scrollback).toContain(
-        "no_providers_available: Your team has restricted access to this",
+      expect(scrollback.replace(/\s+/g, "")).toContain(
+        "no_providers_available:Yourteamhasrestrictedaccesstothis",
       );
-      expect(scrollback).toContain("no_providers_available");
       expect(scrollback).not.toContain('{"error"');
+      expect(finalScrollback).toContain(statusText);
+      expect(finalScrollback).toContain(`Switched to ${recoveryModel}`);
+      expect(finalScrollback).toContain(laterText);
+      expect(countOccurrences(finalScrollback, statusText)).toBe(1);
+      expect(finalScrollback.indexOf(statusText)).toBeLessThan(
+        finalScrollback.indexOf(`Switched to ${recoveryModel}`),
+      );
+      expect(finalScrollback.indexOf(`Switched to ${recoveryModel}`)).toBeLessThan(
+        finalScrollback.indexOf(laterText),
+      );
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
@@ -1905,9 +1929,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   test(
     "content filter opens local recovery modal without transcript card",
     async () => {
+      const laterText = "Content filter history remains before later output.";
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-route-content-filter-",
-        [contentFilterResponse()],
+        [contentFilterResponse(), fakeGatewayFinalText(laterText)],
       );
 
       await session!.sendText("Trigger content filter.");
@@ -1918,7 +1943,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session!.waitForText("⚠ blocked · content_filter · content filter", TIMEOUT);
       const scrollback = await session!.captureFullScrollback();
 
-      expect(queuedGateway.requests.length).toBe(1);
+      await session!.sendText("Produce a later successful response.");
+      await session!.waitForText(laterText, TIMEOUT);
+      const finalScrollback = await session!.captureFullScrollback();
+
+      expect(queuedGateway.requests.length).toBe(2);
       expect(scrollback).not.toContain("What should fx do?");
       expect(pane).toContain("Change model");
       expect(pane).toContain("Try again later");
@@ -1929,6 +1958,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(scrollback).not.toContain("System");
       expect(scrollback).not.toContain("Change model");
       expect(scrollback).not.toContain("request failed: ModelError");
+      expect(finalScrollback).toContain("Trigger content filter.");
+      expect(finalScrollback).toContain("⚠ blocked · content_filter · content filter");
+      expect(finalScrollback).toContain(laterText);
+      expect(
+        countOccurrences(
+          finalScrollback,
+          "⚠ blocked · content_filter · content filter",
+        ),
+      ).toBe(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,

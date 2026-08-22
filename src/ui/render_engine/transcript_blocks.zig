@@ -114,6 +114,7 @@ pub const AssistantTurnSegments = struct {
 pub const RawEntryClass = enum {
     welcome,
     turn_summary,
+    worker_status,
     tool_status,
     command_output,
     diff_block,
@@ -184,6 +185,7 @@ pub fn blockKindForRawClass(class: RawEntryClass) TranscriptBlockKind {
     return switch (class) {
         .welcome => .welcome,
         .turn_summary => .turn_summary,
+        .worker_status => .error_notice,
         .tool_status => .tool_status,
         .command_output => .command_output,
         .diff_block => .diff_block,
@@ -243,6 +245,7 @@ pub fn entryClassForEntry(entry: TranscriptEntry) TranscriptEntryClass {
         .raw_bytes => |raw| switch (raw.class) {
             .welcome => .welcome,
             .turn_summary => .turn_summary,
+            .worker_status => .error_notice,
             .tool_status => .tool_status,
             .command_output => .command_output,
             .diff_block => .diff_block,
