@@ -10,6 +10,7 @@ const streamable_http = @import("streamable_http.zig");
 const Allocator = std.mem.Allocator;
 const max_sse_events: usize = 1024;
 const close_timeout_ms: i64 = 250;
+const default_reconnect_delay_ms: u32 = 1000;
 
 pub const Version = enum {
     v2025_11_25,
@@ -508,23 +509,32 @@ fn notificationGetCore(alloc: Allocator, options: OperationOptions) !OperationRe
         const resumed = try notificationGetOnceCore(alloc, next_options, sink);
         if (last_event_id) |value| alloc.free(value);
         last_event_id = resumed.last_event_id;
-        if (resumed.retry_ms > 0) {
-            const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
-            if (controlExpired(options.control)) {
-                return error.McpRequestTimedOut;
-            }
-            const delay_deadline = now.addDuration(.{
-                .clock = .awake,
-                .raw = .fromMilliseconds(resumed.retry_ms),
-            });
-            const deadline = controlDeadline(options.control);
-            const wake = if (std.Io.Clock.Timestamp.compare(
-                delay_deadline,
-                .lt,
-                deadline,
-            )) delay_deadline else deadline;
-            try wake.wait(io_mod.getIo());
+        // A server-supplied retry is honored as given: SEP-1699 makes it a
+        // MUST, and the MCP conformance suite fails a client that reconnects
+        // either earlier or more than twice as late as the hint. The default
+        // applies only when the server sent no hint at all, which is the case
+        // that storms: a stream that closes as soon as it opens reconnects
+        // with no wait, and no outer backoff sees it, because a clean close is
+        // not an error and the retry path in tool_subscription never runs.
+        const retry_ms = if (resumed.retry_ms > 0)
+            resumed.retry_ms
+        else
+            default_reconnect_delay_ms;
+        const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+        if (controlExpired(options.control)) {
+            return error.McpRequestTimedOut;
         }
+        const delay_deadline = now.addDuration(.{
+            .clock = .awake,
+            .raw = .fromMilliseconds(retry_ms),
+        });
+        const deadline = controlDeadline(options.control);
+        const wake = if (std.Io.Clock.Timestamp.compare(
+            delay_deadline,
+            .lt,
+            deadline,
+        )) delay_deadline else deadline;
+        try wake.wait(io_mod.getIo());
     }
 }
 
@@ -937,7 +947,15 @@ fn readSseWithResumption(
     while (true) switch (stream) {
         .final => |body| return body,
         .resumable => |resume_state| {
-            if (resume_state.retry_ms > 0) {
+            // Same default as the notification listener above, for the same
+            // reason: a server that keeps closing a resumable stream without a
+            // retry hint would otherwise be resumed with no wait at all. A
+            // hint the server did send is still honored as given.
+            const retry_ms = if (resume_state.retry_ms > 0)
+                resume_state.retry_ms
+            else
+                default_reconnect_delay_ms;
+            {
                 const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
                 if (controlExpired(options.control)) {
                     alloc.free(resume_state.last_event_id);
@@ -945,7 +963,7 @@ fn readSseWithResumption(
                 }
                 const delay_deadline = now.addDuration(.{
                     .clock = .awake,
-                    .raw = .fromMilliseconds(resume_state.retry_ms),
+                    .raw = .fromMilliseconds(retry_ms),
                 });
                 const deadline = controlDeadline(options.control);
                 const wake = if (std.Io.Clock.Timestamp.compare(
