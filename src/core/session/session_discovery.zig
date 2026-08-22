@@ -71,8 +71,17 @@ pub const WritableCandidate = struct {
     id: []u8,
     workspace_root: []u8,
     updated_at_ms: i64,
+    history_len: usize,
+    has_durable_activity: bool,
+    has_managed_children: bool,
     storage: CandidateStorage,
     projection_state: ProjectionState,
+
+    pub fn isResumable(self: WritableCandidate) bool {
+        return self.history_len != 0 or
+            self.has_durable_activity or
+            self.has_managed_children;
+    }
 
     pub fn deinit(self: *WritableCandidate, alloc: Allocator) void {
         alloc.free(self.id);
@@ -91,6 +100,10 @@ const LegacyCandidateSummary = struct {
     schema_version: session_json.LegacySchemaVersion = .v1,
 
     fn intoSessionSummary(self: *LegacyCandidateSummary) SessionSummary {
+        // Legacy snapshots cannot distinguish a pristine start from a
+        // zero-history session with durable activity. Preserve zero-history
+        // legacy sessions conservatively; schema-v3 projections can prove the
+        // pristine case from their event sequence.
         const summary = SessionSummary{
             .id = self.id,
             .workspace_root = self.workspace_root,
@@ -98,6 +111,7 @@ const LegacyCandidateSummary = struct {
             .updated_at_ms = self.updated_at_ms,
             .conversation_language = self.conversation_language,
             .history_len = self.history_len,
+            .has_durable_activity = self.history_len == 0,
         };
         self.id = undefined;
         self.workspace_root = null;
@@ -110,6 +124,22 @@ const LegacyCandidateSummary = struct {
         self.* = undefined;
     }
 };
+
+test "legacy zero-history summaries remain conservatively resumable" {
+    const alloc = std.testing.allocator;
+    var legacy = LegacyCandidateSummary{
+        .id = try alloc.dupe(u8, "legacy-zero-history"),
+        .workspace_root = try alloc.dupe(u8, "/tmp/workspace"),
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .history_len = 0,
+    };
+    var summary = legacy.intoSessionSummary();
+    defer summary.deinit(alloc);
+
+    try std.testing.expect(summary.has_durable_activity);
+}
 
 /// Frees every diagnostic in the list and the list itself. Call once on the
 /// slice returned by `Store.inspectForDoctor`.
@@ -602,6 +632,7 @@ pub fn classifySchemaV3Candidate(
             .updated_at_ms = manifest.updated_at_ms,
             .conversation_language = manifest.conversation_language,
             .history_len = history_len,
+            .has_durable_activity = manifest.last_event_seq > 1,
         },
         .storage = .schema_v3,
         .projection_state = projection_state,
@@ -682,6 +713,9 @@ pub fn dupeWritableCandidate(
     id_source: []const u8,
     workspace_source: []const u8,
     updated_at_ms: i64,
+    history_len: usize,
+    has_durable_activity: bool,
+    has_managed_children: bool,
     storage: CandidateStorage,
     projection_state: ProjectionState,
 ) !WritableCandidate {
@@ -692,6 +726,9 @@ pub fn dupeWritableCandidate(
         .id = id,
         .workspace_root = workspace_root,
         .updated_at_ms = updated_at_ms,
+        .history_len = history_len,
+        .has_durable_activity = has_durable_activity,
+        .has_managed_children = has_managed_children,
         .storage = storage,
         .projection_state = projection_state,
     };

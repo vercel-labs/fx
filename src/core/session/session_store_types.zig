@@ -40,6 +40,7 @@ pub const ProjectionState = enum {
 /// only for structured tracing.
 pub const DiscoveryCause = enum {
     listable,
+    empty_session,
     workspace_mismatch,
     authority_transition,
     missing_authority,
@@ -64,6 +65,10 @@ pub const SessionSummary = struct {
     updated_at_ms: i64,
     conversation_language: session.ConversationLanguage,
     history_len: usize,
+    /// True when the canonical log contains an event after `session_started`.
+    /// This distinguishes a genuinely pristine zero-turn entry from a valid
+    /// session whose durable activity has not produced chat history yet.
+    has_durable_activity: bool = false,
     has_managed_children: bool = false,
 
     /// Frees owned summary strings and poisons the value.

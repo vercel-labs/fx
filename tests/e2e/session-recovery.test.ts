@@ -97,7 +97,11 @@ async function waitForPath(path: string, timeoutMs = 3_000): Promise<void> {
   throw new Error(`timed out waiting for ${path}`);
 }
 
-async function createSession(cwd: string, home: string): Promise<string> {
+async function createSession(
+  cwd: string,
+  home: string,
+  options: { durableActivity?: boolean } = {},
+): Promise<string> {
   const client = startAcp(cwd, home);
   try {
     client.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
@@ -105,6 +109,16 @@ async function createSession(cwd: string, home: string): Promise<string> {
     client.send({ jsonrpc: "2.0", id: 2, method: "session/new", params: { mcpServers: [] } });
     const response = await client.read();
     expect(response.result?.sessionId).toBeDefined();
+    if (options.durableActivity) {
+      await client.read(); // consume session/update notification
+      client.send({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "session/set_config_option",
+        params: { configId: "model", value: "o4-mini" },
+      });
+      expect((await client.read()).result).toBeDefined();
+    }
     return response.result.sessionId;
   } finally {
     client.kill();
@@ -119,6 +133,84 @@ function sessionIdsFromHome(home: string): string[] {
 }
 
 describe("session recovery", () => {
+  test(
+    "resume last skips existing zero-turn entries across repeated persistence cycles",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-session-zero-turn-recovery-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      const workspaceRoot = realpathSync(workspace);
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("CANONICAL_SESSION_SEEDED"),
+        fakeGatewayFinalText("CANONICAL_SESSION_RESUMED_ONCE"),
+        fakeGatewayFinalText("CANONICAL_SESSION_RESUMED_TWICE"),
+      ]);
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "e2e-placeholder",
+        VERCEL_OIDC_TOKEN: "",
+        FX_AUTO_UPGRADE: "0",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      };
+
+      try {
+        const seeded = await runFx(
+          ["ask", "--json", "--auto", "Create the canonical saved session."],
+          { cwd: workspaceRoot, env },
+        );
+        expect(seeded.code).toBe(0);
+        expect(seeded.stderr).toBe("");
+        const canonicalId = JSON.parse(seeded.stdout).session_id as string;
+
+        const emptyId = await createSession(workspaceRoot, home);
+        expect(emptyId).not.toBe(canonicalId);
+        expect(sessionIdsFromHome(home).sort()).toEqual(
+          [canonicalId, emptyId].sort(),
+        );
+
+        const latest = await runFx(["session", "last", "--json"], {
+          cwd: workspaceRoot,
+          env: { HOME: home },
+        });
+        expect(latest.code).toBe(0);
+        expect(JSON.parse(latest.stdout).id).toBe(canonicalId);
+
+        for (const expected of [
+          "CANONICAL_SESSION_RESUMED_ONCE",
+          "CANONICAL_SESSION_RESUMED_TWICE",
+        ]) {
+          const resumed = await runFx(
+            ["ask", "--json", "--auto", "--resume", "last", expected],
+            { cwd: workspaceRoot, env },
+          );
+          expect(resumed.code).toBe(0);
+          expect(resumed.stderr).toBe("");
+          expect(JSON.parse(resumed.stdout).session_id).toBe(canonicalId);
+          expect(sessionIdsFromHome(home).sort()).toEqual(
+            [canonicalId, emptyId].sort(),
+          );
+        }
+
+        const listed = await runFx(["sessions", "--json"], {
+          cwd: workspaceRoot,
+          env: { HOME: home },
+        });
+        expect(listed.code).toBe(0);
+        expect(JSON.parse(listed.stdout)).toMatchObject({
+          count: 1,
+          sessions: [{ id: canonicalId }],
+        });
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
   for (const boundary of [
     "after_event_append",
     "after_event_sync",
@@ -405,9 +497,13 @@ describe("session recovery", () => {
 
       const sourceId = await createSession(workspaceARoot, home);
       await Bun.sleep(10);
-      const healthyAId = await createSession(workspaceARoot, home);
+      const healthyAId = await createSession(workspaceARoot, home, {
+        durableActivity: true,
+      });
       await Bun.sleep(10);
-      const newestBId = await createSession(workspaceBRoot, home);
+      const newestBId = await createSession(workspaceBRoot, home, {
+        durableActivity: true,
+      });
 
       const sourceDir = join(home, ".fx", "sessions", sourceId);
       const watermarkName = readdirSync(sourceDir).find(

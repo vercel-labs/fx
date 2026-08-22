@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -62,6 +63,56 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
 });
 
 describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
+  test(
+    "a clean exit discards the pristine zero-turn session",
+    async () => {
+      const root = realpathSync(
+        mkdtempSync(join(tmpdir(), "fx-e2e-pristine-session-exit-")),
+      );
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await TmuxSession.create({
+          isolated: true,
+          cwd: realpathSync(workspace),
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_SKIP_ONBOARDING: "1",
+          },
+          stderrPath,
+        });
+        await session.waitForComposer(10_000);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(5_000)).toBe(true);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+        const durableSessionIds = readdirSync(
+          join(home, ".fx", "sessions"),
+          { withFileTypes: true },
+        )
+          .filter((entry) => entry.isDirectory() && entry.name !== "latest")
+          .map((entry) => entry.name);
+        expect(durableSessionIds).toEqual([]);
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   test(
     "statusline hides the workspace identity by default",
     async () => {

@@ -1673,7 +1673,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Right");
       grid = await waitForStatuslineMenu(session, "off  on");
       pane = grid.join("\n");
-      expect(JSON.parse(readFileSync(settingsPath, "utf8")).statusLine.context).toBe(true);
+      await waitForStatuslineValue(settingsPath, "context", true);
 
       await session.sendKeys("Down");
       await session.sendKeys("Right");
@@ -1681,7 +1681,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       pane = grid.join("\n");
       expect(pane).not.toContain("saved to user settings");
       expect(pane).not.toContain("● Statusline:");
-      expect(JSON.parse(readFileSync(settingsPath, "utf8")).statusLine.session).toBe(true);
+      await waitForStatuslineValue(settingsPath, "session", true);
 
       await session.sendKeys("Down");
       await session.sendKeys("Right");

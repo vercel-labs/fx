@@ -4464,11 +4464,12 @@ pub fn Runtime(comptime App: type) type {
                     .{ loaded.active_id, @errorName(err) },
                 );
             };
+            const pristine = session_store.isPristineStartedSession(loaded);
             const should_create_handoff = resume_boundary_valid and
                 shouldCreateResumeHandoff(.{
                     .intent = handoff_intent,
                     .has_writable_session = true,
-                    .is_pristine = session_store.isPristineStartedSession(loaded),
+                    .is_pristine = pristine,
                     .has_unresolved_degraded_tail = loaded.degradedTail() != null,
                 });
             const handoff: ?ResumeHandoff = if (should_create_handoff) blk: {
@@ -4497,6 +4498,13 @@ pub fn Runtime(comptime App: type) type {
                 app.session.clearWebFetchArtifacts();
             }
             disableSubagentHost(app);
+            if (pristine) {
+                if (app.session_persistence.store) |store| {
+                    _ = store.discardPristineStartedSession(app.alloc, loaded);
+                    app.session_persistence.writable = null;
+                    return handoff;
+                }
+            }
             loaded.deinit(app.alloc);
             app.session_persistence.writable = null;
             return handoff;

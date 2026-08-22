@@ -924,6 +924,7 @@ fn parseIndexedSummary(alloc: Allocator, value: std.json.Value) !SessionSummary 
     const preview = try indexedOptionalStringDup(alloc, root.get("preview"));
     errdefer if (preview) |preview_text| alloc.free(preview_text);
     const language = session.ConversationLanguage.fromSlice(try indexedString(root.get("conversation_language"))) catch return error.InvalidSessionIndex;
+    const history_len = try indexedUsize(root.get("history_len"));
 
     return .{
         .id = id,
@@ -935,7 +936,12 @@ fn parseIndexedSummary(alloc: Allocator, value: std.json.Value) !SessionSummary 
         .created_at_ms = try indexedI64(root.get("created_at_ms")),
         .updated_at_ms = try indexedI64(root.get("updated_at_ms")),
         .conversation_language = language,
-        .history_len = try indexedUsize(root.get("history_len")),
+        .history_len = history_len,
+        // A zero-history row could only enter older maintained indexes after
+        // some durable event; pristine starts use the preserve effect. Treat
+        // the missing field conservatively until the index is rewritten.
+        .has_durable_activity = (try indexedOptionalBool(root.get("has_durable_activity"))) orelse
+            (history_len == 0),
         .has_managed_children = (try indexedOptionalBool(root.get("has_managed_children"))) orelse false,
     };
 }
@@ -959,6 +965,7 @@ const IndexedSummaryView = struct {
     updated_at_ms: i64,
     conversation_language: session.ConversationLanguage,
     history_len: usize,
+    has_durable_activity: bool = false,
     has_managed_children: bool = false,
 
     fn deinit(self: *IndexedSummaryView, alloc: Allocator) void {
@@ -998,6 +1005,7 @@ const IndexedSummaryView = struct {
             .updated_at_ms = self.updated_at_ms,
             .conversation_language = self.conversation_language,
             .history_len = self.history_len,
+            .has_durable_activity = self.has_durable_activity,
             .has_managed_children = self.has_managed_children,
         };
     }
@@ -1125,6 +1133,7 @@ fn readIndexedSummaryView(
     var updated_at_ms: ?i64 = null;
     var conversation_language: ?session.ConversationLanguage = null;
     var history_len: ?usize = null;
+    var has_durable_activity: ?bool = null;
     var has_managed_children: bool = false;
 
     while (true) {
@@ -1157,6 +1166,8 @@ fn readIndexedSummaryView(
                         return error.InvalidSessionIndex;
                 } else if (std.mem.eql(u8, key.text, "history_len")) {
                     history_len = try readJsonUsize(scanner);
+                } else if (std.mem.eql(u8, key.text, "has_durable_activity")) {
+                    has_durable_activity = try readJsonBool(scanner);
                 } else if (std.mem.eql(u8, key.text, "has_managed_children")) {
                     has_managed_children = try readJsonBool(scanner);
                 } else {
@@ -1188,6 +1199,7 @@ fn readIndexedSummaryView(
         .updated_at_ms = parsed_updated_at_ms,
         .conversation_language = parsed_conversation_language,
         .history_len = parsed_history_len,
+        .has_durable_activity = has_durable_activity orelse (parsed_history_len == 0),
         .has_managed_children = has_managed_children,
     };
     id = null;
@@ -1254,6 +1266,7 @@ fn indexedSummaryMatches(
     }
     if (options.resumable_only and
         summary.history_len == 0 and
+        !summary.has_durable_activity and
         !summary.has_managed_children)
     {
         return false;
@@ -1677,8 +1690,9 @@ fn writeIndexedSummaryJson(writer: *std.Io.Writer, summary: SessionSummary) !voi
     }
     try writer.writeAll(",\"conversation_language\":");
     try std.json.Stringify.value(summary.conversation_language.view(), .{}, writer);
-    try writer.print(",\"history_len\":{d},\"has_managed_children\":{s},\"display_metadata_present\":{s},\"title\":", .{
+    try writer.print(",\"history_len\":{d},\"has_durable_activity\":{s},\"has_managed_children\":{s},\"display_metadata_present\":{s},\"title\":", .{
         summary.history_len,
+        if (summary.has_durable_activity) "true" else "false",
         if (summary.has_managed_children) "true" else "false",
         if (summary.display_metadata_present) "true" else "false",
     });
@@ -1724,6 +1738,7 @@ pub fn cloneSessionSummary(alloc: Allocator, source: SessionSummary) !SessionSum
         .updated_at_ms = source.updated_at_ms,
         .conversation_language = source.conversation_language,
         .history_len = source.history_len,
+        .has_durable_activity = source.has_durable_activity,
         .has_managed_children = source.has_managed_children,
     };
 }
@@ -1786,7 +1801,7 @@ pub fn resumablePageFromSummaries(
             const summary_workspace = summary.workspace_root orelse continue;
             if (!std.mem.eql(u8, summary_workspace, root)) continue;
         }
-        if (summary.history_len == 0 and !summary.has_managed_children) continue;
+        if (!summaryIsResumable(summary)) continue;
         if (active_id) |id| {
             if (std.mem.eql(u8, summary.id, id)) continue;
         }
@@ -1817,6 +1832,7 @@ pub fn sessionListPageFromSummaries(
     var page: types.SessionListPage = .{};
     errdefer page.deinit(alloc);
     for (summaries) |summary| {
+        if (!summaryIsResumable(summary)) continue;
         if (workspace_root) |root| {
             const summary_workspace = summary.workspace_root orelse continue;
             if (!std.mem.eql(u8, summary_workspace, root)) continue;
@@ -1836,6 +1852,12 @@ pub fn sessionListPageFromSummaries(
         };
     }
     return page;
+}
+
+pub fn summaryIsResumable(summary: SessionSummary) bool {
+    return summary.history_len != 0 or
+        summary.has_durable_activity or
+        summary.has_managed_children;
 }
 
 fn summaryFollowsContinuation(
@@ -1979,7 +2001,7 @@ test "bounded resumable index page preserves filters and newest-first order" {
         "{\"schema_version\":3,\"sessions\":[" ++
         "{\"id\":\"older\",\"created_at_ms\":1,\"updated_at_ms\":10,\"workspace_root\":\"/tmp/ws\",\"origin_workspace_root\":null,\"conversation_language\":\"en\",\"history_len\":1,\"display_metadata_present\":true,\"title\":\"Older\",\"preview\":\"Older\"}," ++
         "{\"id\":\"other-workspace\",\"created_at_ms\":1,\"updated_at_ms\":100,\"workspace_root\":\"/tmp/other\",\"origin_workspace_root\":null,\"conversation_language\":\"ja\",\"history_len\":1,\"display_metadata_present\":true,\"title\":\"Other\",\"preview\":\"Other\"}," ++
-        "{\"id\":\"empty\",\"created_at_ms\":1,\"updated_at_ms\":90,\"workspace_root\":\"/tmp/ws\",\"origin_workspace_root\":null,\"conversation_language\":\"en\",\"history_len\":0,\"display_metadata_present\":true,\"title\":\"Empty\",\"preview\":\"Empty\"}," ++
+        "{\"id\":\"empty\",\"created_at_ms\":1,\"updated_at_ms\":90,\"workspace_root\":\"/tmp/ws\",\"origin_workspace_root\":null,\"conversation_language\":\"en\",\"history_len\":0,\"has_durable_activity\":false,\"display_metadata_present\":true,\"title\":\"Empty\",\"preview\":\"Empty\"}," ++
         "{\"id\":\"newest\",\"created_at_ms\":1,\"updated_at_ms\":40,\"workspace_root\":\"/tmp/ws\",\"origin_workspace_root\":null,\"conversation_language\":\"fr\",\"history_len\":2,\"display_metadata_present\":true,\"title\":\"Newest 🚀\",\"preview\":\"مرحبا\"}," ++
         "{\"id\":\"active\",\"created_at_ms\":1,\"updated_at_ms\":80,\"workspace_root\":\"/tmp/ws\",\"origin_workspace_root\":null,\"conversation_language\":\"en\",\"history_len\":1,\"display_metadata_present\":true,\"title\":\"Active\",\"preview\":\"Active\"}," ++
         "{\"id\":\"middle-b\",\"created_at_ms\":1,\"updated_at_ms\":30,\"workspace_root\":\"/tmp/ws\",\"origin_workspace_root\":null,\"conversation_language\":\"en\",\"history_len\":1,\"display_metadata_present\":true,\"title\":\"Middle B\",\"preview\":\"Middle B\"}," ++
@@ -2015,6 +2037,23 @@ test "bounded resumable index page preserves filters and newest-first order" {
     try std.testing.expect(!second.has_more);
     try std.testing.expectEqualStrings("middle-a", second.summaries.items[0].id);
     try std.testing.expectEqualStrings("older", second.summaries.items[1].id);
+}
+
+test "bounded resumable index keeps zero-history rows from older indexes" {
+    const alloc = std.testing.allocator;
+    var page = try parseSessionIndexPage(
+        alloc,
+        "{\"schema_version\":3,\"sessions\":[{\"id\":\"eventful-zero-turn\",\"created_at_ms\":1,\"updated_at_ms\":2,\"workspace_root\":\"/tmp/ws\",\"conversation_language\":\"en\",\"history_len\":0}]}",
+        .{
+            .workspace_root = "/tmp/ws",
+            .limit = 10,
+            .resumable_only = true,
+        },
+    );
+    defer page.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), page.summaries.items.len);
+    try std.testing.expect(page.summaries.items[0].has_durable_activity);
 }
 
 test "managed child ownership keeps a zero-turn session resumable" {

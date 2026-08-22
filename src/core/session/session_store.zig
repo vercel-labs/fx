@@ -314,6 +314,7 @@ const removeSessionIndexMarker = summary_codec.removeSessionIndexMarker;
 const resumablePageFromSummaries = summary_codec.resumablePageFromSummaries;
 const sessionListPageFromSummaries = summary_codec.sessionListPageFromSummaries;
 const sortSummariesNewestFirst = summary_codec.sortSummariesNewestFirst;
+const summaryIsResumable = summary_codec.summaryIsResumable;
 const writeSessionIndex = summary_codec.writeSessionIndex;
 
 const SessionSummaryScan = struct {
@@ -863,6 +864,27 @@ pub const Store = struct {
             );
             return .retained;
         }
+        const has_managed_children = self.sessionHasManagedChildrenConservative(
+            alloc,
+            loaded.active_id,
+        ) catch |err| {
+            loaded.deinit(alloc);
+            debug_trace.logf(
+                "session",
+                "event=pristine_session_discard disposition=retained reason=child_probe_failed err={s}",
+                .{@errorName(err)},
+            );
+            return .retained;
+        };
+        if (has_managed_children) {
+            loaded.deinit(alloc);
+            debug_trace.logf(
+                "session",
+                "event=pristine_session_discard disposition=retained reason=managed_children",
+                .{},
+            );
+            return .retained;
+        }
         return self.deleteWriterOwnedSession(
             alloc,
             loaded,
@@ -1012,16 +1034,41 @@ pub const Store = struct {
             .id => |id| try root.admitResumeView(alloc, id),
             .last => blk: {
                 if (self.deferredCacheInvalidatesReads()) {
-                    var latest = try self.latestReadOnlyWorkspaceSummary(alloc);
+                    var latest = try self.latestResumableWorkspaceSummary(alloc);
                     defer latest.deinit(alloc);
                     break :blk try root.admitResumeView(
                         alloc,
                         latest.id,
                     );
                 }
-                var latest = (try readLatestPointer(self, alloc, self.workspace_root)) orelse
-                    return null;
+                var latest = (try readLatestPointer(
+                    self,
+                    alloc,
+                    self.workspace_root,
+                )) orelse {
+                    var discovered = self.latestResumableWorkspaceSummary(alloc) catch |err| switch (err) {
+                        error.NoSavedSessions => return null,
+                        else => return err,
+                    };
+                    defer discovered.deinit(alloc);
+                    break :blk try root.admitResumeView(alloc, discovered.id);
+                };
                 defer latest.deinit(alloc);
+                const pointer_resumable = self.sessionIdIsResumable(
+                    alloc,
+                    latest.session_id,
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => false,
+                };
+                if (!pointer_resumable) {
+                    var discovered = self.latestResumableWorkspaceSummary(alloc) catch |err| switch (err) {
+                        error.NoSavedSessions => return null,
+                        else => return err,
+                    };
+                    defer discovered.deinit(alloc);
+                    break :blk try root.admitResumeView(alloc, discovered.id);
+                }
                 break :blk try root.admitResumeView(
                     alloc,
                     latest.session_id,
@@ -1074,7 +1121,21 @@ pub const Store = struct {
             true,
             options,
         );
-        return self.finishResumedForWrite(alloc, rebound, options);
+        var finished = try self.finishResumedForWrite(alloc, rebound, options);
+        errdefer finished.deinit(alloc);
+        self.repairSelectedLatestPointer(
+            alloc,
+            finished.state,
+            finished.position,
+            options.log,
+        ) catch |err| {
+            debug_trace.logf(
+                "session",
+                "event=admitted_resume_latest_repair_failed err={s}",
+                .{@errorName(err)},
+            );
+        };
+        return finished;
     }
 
     fn finishResumedForWrite(
@@ -1191,7 +1252,44 @@ pub const Store = struct {
                     loaded.deinit(alloc);
                     return err;
                 };
-                if (still_matches) return loaded;
+                if (still_matches) {
+                    if (self.loadedSessionIsResumable(
+                        alloc,
+                        &loaded,
+                    ) catch false) return loaded;
+                    var preferred = self.latestResumableWorkspaceSummaryFor(
+                        alloc,
+                        workspace_root,
+                    ) catch return loaded;
+                    defer preferred.deinit(alloc);
+                    if (preferred.history_len == 0 or
+                        std.mem.eql(u8, preferred.id, loaded.active_id))
+                    {
+                        return loaded;
+                    }
+                    loaded.deinit(alloc);
+                    var recovered = try self.resumeExactForWrite(
+                        alloc,
+                        preferred.id,
+                        workspace_root,
+                        false,
+                        options,
+                    );
+                    errdefer recovered.deinit(alloc);
+                    self.repairSelectedLatestPointer(
+                        alloc,
+                        recovered.state,
+                        recovered.position,
+                        options.log,
+                    ) catch |err| {
+                        debug_trace.logf(
+                            "session",
+                            "event=latest_cache_repair_failed err={s}",
+                            .{@errorName(err)},
+                        );
+                    };
+                    return recovered;
+                }
             }
             loaded.deinit(alloc);
         }
@@ -1311,7 +1409,7 @@ pub const Store = struct {
             options,
         );
         errdefer loaded.deinit(alloc);
-        self.repairLatestPointer(
+        self.repairSelectedLatestPointer(
             alloc,
             loaded.state,
             loaded.position,
@@ -1729,6 +1827,65 @@ pub const Store = struct {
         );
     }
 
+    fn repairSelectedLatestPointer(
+        self: Store,
+        alloc: Allocator,
+        state: session_codec.DurableSessionState,
+        position: session_log.CommitPosition,
+        options: session_log.Options,
+    ) !void {
+        var current = (readLatestPointer(
+            self,
+            alloc,
+            state.workspace_root,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return self.repairLatestPointer(
+                alloc,
+                state,
+                position,
+                options,
+            ),
+        }) orelse return self.repairLatestPointer(
+            alloc,
+            state,
+            position,
+            options,
+        );
+        defer current.deinit(alloc);
+        if (std.mem.eql(u8, current.session_id, state.id)) {
+            return self.repairLatestPointer(
+                alloc,
+                state,
+                position,
+                options,
+            );
+        }
+        const current_resumable = self.sessionIdIsResumable(
+            alloc,
+            current.session_id,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => false,
+        };
+        if (current_resumable) {
+            return self.repairLatestPointer(
+                alloc,
+                state,
+                position,
+                options,
+            );
+        }
+        return self.publishRecoveredLatestPointer(
+            alloc,
+            state,
+            position,
+            current.session_id,
+            options,
+            true,
+        );
+    }
+
     fn publishRecoveredLatestPointer(
         self: Store,
         alloc: Allocator,
@@ -1736,6 +1893,7 @@ pub const Store = struct {
         position: session_log.CommitPosition,
         source_session_id: []const u8,
         options: session_log.Options,
+        resumable_baseline_only: bool,
     ) !void {
         const sessions = &(self.canonical_root.sessions orelse
             return error.SessionStoreUnavailable);
@@ -1747,14 +1905,19 @@ pub const Store = struct {
             try options.test_controls.boundary(
                 .after_recovery_latest_snapshot,
             );
-            var discovered_latest: ?SessionSummary =
+            var discovered_latest: ?SessionSummary = (if (resumable_baseline_only)
+                self.latestResumableWorkspaceSummaryFor(
+                    alloc,
+                    state.workspace_root,
+                )
+            else
                 self.latestReadOnlyWorkspaceSummaryFor(
                     alloc,
                     state.workspace_root,
-                ) catch |err| switch (err) {
-                    error.NoSavedSessions => null,
-                    else => return err,
-                };
+                )) catch |err| switch (err) {
+                error.NoSavedSessions => null,
+                else => return err,
+            };
             defer if (discovered_latest) |*summary| summary.deinit(alloc);
             self.publishLatestPointer(
                 alloc,
@@ -1829,8 +1992,18 @@ pub const Store = struct {
                     self.sessions_dir,
                     session_id,
                 );
+                var summary = try summaryFromState(alloc, state);
+                errdefer summary.deinit(alloc);
+                summary.has_durable_activity = if (state.history.len != 0)
+                    true
+                else
+                    try self.sessionHasDurableActivityConservative(
+                        alloc,
+                        session_id,
+                        options.log,
+                    );
                 return .{
-                    .summary = try summaryFromState(alloc, state),
+                    .summary = summary,
                     .state = state,
                     .storage_format = .schema_v3,
                 };
@@ -2254,7 +2427,7 @@ pub const Store = struct {
                 .workspace_root = workspace_root,
                 .continuation = continuation,
                 .limit = limit,
-                .resumable_only = false,
+                .resumable_only = true,
             }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => null,
@@ -2273,7 +2446,7 @@ pub const Store = struct {
             }
         }
 
-        var scan = self.scanSessionSummariesWithDiagnostics(alloc, .read_only_list, false) catch |err| switch (err) {
+        var scan = self.scanSessionSummariesWithDiagnostics(alloc, .read_only_list, true) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.SessionStoreUnavailable,
         };
@@ -2710,10 +2883,37 @@ pub const Store = struct {
         );
     }
 
+    pub fn latestResumableWorkspaceSummary(
+        self: Store,
+        alloc: Allocator,
+    ) !SessionSummary {
+        return self.latestResumableWorkspaceSummaryFor(
+            alloc,
+            self.workspace_root,
+        );
+    }
+
     fn latestReadOnlyWorkspaceSummaryFor(
         self: Store,
         alloc: Allocator,
         workspace_root: []const u8,
+    ) !SessionSummary {
+        return self.latestWorkspaceSummaryFor(alloc, workspace_root, false);
+    }
+
+    fn latestResumableWorkspaceSummaryFor(
+        self: Store,
+        alloc: Allocator,
+        workspace_root: []const u8,
+    ) !SessionSummary {
+        return self.latestWorkspaceSummaryFor(alloc, workspace_root, true);
+    }
+
+    fn latestWorkspaceSummaryFor(
+        self: Store,
+        alloc: Allocator,
+        workspace_root: []const u8,
+        resumable_only: bool,
     ) !SessionSummary {
         var scan = try self.scanSessionSummariesWithDiagnostics(
             alloc,
@@ -2726,7 +2926,36 @@ pub const Store = struct {
             if (scan.skipped_invalid > 0) return error.NoReadableSessions;
             return error.NoSavedSessions;
         }
-        const latest = scan.summaries.orderedRemove(0);
+        var selected_index: usize = 0;
+        if (resumable_only) selection: {
+            for (scan.summaries.items, 0..) |summary, index| {
+                if (summary.history_len == 0) continue;
+                selected_index = index;
+                break :selection;
+            }
+            var pointer = readLatestPointer(
+                self,
+                alloc,
+                workspace_root,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => null,
+            };
+            defer if (pointer) |*value| value.deinit(alloc);
+            if (pointer) |value| {
+                for (scan.summaries.items, 0..) |summary, index| {
+                    if (!std.mem.eql(u8, summary.id, value.session_id)) continue;
+                    selected_index = index;
+                    break :selection;
+                }
+            }
+            for (scan.summaries.items, 0..) |summary, index| {
+                if (!summaryIsResumable(summary)) continue;
+                selected_index = index;
+                break :selection;
+            }
+        }
+        const latest = scan.summaries.orderedRemove(selected_index);
         for (scan.summaries.items) |*summary| summary.deinit(alloc);
         return latest;
     }
@@ -2828,7 +3057,11 @@ pub const Store = struct {
                             candidate.deinit(alloc);
                             return error.OutOfMemory;
                         },
-                        else => false,
+                        error.FileNotFound => false,
+                        // Legacy fixtures and snapshots predate the private
+                        // managed-child layout. Preserve their historical
+                        // history-based classification on capability errors.
+                        else => candidate.storage == .schema_v3,
                     };
             }
             logDiscovery(
@@ -3246,6 +3479,94 @@ pub const Store = struct {
         return loaded;
     }
 
+    fn sessionHasManagedChildrenConservative(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+    ) !bool {
+        return self.sessionHasManagedChildren(alloc, session_id) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.FileNotFound => false,
+            // An unreadable child index cannot prove that a zero-turn parent is
+            // disposable. Retain it until doctor can classify the payload.
+            else => true,
+        };
+    }
+
+    fn sessionHasDurableActivityConservative(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+        options: session_log.Options,
+    ) !bool {
+        var root = self.canonical_root;
+        var boundary = root.captureReadBoundary(
+            alloc,
+            session_id,
+            options,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // A boundary that cannot be classified is not safe to hide as an
+            // empty orphan. The normal resume path will surface its error.
+            else => return true,
+        };
+        defer boundary.deinit();
+        return boundary.position.through_seq > 1;
+    }
+
+    fn candidateHasManagedChildren(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+        history_len: usize,
+        storage: CandidateStorage,
+    ) !bool {
+        if (history_len != 0) return false;
+        if (storage != .schema_v3) {
+            return self.sessionHasManagedChildren(alloc, session_id) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => false,
+            };
+        }
+        return self.sessionHasManagedChildrenConservative(alloc, session_id);
+    }
+
+    fn loadedSessionIsResumable(
+        self: Store,
+        alloc: Allocator,
+        loaded: *const LoadedWritableSession,
+    ) !bool {
+        if (loaded.state.history.len != 0 or loaded.position.through_seq > 1) {
+            return true;
+        }
+        return self.sessionHasManagedChildrenConservative(
+            alloc,
+            loaded.active_id,
+        );
+    }
+
+    fn sessionIdIsResumable(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+    ) !bool {
+        var session_dir = try self.openSessionDir(session_id);
+        defer session_dir.close();
+        var candidate = try classifyReadOnlyCandidate(
+            alloc,
+            &session_dir,
+            session_id,
+        );
+        defer candidate.deinit(alloc);
+        if (summaryIsResumable(candidate.summary)) return true;
+        if (candidate.projection_state == .stale) {
+            var detail = try self.loadReadOnlyDetail(alloc, session_id, .{});
+            defer detail.deinit(alloc);
+            if (summaryIsResumable(detail.summary)) return true;
+        }
+        return self.sessionHasManagedChildrenConservative(alloc, session_id);
+    }
+
     fn selectWritableLastId(
         self: Store,
         alloc: Allocator,
@@ -3256,9 +3577,20 @@ pub const Store = struct {
         if (self.canonical_root.sessions == null) return null;
         var replay_scope = self.loadDeferredReplayScope(alloc);
         defer replay_scope.deinit(alloc);
+        var preferred_empty = readLatestPointer(
+            self,
+            alloc,
+            workspace_root,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+        defer if (preferred_empty) |*pointer| pointer.deinit(alloc);
 
         var selected: ?WritableCandidate = null;
         defer if (selected) |*candidate| candidate.deinit(alloc);
+        var zero_turn_fallback: ?WritableCandidate = null;
+        defer if (zero_turn_fallback) |*candidate| candidate.deinit(alloc);
         var iter = self.canonical_root.sessions.?.dir.iterate();
         while (try iter.next(io_mod.getIo())) |entry| {
             if (entry.kind != .directory) continue;
@@ -3307,6 +3639,19 @@ pub const Store = struct {
                     state.id,
                     state.workspace_root,
                     state.updated_at_ms,
+                    state.history.len,
+                    state.history.len != 0 or
+                        try self.sessionHasDurableActivityConservative(
+                            alloc,
+                            state.id,
+                            options.log,
+                        ),
+                    try self.candidateHasManagedChildren(
+                        alloc,
+                        state.id,
+                        state.history.len,
+                        .schema_v3,
+                    ),
                     .schema_v3,
                     .current,
                 );
@@ -3322,6 +3667,39 @@ pub const Store = struct {
                     null,
                 );
                 candidate.deinit(alloc);
+                continue;
+            }
+            if (candidate.history_len == 0) {
+                const resumable = candidate.isResumable();
+                logDiscovery(
+                    .workspace_writable_last,
+                    candidate.id,
+                    candidate.storage,
+                    candidate.projection_state,
+                    if (resumable) .listable else .empty_session,
+                    .retained,
+                    null,
+                );
+                const candidate_is_preferred = if (preferred_empty) |pointer|
+                    std.mem.eql(u8, candidate.id, pointer.session_id)
+                else
+                    false;
+                const fallback_is_preferred = if (preferred_empty) |pointer|
+                    if (zero_turn_fallback) |fallback|
+                        std.mem.eql(u8, fallback.id, pointer.session_id)
+                    else
+                        false
+                else
+                    false;
+                if (zero_turn_fallback == null or candidate_is_preferred or
+                    (!fallback_is_preferred and
+                        writableCandidateNewer(candidate, zero_turn_fallback.?)))
+                {
+                    if (zero_turn_fallback) |*old| old.deinit(alloc);
+                    zero_turn_fallback = candidate;
+                } else {
+                    candidate.deinit(alloc);
+                }
                 continue;
             }
             logDiscovery(
@@ -3352,6 +3730,18 @@ pub const Store = struct {
             );
             return try alloc.dupe(u8, candidate.id);
         }
+        if (zero_turn_fallback) |candidate| {
+            logDiscovery(
+                .workspace_writable_last,
+                candidate.id,
+                candidate.storage,
+                candidate.projection_state,
+                if (candidate.isResumable()) .listable else .empty_session,
+                .selected,
+                null,
+            );
+            return try alloc.dupe(u8, candidate.id);
+        }
         return null;
     }
 
@@ -3377,6 +3767,14 @@ pub const Store = struct {
                     candidate.summary.id,
                     candidate.summary.workspace_root orelse self.workspace_root,
                     candidate.summary.updated_at_ms,
+                    candidate.summary.history_len,
+                    candidate.summary.has_durable_activity,
+                    try self.candidateHasManagedChildren(
+                        alloc,
+                        candidate.summary.id,
+                        candidate.summary.history_len,
+                        candidate.storage,
+                    ),
                     candidate.storage,
                     .current,
                 );
@@ -3397,6 +3795,14 @@ pub const Store = struct {
                             candidate.summary.id,
                             candidate.summary.workspace_root.?,
                             candidate.summary.updated_at_ms,
+                            candidate.summary.history_len,
+                            candidate.summary.has_durable_activity,
+                            try self.candidateHasManagedChildren(
+                                alloc,
+                                candidate.summary.id,
+                                candidate.summary.history_len,
+                                .schema_v3,
+                            ),
                             .schema_v3,
                             .current,
                         );
@@ -3428,6 +3834,14 @@ pub const Store = struct {
                         candidate.summary.id,
                         candidate.summary.workspace_root.?,
                         candidate.summary.updated_at_ms,
+                        candidate.summary.history_len,
+                        candidate.summary.has_durable_activity,
+                        try self.candidateHasManagedChildren(
+                            alloc,
+                            candidate.summary.id,
+                            candidate.summary.history_len,
+                            .schema_v3,
+                        ),
                         .schema_v3,
                         .stale,
                     );
@@ -3438,6 +3852,19 @@ pub const Store = struct {
                     state.id,
                     state.workspace_root,
                     state.updated_at_ms,
+                    state.history.len,
+                    state.history.len != 0 or
+                        try self.sessionHasDurableActivityConservative(
+                            alloc,
+                            state.id,
+                            options.log,
+                        ),
+                    try self.candidateHasManagedChildren(
+                        alloc,
+                        state.id,
+                        state.history.len,
+                        .schema_v3,
+                    ),
                     .schema_v3,
                     .stale,
                 );
@@ -4072,6 +4499,7 @@ pub const Store = struct {
             target.position,
             source_id,
             options,
+            false,
         ) catch |err| {
             debug_trace.logf(
                 "session",
@@ -5232,6 +5660,20 @@ fn writeSummaryFixture(
     alloc.free(path);
 }
 
+fn writePristineSummaryFixture(
+    alloc: Allocator,
+    store: Store,
+    id: []const u8,
+    workspace_root: []const u8,
+    updated_at_ms: i64,
+) !void {
+    var state = try testDurableState(alloc, id, workspace_root);
+    defer state.deinit(alloc);
+    state.updated_at_ms = updated_at_ms;
+    var writer = try store.startWritableSession(alloc, state);
+    writer.deinit(alloc);
+}
+
 fn writeWritableHistoryFixture(
     alloc: Allocator,
     store: Store,
@@ -6313,6 +6755,42 @@ test "discarding a pristine started session permits usage checkpoints" {
     );
 }
 
+test "pristine discard retains a zero-turn parent with managed children" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    var state = try testDurableState(alloc, "managed-parent", ctx.workspace);
+    defer state.deinit(alloc);
+    var writable = try ctx.store.startWritableSession(alloc, state);
+    {
+        const header_bytes = try relationship_index_codec.encodeHeader(alloc, .{
+            .high_watermark = 1,
+            .active_count = 1,
+        });
+        defer alloc.free(header_bytes);
+        var capability = try writable.childCapability();
+        var header_file = try capability.createExclusiveFile(
+            alloc,
+            .subagent_control,
+            session_child_store.subagent_relationship_index_file,
+        );
+        defer header_file.deinit();
+        try header_file.writeAll(header_bytes);
+        try header_file.sync();
+    }
+
+    try std.testing.expectEqual(
+        PristineDiscardDisposition.retained,
+        ctx.store.discardPristineStartedSession(alloc, &writable),
+    );
+    var retained = try ctx.store.loadReadOnly(alloc, state.id);
+    defer retained.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), retained.history.len);
+}
+
 test "pristine discard retains active recovery and permits cleared recovery" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -6417,6 +6895,92 @@ test "pristine discard repairs latest and index to the completed predecessor" {
     defer freeSummaries(alloc, &rebuilt_index);
     try std.testing.expectEqual(@as(usize, 1), rebuilt_index.items.len);
     try std.testing.expectEqualStrings("discard-predecessor", rebuilt_index.items[0].id);
+}
+
+test "resume last skips a newer zero-turn orphan and repairs the canonical pointer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    try writeWritableHistoryFixture(
+        alloc,
+        ctx.store,
+        "canonical-predecessor",
+        ctx.workspace,
+        20,
+        "saved prompt",
+    );
+    var empty_state = try testDurableState(
+        alloc,
+        "newer-zero-turn-orphan",
+        ctx.workspace,
+    );
+    defer empty_state.deinit(alloc);
+    empty_state.updated_at_ms = 30;
+    var empty = try ctx.store.startWritableSession(alloc, empty_state);
+    empty.deinit(alloc);
+
+    var stale_latest = try readLatestPointer(ctx.store, alloc, ctx.workspace) orelse
+        return error.TestExpectedEqual;
+    defer stale_latest.deinit(alloc);
+    try std.testing.expectEqualStrings(empty_state.id, stale_latest.session_id);
+
+    try std.testing.expect(!try ctx.store.sessionHasManagedChildren(
+        alloc,
+        empty_state.id,
+    ));
+    var exact_empty = try ctx.store.resumeExactForWrite(
+        alloc,
+        empty_state.id,
+        ctx.workspace,
+        false,
+        .{},
+    );
+    try std.testing.expectEqual(@as(u64, 1), exact_empty.position.through_seq);
+    try std.testing.expect(!try ctx.store.loadedSessionIsResumable(
+        alloc,
+        &exact_empty,
+    ));
+    exact_empty.deinit(alloc);
+    var empty_candidate = try ctx.store.resolveWritableCandidate(
+        alloc,
+        empty_state.id,
+        ctx.workspace,
+        .{},
+    );
+    defer empty_candidate.deinit(alloc);
+    try std.testing.expect(!empty_candidate.isResumable());
+    const selected = (try ctx.store.selectWritableLastId(
+        alloc,
+        ctx.workspace,
+        .{},
+    )) orelse return error.TestExpectedEqual;
+    defer alloc.free(selected);
+    try std.testing.expectEqualStrings("canonical-predecessor", selected);
+
+    var visible = try ctx.store.listWorkspacePage(alloc, null, 10);
+    defer visible.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), visible.summaries.items.len);
+    try std.testing.expectEqualStrings(
+        "canonical-predecessor",
+        visible.summaries.items[0].id,
+    );
+
+    var resumed = try ctx.store.resumeTargetForWrite(
+        alloc,
+        .last,
+        ctx.workspace,
+        .{},
+    );
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualStrings("canonical-predecessor", resumed.state.id);
+
+    var repaired = try readLatestPointer(ctx.store, alloc, ctx.workspace) orelse
+        return error.TestExpectedEqual;
+    defer repaired.deinit(alloc);
+    try std.testing.expectEqualStrings("canonical-predecessor", repaired.session_id);
 }
 
 test "pristine discard refuses resumed and committed writers" {
@@ -11107,7 +11671,7 @@ test "workspace latest ignores newer sessions from other workspaces" {
     try std.testing.expectEqualStrings("workspace-b-newest", latest_b.id);
 }
 
-test "workspace session pages prefer the bounded index and include empty sessions" {
+test "workspace session pages prefer the bounded index and exclude empty sessions" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -11115,7 +11679,8 @@ test "workspace session pages prefer the bounded index and include empty session
     defer ctx.deinit(alloc);
 
     const other_workspace = "/tmp/other-workspace";
-    const summaries = [_]SessionSummary{
+    var summaries = [_]SessionSummary{
+        testIndexedSessionSummary("session-006-empty", ctx.workspace, 60),
         testIndexedSessionSummary("session-005", ctx.workspace, 50),
         testIndexedSessionSummary("other-004", other_workspace, 45),
         testIndexedSessionSummary("session-004", ctx.workspace, 40),
@@ -11123,6 +11688,7 @@ test "workspace session pages prefer the bounded index and include empty session
         testIndexedSessionSummary("session-002", ctx.workspace, 20),
         testIndexedSessionSummary("session-001", ctx.workspace, 10),
     };
+    for (summaries[1..]) |*summary| summary.history_len = 1;
     var sessions = ctx.store.canonical_root.sessions orelse
         return error.TestExpectedEqual;
     try summary_codec.writeSessionIndex(alloc, &sessions, &summaries);
@@ -11133,7 +11699,7 @@ test "workspace session pages prefer the bounded index and include empty session
     try std.testing.expect(first.has_more);
     try std.testing.expectEqualStrings("session-005", first.summaries.items[0].id);
     try std.testing.expectEqualStrings("session-004", first.summaries.items[1].id);
-    try std.testing.expectEqual(@as(usize, 0), first.summaries.items[0].history_len);
+    try std.testing.expectEqual(@as(usize, 1), first.summaries.items[0].history_len);
 
     var profile = try ctx.store.listSessionPage(alloc, .all_workspaces, null, 3);
     defer profile.deinit(alloc);
@@ -11205,7 +11771,6 @@ test "resumable session pages filter before paging and preserve continuation ord
         .{ "tie-a", 1000, 1 },
         .{ "tie-b", 1000, 1 },
         .{ "current", 2000, 1 },
-        .{ "empty", 1500, 0 },
     }) |fixture| {
         const body = try std.fmt.allocPrint(
             alloc,
@@ -11216,6 +11781,7 @@ test "resumable session pages filter before paging and preserve continuation ord
         const path = try writeSessionFixture(alloc, ctx.store, fixture[0], body);
         defer alloc.free(path);
     }
+    try writePristineSummaryFixture(alloc, ctx.store, "empty", "/tmp/ws", 1500);
 
     var first = try ctx.store.listResumablePage(alloc, "current", null);
     defer first.deinit(alloc);
@@ -11272,7 +11838,7 @@ test "workspace resumable pages filter workspace before paging and preserve cont
         try writeSummaryFixture(alloc, ctx.store, id, ctx.workspace, 100 + @as(i64, @intCast(index)), 1);
     }
     try writeSummaryFixture(alloc, ctx.store, "workspace-a-current", ctx.workspace, 2000, 1);
-    try writeSummaryFixture(alloc, ctx.store, "workspace-a-empty", ctx.workspace, 1500, 0);
+    try writePristineSummaryFixture(alloc, ctx.store, "workspace-a-empty", ctx.workspace, 1500);
     try writeSummaryFixture(alloc, ctx.store, "missing-workspace", null, 1600, 1);
 
     var first = try ctx.store.listResumableWorkspacePage(alloc, "workspace-a-current", null);
@@ -11885,7 +12451,7 @@ test "invalid/corrupt record skipping" {
     inline for (.{
         .{ "broken", "{\"schema_version\":1," },
         .{ "unsupported", "{\"schema_version\":99,\"id\":\"unsupported\",\"created_at_ms\":1,\"updated_at_ms\":8,\"workspace_root\":\"/tmp/ws\",\"conversation_language\":\"en\",\"history_len\":0,\"history\":[]}" },
-        .{ "valid", "{\"schema_version\":1,\"id\":\"valid\",\"created_at_ms\":3,\"updated_at_ms\":9,\"workspace_root\":\"/tmp/ws\",\"conversation_language\":\"es\",\"history_len\":0,\"history\":[]}" },
+        .{ "valid", "{\"schema_version\":1,\"id\":\"valid\",\"created_at_ms\":3,\"updated_at_ms\":9,\"workspace_root\":\"/tmp/ws\",\"conversation_language\":\"es\",\"history_len\":1,\"history\":[{\"role\":\"user\",\"content\":\"saved\"}]}" },
     }) |fixture| {
         const path = try writeSessionFixture(alloc, ctx.store, fixture[0], fixture[1]);
         alloc.free(path);
