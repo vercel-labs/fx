@@ -105,7 +105,7 @@ const terminal_shell_schema = gateway_schema.ObjectSchema{
 const terminal_return_schema = gateway_schema.ObjectSchema{
     .properties = &.{
         .{ .name = "kind", .json_type = .string, .shape = &.{ .enum_values = &.{ "started", "exit", "quiet", "match" } }, .description = "started is for start readiness; exit waits for session exit; quiet requires duration_ms; match requires pattern. output_contains is a monitor condition, not a return kind." },
-        .{ .name = "duration_ms", .json_type = .integer, .minimum = 1, .description = "Required for quiet." },
+        .{ .name = "duration_ms", .json_type = .integer, .bounds = &.{ .minimum = 1 }, .description = "Required for quiet." },
         .{ .name = "pattern", .json_type = .string, .description = "Required for match." },
     },
     .required = &.{"kind"},
@@ -114,8 +114,8 @@ const terminal_return_schema = gateway_schema.ObjectSchema{
 
 const terminal_dimensions_schema = gateway_schema.ObjectSchema{
     .properties = &.{
-        .{ .name = "rows", .json_type = .integer, .minimum = 1, .maximum = 4096 },
-        .{ .name = "columns", .json_type = .integer, .minimum = 1, .maximum = 4096 },
+        .{ .name = "rows", .json_type = .integer, .bounds = &.{ .minimum = 1, .maximum = 4096 } },
+        .{ .name = "columns", .json_type = .integer, .bounds = &.{ .minimum = 1, .maximum = 4096 } },
     },
     .required = &.{ "rows", "columns" },
     .additional_properties = false,
@@ -125,11 +125,11 @@ const terminal_monitor_condition_schema = gateway_schema.ObjectSchema{
     .properties = &.{
         .{ .name = "kind", .json_type = .string, .shape = &.{ .enum_values = &.{ "process_exit", "exit_code", "signal", "output_contains", "output_matches", "output_quiet", "screen_matches", "tcp_ready", "http_ready", "path_exists", "path_changed", "path_size", "custom_probe" } } },
         .{ .name = "pattern", .json_type = .string, .description = "Output/screen pattern or HTTP URL, according to kind." },
-        .{ .name = "duration_ms", .json_type = .integer, .minimum = @intCast(terminal_monitor.minimum_schedule_ms), .maximum = @intCast(terminal_monitor.maximum_schedule_ms), .description = "Required for output_quiet." },
+        .{ .name = "duration_ms", .json_type = .integer, .bounds = &.{ .minimum = @intCast(terminal_monitor.minimum_schedule_ms), .maximum = @intCast(terminal_monitor.maximum_schedule_ms) }, .description = "Required for output_quiet." },
         .{ .name = "exit_code", .json_type = .integer },
         .{ .name = "signal", .json_type = .string, .shape = &.{ .enum_values = &.{ "hangup", "interrupt", "quit", "terminate", "kill" } } },
         .{ .name = "host", .json_type = .string },
-        .{ .name = "port", .json_type = .integer, .minimum = 1, .maximum = 65535 },
+        .{ .name = "port", .json_type = .integer, .bounds = &.{ .minimum = 1, .maximum = 65535 } },
         .{ .name = "path", .json_type = .string, .description = "Required for path conditions. The path must resolve within the terminal workspace; external paths are rejected." },
         .{ .name = "minimum_bytes", .json_type = .integer },
         .{ .name = "command", .json_type = .string },
@@ -142,8 +142,8 @@ const terminal_monitor_condition_schema = gateway_schema.ObjectSchema{
 const terminal_monitor_notify_schema = gateway_schema.ObjectSchema{
     .properties = &.{
         .{ .name = "kind", .json_type = .string, .shape = &.{ .enum_values = &.{ "on_match", "on_state_change", "on_exit", "every_check", "every_n_checks", "interval" } } },
-        .{ .name = "count", .json_type = .integer, .minimum = 1 },
-        .{ .name = "interval_ms", .json_type = .integer, .minimum = @intCast(terminal_monitor.minimum_schedule_ms), .maximum = @intCast(terminal_monitor.maximum_schedule_ms) },
+        .{ .name = "count", .json_type = .integer, .bounds = &.{ .minimum = 1 } },
+        .{ .name = "interval_ms", .json_type = .integer, .bounds = &.{ .minimum = @intCast(terminal_monitor.minimum_schedule_ms), .maximum = @intCast(terminal_monitor.maximum_schedule_ms) } },
     },
     .required = &.{"kind"},
     .additional_properties = false,
@@ -152,7 +152,7 @@ const terminal_monitor_notify_schema = gateway_schema.ObjectSchema{
 const terminal_monitor_lifetime_schema = gateway_schema.ObjectSchema{
     .properties = &.{
         .{ .name = "kind", .json_type = .string, .shape = &.{ .enum_values = &.{ "until_match", "until_session_end", "duration" } } },
-        .{ .name = "duration_ms", .json_type = .integer, .minimum = 1, .maximum = @intCast(terminal_monitor.maximum_lifetime_ms) },
+        .{ .name = "duration_ms", .json_type = .integer, .bounds = &.{ .minimum = 1, .maximum = @intCast(terminal_monitor.maximum_lifetime_ms) } },
     },
     .required = &.{"kind"},
     .additional_properties = false,
@@ -161,7 +161,7 @@ const terminal_monitor_lifetime_schema = gateway_schema.ObjectSchema{
 const terminal_monitor_definition_schema = gateway_schema.ObjectSchema{
     .properties = &.{
         .{ .name = "condition", .json_type = .object, .shape = &.{ .object = &terminal_monitor_condition_schema } },
-        .{ .name = "check_interval_ms", .json_type = .integer, .minimum = @intCast(terminal_monitor.minimum_schedule_ms), .maximum = @intCast(terminal_monitor.maximum_schedule_ms), .description = "Required for polling conditions tcp_ready, http_ready, path_exists, path_changed, path_size, and custom_probe. Event-driven conditions process_exit, exit_code, signal, output_contains, output_matches, output_quiet, and screen_matches omit it; materialized values are ignored." },
+        .{ .name = "check_interval_ms", .json_type = .integer, .bounds = &.{ .minimum = @intCast(terminal_monitor.minimum_schedule_ms), .maximum = @intCast(terminal_monitor.maximum_schedule_ms) }, .description = "Required for polling conditions tcp_ready, http_ready, path_exists, path_changed, path_size, and custom_probe. Event-driven conditions process_exit, exit_code, signal, output_contains, output_matches, output_quiet, and screen_matches omit it; materialized values are ignored." },
         .{ .name = "notify", .json_type = .object, .shape = &.{ .object = &terminal_monitor_notify_schema } },
         .{ .name = "lifetime", .json_type = .object, .shape = &.{ .object = &terminal_monitor_lifetime_schema } },
     },
@@ -193,26 +193,26 @@ const terminal_write_schema = gateway_schema.ObjectSchema{
 const terminal_properties = [_]gateway_schema.Property{
     .{ .name = "session_id", .json_type = .string, .description = "Required for session-targeted actions. Set null for start and list; owner-catalog authority is private." },
     .{ .name = "cwd", .json_type = .string, .description = "Working directory for exec or start; defaults to the workspace." },
-    .{ .name = "command", .json_type = .string, .max_length = terminal_contracts.max_command_bytes, .description = "Command for exec, or optional command for start; omit on start for an interactive shell." },
+    .{ .name = "command", .json_type = .string, .bounds = &.{ .max_length = terminal_contracts.max_command_bytes }, .description = "Command for exec, or optional command for start; omit on start for an interactive shell." },
     .{ .name = "profile", .json_type = .string, .shape = &.{ .enum_values = &.{ "clean", "user" } }, .description = "Startup profile for exec or start; omission defaults to user, while clean skips user startup files. User-profile execution supports the configured Bash or zsh login shell. Bash login execution reads login startup files; .bashrc is available only when sourced by the login profile. For start, an explicit shell is used instead of the default profile and is mutually exclusive with profile." },
     .{ .name = "shell", .json_type = .object, .shape = &.{ .object = &terminal_shell_schema } },
     .{ .name = "backend", .json_type = .string, .shape = &.{ .enum_values = &.{ "native", "tmux" } }, .description = "Start backend or optional list filter." },
     .{ .name = "return_when", .json_type = .object, .shape = &.{ .object = &terminal_return_schema }, .description = "Only for start or wait; required for every wait. After a signal intended to stop the session, use kind exit. For output matching, use kind match with pattern; output_contains is monitor-only." },
-    .{ .name = "wait_ceiling_ms", .json_type = .integer, .minimum = 1, .description = "Required for wait; required for start when return_when is non-immediate; maximum blocking time in milliseconds." },
+    .{ .name = "wait_ceiling_ms", .json_type = .integer, .bounds = &.{ .minimum = 1 }, .description = "Required for wait; required for start when return_when is non-immediate; maximum blocking time in milliseconds." },
     .{ .name = "dimensions", .json_type = .object, .shape = &.{ .object = &terminal_dimensions_schema } },
-    .{ .name = "initial_monitors", .json_type = .array, .max_items = 32, .shape = &.{ .array_objects = &terminal_monitor_definition_schema } },
-    .{ .name = "cursor_segment", .json_type = .integer, .minimum = 1, .description = "Only for read and required for every read. For a new session's first read, use segment 1 with cursor_offset 0; otherwise use unread_range.start or raw_gap.available_from from the latest session facts. Continue from the previous raw_range.end." },
+    .{ .name = "initial_monitors", .json_type = .array, .bounds = &.{ .max_items = 32 }, .shape = &.{ .array_objects = &terminal_monitor_definition_schema } },
+    .{ .name = "cursor_segment", .json_type = .integer, .bounds = &.{ .minimum = 1 }, .description = "Only for read and required for every read. For a new session's first read, use segment 1 with cursor_offset 0; otherwise use unread_range.start or raw_gap.available_from from the latest session facts. Continue from the previous raw_range.end." },
     .{ .name = "cursor_offset", .json_type = .integer, .description = "Only for read. Use 0 with segment 1 for a new session's first read, then continue from the previous raw_range.end offset." },
     .{ .name = "after_event_id", .json_type = .integer },
-    .{ .name = "acknowledge_event_id", .json_type = .integer, .minimum = 1 },
-    .{ .name = "max_events", .json_type = .integer, .minimum = 1, .maximum = 256 },
+    .{ .name = "acknowledge_event_id", .json_type = .integer, .bounds = &.{ .minimum = 1 } },
+    .{ .name = "max_events", .json_type = .integer, .bounds = &.{ .minimum = 1, .maximum = 256 } },
     .{ .name = "write", .json_type = .object, .shape = &.{ .object = &terminal_write_schema }, .description = "Payload is valid only with lease=use. Set null for acquire, release, and revoke." },
     .{ .name = "lease", .json_type = .string, .shape = &.{ .enum_values = &.{ "acquire", "use", "release", "revoke" } }, .description = "Use lease=acquire without write, then send a second call with lease=use and the payload. Release and revoke also require write=null." },
     .{ .name = "monitor", .json_type = .object, .shape = &.{ .object = &terminal_monitor_operation_schema } },
     .{ .name = "task_id", .json_type = .string },
     .{ .name = "workspace_root", .json_type = .string },
-    .{ .name = "rows", .json_type = .integer, .minimum = 1, .maximum = 4096 },
-    .{ .name = "columns", .json_type = .integer, .minimum = 1, .maximum = 4096 },
+    .{ .name = "rows", .json_type = .integer, .bounds = &.{ .minimum = 1, .maximum = 4096 } },
+    .{ .name = "columns", .json_type = .integer, .bounds = &.{ .minimum = 1, .maximum = 4096 } },
     .{ .name = "signal", .json_type = .string, .shape = &.{ .enum_values = &.{ "hangup", "interrupt", "quit", "terminate", "kill" } } },
     .{ .name = "close_policy", .json_type = .string, .shape = &.{ .enum_values = &.{ "graceful", "force" } }, .description = "Only for close and required for close. Close is final; read or inspect all needed output before closing." },
 };
@@ -226,8 +226,9 @@ fn terminalNullableDescription(comptime description: []const u8) []const u8 {
 
 fn terminalNullableProperty(comptime property: gateway_schema.Property) gateway_schema.Property {
     var result = property;
-    result.nullable = true;
-    result.nullable_description = terminalNullableDescription(property.description);
+    result.nullable = &.{
+        .description = terminalNullableDescription(property.description),
+    };
     return result;
 }
 
@@ -367,7 +368,7 @@ const ask_user_question_option_schema = gateway_schema.ObjectSchema{
 const ask_user_question_question_schema = gateway_schema.ObjectSchema{
     .properties = &.{
         .{ .name = "question", .json_type = .string, .description = "Specific blocking decision shown to the user; do not ask for facts tools can inspect." },
-        .{ .name = "options", .json_type = .array, .min_items = 2, .max_items = 6, .shape = &.{ .array_objects = &ask_user_question_option_schema } },
+        .{ .name = "options", .json_type = .array, .bounds = &.{ .min_items = 2, .max_items = 6 }, .shape = &.{ .array_objects = &ask_user_question_option_schema } },
     },
     .required = &.{ "question", "options" },
 };
@@ -387,21 +388,21 @@ const subagent_terminal_schema = gateway_schema.ObjectSchema{
 const subagent_notifications_schema = gateway_schema.ObjectSchema{
     .properties = &.{
         .{ .name = "terminal", .json_type = .object, .shape = &.{ .object = &subagent_terminal_schema } },
-        .{ .name = "milestones", .json_type = .array, .max_items = subagent_domain.max_milestones, .shape = &.{ .array_values = .{ .json_type = .string } } },
-        .{ .name = "report_interval_ms", .json_type = .integer, .minimum = 1 },
-        .{ .name = "report_duration_ms", .json_type = .integer, .minimum = 1 },
-        .{ .name = "stop_conditions", .json_type = .array, .max_items = subagent_domain.max_stop_conditions, .shape = &.{ .array_values = .{ .json_type = .string, .enum_values = &.{ "terminal", "duration_elapsed" } } } },
+        .{ .name = "milestones", .json_type = .array, .bounds = &.{ .max_items = subagent_domain.max_milestones }, .shape = &.{ .array_values = .{ .json_type = .string } } },
+        .{ .name = "report_interval_ms", .json_type = .integer, .bounds = &.{ .minimum = 1 } },
+        .{ .name = "report_duration_ms", .json_type = .integer, .bounds = &.{ .minimum = 1 } },
+        .{ .name = "stop_conditions", .json_type = .array, .bounds = &.{ .max_items = subagent_domain.max_stop_conditions }, .shape = &.{ .array_values = .{ .json_type = .string, .enum_values = &.{ "terminal", "duration_elapsed" } } } },
     },
     .additional_properties = false,
 };
 
 const subagent_create_schema = gateway_schema.ObjectSchema{
     .properties = &.{
-        .{ .name = "name", .json_type = .string, .min_length = 1, .max_length = subagent_domain.max_name_bytes },
+        .{ .name = "name", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_name_bytes } },
         .{ .name = "mode", .json_type = .string, .shape = &.{ .enum_values = &.{ "one_off", "persistent" } } },
-        .{ .name = "prompt", .json_type = .string, .min_length = 1, .max_length = subagent_domain.max_prompt_bytes },
-        .{ .name = "model", .json_type = .string, .min_length = 1, .max_length = subagent_domain.max_model_bytes },
-        .{ .name = "effort", .json_type = .string, .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes },
+        .{ .name = "prompt", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_prompt_bytes } },
+        .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes } },
+        .{ .name = "effort", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes } },
         .{ .name = "permission_mode", .json_type = .string, .shape = &.{ .enum_values = &.{ "ask", "auto", "yolo" } }, .description = "Child permission mode. Inherits the caller when omitted and cannot exceed it." },
         .{ .name = "notifications", .json_type = .object, .shape = &.{ .object = &subagent_notifications_schema } },
     },
@@ -412,8 +413,8 @@ const subagent_create_schema = gateway_schema.ObjectSchema{
 const subagent_inspect_wait_schema = gateway_schema.ObjectSchema{
     .properties = &.{
         .{ .name = "until", .json_type = .string, .shape = &.{ .enum_values = &.{"settled"} }, .description = "Wait until a persistent child is idle or the child reaches another non-running terminal/recovery state." },
-        .{ .name = "after_generation", .json_type = .integer, .minimum = 0, .description = "Optional durable generation that must be exceeded before the wait can complete." },
-        .{ .name = "timeout_ms", .json_type = .integer, .minimum = 1, .maximum = subagent_domain.max_inspect_wait_ms, .description = "Bounded wait deadline in milliseconds. A timeout returns the latest inspection with status wait_timed_out." },
+        .{ .name = "after_generation", .json_type = .integer, .bounds = &.{ .minimum = 0 }, .description = "Optional durable generation that must be exceeded before the wait can complete." },
+        .{ .name = "timeout_ms", .json_type = .integer, .bounds = &.{ .minimum = 1, .maximum = subagent_domain.max_inspect_wait_ms }, .description = "Bounded wait deadline in milliseconds. A timeout returns the latest inspection with status wait_timed_out." },
     },
     .required = &.{ "until", "timeout_ms" },
     .additional_properties = false,
@@ -421,10 +422,10 @@ const subagent_inspect_wait_schema = gateway_schema.ObjectSchema{
 
 const subagent_inspect_schema = gateway_schema.ObjectSchema{
     .properties = &.{
-        .{ .name = "id", .json_type = .string, .min_length = 1 },
-        .{ .name = "sections", .json_type = .array, .min_items = 1, .max_items = 6, .shape = &.{ .array_values = .{ .json_type = .string, .enum_values = &.{ "status", "messages", "tool_activity", "events", "configuration", "relationship" } } } },
-        .{ .name = "cursor", .json_type = .string, .min_length = 1 },
-        .{ .name = "limit", .json_type = .integer, .minimum = 1, .maximum = subagent_domain.max_page_limit },
+        .{ .name = "id", .json_type = .string, .bounds = &.{ .min_length = 1 } },
+        .{ .name = "sections", .json_type = .array, .bounds = &.{ .min_items = 1, .max_items = 6 }, .shape = &.{ .array_values = .{ .json_type = .string, .enum_values = &.{ "status", "messages", "tool_activity", "events", "configuration", "relationship" } } } },
+        .{ .name = "cursor", .json_type = .string, .bounds = &.{ .min_length = 1 } },
+        .{ .name = "limit", .json_type = .integer, .bounds = &.{ .minimum = 1, .maximum = subagent_domain.max_page_limit } },
         .{ .name = "wait", .json_type = .object, .shape = &.{ .object = &subagent_inspect_wait_schema }, .description = "Optional condition-driven same-turn wait. Requires the status section and cannot be combined with a cursor." },
     },
     .required = &.{ "id", "sections" },
@@ -433,15 +434,15 @@ const subagent_inspect_schema = gateway_schema.ObjectSchema{
 
 const subagent_send_schema = gateway_schema.ObjectSchema{
     .properties = &.{
-        .{ .name = "id", .json_type = .string, .min_length = 1 },
-        .{ .name = "content", .json_type = .string, .min_length = 1, .max_length = subagent_domain.max_message_bytes },
+        .{ .name = "id", .json_type = .string, .bounds = &.{ .min_length = 1 } },
+        .{ .name = "content", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_message_bytes } },
     },
     .required = &.{ "id", "content" },
     .additional_properties = false,
 };
 
 const subagent_milestone_schema = gateway_schema.ObjectSchema{
-    .properties = &.{.{ .name = "name", .json_type = .string, .min_length = 1, .max_length = subagent_domain.max_name_bytes }},
+    .properties = &.{.{ .name = "name", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_name_bytes } }},
     .required = &.{"name"},
     .additional_properties = false,
 };
@@ -459,8 +460,8 @@ const subagent_message_schema = gateway_schema.ObjectSchema{
 const subagent_relationship_schema = gateway_schema.ObjectSchema{
     .properties = &.{
         .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "attach", "detach", "reparent" } } },
-        .{ .name = "id", .json_type = .string, .min_length = 1 },
-        .{ .name = "parent_id", .json_type = .string, .min_length = 1 },
+        .{ .name = "id", .json_type = .string, .bounds = &.{ .min_length = 1 } },
+        .{ .name = "parent_id", .json_type = .string, .bounds = &.{ .min_length = 1 } },
     },
     .required = &.{ "action", "id" },
     .additional_properties = false,
@@ -468,10 +469,10 @@ const subagent_relationship_schema = gateway_schema.ObjectSchema{
 
 const subagent_configure_schema = gateway_schema.ObjectSchema{
     .properties = &.{
-        .{ .name = "id", .json_type = .string, .min_length = 1 },
-        .{ .name = "name", .json_type = .string, .min_length = 1, .max_length = subagent_domain.max_name_bytes },
-        .{ .name = "model", .json_type = .string, .min_length = 1, .max_length = subagent_domain.max_model_bytes },
-        .{ .name = "effort", .json_type = .string, .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes },
+        .{ .name = "id", .json_type = .string, .bounds = &.{ .min_length = 1 } },
+        .{ .name = "name", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_name_bytes } },
+        .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes } },
+        .{ .name = "effort", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes } },
         .{ .name = "permission_mode", .json_type = .string, .shape = &.{ .enum_values = &.{ "ask", "auto", "yolo" } }, .description = "New child permission mode. Cannot exceed the caller's current mode." },
         .{ .name = "notifications", .json_type = .object, .shape = &.{ .object = &subagent_notifications_schema } },
     },
@@ -481,7 +482,7 @@ const subagent_configure_schema = gateway_schema.ObjectSchema{
 
 const subagent_lifecycle_schema = gateway_schema.ObjectSchema{
     .properties = &.{
-        .{ .name = "id", .json_type = .string, .min_length = 1 },
+        .{ .name = "id", .json_type = .string, .bounds = &.{ .min_length = 1 } },
         .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "cancel", "resume", "close", "reopen" } } },
     },
     .required = &.{ "id", "action" },
@@ -975,7 +976,7 @@ pub const web_search = ToolSpec{
         .description = web_search_description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "query", .json_type = .string, .min_length = 2 },
+                .{ .name = "query", .json_type = .string, .bounds = &.{ .min_length = 2 } },
                 .{ .name = "allowed_domains", .json_type = .array, .shape = &.{ .array_values = .{ .json_type = .string } } },
                 .{ .name = "blocked_domains", .json_type = .array, .shape = &.{ .array_values = .{ .json_type = .string } } },
             },
@@ -1244,8 +1245,8 @@ pub const ask_user_question = ToolSpec{
         .description = ask_user_question_description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "questions", .json_type = .array, .min_items = 1, .max_items = 4, .shape = &.{ .array_objects = &ask_user_question_question_schema } },
-                .{ .name = "permission_request_id", .json_type = .string, .min_length = ask_user_question_impl.permission_request_id_hex_bytes, .max_length = ask_user_question_impl.permission_request_id_hex_bytes, .description = "Exact opaque ID from an auto_denied tool result. Omit for ordinary questions." },
+                .{ .name = "questions", .json_type = .array, .bounds = &.{ .min_items = 1, .max_items = 4 }, .shape = &.{ .array_objects = &ask_user_question_question_schema } },
+                .{ .name = "permission_request_id", .json_type = .string, .bounds = &.{ .min_length = ask_user_question_impl.permission_request_id_hex_bytes, .max_length = ask_user_question_impl.permission_request_id_hex_bytes }, .description = "Exact opaque ID from an auto_denied tool result. Omit for ordinary questions." },
             },
             .required = &.{"questions"},
         },
@@ -1278,21 +1279,21 @@ pub const vision = ToolSpec{
                     .name = "image_ids",
                     .json_type = .array,
                     .description = "Ordered unique IDs of user-authorized images to inspect.",
-                    .min_items = 1,
+                    .bounds = &.{ .min_items = 1 },
                     .shape = &.{ .array_values = .{ .json_type = .integer } },
                 },
                 .{
                     .name = "paths",
                     .json_type = .array,
                     .description = "Ordered unique local image paths supplied by the user. Relative paths resolve from the workspace; ~/ resolves from the user's home directory.",
-                    .min_items = 1,
+                    .bounds = &.{ .min_items = 1 },
                     .shape = &.{ .array_values = .{ .json_type = .string } },
                 },
                 .{
                     .name = "focus",
                     .json_type = .string,
                     .description = "Specific visual evidence to extract from every requested image.",
-                    .min_length = 1,
+                    .bounds = &.{ .min_length = 1 },
                 },
             },
             .required = &.{"focus"},
@@ -1380,6 +1381,39 @@ pub const all = [_]tool_dispatch.Tool{
 
 pub const registry = tool_dispatch.Registry{ .tools = all[0..] };
 
+test "built-in model-facing tool contract stays byte exact" {
+    const alloc = std.testing.allocator;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+
+    inline for (all) |tool| {
+        try std.testing.expectEqualStrings(tool.name, tool.gateway_schema.name);
+        try std.testing.expectEqualStrings(
+            tool.description,
+            tool.gateway_schema.description,
+        );
+        const schema_json = try tool_specs.toolGatewaySchemaJson(alloc, tool);
+        defer alloc.free(schema_json);
+        hasher.update(schema_json);
+        hasher.update("\x00");
+    }
+    for (advertisement_order) |name| {
+        hasher.update(name);
+        hasher.update("\x00");
+    }
+    const exec_only_json = try tool_specs.toolGatewaySchemaJson(
+        alloc,
+        terminalExecOnlySpec(),
+    );
+    defer alloc.free(exec_only_json);
+    hasher.update(exec_only_json);
+
+    const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
+    try std.testing.expectEqualStrings(
+        "33d8513797a6a673dcb22110095ce4694d1852fa8d72ad7947882974b40b6ce7",
+        &actual_hex,
+    );
+}
+
 test "registry classifies every built-in progress label" {
     inline for (all) |tool| {
         var started_buf: [96]u8 = undefined;
@@ -1452,7 +1486,7 @@ test "terminal tool schema derives one closed branch per terminal action" {
         for (contract.allowed, branch.properties) |field_name, property| {
             try std.testing.expectEqualStrings(field_name, property.name);
             if (std.mem.eql(u8, field_name, "action")) {
-                try std.testing.expect(!property.nullable);
+                try std.testing.expect(property.nullable == null);
                 try std.testing.expectEqualSlices(
                     []const u8,
                     &.{@tagName(action)},
@@ -1462,7 +1496,7 @@ test "terminal tool schema derives one closed branch per terminal action" {
             }
             try std.testing.expectEqual(
                 !nameInSet(contract.required, field_name),
-                property.nullable,
+                property.nullable != null,
             );
         }
     }
@@ -1499,11 +1533,11 @@ test "terminal tool schema derives one closed branch per terminal action" {
     );
     try std.testing.expectEqualStrings(
         "Only for start or wait; required for every wait. After a signal intended to stop the session, use kind exit. For output matching, use kind match with pattern; output_contains is monitor-only. Set null when the selected action does not use this field.",
-        schemaProperty(start_schema, "return_when").?.nullable_description,
+        schemaProperty(start_schema, "return_when").?.nullable.?.description,
     );
     try std.testing.expectEqualStrings(
         "Only for read. Use 0 with segment 1 for a new session's first read, then continue from the previous raw_range.end offset. Set null when the selected action does not use this field.",
-        schemaProperty(read_schema, "cursor_offset").?.nullable_description,
+        schemaProperty(read_schema, "cursor_offset").?.nullable.?.description,
     );
     try std.testing.expectEqualStrings(
         "Only for close and required for close. Close is final; read or inspect all needed output before closing.",
@@ -1519,14 +1553,14 @@ test "terminal tool schema derives one closed branch per terminal action" {
     const notification_interval = schemaProperty(terminal_monitor_notify_schema, "interval_ms").?;
     const lifetime_duration = schemaProperty(terminal_monitor_lifetime_schema, "duration_ms").?;
     const check_interval = schemaProperty(terminal_monitor_definition_schema, "check_interval_ms").?;
-    try std.testing.expectEqual(@as(?u64, terminal_monitor.minimum_schedule_ms), output_quiet_duration.minimum);
-    try std.testing.expectEqual(@as(?u64, terminal_monitor.maximum_schedule_ms), output_quiet_duration.maximum);
-    try std.testing.expectEqual(@as(?u64, terminal_monitor.minimum_schedule_ms), notification_interval.minimum);
-    try std.testing.expectEqual(@as(?u64, terminal_monitor.maximum_schedule_ms), notification_interval.maximum);
-    try std.testing.expectEqual(@as(?u64, 1), lifetime_duration.minimum);
-    try std.testing.expectEqual(@as(?u64, terminal_monitor.maximum_lifetime_ms), lifetime_duration.maximum);
-    try std.testing.expectEqual(@as(?u64, terminal_monitor.minimum_schedule_ms), check_interval.minimum);
-    try std.testing.expectEqual(@as(?u64, terminal_monitor.maximum_schedule_ms), check_interval.maximum);
+    try std.testing.expectEqual(@as(?u64, terminal_monitor.minimum_schedule_ms), output_quiet_duration.bounds.?.minimum);
+    try std.testing.expectEqual(@as(?u64, terminal_monitor.maximum_schedule_ms), output_quiet_duration.bounds.?.maximum);
+    try std.testing.expectEqual(@as(?u64, terminal_monitor.minimum_schedule_ms), notification_interval.bounds.?.minimum);
+    try std.testing.expectEqual(@as(?u64, terminal_monitor.maximum_schedule_ms), notification_interval.bounds.?.maximum);
+    try std.testing.expectEqual(@as(?u64, 1), lifetime_duration.bounds.?.minimum);
+    try std.testing.expectEqual(@as(?u64, terminal_monitor.maximum_lifetime_ms), lifetime_duration.bounds.?.maximum);
+    try std.testing.expectEqual(@as(?u64, terminal_monitor.minimum_schedule_ms), check_interval.bounds.?.minimum);
+    try std.testing.expectEqual(@as(?u64, terminal_monitor.maximum_schedule_ms), check_interval.bounds.?.maximum);
     try std.testing.expectEqualStrings(
         "Required for path conditions. The path must resolve within the terminal workspace; external paths are rejected.",
         monitor_path.description,

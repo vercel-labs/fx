@@ -24,19 +24,28 @@ const PropertyShape = union(enum) {
     array_objects: *const ObjectSchema,
 };
 
-pub const Property = struct {
-    name: []const u8,
-    json_type: JsonType,
-    description: []const u8 = "",
-    nullable: bool = false,
-    nullable_description: []const u8 = "",
-    shape: ?*const PropertyShape = null,
+const PropertyBounds = struct {
     min_length: u32 = no_u32_bound,
     max_length: u32 = no_u32_bound,
     minimum: u64 = no_u64_bound,
     maximum: u64 = no_u64_bound,
     min_items: u32 = no_u32_bound,
     max_items: u32 = no_u32_bound,
+};
+
+const no_property_bounds = PropertyBounds{};
+
+const NullableMetadata = struct {
+    description: []const u8 = "",
+};
+
+pub const Property = struct {
+    name: []const u8,
+    description: []const u8 = "",
+    shape: ?*const PropertyShape = null,
+    bounds: ?*const PropertyBounds = null,
+    nullable: ?*const NullableMetadata = null,
+    json_type: JsonType,
 };
 
 pub const ObjectSchema = struct {
@@ -55,7 +64,7 @@ pub const FunctionSchema = struct {
 };
 
 test "static property representation stays within the measured size budget" {
-    try std.testing.expect(@sizeOf(Property) <= 96);
+    try std.testing.expect(@sizeOf(Property) <= 64);
 }
 
 fn cappedDescriptionAlloc(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
@@ -180,19 +189,18 @@ fn writePropertySchema(
     writer: *std.Io.Writer,
     property: Property,
 ) anyerror!void {
-    if (property.nullable) {
+    if (property.nullable) |nullable| {
         var concrete = property;
-        concrete.nullable = false;
-        concrete.nullable_description = "";
+        concrete.nullable = null;
         try writer.writeAll("{\"anyOf\":[");
         try writePropertySchema(alloc, writer, concrete);
         try writer.writeAll(",{\"type\":\"null\"}]");
-        if (property.nullable_description.len > 0) {
+        if (nullable.description.len > 0) {
             try writer.writeAll(",\"description\":");
             try writeCappedDescriptionJsonString(
                 alloc,
                 writer,
-                property.nullable_description,
+                nullable.description,
             );
         }
         try writer.writeByte('}');
@@ -222,16 +230,17 @@ fn writePropertySchema(
             else => {},
         }
     }
-    if (property.min_length != no_u32_bound) try writer.print(",\"minLength\":{d}", .{property.min_length});
-    if (property.max_length != no_u32_bound) try writer.print(",\"maxLength\":{d}", .{property.max_length});
-    if (property.minimum != no_u64_bound) try writer.print(",\"minimum\":{d}", .{property.minimum});
-    if (property.maximum != no_u64_bound) try writer.print(",\"maximum\":{d}", .{property.maximum});
+    const bounds = property.bounds orelse &no_property_bounds;
+    if (bounds.min_length != no_u32_bound) try writer.print(",\"minLength\":{d}", .{bounds.min_length});
+    if (bounds.max_length != no_u32_bound) try writer.print(",\"maxLength\":{d}", .{bounds.max_length});
+    if (bounds.minimum != no_u64_bound) try writer.print(",\"minimum\":{d}", .{bounds.minimum});
+    if (bounds.maximum != no_u64_bound) try writer.print(",\"maximum\":{d}", .{bounds.maximum});
     if (property.description.len > 0) {
         try writer.writeAll(",\"description\":");
         try writeCappedDescriptionJsonString(alloc, writer, property.description);
     }
-    if (property.min_items != no_u32_bound) try writer.print(",\"minItems\":{d}", .{property.min_items});
-    if (property.max_items != no_u32_bound) try writer.print(",\"maxItems\":{d}", .{property.max_items});
+    if (bounds.min_items != no_u32_bound) try writer.print(",\"minItems\":{d}", .{bounds.min_items});
+    if (bounds.max_items != no_u32_bound) try writer.print(",\"maxItems\":{d}", .{bounds.max_items});
     if (property.shape) |shape| {
         switch (shape.*) {
             .array_values => |values| {
@@ -273,15 +282,13 @@ test "nullable properties preserve concrete constraints and add one null branch"
                     .name = "choice",
                     .json_type = .string,
                     .description = "Concrete choice.",
-                    .nullable = true,
-                    .nullable_description = "Concrete choice. Set null when unused.",
+                    .nullable = &.{ .description = "Concrete choice. Set null when unused." },
                     .shape = &.{ .enum_values = &.{ "one", "two" } },
                 },
                 .{
                     .name = "config",
                     .json_type = .object,
-                    .nullable = true,
-                    .nullable_description = "Set null when unused.",
+                    .nullable = &.{ .description = "Set null when unused." },
                     .shape = &.{ .object = &object_value_schema },
                 },
             },
@@ -461,17 +468,15 @@ test "builtinFunctionSchemaJsonAlloc serializes every supported property shape" 
                     .json_type = .string,
                     .description = "bounded choice",
                     .shape = &.{ .enum_values = &.{ "alpha", "beta" } },
-                    .min_length = 1,
-                    .max_length = 8,
+                    .bounds = &.{ .min_length = 1, .max_length = 8 },
                 },
-                .{ .name = "count", .json_type = .integer, .minimum = 2, .maximum = 9 },
+                .{ .name = "count", .json_type = .integer, .bounds = &.{ .minimum = 2, .maximum = 9 } },
                 .{ .name = "enabled", .json_type = .boolean },
                 .{ .name = "config", .json_type = .object, .shape = &.{ .object = &object_value_schema } },
                 .{
                     .name = "tags",
                     .json_type = .array,
-                    .min_items = 1,
-                    .max_items = 3,
+                    .bounds = &.{ .min_items = 1, .max_items = 3 },
                     .shape = &.{ .array_values = .{ .json_type = .string, .enum_values = &.{ "red", "blue" } } },
                 },
                 .{ .name = "records", .json_type = .array, .shape = &.{ .array_objects = &array_item_schema } },

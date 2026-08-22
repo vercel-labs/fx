@@ -21,7 +21,7 @@ fn buildTerminalSpec() tool_dispatch.Tool {
                 .{
                     .name = "command",
                     .json_type = .string,
-                    .max_length = 64 * 1024,
+                    .bounds = &.{ .max_length = 64 * 1024 },
                     .description = "Foreground command to run in the browser workspace.",
                 },
             },
@@ -61,10 +61,27 @@ test "browser workspace projects exactly one command-only terminal" {
     try std.testing.expectEqual(@as(usize, 2), schema.input_schema.properties.len);
     try std.testing.expectEqualStrings("action", schema.input_schema.properties[0].name);
     try std.testing.expectEqualStrings("command", schema.input_schema.properties[1].name);
-    try std.testing.expectEqual(@as(?usize, 64 * 1024), schema.input_schema.properties[1].max_length);
+    try std.testing.expectEqual(@as(?usize, 64 * 1024), schema.input_schema.properties[1].bounds.?.max_length);
     try std.testing.expectEqual(false, schema.input_schema.additional_properties.?);
     try std.testing.expect(std.mem.find(u8, schema.description, "shell is the workspace interface") != null);
     try std.testing.expect(std.mem.find(u8, schema.description, "clean root-fixed") != null);
+}
+
+test "browser workspace model-facing tool contract stays byte exact" {
+    const gateway_schema = @import("../core/tooling/gateway_schema.zig");
+    const schema_json = try gateway_schema.builtinFunctionSchemaJsonAlloc(
+        std.testing.allocator,
+        registry.tools[0].gateway_schema,
+    );
+    defer std.testing.allocator.free(schema_json);
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(schema_json, &digest, .{});
+    const actual_hex = std.fmt.bytesToHex(digest, .lower);
+    try std.testing.expectEqualStrings(
+        "6b818f083e689d8832dff7f9c7e238c4ade0999eb4f2abb1ef91522d096dcc64",
+        &actual_hex,
+    );
 }
 
 fn expectDecodeFailure(arguments_json: []const u8) !void {

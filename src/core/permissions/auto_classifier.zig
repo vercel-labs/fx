@@ -855,6 +855,19 @@ fn toolsJsonAlloc(alloc: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(alloc, "[{s}]", .{schema_json});
 }
 
+test "automatic review model-facing tool contract stays byte exact" {
+    const tools_json = try toolsJsonAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(tools_json);
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(tools_json, &digest, .{});
+    const actual_hex = std.fmt.bytesToHex(digest, .lower);
+    try std.testing.expectEqualStrings(
+        "a8980fcb16cd2ab8d1f98f7a4d61eed40df435fe406bfb65fc1d3ef4126def08",
+        &actual_hex,
+    );
+}
+
 fn parseCompletion(alloc: std.mem.Allocator, completion: types.GatewayCompletion) !ParseOutcome {
     if (completion.content) |content| {
         if (std.mem.trim(u8, content, " \t\r\n").len > 0) return .invalid;
