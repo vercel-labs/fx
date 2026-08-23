@@ -289,13 +289,13 @@ pub fn traceCancelObserved(ctx: TraceContext, active_tool_known: bool) void {
     debug_trace.eventf("interrupt", "cancel_observed", ctx, "active_tool_known={s}", .{if (active_tool_known) "true" else "false"});
 }
 
-pub fn traceGatewayProviderOptions(ctx: TraceContext, model: []const u8, fast_mode: bool, effort: ReasoningEffort, provider_opts: model_capabilities.ResolvedProviderOptions) void {
-    const reasoning_outcome = if (provider_opts.reasoning != null)
+pub fn traceGatewayProviderOptions(ctx: TraceContext, model: []const u8, fast_mode: bool, effort: ReasoningEffort, capabilities: model_capabilities.Capabilities, provider_opts: model_capabilities.ResolvedProviderOptions) void {
+    const reasoning_outcome = if (model_capabilities.reasoningEffortDropped(capabilities, effort))
+        "unsupported_or_missing"
+    else if (provider_opts.reasoning != null)
         "selected"
-    else if (effort.isDefault())
-        "default"
     else
-        "unsupported_or_missing";
+        "default";
     const fast_outcome = if (provider_opts.fast)
         "selected"
     else if (!fast_mode)

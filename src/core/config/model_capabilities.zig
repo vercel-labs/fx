@@ -129,6 +129,10 @@ pub fn reasoningEffortSupported(capabilities: Capabilities, effort: types.Reason
     return false;
 }
 
+pub fn reasoningEffortDropped(capabilities: Capabilities, effort: types.ReasoningEffort) bool {
+    return !effort.isDefault() and !reasoningEffortSupported(capabilities, effort);
+}
+
 pub fn reasoningEffortIndex(capabilities: Capabilities, effort: types.ReasoningEffort) usize {
     if (effort.isDefault()) return 0;
     for (capabilities.reasoning_efforts.slice(), 0..) |option, i| {
@@ -296,6 +300,20 @@ test "request controls form a total fail-closed state machine" {
             try std.testing.expect(resolved.reasoning == null);
         }
     }
+}
+
+test "reasoningEffortDropped agrees with the fail-closed resolution" {
+    const declared_efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("high")};
+    const declared_capabilities: Capabilities = .{ .reasoning_efforts = .fromSlice(&declared_efforts) };
+    const empty_capabilities: Capabilities = .{};
+    const high = types.ReasoningEffort.literal("high");
+    const stale = types.ReasoningEffort.literal("stale-tier");
+
+    try std.testing.expect(!reasoningEffortDropped(declared_capabilities, .auto));
+    try std.testing.expect(!reasoningEffortDropped(declared_capabilities, high));
+    try std.testing.expect(reasoningEffortDropped(declared_capabilities, stale));
+    try std.testing.expect(!reasoningEffortDropped(empty_capabilities, .auto));
+    try std.testing.expect(reasoningEffortDropped(empty_capabilities, high));
 }
 
 test "request controls remain safe across repeated state transitions" {
