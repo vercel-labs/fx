@@ -1096,24 +1096,26 @@ pub const Store = struct {
             loaded.state.permission_state.deinit(alloc);
             loaded.state.permission_state = migrated_permission_state;
         }
-        var migration_state = try loaded.state.dupe(alloc);
-        defer migration_state.deinit(alloc);
-        const session_dir = try sessionDirPath(
-            alloc,
-            self.sessions_dir,
-            loaded.active_id,
-        );
-        defer alloc.free(session_dir);
-        const snapshot_dir = try std.fs.path.join(alloc, &.{ session_dir, "images" });
-        defer alloc.free(snapshot_dir);
-        const needs_image_migration = try session.repair_legacy_images_transactionally(
-            alloc,
-            migration_state.history,
-            snapshot_dir,
-        );
-        const needs_migration_commit = needs_permission_migration or
-            needs_image_migration;
-        if (needs_migration_commit) {
+        const may_need_image_migration =
+            session.history_needs_legacy_image_repair(loaded.state.history);
+        if (needs_permission_migration or may_need_image_migration) {
+            var migration_state = try loaded.state.dupe(alloc);
+            defer migration_state.deinit(alloc);
+            const session_dir = try sessionDirPath(
+                alloc,
+                self.sessions_dir,
+                loaded.active_id,
+            );
+            defer alloc.free(session_dir);
+            const snapshot_dir = try std.fs.path.join(alloc, &.{ session_dir, "images" });
+            defer alloc.free(snapshot_dir);
+            if (may_need_image_migration) {
+                _ = try session.repair_legacy_images_transactionally(
+                    alloc,
+                    migration_state.history,
+                    snapshot_dir,
+                );
+            }
             var migration_committed = false;
             errdefer if (!migration_committed) {
                 deleteSnapshotFilesAddedByMigration(

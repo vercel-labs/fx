@@ -539,6 +539,45 @@ fn mutable_user_for_history_turn(turn: *HistoryTurn) ?*UserTurn {
     };
 }
 
+/// Returns whether a resumed history needs the legacy image migration path.
+/// This preflight avoids deep-copying large modern histories that contain no
+/// legacy image metadata.
+pub fn history_needs_legacy_image_repair(history: []const HistoryTurn) bool {
+    for (history) |turn| {
+        for (images_for_history_turn(turn)) |attachment| {
+            if (attachment.id == 0 or
+                attachment.snapshot_path == null or
+                attachment.snapshot_sha256 == null)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+test "legacy image repair preflight skips complete modern histories" {
+    const image = ImageAttachment{
+        .id = 1,
+        .path = @constCast("/tmp/image.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = @constCast("/tmp/snapshot.png"),
+        .snapshot_sha256 = @constCast("sha256"),
+    };
+    var images = [_]ImageAttachment{image};
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("image"), .images = &images },
+        .assistant = @constCast("done"),
+    } }};
+
+    try std.testing.expect(!history_needs_legacy_image_repair(&history));
+    images[0].id = 0;
+    try std.testing.expect(history_needs_legacy_image_repair(&history));
+    images[0] = image;
+    images[0].snapshot_sha256 = null;
+    try std.testing.expect(history_needs_legacy_image_repair(&history));
+}
+
 /// Repairs image IDs omitted by the legacy session deep-copy path. This is
 /// only for allocator-owned history loaded from durable storage. Rebuilt text
 /// remains owned by its history turn. Returns whether any attachment changed.

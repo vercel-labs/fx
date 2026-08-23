@@ -9,7 +9,7 @@ const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const manifest_max_bytes: usize = 64 * 1024;
-pub const checkpoint_max_bytes: usize = 32 * 1024 * 1024;
+pub const checkpoint_max_bytes: usize = 128 * 1024 * 1024;
 pub const Digest = [Sha256.digest_length]u8;
 
 pub const Manifest = struct {
@@ -322,7 +322,24 @@ pub fn decodeCheckpoint(alloc: Allocator, bytes: []const u8) !Checkpoint {
 
 fn decodeCheckpointImpl(alloc: Allocator, bytes: []const u8) !Checkpoint {
     if (bytes.len == 0 or bytes.len > checkpoint_max_bytes) return error.CheckpointTooLarge;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
+    const canonical = std.mem.trim(u8, bytes, " \t\r\n");
+    const state_marker = ",\"state\":";
+    const marker_start = std.mem.find(u8, canonical, state_marker) orelse
+        return error.InvalidCheckpoint;
+    const state_start = marker_start + state_marker.len;
+    if (canonical.len == 0 or canonical[canonical.len - 1] != '}' or
+        state_start >= canonical.len - 1)
+    {
+        return error.InvalidCheckpoint;
+    }
+
+    const metadata_bytes = try std.mem.concat(
+        alloc,
+        u8,
+        &.{ canonical[0..state_start], "null}" },
+    );
+    defer alloc.free(metadata_bytes);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, metadata_bytes, .{
         .parse_numbers = false,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -338,16 +355,13 @@ fn decodeCheckpointImpl(alloc: Allocator, bytes: []const u8) !Checkpoint {
         "through_event_log_bytes",
         "state",
     });
-    if (try requireU64(root, "schema_version") != 1) return error.InvalidCheckpoint;
+    if (try requireU64(root, "schema_version") != 1) {
+        return error.InvalidCheckpoint;
+    }
+    const metadata_state = root.get("state") orelse return error.InvalidCheckpoint;
+    if (metadata_state != .null) return error.InvalidCheckpoint;
 
-    var state_json: std.Io.Writer.Allocating = .init(alloc);
-    defer state_json.deinit();
-    try std.json.Stringify.value(
-        root.get("state") orelse return error.InvalidCheckpoint,
-        .{},
-        &state_json.writer,
-    );
-    var state_source = std.Io.Reader.fixed(state_json.written());
+    var state_source = std.Io.Reader.fixed(canonical[state_start .. canonical.len - 1]);
     var state = session_codec.decodeState(alloc, &state_source, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidCheckpoint,
