@@ -95,12 +95,42 @@ pub fn executeBearerGet(
     url: []const u8,
     access_token: []const u8,
 ) !oauth_transport.Response {
-    const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{access_token});
+    // Sized exactly rather than formatted, because allocPrint grows an
+    // oversized buffer and releases it once the exact length is known, leaving
+    // a plaintext copy of the token behind in the abandoned allocation.
+    const prefix = "Bearer ";
+    const authorization = try alloc.alloc(u8, prefix.len + access_token.len);
     defer secret.zeroAndFree(alloc, authorization);
+    @memcpy(authorization[0..prefix.len], prefix);
+    @memcpy(authorization[prefix.len..], access_token);
     return executeRequest(alloc, "GET", url, &.{.{
         .name = "authorization",
         .value = authorization,
     }}, "");
+}
+
+/// Upper bound on the encoded header JSON. JSON string escaping expands a byte
+/// to at most six characters (`\uXXXX`), and each header contributes a fixed
+/// amount of punctuation and key names.
+fn headersJsonCapacity(headers: anytype) usize {
+    var total: usize = 2;
+    // Callers pass either a comptime tuple literal or a runtime slice, and a
+    // tuple can only be walked with `inline for`.
+    const Element = switch (@typeInfo(@TypeOf(headers))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(headers),
+    };
+    const element_info = @typeInfo(Element);
+    if (element_info == .@"struct" and element_info.@"struct".is_tuple) {
+        inline for (headers) |header| {
+            total += (header.name.len + header.value.len) * 6 + 32;
+        }
+    } else {
+        for (headers) |header| {
+            total += (header.name.len + header.value.len) * 6 + 32;
+        }
+    }
+    return total;
 }
 
 fn executeRequest(
@@ -110,8 +140,16 @@ fn executeRequest(
     headers: anytype,
     body: []const u8,
 ) !oauth_transport.Response {
-    var headers_json: std.Io.Writer.Allocating = .init(alloc);
+    // An Authorization header is a credential, so the encoded buffer is
+    // reserved up front and overwritten at scope exit. Without the reservation
+    // the writer reallocates mid-encode and abandons buffers that keep their
+    // own plaintext copy of the token.
+    var headers_json: std.Io.Writer.Allocating = try .initCapacity(
+        alloc,
+        headersJsonCapacity(headers),
+    );
     defer headers_json.deinit();
+    defer secret.zero(headers_json.written());
     try std.json.Stringify.value(headers, .{}, &headers_json.writer);
 
     const response_buffer = try alloc.alloc(u8, max_response_bytes);
@@ -285,4 +323,34 @@ test "request bounds reject cancellation before touching the JS host" {
         .url = "https://vercel.test",
         .cancel_flag = &cancelled,
     }));
+}
+
+test "header json capacity covers the encoded bound so the writer never grows" {
+    const headers = .{
+        .{ .name = "authorization", .value = "Bearer abc.def.ghi" },
+        .{ .name = "content-type", .value = "application/json" },
+    };
+    var encoded: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer encoded.deinit();
+    try std.json.Stringify.value(headers, .{}, &encoded.writer);
+    try std.testing.expect(headersJsonCapacity(headers) >= encoded.written().len);
+
+    // The other call shape: a runtime slice, which cannot be walked inline.
+    const Header = struct { name: []const u8, value: []const u8 };
+    var buf: [2]Header = .{
+        .{ .name = "authorization", .value = "Bearer abc.def.ghi" },
+        .{ .name = "content-type", .value = "application/json" },
+    };
+    const as_slice: []const Header = buf[0..2];
+    var encoded_slice: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer encoded_slice.deinit();
+    try std.json.Stringify.value(as_slice, .{}, &encoded_slice.writer);
+    try std.testing.expect(headersJsonCapacity(as_slice) >= encoded_slice.written().len);
+
+    // A value needing maximal JSON escaping must still fit the reservation.
+    const escaped = .{.{ .name = "authorization", .value = "\x00\x01\x02\x03\x04\x05" }};
+    var encoded_escaped: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer encoded_escaped.deinit();
+    try std.json.Stringify.value(escaped, .{}, &encoded_escaped.writer);
+    try std.testing.expect(headersJsonCapacity(escaped) >= encoded_escaped.written().len);
 }
