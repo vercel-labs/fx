@@ -68,7 +68,7 @@ fx
 
 The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands.
 
-Submitted PNG attachments render inline in Kitty graphics compatible terminals such as Kitty, Ghostty, and WezTerm. Fx keeps at most eight visible previews live and retains the linked text badge as a fallback. Automatic graphics are disabled inside terminal multiplexers; set `FX_IMAGE_PROTOCOL=kitty` to force Kitty passthrough through tmux, or `FX_IMAGE_PROTOCOL=off` to disable previews.
+Submitted PNG, JPEG, GIF, and WebP attachments—and matching files read or opened by the agent—render inline in Kitty graphics compatible terminals such as Kitty, Ghostty, and WezTerm. Fx converts non-PNG previews to a bounded first-frame PNG before transmission, keeps at most eight visible previews live, and retains the linked text badge as a fallback. Automatic graphics are disabled inside terminal multiplexers; set `FX_IMAGE_PROTOCOL=kitty` to force Kitty passthrough through tmux, or `FX_IMAGE_PROTOCOL=off` to disable previews.
 
 The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
 

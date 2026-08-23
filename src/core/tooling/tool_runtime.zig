@@ -789,6 +789,7 @@ fn toolExecutionResultFromDispatch(result: tool_dispatch.DispatchResult) ToolExe
             .web_search_completion = result.web_search_completion,
             .web_fetch_completion = result.web_fetch_completion,
             .tool_result_memory = result.tool_result_memory,
+            .presentation_image = result.presentation_image,
         },
         .failure => .{
             .status = .failure,
@@ -798,6 +799,7 @@ fn toolExecutionResultFromDispatch(result: tool_dispatch.DispatchResult) ToolExe
             .web_search_completion = result.web_search_completion,
             .web_fetch_completion = result.web_fetch_completion,
             .tool_result_memory = result.tool_result_memory,
+            .presentation_image = result.presentation_image,
         },
     };
 }

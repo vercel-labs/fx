@@ -991,6 +991,7 @@ pub fn finishExecutedToolStatus(
             },
             .result = safe_result,
             .result_memory = result_memory,
+            .presentation_image = result.presentation_image,
             .command_artifact_handle = command_artifact_handle,
         },
     });

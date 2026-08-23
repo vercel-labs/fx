@@ -3284,9 +3284,18 @@ fn imageAttachmentForEntry(
     image_id: usize,
 ) ?types.ImageAttachment {
     for (self.entries.items) |entry| {
-        if (entry != .user_turn or entry.user_turn.id != entry_id) continue;
-        for (entry.user_turn.turn.images) |attachment| {
-            if (attachment.id == image_id) return attachment;
+        if (entry.id() != entry_id) continue;
+        switch (entry) {
+            .user_turn => |user| {
+                for (user.turn.images) |attachment| {
+                    if (attachment.id == image_id) return attachment;
+                }
+            },
+            .raw_bytes => |raw| {
+                const attachment = raw.inline_image orelse return null;
+                if (attachment.id == image_id) return attachment;
+            },
+            else => {},
         }
         return null;
     }

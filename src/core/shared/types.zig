@@ -167,6 +167,7 @@ pub const ToolLifecycleEvent = union(enum) {
         outcome: ToolOutcome,
         result: ?[]const u8 = null,
         result_memory: ?ToolResultMemory = null,
+        presentation_image: ?ImageAttachment = null,
         command_artifact_handle: ?[]const u8 = null,
     },
     turn_finished: TurnFinished,
@@ -2358,6 +2359,34 @@ pub fn dupeUserTurn(alloc: std.mem.Allocator, user: UserTurn) !UserTurn {
     };
 }
 
+pub fn dupeImageAttachment(alloc: std.mem.Allocator, attachment: ImageAttachment) !ImageAttachment {
+    const path = try alloc.dupe(u8, attachment.path);
+    errdefer alloc.free(path);
+
+    const media_type = try alloc.dupe(u8, attachment.media_type);
+    errdefer alloc.free(media_type);
+
+    const snapshot_path = if (attachment.snapshot_path) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (snapshot_path) |value| alloc.free(value);
+
+    const snapshot_sha256 = if (attachment.snapshot_sha256) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    return .{
+        .id = attachment.id,
+        .path = path,
+        .media_type = media_type,
+        .snapshot_path = snapshot_path,
+        .snapshot_sha256 = snapshot_sha256,
+        .pixel_width = attachment.pixel_width,
+        .pixel_height = attachment.pixel_height,
+    };
+}
+
 pub fn dupeImageAttachmentSlice(alloc: std.mem.Allocator, attachments: []const ImageAttachment) ![]ImageAttachment {
     if (attachments.len == 0) return &.{};
 
@@ -2373,31 +2402,7 @@ pub fn dupeImageAttachmentSlice(alloc: std.mem.Allocator, attachments: []const I
     }
 
     for (attachments, 0..) |attachment, i| {
-        const path = try alloc.dupe(u8, attachment.path);
-        errdefer alloc.free(path);
-
-        const media_type = try alloc.dupe(u8, attachment.media_type);
-        errdefer alloc.free(media_type);
-
-        const snapshot_path = if (attachment.snapshot_path) |value|
-            try alloc.dupe(u8, value)
-        else
-            null;
-        errdefer if (snapshot_path) |value| alloc.free(value);
-
-        const snapshot_sha256 = if (attachment.snapshot_sha256) |value|
-            try alloc.dupe(u8, value)
-        else
-            null;
-        copy[i] = .{
-            .id = attachment.id,
-            .path = path,
-            .media_type = media_type,
-            .snapshot_path = snapshot_path,
-            .snapshot_sha256 = snapshot_sha256,
-            .pixel_width = attachment.pixel_width,
-            .pixel_height = attachment.pixel_height,
-        };
+        copy[i] = try dupeImageAttachment(alloc, attachment);
         copied += 1;
     }
     return copy;

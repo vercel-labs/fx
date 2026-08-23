@@ -2,11 +2,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const image_attachments = @import("../../core/images/image_attachments.zig");
+const image_dimensions = @import("../../core/images/image_dimensions.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const types = @import("../../core/shared/types.zig");
 const terminal_diff = @import("../render_engine/terminal_diff.zig");
 const ui_terminal = @import("terminal.zig");
 const image_types = @import("image_types.zig");
+const terminal_image_codec = @import("terminal_image_codec");
 
 const Allocator = std.mem.Allocator;
 const Metrics = types.Metrics;
@@ -198,6 +200,7 @@ pub const Runtime = struct {
             placements.len - self.max_live_images
         else
             0;
+        const preview_config = self.previewConfig();
         for (placements[live_start..]) |placement| {
             if (!self.capabilities.protocol.supportsMediaType(placement.attachment.media_type)) continue;
             const key = resourceKey(placement) orelse continue;
@@ -218,10 +221,48 @@ pub const Runtime = struct {
                     continue;
                 };
                 defer snapshot.deinit(alloc);
+                var converted_png: ?[]u8 = null;
+                defer if (converted_png) |bytes| alloc.free(bytes);
+                const payload = if (std.mem.eql(u8, snapshot.media_type, "image/png"))
+                    snapshot.bytes
+                else blk: {
+                    const dimensions = image_dimensions.detect(
+                        snapshot.bytes,
+                        snapshot.media_type,
+                    ) orelse {
+                        debug_trace.logf(
+                            "images",
+                            "event=terminal_image_conversion_failed image_id={d} media_type={s} err=InvalidImageDimensions",
+                            .{ placement.attachment.id, snapshot.media_type },
+                        );
+                        continue;
+                    };
+                    const bytes = terminal_image_codec.convertToPng(
+                        alloc,
+                        snapshot.bytes,
+                        snapshot.media_type,
+                        .{ .width = dimensions.width, .height = dimensions.height },
+                        .{
+                            .width = @as(u32, placement.columns) *
+                                @as(u32, preview_config.cells.width_px),
+                            .height = @as(u32, placement.rows) *
+                                @as(u32, preview_config.cells.height_px),
+                        },
+                    ) catch |err| {
+                        debug_trace.logf(
+                            "images",
+                            "event=terminal_image_conversion_failed image_id={d} media_type={s} err={s}",
+                            .{ placement.attachment.id, snapshot.media_type, @errorName(err) },
+                        );
+                        continue;
+                    };
+                    converted_png = bytes;
+                    break :blk bytes;
+                };
                 image_id = if (existing) |resource| resource.image_id else self.allocateImageId();
                 try writeKittyTransmit(
                     &transmits.writer,
-                    snapshot.bytes,
+                    payload,
                     image_id,
                     self.capabilities.tmux_passthrough,
                 );
@@ -642,6 +683,57 @@ test "Kitty runtime transmits once, moves stably, and deletes stale images" {
     sink.clear();
     _ = try runtime.commitFrame(alloc, &.{}, false, 12, 5, true, false, sink.sink(), &metrics);
     try std.testing.expect(std.mem.find(u8, sink.bytes.items, "a=d,d=I,i=42,q=2") != null);
+}
+
+test "Kitty runtime converts JPEG snapshots to PNG before transmission" {
+    const alloc = std.testing.allocator;
+    const jpeg_bytes = @embedFile("testdata/red-2x3.jpg");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "snapshot.jpg", .{});
+    try file.writeStreamingAll(std.testing.io, jpeg_bytes);
+    file.close(std.testing.io);
+    const snapshot_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "snapshot.jpg");
+    defer alloc.free(snapshot_path);
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(jpeg_bytes, &digest, .{});
+    var digest_hex = std.fmt.bytesToHex(digest, .lower);
+    const attachment = types.ImageAttachment{
+        .id = 2,
+        .path = @constCast("/tmp/original.jpg"),
+        .media_type = @constCast("image/jpeg"),
+        .snapshot_path = snapshot_path,
+        .snapshot_sha256 = digest_hex[0..],
+        .pixel_width = 2,
+        .pixel_height = 3,
+    };
+    const placement = image_types.Placement{
+        .source_namespace = 91,
+        .entry_id = 4,
+        .attachment = attachment,
+        .row = 1,
+        .col = 1,
+        .columns = 2,
+        .rows = 1,
+    };
+
+    var runtime = Runtime.initForTest(.{
+        .protocol = .kitty,
+        .cells = .{ .width_px = 8, .height_px = 16 },
+    }, 55);
+    defer runtime.deinit(alloc);
+    var sink = TestSink{ .alloc = alloc };
+    defer sink.deinit();
+    var metrics: Metrics = .{};
+
+    try std.testing.expectEqual(
+        CommitOutcome.committed,
+        try runtime.commitFrame(alloc, &.{placement}, false, 1, 1, true, false, sink.sink(), &metrics),
+    );
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, "a=t,f=100,q=2,i=55") != null);
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, "iVBOR") != null);
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, "/9j/") == null);
 }
 
 test "Kitty runtime repairs an uncertain partial sidecar write" {

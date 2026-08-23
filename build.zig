@@ -1,4 +1,5 @@
 const std = @import("std");
+const imgz = @import("imgz");
 
 const UpdateChannel = enum { stable, dev };
 
@@ -20,9 +21,14 @@ const NapiSurface = enum {
     core,
 };
 
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const terminal_image_codec = try createTerminalImageCodec(
+        b,
+        target,
+        optimize,
+    );
     const pgso_artifact = b.option(
         PgsoArtifact,
         "pgso-artifact",
@@ -65,6 +71,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("build_options", build_options.createModule());
+    exe.root_module.addImport("terminal_image_codec", terminal_image_codec);
 
     b.installArtifact(exe);
 
@@ -90,8 +97,24 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
 
+    const terminal_image_codec_tests = b.addTest(.{
+        .name = "terminal-image-codec-tests",
+        .root_module = terminal_image_codec,
+    });
+    const run_terminal_image_codec_tests = b.addRunArtifact(
+        terminal_image_codec_tests,
+    );
+    test_step.dependOn(&run_terminal_image_codec_tests.step);
+    const test_terminal_image_codec_step = b.step(
+        "test-terminal-image-codec",
+        "Run terminal image conversion tests",
+    );
+    test_terminal_image_codec_step.dependOn(
+        &run_terminal_image_codec_tests.step,
+    );
+
     if (wasm_surface != .none) {
-        addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
+        try addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
     }
     if (napi_surface != .none) {
         addNapiArtifact(b, napi_surface, target, git_commit, app_version, update_channel);
@@ -155,6 +178,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    benchmark_exports_mod.addImport(
+        "terminal_image_codec",
+        terminal_image_codec,
+    );
     const file_index_bench = b.addExecutable(.{
         .name = "file-index-bench",
         .root_module = b.createModule(.{
@@ -308,13 +335,63 @@ pub fn build(b: *std.Build) void {
     }
 }
 
+fn createTerminalImageCodec(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) !*std.Build.Module {
+    const codec = b.createModule(.{
+        .root_source_file = b.path("src/ui/terminal/image_codec.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const zigimg = b.dependency("zigimg", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    codec.addImport("zigimg", zigimg.module("zigimg"));
+
+    const webp_options = imgz.Webp.Options{
+        .enable_encoding = false,
+        .enable_mux = false,
+        // libwebp still needs the worker implementation when decoding is
+        // configured without a caller-managed worker interface.
+        .enable_threading = true,
+        .enable_simd = true,
+    };
+    const webp_lib = try imgz.Webp.get(
+        b,
+        target,
+        optimize,
+        webp_options,
+        .{
+            .libz = .disabled,
+            .libjpeg_turbo = .disabled,
+            .libsharpyuv = .bundled,
+        },
+    );
+    const webp_upstream = b.dependency("libwebp_upstream", .{});
+    webp_lib.root_module.addCSourceFiles(.{
+        .files = &.{
+            "src/demux/anim_decode.c",
+            "src/demux/demux.c",
+        },
+        .flags = &.{"-std=c99"},
+        .root = webp_upstream.path("."),
+    });
+    codec.addIncludePath(webp_upstream.path("src"));
+    codec.linkLibrary(webp_lib);
+    return codec;
+}
+
 fn addWasmArtifact(
     b: *std.Build,
     surface: WasmSurface,
     git_commit: []const u8,
     app_version: []const u8,
     update_channel: UpdateChannel,
-) void {
+) !void {
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .wasi,
@@ -358,6 +435,11 @@ fn addWasmArtifact(
         }),
     });
     wasm_exe.root_module.addImport("build_options", wasm_options.createModule());
+    wasm_exe.root_module.addImport("terminal_image_codec", b.createModule(.{
+        .root_source_file = b.path("src/ui/terminal/image_codec_stub.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    }));
 
     const install_wasm = b.addInstallArtifact(wasm_exe, .{});
     const wasm_step = b.step(name ++ "-wasm", description);

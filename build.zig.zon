@@ -31,15 +31,20 @@
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
-    .dependencies = .{},
-    // Specifies the set of files and directories that are included in this package.
-    // Only files and directories listed here are included in the `hash` that
-    // is computed for this package. Only files listed here will remain on disk
-    // when using the zig package manager. As a rule of thumb, one should list
-    // files required for compilation plus any license(s).
-    // Paths are relative to the build root. Use the empty string (`""`) to refer to
-    // the build root itself.
-    // A directory listed here means that all files within, recursively, are included.
+    .dependencies = .{
+        .zigimg = .{
+            .url = "git+https://github.com/zigimg/zigimg.git#a7440df3fc41cde7df078b1c5829646c13056d49",
+            .hash = "zigimg-0.1.0-8_eo2sPVFwAm8y-DVfaCHNKQIpv9oHl_mbcKbGQZRLrK",
+        },
+        .imgz = .{
+            .url = "git+https://github.com/shreyassanthu77/imgz.git#03ac9bcb706d054c51cca952b8b358110e2932e4",
+            .hash = "imgz-0.4.0-BqHzkOpyCwAFpGCa3VvzNo15mIfoPY81AXbkGDRcuTRM",
+        },
+        .libwebp_upstream = .{
+            .url = "git+https://github.com/webmproject/libwebp.git#23359a1039d054b6e46ca97fa8789a755457fbd5",
+            .hash = "N-V-__8AAAgPfAB2dLHqe8Vw--VN8ULPqqYFewfk4tobT8ov",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

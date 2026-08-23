@@ -322,6 +322,7 @@ pub const TranscriptEntry = union(enum) {
         bytes: []const u8,
         class: RawEntryClass = .unknown_raw,
         lifecycle_pinned: bool = false,
+        inline_image: ?types.ImageAttachment = null,
     };
 
     pub const SemanticNoticeEntry = struct {
@@ -394,6 +395,7 @@ pub const TranscriptEntry = union(enum) {
         switch (self.*) {
             .raw_bytes => |e| {
                 alloc.free(e.bytes);
+                if (e.inline_image) |image| types.freeImageAttachment(alloc, image);
             },
             .semantic_notice => |e| {
                 alloc.free(e.topic);
@@ -1565,16 +1567,26 @@ fn renderEntryToBlockForPresentationInterruptible(
         };
     }
     return switch (entry) {
-        .raw_bytes => |e| if (e.class == .tool_status and presentation == .full) blk: {
-            const full = try formatFullToolStatus(alloc, e.bytes, cols);
-            break :blk try normalizeOwnedRenderedBlock(alloc, kind, full);
-        } else if (e.class == .tool_status and toolStatusNeedsPreview(e.bytes, cols)) blk: {
-            const preview = try formatToolStatusPreview(alloc, e.bytes, cols);
-            break :blk try normalizeOwnedRenderedBlock(alloc, kind, preview);
-        } else if (e.class == .diff_block and presentation == .compact) blk: {
-            const compact = try reflowDiffBlock(alloc, e.bytes, cols);
-            break :blk try normalizeOwnedRenderedBlock(alloc, kind, compact);
-        } else try normalizeRenderedBlockTail(alloc, kind, e.bytes),
+        .raw_bytes => |e| blk: {
+            const base = if (e.class == .tool_status and presentation == .full) base: {
+                const full = try formatFullToolStatus(alloc, e.bytes, cols);
+                break :base try normalizeOwnedRenderedBlock(alloc, kind, full);
+            } else if (e.class == .tool_status and toolStatusNeedsPreview(e.bytes, cols)) base: {
+                const preview = try formatToolStatusPreview(alloc, e.bytes, cols);
+                break :base try normalizeOwnedRenderedBlock(alloc, kind, preview);
+            } else if (e.class == .diff_block and presentation == .compact) base: {
+                const compact = try reflowDiffBlock(alloc, e.bytes, cols);
+                break :base try normalizeOwnedRenderedBlock(alloc, kind, compact);
+            } else try normalizeRenderedBlockTail(alloc, kind, e.bytes);
+            if (presentation != .compact or e.inline_image == null) break :blk base;
+            break :blk try appendRawImagePreview(
+                alloc,
+                base,
+                e,
+                cols,
+                styles.image_preview,
+            );
+        },
         .semantic_notice => |e| blk: {
             const rendered = try renderSemanticNotice(
                 alloc,
@@ -1655,6 +1667,57 @@ fn renderEntryToBlockForPresentationInterruptible(
             };
         },
     };
+}
+
+fn appendRawImagePreview(
+    alloc: Allocator,
+    base: RenderedBlock,
+    entry: TranscriptEntry.RawBytesEntry,
+    cols: u16,
+    config: image_types.PreviewConfig,
+) !RenderedBlock {
+    const image = entry.inline_image orelse return base;
+    const fit = image_types.fitPreview(image, cols, config) orelse return base;
+    defer base.deinit(alloc);
+
+    const base_line_count = renderedHardLineCount(base.bytes);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll(base.bytes);
+    var row: u16 = 0;
+    while (row < fit.rows) : (row += 1) {
+        if (out.written().len > 0) try out.writer.writeByte('\n');
+        // Keep two ordinary blank cells for the left gutter and a zero-width
+        // sentinel so boundary trimming cannot collapse this image-only row.
+        try out.writer.writeAll("  \u{200b}\x1b[0m");
+    }
+
+    const bytes = try out.toOwnedSlice();
+    var block = try normalizeOwnedRenderedBlock(alloc, base.kind, bytes);
+    errdefer block.deinit(alloc);
+    const line_count = renderedHardLineCount(block.bytes);
+    const provenance = try alloc.alloc(LineProvenance, line_count);
+    errdefer alloc.free(provenance);
+    @memset(provenance, .{ .entry = .{
+        .entry_id = entry.id,
+        .entry_class = .tool_status,
+    } });
+    var row_index: u16 = 0;
+    while (row_index < fit.rows) : (row_index += 1) {
+        const line_index = base_line_count + @as(usize, row_index);
+        std.debug.assert(line_index < provenance.len);
+        provenance[line_index] = .{ .image = .{
+            .entry_id = entry.id,
+            .image_id = image.id,
+            .row_index = row_index,
+            .row_count = fit.rows,
+            .col = image_types.preview_origin_col,
+            .columns = fit.columns,
+        } };
+    }
+    block.line_provenance = provenance;
+    block.owns_line_provenance = true;
+    return block;
 }
 
 fn attachUserPreviewProvenance(
@@ -2156,11 +2219,20 @@ fn renderEntriesInterruptible(
         try build_checkpoint.tick(checkpoint);
         if (options.shouldOmit(entry_index, entry)) continue;
         if (options.overrideForEntry(entry_index, entry)) |override| {
-            const block = try normalizeRenderedBlockTail(
+            var block = try normalizeRenderedBlockTail(
                 alloc,
                 override.kind,
                 override.bytes,
             );
+            if (entry == .raw_bytes and entry.raw_bytes.inline_image != null) {
+                block = try appendRawImagePreview(
+                    alloc,
+                    block,
+                    entry.raw_bytes,
+                    cols,
+                    styles.image_preview,
+                );
+            }
             defer block.deinit(alloc);
             if (!renderedBlockHasContent(block)) continue;
             try builder.appendBlock(alloc, entry, block, options, checkpoint);
@@ -4443,6 +4515,50 @@ test "compact preparation preserves image row provenance outside text bytes" {
         try std.testing.expectEqual(@as(usize, 1), image.image_id);
         try std.testing.expectEqual(@as(u16, @intCast(row_index)), image.row_index);
         try std.testing.expectEqual(@as(u16, 2), image.row_count);
+    }
+}
+
+test "compact preparation appends tool presentation image provenance" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendRawTestEntry(&entries, alloc, 11, "● Opened preview.png\n", .tool_status);
+    entries.items[0].raw_bytes.inline_image = try types.dupeImageAttachment(alloc, .{
+        .id = 1,
+        .path = @constCast("/tmp/preview.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = @constCast("/tmp/preview.png"),
+        .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        .pixel_width = 100,
+        .pixel_height = 100,
+    });
+
+    var prepared = try renderEntriesForPreparation(
+        alloc,
+        entries.items,
+        20,
+        .{ .image_preview = .{
+            .protocol = .kitty,
+            .cells = .{ .width_px = 10, .height_px = 10 },
+            .max_width_cells = 10,
+            .max_height_cells = 2,
+        } },
+        .{ .capture_provenance = true },
+    );
+    defer prepared.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), prepared.line_provenance.len);
+    try std.testing.expect(prepared.line_provenance[0] == .entry);
+    for (prepared.line_provenance[1..], 0..) |source, row_index| {
+        const image = switch (source) {
+            .image => |value| value,
+            else => return error.TestExpectedImageProvenance,
+        };
+        try std.testing.expectEqual(@as(u32, 11), image.entry_id);
+        try std.testing.expectEqual(@as(usize, 1), image.image_id);
+        try std.testing.expectEqual(@as(u16, @intCast(row_index)), image.row_index);
+        try std.testing.expectEqual(@as(u16, 2), image.row_count);
+        try std.testing.expectEqual(image_types.preview_origin_col, image.col);
     }
 }
 

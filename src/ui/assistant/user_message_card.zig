@@ -296,7 +296,7 @@ pub fn buildUserPromptCardWithImagePreviewsInterruptible(
                 .image_id = image.id,
                 .row_index = image_row,
                 .row_count = fit.rows,
-                .col = 3,
+                .col = image_types.preview_origin_col,
                 .columns = fit.columns,
             });
             line_index += 1;
@@ -772,6 +772,7 @@ test "terminal prompt card reserves typed rows for supported image previews" {
     try std.testing.expectEqual(@as(usize, 1), card.image_preview_lines[0].line_index);
     try std.testing.expectEqual(@as(u16, 0), card.image_preview_lines[0].row_index);
     try std.testing.expectEqual(@as(u16, 2), card.image_preview_lines[0].row_count);
+    try std.testing.expectEqual(image_types.preview_origin_col, card.image_preview_lines[0].col);
     try std.testing.expectEqual(@as(u16, 2), card.image_preview_lines[0].columns);
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, card.bytes, "\n"));
 }

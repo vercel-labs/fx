@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
+  chmodSync,
   copyFileSync,
   linkSync,
   mkdirSync,
@@ -24,6 +25,8 @@ const TIMEOUT = 15_000;
 const GLM_MODEL = "zai/glm-5.2-fast";
 const GEMINI_MODEL = "google/gemini-2.5-flash";
 const IMAGE_PATH = join(REPO_ROOT, "tests/e2e/fixtures/placeholder-logo.png");
+const JPEG_IMAGE_PATH = join(REPO_ROOT, "tests/e2e/fixtures/red-2x3.jpg");
+const WEBP_IMAGE_PATH = join(REPO_ROOT, "tests/e2e/fixtures/blue-2x3.webp");
 
 type CapturedRequest = {
   body: string;
@@ -111,6 +114,32 @@ function visionBatchResult(imageIds: number[]) {
 
 function filePartCount(body: string) {
   return body.match(/"type":"file"/g)?.length ?? 0;
+}
+
+function expectLargeLeftAlignedKittyPlacement(raw: Buffer) {
+  const placements = [...raw.toString("latin1").matchAll(
+    /\x1b\[(\d+);(\d+)H\x1bPtmux;\x1b\x1b_Ga=p,q=2,C=1,i=(\d+),p=(\d+),c=(\d+),r=(\d+)/g,
+  )].map((match) => ({
+    row: Number(match[1]),
+    col: Number(match[2]),
+    imageId: Number(match[3]),
+    placementId: Number(match[4]),
+    columns: Number(match[5]),
+    rows: Number(match[6]),
+  }));
+
+  expect(placements.length).toBeGreaterThan(0);
+  expect(placements.every((placement) => placement.row > 0)).toBe(true);
+  expect(placements.every((placement) => placement.col === 1)).toBe(true);
+  expect(placements.every(
+    (placement) => placement.imageId === placement.placementId,
+  )).toBe(true);
+  expect(placements.some(
+    (placement) => placement.columns === 100 || placement.rows === 20,
+  )).toBe(true);
+  expect(placements.some(
+    (placement) => placement.columns > 48 || placement.rows > 10,
+  )).toBe(true);
 }
 
 function nativeFileParts(body: string) {
@@ -246,8 +275,8 @@ function startImageGateway(
   };
 }
 
-function createIsolatedRoot() {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-vision-route-e2e-")));
+function createIsolatedRoot(prefix = join(tmpdir(), "fx-vision-route-e2e-")) {
+  const root = realpathSync(mkdtempSync(prefix));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
   mkdirSync(join(home, ".fx"), { recursive: true });
@@ -2393,6 +2422,139 @@ describe("Vision route fake Gateway", () => {
         const raw = readFileSync(rawOutputPath);
         expect(raw.includes(Buffer.from("\x1bPtmux;\x1b\x1b_Ga=t,f=100,q=2"))).toBe(true);
         expect(raw.includes(Buffer.from("\x1bPtmux;\x1b\x1b_Ga=p,q=2,C=1"))).toBe(true);
+        expectLargeLeftAlignedKittyPlacement(raw);
+        expect(raw.includes(Buffer.from("\x1bPtmux;\x1b\x1b_Ga=d,d=I"))).toBe(true);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) await session.kill();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "open_file completion converts WebP and renders it inline without /image",
+    async () => {
+      const root = createIsolatedRoot();
+      const imagePath = join(root.workspace, "opened-preview.webp");
+      copyFileSync(WEBP_IMAGE_PATH, imagePath);
+      const stubBin = join(root.root, "bin");
+      mkdirSync(stubBin, { recursive: true });
+      for (const command of ["open", "xdg-open"]) {
+        const stub = join(stubBin, command);
+        writeFileSync(stub, "#!/bin/sh\nexit 0\n");
+        chmodSync(stub, 0o755);
+      }
+      const gateway = startImageGateway([
+        sseToolCall("open_file", { path: imagePath }, "open_inline_webp"),
+        sseText("inline open complete"),
+      ]);
+      const stderrPath = join(root.root, "stderr.log");
+      const rawOutputPath = join(root.root, "pane-output.bin");
+      writeFileSync(stderrPath, "");
+      writeFileSync(rawOutputPath, "");
+      let session: TmuxSession | null = null;
+      try {
+        session = await TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway, GEMINI_MODEL),
+            FX_AUTO_UPGRADE: "0",
+            FX_IMAGE_PROTOCOL: "kitty",
+            FX_PERMISSION_MODE: "yolo",
+            NO_COLOR: "1",
+            PATH: `${stubBin}:${process.env.PATH ?? ""}`,
+          },
+          stderrPath,
+          width: 140,
+          height: 50,
+        });
+        const pipe = spawnSync(
+          "tmux",
+          ["pipe-pane", "-o", "-t", session.name, `cat >> ${JSON.stringify(rawOutputPath)}`],
+          { encoding: "utf8" },
+        );
+        expect(pipe.status).toBe(0);
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        await session.sendText("Show the local WebP inline.");
+        await session.waitForText("inline open complete", TIMEOUT);
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+
+        const raw = readFileSync(rawOutputPath);
+        expect(raw.includes(Buffer.from("\x1bPtmux;\x1b\x1b_Ga=t,f=100,q=2"))).toBe(true);
+        expect(raw.includes(Buffer.from("iVBOR"))).toBe(true);
+        expect(raw.includes(Buffer.from("UklGR"))).toBe(false);
+        expect(raw.includes(Buffer.from("\x1bPtmux;\x1b\x1b_Ga=p,q=2,C=1"))).toBe(true);
+        expectLargeLeftAlignedKittyPlacement(raw);
+        expect(raw.includes(Buffer.from("\x1bPtmux;\x1b\x1b_Ga=d,d=I"))).toBe(true);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) await session.kill();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "read_file completion converts JPEG and renders it inline without /image or an external app",
+    async () => {
+      const root = createIsolatedRoot();
+      const imagePath = join(root.workspace, "read-preview.jpg");
+      copyFileSync(JPEG_IMAGE_PATH, imagePath);
+      const gateway = startImageGateway([
+        sseToolCall("read_file", { path: imagePath }, "read_inline_jpeg"),
+        sseText("inline read complete"),
+      ]);
+      const stderrPath = join(root.root, "stderr.log");
+      const rawOutputPath = join(root.root, "pane-output.bin");
+      writeFileSync(stderrPath, "");
+      writeFileSync(rawOutputPath, "");
+      let session: TmuxSession | null = null;
+      try {
+        session = await TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway, GEMINI_MODEL),
+            FX_AUTO_UPGRADE: "0",
+            FX_IMAGE_PROTOCOL: "kitty",
+            FX_PERMISSION_MODE: "yolo",
+            NO_COLOR: "1",
+          },
+          stderrPath,
+          width: 140,
+          height: 50,
+        });
+        const pipe = spawnSync(
+          "tmux",
+          ["pipe-pane", "-o", "-t", session.name, `cat >> ${JSON.stringify(rawOutputPath)}`],
+          { encoding: "utf8" },
+        );
+        expect(pipe.status).toBe(0);
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        await session.sendText("Show the local JPEG inline without opening another app.");
+        await session.waitForText("inline read complete", TIMEOUT);
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+
+        const raw = readFileSync(rawOutputPath);
+        expect(raw.includes(Buffer.from("\x1bPtmux;\x1b\x1b_Ga=t,f=100,q=2"))).toBe(true);
+        expect(raw.includes(Buffer.from("iVBOR"))).toBe(true);
+        expect(raw.includes(Buffer.from("/9j/"))).toBe(false);
+        expect(raw.includes(Buffer.from("\x1bPtmux;\x1b\x1b_Ga=p,q=2,C=1"))).toBe(true);
+        expectLargeLeftAlignedKittyPlacement(raw);
         expect(raw.includes(Buffer.from("\x1bPtmux;\x1b\x1b_Ga=d,d=I"))).toBe(true);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
@@ -2765,7 +2927,8 @@ describe("Vision route fake Gateway", () => {
   test.skipIf(!tmuxAvailable())(
     "tmux path-source Vision returns Unix socket failures to the model",
     async () => {
-      const root = createIsolatedRoot();
+      // Darwin limits AF_UNIX paths to 103 bytes; TMPDIR is usually longer than that.
+      const root = createIsolatedRoot("/tmp/fx-vr-sock-");
       const socketPath = join(root.workspace, "image.socket");
       const socketServer = createServer();
       try {

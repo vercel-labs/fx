@@ -263,6 +263,9 @@ pub const DispatchContext = struct {
     web_search_completion_sink: ?*?core_types.WebSearchCompletion = null,
     web_fetch_completion_sink: ?*?core_types.WebFetchCompletion = null,
     tool_result_memory_sink: ?*?core_types.ToolResultMemory = null,
+    /// Optional presentation-only image produced by a successful local tool.
+    /// The dispatch result owns the attachment fields when this sink is used.
+    presentation_image_sink: ?*?core_types.ImageAttachment = null,
 };
 
 /// Function pointer used by ask_user_question to request live user answers.
@@ -761,6 +764,7 @@ pub const DispatchResult = struct {
     web_search_completion: ?core_types.WebSearchCompletion = null,
     web_fetch_completion: ?core_types.WebFetchCompletion = null,
     tool_result_memory: ?core_types.ToolResultMemory = null,
+    presentation_image: ?core_types.ImageAttachment = null,
 
     /// Tool-result status used only by tests and diagnostics.
     pub const Status = enum {
@@ -772,6 +776,7 @@ pub const DispatchResult = struct {
     pub fn deinit(self: DispatchResult, alloc: Allocator) void {
         alloc.free(self.body);
         if (self.status_detail) |detail| alloc.free(detail);
+        if (self.presentation_image) |image| core_types.freeImageAttachment(alloc, image);
     }
 };
 
@@ -781,11 +786,13 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
     var captured_web_search_completion: ?core_types.WebSearchCompletion = null;
     var captured_web_fetch_completion: ?core_types.WebFetchCompletion = null;
     var captured_tool_result_memory: ?core_types.ToolResultMemory = null;
+    var captured_presentation_image: ?core_types.ImageAttachment = null;
     var call_ctx = ctx;
     if (call_ctx.inner_usage_sink == null) call_ctx.inner_usage_sink = &captured_usage;
     if (call_ctx.web_search_completion_sink == null) call_ctx.web_search_completion_sink = &captured_web_search_completion;
     if (call_ctx.web_fetch_completion_sink == null) call_ctx.web_fetch_completion_sink = &captured_web_fetch_completion;
     if (call_ctx.tool_result_memory_sink == null) call_ctx.tool_result_memory_sink = &captured_tool_result_memory;
+    if (call_ctx.presentation_image_sink == null) call_ctx.presentation_image_sink = &captured_presentation_image;
 
     const admission = try admitToolCall(call_ctx, registry, call);
     switch (admission) {
@@ -794,11 +801,15 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
         .admitted => |admitted| {
             defer admitted.deinit();
 
-            const result = try admitted.tool.call(admitted.context, admitted.input);
+            const result = admitted.tool.call(admitted.context, admitted.input) catch |err| {
+                clearPresentationImage(admitted.context.allocator, admitted.context.presentation_image_sink);
+                return err;
+            };
             const inner_usage = if (admitted.context.inner_usage_sink) |slot| slot.* else captured_usage;
             const web_search_completion = if (admitted.context.web_search_completion_sink) |slot| slot.* else captured_web_search_completion;
             const web_fetch_completion = if (admitted.context.web_fetch_completion_sink) |slot| slot.* else captured_web_fetch_completion;
             const tool_result_memory = if (admitted.context.tool_result_memory_sink) |slot| slot.* else captured_tool_result_memory;
+            const presentation_image = if (admitted.context.presentation_image_sink) |slot| slot.* else captured_presentation_image;
             return switch (result) {
                 .success => |body| .{
                     .status = .success,
@@ -807,6 +818,7 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
                     .web_search_completion = web_search_completion,
                     .web_fetch_completion = web_fetch_completion,
                     .tool_result_memory = tool_result_memory,
+                    .presentation_image = presentation_image,
                 },
                 .failure => |body| .{
                     .status = .failure,
@@ -815,6 +827,7 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
                     .web_search_completion = web_search_completion,
                     .web_fetch_completion = web_fetch_completion,
                     .tool_result_memory = tool_result_memory,
+                    .presentation_image = presentation_image,
                 },
             };
         },
@@ -847,11 +860,13 @@ pub fn dispatchAuthorizedToolCallDefault(ctx: DispatchContext, registry: Registr
     var captured_web_search_completion: ?core_types.WebSearchCompletion = null;
     var captured_web_fetch_completion: ?core_types.WebFetchCompletion = null;
     var captured_tool_result_memory: ?core_types.ToolResultMemory = null;
+    var captured_presentation_image: ?core_types.ImageAttachment = null;
     var call_ctx = ctx;
     if (call_ctx.inner_usage_sink == null) call_ctx.inner_usage_sink = &captured_usage;
     if (call_ctx.web_search_completion_sink == null) call_ctx.web_search_completion_sink = &captured_web_search_completion;
     if (call_ctx.web_fetch_completion_sink == null) call_ctx.web_fetch_completion_sink = &captured_web_fetch_completion;
     if (call_ctx.tool_result_memory_sink == null) call_ctx.tool_result_memory_sink = &captured_tool_result_memory;
+    if (call_ctx.presentation_image_sink == null) call_ctx.presentation_image_sink = &captured_presentation_image;
 
     const validated = try decodeAndValidateRegisteredToolCall(call_ctx, registry, call);
     switch (validated) {
@@ -860,18 +875,23 @@ pub fn dispatchAuthorizedToolCallDefault(ctx: DispatchContext, registry: Registr
         .input => |input| {
             defer input.value.deinit(call_ctx.allocator);
 
-            const result = try input.tool.call(call_ctx, input.value);
+            const result = input.tool.call(call_ctx, input.value) catch |err| {
+                clearPresentationImage(call_ctx.allocator, call_ctx.presentation_image_sink);
+                return err;
+            };
             if (input.tool.cancel_if_requested_after_call and
                 call_ctx.cancel_flag != null and
                 call_ctx.cancel_flag.?.load(.seq_cst))
             {
                 result.deinit(call_ctx.allocator);
+                clearPresentationImage(call_ctx.allocator, call_ctx.presentation_image_sink);
                 return error.Cancelled;
             }
             const inner_usage = if (call_ctx.inner_usage_sink) |slot| slot.* else captured_usage;
             const web_search_completion = if (call_ctx.web_search_completion_sink) |slot| slot.* else captured_web_search_completion;
             const web_fetch_completion = if (call_ctx.web_fetch_completion_sink) |slot| slot.* else captured_web_fetch_completion;
             const tool_result_memory = if (call_ctx.tool_result_memory_sink) |slot| slot.* else captured_tool_result_memory;
+            const presentation_image = if (call_ctx.presentation_image_sink) |slot| slot.* else captured_presentation_image;
             return switch (result) {
                 .success => |body| .{
                     .status = .success,
@@ -880,6 +900,7 @@ pub fn dispatchAuthorizedToolCallDefault(ctx: DispatchContext, registry: Registr
                     .web_search_completion = web_search_completion,
                     .web_fetch_completion = web_fetch_completion,
                     .tool_result_memory = tool_result_memory,
+                    .presentation_image = presentation_image,
                 },
                 .failure => |body| .{
                     .status = .failure,
@@ -888,6 +909,7 @@ pub fn dispatchAuthorizedToolCallDefault(ctx: DispatchContext, registry: Registr
                     .web_search_completion = web_search_completion,
                     .web_fetch_completion = web_fetch_completion,
                     .tool_result_memory = tool_result_memory,
+                    .presentation_image = presentation_image,
                 },
             };
         },
@@ -967,6 +989,15 @@ pub fn localToolAvailabilityFailureForCall(
             break :blk try localToolAvailabilityFailure(ctx, input.tool, input.value);
         },
     };
+}
+
+fn clearPresentationImage(
+    alloc: Allocator,
+    sink: ?*?core_types.ImageAttachment,
+) void {
+    const slot = sink orelse return;
+    if (slot.*) |image| core_types.freeImageAttachment(alloc, image);
+    slot.* = null;
 }
 
 fn failure(body: []u8) DispatchResult {
