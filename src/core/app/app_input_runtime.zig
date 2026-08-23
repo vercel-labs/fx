@@ -2423,6 +2423,7 @@ pub fn Runtime(comptime App: type) type {
                         return;
                     }
                 }
+                if (handleComposerDraftEscape(app, now)) return;
                 if (!interrupt_rt.pauseActiveRecovery(app)) {
                     try interrupt_rt.cancelActiveOperation(app);
                 }
@@ -2471,9 +2472,13 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 }
             }
+            _ = handleComposerDraftEscape(app, now);
+        }
+
+        fn handleComposerDraftEscape(app: *App, now: i64) bool {
             if (!draftHasState(app)) {
                 _ = disarmEscapeClear(app);
-                return;
+                return false;
             }
             const transition = gesture_state.pressEscapeClear(
                 app.input_runtime.gestures,
@@ -2482,11 +2487,10 @@ pub fn Runtime(comptime App: type) type {
             app.input_runtime.gestures = transition.next;
             if (transition.result == .activated) {
                 clearDraftState(app, "double_escape");
-                app.shell.render_requests.request(.footer);
                 if (comptime @hasDecl(App, "playInputClearedSound")) app.playInputClearedSound();
-            } else {
-                app.shell.render_requests.request(.footer);
             }
+            app.shell.render_requests.request(.footer);
+            return true;
         }
 
         fn cancelSkillsMenu(app: *App) bool {
@@ -4085,7 +4089,7 @@ test "app_input_runtime Escape dismisses an idle inline slash completion" {
     try std.testing.expect(!app.input_runtime.gestures.escapeClearArmed());
 }
 
-test "app_input_runtime active operation Escape keeps precedence over inline skill dismissal" {
+test "app_input_runtime active draft Escape keeps precedence over inline skill dismissal" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -4102,8 +4106,9 @@ test "app_input_runtime active operation Escape keeps precedence over inline ski
 
     try Runtime(RoutingFakeApp).resolveEscape(&app, true, 1);
 
-    try std.testing.expect(app.worker.cancel_requested);
-    try std.testing.expect(!app.stream.active);
+    try std.testing.expect(!app.worker.cancel_requested);
+    try std.testing.expect(app.stream.active);
+    try std.testing.expect(app.input_runtime.gestures.escapeClearArmed());
     try std.testing.expect(!app.input_runtime.picker.isInlinePickerDismissed(.skill));
 }
 
@@ -5099,6 +5104,33 @@ test "app_input_runtime Escape cancels an idle session picker before empty-compo
     try std.testing.expect(!app.session_persistence.session_picker.active);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
     try std.testing.expect(!app.worker.cancel_requested);
+}
+
+test "app_input_runtime stream double Escape clears the draft before cancelling" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "keep working");
+    app.stream.active = true;
+
+    try Runtime(RoutingFakeApp).resolveEscape(&app, true, 1);
+
+    try std.testing.expectEqualStrings("keep working", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(?i64, 1), app.input_runtime.gestures.escapeClearArmedAt());
+    try std.testing.expect(app.stream.active);
+    try std.testing.expect(!app.worker.cancel_requested);
+
+    try Runtime(RoutingFakeApp).resolveEscape(&app, true, 2);
+
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(!app.input_runtime.gestures.escapeClearArmed());
+    try std.testing.expect(app.stream.active);
+    try std.testing.expect(!app.worker.cancel_requested);
+
+    try Runtime(RoutingFakeApp).resolveEscape(&app, true, 3);
+
+    try std.testing.expect(app.worker.cancel_requested);
+    try std.testing.expect(!app.stream.active);
 }
 
 test "app_input_runtime stream Escape retains cancellation precedence over session picker state" {
