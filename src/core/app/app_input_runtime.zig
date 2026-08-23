@@ -3493,10 +3493,6 @@ const RoutingFakeApp = struct {
         self.approval_resize_interlock.releaseAffirmative();
     }
 
-    pub fn enqueuePrompt(self: *RoutingFakeApp, text: []const u8) !bool {
-        return self.enqueuePromptWithSkillBindingsIntent(text, &.{}, .queue);
-    }
-
     pub fn enqueuePromptWithSkillBindingsIntent(
         self: *RoutingFakeApp,
         text: []const u8,
@@ -10956,18 +10952,6 @@ const FakeSubmitApp = struct {
         return self.prompt_admitted;
     }
 
-    pub fn enqueuePrompt(self: *FakeSubmitApp, text: []const u8) !bool {
-        return self.enqueuePromptWithSkillBindings(text, &.{});
-    }
-
-    pub fn enqueuePromptWithSkillBindings(
-        self: *FakeSubmitApp,
-        text: []const u8,
-        skill_tokens: []const registered_entities.SkillTokenSpan,
-    ) !bool {
-        return self.enqueuePromptWithSkillBindingsIntent(text, skill_tokens, .queue);
-    }
-
     pub fn enqueuePromptWithSkillBindingsIntent(
         self: *FakeSubmitApp,
         text: []const u8,
@@ -11063,7 +11047,12 @@ const FrameSubmitApp = struct {
         try self.shell.writeNotice(self.alloc, &self.metrics, notice, record);
     }
 
-    pub fn enqueuePrompt(_: *FrameSubmitApp, _: []const u8) !bool {
+    pub fn enqueuePromptWithSkillBindingsIntent(
+        _: *FrameSubmitApp,
+        _: []const u8,
+        _: []const registered_entities.SkillTokenSpan,
+        _: worker_runtime.PromptEnqueueIntent,
+    ) !bool {
         return true;
     }
 

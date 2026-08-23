@@ -461,7 +461,7 @@ const required_fragments = [_]Fragment{
 const current_inventory = [_]EntrypointInventory{
     .{
         .entrypoint = .interactive,
-        .assembly_path = "main.App.enqueuePrompt -> app_agent_runtime.processQueuedPrompt -> agent_runtime dependencies",
+        .assembly_path = "main.App.enqueuePromptWithSkillBindingsIntent -> app_agent_runtime.processQueuedPrompt -> agent_runtime dependencies",
         .static_context = "builtins/context captures one global/root/ancestor/applicable AGENTS.md snapshot before enqueue, then adds scoped deltas from effective structured tool targets",
         .transient_context = "tool_runtime transient context each model step: env_context, captured permission mode, background runtime, non-live background history",
         .tools = "App.snapshotGatewayToolProjection pairs full tool advertisement with included custom-provider guidance after permission and deferred MCP discovery",
@@ -651,7 +651,7 @@ test "entrypoint context inventory snapshot documents current deltas" {
         \\contract: fx.shared_model_context.v1
         \\entrypoints:
         \\- entrypoint: interactive
-        \\  assembly_path: main.App.enqueuePrompt -> app_agent_runtime.processQueuedPrompt -> agent_runtime dependencies
+        \\  assembly_path: main.App.enqueuePromptWithSkillBindingsIntent -> app_agent_runtime.processQueuedPrompt -> agent_runtime dependencies
         \\  static_context: builtins/context captures one global/root/ancestor/applicable AGENTS.md snapshot before enqueue, then adds scoped deltas from effective structured tool targets
         \\  transient_context: tool_runtime transient context each model step: env_context, captured permission mode, background runtime, non-live background history
         \\  tools: App.snapshotGatewayToolProjection pairs full tool advertisement with included custom-provider guidance after permission and deferred MCP discovery

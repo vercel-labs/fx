@@ -474,6 +474,9 @@ pub fn SubmitRuntime(comptime App: type) type {
                 }
             }
 
+            // Only the real App carries a queue-review draft; the test hosts
+            // implement the plain enqueue alone, so the draft call stays
+            // conditional while the enqueue below does not.
             const accepted = if (accepted_draft) |draft| blk: {
                 if (comptime @hasDecl(App, "enqueuePromptWithReviewDraftIntent")) {
                     break :blk try App.enqueuePromptWithReviewDraftIntent(
@@ -487,19 +490,8 @@ pub fn SubmitRuntime(comptime App: type) type {
                         intent,
                     );
                 }
-                if (comptime @hasDecl(App, "enqueuePromptWithReviewDraft")) {
-                    break :blk try App.enqueuePromptWithReviewDraft(
-                        app,
-                        prompt,
-                        skill_tokens,
-                        draft.input,
-                        draft.pasted_blocks.items,
-                        draft.image_tokens.items,
-                        draft.skill_tokens.items,
-                    );
-                }
-                break :blk try enqueueBySkillBindings(app, prompt, skill_tokens, intent);
-            } else try enqueueBySkillBindings(app, prompt, skill_tokens, intent);
+                break :blk try App.enqueuePromptWithSkillBindingsIntent(app, prompt, skill_tokens, intent);
+            } else try App.enqueuePromptWithSkillBindingsIntent(app, prompt, skill_tokens, intent);
             if (!accepted) return false;
             if (resume_review) {
                 if (comptime @hasField(App, "queued_prompt_review")) {
@@ -508,23 +500,6 @@ pub fn SubmitRuntime(comptime App: type) type {
             }
             beginIdleSubmittedPromptTransition(app);
             return true;
-        }
-
-        /// Skill-bindings enqueue fallback chain, shared by the draft and
-        /// no-draft submission paths so the dispatch order cannot drift.
-        fn enqueueBySkillBindings(
-            app: *App,
-            prompt: []const u8,
-            skill_tokens: []const registered_entities.SkillTokenSpan,
-            intent: worker_runtime.PromptEnqueueIntent,
-        ) !bool {
-            if (comptime @hasDecl(App, "enqueuePromptWithSkillBindingsIntent")) {
-                return try App.enqueuePromptWithSkillBindingsIntent(app, prompt, skill_tokens, intent);
-            }
-            if (comptime @hasDecl(App, "enqueuePromptWithSkillBindings")) {
-                return try App.enqueuePromptWithSkillBindings(app, prompt, skill_tokens);
-            }
-            return try App.enqueuePrompt(app, prompt);
         }
 
         fn beginIdleSubmittedPromptTransition(app: *App) void {

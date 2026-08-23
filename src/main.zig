@@ -1018,14 +1018,6 @@ const App = struct {
         try SessionAppRuntime.captureImageAttachment(self, attachment);
     }
 
-    pub fn enqueuePrompt(self: *App, prompt: []const u8) !bool {
-        return self.enqueuePromptWithSkillBindings(prompt, &.{});
-    }
-
-    pub fn enqueuePromptWithSkillBindings(self: *App, prompt: []const u8, skill_tokens: []const registered_entities.SkillTokenSpan) !bool {
-        return self.enqueuePromptWithSkillBindingsIntent(prompt, skill_tokens, .queue);
-    }
-
     pub fn enqueuePromptWithSkillBindingsIntent(
         self: *App,
         prompt: []const u8,
@@ -1037,26 +1029,6 @@ const App = struct {
             skill_tokens,
             null,
             intent,
-        );
-    }
-
-    pub fn enqueuePromptWithReviewDraft(
-        self: *App,
-        prompt: []const u8,
-        skill_tokens: []const registered_entities.SkillTokenSpan,
-        review_input: []const u8,
-        review_pasted_blocks: []const paste_blocks.PastedBlock,
-        review_image_tokens: []const entity_spans.ImageTokenSpan,
-        review_skill_tokens: []const registered_entities.SkillTokenSpan,
-    ) !bool {
-        return self.enqueuePromptWithReviewDraftIntent(
-            prompt,
-            skill_tokens,
-            review_input,
-            review_pasted_blocks,
-            review_image_tokens,
-            review_skill_tokens,
-            .queue,
         );
     }
 
