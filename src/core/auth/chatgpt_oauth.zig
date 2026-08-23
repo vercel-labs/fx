@@ -226,10 +226,19 @@ fn pollBrowserToken(
     if (comptime host_target.is_wasm) return error.ChatGptOAuthUnavailable;
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const context: *BrowserLoginContext = @ptrCast(@alignCast(raw.?));
-    if (!try browserCallbackReady(&context.listener, cancel_flag)) return .pending;
-
-    var stream = try context.listener.accept(io_mod.getIo());
+    var stream = if (comptime builtin.os.tag == .windows) blk: {
+        const accepted = try windows_socket.acceptWithTimeout(
+            io_mod.getIo(),
+            &context.listener,
+            @intCast(browser_callback_poll_ms),
+        );
+        break :blk accepted orelse return .pending;
+    } else blk: {
+        if (!try browserCallbackReady(&context.listener, cancel_flag)) return .pending;
+        break :blk try context.listener.accept(io_mod.getIo());
+    };
     defer stream.close(io_mod.getIo());
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     setBrowserSocketTimeouts(stream.socket.handle);
     const target = try readBrowserCallbackTarget(alloc, stream);
     defer alloc.free(target);
