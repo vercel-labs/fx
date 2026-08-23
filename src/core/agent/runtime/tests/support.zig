@@ -601,6 +601,9 @@ pub const FakeAgentRuntimeDeps = struct {
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
     enable_turn_yield: bool = false,
     yield_requested: bool = false,
+    /// Withholds the yield until the nth check (1-based), so a test can arm it
+    /// for the exact batch that also exhausts a retry budget.
+    yield_requested_from_check: usize = 0,
     yield_check_count: usize = 0,
     yield_checked_turn_id: u64 = 0,
 
@@ -745,7 +748,8 @@ pub const FakeAgentRuntimeDeps = struct {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         self.yield_check_count += 1;
         self.yield_checked_turn_id = turn_id;
-        return self.yield_requested;
+        if (!self.yield_requested) return false;
+        return self.yield_check_count >= self.yield_requested_from_check;
     }
 
     fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) !model_capabilities.Capabilities {

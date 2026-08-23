@@ -128,34 +128,6 @@ pub fn finishAssistantTerminalWithExecution(
     if (propagation_error) |err| return err;
 }
 
-pub fn finishYieldedTurn(
-    deps: *const AgentRuntimeDeps,
-    finalization: *TurnFinalizationGuard,
-    arena: Allocator,
-    job: QueuedPrompt,
-    current_turn_messages: []const ChatMessage,
-    summary: *TurnSummaryAccumulator,
-    assistant_text: []const u8,
-    finish_trace: *PromptFinishTrace,
-) !void {
-    const execution = try execution_memory.buildExecutionMemory(
-        arena,
-        current_turn_messages,
-    );
-    try finishAssistantTerminalWithExecution(
-        deps,
-        finalization,
-        job,
-        execution,
-        summary,
-        assistant_text,
-        .completed,
-        null,
-        finish_trace,
-        "yielded",
-    );
-}
-
 pub fn finishExecutionOnlyFailureIfNeeded(
     deps: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,

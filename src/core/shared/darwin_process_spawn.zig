@@ -26,7 +26,13 @@ const ConnectTransition = enum {
     other,
 };
 
-fn connect_transition(err: std.posix.E, interrupted: bool) ConnectTransition {
+/// The connect that feeds this runs on a nonblocking descriptor, so it never
+/// waits and therefore cannot report EINTR: that is what keeps the wrapper off
+/// the interrupted-connect path where Darwin answers the required retry with
+/// EISCONN and `std.Io.Threaded.posixConnect` calls it a programmer bug. The
+/// `.INTR` arm stays as a cheap retry rather than a claim that the kernel can
+/// never surprise us; a retry mid-connect reports EALREADY and waits below.
+fn connect_transition(err: std.posix.E) ConnectTransition {
     return switch (err) {
         .SUCCESS => .connected,
         .INTR => .retry,
@@ -34,9 +40,6 @@ fn connect_transition(err: std.posix.E, interrupted: bool) ConnectTransition {
         // for readiness through a cancellable probe loop instead of surfacing
         // the implementation detail to callers.
         .AGAIN, .INPROGRESS, .ALREADY => .wait_for_completion,
-        // Darwin may complete a connect after it returned EINTR. The
-        // required retry then reports EISCONN; that is success, not a caller bug.
-        .ISCONN => if (interrupted) .connected else .other,
         else => .other,
     };
 }
@@ -272,18 +275,16 @@ fn net_connect_ip(
 
     var storage: std.Io.Threaded.PosixAddress = undefined;
     var address_len = std.Io.Threaded.addressToPosix(address, &storage);
-    var interrupted = false;
     while (true) {
         const err = std.posix.errno(std.posix.system.connect(
             socket_fd,
             &storage.any,
             address_len,
         ));
-        switch (connect_transition(err, interrupted)) {
+        switch (connect_transition(err)) {
             .connected => break,
             .retry => {
                 try check_cancel(userdata);
-                interrupted = true;
                 continue;
             },
             .wait_for_completion => {
@@ -599,18 +600,14 @@ fn close_fd(fd: std.posix.fd_t) void {
     }
 }
 
-test "Darwin connect accepts EISCONN only after an interrupted connect" {
-    try std.testing.expectEqual(ConnectTransition.retry, connect_transition(.INTR, false));
-    try std.testing.expectEqual(ConnectTransition.connected, connect_transition(.ISCONN, true));
-    try std.testing.expectEqual(ConnectTransition.other, connect_transition(.ISCONN, false));
-    try std.testing.expectEqual(ConnectTransition.connected, connect_transition(.SUCCESS, false));
-}
-
-test "Darwin nonblocking connect waits for completion" {
-    try std.testing.expectEqual(ConnectTransition.wait_for_completion, connect_transition(.AGAIN, false));
-    try std.testing.expectEqual(ConnectTransition.wait_for_completion, connect_transition(.INPROGRESS, false));
-    try std.testing.expectEqual(ConnectTransition.wait_for_completion, connect_transition(.ALREADY, true));
-    try std.testing.expectEqual(ConnectTransition.wait_for_completion, connect_transition(.ALREADY, false));
+test "Darwin nonblocking connect waits for completion instead of failing" {
+    try std.testing.expectEqual(ConnectTransition.connected, connect_transition(.SUCCESS));
+    try std.testing.expectEqual(ConnectTransition.wait_for_completion, connect_transition(.AGAIN));
+    try std.testing.expectEqual(ConnectTransition.wait_for_completion, connect_transition(.INPROGRESS));
+    try std.testing.expectEqual(ConnectTransition.wait_for_completion, connect_transition(.ALREADY));
+    try std.testing.expectEqual(ConnectTransition.retry, connect_transition(.INTR));
+    try std.testing.expectEqual(ConnectTransition.other, connect_transition(.CONNREFUSED));
+    try std.testing.expectEqual(ConnectTransition.other, connect_transition(.ISCONN));
 }
 
 fn darwin_io() !std.Io {

@@ -333,6 +333,61 @@ test "processQueuedPrompt stops repeated malformed calls before another provider
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
 }
 
+test "repeated malformed calls finalize as a failure even when a steer wants the turn" {
+    const alloc = std.testing.allocator;
+    const call_one = [_]ToolCall{.{
+        .id = "call_1",
+        .name = "read_file",
+        .arguments_json = "{}",
+        .argument_integrity = .malformed_json,
+    }};
+    const call_two = [_]ToolCall{.{
+        .id = "call_2",
+        .name = "read_file",
+        .arguments_json = "{}",
+        .argument_integrity = .malformed_json,
+    }};
+    const call_three = [_]ToolCall{.{
+        .id = "call_3",
+        .name = "read_file",
+        .arguments_json = "{}",
+        .argument_integrity = .malformed_json,
+    }};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &call_one },
+        .{ .tool_calls = &call_two },
+        .{ .tool_calls = &call_three },
+        .{ .content = "must not be requested" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.enable_turn_yield = true;
+    hooks.yield_requested = true;
+    // Arm the steer for the third batch, the one that exhausts the malformed
+    // retry budget. Arming it earlier would yield before the turn ever reaches
+    // the exhaustion this test is about.
+    hooks.yield_requested_from_check = 3;
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.agent_step_limit = 0;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    // The failure finalizer runs before the yield check, so the third check
+    // never happens and the turn is recorded as failed with its notice. Move
+    // the yield check above the retry finalizers and the third check fires,
+    // the yield wins, and the exhaustion is reported as a clean completion.
+    const notice = "Repeated malformed tool arguments stopped the agent loop. The invalid calls were not executed. Continue with a follow-up prompt if needed.";
+    try std.testing.expectEqual(@as(usize, 2), hooks.yield_check_count);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    try std.testing.expect(textContains(&hooks, notice));
+    try std.testing.expectEqualStrings(notice, hooks.history_assistant_text.?);
+}
+
 test "processQueuedPrompt returns a final response after a repeated tool-name cycle" {
     const alloc = std.testing.allocator;
     const c1 = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};

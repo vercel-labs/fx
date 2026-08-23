@@ -61,10 +61,20 @@ pub const PromptEnqueueIntent = enum {
 
 pub const QueuedPrompt = struct {
     turn_id: u64 = 0,
-    /// The exact active turn this prompt may ask to yield. Goes stale (and is
-    /// ignored) once that turn is no longer active, so prioritized steering
-    /// prompts cannot cascade; turn ids are never reused.
+    /// The exact active turn this prompt may ask to yield, cleared by
+    /// `finishProcessing` when that turn ends so a steer cannot cascade into
+    /// the turn that follows. Turn ids DO repeat within a session:
+    /// `debug_trace.next_turn_id` restarts at 1 each process while a resumed
+    /// session replays the turn id persisted in its recovery checkpoint, so
+    /// nothing here may rest on an id identifying one turn for all time.
     steer_target_turn_id: ?u64 = null,
+    /// Set for every prompt submitted with steering intent, and never cleared.
+    /// `steer_target_turn_id` answers "may this yield the running turn"; this
+    /// answers "where does this belong in the queue", which outlives the turn
+    /// it was aimed at. Ordering must not read the target: once demotion nulls
+    /// it, an earlier steer would look like an ordinary queued prompt and a
+    /// later steer would jump it.
+    submitted_as_steer: bool = false,
     prompt: []u8,
     images: []types.ImageAttachment,
     authorized_image_catalog: []types.ImageAttachment = &.{},
@@ -778,11 +788,16 @@ pub const WorkerRuntime = struct {
             self.active_turn_id
         else
             null;
+        queued.submitted_as_steer = queued.steer_target_turn_id != null;
 
-        if (queued.steer_target_turn_id) |target_turn_id| {
+        if (queued.submitted_as_steer) {
+            // Land after every steer already waiting, whichever turn each was
+            // aimed at. Scanning for a matching target instead would treat a
+            // demoted steer as an ordinary queued prompt and jump it, so a
+            // prompt could be pushed back by every later steer.
             var insert_index: usize = 0;
             while (insert_index < self.queued_prompts.items.len and
-                self.queued_prompts.items[insert_index].steer_target_turn_id == target_turn_id) : (insert_index += 1)
+                self.queued_prompts.items[insert_index].submitted_as_steer) : (insert_index += 1)
             {}
             try self.queued_prompts.insert(alloc, insert_index, queued);
         } else {
@@ -3104,6 +3119,41 @@ test "targeted steers jump the queue in FIFO order and do not cascade" {
     defer freeQueuedPrompt(alloc, next);
     try std.testing.expectEqualStrings("steer one", next.prompt);
     try std.testing.expect(!runtime.shouldYieldTurn(next.turn_id));
+    runtime.finishProcessing();
+}
+
+test "a later steer keeps its place behind a steer whose turn already ended" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "active", "model"));
+    const first = (try runtime.waitAndTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, first);
+
+    try runtime.enqueuePromptWithIntent(alloc, try makePrompt(alloc, "steer one", "model"), .steer_if_active);
+    try runtime.enqueuePromptWithIntent(alloc, try makePrompt(alloc, "steer two", "model"), .steer_if_active);
+
+    // The first turn yields, so both steers are demoted and "steer one" runs.
+    runtime.finishProcessing();
+    const second = (try runtime.waitAndTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, second);
+    try std.testing.expectEqualStrings("steer one", second.prompt);
+
+    // A steer aimed at that second turn must land behind the still-waiting
+    // "steer two", which was submitted first. Ordering reads
+    // submitted_as_steer, not the demoted target, so "steer two" cannot be
+    // pushed back by every steer that follows it.
+    try runtime.enqueuePromptWithIntent(alloc, try makePrompt(alloc, "steer three", "model"), .steer_if_active);
+    try std.testing.expectEqualStrings("steer two", runtime.queued_prompts.items[0].prompt);
+    try std.testing.expectEqualStrings("steer three", runtime.queued_prompts.items[1].prompt);
+    try std.testing.expect(runtime.queued_prompts.items[0].steer_target_turn_id == null);
+    try std.testing.expectEqual(second.turn_id, runtime.queued_prompts.items[1].steer_target_turn_id.?);
+    try std.testing.expect(runtime.shouldYieldTurn(second.turn_id));
+
+    // An ordinary queued prompt still sits behind both of them.
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "queued", "model"));
+    try std.testing.expectEqualStrings("queued", runtime.queued_prompts.items[2].prompt);
     runtime.finishProcessing();
 }
 

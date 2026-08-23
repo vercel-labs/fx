@@ -2912,16 +2912,22 @@ fn finishYieldedTurnIfRequested(
     summary: *runtime_telemetry.TurnSummaryAccumulator,
     stop_state: *CommonStopState,
     finish_trace: *PromptFinishTrace,
+    review_pass_dropped: bool,
 ) !bool {
     const should_yield = deps.should_yield_turn orelse return false;
     if (!should_yield(deps.ctx, turn_id)) return false;
 
+    // review_pass_dropped records the accepted cost of steering under review
+    // mode: the caller yields before appending the review continuation, so a
+    // steered batch that wrote files never gets its review pass. Gating the
+    // yield on the writes instead would make write batches unsteerable, which
+    // is the whole feature, so the tradeoff is logged rather than avoided.
     debug_trace.eventf(
         "agent",
         "turn_yield_requested",
         step_ctx,
-        "settled_message_count={d}",
-        .{current_turn_messages.len},
+        "settled_message_count={d} review_pass_dropped={s}",
+        .{ current_turn_messages.len, if (review_pass_dropped) "true" else "false" },
     );
     const assistant_text = if (stop_state.retained_candidate != null)
         try hooks.prompt.joinVisibleSegments(
@@ -2932,7 +2938,7 @@ fn finishYieldedTurnIfRequested(
     else
         "";
     stop_state.terminal_materializing = true;
-    try runtime_finalization.finishYieldedTurn(
+    try finishCommonAssistantTerminal(
         deps,
         finalization,
         arena,
@@ -2940,7 +2946,10 @@ fn finishYieldedTurnIfRequested(
         current_turn_messages,
         summary,
         assistant_text,
+        .completed,
+        null,
         finish_trace,
+        "yielded",
     );
     debug_trace.eventf(
         "agent",
@@ -7352,6 +7361,9 @@ fn processQueuedPromptLoop(
             );
             return;
         }
+        // Yielding here, ahead of the review continuation, costs a steered
+        // batch its review pass under review mode; see
+        // finishYieldedTurnIfRequested for why that is the accepted trade.
         if (!terminal_provider_completion and try finishYieldedTurnIfRequested(
             deps,
             finalization,
@@ -7363,6 +7375,7 @@ fn processQueuedPromptLoop(
             &summary_accumulator,
             stop_state,
             &finish_trace,
+            config.review_enabled and step_batch.step_had_writes,
         )) return;
         try runtime_tool_batch.appendReviewContinuationSuffix(
             config.review_enabled,
