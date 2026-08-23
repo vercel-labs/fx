@@ -32,4 +32,5 @@ test "subscription providers opt out of Gateway usage observation" {
     try std.testing.expect(agentStream(.gateway).observes_gateway_usage);
     try std.testing.expect(!agentStream(.codex).observes_gateway_usage);
     try std.testing.expect(!agentStream(.grok).observes_gateway_usage);
+    try std.testing.expect(!agentStream(.opencode).observes_gateway_usage);
 }

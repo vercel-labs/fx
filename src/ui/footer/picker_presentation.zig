@@ -1677,6 +1677,7 @@ test "auth picker composes only detected credential sources" {
     var switch_provider = try composeAuthPickerRow(alloc, view, 5, row_count, 80);
     defer switch_provider.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, switch_provider.items, "Switch provider") != null);
+    try std.testing.expect(std.mem.find(u8, switch_provider.items, "includes OpenCode Go") != null);
 
     var change_team = try composeAuthPickerRow(alloc, view, 6, row_count, 80);
     defer change_team.deinit(alloc);
