@@ -93,7 +93,7 @@ pub const TeamSelection = struct {
         if (selected_index >= self.teams.items.len) return LoginError.InvalidTeamSelection;
         const selected = self.teams.items[selected_index];
 
-        var mutation = (try oauth_session.beginExistingMutation()) orelse return LoginError.SessionChanged;
+        var mutation = (try oauth_session.beginExistingMutation(alloc)) orelse return LoginError.SessionChanged;
         defer mutation.deinit();
         var current = (try mutation.load(alloc)) orelse return LoginError.SessionChanged;
         defer current.deinit(alloc);
@@ -649,7 +649,7 @@ pub fn loadTeamSelection(
     transport: oauth_transport.Provider,
 ) !TeamSelection {
     var session = blk: {
-        var mutation = (try oauth_session.beginExistingMutation()) orelse return LoginError.NoSession;
+        var mutation = (try oauth_session.beginExistingMutation(alloc)) orelse return LoginError.NoSession;
         defer mutation.deinit();
 
         var loaded = (try mutation.load(alloc)) orelse return LoginError.NoSession;
@@ -686,7 +686,7 @@ pub fn logout(
     var session_load_failed = false;
     defer if (session) |*loaded| loaded.deinit(alloc);
     const delete_result = blk: {
-        var mutation = (oauth_session.beginExistingMutation() catch {
+        var mutation = (oauth_session.beginExistingMutation(alloc) catch {
             return LogoutError.SessionDeleteFailed;
         }) orelse return .{};
         defer mutation.deinit();

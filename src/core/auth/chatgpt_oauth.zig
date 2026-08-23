@@ -405,8 +405,8 @@ pub fn runLogin(
     }
 }
 
-pub fn logout() !chatgpt_session.DeleteOutcome {
-    var mutation = (try chatgpt_session.beginExistingMutation()) orelse return .missing;
+pub fn logout(alloc: Allocator) !chatgpt_session.DeleteOutcome {
+    var mutation = (try chatgpt_session.beginExistingMutation(alloc)) orelse return .missing;
     defer mutation.deinit();
     return mutation.delete();
 }
@@ -428,7 +428,7 @@ pub fn loadAccess(
         return takeAccess(&session);
     }
 
-    var mutation = (try chatgpt_session.beginExistingMutation()) orelse return null;
+    var mutation = (try chatgpt_session.beginExistingMutation(alloc)) orelse return null;
     defer mutation.deinit();
     var session = (try mutation.load(alloc)) orelse return null;
     defer session.deinit(alloc);

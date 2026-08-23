@@ -8,7 +8,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN } from "../evals/eval-helpers";
+import { FX_BIN, fxProfileRoots } from "../evals/eval-helpers";
 import {
   fakeGatewaySse,
   startFakeGateway,
@@ -130,7 +130,7 @@ async function waitForProfileUsage(
   generationId: string,
 ): Promise<void> {
   const deadline = Date.now() + TIMEOUT;
-  const usagePath = join(home, ".fx", "usage.jsonl");
+  const usagePath = join(fxProfileRoots(home).state, "usage.jsonl");
   while (Date.now() < deadline) {
     try {
       if (readFileSync(usagePath, "utf8").includes(generationId)) return;

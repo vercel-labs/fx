@@ -10,7 +10,7 @@ const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
 const streamable_http = @import("../core/mcp/streamable_http.zig");
 const profile_paths = @import("../core/shared/profile_paths.zig");
-const text_utils = @import("../core/shared/text_utils.zig");
+const profile_roots = @import("../core/shared/profile_roots.zig");
 
 const Allocator = std.mem.Allocator;
 const CommandRequest = command_provider_contract.Request;
@@ -346,7 +346,9 @@ fn lineParts(alloc: Allocator, parts: []const []const u8, reload: bool) !Command
 }
 
 pub fn configPathFromHome(alloc: Allocator, home: []const u8) ![]u8 {
-    return profile_paths.mcpConfigPath(alloc, home);
+    const config_root = try profile_roots.resolveRootForProcess(alloc, home, .config, .{});
+    defer alloc.free(config_root);
+    return profile_paths.mcpConfigPath(alloc, config_root);
 }
 
 pub fn loadRuntime(
@@ -367,7 +369,11 @@ pub fn inspectProfileConfig(
     alloc: Allocator,
 ) error{OutOfMemory}!mcp_contract.ProfileConfigDiagnostic {
     const home = io_mod.getenv("HOME") orelse return .clear;
-    const config_path = try configPathFromHome(alloc, home);
+    const config_path = configPathFromHome(alloc, home) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // An unusable HOME reports no profile config, same as an absent one.
+        error.ProfileRootNotAbsolute => return .clear,
+    };
     defer alloc.free(config_path);
 
     var configs = loadConfigFromPath(alloc, config_path) catch |err| {
@@ -498,13 +504,10 @@ fn saveConfigsToPath(alloc: Allocator, path: []const u8, configs: []const McpSer
     defer alloc.free(json);
 
     const parent = std.fs.path.dirname(path) orelse return error.McpConfigPathInvalid;
-    const grandparent = std.fs.path.dirname(parent) orelse return error.McpConfigPathInvalid;
 
-    var enclosing = io_mod.VerifiedDir{
-        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), grandparent, .{ .iterate = true }),
-    };
-    defer enclosing.close();
-    var dir = try io_mod.openOrCreateVerifiedPrivateDir(&enclosing, std.fs.path.basename(parent));
+    // The config root can sit under a base directory that does not exist yet, so the whole
+    // chain is created here instead of assuming an enclosing directory is already there.
+    var dir = try io_mod.openOrCreateVerifiedPrivateRootAbsolute(parent, null);
     defer dir.close();
     try io_mod.durableReplaceVerified(alloc, &dir, std.fs.path.basename(path), json);
 }
@@ -1751,9 +1754,15 @@ test "adding an MCP server creates the profile directory privately" {
     defer result.deinit(alloc);
     try expectLine(result, "Saved MCP server 'fs'.", true);
 
-    const dir_stat = try tmp.dir.statFile(io_mod.getIo(), "home/.fx", .{ .follow_symlinks = false });
+    // A fixture home seeds nothing, so the resolved config root is the one the platform picks.
+    const config_root = "home/" ++ profile_roots.test_relative_roots.config;
+    const dir_stat = try tmp.dir.statFile(io_mod.getIo(), config_root, .{ .follow_symlinks = false });
     try std.testing.expectEqual(@as(u32, 0o700), dir_stat.permissions.toMode() & 0o777);
-    const file_stat = try tmp.dir.statFile(io_mod.getIo(), "home/.fx/mcp.json", .{ .follow_symlinks = false });
+    const file_stat = try tmp.dir.statFile(
+        io_mod.getIo(),
+        config_root ++ "/" ++ profile_paths.mcp_config_file_name,
+        .{ .follow_symlinks = false },
+    );
     try std.testing.expectEqual(@as(u32, 0o600), file_stat.permissions.toMode() & 0o777);
 }
 

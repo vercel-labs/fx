@@ -4,6 +4,7 @@ const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const profile_roots = @import("../shared/profile_roots.zig");
 
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
@@ -110,7 +111,12 @@ fn configureAutomatic(
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
         break :blk if (trimmed.len > 0) trimmed else null;
     } else null;
-    const root = if (home) |value|
+    const state_root = if (home) |value|
+        try profile_roots.resolveRootForProcess(alloc, value, .state, .{})
+    else
+        null;
+    defer if (state_root) |root| alloc.free(root);
+    const root = if (state_root) |value|
         try profile_paths.recordingsDir(alloc, value)
     else
         try std.fs.path.join(alloc, &.{ io_mod.getenv("TMPDIR") orelse "/tmp", "fx-recordings" });
@@ -667,7 +673,9 @@ test "requested recording creates a private tape under home" {
     defer status.deinit(alloc);
     switch (status) {
         .active => |path| {
-            const expected_dir = try profile_paths.recordingsDir(alloc, home);
+            const expected_root = try profile_roots.resolveRootForProcess(alloc, home, .state, .{});
+            defer alloc.free(expected_root);
+            const expected_dir = try profile_paths.recordingsDir(alloc, expected_root);
             defer alloc.free(expected_dir);
             try testing.expect(std.mem.startsWith(u8, path, expected_dir));
             const file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});

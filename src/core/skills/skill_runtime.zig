@@ -937,7 +937,7 @@ pub fn skillSourceLabel(source: SkillSource) []const u8 {
         .workspace_claude => "workspace .claude/skills",
         .workspace_agents => "workspace .agents/skills",
         .workspace_claw => "workspace .claw/skills",
-        .global_fx => "global ~/.fx/skills",
+        .global_fx => "global fx skills",
         .global_opencode => "global ~/.config/opencode/skills",
         .global_codex => "global ~/.codex/skills",
         .global_claude => "global ~/.claude/skills",
@@ -955,7 +955,7 @@ pub fn skillSourceShortLabel(source: SkillSource) []const u8 {
         .workspace_claude => "workspace .claude",
         .workspace_agents => "workspace .agents",
         .workspace_claw => "workspace .claw",
-        .global_fx => "global .fx",
+        .global_fx => "global fx",
         .global_opencode => "global opencode",
         .global_codex => "global .codex",
         .global_claude => "global .claude",
@@ -2396,7 +2396,7 @@ test "listSkillsSummary with skills" {
         \\Visible skills (3):
         \\
         \\Managed installs (1):
-        \\  - managed: installed [global ~/.fx/skills]
+        \\  - managed: installed [global fx skills]
         \\
         \\Workspace skills (1):
         \\  - local [workspace skills/]
@@ -2418,7 +2418,7 @@ test "listSkillsSummaryStyled dims only source labels" {
     });
     defer alloc.free(result);
 
-    try std.testing.expect(std.mem.find(u8, result, "  - managed: installed \x1b[38;5;245m[global ~/.fx/skills]\x1b[0m\n") != null);
+    try std.testing.expect(std.mem.find(u8, result, "  - managed: installed \x1b[38;5;245m[global fx skills]\x1b[0m\n") != null);
     try std.testing.expect(std.mem.find(u8, result, "\x1b[38;5;245mmanaged") == null);
     try std.testing.expect(std.mem.find(u8, result, "\x1b[38;5;245minstalled") == null);
 }

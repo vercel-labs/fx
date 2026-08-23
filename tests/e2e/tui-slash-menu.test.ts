@@ -14,7 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN } from "../evals/eval-helpers";
+import { FX_BIN, fxProfileRoots } from "../evals/eval-helpers";
 import {
   composerContains,
   FAKE_GATEWAY_MODEL,
@@ -1271,7 +1271,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       grid = await session.capturePaneGrid();
       const skillRow = grid.find((line) => line.includes("managed menu first line"));
       expect(skillRow).toContain("managed-menu");
-      expect(skillRow).not.toContain("global .fx");
+      expect(skillRow).not.toContain("global fx");
 
       await session.sendKeys("C-u");
       await session.sendText("/quit");
@@ -1900,7 +1900,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendText("/usage");
       await session.waitForText("Tracking has not started", TIMEOUT);
 
-      const fxDir = join(home, ".fx");
+      // The home was empty at startup, so fx owns whichever state root the layout resolved.
+      const fxDir = fxProfileRoots(home).state;
       const now = Date.now();
       writeFileSync(
         join(fxDir, "usage.jsonl"),

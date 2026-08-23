@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxProfileRoots, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -47,7 +47,11 @@ afterEach(async () => {
 });
 
 async function waitForTerminalHostExit(root: string): Promise<void> {
-  const identityPath = join(root, "home", ".fx", "terminal-host", "host.json");
+  const identityPath = join(
+    fxProfileRoots(join(root, "home")).state,
+    "terminal-host",
+    "host.json",
+  );
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     if (!existsSync(identityPath)) return;
@@ -338,7 +342,7 @@ describe("fx ask presentation", () => {
     expect(existsSync(nestedExecMarker)).toBe(false);
     expect(gateway.requests[6]!.body).toContain("neighbor-exec");
     expect(
-      existsSync(join(root.home, ".fx", "terminal-host", "host.json")),
+      existsSync(join(fxProfileRoots(root.home).state, "terminal-host", "host.json")),
     ).toBe(false);
   }, TIMEOUT);
 

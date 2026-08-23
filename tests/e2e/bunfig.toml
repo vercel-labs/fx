@@ -1,0 +1,3 @@
+[test]
+# Strips the host XDG environment before any fixture spawns fx. See test-preload.ts.
+preload = ["./test-preload.ts"]

@@ -9,6 +9,7 @@ const terminal_store = @import("store.zig");
 const host_capabilities = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const profile_roots = @import("../shared/profile_roots.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
@@ -97,11 +98,14 @@ fn resolveEndpointSelection(
 ) !EndpointSelection {
     const runtime_base = runtimeBase(target) orelse
         return error.TerminalHostUnsupported;
+    const state_root = try profile_roots.resolveRootForProcess(alloc, home, .state, .{});
+    defer alloc.free(state_root);
     const authority_root = try std.fs.path.join(
         alloc,
-        &.{ home, profile_paths.root_dir_name, host_dir_name },
+        &.{ state_root, host_dir_name },
     );
     errdefer alloc.free(authority_root);
+
     const profile_endpoint = try std.fs.path.join(
         alloc,
         &.{ authority_root, endpoint_name },
@@ -207,6 +211,8 @@ pub const Paths = struct {
         );
         var selection_owned = true;
         errdefer if (selection_owned) selection.deinit(alloc);
+        const state_root = try profile_roots.resolveRootForProcess(alloc, home, .state, .{});
+        defer alloc.free(state_root);
         var home_dir = io_mod.VerifiedDir{
             .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{
                 .iterate = true,
@@ -214,10 +220,7 @@ pub const Paths = struct {
             }),
         };
         errdefer home_dir.close();
-        var fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(
-            &home_dir,
-            profile_paths.root_dir_name,
-        );
+        var fx_dir = try io_mod.openOrCreateVerifiedPrivateRootAbsolute(state_root, null);
         errdefer fx_dir.close();
         var host_dir = try io_mod.openOrCreateVerifiedPrivateDir(
             &fx_dir,
@@ -1514,6 +1517,14 @@ test "endpoint paths honor the native sockaddr capacity" {
     try std.testing.expectError(error.NameTooLong, validateEndpointPath(&oversized));
 }
 
+/// Authority root suffix the host resolves for the platform under test. macOS pins every root
+/// to `~/.fx`, while a fresh Linux profile moves to the XDG state root, so freezing both keeps
+/// the assertion honest on all four Full CI platforms.
+const expected_authority_suffix = if (builtin.os.tag == .linux)
+    "/.local/state/" ++ profile_roots.app_dir_name ++ "/" ++ host_dir_name
+else
+    "/" ++ profile_paths.root_dir_name ++ "/" ++ host_dir_name;
+
 test "endpoint selection preserves short homes and deterministically separates long homes" {
     if (!isSupported()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -1525,9 +1536,11 @@ test "endpoint selection preserves short homes and deterministically separates l
         501,
     );
     defer short.deinit(alloc);
+    const short_state_root = try profile_roots.resolveRootForProcess(alloc, short_home, .state, .{});
+    defer alloc.free(short_state_root);
     const expected_short = try std.fs.path.join(
         alloc,
-        &.{ short_home, profile_paths.root_dir_name, host_dir_name },
+        &.{ short_state_root, host_dir_name },
     );
     defer alloc.free(expected_short);
     try std.testing.expect(!short.uses_fallback);
@@ -1566,7 +1579,7 @@ test "endpoint selection preserves short homes and deterministically separates l
     try std.testing.expect(std.mem.endsWith(
         u8,
         first.authority_root,
-        "/.fx/terminal-host",
+        expected_authority_suffix,
     ));
     try std.testing.expect(!std.mem.eql(
         u8,

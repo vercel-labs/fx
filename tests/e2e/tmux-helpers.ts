@@ -11,6 +11,7 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT } from "../evals/eval-helpers";
+import { XDG_ENV_KEYS, xdgEnvForHome } from "../test-support/profile-env";
 
 let sessionCounter = 0;
 
@@ -29,6 +30,9 @@ const DEFAULT_UNSET_ENV_KEYS = [
   "FX_E2E_GATEWAY_CREDITS_URL",
   "FX_E2E_UPGRADE_BASE_URL",
   "FX_PERMISSION_MODE",
+  // fx resolves its profile roots from the XDG environment. Every value the pane sees is set from the fixture HOME
+  // below, so nothing here is inherited from the developer's machine.
+  ...XDG_ENV_KEYS,
 ] as const;
 const MIRRORED_ENV_KEYS = [
   "FX_GATEWAY_BASE_URL",
@@ -437,7 +441,7 @@ export class TmuxSession {
     const {
       cmd = FX_BIN,
       cwd = REPO_ROOT,
-      env = {},
+      env: callerEnv = {},
       width = 120,
       height = 40,
       stderrPath,
@@ -447,6 +451,14 @@ export class TmuxSession {
       isolated = false,
       socketName,
     } = opts ?? {};
+
+    // The pane never inherits the developer's XDG environment: the roots fx resolves are
+    // derived from the fixture HOME, so a machine that exports XDG_STATE_HOME gets the same
+    // result as CI and the process under test cannot write outside its temporary home.
+    const env: Record<string, string | undefined> = {
+      ...xdgEnvForHome(callerEnv.HOME ?? process.env.HOME),
+      ...callerEnv,
+    };
 
     if (
       minimumHistoryLines !== undefined &&

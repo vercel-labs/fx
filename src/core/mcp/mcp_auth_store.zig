@@ -4,6 +4,7 @@ const mcp_auth = @import("mcp_auth.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const profile_roots = @import("../shared/profile_roots.zig");
 const secret = @import("../auth/secret.zig");
 
 const Allocator = std.mem.Allocator;
@@ -204,6 +205,7 @@ fn loadControlled(
 ) !?mcp_auth.Credentials {
     const backend = storageBackend();
     var locked = (try openLockedDirForReadControlled(
+        alloc,
         backend,
         cancel_flag,
     )) orelse return null;
@@ -268,7 +270,7 @@ pub fn save(
     credentials: mcp_auth.Credentials,
 ) !void {
     const backend = storageBackend();
-    var locked = try openOrCreateLockedDir();
+    var locked = try openOrCreateLockedDir(alloc);
     defer locked.deinit();
     var store = try loadStore(alloc, &locked.dir, backend, native_keychain_backend);
     defer store.deinit(alloc);
@@ -299,7 +301,7 @@ pub fn delete(
     endpoint: []const u8,
 ) !DeleteResult {
     const backend = storageBackend();
-    var locked = (try openLockedDirForRead(backend)) orelse return .{};
+    var locked = (try openLockedDirForRead(alloc, backend)) orelse return .{};
     defer locked.deinit();
     var store = try loadStore(alloc, &locked.dir, backend, native_keychain_backend);
     defer store.deinit(alloc);
@@ -340,22 +342,18 @@ fn sameIdentity(
         std.mem.eql(u8, entry.credentials.issuer, credentials.issuer);
 }
 
-fn openOrCreateLockedDir() !LockedDir {
-    return openOrCreateLockedDirControlled(null);
+fn openOrCreateLockedDir(alloc: Allocator) !LockedDir {
+    return openOrCreateLockedDirControlled(alloc, null);
 }
 
 fn openOrCreateLockedDirControlled(
+    alloc: Allocator,
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !LockedDir {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-    var home_dir = io_mod.VerifiedDir{
-        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
-    };
-    defer home_dir.close();
-    var root = try io_mod.openOrCreateVerifiedPrivateDir(
-        &home_dir,
-        profile_paths.root_dir_name,
-    );
+    const state_root = try profile_roots.resolveRootForProcess(alloc, home, .state, .{});
+    defer alloc.free(state_root);
+    var root = try io_mod.openOrCreateVerifiedPrivateRootAbsolute(state_root, null);
     defer root.close();
     var credentials_dir = try io_mod.openOrCreateVerifiedPrivateDir(
         &root,
@@ -379,24 +377,18 @@ fn openOrCreateLockedDirControlled(
     return .{ .dir = credentials_dir, .lock = lock };
 }
 
-fn openExistingLockedDir() !?LockedDir {
-    return openExistingLockedDirControlled(null);
+fn openExistingLockedDir(alloc: Allocator) !?LockedDir {
+    return openExistingLockedDirControlled(alloc, null);
 }
 
 fn openExistingLockedDirControlled(
+    alloc: Allocator,
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !?LockedDir {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-    var home_dir = io_mod.VerifiedDir{
-        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{
-            .iterate = true,
-        }),
-    };
-    defer home_dir.close();
-    var root = openExistingPrivateChild(
-        &home_dir,
-        profile_paths.root_dir_name,
-    ) catch |err| switch (err) {
+    const state_root = try profile_roots.resolveRootForProcess(alloc, home, .state, .{});
+    defer alloc.free(state_root);
+    var root = openExistingPrivateRoot(state_root) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -426,18 +418,29 @@ fn openExistingLockedDirControlled(
     return .{ .dir = credentials_dir, .lock = lock };
 }
 
-fn openLockedDirForRead(backend: StorageBackend) !?LockedDir {
-    return openLockedDirForReadControlled(backend, null);
+fn openLockedDirForRead(alloc: Allocator, backend: StorageBackend) !?LockedDir {
+    return openLockedDirForReadControlled(alloc, backend, null);
 }
 
 fn openLockedDirForReadControlled(
+    alloc: Allocator,
     backend: StorageBackend,
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !?LockedDir {
     return switch (backend) {
-        .profile_file => openExistingLockedDirControlled(cancel_flag),
-        .macos_keychain => try openOrCreateLockedDirControlled(cancel_flag),
+        .profile_file => openExistingLockedDirControlled(alloc, cancel_flag),
+        .macos_keychain => try openOrCreateLockedDirControlled(alloc, cancel_flag),
     };
+}
+
+fn openExistingPrivateRoot(root_abs: []const u8) !io_mod.VerifiedDir {
+    var dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), root_abs, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    errdefer dir.close(io_mod.getIo());
+    try normalizeAndVerifyPrivateDir(dir);
+    return .{ .dir = dir };
 }
 
 fn openExistingPrivateChild(
@@ -1064,7 +1067,7 @@ test "Keychain migration publishes before deleting portable credentials" {
     var fake = FakeKeychain{ .alloc = alloc };
     defer fake.deinit();
     {
-        var locked = (try openExistingLockedDir()).?;
+        var locked = (try openExistingLockedDir(alloc)).?;
         defer locked.deinit();
         var migrated = try loadStore(
             alloc,
@@ -1089,7 +1092,7 @@ test "Keychain migration publishes before deleting portable credentials" {
     }
 
     {
-        var locked = (try openExistingLockedDir()).?;
+        var locked = (try openExistingLockedDir(alloc)).?;
         defer locked.deinit();
         var loaded = try loadStore(
             alloc,
@@ -1115,7 +1118,7 @@ test "Keychain migration publishes before deleting portable credentials" {
     try save(alloc, "server-one", credentials);
     fake.fail_store = true;
     {
-        var locked = (try openExistingLockedDir()).?;
+        var locked = (try openExistingLockedDir(alloc)).?;
         defer locked.deinit();
         try std.testing.expectError(
             error.KeychainWriteFailed,
@@ -1136,7 +1139,7 @@ test "Keychain migration publishes before deleting portable credentials" {
     fake.fail_store = false;
     fake.corrupt_store = true;
     {
-        var locked = (try openExistingLockedDir()).?;
+        var locked = (try openExistingLockedDir(alloc)).?;
         defer locked.deinit();
         try std.testing.expectError(
             error.McpCredentialStoreWriteMismatch,
@@ -1184,7 +1187,11 @@ test "credential store is private atomic and supports restart deletion" {
     defer loaded.deinit(alloc);
     try std.testing.expectEqualStrings("access-secret", loaded.access_token);
 
-    var root = try tmp.dir.openDir(std.testing.io, "home/.fx", .{ .iterate = true });
+    var root = try tmp.dir.openDir(
+        std.testing.io,
+        "home/" ++ profile_roots.test_relative_roots.state,
+        .{ .iterate = true },
+    );
     defer root.close(std.testing.io);
     const root_stat = try root.stat(std.testing.io);
     try std.testing.expectEqual(
@@ -1260,7 +1267,7 @@ test "credential load cancellation interrupts a held advisory lock" {
     defer test_home.deinit();
     test_home.activate();
 
-    var held = try openOrCreateLockedDir();
+    var held = try openOrCreateLockedDir(alloc);
     defer held.deinit();
     var cancel = std.atomic.Value(bool).init(false);
     var waiter = Waiter{ .cancel = &cancel };
@@ -1297,7 +1304,7 @@ test "credential cancellation interrupts Keychain read and preserves migration s
     test_home.activate();
 
     {
-        var locked = try openOrCreateLockedDir();
+        var locked = try openOrCreateLockedDir(alloc);
         defer locked.deinit();
         var fake = FakeKeychain{ .alloc = alloc, .stall_load = true };
         defer fake.deinit();
@@ -1330,7 +1337,7 @@ test "credential cancellation interrupts Keychain read and preserves migration s
     defer credentials.deinit(alloc);
     try save(alloc, "fixture", credentials);
     {
-        var locked = (try openExistingLockedDir()).?;
+        var locked = (try openExistingLockedDir(alloc)).?;
         defer locked.deinit();
         var fake = FakeKeychain{ .alloc = alloc, .stall_store = true };
         defer fake.deinit();

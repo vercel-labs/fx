@@ -32,6 +32,8 @@ const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
+const profile_roots = @import("../shared/profile_roots.zig");
 const session_store = @import("../session/session_store.zig");
 const usage_report = @import("../session/usage_report.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
@@ -998,7 +1000,7 @@ fn runNonInteractiveWithDeps(
             // Preserve the original `fx logout` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .vercel;
             if (login_provider == .codex) {
-                const outcome = chatgpt_oauth.logout() catch {
+                const outcome = chatgpt_oauth.logout(alloc) catch {
                     try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
                     return .handled_failure;
                 };
@@ -5026,10 +5028,35 @@ test "status and doctor inspect the supplied MCP profile diagnostic once" {
             "\"name\":\"mcp_config\"",
         ),
     );
+    const config_root = try profile_roots.resolveRootForProcess(alloc, home, .config, .{});
+    defer alloc.free(config_root);
+    const mcp_config_path = try profile_paths.mcpConfigPath(alloc, config_root);
+    defer alloc.free(mcp_config_path);
+    const expected_mcp_detail = try std.fmt.allocPrint(
+        alloc,
+        "\"detail\":\"failed to load {s}: McpConfigInvalidJson\"",
+        .{mcp_config_path},
+    );
+    defer alloc.free(expected_mcp_detail);
     try std.testing.expect(std.mem.find(
         u8,
         doctor_capture.stdout.written(),
-        "\"detail\":\"failed to load ~/.fx/mcp.json: McpConfigInvalidJson\"",
+        expected_mcp_detail,
+    ) != null);
+
+    // doctor reports the roots it actually resolved, so an operator never has to guess them.
+    var roots = try profile_roots.resolveForProcess(alloc, home, .{});
+    defer roots.deinit(alloc);
+    const expected_profile_detail = try std.fmt.allocPrint(
+        alloc,
+        "\"name\":\"profile\",\"status\":\"ok\",\"detail\":\"{s} layout; config={s} state={s} data={s}\"",
+        .{ @tagName(roots.layout), roots.config, roots.state, roots.data },
+    );
+    defer alloc.free(expected_profile_detail);
+    try std.testing.expect(std.mem.find(
+        u8,
+        doctor_capture.stdout.written(),
+        expected_profile_detail,
     ) != null);
 }
 

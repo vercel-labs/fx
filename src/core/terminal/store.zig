@@ -10,6 +10,7 @@ const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
 const profile_paths = @import("../shared/profile_paths.zig");
+const profile_roots = @import("../shared/profile_roots.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
@@ -559,20 +560,20 @@ pub const ProfileStore = struct {
         options: Options,
     ) !ProfileStore {
         try options.validate();
-        var home_dir = io_mod.VerifiedDir{
-            .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{
-                .iterate = true,
-                .follow_symlinks = false,
-            }),
+        const state_root = try profile_roots.resolveRootForProcess(alloc, home, .state, .{});
+        defer alloc.free(state_root);
+        var failure: io_mod.BaseDirFailure = .{};
+        var state_dir = io_mod.openOrCreateVerifiedPrivateRootAbsolute(state_root, &failure) catch |err| {
+            debug_trace.logf(
+                "terminal_store",
+                "state root creation failed path={s} err={s}",
+                .{ failure.path, @errorName(failure.err) },
+            );
+            return err;
         };
-        defer home_dir.close();
-        var fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(
-            &home_dir,
-            profile_paths.root_dir_name,
-        );
-        defer fx_dir.close();
+        defer state_dir.close();
         var sessions_dir = try io_mod.openOrCreateVerifiedPrivateDir(
-            &fx_dir,
+            &state_dir,
             profile_paths.sessions_dir_name,
         );
         errdefer sessions_dir.close();
@@ -580,7 +581,7 @@ pub const ProfileStore = struct {
             .alloc = alloc,
             .process_provider = process_provider,
             .sessions_dir = sessions_dir,
-            .display_sessions_path = try profile_paths.sessionsDir(alloc, home),
+            .display_sessions_path = try profile_paths.sessionsDir(alloc, state_root),
             .options = options,
         };
     }

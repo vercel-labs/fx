@@ -13,7 +13,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxProfileRoots, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -1051,7 +1051,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
 
     expect(session.isAlive()).toBe(true);
-    expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+    expect(existsSync(join(fxProfileRoots(home).state, "auth.json"))).toBe(false);
     expect(await session.captureFullScrollback()).not.toContain("Signed in to Vercel.");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
@@ -1097,7 +1097,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
 
     expect(session.isAlive()).toBe(true);
-    expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
+    expect(existsSync(join(fxProfileRoots(home).state, "chatgpt-auth.json"))).toBe(false);
     expect(await session.captureFullScrollback()).not.toContain("Signed in with Codex.");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
@@ -1138,7 +1138,7 @@ tmuxTest(
     await completeDisplayedCodexLogin(session, chatgptOauth);
     await session.waitForText("Switched to Codex subscription with gpt-5.6-sol.", TIMEOUT);
 
-    const authPath = join(home, ".fx", "chatgpt-auth.json");
+    const authPath = join(fxProfileRoots(home).state, "chatgpt-auth.json");
     expect(existsSync(authPath)).toBe(true);
     expect(statSync(authPath).mode & 0o077).toBe(0);
 
@@ -1206,7 +1206,7 @@ tmuxTest(
     const authorizeRequestsBeforeRoundTrip = chatgptOauth.requests.filter(
       (request) => request.path === "/oauth/authorize",
     ).length;
-    const settingsPath = join(home, ".fx", "settings.json");
+    const settingsPath = join(fxProfileRoots(home).config, "settings.json");
     const gatewayModelBefore = JSON.parse(readFileSync(settingsPath, "utf8")).model;
     expect(typeof gatewayModelBefore).toBe("string");
     const savedCodex = JSON.parse(readFileSync(settingsPath, "utf8"));
@@ -1299,7 +1299,7 @@ tmuxTest(
     await completeDisplayedCodexLogin(session, chatgptOauth);
     await session.waitForText("Switched to Codex subscription with gpt-5.6-sol.", TIMEOUT);
 
-    const selected = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+    const selected = JSON.parse(readFileSync(join(fxProfileRoots(home).config, "settings.json"), "utf8"));
     expect(selected.provider).toBe("codex");
     expect(selected.codex_model).toBe("gpt-5.6-sol");
     await session.sendText("/status");
@@ -1495,8 +1495,19 @@ async function openSwitchCredential(pickerSession: TmuxSession): Promise<void> {
   await enterSwitchCredential(pickerSession);
 }
 
+/**
+ * Settings path for a fixture HOME. The `writeSeeded*Login` helpers create `~/.fx`, which pins
+ * every root to the legacy layout; a fixture that seeds nothing splits across the XDG roots.
+ */
+function profileSettingsPath(testHome: string): string {
+  const legacy = join(testHome, ".fx");
+  return existsSync(legacy)
+    ? join(legacy, "settings.json")
+    : join(fxProfileRoots(testHome).config, "settings.json");
+}
+
 function savedCredentialSource(testHome: string): string | undefined {
-  const settingsPath = join(testHome, ".fx", "settings.json");
+  const settingsPath = profileSettingsPath(testHome);
   if (!existsSync(settingsPath)) return undefined;
   return (JSON.parse(readFileSync(settingsPath, "utf8")) as { credential_source?: string })
     .credential_source;
@@ -1531,7 +1542,7 @@ profileStoredKeyTmuxTest(
     await session.waitForText("auth=stored API key (profile file)", TIMEOUT);
     expect(savedCredentialSource(home)).toBe("stored_key");
 
-    const keyPath = join(home, ".fx", "api-key");
+    const keyPath = join(fxProfileRoots(home).state, "api-key");
     expect(readFileSync(keyPath, "utf8")).toBe(STORED_TOKEN);
     expect(statSync(keyPath).mode & 0o777).toBe(0o600);
 
@@ -2058,10 +2069,10 @@ test(
     expect(login.stdout).not.toContain("Code:");
     expect(login.stderr).toBe("");
 
-    const authPath = join(home, ".fx", "chatgpt-auth.json");
+    const authPath = join(fxProfileRoots(home).state, "chatgpt-auth.json");
     expect(existsSync(authPath)).toBe(true);
     expect(statSync(authPath).mode & 0o077).toBe(0);
-    const settingsPath = join(home, ".fx", "settings.json");
+    const settingsPath = join(fxProfileRoots(home).config, "settings.json");
     const selected = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(selected.provider).toBe("codex");
     expect(selected.codex_model).toBe("gpt-5.6-sol");
@@ -2155,10 +2166,10 @@ test(
       expect(login.stdout).toContain("Signed in with Grok.");
       expect(login.stderr).toBe("");
 
-      const authPath = join(home, ".fx", "grok-auth.json");
+      const authPath = join(fxProfileRoots(home).state, "grok-auth.json");
       expect(existsSync(authPath)).toBe(true);
       expect(statSync(authPath).mode & 0o077).toBe(0);
-      const settings = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+      const settings = JSON.parse(readFileSync(join(fxProfileRoots(home).config, "settings.json"), "utf8"));
       expect(settings.provider).toBe("grok");
       expect(settings.grok_model).toBe("grok-4.20");
 
@@ -2382,7 +2393,7 @@ tmuxTest(
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       await session.waitForText("Switched to Grok subscription with grok-4.20.", TIMEOUT);
-      const settingsPath = join(home, ".fx", "settings.json");
+      const settingsPath = join(fxProfileRoots(home).config, "settings.json");
       const persistenceDeadline = Date.now() + TIMEOUT;
       let saved: { provider: string; grok_model: string } | undefined;
       while (Date.now() < persistenceDeadline) {
@@ -2649,8 +2660,8 @@ test(
     expect(login.code).toBe(1);
     expect(login.stdout).not.toContain("Signed in with Codex.");
     expect(login.stderr).toContain("fx login: could not load the target model catalog (malformed_response)");
-    expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(true);
-    const settingsPath = join(home, ".fx", "settings.json");
+    expect(existsSync(join(fxProfileRoots(home).state, "chatgpt-auth.json"))).toBe(true);
+    const settingsPath = join(fxProfileRoots(home).config, "settings.json");
     expect(existsSync(settingsPath)).toBe(false);
   },
   60_000,
@@ -2681,8 +2692,8 @@ test(
       expect(login.code).toBe(1);
       expect(login.stdout).not.toContain("Signed in with Grok.");
       expect(login.stderr).toContain("fx login: target model catalog is empty");
-      expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(true);
-      expect(existsSync(join(home, ".fx", "settings.json"))).toBe(false);
+      expect(existsSync(join(fxProfileRoots(home).state, "grok-auth.json"))).toBe(true);
+      expect(existsSync(join(fxProfileRoots(home).config, "settings.json"))).toBe(false);
     } finally {
       grok.stop();
     }

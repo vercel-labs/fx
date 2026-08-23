@@ -613,6 +613,89 @@ pub fn openOrCreateVerifiedPrivateDir(parent: *VerifiedDir, name: []const u8) !V
     return openOrCreateVerifiedPrivateChild(parent.dir, name);
 }
 
+/// Names the directory a base-directory walk failed on, so a caller can report the path that
+/// could not be opened or created instead of a bare errno.
+pub const BaseDirFailure = struct {
+    /// Borrows storage from the absolute path passed to the helper.
+    path: []const u8 = &.{},
+    err: anyerror = error.Unexpected,
+};
+
+/// Base components are user-owned: `~/.config` or `~/.local` is a symlink under every dotfile
+/// manager, so a component that already exists is followed and only checked to be a directory.
+/// A component fx creates itself is never a symlink, and the fx leaf still gets the no-follow
+/// contract from `openOrCreateVerifiedPrivateChild`.
+fn openOrCreateBaseDirChild(parent: std.Io.Dir, name: []const u8) !std.Io.Dir {
+    const zio = getIo();
+    const options: std.Io.Dir.OpenOptions = .{ .iterate = true };
+    return parent.openDir(zio, name, options) catch |err| switch (err) {
+        error.FileNotFound => {
+            e2eFailIfDurableMutationAttempted();
+            parent.createDir(zio, name, private_dir_permissions) catch |create_err| switch (create_err) {
+                error.PathAlreadyExists => {},
+                else => return create_err,
+            };
+            return parent.openDir(zio, name, options);
+        },
+        error.SymLinkLoop, error.NotDir => return error.DurablePathUnsafe,
+        else => return err,
+    };
+}
+
+/// Opens an absolute base directory, creating any missing component with mode 0700 as the XDG
+/// Base Directory Specification prescribes. A component that already exists keeps its mode:
+/// the same paragraph states that "if the destination directory exists already the permissions
+/// should not be changed", so fx issues no `chmod` against a directory it did not create.
+/// An existing base component is followed through a symlink, for the reason
+/// `openOrCreateBaseDirChild` documents, and only the filesystem root is opened no-follow.
+/// The caller owns the returned handle.
+pub fn openOrCreateBaseDirAbsolute(path_abs: []const u8, failure: ?*BaseDirFailure) !std.Io.Dir {
+    if (!std.fs.path.isAbsolute(path_abs)) return error.InvalidPath;
+    const zio = getIo();
+
+    var components = std.fs.path.componentIterator(path_abs);
+    const root = components.root() orelse return error.InvalidPath;
+    var dir = std.Io.Dir.openDirAbsolute(zio, root, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| {
+        if (failure) |slot| slot.* = .{ .path = root, .err = err };
+        return err;
+    };
+    errdefer dir.close(zio);
+
+    while (components.next()) |component| {
+        if (std.mem.eql(u8, component.name, ".") or std.mem.eql(u8, component.name, "..")) {
+            return error.InvalidPath;
+        }
+        const next = openOrCreateBaseDirChild(dir, component.name) catch |err| {
+            if (failure) |slot| slot.* = .{ .path = component.path, .err = err };
+            return err;
+        };
+        dir.close(zio);
+        dir = next;
+    }
+    return dir;
+}
+
+/// Opens an fx-owned root at an absolute path: missing base components are created at 0700
+/// without touching the mode of one that already exists, and the final leaf gets the full
+/// verified private-directory contract.
+pub fn openOrCreateVerifiedPrivateRootAbsolute(path_abs: []const u8, failure: ?*BaseDirFailure) !VerifiedDir {
+    if (!std.fs.path.isAbsolute(path_abs)) return error.InvalidPath;
+    const leaf = std.fs.path.basename(path_abs);
+    const base = std.fs.path.dirname(path_abs) orelse return error.InvalidPath;
+    if (leaf.len == 0) return error.InvalidPath;
+
+    var base_dir = try openOrCreateBaseDirAbsolute(base, failure);
+    defer base_dir.close(getIo());
+
+    return openOrCreateVerifiedPrivateChild(base_dir, leaf) catch |err| {
+        if (failure) |slot| slot.* = .{ .path = path_abs, .err = err };
+        return err;
+    };
+}
+
 pub fn openOrCreateVerifiedPrivateDirFromDir(parent: std.Io.Dir, name: []const u8) !VerifiedDir {
     return openOrCreateVerifiedPrivateChild(parent, name);
 }
@@ -1329,6 +1412,135 @@ test "caller-owned directory rejects unsafe private children" {
     try std.testing.expectError(
         error.DurablePathUnsafe,
         openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "link"),
+    );
+}
+
+fn expectDirMode(path_abs: []const u8, expected: std.posix.mode_t) !void {
+    var dir = try std.Io.Dir.openDirAbsolute(getIo(), path_abs, .{ .follow_symlinks = false });
+    defer dir.close(getIo());
+    const stat = try dir.stat(getIo());
+    try std.testing.expectEqual(expected, stat.permissions.toMode() & 0o777);
+}
+
+test "base directory creation leaves a pre-existing parent mode untouched" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDir(getIo(), "config", std.Io.File.Permissions.fromMode(0o755));
+    const base = try dirRealpathAlloc(std.testing.allocator, tmp.dir, "config");
+    defer std.testing.allocator.free(base);
+    try expectDirMode(base, 0o755);
+
+    const root_path = try std.fs.path.join(std.testing.allocator, &.{ base, "fx" });
+    defer std.testing.allocator.free(root_path);
+
+    var root = try openOrCreateVerifiedPrivateRootAbsolute(root_path, null);
+    root.close();
+
+    try expectDirMode(base, 0o755);
+    try expectDirMode(root_path, 0o700);
+}
+
+test "base directory creation makes missing intermediates private" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home = try dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+
+    const root_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".local", "state", "fx" });
+    defer std.testing.allocator.free(root_path);
+
+    var root = try openOrCreateVerifiedPrivateRootAbsolute(root_path, null);
+    root.close();
+
+    const local = try std.fs.path.join(std.testing.allocator, &.{ home, ".local" });
+    defer std.testing.allocator.free(local);
+    const state = try std.fs.path.join(std.testing.allocator, &.{ home, ".local", "state" });
+    defer std.testing.allocator.free(state);
+
+    try expectDirMode(local, 0o700);
+    try expectDirMode(state, 0o700);
+    try expectDirMode(root_path, 0o700);
+
+    // Reopening an existing tree must be idempotent and must not alter any mode.
+    var again = try openOrCreateVerifiedPrivateRootAbsolute(root_path, null);
+    again.close();
+    try expectDirMode(local, 0o700);
+    try expectDirMode(root_path, 0o700);
+}
+
+test "base directory creation follows a symlinked base component" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDir(getIo(), "elsewhere", std.Io.File.Permissions.fromMode(0o755));
+    tmp.dir.symLink(getIo(), "elsewhere", "config", .{ .is_directory = true }) catch |err| switch (err) {
+        error.AccessDenied, error.Unexpected => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const home = try dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+
+    const root_path = try std.fs.path.join(std.testing.allocator, &.{ home, "config", "fx" });
+    defer std.testing.allocator.free(root_path);
+
+    var root = try openOrCreateVerifiedPrivateRootAbsolute(root_path, null);
+    root.close();
+
+    const target = try std.fs.path.join(std.testing.allocator, &.{ home, "elsewhere", "fx" });
+    defer std.testing.allocator.free(target);
+    try expectDirMode(target, 0o700);
+}
+
+test "base directory creation names the directory that failed" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDir(getIo(), "locked", std.Io.File.Permissions.fromMode(0o500));
+    const base = try dirRealpathAlloc(std.testing.allocator, tmp.dir, "locked");
+    defer std.testing.allocator.free(base);
+
+    const root_path = try std.fs.path.join(std.testing.allocator, &.{ base, "state", "fx" });
+    defer std.testing.allocator.free(root_path);
+
+    var failure: BaseDirFailure = .{};
+    const result = openOrCreateVerifiedPrivateRootAbsolute(root_path, &failure);
+    if (result) |dir| {
+        var opened = dir;
+        opened.close();
+        return error.SkipZigTest; // running as a user that ignores directory permissions
+    } else |err| {
+        try std.testing.expectEqual(err, failure.err);
+        const expected = try std.fs.path.join(std.testing.allocator, &.{ base, "state" });
+        defer std.testing.allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, failure.path);
+    }
+}
+
+test "base directory creation rejects a non-directory leaf" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(getIo(), .{ .sub_path = "fx", .data = "not a directory" });
+    const home = try dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+
+    const root_path = try std.fs.path.join(std.testing.allocator, &.{ home, "fx" });
+    defer std.testing.allocator.free(root_path);
+
+    try std.testing.expectError(
+        error.DurablePathUnsafe,
+        openOrCreateVerifiedPrivateRootAbsolute(root_path, null),
     );
 }
 

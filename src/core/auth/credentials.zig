@@ -569,7 +569,7 @@ fn refreshFxLoginCredentialLocked(
     transport: oauth_transport.Provider,
     mode: FxLoginRefreshMode,
 ) !?Credential {
-    var mutation = (try oauth_session.beginExistingMutation()) orelse return null;
+    var mutation = (try oauth_session.beginExistingMutation(alloc)) orelse return null;
     defer mutation.deinit();
 
     var session = (try mutation.load(alloc)) orelse return null;

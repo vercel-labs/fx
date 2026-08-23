@@ -5,6 +5,7 @@ const host_target = @import("../hosts/target.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const profile_roots = @import("../shared/profile_roots.zig");
 const js_host_auth = @import("js_host_auth.zig");
 const secret = @import("secret.zig");
 
@@ -576,20 +577,20 @@ pub fn load(alloc: Allocator) !?Session {
         return null;
     };
     if (storageBackend() == .macos_keychain) {
-        if (try beginExistingNativeMutation()) |existing| {
+        if (try beginExistingNativeMutation(alloc)) |existing| {
             var mutation = existing;
             defer mutation.deinit();
             return mutation.load(alloc);
         }
         return loadKeychainWithoutProfile(alloc);
     }
-    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
-        debug_trace.logf("auth", "session load failed step=open_home err={s}", .{@errorName(err)});
+    const state_root = profile_roots.resolveRootForProcess(alloc, home, .state, .{}) catch |err| {
+        debug_trace.logf("auth", "session load failed step=resolve_roots err={s}", .{@errorName(err)});
         return null;
     };
-    defer home_dir.close(io_mod.getIo());
+    defer alloc.free(state_root);
 
-    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
+    var fx_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), state_root, .{
         .iterate = true,
         .follow_symlinks = false,
     }) catch |err| {
@@ -652,29 +653,27 @@ pub fn saveNewSession(alloc: Allocator, session: Session) !void {
         try mutation.captureRevision(alloc);
         return mutation.save(alloc, session);
     }
-    var mutation = try beginMutation();
+    var mutation = try beginMutation(alloc);
     defer mutation.deinit();
     try mutation.save(alloc, session);
 }
 
-pub fn beginExistingMutation() !?Mutation {
+pub fn beginExistingMutation(alloc: Allocator) !?Mutation {
     if (comptime host_target.is_wasm) {
         return @as(?Mutation, HostMutation.init(js_host_auth.oauth_session_store));
     }
     if (storageBackend() == .macos_keychain) {
-        return @as(?Mutation, try beginMutation());
+        return @as(?Mutation, try beginMutation(alloc));
     }
-    return beginExistingNativeMutation();
+    return beginExistingNativeMutation(alloc);
 }
 
-fn beginExistingNativeMutation() !?Mutation {
+fn beginExistingNativeMutation(alloc: Allocator) !?Mutation {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-    var home_dir = io_mod.VerifiedDir{
-        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
-    };
-    defer home_dir.close();
+    const state_root = try profile_roots.resolveRootForProcess(alloc, home, .state, .{});
+    defer alloc.free(state_root);
 
-    const fx_dir = openExistingPrivateFxDir(&home_dir) catch |err| switch (err) {
+    const fx_dir = openExistingPrivateFxDir(state_root) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -685,7 +684,7 @@ fn loadKeychainWithoutProfile(alloc: Allocator) !?Session {
     var keychain = try observeKeychain(alloc, native_keychain_backend);
     defer keychain.deinit(alloc);
 
-    if (try beginExistingNativeMutation()) |existing| {
+    if (try beginExistingNativeMutation(alloc)) |existing| {
         var mutation = existing;
         defer mutation.deinit();
         return mutation.load(alloc);
@@ -699,14 +698,20 @@ fn loadKeychainWithoutProfile(alloc: Allocator) !?Session {
     };
 }
 
-fn beginMutation() !Mutation {
+fn beginMutation(alloc: Allocator) !Mutation {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-    var home_dir = io_mod.VerifiedDir{
-        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
-    };
-    defer home_dir.close();
+    const state_root = try profile_roots.resolveRootForProcess(alloc, home, .state, .{});
+    defer alloc.free(state_root);
 
-    const fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name);
+    var failure: io_mod.BaseDirFailure = .{};
+    const fx_dir = io_mod.openOrCreateVerifiedPrivateRootAbsolute(state_root, &failure) catch |err| {
+        debug_trace.logf(
+            "auth",
+            "state root creation failed path={s} err={s}",
+            .{ failure.path, @errorName(failure.err) },
+        );
+        return err;
+    };
     return lockMutation(fx_dir);
 }
 
@@ -758,8 +763,8 @@ fn lockMutationWithBackend(
     };
 }
 
-fn openExistingPrivateFxDir(home_dir: *io_mod.VerifiedDir) !io_mod.VerifiedDir {
-    var dir = try home_dir.dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
+fn openExistingPrivateFxDir(state_root: []const u8) !io_mod.VerifiedDir {
+    var dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), state_root, .{
         .iterate = true,
         .follow_symlinks = false,
     });

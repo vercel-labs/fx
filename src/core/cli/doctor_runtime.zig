@@ -6,6 +6,8 @@ const agent_steps = @import("../config/agent_steps.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const host = @import("../hosts/host.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
+const profile_roots = @import("../shared/profile_roots.zig");
 const session_store = @import("../session/session_store.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -94,11 +96,16 @@ pub fn collect(
         mutable_paths.deinit(alloc);
     }
 
+    // Reported before the settings load so an unreadable config still shows where fx is looking.
+    try appendProfileCheck(&checks, alloc, paths);
+    const mcp_config_path = try resolvedMcpConfigPath(alloc, paths);
+    defer if (mcp_config_path) |path| alloc.free(path);
+
     var detailed = config_runtime.loadMergedSettingsDetailed(alloc, snapshot.workspace_root) catch |err| {
         // Settings are unreadable, so no remembered choice is available to honour.
         snapshot.auth = try auth_runtime.loadStatusSnapshot(alloc, secret_store, null);
         try appendConfigLoadFailureCheck(&checks, alloc, "config", "failed to load config", err);
-        try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
+        try appendMcpConfigCheck(&checks, alloc, mcp_config_path, mcp_config_diagnostic);
         try appendAuthCheck(&checks, alloc, snapshot.auth);
         try appendConfigLoadFailureCheck(&checks, alloc, "startup", "failed to resolve startup settings", err);
         try appendStateChecks(&checks, alloc, snapshot.workspace_root);
@@ -120,7 +127,7 @@ pub fn collect(
 
     try appendConfigCheck(&checks, alloc, paths, detailed.diagnostics);
     try appendConfigDiagnosticChecks(&checks, alloc, detailed.diagnostics);
-    try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
+    try appendMcpConfigCheck(&checks, alloc, mcp_config_path, mcp_config_diagnostic);
     try appendAuthCheck(&checks, alloc, snapshot.auth);
     try appendResolvedStartupCheck(&snapshot, &checks, alloc, .{
         .model = switch (snapshot.provider) {
@@ -175,7 +182,7 @@ fn appendConfigCheck(
         return;
     }
 
-    const detail = try formatConfigPresence(alloc, user_exists, repo_exists);
+    const detail = try formatConfigPresence(alloc, paths.user_settings, user_exists, repo_exists);
     try appendCheckOwned(checks, alloc, "config", .ok, detail);
 }
 
@@ -392,10 +399,11 @@ fn appendSessionDiagnosticChecks(
             => .fail,
         };
 
-        var recovery_buffer: [512]u8 = undefined;
+        var recovery_buffer: [512 + std.fs.max_path_bytes]u8 = undefined;
         const recovery = try recoveryActionForSessionDiagnostic(
             diagnostic.kind,
             diagnostic.session_id,
+            read_store.sessions_dir,
             &recovery_buffer,
         );
         const detail = if (diagnostic.growth_bytes) |growth_bytes|
@@ -438,6 +446,7 @@ fn appendSessionDiagnosticChecks(
 fn recoveryActionForSessionDiagnostic(
     kind: session_store.DoctorIssueKind,
     session_id: []const u8,
+    sessions_dir: []const u8,
     buffer: []u8,
 ) ![]const u8 {
     return switch (kind) {
@@ -475,15 +484,19 @@ fn recoveryActionForSessionDiagnostic(
         .invalid_commit_intent,
         => std.fmt.bufPrint(
             buffer,
-            "back up ~/.fx/sessions, then inspect this session with fx session {s} --json",
-            .{session_id},
+            "back up {s}, then inspect this session with fx session {s} --json",
+            .{ sessions_dir, session_id },
         ),
 
         .missing_authority,
         .invalid_authority,
         .invalid_authority_transition,
         .unsafe_path,
-        => "back up ~/.fx/sessions and avoid opening this session until the path is repaired",
+        => std.fmt.bufPrint(
+            buffer,
+            "back up {s} and avoid opening this session until the path is repaired",
+            .{sessions_dir},
+        ),
     };
 }
 
@@ -552,6 +565,7 @@ fn appendCheckOwned(checks: *std.ArrayList(Check), alloc: Allocator, name: []con
 fn appendMcpConfigCheck(
     checks: *std.ArrayList(Check),
     alloc: Allocator,
+    mcp_config_path: ?[]const u8,
     diagnostic: mcp_contract.ProfileConfigDiagnostic,
 ) !void {
     const err = switch (diagnostic) {
@@ -560,13 +574,45 @@ fn appendMcpConfigCheck(
     };
     const detail = try std.fmt.allocPrint(
         alloc,
-        "failed to load ~/.fx/mcp.json: {s}",
-        .{@errorName(err)},
+        "failed to load {s}: {s}",
+        .{ mcp_config_path orelse "the profile mcp.json", @errorName(err) },
     );
     try appendCheckOwned(checks, alloc, "mcp_config", .fail, detail);
 }
 
-fn formatConfigPresence(alloc: Allocator, user_exists: bool, repo_exists: bool) ![]u8 {
+/// Absolute `mcp.json` under the resolved config root, or null when HOME is unavailable.
+fn resolvedMcpConfigPath(alloc: Allocator, paths: config_runtime.Paths) !?[]u8 {
+    const config_root = paths.config_fx_dir orelse return null;
+    return try profile_paths.mcpConfigPath(alloc, config_root);
+}
+
+/// Reports the roots every profile path is built from, and which layout produced them.
+fn appendProfileCheck(
+    checks: *std.ArrayList(Check),
+    alloc: Allocator,
+    paths: config_runtime.Paths,
+) !void {
+    if (paths.home_dir == null) {
+        try appendCheck(checks, alloc, "profile", .warn, "HOME is not set; no profile root can be resolved");
+        return;
+    }
+    const config_root = paths.config_fx_dir.?;
+    const state_root = paths.state_fx_dir.?;
+    const data_root = paths.data_fx_dir.?;
+    const detail = try std.fmt.allocPrint(
+        alloc,
+        "{s} layout; config={s} state={s} data={s}",
+        .{ @tagName(paths.profile_layout.?), config_root, state_root, data_root },
+    );
+    try appendCheckOwned(checks, alloc, "profile", .ok, detail);
+}
+
+fn formatConfigPresence(
+    alloc: Allocator,
+    user_settings: ?[]const u8,
+    user_exists: bool,
+    repo_exists: bool,
+) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
@@ -575,7 +621,8 @@ fn formatConfigPresence(alloc: Allocator, user_exists: bool, repo_exists: bool) 
     if (user_exists) {
         if (!first) try out.writer.writeAll(", ");
         first = false;
-        try out.writer.writeAll("~/.fx/settings.json");
+        // `user_exists` is only true once the path resolved, so the fallback is unreachable.
+        try out.writer.writeAll(user_settings orelse "the profile settings.json");
     }
     if (repo_exists) {
         if (!first) try out.writer.writeAll(", ");
@@ -667,10 +714,18 @@ fn permissionModeLabel(mode: types.PermissionMode) []const u8 {
 }
 
 test "format config presence names existing layers" {
-    const detail = try formatConfigPresence(std.testing.allocator, true, false);
+    const detail = try formatConfigPresence(
+        std.testing.allocator,
+        "/home/tester/.config/fx/settings.json",
+        true,
+        false,
+    );
     defer std.testing.allocator.free(detail);
 
-    try std.testing.expectEqualStrings("loaded config from ~/.fx/settings.json", detail);
+    try std.testing.expectEqualStrings(
+        "loaded config from /home/tester/.config/fx/settings.json",
+        detail,
+    );
 }
 
 test "MCP config diagnostic maps only failures to one doctor check" {
@@ -681,19 +736,20 @@ test "MCP config diagnostic maps only failures to one doctor check" {
         checks.deinit(alloc);
     }
 
-    try appendMcpConfigCheck(&checks, alloc, .clear);
+    try appendMcpConfigCheck(&checks, alloc, "/home/tester/.config/fx/mcp.json", .clear);
     try std.testing.expectEqual(@as(usize, 0), checks.items.len);
 
     try appendMcpConfigCheck(
         &checks,
         alloc,
+        "/home/tester/.config/fx/mcp.json",
         .{ .failed = error.McpConfigInvalidJson },
     );
     try std.testing.expectEqual(@as(usize, 1), checks.items.len);
     try std.testing.expectEqualStrings("mcp_config", checks.items[0].name);
     try std.testing.expectEqual(CheckStatus.fail, checks.items[0].status);
     try std.testing.expectEqualStrings(
-        "failed to load ~/.fx/mcp.json: McpConfigInvalidJson",
+        "failed to load /home/tester/.config/fx/mcp.json: McpConfigInvalidJson",
         checks.items[0].detail,
     );
 }
@@ -725,7 +781,7 @@ test "config check handles user and workspace config files together" {
 
     try std.testing.expectEqual(@as(usize, 1), checks.items.len);
     try std.testing.expectEqual(CheckStatus.ok, checks.items[0].status);
-    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, "~/.fx/settings.json") != null);
+    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, paths.user_settings.?) != null);
     try std.testing.expect(std.mem.find(u8, checks.items[0].detail, ".fx.json") != null);
 }
 
@@ -762,7 +818,7 @@ test "config check does not claim rejected user settings loaded" {
 
     try std.testing.expectEqual(@as(usize, 1), checks.items.len);
     try std.testing.expectEqual(CheckStatus.ok, checks.items[0].status);
-    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, "~/.fx/settings.json") == null);
+    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, paths.user_settings.?) == null);
     try std.testing.expect(std.mem.find(u8, checks.items[0].detail, ".fx.json") != null);
 }
 
@@ -896,4 +952,114 @@ test "command in path checks explicit path entries" {
 
     try std.testing.expect(try commandInPathValue(std.testing.allocator, "gh", path_env));
     try std.testing.expect(!(try commandInPathValue(std.testing.allocator, "missing-command", path_env)));
+}
+
+test "profile check reports the resolved roots and the active layout" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    var paths = try config_runtime.discoverPathsFromHome(alloc, home_root, workspace_root);
+    defer paths.deinit(alloc);
+
+    var checks: std.ArrayList(Check) = .empty;
+    defer {
+        for (checks.items) |*entry| entry.deinit(alloc);
+        checks.deinit(alloc);
+    }
+
+    try appendProfileCheck(&checks, alloc, paths);
+
+    try std.testing.expectEqual(@as(usize, 1), checks.items.len);
+    try std.testing.expectEqualStrings("profile", checks.items[0].name);
+    try std.testing.expectEqual(CheckStatus.ok, checks.items[0].status);
+
+    // The detail must be the resolver's answer, never a path doctor spells out on its own.
+    var roots = try profile_roots.resolveForProcess(alloc, home_root, .{});
+    defer roots.deinit(alloc);
+    const expected = try std.fmt.allocPrint(alloc, "{s} layout; config={s} state={s} data={s}", .{
+        @tagName(roots.layout),
+        roots.config,
+        roots.state,
+        roots.data,
+    });
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, checks.items[0].detail);
+    try std.testing.expect(std.fs.path.isAbsolute(roots.config));
+    try std.testing.expect(std.fs.path.isAbsolute(roots.state));
+    try std.testing.expect(std.fs.path.isAbsolute(roots.data));
+}
+
+test "profile check collapses onto the legacy root when one exists" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeDoctorFixtureFile(tmp.dir, "home/.fx/settings.json", "{}");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    var paths = try config_runtime.discoverPathsFromHome(alloc, home_root, workspace_root);
+    defer paths.deinit(alloc);
+
+    var checks: std.ArrayList(Check) = .empty;
+    defer {
+        for (checks.items) |*entry| entry.deinit(alloc);
+        checks.deinit(alloc);
+    }
+
+    try appendProfileCheck(&checks, alloc, paths);
+
+    // Whatever the host exports for XDG, an existing profile keeps every root where it is.
+    const legacy = try std.fs.path.join(alloc, &.{ home_root, ".fx" });
+    defer alloc.free(legacy);
+    const expected = try std.fmt.allocPrint(alloc, "legacy layout; config={s} state={s} data={s}", .{ legacy, legacy, legacy });
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, checks.items[0].detail);
+}
+
+test "profile check warns instead of failing when HOME is unavailable" {
+    const alloc = std.testing.allocator;
+    var checks: std.ArrayList(Check) = .empty;
+    defer {
+        for (checks.items) |*entry| entry.deinit(alloc);
+        checks.deinit(alloc);
+    }
+
+    try appendProfileCheck(&checks, alloc, .{
+        .workspace_settings = @constCast("/workspace/.fx.json"),
+        .workspace_root = @constCast("/workspace"),
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), checks.items.len);
+    try std.testing.expectEqual(CheckStatus.warn, checks.items[0].status);
+    try std.testing.expectEqualStrings(
+        "HOME is not set; no profile root can be resolved",
+        checks.items[0].detail,
+    );
+}
+
+test "session recovery hints name the resolved sessions directory" {
+    var buffer: [512 + std.fs.max_path_bytes]u8 = undefined;
+    const sessions_dir = "/home/tester/.local/state/fx/sessions";
+
+    try std.testing.expectEqualStrings(
+        "back up /home/tester/.local/state/fx/sessions, then inspect this session with fx session abc --json",
+        try recoveryActionForSessionDiagnostic(.projection_invalid, "abc", sessions_dir, &buffer),
+    );
+    try std.testing.expectEqualStrings(
+        "back up /home/tester/.local/state/fx/sessions and avoid opening this session until the path is repaired",
+        try recoveryActionForSessionDiagnostic(.unsafe_path, "abc", sessions_dir, &buffer),
+    );
 }

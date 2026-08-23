@@ -11,6 +11,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import {
+  fxProfileRoots,
+  XDG_ENV_KEYS,
+  xdgEnvForHome,
+} from "../test-support/profile-env";
+
+export { fxProfileRoots, XDG_ENV_KEYS, xdgEnvForHome };
 
 export const FX_BIN = resolve(import.meta.dirname, "../../zig-out/bin/fx");
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
@@ -479,7 +486,18 @@ export async function runFx(
       HOME: process.env.HOME ?? "",
       PATH: process.env.PATH ?? "",
     };
-    for (const [key, value] of Object.entries(opts.env ?? {})) {
+    const callerEnv = opts.env ?? {};
+    for (const [key, value] of Object.entries(callerEnv)) {
+      if (value === undefined) {
+        delete env[key];
+      } else {
+        env[key] = value;
+      }
+    }
+    // Applied after the caller's overrides so it follows the HOME the caller actually chose,
+    // while a caller that names an XDG variable itself still wins.
+    for (const [key, value] of Object.entries(xdgEnvForHome(env.HOME))) {
+      if (Object.prototype.hasOwnProperty.call(callerEnv, key)) continue;
       if (value === undefined) {
         delete env[key];
       } else {

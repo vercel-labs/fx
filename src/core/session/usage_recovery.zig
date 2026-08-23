@@ -1,6 +1,7 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const profile_roots = @import("../shared/profile_roots.zig");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
 const types = @import("../shared/types.zig");
@@ -189,7 +190,7 @@ test "missing recovery registry is an empty bounded set" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
     var store = try session_store.Store.initFromHome(alloc, home, "/");
@@ -205,7 +206,7 @@ test "recovery markers are idempotent and clear durably" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -220,13 +221,13 @@ test "recovery markers are idempotent and clear durably" {
         error.FileNotFound,
         tmp.dir.access(
             io_mod.getIo(),
-            "home/.fx/sessions/usage-recovery",
+            "home/" ++ profile_roots.test_relative_roots.state ++ "/sessions/usage-recovery",
             .{},
         ),
     );
     try tmp.dir.access(
         io_mod.getIo(),
-        "home/.fx/usage-recovery/recovery-marker",
+        "home/" ++ profile_roots.test_relative_roots.state ++ "/usage-recovery/recovery-marker",
         .{},
     );
 
@@ -260,7 +261,7 @@ test "recovery registry reads only marked durable session state" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -333,7 +334,7 @@ test "recovery registry reads only marked durable session state" {
 
     var marker_before_file = try tmp.dir.openFile(
         io_mod.getIo(),
-        "home/.fx/usage-recovery/indexed-usage-recovery",
+        "home/" ++ profile_roots.test_relative_roots.state ++ "/usage-recovery/indexed-usage-recovery",
         .{},
     );
     defer marker_before_file.close(io_mod.getIo());
@@ -356,7 +357,7 @@ test "recovery registry reads only marked durable session state" {
 
     var marker_after_file = try tmp.dir.openFile(
         io_mod.getIo(),
-        "home/.fx/usage-recovery/indexed-usage-recovery",
+        "home/" ++ profile_roots.test_relative_roots.state ++ "/usage-recovery/indexed-usage-recovery",
         .{},
     );
     defer marker_after_file.close(io_mod.getIo());
@@ -374,7 +375,7 @@ test "recovery marker distinguishes checkpoints around a crash boundary" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);

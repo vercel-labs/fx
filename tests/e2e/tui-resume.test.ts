@@ -16,7 +16,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxProfileRoots, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -38,8 +38,17 @@ const UPGRADE_TIMEOUT = TIMEOUT * 2;
 const SESSION_PICKER_META_RE = /\bturns?\b/;
 const SELECTED_COMPLETION_SGR = "\x1b[1m\x1b[38;5;255m";
 
+// fx resolves its profile roots once at startup: a `~/.fx` holding a known profile entry keeps
+// every root there, otherwise Linux splits them across the XDG roots. The sessions directory is
+// the materialized answer, so read it back instead of guessing the layout from the test setup.
+function sessionsDirFromHome(home: string): string {
+  const legacy = join(home, ".fx", "sessions");
+  if (existsSync(legacy)) return legacy;
+  return join(fxProfileRoots(home).state, "sessions");
+}
+
 function sessionIdFromHome(home: string): string {
-  const sessions = join(home, ".fx", "sessions");
+  const sessions = sessionsDirFromHome(home);
   const ids = readdirSync(sessions, { withFileTypes: true })
     .filter((entry) => entry.name !== "latest" && entry.isDirectory())
     .map((entry) => entry.name);
@@ -246,8 +255,8 @@ async function waitForPersistedSessionMarker(
   marker: string,
   timeout = TIMEOUT,
 ): Promise<void> {
-  const sessionsDir = join(home, ".fx", "sessions");
   await waitForCondition(() => {
+    const sessionsDir = sessionsDirFromHome(home);
     if (!existsSync(sessionsDir)) return false;
     return readdirSync(sessionsDir, { withFileTypes: true })
       .filter((entry) => entry.name !== "latest" && entry.isDirectory())
@@ -264,8 +273,8 @@ async function waitForCommittedSessionMarker(
   marker: string,
   timeout = TIMEOUT,
 ): Promise<void> {
-  const sessionsDir = join(home, ".fx", "sessions");
   await waitForCondition(() => {
+    const sessionsDir = sessionsDirFromHome(home);
     if (!existsSync(sessionsDir)) return false;
     return readdirSync(sessionsDir, { withFileTypes: true })
       .filter((entry) => entry.name !== "latest" && entry.isDirectory())
@@ -4492,9 +4501,7 @@ test.skipIf(!tmuxAvailable())(
 
       const sessionId = sessionIdFromHome(home);
       const resumeViewPath = join(
-        home,
-        ".fx",
-        "sessions",
+        sessionsDirFromHome(home),
         sessionId,
         "resume-view.bin",
       );
@@ -4988,7 +4995,7 @@ test.skipIf(!tmuxAvailable())(
         UPGRADE_TIMEOUT,
       );
 
-      const sessionDir = join(home, ".fx", "sessions", sessionId);
+      const sessionDir = join(sessionsDirFromHome(home), sessionId);
       const watermarkName = readdirSync(sessionDir).find(
         (name) => name.startsWith("commit.") && name.endsWith(".json"),
       )!;
@@ -5611,7 +5618,7 @@ test.skipIf(!tmuxAvailable())(
       expect(filteredPicker).toContain("workspace B");
       expect(filteredPicker).toContain("workspace-b");
       expect(filteredPicker).not.toContain("Preview:");
-      const sessionIds = readdirSync(join(home, ".fx", "sessions"), {
+      const sessionIds = readdirSync(sessionsDirFromHome(home), {
         withFileTypes: true,
       })
         .filter((entry) => entry.name !== "latest" && entry.isDirectory())

@@ -21,6 +21,7 @@ import {
   cleanupIsolatedTestHome,
   createIsolatedTestHome,
   FX_BIN,
+  fxProfileRoots,
   HAS_API_KEY,
   REPO_ROOT,
   runFx,
@@ -480,6 +481,8 @@ describe("cli: status", () => {
         };
         const cwd = realpathSync(workspace);
         const before = snapshotTree(home);
+        // The seeded ~/.fx keeps the legacy layout, so doctor names that exact file.
+        const mcpConfigPath = join(env.HOME, ".fx", "mcp.json");
 
         const statusText = await runFx(["status"], { cwd, env });
         const statusJsonResult = await runFx(["status", "--json"], { cwd, env });
@@ -502,7 +505,7 @@ describe("cli: status", () => {
           mcp_config_error: "McpConfigInvalidJson",
         });
         expect(doctorText.stdout).toContain(
-          "[fail] mcp_config: failed to load ~/.fx/mcp.json: McpConfigInvalidJson\n",
+          `[fail] mcp_config: failed to load ${mcpConfigPath}: McpConfigInvalidJson\n`,
         );
         const doctorJson = JSON.parse(doctorJsonResult.stdout);
         expect(doctorJson.fail_count).toBe(1);
@@ -514,7 +517,7 @@ describe("cli: status", () => {
           {
             name: "mcp_config",
             status: "fail",
-            detail: "failed to load ~/.fx/mcp.json: McpConfigInvalidJson",
+            detail: `failed to load ${mcpConfigPath}: McpConfigInvalidJson`,
           },
         ]);
         expect(ask.code).toBe(1);
@@ -2189,7 +2192,7 @@ describe("cli: missing durable home", () => {
         expect(JSON.parse(asked.stdout).output.trim()).toBe(
           "missing home persisted",
         );
-        expect(existsSync(join(home, ".fx", "sessions"))).toBe(true);
+        expect(existsSync(join(fxProfileRoots(home).state, "sessions"))).toBe(true);
         expect(gateway.requests).toHaveLength(1);
       } finally {
         gateway.stop();
@@ -4210,7 +4213,7 @@ describe("cli: ask success", () => {
         );
         expect(
           existsSync(
-            join(savedHome, ".fx", "sessions", firstJson.session_id),
+            join(fxProfileRoots(savedHome).state, "sessions", firstJson.session_id),
           ),
         ).toBe(true);
 
@@ -4340,7 +4343,7 @@ describe("cli: ask success", () => {
         expect(first.code).toBe(0);
         expect(first.stderr).toBe("");
         const sessionId = JSON.parse(first.stdout).session_id as string;
-        const lockPath = join(home, ".fx", "sessions", "latest.lock");
+        const lockPath = join(fxProfileRoots(home).state, "sessions", "latest.lock");
         lockHolder = Bun.spawn(
           [
             "python3",
@@ -4377,8 +4380,7 @@ describe("cli: ask success", () => {
         expect(exact.stderr).toBe("");
         expect(JSON.parse(exact.stdout).output.trim()).toBe("contended exact turn");
         const tokenPath = join(
-          home,
-          ".fx",
+          fxProfileRoots(home).state,
           "sessions",
           "latest",
           "deferred",
@@ -4696,7 +4698,7 @@ describe("cli: workspace access", () => {
         ]);
 
         const stored = JSON.parse(
-          readFileSync(join(home, ".fx", "settings.json"), "utf8"),
+          readFileSync(join(fxProfileRoots(home).config, "settings.json"), "utf8"),
         );
         expect(stored.workspaces[workspaceRoot].additional_directories).toEqual([
           sharedRoot,
@@ -4775,7 +4777,7 @@ describe("cli: workspace access", () => {
           additional_directories: [],
         });
         const removedSettings = JSON.parse(
-          readFileSync(join(home, ".fx", "settings.json"), "utf8"),
+          readFileSync(join(fxProfileRoots(home).config, "settings.json"), "utf8"),
         );
         expect(
           removedSettings.workspaces?.[workspaceRoot]?.additional_directories,

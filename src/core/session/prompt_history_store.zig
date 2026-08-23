@@ -2,6 +2,7 @@ const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const profile_roots = @import("../shared/profile_roots.zig");
 const session_codec = @import("session_codec.zig");
 
 const Allocator = std.mem.Allocator;
@@ -53,6 +54,7 @@ const LineRead = struct {
 };
 
 pub const Store = struct {
+    alloc: Allocator,
     home_path: []u8,
     display_path: []u8,
     durable_home: ?io_mod.VerifiedDir = null,
@@ -67,11 +69,11 @@ pub const Store = struct {
 
     pub fn initFromHome(alloc: Allocator, home_path: []const u8) !Store {
         const zio = io_mod.getIo();
-        var home = try std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true });
-        defer home.close(zio);
+        const state_root = try profile_roots.resolveRootForProcess(alloc, home_path, .state, .{});
+        defer alloc.free(state_root);
 
         var durable_home: ?io_mod.VerifiedDir = null;
-        if (home.openDir(zio, profile_paths.root_dir_name, .{
+        if (std.Io.Dir.openDirAbsolute(zio, state_root, .{
             .iterate = true,
             .follow_symlinks = false,
         })) |dir| {
@@ -86,8 +88,9 @@ pub const Store = struct {
         }
 
         return .{
+            .alloc = alloc,
             .home_path = try alloc.dupe(u8, home_path),
-            .display_path = try profile_paths.promptHistoryPath(alloc, home_path),
+            .display_path = try profile_paths.promptHistoryPath(alloc, state_root),
             .durable_home = durable_home,
         };
     }
@@ -225,14 +228,9 @@ pub const Store = struct {
         if (self.fail_private_mode) return error.PrivateStatePermissionsUnsupported;
         if (self.durable_home == null) {
             if (self.fail_layout_creation) return error.DurableLayoutFailed;
-            const zio = io_mod.getIo();
-            var home = io_mod.VerifiedDir{
-                .dir = std.Io.Dir.openDirAbsolute(zio, self.home_path, .{
-                    .iterate = true,
-                }) catch return error.DurableLayoutFailed,
-            };
-            defer home.close();
-            self.durable_home = io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.root_dir_name) catch |err| switch (err) {
+            const state_root = profile_roots.resolveRootForProcess(self.alloc, self.home_path, .state, .{}) catch return error.DurableLayoutFailed;
+            defer self.alloc.free(state_root);
+            self.durable_home = io_mod.openOrCreateVerifiedPrivateRootAbsolute(state_root, null) catch |err| switch (err) {
                 error.PrivateStatePermissionsUnsupported, error.DurablePathUnsafe => return err,
                 else => return error.DurableLayoutFailed,
             };
@@ -871,20 +869,17 @@ fn filterOtherWorkspaceRecords(
 }
 
 fn historyPath(alloc: Allocator, home: []const u8) ![]u8 {
-    return profile_paths.promptHistoryPath(alloc, home);
+    const state_root = try profile_roots.resolveRootForProcess(alloc, home, .state, .{});
+    defer alloc.free(state_root);
+    return profile_paths.promptHistoryPath(alloc, state_root);
 }
 
 fn ensureFixtureHome(home: []const u8) !void {
-    const fx_dir = try profile_paths.rootDir(std.testing.allocator, home);
-    defer std.testing.allocator.free(fx_dir);
-    std.Io.Dir.createDirAbsolute(
-        std.testing.io,
-        fx_dir,
-        std.Io.File.Permissions.fromMode(0o700),
-    ) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
+    const alloc = std.testing.allocator;
+    const state_root = try profile_roots.resolveRootForProcess(alloc, home, .state, .{});
+    defer alloc.free(state_root);
+    var root = try io_mod.openOrCreateVerifiedPrivateRootAbsolute(state_root, null);
+    root.close();
 }
 
 fn writeFixture(home: []const u8, bytes: []const u8) !void {
@@ -1092,7 +1087,7 @@ test "oversized prompt history record is skipped without creating durable state"
         try store.append(alloc, 1, "/tmp/workspace", oversized),
     );
 
-    const fx_path = try profile_paths.rootDir(alloc, home);
+    const fx_path = try profile_roots.resolveRootForProcess(alloc, home, .state, .{});
     defer alloc.free(fx_path);
     try std.testing.expectError(
         error.FileNotFound,
@@ -1334,7 +1329,7 @@ test "read-only empty home load creates no prompt history state" {
     defer freeLoadedEntries(alloc, entries);
     try std.testing.expectEqual(@as(usize, 0), entries.len);
 
-    const fx_path = try profile_paths.rootDir(alloc, home);
+    const fx_path = try profile_roots.resolveRootForProcess(alloc, home, .state, .{});
     defer alloc.free(fx_path);
     try std.testing.expectError(
         error.FileNotFound,
@@ -1353,7 +1348,7 @@ test "first append creates only private prompt history layout and reports layout
     defer store.deinit(alloc);
     _ = try store.append(alloc, 1, "/tmp/workspace", "first");
 
-    const fx_path = try profile_paths.rootDir(alloc, home);
+    const fx_path = try profile_roots.resolveRootForProcess(alloc, home, .state, .{});
     defer alloc.free(fx_path);
     var fx_dir = try std.Io.Dir.openDirAbsolute(
         std.testing.io,

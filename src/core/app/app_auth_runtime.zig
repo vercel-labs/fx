@@ -217,7 +217,7 @@ pub fn Runtime(comptime App: type) type {
                     app.auth.credentialSource() == .chatgpt_subscription or
                     chatgpt_is_only_logout_session;
             if (logout_chatgpt) {
-                const outcome = chatgpt_oauth.logout() catch {
+                const outcome = chatgpt_oauth.logout(app.alloc) catch {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .@"error",

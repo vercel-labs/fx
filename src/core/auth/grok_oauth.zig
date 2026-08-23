@@ -406,7 +406,7 @@ pub const LogoutResult = struct {
 };
 
 pub fn logout(alloc: Allocator, transport: oauth_transport.Provider) !LogoutResult {
-    var mutation = (try grok_session.beginExistingMutation()) orelse return .{
+    var mutation = (try grok_session.beginExistingMutation(alloc)) orelse return .{
         .deletion = .missing,
         .revocation_failed = false,
     };
@@ -442,7 +442,7 @@ pub fn loadAccess(
         return takeAccess(&session);
     }
 
-    var mutation = (try grok_session.beginExistingMutation()) orelse return null;
+    var mutation = (try grok_session.beginExistingMutation(alloc)) orelse return null;
     defer mutation.deinit();
     var session = (try mutation.load(alloc)) orelse return null;
     defer session.deinit(alloc);

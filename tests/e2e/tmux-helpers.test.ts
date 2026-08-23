@@ -2,7 +2,9 @@ import { expect, test } from "bun:test";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -19,6 +21,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { XDG_ENV_KEYS } from "../test-support/profile-env";
 
 const tmuxTest = test.skipIf(!tmuxAvailable());
 const ISOLATED_KEYS = [
@@ -312,5 +315,66 @@ tmuxTest("minimum history lines survive a fresh tmux server restart", async () =
         stdio: "pipe",
       });
     } catch {}
+  }
+});
+
+tmuxTest("tmux launch pins the XDG roots inside the pane HOME", async () => {
+  const socketName = `fx-xdg-${process.pid}-${Date.now().toString(36)}`;
+  const root = mkdtempSync(join(tmpdir(), "fx-tmux-xdg-isolation-"));
+  const paneHome = join(root, "pane-home");
+  const hostStateHome = join(root, "host-state");
+  const probePath = join(root, "probe.mjs");
+  const resultPath = join(root, "result.json");
+  const staleValues = {
+    XDG_CONFIG_HOME: join(root, "host-config"),
+    XDG_STATE_HOME: hostStateHome,
+    XDG_DATA_HOME: join(root, "host-data"),
+  };
+  for (const value of Object.values(staleValues)) mkdirSync(value, { recursive: true });
+  mkdirSync(paneHome, { recursive: true });
+
+  let session: TmuxSession | undefined;
+  try {
+    // A tmux server started from a shell that exports the XDG variables keeps them in its own
+    // environment, which is exactly the developer machine the suite must be immune to.
+    execFileSync(
+      "tmux",
+      ["-L", socketName, "new-session", "-d", "-s", "fx-xdg-seed", "sleep 60"],
+      { env: { ...process.env, ...staleValues }, stdio: "pipe" },
+    );
+
+    writeFileSync(
+      probePath,
+      `await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({\n` +
+        XDG_ENV_KEYS.map((key) =>
+          `  ${JSON.stringify(key)}: process.env[${JSON.stringify(key)}] ?? null,\n`
+        ).join("") +
+        "}));\nawait Bun.sleep(5_000);\n",
+    );
+    session = await TmuxSession.create({
+      cmd: `${process.execPath} ${probePath}`,
+      socketName,
+      startupWaitMs: 200,
+      env: { HOME: paneHome },
+    });
+
+    const resultDeadline = Date.now() + 5_000;
+    while (!existsSync(resultPath) && Date.now() < resultDeadline) {
+      await Bun.sleep(25);
+    }
+    expect(existsSync(resultPath)).toBe(true);
+    expect(JSON.parse(readFileSync(resultPath, "utf8"))).toEqual({
+      XDG_CONFIG_HOME: join(paneHome, ".config"),
+      XDG_STATE_HOME: join(paneHome, ".local", "state"),
+      XDG_DATA_HOME: join(paneHome, ".local", "share"),
+    });
+    // The seeded host state root stays untouched: nothing the pane runs can reach it.
+    expect(readdirSync(hostStateHome)).toEqual([]);
+  } finally {
+    await session?.kill();
+    try {
+      execFileSync("tmux", ["-L", socketName, "kill-server"], { stdio: "pipe" });
+    } catch {}
+    rmSync(root, { recursive: true, force: true });
   }
 });

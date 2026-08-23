@@ -13,7 +13,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxProfileRoots, runFx } from "../evals/eval-helpers";
 import {
   composerContains,
   FAKE_GATEWAY_MODEL,
@@ -1133,7 +1133,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.waitForSessionEnd(TIMEOUT);
         session = null;
 
-        const stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+        const stored = JSON.parse(readFileSync(join(fxProfileRoots(home).config, "settings.json"), "utf8"));
         expect(stored).toMatchObject({
           model: "anthropic/claude-fable-5",
           effort: "xhigh",
@@ -1277,7 +1277,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.sendKeys("Enter");
         await session.waitForText("● Switched to provider/new-reasoning-model", TIMEOUT);
 
-        let stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+        let stored = JSON.parse(readFileSync(join(fxProfileRoots(home).config, "settings.json"), "utf8"));
         expect(stored.model).toBe("provider/new-reasoning-model");
         expect(stored).not.toHaveProperty("fast_mode");
 
@@ -1305,11 +1305,11 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.sendKeys("Enter");
         await session.waitForText("· future-tier", TIMEOUT);
 
-        stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+        stored = JSON.parse(readFileSync(join(fxProfileRoots(home).config, "settings.json"), "utf8"));
         const persistenceDeadline = Date.now() + TIMEOUT;
         while (stored.effort !== "future-tier" && Date.now() < persistenceDeadline) {
           await Bun.sleep(25);
-          stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+          stored = JSON.parse(readFileSync(join(fxProfileRoots(home).config, "settings.json"), "utf8"));
         }
         expect(stored).toMatchObject({
           model: "provider/new-reasoning-model",
@@ -1335,7 +1335,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.waitForSessionEnd(TIMEOUT);
         session = null;
 
-        stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+        stored = JSON.parse(readFileSync(join(fxProfileRoots(home).config, "settings.json"), "utf8"));
         expect(stored).toMatchObject({
           model: "provider/new-reasoning-model",
           effort: "future-tier",
@@ -2286,7 +2286,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         session = null;
 
         const stored = JSON.parse(
-          readFileSync(join(home, ".fx", "settings.json"), "utf8"),
+          readFileSync(join(fxProfileRoots(home).config, "settings.json"), "utf8"),
         );
         expect(stored.workspaces[workspaceRoot].additional_directories).toEqual([
           sharedRoot,
@@ -2311,7 +2311,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         secondSession = null;
 
         const cleared = JSON.parse(
-          readFileSync(join(home, ".fx", "settings.json"), "utf8"),
+          readFileSync(join(fxProfileRoots(home).config, "settings.json"), "utf8"),
         );
         expect(cleared.workspaces?.[workspaceRoot]?.additional_directories).toBeUndefined();
         expect(readFileSync(stderrAPath, "utf8")).toBe("");

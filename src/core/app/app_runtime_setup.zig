@@ -1,6 +1,7 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const profile_roots = @import("../shared/profile_roots.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 
@@ -32,7 +33,13 @@ pub fn loadSkills(
     };
     defer if (canonical_home) |home| alloc.free(home);
     const home = canonical_home orelse configured_home;
-    const dir = try profile_paths.managedSkillsDir(alloc, home);
+    const data_root = try profile_roots.resolveRootForProcess(alloc, home, .data, .{});
+    defer alloc.free(data_root);
+    const dir = profile_paths.managedSkillsDir(alloc, data_root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // An unusable HOME yields no managed skills, same as an absent one.
+        error.ProfileRootNotAbsolute => return .{},
+    };
     errdefer alloc.free(dir);
     const discovery = try skill_runtime.loadVisibleSkills(alloc, workspace_root, home, dir, root_policy);
 
@@ -143,7 +150,9 @@ test "loadSkills loads managed skills under HOME" {
     var loaded = try loadSkills(alloc, workspace_path, test_root_policy);
     defer loaded.deinit(alloc);
 
-    const expected_dir = try profile_paths.managedSkillsDir(alloc, home_path);
+    const expected_root = try profile_roots.resolveRootForProcess(alloc, home_path, .data, .{});
+    defer alloc.free(expected_root);
+    const expected_dir = try profile_paths.managedSkillsDir(alloc, expected_root);
     defer alloc.free(expected_dir);
 
     try std.testing.expectEqualStrings(expected_dir, loaded.dir);
