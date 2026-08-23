@@ -118,7 +118,7 @@ pub fn prepareManaged(
 }
 
 pub fn prepareExternal(alloc: Allocator) !Output {
-    const root = io_mod.tempDir() orelse ".";
+    const root = io_mod.tempDir();
     var attempt: usize = 0;
     while (attempt < 16) : (attempt += 1) {
         const name = try randomLogName(alloc);
@@ -131,7 +131,7 @@ pub fn prepareExternal(alloc: Allocator) !Output {
                 .read = true,
                 .truncate = false,
                 .exclusive = true,
-                .permissions = std.Io.File.Permissions.fromMode(0o600),
+                .permissions = io_mod.private_file_permissions,
             },
         ) catch |err| switch (err) {
             error.PathAlreadyExists => {
@@ -185,7 +185,7 @@ test "background launch output removes managed log on cancellation" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.private_dir_permissions,
     );
     const display_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
     defer alloc.free(display_path);

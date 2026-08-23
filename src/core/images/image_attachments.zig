@@ -167,7 +167,7 @@ fn loadResolvedImageAttachment(
 }
 
 pub fn createTempSnapshotDir(alloc: std.mem.Allocator) ![]u8 {
-    const temp_root = try io_mod.realpathAlloc(alloc, io_mod.tempDir() orelse ".");
+    const temp_root = try io_mod.realpathAlloc(alloc, io_mod.tempDir());
     defer alloc.free(temp_root);
     for (0..16) |_| {
         var suffix: u64 = undefined;

@@ -11,11 +11,15 @@ pub fn processId() ProcessId {
     return std.c.getpid();
 }
 
-pub fn tempDir() ?[]const u8 {
+pub fn tempDir() []const u8 {
     if (comptime builtin.os.tag == .windows) {
-        return getenv("TEMP") orelse getenv("TMP") orelse getenv("TMPDIR");
+        return getenv("TEMP") orelse
+            getenv("TMP") orelse
+            getenv("TMPDIR") orelse
+            homeDir() orelse
+            "C:\\Windows\\Temp";
     }
-    return getenv("TMPDIR") orelse getenv("TEMP") orelse getenv("TMP");
+    return getenv("TMPDIR") orelse getenv("TEMP") orelse getenv("TMP") orelse "/tmp";
 }
 
 // Process globals are installed before threads start and remain read-only.

@@ -1785,7 +1785,7 @@ fn traceFilePermissions() std.Io.File.Permissions {
 }
 
 fn writeTraceReportFile(alloc: std.mem.Allocator, contents: []const u8) ![]u8 {
-    const tmp_dir = io_mod.tempDir() orelse ".";
+    const tmp_dir = io_mod.tempDir();
     const trimmed = std.mem.trimEnd(u8, tmp_dir, "/");
     const now_ms = io_mod.milliTimestamp();
     const now_secs: i64 = @max(@divFloor(now_ms, 1000), 0);
