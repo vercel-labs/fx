@@ -2862,7 +2862,17 @@ pub fn formatExecutionFileContext(alloc: Allocator, files: []const core_types.Fi
     errdefer out.deinit();
 
     out.writer.writeAll("Session file evidence from previous tool execution. Re-read stale paths before relying on exact contents:") catch return error.OutOfMemory;
-    for (files) |file| {
+
+    for (files, 0..) |file, i| {
+        var has_later = false;
+        for (files[i + 1 ..]) |later| {
+            if (std.mem.eql(u8, later.path, file.path)) {
+                has_later = true;
+                break;
+            }
+        }
+        if (has_later) continue;
+
         out.writer.print("\n- action={s} status={s} path={s}", .{ @tagName(file.action), @tagName(file.status), file.path }) catch return error.OutOfMemory;
         if (file.new_path) |new_path| {
             out.writer.print(" new_path={s}", .{new_path}) catch return error.OutOfMemory;
@@ -3232,7 +3242,8 @@ fn appendExecutionSummaryLines(arena: Allocator, lines: *std.ArrayList([]const u
                     try lines.append(arena, "- Tool execution evidence:");
                     saw_header = true;
                 }
-                try lines.append(arena, try formatToolResultEvidenceLine(arena, result));
+                const call = findToolCallById(step.tool_calls, result.tool_call_id);
+                try lines.append(arena, try formatToolResultEvidenceLine(arena, result, call));
                 added += 1;
                 if (added >= 4) return;
             }
@@ -3311,7 +3322,8 @@ fn appendBudgetEvidenceForTurn(arena: Allocator, lines: *std.ArrayList([]const u
     var added: usize = 0;
     for (execution.tool_steps) |step| {
         for (step.tool_results) |result| {
-            try lines.append(arena, try formatToolResultEvidenceLine(arena, result));
+            const call = findToolCallById(step.tool_calls, result.tool_call_id);
+            try lines.append(arena, try formatToolResultEvidenceLine(arena, result, call));
             added += 1;
             if (added >= remaining) return added;
         }
@@ -3325,14 +3337,50 @@ fn appendBudgetEvidenceForTurn(arena: Allocator, lines: *std.ArrayList([]const u
     return added;
 }
 
-fn formatToolResultEvidenceLine(arena: Allocator, result: core_types.PersistedToolResult) ![]const u8 {
+fn findToolCallById(calls: []const core_types.ToolCall, id: []const u8) ?core_types.ToolCall {
+    for (calls) |call| {
+        if (std.mem.eql(u8, call.id, id)) return call;
+    }
+    return null;
+}
+
+fn extractToolArgumentSummary(arena: Allocator, tool_name: []const u8, arguments_json: []const u8) !?[]const u8 {
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, arguments_json, .{}) catch return null;
+    if (root != .object) return null;
+
+    const candidates: []const []const u8 = if (std.mem.eql(u8, tool_name, "run_command") or std.mem.eql(u8, tool_name, "terminal"))
+        &[_][]const u8{ "command", "cwd" }
+    else if (std.mem.eql(u8, tool_name, "grep_files") or std.mem.eql(u8, tool_name, "semantic_search"))
+        &[_][]const u8{ "pattern", "query", "include", "path" }
+    else if (std.mem.eql(u8, tool_name, "edit_file") or std.mem.eql(u8, tool_name, "write_file"))
+        &[_][]const u8{ "path", "old_string", "new_string" }
+    else if (std.mem.eql(u8, tool_name, "rename_file") or std.mem.eql(u8, tool_name, "copy_file"))
+        &[_][]const u8{ "old_path", "new_path", "source", "destination" }
+    else if (std.mem.eql(u8, tool_name, "web_fetch") or std.mem.eql(u8, tool_name, "perplexity_search"))
+        &[_][]const u8{ "url", "query" }
+    else
+        &[_][]const u8{ "path", "command", "pattern", "query", "url", "file" };
+
+    for (candidates) |key| {
+        const value = root.object.get(key) orelse continue;
+        if (value != .string or value.string.len == 0) continue;
+        return try compactLineText(arena, value.string, compact_summary_max_line_chars - 4);
+    }
+    return null;
+}
+
+fn formatToolResultEvidenceLine(arena: Allocator, result: core_types.PersistedToolResult, call: ?core_types.ToolCall) ![]const u8 {
+    const args = if (call) |c| try extractToolArgumentSummary(arena, c.name, c.arguments_json) else null;
     if (result.output_handle) |handle| {
         if (result.preview) |preview| {
             const compact_preview = try compactLineText(arena, preview, 96);
+            if (args) |a| return std.fmt.allocPrint(arena, "- {s} {s} {s} ({d} stored bytes, handle={s}, preview={s})", .{ result.tool_name, @tagName(result.status), a, result.stored_output_bytes, handle, compact_preview });
             return std.fmt.allocPrint(arena, "- {s} {s} ({d} stored bytes, handle={s}, preview={s})", .{ result.tool_name, @tagName(result.status), result.stored_output_bytes, handle, compact_preview });
         }
+        if (args) |a| return std.fmt.allocPrint(arena, "- {s} {s} {s} ({d} stored bytes, handle={s})", .{ result.tool_name, @tagName(result.status), a, result.stored_output_bytes, handle });
         return std.fmt.allocPrint(arena, "- {s} {s} ({d} stored bytes, handle={s})", .{ result.tool_name, @tagName(result.status), result.stored_output_bytes, handle });
     }
+    if (args) |a| return std.fmt.allocPrint(arena, "- {s} {s} {s} ({d} stored bytes)", .{ result.tool_name, @tagName(result.status), a, result.stored_output_bytes });
     return std.fmt.allocPrint(arena, "- {s} {s} ({d} stored bytes)", .{ result.tool_name, @tagName(result.status), result.stored_output_bytes });
 }
 
@@ -4503,6 +4551,7 @@ test "context compaction summary preserves large result handle without dropping 
     try std.testing.expectEqual(HistoryTurn.compacted_summary, std.meta.activeTag(context[0]));
     try std.testing.expect(std.mem.find(u8, context[0].compacted_summary.summary, "result-call_large-abc.txt") != null);
     try std.testing.expect(std.mem.find(u8, context[0].compacted_summary.summary, "important preview") != null);
+    try std.testing.expect(std.mem.find(u8, context[0].compacted_summary.summary, "large") != null);
 }
 
 test "interrupted history projects marker and aborted tool result" {
@@ -4929,6 +4978,65 @@ test "compactLineText preserves complete UTF-8 codepoints at the byte cap" {
 
     const collapsed = try compactLineText(arena, "  alpha\n\tbeta  ", 10);
     try std.testing.expectEqualStrings("alpha beta", collapsed);
+}
+
+test "extractToolArgumentSummary picks the most relevant field per tool" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const path_arg = try extractToolArgumentSummary(arena, "read_file", "{\"path\":\"src/main.zig\"}");
+    try std.testing.expectEqualStrings("src/main.zig", path_arg.?);
+
+    const cmd_arg = try extractToolArgumentSummary(arena, "run_command", "{\"command\":\"zig build test\"}");
+    try std.testing.expectEqualStrings("zig build test", cmd_arg.?);
+
+    const grep_arg = try extractToolArgumentSummary(arena, "grep_files", "{\"pattern\":\"compactHistory\",\"include\":\"*.zig\"}");
+    try std.testing.expectEqualStrings("compactHistory", grep_arg.?);
+
+    const edit_arg = try extractToolArgumentSummary(arena, "edit_file", "{\"path\":\"src/main.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}");
+    try std.testing.expectEqualStrings("src/main.zig", edit_arg.?);
+
+    const fallback_arg = try extractToolArgumentSummary(arena, "custom_tool", "{\"path\":\"/tmp/x\"}");
+    try std.testing.expectEqualStrings("/tmp/x", fallback_arg.?);
+
+    try std.testing.expect(try extractToolArgumentSummary(arena, "read_file", "not json") == null);
+}
+
+test "formatExecutionFileContext deduplicates by path keeping last action" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const files = [_]core_types.FileEvidence{
+        .{ .path = try arena.dupe(u8, "src/main.zig"), .tool_call_id = @constCast(""), .tool_name = @constCast("read_file"), .action = .read, .status = .success },
+        .{ .path = try arena.dupe(u8, "src/main.zig"), .tool_call_id = @constCast(""), .tool_name = @constCast("read_file"), .action = .read, .status = .success, .stale = true },
+        .{ .path = try arena.dupe(u8, "src/main.zig"), .tool_call_id = @constCast(""), .tool_name = @constCast("edit_file"), .action = .edit, .status = .success },
+        .{ .path = try arena.dupe(u8, "src/other.zig"), .tool_call_id = @constCast(""), .tool_name = @constCast("read_file"), .action = .read, .status = .success, .stale = true },
+        .{ .path = try arena.dupe(u8, "src/main.zig"), .tool_call_id = @constCast(""), .tool_name = @constCast("read_file"), .action = .read, .status = .success, .stale = true },
+        .{ .path = try arena.dupe(u8, "src/main.zig"), .tool_call_id = @constCast(""), .tool_name = @constCast("write_file"), .action = .write, .status = .success },
+    };
+
+    const text = try formatExecutionFileContext(alloc, &files);
+    defer alloc.free(text);
+
+    var main_count: usize = 0;
+    var main_has_write = false;
+    var other_count: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const main_seen = std.mem.indexOf(u8, line, "path=src/main.zig") != null;
+        const other_seen = std.mem.indexOf(u8, line, "path=src/other.zig") != null;
+        if (main_seen) {
+            main_count += 1;
+            if (std.mem.indexOf(u8, line, "action=write") != null) main_has_write = true;
+        }
+        if (other_seen) other_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), main_count);
+    try std.testing.expect(main_has_write);
+    try std.testing.expectEqual(@as(usize, 1), other_count);
 }
 
 test "compacted Unicode history serializes system content as a string" {
