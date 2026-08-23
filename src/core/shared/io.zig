@@ -412,7 +412,10 @@ pub fn getenv(key: []const u8) ?[]const u8 {
 /// Returns the profile home used by fx. Native Windows does not define HOME,
 /// so USERPROFILE is the equivalent profile root there.
 pub fn homeDir() ?[]const u8 {
-    return getenv("HOME") orelse getenv("USERPROFILE");
+    if (comptime builtin.os.tag == .windows) {
+        return getenv("HOME") orelse getenv("USERPROFILE");
+    }
+    return getenv("HOME");
 }
 
 pub fn e2eFailIfDurableMutationAttempted() void {
@@ -1070,7 +1073,7 @@ test "getenv returns set value after setEnvironMap" {
     global_environ = null;
 }
 
-test "homeDir falls back to USERPROFILE when HOME is absent" {
+test "homeDir uses USERPROFILE only on Windows" {
     const previous_environ = global_environ;
     const previous_block = global_environ_block;
     const previous_raw = global_raw_environ;
@@ -1084,7 +1087,11 @@ test "homeDir falls back to USERPROFILE when HOME is absent" {
     defer environ.deinit();
     try environ.put("USERPROFILE", "C:\\Users\\fx-test");
     setEnvironMap(&environ);
-    try std.testing.expectEqualStrings("C:\\Users\\fx-test", homeDir().?);
+    if (comptime builtin.os.tag == .windows) {
+        try std.testing.expectEqualStrings("C:\\Users\\fx-test", homeDir().?);
+    } else {
+        try std.testing.expect(homeDir() == null);
+    }
 
     try environ.put("HOME", "C:\\Users\\preferred");
     try std.testing.expectEqualStrings("C:\\Users\\preferred", homeDir().?);
