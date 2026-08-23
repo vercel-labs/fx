@@ -978,21 +978,32 @@ fn composeTranscriptViewerFooterFrame(
     var frame = footer_viewport.ComposedFooterFrame{};
     errdefer frame.deinit(alloc);
     const width = shell.layout.cols;
-    const navigation = switch (input.ctx.transcript_depth) {
+    const navigation = if (input.ctx.rewind_active)
+        if (input.ctx.rewind_confirming)
+            "Enter confirm · Esc cancel"
+        else
+            "↑/↓ select · Enter rewind · Esc cancel"
+    else switch (input.ctx.transcript_depth) {
         .review => "Review · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close",
         .full => "Full detail · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close",
         .inline_mode => unreachable,
     };
 
     var navigation_row: std.ArrayList(u8) = .empty;
-    try navigation_row.appendSlice(alloc, user_message_card.promptMarkerStyle());
-    try row_text.appendClipped(alloc, &navigation_row, "┃", width);
-    try navigation_row.appendSlice(alloc, ui_render.reset_style);
-    if (width > 1) {
-        try navigation_row.append(alloc, ' ');
+    if (input.ctx.rewind_active) {
         try navigation_row.appendSlice(alloc, ui_render.statusline_style);
-        try row_text.appendSingleLineEllipsized(alloc, &navigation_row, navigation, width - 2);
+        try row_text.appendSingleLineEllipsized(alloc, &navigation_row, navigation, width);
         try navigation_row.appendSlice(alloc, ui_render.reset_style);
+    } else {
+        try navigation_row.appendSlice(alloc, user_message_card.promptMarkerStyle());
+        try row_text.appendClipped(alloc, &navigation_row, "┃", width);
+        try navigation_row.appendSlice(alloc, ui_render.reset_style);
+        if (width > 1) {
+            try navigation_row.append(alloc, ' ');
+            try navigation_row.appendSlice(alloc, ui_render.statusline_style);
+            try row_text.appendSingleLineEllipsized(alloc, &navigation_row, navigation, width - 2);
+            try navigation_row.appendSlice(alloc, ui_render.reset_style);
+        }
     }
     try pushFooterBandRow(
         alloc,
@@ -1011,13 +1022,16 @@ fn composeTranscriptViewerFooterFrame(
         &gap_row,
     );
 
-    var status_row = try input_presentation.composeHintRow(
-        alloc,
-        false,
-        null,
-        input.ctx,
-        width,
-    );
+    var status_row: std.ArrayList(u8) = if (input.ctx.rewind_active)
+        .empty
+    else
+        try input_presentation.composeHintRow(
+            alloc,
+            false,
+            null,
+            input.ctx,
+            width,
+        );
     try pushFooterBandRow(
         alloc,
         &frame,

@@ -13,10 +13,12 @@ import { join } from "node:path";
 import {
   cleanupIsolatedTestHome,
   createIsolatedTestHome,
+  FX_BIN,
   HAS_API_KEY,
 } from "../evals/eval-helpers";
 import { readTrace } from "./tui-render-assertions";
 import {
+  composerContains,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   hasEmptyComposer,
@@ -45,6 +47,20 @@ async function launchAndWait(): Promise<TmuxSession> {
   const s = await TmuxSession.create();
   await s.waitForComposer(10_000);
   return s;
+}
+
+async function waitForBrightRewindPrompt(
+  active: TmuxSession,
+  prompt: string,
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const escapes = await active.capturePaneEscapes();
+    if (escapes.includes(`\x1b[1m${prompt}`)) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for bright rewind prompt: ${prompt}`);
 }
 
 describe.skipIf(!tmuxAvailable())("tui: skills command recovery", () => {
@@ -289,6 +305,144 @@ describe.skipIf(!tmuxAvailable())("tui: active session transitions", () => {
       }
     },
     TIMEOUT,
+  );
+});
+
+describe.skipIf(!tmuxAvailable())("tui: chat rewind", () => {
+  test(
+    "/rewind confirms before removing turns and restores the selected prompt",
+    async () => {
+      const workDir = mkdtempSync(join(tmpdir(), "fx-chat-rewind-"));
+      const homeDir = mkdtempSync(join(tmpdir(), "fx-chat-rewind-home-"));
+      const stderrPath = join(workDir, "stderr.log");
+      const replies = ["FIRST_REPLY", "SECOND_REPLY", "THIRD_REPLY"];
+      const gateway = startDynamicFakeGateway(() =>
+        fakeGatewayFinalText(replies.shift() ?? "UNEXPECTED_REPLY")
+      );
+
+      try {
+        session = await TmuxSession.create({
+          cwd: workDir,
+          stderrPath,
+          env: {
+            HOME: homeDir,
+            AI_GATEWAY_API_KEY: "rewind-fake-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+          },
+          width: 120,
+          height: 40,
+        });
+        await session.waitForComposer(10_000);
+
+        await session.sendText("first rewind prompt");
+        await session.waitForText("FIRST_REPLY", 30_000);
+        await session.waitForComposer(10_000);
+        await session.sendText("second rewind prompt");
+        await session.waitForText("SECOND_REPLY", 30_000);
+        await session.waitForComposer(10_000);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(10_000)).toBe(true);
+        await session.kill();
+        session = await TmuxSession.create({
+          cmd: `${FX_BIN} session resume last`,
+          cwd: workDir,
+          stderrPath,
+          env: {
+            HOME: homeDir,
+            AI_GATEWAY_API_KEY: "rewind-fake-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+          },
+          width: 120,
+          height: 40,
+        });
+        await session.waitForText("Session resumed:", 10_000);
+        await session.waitForComposer(10_000);
+
+        await session.sendText("/rewind");
+        await session.waitForText(
+          "↑/↓ select · Enter rewind · Esc cancel",
+          10_000,
+        );
+        await waitForBrightRewindPrompt(
+          session,
+          "second rewind prompt",
+          10_000,
+        );
+        const latestSelection = await session.capturePane();
+        const latestRows = latestSelection.split("\n");
+        const latestFirstRow = latestRows.findIndex((line) =>
+          line.trimStart().startsWith("┃ first rewind prompt")
+        );
+        const latestSecondRow = latestRows.findIndex((line) =>
+          line.trimStart().startsWith("┃ second rewind prompt")
+        );
+        expect(latestFirstRow).toBeGreaterThanOrEqual(0);
+        expect(latestFirstRow).toBeLessThan(10);
+        expect(latestSecondRow).toBeGreaterThan(latestFirstRow);
+        expect(latestSelection).toContain("first rewind prompt");
+        expect(latestSelection).toContain("FIRST_REPLY");
+        expect(latestSelection).toContain("SECOND_REPLY");
+        expect(latestSelection).not.toContain("run /login");
+
+        await session.sendKeys("Up");
+        await waitForBrightRewindPrompt(session, "first rewind prompt", 10_000);
+        const olderSelection = await session.capturePane();
+        const olderRows = olderSelection.split("\n");
+        const olderFirstRow = olderRows.findIndex((line) =>
+          line.trimStart().startsWith("┃ first rewind prompt")
+        );
+        const olderSecondRow = olderRows.findIndex((line) =>
+          line.trimStart().startsWith("┃ second rewind prompt")
+        );
+        expect(olderFirstRow).toBe(latestFirstRow);
+        expect(olderSecondRow).toBe(latestSecondRow);
+        expect(olderSelection).toContain("FIRST_REPLY");
+        expect(olderSelection).toContain("second rewind prompt");
+        expect(olderSelection).toContain("SECOND_REPLY");
+        expect(olderSelection).not.toContain("run /login");
+        await session.sendKeys("Enter");
+        await session.waitForText("Enter confirm · Esc cancel", 10_000);
+        await session.sendKeys("Enter");
+
+        const rewoundPane = await session.waitForPane(
+          (pane) =>
+            composerContains(pane, "first rewind prompt") &&
+            !pane.includes("SECOND_REPLY") &&
+            !pane.includes("second rewind prompt"),
+          10_000,
+        );
+        expect(rewoundPane).not.toContain("FIRST_REPLY");
+        expect(rewoundPane).not.toContain("SECOND_REPLY");
+        expect(rewoundPane).not.toContain("second rewind prompt");
+        await session.sendKeys("C-u");
+        await session.sendText("third prompt after rewind");
+        await session.waitForText("THIRD_REPLY", 30_000);
+        expect(gateway.requests).toHaveLength(3);
+        expect(gateway.requests[2].body).not.toContain("FIRST_REPLY");
+        expect(gateway.requests[2].body).not.toContain("SECOND_REPLY");
+        expect(gateway.requests[2].body).not.toContain("first rewind prompt");
+        expect(gateway.requests[2].body).not.toContain("second rewind prompt");
+        expect(session.isAlive()).toBe(true);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        gateway.stop();
+        rmSync(workDir, { recursive: true, force: true });
+        rmSync(homeDir, { recursive: true, force: true });
+      }
+    },
+    LONG_TIMEOUT,
   );
 });
 

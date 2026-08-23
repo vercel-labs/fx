@@ -4123,6 +4123,8 @@ pub const TranscriptRuntime = struct {
     full_transcript_open_cols: u16 = 0,
     full_transcript_open_rows: u16 = 0,
     full_transcript_primary_recovery_entry_id: ?u32 = null,
+    rewind_selected_entry_id: ?u32 = null,
+    rewind_reveal_selection: bool = false,
     full_transcript_projection_cache: FullTranscriptProjectionCache = .{},
     full_transcript_content_revision: u64 = 0,
     full_transcript_review_revision: u64 = 0,
@@ -6239,6 +6241,13 @@ pub const TranscriptRuntime = struct {
 
     pub fn retargetFullTranscriptAnchor(self: *TranscriptRuntime, entry_id: u32) void {
         self.full_transcript = self.full_transcript.retarget_anchor(entry_id);
+    }
+
+    pub fn setRewindSelectedEntry(self: *TranscriptRuntime, entry_id: ?u32) void {
+        if (self.rewind_selected_entry_id == entry_id) return;
+        self.rewind_reveal_selection = entry_id != null;
+        self.rewind_selected_entry_id = entry_id;
+        self.markTranscriptStructureDirty();
     }
 
     pub fn scrollFullTranscript(
@@ -9448,6 +9457,34 @@ pub const TranscriptRuntime = struct {
             checkpoint,
         );
         defer entry_actions.deinit(alloc);
+        if (self.rewind_selected_entry_id) |selected_entry_id| {
+            for (self.entries.items[start_index..], 0..) |entry, relative_index| {
+                try build_checkpoint.tick(checkpoint);
+                if (entry != .user_turn) continue;
+                if (entry_actions.entry_actions.items[relative_index] == .hide) continue;
+                const user = entry.user_turn;
+                const card = try user_message_card.buildUserPromptCardWithSkillTokensForTerminalPresentationInterruptible(
+                    alloc,
+                    user.turn.text,
+                    user.turn.images,
+                    self.layout.cols,
+                    user.skill_tokens,
+                    checkpoint,
+                );
+                const rendered = if (user.id == selected_entry_id)
+                    card
+                else blk: {
+                    defer alloc.free(card);
+                    break :blk try user_message_card.dimTerminalPresentation(alloc, card);
+                };
+                try entry_actions.setOwnedOverride(
+                    alloc,
+                    relative_index,
+                    .user_turn,
+                    rendered,
+                );
+            }
+        }
         return full_transcript_screen.buildProjectionForDepthWithEntryActionsInterruptible(
             alloc,
             self.entries.items[start_index..],
@@ -9606,13 +9643,56 @@ pub const TranscriptRuntime = struct {
         visible_rows: u16,
     ) u32 {
         const self: *TranscriptRuntime = @ptrCast(@alignCast(context));
-        const selection = self.full_transcript.select_visual_offset(
-            measurement.total_rows,
-            visible_rows,
-            measurement.item_rows,
-        );
+        const rewind_anchor_row = if (self.rewind_selected_entry_id != null)
+            measurement.anchor_row
+        else
+            null;
+        const selection = if (self.rewind_reveal_selection)
+            self.full_transcript.select_visual_offset_revealing_anchor(
+                measurement.total_rows,
+                visible_rows,
+                measurement.item_rows,
+                rewind_anchor_row,
+            )
+        else
+            self.full_transcript.select_visual_offset_with_anchor_row(
+                measurement.total_rows,
+                visible_rows,
+                measurement.item_rows,
+                rewind_anchor_row,
+                if (self.rewind_selected_entry_id != null) visible_rows / 2 else 0,
+            );
+        self.rewind_reveal_selection = false;
         self.full_transcript = selection.state;
         return selection.offset;
+    }
+
+    test "rewind selection keeps surrounding transcript visible" {
+        const alloc = std.testing.allocator;
+        const measurement = full_transcript_screen.ProjectionMeasurement{
+            .total_rows = 30,
+            .anchor_row = null,
+            .item_rows = &.{
+                .{ .entry_id = 10, .row = 2 },
+                .{ .entry_id = 20, .row = 12 },
+                .{ .entry_id = 30, .row = 22 },
+            },
+        };
+        var runtime = TranscriptRuntime{
+            .rewind_selected_entry_id = 20,
+            .rewind_reveal_selection = true,
+            .full_transcript = .{
+                .depth = .review,
+                .follow_tail = false,
+                .anchor_entry_id = 20,
+                .anchor_pending = true,
+            },
+        };
+        defer runtime.deinit(alloc);
+        try std.testing.expectEqual(
+            @as(u32, 3),
+            selectProjectionViewportOffset(&runtime, measurement, 10),
+        );
     }
 
     test "full transcript depth changes preserve tail and history viewport intent" {

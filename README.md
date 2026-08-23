@@ -87,6 +87,8 @@ fx session resume --id <id>
 
 Each interactive session names its terminal tab. The title prefers the session name, falls back to the workspace name, and keeps the active model as secondary context. Renaming or resuming a session updates the tab, and exiting clears the fx-owned title. Noninteractive commands do not emit terminal-title controls.
 
+Run `/rewind` while fx is idle to select an earlier text prompt, remove that prompt and all later turns from the saved conversation, and place the selected prompt back in the composer for editing. Rewind changes chat history only. It does not reverse file edits, commands, permissions, child sessions, or other external effects.
+
 Run `/feedback` to open the feedback form at `fx.sh/feedback`. It does not create a diagnostic or change the clipboard.
 
 Run `/trace` to create a private Markdown diagnostic with logs, session context, runtime state, permissions, and recent activity. On macOS, fx copies the `.md` file to the clipboard; on other platforms, it saves the file and prints its path. Review and redact the trace before sharing it.

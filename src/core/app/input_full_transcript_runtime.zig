@@ -2,6 +2,7 @@ const std = @import("std");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
+const chat_rewind = @import("chat_rewind.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const input_action = @import("../input/input_action.zig");
 const transcript_presentation = @import("../output/transcript_presentation.zig");
@@ -52,6 +53,12 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn routeByte(app: *App, byte: u8) !bool {
+            if (comptime @hasField(App, "chat_rewind")) {
+                if (app.chat_rewind.active and (byte == '\r' or byte == '\n')) {
+                    try chat_rewind.enter(app);
+                    return true;
+                }
+            }
             const key = keyForByte(byte) orelse return false;
             if (!screenOwnsInput(app)) return false;
             try routeKey(app, key);
@@ -59,6 +66,23 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn routeAction(app: *App, resolved: input_action.Action) !bool {
+            if (comptime @hasField(App, "chat_rewind")) {
+                if (app.chat_rewind.active) switch (resolved) {
+                    .cursor_up, .history_up => {
+                        chat_rewind.move(app, true);
+                        return true;
+                    },
+                    .cursor_down, .history_down => {
+                        chat_rewind.move(app, false);
+                        return true;
+                    },
+                    .escape => {
+                        try chat_rewind.cancel(app);
+                        return true;
+                    },
+                    else => {},
+                };
+            }
             const key = keyForAction(resolved) orelse return false;
             switch (key) {
                 .toggle => if (childRouteActive(app)) {
@@ -150,6 +174,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn closeScreen(app: *App, trigger: TransitionTrigger) !void {
+            if (comptime @hasField(App, "chat_rewind")) app.chat_rewind.reset();
             debug_trace.logf(
                 "full_transcript",
                 "close_screen trigger={s}",

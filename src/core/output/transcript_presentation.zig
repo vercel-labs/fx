@@ -142,9 +142,54 @@ pub const State = struct {
         visible_rows: u16,
         item_rows: []const ItemRow,
     ) OffsetSelection {
+        return self.select_visual_offset_with_anchor_row(
+            total_rows,
+            visible_rows,
+            item_rows,
+            null,
+            0,
+        );
+    }
+
+    pub fn select_visual_offset_revealing_anchor(
+        self: State,
+        total_rows: u32,
+        visible_rows: u16,
+        item_rows: []const ItemRow,
+        measured_anchor_row: ?u32,
+    ) OffsetSelection {
         var next = self;
         const max_offset = total_rows -| visible_rows;
-        const anchor_rows = resolve_bookmark_row(item_rows, next.anchor_entry_id);
+        const anchor_row = measured_anchor_row orelse resolve_bookmark_row(item_rows, next.anchor_entry_id);
+        next.anchor_pending = false;
+        next.follow_tail = false;
+        const visible_end = next.scroll_rows +| visible_rows;
+        const offset = if (anchor_row) |row|
+            if (row < next.scroll_rows)
+                row
+            else if (row >= visible_end)
+                row -| visible_rows +| 1
+            else
+                next.scroll_rows
+        else
+            @min(next.scroll_rows, max_offset);
+        next.scroll_rows = @min(offset, max_offset);
+        next.follow_tail = next.scroll_rows == max_offset;
+        next = next.refresh_bookmark(item_rows, next.scroll_rows);
+        return .{ .state = next, .offset = next.scroll_rows };
+    }
+
+    pub fn select_visual_offset_with_anchor_row(
+        self: State,
+        total_rows: u32,
+        visible_rows: u16,
+        item_rows: []const ItemRow,
+        measured_anchor_row: ?u32,
+        anchor_viewport_row: u16,
+    ) OffsetSelection {
+        var next = self;
+        const max_offset = total_rows -| visible_rows;
+        const anchor_rows = measured_anchor_row orelse resolve_bookmark_row(item_rows, next.anchor_entry_id);
         const offset = if (next.bookmark_pending) blk: {
             next.bookmark_pending = false;
             next.follow_tail = false;
@@ -162,7 +207,7 @@ pub const State = struct {
         } else if (next.anchor_pending and anchor_rows != null) blk: {
             next.anchor_pending = false;
             next.follow_tail = false;
-            break :blk @min(anchor_rows.?, max_offset);
+            break :blk @min(anchor_rows.? -| anchor_viewport_row, max_offset);
         } else if (next.follow_tail)
             max_offset
         else
@@ -393,6 +438,66 @@ test "transcript presentation clamps bookmarks and selects retained neighbor" {
     }).select_visual_offset(14, 4, &item_rows);
     try std.testing.expectEqual(@as(u32, 2), following.offset);
     try std.testing.expectEqual(@as(?u32, 10), following.state.bookmark_entry_id);
+}
+
+test "transcript presentation can keep an anchor inside the viewport" {
+    const item_rows = [_]ItemRow{
+        .{ .entry_id = 10, .row = 2 },
+        .{ .entry_id = 20, .row = 12 },
+        .{ .entry_id = 30, .row = 22 },
+    };
+    const centered = (State{
+        .follow_tail = false,
+        .anchor_entry_id = 20,
+        .anchor_pending = true,
+    }).select_visual_offset_with_anchor_row(30, 10, &item_rows, null, 5);
+    try std.testing.expectEqual(@as(u32, 7), centered.offset);
+    try std.testing.expectEqual(@as(u32, 5), item_rows[1].row - centered.offset);
+
+    const measured = (State{
+        .follow_tail = false,
+        .anchor_entry_id = 20,
+        .anchor_pending = true,
+    }).select_visual_offset_with_anchor_row(30, 10, &item_rows, 14, 5);
+    try std.testing.expectEqual(@as(u32, 9), measured.offset);
+
+    const clamped_head = (State{
+        .follow_tail = false,
+        .anchor_entry_id = 10,
+        .anchor_pending = true,
+    }).select_visual_offset_with_anchor_row(30, 10, &item_rows, null, 5);
+    try std.testing.expectEqual(@as(u32, 0), clamped_head.offset);
+}
+
+test "transcript presentation reveals anchors without shifting visible content" {
+    const item_rows = [_]ItemRow{
+        .{ .entry_id = 10, .row = 5 },
+        .{ .entry_id = 20, .row = 12 },
+        .{ .entry_id = 30, .row = 22 },
+    };
+    const visible = (State{
+        .scroll_rows = 7,
+        .follow_tail = false,
+        .anchor_entry_id = 20,
+        .anchor_pending = true,
+    }).select_visual_offset_revealing_anchor(30, 10, &item_rows, 12);
+    try std.testing.expectEqual(@as(u32, 7), visible.offset);
+
+    const above = (State{
+        .scroll_rows = 7,
+        .follow_tail = false,
+        .anchor_entry_id = 10,
+        .anchor_pending = true,
+    }).select_visual_offset_revealing_anchor(30, 10, &item_rows, 5);
+    try std.testing.expectEqual(@as(u32, 5), above.offset);
+
+    const below = (State{
+        .scroll_rows = 7,
+        .follow_tail = false,
+        .anchor_entry_id = 30,
+        .anchor_pending = true,
+    }).select_visual_offset_revealing_anchor(30, 10, &item_rows, 22);
+    try std.testing.expectEqual(@as(u32, 13), below.offset);
 }
 
 test "transcript presentation snapshot round trips all state" {

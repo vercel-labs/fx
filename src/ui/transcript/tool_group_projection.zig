@@ -20,7 +20,7 @@ pub const Projection = struct {
         self.* = undefined;
     }
 
-    fn setOwnedOverride(
+    pub fn setOwnedOverride(
         self: *Projection,
         alloc: std.mem.Allocator,
         entry_index: usize,
