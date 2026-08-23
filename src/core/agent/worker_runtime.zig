@@ -1100,11 +1100,29 @@ pub const WorkerRuntime = struct {
     pub fn finishProcessing(self: *WorkerRuntime) void {
         debug_trace.logf("worker", "finish processing queued={d}", .{self.queuedPromptCount()});
         self.worker_mutex.lockUncancelable(io_mod.getIo());
-        // Steer targets referencing the finished turn go stale here on their
-        // own: a prompt only counts as steering while its target equals the
-        // active turn, so zeroing active_turn_id below demotes them without a
-        // rewrite pass. Turn ids are never reused, so a stale target can never
-        // match a later turn — prioritized steers cannot cascade.
+        // Demote steer targets for the finished turn explicitly. A restored
+        // recovery checkpoint replays a persisted turn id while the id counter
+        // restarts at 1 each process, so ids do repeat within a session; left
+        // set, a stale target would match a later turn and yield it early.
+        const finished_turn_id = self.active_turn_id;
+        var demoted_count: usize = 0;
+        if (finished_turn_id != 0) {
+            for (self.queued_prompts.items) |*prompt| {
+                if (prompt.steer_target_turn_id == finished_turn_id) {
+                    prompt.steer_target_turn_id = null;
+                    demoted_count += 1;
+                }
+            }
+        }
+        if (demoted_count > 0) {
+            debug_trace.eventf(
+                "worker",
+                "steer_target_demoted",
+                .{ .turn_id = finished_turn_id },
+                "prompt_count={d}",
+                .{demoted_count},
+            );
+        }
         self.worker_processing = false;
         self.active_turn_id = 0;
         self.worker_connectivity_wait_active.store(false, .seq_cst);
@@ -1188,10 +1206,8 @@ pub const WorkerRuntime = struct {
         const count = self.queued_prompts.items.len;
         if (count == 0) return .{};
         var steering_count: usize = 0;
-        if (self.active_turn_id != 0) {
-            for (self.queued_prompts.items) |prompt| {
-                if (prompt.steer_target_turn_id == self.active_turn_id) steering_count += 1;
-            }
+        for (self.queued_prompts.items) |prompt| {
+            if (prompt.steer_target_turn_id != null) steering_count += 1;
         }
         return .{
             .count = count,
@@ -3088,6 +3104,39 @@ test "targeted steers jump the queue in FIFO order and do not cascade" {
     defer freeQueuedPrompt(alloc, next);
     try std.testing.expectEqualStrings("steer one", next.prompt);
     try std.testing.expect(!runtime.shouldYieldTurn(next.turn_id));
+    runtime.finishProcessing();
+}
+
+test "a turn reusing a finished turn id does not inherit its steers" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "active", "model"));
+    const active = (try runtime.waitAndTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, active);
+    const reused_turn_id = active.turn_id;
+
+    try runtime.enqueuePromptWithIntent(
+        alloc,
+        try makePrompt(alloc, "steer", "model"),
+        .steer_if_active,
+    );
+    try std.testing.expect(runtime.shouldYieldTurn(reused_turn_id));
+
+    // Finishing must clear the target outright. The idle guards in
+    // shouldYieldTurn hide a leftover target while nothing is running, so
+    // assert on the field rather than on the predicate.
+    runtime.finishProcessing();
+    try std.testing.expect(runtime.queued_prompts.items[0].steer_target_turn_id == null);
+
+    // A resumed session replays a persisted checkpoint turn id while the id
+    // counter restarts at 1, so a later turn can carry an id an earlier turn
+    // already used. That turn was never steered and must run uninterrupted.
+    runtime.worker_processing = true;
+    runtime.active_turn_id = reused_turn_id;
+    try std.testing.expect(!runtime.shouldYieldTurn(reused_turn_id));
+    try std.testing.expectEqual(@as(usize, 0), runtime.queuePreview().steering_count);
     runtime.finishProcessing();
 }
 
