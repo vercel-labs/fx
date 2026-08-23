@@ -8,6 +8,7 @@ const assistant_wrap = @import("assistant_wrap.zig");
 const transcript_measure = @import("transcript_measure.zig");
 const user_message_card = @import("../assistant/user_message_card.zig");
 const input_visual_layout = @import("../input/visual_layout.zig");
+const image_types = @import("../terminal/image_types.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 const assistant_presentation = @import("../../core/agent/assistant_presentation.zig");
 const code_highlight = @import("code_highlight.zig");
@@ -41,6 +42,7 @@ pub const Styles = struct {
     notice_error_style: []const u8 = "",
     notice_cancelled_style: []const u8 = "",
     code_highlight_theme: CodeHighlightTheme = .dark,
+    image_preview: image_types.PreviewConfig = .{},
 };
 
 pub const ToolFallbackDisposition = enum {
@@ -163,6 +165,14 @@ pub const LineProvenance = union(enum) {
     entry: struct {
         entry_id: u32,
         entry_class: TranscriptEntryClass,
+    },
+    image: struct {
+        entry_id: u32,
+        image_id: usize,
+        row_index: u16,
+        row_count: u16,
+        col: u16,
+        columns: u16,
     },
     block_separator,
     boundary_blank,
@@ -1580,15 +1590,26 @@ fn renderEntryToBlockForPresentationInterruptible(
             break :blk try normalizeOwnedRenderedBlock(alloc, kind, rendered);
         },
         .user_turn => |e| blk: {
-            const card = try user_message_card.buildUserPromptCardWithSkillTokensForTerminalPresentationInterruptible(
+            const card = try user_message_card.buildUserPromptCardWithImagePreviewsInterruptible(
                 alloc,
                 e.turn.text,
                 e.turn.images,
                 cols,
                 e.skill_tokens,
+                true,
+                if (presentation == .compact) styles.image_preview else .{},
                 checkpoint,
             );
-            break :blk try normalizeOwnedRenderedBlock(alloc, kind, card);
+            defer if (card.image_preview_lines.len > 0) alloc.free(card.image_preview_lines);
+            var block = try normalizeOwnedRenderedBlock(alloc, kind, card.bytes);
+            errdefer block.deinit(alloc);
+            try attachUserPreviewProvenance(
+                alloc,
+                &block,
+                e.id,
+                card.image_preview_lines,
+            );
+            break :blk block;
         },
         .assistant_turn => |e| blk: {
             const wrapped = try assistant_wrap.wrapTranscriptAssistantTextInterruptible(
@@ -1634,6 +1655,36 @@ fn renderEntryToBlockForPresentationInterruptible(
             };
         },
     };
+}
+
+fn attachUserPreviewProvenance(
+    alloc: Allocator,
+    block: *RenderedBlock,
+    entry_id: u32,
+    previews: []const user_message_card.ImagePreviewLine,
+) !void {
+    if (previews.len == 0) return;
+    const line_count = renderedHardLineCount(block.bytes);
+    const provenance = try alloc.alloc(LineProvenance, line_count);
+    errdefer alloc.free(provenance);
+    @memset(provenance, .{ .entry = .{
+        .entry_id = entry_id,
+        .entry_class = .user_turn,
+    } });
+    for (previews) |preview| {
+        std.debug.assert(preview.line_index < provenance.len);
+        if (preview.line_index >= provenance.len) continue;
+        provenance[preview.line_index] = .{ .image = .{
+            .entry_id = entry_id,
+            .image_id = preview.image_id,
+            .row_index = preview.row_index,
+            .row_count = preview.row_count,
+            .col = preview.col,
+            .columns = preview.columns,
+        } };
+    }
+    block.line_provenance = provenance;
+    block.owns_line_provenance = true;
 }
 
 fn normalizeOwnedRenderedBlock(
@@ -2015,8 +2066,16 @@ const RenderEntriesBuilder = struct {
         } };
         var block_line: usize = 0;
         const block_lines = renderedHardLineCount(block.bytes);
+        std.debug.assert(block.line_provenance.len == 0 or
+            block.line_provenance.len == block_lines);
         while (block_line < block_lines) : (block_line += 1) {
-            try lines.append(alloc, source);
+            try lines.append(
+                alloc,
+                if (block.line_provenance.len > 0)
+                    block.line_provenance[block_line]
+                else
+                    source,
+            );
         }
     }
 
@@ -2641,9 +2700,12 @@ pub const RenderedBlock = struct {
     stored_tail_newlines: usize,
     allocation: []const u8 = &.{},
     owned: bool = false,
+    line_provenance: []LineProvenance = &.{},
+    owns_line_provenance: bool = false,
 
     pub fn deinit(self: RenderedBlock, alloc: Allocator) void {
         if (self.owned) alloc.free(self.allocation);
+        if (self.owns_line_provenance) alloc.free(self.line_provenance);
     }
 };
 
@@ -4328,6 +4390,60 @@ test "renderEntriesToBytes rebuilds user card at paint-time cols" {
     try std.testing.expect(std.mem.find(u8, wide, "┃") != null);
     try std.testing.expect(std.mem.find(u8, wide, "this is") != null);
     try std.testing.expect(std.mem.find(u8, narrow, "this is") != null);
+}
+
+test "compact preparation preserves image row provenance outside text bytes" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    var source_images = [_]types.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/tmp/x.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = @constCast("/tmp/snapshot.png"),
+        .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        .pixel_width = 100,
+        .pixel_height = 100,
+    }};
+    const turn = try types.dupeUserTurn(alloc, .{
+        .text = @constCast("[Image #1]"),
+        .images = &source_images,
+    });
+    var handed_off = false;
+    errdefer if (!handed_off) types.freeUserTurn(alloc, turn);
+    try entries.append(alloc, .{ .user_turn = .{
+        .id = 7,
+        .turn = turn,
+    } });
+    handed_off = true;
+
+    var prepared = try renderEntriesForPreparation(
+        alloc,
+        entries.items,
+        20,
+        .{ .image_preview = .{
+            .protocol = .kitty,
+            .cells = .{ .width_px = 10, .height_px = 10 },
+            .max_width_cells = 10,
+            .max_height_cells = 2,
+        } },
+        .{ .capture_provenance = true },
+    );
+    defer prepared.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), prepared.line_provenance.len);
+    try std.testing.expect(prepared.line_provenance[0] == .entry);
+    for (prepared.line_provenance[1..], 0..) |source, row_index| {
+        const image = switch (source) {
+            .image => |value| value,
+            else => return error.TestExpectedImageProvenance,
+        };
+        try std.testing.expectEqual(@as(u32, 7), image.entry_id);
+        try std.testing.expectEqual(@as(usize, 1), image.image_id);
+        try std.testing.expectEqual(@as(u16, @intCast(row_index)), image.row_index);
+        try std.testing.expectEqual(@as(u16, 2), image.row_count);
+    }
 }
 
 test "renderEntriesToBytes preserves selected skill token spans through user card reflow" {

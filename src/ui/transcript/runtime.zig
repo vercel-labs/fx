@@ -6138,6 +6138,7 @@ pub const TranscriptRuntime = struct {
         }
         const source_entry_id = switch (source orelse return) {
             .entry => |entry| entry.entry_id,
+            .image => |image| image.entry_id,
             .folded_command_output => |output| output.entry_id,
             else => null,
         };
@@ -6168,6 +6169,7 @@ pub const TranscriptRuntime = struct {
         for (provenance, 0..) |source, line_index| {
             const entry_id = switch (source) {
                 .entry => |entry| entry.entry_id,
+                .image => |image| image.entry_id,
                 .folded_command_output => |output| output.entry_id orelse continue,
                 else => continue,
             };

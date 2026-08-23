@@ -146,6 +146,7 @@ const entity_spans = @import("core/shared/entity_spans.zig");
 const ui_render = @import("ui/render.zig");
 const shell_runtime = @import("ui/shell_runtime.zig");
 const ui_terminal = @import("ui/terminal/terminal.zig");
+const image_graphics = @import("ui/terminal/image_graphics.zig");
 const cursor_probe = @import("ui/terminal/cursor_probe.zig");
 const ui_subagents = @import("ui/subagent/controller.zig");
 const transcript_runtime = @import("ui/transcript/runtime.zig");
@@ -483,6 +484,7 @@ const App = struct {
 
     alloc: Allocator,
     terminal: TerminalState = .{},
+    terminal_images: image_graphics.Runtime = .{},
 
     auth: auth_runtime.Runtime = auth_runtime.Runtime.init(
         if (host_target.is_wasm) api_key_validator.unavailable_provider else builtin_gateway.api_key_validator,
@@ -578,6 +580,7 @@ const App = struct {
     pub fn init(alloc: Allocator, launch: *cli_surface.InteractiveLaunch) !Self {
         var app = Self{
             .alloc = alloc,
+            .terminal_images = image_graphics.Runtime.initDetected(),
             .subagents = ui_subagents.Controller.init(),
             .lifecycle_runtime = hooks.Runtime.init(alloc),
             .background = BackgroundRuntime.init(if (comptime host_target.is_wasm)
@@ -808,6 +811,11 @@ const App = struct {
         self.file_index.requestStop();
 
         self.terminal_takeover.shutdown(App, self);
+        self.terminal_images.clear(
+            self.alloc,
+            self.shell.frameSink(),
+            &self.metrics,
+        );
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
         self.terminal_takeover.deinit(self.alloc);
@@ -837,6 +845,7 @@ const App = struct {
         self.pending_images.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
         self.terminal_input_runtime.deinit(self.alloc);
+        self.terminal_images.deinit(self.alloc);
         self.shell.deinit(self.alloc);
         self.pacer.deinit(self.alloc);
         self.provider_selection.deinit();

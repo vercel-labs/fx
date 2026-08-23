@@ -331,6 +331,8 @@ pub const State = struct {
             .media_type = media_type,
             .snapshot_path = snapshot_path,
             .snapshot_sha256 = snapshot_sha256,
+            .pixel_width = attachment.pixel_width,
+            .pixel_height = attachment.pixel_height,
         });
     }
 

@@ -2346,6 +2346,65 @@ describe("Vision route fake Gateway", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "forced Kitty previews transmit, place, and delete through tmux passthrough",
+    async () => {
+      const root = createIsolatedRoot();
+      const imagePath = join(root.workspace, "preview.png");
+      copyFileSync(IMAGE_PATH, imagePath);
+      const gateway = startImageGateway([sseText("forced Kitty preview complete")]);
+      const stderrPath = join(root.root, "stderr.log");
+      const rawOutputPath = join(root.root, "pane-output.bin");
+      writeFileSync(stderrPath, "");
+      writeFileSync(rawOutputPath, "");
+      let session: TmuxSession | null = null;
+      try {
+        session = await TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway, GEMINI_MODEL),
+            FX_AUTO_UPGRADE: "0",
+            FX_IMAGE_PROTOCOL: "kitty",
+            NO_COLOR: "1",
+          },
+          stderrPath,
+          width: 140,
+          height: 50,
+        });
+        const pipe = spawnSync(
+          "tmux",
+          ["pipe-pane", "-o", "-t", session.name, `cat >> ${JSON.stringify(rawOutputPath)}`],
+          { encoding: "utf8" },
+        );
+        expect(pipe.status).toBe(0);
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        await session.sendLiteral("@preview.png");
+        await session.waitForText("preview.png", TIMEOUT);
+        await session.sendKeys("Tab");
+        await session.sendLiteral(" describe this image");
+        await session.sendKeys("Enter");
+        await session.waitForText("forced Kitty preview complete", TIMEOUT);
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+
+        const raw = readFileSync(rawOutputPath);
+        expect(raw.includes(Buffer.from("\x1bPtmux;\x1b\x1b_Ga=t,f=100,q=2"))).toBe(true);
+        expect(raw.includes(Buffer.from("\x1bPtmux;\x1b\x1b_Ga=p,q=2,C=1"))).toBe(true);
+        expect(raw.includes(Buffer.from("\x1bPtmux;\x1b\x1b_Ga=d,d=I"))).toBe(true);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) await session.kill();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "tmux preserves unresolved image-looking paths as prompt text",
     async () => {
       const root = createIsolatedRoot();

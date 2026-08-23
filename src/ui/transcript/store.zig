@@ -2455,15 +2455,18 @@ pub fn writeUserPromptCard(
         );
     }
 
-    const card = try user_message_card.buildUserPromptCardWithSkillTokensForTerminalPresentation(
+    var card = try user_message_card.buildUserPromptCardWithImagePreviewsInterruptible(
         alloc,
         user.text,
         user.images,
         shadow.layout.cols,
         skill_tokens,
+        true,
+        shadow.command_output_render.styles.image_preview,
+        null,
     );
-    defer alloc.free(card);
-    try shadow.writeTranscriptBytes(alloc, metrics, card, true);
+    defer card.deinit(alloc);
+    try shadow.writeTranscriptBytes(alloc, metrics, card.bytes, true);
 
     const user_copy = try types.dupeUserTurn(alloc, user);
     const admission = try appendUserTurnOwnedWithSkillTokensAndRetention(

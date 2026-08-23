@@ -466,7 +466,8 @@ fn prepareTranscriptSourceInternal(
     if (self.entries.items.len > 0 and self.layout.cols > 0) {
         rendered_from_entries = true;
         const capture_provenance = observationEnabled(self, alloc) or
-            self.command_output_blocks.items.len > 0;
+            self.command_output_blocks.items.len > 0 or
+            self.command_output_render.styles.image_preview.enabled();
         const replaceable_entry_id: ?u32 = if (self.replaceable_last_line and
             self.entries.items[self.entries.items.len - 1] == .raw_bytes)
             self.entries.items[self.entries.items.len - 1].raw_bytes.id

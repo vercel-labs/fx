@@ -846,6 +846,10 @@ pub const ImageAttachment = struct {
     media_type: []u8,
     snapshot_path: ?[]u8 = null,
     snapshot_sha256: ?[]u8 = null,
+    /// Intrinsic image geometry captured from the verified snapshot. Zero keeps
+    /// legacy sessions valid and asks the UI to use its conservative 4:3 fit.
+    pixel_width: u32 = 0,
+    pixel_height: u32 = 0,
 };
 
 pub const UserTurn = struct {
@@ -2391,6 +2395,8 @@ pub fn dupeImageAttachmentSlice(alloc: std.mem.Allocator, attachments: []const I
             .media_type = media_type,
             .snapshot_path = snapshot_path,
             .snapshot_sha256 = snapshot_sha256,
+            .pixel_width = attachment.pixel_width,
+            .pixel_height = attachment.pixel_height,
         };
         copied += 1;
     }
@@ -2694,11 +2700,15 @@ test "ImageAttachment helpers duplicate empty and populated slices" {
     originals[0] = .{
         .path = try alloc.dupe(u8, "/tmp/image.png"),
         .media_type = try alloc.dupe(u8, "image/png"),
+        .pixel_width = 640,
+        .pixel_height = 480,
     };
 
     const copy = try dupeImageAttachmentSlice(alloc, originals);
     try std.testing.expectEqualStrings("/tmp/image.png", copy[0].path);
     try std.testing.expectEqualStrings("image/png", copy[0].media_type);
+    try std.testing.expectEqual(@as(u32, 640), copy[0].pixel_width);
+    try std.testing.expectEqual(@as(u32, 480), copy[0].pixel_height);
     try std.testing.expect(copy[0].path.ptr != originals[0].path.ptr);
 
     freeImageAttachmentSlice(alloc, copy);

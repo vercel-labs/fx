@@ -1001,6 +1001,10 @@ fn writeUserTurn(writer: *std.Io.Writer, user: session.UserTurn) !void {
         try writeSnapshotLocator(writer, image.snapshot_path);
         try writer.writeAll(",\"snapshot_sha256\":");
         try writeOptionalDurableBytes(writer, image.snapshot_sha256);
+        try writer.print(",\"pixel_width\":{d},\"pixel_height\":{d}", .{
+            image.pixel_width,
+            image.pixel_height,
+        });
         try writer.writeByte('}');
     }
     try writer.writeByte(']');
@@ -1280,12 +1284,22 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value) !session.UserTurn {
         );
         errdefer if (snapshot_sha256) |sha256_bytes| alloc.free(sha256_bytes);
         if ((snapshot_path == null) != (snapshot_sha256 == null)) return error.InvalidSessionFormat;
+        const pixel_width = if (image.get("pixel_width") != null)
+            std.math.cast(u32, try requireUsize(image, "pixel_width")) orelse return error.InvalidSessionFormat
+        else
+            0;
+        const pixel_height = if (image.get("pixel_height") != null)
+            std.math.cast(u32, try requireUsize(image, "pixel_height")) orelse return error.InvalidSessionFormat
+        else
+            0;
         images[i] = .{
             .id = try requireUsize(image, "id"),
             .path = path,
             .media_type = media_type,
             .snapshot_path = snapshot_path,
             .snapshot_sha256 = snapshot_sha256,
+            .pixel_width = pixel_width,
+            .pixel_height = pixel_height,
         };
         parsed_count += 1;
     }
@@ -1306,7 +1320,9 @@ fn imageAttachmentObject(value: std.json.Value) !std.json.ObjectMap {
         } else if (std.mem.eql(u8, entry.key_ptr.*, "media_type")) {
             has_media_type = true;
         } else if (std.mem.eql(u8, entry.key_ptr.*, "snapshot_path") or
-            std.mem.eql(u8, entry.key_ptr.*, "snapshot_sha256"))
+            std.mem.eql(u8, entry.key_ptr.*, "snapshot_sha256") or
+            std.mem.eql(u8, entry.key_ptr.*, "pixel_width") or
+            std.mem.eql(u8, entry.key_ptr.*, "pixel_height"))
         {
             continue;
         } else {

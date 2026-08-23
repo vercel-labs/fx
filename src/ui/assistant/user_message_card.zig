@@ -5,9 +5,30 @@ const display_width = @import("../../core/shared/display_width.zig");
 const types = @import("../../core/shared/types.zig");
 const image_attachments = @import("../../core/images/image_attachments.zig");
 const visual_layout = @import("../input/visual_layout.zig");
+const image_types = @import("../terminal/image_types.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
+
+pub const ImagePreviewLine = struct {
+    line_index: usize,
+    image_id: usize,
+    row_index: u16,
+    row_count: u16,
+    col: u16,
+    columns: u16,
+};
+
+pub const BuiltUserPromptCard = struct {
+    bytes: []u8,
+    image_preview_lines: []ImagePreviewLine = &.{},
+
+    pub fn deinit(self: *BuiltUserPromptCard, alloc: std.mem.Allocator) void {
+        alloc.free(self.bytes);
+        if (self.image_preview_lines.len > 0) alloc.free(self.image_preview_lines);
+        self.* = undefined;
+    }
+};
 
 const reset_style = "\x1b[0m";
 const prompt_text_style = "\x1b[1m";
@@ -170,17 +191,43 @@ fn buildUserPromptCardWithSkillTokensAndLinksInterruptible(
     linked_images: bool,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) ![]u8 {
+    const built = try buildUserPromptCardWithImagePreviewsInterruptible(
+        alloc,
+        text,
+        images,
+        cols,
+        skill_tokens,
+        linked_images,
+        .{},
+        checkpoint,
+    );
+    std.debug.assert(built.image_preview_lines.len == 0);
+    return built.bytes;
+}
+
+pub fn buildUserPromptCardWithImagePreviewsInterruptible(
+    alloc: std.mem.Allocator,
+    text: []const u8,
+    images: []const types.ImageAttachment,
+    cols: u16,
+    skill_tokens: []const visual_layout.SkillTokenSpan,
+    linked_images: bool,
+    preview: image_types.PreviewConfig,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !BuiltUserPromptCard {
     const window: usize = if (cols > 2) @as(usize, cols) - 2 else 0;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
+    var preview_lines: std.ArrayList(ImagePreviewLine) = .empty;
+    errdefer preview_lines.deinit(alloc);
 
     if (window == 0) {
         try build_checkpoint.consume(checkpoint, text.len +| images.len);
-        return out.toOwnedSlice();
+        return .{ .bytes = try out.toOwnedSlice() };
     }
     if (text.len == 0 and images.len == 0) {
-        return out.toOwnedSlice();
+        return .{ .bytes = try out.toOwnedSlice() };
     }
 
     const token_text = if (skill_tokens.len > 0)
@@ -235,7 +282,31 @@ fn buildUserPromptCardWithSkillTokensAndLinksInterruptible(
         try emitRow(&out.writer, content);
     }
 
-    return out.toOwnedSlice();
+    var line_index = rows.items.len;
+    for (images) |image| {
+        const fit = image_types.fitPreview(image, cols, preview) orelse continue;
+        var image_row: u16 = 0;
+        while (image_row < fit.rows) : (image_row += 1) {
+            try build_checkpoint.tick(checkpoint);
+            row_buf.clearRetainingCapacity();
+            try writeRowPrefix(&row_buf.writer);
+            try emitRow(&out.writer, row_buf.written());
+            try preview_lines.append(alloc, .{
+                .line_index = line_index,
+                .image_id = image.id,
+                .row_index = image_row,
+                .row_count = fit.rows,
+                .col = 3,
+                .columns = fit.columns,
+            });
+            line_index += 1;
+        }
+    }
+
+    return .{
+        .bytes = try out.toOwnedSlice(),
+        .image_preview_lines = try preview_lines.toOwnedSlice(alloc),
+    };
 }
 
 fn renderSkillTokensForCard(
@@ -666,6 +737,43 @@ test "buildUserPromptCard wraps when badge + text overflows" {
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(first_content) <= @as(usize, cols));
 
     try std.testing.expect(std.mem.count(u8, card, user_turn_rail) > 1);
+}
+
+test "terminal prompt card reserves typed rows for supported image previews" {
+    const alloc = std.testing.allocator;
+    const images = [_]types.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/tmp/x.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = @constCast("/tmp/snapshot.png"),
+        .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        .pixel_width = 100,
+        .pixel_height = 100,
+    }};
+
+    var card = try buildUserPromptCardWithImagePreviewsInterruptible(
+        alloc,
+        "[Image #1]",
+        &images,
+        20,
+        &.{},
+        true,
+        .{
+            .protocol = .kitty,
+            .cells = .{ .width_px = 10, .height_px = 10 },
+            .max_width_cells = 10,
+            .max_height_cells = 2,
+        },
+        null,
+    );
+    defer card.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), card.image_preview_lines.len);
+    try std.testing.expectEqual(@as(usize, 1), card.image_preview_lines[0].line_index);
+    try std.testing.expectEqual(@as(u16, 0), card.image_preview_lines[0].row_index);
+    try std.testing.expectEqual(@as(u16, 2), card.image_preview_lines[0].row_count);
+    try std.testing.expectEqual(@as(u16, 2), card.image_preview_lines[0].columns);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, card.bytes, "\n"));
 }
 
 test "terminal image badges balance hyperlinks across narrow card rows" {

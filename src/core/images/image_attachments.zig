@@ -6,6 +6,7 @@ const entity_spans = @import("../shared/entity_spans.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
+const image_dimensions = @import("image_dimensions.zig");
 const pathing = @import("../workspace/pathing.zig");
 
 pub const max_image_bytes: usize = 20 * 1024 * 1024;
@@ -14,6 +15,7 @@ pub const image_too_large_notice = "image exceeds the 20 MiB limit";
 pub const image_preparation_failed_notice = "Unable to prepare this image for upload. Use a smaller image.";
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const snapshot_digest_hex_len = Sha256.digest_length * 2;
+const metadata_prefix_bytes = 64 * 1024;
 const transfer_buffer_bytes = 64 * 1024;
 const image_normalization_timeout = std.Io.Clock.Duration{
     .clock = .awake,
@@ -154,15 +156,19 @@ fn loadResolvedImageAttachment(
 ) !types.ImageAttachment {
     errdefer alloc.free(resolved_path);
 
-    var header: [64]u8 = undefined;
+    var header: [metadata_prefix_bytes]u8 = undefined;
     const bytes = try readImageHeaderBytes(resolved_path, &header);
 
-    const media_type = try alloc.dupe(u8, detectMediaTypeFromBytes(bytes) orelse return error.UnsupportedImageType);
+    const detected_media_type = detectMediaTypeFromBytes(bytes) orelse return error.UnsupportedImageType;
+    const media_type = try alloc.dupe(u8, detected_media_type);
     errdefer alloc.free(media_type);
+    const dimensions = image_dimensions.detect(bytes, detected_media_type);
 
     return .{
         .path = resolved_path,
         .media_type = media_type,
+        .pixel_width = if (dimensions) |value| value.width else 0,
+        .pixel_height = if (dimensions) |value| value.height else 0,
     };
 }
 
@@ -601,6 +607,8 @@ fn captureImageSnapshotFromOpenFileWithBudget(
     attachment.media_type = media_type;
     attachment.snapshot_path = final_path;
     attachment.snapshot_sha256 = digest_hex;
+    attachment.pixel_width = metadata.pixel_width;
+    attachment.pixel_height = metadata.pixel_height;
     cleanup_final = false;
 
     alloc.free(old_media_type);
@@ -631,7 +639,7 @@ fn streamSourceToFile(
     defer destination.close(io_mod.getIo());
 
     var hasher = Sha256.init(.{});
-    var header: [64]u8 = undefined;
+    var header: [metadata_prefix_bytes]u8 = undefined;
     var header_len: usize = 0;
     var read_buffer: [8192]u8 = undefined;
     var reader = source.readerStreaming(io_mod.getIo(), &read_buffer);
@@ -656,10 +664,13 @@ fn streamSourceToFile(
     hasher.final(&digest);
     const media_type = detectMediaTypeFromBytes(header[0..header_len]) orelse
         return error.UnsupportedImageType;
+    const dimensions = image_dimensions.detect(header[0..header_len], media_type);
     return .{
         .digest_hex = std.fmt.bytesToHex(digest, .lower),
         .media_type = media_type,
         .size_bytes = written,
+        .pixel_width = if (dimensions) |value| value.width else 0,
+        .pixel_height = if (dimensions) |value| value.height else 0,
     };
 }
 
@@ -667,6 +678,8 @@ const SnapshotMetadata = struct {
     digest_hex: [snapshot_digest_hex_len]u8,
     media_type: []const u8,
     size_bytes: usize,
+    pixel_width: u32,
+    pixel_height: u32,
 };
 
 fn fitsEncodedLimit(raw_bytes: usize) bool {
@@ -825,7 +838,7 @@ fn inspectImageCandidate(
     }
 
     var hasher = Sha256.init(.{});
-    var header: [64]u8 = undefined;
+    var header: [metadata_prefix_bytes]u8 = undefined;
     var header_len: usize = 0;
     var read_buffer: [8192]u8 = undefined;
     var reader = candidate.readerStreaming(io_mod.getIo(), &read_buffer);
@@ -850,10 +863,13 @@ fn inspectImageCandidate(
     hasher.final(&digest);
     const media_type = detectMediaTypeFromBytes(header[0..header_len]) orelse
         return error.ImagePreparationFailed;
+    const dimensions = image_dimensions.detect(header[0..header_len], media_type);
     return .{
         .digest_hex = std.fmt.bytesToHex(digest, .lower),
         .media_type = media_type,
         .size_bytes = read_bytes,
+        .pixel_width = if (dimensions) |value| value.width else 0,
+        .pixel_height = if (dimensions) |value| value.height else 0,
     };
 }
 
@@ -1134,6 +1150,7 @@ pub fn copyVerifiedImageAttachmentToDir(
     };
     try syncSnapshotDirectory(snapshot_dir_handle);
 
+    const dimensions = image_dimensions.detect(verified.bytes, verified.media_type);
     cleanup_final = false;
     return .{
         .id = new_id,
@@ -1141,6 +1158,18 @@ pub fn copyVerifiedImageAttachmentToDir(
         .media_type = media_type,
         .snapshot_path = final_path,
         .snapshot_sha256 = digest,
+        .pixel_width = if (attachment.pixel_width > 0)
+            attachment.pixel_width
+        else if (dimensions) |value|
+            value.width
+        else
+            0,
+        .pixel_height = if (attachment.pixel_height > 0)
+            attachment.pixel_height
+        else if (dimensions) |value|
+            value.height
+        else
+            0,
     };
 }
 
@@ -2337,7 +2366,10 @@ test "loadImageAttachment accepts files larger than header length" {
     {
         var file = try tmp.dir.createFile(std.testing.io, "large.png", .{});
         defer file.close(io_mod.getIo());
-        try file.writeStreamingAll(io_mod.getIo(), "\x89PNG\r\n\x1a\n");
+        try file.writeStreamingAll(
+            io_mod.getIo(),
+            "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x02\x80\x00\x00\x01\xe0",
+        );
         var padding: [256]u8 = undefined;
         @memset(padding[0..], 'a');
         try file.writeStreamingAll(io_mod.getIo(), padding[0..]);
@@ -2350,6 +2382,8 @@ test "loadImageAttachment accepts files larger than header length" {
     defer types.freeImageAttachment(std.testing.allocator, attachment);
 
     try std.testing.expectEqualStrings("image/png", attachment.media_type);
+    try std.testing.expectEqual(@as(u32, 640), attachment.pixel_width);
+    try std.testing.expectEqual(@as(u32, 480), attachment.pixel_height);
 }
 
 test "loadUserImageAttachment resolves paths from the workspace" {

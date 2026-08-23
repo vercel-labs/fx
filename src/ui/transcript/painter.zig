@@ -20,6 +20,7 @@ const render_engine = @import("../render_engine.zig");
 const source_preparation = @import("source_preparation.zig");
 const transcript_release = @import("../../core/output/transcript_release.zig");
 const transcript_writer = @import("writer.zig");
+const image_types = @import("../terminal/image_types.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const Allocator = std.mem.Allocator;
@@ -3208,6 +3209,90 @@ pub fn preparedTranscriptProjectionExceedsArea(
     return remaining_visual_rows > area.height();
 }
 
+fn stagePreparedTranscriptImages(
+    self: anytype,
+    surface: *frame_surface.FrameSurface,
+    prepared: *const PreparedTranscriptSurfacePaint,
+) !void {
+    var index: usize = 0;
+    while (index < prepared.row_provenance.items.len) {
+        const first = prepared.row_provenance.items[index];
+        const image = switch (first.source) {
+            .image => |value| value,
+            else => {
+                index += 1;
+                continue;
+            },
+        };
+        if (image.row_index != 0 or image.row_count == 0) {
+            index += 1;
+            continue;
+        }
+        if (image.row_count > prepared.row_provenance.items.len - index) {
+            index += 1;
+            continue;
+        }
+
+        var complete = true;
+        var row_offset: u16 = 0;
+        while (row_offset < image.row_count) : (row_offset += 1) {
+            const candidate = prepared.row_provenance.items[index + @as(usize, row_offset)];
+            const candidate_image = switch (candidate.source) {
+                .image => |value| value,
+                else => {
+                    complete = false;
+                    break;
+                },
+            };
+            if (candidate.row != first.row + row_offset or
+                candidate_image.entry_id != image.entry_id or
+                candidate_image.image_id != image.image_id or
+                candidate_image.row_index != row_offset or
+                candidate_image.row_count != image.row_count or
+                candidate_image.col != image.col or
+                candidate_image.columns != image.columns)
+            {
+                complete = false;
+                break;
+            }
+        }
+        if (!complete) {
+            index += 1;
+            continue;
+        }
+
+        const attachment = imageAttachmentForEntry(self, image.entry_id, image.image_id) orelse {
+            index += @as(usize, image.row_count);
+            continue;
+        };
+        try surface.addImagePlacement(image_types.Placement{
+            .source_namespace = @intFromPtr(self),
+            .entry_id = image.entry_id,
+            .attachment = attachment,
+            .row = first.row,
+            .col = image.col,
+            .columns = image.columns,
+            .rows = image.row_count,
+        });
+        index += @as(usize, image.row_count);
+    }
+}
+
+fn imageAttachmentForEntry(
+    self: anytype,
+    entry_id: u32,
+    image_id: usize,
+) ?types.ImageAttachment {
+    for (self.entries.items) |entry| {
+        if (entry != .user_turn or entry.user_turn.id != entry_id) continue;
+        for (entry.user_turn.turn.images) |attachment| {
+            if (attachment.id == image_id) return attachment;
+        }
+        return null;
+    }
+    return null;
+}
+
 pub fn paintPreparedTranscriptIntoSurface(
     self: anytype,
     alloc: Allocator,
@@ -3233,6 +3318,7 @@ pub fn paintPreparedTranscriptIntoSurface(
         prepared.projection_resume_bytes,
         prepared.projection_start_flow_offset,
     );
+    try stagePreparedTranscriptImages(self, surface, prepared);
     if (prepared.projection_cursor) |cursor| {
         surface.cursor_target = .{
             .row = cursor.cursor_row,

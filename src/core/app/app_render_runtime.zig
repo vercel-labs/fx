@@ -53,6 +53,7 @@ const shell_runtime = @import("../../ui/shell_runtime.zig");
 const shimmer_runtime = @import("../../ui/transcript/shimmer_runtime.zig");
 const ui_subagents = @import("../../ui/subagent/controller.zig");
 const ui_terminal = @import("../../ui/terminal/terminal.zig");
+const image_graphics = @import("../../ui/terminal/image_graphics.zig");
 const vt_emulator = @import("../terminal/engine.zig");
 const transcript_painter = @import("../../ui/transcript/painter.zig");
 const command_output_runtime = @import("../../ui/transcript/command_output_runtime.zig");
@@ -369,7 +370,13 @@ pub fn Runtime(comptime App: type) type {
                 .notice_error_style = ui_render.red_style,
                 .notice_cancelled_style = ui_render.dim_style,
                 .code_highlight_theme = if (ui_render.is_light) .light else .dark,
+                .image_preview = image_graphics.detectedPreviewConfig(),
             };
+        }
+
+        fn imageRuntime(app: *App) ?*image_graphics.Runtime {
+            if (comptime @hasField(App, "terminal_images")) return &app.terminal_images;
+            return null;
         }
 
         var model_completions_buf: [32][]const u8 = undefined;
@@ -2102,6 +2109,7 @@ pub fn Runtime(comptime App: type) type {
                     .body_painter = .{ .ctx = &frame_ctx, .paint = FramePaintContext(App).paintBody },
                     .footer_painter = .{ .ctx = &frame_ctx, .paint = FramePaintContext(App).paintFooter },
                     .activity_painter = .{ .ctx = &frame_ctx, .paint = FramePaintContext(App).paintActivity },
+                    .image_runtime = imageRuntime(app),
                     .trace_counters = &counters,
                     .observation = .{
                         .observer = &presentation_shell.ui_observer,
