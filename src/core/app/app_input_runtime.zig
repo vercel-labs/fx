@@ -9965,6 +9965,38 @@ test "app_input_runtime plain vertical routes visible slash picker while stream 
     try std.testing.expect(app.input_runtime.vertical_navigation.preferredColumn() == null);
 }
 
+test "app_input_runtime recalled slash command keeps prompt history navigation" {
+    const alloc = std.testing.allocator;
+    var app = FakeApprovalCancelApp{ .alloc = alloc };
+    defer app.deinit();
+    app.stream.active = false;
+    try app.input_runtime.composer_history.installTextEntries(alloc, &.{ "older", "/help" });
+
+    try input_completion_runtime.CompletionRuntime(FakeApprovalCancelApp).navigatePromptHistory(&app, -1);
+    try std.testing.expectEqualStrings("/help", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(Runtime(FakeApprovalCancelApp).routeSlashCompletionMove(&app, 1));
+
+    try Runtime(FakeApprovalCancelApp).routePlainVertical(&app, .up, -1);
+    try std.testing.expectEqualStrings("/help", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.cursor);
+
+    try Runtime(FakeApprovalCancelApp).routePlainVertical(&app, .up, -1);
+    try std.testing.expectEqualStrings("older", app.input_runtime.edit_state.input.items);
+}
+
+test "app_input_runtime recalled slash command keeps modified prompt history navigation" {
+    const alloc = std.testing.allocator;
+    var app = FakeApprovalCancelApp{ .alloc = alloc };
+    defer app.deinit();
+    app.stream.active = false;
+    try app.input_runtime.composer_history.installTextEntries(alloc, &.{ "older", "/help" });
+
+    try input_completion_runtime.CompletionRuntime(FakeApprovalCancelApp).navigatePromptHistory(&app, -1);
+    try Runtime(FakeApprovalCancelApp).routeModifiedHistory(&app, .up, -1);
+
+    try std.testing.expectEqualStrings("older", app.input_runtime.edit_state.input.items);
+}
+
 test "app_input_runtime plain vertical keeps composer precedence over wrapped slash picker" {
     const alloc = std.testing.allocator;
     var app = FakeApprovalCancelApp{ .alloc = alloc };
