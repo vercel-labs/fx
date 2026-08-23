@@ -283,6 +283,7 @@ pub const Runtime = struct {
     requested_access: ?model_catalog.AccessMetadata = null,
     outcome: CatalogOutcome = .{},
     menu: ModelMenu = .{},
+    acp_agent_ids: std.ArrayList([]u8) = .empty,
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
         return .{
@@ -295,6 +296,29 @@ pub const Runtime = struct {
         self.cancelAndJoin();
         self.menu.deinit(self.alloc);
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
+        for (self.acp_agent_ids.items) |id| self.alloc.free(id);
+        self.acp_agent_ids.deinit(self.alloc);
+    }
+
+    /// Replaces the ACP agent entries surfaced in the model menu. Each name
+    /// becomes an `acp/<name>` menu item alongside the fetched catalog.
+    pub fn setAcpAgentNames(self: *Self, names: []const []const u8) !void {
+        var next: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (next.items) |id| self.alloc.free(id);
+            next.deinit(self.alloc);
+        }
+        try next.ensureTotalCapacity(self.alloc, names.len);
+        for (names) |name| {
+            const id = try std.fmt.allocPrint(self.alloc, "acp/{s}", .{name});
+            next.appendAssumeCapacity(id);
+        }
+
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.acp_agent_ids.items) |id| self.alloc.free(id);
+        self.acp_agent_ids.deinit(self.alloc);
+        self.acp_agent_ids = next;
     }
 
     pub fn startWarmup(
@@ -611,6 +635,14 @@ pub const Runtime = struct {
                 count += 1;
             }
         }
+        // Configured ACP agents complete alongside gateway models.
+        for (self.acp_agent_ids.items) |id| {
+            if (count >= out.len) break;
+            if (query.len == 0 or text_utils.containsIgnoreCase(id, query)) {
+                out[count] = id;
+                count += 1;
+            }
+        }
         return count;
     }
 
@@ -698,7 +730,7 @@ pub const Runtime = struct {
                 menu.clearSnapshot(self.alloc);
                 menu.load_state = .failed;
             },
-            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items),
+            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items, self.acp_agent_ids.items),
         }
         menu.catalog_state = modelMenuCatalogState(self.outcome);
     }
@@ -736,13 +768,29 @@ fn hydrateMenuSnapshot(
     alloc: Allocator,
     menu: *ModelMenu,
     catalog: []const model_catalog.ModelCatalogEntry,
+    acp_agent_ids: []const []const u8,
 ) !void {
     var items: std.ArrayList(ModelMenuItem) = .empty;
     errdefer {
         for (items.items) |item| item.deinit(alloc);
         items.deinit(alloc);
     }
-    try items.ensureTotalCapacity(alloc, catalog.len);
+    try items.ensureTotalCapacity(alloc, catalog.len + acp_agent_ids.len);
+
+    // ACP agents lead the list so a configured agent is visible immediately.
+    debug_trace.logf("acp", "hydrate catalog={d} acp={d}", .{ catalog.len, acp_agent_ids.len });
+    for (acp_agent_ids) |agent_id| {
+        const id = try alloc.dupe(u8, agent_id);
+        const item = ModelMenuItem{
+            .id = id,
+            .provider = modelProvider(id),
+            .capabilities = model_capabilities.resolveCapabilities(id, null),
+        };
+        items.append(alloc, item) catch |err| {
+            item.deinit(alloc);
+            return err;
+        };
+    }
 
     for (catalog) |entry| {
         const item = item: {
@@ -1343,7 +1391,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
         },
     };
     runtime.state = .ready;
-    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries);
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, &.{});
     runtime.menu.active = true;
 
     try std.testing.expectEqual(ModelMenuLoadState.ready, runtime.menu.load_state);
@@ -1382,6 +1430,28 @@ test "model menu owns resolved catalog state and filters without changing catalo
     try std.testing.expectEqualStrings("standalone", selected);
 }
 
+test "model menu snapshot lists acp agents with acp provider" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc, "unused");
+    defer runtime.deinit();
+
+    try runtime.setAcpAgentNames(&.{ "claude-acp", "gemini" });
+    runtime.state = .ready;
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &.{}, runtime.acp_agent_ids.items);
+    runtime.menu.active = true;
+
+    try std.testing.expectEqual(@as(usize, 2), runtime.menu.filteredItemCount());
+    try std.testing.expectEqualStrings("acp/claude-acp", runtime.menu.itemAt(0).?.id);
+    try std.testing.expectEqualStrings("acp", runtime.menu.itemAt(0).?.provider);
+    try std.testing.expectEqualStrings("acp/gemini", runtime.menu.itemAt(1).?.id);
+
+    // Replacing the list drops stale entries.
+    try runtime.setAcpAgentNames(&.{"opencode"});
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &.{}, runtime.acp_agent_ids.items);
+    try std.testing.expectEqual(@as(usize, 1), runtime.menu.filteredItemCount());
+    try std.testing.expectEqualStrings("acp/opencode", runtime.menu.itemAt(0).?.id);
+}
+
 test "model menu snapshot construction cleans every allocation failure" {
     const backing = std.testing.allocator;
     const entries = [_]model_catalog.ModelCatalogEntry{
@@ -1391,14 +1461,14 @@ test "model menu snapshot construction cleans every allocation failure" {
 
     var probe = std.testing.FailingAllocator.init(backing, .{});
     var menu: ModelMenu = .{};
-    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries);
+    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries, &.{});
     menu.deinit(probe.allocator());
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
     for (0..probe.alloc_index) |fail_index| {
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
         var failed_menu: ModelMenu = .{};
-        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries)) {
+        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries, &.{})) {
             failed_menu.deinit(failing.allocator());
         } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
         try std.testing.expect(failing.has_induced_failure);

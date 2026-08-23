@@ -501,9 +501,17 @@ pub fn Runtime(comptime App: type) type {
                     (snapshot.queued_count > 0 and !queue_review_active));
             const awaiting_tool_terminal = snapshot.cancel_requested and
                 activeToolStatusCount(presenter) > 0;
+            // An ACP agent turn keeps the thinking indicator alive even
+            // though the gateway worker is idle; drainAcpTurn clears the
+            // stream when the turn finishes.
+            const acp_turn_active = if (comptime @hasField(App, "acp_turn"))
+                app.acp_turn != null
+            else
+                false;
             if (!modal_active and
                 !visible_worker_active and
                 !awaiting_tool_terminal and
+                !acp_turn_active and
                 app.stream.active)
             {
                 // The worker can become idle before its final UI events reach
@@ -537,6 +545,12 @@ pub fn Runtime(comptime App: type) type {
             app.background.refreshTasks(std.heap.c_allocator, @ptrCast(app), on_task_completion);
             try drainEvents(app, event_handlers);
             syncState(app, event_handlers.tool_lifecycle);
+            if (comptime @hasDecl(App, "drainAcpTurn")) {
+                try app.drainAcpTurn();
+            }
+            if (comptime @hasDecl(App, "drainAcpTurn")) {
+                try app.drainAcpTurn();
+            }
             if (comptime @hasDecl(App, "refreshSubagentManagerProjection")) {
                 try app.refreshSubagentManagerProjection();
             }

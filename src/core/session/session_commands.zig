@@ -330,14 +330,29 @@ pub fn Commands(comptime App: type) type {
         }
 
         pub fn handleModel(app: *App, query: []const u8) !void {
-            if (query.len == 0) {
+            const trimmed_query = std.mem.trim(u8, query, " \t");
+            if (trimmed_query.len == 0) {
                 try app.writeDomainNotice(.{ .topic = "model", .tone = .neutral, .body = provider_runtime.model(app) }, true);
                 return;
             }
 
-            const resolved = try resolveModelQuery(app, query);
+            // "/model <id> <effort>" sets both in one command.
+            var model_query = trimmed_query;
+            var effort: ?types.ReasoningEffort = null;
+            if (splitFirstWord(trimmed_query)) |first| {
+                const rest = std.mem.trim(u8, first.rest, " \t");
+                if (rest.len > 0) {
+                    if (types.ReasoningEffort.parse(rest)) |parsed| {
+                        effort = parsed;
+                        model_query = first.word;
+                    }
+                }
+            }
+
+            const resolved = try resolveModelQuery(app, model_query);
             defer app.alloc.free(resolved);
             try setResolvedModel(app, resolved, true);
+            if (effort) |value| try applyEffort(app, value, true, true);
         }
 
         pub fn handlePermissions(app: *App, rest: []const u8) !void {
@@ -757,6 +772,18 @@ pub fn Commands(comptime App: type) type {
         }
 
         pub fn selectModelFromPicker(app: *App, model: []const u8, effort: types.ReasoningEffort, fast_mode: bool) !void {
+            // ACP agents are external CLIs; while one is selected, plain
+            // prompts route through the agent instead of the gateway.
+            if (std.mem.startsWith(u8, model, "acp/")) {
+                const agent = model["acp/".len..];
+                const text = try std.fmt.allocPrint(
+                    app.alloc,
+                    "ACP agent '{s}' is now the session backend; prompts route through it. Pick another model to switch back.",
+                    .{agent},
+                );
+                defer app.alloc.free(text);
+                try app.writeDomainNotice(.{ .topic = "acp", .tone = .neutral, .body = text }, true);
+            }
             try setResolvedModelRuntime(app, model, true);
             var patch = app_session_runtime.SessionPreferencePatch{
                 .provider = provider_runtime.provider(app),
@@ -1013,6 +1040,7 @@ pub fn Commands(comptime App: type) type {
             if (try app.snapshotCachedModelIds(app.alloc)) |snapshot| {
                 var ids = snapshot;
                 defer freeStringList(app.alloc, &ids);
+                appendAcpModelIds(app, &ids);
                 if (try resolveModelQueryFromIds(app.alloc, ids.items, query)) |resolved| {
                     return resolved;
                 }
@@ -1022,12 +1050,29 @@ pub fn Commands(comptime App: type) type {
                 return app.alloc.dupe(u8, query);
             };
             defer freeStringList(app.alloc, &ids);
+            appendAcpModelIds(app, &ids);
 
             if (try resolveModelQueryFromIds(app.alloc, ids.items, query)) |resolved| {
                 return resolved;
             }
 
             return app.alloc.dupe(u8, query);
+        }
+
+        /// Adds configured ACP agents (and their cached models) as acp/<name>
+        /// candidates so "/model" queries resolve to them like any other id.
+        /// Best effort: failures leave the list unchanged.
+        fn appendAcpModelIds(app: *App, ids: *std.ArrayList([]u8)) void {
+            const builtin_acp = @import("../../builtins/acp.zig");
+            const names = builtin_acp.enabledAgentNames(app.alloc, io_mod.getenv("HOME")) catch return;
+            defer builtin_acp.freeAgentNames(app.alloc, names);
+            for (names) |name| {
+                const id = std.fmt.allocPrint(app.alloc, "acp/{s}", .{name}) catch return;
+                ids.append(app.alloc, id) catch {
+                    app.alloc.free(id);
+                    return;
+                };
+            }
         }
 
         fn setResolvedModel(app: *App, resolved: []const u8, announce: bool) !void {

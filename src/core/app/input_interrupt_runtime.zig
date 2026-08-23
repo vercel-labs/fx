@@ -9,6 +9,17 @@ pub fn InterruptRuntime(comptime App: type) type {
         const queue_rt = input_queue_runtime.Runtime(App);
 
         pub fn cancelActiveOperation(app: *App) !void {
+            if (comptime @hasField(App, "acp_turn")) {
+                if (app.acp_turn != null) {
+                    if (comptime @hasDecl(App, "requestAcpCancel")) app.requestAcpCancel();
+                    try app.writeDomainNotice(.{
+                        .topic = "acp",
+                        .tone = .neutral,
+                        .body = "Interrupting ACP agent turn...",
+                    }, true);
+                    return;
+                }
+            }
             if (!app.stream.active) return;
             // Pending approval keeps the stream active until resolution.
             // Avoid duplicate cancellation notices once the worker is cancelled.
