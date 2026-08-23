@@ -130,7 +130,7 @@ function expectLargeLeftAlignedKittyPlacement(raw: Buffer) {
 
   expect(placements.length).toBeGreaterThan(0);
   expect(placements.every((placement) => placement.row > 0)).toBe(true);
-  expect(placements.every((placement) => placement.col === 1)).toBe(true);
+  expect(placements.every((placement) => placement.col === 3)).toBe(true);
   expect(placements.every(
     (placement) => placement.imageId === placement.placementId,
   )).toBe(true);

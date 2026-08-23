@@ -285,6 +285,12 @@ pub fn buildUserPromptCardWithImagePreviewsInterruptible(
     var line_index = rows.items.len;
     for (images) |image| {
         const fit = image_types.fitPreview(image, cols, preview) orelse continue;
+        try build_checkpoint.tick(checkpoint);
+        row_buf.clearRetainingCapacity();
+        try writeRowPrefix(&row_buf.writer);
+        try emitRow(&out.writer, row_buf.written());
+        line_index += 1;
+
         var image_row: u16 = 0;
         while (image_row < fit.rows) : (image_row += 1) {
             try build_checkpoint.tick(checkpoint);
@@ -769,12 +775,13 @@ test "terminal prompt card reserves typed rows for supported image previews" {
     defer card.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 2), card.image_preview_lines.len);
-    try std.testing.expectEqual(@as(usize, 1), card.image_preview_lines[0].line_index);
+    try std.testing.expectEqual(@as(usize, 2), card.image_preview_lines[0].line_index);
+    try std.testing.expectEqual(@as(usize, 3), card.image_preview_lines[1].line_index);
     try std.testing.expectEqual(@as(u16, 0), card.image_preview_lines[0].row_index);
     try std.testing.expectEqual(@as(u16, 2), card.image_preview_lines[0].row_count);
-    try std.testing.expectEqual(image_types.preview_origin_col, card.image_preview_lines[0].col);
+    try std.testing.expectEqual(@as(u16, 3), card.image_preview_lines[0].col);
     try std.testing.expectEqual(@as(u16, 2), card.image_preview_lines[0].columns);
-    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, card.bytes, "\n"));
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, card.bytes, "\n"));
 }
 
 test "terminal image badges balance hyperlinks across narrow card rows" {

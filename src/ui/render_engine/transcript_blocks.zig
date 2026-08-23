@@ -1684,12 +1684,16 @@ fn appendRawImagePreview(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll(base.bytes);
+
+    // Keep two ordinary blank cells for the left gutter and a zero-width
+    // sentinel so boundary trimming cannot collapse these image canvas rows.
+    const canvas_row = "  \u{200b}\x1b[0m";
+    if (out.written().len > 0) try out.writer.writeByte('\n');
+    try out.writer.writeAll(canvas_row);
     var row: u16 = 0;
     while (row < fit.rows) : (row += 1) {
-        if (out.written().len > 0) try out.writer.writeByte('\n');
-        // Keep two ordinary blank cells for the left gutter and a zero-width
-        // sentinel so boundary trimming cannot collapse this image-only row.
-        try out.writer.writeAll("  \u{200b}\x1b[0m");
+        try out.writer.writeByte('\n');
+        try out.writer.writeAll(canvas_row);
     }
 
     const bytes = try out.toOwnedSlice();
@@ -1704,7 +1708,7 @@ fn appendRawImagePreview(
     } });
     var row_index: u16 = 0;
     while (row_index < fit.rows) : (row_index += 1) {
-        const line_index = base_line_count + @as(usize, row_index);
+        const line_index = base_line_count + 1 + @as(usize, row_index);
         std.debug.assert(line_index < provenance.len);
         provenance[line_index] = .{ .image = .{
             .entry_id = entry.id,
@@ -4489,6 +4493,7 @@ test "compact preparation preserves image row provenance outside text bytes" {
         .turn = turn,
     } });
     handed_off = true;
+    try appendAssistantTestEntry(&entries, alloc, 8, "assistant response");
 
     var prepared = try renderEntriesForPreparation(
         alloc,
@@ -4504,9 +4509,10 @@ test "compact preparation preserves image row provenance outside text bytes" {
     );
     defer prepared.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 3), prepared.line_provenance.len);
+    try std.testing.expectEqual(@as(usize, 6), prepared.line_provenance.len);
     try std.testing.expect(prepared.line_provenance[0] == .entry);
-    for (prepared.line_provenance[1..], 0..) |source, row_index| {
+    try std.testing.expect(prepared.line_provenance[1] == .entry);
+    for (prepared.line_provenance[2..4], 0..) |source, row_index| {
         const image = switch (source) {
             .image => |value| value,
             else => return error.TestExpectedImageProvenance,
@@ -4515,7 +4521,10 @@ test "compact preparation preserves image row provenance outside text bytes" {
         try std.testing.expectEqual(@as(usize, 1), image.image_id);
         try std.testing.expectEqual(@as(u16, @intCast(row_index)), image.row_index);
         try std.testing.expectEqual(@as(u16, 2), image.row_count);
+        try std.testing.expectEqual(@as(u16, 3), image.col);
     }
+    try std.testing.expectEqual(LineProvenance.block_separator, prepared.line_provenance[4]);
+    try std.testing.expect(prepared.line_provenance[5] == .entry);
 }
 
 test "compact preparation appends tool presentation image provenance" {
@@ -4532,6 +4541,7 @@ test "compact preparation appends tool presentation image provenance" {
         .pixel_width = 100,
         .pixel_height = 100,
     });
+    try appendAssistantTestEntry(&entries, alloc, 12, "assistant response");
 
     var prepared = try renderEntriesForPreparation(
         alloc,
@@ -4547,9 +4557,10 @@ test "compact preparation appends tool presentation image provenance" {
     );
     defer prepared.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 3), prepared.line_provenance.len);
+    try std.testing.expectEqual(@as(usize, 6), prepared.line_provenance.len);
     try std.testing.expect(prepared.line_provenance[0] == .entry);
-    for (prepared.line_provenance[1..], 0..) |source, row_index| {
+    try std.testing.expect(prepared.line_provenance[1] == .entry);
+    for (prepared.line_provenance[2..4], 0..) |source, row_index| {
         const image = switch (source) {
             .image => |value| value,
             else => return error.TestExpectedImageProvenance,
@@ -4558,8 +4569,10 @@ test "compact preparation appends tool presentation image provenance" {
         try std.testing.expectEqual(@as(usize, 1), image.image_id);
         try std.testing.expectEqual(@as(u16, @intCast(row_index)), image.row_index);
         try std.testing.expectEqual(@as(u16, 2), image.row_count);
-        try std.testing.expectEqual(image_types.preview_origin_col, image.col);
+        try std.testing.expectEqual(@as(u16, 3), image.col);
     }
+    try std.testing.expectEqual(LineProvenance.block_separator, prepared.line_provenance[4]);
+    try std.testing.expect(prepared.line_provenance[5] == .entry);
 }
 
 test "renderEntriesToBytes preserves selected skill token spans through user card reflow" {

@@ -23,7 +23,8 @@ pub const CellDimensions = struct {
     height_px: u16 = 16,
 };
 
-pub const preview_origin_col: u16 = 1;
+pub const preview_gutter_columns: u16 = 2;
+pub const preview_origin_col: u16 = preview_gutter_columns + 1;
 
 pub const PreviewConfig = struct {
     protocol: Protocol = .none,
@@ -59,8 +60,11 @@ pub fn fitPreview(
     terminal_cols: u16,
     config: PreviewConfig,
 ) ?Fit {
-    if (!config.supports(attachment) or terminal_cols <= 2) return null;
-    const max_columns = @min(config.max_width_cells, terminal_cols - 2);
+    if (!config.supports(attachment) or terminal_cols <= preview_gutter_columns) return null;
+    const max_columns = @min(
+        config.max_width_cells,
+        terminal_cols - preview_gutter_columns,
+    );
     if (max_columns == 0) return null;
 
     const width_px: u64 = if (attachment.pixel_width > 0) attachment.pixel_width else 800;
