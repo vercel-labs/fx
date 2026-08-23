@@ -7166,11 +7166,11 @@ test "app_input_runtime Ghostty Escape release leaves the usage dashboard open" 
     try std.testing.expect(app.input_runtime.usage_menu.active);
 }
 
-test "app_input_runtime ctrl enter queues without interrupting the active turn" {
+test "app_input_runtime enter modifiers choose queued versus steering delivery" {
     const alloc = std.testing.allocator;
-    const sequences = [_][]const u8{ "\x1b[13;5u", "\x1b[27;5;13~" };
+    const queue_sequences = [_][]const u8{ "\x1b\r", "\x1b[13;3u", "\x1b[27;3;13~" };
 
-    for (sequences) |sequence| {
+    for (queue_sequences) |sequence| {
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         app.stream.active = true;
@@ -7190,6 +7190,17 @@ test "app_input_runtime ctrl enter queues without interrupting the active turn" 
         try std.testing.expect(!app.worker.cancel_requested);
         try std.testing.expect(app.stream.active);
     }
+
+    var ctrl_enter_app = try RoutingFakeApp.init(alloc);
+    defer ctrl_enter_app.deinit();
+    ctrl_enter_app.stream.active = true;
+
+    try feedRoutingBytes(&ctrl_enter_app, "steer this\x1b[13;5u");
+
+    try std.testing.expectEqual(
+        worker_runtime.PromptEnqueueIntent.steer_if_active,
+        ctrl_enter_app.submitted_prompt_intent.?,
+    );
 }
 
 test "app_input_runtime decoded kitty Backspace edits the draft without cancelling" {

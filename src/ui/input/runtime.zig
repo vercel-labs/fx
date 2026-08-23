@@ -2945,17 +2945,17 @@ test "input escape parser restarts from an expired mouse report on Escape" {
     try std.testing.expectEqual(@as(u16, 0), param2);
 }
 
-test "input escape parser handles alt+enter as insert_newline" {
+test "input escape parser handles alt+enter as queued submit" {
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
-    try std.testing.expectEqual(@as(?InputEscapeAction, .insert_newline), consumeInputEscapeByte(&stage, &param, &param2, '\r'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, .submit_queued), consumeInputEscapeByte(&stage, &param, &param2, '\r'));
     try std.testing.expectEqual(@as(u8, 0), stage);
 }
 
-test "input escape parser handles enhanced alt+enter as insert_newline" {
-    try expectEscapeAction("[13;3u", .insert_newline);
-    try expectEscapeAction("[27;3;13~", .insert_newline);
+test "input escape parser handles enhanced alt+enter as queued submit" {
+    try expectEscapeAction("[13;3u", .submit_queued);
+    try expectEscapeAction("[27;3;13~", .submit_queued);
 }
 
 test "input escape parser handles shift+enter csi u sequence" {

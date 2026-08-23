@@ -109,12 +109,11 @@ fn kittyUnicodeKeyAction(keycode: u16, modifiers: u16, meta_prefixed: bool) Inpu
         }
         return if (keycode == kitty_up_key) .cursor_up else .cursor_down;
     }
-    // Plain terminals collapse Ctrl+Enter to Enter; enhanced reports preserve
-    // the modifier and expose the explicit queue shortcut.
-    if (keycode == 13 and mods == ctrl_modifier) return .submit_queued;
-    if (keycode == 13 and (mods & (shift_modifier | alt_modifier)) != 0) {
-        return .insert_newline;
-    }
+    // Alt+Enter queues a follow-up; Shift+Enter remains the multiline shortcut.
+    // Enhanced reports preserve either modifier, while legacy Alt+Enter arrives
+    // through the ESC-prefixed path below.
+    if (keycode == 13 and mods == alt_modifier) return .submit_queued;
+    if (keycode == 13 and (mods & shift_modifier) != 0) return .insert_newline;
     if (keycode == ' ' and mods == shift_modifier and !meta_prefixed) return .{ .remapped_byte = ' ' };
     if ((keycode == 'a' or keycode == 'A') and (mods & super_modifier) != 0) {
         return .{ .composer_shortcut = .select_all };
@@ -411,7 +410,7 @@ pub fn consumeInputEscapeByteWithMouse(
                 stage.* = 0;
                 param.* = 0;
                 param2.* = 0;
-                return .insert_newline;
+                return .submit_queued;
             }
             if (byte == 'o') {
                 stage.* = 0;
