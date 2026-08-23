@@ -3924,9 +3924,15 @@ describe("cli: ask success", () => {
 
         expect(result.code).toBe(0);
         expect(result.stderr).toBe("");
-        expect(JSON.parse(result.stdout).output.trim()).toBe(
+        const json = JSON.parse(result.stdout);
+        expect(json.output.trim()).toBe(
           "explicit skill ask complete",
         );
+        expect(json.usage).toEqual({
+          requests: 1,
+          input_tokens: 3,
+          output_tokens: 5,
+        });
         expect(gateway.requests).toHaveLength(1);
         expect(gateway.modelRequests).toHaveLength(0);
         expect(gateway.requests[0]!.body).toContain(
@@ -4022,7 +4028,7 @@ describe("cli: ask success", () => {
       expect(jsonResult.code).toBe(1);
       expect(jsonResult.stderr).toBe("");
       expect(jsonResult.stdout).toBe(
-        '{"output":"","exit_code":1,"model":"","session_id":"","steps":0,"tool_calls":[],"error":"PromptResourceLimitExceeded"}\n',
+        '{"output":"","exit_code":1,"model":"","session_id":"","steps":0,"usage":{"requests":0,"input_tokens":0,"output_tokens":0},"tool_calls":[],"error":"PromptResourceLimitExceeded"}\n',
       );
     },
     120_000,

@@ -3610,13 +3610,11 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
 }
 
 fn renderErrorJsonResult(alloc: Allocator, err_name: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-
-    try out.writer.writeAll("{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":");
-    try std.json.Stringify.value(err_name, .{}, &out.writer);
-    try out.writer.writeAll("}\n");
-    return try out.toOwnedSlice();
+    return renderFinalJsonResult(alloc, .{
+        .exit_code = 1,
+        .assistant_output = &.{},
+        .error_code = err_name,
+    });
 }
 
 fn toCoreReasoningEffort(effort: types.ReasoningEffort) types.ReasoningEffort {
@@ -5205,14 +5203,14 @@ test "stdin prompt errors keep exact structured names" {
     const overflow = try renderErrorJsonResult(alloc, "PromptResourceLimitExceeded");
     defer alloc.free(overflow);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptResourceLimitExceeded\"}\n",
+        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"usage\":{\"requests\":0,\"input_tokens\":0,\"output_tokens\":0},\"tool_calls\":[],\"error\":\"PromptResourceLimitExceeded\"}\n",
         overflow,
     );
 
     const read_failure = try renderErrorJsonResult(alloc, "PromptInputReadFailed");
     defer alloc.free(read_failure);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptInputReadFailed\"}\n",
+        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"usage\":{\"requests\":0,\"input_tokens\":0,\"output_tokens\":0},\"tool_calls\":[],\"error\":\"PromptInputReadFailed\"}\n",
         read_failure,
     );
 }
@@ -5229,7 +5227,7 @@ test "image preparation failure has stable text and JSON contracts" {
     const json = try renderErrorJsonResult(alloc, @errorName(error.ImagePreparationFailed));
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"ImagePreparationFailed\"}\n",
+        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"usage\":{\"requests\":0,\"input_tokens\":0,\"output_tokens\":0},\"tool_calls\":[],\"error\":\"ImagePreparationFailed\"}\n",
         json,
     );
 }
@@ -5260,7 +5258,7 @@ test "stdin read failure has distinct text and JSON output contracts" {
         try runWithDeps(alloc, &.{"--json"}, testConfig(), deps),
     );
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptInputReadFailed\"}\n",
+        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"usage\":{\"requests\":0,\"input_tokens\":0,\"output_tokens\":0},\"tool_calls\":[],\"error\":\"PromptInputReadFailed\"}\n",
         stdout_capture.bytes.items,
     );
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
@@ -7448,6 +7446,14 @@ test "headless ask tracks turn usage while preserving latest session usage" {
     try std.testing.expectEqual(@as(u64, 3), failed.usage_requests);
     try std.testing.expectEqual(@as(u64, 207), failed.usage_input_tokens);
     try std.testing.expectEqual(@as(u64, 43), failed.usage_output_tokens);
+
+    ctx.usage_requests = std.math.maxInt(u64);
+    ctx.usage_input_tokens = std.math.maxInt(u64);
+    ctx.usage_output_tokens = std.math.maxInt(u64);
+    report_fn(deps.ctx, .{ .input_tokens = 1, .output_tokens = 1 });
+    try std.testing.expectEqual(std.math.maxInt(u64), ctx.usage_requests);
+    try std.testing.expectEqual(std.math.maxInt(u64), ctx.usage_input_tokens);
+    try std.testing.expectEqual(std.math.maxInt(u64), ctx.usage_output_tokens);
 }
 
 test "saved ask settles profile publication before persistence teardown" {
@@ -8914,8 +8920,8 @@ test "default fx ask preserves project context gathering error mappings" {
         json: ?[]const u8,
     }{
         .{ .err = error.OutOfMemory, .json = null },
-        .{ .err = error.NoSpaceLeft, .json = "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"NoSpaceLeft\"}\n" },
-        .{ .err = error.WriteFailed, .json = "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"WriteFailed\"}\n" },
+        .{ .err = error.NoSpaceLeft, .json = "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"usage\":{\"requests\":0,\"input_tokens\":0,\"output_tokens\":0},\"tool_calls\":[],\"error\":\"NoSpaceLeft\"}\n" },
+        .{ .err = error.WriteFailed, .json = "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"usage\":{\"requests\":0,\"input_tokens\":0,\"output_tokens\":0},\"tool_calls\":[],\"error\":\"WriteFailed\"}\n" },
     };
 
     for (cases) |case| {
