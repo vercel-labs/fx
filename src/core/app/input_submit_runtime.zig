@@ -31,23 +31,11 @@ pub fn SubmitRuntime(comptime App: type) type {
             }
         };
 
-        pub fn submitInput(app: *App, max_prompt_history: usize) !void {
-            try submitWithIntent(app, max_prompt_history, .steer_if_active);
-        }
-
-        pub fn submitInputWithIntent(
-            app: *App,
-            max_prompt_history: usize,
-            intent: worker_runtime.PromptEnqueueIntent,
-        ) !void {
-            try submitWithIntent(app, max_prompt_history, intent);
-        }
-
         pub fn submit(app: *App, max_prompt_history: usize) !void {
             try submitWithIntent(app, max_prompt_history, .steer_if_active);
         }
 
-        fn submitWithIntent(
+        pub fn submitWithIntent(
             app: *App,
             max_prompt_history: usize,
             intent: worker_runtime.PromptEnqueueIntent,
@@ -510,24 +498,8 @@ pub fn SubmitRuntime(comptime App: type) type {
                         draft.skill_tokens.items,
                     );
                 }
-                if (comptime @hasDecl(App, "enqueuePromptWithSkillBindingsIntent")) {
-                    break :blk try App.enqueuePromptWithSkillBindingsIntent(
-                        app,
-                        prompt,
-                        skill_tokens,
-                        intent,
-                    );
-                }
-                if (comptime @hasDecl(App, "enqueuePromptWithSkillBindings")) {
-                    break :blk try App.enqueuePromptWithSkillBindings(app, prompt, skill_tokens);
-                }
-                break :blk try App.enqueuePrompt(app, prompt);
-            } else if (comptime @hasDecl(App, "enqueuePromptWithSkillBindingsIntent"))
-                try App.enqueuePromptWithSkillBindingsIntent(app, prompt, skill_tokens, intent)
-            else if (comptime @hasDecl(App, "enqueuePromptWithSkillBindings"))
-                try App.enqueuePromptWithSkillBindings(app, prompt, skill_tokens)
-            else
-                try App.enqueuePrompt(app, prompt);
+                break :blk try enqueueBySkillBindings(app, prompt, skill_tokens, intent);
+            } else try enqueueBySkillBindings(app, prompt, skill_tokens, intent);
             if (!accepted) return false;
             if (resume_review) {
                 if (comptime @hasField(App, "queued_prompt_review")) {
@@ -536,6 +508,23 @@ pub fn SubmitRuntime(comptime App: type) type {
             }
             beginIdleSubmittedPromptTransition(app);
             return true;
+        }
+
+        /// Skill-bindings enqueue fallback chain, shared by the draft and
+        /// no-draft submission paths so the dispatch order cannot drift.
+        fn enqueueBySkillBindings(
+            app: *App,
+            prompt: []const u8,
+            skill_tokens: []const registered_entities.SkillTokenSpan,
+            intent: worker_runtime.PromptEnqueueIntent,
+        ) !bool {
+            if (comptime @hasDecl(App, "enqueuePromptWithSkillBindingsIntent")) {
+                return try App.enqueuePromptWithSkillBindingsIntent(app, prompt, skill_tokens, intent);
+            }
+            if (comptime @hasDecl(App, "enqueuePromptWithSkillBindings")) {
+                return try App.enqueuePromptWithSkillBindings(app, prompt, skill_tokens);
+            }
+            return try App.enqueuePrompt(app, prompt);
         }
 
         fn beginIdleSubmittedPromptTransition(app: *App) void {

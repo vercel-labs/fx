@@ -1232,14 +1232,24 @@ fn connectPinned(address: IpAddress, options: FetchOptions) !posix.fd_t {
 
     var storage: PosixAddress = undefined;
     const len = addressToPosix(address, &storage);
+    var interrupted = false;
     while (true) switch (posix.errno(posix.system.connect(fd, &storage.any, len))) {
         .SUCCESS => return fd,
         .INTR => {
             try checkControl(options);
+            interrupted = true;
             continue;
         },
         .INPROGRESS, .AGAIN, .ALREADY => {
             try pollFd(fd, posix.POLL.OUT, options);
+            try checkSocketError(fd);
+            return fd;
+        },
+        // Darwin may complete a blocking connect after it returned EINTR;
+        // the required retry then reports EISCONN, which is success here,
+        // not a caller bug.
+        .ISCONN => {
+            if (!interrupted) return classifyConnectErrno(.ISCONN);
             try checkSocketError(fd);
             return fd;
         },

@@ -22,6 +22,7 @@ pub fn wrap(original: std.Io) std.Io {
 const ConnectTransition = enum {
     connected,
     retry,
+    wait_for_completion,
     other,
 };
 
@@ -32,8 +33,79 @@ fn connect_transition(err: std.posix.E, interrupted: bool) ConnectTransition {
         // Darwin may complete a blocking connect after it returned EINTR. The
         // required retry then reports EISCONN; that is success, not a caller bug.
         .ISCONN => if (interrupted) .connected else .other,
+        // While the interrupted connect is still establishing, the retry
+        // reports EALREADY; wait for the socket to become writable instead of
+        // surfacing a spurious ConnectionPending.
+        .ALREADY => if (interrupted) .wait_for_completion else .other,
         else => .other,
     };
+}
+
+/// std.Io.Threaded turns a pending cancel into EINTR and surfaces
+/// error.Canceled via Syscall.checkCancel. Our raw retry loops must do the
+/// same or a canceled connect keeps blocking until the kernel timeout.
+fn checkCancelAfterIntr(userdata: ?*anyopaque) std.Io.Cancelable!void {
+    return wrapped_original_vtable.?.checkCancel(userdata);
+}
+
+fn connectFailureError(err: std.posix.E) std.Io.net.IpAddress.ConnectError {
+    return switch (err) {
+        .ADDRNOTAVAIL => error.AddressUnavailable,
+        .AFNOSUPPORT => error.AddressFamilyUnsupported,
+        .AGAIN, .INPROGRESS => error.WouldBlock,
+        .ALREADY => error.ConnectionPending,
+        .CONNREFUSED => error.ConnectionRefused,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .HOSTUNREACH => error.HostUnreachable,
+        .NETUNREACH => error.NetworkUnreachable,
+        .TIMEDOUT => error.Timeout,
+        .ACCES, .PERM => error.AccessDenied,
+        .NETDOWN => error.NetworkDown,
+        else => error.Unexpected,
+    };
+}
+
+/// Wait for an interrupted blocking connect to finish establishing, then
+/// report its outcome from SO_ERROR.
+fn awaitInterruptedConnect(
+    userdata: ?*anyopaque,
+    socket_fd: std.posix.socket_t,
+) std.Io.net.IpAddress.ConnectError!void {
+    var poll_fds = [_]std.posix.pollfd{.{
+        .fd = socket_fd,
+        .events = std.posix.POLL.OUT,
+        .revents = 0,
+    }};
+    while (true) {
+        const rc = std.posix.system.poll(&poll_fds, poll_fds.len, -1);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => break,
+            .INTR => {
+                try checkCancelAfterIntr(userdata);
+                continue;
+            },
+            .NOMEM => return error.SystemResources,
+            else => return error.Unexpected,
+        }
+    }
+    var so_error: c_int = 0;
+    var option_len: std.posix.socklen_t = @sizeOf(c_int);
+    while (true) {
+        const rc = std.posix.system.getsockopt(
+            socket_fd,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.ERROR,
+            @ptrCast(&so_error),
+            &option_len,
+        );
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.Unexpected,
+        }
+    }
+    const completion: std.posix.E = @enumFromInt(so_error);
+    if (completion != .SUCCESS) return connectFailureError(completion);
 }
 
 fn net_connect_ip(
@@ -61,7 +133,10 @@ fn net_connect_ip(
         const rc = std.posix.system.socket(family, mode, protocol);
         switch (std.posix.errno(rc)) {
             .SUCCESS => break :socket @as(std.posix.socket_t, @intCast(rc)),
-            .INTR => continue,
+            .INTR => {
+                try checkCancelAfterIntr(userdata);
+                continue;
+            },
             .AFNOSUPPORT => return error.AddressFamilyUnsupported,
             .INVAL => return error.ProtocolUnsupportedBySystem,
             .MFILE => return error.ProcessFdQuotaExceeded,
@@ -81,7 +156,10 @@ fn net_connect_ip(
         );
         switch (std.posix.errno(rc)) {
             .SUCCESS => break,
-            .INTR => continue,
+            .INTR => {
+                try checkCancelAfterIntr(userdata);
+                continue;
+            },
             else => return error.Unexpected,
         }
     }
@@ -98,23 +176,15 @@ fn net_connect_ip(
         switch (connect_transition(err, interrupted)) {
             .connected => break,
             .retry => {
+                try checkCancelAfterIntr(userdata);
                 interrupted = true;
                 continue;
             },
-            .other => switch (err) {
-                .ADDRNOTAVAIL => return error.AddressUnavailable,
-                .AFNOSUPPORT => return error.AddressFamilyUnsupported,
-                .AGAIN, .INPROGRESS => return error.WouldBlock,
-                .ALREADY => return error.ConnectionPending,
-                .CONNREFUSED => return error.ConnectionRefused,
-                .CONNRESET => return error.ConnectionResetByPeer,
-                .HOSTUNREACH => return error.HostUnreachable,
-                .NETUNREACH => return error.NetworkUnreachable,
-                .TIMEDOUT => return error.Timeout,
-                .ACCES, .PERM => return error.AccessDenied,
-                .NETDOWN => return error.NetworkDown,
-                else => return error.Unexpected,
+            .wait_for_completion => {
+                try awaitInterruptedConnect(userdata, socket_fd);
+                break;
             },
+            .other => return connectFailureError(err),
         }
     }
 
@@ -122,7 +192,10 @@ fn net_connect_ip(
         const rc = std.posix.system.getsockname(socket_fd, &storage.any, &address_len);
         switch (std.posix.errno(rc)) {
             .SUCCESS => break,
-            .INTR => continue,
+            .INTR => {
+                try checkCancelAfterIntr(userdata);
+                continue;
+            },
             .NOBUFS => return error.SystemResources,
             else => return error.Unexpected,
         }
@@ -420,6 +493,11 @@ test "Darwin connect accepts EISCONN only after an interrupted connect" {
     try std.testing.expectEqual(ConnectTransition.connected, connect_transition(.ISCONN, true));
     try std.testing.expectEqual(ConnectTransition.other, connect_transition(.ISCONN, false));
     try std.testing.expectEqual(ConnectTransition.connected, connect_transition(.SUCCESS, false));
+}
+
+test "Darwin connect waits out EALREADY only after an interrupted connect" {
+    try std.testing.expectEqual(ConnectTransition.wait_for_completion, connect_transition(.ALREADY, true));
+    try std.testing.expectEqual(ConnectTransition.other, connect_transition(.ALREADY, false));
 }
 
 fn darwin_io() !std.Io {

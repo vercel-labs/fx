@@ -7298,24 +7298,9 @@ fn processQueuedPromptLoop(
             );
             pending_image_ids = transition.pending_ids;
         }
-        if (!terminal_provider_completion and try finishYieldedTurnIfRequested(
-            deps,
-            finalization,
-            arena,
-            job,
-            turn_id,
-            step_ctx,
-            within_turn_suffix.items,
-            &summary_accumulator,
-            stop_state,
-            &finish_trace,
-        )) return;
-        try runtime_tool_batch.appendReviewContinuationSuffix(
-            config.review_enabled,
-            arena,
-            &within_turn_suffix,
-            &step_batch,
-        );
+        // Retry-exhaustion failures must finalize before a steering yield can
+        // claim the turn, or the failure notice is silently recorded as a
+        // clean "yielded" completion.
         if (malformed_arguments_retry.finishBatch()) {
             debug_trace.eventf(
                 "agent",
@@ -7367,6 +7352,24 @@ fn processQueuedPromptLoop(
             );
             return;
         }
+        if (!terminal_provider_completion and try finishYieldedTurnIfRequested(
+            deps,
+            finalization,
+            arena,
+            job,
+            turn_id,
+            step_ctx,
+            within_turn_suffix.items,
+            &summary_accumulator,
+            stop_state,
+            &finish_trace,
+        )) return;
+        try runtime_tool_batch.appendReviewContinuationSuffix(
+            config.review_enabled,
+            arena,
+            &within_turn_suffix,
+            &step_batch,
+        );
         if (terminal_provider_completion) {
             const raw_final = completion.content.?;
             const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);

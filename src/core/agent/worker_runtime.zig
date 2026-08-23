@@ -61,8 +61,9 @@ pub const PromptEnqueueIntent = enum {
 
 pub const QueuedPrompt = struct {
     turn_id: u64 = 0,
-    /// The exact active turn this prompt may ask to yield. Cleared when that
-    /// turn finishes so prioritized steering prompts cannot cascade.
+    /// The exact active turn this prompt may ask to yield. Goes stale (and is
+    /// ignored) once that turn is no longer active, so prioritized steering
+    /// prompts cannot cascade; turn ids are never reused.
     steer_target_turn_id: ?u64 = null,
     prompt: []u8,
     images: []types.ImageAttachment,
@@ -760,8 +761,18 @@ pub const WorkerRuntime = struct {
             return error.RecoveryBusy;
         }
         queued.agent_settings = self.agent_turn_settings;
+        // A queued recovery continuation must run next; a steering prompt may
+        // not jump ahead of it or the checkpoint replays against state the
+        // interleaved turn already advanced.
+        const recovery_continuation_queued = blk: {
+            for (self.queued_prompts.items) |pending| {
+                if (pending.recovery_checkpoint != null) break :blk true;
+            }
+            break :blk false;
+        };
         queued.steer_target_turn_id = if (intent == .steer_if_active and
             queued.recovery_checkpoint == null and
+            !recovery_continuation_queued and
             self.worker_processing and
             self.active_turn_id != 0)
             self.active_turn_id
@@ -1089,25 +1100,11 @@ pub const WorkerRuntime = struct {
     pub fn finishProcessing(self: *WorkerRuntime) void {
         debug_trace.logf("worker", "finish processing queued={d}", .{self.queuedPromptCount()});
         self.worker_mutex.lockUncancelable(io_mod.getIo());
-        const finished_turn_id = self.active_turn_id;
-        var demoted_count: usize = 0;
-        if (finished_turn_id != 0) {
-            for (self.queued_prompts.items) |*prompt| {
-                if (prompt.steer_target_turn_id == finished_turn_id) {
-                    prompt.steer_target_turn_id = null;
-                    demoted_count += 1;
-                }
-            }
-        }
-        if (demoted_count > 0) {
-            debug_trace.eventf(
-                "worker",
-                "steer_target_demoted",
-                .{ .turn_id = finished_turn_id },
-                "prompt_count={d}",
-                .{demoted_count},
-            );
-        }
+        // Steer targets referencing the finished turn go stale here on their
+        // own: a prompt only counts as steering while its target equals the
+        // active turn, so zeroing active_turn_id below demotes them without a
+        // rewrite pass. Turn ids are never reused, so a stale target can never
+        // match a later turn — prioritized steers cannot cascade.
         self.worker_processing = false;
         self.active_turn_id = 0;
         self.worker_connectivity_wait_active.store(false, .seq_cst);
@@ -1191,8 +1188,10 @@ pub const WorkerRuntime = struct {
         const count = self.queued_prompts.items.len;
         if (count == 0) return .{};
         var steering_count: usize = 0;
-        for (self.queued_prompts.items) |prompt| {
-            if (prompt.steer_target_turn_id != null) steering_count += 1;
+        if (self.active_turn_id != 0) {
+            for (self.queued_prompts.items) |prompt| {
+                if (prompt.steer_target_turn_id == self.active_turn_id) steering_count += 1;
+            }
         }
         return .{
             .count = count,
@@ -3080,8 +3079,10 @@ test "targeted steers jump the queue in FIFO order and do not cascade" {
     try std.testing.expect(runtime.shouldYieldTurn(active_turn_id));
 
     runtime.finishProcessing();
-    try std.testing.expect(runtime.queued_prompts.items[0].steer_target_turn_id == null);
-    try std.testing.expect(runtime.queued_prompts.items[1].steer_target_turn_id == null);
+    try std.testing.expect(!runtime.shouldYieldTurn(active_turn_id));
+    const demoted_preview = runtime.queuePreview();
+    try std.testing.expectEqual(@as(usize, 3), demoted_preview.count);
+    try std.testing.expectEqual(@as(usize, 0), demoted_preview.steering_count);
 
     const next = (try runtime.waitAndTakeNextPrompt(alloc)).?;
     defer freeQueuedPrompt(alloc, next);
@@ -3107,6 +3108,44 @@ test "deleting the last targeted steer removes the yield request" {
     const steer_turn_id = runtime.queued_prompts.items[0].turn_id;
     try std.testing.expect(runtime.shouldYieldTurn(active.turn_id));
     try std.testing.expect(runtime.deleteQueuedPromptDraft(alloc, steer_turn_id, &.{}));
+    try std.testing.expect(!runtime.shouldYieldTurn(active.turn_id));
+    runtime.finishProcessing();
+}
+
+test "steer intent never jumps a queued recovery continuation" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "active", "model"));
+    const active = (try runtime.waitAndTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, active);
+
+    runtime.recovery_continuation_ready = true;
+    var continuation = try makePrompt(alloc, "continue preserved turn", "model");
+    continuation.recovery_checkpoint = try (session_codec.RecoveryCheckpoint{
+        .turn_id = 41,
+        .user = .{ .text = @constCast("unfinished prompt") },
+        .assistant_source = @constCast("partial response"),
+        .cause = .network_interrupted,
+        .action = .paused,
+        .route_model = @constCast("model"),
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 10,
+    }).dupe(alloc);
+    try runtime.enqueuePrompt(alloc, continuation);
+
+    try runtime.enqueuePromptWithIntent(
+        alloc,
+        try makePrompt(alloc, "steer", "model"),
+        .steer_if_active,
+    );
+
+    try std.testing.expectEqualStrings("continue preserved turn", runtime.queued_prompts.items[0].prompt);
+    try std.testing.expectEqualStrings("steer", runtime.queued_prompts.items[1].prompt);
+    try std.testing.expect(runtime.queued_prompts.items[1].steer_target_turn_id == null);
     try std.testing.expect(!runtime.shouldYieldTurn(active.turn_id));
     runtime.finishProcessing();
 }

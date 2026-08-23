@@ -336,6 +336,9 @@ fn subagentActionFromDecoded(action: input_action.Action) ?subagent_input.Action
         .delete_to_line_end => .delete_to_line_end,
         .clear_line => .clear_line,
         .insert_newline => .insert_newline,
+        // The child composer has no prompt queue; keep Alt+Enter as the
+        // newline it inserted before the key was repurposed for queueing.
+        .submit_queued => .insert_newline,
         .page_up => .page_up,
         .page_down => .page_down,
         .composer_shortcut => |typed| subagentActionFromShortcut(typed),
@@ -345,7 +348,6 @@ fn subagentActionFromDecoded(action: input_action.Action) ?subagent_input.Action
         .toggle_full_transcript,
         .toggle_permission_mode,
         .open_all_sessions,
-        .submit_queued,
         .paste_start,
         .paste_end,
         .ignore,
@@ -2956,6 +2958,10 @@ test "input escape parser handles alt+enter as queued submit" {
 test "input escape parser handles enhanced alt+enter as queued submit" {
     try expectEscapeAction("[13;3u", .submit_queued);
     try expectEscapeAction("[27;3;13~", .submit_queued);
+    // Extra modifiers alongside Alt still queue rather than falling through
+    // to a plain (steering) Enter; Shift keeps winning as the newline chord.
+    try expectEscapeAction("[13;7u", .submit_queued);
+    try expectEscapeAction("[13;4u", .insert_newline);
 }
 
 test "input escape parser handles shift+enter csi u sequence" {

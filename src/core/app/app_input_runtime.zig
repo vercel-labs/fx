@@ -1502,7 +1502,7 @@ pub fn Runtime(comptime App: type) type {
             intent: worker_runtime.PromptEnqueueIntent,
         ) !void {
             if (try submitSettingsMenuSelection(app)) return;
-            if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
+            if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history, intent)) return;
             if (try submitAuthPickerSelection(app)) return;
             if (try submitModelMenuSelection(app)) return;
             if (try submitSkillsMenuSelection(app, max_input_len)) return;
@@ -1555,7 +1555,7 @@ pub fn Runtime(comptime App: type) type {
                     if (intent == .steer_if_active) "steer_if_active" else "queue",
                 },
             );
-            try submit_rt.submitInputWithIntent(app, max_prompt_history, intent);
+            try submit_rt.submitWithIntent(app, max_prompt_history, intent);
         }
 
         fn handleSemanticCtrlC(app: *App) !void {
@@ -2077,7 +2077,12 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn submitHelpMenuSelection(app: *App, max_input_len: usize, max_prompt_history: usize) !bool {
+        fn submitHelpMenuSelection(
+            app: *App,
+            max_input_len: usize,
+            max_prompt_history: usize,
+            intent: worker_runtime.PromptEnqueueIntent,
+        ) !bool {
             if (!app.input_runtime.help_menu.active) return false;
             if (app.slashRegistry().matchExact(app.input_runtime.edit_state.input.items) != null) {
                 app.input_runtime.help_menu.close();
@@ -2107,7 +2112,7 @@ pub fn Runtime(comptime App: type) type {
                 app.shell.render_requests.request(.footer);
                 return true;
             }
-            try submit_rt.submitInput(app, max_prompt_history);
+            try submit_rt.submitWithIntent(app, max_prompt_history, intent);
             return true;
         }
 
