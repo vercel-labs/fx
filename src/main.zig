@@ -1023,10 +1023,20 @@ const App = struct {
     }
 
     pub fn enqueuePromptWithSkillBindings(self: *App, prompt: []const u8, skill_tokens: []const registered_entities.SkillTokenSpan) !bool {
+        return self.enqueuePromptWithSkillBindingsIntent(prompt, skill_tokens, .queue);
+    }
+
+    pub fn enqueuePromptWithSkillBindingsIntent(
+        self: *App,
+        prompt: []const u8,
+        skill_tokens: []const registered_entities.SkillTokenSpan,
+        intent: worker_runtime.PromptEnqueueIntent,
+    ) !bool {
         return self.enqueuePromptWithOptionalReview(
             prompt,
             skill_tokens,
             null,
+            intent,
         );
     }
 
@@ -1038,6 +1048,27 @@ const App = struct {
         review_pasted_blocks: []const paste_blocks.PastedBlock,
         review_image_tokens: []const entity_spans.ImageTokenSpan,
         review_skill_tokens: []const registered_entities.SkillTokenSpan,
+    ) !bool {
+        return self.enqueuePromptWithReviewDraftIntent(
+            prompt,
+            skill_tokens,
+            review_input,
+            review_pasted_blocks,
+            review_image_tokens,
+            review_skill_tokens,
+            .queue,
+        );
+    }
+
+    pub fn enqueuePromptWithReviewDraftIntent(
+        self: *App,
+        prompt: []const u8,
+        skill_tokens: []const registered_entities.SkillTokenSpan,
+        review_input: []const u8,
+        review_pasted_blocks: []const paste_blocks.PastedBlock,
+        review_image_tokens: []const entity_spans.ImageTokenSpan,
+        review_skill_tokens: []const registered_entities.SkillTokenSpan,
+        intent: worker_runtime.PromptEnqueueIntent,
     ) !bool {
         const review_skill_spans = try dupeSkillDisplaySpansFromTokens(
             self.alloc,
@@ -1056,6 +1087,7 @@ const App = struct {
                 .image_tokens = @constCast(review_image_tokens),
                 .skill_display_spans = review_skill_spans,
             },
+            intent,
         );
     }
 
@@ -1064,6 +1096,7 @@ const App = struct {
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
+        intent: worker_runtime.PromptEnqueueIntent,
     ) !bool {
         const context_targets = if (self.context_enabled)
             try context_contract.applicableTargetsForImages(self.alloc, self.pending_images.items)
@@ -1088,6 +1121,7 @@ const App = struct {
             prompt,
             skill_tokens,
             review_draft,
+            intent,
         )) return false;
         WorkerAppRuntime.syncState(
             self,
@@ -1222,12 +1256,14 @@ const App = struct {
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
+        intent: worker_runtime.PromptEnqueueIntent,
     ) !bool {
         return self.snapshotAndQueuePrompt(
             prompt,
             skill_tokens,
             review_draft,
             null,
+            intent,
         );
     }
 
@@ -1244,6 +1280,7 @@ const App = struct {
             &.{},
             null,
             checkpoint,
+            .queue,
         )) return false;
         WorkerAppRuntime.syncState(
             self,
@@ -1258,6 +1295,7 @@ const App = struct {
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
         recovery_checkpoint: ?*const session_codec.RecoveryCheckpoint,
+        intent: worker_runtime.PromptEnqueueIntent,
     ) !bool {
         try self.reloadSkills();
 
@@ -1344,7 +1382,7 @@ const App = struct {
                 review,
             );
 
-        try self.worker.enqueuePrompt(std.heap.c_allocator, .{
+        try self.worker.enqueuePromptWithIntent(std.heap.c_allocator, .{
             .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
             .prompt = prompt_copy,
             .images = images_copy,
@@ -1365,7 +1403,7 @@ const App = struct {
             .context_snapshot = context_snapshot_copy,
             .recovery_checkpoint = recovery_checkpoint_copy,
             .recovery_source_already_presented = recovery_checkpoint != null,
-        });
+        }, intent);
         HerdrAppRuntime.reportWorking(self);
         return true;
     }

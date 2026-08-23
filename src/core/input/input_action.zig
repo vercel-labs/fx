@@ -94,6 +94,7 @@ pub const Action = union(enum) {
     toggle_permission_mode,
     open_all_sessions,
     insert_newline,
+    submit_queued,
     paste_start,
     paste_end,
     composer_shortcut: ShortcutAction,

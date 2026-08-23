@@ -491,6 +491,10 @@ pub fn Runtime(comptime App: type) type {
                 else
                     .ask,
                 .queued_count = if (queued_cards.cards.len > 0) queued_cards.cards.len else queue_preview.count,
+                .steering_count = if (comptime @hasField(@TypeOf(queue_preview), "steering_count"))
+                    queue_preview.steering_count
+                else
+                    0,
                 .queued_paused = if (comptime @hasField(@TypeOf(queue_preview), "paused"))
                     queue_preview.paused
                 else

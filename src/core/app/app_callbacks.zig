@@ -283,6 +283,10 @@ pub fn Bindings(comptime App: type) type {
                     agentSnapshotRootPermissionMode
                 else
                     null,
+                .should_yield_turn = if (comptime @hasDecl(@TypeOf(app.worker), "shouldYieldTurn"))
+                    agentShouldYieldTurn
+                else
+                    null,
                 .finalize_turn = agentFinalizeTurn,
                 .prepare_parent_turn_context = agentPrepareParentTurnContext,
                 .acknowledge_parent_turn_context = agentAcknowledgeParentTurnContext,
@@ -545,6 +549,11 @@ pub fn Bindings(comptime App: type) type {
         fn cooperativeTransportPulse(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app.cooperativeTransportPulse();
+        }
+
+        fn agentShouldYieldTurn(ctx: *anyopaque, turn_id: u64) bool {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            return app.worker.shouldYieldTurn(turn_id);
         }
 
         fn agentFinalizeTurn(ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, _: ?types.ProviderCompletionDisposition) !void {

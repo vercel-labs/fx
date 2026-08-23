@@ -204,6 +204,7 @@ pub fn Runtime(comptime App: type) type {
         const ResolvedEscapeRoute = union(enum) {
             done,
             remapped_byte: u8,
+            submit_queued,
         };
 
         const routeSlashCompletionMove = completion_rt.routeSlashCompletionMove;
@@ -636,6 +637,12 @@ pub fn Runtime(comptime App: type) type {
                                 std.debug.assert(replay_byte == null);
                                 replay_byte = byte;
                             },
+                            .submit_queued => try handleComposerSubmit(
+                                app,
+                                input_limits.composer_bytes,
+                                max_prompt_history,
+                                .queue,
+                            ),
                         }
                     },
                 }
@@ -1039,6 +1046,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             switch (resolved) {
+                .submit_queued => return .submit_queued,
                 .history_up => {
                     try completion_rt.routeModifiedHistory(app, .up, -1);
                     app.shell.render_requests.request(.footer);
@@ -1441,54 +1449,12 @@ pub fn Runtime(comptime App: type) type {
                         try subagent_rt.toggleSubagentView(app);
                     }
                 },
-                '\r' => {
-                    if (try submitSettingsMenuSelection(app)) return;
-                    if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
-                    if (try submitAuthPickerSelection(app)) return;
-                    if (try submitModelMenuSelection(app)) return;
-                    if (try submitSkillsMenuSelection(app, max_input_len)) return;
-                    if (try submitSlashSkillSelection(app)) return;
-                    if (comptime runtime_profile.allows(App, .durable_sessions)) {
-                        if (try submitSessionPickerSelection(app)) return;
-                    }
-                    if (try completion_rt.submitFilePickerOnEnter(app, max_input_len)) |result| {
-                        if (result == .limit_exceeded) {
-                            try input_limit_feedback.report(App, app, .composer, 1);
-                        }
-                        app.shell.render_requests.request(.footer);
-                        return;
-                    }
-                    if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
-                        try completion_rt.openCurrentModelPicker(app);
-                        return;
-                    }
-                    if (completion_rt.hasModelQuery(app)) {
-                        if (app.stream.active) {
-                            if (try submitExplicitModelSelection(
-                                app,
-                                resolveExplicitModelSelection(app, app.input_runtime.edit_state.input.items),
-                            )) return;
-                            try app.writeDomainNotice(.{
-                                .topic = "model",
-                                .tone = .neutral,
-                                .body = "Complete the model selection for the next turn: /model <id> <effort> [normal|fast].",
-                            }, true);
-                            app.shell.render_requests.request(.footer);
-                            return;
-                        }
-                        if (try completion_rt.submitModelPicker(app)) return;
-                    }
-                    if (try submitExplicitModelSelection(
-                        app,
-                        resolveExplicitModelSelection(app, app.input_runtime.edit_state.input.items),
-                    )) return;
-                    if (app.input_runtime.lineContinuationState().replaceBackslashBeforeCursorWithNewline(app.alloc)) {
-                        app.shell.render_requests.request(.footer);
-                        return;
-                    }
-                    debug_trace.logf("input", "submit requested stream_active={s} queued={d} input_bytes={d}", .{ if (app.stream.active) "true" else "false", app.worker.queuedPromptCount(), app.input_runtime.edit_state.input.items.len });
-                    try submit_rt.submitInput(app, max_prompt_history);
-                },
+                '\r' => try handleComposerSubmit(
+                    app,
+                    max_input_len,
+                    max_prompt_history,
+                    .steer_if_active,
+                ),
                 else => {
                     if (composer_shortcut) |action| {
                         try routeComposerShortcutAction(app, action, max_input_len);
@@ -1527,6 +1493,69 @@ pub fn Runtime(comptime App: type) type {
                     }
                 },
             }
+        }
+
+        fn handleComposerSubmit(
+            app: *App,
+            max_input_len: usize,
+            max_prompt_history: usize,
+            intent: worker_runtime.PromptEnqueueIntent,
+        ) !void {
+            if (try submitSettingsMenuSelection(app)) return;
+            if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
+            if (try submitAuthPickerSelection(app)) return;
+            if (try submitModelMenuSelection(app)) return;
+            if (try submitSkillsMenuSelection(app, max_input_len)) return;
+            if (try submitSlashSkillSelection(app)) return;
+            if (comptime runtime_profile.allows(App, .durable_sessions)) {
+                if (try submitSessionPickerSelection(app)) return;
+            }
+            if (try completion_rt.submitFilePickerOnEnter(app, max_input_len)) |result| {
+                if (result == .limit_exceeded) {
+                    try input_limit_feedback.report(App, app, .composer, 1);
+                }
+                app.shell.render_requests.request(.footer);
+                return;
+            }
+            if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
+                try completion_rt.openCurrentModelPicker(app);
+                return;
+            }
+            if (completion_rt.hasModelQuery(app)) {
+                if (app.stream.active) {
+                    if (try submitExplicitModelSelection(
+                        app,
+                        resolveExplicitModelSelection(app, app.input_runtime.edit_state.input.items),
+                    )) return;
+                    try app.writeDomainNotice(.{
+                        .topic = "model",
+                        .tone = .neutral,
+                        .body = "Complete the model selection for the next turn: /model <id> <effort> [normal|fast].",
+                    }, true);
+                    app.shell.render_requests.request(.footer);
+                    return;
+                }
+                if (try completion_rt.submitModelPicker(app)) return;
+            }
+            if (try submitExplicitModelSelection(
+                app,
+                resolveExplicitModelSelection(app, app.input_runtime.edit_state.input.items),
+            )) return;
+            if (app.input_runtime.lineContinuationState().replaceBackslashBeforeCursorWithNewline(app.alloc)) {
+                app.shell.render_requests.request(.footer);
+                return;
+            }
+            debug_trace.logf(
+                "input",
+                "submit requested stream_active={s} queued={d} input_bytes={d} delivery={s}",
+                .{
+                    if (app.stream.active) "true" else "false",
+                    app.worker.queuedPromptCount(),
+                    app.input_runtime.edit_state.input.items.len,
+                    if (intent == .steer_if_active) "steer_if_active" else "queue",
+                },
+            );
+            try submit_rt.submitInputWithIntent(app, max_prompt_history, intent);
         }
 
         fn handleSemanticCtrlC(app: *App) !void {
@@ -3125,6 +3154,7 @@ const RoutingFakeApp = struct {
     submitted_prompt_count: usize = 0,
     submitted_prompt: [128]u8 = undefined,
     submitted_prompt_len: usize = 0,
+    submitted_prompt_intent: ?worker_runtime.PromptEnqueueIntent = null,
     approval_resize_interlock: shell_runtime.ResizeApprovalInterlock = .{},
     inject_resize_before_affirmative_claim: bool = false,
     affirmative_claim_count: usize = 0,
@@ -3459,9 +3489,19 @@ const RoutingFakeApp = struct {
     }
 
     pub fn enqueuePrompt(self: *RoutingFakeApp, text: []const u8) !bool {
+        return self.enqueuePromptWithSkillBindingsIntent(text, &.{}, .queue);
+    }
+
+    pub fn enqueuePromptWithSkillBindingsIntent(
+        self: *RoutingFakeApp,
+        text: []const u8,
+        _: []const registered_entities.SkillTokenSpan,
+        intent: worker_runtime.PromptEnqueueIntent,
+    ) !bool {
         self.submitted_prompt_len = @min(text.len, self.submitted_prompt.len);
         @memcpy(self.submitted_prompt[0..self.submitted_prompt_len], text[0..self.submitted_prompt_len]);
         self.submitted_prompt_count += 1;
+        self.submitted_prompt_intent = intent;
         return true;
     }
 
@@ -4571,6 +4611,10 @@ test "app_input_runtime Enter binds a selected skill token" {
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
     try std.testing.expectEqual(@as(usize, 1), app.submitted_prompt_count);
+    try std.testing.expectEqual(
+        worker_runtime.PromptEnqueueIntent.steer_if_active,
+        app.submitted_prompt_intent.?,
+    );
     try std.testing.expect(app.last_command == null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Unknown command") == null);
 }
@@ -7120,6 +7164,32 @@ test "app_input_runtime Ghostty Escape release leaves the usage dashboard open" 
     try feedRoutingBytes(&app, "\x1b[27;1:3u");
 
     try std.testing.expect(app.input_runtime.usage_menu.active);
+}
+
+test "app_input_runtime ctrl enter queues without interrupting the active turn" {
+    const alloc = std.testing.allocator;
+    const sequences = [_][]const u8{ "\x1b[13;5u", "\x1b[27;5;13~" };
+
+    for (sequences) |sequence| {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        app.stream.active = true;
+
+        try feedRoutingBytes(&app, "queue this");
+        try feedRoutingBytes(&app, sequence);
+
+        try std.testing.expectEqual(@as(usize, 1), app.submitted_prompt_count);
+        try std.testing.expectEqualStrings(
+            "queue this",
+            app.submitted_prompt[0..app.submitted_prompt_len],
+        );
+        try std.testing.expectEqual(
+            worker_runtime.PromptEnqueueIntent.queue,
+            app.submitted_prompt_intent.?,
+        );
+        try std.testing.expect(!app.worker.cancel_requested);
+        try std.testing.expect(app.stream.active);
+    }
 }
 
 test "app_input_runtime decoded kitty Backspace edits the draft without cancelling" {
@@ -10781,6 +10851,7 @@ const FakeSubmitApp = struct {
     prompt_admitted: bool = true,
     queue_admitted: bool = true,
     queue_accept_count: usize = 0,
+    last_enqueue_intent: ?worker_runtime.PromptEnqueueIntent = null,
     preflight_count: usize = 0,
     notice_count: usize = 0,
     capture_count: usize = 0,
@@ -10878,7 +10949,17 @@ const FakeSubmitApp = struct {
         text: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
     ) !bool {
+        return self.enqueuePromptWithSkillBindingsIntent(text, skill_tokens, .queue);
+    }
+
+    pub fn enqueuePromptWithSkillBindingsIntent(
+        self: *FakeSubmitApp,
+        text: []const u8,
+        skill_tokens: []const registered_entities.SkillTokenSpan,
+        intent: worker_runtime.PromptEnqueueIntent,
+    ) !bool {
         if (!self.queue_admitted) return false;
+        self.last_enqueue_intent = intent;
         const prompt_copy = try self.alloc.dupe(u8, text);
         errdefer self.alloc.free(prompt_copy);
         const images_copy = try types.dupeImageAttachmentSlice(self.alloc, self.pending_images.items);
@@ -11889,6 +11970,10 @@ test "app_input_runtime accepted prompt repaints while a turn is active" {
     try Runtime(FakeSubmitApp).submit(&app, 100);
 
     try std.testing.expectEqualStrings("queued follow-up", app.last_prompt.?);
+    try std.testing.expectEqual(
+        worker_runtime.PromptEnqueueIntent.steer_if_active,
+        app.last_enqueue_intent.?,
+    );
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
     try std.testing.expect(!app.shell.render_requests.submittedPromptTransitionPending());
     try std.testing.expect(!app.shell.render_requests.blocksFrameCommit());

@@ -599,6 +599,10 @@ pub const FakeAgentRuntimeDeps = struct {
     cancel_on_recovery_reservation: ?*std.atomic.Value(bool) = null,
     pause_on_auto_retry_status: bool = false,
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
+    enable_turn_yield: bool = false,
+    yield_requested: bool = false,
+    yield_check_count: usize = 0,
+    yield_checked_turn_id: u64 = 0,
 
     pub fn init(alloc: Allocator) FakeAgentRuntimeDeps {
         return .{ .alloc = alloc };
@@ -674,6 +678,7 @@ pub const FakeAgentRuntimeDeps = struct {
                 snapshotRootPermissionMode
             else
                 null,
+            .should_yield_turn = if (self.enable_turn_yield) shouldYieldTurn else null,
             .finalize_turn = finalizeTurn,
             .prepare_parent_turn_context = prepareParentTurnContext,
             .acknowledge_parent_turn_context = acknowledgeParentTurnContext,
@@ -734,6 +739,13 @@ pub const FakeAgentRuntimeDeps = struct {
     fn snapshotRootPermissionMode(raw: *anyopaque) PermissionMode {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         return self.root_permission_mode.?;
+    }
+
+    fn shouldYieldTurn(raw: *anyopaque, turn_id: u64) bool {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.yield_check_count += 1;
+        self.yield_checked_turn_id = turn_id;
+        return self.yield_requested;
     }
 
     fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) !model_capabilities.Capabilities {

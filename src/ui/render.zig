@@ -404,6 +404,42 @@ pub fn buildHintLine(
     width: u16,
     out: []u8,
 ) []const u8 {
+    return buildHintLineWithSteering(
+        stream_active,
+        awaiting_permission,
+        has_api_key,
+        model,
+        permission_mode,
+        queued_count,
+        0,
+        active_label,
+        fast_mode,
+        model_supports_fast,
+        effort,
+        model_supports_effort,
+        statusline,
+        width,
+        out,
+    );
+}
+
+pub fn buildHintLineWithSteering(
+    stream_active: bool,
+    awaiting_permission: bool,
+    has_api_key: bool,
+    model: []const u8,
+    permission_mode: types.PermissionMode,
+    queued_count: usize,
+    steering_count_raw: usize,
+    active_label: ?[]const u8,
+    fast_mode: bool,
+    model_supports_fast: bool,
+    effort: types.ReasoningEffort,
+    model_supports_effort: bool,
+    statusline: StatuslineItems,
+    width: u16,
+    out: []u8,
+) []const u8 {
     _ = active_label;
     _ = stream_active;
 
@@ -417,8 +453,16 @@ pub fn buildHintLine(
         appendStatusSegment(out, &end, "run /login");
     }
     if (!awaiting_permission and queued_count > 0) {
-        var queued_buf: [32]u8 = undefined;
-        appendStatusSegment(out, &end, std.fmt.bufPrint(&queued_buf, "queued {d}", .{queued_count}) catch "");
+        const steering_count = @min(steering_count_raw, queued_count);
+        const queued_only_count = queued_count - steering_count;
+        if (steering_count > 0) {
+            var steering_buf: [32]u8 = undefined;
+            appendStatusSegment(out, &end, std.fmt.bufPrint(&steering_buf, "steering {d}", .{steering_count}) catch "");
+        }
+        if (queued_only_count > 0) {
+            var queued_buf: [32]u8 = undefined;
+            appendStatusSegment(out, &end, std.fmt.bufPrint(&queued_buf, "queued {d}", .{queued_only_count}) catch "");
+        }
     }
     const status_limit = @min(@as(usize, width), out.len);
     const show_effort = model_supports_effort and !effort.isDefault();
@@ -1088,6 +1132,28 @@ test "buildHintLine keeps system labels and dot separators" {
         expected,
         line,
     );
+}
+
+test "buildHintLine distinguishes steering from queued prompts" {
+    var buf: [128]u8 = undefined;
+    const line = buildHintLineWithSteering(
+        false,
+        false,
+        true,
+        "openai/gpt-5",
+        .ask,
+        3,
+        2,
+        null,
+        false,
+        false,
+        .auto,
+        false,
+        .{},
+        128,
+        &buf,
+    );
+    try std.testing.expectEqualStrings("steering 2 · queued 1 · ask · gpt-5", line);
 }
 
 test "buildHintLine skips an over-capacity segment without a dangling dot" {

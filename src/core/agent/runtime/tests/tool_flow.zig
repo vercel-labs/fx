@@ -617,6 +617,50 @@ test "same completion duplicate skill calls both execute for explicit rereads" {
     try std.testing.expectEqualStrings("loaded skill", results[1].output);
 }
 
+test "settled tool batch yields before another model request" {
+    const alloc = std.testing.allocator;
+    const chunks = [_][]const u8{"I'll inspect both."};
+    const calls = [_]ToolCall{
+        toolCall("call_1", "skill", "{\"name\":\"one\",\"location\":\"/tmp/one\"}"),
+        toolCall("call_2", "skill", "{\"name\":\"two\",\"location\":\"/tmp/two\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{
+            .chunks = &chunks,
+            .content = "I'll inspect both.",
+            .tool_calls = &calls,
+        },
+        .{ .content = "must not be requested" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.enable_turn_yield = true;
+    hooks.yield_requested = true;
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "one loaded" } },
+        .{ .result = .{ .model_output = "two loaded" } },
+    };
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.index);
+    try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.yield_check_count);
+    try std.testing.expect(hooks.yield_checked_turn_id != 0);
+    try std.testing.expectEqual(hooks.finalized_turn_id, hooks.yield_checked_turn_id);
+    try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const turn = hooks.history_turns.items[0].assistant;
+    try std.testing.expectEqual(@as(usize, 0), turn.assistant.len);
+    try std.testing.expectEqual(@as(usize, 1), turn.execution.tool_steps.len);
+    try std.testing.expectEqualStrings("I'll inspect both.", turn.execution.tool_steps[0].assistant.?);
+    try std.testing.expectEqual(@as(usize, 2), turn.execution.tool_steps[0].tool_results.len);
+}
+
 test "tool execution result propagates inner search usage exactly once" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_search", "web_search", "{\"query\":\"current news\"}")};
@@ -2020,11 +2064,14 @@ test "provider search finalizes when stop includes provider result and final ans
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
+    hooks.enable_turn_yield = true;
+    hooks.yield_requested = true;
     var fixture = PromptFixture{};
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
     try std.testing.expectEqual(@as(usize, 1), gateway.index);
+    try std.testing.expectEqual(@as(usize, 0), hooks.yield_check_count);
     try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);

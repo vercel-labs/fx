@@ -7,6 +7,7 @@ const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
 const types = @import("../shared/types.zig");
+const worker_runtime = @import("../agent/worker_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
@@ -31,10 +32,26 @@ pub fn SubmitRuntime(comptime App: type) type {
         };
 
         pub fn submitInput(app: *App, max_prompt_history: usize) !void {
-            try submit(app, max_prompt_history);
+            try submitWithIntent(app, max_prompt_history, .steer_if_active);
+        }
+
+        pub fn submitInputWithIntent(
+            app: *App,
+            max_prompt_history: usize,
+            intent: worker_runtime.PromptEnqueueIntent,
+        ) !void {
+            try submitWithIntent(app, max_prompt_history, intent);
         }
 
         pub fn submit(app: *App, max_prompt_history: usize) !void {
+            try submitWithIntent(app, max_prompt_history, .steer_if_active);
+        }
+
+        fn submitWithIntent(
+            app: *App,
+            max_prompt_history: usize,
+            intent: worker_runtime.PromptEnqueueIntent,
+        ) !void {
             const expanded_len = paste_blocks.expandedLen(
                 app.input_runtime.edit_state.input.items,
                 app.input_runtime.entities.pasted_blocks.items,
@@ -101,7 +118,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (trimmed.len == 0) {
                 if (app.pending_images.items.len > 0) {
                     if (!try preflightPrompt(app)) return;
-                    if (!try enqueuePromptForSubmit(app, "", &.{}, null)) return;
+                    if (!try enqueuePromptForSubmit(app, "", &.{}, null, intent)) return;
                     releasePendingImages(app);
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
                     if (acceptedPromptNeedsImmediateFooter(app)) {
@@ -225,6 +242,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     display_skill_tokens,
                     &accepted_draft,
                     images,
+                    intent,
                 )
             else
                 try enqueuePromptForSubmit(
@@ -232,6 +250,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     visual_text.text,
                     display_skill_tokens,
                     &accepted_draft,
+                    intent,
                 );
             if (!queued) return;
             commitStableExtractedImageIds(app, extracted.images);
@@ -445,6 +464,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
             accepted_draft: ?*const AcceptedDraftProjection,
+            intent: worker_runtime.PromptEnqueueIntent,
         ) !bool {
             const resume_review = if (comptime @hasField(App, "queued_prompt_review"))
                 app.queued_prompt_review.active()
@@ -466,8 +486,20 @@ pub fn SubmitRuntime(comptime App: type) type {
                 }
             }
 
-            const accepted = if (comptime @hasDecl(App, "enqueuePromptWithReviewDraft")) blk: {
-                if (accepted_draft) |draft| {
+            const accepted = if (accepted_draft) |draft| blk: {
+                if (comptime @hasDecl(App, "enqueuePromptWithReviewDraftIntent")) {
+                    break :blk try App.enqueuePromptWithReviewDraftIntent(
+                        app,
+                        prompt,
+                        skill_tokens,
+                        draft.input,
+                        draft.pasted_blocks.items,
+                        draft.image_tokens.items,
+                        draft.skill_tokens.items,
+                        intent,
+                    );
+                }
+                if (comptime @hasDecl(App, "enqueuePromptWithReviewDraft")) {
                     break :blk try App.enqueuePromptWithReviewDraft(
                         app,
                         prompt,
@@ -478,12 +510,21 @@ pub fn SubmitRuntime(comptime App: type) type {
                         draft.skill_tokens.items,
                     );
                 }
-                break :blk try App.enqueuePromptWithSkillBindings(
-                    app,
-                    prompt,
-                    skill_tokens,
-                );
-            } else if (comptime @hasDecl(App, "enqueuePromptWithSkillBindings"))
+                if (comptime @hasDecl(App, "enqueuePromptWithSkillBindingsIntent")) {
+                    break :blk try App.enqueuePromptWithSkillBindingsIntent(
+                        app,
+                        prompt,
+                        skill_tokens,
+                        intent,
+                    );
+                }
+                if (comptime @hasDecl(App, "enqueuePromptWithSkillBindings")) {
+                    break :blk try App.enqueuePromptWithSkillBindings(app, prompt, skill_tokens);
+                }
+                break :blk try App.enqueuePrompt(app, prompt);
+            } else if (comptime @hasDecl(App, "enqueuePromptWithSkillBindingsIntent"))
+                try App.enqueuePromptWithSkillBindingsIntent(app, prompt, skill_tokens, intent)
+            else if (comptime @hasDecl(App, "enqueuePromptWithSkillBindings"))
                 try App.enqueuePromptWithSkillBindings(app, prompt, skill_tokens)
             else
                 try App.enqueuePrompt(app, prompt);
@@ -520,6 +561,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             skill_tokens: []const registered_entities.SkillTokenSpan,
             accepted_draft: *const AcceptedDraftProjection,
             staged_images: *std.ArrayList(types.ImageAttachment),
+            intent: worker_runtime.PromptEnqueueIntent,
         ) !bool {
             const original_images = app.pending_images;
             app.pending_images = staged_images.*;
@@ -534,6 +576,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 prompt,
                 skill_tokens,
                 accepted_draft,
+                intent,
             )) {
                 staged_images.* = app.pending_images;
                 app.pending_images = original_images;

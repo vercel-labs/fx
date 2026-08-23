@@ -54,8 +54,16 @@ pub const QueueReviewDraft = struct {
     skill_display_spans: []SkillDisplaySpan = &.{},
 };
 
+pub const PromptEnqueueIntent = enum {
+    queue,
+    steer_if_active,
+};
+
 pub const QueuedPrompt = struct {
     turn_id: u64 = 0,
+    /// The exact active turn this prompt may ask to yield. Cleared when that
+    /// turn finishes so prioritized steering prompts cannot cascade.
+    steer_target_turn_id: ?u64 = null,
     prompt: []u8,
     images: []types.ImageAttachment,
     authorized_image_catalog: []types.ImageAttachment = &.{},
@@ -193,6 +201,7 @@ pub const CommandOutputChunk = struct {
 
 pub const QueuePreview = struct {
     count: usize = 0,
+    steering_count: usize = 0,
     paused: bool = false,
 };
 
@@ -725,6 +734,15 @@ pub const WorkerRuntime = struct {
     }
 
     pub fn enqueuePrompt(self: *WorkerRuntime, alloc: std.mem.Allocator, prompt: QueuedPrompt) !void {
+        return self.enqueuePromptWithIntent(alloc, prompt, .queue);
+    }
+
+    pub fn enqueuePromptWithIntent(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        prompt: QueuedPrompt,
+        intent: PromptEnqueueIntent,
+    ) !void {
         var queued = prompt;
         if (queued.turn_id == 0) queued.turn_id = debug_trace.nextTurnId();
 
@@ -742,19 +760,36 @@ pub const WorkerRuntime = struct {
             return error.RecoveryBusy;
         }
         queued.agent_settings = self.agent_turn_settings;
-        try self.queued_prompts.append(alloc, queued);
+        queued.steer_target_turn_id = if (intent == .steer_if_active and
+            queued.recovery_checkpoint == null and
+            self.worker_processing and
+            self.active_turn_id != 0)
+            self.active_turn_id
+        else
+            null;
+
+        if (queued.steer_target_turn_id) |target_turn_id| {
+            var insert_index: usize = 0;
+            while (insert_index < self.queued_prompts.items.len and
+                self.queued_prompts.items[insert_index].steer_target_turn_id == target_turn_id) : (insert_index += 1)
+            {}
+            try self.queued_prompts.insert(alloc, insert_index, queued);
+        } else {
+            try self.queued_prompts.append(alloc, queued);
+        }
         self.queued_prompt_count += 1;
+        const delivery = if (queued.steer_target_turn_id != null) "steer" else "queue";
         debug_trace.logf(
             "worker",
-            "queued prompt bytes={d} queue_depth={d} fast_mode={s} effort={s}",
-            .{ queued.prompt.len, self.queued_prompt_count, if (queued.agent_settings.fast_mode) "true" else "false", queued.agent_settings.effort.label() },
+            "queued prompt bytes={d} queue_depth={d} delivery={s} steer_target_turn_id={d} fast_mode={s} effort={s}",
+            .{ queued.prompt.len, self.queued_prompt_count, delivery, queued.steer_target_turn_id orelse 0, if (queued.agent_settings.fast_mode) "true" else "false", queued.agent_settings.effort.label() },
         );
         debug_trace.eventf(
             "worker",
             "prompt_enqueue",
             .{ .turn_id = queued.turn_id },
-            "prompt_bytes={d} queue_depth={d} fast_mode={s} effort={s}",
-            .{ queued.prompt.len, self.queued_prompt_count, if (queued.agent_settings.fast_mode) "true" else "false", queued.agent_settings.effort.label() },
+            "prompt_bytes={d} queue_depth={d} delivery={s} steer_target_turn_id={d} fast_mode={s} effort={s}",
+            .{ queued.prompt.len, self.queued_prompt_count, delivery, queued.steer_target_turn_id orelse 0, if (queued.agent_settings.fast_mode) "true" else "false", queued.agent_settings.effort.label() },
         );
         self.worker_cond.broadcast(io_mod.getIo());
     }
@@ -1054,6 +1089,25 @@ pub const WorkerRuntime = struct {
     pub fn finishProcessing(self: *WorkerRuntime) void {
         debug_trace.logf("worker", "finish processing queued={d}", .{self.queuedPromptCount()});
         self.worker_mutex.lockUncancelable(io_mod.getIo());
+        const finished_turn_id = self.active_turn_id;
+        var demoted_count: usize = 0;
+        if (finished_turn_id != 0) {
+            for (self.queued_prompts.items) |*prompt| {
+                if (prompt.steer_target_turn_id == finished_turn_id) {
+                    prompt.steer_target_turn_id = null;
+                    demoted_count += 1;
+                }
+            }
+        }
+        if (demoted_count > 0) {
+            debug_trace.eventf(
+                "worker",
+                "steer_target_demoted",
+                .{ .turn_id = finished_turn_id },
+                "prompt_count={d}",
+                .{demoted_count},
+            );
+        }
         self.worker_processing = false;
         self.active_turn_id = 0;
         self.worker_connectivity_wait_active.store(false, .seq_cst);
@@ -1111,14 +1165,38 @@ pub const WorkerRuntime = struct {
         return self.active_turn_id;
     }
 
+    pub fn shouldYieldTurn(self: *WorkerRuntime, turn_id: u64) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+
+        if (turn_id == 0 or
+            self.worker_stop_requested or
+            !self.worker_processing or
+            self.active_turn_id != turn_id or
+            self.queue_admission != null or
+            self.turn_start_held)
+        {
+            return false;
+        }
+        for (self.queued_prompts.items) |prompt| {
+            if (prompt.steer_target_turn_id == turn_id) return true;
+        }
+        return false;
+    }
+
     pub fn queuePreview(self: *WorkerRuntime) QueuePreview {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
 
         const count = self.queued_prompts.items.len;
         if (count == 0) return .{};
+        var steering_count: usize = 0;
+        for (self.queued_prompts.items) |prompt| {
+            if (prompt.steer_target_turn_id != null) steering_count += 1;
+        }
         return .{
             .count = count,
+            .steering_count = steering_count,
             .paused = self.queue_admission != null,
         };
     }
@@ -2928,6 +3006,109 @@ test "dedicated turn finalizer queues before optional finish payload" {
         events.items[0].tool_lifecycle.turn_finished.turn_id,
     );
     try std.testing.expect(events.items[1] == .finish_prompt);
+}
+
+test "steer intent while idle preserves ordinary FIFO queueing" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "queued", "model"));
+    try runtime.enqueuePromptWithIntent(
+        alloc,
+        try makePrompt(alloc, "idle steer", "model"),
+        .steer_if_active,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), runtime.queued_prompts.items.len);
+    try std.testing.expectEqualStrings("queued", runtime.queued_prompts.items[0].prompt);
+    try std.testing.expectEqualStrings("idle steer", runtime.queued_prompts.items[1].prompt);
+    try std.testing.expect(runtime.queued_prompts.items[1].steer_target_turn_id == null);
+}
+
+test "targeted steers jump the queue in FIFO order and do not cascade" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "active", "model"));
+    const active = (try runtime.waitAndTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, active);
+    const active_turn_id = active.turn_id;
+
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "queued", "model"));
+    try runtime.enqueuePromptWithIntent(
+        alloc,
+        try makePrompt(alloc, "steer one", "model"),
+        .steer_if_active,
+    );
+    try runtime.enqueuePromptWithIntent(
+        alloc,
+        try makePrompt(alloc, "steer two", "model"),
+        .steer_if_active,
+    );
+
+    try std.testing.expectEqualStrings("steer one", runtime.queued_prompts.items[0].prompt);
+    try std.testing.expectEqualStrings("steer two", runtime.queued_prompts.items[1].prompt);
+    try std.testing.expectEqualStrings("queued", runtime.queued_prompts.items[2].prompt);
+    const preview = runtime.queuePreview();
+    try std.testing.expectEqual(@as(usize, 3), preview.count);
+    try std.testing.expectEqual(@as(usize, 2), preview.steering_count);
+    try std.testing.expectEqual(active_turn_id, runtime.queued_prompts.items[0].steer_target_turn_id.?);
+    try std.testing.expectEqual(active_turn_id, runtime.queued_prompts.items[1].steer_target_turn_id.?);
+    try std.testing.expect(runtime.shouldYieldTurn(active_turn_id));
+
+    const settled_turn: types.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("active") },
+        .assistant = @constCast("settled tool batch"),
+    } };
+    try runtime.propagateHistoryTurn(alloc, settled_turn, 8);
+    for (runtime.queued_prompts.items) |queued| {
+        try std.testing.expectEqual(@as(usize, 1), queued.history.len);
+        try std.testing.expectEqualStrings(
+            "settled tool batch",
+            queued.history[0].assistant.assistant,
+        );
+    }
+
+    try std.testing.expect(runtime.beginQueueReview(.manual));
+    try std.testing.expect(!runtime.shouldYieldTurn(active_turn_id));
+    try std.testing.expect(runtime.resumeQueueReview());
+    runtime.turn_start_held = true;
+    try std.testing.expect(!runtime.shouldYieldTurn(active_turn_id));
+    runtime.turn_start_held = false;
+    try std.testing.expect(runtime.shouldYieldTurn(active_turn_id));
+
+    runtime.finishProcessing();
+    try std.testing.expect(runtime.queued_prompts.items[0].steer_target_turn_id == null);
+    try std.testing.expect(runtime.queued_prompts.items[1].steer_target_turn_id == null);
+
+    const next = (try runtime.waitAndTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, next);
+    try std.testing.expectEqualStrings("steer one", next.prompt);
+    try std.testing.expect(!runtime.shouldYieldTurn(next.turn_id));
+    runtime.finishProcessing();
+}
+
+test "deleting the last targeted steer removes the yield request" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "active", "model"));
+    const active = (try runtime.waitAndTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, active);
+
+    try runtime.enqueuePromptWithIntent(
+        alloc,
+        try makePrompt(alloc, "steer", "model"),
+        .steer_if_active,
+    );
+    const steer_turn_id = runtime.queued_prompts.items[0].turn_id;
+    try std.testing.expect(runtime.shouldYieldTurn(active.turn_id));
+    try std.testing.expect(runtime.deleteQueuedPromptDraft(alloc, steer_turn_id, &.{}));
+    try std.testing.expect(!runtime.shouldYieldTurn(active.turn_id));
+    runtime.finishProcessing();
 }
 
 test "queue, event, snapshot, sync, history, and grant behavior" {

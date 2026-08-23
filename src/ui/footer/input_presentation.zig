@@ -56,6 +56,7 @@ pub const ComposedInputRows = struct {
 pub fn composeQueuedSummaryRow(
     alloc: Allocator,
     queued_count: usize,
+    steering_count_raw: usize,
     queued_paused: bool,
     width: u16,
 ) !std.ArrayList(u8) {
@@ -64,9 +65,22 @@ pub fn composeQueuedSummaryRow(
 
     // The paused hint row already owns the controls, so it drops the affordance.
     const affordance = if (queued_paused) "" else " · ↑ to edit";
+    const steering_count = @min(steering_count_raw, queued_count);
+    const queued_only_count = queued_count - steering_count;
     var row_buf: [max_top_row_len]u8 = undefined;
     const label = if (queued_count == 0)
         "queued"
+    else if (steering_count == queued_count)
+        if (steering_count == 1)
+            std.fmt.bufPrint(&row_buf, "1 steering message{s}", .{affordance}) catch "1 steering message"
+        else
+            std.fmt.bufPrint(&row_buf, "{d} steering messages{s}", .{ steering_count, affordance }) catch "steering messages"
+    else if (steering_count > 0)
+        std.fmt.bufPrint(
+            &row_buf,
+            "{d} steering · {d} queued{s}",
+            .{ steering_count, queued_only_count, affordance },
+        ) catch "steering and queued messages"
     else if (queued_count == 1)
         std.fmt.bufPrint(&row_buf, "1 queued message{s}", .{affordance}) catch "1 queued message"
     else
@@ -96,18 +110,26 @@ pub fn composeQueueReviewHintRow(
     return row;
 }
 
-test "collapsed queue banner counts the waiting prompts and offers the review" {
-    var single = try composeQueuedSummaryRow(std.testing.allocator, 1, false, 80);
+test "collapsed queue banner reports queued and steering prompts" {
+    var single = try composeQueuedSummaryRow(std.testing.allocator, 1, 0, false, 80);
     defer single.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, single.items, "1 queued message · ↑ to edit") != null);
 
-    var many = try composeQueuedSummaryRow(std.testing.allocator, 3, false, 80);
+    var many = try composeQueuedSummaryRow(std.testing.allocator, 3, 0, false, 80);
     defer many.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, many.items, "3 queued messages · ↑ to edit") != null);
+
+    var steering = try composeQueuedSummaryRow(std.testing.allocator, 1, 1, false, 80);
+    defer steering.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, steering.items, "1 steering message · ↑ to edit") != null);
+
+    var mixed = try composeQueuedSummaryRow(std.testing.allocator, 3, 2, false, 80);
+    defer mixed.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, mixed.items, "2 steering · 1 queued · ↑ to edit") != null);
 }
 
 test "collapsed queue banner drops the affordance while the review is paused" {
-    var row = try composeQueuedSummaryRow(std.testing.allocator, 2, true, 80);
+    var row = try composeQueuedSummaryRow(std.testing.allocator, 2, 0, true, 80);
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "2 queued messages") != null);
@@ -307,13 +329,14 @@ pub fn composeHintRow(
         null;
     var hint_buf: [max_status_line_len]u8 = undefined;
     var hint_with_subagents_buf: [max_status_line_len + 128]u8 = undefined;
-    const base_hint_line = ui_render.buildHintLine(
+    const base_hint_line = ui_render.buildHintLineWithSteering(
         ctx.stream.active,
         approval_active,
         ctx.has_api_key or (ctx.auth_picker.active and ctx.auth_picker.include_skip),
         ctx.model,
         ctx.permission_mode,
         ctx.queued_count,
+        ctx.steering_count,
         active_label,
         ctx.fast_mode,
         ctx.model_supports_fast,

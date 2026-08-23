@@ -2901,6 +2901,57 @@ test "vision fallback is available only through Gateway" {
     );
 }
 
+fn finishYieldedTurnIfRequested(
+    deps: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    arena: Allocator,
+    job: QueuedPrompt,
+    turn_id: u64,
+    step_ctx: TraceContext,
+    current_turn_messages: []const ChatMessage,
+    summary: *runtime_telemetry.TurnSummaryAccumulator,
+    stop_state: *CommonStopState,
+    finish_trace: *PromptFinishTrace,
+) !bool {
+    const should_yield = deps.should_yield_turn orelse return false;
+    if (!should_yield(deps.ctx, turn_id)) return false;
+
+    debug_trace.eventf(
+        "agent",
+        "turn_yield_requested",
+        step_ctx,
+        "settled_message_count={d}",
+        .{current_turn_messages.len},
+    );
+    const assistant_text = if (stop_state.retained_candidate != null)
+        try hooks.prompt.joinVisibleSegments(
+            arena,
+            stop_state.retained_candidate,
+            stop_state.latest_partial,
+        )
+    else
+        "";
+    stop_state.terminal_materializing = true;
+    try runtime_finalization.finishYieldedTurn(
+        deps,
+        finalization,
+        arena,
+        job,
+        current_turn_messages,
+        summary,
+        assistant_text,
+        finish_trace,
+    );
+    debug_trace.eventf(
+        "agent",
+        "turn_yield_completed",
+        step_ctx,
+        "settled_message_count={d}",
+        .{current_turn_messages.len},
+    );
+    return true;
+}
+
 fn processQueuedPromptLoop(
     deps: *const AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
@@ -7247,6 +7298,18 @@ fn processQueuedPromptLoop(
             );
             pending_image_ids = transition.pending_ids;
         }
+        if (!terminal_provider_completion and try finishYieldedTurnIfRequested(
+            deps,
+            finalization,
+            arena,
+            job,
+            turn_id,
+            step_ctx,
+            within_turn_suffix.items,
+            &summary_accumulator,
+            stop_state,
+            &finish_trace,
+        )) return;
         try runtime_tool_batch.appendReviewContinuationSuffix(
             config.review_enabled,
             arena,

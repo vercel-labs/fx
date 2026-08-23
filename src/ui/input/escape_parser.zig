@@ -109,6 +109,9 @@ fn kittyUnicodeKeyAction(keycode: u16, modifiers: u16, meta_prefixed: bool) Inpu
         }
         return if (keycode == kitty_up_key) .cursor_up else .cursor_down;
     }
+    // Plain terminals collapse Ctrl+Enter to Enter; enhanced reports preserve
+    // the modifier and expose the explicit queue shortcut.
+    if (keycode == 13 and mods == ctrl_modifier) return .submit_queued;
     if (keycode == 13 and (mods & (shift_modifier | alt_modifier)) != 0) {
         return .insert_newline;
     }
