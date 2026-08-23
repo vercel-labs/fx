@@ -14,6 +14,7 @@ const enable_virtual_terminal_processing: windows.DWORD = 0x0004;
 const wait_object_0: windows.DWORD = 0;
 const wait_timeout: windows.DWORD = 258;
 const wait_failed: windows.DWORD = 0xffffffff;
+const utf8_code_page: windows.DWORD = 65001;
 
 const Coord = extern struct {
     x: i16,
@@ -38,6 +39,8 @@ const ConsoleScreenBufferInfo = extern struct {
 pub const Mode = struct {
     input: windows.DWORD,
     output: windows.DWORD,
+    input_code_page: windows.DWORD,
+    output_code_page: windows.DWORD,
 };
 
 pub const Size = struct {
@@ -66,6 +69,11 @@ extern "kernel32" fn SetConsoleMode(
     mode: windows.DWORD,
 ) callconv(.winapi) windows.BOOL;
 
+extern "kernel32" fn GetConsoleCP() callconv(.winapi) windows.DWORD;
+extern "kernel32" fn SetConsoleCP(code_page: windows.DWORD) callconv(.winapi) windows.BOOL;
+extern "kernel32" fn GetConsoleOutputCP() callconv(.winapi) windows.DWORD;
+extern "kernel32" fn SetConsoleOutputCP(code_page: windows.DWORD) callconv(.winapi) windows.BOOL;
+
 extern "kernel32" fn GetConsoleScreenBufferInfo(
     handle: windows.HANDLE,
     info: *ConsoleScreenBufferInfo,
@@ -85,6 +93,8 @@ fn restoreForControlEvent(_: windows.DWORD) callconv(.winapi) windows.BOOL {
     if (saved_mode) |mode| {
         if (saved_input) |input| _ = SetConsoleMode(input, mode.input);
         if (saved_output) |output| _ = SetConsoleMode(output, mode.output);
+        _ = SetConsoleCP(mode.input_code_page);
+        _ = SetConsoleOutputCP(mode.output_code_page);
     }
     return .FALSE;
 }
@@ -102,7 +112,17 @@ pub fn captureMode(input: windows.HANDLE, output: windows.HANDLE) !Mode {
     {
         return error.NotATerminal;
     }
-    return .{ .input = input_mode, .output = output_mode };
+    const input_code_page = GetConsoleCP();
+    const output_code_page = GetConsoleOutputCP();
+    if (input_code_page == 0 or output_code_page == 0) {
+        return error.ConsoleModeUnavailable;
+    }
+    return .{
+        .input = input_mode,
+        .output = output_mode,
+        .input_code_page = input_code_page,
+        .output_code_page = output_code_page,
+    };
 }
 
 pub fn rawInputMode(original: windows.DWORD) windows.DWORD {
@@ -117,9 +137,19 @@ pub fn rawInputMode(original: windows.DWORD) windows.DWORD {
 }
 
 pub fn enableRawMode(input: windows.HANDLE, output: windows.HANDLE, original: Mode) !void {
+    errdefer {
+        _ = SetConsoleMode(input, original.input);
+        _ = SetConsoleMode(output, original.output);
+        _ = SetConsoleCP(original.input_code_page);
+        _ = SetConsoleOutputCP(original.output_code_page);
+    }
+    if (!SetConsoleCP(utf8_code_page).toBool() or
+        !SetConsoleOutputCP(utf8_code_page).toBool())
+    {
+        return error.ConsoleModeUnavailable;
+    }
     const input_mode = rawInputMode(original.input);
     if (!SetConsoleMode(input, input_mode).toBool()) return error.ConsoleModeUnavailable;
-    errdefer _ = SetConsoleMode(input, original.input);
 
     const output_mode = original.output | enable_virtual_terminal_processing;
     if (!SetConsoleMode(output, output_mode).toBool()) return error.ConsoleModeUnavailable;
@@ -145,6 +175,8 @@ pub fn restoreMode(input: windows.HANDLE, output: windows.HANDLE, original: Mode
     saved_mode = null;
     _ = SetConsoleMode(input, original.input);
     _ = SetConsoleMode(output, original.output);
+    _ = SetConsoleCP(original.input_code_page);
+    _ = SetConsoleOutputCP(original.output_code_page);
 }
 
 pub fn querySize(output: windows.HANDLE) !Size {
