@@ -695,7 +695,7 @@ pub fn freeExecuteResult(alloc: Allocator, result: ExecuteResult) void {
 }
 
 fn loadVisibleSkillsForContext(alloc: Allocator, workspace_root: []const u8, skills_dir: []const u8) !skill_runtime.SkillDiscovery {
-    if (io_mod.getenv("HOME") orelse homeFromSkillsDir(skills_dir)) |home| {
+    if (io_mod.homeDir() orelse homeFromSkillsDir(skills_dir)) |home| {
         return skill_runtime.loadVisibleSkills(alloc, workspace_root, home, skills_dir, test_root_policy);
     }
     return skill_runtime.loadVisibleSkills(alloc, workspace_root, null, skills_dir, test_root_policy);

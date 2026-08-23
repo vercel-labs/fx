@@ -248,7 +248,7 @@ fn loadsProjectInstructionFiles() bool {
 }
 
 fn gatherProjectContext(alloc: Allocator, input: InitialContextInput) context_contract.ProviderError!ProviderContext {
-    return gatherProjectContextWithHome(alloc, input, io_mod.getenv("HOME"));
+    return gatherProjectContextWithHome(alloc, input, io_mod.homeDir());
 }
 
 fn gatherProjectContextWithHome(
@@ -2090,7 +2090,7 @@ fn shellPath() ?[]const u8 {
 }
 
 fn homeDir() ?[]const u8 {
-    return io_mod.getenv("HOME") orelse io_mod.getenv("USERPROFILE");
+    return io_mod.homeDir() orelse io_mod.getenv("USERPROFILE");
 }
 
 fn todayUtcText(arena: Allocator) ![]const u8 {

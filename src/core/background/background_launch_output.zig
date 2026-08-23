@@ -118,7 +118,7 @@ pub fn prepareManaged(
 }
 
 pub fn prepareExternal(alloc: Allocator) !Output {
-    const root = io_mod.getenv("TMPDIR") orelse "/tmp";
+    const root = io_mod.tempDir() orelse ".";
     var attempt: usize = 0;
     while (attempt < 16) : (attempt += 1) {
         const name = try randomLogName(alloc);

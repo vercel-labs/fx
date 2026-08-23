@@ -1446,7 +1446,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
     defer ctx.deinit();
     if (options.save_session) {
-        _ = try ctx.session.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
+        _ = try ctx.session.initializeProfileUsage(alloc, io_mod.homeDir());
         ctx.session.attachProfileUsagePublisher(alloc);
     }
     ctx.use_process_interrupt_flag = options.deps.install_headless_interrupt;

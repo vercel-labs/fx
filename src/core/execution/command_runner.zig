@@ -1310,14 +1310,14 @@ fn artifactPath(alloc: Allocator, dir: []const u8, stem: []const u8, suffix: []c
 }
 
 fn fallbackCommandArtifactDir(alloc: Allocator) ![]u8 {
-    const temp_root = io_mod.getenv("TMPDIR") orelse "/tmp";
+    const temp_root = io_mod.tempDir() orelse ".";
     const pid_text = try std.fmt.allocPrint(alloc, "{d}", .{currentProcessId()});
     defer alloc.free(pid_text);
     return std.fs.path.join(alloc, &.{ temp_root, command_artifact_fallback_dir_name, pid_text });
 }
 
 fn currentProcessId() u64 {
-    return @intCast(std.c.getpid());
+    return @intCast(io_mod.processId());
 }
 
 fn elapsedMs(started_ms: i64, finished_ms: i64) u64 {
@@ -2049,7 +2049,7 @@ fn signalChild(
     process_group_id: ?std.posix.pid_t,
     force: bool,
 ) !void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         child.kill(io_mod.getIo());
         return;
     }
@@ -2060,6 +2060,7 @@ fn signalChild(
 }
 
 fn signalProcessGroup(pid: std.posix.pid_t, force: bool) !void {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
     std.posix.kill(-pid, if (force) std.posix.SIG.KILL else std.posix.SIG.TERM) catch |err| switch (err) {
         error.ProcessNotFound => {},
         else => return err,
@@ -2153,6 +2154,23 @@ test "format output covers stdout stderr empty signal and unknown statuses" {
     const signaled = try formatOutput(std.testing.allocator, "cmd", "/tmp", .{ .signal = .TERM }, "", "", null);
     defer std.testing.allocator.free(signaled.output);
     try std.testing.expectEqualStrings("signal=15\n(no output)\n", signaled.output);
+}
+
+test "Windows command execution uses cmd and returns foreground output" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const cwd = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(cwd);
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 4096,
+    }, alloc, "echo windows-command-ok", cwd);
+    defer alloc.free(result.output);
+
+    try std.testing.expect(std.mem.find(u8, result.output, "exit_code=0\n") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, "windows-command-ok") != null);
+    const foreground = result.command_result.?.foreground;
+    try std.testing.expectEqualStrings("echo windows-command-ok", foreground.command);
+    try std.testing.expectEqual(@as(?i64, 0), foreground.exit_code);
 }
 
 test "raw process execution returns foreground output" {

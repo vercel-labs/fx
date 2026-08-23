@@ -3,6 +3,7 @@ const host_target = @import("../hosts/target.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const windows_socket = @import("../shared/windows_socket.zig");
 const operation_control = @import("operation_control.zig");
 const secret = @import("../auth/secret.zig");
 
@@ -1006,7 +1007,7 @@ pub fn authorizeInteractive(
     alloc: Allocator,
     options: InteractiveAuthorizationOptions,
 ) !AuthorizationResult {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (comptime builtin.os.tag == .wasi) {
         return error.InteractiveMcpAuthorizationUnsupported;
     }
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -1252,23 +1253,37 @@ fn waitForInteractiveCallback(
     listener: *std.Io.net.Server,
     cancellation: operation_control.CancellationSources,
 ) !void {
-    var fds = [_]std.posix.pollfd{.{
-        .fd = listener.socket.handle,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
     var remaining_ms = interactive_callback_timeout_ms;
     while (remaining_ms > 0) {
         try checkAuthorizationCancellation(cancellation);
-        fds[0].revents = 0;
         const wait_ms = @min(remaining_ms, interactive_callback_poll_ms);
-        const ready = try std.posix.poll(&fds, wait_ms);
-        if (ready > 0) {
-            if ((fds[0].revents & std.posix.POLL.IN) == 0) {
+        if (comptime builtin.os.tag == .windows) {
+            const result = try windows_socket.poll(
+                listener.socket.handle,
+                windows_socket.poll_read,
+                wait_ms,
+            );
+            if (result.ready) {
+                try checkAuthorizationCancellation(cancellation);
+                return;
+            }
+            if (result.hung_up or result.has_error or result.invalid) {
                 return error.McpAuthorizationCallbackTimedOut;
             }
-            try checkAuthorizationCancellation(cancellation);
-            return;
+        } else {
+            var fds = [_]std.posix.pollfd{.{
+                .fd = listener.socket.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = try std.posix.poll(&fds, wait_ms);
+            if (ready > 0) {
+                if ((fds[0].revents & std.posix.POLL.IN) == 0) {
+                    return error.McpAuthorizationCallbackTimedOut;
+                }
+                try checkAuthorizationCancellation(cancellation);
+                return;
+            }
         }
         remaining_ms -= wait_ms;
     }
@@ -1858,9 +1873,18 @@ fn validateJsonContentType(content_type: ?[]const u8) !void {
     }
 }
 
-fn setSocketTimeouts(socket: std.posix.socket_t, seconds: i64) void {
+fn setSocketTimeouts(socket: std.Io.net.Socket.Handle, seconds: i64) void {
     if (comptime host_target.is_wasm) return;
-    const timeout = std.posix.timeval{ .sec = seconds, .usec = 0 };
+    if (comptime builtin.os.tag == .windows) {
+        const timeout_ms: u32 = @intCast(@max(seconds, 0) * std.time.ms_per_s);
+        windows_socket.setTimeouts(socket, timeout_ms) catch |err| debug_trace.logf(
+            "mcp",
+            "OAuth socket timeout setup failed err={s}",
+            .{@errorName(err)},
+        );
+        return;
+    }
+    const timeout = std.posix.timeval{ .sec = @intCast(seconds), .usec = 0 };
     const bytes = std.mem.asBytes(&timeout);
     std.posix.setsockopt(
         socket,

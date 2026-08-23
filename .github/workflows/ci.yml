@@ -60,6 +60,39 @@ jobs:
           MATRIX_RESULT: ${{ needs.zig_mode.result }}
         run: test "$MATRIX_RESULT" = success
 
+  windows-native:
+    name: Windows 11 Build & Test
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+          cache-key: ci-windows-native
+
+      - name: Check formatting
+        run: zig fmt --check src/
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Test Windows platform contracts
+        run: |
+          zig test src/core/shared/windows_console.zig
+          zig test src/core/shared/windows_process.zig
+          zig test src/core/shared/windows_file_io.zig
+          zig build test -Doptimize=ReleaseSafe '-Dtest-filter=Windows command execution uses cmd and returns foreground output'
+          zig build test -Doptimize=ReleaseSafe '-Dtest-filter=native provider transfers a prepared process to its owned handle'
+          zig build test -Doptimize=ReleaseSafe '-Dtest-filter=process instance tokens are canonical and require exact match'
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          .\zig-out\bin\fx.exe status --json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
   sdk-node-wasm:
     name: SDK (Node + WASM)
     runs-on: ubuntu-latest
@@ -305,6 +338,10 @@ jobs:
             target: x86_64-macos
           - name: macos-aarch64
             target: aarch64-macos
+          - name: windows-x86_64
+            target: x86_64-windows
+          - name: windows-aarch64
+            target: aarch64-windows
     steps:
       - uses: actions/checkout@v4
 

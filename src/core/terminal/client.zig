@@ -765,7 +765,7 @@ fn connectAndHandshakeOnce(
     process_provider: background_process_provider.Provider,
 ) !Connected {
     if (!host.isSupported()) return error.TerminalHostUnsupported;
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var paths = try host.Paths.open(alloc, home);
     defer paths.deinit(alloc);
 

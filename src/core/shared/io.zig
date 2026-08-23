@@ -1,8 +1,22 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const darwin_process_spawn = @import("darwin_process_spawn.zig");
+const windows_file_io = @import("windows_file_io.zig");
 
 pub const RawEnviron = [*:null]const ?[*:0]const u8;
+pub const ProcessId = if (builtin.os.tag == .windows) std.os.windows.DWORD else std.posix.pid_t;
+
+pub fn processId() ProcessId {
+    if (comptime builtin.os.tag == .windows) return std.os.windows.GetCurrentProcessId();
+    return std.c.getpid();
+}
+
+pub fn tempDir() ?[]const u8 {
+    if (comptime builtin.os.tag == .windows) {
+        return getenv("TEMP") orelse getenv("TMP") orelse getenv("TMPDIR");
+    }
+    return getenv("TMPDIR") orelse getenv("TEMP") orelse getenv("TMP");
+}
 
 // Process globals are installed before threads start and remain read-only.
 var real_io: ?std.Io = null;
@@ -20,7 +34,11 @@ pub fn setIo(zio: std.Io) void {
 }
 
 fn process_io_for(comptime os_tag: std.Target.Os.Tag, zio: std.Io) std.Io {
-    return if (os_tag == .macos) darwin_process_spawn.wrap(zio) else zio;
+    return switch (os_tag) {
+        .macos => darwin_process_spawn.wrap(zio),
+        .windows => windows_file_io.wrap(zio),
+        else => zio,
+    };
 }
 
 pub fn getIo() std.Io {
@@ -387,6 +405,12 @@ pub fn getenv(key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Returns the profile home used by fx. Native Windows does not define HOME,
+/// so USERPROFILE is the equivalent profile root there.
+pub fn homeDir() ?[]const u8 {
+    return getenv("HOME") orelse getenv("USERPROFILE");
+}
+
 pub fn e2eFailIfDurableMutationAttempted() void {
     const enabled = getenv("FX_E2E_FAIL_ON_DURABLE_MUTATION") orelse return;
     if (!std.mem.eql(u8, enabled, "1")) return;
@@ -465,7 +489,7 @@ pub fn writeFileAtomic(alloc: std.mem.Allocator, path: []const u8, text: []const
     e2eFailIfDurableMutationAttempted();
     const maybe_existing_permissions = existingFilePermissions(path);
     if (maybe_existing_permissions) |existing_permissions| {
-        if (existing_permissions.toMode() & 0o222 == 0) return error.AccessDenied;
+        if (!permissionsWritable(existing_permissions)) return error.AccessDenied;
     }
     const permissions = maybe_existing_permissions orelse .default_file;
     const temp_path = try std.fmt.allocPrint(alloc, "{s}.tmp.{d}", .{ path, nanoTimestamp() });
@@ -485,8 +509,51 @@ pub fn writeFileAtomic(alloc: std.mem.Allocator, path: []const u8, text: []const
     cleanup_temp = false;
 }
 
-const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+pub const private_dir_permissions = permissionsFromMode(0o700);
+pub const private_file_permissions = permissionsFromMode(0o600);
+
+/// Converts a POSIX-style creation mode into the target's permission model.
+/// Windows exposes DOS attributes rather than Unix ownership bits; its profile
+/// ACL remains authoritative and the read-only attribute is preserved.
+pub fn permissionsFromMode(mode: u32) std.Io.File.Permissions {
+    if (comptime builtin.os.tag == .windows) {
+        const attributes: u32 = if (mode & 0o222 == 0) 0x0001 else 0;
+        return @enumFromInt(attributes);
+    }
+    return std.Io.File.Permissions.fromMode(@intCast(mode));
+}
+
+pub fn permissionsMode(permissions: std.Io.File.Permissions) u32 {
+    if (comptime builtin.os.tag == .windows) {
+        return if (@intFromEnum(permissions) & 0x0001 != 0) 0o444 else 0o666;
+    }
+    return @intCast(permissions.toMode());
+}
+
+pub fn permissionsWritable(permissions: std.Io.File.Permissions) bool {
+    if (comptime builtin.os.tag == .windows) return @intFromEnum(permissions) & 0x0001 == 0;
+    return !permissions.readOnly();
+}
+
+pub fn permissionsGroupOrOtherWritable(permissions: std.Io.File.Permissions) bool {
+    if (comptime builtin.os.tag == .windows) return false;
+    return permissions.toMode() & 0o022 != 0;
+}
+
+pub fn permissionsPrivateFile(permissions: std.Io.File.Permissions) bool {
+    if (comptime builtin.os.tag == .windows) return true;
+    return permissions.toMode() & 0o077 == 0;
+}
+
+pub fn permissionsPrivateDir(permissions: std.Io.File.Permissions) bool {
+    if (comptime builtin.os.tag == .windows) return true;
+    return permissions.toMode() & 0o777 == 0o700;
+}
+
+pub fn setPrivateDirPermissions(dir: std.Io.Dir) !void {
+    if (comptime builtin.os.tag == .windows) return;
+    try dir.setPermissions(getIo(), private_dir_permissions);
+}
 
 pub const VerifiedDir = struct {
     dir: std.Io.Dir,
@@ -550,19 +617,19 @@ fn validateRelativeLeaf(name: []const u8) !void {
 fn verifyPrivateRegularFile(file: std.Io.File) !void {
     const stat = try file.stat(getIo());
     if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o600) return error.PrivateStatePermissionsUnsupported;
+    if (!permissionsPrivateFile(stat.permissions)) return error.PrivateStatePermissionsUnsupported;
 }
 
 fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
     const stat = try dir.stat(getIo());
     if (stat.kind != .directory) return error.DurablePathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o700) return error.PrivateStatePermissionsUnsupported;
+    if (!permissionsPrivateDir(stat.permissions)) return error.PrivateStatePermissionsUnsupported;
 }
 
 /// The handle must come from an `openDir` that requested iteration. Linux returns an
 /// `O_PATH` descriptor otherwise, and `fsync` rejects those with `EBADF`.
 pub fn syncVerifiedDir(dir: std.Io.Dir) !void {
-    if (comptime builtin.os.tag == .windows) return error.OperationUnsupported;
+    if (comptime builtin.os.tag == .windows) return;
     while (true) {
         const rc = std.c.fsync(dir.handle);
         if (rc == 0) return;
@@ -603,7 +670,7 @@ fn openOrCreateVerifiedPrivateChild(parent: std.Io.Dir, name: []const u8) !Verif
     };
     errdefer dir.close(zio);
 
-    dir.setPermissions(zio, private_dir_permissions) catch return error.PrivateStatePermissionsUnsupported;
+    setPrivateDirPermissions(dir) catch return error.PrivateStatePermissionsUnsupported;
     try verifyPrivateDirectory(dir);
     if (created) try syncVerifiedDir(parent);
     return .{ .dir = dir };
@@ -624,7 +691,7 @@ fn validateReplaceTarget(dir: std.Io.Dir, name: []const u8) !void {
         else => return err,
     };
     if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
-    if (stat.permissions.toMode() & 0o222 == 0) return error.AccessDenied;
+    if (!permissionsWritable(stat.permissions)) return error.AccessDenied;
 }
 
 fn cleanupVerifiedTemp(dir: std.Io.Dir, name: []const u8) void {
@@ -689,7 +756,7 @@ pub fn durableReplaceVerifiedWithOps(
         return error.DurableReplacePostRenameFailed;
     };
     if (final_stat.kind != .file or final_stat.nlink != 1 or
-        final_stat.permissions.toMode() & 0o777 != 0o600)
+        !permissionsPrivateFile(final_stat.permissions))
     {
         return error.DurableReplacePostRenameFailed;
     }
@@ -822,7 +889,7 @@ pub fn copyFileAtomic(alloc: std.mem.Allocator, source_path: []const u8, dest_pa
     const stat = try source.stat(zio);
     if (stat.kind != .file) return error.NotRegularFile;
     if (existingFilePermissions(dest_path)) |existing_permissions| {
-        if (existing_permissions.toMode() & 0o222 == 0) return error.AccessDenied;
+        if (!permissionsWritable(existing_permissions)) return error.AccessDenied;
     }
 
     const temp_path = try std.fmt.allocPrint(alloc, "{s}.tmp.{d}", .{ dest_path, nanoTimestamp() });
@@ -879,6 +946,12 @@ pub fn makeDirRecursive(path: []const u8) !void {
 }
 
 pub fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (comptime builtin.os.tag == .windows) {
+        return if (std.fs.path.isAbsolute(path))
+            std.Io.Dir.realPathFileAbsoluteAlloc(getIo(), path, alloc)
+        else
+            std.Io.Dir.cwd().realPathFileAlloc(getIo(), path, alloc);
+    }
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_z = try std.fmt.bufPrintZ(&buf, "{s}", .{path});
     var result_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -942,6 +1015,15 @@ pub fn dirRealpathAlloc(alloc: std.mem.Allocator, dir: std.Io.Dir, sub_path: []c
         const joined = try std.fs.path.join(alloc, &.{ dir_path, sub_path });
         defer alloc.free(joined);
         return realpathAlloc(alloc, joined);
+    } else if (comptime builtin.os.tag == .windows) {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_len = dir.realPath(getIo(), &path_buf) catch
+            return error.FileNotFound;
+        const dir_path = path_buf[0..path_len];
+        if (sub_path.len == 0) return alloc.dupe(u8, dir_path);
+        const joined = try std.fs.path.join(alloc, &.{ dir_path, sub_path });
+        defer alloc.free(joined);
+        return realpathAlloc(alloc, joined);
     } else if (comptime builtin.os.tag == .wasi) {
         if (std.fs.path.isAbsolute(sub_path)) return alloc.dupe(u8, sub_path);
         return std.fs.path.resolve(alloc, &.{sub_path});
@@ -982,6 +1064,26 @@ test "getenv returns set value after setEnvironMap" {
     setEnvironMap(&environ);
     try std.testing.expectEqualStrings("present", getenv("FX_IO_TEST").?);
     global_environ = null;
+}
+
+test "homeDir falls back to USERPROFILE when HOME is absent" {
+    const previous_environ = global_environ;
+    const previous_block = global_environ_block;
+    const previous_raw = global_raw_environ;
+    defer {
+        global_environ = previous_environ;
+        global_environ_block = previous_block;
+        global_raw_environ = previous_raw;
+    }
+
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("USERPROFILE", "C:\\Users\\fx-test");
+    setEnvironMap(&environ);
+    try std.testing.expectEqualStrings("C:\\Users\\fx-test", homeDir().?);
+
+    try environ.put("HOME", "C:\\Users\\preferred");
+    try std.testing.expectEqualStrings("C:\\Users\\preferred", homeDir().?);
 }
 
 test "environMap returns borrowed process environment map" {

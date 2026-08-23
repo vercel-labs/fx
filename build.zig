@@ -23,6 +23,7 @@ const NapiSurface = enum {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const test_filter = b.option([]const u8, "test-filter", "Run only tests whose names contain this text");
     const pgso_artifact = b.option(
         PgsoArtifact,
         "pgso-artifact",
@@ -58,9 +59,9 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .stack_check = false,
             .stack_protector = false,
-            .omit_frame_pointer = true,
-            .unwind_tables = .none,
-            .error_tracing = false,
+            .omit_frame_pointer = optimize != .Debug,
+            .unwind_tables = if (optimize == .Debug) .sync else .none,
+            .error_tracing = optimize == .Debug,
             .strip = optimize != .Debug,
         }),
     });
@@ -79,8 +80,10 @@ pub fn build(b: *std.Build) void {
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .filters = if (test_filter) |filter| &.{filter} else &.{},
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
+    if (b.args) |args| run_exe_tests.addArgs(args);
     run_exe_tests.step.dependOn(b.getInstallStep());
     run_exe_tests.setEnvironmentVariable(
         "FX_TEST_PRODUCT_EXE",

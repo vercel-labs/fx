@@ -43,74 +43,69 @@ const alternate_screen_enter = "\x1b[?1049h";
 const alternate_mouse_tracking_enter = "\x1b[?1000h\x1b[?1006h";
 const terminal_takeover_reset = "\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1004l\x1b[?1006l\x1b[?1l\x1b>\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b[4l\x1b[?6l\x1b[?7h\x1b[0m\x1b[?25h";
 
-/// Original handlers, written at bootstrap and restored at shutdown.
-/// Signal context never mutates them.
-var old_sigterm_action: ?std.posix.Sigaction = null;
-var old_sighup_action: ?std.posix.Sigaction = null;
+const AbnormalExitSignals = if (shell_runtime.supports_resize_signal) struct {
+    /// Original handlers, written at bootstrap and restored at shutdown.
+    /// Signal context never mutates them.
+    var old_sigterm_action: ?std.posix.Sigaction = null;
+    var old_sighup_action: ?std.posix.Sigaction = null;
 
-/// Restores terminal state, installs the default disposition, and re-raises.
-/// Must remain async-signal-safe: only `write(2)`, `sigaction(2)`, and `raise(3)`.
-fn abnormalExitHandlerWithRestore(comptime restore: []const u8, sig: std.posix.SIG) void {
-    // Signal context cannot recover from a failed async-signal-safe write.
-    _ = std.c.write(
-        std.posix.STDOUT_FILENO,
-        restore.ptr,
-        restore.len,
-    );
+    /// Restores terminal state, installs the default disposition, and re-raises.
+    /// Must remain async-signal-safe: only `write(2)`, `sigaction(2)`, and `raise(3)`.
+    fn handleWithRestore(comptime restore: []const u8, sig: std.posix.SIG) void {
+        _ = std.c.write(std.posix.STDOUT_FILENO, restore.ptr, restore.len);
+        const default_action: std.posix.Sigaction = .{
+            .handler = .{ .handler = std.posix.SIG.DFL },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(sig, &default_action, null);
+        _ = std.c.raise(sig);
+    }
 
-    const default_action: std.posix.Sigaction = .{
-        .handler = .{ .handler = std.posix.SIG.DFL },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(sig, &default_action, null);
-    _ = std.c.raise(sig);
-}
+    fn handle(sig: std.posix.SIG) callconv(.c) void {
+        handleWithRestore(abnormal_exit_restore, sig);
+    }
 
-fn abnormalExitHandler(sig: std.posix.SIG) callconv(.c) void {
-    abnormalExitHandlerWithRestore(abnormal_exit_restore, sig);
-}
+    fn handleTmux(sig: std.posix.SIG) callconv(.c) void {
+        handleWithRestore(tmux_abnormal_exit_restore, sig);
+    }
 
-fn tmuxAbnormalExitHandler(sig: std.posix.SIG) callconv(.c) void {
-    abnormalExitHandlerWithRestore(tmux_abnormal_exit_restore, sig);
-}
+    fn install(tmux: ?[]const u8) void {
+        const handler: std.posix.Sigaction.handler_fn = if (tmux == null) handle else handleTmux;
+        const act: std.posix.Sigaction = .{
+            .handler = .{ .handler = handler },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        var old_term: std.posix.Sigaction = undefined;
+        std.posix.sigaction(std.posix.SIG.TERM, &act, &old_term);
+        old_sigterm_action = old_term;
+        var old_hup: std.posix.Sigaction = undefined;
+        std.posix.sigaction(std.posix.SIG.HUP, &act, &old_hup);
+        old_sighup_action = old_hup;
+    }
 
-/// Install handlers for SIGTERM and SIGHUP so an externally-terminated
-/// fx restores terminal state before dying. SIGINT is not included
-/// because raw mode disables terminal-generated SIGINT.
+    fn uninstall() void {
+        if (old_sigterm_action) |old| {
+            std.posix.sigaction(std.posix.SIG.TERM, &old, null);
+            old_sigterm_action = null;
+        }
+        if (old_sighup_action) |old| {
+            std.posix.sigaction(std.posix.SIG.HUP, &old, null);
+            old_sighup_action = null;
+        }
+    }
+} else struct {
+    fn install(_: ?[]const u8) void {}
+    fn uninstall() void {}
+};
+
 pub fn installAbnormalExitHandlers(tmux: ?[]const u8) void {
-    if (!shell_runtime.supports_resize_signal) return;
-
-    const handler: std.posix.Sigaction.handler_fn = if (tmux == null)
-        abnormalExitHandler
-    else
-        tmuxAbnormalExitHandler;
-    const act: std.posix.Sigaction = .{
-        .handler = .{ .handler = handler },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-
-    var old_term: std.posix.Sigaction = undefined;
-    std.posix.sigaction(std.posix.SIG.TERM, &act, &old_term);
-    old_sigterm_action = old_term;
-
-    var old_hup: std.posix.Sigaction = undefined;
-    std.posix.sigaction(std.posix.SIG.HUP, &act, &old_hup);
-    old_sighup_action = old_hup;
+    AbnormalExitSignals.install(tmux);
 }
 
 pub fn uninstallAbnormalExitHandlers() void {
-    if (!shell_runtime.supports_resize_signal) return;
-
-    if (old_sigterm_action) |old| {
-        std.posix.sigaction(std.posix.SIG.TERM, &old, null);
-        old_sigterm_action = null;
-    }
-    if (old_sighup_action) |old| {
-        std.posix.sigaction(std.posix.SIG.HUP, &old, null);
-        old_sighup_action = null;
-    }
+    AbnormalExitSignals.uninstall();
 }
 
 pub const StartupState = struct {
@@ -612,7 +607,7 @@ pub fn suspendToJobControl(
     metrics: *Metrics,
     footer_rows: u16,
 ) !void {
-    if (!shell_runtime.supports_resize_signal) return;
+    if (comptime !shell_runtime.supports_resize_signal) return;
 
     suspendTerminalForJobControl(terminal, shell, metrics);
     _ = std.c.raise(std.posix.SIG.TSTP);

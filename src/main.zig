@@ -590,6 +590,7 @@ const App = struct {
             else
                 background_process.provider),
         };
+        app.shell.stdout_file = std.Io.File.stdout();
         if (comptime host_profile.js_host_workspace) {
             app.workspace_host = js_host_workspace.Runtime.init(alloc) catch |err| blk: {
                 if (err != error.WorkspaceUnavailable) {
@@ -747,6 +748,7 @@ const App = struct {
     /// Must be called after init() returns so the AutoUpgrade thread
     /// captures a pointer to the final App location (not a temporary).
     pub fn startAutoUpgrade(self: *App) void {
+        if (comptime builtin.os.tag == .windows) return;
         if (self.auto_upgrade_enabled) {
             self.upgrader.start(self.alloc, currentBuild());
         }
@@ -2607,6 +2609,12 @@ const App = struct {
     }
 
     fn admitPendingResizeSignal(self: *App, source: []const u8) bool {
+        if (comptime builtin.os.tag == .windows) {
+            const layout = self.terminal.queryLayout(footer_rows) catch return false;
+            if (layout.rows != self.shell.layout.rows or layout.cols != self.shell.layout.cols) {
+                resize_interlock.noteResizeSignal();
+            }
+        }
         return shell_runtime.admitResizeSignal(
             &self.shell,
             &resize_interlock,
@@ -2981,10 +2989,15 @@ fn rawArgs(c_argc: c_int, c_argv: [*][*:0]c_char) []const [*:0]const u8 {
 }
 
 fn argsFromRaw(raw_args: []const [*:0]const u8) std.process.Args {
+    if (comptime builtin.os.tag == .windows) {
+        const command_line = std.os.windows.peb().ProcessParameters.CommandLine;
+        return .{ .vector = command_line.Buffer.?[0 .. command_line.Length / @sizeOf(u16)] };
+    }
     return .{ .vector = raw_args };
 }
 
 fn environBlockFromRaw(raw_env: RawEnviron) std.process.Environ.Block {
+    if (comptime builtin.os.tag == .windows) return .global;
     var count: usize = 0;
     while (raw_env[count] != null) : (count += 1) {}
     return .{ .slice = raw_env[0..count :null] };
@@ -3362,10 +3375,10 @@ fn handleSigWinchWeb() callconv(.c) void {
     resize_interlock.noteResizeSignal();
 }
 
-const handle_sigwinch: app_lifecycle.ResizeHandler = if (host_target.is_wasm)
-    handleSigWinchWeb
+const handle_sigwinch: app_lifecycle.ResizeHandler = if (shell_runtime.supports_resize_signal)
+    handleSigWinchNative
 else
-    handleSigWinchNative;
+    handleSigWinchWeb;
 
 test "interactive startup does not begin with synthetic resize pending" {
     try std.testing.expect(!resize_interlock.resizePending());
