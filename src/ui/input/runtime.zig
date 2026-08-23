@@ -2962,6 +2962,10 @@ test "input escape parser handles enhanced alt+enter as queued submit" {
     // to a plain (steering) Enter; Shift keeps winning as the newline chord.
     try expectEscapeAction("[13;7u", .submit_queued);
     try expectEscapeAction("[13;4u", .insert_newline);
+    // Terminals that spell the Alt as an ESC prefix ahead of an unmodified
+    // report queue as well, instead of resolving to a plain steering Enter.
+    try expectEscapeAction("\x1b[13u", .submit_queued);
+    try expectEscapeAction("\x1b[13;1u", .submit_queued);
 }
 
 test "input escape parser handles shift+enter csi u sequence" {

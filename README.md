@@ -68,6 +68,8 @@ fx
 
 The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands.
 
+Enter sends a prompt. While a turn is running, it steers the agent: the turn stops after its current tool batch and picks the new prompt up next. Alt+Enter queues a prompt instead, leaving the running turn alone and sending it in order once the turn finishes. Shift+Enter inserts a newline, and wins when it is held together with Alt.
+
 The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
 
 ```json

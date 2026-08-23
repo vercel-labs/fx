@@ -30,25 +30,33 @@ fn connect_transition(err: std.posix.E, interrupted: bool) ConnectTransition {
     return switch (err) {
         .SUCCESS => .connected,
         .INTR => .retry,
-        // Darwin may complete a blocking connect after it returned EINTR. The
+        // The socket is nonblocking while the connection is established. Wait
+        // for readiness through a cancellable probe loop instead of surfacing
+        // the implementation detail to callers.
+        .AGAIN, .INPROGRESS, .ALREADY => .wait_for_completion,
+        // Darwin may complete a connect after it returned EINTR. The
         // required retry then reports EISCONN; that is success, not a caller bug.
         .ISCONN => if (interrupted) .connected else .other,
-        // While the interrupted connect is still establishing, the retry
-        // reports EALREADY; wait for the socket to become writable instead of
-        // surfacing a spurious ConnectionPending.
-        .ALREADY => if (interrupted) .wait_for_completion else .other,
         else => .other,
     };
 }
 
-/// std.Io.Threaded turns a pending cancel into EINTR and surfaces
-/// error.Canceled via Syscall.checkCancel. Our raw retry loops must do the
-/// same or a canceled connect keeps blocking until the kernel timeout.
-fn checkCancelAfterIntr(userdata: ?*anyopaque) std.Io.Cancelable!void {
+const ConnectError = std.Io.net.IpAddress.ConnectError;
+const connect_probe_interval_ns: i96 = 2 * std.time.ns_per_ms;
+const nonblocking_flag: usize = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
+
+fn original_io(userdata: ?*anyopaque) std.Io {
+    return .{
+        .userdata = userdata,
+        .vtable = wrapped_original_vtable.?,
+    };
+}
+
+fn check_cancel(userdata: ?*anyopaque) std.Io.Cancelable!void {
     return wrapped_original_vtable.?.checkCancel(userdata);
 }
 
-fn connectFailureError(err: std.posix.E) std.Io.net.IpAddress.ConnectError {
+fn connect_failure_error(err: std.posix.E) ConnectError {
     return switch (err) {
         .ADDRNOTAVAIL => error.AddressUnavailable,
         .AFNOSUPPORT => error.AddressFamilyUnsupported,
@@ -61,33 +69,21 @@ fn connectFailureError(err: std.posix.E) std.Io.net.IpAddress.ConnectError {
         .TIMEDOUT => error.Timeout,
         .ACCES, .PERM => error.AccessDenied,
         .NETDOWN => error.NetworkDown,
+        .NOBUFS, .NOMEM => error.SystemResources,
+        .CANCELED => error.Canceled,
         else => error.Unexpected,
     };
 }
 
-/// Wait for an interrupted blocking connect to finish establishing, then
-/// report its outcome from SO_ERROR.
-fn awaitInterruptedConnect(
+const ConnectProbe = struct {
+    context: ?*anyopaque,
+    ready_fn: *const fn (?*anyopaque, std.posix.socket_t) ConnectError!bool,
+};
+
+fn socket_connect_error(
     userdata: ?*anyopaque,
     socket_fd: std.posix.socket_t,
-) std.Io.net.IpAddress.ConnectError!void {
-    var poll_fds = [_]std.posix.pollfd{.{
-        .fd = socket_fd,
-        .events = std.posix.POLL.OUT,
-        .revents = 0,
-    }};
-    while (true) {
-        const rc = std.posix.system.poll(&poll_fds, poll_fds.len, -1);
-        switch (std.posix.errno(rc)) {
-            .SUCCESS => break,
-            .INTR => {
-                try checkCancelAfterIntr(userdata);
-                continue;
-            },
-            .NOMEM => return error.SystemResources,
-            else => return error.Unexpected,
-        }
-    }
+) ConnectError!std.posix.E {
     var so_error: c_int = 0;
     var option_len: std.posix.socklen_t = @sizeOf(c_int);
     while (true) {
@@ -99,13 +95,135 @@ fn awaitInterruptedConnect(
             &option_len,
         );
         switch (std.posix.errno(rc)) {
-            .SUCCESS => break,
-            .INTR => continue,
+            .SUCCESS => return @enumFromInt(so_error),
+            .INTR => {
+                try check_cancel(userdata);
+                continue;
+            },
             else => return error.Unexpected,
         }
     }
-    const completion: std.posix.E = @enumFromInt(so_error);
-    if (completion != .SUCCESS) return connectFailureError(completion);
+}
+
+/// Checks connect readiness without blocking. Waiting happens through the
+/// original Io sleep implementation below so std.Io cancellation can wake the
+/// task without access to Threaded.Syscall's private state.
+fn socket_connect_ready(
+    userdata: ?*anyopaque,
+    socket_fd: std.posix.socket_t,
+) ConnectError!bool {
+    var poll_fds = [_]std.posix.pollfd{.{
+        .fd = socket_fd,
+        .events = std.posix.POLL.OUT | std.posix.POLL.ERR | std.posix.POLL.HUP,
+        .revents = 0,
+    }};
+    while (true) {
+        poll_fds[0].revents = 0;
+        const rc = std.posix.system.poll(&poll_fds, poll_fds.len, 0);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return false;
+                const revents = poll_fds[0].revents;
+                if ((revents & std.posix.POLL.NVAL) != 0) return error.Unexpected;
+                if ((revents & (std.posix.POLL.OUT | std.posix.POLL.ERR | std.posix.POLL.HUP)) == 0) {
+                    return false;
+                }
+                return switch (try socket_connect_error(userdata, socket_fd)) {
+                    .SUCCESS => true,
+                    .AGAIN, .INPROGRESS, .ALREADY => false,
+                    else => |err| connect_failure_error(err),
+                };
+            },
+            .INTR => {
+                try check_cancel(userdata);
+                continue;
+            },
+            .NOMEM => return error.SystemResources,
+            .NETDOWN => return error.NetworkDown,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+fn next_connect_probe_timeout(io: std.Io, deadline: ?std.Io.Clock.Timestamp) ConnectError!std.Io.Timeout {
+    const target = deadline orelse return .{ .duration = .{
+        .clock = .awake,
+        .raw = .fromNanoseconds(connect_probe_interval_ns),
+    } };
+    const now = std.Io.Clock.Timestamp.now(io, target.clock);
+    if (!std.Io.Clock.Timestamp.compare(now, .lt, target)) return error.Timeout;
+    const remaining_ns = now.durationTo(target).raw.nanoseconds;
+    return .{ .duration = .{
+        .clock = target.clock,
+        .raw = .fromNanoseconds(@min(remaining_ns, connect_probe_interval_ns)),
+    } };
+}
+
+fn await_connect_completion(
+    userdata: ?*anyopaque,
+    socket_fd: std.posix.socket_t,
+    deadline: ?std.Io.Clock.Timestamp,
+    probe: ConnectProbe,
+) ConnectError!void {
+    const io = original_io(userdata);
+    while (true) {
+        try check_cancel(userdata);
+        if (try probe.ready_fn(probe.context, socket_fd)) return;
+        try wrapped_original_vtable.?.sleep(
+            userdata,
+            try next_connect_probe_timeout(io, deadline),
+        );
+    }
+}
+
+fn get_status_flags(userdata: ?*anyopaque, socket_fd: std.posix.socket_t) ConnectError!usize {
+    while (true) {
+        const rc = std.posix.system.fcntl(socket_fd, std.posix.F.GETFL, @as(usize, 0));
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => {
+                try check_cancel(userdata);
+                continue;
+            },
+            else => return error.Unexpected,
+        }
+    }
+}
+
+fn set_status_flags(
+    userdata: ?*anyopaque,
+    socket_fd: std.posix.socket_t,
+    flags: usize,
+) ConnectError!void {
+    while (true) {
+        const rc = std.posix.system.fcntl(socket_fd, std.posix.F.SETFL, flags);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => {
+                try check_cancel(userdata);
+                continue;
+            },
+            else => return error.Unexpected,
+        }
+    }
+}
+
+fn set_close_on_exec(userdata: ?*anyopaque, socket_fd: std.posix.socket_t) ConnectError!void {
+    while (true) {
+        const rc = std.posix.system.fcntl(
+            socket_fd,
+            std.posix.F.SETFD,
+            @as(usize, std.posix.FD_CLOEXEC),
+        );
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => {
+                try check_cancel(userdata);
+                continue;
+            },
+            else => return error.Unexpected,
+        }
+    }
 }
 
 fn net_connect_ip(
@@ -116,9 +234,9 @@ fn net_connect_ip(
     if (comptime builtin.os.tag != .macos) {
         return wrapped_original_vtable.?.netConnectIp(userdata, address, options);
     }
-    if (options.timeout != .none) {
-        return wrapped_original_vtable.?.netConnectIp(userdata, address, options);
-    }
+
+    try check_cancel(userdata);
+    const deadline = options.timeout.toTimestamp(original_io(userdata));
 
     const family = std.Io.Threaded.posixAddressFamily(address);
     const mode, const protocol = std.Io.Threaded.posixSocketModeProtocol(
@@ -134,7 +252,7 @@ fn net_connect_ip(
         switch (std.posix.errno(rc)) {
             .SUCCESS => break :socket @as(std.posix.socket_t, @intCast(rc)),
             .INTR => {
-                try checkCancelAfterIntr(userdata);
+                try check_cancel(userdata);
                 continue;
             },
             .AFNOSUPPORT => return error.AddressFamilyUnsupported,
@@ -148,21 +266,9 @@ fn net_connect_ip(
         }
     };
     errdefer std.Io.Threaded.closeFd(socket_fd);
-    while (true) {
-        const rc = std.posix.system.fcntl(
-            socket_fd,
-            std.posix.F.SETFD,
-            @as(usize, std.posix.FD_CLOEXEC),
-        );
-        switch (std.posix.errno(rc)) {
-            .SUCCESS => break,
-            .INTR => {
-                try checkCancelAfterIntr(userdata);
-                continue;
-            },
-            else => return error.Unexpected,
-        }
-    }
+    try set_close_on_exec(userdata, socket_fd);
+    const original_status_flags = try get_status_flags(userdata, socket_fd);
+    try set_status_flags(userdata, socket_fd, original_status_flags | nonblocking_flag);
 
     var storage: std.Io.Threaded.PosixAddress = undefined;
     var address_len = std.Io.Threaded.addressToPosix(address, &storage);
@@ -176,24 +282,29 @@ fn net_connect_ip(
         switch (connect_transition(err, interrupted)) {
             .connected => break,
             .retry => {
-                try checkCancelAfterIntr(userdata);
+                try check_cancel(userdata);
                 interrupted = true;
                 continue;
             },
             .wait_for_completion => {
-                try awaitInterruptedConnect(userdata, socket_fd);
+                try await_connect_completion(userdata, socket_fd, deadline, .{
+                    .context = userdata,
+                    .ready_fn = socket_connect_ready,
+                });
                 break;
             },
-            .other => return connectFailureError(err),
+            .other => return connect_failure_error(err),
         }
     }
+    try check_cancel(userdata);
+    try set_status_flags(userdata, socket_fd, original_status_flags);
 
     while (true) {
         const rc = std.posix.system.getsockname(socket_fd, &storage.any, &address_len);
         switch (std.posix.errno(rc)) {
             .SUCCESS => break,
             .INTR => {
-                try checkCancelAfterIntr(userdata);
+                try check_cancel(userdata);
                 continue;
             },
             .NOBUFS => return error.SystemResources,
@@ -495,14 +606,107 @@ test "Darwin connect accepts EISCONN only after an interrupted connect" {
     try std.testing.expectEqual(ConnectTransition.connected, connect_transition(.SUCCESS, false));
 }
 
-test "Darwin connect waits out EALREADY only after an interrupted connect" {
+test "Darwin nonblocking connect waits for completion" {
+    try std.testing.expectEqual(ConnectTransition.wait_for_completion, connect_transition(.AGAIN, false));
+    try std.testing.expectEqual(ConnectTransition.wait_for_completion, connect_transition(.INPROGRESS, false));
     try std.testing.expectEqual(ConnectTransition.wait_for_completion, connect_transition(.ALREADY, true));
-    try std.testing.expectEqual(ConnectTransition.other, connect_transition(.ALREADY, false));
+    try std.testing.expectEqual(ConnectTransition.wait_for_completion, connect_transition(.ALREADY, false));
 }
 
 fn darwin_io() !std.Io {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     return wrap(std.testing.io);
+}
+
+const PendingConnectProbe = struct {
+    calls: std.atomic.Value(usize) = .init(0),
+
+    fn probe(self: *@This()) ConnectProbe {
+        return .{
+            .context = @ptrCast(self),
+            .ready_fn = ready,
+        };
+    }
+
+    fn ready(raw: ?*anyopaque, _: std.posix.socket_t) ConnectError!bool {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        _ = self.calls.fetchAdd(1, .seq_cst);
+        return false;
+    }
+};
+
+fn await_pending_connect_probe(userdata: ?*anyopaque, probe: ConnectProbe) ConnectError!void {
+    return await_connect_completion(userdata, -1, null, probe);
+}
+
+test "Darwin pending connect cancellation wakes through the original Io" {
+    const io = try darwin_io();
+    var pending = PendingConnectProbe{};
+    var future = try std.Io.concurrent(
+        io,
+        await_pending_connect_probe,
+        .{ io.userdata, pending.probe() },
+    );
+    defer future.cancel(io) catch {};
+
+    const observation_deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(1_000),
+    });
+    while (pending.calls.load(.seq_cst) == 0) {
+        const now = std.Io.Clock.Timestamp.now(io, .awake);
+        if (!std.Io.Clock.Timestamp.compare(now, .lt, observation_deadline)) {
+            return error.ConnectProbeDidNotStart;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+
+    const started = std.Io.Clock.Timestamp.now(io, .awake);
+    try std.testing.expectError(error.Canceled, future.cancel(io));
+    const elapsed_ms = started.durationTo(
+        std.Io.Clock.Timestamp.now(io, .awake),
+    ).raw.toMilliseconds();
+    try std.testing.expect(elapsed_ms < 500);
+}
+
+test "Darwin pending connect honors its deadline" {
+    const io = try darwin_io();
+    var pending = PendingConnectProbe{};
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(10),
+    });
+    const started = std.Io.Clock.Timestamp.now(io, .awake);
+    try std.testing.expectError(
+        error.Timeout,
+        await_connect_completion(io.userdata, -1, deadline, pending.probe()),
+    );
+    const elapsed_ms = started.durationTo(
+        std.Io.Clock.Timestamp.now(io, .awake),
+    ).raw.toMilliseconds();
+    try std.testing.expect(pending.calls.load(.seq_cst) > 0);
+    try std.testing.expect(elapsed_ms < 500);
+}
+
+test "Darwin connect honors timeout options and restores blocking mode" {
+    const io = try darwin_io();
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try listen_address.listen(io, .{});
+    defer server.deinit(io);
+
+    var stream = try server.socket.address.connect(io, .{
+        .mode = .stream,
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = .fromMilliseconds(1_000),
+        } },
+    });
+    defer stream.close(io);
+    var accepted = try server.accept(io);
+    defer accepted.close(io);
+
+    const status_flags = try get_status_flags(io.userdata, stream.socket.handle);
+    try std.testing.expectEqual(@as(usize, 0), status_flags & nonblocking_flag);
 }
 
 fn expect_exited(term: std.process.Child.Term, expected: u8) !void {
