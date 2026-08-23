@@ -68,7 +68,9 @@ pub const QueuedPrompt = struct {
     /// session replays the turn id persisted in its recovery checkpoint, so
     /// nothing here may rest on an id identifying one turn for all time.
     steer_target_turn_id: ?u64 = null,
-    /// Set for every prompt submitted with steering intent, and never cleared.
+    /// Set when the prompt actually took a steer target, and never cleared
+    /// after that. Steering intent alone is not enough: an Enter pressed while
+    /// nothing is running takes no target and is an ordinary queued prompt.
     /// `steer_target_turn_id` answers "may this yield the running turn"; this
     /// answers "where does this belong in the queue", which outlives the turn
     /// it was aimed at. Ordering must not read the target: once demotion nulls

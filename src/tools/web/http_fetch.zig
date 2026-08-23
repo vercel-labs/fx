@@ -1233,9 +1233,11 @@ fn connectPinned(address: IpAddress, options: FetchOptions) !posix.fd_t {
     var storage: PosixAddress = undefined;
     const len = addressToPosix(address, &storage);
     // The descriptor is nonblocking (see openSocket), so connect reports
-    // EINPROGRESS rather than waiting; the EINTR arm below is a cheap retry for
-    // a kernel that waits anyway, not a path this normally takes. Nothing here
-    // may treat EISCONN as success on the strength of a preceding EINTR.
+    // EINPROGRESS rather than waiting and should never report EINTR; the arm
+    // below is a cheap retry, not a path this normally takes. Unlike the Darwin
+    // netConnectIp wrapper, that retry has no EISCONN arm to land on, so a
+    // connection that completes between the two calls would be reported as a
+    // failure. Unreachable while the descriptor stays nonblocking.
     while (true) switch (posix.errno(posix.system.connect(fd, &storage.any, len))) {
         .SUCCESS => return fd,
         .INTR => {
