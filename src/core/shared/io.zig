@@ -62,7 +62,7 @@ pub fn openDirAbsoluteNoFollow(path: []const u8, options: std.Io.Dir.OpenOptions
     return result;
 }
 
-test "Darwin process I/O replaces only processSpawn with stable storage" {
+test "Darwin process I/O replaces spawn and connect with stable storage" {
     const original = std.testing.io;
     const selected = process_io_for(.macos, original);
     const selected_again = process_io_for(.macos, original);
@@ -70,7 +70,9 @@ test "Darwin process I/O replaces only processSpawn with stable storage" {
     try std.testing.expect(selected.userdata == original.userdata);
     try std.testing.expect(selected.vtable == selected_again.vtable);
     inline for (@typeInfo(std.Io.VTable).@"struct".fields) |field| {
-        if (comptime std.mem.eql(u8, field.name, "processSpawn")) {
+        if (comptime std.mem.eql(u8, field.name, "processSpawn") or
+            std.mem.eql(u8, field.name, "netConnectIp"))
+        {
             try std.testing.expect(@field(selected.vtable, field.name) != @field(original.vtable, field.name));
         } else {
             try std.testing.expectEqual(@field(original.vtable, field.name), @field(selected.vtable, field.name));

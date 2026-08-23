@@ -10,11 +10,126 @@ pub fn wrap(original: std.Io) std.Io {
     } else {
         wrapped_vtable = original.vtable.*;
         wrapped_vtable.processSpawn = process_spawn;
+        wrapped_vtable.netConnectIp = net_connect_ip;
         wrapped_original_vtable = original.vtable;
     }
     return .{
         .userdata = original.userdata,
         .vtable = &wrapped_vtable,
+    };
+}
+
+const ConnectTransition = enum {
+    connected,
+    retry,
+    other,
+};
+
+fn connect_transition(err: std.posix.E, interrupted: bool) ConnectTransition {
+    return switch (err) {
+        .SUCCESS => .connected,
+        .INTR => .retry,
+        // Darwin may complete a blocking connect after it returned EINTR. The
+        // required retry then reports EISCONN; that is success, not a caller bug.
+        .ISCONN => if (interrupted) .connected else .other,
+        else => .other,
+    };
+}
+
+fn net_connect_ip(
+    userdata: ?*anyopaque,
+    address: *const std.Io.net.IpAddress,
+    options: std.Io.net.IpAddress.ConnectOptions,
+) std.Io.net.IpAddress.ConnectError!std.Io.net.Socket {
+    if (comptime builtin.os.tag != .macos) {
+        return wrapped_original_vtable.?.netConnectIp(userdata, address, options);
+    }
+    if (options.timeout != .none) {
+        return wrapped_original_vtable.?.netConnectIp(userdata, address, options);
+    }
+
+    const family = std.Io.Threaded.posixAddressFamily(address);
+    const mode, const protocol = std.Io.Threaded.posixSocketModeProtocol(
+        family,
+        options.mode,
+        options.protocol,
+    ) catch |err| switch (err) {
+        error.ProtocolUnsupportedByAddressFamily => return error.ProtocolUnsupportedByAddressFamily,
+        else => return error.Unexpected,
+    };
+    const socket_fd = socket: while (true) {
+        const rc = std.posix.system.socket(family, mode, protocol);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => break :socket @as(std.posix.socket_t, @intCast(rc)),
+            .INTR => continue,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .INVAL => return error.ProtocolUnsupportedBySystem,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS, .NOMEM => return error.SystemResources,
+            .PROTONOSUPPORT => return error.ProtocolUnsupportedByAddressFamily,
+            .PROTOTYPE => return error.SocketModeUnsupported,
+            else => return error.Unexpected,
+        }
+    };
+    errdefer std.Io.Threaded.closeFd(socket_fd);
+    while (true) {
+        const rc = std.posix.system.fcntl(
+            socket_fd,
+            std.posix.F.SETFD,
+            @as(usize, std.posix.FD_CLOEXEC),
+        );
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.Unexpected,
+        }
+    }
+
+    var storage: std.Io.Threaded.PosixAddress = undefined;
+    var address_len = std.Io.Threaded.addressToPosix(address, &storage);
+    var interrupted = false;
+    while (true) {
+        const err = std.posix.errno(std.posix.system.connect(
+            socket_fd,
+            &storage.any,
+            address_len,
+        ));
+        switch (connect_transition(err, interrupted)) {
+            .connected => break,
+            .retry => {
+                interrupted = true;
+                continue;
+            },
+            .other => switch (err) {
+                .ADDRNOTAVAIL => return error.AddressUnavailable,
+                .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+                .AGAIN, .INPROGRESS => return error.WouldBlock,
+                .ALREADY => return error.ConnectionPending,
+                .CONNREFUSED => return error.ConnectionRefused,
+                .CONNRESET => return error.ConnectionResetByPeer,
+                .HOSTUNREACH => return error.HostUnreachable,
+                .NETUNREACH => return error.NetworkUnreachable,
+                .TIMEDOUT => return error.Timeout,
+                .ACCES, .PERM => return error.AccessDenied,
+                .NETDOWN => return error.NetworkDown,
+                else => return error.Unexpected,
+            },
+        }
+    }
+
+    while (true) {
+        const rc = std.posix.system.getsockname(socket_fd, &storage.any, &address_len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => break,
+            .INTR => continue,
+            .NOBUFS => return error.SystemResources,
+            else => return error.Unexpected,
+        }
+    }
+    return .{
+        .handle = socket_fd,
+        .address = std.Io.Threaded.addressFromPosix(&storage),
     };
 }
 
@@ -298,6 +413,13 @@ fn close_fd(fd: std.posix.fd_t) void {
         .SUCCESS, .INTR => {},
         else => {},
     }
+}
+
+test "Darwin connect accepts EISCONN only after an interrupted connect" {
+    try std.testing.expectEqual(ConnectTransition.retry, connect_transition(.INTR, false));
+    try std.testing.expectEqual(ConnectTransition.connected, connect_transition(.ISCONN, true));
+    try std.testing.expectEqual(ConnectTransition.other, connect_transition(.ISCONN, false));
+    try std.testing.expectEqual(ConnectTransition.connected, connect_transition(.SUCCESS, false));
 }
 
 fn darwin_io() !std.Io {
