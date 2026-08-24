@@ -198,6 +198,8 @@ const FxLoginRefreshMode = enum { if_needed, force };
 
 pub const missing_credential_message = "Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_interactive_credential_message = "Fx needs access to Vercel AI Gateway. Run /login to sign in, /setup to use an API key, or set AI_GATEWAY_API_KEY.";
+pub const missing_bare_credential_message = "fx ask --bare never reads OAuth logins or stored keys. Set AI_GATEWAY_API_KEY (or VERCEL_OIDC_TOKEN) in the environment.";
+pub const missing_bare_subscription_credential_message = "fx ask --bare never reads OAuth logins or stored keys, so ChatGPT and Grok subscription credentials are unavailable. Use the gateway with AI_GATEWAY_API_KEY.";
 pub const missing_chatgpt_credential_message = "fx needs a Codex subscription login for this model. Run fx login codex.";
 pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login and choose Sign in with Codex.";
 pub const missing_grok_credential_message = "fx needs a Grok subscription login for this model. Run fx login grok.";
@@ -352,6 +354,28 @@ pub fn resolvePreferring(
     };
     if (stored) |credential| return .{ .credential = credential, .fx_login_status = fx_login_status };
     return .{ .stored_key_status = status, .fx_login_status = fx_login_status };
+}
+
+pub fn envCredentialAvailable() bool {
+    return nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null or
+        nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null;
+}
+
+/// Bare-mode credential resolution: environment-variable keys only. OAuth
+/// session files and the secret store are never read, and subscription
+/// providers (codex, grok) have no environment key, so they do not resolve.
+pub fn resolveEnvOnly(
+    alloc: std.mem.Allocator,
+    provider: model_provider.ProviderId,
+) !Resolution {
+    if (provider != .gateway) return .{};
+    if (try loadSource(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .vercel_oidc_token)) |credential| {
+        return .{ .credential = credential };
+    }
+    if (try loadSource(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .ai_gateway_api_key)) |credential| {
+        return .{ .credential = credential };
+    }
+    return .{};
 }
 
 fn loadFxLoginForPrecedence(
@@ -919,6 +943,49 @@ test "source-specific credential loading bypasses generic precedence" {
     try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .ai_gateway_api_key));
     try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .vercel_oidc_token));
     try std.testing.expect(!(try sourceExists(alloc, host.unavailable_secret_store, .stored_key)));
+}
+
+test "bare resolution reads only environment keys and prefers OIDC" {
+    const alloc = std.testing.allocator;
+    const env = try CredentialTestEnv.install(alloc, &.{
+        .{ "VERCEL_OIDC_TOKEN", "oidc-token" },
+        .{ "AI_GATEWAY_API_KEY", "api-key" },
+    });
+    defer env.deinit();
+
+    const resolution = try resolveEnvOnly(alloc, .gateway);
+    var credential = resolution.credential orelse return error.TestExpectedCredential;
+    defer credential.deinit(alloc);
+    try std.testing.expectEqualStrings("oidc-token", credential.token);
+    try std.testing.expectEqual(Source.vercel_oidc_token, credential.source);
+
+    const api_only = try resolveEnvOnly(alloc, .codex);
+    try std.testing.expect(api_only.credential == null);
+    const grok_only = try resolveEnvOnly(alloc, .grok);
+    try std.testing.expect(grok_only.credential == null);
+}
+
+test "bare resolution falls back to the API key and reports absence" {
+    const alloc = std.testing.allocator;
+
+    {
+        const env = try CredentialTestEnv.install(alloc, &.{
+            .{ "AI_GATEWAY_API_KEY", "api-key" },
+        });
+        defer env.deinit();
+        const resolution = try resolveEnvOnly(alloc, .gateway);
+        var credential = resolution.credential orelse return error.TestExpectedCredential;
+        defer credential.deinit(alloc);
+        try std.testing.expectEqualStrings("api-key", credential.token);
+        try std.testing.expectEqual(Source.ai_gateway_api_key, credential.source);
+    }
+
+    {
+        const env = try CredentialTestEnv.install(alloc, &.{});
+        defer env.deinit();
+        const resolution = try resolveEnvOnly(alloc, .gateway);
+        try std.testing.expect(resolution.credential == null);
+    }
 }
 
 test "a remembered choice outranks the environment" {

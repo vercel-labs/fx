@@ -196,6 +196,7 @@ pub const Config = struct {
     tool_set: tool_set_contract.ToolSet,
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
+    load_mcp_runtime_from_path: mcp_runtime.LoadRuntimeFromPathFn,
     acp_runner: acp_runner.Runner,
 };
 
@@ -2980,6 +2981,7 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .max_history_turns = cfg.max_history_turns,
         .mode_registry = cfg.mode_registry,
         .load_mcp_runtime = cfg.load_mcp_runtime,
+        .load_mcp_runtime_from_path = cfg.load_mcp_runtime_from_path,
     };
 }
 
@@ -5180,6 +5182,10 @@ fn noMcpRuntimeForTest(_: Allocator, _: @import("../mcp/elicitation.zig").Capabi
     return null;
 }
 
+fn noMcpRuntimeFromPathForTest(_: Allocator, _: @import("../mcp/elicitation.zig").Capabilities, _: []const u8) !?*mcp_runtime.McpRuntime {
+    return null;
+}
+
 fn clearMcpConfigInspectionForTest(
     _: Allocator,
 ) error{OutOfMemory}!mcp_contract.ProfileConfigDiagnostic {
@@ -5247,6 +5253,7 @@ fn testConfig() Config {
         .mode_registry = .{ .default_mode_id = "surface" },
         .inspect_mcp_profile_config = clearMcpConfigInspectionForTest,
         .load_mcp_runtime = noMcpRuntimeForTest,
+        .load_mcp_runtime_from_path = noMcpRuntimeFromPathForTest,
         .acp_runner = .{ .run_fn = unexpectedAcpRunForTest },
         .tool_set = .{
             .registry = .{ .tools = &.{} },

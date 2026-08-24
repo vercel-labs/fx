@@ -91,6 +91,10 @@ fn allocateRuntimeGeneration() u64 {
 
 pub const LoadRuntimeFn = *const fn (Allocator, elicitation.Capabilities) anyerror!?*McpRuntime;
 
+/// Explicit-config variant of `LoadRuntimeFn`: load servers from the given
+/// file instead of the profile default (`fx ask --mcp-config`).
+pub const LoadRuntimeFromPathFn = *const fn (Allocator, elicitation.Capabilities, []const u8) anyerror!?*McpRuntime;
+
 const ConnectionControl = struct {
     deadline: ?std.Io.Clock.Timestamp = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
