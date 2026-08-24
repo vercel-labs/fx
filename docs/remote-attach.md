@@ -46,7 +46,7 @@ Ordinary input lines submit prompts. The first presentation supports:
 - `/mode <id>`
 - `/detach`
 
-EOF and `/detach` release only the presentation. Already accepted work continues in the server.
+EOF and `/detach` release only the presentation. Already accepted work continues in the server. Model and mode changes are accepted only while the resident session is idle, so a configuration request cannot wait behind active provider work.
 
 ## Protocol
 
@@ -71,7 +71,7 @@ Prompts use caller-generated operation IDs. Repeating the same ID with the same 
 
 ## Backpressure and limits
 
-Each presentation sends semantic JSON-RPC through one ordered writer queue. A queue accepts at most 64 messages and 8 MiB. The server closes a slow or overflowing presentation rather than blocking agent execution or silently dropping semantic events. RFC 6455 ping replies are the sole control-frame exception: they are limited to 125 bytes and serialized with the same wire mutex, but do not enter the semantic queue. A resident server is bounded to 16 session actors, 16 attachments per actor, 128 retained operation records per actor, and 256 projected tool records per actor.
+Each presentation sends semantic JSON-RPC through one ordered writer queue. A queue accepts at most 64 messages and 8 MiB. The server closes a slow or overflowing presentation rather than blocking agent execution or silently dropping semantic events. RFC 6455 ping replies are the sole control-frame exception: they are limited to 125 bytes and serialized with the same wire mutex, but do not enter the semantic queue. A resident server is bounded to 16 session actors, 16 attachments per actor, 128 retained operation records per actor, and 256 projected tool records per actor. If another distinct tool would exceed that projection bound, the host closes existing presentations and rejects new snapshots for that actor rather than returning incomplete state; resident execution and session persistence remain host-owned.
 
 ## Tailscale Serve
 
@@ -117,8 +117,8 @@ Serve capabilities authorize actions and resources but do not uniquely identify 
 The first vertical slice is covered by deterministic tests and built-binary probes:
 
 - `zig fmt --check src/` and `zig build -Doptimize=ReleaseSafe`
-- focused Zig tests for capability parsing, allocation cleanup, attachment fencing, atomic snapshot registration, UTF-8-safe chunk reassembly, frame and queue limits, operation eviction, connection-task ownership, semantic sanitization, and client protocol failures
-- `bun test --max-concurrency 1 remote-attach.test.ts`: six tests covering 194 assertions
+- focused Zig tests for capability parsing, allocation cleanup, attachment fencing, atomic snapshot registration, UTF-8-safe chunk reassembly, frame and queue limits, operation eviction, connection and host-shutdown ownership, configuration shutdown, projection exhaustion, semantic sanitization, and client protocol failures
+- `bun test --max-concurrency 1 remote-attach.test.ts`: six tests covering 195 assertions
 - built-binary Unix create, serve, attach, detach, restart, and sole-writer contention
 - built-binary WebSocket capability rejection and authorization through a deterministic capability-injecting loopback proxy
 - an actual Tailscale Serve HTTPS/WSS negative probe, which rejected a caller lacking the configured app grant with `WebSocketUpgradeRejected`; no tailnet policy was modified to manufacture a positive grant

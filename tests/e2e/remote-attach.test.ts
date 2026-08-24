@@ -280,6 +280,10 @@ test("semantic attach detaches without aborting and reconciles idempotently", as
   expect(concurrent.error.message).toContain("active");
   const stillRunning = await controller.client.request("fx/operation/inspect", { operationId: "operation-detach-1" });
   expect(stillRunning.result.state).toBe("running");
+  const busyConfiguration = await controller.client.request("fx/configure", {
+    ...mutation(controller), kind: "mode", value: "ask",
+  });
+  expect(busyConfiguration.error.message).toContain("idle session");
 
   const replayed = await controller.client.request("fx/prompt", {
     ...mutation(controller), operationId: "operation-detach-1", prompt,

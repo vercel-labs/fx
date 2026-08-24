@@ -291,6 +291,7 @@ const UnixWire = struct {
 };
 
 const Projection = struct {
+    complete: bool = true,
     history: std.ArrayList(contracts.HistoryItem) = .empty,
     assistant_partial: std.ArrayList(u8) = .empty,
     tools: std.ArrayList(contracts.ToolRecord) = .empty,
@@ -379,6 +380,7 @@ const Projection = struct {
     }
 
     fn consumeUpdate(self: *Projection, alloc: Allocator, root: std.json.Value, replaying: bool) !void {
+        if (!self.complete) return error.ProjectionUnavailable;
         const params = root.object.get("params") orelse return;
         if (params != .object) return;
         const update = params.object.get("update") orelse return;
@@ -413,7 +415,11 @@ const Projection = struct {
                 try replaceOwned(alloc, &tool.title, title);
                 try replaceOwned(alloc, &tool.kind, tool_kind);
                 try replaceOwned(alloc, &tool.status, status);
-            } else if (self.tools.items.len < contracts.max_tools_per_actor) {
+            } else {
+                if (self.tools.items.len >= contracts.max_tools_per_actor) {
+                    self.complete = false;
+                    return error.ToolProjectionCapacityExceeded;
+                }
                 const owned_id = try contracts.sanitizeSemanticAlloc(alloc, id);
                 errdefer alloc.free(owned_id);
                 const owned_title = try contracts.sanitizeSemanticAlloc(alloc, title);
@@ -441,6 +447,9 @@ const Projection = struct {
                     try replaceOptional(alloc, &tool.result, text)
                 else
                     try replaceOptional(alloc, &tool.progress, text);
+            } else {
+                self.complete = false;
+                return error.ToolProjectionOutOfOrder;
             }
         } else if (std.mem.eql(u8, kind, "session_info_update")) {
             if (update.object.get("_meta")) |meta| if (meta == .object) {
@@ -618,10 +627,19 @@ const Actor = struct {
         return actor;
     }
 
-    fn destroy(self: *Actor) void {
+    fn beginShutdown(self: *Actor) void {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         self.stopping = true;
+        self.changed.broadcast(io);
+        self.mutex.unlock(io);
+        self.pipe.close();
+    }
+
+    fn destroy(self: *Actor) void {
+        self.beginShutdown();
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
         for (self.attachments) |maybe_attachment| {
             if (maybe_attachment) |attachment| {
                 attachment.queue.close();
@@ -711,11 +729,18 @@ const Actor = struct {
             }
         };
 
+        if (!self.projection.complete) return;
         if (parsed.value.object.get("method")) |method_value| if (method_value == .string) {
             const method = method_value.string;
             var run_state_changed = false;
             if (std.mem.eql(u8, method, "session/update")) {
-                try self.projection.consumeUpdate(self.alloc, parsed.value, self.replaying);
+                self.projection.consumeUpdate(self.alloc, parsed.value, self.replaying) catch |err| switch (err) {
+                    error.ToolProjectionCapacityExceeded, error.ToolProjectionOutOfOrder => {
+                        self.failProjectionLocked();
+                        return;
+                    },
+                    else => return err,
+                };
             } else if (std.mem.eql(u8, method, "session/request_permission") or
                 std.mem.eql(u8, method, "elicitation/create"))
             {
@@ -745,6 +770,15 @@ const Actor = struct {
             try self.broadcastEvent(sanitized_event.writer.buffered());
             if (run_state_changed) try self.publishRunState();
         };
+    }
+
+    fn failProjectionLocked(self: *Actor) void {
+        self.projection.complete = false;
+        for (self.attachments) |maybe_attachment| {
+            const attachment = maybe_attachment orelse continue;
+            attachment.queue.close();
+            attachment.queue.interruptOwner();
+        }
     }
 
     fn handleInternalResponse(self: *Actor, internal_id: u64, root: std.json.Value) !void {
@@ -861,6 +895,8 @@ const Actor = struct {
     }
 
     fn attachLocked(self: *Actor, queue: *OutboundQueue, role: contracts.Role) !*Attachment {
+        if (self.stopping) return error.ActorStopping;
+        if (!self.projection.complete) return error.ProjectionUnavailable;
         if (role == .controller and self.controller_id != null) return error.ControllerBusy;
         const slot = for (&self.attachments) |*entry| {
             if (entry.* == null) break entry;
@@ -1066,6 +1102,8 @@ const Actor = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         try self.validateController(attachment, attachment_id, epoch);
+        if (self.active_operation_internal_id != null or self.projection.run_state != .idle)
+            return error.ConfigurationBusy;
         if (std.mem.eql(u8, kind, "mode") and !self.projection.supportsMode(value))
             return error.InvalidConfiguration;
         const internal_id = self.next_internal_id;
@@ -1085,7 +1123,7 @@ const Actor = struct {
         var waiter = ConfigureWait{ .kind = kind, .value = value };
         try self.pending_routes.append(self.alloc, .{ .internal_id = internal_id, .configure_wait = &waiter });
         var route_added = true;
-        errdefer if (route_added) {
+        defer if (route_added) {
             for (self.pending_routes.items, 0..) |route, index| {
                 if (route.internal_id == internal_id) {
                     _ = self.pending_routes.orderedRemove(index);
@@ -1095,8 +1133,9 @@ const Actor = struct {
         };
         try self.sendRaw(request.writer.buffered());
         while (!waiter.done and !self.failed and !self.stopping) self.changed.waitUncancelable(io, &self.mutex);
+        if (!waiter.done) return error.ConfigurationRejected;
         route_added = false;
-        if (!waiter.done or !waiter.succeeded) return error.ConfigurationRejected;
+        if (!waiter.succeeded) return error.ConfigurationRejected;
     }
 
     fn promptText(value: std.json.Value) ?[]const u8 {
@@ -1107,6 +1146,7 @@ const Actor = struct {
     }
 
     fn writeSnapshotJson(self: *Actor, writer: *std.Io.Writer, snapshot_id: []const u8) !void {
+        if (!self.projection.complete) return error.ProjectionUnavailable;
         try writer.writeAll("{\"schemaVersion\":1,\"snapshotId\":");
         try jsonrpc.writeJsonStr(snapshot_id, writer);
         try writer.writeAll(",\"sessionId\":");
@@ -1211,6 +1251,7 @@ const Host = struct {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         self.stopping = true;
+        for (self.actors) |maybe_actor| if (maybe_actor) |session_actor| session_actor.beginShutdown();
         for (self.connections) |connection| if (connection) |active| {
             active.queue.close();
             active.wire.interrupt();
@@ -1284,13 +1325,20 @@ const Host = struct {
         token.* = null;
     }
 
-    fn unregisterConnection(self: *Host, connection: *Connection) void {
+    fn finalizeConnection(self: *Host, connection: *Connection) void {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
+        var registered_slot: ?*?*Connection = null;
         for (&self.connections) |*slot| if (slot.* == connection) {
-            slot.* = null;
+            registered_slot = slot;
             break;
         };
+        const slot = registered_slot orelse {
+            self.mutex.unlock(io);
+            @panic("finalizing an unregistered remote connection");
+        };
+        connection.deinit();
+        slot.* = null;
         self.changed.broadcast(io);
         self.mutex.unlock(io);
     }
@@ -1299,6 +1347,7 @@ const Host = struct {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        if (self.stopping) return error.HostStopping;
         for (self.actors) |maybe_actor| {
             const existing = maybe_actor orelse continue;
             if (std.mem.eql(u8, existing.session_id, session_id)) return existing;
@@ -1340,8 +1389,7 @@ const Connection = struct {
             connection.deinit();
             return err;
         };
-        defer host.unregisterConnection(&connection);
-        defer connection.deinit();
+        defer host.finalizeConnection(&connection);
         connection.writer_thread = try std.Thread.spawn(.{}, writerMain, .{&connection});
         while (try wire.read(alloc)) |message| {
             defer alloc.free(message);
@@ -1600,6 +1648,7 @@ const Connection = struct {
             error.PromptAlreadyActive => "Another prompt is active",
             error.OperationCapacityExceeded => "Operation reconciliation window is full",
             error.InvalidConfiguration => "Invalid configuration",
+            error.ConfigurationBusy => "Configuration changes require an idle session",
             error.ConfigurationRejected => "Configuration rejected",
             error.StaleInteraction => "Stale interaction",
             error.NoPendingInteraction => "No pending interaction",
@@ -2139,7 +2188,73 @@ test "promotion transfers task ownership and late unregister cannot clear a reus
     try std.testing.expect(host.task_streams[replacement.index] != null);
     try std.testing.expectEqual(replacement.generation, host.task_generations[replacement.index]);
     host.unregisterTask(replacement);
-    host.unregisterConnection(&connection);
+    for (&host.connections) |*slot| {
+        if (slot.* == &connection) slot.* = null;
+    }
+}
+
+test "host shutdown and connection finalization serialize queue and wire destruction" {
+    const alloc = std.testing.allocator;
+    const TestWire = struct {
+        interrupted: std.atomic.Value(bool) = .init(false),
+        closed: std.atomic.Value(bool) = .init(false),
+
+        fn wire(self: *@This()) Wire {
+            return .{
+                .context = self,
+                .read_fn = read,
+                .write_fn = write,
+                .interrupt_fn = interrupt,
+                .close_fn = close,
+            };
+        }
+
+        fn read(_: *anyopaque, _: Allocator) !?[]u8 {
+            return null;
+        }
+
+        fn write(_: *anyopaque, _: []const u8) !void {}
+
+        fn interrupt(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.interrupted.store(true, .release);
+        }
+
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed.store(true, .release);
+        }
+    };
+    var wire_state = TestWire{};
+    var host = Host.init(alloc, undefined);
+    var connection = Connection{
+        .alloc = alloc,
+        .host = &host,
+        .wire = wire_state.wire(),
+        .principal = .{
+            .observe_sessions = try alloc.alloc([]u8, 0),
+            .control_sessions = try alloc.alloc([]u8, 0),
+        },
+        .queue = OutboundQueue.init(alloc),
+        .writer = undefined,
+    };
+    connection.queue.overflow_context = &connection;
+    connection.queue.overflow_fn = Connection.interrupt;
+    connection.writer = jsonrpc.Writer.initCallback(&connection.queue, OutboundQueue.callback);
+    connection.writer_thread = try std.Thread.spawn(.{}, Connection.writerMain, .{&connection});
+    host.connections[0] = &connection;
+
+    const Finalizer = struct {
+        fn run(target: *Host, active: *Connection, state: *TestWire) void {
+            while (!state.interrupted.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+            target.finalizeConnection(active);
+        }
+    };
+    var finalizer = try std.Thread.spawn(.{}, Finalizer.run, .{ &host, &connection, &wire_state });
+    host.deinit();
+    finalizer.join();
+    try std.testing.expect(wire_state.interrupted.load(.acquire));
+    try std.testing.expect(wire_state.closed.load(.acquire));
 }
 
 test "slow attachment overflow does not harm another observer or actor" {
@@ -2205,6 +2320,56 @@ test "projection and nested event serialization strip terminal controls" {
     try writeSanitizedJsonValue(alloc, &serialized.writer, nested.value);
     try std.testing.expect(std.mem.find(u8, serialized.writer.buffered(), "\\u001b") == null);
     try std.testing.expect(std.mem.find(u8, serialized.writer.buffered(), "live[9m") != null);
+}
+
+test "tool projection exhaustion closes attachments and rejects incomplete reattach snapshots" {
+    const alloc = std.testing.allocator;
+    var actor = Actor{
+        .alloc = alloc,
+        .cfg = undefined,
+        .session_id = try alloc.dupe(u8, "session"),
+        .pipe = BytePipe.init(alloc),
+    };
+    defer {
+        actor.projection.deinit(alloc);
+        actor.operations.deinit(alloc);
+        actor.pending_routes.deinit(alloc);
+        actor.pipe.deinit();
+        alloc.free(actor.session_id);
+    }
+    var first_queue = OutboundQueue.init(alloc);
+    defer first_queue.deinit();
+    const first = try actor.attachLocked(&first_queue, .observer);
+
+    for (0..contracts.max_tools_per_actor + 1) |index| {
+        const encoded = try std.fmt.allocPrint(
+            alloc,
+            "{{\"params\":{{\"update\":{{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"tool-{d}\",\"title\":\"Tool\",\"kind\":\"execute\",\"status\":\"pending\"}}}}}}",
+            .{index},
+        );
+        defer alloc.free(encoded);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+        defer parsed.deinit();
+        if (index < contracts.max_tools_per_actor) {
+            try actor.projection.consumeUpdate(alloc, parsed.value, false);
+        } else {
+            try std.testing.expectError(
+                error.ToolProjectionCapacityExceeded,
+                actor.projection.consumeUpdate(alloc, parsed.value, false),
+            );
+        }
+    }
+    actor.failProjectionLocked();
+    try std.testing.expect(!actor.projection.complete);
+    try std.testing.expect(first_queue.closed);
+    actor.detach(first);
+
+    var replacement_queue = OutboundQueue.init(alloc);
+    defer replacement_queue.deinit();
+    try std.testing.expectError(error.ProjectionUnavailable, actor.attachLocked(&replacement_queue, .observer));
+    var snapshot: std.Io.Writer.Allocating = .init(alloc);
+    defer snapshot.deinit();
+    try std.testing.expectError(error.ProjectionUnavailable, actor.writeSnapshotJson(&snapshot.writer, "replacement"));
 }
 
 test "snapshot reconstructs assistant partial and running tool" {
@@ -2345,6 +2510,103 @@ test "rejected authoritative configuration response leaves projection unchanged"
     try std.testing.expect(!waiter.succeeded);
     try std.testing.expectEqualStrings("ask", actor.projection.current_mode.?);
     try std.testing.expectEqual(@as(u64, 0), actor.revision);
+}
+
+test "configuration is rejected during active work without retaining the controller" {
+    const alloc = std.testing.allocator;
+    var actor = Actor{
+        .alloc = alloc,
+        .cfg = undefined,
+        .session_id = try alloc.dupe(u8, "session"),
+        .pipe = BytePipe.init(alloc),
+    };
+    defer {
+        actor.projection.deinit(alloc);
+        actor.operations.deinit(alloc);
+        actor.pending_routes.deinit(alloc);
+        actor.pipe.deinit();
+        alloc.free(actor.session_id);
+    }
+    actor.projection.current_mode = try alloc.dupe(u8, "ask");
+    try actor.projection.available_modes.append(alloc, try alloc.dupe(u8, "ask"));
+    try actor.projection.available_modes.append(alloc, try alloc.dupe(u8, "code"));
+    actor.projection.run_state = .running;
+    actor.active_operation_internal_id = 55;
+
+    var first_queue = OutboundQueue.init(alloc);
+    defer first_queue.deinit();
+    const first = try actor.attachLocked(&first_queue, .controller);
+    try std.testing.expectError(
+        error.ConfigurationBusy,
+        actor.configure(first, first.idSlice(), first.control_epoch, "mode", "code"),
+    );
+    try std.testing.expectEqual(@as(usize, 0), actor.pending_routes.items.len);
+    actor.detach(first);
+
+    var replacement_queue = OutboundQueue.init(alloc);
+    defer replacement_queue.deinit();
+    const replacement = try actor.attachLocked(&replacement_queue, .controller);
+    actor.detach(replacement);
+}
+
+test "actor shutdown wakes a pending configuration and removes its route" {
+    const alloc = std.testing.allocator;
+    var actor = Actor{
+        .alloc = alloc,
+        .cfg = undefined,
+        .session_id = try alloc.dupe(u8, "session"),
+        .pipe = BytePipe.init(alloc),
+    };
+    defer {
+        actor.projection.deinit(alloc);
+        actor.operations.deinit(alloc);
+        actor.pending_routes.deinit(alloc);
+        actor.pipe.deinit();
+        alloc.free(actor.session_id);
+    }
+    actor.projection.current_mode = try alloc.dupe(u8, "ask");
+    try actor.projection.available_modes.append(alloc, try alloc.dupe(u8, "ask"));
+    try actor.projection.available_modes.append(alloc, try alloc.dupe(u8, "code"));
+    var queue = OutboundQueue.init(alloc);
+    defer queue.deinit();
+    const attachment = try actor.attachLocked(&queue, .controller);
+    defer actor.detach(attachment);
+
+    const Context = struct {
+        actor: *Actor,
+        attachment: *Attachment,
+        result: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.actor.configure(
+                self.attachment,
+                self.attachment.idSlice(),
+                self.attachment.control_epoch,
+                "mode",
+                "code",
+            ) catch |err| {
+                self.result = err;
+                return;
+            };
+        }
+    };
+    var context = Context{ .actor = &actor, .attachment = attachment };
+    var configure_thread = try std.Thread.spawn(.{}, Context.run, .{&context});
+    var route_registered = false;
+    for (0..1000) |_| {
+        const io = io_mod.getIo();
+        actor.mutex.lockUncancelable(io);
+        route_registered = actor.pending_routes.items.len == 1;
+        actor.mutex.unlock(io);
+        if (route_registered) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(route_registered);
+    actor.beginShutdown();
+    configure_thread.join();
+    const configure_error = context.result orelse return error.ExpectedConfigurationRejection;
+    try std.testing.expectEqualStrings("ConfigurationRejected", @errorName(configure_error));
+    try std.testing.expectEqual(@as(usize, 0), actor.pending_routes.items.len);
 }
 
 test "operation window evicts oldest terminal record and preserves active records" {
