@@ -17,6 +17,7 @@ import { runFx } from "../evals/eval-helpers";
 const TIMEOUT = 30_000;
 const MODEL = "openai/gpt-5";
 const NEEDLE = "TRUSTED_GIT_E2E_NEEDLE";
+const PROBE = "fx-trusted-git-e2e-probe";
 
 // Workspace grep resolves Git from a fixed absolute allowlist and never from
 // PATH. These tests drive the built binary with a `git` planted earlier on
@@ -121,13 +122,19 @@ function createRoot() {
   mkdirSync(fakeBin, { recursive: true });
   writeFileSync(join(home, ".fx", "settings.json"), "{}");
   const marker = join(root, "planted-git.log");
+  const probeMarker = join(root, "planted-probe.log");
 
   // Exits 1 so a caller reading it as "no matches" still records the run.
-  writeFileSync(
-    join(fakeBin, "git"),
-    `#!/bin/sh\nprintf '%s\\n' "$*" >> "${marker}"\nexit 1\n`,
-  );
-  chmodSync(join(fakeBin, "git"), 0o755);
+  const recorder = (name: string, log: string) => {
+    writeFileSync(join(fakeBin, name), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${log}"\nexit 1\n`);
+    chmodSync(join(fakeBin, name), 0o755);
+  };
+  recorder("git", marker);
+  // The control cannot plant a second `git`: a macOS login shell runs
+  // path_helper, which puts the system paths first, so /usr/bin/git wins
+  // wherever the plant sits. A name that exists nowhere else resolves through
+  // PATH on every platform, which is the property the control needs.
+  recorder(PROBE, probeMarker);
 
   writeFileSync(join(workspace, "tracked.txt"), `${NEEDLE} tracked\n`);
   const git = (args: string[]) =>
@@ -147,6 +154,10 @@ function createRoot() {
     plantedRuns() {
       if (!existsSync(marker)) return [];
       return readFileSync(marker, "utf8").split("\n").filter((line) => line.length > 0);
+    },
+    probeRuns() {
+      if (!existsSync(probeMarker)) return [];
+      return readFileSync(probeMarker, "utf8").split("\n").filter((line) => line.length > 0);
     },
   };
 }
@@ -198,12 +209,12 @@ describe("workspace grep Git resolution", () => {
         // apart from a PATH override that never reached the child.
         const control = await runOneToolCall(root, "control_1", "terminal", {
           action: "exec",
-          command: "git --version",
+          command: `${PROBE} sentinel`,
         });
         expect(control).not.toContain("Not executed");
-        expect(root.plantedRuns()).toEqual(["--version"]);
-
-        rmSync(root.marker, { force: true });
+        expect(root.probeRuns()).toEqual(["sentinel"]);
+        // Planting is effective and nothing has touched the git plant yet.
+        expect(root.plantedRuns()).toEqual([]);
 
         const output = await runOneToolCall(root, "grep_1", "grep_files", {
           pattern: NEEDLE,
