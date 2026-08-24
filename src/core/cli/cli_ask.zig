@@ -241,7 +241,7 @@ pub const Config = struct {
     max_history_turns: usize,
     mode_registry: mode_registry.Registry,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
-    load_mcp_runtime_from_path: ?mcp_runtime.LoadRuntimeFromPathFn = null,
+    load_mcp_runtime_from_path: mcp_runtime.LoadRuntimeFromPathFn,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
@@ -411,7 +411,7 @@ const RunDeps = struct {
     context_registry: context_contract.Registry,
     tool_set: tool_set_contract.ToolSet,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
-    load_mcp_runtime_from_path: ?mcp_runtime.LoadRuntimeFromPathFn = null,
+    load_mcp_runtime_from_path: mcp_runtime.LoadRuntimeFromPathFn,
     process_queued_prompt: ProcessQueuedPromptFn = processQueuedPromptDefault,
     persist_yolo_acknowledgment: PersistYoloAcknowledgmentFn = persistYoloAcknowledgmentDefault,
     discard_pristine_session_ctx: ?*anyopaque = null,
@@ -1397,6 +1397,7 @@ pub fn runPrompt(alloc: Allocator, prompt: []const u8, auto_permission: bool, cf
             .context_registry = context_registry,
             .tool_set = tool_set,
             .load_mcp_runtime = cfg.load_mcp_runtime,
+            .load_mcp_runtime_from_path = cfg.load_mcp_runtime_from_path,
         },
     });
     defer result.deinit(alloc);
@@ -1411,6 +1412,7 @@ pub fn runPromptCapture(alloc: Allocator, prompt: []const u8, auto_permission: b
             .context_registry = context_registry,
             .tool_set = tool_set,
             .load_mcp_runtime = cfg.load_mcp_runtime,
+            .load_mcp_runtime_from_path = cfg.load_mcp_runtime_from_path,
         },
     });
 }
@@ -1691,11 +1693,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
 
     try ctx.checkCancellation();
     if (options.mcp_config_path) |mcp_path| {
-        const loader = options.deps.load_mcp_runtime_from_path orelse {
-            try ctx.writeStderr("fx ask: --mcp-config is not supported in this build\n");
-            return error.McpConfigUnsupported;
-        };
-        ctx.mcp = try loader(alloc, ctx.mcp_elicitation_capabilities, mcp_path);
+        ctx.mcp = try options.deps.load_mcp_runtime_from_path(alloc, ctx.mcp_elicitation_capabilities, mcp_path);
     } else if (!options.bare) {
         ctx.mcp = try options.deps.load_mcp_runtime(alloc, ctx.mcp_elicitation_capabilities);
     }
@@ -3924,6 +3922,7 @@ fn testConfig() Config {
         .max_history_turns = 2,
         .mode_registry = test_mode_registry,
         .load_mcp_runtime = testNoMcpRuntime,
+        .load_mcp_runtime_from_path = testNoMcpRuntimeFromPath,
     };
 }
 
@@ -4459,6 +4458,10 @@ fn testNoMcpRuntime(_: Allocator, _: mcp_elicitation.Capabilities) !?*mcp_runtim
     return null;
 }
 
+fn testNoMcpRuntimeFromPath(_: Allocator, _: mcp_elicitation.Capabilities, _: []const u8) !?*mcp_runtime.McpRuntime {
+    return null;
+}
+
 fn testPromptRunDeps(stdout_capture: *TestCapture, stderr_capture: *TestCapture, load_startup_state: LoadStartupStateFn) RunDeps {
     return .{
         .stdout_ctx = stdout_capture,
@@ -4471,6 +4474,7 @@ fn testPromptRunDeps(stdout_capture: *TestCapture, stderr_capture: *TestCapture,
         .context_registry = test_no_context_registry,
         .tool_set = builtin_tools.advertisement_set,
         .load_mcp_runtime = testNoMcpRuntime,
+        .load_mcp_runtime_from_path = testNoMcpRuntimeFromPath,
         .process_queued_prompt = testProcessQueuedPrompt,
     };
 }
@@ -4917,11 +4921,10 @@ test "parse options accepts yolo and rejects permission flag conflicts" {
     );
 }
 
-var ask_test_empty_env: std.process.Environ.Map = std.process.Environ.Map.init(std.heap.c_allocator);
-
 test "parse options enables bare via --bare flag or FX_BARE env" {
     const alloc = std.testing.allocator;
-    defer io_mod.setEnvironMap(&ask_test_empty_env);
+    const empty_env = try TestAskHome.stableEmptyEnv();
+    defer io_mod.setEnvironMap(empty_env);
 
     var flagged = try parseOptionsWithStdin(alloc, &.{ "--bare", "hello" }, .tty);
     defer flagged.deinit(alloc);
@@ -4940,7 +4943,7 @@ test "parse options enables bare via --bare flag or FX_BARE env" {
     defer disabled.deinit(alloc);
     try std.testing.expect(!disabled.bare);
 
-    io_mod.setEnvironMap(&ask_test_empty_env);
+    io_mod.setEnvironMap(empty_env);
     var no_env = try parseOptionsWithStdin(alloc, &.{"hello"}, .tty);
     defer no_env.deinit(alloc);
     try std.testing.expect(!no_env.bare);
@@ -8579,6 +8582,7 @@ test "fx ask JSON permission-denied capture is best effort under allocation fail
             .context_registry = test_no_context_registry,
             .tool_set = builtin_tools.advertisement_set,
             .load_mcp_runtime = testNoMcpRuntime,
+            .load_mcp_runtime_from_path = testNoMcpRuntimeFromPath,
         },
         "/tmp/workspace",
     );
@@ -8692,6 +8696,7 @@ fn checkAskJsonCaptureAllocationFailures(alloc: Allocator) !void {
         .context_registry = test_no_context_registry,
         .tool_set = builtin_tools.advertisement_set,
         .load_mcp_runtime = testNoMcpRuntime,
+        .load_mcp_runtime_from_path = testNoMcpRuntimeFromPath,
     }, "/tmp/workspace");
     defer ctx.deinit();
     ctx.output_mode = .json;
@@ -8779,6 +8784,7 @@ test "fx ask JSON clips ask_user_question text at a UTF-8 boundary" {
         .context_registry = test_no_context_registry,
         .tool_set = builtin_tools.advertisement_set,
         .load_mcp_runtime = testNoMcpRuntime,
+        .load_mcp_runtime_from_path = testNoMcpRuntimeFromPath,
     }, "/tmp/workspace");
     defer ctx.deinit();
     ctx.output_mode = .json;
