@@ -112,6 +112,19 @@ fx attach wss://builder.example.ts.net/fx --session <session-id>
 
 Serve capabilities authorize actions and resources but do not uniquely identify two devices with equivalent grants. Deployments requiring exact node identity should terminate the connection in a separately reviewed `tsnet` or LocalAPI WhoIs sidecar and forward a narrow authenticated assertion to the loopback backend.
 
+## Verification evidence
+
+The first vertical slice is covered by deterministic tests and built-binary probes:
+
+- `zig fmt --check src/` and `zig build -Doptimize=ReleaseSafe`
+- focused Zig tests for capability parsing, allocation cleanup, attachment fencing, atomic snapshot registration, UTF-8-safe chunk reassembly, frame and queue limits, operation eviction, connection-task ownership, semantic sanitization, and client protocol failures
+- `bun test --max-concurrency 1 remote-attach.test.ts`: six tests covering 194 assertions
+- built-binary Unix create, serve, attach, detach, restart, and sole-writer contention
+- built-binary WebSocket capability rejection and authorization through a deterministic capability-injecting loopback proxy
+- an actual Tailscale Serve HTTPS/WSS negative probe, which rejected a caller lacking the configured app grant with `WebSocketUpgradeRejected`; no tailnet policy was modified to manufacture a positive grant
+
+The end-to-end scenarios attach before and during work, preserve a held assistant partial and pending tool permission across detach, reconcile a lost prompt response by operation ID with one provider request, reject stale attachment IDs and epochs, reject observer mutations, and verify that a presentation process with an empty HOME creates no session store. Exact-commit Full CI across supported Linux and macOS runners remains the release authority.
+
 ## Security and lifecycle limitations
 
 - The Unix socket is mode `0600` inside an existing, current-user-owned mode `0700` directory and accepts only the current operating-system user through peer credentials. A held authority lock rejects a second server. FX refuses every pre-existing endpoint path; after a crash, verify and manually remove the stale socket before restarting.
