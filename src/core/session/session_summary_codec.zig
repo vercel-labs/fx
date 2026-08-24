@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const session = @import("session.zig");
 const session_replay = @import("session_replay.zig");
@@ -53,8 +54,8 @@ pub const deferred_cache_dir = "deferred";
 pub const relationship_migration_candidate_limit: usize = 16;
 const relationship_migration_read_bytes: usize = 64 * 1024;
 const relationship_migration_overlap_bytes: u64 = 512;
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
-const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
+const private_file_permissions = io_mod.permissionsFromMode(0o600);
+const private_dir_permissions = io_mod.permissionsFromMode(0o700);
 
 const DeferredCachePositionJson = struct {
     log_generation: []const u8,
@@ -206,7 +207,7 @@ fn openDeferredCacheDirectory(
 fn requirePrivateCacheDirectory(dir: std.Io.Dir) !void {
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory or
-        stat.permissions.toMode() & 0o777 != private_dir_permissions.toMode())
+        io_mod.permissionsToMode(stat.permissions) & 0o777 != io_mod.permissionsToMode(private_dir_permissions))
     {
         return error.InvalidSessionIndex;
     }
@@ -279,7 +280,7 @@ fn readDeferredCacheTokenFromDirectory(
     defer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.nlink != 1 or
-        stat.permissions.toMode() & 0o777 != private_file_permissions.toMode() or
+        (comptime builtin.os.tag != .windows and io_mod.permissionsToMode(stat.permissions) & 0o777 != io_mod.permissionsToMode(private_file_permissions)) or
         stat.size == 0 or stat.size > max_deferred_cache_token_bytes)
     {
         return error.InvalidSessionIndex;
@@ -1527,9 +1528,10 @@ pub fn refreshRelationshipMigrationSnapshot(
     ) catch return error.InvalidSessionIndex;
     const target_stat = target.stat(io_mod.getIo()) catch
         return error.InvalidSessionIndex;
+    if (comptime builtin.os.tag == .windows) return error.PrivateStatePermissionsUnsupported;
     if (target_stat.kind != .file or
         target_stat.nlink != 1 or
-        target_stat.permissions.toMode() & 0o777 != 0o600)
+        io_mod.permissionsToMode(target_stat.permissions) & 0o777 != 0o600)
     {
         return error.InvalidSessionIndex;
     }
@@ -1644,7 +1646,7 @@ fn openVerifiedSessionIndexFile(
     };
     errdefer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
-    if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o777 != 0o600) {
+    if (stat.kind != .file or stat.nlink != 1 or (comptime builtin.os.tag != .windows and io_mod.permissionsToMode(stat.permissions) & 0o777 != 0o600)) {
         return error.InvalidSessionIndex;
     }
     return file;
@@ -2309,7 +2311,7 @@ test "deferred cache token reader rejects non-private files" {
     });
     try file.setPermissions(
         std.testing.io,
-        std.Io.File.Permissions.fromMode(0o644),
+        io_mod.permissionsFromMode(0o644),
     );
     file.close(std.testing.io);
 

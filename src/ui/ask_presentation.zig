@@ -400,6 +400,7 @@ fn probeTerminal(
     const fallback = shell_runtime.CursorPosition{ .row = layout.rows, .col = 1 };
     const fallback_light = if (no_color) false else ui_render.explicitThemeOverride() orelse false;
     ui_render.initTheme(fallback_light, null);
+    if (comptime @import("builtin").os.tag == .windows) return fallback;
     if (std.c.isatty(std.posix.STDIN_FILENO) == 0) return fallback;
     terminal.captureOriginalTermios() catch return fallback;
     terminal.enableRawMode() catch return fallback;

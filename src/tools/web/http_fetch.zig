@@ -4,8 +4,14 @@ const io_mod = @import("../../core/shared/io.zig");
 const url_policy = @import("url_policy.zig");
 
 const Allocator = std.mem.Allocator;
+const builtin = @import("builtin");
 const IpAddress = std.Io.net.IpAddress;
 const posix = std.posix;
+const PollFd = if (builtin.os.tag == .windows) struct {
+    fd: posix.fd_t,
+    events: i16,
+    revents: i16,
+} else posix.pollfd;
 
 pub const max_body_bytes: usize = 10 * 1024 * 1024;
 const max_redirect_hops: usize = 10;
@@ -1222,6 +1228,7 @@ fn readChunkedTrailers(reader: *BodyReader, alloc: Allocator) !void {
 }
 
 fn connectPinned(address: IpAddress, options: FetchOptions) !posix.fd_t {
+    if (comptime builtin.os.tag == .windows) return error.PlatformUnsupported;
     try checkControl(options);
     const family: posix.sa_family_t = switch (address) {
         .ip4 => posix.AF.INET,
@@ -1291,10 +1298,16 @@ fn addressToPosix(address: IpAddress, storage: *PosixAddress) posix.socklen_t {
 }
 
 fn openSocket(family: posix.sa_family_t) !posix.fd_t {
+    if (comptime builtin.os.tag == .windows) return error.PlatformUnsupported;
     const fd = while (true) {
         const rc = posix.system.socket(family, posix.SOCK.STREAM, 0);
         switch (posix.errno(rc)) {
-            .SUCCESS => break @as(posix.fd_t, @intCast(rc)),
+            .SUCCESS => {
+                if (comptime builtin.os.tag == .windows) {
+                    return @ptrFromInt(@as(usize, @bitCast(@as(isize, @intCast(rc)))));
+                }
+                break @as(posix.fd_t, @intCast(rc));
+            },
             .INTR => continue,
             .AFNOSUPPORT => return error.AddressFamilyUnsupported,
             .MFILE => return error.ProcessFdQuotaExceeded,
@@ -1337,6 +1350,7 @@ fn setNonblocking(fd: posix.fd_t) !void {
 }
 
 fn checkSocketError(fd: posix.fd_t) !void {
+    if (comptime builtin.os.tag == .windows) return error.PlatformUnsupported;
     var value: c_int = 0;
     var len: std.c.socklen_t = @sizeOf(c_int);
     if (std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, &value, &len) != 0) return error.ConnectionFailed;
@@ -1493,10 +1507,11 @@ const PollError = posix.PollError || error{Interrupted};
 
 const Poller = struct {
     ctx: ?*anyopaque,
-    poll_fn: *const fn (?*anyopaque, []posix.pollfd, i32) PollError!usize,
+    poll_fn: *const fn (?*anyopaque, []PollFd, i32) PollError!usize,
 };
 
-fn pollDefault(_: ?*anyopaque, fds: []posix.pollfd, timeout_ms: i32) PollError!usize {
+fn pollDefault(_: ?*anyopaque, fds: []PollFd, timeout_ms: i32) PollError!usize {
+    if (comptime builtin.os.tag == .windows) return error.Unexpected;
     const fds_count = std.math.cast(posix.nfds_t, fds.len) orelse
         return error.SystemResources;
     const rc = posix.system.poll(fds.ptr, fds_count, timeout_ms);
@@ -1606,6 +1621,7 @@ fn rawWriteAll(fd: posix.fd_t, bytes: []const u8, options: FetchOptions) !void {
 }
 
 fn rawWriteAllWith(fd: posix.fd_t, bytes: []const u8, options: FetchOptions, poller: Poller) !void {
+    if (comptime builtin.os.tag == .windows) return error.PlatformUnsupported;
     var written: usize = 0;
     while (written < bytes.len) {
         try pollFdWith(fd, posix.POLL.OUT, options, poller);
@@ -1635,7 +1651,7 @@ fn pollFd(fd: posix.fd_t, events: i16, options: FetchOptions) !void {
 
 fn pollFdWith(fd: posix.fd_t, events: i16, options: FetchOptions, poller: Poller) !void {
     while (true) {
-        var fds = [_]posix.pollfd{.{
+        var fds = [_]PollFd{.{
             .fd = fd,
             .events = events,
             .revents = 0,
@@ -1666,6 +1682,7 @@ fn classifyPollEvents(fd: posix.fd_t, events: i16, revents: i16) !void {
 }
 
 fn pollSocketError(fd: posix.fd_t) !void {
+    if (comptime builtin.os.tag == .windows) return error.PlatformUnsupported;
     var value: c_int = 0;
     var len: std.c.socklen_t = @sizeOf(c_int);
     if (std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, &value, &len) != 0)
@@ -3601,7 +3618,7 @@ const ScriptedPoller = struct {
         return .{ .ctx = @ptrCast(self), .poll_fn = poll };
     }
 
-    fn poll(raw: ?*anyopaque, fds: []posix.pollfd, timeout_ms: i32) PollError!usize {
+    fn poll(raw: ?*anyopaque, fds: []PollFd, timeout_ms: i32) PollError!usize {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
         self.calls += 1;
         self.observed_events = fds[0].events;

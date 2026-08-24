@@ -3089,6 +3089,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn suspendToJobControl(app: *App, footer_rows: u16) !void {
             if (!shell_runtime.supports_resize_signal) return;
+            if (@import("builtin").os.tag == .windows) return;
             if (!tryBeginIdleSessionPark(app)) {
                 return app_lifecycle.suspendToJobControl(
                     &app.terminal,
@@ -7241,7 +7242,7 @@ test "resume view persistence waits for main frame and retries failed writes" {
     try loaded.log.dir.dir.createDir(
         std.testing.io,
         "resume-view.bin",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     Runtime(TestApp).persistResumeViewAfterFrame(&app);
     try std.testing.expect(loaded.resume_view_stale);

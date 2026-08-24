@@ -755,8 +755,8 @@ test "glob_files permission denied directory returns structured recovery" {
     defer alloc.free(blocked);
     try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), blocked);
 
-    std.Io.Dir.cwd().setFilePermissions(io_mod.getIo(), blocked, std.Io.File.Permissions.fromMode(0), .{}) catch return error.SkipZigTest;
-    defer std.Io.Dir.cwd().setFilePermissions(io_mod.getIo(), blocked, std.Io.File.Permissions.fromMode(0o700), .{}) catch {};
+    std.Io.Dir.cwd().setFilePermissions(io_mod.getIo(), blocked, io_mod.permissionsFromMode(0), .{}) catch return error.SkipZigTest;
+    defer std.Io.Dir.cwd().setFilePermissions(io_mod.getIo(), blocked, io_mod.permissionsFromMode(0o700), .{}) catch {};
 
     var result = try dispatchGlobFiles(alloc, workspace, "**/*.zig", blocked);
     defer result.deinit(alloc);

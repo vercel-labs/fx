@@ -243,7 +243,7 @@ fn isSymlinkPermissionError(err: anyerror) bool {
 }
 
 fn setMode(path: []const u8, mode: std.posix.mode_t) !void {
-    try std.Io.Dir.cwd().setFilePermissions(io_mod.getIo(), path, std.Io.File.Permissions.fromMode(mode), .{});
+    try std.Io.Dir.cwd().setFilePermissions(io_mod.getIo(), path, io_mod.permissionsFromMode(mode), .{});
 }
 
 fn restoreMode(path: []const u8, mode: std.posix.mode_t) void {

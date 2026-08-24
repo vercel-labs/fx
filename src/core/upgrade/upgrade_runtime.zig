@@ -189,7 +189,8 @@ fn upgradeWorkerInner(
     progress.markUpdateFound();
     if (show_progress) io_mod.sleep(found_hold_ns);
 
-    const tmp_base: []const u8 = io_mod.getenv("TMPDIR") orelse "/tmp";
+    const tmp_base = try io_mod.tempDir(alloc);
+    defer alloc.free(tmp_base);
     var rand_buf: [8]u8 = undefined;
     io_mod.getIo().random(&rand_buf);
     const rand_hex = std.fmt.bytesToHex(rand_buf, .lower);

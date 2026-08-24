@@ -181,7 +181,7 @@ pub fn createTempSnapshotDir(alloc: std.mem.Allocator) ![]u8 {
         std.Io.Dir.createDirAbsolute(
             io_mod.getIo(),
             path,
-            std.Io.File.Permissions.fromMode(0o700),
+            io_mod.permissionsFromMode(0o700),
         ) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 alloc.free(path);
@@ -624,7 +624,7 @@ fn streamSourceToFile(
         .{
             .truncate = false,
             .exclusive = true,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
+            .permissions = io_mod.permissionsFromMode(0o600),
             .resolve_beneath = true,
         },
     );
@@ -858,6 +858,7 @@ fn inspectImageCandidate(
 }
 
 fn syncSnapshotDirectory(snapshot_dir: std.Io.Dir) !void {
+    if (comptime @import("builtin").os.tag == .windows) return;
     io_mod.syncVerifiedDir(snapshot_dir) catch |err| switch (err) {
         error.OperationUnsupported => {},
         else => return err,
@@ -970,7 +971,7 @@ fn openOrCreateSnapshotDirectoryNoFollow(path: []const u8) !std.Io.Dir {
             parent.createDir(
                 io_mod.getIo(),
                 name,
-                std.Io.File.Permissions.fromMode(0o700),
+                io_mod.permissionsFromMode(0o700),
             ) catch |create_err| switch (create_err) {
                 error.PathAlreadyExists => {},
                 else => return unsafeSnapshotPathError(create_err),
@@ -1114,7 +1115,7 @@ pub fn copyVerifiedImageAttachmentToDir(
         .{
             .truncate = false,
             .exclusive = true,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
+            .permissions = io_mod.permissionsFromMode(0o600),
             .resolve_beneath = true,
         },
     );
@@ -2475,7 +2476,7 @@ test "extractInlineImageAttachments preserves image-looking directories" {
     try tmp.dir.createDir(
         std.testing.io,
         "photos.png",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
@@ -3306,7 +3307,7 @@ test "verified snapshot loading rejects a symlinked directory" {
     try tmp.dir.createDir(
         std.testing.io,
         "owned",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     {
         var owned = try tmp.dir.openDir(std.testing.io, "owned", .{});

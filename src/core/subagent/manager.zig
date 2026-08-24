@@ -10104,7 +10104,7 @@ test "exact relationship replay repairs a failed resume-index marker" {
     try sessions.dir.createDir(
         io_mod.getIo(),
         "index.pending",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     var blocker_present = true;
     defer if (blocker_present) {
@@ -10149,7 +10149,7 @@ test "exact relationship replay repairs a failed resume-index marker" {
     try sessions.dir.createDir(
         io_mod.getIo(),
         "index.pending",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     blocker_present = true;
     var detach = try domain.validateCommand(alloc, .{ .relationship = .{
@@ -10200,7 +10200,7 @@ test "exact relationship replay repairs a failed resume-index marker" {
     try sessions.dir.createDir(
         io_mod.getIo(),
         "index.pending",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     blocker_present = true;
     var reparent = try domain.validateCommand(alloc, .{ .relationship = .{

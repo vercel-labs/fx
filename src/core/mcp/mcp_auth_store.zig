@@ -467,15 +467,16 @@ fn openExistingPrivateChild(
 fn normalizeAndVerifyPrivateDir(dir: std.Io.Dir) !void {
     const initial = try dir.stat(io_mod.getIo());
     if (initial.kind != .directory) return error.DurablePathUnsafe;
-    if (initial.permissions.toMode() & 0o200 == 0) {
+    if (io_mod.permissionsToMode(initial.permissions) & 0o200 == 0) {
         return error.PrivateStatePermissionsUnsupported;
     }
     try dir.setPermissions(
         io_mod.getIo(),
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     const stat = try dir.stat(io_mod.getIo());
-    if (stat.kind != .directory or stat.permissions.toMode() & 0o777 != 0o700) {
+    if (comptime builtin.os.tag == .windows) return error.PrivateStatePermissionsUnsupported;
+    if (stat.kind != .directory or io_mod.permissionsToMode(stat.permissions) & 0o777 != 0o700) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -551,7 +552,8 @@ fn loadFromDir(alloc: Allocator, dir: *io_mod.VerifiedDir) !?Store {
     defer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o600) {
+    if (comptime builtin.os.tag == .windows) return error.PrivateStatePermissionsUnsupported;
+    if (io_mod.permissionsToMode(stat.permissions) & 0o777 != 0o600) {
         return error.PrivateStatePermissionsUnsupported;
     }
     const bytes = try io_mod.readFileToEnd(alloc, &file, max_store_bytes);
@@ -1383,7 +1385,7 @@ test "credential store is private atomic and supports restart deletion" {
     const root_stat = try root.stat(std.testing.io);
     try std.testing.expectEqual(
         @as(u32, 0o700),
-        root_stat.permissions.toMode() & 0o777,
+        io_mod.permissionsToMode(root_stat.permissions) & 0o777,
     );
     var credentials_dir = try root.openDir(
         std.testing.io,
@@ -1394,7 +1396,7 @@ test "credential store is private atomic and supports restart deletion" {
     const dir_stat = try credentials_dir.stat(std.testing.io);
     try std.testing.expectEqual(
         @as(u32, 0o700),
-        dir_stat.permissions.toMode() & 0o777,
+        io_mod.permissionsToMode(dir_stat.permissions) & 0o777,
     );
     const file_stat = try credentials_dir.statFile(
         std.testing.io,
@@ -1403,7 +1405,7 @@ test "credential store is private atomic and supports restart deletion" {
     );
     try std.testing.expectEqual(
         @as(u32, 0o600),
-        file_stat.permissions.toMode() & 0o777,
+        io_mod.permissionsToMode(file_stat.permissions) & 0o777,
     );
 
     const deleted = try delete(

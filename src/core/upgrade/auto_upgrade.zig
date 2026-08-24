@@ -208,7 +208,8 @@ pub const AutoUpgrade = struct {
         var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
         defer client.deinit();
 
-        const tmp_base: []const u8 = io_mod.getenv("TMPDIR") orelse "/tmp";
+        const tmp_base = io_mod.tempDir(alloc) catch return error.AllocFailed;
+        defer alloc.free(tmp_base);
         var rand_buf: [8]u8 = undefined;
         io_mod.getIo().random(&rand_buf);
         const rand_hex = std.fmt.bytesToHex(rand_buf, .lower);

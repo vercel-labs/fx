@@ -239,7 +239,7 @@ fn ensureManagedDir(parent_path: []const u8, child_name: []const u8) !void {
             .follow_symlinks = false,
         }) catch |err| switch (err) {
             error.FileNotFound => {
-                parent.createDir(zio, child_name, std.Io.File.Permissions.fromMode(0o700)) catch |create_err| switch (create_err) {
+                parent.createDir(zio, child_name, io_mod.permissionsFromMode(0o700)) catch |create_err| switch (create_err) {
                     error.PathAlreadyExists => continue,
                     error.NotDir, error.SymLinkLoop => return error.CorruptArtifactStore,
                     else => return create_err,
@@ -251,12 +251,12 @@ fn ensureManagedDir(parent_path: []const u8, child_name: []const u8) !void {
             else => return err,
         };
         defer child.close(zio);
-        child.setPermissions(zio, std.Io.File.Permissions.fromMode(0o700)) catch
+        child.setPermissions(zio, io_mod.permissionsFromMode(0o700)) catch
             return error.CorruptArtifactStore;
         const stat = try child.stat(zio);
-        if (stat.kind != .directory or stat.permissions.toMode() & 0o777 != 0o700) {
-            return error.CorruptArtifactStore;
-        }
+        if (stat.kind != .directory) return error.CorruptArtifactStore;
+        if (comptime @import("builtin").os.tag != .windows and
+            io_mod.permissionsToMode(stat.permissions) & 0o777 != 0o700) return error.CorruptArtifactStore;
         return;
     }
     return error.CorruptArtifactStore;
@@ -472,8 +472,8 @@ test "web_fetch artifact store creates private managed directories" {
 
     const artifacts_stat = try tmp.dir.statFile(io_mod.getIo(), "artifacts", .{ .follow_symlinks = false });
     const web_fetch_stat = try tmp.dir.statFile(io_mod.getIo(), "artifacts/web-fetch", .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), artifacts_stat.permissions.toMode() & 0o777);
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), web_fetch_stat.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), io_mod.permissionsToMode(artifacts_stat.permissions) & 0o777);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), io_mod.permissionsToMode(web_fetch_stat.permissions) & 0o777);
 }
 
 test "web_fetch corrupt durable artifact store fails instead of degrading to storeless metadata" {

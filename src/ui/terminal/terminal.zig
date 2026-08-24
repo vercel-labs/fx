@@ -33,7 +33,8 @@ pub fn interactiveModeEnableSequence(tmux: ?[]const u8) []const u8 {
         tmux_interactive_mode_enable_sequence;
 }
 
-pub fn queryLayout(fd: std.posix.fd_t, footer_rows: u16) !types.Layout {
+pub fn queryLayout(fd: anytype, footer_rows: u16) !types.Layout {
+    if (comptime @import("builtin").os.tag == .windows) return error.UnableToReadTerminalSize;
     var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
 
     const req: c_int = @intCast(std.c.T.IOCGWINSZ);

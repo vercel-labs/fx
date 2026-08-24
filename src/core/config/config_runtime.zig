@@ -336,13 +336,13 @@ fn loadMergedSettingsDetailedWithOptionalHome(
 
     const project_path = try std.fs.path.join(alloc, &.{ workspace_root, ".fx.json" });
     defer alloc.free(project_path);
-    const project_text = readOptionalFile(alloc, project_path) catch |err| blk: {
+const project_text = readOptionalFile(alloc, project_path) catch |err| blk: {
         if (err == error.OutOfMemory) return err;
         try diagnostics.append(alloc, .{
             .layer = .project,
             .cause = switch (err) {
                 error.StreamTooLong => .settings_too_large,
-                error.DurablePathUnsafe => .durable_path_unsafe,
+                error.DurablePathUnsafe => return error.DurablePathUnsafe,
                 else => .malformed_settings,
             },
         });
@@ -1753,7 +1753,7 @@ test "merged settings rejects writable user policy files" {
     var root_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.fx", .{});
     defer root_dir.close(io_mod.getIo());
     var file = try root_dir.openFile(io_mod.getIo(), "settings.json", .{ .mode = .read_write });
-    file.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o666)) catch {
+    file.setPermissions(io_mod.getIo(), io_mod.permissionsFromMode(0o666)) catch {
         file.close(io_mod.getIo());
         return error.SkipZigTest;
     };
@@ -3334,7 +3334,7 @@ test "detailed settings report unsafe user permissions distinctly" {
     var root_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.fx", .{});
     defer root_dir.close(io_mod.getIo());
     var file = try root_dir.openFile(io_mod.getIo(), "settings.json", .{ .mode = .read_write });
-    file.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o666)) catch {
+    file.setPermissions(io_mod.getIo(), io_mod.permissionsFromMode(0o666)) catch {
         file.close(io_mod.getIo());
         return error.SkipZigTest;
     };

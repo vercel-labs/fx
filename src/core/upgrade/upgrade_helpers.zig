@@ -46,8 +46,10 @@ fn isLoopbackE2eUpgradeBase(url: []const u8) bool {
     return std.mem.eql(u8, host, "127.0.0.1");
 }
 
-pub const platform = platformFromTarget() orelse
+pub const platform = platformFromTarget() orelse blk: {
+    if (builtin.os.tag == .windows) break :blk "windows-x86_64";
     @compileError("unsupported platform for auto-upgrade (requires macOS or Linux, x86_64 or aarch64)");
+};
 
 fn platformFromTarget() ?[]const u8 {
     const os: ?[]const u8 = switch (builtin.os.tag) {
@@ -243,8 +245,13 @@ fn extractChecksumHex(raw: []const u8) ?[]const u8 {
 }
 
 pub fn extractTarGz(alloc: Allocator, archive_path: []const u8, dest_dir: []const u8) !void {
+    const tar_path = if (comptime builtin.os.tag == .windows)
+        windowsTarPath(alloc) catch return error.TarNotAvailable
+    else
+        "tar";
+    defer if (comptime builtin.os.tag == .windows) alloc.free(tar_path);
     const result = std.process.run(alloc, io_mod.getIo(), .{
-        .argv = &.{ "tar", "-xzf", archive_path, "-C", dest_dir },
+        .argv = &.{ tar_path, "-xzf", archive_path, "-C", dest_dir },
     }) catch return error.ExtractionFailed;
     defer alloc.free(result.stdout);
     defer alloc.free(result.stderr);
@@ -253,6 +260,26 @@ pub fn extractTarGz(alloc: Allocator, archive_path: []const u8, dest_dir: []cons
         .exited => |code| if (code != 0) return error.ExtractionFailed,
         else => return error.ExtractionFailed,
     }
+}
+
+fn windowsTarPath(alloc: Allocator) ![]u8 {
+    const system_path = "C:\\Windows\\System32\\tar.exe";
+    if (std.Io.Dir.accessAbsolute(io_mod.getIo(), system_path, .{})) {
+        return try alloc.dupe(u8, system_path);
+    } else |_| {}
+
+    const path_env = io_mod.getenv("Path") orelse io_mod.getenv("PATH") orelse return error.NotFound;
+    var it = std.mem.splitScalar(u8, path_env, std.fs.path.delimiter);
+    while (it.next()) |entry| {
+        if (entry.len == 0) continue;
+        const candidate = std.fs.path.join(alloc, &.{ entry, "tar.exe" }) catch continue;
+        if (std.Io.Dir.accessAbsolute(io_mod.getIo(), candidate, .{})) {
+            return candidate;
+        } else |_| {
+            alloc.free(candidate);
+        }
+    }
+    return error.NotFound;
 }
 
 pub fn replaceBinary(new_path: []const u8, target_path: []const u8) !void {

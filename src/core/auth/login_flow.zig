@@ -1002,8 +1002,9 @@ fn unavailableWaitForEnter(_: ?*anyopaque, _: u64) bool {
 }
 
 fn realWaitForEnter(_: ?*anyopaque, timeout_ms: u64) bool {
+    if (comptime @import("builtin").os.tag == .windows) return false;
     var fds = [_]std.posix.pollfd{.{
-        .fd = std.posix.STDIN_FILENO,
+        .fd = @as(std.posix.fd_t, @intCast(std.posix.STDIN_FILENO)),
         .events = std.posix.POLL.IN,
         .revents = 0,
     }};
@@ -1015,9 +1016,10 @@ fn realWaitForEnter(_: ?*anyopaque, timeout_ms: u64) bool {
 }
 
 fn discardStdinLine() void {
+    if (comptime @import("builtin").os.tag == .windows) return;
     var buf: [256]u8 = undefined;
     while (true) {
-        const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch return;
+        const n = std.posix.read(@as(std.posix.fd_t, @intCast(std.posix.STDIN_FILENO)), &buf) catch return;
         if (n == 0) return;
         if (std.mem.findScalar(u8, buf[0..n], '\n') != null) return;
     }
@@ -1184,6 +1186,7 @@ fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: u
 }
 
 fn canUseInteractiveTeamPicker() bool {
+    if (comptime @import("builtin").os.tag == .windows) return false;
     const stdin_tty = std.Io.File.stdin().isTty(io_mod.getIo()) catch false;
     return stdin_tty and std.c.isatty(std.posix.STDOUT_FILENO) != 0;
 }
@@ -1219,6 +1222,7 @@ const TeamPickerKey = union(enum) {
 };
 
 fn readTeamPickerKey() !TeamPickerKey {
+    if (comptime @import("builtin").os.tag == .windows) return .ignored;
     var buf: [8]u8 = undefined;
     const first_read = try std.posix.read(std.posix.STDIN_FILENO, buf[0..1]);
     if (first_read == 0) return .ignored;
@@ -1273,10 +1277,11 @@ fn parseEscapeTeamPickerKey(bytes: []const u8) TeamPickerKey {
 }
 
 const TeamPickerRawMode = struct {
-    original: std.posix.termios = undefined,
+    original: if (@import("builtin").os.tag == .windows) void else std.posix.termios = if (@import("builtin").os.tag == .windows) {} else undefined,
     active: bool = false,
 
     fn enable() !TeamPickerRawMode {
+        if (comptime @import("builtin").os.tag == .windows) return error.NotATerminal;
         if (std.c.isatty(std.posix.STDIN_FILENO) == 0 or std.c.isatty(std.posix.STDOUT_FILENO) == 0) {
             return error.NotATerminal;
         }
@@ -1313,6 +1318,7 @@ const TeamPickerRawMode = struct {
 
     fn disable(self: *TeamPickerRawMode) void {
         if (!self.active) return;
+        if (comptime @import("builtin").os.tag == .windows) return;
         std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
         self.active = false;
     }
