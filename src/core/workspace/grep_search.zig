@@ -1108,6 +1108,44 @@ test "grep search builds no Git argv from a bare executable name" {
     try std.testing.expect(std.mem.find(u8, source, bare) == null);
 }
 
+test "grep search public entry points resolve a trusted Git rather than skipping it" {
+    _ = workspace_files.trustedGitExecutable() orelse return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const tracked = try writeTempFile(alloc, &tmp, "tracked.txt", "needle tracked\n");
+    defer alloc.free(tracked);
+    const trace_path = try std.fs.path.join(alloc, &.{ workspace, "trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    _ = try collectDirectoryMatchesWithIgnored(
+        arena_state.allocator(),
+        workspace,
+        workspace,
+        "needle",
+        false,
+        ignored_dirs.ignored_directory_names,
+        null,
+    );
+
+    // The wrappers are the only place the trusted executable is looked up, and
+    // handing the search a null there degrades every grep to the scanner while
+    // still returning the same matches. The refusal trace is the one signal
+    // that separates "resolved it" from "never asked".
+    const trace = try readTrace(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "trusted Git unavailable") == null);
+}
+
 test "workspace grep only ever selects an absolute Git executable" {
     const executable = workspace_files.trustedGitExecutable() orelse return error.SkipZigTest;
     try std.testing.expect(std.fs.path.isAbsolute(executable));
