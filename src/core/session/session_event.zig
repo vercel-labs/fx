@@ -28,6 +28,7 @@ pub const Kind = enum {
 
 pub const ReplacementReason = enum {
     compaction,
+    rewind,
     migration,
     recovery,
     log_compaction,

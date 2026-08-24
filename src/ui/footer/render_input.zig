@@ -327,6 +327,8 @@ pub const RenderContext = struct {
     statusline: ui_render.StatuslineItems = .{},
     activity: ActivityProjection = .none,
     transcript_depth: transcript_presentation.Depth = .inline_mode,
+    rewind_active: bool = false,
+    rewind_confirming: bool = false,
     input: *const InputRuntime,
 };
 

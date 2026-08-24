@@ -36,6 +36,7 @@ const app_worker_runtime = @import("core/app/app_worker_runtime.zig");
 const app_workspace_runtime = @import("core/app/app_workspace_runtime.zig");
 const app_callbacks = @import("core/app/app_callbacks.zig");
 const app_commands = @import("core/app/app_commands.zig");
+const chat_rewind = @import("core/app/chat_rewind.zig");
 const change_tracker_mod = @import("core/workspace/change_tracker.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const statusline_identity = @import("core/workspace/statusline_identity.zig");
@@ -523,6 +524,7 @@ const App = struct {
     ),
     session_persistence: app_session_runtime.Persistence = .{},
     prompt_history: PromptHistoryRuntime = .{},
+    chat_rewind: chat_rewind.State = .{},
     requested_resume: ?cli_surface.ResumeTarget = null,
     approval_prompt: ApprovalPrompt = .{},
     approval_screen: ApprovalScreenState = .{},
@@ -1173,8 +1175,29 @@ const App = struct {
         return SessionAppRuntime.loadMoreSessionPicker(self);
     }
 
+    pub fn beginChatRewind(self: *App) !bool {
+        return chat_rewind.begin(self);
+    }
+
+    pub fn chatRewindPromptCopy(self: *App, history_index: usize) ![]u8 {
+        return SessionAppRuntime.chatRewindPromptCopy(self, history_index);
+    }
+
+    pub fn commitChatRewind(self: *App, history_index: usize) !void {
+        return SessionAppRuntime.commitChatRewind(self, history_index);
+    }
+
     pub fn beginResumeProjection(self: *App) !ResumeProjection {
         return ResumeProjection.init(
+            self.alloc,
+            &self.shell,
+            io_mod.milliTimestamp(),
+            self.next_diff_id,
+        );
+    }
+
+    pub fn beginChatRewindProjection(self: *App) !ResumeProjection {
+        return ResumeProjection.initEmpty(
             self.alloc,
             &self.shell,
             io_mod.milliTimestamp(),

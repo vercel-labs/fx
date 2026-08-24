@@ -357,6 +357,7 @@ pub fn Handlers(comptime App: type) type {
                 .show_stats = commandShowStats,
                 .show_usage = commandShowUsage,
                 .undo_last = commandUndoLast,
+                .rewind_chat = commandRewindChat,
                 .handle_mcp = commandHandleMcp,
                 .handle_skills = commandHandleSkills,
                 .copy_last = commandCopyLast,
@@ -1108,6 +1109,16 @@ pub fn Handlers(comptime App: type) type {
                 .topic = "undo",
                 .tone = .neutral,
                 .body = msg,
+            }, true);
+        }
+
+        fn commandRewindChat(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (try app.beginChatRewind()) return;
+            try app.writeDomainNotice(.{
+                .topic = "rewind",
+                .tone = .neutral,
+                .body = "No prior text prompt is available to rewind.",
             }, true);
         }
 

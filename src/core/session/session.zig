@@ -1853,6 +1853,15 @@ pub const SessionRuntime = struct {
     }
 
     pub fn snapshotHistory(self: *const SessionRuntime, alloc: Allocator) ![]HistoryTurn {
+        return self.snapshotHistoryPrefix(alloc, self.history.items.len);
+    }
+
+    pub fn snapshotHistoryPrefix(
+        self: *const SessionRuntime,
+        alloc: Allocator,
+        end: usize,
+    ) ![]HistoryTurn {
+        if (end > self.history.items.len) return error.InvalidHistoryPrefix;
         var copy: std.ArrayList(HistoryTurn) = .empty;
         errdefer {
             for (copy.items) |turn| {
@@ -1860,8 +1869,25 @@ pub const SessionRuntime = struct {
             }
             copy.deinit(alloc);
         }
-        try appendHistoryCopies(alloc, &copy, self.history.items);
+        try appendHistoryCopies(alloc, &copy, self.history.items[0..end]);
         return copy.toOwnedSlice(alloc);
+    }
+
+    /// Replaces canonical history without allocation. On success, this runtime
+    /// owns `history` and resets the caller's slice to empty.
+    pub fn replaceHistoryOwned(
+        self: *SessionRuntime,
+        alloc: Allocator,
+        history: *[]HistoryTurn,
+        context_history_start: usize,
+    ) !void {
+        if (context_history_start > history.len) return error.InvalidContextHistoryStart;
+        self.clearHistory(alloc);
+        self.history.deinit(alloc);
+        self.history = .fromOwnedSlice(history.*);
+        history.* = &.{};
+        self.context_history_start = context_history_start;
+        self.clearContextNotices();
     }
 
     pub fn snapshotImageCatalog(
@@ -5663,6 +5689,26 @@ test "SessionRuntime.snapshotHistory returns deep copy that outlives runtime his
 
     try std.testing.expectEqualStrings("hello", snapshot[0].assistant.user.text);
     try std.testing.expectEqualStrings("/tmp/run.log", snapshot[1].background_command.log_path);
+}
+
+test "SessionRuntime replaces canonical history with an owned prefix" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(alloc);
+
+    try runtime.appendAssistantHistoryTurn(alloc, "one", "reply one");
+    try runtime.appendAssistantHistoryTurn(alloc, "two", "reply two");
+    try runtime.appendAssistantHistoryTurn(alloc, "three", "reply three");
+    runtime.context_history_start = 2;
+
+    var prefix = try runtime.snapshotHistoryPrefix(alloc, 1);
+    defer freeHistoryTurnSlice(alloc, prefix);
+    try runtime.replaceHistoryOwned(alloc, &prefix, 1);
+
+    try std.testing.expectEqual(@as(usize, 0), prefix.len);
+    try std.testing.expectEqual(@as(usize, 1), runtime.historyLen());
+    try std.testing.expectEqual(@as(usize, 1), runtime.contextHistoryStart());
+    try std.testing.expectEqualStrings("one", runtime.history.items[0].assistant.user.text);
 }
 
 test "work provenance survives owned runtime snapshots without entering model context" {

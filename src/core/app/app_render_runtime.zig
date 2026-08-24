@@ -3,6 +3,7 @@ const question_prompt = @import("../agent/question_prompt.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
 const app_commands = @import("app_commands.zig");
+const chat_rewind_runtime = @import("chat_rewind.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
@@ -598,6 +599,8 @@ pub fn Runtime(comptime App: type) type {
                     visible_model,
                 ),
                 .activity = activityProjection(app),
+                .rewind_active = if (comptime @hasField(App, "chat_rewind")) app.chat_rewind.active else false,
+                .rewind_confirming = if (comptime @hasField(App, "chat_rewind")) app.chat_rewind.confirming else false,
                 .input = &app.input_runtime,
             };
         }

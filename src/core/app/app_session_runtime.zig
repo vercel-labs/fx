@@ -2840,6 +2840,108 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
+        pub fn chatRewindPromptCopy(app: *App, history_index: usize) ![]u8 {
+            if (history_index >= app.session.history.items.len) return error.InvalidRewindTarget;
+            const text = switch (app.session.history.items[history_index]) {
+                .assistant => |value| value.user.text,
+                .background_command => |value| value.user.text,
+                .interrupted => |value| value.user.text,
+                .compacted_summary => return error.InvalidRewindTarget,
+            };
+            if (text.len == 0) return error.InvalidRewindTarget;
+            return app.alloc.dupe(u8, text);
+        }
+
+        pub fn commitChatRewind(app: *App, history_index: usize) !void {
+            if (history_index >= app.session.history.items.len) return error.InvalidRewindTarget;
+            const context_history_start = @min(
+                app.session.contextHistoryStart(),
+                history_index,
+            );
+            var live_history = try app.session.snapshotHistoryPrefix(
+                app.alloc,
+                history_index,
+            );
+            defer session_runtime.freeHistoryTurnSlice(app.alloc, live_history);
+
+            if (comptime @hasDecl(App, "beginResumeProjection")) {
+                var projection = if (comptime @hasDecl(App, "beginChatRewindProjection"))
+                    try app.beginChatRewindProjection()
+                else
+                    try app.beginResumeProjection();
+                defer projection.deinit();
+                var sink = DetachedHistorySink(@TypeOf(projection)){
+                    .app = app,
+                    .projection = &projection,
+                };
+                if (live_history.len == 0) {
+                    _ = try projection.appendRawClassified("Rewound to start\n", .unknown_raw);
+                }
+                try replayHistoryToSink(app, &sink, live_history);
+                try projection.finalize();
+
+                try persistChatRewind(app, history_index, context_history_start);
+                try app.session.replaceHistoryOwned(
+                    app.alloc,
+                    &live_history,
+                    context_history_start,
+                );
+                commitJsHostSnapshot(app, "rewind");
+                app.shell.clearTranscript(app.alloc);
+                try app.installResumeProjection(&projection);
+            } else {
+                try persistChatRewind(app, history_index, context_history_start);
+                try app.session.replaceHistoryOwned(
+                    app.alloc,
+                    &live_history,
+                    context_history_start,
+                );
+                commitJsHostSnapshot(app, "rewind");
+                app.shell.clearTranscript(app.alloc);
+                var sink = LiveHistorySink(App){ .app = app };
+                try replayHistoryToSink(app, &sink, app.session.history.items);
+            }
+        }
+
+        fn persistChatRewind(
+            app: *App,
+            history_index: usize,
+            context_history_start: usize,
+        ) !void {
+            if (comptime !@hasField(App, "session_persistence")) return;
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const loaded = if (app.session_persistence.writable) |*value|
+                value
+            else
+                return;
+            try convergeDegraded(app, loaded, .{});
+
+            const now_ms = io_mod.milliTimestamp();
+            var current = try snapshotCurrentState(app, loaded.state, now_ms);
+            defer current.deinit(app.alloc);
+            session_runtime.freeHistoryTurnSlice(app.alloc, current.history);
+            current.history = &.{};
+            current.history = try app.session.snapshotHistoryPrefix(
+                app.alloc,
+                history_index,
+            );
+            current.context_history_start = context_history_start;
+            if (current.recovery_checkpoint) |*checkpoint| checkpoint.deinit(app.alloc);
+            current.recovery_checkpoint = null;
+
+            _ = try loaded.commitStateReplacement(
+                app.alloc,
+                current,
+                .rewind,
+                .retry_expected_tail,
+                .{},
+            );
+            if (comptime @hasField(@TypeOf(app.session), "usage")) {
+                if (current.usage) |usage| app.session.usage.markClean(usage);
+            }
+        }
+
         pub fn compactHistory(app: *App) !void {
             const previous_start = app.session.contextHistoryStart();
             app.session.forceCompaction();

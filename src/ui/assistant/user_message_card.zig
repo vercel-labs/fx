@@ -34,6 +34,46 @@ pub fn promptMarkerStyle() []const u8 {
     return marker_style;
 }
 
+/// Returns a dim copy of an already rendered user card. SGR styling inside the
+/// card is replaced so unselected rewind candidates cannot restore bold text.
+pub fn dimTerminalPresentation(alloc: std.mem.Allocator, card: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("\x1b[2m");
+
+    const content_end = std.mem.trimEnd(u8, card, "\n").len;
+    var index: usize = 0;
+    while (index < content_end) {
+        if (card[index] == 0x1b and index + 1 < content_end and card[index + 1] == '[') {
+            var end = index + 2;
+            while (end < content_end and card[end] != 'm') : (end += 1) {}
+            if (end < content_end) {
+                try out.writer.writeAll("\x1b[2m");
+                index = end + 1;
+                continue;
+            }
+        }
+        try out.writer.writeByte(card[index]);
+        index += 1;
+    }
+    try out.writer.writeAll(reset_style);
+    try out.writer.writeAll(card[content_end..]);
+    return out.toOwnedSlice();
+}
+
+test "rewind dim presentation replaces embedded user card styles" {
+    const alloc = std.testing.allocator;
+    const dimmed = try dimTerminalPresentation(
+        alloc,
+        "\x1b[38;5;255m┃\x1b[0m \x1b[1mhello\x1b[0m\n",
+    );
+    defer alloc.free(dimmed);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m\x1b[2m┃\x1b[2m \x1b[2mhello\x1b[2m\x1b[0m\n",
+        dimmed,
+    );
+}
+
 fn emitRow(writer: *std.Io.Writer, content: []const u8) !void {
     try writer.writeAll(content);
     try writer.writeAll(reset_style);
