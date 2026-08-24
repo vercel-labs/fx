@@ -460,7 +460,7 @@ pub const Record = struct {
             return error.InvalidTerminalRecord;
         }
         if (self.takeover_owner_pid) |pid| {
-            _ = std.fmt.parseInt(std.posix.pid_t, pid, 10) catch
+            _ = std.fmt.parseInt(io_mod.ProcessId, pid, 10) catch
                 return error.InvalidTerminalRecord;
             _ = process_supervisor.ProcessInstanceToken.parse(
                 self.takeover_owner_process_token.?,

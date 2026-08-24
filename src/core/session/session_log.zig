@@ -18,8 +18,8 @@ const session_usage_sidecar = @import("session_usage_sidecar.zig");
 
 const Allocator = std.mem.Allocator;
 const Identifier = session_event.Identifier;
-const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_dir_permissions = io_mod.private_dir_permissions;
+const private_file_permissions = io_mod.private_file_permissions;
 const lock_deadline_ms: u64 = 2000;
 const authority_max_bytes: usize = 16 * 1024;
 const authority_intent_max_bytes: usize = 32 * 1024;
@@ -1049,7 +1049,7 @@ pub const Root = struct {
         };
         defer durable_home.close(zio);
         if (mode == .writable) {
-            durable_home.setPermissions(zio, private_dir_permissions) catch
+            io_mod.setPrivateDirPermissions(durable_home) catch
                 return error.PrivateStatePermissionsUnsupported;
         }
         try verifyPrivateDir(durable_home, mode);
@@ -1081,7 +1081,7 @@ pub const Root = struct {
         };
         errdefer sessions_dir.close(zio);
         if (mode == .writable) {
-            sessions_dir.setPermissions(zio, private_dir_permissions) catch
+            io_mod.setPrivateDirPermissions(sessions_dir) catch
                 return error.PrivateStatePermissionsUnsupported;
         }
         try verifyPrivateDir(sessions_dir, mode);
@@ -1400,7 +1400,7 @@ fn validateLeaf(name: []const u8) !void {
 fn verifyPrivateDir(dir: std.Io.Dir, mode: OpenMode) !void {
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory) return error.SessionPathUnsafe;
-    if (mode == .writable and stat.permissions.toMode() & 0o777 != 0o700) {
+    if (mode == .writable and !io_mod.permissionsPrivateDir(stat.permissions)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -1408,7 +1408,7 @@ fn verifyPrivateDir(dir: std.Io.Dir, mode: OpenMode) !void {
 fn verifyManagedFile(file: std.Io.File, mode: OpenMode) !void {
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.nlink != 1) return error.SessionPathUnsafe;
-    if (mode == .writable and stat.permissions.toMode() & 0o777 != 0o600) {
+    if (mode == .writable and !io_mod.permissionsPrivateFile(stat.permissions)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -1428,7 +1428,7 @@ fn openSessionDir(
     };
     errdefer dir.close(io_mod.getIo());
     if (mode == .writable) {
-        dir.setPermissions(io_mod.getIo(), private_dir_permissions) catch
+        io_mod.setPrivateDirPermissions(dir) catch
             return error.PrivateStatePermissionsUnsupported;
     }
     try verifyPrivateDir(dir, mode);
@@ -4023,7 +4023,7 @@ fn eventStat(
         .device = try eventDevice(file),
         .inode = @intCast(stat.inode),
         .kind = .regular,
-        .mode = stat.permissions.toMode(),
+        .mode = io_mod.permissionsMode(stat.permissions),
         .link_count = @intCast(stat.nlink),
         .size = stat.size,
         .mtime_ns = stat.mtime.nanoseconds,
@@ -4383,7 +4383,7 @@ fn cleanupOrphansImpl(
             continue;
         };
         if (stat.kind != .file or stat.nlink != 1 or
-            stat.permissions.toMode() & 0o777 != 0o600)
+            !io_mod.permissionsPrivateFile(stat.permissions))
         {
             report.ignored += 1;
             continue;

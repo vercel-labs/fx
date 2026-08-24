@@ -86,7 +86,7 @@ fn loadFromKeychain(alloc: Allocator) LoadError!?[]u8 {
 }
 
 fn loadFromProfile(alloc: Allocator) LoadError!?[]u8 {
-    const home = io_mod.getenv("HOME") orelse {
+    const home = io_mod.homeDir() orelse {
         debug_trace.logf("stored_key", "load failed step=home err=HomeNotSet", .{});
         return error.StoredKeyUnreadable;
     };
@@ -130,7 +130,7 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) LoadError!?[]u8 {
         debug_trace.logf("stored_key", "load failed step=stat err={s}", .{@errorName(err)});
         return error.StoredKeyUnreadable;
     };
-    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) {
+    if (stat.kind != .file or !io_mod.permissionsPrivateFile(stat.permissions)) {
         debug_trace.logf("stored_key", "load failed step=permissions err=StoredKeyInsecure", .{});
         return error.StoredKeyInsecure;
     }
@@ -155,7 +155,7 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) LoadError!?[]u8 {
 }
 
 fn storeInProfile(alloc: Allocator, value: []const u8) StoreError!void {
-    const home = io_mod.getenv("HOME") orelse return writeFailed("home", error.HomeNotSet);
+    const home = io_mod.homeDir() orelse return writeFailed("home", error.HomeNotSet);
     var home_dir = io_mod.VerifiedDir{
         .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
             return writeFailed("open_home", err);

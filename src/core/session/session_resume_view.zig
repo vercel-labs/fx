@@ -194,7 +194,7 @@ pub fn loadMatching(
 
 fn safeFile(stat: std.Io.File.Stat) bool {
     return stat.kind == .file and stat.nlink == 1 and
-        stat.permissions.toMode() & 0o777 == 0o600;
+        io_mod.permissionsPrivateFile(stat.permissions);
 }
 
 fn validVisibleText(text: []const u8) bool {

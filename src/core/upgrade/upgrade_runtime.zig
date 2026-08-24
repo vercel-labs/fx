@@ -189,7 +189,7 @@ fn upgradeWorkerInner(
     progress.markUpdateFound();
     if (show_progress) io_mod.sleep(found_hold_ns);
 
-    const tmp_base: []const u8 = io_mod.getenv("TMPDIR") orelse "/tmp";
+    const tmp_base: []const u8 = io_mod.tempDir();
     var rand_buf: [8]u8 = undefined;
     io_mod.getIo().random(&rand_buf);
     const rand_hex = std.fmt.bytesToHex(rand_buf, .lower);
@@ -237,7 +237,8 @@ fn upgradeWorkerInner(
         return;
     };
 
-    const extracted_bin = try std.fmt.allocPrint(alloc, "{s}/fx", .{tmp_dir});
+    const extracted_name = if (@import("builtin").os.tag == .windows) "fx.exe" else "fx";
+    const extracted_bin = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ tmp_dir, extracted_name });
     defer alloc.free(extracted_bin);
 
     var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;

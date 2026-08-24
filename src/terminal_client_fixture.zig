@@ -204,7 +204,7 @@ fn runCapabilityStartFixture(
     alloc: Allocator,
     process_provider: background_process_provider.Provider,
 ) !void {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var runtime = client.Runtime.init(process_provider);
     defer runtime.deinit();
     const correlation_id = contracts.CorrelationId{ .value = 1 };
@@ -218,7 +218,7 @@ fn runCapabilityForceCloseFixture(
     alloc: Allocator,
     process_provider: background_process_provider.Provider,
 ) !void {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     const terminal_session_id = io_mod.getenv(
         "FX_TERMINAL_AUTHORITY_SESSION_ID",
     ) orelse return error.TerminalAuthorityFixtureSessionMissing;
@@ -286,7 +286,7 @@ fn runAuthorityStartFixture(
     alloc: Allocator,
     process_provider: background_process_provider.Provider,
 ) !void {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     const compatibility_fixture = if (io_mod.getenv(
         "FX_TERMINAL_AUTHORITY_FIXTURE_COMPAT",
     )) |value|
@@ -345,7 +345,7 @@ fn runAuthorityReloadFixture(
     alloc: Allocator,
     process_provider: background_process_provider.Provider,
 ) !void {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     const terminal_session_id = io_mod.getenv(
         "FX_TERMINAL_AUTHORITY_SESSION_ID",
     ) orelse return error.TerminalAuthorityFixtureSessionMissing;
@@ -519,7 +519,7 @@ fn runOutcomeOrderingFixture(
     alloc: Allocator,
     process_provider: background_process_provider.Provider,
 ) !void {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     const shell = io_mod.getenv("SHELL") orelse return error.ShellNotSet;
     const initial_monitors = [_]contracts.MonitorDefinition{.{
         .condition = .{ .output_contains = "ordered-event" },

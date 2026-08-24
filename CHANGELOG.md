@@ -16,6 +16,7 @@
 - **Workspace status line:** Opt in to the active workspace path and Git branch through `/settings`, `/statusline workspace`, or `statusLine.workspace`
 - **fx-native workspace skills:** Discover project skills from `.fx/skills` before other workspace and compatibility roots
 - **External skill authorities:** Allow symlinked skills under explicitly trusted external directories through `FX_SKILL_SYMLINK_AUTHORITIES`
+- **Windows 11 support:** Run the native CLI and interactive interface in Windows Terminal, execute commands through `cmd.exe`, open browser and file targets with Windows handlers, and install or upgrade native x86-64 and ARM64 releases
 
 ### Improvements
 

@@ -1,9 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const grok_session = @import("grok_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
+const windows_socket = @import("../shared/windows_socket.zig");
 const login_flow = @import("login_flow.zig");
 const oauth = @import("oauth.zig");
 const oauth_transport = @import("oauth_transport.zig");
@@ -218,10 +220,19 @@ fn pollBrowserToken(
     if (comptime host_target.is_wasm) return error.GrokOAuthUnavailable;
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const context: *BrowserLoginContext = @ptrCast(@alignCast(raw.?));
-    if (!try browserCallbackReady(&context.listener, cancel_flag)) return .pending;
-
-    var stream = try context.listener.accept(io_mod.getIo());
+    var stream = if (comptime builtin.os.tag == .windows) blk: {
+        const accepted = try windows_socket.acceptWithTimeout(
+            io_mod.getIo(),
+            &context.listener,
+            @intCast(browser_callback_poll_ms),
+        );
+        break :blk accepted orelse return .pending;
+    } else blk: {
+        if (!try browserCallbackReady(&context.listener, cancel_flag)) return .pending;
+        break :blk try context.listener.accept(io_mod.getIo());
+    };
     defer stream.close(io_mod.getIo());
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     setBrowserSocketTimeouts(stream.socket.handle);
     const target = try readBrowserCallbackTarget(alloc, stream);
     defer alloc.free(target);
@@ -269,6 +280,17 @@ fn browserCallbackReady(
     cancel_flag: *std.atomic.Value(bool),
 ) !bool {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    if (comptime builtin.os.tag == .windows) {
+        const result = try windows_socket.poll(
+            listener.socket.handle,
+            windows_socket.poll_read,
+            browser_callback_poll_ms,
+        );
+        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+        if (!result.ready and !result.hung_up and !result.has_error) return false;
+        if (!result.ready) return error.InvalidGrokOAuthCallback;
+        return true;
+    }
     var fds = [_]std.posix.pollfd{.{
         .fd = listener.socket.handle,
         .events = std.posix.POLL.IN,
@@ -322,7 +344,16 @@ fn writeBrowserCallbackResponse(stream: std.Io.net.Stream, success: bool) !void 
     try writer.interface.flush();
 }
 
-fn setBrowserSocketTimeouts(socket: std.posix.socket_t) void {
+fn setBrowserSocketTimeouts(socket: std.Io.net.Socket.Handle) void {
+    if (comptime builtin.os.tag == .windows) {
+        windows_socket.setTimeouts(
+            socket,
+            browser_callback_io_timeout_seconds * std.time.ms_per_s,
+        ) catch |err| {
+            debug_trace.logf("auth", "Grok callback socket timeout setup failed err={s}", .{@errorName(err)});
+        };
+        return;
+    }
     const timeout = std.posix.timeval{ .sec = browser_callback_io_timeout_seconds, .usec = 0 };
     const bytes = std.mem.asBytes(&timeout);
     std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, bytes) catch |err| {

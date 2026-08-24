@@ -198,7 +198,7 @@ pub const Paths = struct {
     endpoint_path: []u8,
 
     pub fn open(alloc: Allocator, home: []const u8) !Paths {
-        if (!isSupported()) return error.TerminalHostUnsupported;
+        if (comptime !isSupported()) return error.TerminalHostUnsupported;
         var selection = try resolveEndpointSelection(
             alloc,
             builtin.os.tag,
@@ -290,7 +290,7 @@ fn openVerifiedPrivateRuntimeDir(
             parent.createDir(
                 zio,
                 name,
-                std.Io.File.Permissions.fromMode(0o700),
+                io_mod.private_dir_permissions,
             ) catch |create_err| switch (create_err) {
                 error.PathAlreadyExists => {},
                 else => return create_err,
@@ -362,7 +362,7 @@ fn validatePrivateRuntimeDir(
 ) !void {
     if (stat.kind != .directory) return error.RuntimeDirectoryUnsafe;
     if (owner_uid != uid) return error.RuntimeDirectoryOwnerMismatch;
-    if (stat.permissions.toMode() & 0o777 != 0o700) {
+    if (!io_mod.permissionsPrivateDir(stat.permissions)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -381,7 +381,7 @@ pub fn run(alloc: Allocator, config: Config) !void {
 }
 
 fn runSupported(alloc: Allocator, config: Config) !void {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var paths = try Paths.open(alloc, home);
     defer paths.deinit(alloc);
 

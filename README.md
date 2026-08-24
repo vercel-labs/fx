@@ -21,9 +21,31 @@ It's open source (Apache-2.0), model-agnostic, and suitable for both local and c
 
 ## Install
 
+### macOS and Linux
+
 ```bash
 curl -fsSL https://fx.sh/setup.sh | bash
 ```
+
+### Windows 11
+
+Run this in PowerShell to install the latest release for the current user's architecture:
+
+```powershell
+$architecture = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "aarch64" } else { "x86_64" }
+$version = (Invoke-RestMethod https://releases.fx.sh/latest.txt).Trim()
+$installDir = Join-Path $env:LOCALAPPDATA "Programs\fx"
+$archive = Join-Path $env:TEMP "fx-windows-$architecture.tar.gz"
+New-Item -ItemType Directory -Force $installDir | Out-Null
+Invoke-WebRequest "https://releases.fx.sh/$version/fx-windows-$architecture.tar.gz" -OutFile $archive
+tar.exe -xzf $archive -C $installDir
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if (($userPath -split ";") -notcontains $installDir) {
+  [Environment]::SetEnvironmentVariable("Path", "$installDir;$userPath", "User")
+}
+```
+
+Open a new Windows Terminal tab after installation, then run `fx`. The interactive interface uses Windows 11 virtual terminal input and output. Foreground and background commands executed by `run_command` use `cmd.exe`. Hosted `terminal` sessions still require macOS or Linux.
 
 ## Run fx
 
@@ -125,14 +147,15 @@ Read the [fx documentation](https://fx.sh/docs).
 
 ## Build from source
 
-Building fx requires [Zig 0.16.0+](https://ziglang.org/download/):
+Building fx requires [Zig 0.16.0](https://ziglang.org/download/):
 
 ```bash
 git clone https://github.com/vercel-labs/fx.git
 cd fx
 zig build -Doptimize=ReleaseSafe
-./zig-out/bin/fx
 ```
+
+Run the built binary with `./zig-out/bin/fx` on macOS or Linux, or `.\zig-out\bin\fx.exe` in PowerShell on Windows.
 
 Run the test suite with `zig build test`. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and contribution guidelines.
 

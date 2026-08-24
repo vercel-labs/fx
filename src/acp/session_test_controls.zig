@@ -2,7 +2,7 @@ const std = @import("std");
 const io_mod = @import("../core/shared/io.zig");
 const session_log = @import("../core/session/session_log.zig");
 
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_file_permissions = io_mod.private_file_permissions;
 
 pub fn logOptions() session_log.Options {
     return logOptionsFromEnv(

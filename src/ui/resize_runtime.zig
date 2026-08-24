@@ -192,7 +192,7 @@ pub fn collectResizeFacts(
 ) !void {
     const now = io_mod.milliTimestamp();
 
-    if (supports_resize_signal) {
+    if (supports_resize_signal or builtin.os.tag == .windows) {
         if (cursor_probe_allowed) resumeResizeCursorProbeAfterPaste(probe, now);
         switch (probe.poll(now)) {
             .none => {},
@@ -284,7 +284,8 @@ pub fn admitResizeSignal(
     debounce_ms: i64,
     source: []const u8,
 ) bool {
-    if (!supports_resize_signal or !resize_interlock.takeResizePending()) return false;
+    if (comptime !supports_resize_signal and builtin.os.tag != .windows) return false;
+    if (!resize_interlock.takeResizePending()) return false;
     shell.render_requests.observeResizeSignal(now_ms, debounce_ms);
     debug_trace.logf(
         "frame_schedule",

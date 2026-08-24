@@ -1046,7 +1046,7 @@ pub fn Handlers(comptime App: type) type {
             if (scope == .session) {
                 return app.session.usage.reportSnapshot(app.alloc);
             }
-            const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+            const home = io_mod.homeDir() orelse return error.HomeNotSet;
             const availability = try app.session.ensureProfileUsageReadable(
                 app.alloc,
                 home,
@@ -1114,7 +1114,7 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleMcp(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             const result = try app.mcpCommandProvider().handle(app.alloc, rest, .{
-                .home = io_mod.getenv("HOME"),
+                .home = io_mod.homeDir(),
                 .list_ctx = @ptrCast(app),
                 .summarize_servers = summarizeMcpServers,
                 .list_servers_and_tools = listMcpServersAndTools,
@@ -1785,7 +1785,7 @@ fn traceFilePermissions() std.Io.File.Permissions {
 }
 
 fn writeTraceReportFile(alloc: std.mem.Allocator, contents: []const u8) ![]u8 {
-    const tmp_dir = io_mod.getenv("TMPDIR") orelse "/tmp";
+    const tmp_dir = io_mod.tempDir();
     const trimmed = std.mem.trimEnd(u8, tmp_dir, "/");
     const now_ms = io_mod.milliTimestamp();
     const now_secs: i64 = @max(@divFloor(now_ms, 1000), 0);
@@ -2006,12 +2006,15 @@ fn writeCurrentStateSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
 }
 
 fn writeProcessSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator) !void {
-    const pid = std.c.getpid();
+    const pid = io_mod.processId();
     try writer.print("process: pid={d}", .{pid});
     if (countOpenFileDescriptors()) |fd_count| try writer.print(" open_fds={d}", .{fd_count});
     try writer.writeByte('\n');
 
-    const ps = processMemorySnapshot(alloc, pid) catch null;
+    const ps = if (comptime @import("builtin").os.tag == .windows)
+        null
+    else
+        processMemorySnapshot(alloc, pid) catch null;
     if (ps) |text| {
         defer alloc.free(text);
         const trimmed = std.mem.trim(u8, text, " \t\r\n");

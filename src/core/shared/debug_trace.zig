@@ -440,7 +440,7 @@ fn resolveLogPath(alloc: Allocator, workspace_root: []const u8, raw_path: []cons
 }
 
 fn defaultLogPath(alloc: Allocator) ![]u8 {
-    if (io_mod.getenv("HOME")) |home| {
+    if (io_mod.homeDir()) |home| {
         return defaultLogPathForHome(alloc, home);
     }
     return fallbackLogPathForMillis(alloc, io_mod.milliTimestamp());

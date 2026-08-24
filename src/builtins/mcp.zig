@@ -353,7 +353,7 @@ pub fn loadRuntime(
     alloc: Allocator,
     elicitation_capabilities: elicitation.Capabilities,
 ) !?*mcp_runtime.McpRuntime {
-    const home = io_mod.getenv("HOME") orelse return null;
+    const home = io_mod.homeDir() orelse return null;
     const config_path = try configPathFromHome(alloc, home);
     defer alloc.free(config_path);
 
@@ -366,7 +366,7 @@ pub fn loadRuntime(
 pub fn inspectProfileConfig(
     alloc: Allocator,
 ) error{OutOfMemory}!mcp_contract.ProfileConfigDiagnostic {
-    const home = io_mod.getenv("HOME") orelse return .clear;
+    const home = io_mod.homeDir() orelse return .clear;
     const config_path = try configPathFromHome(alloc, home);
     defer alloc.free(config_path);
 

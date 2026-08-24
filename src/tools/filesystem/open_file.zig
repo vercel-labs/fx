@@ -109,14 +109,17 @@ fn displayPath(arena: Allocator, workspace_root: []const u8, absolute_path: []co
 }
 
 fn launch_file(alloc: Allocator, display_path: []const u8, target: []const u8, os_tag: std.Target.Os.Tag, launcher: Launcher) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    var argv: [2][]const u8 = undefined;
-    switch (os_tag) {
-        .macos => argv = .{ "open", target },
-        .linux => argv = .{ "xdg-open", target },
+    const macos_argv = [_][]const u8{ "open", target };
+    const linux_argv = [_][]const u8{ "xdg-open", target };
+    const windows_argv = [_][]const u8{ "rundll32.exe", "url.dll,FileProtocolHandler", target };
+    const argv: []const []const u8 = switch (os_tag) {
+        .windows => &windows_argv,
+        .macos => &macos_argv,
+        .linux => &linux_argv,
         else => return .{ .failure = try alloc.dupe(u8, "open_file not supported on this OS") },
-    }
+    };
 
-    const result = launcher.launch(launcher.ctx, alloc, &argv) catch |err| {
+    const result = launcher.launch(launcher.ctx, alloc, argv) catch |err| {
         debug_trace.logf("core", "open_file launcher failed err={s} path={s} target={s}", .{ @errorName(err), display_path, target });
         return .{ .failure = try std.fmt.allocPrint(alloc, "failed to open {s}", .{target}) };
     };
@@ -315,6 +318,27 @@ test "open_file displays workspace-relative path on success" {
     try std.testing.expectEqualStrings(target, launcher.argv.items[1]);
 }
 
+test "open_file uses the Windows file protocol handler" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const target = try writeTempFile(alloc, &tmp, "notes.txt", "hello\n");
+    defer alloc.free(target);
+    var launcher = MockLauncher{};
+    defer launcher.deinit(alloc);
+
+    var result = try callPathWithMock(alloc, workspace, "notes.txt", .windows, &launcher);
+    defer result.deinit(alloc);
+
+    try expectSuccessBody(result, "opened notes.txt");
+    try std.testing.expectEqual(@as(usize, 3), launcher.argv.items.len);
+    try std.testing.expectEqualStrings("rundll32.exe", launcher.argv.items[0]);
+    try std.testing.expectEqualStrings("url.dll,FileProtocolHandler", launcher.argv.items[1]);
+    try std.testing.expectEqualStrings(target, launcher.argv.items[2]);
+}
+
 test "open_file accepts external absolute paths through active workspace resolver" {
     const alloc = std.testing.allocator;
     var workspace_tmp = std.testing.tmpDir(.{});
@@ -351,7 +375,7 @@ test "open_file unsupported os does not launch" {
     var launcher = MockLauncher{};
     defer launcher.deinit(alloc);
 
-    var result = try callPathWithMock(alloc, workspace, "notes.txt", .windows, &launcher);
+    var result = try callPathWithMock(alloc, workspace, "notes.txt", .freebsd, &launcher);
     defer result.deinit(alloc);
 
     try expectFailureBody(result, "open_file not supported on this OS");

@@ -483,7 +483,7 @@ fn openUsageRecoveryProfileRoot(
     errdefer profile.close(zio);
     const stat = try profile.stat(zio);
     if (stat.kind != .directory or
-        stat.permissions.toMode() & 0o777 != 0o700)
+        !io_mod.permissionsPrivateDir(stat.permissions))
     {
         return error.InvalidUsageRecoveryIndex;
     }
@@ -506,7 +506,7 @@ fn openUsageRecoveryDir(
     errdefer dir.close(io_mod.getIo());
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory or
-        stat.permissions.toMode() & 0o777 != 0o700)
+        !io_mod.permissionsPrivateDir(stat.permissions))
     {
         return error.InvalidUsageRecoveryIndex;
     }
@@ -532,7 +532,7 @@ fn validateUsageRecoveryMarker(
         stat.nlink != 1 or
         stat.size == 0 or
         stat.size > max_usage_recovery_marker_bytes or
-        stat.permissions.toMode() & 0o777 != 0o600)
+        !io_mod.permissionsPrivateFile(stat.permissions))
     {
         return error.InvalidUsageRecoveryIndex;
     }
@@ -588,13 +588,13 @@ pub const Store = struct {
 
     /// Opens a writable store rooted at `$HOME`, creating the layout if needed.
     pub fn init(alloc: Allocator, workspace_root: []const u8) !Store {
-        const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+        const home = io_mod.homeDir() orelse return error.HomeNotSet;
         return initWithHome(alloc, home, workspace_root, true);
     }
 
     /// Opens a read-only store rooted at `$HOME`; never creates layout.
     pub fn initReadOnly(alloc: Allocator, workspace_root: []const u8) !Store {
-        const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+        const home = io_mod.homeDir() orelse return error.HomeNotSet;
         return initWithHome(alloc, home, workspace_root, false);
     }
 
@@ -4877,12 +4877,11 @@ fn loadedWriterBelongsToRoot(
 }
 
 fn prepareWritableSessionDir(dir: std.Io.Dir) !void {
-    const permissions = std.Io.File.Permissions.fromMode(0o700);
-    dir.setPermissions(io_mod.getIo(), permissions) catch
+    io_mod.setPrivateDirPermissions(dir) catch
         return error.PrivateStatePermissionsUnsupported;
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory) return error.SessionPathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o700) {
+    if (!io_mod.permissionsPrivateDir(stat.permissions)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }

@@ -7,6 +7,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
+const windows_console = @import("../shared/windows_console.zig");
 const js_host_auth = @import("js_host_auth.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
@@ -986,15 +987,22 @@ fn unavailableWaitForEnter(_: ?*anyopaque, _: u64) bool {
     return false;
 }
 
-fn realWaitForEnter(_: ?*anyopaque, timeout_ms: u64) bool {
+fn stdinReady(timeout_ms: i32) bool {
+    if (comptime builtin.os.tag == .windows) {
+        return (windows_console.waitForInput(std.Io.File.stdin().handle, timeout_ms) catch return false) == .ready;
+    }
     var fds = [_]std.posix.pollfd{.{
         .fd = std.posix.STDIN_FILENO,
         .events = std.posix.POLL.IN,
         .revents = 0,
     }};
+    const ready = std.posix.poll(&fds, timeout_ms) catch return false;
+    return ready != 0 and (fds[0].revents & std.posix.POLL.IN) != 0;
+}
+
+fn realWaitForEnter(_: ?*anyopaque, timeout_ms: u64) bool {
     const timeout: i32 = @intCast(@min(timeout_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
-    const ready = std.posix.poll(&fds, timeout) catch return false;
-    if (ready == 0 or (fds[0].revents & std.posix.POLL.IN) == 0) return false;
+    if (!stdinReady(timeout)) return false;
     discardStdinLine();
     return true;
 }
@@ -1002,7 +1010,7 @@ fn realWaitForEnter(_: ?*anyopaque, timeout_ms: u64) bool {
 fn discardStdinLine() void {
     var buf: [256]u8 = undefined;
     while (true) {
-        const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch return;
+        const n = std.Io.File.stdin().readStreaming(io_mod.getIo(), &.{&buf}) catch return;
         if (n == 0) return;
         if (std.mem.findScalar(u8, buf[0..n], '\n') != null) return;
     }
@@ -1169,6 +1177,10 @@ fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: u
 }
 
 fn canUseInteractiveTeamPicker() bool {
+    if (comptime builtin.os.tag == .windows) {
+        return windows_console.isConsole(std.Io.File.stdin().handle) and
+            windows_console.isConsole(std.Io.File.stdout().handle);
+    }
     const stdin_tty = std.Io.File.stdin().isTty(io_mod.getIo()) catch false;
     return stdin_tty and std.c.isatty(std.posix.STDOUT_FILENO) != 0;
 }
@@ -1205,21 +1217,18 @@ const TeamPickerKey = union(enum) {
 
 fn readTeamPickerKey() !TeamPickerKey {
     var buf: [8]u8 = undefined;
-    const first_read = try std.posix.read(std.posix.STDIN_FILENO, buf[0..1]);
+    const first_read = try std.Io.File.stdin().readStreaming(io_mod.getIo(), &.{buf[0..1]});
     if (first_read == 0) return .ignored;
 
     var len = first_read;
     if (buf[0] == 0x1b) {
         while (len < buf.len) {
             if (escapeSequenceComplete(buf[0..len])) break;
-            var fds = [_]std.posix.pollfd{.{
-                .fd = std.posix.STDIN_FILENO,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            }};
-            const ready = try std.posix.poll(&fds, 25);
-            if (ready == 0 or (fds[0].revents & std.posix.POLL.IN) == 0) break;
-            const n = try std.posix.read(std.posix.STDIN_FILENO, buf[len .. len + 1]);
+            if (!stdinReady(25)) break;
+            const n = try std.Io.File.stdin().readStreaming(
+                io_mod.getIo(),
+                &.{buf[len .. len + 1]},
+            );
             if (n == 0) break;
             len += n;
         }
@@ -1258,39 +1267,49 @@ fn parseEscapeTeamPickerKey(bytes: []const u8) TeamPickerKey {
 }
 
 const TeamPickerRawMode = struct {
-    original: std.posix.termios = undefined,
+    const NativeMode = if (builtin.os.tag == .windows)
+        windows_console.Mode
+    else
+        std.posix.termios;
+
+    original: NativeMode = undefined,
     active: bool = false,
 
     fn enable() !TeamPickerRawMode {
-        if (std.c.isatty(std.posix.STDIN_FILENO) == 0 or std.c.isatty(std.posix.STDOUT_FILENO) == 0) {
+        var self = TeamPickerRawMode{};
+        if (comptime builtin.os.tag == .windows) {
+            const input = std.Io.File.stdin().handle;
+            const output = std.Io.File.stdout().handle;
+            self.original = try windows_console.captureMode(input, output);
+            try windows_console.enableRawMode(input, output, self.original);
+            self.active = true;
+            return self;
+        }
+        if (std.c.isatty(std.posix.STDIN_FILENO) == 0 or
+            std.c.isatty(std.posix.STDOUT_FILENO) == 0)
+        {
             return error.NotATerminal;
         }
 
-        var self = TeamPickerRawMode{};
         self.original = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
         var raw = self.original;
-
         raw.iflag.BRKINT = false;
         raw.iflag.ICRNL = false;
         raw.iflag.INPCK = false;
         raw.iflag.ISTRIP = false;
         raw.iflag.IXON = false;
         raw.iflag.IXOFF = false;
-
         raw.cflag.CSIZE = .CS8;
-
         raw.lflag.ECHO = false;
         raw.lflag.ICANON = false;
         raw.lflag.IEXTEN = false;
         raw.lflag.ISIG = false;
-
         const vmin_idx = vminIndex();
         const vtime_idx = vtimeIndex();
         if (vmin_idx < raw.cc.len and vtime_idx < raw.cc.len) {
             raw.cc[vmin_idx] = 1;
             raw.cc[vtime_idx] = 0;
         }
-
         try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
         self.active = true;
         return self;
@@ -1298,7 +1317,15 @@ const TeamPickerRawMode = struct {
 
     fn disable(self: *TeamPickerRawMode) void {
         if (!self.active) return;
-        std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+        if (comptime builtin.os.tag == .windows) {
+            windows_console.restoreMode(
+                std.Io.File.stdin().handle,
+                std.Io.File.stdout().handle,
+                self.original,
+            );
+        } else {
+            std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+        }
         self.active = false;
     }
 };

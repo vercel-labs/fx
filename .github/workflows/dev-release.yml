@@ -27,12 +27,22 @@ jobs:
         include:
           - name: linux-x86_64
             target: x86_64-linux
+            binary: fx
           - name: linux-aarch64
             target: aarch64-linux
+            binary: fx
           - name: macos-x86_64
             target: x86_64-macos
+            binary: fx
           - name: macos-aarch64
             target: aarch64-macos
+            binary: fx
+          - name: windows-x86_64
+            target: x86_64-windows
+            binary: fx.exe
+          - name: windows-aarch64
+            target: aarch64-windows
+            binary: fx.exe
     steps:
       - uses: actions/checkout@v4
         with:
@@ -50,8 +60,8 @@ jobs:
         run: |
           package_dir="$RUNNER_TEMP/fx-package-${{ matrix.name }}"
           mkdir -p "$package_dir"
-          cp zig-out/bin/fx LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
-          tar -czf fx-${{ matrix.name }}.tar.gz -C "$package_dir" fx LICENSE THIRD_PARTY_NOTICES.md
+          cp "zig-out/bin/${{ matrix.binary }}" LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
+          tar -czf fx-${{ matrix.name }}.tar.gz -C "$package_dir" "${{ matrix.binary }}" LICENSE THIRD_PARTY_NOTICES.md
           sha256sum fx-${{ matrix.name }}.tar.gz > fx-${{ matrix.name }}.tar.gz.sha256
 
       - name: Upload artifact

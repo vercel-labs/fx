@@ -108,7 +108,7 @@ pub fn execute(arena: Allocator, args_json: []const u8) ![]u8 {
 fn runMemory(alloc: Allocator, action: []const u8, fact: ?[]const u8) ![]u8 {
     if (!isSupportedAction(action)) return error.UnsupportedMemoryAction;
 
-    const home = io_mod.getenv("HOME") orelse return std.fmt.allocPrint(alloc, "memory unavailable: HOME not set", .{});
+    const home = io_mod.homeDir() orelse return std.fmt.allocPrint(alloc, "memory unavailable: HOME not set", .{});
     const memories_path = try profile_paths.memoriesPath(alloc, home);
     defer alloc.free(memories_path);
 

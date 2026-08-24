@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
+const windows_socket = @import("../shared/windows_socket.zig");
 const update_target = @import("update_target.zig");
 
 const Allocator = std.mem.Allocator;
@@ -13,9 +14,13 @@ const Channel = update_target.Channel;
 const Target = update_target.Target;
 
 fn setRecvTimeout(conn: *std.http.Client.Connection) void {
-    const sock = conn.stream_writer.stream.socket.handle;
-    const timeout = std.posix.timeval{ .sec = recv_timeout_sec, .usec = 0 };
-    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+    const socket = conn.stream_writer.stream.socket.handle;
+    if (comptime builtin.os.tag == .windows) {
+        windows_socket.setTimeouts(socket, recv_timeout_sec * std.time.ms_per_s) catch {};
+        return;
+    }
+    const timeout = std.posix.timeval{ .sec = @intCast(recv_timeout_sec), .usec = 0 };
+    std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
 }
 
 pub const cdn_base = "https://releases.fx.sh";
@@ -47,10 +52,11 @@ fn isLoopbackE2eUpgradeBase(url: []const u8) bool {
 }
 
 pub const platform = platformFromTarget() orelse
-    @compileError("unsupported platform for auto-upgrade (requires macOS or Linux, x86_64 or aarch64)");
+    @compileError("unsupported platform for upgrade (requires Windows, macOS, or Linux on x86_64 or aarch64)");
 
 fn platformFromTarget() ?[]const u8 {
     const os: ?[]const u8 = switch (builtin.os.tag) {
+        .windows => "windows",
         .macos => "macos",
         .linux => "linux",
         else => null,
@@ -256,10 +262,48 @@ pub fn extractTarGz(alloc: Allocator, archive_path: []const u8, dest_dir: []cons
 }
 
 pub fn replaceBinary(new_path: []const u8, target_path: []const u8) !void {
+    if (comptime builtin.os.tag == .windows) {
+        return scheduleWindowsBinaryReplacement(new_path, target_path);
+    }
     std.Io.Dir.renameAbsolute(new_path, target_path, io_mod.getIo()) catch {
         copyBinary(new_path, target_path) catch return error.ReplaceFailed;
         return;
     };
+}
+
+fn scheduleWindowsBinaryReplacement(new_path: []const u8, target_path: []const u8) !void {
+    const alloc = std.heap.c_allocator;
+    const staged_path = std.fmt.allocPrint(
+        alloc,
+        "{s}.update.{d}.exe",
+        .{ target_path, io_mod.processId() },
+    ) catch return error.ReplaceFailed;
+    defer alloc.free(staged_path);
+    copyBinary(new_path, staged_path) catch return error.ReplaceFailed;
+    errdefer std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), staged_path) catch {};
+
+    const pid_text = std.fmt.allocPrint(alloc, "{d}", .{io_mod.processId()}) catch
+        return error.ReplaceFailed;
+    defer alloc.free(pid_text);
+    const script =
+        "Wait-Process -Id ([int]$args[0]) -ErrorAction SilentlyContinue; " ++
+        "Copy-Item -LiteralPath $args[1] -Destination $args[2] -Force; " ++
+        "Remove-Item -LiteralPath $args[1] -Force";
+    _ = std.process.spawn(io_mod.getIo(), .{
+        .argv = &.{
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+            pid_text,
+            staged_path,
+            target_path,
+        },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return error.ReplaceFailed;
 }
 
 pub const ExecutablePathError = error{

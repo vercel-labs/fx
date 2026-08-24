@@ -1,6 +1,7 @@
 const std = @import("std");
 const io_mod = @import("../../core/shared/io.zig");
 const builtin = @import("builtin");
+const windows_process = @import("../../core/shared/windows_process.zig");
 const background_process_provider = @import(
     "../../core/execution/background_process_provider.zig",
 );
@@ -36,6 +37,19 @@ const blocked_background_wrapper_command = std.fmt.comptimePrint(
     .{ background_ready_byte, background_exit_marker },
 );
 
+const windows_background_wrapper_command =
+    "[Console]::Error.Write([char]82)\n" ++
+    "$release = [Console]::In.Read()\n" ++
+    "$null = [Console]::In.ReadLine()\n" ++
+    "if ($release -ne 6) { exit 125 }\n" ++
+    "$script = [Console]::In.ReadToEnd()\n" ++
+    "[Console]::SetError([Console]::Out)\n" ++
+    "& $env:ComSpec /D /S /C $script\n" ++
+    "$status = $LASTEXITCODE\n" ++
+    "if ($null -eq $status) { if ($?) { $status = 0 } else { $status = 1 } }\n" ++
+    "[Console]::Out.Write(\"`n" ++ background_exit_marker ++ "$status`n\")\n" ++
+    "exit $status";
+
 pub const provider = background_process_provider.Provider{
     .spawn_prepared_fn = spawnPrepared,
     .capture_token_fn = captureToken,
@@ -60,13 +74,20 @@ fn spawnPrepared(
 ) background_process_provider.ProviderError!background_process_provider.PreparedProcess {
     if (!host.current().background_processes) return error.Unsupported;
 
-    const direct_argv = [_][]const u8{
+    const posix_argv = [_][]const u8{
         "sh",
         "-lc",
         blocked_background_wrapper_command,
         "fx-background",
     };
-    const argv: []const []const u8 = &direct_argv;
+    const windows_argv = [_][]const u8{
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        windows_background_wrapper_command,
+    };
+    const argv: []const []const u8 = if (builtin.os.tag == .windows) &windows_argv else &posix_argv;
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = argv,
         .cwd = .{ .path = request.cwd },
@@ -84,7 +105,11 @@ fn spawnPrepared(
         _ = child.wait(io_mod.getIo()) catch {};
     };
 
-    const child_id = child.id orelse return error.SpawnFailed;
+    const child_handle = child.id orelse return error.SpawnFailed;
+    const child_id: u64 = if (comptime builtin.os.tag == .windows)
+        try windows_process.idFromHandle(child_handle)
+    else
+        @intCast(child_handle);
     const pid = try std.fmt.allocPrint(alloc, "{d}", .{child_id});
     var pid_owned = true;
     errdefer if (pid_owned) alloc.free(pid);
@@ -245,9 +270,13 @@ fn captureToken(
     alloc: Allocator,
     pid_text: []const u8,
 ) background_process_provider.ProviderError!process_supervisor.ProcessInstanceToken {
-    const pid = std.fmt.parseInt(std.posix.pid_t, pid_text, 10) catch
+    const pid = std.fmt.parseInt(io_mod.ProcessId, pid_text, 10) catch
         return error.InvalidPid;
     return switch (builtin.os.tag) {
+        .windows => captureWindowsToken(pid) catch |err| switch (err) {
+            error.ProcessNotFound => error.ProcessNotFound,
+            else => error.ProcessIdentityUnavailable,
+        },
         .linux => captureLinuxToken(alloc, pid) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.ProcessNotFound => error.ProcessNotFound,
@@ -259,6 +288,18 @@ fn captureToken(
         },
         else => error.ProcessIdentityUnsupported,
     };
+}
+
+fn captureWindowsToken(pid: io_mod.ProcessId) !process_supervisor.ProcessInstanceToken {
+    if (comptime builtin.os.tag != .windows) return error.ProcessIdentityUnsupported;
+    const creation_time = try windows_process.creationTime(pid);
+    var token_buf: [128]u8 = undefined;
+    const text = try std.fmt.bufPrint(
+        &token_buf,
+        "windows:00000000000000000000000000000000:{d}",
+        .{creation_time},
+    );
+    return process_supervisor.ProcessInstanceToken.parse(text);
 }
 
 fn matchToken(
@@ -482,6 +523,19 @@ fn signalProcess(
         },
     }
     if (!host.current().background_processes) return error.Unsupported;
+    if (comptime builtin.os.tag == .windows) {
+        const result = std.process.run(alloc, io_mod.getIo(), .{
+            .argv = &.{ "taskkill.exe", "/PID", pid_text, "/T", "/F" },
+            .stdout_limit = .limited(16 * 1024),
+            .stderr_limit = .limited(16 * 1024),
+        }) catch return error.Unexpected;
+        defer alloc.free(result.stdout);
+        defer alloc.free(result.stderr);
+        return switch (result.term) {
+            .exited => |code| if (code == 0) {} else error.ProcessNotFound,
+            else => error.Unexpected,
+        };
+    }
     const pid = std.fmt.parseInt(std.posix.pid_t, pid_text, 10) catch
         return error.InvalidPid;
     try signalPidTree(pid);
@@ -1013,7 +1067,7 @@ test "native provider transfers a prepared process to its owned handle" {
     defer if (prepared_active) {
         _ = prepared.closeAndWaitUnreleased(null, 2000);
     };
-    var owned = try prepared.release("printf provider-owned");
+    var owned = try prepared.release(if (builtin.os.tag == .windows) "echo provider-owned" else "printf provider-owned");
     prepared_active = false;
     owned.wait();
 
@@ -1028,16 +1082,24 @@ test "native provider transfers a prepared process to its owned handle" {
 }
 
 test "native provider captures the current process identity" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
+    if (builtin.os.tag != .windows and
+        builtin.os.tag != .linux and
+        builtin.os.tag != .macos)
+    {
         return error.SkipZigTest;
     }
 
     const alloc = std.testing.allocator;
-    const pid = try std.fmt.allocPrint(alloc, "{d}", .{std.c.getpid()});
+    const pid = try std.fmt.allocPrint(alloc, "{d}", .{io_mod.processId()});
     defer alloc.free(pid);
 
     const token = try provider.captureToken(alloc, pid);
-    const platform = if (builtin.os.tag == .linux) "linux:" else "macos:";
+    const platform = switch (builtin.os.tag) {
+        .windows => "windows:",
+        .linux => "linux:",
+        .macos => "macos:",
+        else => unreachable,
+    };
     try std.testing.expect(std.mem.startsWith(u8, token.view(), platform));
 }
 
@@ -1079,7 +1141,7 @@ test "native provider writes through the verified borrowed output handle" {
     defer if (prepared_active) {
         _ = prepared.closeAndWaitUnreleased(null, 2000);
     };
-    var owned = try prepared.release("printf verified-handle");
+    var owned = try prepared.release(if (builtin.os.tag == .windows) "echo verified-handle" else "printf verified-handle");
     prepared_active = false;
     owned.wait();
 

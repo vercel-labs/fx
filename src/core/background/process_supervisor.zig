@@ -35,7 +35,9 @@ pub const ProcessInstanceToken = struct {
         if (!isLowerHex(boot_id, 32)) {
             return error.InvalidProcessInstanceToken;
         }
-        if (std.mem.eql(u8, platform, "linux")) {
+        if (std.mem.eql(u8, platform, "linux") or
+            std.mem.eql(u8, platform, "windows"))
+        {
             const start_ticks = parts.next() orelse
                 return error.InvalidProcessInstanceToken;
             if (parts.next() != null or
@@ -1013,6 +1015,13 @@ test "process instance tokens are canonical and require exact match" {
         token.view(),
     );
     try std.testing.expect(token.eql(token));
+    const windows_token = try ProcessInstanceToken.parse(
+        "windows:00000000000000000000000000000000:134170000000000000",
+    );
+    try std.testing.expectEqualStrings(
+        "windows:00000000000000000000000000000000:134170000000000000",
+        windows_token.view(),
+    );
     try std.testing.expectError(
         error.InvalidProcessInstanceToken,
         ProcessInstanceToken.parse(

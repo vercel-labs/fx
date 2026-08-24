@@ -52,9 +52,11 @@ fn launchUrl(
     os_tag: std.Target.Os.Tag,
     launcher: Launcher,
 ) LaunchOutcome {
-    var macos_argv = [_][]const u8{ "open", url };
-    var linux_argv = [_][]const u8{ "xdg-open", url };
+    const macos_argv = [_][]const u8{ "open", url };
+    const linux_argv = [_][]const u8{ "xdg-open", url };
+    const windows_argv = [_][]const u8{ "rundll32.exe", "url.dll,FileProtocolHandler", url };
     const argv: []const []const u8 = switch (os_tag) {
+        .windows => &windows_argv,
         .macos => &macos_argv,
         .linux => &linux_argv,
         else => return .unsupported,
@@ -116,13 +118,18 @@ test "url opener selects the platform launcher argv" {
     defer linux.deinit(alloc);
     try std.testing.expectEqual(LaunchOutcome.opened, launchUrl(alloc, "http://localhost:3000", .linux, linux.launcher()));
     try std.testing.expectEqualStrings("xdg-open http://localhost:3000", linux.argv_joined.items);
+
+    var windows = MockLauncher{};
+    defer windows.deinit(alloc);
+    try std.testing.expectEqual(LaunchOutcome.opened, launchUrl(alloc, "http://localhost:3000", .windows, windows.launcher()));
+    try std.testing.expectEqualStrings("rundll32.exe url.dll,FileProtocolHandler http://localhost:3000", windows.argv_joined.items);
 }
 
 test "url opener reports unsupported platforms without launching" {
     const alloc = std.testing.allocator;
     var mock = MockLauncher{};
     defer mock.deinit(alloc);
-    try std.testing.expectEqual(LaunchOutcome.unsupported, launchUrl(alloc, "http://x", .windows, mock.launcher()));
+    try std.testing.expectEqual(LaunchOutcome.unsupported, launchUrl(alloc, "http://x", .freebsd, mock.launcher()));
     try std.testing.expectEqualStrings("", mock.argv_joined.items);
 }
 

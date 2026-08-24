@@ -25,7 +25,7 @@ pub fn loadSkills(
     workspace_root: []const u8,
     root_policy: skill_contract.RootPolicy,
 ) LoadSkillsError!LoadedSkills {
-    const configured_home = io_mod.getenv("HOME") orelse return .{};
+    const configured_home = io_mod.homeDir() orelse return .{};
     const canonical_home = io_mod.realpathAlloc(alloc, configured_home) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => null,

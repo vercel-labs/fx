@@ -53,8 +53,8 @@ pub const deferred_cache_dir = "deferred";
 pub const relationship_migration_candidate_limit: usize = 16;
 const relationship_migration_read_bytes: usize = 64 * 1024;
 const relationship_migration_overlap_bytes: u64 = 512;
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
-const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
+const private_file_permissions = io_mod.private_file_permissions;
+const private_dir_permissions = io_mod.private_dir_permissions;
 
 const DeferredCachePositionJson = struct {
     log_generation: []const u8,
@@ -206,7 +206,7 @@ fn openDeferredCacheDirectory(
 fn requirePrivateCacheDirectory(dir: std.Io.Dir) !void {
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory or
-        stat.permissions.toMode() & 0o777 != private_dir_permissions.toMode())
+        !io_mod.permissionsPrivateDir(stat.permissions))
     {
         return error.InvalidSessionIndex;
     }
@@ -279,7 +279,7 @@ fn readDeferredCacheTokenFromDirectory(
     defer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.nlink != 1 or
-        stat.permissions.toMode() & 0o777 != private_file_permissions.toMode() or
+        !io_mod.permissionsPrivateFile(stat.permissions) or
         stat.size == 0 or stat.size > max_deferred_cache_token_bytes)
     {
         return error.InvalidSessionIndex;
@@ -1529,7 +1529,7 @@ pub fn refreshRelationshipMigrationSnapshot(
         return error.InvalidSessionIndex;
     if (target_stat.kind != .file or
         target_stat.nlink != 1 or
-        target_stat.permissions.toMode() & 0o777 != 0o600)
+        !io_mod.permissionsPrivateFile(target_stat.permissions))
     {
         return error.InvalidSessionIndex;
     }
@@ -1644,7 +1644,7 @@ fn openVerifiedSessionIndexFile(
     };
     errdefer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
-    if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o777 != 0o600) {
+    if (stat.kind != .file or stat.nlink != 1 or !io_mod.permissionsPrivateFile(stat.permissions)) {
         return error.InvalidSessionIndex;
     }
     return file;
