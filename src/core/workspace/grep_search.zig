@@ -862,7 +862,9 @@ fn readTrace(alloc: Allocator, trace_path: []const u8) ![]u8 {
 fn runGitForTest(alloc: Allocator, cwd: []const u8, args: []const []const u8) !void {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(alloc);
-    try argv.append(alloc, "git");
+    // Test setup resolves Git the same way production does, so this file holds
+    // no bare executable name for the argv guard below to have to except.
+    try argv.append(alloc, workspace_files.trustedGitExecutable() orelse return error.SkipZigTest);
     try argv.appendSlice(alloc, args);
 
     const result = std.process.run(alloc, std.testing.io, .{
@@ -949,13 +951,15 @@ test "grep search does not ignore workspace because ignored name is outside work
     try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "src/file.txt"));
 }
 
-fn countScriptRuns(alloc: Allocator, marker_path: []const u8) !usize {
-    const contents = readFileToEndForTest(alloc, marker_path, 4096) catch |err| switch (err) {
-        error.FileNotFound => return 0,
+/// The argv of every spawn the injected executable received, one per line.
+/// A site that resolves its own name through PATH runs the real Git instead
+/// and leaves nothing here, so the caller asserts on content rather than a
+/// count: a tally cannot tell a missing spawn from an unrecorded one.
+fn recordedSpawns(alloc: Allocator, marker_path: []const u8) ![]u8 {
+    return readFileToEndForTest(alloc, marker_path, 4096) catch |err| switch (err) {
+        error.FileNotFound => return alloc.alloc(u8, 0),
         else => return err,
     };
-    defer alloc.free(contents);
-    return std.mem.count(u8, contents, "ran\n");
 }
 
 fn writeExecutableScript(tmp: *std.testing.TmpDir, sub_path: []const u8, body: []const u8) !void {
@@ -979,7 +983,7 @@ test "grep search spawns the selected Git executable rather than resolving one f
 
     const marker = try std.fs.path.join(alloc, &.{ workspace, "spawned.log" });
     defer alloc.free(marker);
-    const script = try std.fmt.allocPrint(alloc, "#!/bin/sh\nprintf 'ran\\n' >> {s}\nexit 1\n", .{marker});
+    const script = try std.fmt.allocPrint(alloc, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{s}\"\nexit 1\n", .{marker});
     defer alloc.free(script);
     try writeExecutableScript(&tmp, "fake-git", script);
     const fake_git = try std.fs.path.join(alloc, &.{ workspace, "fake-git" });
@@ -999,9 +1003,13 @@ test "grep search spawns the selected Git executable rather than resolving one f
         fake_git,
     );
 
-    // Both spawns on this path used the selection. A bare "git" argv0 at
-    // either site would have resolved through PATH and gone unrecorded.
-    try std.testing.expectEqual(@as(usize, 2), try countScriptRuns(alloc, marker));
+    // Assert what the selection was asked to run, not how often it ran. A
+    // bare argv0 at either site resolves through PATH to the real Git and
+    // records nothing, so a missing line is the regression this catches.
+    const spawns = try recordedSpawns(alloc, marker);
+    defer alloc.free(spawns);
+    try std.testing.expect(std.mem.find(u8, spawns, "check-ignore") != null);
+    try std.testing.expect(std.mem.find(u8, spawns, "grep -n") != null);
 }
 
 test "grep search count path spawns the selected Git executable rather than resolving one from PATH" {
@@ -1018,7 +1026,7 @@ test "grep search count path spawns the selected Git executable rather than reso
 
     const marker = try std.fs.path.join(alloc, &.{ workspace, "spawned.log" });
     defer alloc.free(marker);
-    const script = try std.fmt.allocPrint(alloc, "#!/bin/sh\nprintf 'ran\\n' >> {s}\nexit 1\n", .{marker});
+    const script = try std.fmt.allocPrint(alloc, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{s}\"\nexit 1\n", .{marker});
     defer alloc.free(script);
     try writeExecutableScript(&tmp, "fake-git", script);
     const fake_git = try std.fs.path.join(alloc, &.{ workspace, "fake-git" });
@@ -1038,10 +1046,13 @@ test "grep search count path spawns the selected Git executable rather than reso
         fake_git,
     );
 
-    try std.testing.expectEqual(@as(usize, 2), try countScriptRuns(alloc, marker));
+    const spawns = try recordedSpawns(alloc, marker);
+    defer alloc.free(spawns);
+    try std.testing.expect(std.mem.find(u8, spawns, "check-ignore") != null);
+    try std.testing.expect(std.mem.find(u8, spawns, "grep --count") != null);
 }
 
-test "grep search falls back to the Zig scanner when no trusted Git executable is available" {
+test "grep search refuses to resolve Git when no trusted executable is available" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1050,6 +1061,12 @@ test "grep search falls back to the Zig scanner when no trusted Git executable i
 
     const tracked = try writeTempFile(alloc, &tmp, "tracked.txt", "needle tracked\n");
     defer alloc.free(tracked);
+    const trace_path = try std.fs.path.join(alloc, &.{ workspace, "trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -1065,14 +1082,35 @@ test "grep search falls back to the Zig scanner when no trusted Git executable i
         null,
     );
 
+    // The trace line is what separates a refusal from a fallback reached by
+    // some other route: substituting a name for the missing executable would
+    // still land in the scanner, but never emits this.
+    const trace = try readTrace(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "trusted Git unavailable") != null);
+
     try std.testing.expectEqual(@as(usize, 1), result.matches.len);
     try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "tracked.txt"));
 }
 
-test "workspace grep never selects a Git executable by bare name" {
-    if (workspace_files.trustedGitExecutable()) |executable| {
-        try std.testing.expect(std.fs.path.isAbsolute(executable));
-    }
+test "grep search builds no Git argv from a bare executable name" {
+    const alloc = std.testing.allocator;
+    var file = try std.Io.Dir.cwd().openFile(io_mod.getIo(), "src/core/workspace/grep_search.zig", .{});
+    defer file.close(io_mod.getIo());
+    const source = try io_mod.readFileToEnd(alloc, &file, 256 * 1024);
+    defer alloc.free(source);
+
+    // No argv in this file may name the executable instead of resolving it.
+    // Keyed on the bare literal, not on any argv shape, so a future spawn
+    // that skips the usual flags cannot slip past. Split so the needle does
+    // not match itself in this test's own source.
+    const bare = "\"gi" ++ "t\"";
+    try std.testing.expect(std.mem.find(u8, source, bare) == null);
+}
+
+test "workspace grep only ever selects an absolute Git executable" {
+    const executable = workspace_files.trustedGitExecutable() orelse return error.SkipZigTest;
+    try std.testing.expect(std.fs.path.isAbsolute(executable));
 }
 
 test "grep search falls back to Zig scanner outside git repositories" {
