@@ -28,6 +28,7 @@ TRAINING_E2E_TESTS = (
     "file-tool-paths.test.ts",
     "file-tool-permissions.test.ts",
     "gateway-stream-lifecycle.test.ts",
+    "grep-trusted-git.test.ts",
     "web-fetch-fake-network.test.ts",
     "web-search-fake-gateway.test.ts",
     "vision-route-fake-gateway.test.ts",
@@ -364,8 +365,8 @@ class PgsoCorpusTests(unittest.TestCase):
             EXCLUDED_E2E_TESTS,
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
-        self.assertEqual(36, len(corpus.scenarios))
-        self.assertEqual(53, len(corpus.candidate_scenarios))
+        self.assertEqual(37, len(corpus.scenarios))
+        self.assertEqual(54, len(corpus.candidate_scenarios))
         self.assertEqual(
             100,
             next(
