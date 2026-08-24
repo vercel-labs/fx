@@ -103,6 +103,20 @@ JSON and quiet requests stay noninteractive by default. Add `--prompt-permission
 
 Inside a saved session, `/permissions remember <allow|deny> <tool-name> <arguments-json>` stores an exact confirmed rule without running the action. `/permissions` lists stable rule IDs, and `/permissions revoke <rule-id>` removes a stored rule even when its original workspace or file state has changed.
 
+## Attach to a resident fx session
+
+Run the agent and tools on one machine while another fx process presents the structured conversation:
+
+```bash
+# Remote workspace owner
+fx serve
+
+# Presentation client
+fx attach unix://$HOME/.fx/agent.sock --session <session-id>
+```
+
+Detaching leaves accepted work running in the server. The client receives semantic history, assistant updates, tool progress, status, and permission requests rather than terminal output. WebSocket attachment can be exposed through a loopback-only Tailscale Serve backend with app-capability authorization. See [Semantic remote attachment](docs/remote-attach.md) for lifecycle, protocol, deployment, and security details.
+
 ## Embed fx
 
 fx builds as a native binary or WebAssembly. Applications embedding fx can provide network transport, session storage, configuration, permission handling, and terminal I/O.

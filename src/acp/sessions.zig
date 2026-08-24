@@ -992,9 +992,52 @@ fn sendExecutionHistory(
     session_id: []const u8,
     execution: types.ExecutionMemory,
 ) !void {
+    if (state.client_remote_projection) {
+        try sendStructuredExecutionHistory(state, alloc, session_id, execution);
+    }
     const text = try session_runtime.formatExecutionReplayContext(alloc, execution) orelse return;
     defer alloc.free(text);
     try sendAgentHistoryChunk(state, alloc, session_id, text);
+}
+
+fn sendStructuredExecutionHistory(
+    state: *server.ServerState,
+    alloc: Allocator,
+    session_id: []const u8,
+    execution: types.ExecutionMemory,
+) !void {
+    for (execution.tool_steps) |step| {
+        for (step.tool_calls) |call| {
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            try out.writer.writeAll("{\"sessionId\":");
+            try writeJsonStr(session_id, &out.writer);
+            try out.writer.writeAll(",\"update\":");
+            try acp_types.writeToolCall(&out.writer, call.id, call.name, .other, .pending);
+            try out.writer.writeByte('}');
+            try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+
+            const result = for (step.tool_results) |candidate| {
+                if (std.mem.eql(u8, candidate.tool_call_id, call.id)) break candidate;
+            } else null;
+            out.writer.end = 0;
+            try out.writer.writeAll("{\"sessionId\":");
+            try writeJsonStr(session_id, &out.writer);
+            try out.writer.writeAll(",\"update\":");
+            if (result) |value| {
+                try acp_types.writeToolCallUpdate(
+                    &out.writer,
+                    call.id,
+                    if (value.status == .success) .completed else .failed,
+                    value.output,
+                );
+            } else {
+                try acp_types.writeToolCallUpdate(&out.writer, call.id, .completed, null);
+            }
+            try out.writer.writeByte('}');
+            try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+        }
+    }
 }
 
 fn sendAgentHistoryChunk(state: *server.ServerState, alloc: Allocator, session_id: []const u8, text: []const u8) !void {

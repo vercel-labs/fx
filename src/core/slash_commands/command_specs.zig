@@ -8,7 +8,9 @@ const Allocator = std.mem.Allocator;
 pub const TopLevelKind = enum {
     help,
     ask,
+    attach,
     acp,
+    serve,
     pr,
     issue,
     login,

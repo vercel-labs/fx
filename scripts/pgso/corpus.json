@@ -110,6 +110,7 @@
     {"name": "e2e-tui-gateway-stream-lifecycle", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-gateway-stream-lifecycle.test.ts"], "test_file": "tui-gateway-stream-lifecycle.test.ts"}
   ],
   "verification_scenarios": [
+    {"name": "verify-remote-attach", "argv": ["bun", "test", "--max-concurrency", "1", "./remote-attach.test.ts"], "test_file": "remote-attach.test.ts", "requires_tmux": false},
     {"name": "verify-auto-mode-reliability", "argv": ["bun", "test", "--max-concurrency", "1", "./auto-mode-reliability.test.ts"], "test_file": "auto-mode-reliability.test.ts"},
     {"name": "verify-oauth-keychain-migration", "argv": ["bun", "test", "--max-concurrency", "1", "./oauth-keychain-migration.test.ts"], "test_file": "oauth-keychain-migration.test.ts", "allow_keychain": true},
     {"name": "verify-tui-auth-source-selection", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-auth-source-selection.test.ts"], "test_file": "tui-auth-source-selection.test.ts"},

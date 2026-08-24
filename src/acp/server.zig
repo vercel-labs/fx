@@ -212,6 +212,7 @@ pub const ServerState = struct {
     client_fs_read: bool = false,
     client_fs_write: bool = false,
     client_terminal: bool = false,
+    client_remote_projection: bool = false,
     client_elicitation: elicitation.Capabilities = .{},
     workspace_root: []u8 = &.{},
     workspace_access: workspace_access.WorkspaceAccess = .{},
@@ -1228,6 +1229,7 @@ const InitializeRequest = struct {
     client_fs_read: bool = false,
     client_fs_write: bool = false,
     client_terminal: bool = false,
+    client_remote_projection: bool = false,
     client_elicitation: elicitation.Capabilities = .{},
 };
 
@@ -1263,6 +1265,9 @@ fn parseInitializeRequest(
     }
     if (capabilities.object.get("terminal")) |value| {
         request.client_terminal = value == .bool and value.bool;
+    }
+    if (capabilities.object.get("fxRemoteAttach")) |value| {
+        request.client_remote_projection = value == .bool and value.bool;
     }
     request.client_elicitation = elicitation.parseAcpCapabilities(capabilities);
     return request;
@@ -1442,6 +1447,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.client_fs_read = request.client_fs_read;
     state.client_fs_write = request.client_fs_write;
     state.client_terminal = request.client_terminal;
+    state.client_remote_projection = request.client_remote_projection;
     state.client_elicitation = request.client_elicitation;
     state.initialized = true;
 

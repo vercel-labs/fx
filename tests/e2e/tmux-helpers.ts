@@ -206,7 +206,7 @@ export function fakeGatewayFinalText(text: string) {
   ]);
 }
 
-export function heldFakeGatewayFinalText() {
+export function heldFakeGatewayFinalText(initialText?: string) {
   const encoder = new TextEncoder();
   let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
   let closed = false;
@@ -251,6 +251,14 @@ export function heldFakeGatewayFinalText() {
         if (closed) {
           value.close();
           return;
+        }
+        if (initialText !== undefined) {
+          setTimeout(() => {
+            if (!closed) value.enqueue(encoder.encode(
+              `data: ${JSON.stringify({ type: "text-start", id: "answer_1" })}\n\n` +
+              `data: ${JSON.stringify({ type: "text-delta", id: "answer_1", delta: initialText })}\n\n`,
+            ));
+          }, 100);
         }
         const keepAlive = () => {
           if (!closed) value.enqueue(encoder.encode(": hold-response\n\n"));

@@ -7,6 +7,8 @@ const background_store = @import("../background/background_store.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const acp_runner = @import("acp_runner.zig");
+const remote_runner = @import("remote_runner.zig");
+const remote_contracts = @import("../remote/contracts.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
@@ -57,7 +59,9 @@ pub const Command = union(enum) {
     interactive,
     help,
     ask: []const [:0]const u8,
+    attach: []const [:0]const u8,
     acp: []const [:0]const u8,
+    serve: []const [:0]const u8,
     pr: []const [:0]const u8,
     issue: []const [:0]const u8,
     login: []const [:0]const u8,
@@ -197,6 +201,7 @@ pub const Config = struct {
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     acp_runner: acp_runner.Runner,
+    remote_runner: remote_runner.Runner = .{},
 };
 
 const LocalSurfaceOptions = struct {
@@ -302,6 +307,17 @@ const SessionRecoveryOptions = struct {
 const AcpOptions = struct {
     model: ?[]const u8 = null,
     log_file: ?[]const u8 = null,
+};
+
+const ServeOptions = struct {
+    listen: ?[]const u8 = null,
+    tailscale_capability: []const u8 = remote_contracts.default_capability,
+};
+
+const AttachOptions = struct {
+    endpoint: []const u8,
+    session_id: []const u8,
+    observe: bool = false,
 };
 
 const WorkflowOptions = struct {
@@ -452,6 +468,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         },
         'a' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .ask)) return .{ .ask = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .attach)) return .{ .attach = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .acp)) return .{ .acp = args[1..] };
         },
         'b' => {
@@ -485,6 +502,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         },
         's' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .setup)) return .{ .setup = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .serve)) return .{ .serve = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .status)) return .{ .status = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .sessions)) return .{ .sessions = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .session)) {
@@ -872,38 +890,48 @@ fn runNonInteractiveWithDeps(
             const exit_code = try cli_ask.run(alloc, rest, workflowConfigWithLaunchModifiers(cfg, global_args.modifiers), cfg.context_registry, cfg.tool_set);
             return if (exit_code == 0) .handled_success else .handled_failure;
         },
+        .attach => |rest| {
+            const options = parseAttachArgs(rest) catch {
+                try writeStderr(deps, "usage: fx attach <endpoint> --session <id> [--observe]\n");
+                return .handled_failure;
+            };
+            try cfg.remote_runner.attach(alloc, .{
+                .endpoint = options.endpoint,
+                .session_id = options.session_id,
+                .observe = options.observe,
+            });
+            return .handled_success;
+        },
+        .serve => |rest| {
+            const options = parseServeArgs(rest) catch {
+                try writeStderr(deps, "usage: fx serve [--listen <endpoint>] [--tailscale-capability <key>]\n");
+                return .handled_failure;
+            };
+            const default_listen = if (options.listen == null) blk: {
+                const home = deps.getenv(deps.env_ctx, "HOME") orelse {
+                    try writeStderr(deps, "fx serve: HOME is not set; pass --listen\n");
+                    return .handled_failure;
+                };
+                break :blk try std.fmt.allocPrint(alloc, "unix://{s}/.fx/agent.sock", .{home});
+            } else null;
+            defer if (default_listen) |value| alloc.free(value);
+            try cfg.remote_runner.serve(alloc, acpConfig(cfg, global_args.modifiers, null, null), .{
+                .listen = options.listen orelse default_listen.?,
+                .tailscale_capability = options.tailscale_capability,
+            });
+            return .handled_success;
+        },
         .acp => |rest| {
             const acp_opts = parseAcpArgs(rest) catch {
                 try writeStderr(deps, "usage: fx acp [--model <id>] [--log-file <path>]\n");
                 return .handled_failure;
             };
-            try cfg.acp_runner.run(alloc, .{
-                .default_model = cfg.default_model,
-                .default_agent_step_limit = cfg.default_agent_step_limit,
-                .gateway_retry_count = cfg.gateway_retry_count,
-                .gateway_chat_url = cfg.gateway_provider.chat_url.resolve(cfg.gateway_chat_url),
-                .gateway_models_path = cfg.models_path,
-                .gateway_provider = cfg.gateway_provider,
-                .provider_set = cfg.provider_set,
-                .background_process_provider = cfg.background_process_provider,
-                .secret_store = cfg.secret_store,
-                .prompt_policy = cfg.prompt_policy,
-                .ignored_list_entries = cfg.ignored_list_entries,
-                .max_list_entries = cfg.max_list_entries,
-                .max_read_file_bytes = cfg.max_read_file_bytes,
-                .max_read_file_lines = cfg.max_read_file_lines,
-                .max_read_file_line_len = cfg.max_read_file_line_len,
-                .max_command_output_bytes = cfg.max_command_output_bytes,
-                .max_tool_result_bytes = cfg.max_tool_result_bytes,
-                .max_history_turns = cfg.max_history_turns,
-                .context_registry = cfg.context_registry,
-                .mode_registry = cfg.mode_registry,
-                .context_limit_overrides = global_args.modifiers.context_limit_overrides,
-                .additional_directories = global_args.modifiers.additional_directories,
-                .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
-                .model_override = acp_opts.model,
-                .log_file = acp_opts.log_file,
-            });
+            try cfg.acp_runner.run(alloc, acpConfig(
+                cfg,
+                global_args.modifiers,
+                acp_opts.model,
+                acp_opts.log_file,
+            ));
             return .handled_success;
         },
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
@@ -2956,6 +2984,41 @@ test "session recovery boundary failures keep stable text and json guidance" {
     );
 }
 
+fn acpConfig(
+    cfg: Config,
+    modifiers: LaunchModifiers,
+    model_override: ?[]const u8,
+    log_file: ?[]const u8,
+) acp_runner.Config {
+    return .{
+        .default_model = cfg.default_model,
+        .default_agent_step_limit = cfg.default_agent_step_limit,
+        .gateway_retry_count = cfg.gateway_retry_count,
+        .gateway_chat_url = cfg.gateway_provider.chat_url.resolve(cfg.gateway_chat_url),
+        .gateway_models_path = cfg.models_path,
+        .gateway_provider = cfg.gateway_provider,
+        .provider_set = cfg.provider_set,
+        .background_process_provider = cfg.background_process_provider,
+        .secret_store = cfg.secret_store,
+        .prompt_policy = cfg.prompt_policy,
+        .ignored_list_entries = cfg.ignored_list_entries,
+        .max_list_entries = cfg.max_list_entries,
+        .max_read_file_bytes = cfg.max_read_file_bytes,
+        .max_read_file_lines = cfg.max_read_file_lines,
+        .max_read_file_line_len = cfg.max_read_file_line_len,
+        .max_command_output_bytes = cfg.max_command_output_bytes,
+        .max_tool_result_bytes = cfg.max_tool_result_bytes,
+        .max_history_turns = cfg.max_history_turns,
+        .context_registry = cfg.context_registry,
+        .mode_registry = cfg.mode_registry,
+        .context_limit_overrides = modifiers.context_limit_overrides,
+        .additional_directories = modifiers.additional_directories,
+        .saved_directories_suppressed = modifiers.saved_directories_suppressed,
+        .model_override = model_override,
+        .log_file = log_file,
+    };
+}
+
 fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
     return .{
         .command_usage = command_specs.topLevelUsage(cfg.command_catalog, .ask),
@@ -2996,7 +3059,7 @@ fn workflowConfigWithLaunchModifiers(
 
 fn commandSupportsWorkspaceModifiers(command: Command) bool {
     return switch (command) {
-        .interactive, .ask, .acp, .pr, .issue, .resume_session => true,
+        .interactive, .ask, .acp, .serve, .pr, .issue, .resume_session => true,
         else => false,
     };
 }
@@ -3004,7 +3067,7 @@ fn commandSupportsWorkspaceModifiers(command: Command) bool {
 fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
-        "fx: --add-dir and --no-additional-dirs are only supported for interactive, resume, ask, ACP, PR, and issue launches\n",
+        "fx: --add-dir and --no-additional-dirs are only supported for interactive, resume, ask, ACP, serve, PR, and issue launches\n",
     );
 }
 
@@ -3014,6 +3077,57 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.DuplicateAdditionalDirectorySuppression => "--no-additional-dirs may only be specified once",
         else => null,
     };
+}
+
+fn parseServeArgs(args: []const [:0]const u8) !ServeOptions {
+    var options = ServeOptions{};
+    var capability_seen = false;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--listen")) {
+            if (options.listen != null or index + 1 >= args.len) return error.InvalidServeArgs;
+            index += 1;
+            options.listen = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--listen=")) {
+            if (options.listen != null or arg["--listen=".len..].len == 0) return error.InvalidServeArgs;
+            options.listen = arg["--listen=".len..];
+        } else if (std.mem.eql(u8, arg, "--tailscale-capability")) {
+            if (capability_seen or index + 1 >= args.len) return error.InvalidServeArgs;
+            index += 1;
+            if (args[index].len == 0) return error.InvalidServeArgs;
+            capability_seen = true;
+            options.tailscale_capability = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--tailscale-capability=")) {
+            const value = arg["--tailscale-capability=".len..];
+            if (capability_seen or value.len == 0) return error.InvalidServeArgs;
+            capability_seen = true;
+            options.tailscale_capability = value;
+        } else return error.InvalidServeArgs;
+    }
+    return options;
+}
+
+fn parseAttachArgs(args: []const [:0]const u8) !AttachOptions {
+    if (args.len == 0 or args[0].len == 0) return error.InvalidAttachArgs;
+    var session_id: ?[]const u8 = null;
+    var observe = false;
+    var index: usize = 1;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--session")) {
+            if (session_id != null or index + 1 >= args.len) return error.InvalidAttachArgs;
+            index += 1;
+            session_id = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--session=")) {
+            if (session_id != null or arg["--session=".len..].len == 0) return error.InvalidAttachArgs;
+            session_id = arg["--session=".len..];
+        } else if (std.mem.eql(u8, arg, "--observe")) {
+            if (observe) return error.InvalidAttachArgs;
+            observe = true;
+        } else return error.InvalidAttachArgs;
+    }
+    return .{ .endpoint = args[0], .session_id = session_id orelse return error.InvalidAttachArgs, .observe = observe };
 }
 
 fn parseAcpArgs(args: []const [:0]const u8) !AcpOptions {
@@ -3648,6 +3762,36 @@ test "parse acp args extracts known flags and rejects invalid arguments" {
     );
 }
 
+test "parse remote serve and attach options rejects ambiguous authority" {
+    const serve = try parseServeArgs(&.{
+        @as([:0]const u8, "--listen"),
+        @as([:0]const u8, "unix:///tmp/private/agent.sock"),
+        @as([:0]const u8, "--tailscale-capability=example.com/cap/fx"),
+    });
+    try std.testing.expectEqualStrings("unix:///tmp/private/agent.sock", serve.listen.?);
+    try std.testing.expectEqualStrings("example.com/cap/fx", serve.tailscale_capability);
+
+    const attach = try parseAttachArgs(&.{
+        @as([:0]const u8, "wss://builder.example/fx"),
+        @as([:0]const u8, "--session"),
+        @as([:0]const u8, "session-1"),
+        @as([:0]const u8, "--observe"),
+    });
+    try std.testing.expectEqualStrings("wss://builder.example/fx", attach.endpoint);
+    try std.testing.expectEqualStrings("session-1", attach.session_id);
+    try std.testing.expect(attach.observe);
+    try std.testing.expectError(error.InvalidAttachArgs, parseAttachArgs(&.{@as([:0]const u8, "unix:///tmp/a")}));
+    try std.testing.expectError(error.InvalidAttachArgs, parseAttachArgs(&.{
+        @as([:0]const u8, "unix:///tmp/a"),
+        @as([:0]const u8, "--session=x"),
+        @as([:0]const u8, "--session=y"),
+    }));
+    try std.testing.expectError(error.InvalidServeArgs, parseServeArgs(&.{
+        @as([:0]const u8, "--tailscale-capability=a/cap/x"),
+        @as([:0]const u8, "--tailscale-capability=b/cap/y"),
+    }));
+}
+
 test "ACP command routes parsed options and launch config through the injected runner" {
     const Capture = struct {
         expected: Config,
@@ -4170,7 +4314,7 @@ test "workspace launch modifiers still reject unsupported local command help" {
     );
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings("", capture.stdout.written());
-    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "only supported for interactive, resume, ask, ACP, PR, and issue launches") != null);
+    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "only supported for interactive, resume, ask, ACP, serve, PR, and issue launches") != null);
 }
 
 test "global workspace launch option errors use user-facing copy" {

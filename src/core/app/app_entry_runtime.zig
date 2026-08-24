@@ -4,6 +4,7 @@ const app_process_runtime = @import("app_process_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const acp_runner = @import("../cli/acp_runner.zig");
+const remote_runner = @import("../cli/remote_runner.zig");
 const cli_surface = @import("../cli/cli_surface.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
@@ -65,6 +66,7 @@ pub const Config = struct {
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     acp_runner: acp_runner.Runner,
+    remote_runner: remote_runner.Runner = .{},
 };
 
 pub fn run(comptime App: type, alloc: Allocator, args: []const [:0]const u8, cfg: Config) !void {
@@ -406,6 +408,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .inspect_mcp_profile_config = cfg.inspect_mcp_profile_config,
         .load_mcp_runtime = cfg.load_mcp_runtime,
         .acp_runner = cfg.acp_runner,
+        .remote_runner = cfg.remote_runner,
     };
 }
 
