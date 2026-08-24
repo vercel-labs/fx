@@ -70,6 +70,8 @@ const allowlist: AllowRule[] = [
   rule("src/core/cli/cli_ask.zig", "realStdoutIsTty", /stdio_acquisition/, "terminal_probe", "ask presentation TTY capability probe"),
   rule("src/core/cli/cli_ask.zig", "realStderrIsTty", /stdio_acquisition/, "terminal_probe", "notification fallback TTY capability probe"),
   rule("src/core/cli/cli_replay.zig", "(?:writeStdout|writeStderr)", /stdio_acquisition_write/, "noninteractive_output", "replay process output"),
+  rule("src/ui/remote_attach.zig", "(?:renderSnapshot|renderUpdate|renderToolUnlocked|renderPendingUnlocked|renderRunState|renderOperation|renderError|sendPrompt)", /stdio_(?:acquisition|acquisition_write|write)/, "noninteractive_output", "append-only semantic remote presentation"),
+  rule("src/acp/remote_host.zig", "(?:announceUnix|runWebSocket)", /stdio_(?:acquisition|acquisition_write|write)/, "noninteractive_output", "resident serve-listener announcement"),
   rule("src/core/cli/cli_surface.zig", "(?:writeRealStdout|writeRealStderr|writeFdAll)", /(?:stdio_acquisition_write|fixed_fd_write|raw_fd_write|delegated_fd_write)/, "noninteractive_output", "top-level CLI output"),
   rule("src/core/cli/cli_surface.zig", "(?:setupTerminalAvailableDefault|enable)", /fixed_descriptor/, "terminal_probe", "masked setup prompt TTY and raw-mode setup"),
   rule("src/core/auth/login_flow.zig", "(?:canUseInteractiveTeamPicker|enable)", /fixed_descriptor/, "terminal_probe", "auth login team-picker TTY probe"),

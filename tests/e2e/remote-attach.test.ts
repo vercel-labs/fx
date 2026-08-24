@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,7 +27,9 @@ afterEach(async () => {
 });
 
 function isolatedRoot(prefix: string) {
-  const root = mkdtempSync(join(tmpdir(), prefix));
+  // macOS reports /var/... for TMPDIR even though /var is a symlink. The Unix
+  // listener deliberately rejects every symlink in its secure parent walk.
+  const root = mkdtempSync(join(realpathSync(tmpdir()), prefix));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
   mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
@@ -178,7 +180,14 @@ async function startServer(root: ReturnType<typeof isolatedRoot>, env: NodeJS.Pr
   let stderr = "";
   proc.stdout!.on("data", (chunk) => stdout += chunk.toString());
   proc.stderr!.on("data", (chunk) => stderr += chunk.toString());
-  await waitFor(() => existsSync(socket) && stdout.includes("fx serve: listening"), "serve socket");
+  await waitFor(() => {
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+      throw new Error(`fx serve exited code=${proc.exitCode} signal=${proc.signalCode}\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+    }
+    return existsSync(socket) && stdout.includes("fx serve: listening");
+  }, "serve socket").catch((cause) => {
+    throw new Error(`${cause instanceof Error ? cause.message : cause}\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+  });
   return { socket, proc, stdout: () => stdout, stderr: () => stderr };
 }
 
