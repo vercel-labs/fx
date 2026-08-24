@@ -640,6 +640,9 @@ fn fetchCredits(
     if (input.credential_source == .grok_subscription) {
         return creditsErrorSnapshot(alloc, "AI Gateway credits are unavailable for a Grok subscription.");
     }
+    if (input.credential_source == .opencode_api_key) {
+        return creditsErrorSnapshot(alloc, "AI Gateway credits are unavailable for an OpenCode API key.");
+    }
     return fetchCreditsWithFetch(
         alloc,
         input.credential,

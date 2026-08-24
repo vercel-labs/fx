@@ -545,6 +545,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "provider",
         "codex_model",
         "grok_model",
+        "opencode_model",
         "effort",
         "fast_mode",
         "slash_menu_categories",
@@ -1299,6 +1300,12 @@ fn parseProfileOnlyFields(
                 try settings.models.putCopy(alloc, provider, model_value.string);
             }
         }
+    }
+
+    if (root.object.get("opencode_model")) |model_value| {
+        if (model_value != .string) return error.InvalidOpenCodeModelType;
+        settings_store.validateModel(model_value.string) catch return error.InvalidOpenCodeModelValue;
+        try settings.models.putCopy(alloc, .opencode, model_value.string);
     }
 
     if (root.object.get("permission_mode")) |permission_mode_value| {

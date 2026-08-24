@@ -389,6 +389,7 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
           pane.includes("Sign in with Vercel") &&
           pane.includes("Sign in with Codex") &&
           pane.includes("Sign in with Grok") &&
+          pane.includes("Sign in with OpenCode") &&
           pane.includes("API key") &&
           pane.includes("Switch provider"),
         TIMEOUT,
