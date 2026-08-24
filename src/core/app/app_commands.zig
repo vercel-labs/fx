@@ -211,7 +211,7 @@ noinline fn parseWorkspaceCommand(rest: []const u8) !?workspace_commands.Action 
     return error.InvalidWorkspaceCommand;
 }
 
-noinline fn tryBeginWorkspaceMutation(app: anytype) bool {
+noinline fn tryBeginIdleMutation(app: anytype) bool {
     const queued_review_active = if (comptime @hasField(@TypeOf(app.*), "queued_prompt_review"))
         app.queued_prompt_review.active()
     else
@@ -221,7 +221,7 @@ noinline fn tryBeginWorkspaceMutation(app: anytype) bool {
 }
 
 fn refreshWorkspaceAvailabilityForList(app: anytype) !void {
-    if (!tryBeginWorkspaceMutation(app)) return;
+    if (!tryBeginIdleMutation(app)) return;
     defer app.worker.releaseTurnStartHold();
     if (comptime @hasDecl(@TypeOf(app.*), "refreshWorkspaceAccess")) {
         _ = try app.refreshWorkspaceAccess();
@@ -252,7 +252,7 @@ fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
         return writeWorkspaceSnapshot(app, null);
     };
 
-    if (!tryBeginWorkspaceMutation(app)) {
+    if (!tryBeginIdleMutation(app)) {
         try app.writeDomainNotice(.{
             .topic = "workspace",
             .tone = .neutral,
@@ -345,6 +345,7 @@ pub fn Handlers(comptime App: type) type {
             return .{
                 .ctx = @ptrCast(app),
                 .quit = commandQuit,
+                .delete_session = commandDeleteSession,
                 .clear_screen = commandClearScreen,
                 .new_session = commandNewSession,
                 .reset_session = commandResetSession,
@@ -590,6 +591,34 @@ pub fn Handlers(comptime App: type) type {
         fn commandQuit(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             requestResumeExit(app);
+        }
+
+        fn commandDeleteSession(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (!tryBeginIdleMutation(app)) {
+                try app.writeDomainNotice(.{
+                    .topic = "session",
+                    .tone = .neutral,
+                    .body = "Session deletion is unavailable until the active and queued work finishes.",
+                }, true);
+                return;
+            }
+            defer app.worker.releaseTurnStartHold();
+
+            app_session_runtime.Runtime(App).deleteActiveSession(app) catch |err| {
+                const body: []const u8 = switch (err) {
+                    error.NoActiveSession => "there is no saved session to delete",
+                    error.SessionDeletionRetained => "the current session could not be deleted safely",
+                    error.SessionDeletionIndeterminate => "fx could not confirm that the current session was deleted",
+                };
+                try app.writeDomainNotice(.{
+                    .topic = "session",
+                    .tone = .warning,
+                    .body = body,
+                }, true);
+                return;
+            };
+            app.should_exit = true;
         }
 
         fn commandClearScreen(ctx: *anyopaque) !void {
@@ -2753,7 +2782,7 @@ test "workspace slash parser preserves paths with spaces and rejects incomplete 
     try std.testing.expectError(error.InvalidWorkspaceCommand, parseWorkspaceCommand("unknown"));
 }
 
-test "workspace mutation admission rejects queue-zero processing gap" {
+test "idle mutation admission rejects queue-zero processing gap without cancellation" {
     const alloc = std.testing.allocator;
     var app = struct {
         stream: struct { active: bool = false } = .{},
@@ -2770,14 +2799,18 @@ test "workspace mutation admission rejects queue-zero processing gap" {
         .history = try alloc.alloc(types.HistoryTurn, 0),
         .grants = try alloc.alloc(types.PermissionGrant, 0),
     });
+    try std.testing.expect(!tryBeginIdleMutation(&app));
+    try std.testing.expect(!app.worker.isCancelRequested());
+
     const active = (try app.worker.waitAndTakeNextPrompt(alloc)).?;
     defer worker_runtime.freeQueuedPrompt(alloc, active);
 
     try std.testing.expectEqual(@as(usize, 0), app.worker.queuedPromptCount());
-    try std.testing.expect(!tryBeginWorkspaceMutation(&app));
+    try std.testing.expect(!tryBeginIdleMutation(&app));
+    try std.testing.expect(!app.worker.isCancelRequested());
 
     app.worker.finishProcessing();
-    try std.testing.expect(tryBeginWorkspaceMutation(&app));
+    try std.testing.expect(tryBeginIdleMutation(&app));
     app.worker.releaseTurnStartHold();
 }
 
