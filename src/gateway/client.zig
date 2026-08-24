@@ -1154,6 +1154,37 @@ fn streamGatewayCompletionCore(
     );
 }
 
+/// Process-wide HTTP client for gateway streaming. Reusing one client lets
+/// std.http.Client's connection pool keep TCP/TLS connections warm across
+/// retry attempts and chat turns instead of paying DNS + TCP + TLS setup
+/// (~1-3 round trips, often 100-300 ms) on every model request.
+var shared_gateway_client: ?*std.http.Client = null;
+const shared_client_c = struct {
+    pub var mu: std.atomic.Value(bool) = .init(false);
+
+    fn tryLock() bool {
+        return !mu.swap(true, .acq_rel);
+    }
+    fn unlock() void {
+        mu.store(false, .release);
+    }
+};
+
+fn sharedGatewayClient() *std.http.Client {
+    while (!shared_client_c.tryLock()) {
+        std.Thread.yield() catch {};
+    }
+    defer shared_client_c.unlock();
+    if (shared_gateway_client == null) {
+        // The client outlives any single request's arena, so it must not
+        // hold an arena allocator.
+        const c = std.heap.c_allocator.create(std.http.Client) catch @panic("oom");
+        c.* = .{ .allocator = std.heap.c_allocator, .io = io_mod.getIo() };
+        shared_gateway_client = c;
+    }
+    return shared_gateway_client.?;
+}
+
 fn streamGatewayCompletionCoreWithOptions(
     alloc: std.mem.Allocator,
     request: StreamRequest,
@@ -1193,8 +1224,7 @@ fn streamGatewayCompletionCoreWithOptions(
     var setup_epoch: ?ConnectionSetupEpoch = null;
     while (attempt < retry_count) : (attempt += 1) {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-        var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-        defer client.deinit();
+        const client = sharedGatewayClient();
 
         if (setup_epoch == null) {
             setup_epoch = ConnectionSetupEpoch.init(core_options.setup_timing);
@@ -1209,7 +1239,7 @@ fn streamGatewayCompletionCoreWithOptions(
 
         debug_trace.eventf("gateway", "before_http_open_connect", trace_ctx, "attempt={d} retry_count={d}", .{ attempt + 1, retry_count });
         debug_trace.eventf("gateway", "before_request_open", trace_ctx, "attempt={d} retry_count={d} payload_bytes={d}", .{ attempt + 1, retry_count, payload.len });
-        var req = openGatewayRequestBounded(&client, uri, .{
+        var req = openGatewayRequestBounded(client, uri, .{
             .headers = .{
                 .content_type = .{ .override = "application/json" },
                 .authorization = .{ .override = auth_header },
@@ -1217,7 +1247,7 @@ fn streamGatewayCompletionCoreWithOptions(
                 .user_agent = .{ .override = user_agent },
             },
             .extra_headers = extra_headers,
-            .keep_alive = false,
+            .keep_alive = true,
             .redirect_behavior = .unhandled,
         }, core_options.request_open_override, epoch, cancel_flag) catch |err| {
             debug_trace.eventf("gateway", "http_open_connect_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
