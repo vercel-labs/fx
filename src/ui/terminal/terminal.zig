@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("../../core/shared/types.zig");
+const image_types = @import("image_types.zig");
 
 pub const interactive_mode_enable_sequence = "\x1b[>4;2m\x1b[>1u\x1b[?2004h\x1b[?7l";
 const tmux_interactive_mode_enable_sequence = "\x1b[>4;2m\x1b[?2004h\x1b[?7l";
@@ -44,6 +45,26 @@ pub fn queryLayout(fd: std.posix.fd_t, footer_rows: u16) !types.Layout {
     return layoutFromSize(ws.row, ws.col, footer_rows);
 }
 
+pub fn queryCellDimensions(fd: std.posix.fd_t) ?image_types.CellDimensions {
+    var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
+    const req: c_int = @intCast(std.c.T.IOCGWINSZ);
+    if (std.c.ioctl(fd, req, &ws) == -1) return null;
+    return cellDimensionsFromSize(ws.row, ws.col, ws.xpixel, ws.ypixel);
+}
+
+pub fn cellDimensionsFromSize(
+    rows: u16,
+    cols: u16,
+    width_px: u16,
+    height_px: u16,
+) ?image_types.CellDimensions {
+    if (rows == 0 or cols == 0 or width_px == 0 or height_px == 0) return null;
+    return .{
+        .width_px = @max(@as(u16, 1), width_px / cols),
+        .height_px = @max(@as(u16, 1), height_px / rows),
+    };
+}
+
 pub fn layoutFromSize(rows: u16, cols: u16, footer_rows: u16) !types.Layout {
     if (rows <= footer_rows) return error.TerminalTooSmall;
 
@@ -64,6 +85,14 @@ pub fn isInvalidLayoutError(err: anyerror) bool {
 
 pub fn moveCursorSequence(buf: []u8, row: u16, col: u16) ![]const u8 {
     return std.fmt.bufPrint(buf, "\x1b[{d};{d}H", .{ row, col });
+}
+
+test "cell dimensions use terminal pixel geometry when available" {
+    try std.testing.expectEqual(
+        image_types.CellDimensions{ .width_px = 10, .height_px = 20 },
+        cellDimensionsFromSize(24, 80, 800, 480).?,
+    );
+    try std.testing.expect(cellDimensionsFromSize(24, 80, 0, 0) == null);
 }
 
 test "moveCursorSequence formats correctly" {

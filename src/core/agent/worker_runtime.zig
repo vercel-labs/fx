@@ -2657,6 +2657,11 @@ pub fn dupeToolLifecycleEvent(
             errdefer if (result) |value| alloc.free(value);
             const result_memory = try dupeToolResultMemory(alloc, terminal.result_memory);
             errdefer freeToolResultMemory(alloc, result_memory);
+            const presentation_image = if (terminal.presentation_image) |image|
+                try types.dupeImageAttachment(alloc, image)
+            else
+                null;
+            errdefer if (presentation_image) |image| types.freeImageAttachment(alloc, image);
             const command_artifact_handle = if (terminal.command_artifact_handle) |handle|
                 try alloc.dupe(u8, handle)
             else
@@ -2670,6 +2675,7 @@ pub fn dupeToolLifecycleEvent(
                 },
                 .result = result,
                 .result_memory = result_memory,
+                .presentation_image = presentation_image,
                 .command_artifact_handle = command_artifact_handle,
             } };
         },
@@ -2705,6 +2711,7 @@ pub fn freeToolLifecycleEvent(
             alloc.free(@constCast(terminal.outcome.summary));
             if (terminal.result) |result| alloc.free(@constCast(result));
             freeToolResultMemory(alloc, terminal.result_memory);
+            if (terminal.presentation_image) |image| types.freeImageAttachment(alloc, image);
             if (terminal.command_artifact_handle) |handle| alloc.free(@constCast(handle));
         },
         .turn_finished => {},
@@ -4304,6 +4311,13 @@ test "typed lifecycle worker events duplicate and free every payload variant" {
         .{ .terminal = .{
             .id = .{ .turn_id = 1, .call_id = "final" },
             .outcome = .{ .kind = .completed, .summary = "Listed files" },
+            .presentation_image = .{
+                .id = 1,
+                .path = @constCast("/tmp/preview.png"),
+                .media_type = @constCast("image/png"),
+                .snapshot_path = @constCast("/tmp/preview.png"),
+                .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            },
             .command_artifact_handle = "fx-command-final.log",
         } },
         .{ .turn_finished = .{ .turn_id = 1, .outcome = .completed } },

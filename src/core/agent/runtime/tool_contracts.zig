@@ -91,6 +91,8 @@ pub const ToolExecutionResult = struct {
     selected_dynamic_tool_schema_json: ?[]const u8 = null,
     tool_result_memory: ?types.ToolResultMemory = null,
     prepared_result_memory: ?types.ToolResultMemory = null,
+    /// Presentation-only local image produced by tools such as open_file.
+    presentation_image: ?types.ImageAttachment = null,
     committed_file_handoff: ?file_mutation.CommittedFileHandoff = null,
     deferred_tool_completion: ?DeferredToolCompletion = null,
     command_replay_capture: ?*command_replay_store.Capture = null,

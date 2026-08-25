@@ -72,6 +72,7 @@
 - **Workspace status line:** Opt in to the active workspace path and Git branch through `/settings`, `/statusline workspace`, or `statusLine.workspace`
 - **fx-native workspace skills:** Discover project skills from `.fx/skills` before other workspace and compatibility roots
 - **External skill authorities:** Allow symlinked skills under explicitly trusted external directories through `FX_SKILL_SYMLINK_AUTHORITIES`
+- **Terminal image previews:** Render submitted and agent-read or agent-opened PNG, JPEG, GIF, and WebP files inline through Kitty graphics, converting non-PNG previews to bounded first-frame PNG payloads with placement, cleanup, and text fallback behavior
 
 ### Improvements
 

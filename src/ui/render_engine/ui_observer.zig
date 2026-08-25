@@ -695,6 +695,10 @@ fn writeProvenanceJson(
             try std.json.Stringify.value(@tagName(entry.entry_class), .{}, writer);
             try writer.writeAll("}");
         },
+        .image => |image| try writer.print(
+            "{{\"kind\":\"image\",\"entry_id\":{d},\"image_id\":{d},\"row_index\":{d},\"row_count\":{d}}}",
+            .{ image.entry_id, image.image_id, image.row_index, image.row_count },
+        ),
         .block_separator,
         .boundary_blank,
         .capped_continuation,
@@ -727,6 +731,10 @@ fn writeProvenanceSummary(
         .entry => |entry| try writer.print(
             "entry:{d}:{s}",
             .{ entry.entry_id, @tagName(entry.entry_class) },
+        ),
+        .image => |image| try writer.print(
+            "image:{d}:{d}:{d}/{d}",
+            .{ image.entry_id, image.image_id, image.row_index + 1, image.row_count },
         ),
         .folded_command_output => |output| {
             if (output.entry_id) |entry_id| {

@@ -9,6 +9,7 @@ const paint_plan = @import("paint_plan.zig");
 const terminal_diff = @import("terminal_diff.zig");
 const transcript_blocks = @import("transcript_blocks.zig");
 const ui_observer = @import("ui_observer.zig");
+const image_graphics = @import("../terminal/image_graphics.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 const activity_runtime = @import("../../core/output/activity_runtime.zig");
 
@@ -55,6 +56,7 @@ pub const BuildFrameOptions = struct {
     footer_painter: ?SurfacePainter = null,
     activity_painter: ?SurfacePainter = null,
     presentation: FramePresentation = .styled,
+    image_runtime: ?*image_graphics.Runtime = null,
     trace_counters: ?*TraceCounters = null,
     observation: ?FrameObservation = null,
 };
@@ -123,12 +125,67 @@ pub fn buildAndFlushFrame(
         .sink = shell.frameSink(),
         .metrics = metrics,
     });
+    reconcileImageSidecar(shell, metrics, &surface, result, options);
     if (options.trace_counters) |counters| counters.frame_commits += 1;
 
     logFrameCommitResult(plan, result);
     observeCommittedFrame(alloc, &surface, &plan, result, &options);
     try record_retry_invalidation(shell, result);
     return result;
+}
+
+fn reconcileImageSidecar(
+    shell: anytype,
+    metrics: *Metrics,
+    surface: *const frame_surface.FrameSurface,
+    result: terminal_diff.FrameCommitResult,
+    options: BuildFrameOptions,
+) void {
+    const runtime = options.image_runtime orelse return;
+    if (!result.is_committed()) {
+        runtime.invalidatePlacements();
+        return;
+    }
+    switch (options.transcript_body) {
+        .retain => return,
+        .paint => {},
+    }
+
+    const outcome = runtime.commitFrame(
+        surface.alloc,
+        surface.image_placements.items,
+        surface.plan.synchronized_update,
+        result.committed_cursor_row,
+        result.committed_cursor_col,
+        result.committed_cursor_visible,
+        surface.plan.reset_terminal,
+        shell.frameSink(),
+        metrics,
+    ) catch |err| {
+        runtime.invalidatePlacements();
+        debug_trace.logf(
+            "images",
+            "event=terminal_image_sidecar_failed err={s}",
+            .{@errorName(err)},
+        );
+        requestImageRetry(shell, surface.plan);
+        return;
+    };
+    if (outcome == .failed) requestImageRetry(shell, surface.plan);
+}
+
+fn requestImageRetry(shell: anytype, plan: paint_plan.PaintPlan) void {
+    const band = paint_plan.paintedContentBand(plan);
+    if (band.isEmpty()) return;
+    shell.recordFrameInvalidation(.{
+        .reason = .partial_write,
+        .top = band.top,
+        .bottom = band.bottom,
+    }) catch |err| debug_trace.logf(
+        "images",
+        "event=terminal_image_retry_request_failed err={s}",
+        .{@errorName(err)},
+    );
 }
 
 fn alignmentClearStartRow(

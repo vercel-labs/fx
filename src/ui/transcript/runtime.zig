@@ -1956,6 +1956,69 @@ test "authoritative lifecycle detail is retained by its compact status entry" {
     try std.testing.expect(std.mem.find(u8, source.bytes, "full result") == null);
 }
 
+test "completed tool lifecycle retains and renders its presentation image" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+    runtime.setCommandOutputRenderPolicy(.{ .image_preview = .{
+        .protocol = .kitty,
+        .cells = .{ .width_px = 10, .height_px = 10 },
+        .max_width_cells = 10,
+        .max_height_cells = 2,
+    } });
+
+    const id = types.ToolLifecycleId{ .turn_id = 2, .call_id = "open-image" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "open_file",
+        .activity_kind = .open,
+        .arguments_json = "{\"path\":\"preview.png\"}",
+    } });
+    const image = types.ImageAttachment{
+        .id = 1,
+        .path = @constCast("/tmp/preview.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = @constCast("/tmp/preview.png"),
+        .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        .pixel_width = 100,
+        .pixel_height = 100,
+    };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Opened preview.png" },
+        .presentation_image = image,
+    } });
+
+    const entry_id = runtime.toolActivityRecord(id).?.entry_id;
+    var retained: ?types.ImageAttachment = null;
+    for (runtime.entries.items) |entry| {
+        if (entry.id() == entry_id and entry == .raw_bytes) {
+            retained = entry.raw_bytes.inline_image;
+            break;
+        }
+    }
+    const retained_image = retained.?;
+    try std.testing.expectEqualStrings(image.path, retained_image.path);
+    try std.testing.expect(retained_image.path.ptr != image.path.ptr);
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    var image_rows: usize = 0;
+    for (source.line_provenance) |provenance| {
+        if (provenance == .image) image_rows += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), image_rows);
+}
+
 test "paused tool turn can resume the same lifecycle identity before finalization" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{};
@@ -4446,6 +4509,7 @@ pub const TranscriptRuntime = struct {
                 terminal.outcome,
                 terminal.result,
                 terminal.result_memory,
+                terminal.presentation_image,
                 terminal.command_artifact_handle,
             ),
             .turn_finished => |finished| self.applyTurnFinishedLifecycle(
@@ -4934,6 +4998,7 @@ pub const TranscriptRuntime = struct {
         outcome: types.ToolOutcome,
         result: ?[]const u8,
         result_memory: ?types.ToolResultMemory,
+        presentation_image: ?types.ImageAttachment,
         command_artifact_handle: ?[]const u8,
     ) !?types.ToolActivityKind {
         const record = self.lifecycle_state.recordPtr(id) orelse {
@@ -4977,6 +5042,7 @@ pub const TranscriptRuntime = struct {
             alloc,
             record.entry_id,
             line,
+            presentation_image,
             @intFromBool(detail_start != null),
             @intFromBool(detail_update.command_process_entry != null),
         )) return error.MissingLifecycleTranscriptEntry;
@@ -6180,6 +6246,7 @@ pub const TranscriptRuntime = struct {
         }
         const source_entry_id = switch (source orelse return) {
             .entry => |entry| entry.entry_id,
+            .image => |image| image.entry_id,
             .folded_command_output => |output| output.entry_id,
             else => null,
         };
@@ -6210,6 +6277,7 @@ pub const TranscriptRuntime = struct {
         for (provenance, 0..) |source, line_index| {
             const entry_id = switch (source) {
                 .entry => |entry| entry.entry_id,
+                .image => |image| image.entry_id,
                 .folded_command_output => |output| output.entry_id orelse continue,
                 else => continue,
             };

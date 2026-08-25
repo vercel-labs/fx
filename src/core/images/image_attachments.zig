@@ -6,6 +6,7 @@ const entity_spans = @import("../shared/entity_spans.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
+const image_dimensions = @import("image_dimensions.zig");
 const pathing = @import("../workspace/pathing.zig");
 
 pub const max_image_bytes: usize = 20 * 1024 * 1024;
@@ -14,6 +15,7 @@ pub const image_too_large_notice = "image exceeds the 20 MiB limit";
 pub const image_preparation_failed_notice = "Unable to prepare this image for upload. Use a smaller image.";
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const snapshot_digest_hex_len = Sha256.digest_length * 2;
+const metadata_prefix_bytes = 64 * 1024;
 const transfer_buffer_bytes = 64 * 1024;
 const image_normalization_timeout = std.Io.Clock.Duration{
     .clock = .awake,
@@ -154,16 +156,91 @@ fn loadResolvedImageAttachment(
 ) !types.ImageAttachment {
     errdefer alloc.free(resolved_path);
 
-    var header: [64]u8 = undefined;
+    var header: [metadata_prefix_bytes]u8 = undefined;
     const bytes = try readImageHeaderBytes(resolved_path, &header);
 
-    const media_type = try alloc.dupe(u8, detectMediaTypeFromBytes(bytes) orelse return error.UnsupportedImageType);
+    const detected_media_type = detectMediaTypeFromBytes(bytes) orelse return error.UnsupportedImageType;
+    const media_type = try alloc.dupe(u8, detected_media_type);
     errdefer alloc.free(media_type);
+    const dimensions = image_dimensions.detect(bytes, detected_media_type);
 
     return .{
         .path = resolved_path,
         .media_type = media_type,
+        .pixel_width = if (dimensions) |value| value.width else 0,
+        .pixel_height = if (dimensions) |value| value.height else 0,
     };
+}
+
+/// Captures a digest-pinned view of an existing local image without copying the
+/// source. Terminal rendering re-opens `snapshot_path` and verifies this digest
+/// immediately before transmission, so a replaced or modified file is skipped.
+/// The caller owns every returned field.
+pub fn loadTerminalPreviewAttachment(
+    alloc: std.mem.Allocator,
+    canonical_path: []const u8,
+    image_id: usize,
+) !types.ImageAttachment {
+    if (image_id == 0) return error.InvalidImageId;
+    var attachment = try loadImageAttachment(alloc, canonical_path);
+    errdefer types.freeImageAttachment(alloc, attachment);
+    attachment.id = image_id;
+
+    var source = openVisionRegularFile(attachment.path) catch |err| switch (err) {
+        error.NotRegularFile => return error.ImageTargetChanged,
+        else => return err,
+    };
+    defer source.close();
+    const stat = try source.file.stat(io_mod.getIo());
+    if (stat.kind != .file) return error.NotRegularFile;
+    const size_bytes = std.math.cast(usize, stat.size) orelse return error.ImageTooLarge;
+    if (size_bytes > max_image_bytes) return error.ImageTooLarge;
+    const direct_png_transfer = std.mem.eql(u8, attachment.media_type, "image/png");
+    if (direct_png_transfer and !fitsEncodedLimit(size_bytes)) {
+        return error.ImagePreparationFailed;
+    }
+
+    var hasher = Sha256.init(.{});
+    var header: [metadata_prefix_bytes]u8 = undefined;
+    var header_len: usize = 0;
+    var read_buffer: [8192]u8 = undefined;
+    var reader = source.file.readerStreaming(io_mod.getIo(), &read_buffer);
+    var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
+    var read_bytes: usize = 0;
+    while (true) {
+        const n = try reader.interface.readSliceShort(&transfer_buffer);
+        if (n == 0) break;
+        if (n > max_image_bytes - read_bytes) return error.ImageTooLarge;
+        const header_bytes = @min(n, header.len - header_len);
+        @memcpy(header[header_len..][0..header_bytes], transfer_buffer[0..header_bytes]);
+        header_len += header_bytes;
+        hasher.update(transfer_buffer[0..n]);
+        read_bytes += n;
+    }
+    if (read_bytes != size_bytes or
+        (direct_png_transfer and !fitsEncodedLimit(read_bytes)))
+    {
+        return error.ImageTargetChanged;
+    }
+
+    const detected_media_type = detectMediaTypeFromBytes(header[0..header_len]) orelse
+        return error.UnsupportedImageType;
+    if (!std.mem.eql(u8, detected_media_type, attachment.media_type)) {
+        return error.ImageTargetChanged;
+    }
+    const dimensions = image_dimensions.detect(header[0..header_len], detected_media_type);
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+
+    const snapshot_path = try alloc.dupe(u8, attachment.path);
+    errdefer alloc.free(snapshot_path);
+    const snapshot_sha256 = try alloc.dupe(u8, &digest_hex);
+    attachment.snapshot_path = snapshot_path;
+    attachment.snapshot_sha256 = snapshot_sha256;
+    attachment.pixel_width = if (dimensions) |value| value.width else 0;
+    attachment.pixel_height = if (dimensions) |value| value.height else 0;
+    return attachment;
 }
 
 pub fn createTempSnapshotDir(alloc: std.mem.Allocator) ![]u8 {
@@ -601,6 +678,8 @@ fn captureImageSnapshotFromOpenFileWithBudget(
     attachment.media_type = media_type;
     attachment.snapshot_path = final_path;
     attachment.snapshot_sha256 = digest_hex;
+    attachment.pixel_width = metadata.pixel_width;
+    attachment.pixel_height = metadata.pixel_height;
     cleanup_final = false;
 
     alloc.free(old_media_type);
@@ -631,7 +710,7 @@ fn streamSourceToFile(
     defer destination.close(io_mod.getIo());
 
     var hasher = Sha256.init(.{});
-    var header: [64]u8 = undefined;
+    var header: [metadata_prefix_bytes]u8 = undefined;
     var header_len: usize = 0;
     var read_buffer: [8192]u8 = undefined;
     var reader = source.readerStreaming(io_mod.getIo(), &read_buffer);
@@ -656,10 +735,13 @@ fn streamSourceToFile(
     hasher.final(&digest);
     const media_type = detectMediaTypeFromBytes(header[0..header_len]) orelse
         return error.UnsupportedImageType;
+    const dimensions = image_dimensions.detect(header[0..header_len], media_type);
     return .{
         .digest_hex = std.fmt.bytesToHex(digest, .lower),
         .media_type = media_type,
         .size_bytes = written,
+        .pixel_width = if (dimensions) |value| value.width else 0,
+        .pixel_height = if (dimensions) |value| value.height else 0,
     };
 }
 
@@ -667,6 +749,8 @@ const SnapshotMetadata = struct {
     digest_hex: [snapshot_digest_hex_len]u8,
     media_type: []const u8,
     size_bytes: usize,
+    pixel_width: u32,
+    pixel_height: u32,
 };
 
 fn fitsEncodedLimit(raw_bytes: usize) bool {
@@ -825,7 +909,7 @@ fn inspectImageCandidate(
     }
 
     var hasher = Sha256.init(.{});
-    var header: [64]u8 = undefined;
+    var header: [metadata_prefix_bytes]u8 = undefined;
     var header_len: usize = 0;
     var read_buffer: [8192]u8 = undefined;
     var reader = candidate.readerStreaming(io_mod.getIo(), &read_buffer);
@@ -850,10 +934,13 @@ fn inspectImageCandidate(
     hasher.final(&digest);
     const media_type = detectMediaTypeFromBytes(header[0..header_len]) orelse
         return error.ImagePreparationFailed;
+    const dimensions = image_dimensions.detect(header[0..header_len], media_type);
     return .{
         .digest_hex = std.fmt.bytesToHex(digest, .lower),
         .media_type = media_type,
         .size_bytes = read_bytes,
+        .pixel_width = if (dimensions) |value| value.width else 0,
+        .pixel_height = if (dimensions) |value| value.height else 0,
     };
 }
 
@@ -1134,6 +1221,7 @@ pub fn copyVerifiedImageAttachmentToDir(
     };
     try syncSnapshotDirectory(snapshot_dir_handle);
 
+    const dimensions = image_dimensions.detect(verified.bytes, verified.media_type);
     cleanup_final = false;
     return .{
         .id = new_id,
@@ -1141,6 +1229,18 @@ pub fn copyVerifiedImageAttachmentToDir(
         .media_type = media_type,
         .snapshot_path = final_path,
         .snapshot_sha256 = digest,
+        .pixel_width = if (attachment.pixel_width > 0)
+            attachment.pixel_width
+        else if (dimensions) |value|
+            value.width
+        else
+            0,
+        .pixel_height = if (attachment.pixel_height > 0)
+            attachment.pixel_height
+        else if (dimensions) |value|
+            value.height
+        else
+            0,
     };
 }
 
@@ -2337,7 +2437,10 @@ test "loadImageAttachment accepts files larger than header length" {
     {
         var file = try tmp.dir.createFile(std.testing.io, "large.png", .{});
         defer file.close(io_mod.getIo());
-        try file.writeStreamingAll(io_mod.getIo(), "\x89PNG\r\n\x1a\n");
+        try file.writeStreamingAll(
+            io_mod.getIo(),
+            "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x02\x80\x00\x00\x01\xe0",
+        );
         var padding: [256]u8 = undefined;
         @memset(padding[0..], 'a');
         try file.writeStreamingAll(io_mod.getIo(), padding[0..]);
@@ -2350,6 +2453,45 @@ test "loadImageAttachment accepts files larger than header length" {
     defer types.freeImageAttachment(std.testing.allocator, attachment);
 
     try std.testing.expectEqualStrings("image/png", attachment.media_type);
+    try std.testing.expectEqual(@as(u32, 640), attachment.pixel_width);
+    try std.testing.expectEqual(@as(u32, 480), attachment.pixel_height);
+}
+
+test "terminal preview attachment pins source bytes for verified rendering" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const png = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x20\x00\x00\x00\x10preview";
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "preview.png", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, png);
+    }
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "preview.png");
+    defer alloc.free(path);
+
+    const attachment = try loadTerminalPreviewAttachment(alloc, path, 7);
+    defer types.freeImageAttachment(alloc, attachment);
+    try std.testing.expectEqual(@as(usize, 7), attachment.id);
+    try std.testing.expectEqualStrings(path, attachment.snapshot_path.?);
+    try std.testing.expectEqual(@as(usize, 64), attachment.snapshot_sha256.?.len);
+    try std.testing.expectEqual(@as(u32, 32), attachment.pixel_width);
+    try std.testing.expectEqual(@as(u32, 16), attachment.pixel_height);
+
+    var snapshot = try loadVerifiedSnapshot(alloc, attachment, .{});
+    try std.testing.expectEqualStrings(png, snapshot.bytes);
+    snapshot.deinit(alloc);
+
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "preview.png", .{ .truncate = true });
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, png ++ "changed");
+    }
+    try std.testing.expectError(
+        error.ImageSnapshotCorrupt,
+        loadVerifiedSnapshot(alloc, attachment, .{}),
+    );
 }
 
 test "loadUserImageAttachment resolves paths from the workspace" {

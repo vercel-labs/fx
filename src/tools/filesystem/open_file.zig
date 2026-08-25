@@ -1,9 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const image_attachments = @import("../../core/images/image_attachments.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const types = @import("../../core/shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -84,7 +86,14 @@ fn callWithLauncher(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.To
 
     const target = pathing.resolveWorkspaceOrExternalPath(arena, ctx.workspace_root, input.path) catch |err| return mapPathError(err);
     const display_path = try displayPath(arena, ctx.workspace_root, target);
-    return launch_file(ctx.allocator, display_path, target, os_tag, launcher);
+    return launch_file(
+        ctx.allocator,
+        display_path,
+        target,
+        os_tag,
+        launcher,
+        ctx.presentation_image_sink,
+    );
 }
 
 fn mapPathError(err: anyerror) tool_dispatch.DispatchError {
@@ -108,7 +117,14 @@ fn displayPath(arena: Allocator, workspace_root: []const u8, absolute_path: []co
     return if (rel.len == 0) "." else rel;
 }
 
-fn launch_file(alloc: Allocator, display_path: []const u8, target: []const u8, os_tag: std.Target.Os.Tag, launcher: Launcher) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+fn launch_file(
+    alloc: Allocator,
+    display_path: []const u8,
+    target: []const u8,
+    os_tag: std.Target.Os.Tag,
+    launcher: Launcher,
+    presentation_image_sink: ?*?types.ImageAttachment,
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     var argv: [2][]const u8 = undefined;
     switch (os_tag) {
         .macos => argv = .{ "open", target },
@@ -122,13 +138,41 @@ fn launch_file(alloc: Allocator, display_path: []const u8, target: []const u8, o
     };
     switch (result.term) {
         .exited => |code| if (code == 0) {
-            return .{ .success = try std.fmt.allocPrint(alloc, "opened {s}", .{display_path}) };
+            const body = try std.fmt.allocPrint(alloc, "opened {s}", .{display_path});
+            errdefer alloc.free(body);
+            try capturePresentationImage(alloc, target, presentation_image_sink);
+            return .{ .success = body };
         },
         else => {},
     }
 
     logUnsuccessfulTerm("open_file", display_path, target, result.term);
     return .{ .failure = try std.fmt.allocPrint(alloc, "failed to open {s}", .{target}) };
+}
+
+fn capturePresentationImage(
+    alloc: Allocator,
+    target: []const u8,
+    sink: ?*?types.ImageAttachment,
+) Allocator.Error!void {
+    const slot = sink orelse return;
+    const image = image_attachments.loadTerminalPreviewAttachment(
+        alloc,
+        target,
+        1,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf(
+                "images",
+                "event=open_file_inline_preview_skipped path={s} err={s}",
+                .{ target, @errorName(err) },
+            );
+            return;
+        },
+    };
+    if (slot.*) |previous| types.freeImageAttachment(alloc, previous);
+    slot.* = image;
 }
 
 fn logUnsuccessfulTerm(tool_name: []const u8, display_path: []const u8, target: []const u8, term: std.process.Child.Term) void {
@@ -228,9 +272,31 @@ const MockLauncher = struct {
 };
 
 fn callPathWithMock(alloc: Allocator, workspace_root: []const u8, path: []const u8, os_tag: std.Target.Os.Tag, launcher: *MockLauncher) !tool_dispatch.ToolResult {
+    return callPathWithMockAndImageSink(
+        alloc,
+        workspace_root,
+        path,
+        os_tag,
+        launcher,
+        null,
+    );
+}
+
+fn callPathWithMockAndImageSink(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    path: []const u8,
+    os_tag: std.Target.Os.Tag,
+    launcher: *MockLauncher,
+    presentation_image_sink: ?*?types.ImageAttachment,
+) !tool_dispatch.ToolResult {
     var input = Input{ .path = try alloc.dupe(u8, path) };
     defer input.deinit(alloc);
-    return callWithLauncher(.{ .allocator = alloc, .workspace_root = workspace_root }, stackInput(&input), os_tag, .{
+    return callWithLauncher(.{
+        .allocator = alloc,
+        .workspace_root = workspace_root,
+        .presentation_image_sink = presentation_image_sink,
+    }, stackInput(&input), os_tag, .{
         .ctx = @ptrCast(launcher),
         .launch = MockLauncher.launch,
     });
@@ -313,6 +379,39 @@ test "open_file displays workspace-relative path on success" {
     try std.testing.expectEqual(@as(usize, 2), launcher.argv.items.len);
     try std.testing.expectEqualStrings("open", launcher.argv.items[0]);
     try std.testing.expectEqualStrings(target, launcher.argv.items[1]);
+}
+
+test "open_file exposes a verified PNG presentation image after launch" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const png = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x20\x00\x00\x00\x10preview";
+    const target = try writeTempFile(alloc, &tmp, "preview.png", png);
+    defer alloc.free(target);
+    var launcher = MockLauncher{};
+    defer launcher.deinit(alloc);
+    var image: ?types.ImageAttachment = null;
+    defer if (image) |attachment| types.freeImageAttachment(alloc, attachment);
+
+    var result = try callPathWithMockAndImageSink(
+        alloc,
+        workspace,
+        "preview.png",
+        .macos,
+        &launcher,
+        &image,
+    );
+    defer result.deinit(alloc);
+
+    try expectSuccessBody(result, "opened preview.png");
+    const attachment = image.?;
+    try std.testing.expectEqualStrings(target, attachment.path);
+    try std.testing.expectEqualStrings(target, attachment.snapshot_path.?);
+    try std.testing.expectEqualStrings("image/png", attachment.media_type);
+    try std.testing.expectEqual(@as(u32, 32), attachment.pixel_width);
+    try std.testing.expectEqual(@as(u32, 16), attachment.pixel_height);
 }
 
 test "open_file accepts external absolute paths through active workspace resolver" {

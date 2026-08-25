@@ -8,6 +8,7 @@ const assistant_wrap = @import("assistant_wrap.zig");
 const transcript_measure = @import("transcript_measure.zig");
 const user_message_card = @import("../assistant/user_message_card.zig");
 const input_visual_layout = @import("../input/visual_layout.zig");
+const image_types = @import("../terminal/image_types.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 const assistant_presentation = @import("../../core/agent/assistant_presentation.zig");
 const code_highlight = @import("code_highlight.zig");
@@ -41,6 +42,7 @@ pub const Styles = struct {
     notice_error_style: []const u8 = "",
     notice_cancelled_style: []const u8 = "",
     code_highlight_theme: CodeHighlightTheme = .dark,
+    image_preview: image_types.PreviewConfig = .{},
 };
 
 pub const ToolFallbackDisposition = enum {
@@ -163,6 +165,14 @@ pub const LineProvenance = union(enum) {
     entry: struct {
         entry_id: u32,
         entry_class: TranscriptEntryClass,
+    },
+    image: struct {
+        entry_id: u32,
+        image_id: usize,
+        row_index: u16,
+        row_count: u16,
+        col: u16,
+        columns: u16,
     },
     block_separator,
     boundary_blank,
@@ -312,6 +322,7 @@ pub const TranscriptEntry = union(enum) {
         bytes: []const u8,
         class: RawEntryClass = .unknown_raw,
         lifecycle_pinned: bool = false,
+        inline_image: ?types.ImageAttachment = null,
     };
 
     pub const SemanticNoticeEntry = struct {
@@ -384,6 +395,7 @@ pub const TranscriptEntry = union(enum) {
         switch (self.*) {
             .raw_bytes => |e| {
                 alloc.free(e.bytes);
+                if (e.inline_image) |image| types.freeImageAttachment(alloc, image);
             },
             .semantic_notice => |e| {
                 alloc.free(e.topic);
@@ -1555,16 +1567,26 @@ fn renderEntryToBlockForPresentationInterruptible(
         };
     }
     return switch (entry) {
-        .raw_bytes => |e| if (e.class == .tool_status and presentation == .full) blk: {
-            const full = try formatFullToolStatus(alloc, e.bytes, cols);
-            break :blk try normalizeOwnedRenderedBlock(alloc, kind, full);
-        } else if (e.class == .tool_status and toolStatusNeedsPreview(e.bytes, cols)) blk: {
-            const preview = try formatToolStatusPreview(alloc, e.bytes, cols);
-            break :blk try normalizeOwnedRenderedBlock(alloc, kind, preview);
-        } else if (e.class == .diff_block and presentation == .compact) blk: {
-            const compact = try reflowDiffBlock(alloc, e.bytes, cols);
-            break :blk try normalizeOwnedRenderedBlock(alloc, kind, compact);
-        } else try normalizeRenderedBlockTail(alloc, kind, e.bytes),
+        .raw_bytes => |e| blk: {
+            const base = if (e.class == .tool_status and presentation == .full) base: {
+                const full = try formatFullToolStatus(alloc, e.bytes, cols);
+                break :base try normalizeOwnedRenderedBlock(alloc, kind, full);
+            } else if (e.class == .tool_status and toolStatusNeedsPreview(e.bytes, cols)) base: {
+                const preview = try formatToolStatusPreview(alloc, e.bytes, cols);
+                break :base try normalizeOwnedRenderedBlock(alloc, kind, preview);
+            } else if (e.class == .diff_block and presentation == .compact) base: {
+                const compact = try reflowDiffBlock(alloc, e.bytes, cols);
+                break :base try normalizeOwnedRenderedBlock(alloc, kind, compact);
+            } else try normalizeRenderedBlockTail(alloc, kind, e.bytes);
+            if (presentation != .compact or e.inline_image == null) break :blk base;
+            break :blk try appendRawImagePreview(
+                alloc,
+                base,
+                e,
+                cols,
+                styles.image_preview,
+            );
+        },
         .semantic_notice => |e| blk: {
             const rendered = try renderSemanticNotice(
                 alloc,
@@ -1580,15 +1602,26 @@ fn renderEntryToBlockForPresentationInterruptible(
             break :blk try normalizeOwnedRenderedBlock(alloc, kind, rendered);
         },
         .user_turn => |e| blk: {
-            const card = try user_message_card.buildUserPromptCardWithSkillTokensForTerminalPresentationInterruptible(
+            const card = try user_message_card.buildUserPromptCardWithImagePreviewsInterruptible(
                 alloc,
                 e.turn.text,
                 e.turn.images,
                 cols,
                 e.skill_tokens,
+                true,
+                if (presentation == .compact) styles.image_preview else .{},
                 checkpoint,
             );
-            break :blk try normalizeOwnedRenderedBlock(alloc, kind, card);
+            defer if (card.image_preview_lines.len > 0) alloc.free(card.image_preview_lines);
+            var block = try normalizeOwnedRenderedBlock(alloc, kind, card.bytes);
+            errdefer block.deinit(alloc);
+            try attachUserPreviewProvenance(
+                alloc,
+                &block,
+                e.id,
+                card.image_preview_lines,
+            );
+            break :blk block;
         },
         .assistant_turn => |e| blk: {
             const wrapped = try assistant_wrap.wrapTranscriptAssistantTextInterruptible(
@@ -1634,6 +1667,91 @@ fn renderEntryToBlockForPresentationInterruptible(
             };
         },
     };
+}
+
+fn appendRawImagePreview(
+    alloc: Allocator,
+    base: RenderedBlock,
+    entry: TranscriptEntry.RawBytesEntry,
+    cols: u16,
+    config: image_types.PreviewConfig,
+) !RenderedBlock {
+    const image = entry.inline_image orelse return base;
+    const fit = image_types.fitPreview(image, cols, config) orelse return base;
+    defer base.deinit(alloc);
+
+    const base_line_count = renderedHardLineCount(base.bytes);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll(base.bytes);
+
+    // Keep two ordinary blank cells for the left gutter and a zero-width
+    // sentinel so boundary trimming cannot collapse these image canvas rows.
+    const canvas_row = "  \u{200b}\x1b[0m";
+    if (out.written().len > 0) try out.writer.writeByte('\n');
+    try out.writer.writeAll(canvas_row);
+    var row: u16 = 0;
+    while (row < fit.rows) : (row += 1) {
+        try out.writer.writeByte('\n');
+        try out.writer.writeAll(canvas_row);
+    }
+
+    const bytes = try out.toOwnedSlice();
+    var block = try normalizeOwnedRenderedBlock(alloc, base.kind, bytes);
+    errdefer block.deinit(alloc);
+    const line_count = renderedHardLineCount(block.bytes);
+    const provenance = try alloc.alloc(LineProvenance, line_count);
+    errdefer alloc.free(provenance);
+    @memset(provenance, .{ .entry = .{
+        .entry_id = entry.id,
+        .entry_class = .tool_status,
+    } });
+    var row_index: u16 = 0;
+    while (row_index < fit.rows) : (row_index += 1) {
+        const line_index = base_line_count + 1 + @as(usize, row_index);
+        std.debug.assert(line_index < provenance.len);
+        provenance[line_index] = .{ .image = .{
+            .entry_id = entry.id,
+            .image_id = image.id,
+            .row_index = row_index,
+            .row_count = fit.rows,
+            .col = image_types.preview_origin_col,
+            .columns = fit.columns,
+        } };
+    }
+    block.line_provenance = provenance;
+    block.owns_line_provenance = true;
+    return block;
+}
+
+fn attachUserPreviewProvenance(
+    alloc: Allocator,
+    block: *RenderedBlock,
+    entry_id: u32,
+    previews: []const user_message_card.ImagePreviewLine,
+) !void {
+    if (previews.len == 0) return;
+    const line_count = renderedHardLineCount(block.bytes);
+    const provenance = try alloc.alloc(LineProvenance, line_count);
+    errdefer alloc.free(provenance);
+    @memset(provenance, .{ .entry = .{
+        .entry_id = entry_id,
+        .entry_class = .user_turn,
+    } });
+    for (previews) |preview| {
+        std.debug.assert(preview.line_index < provenance.len);
+        if (preview.line_index >= provenance.len) continue;
+        provenance[preview.line_index] = .{ .image = .{
+            .entry_id = entry_id,
+            .image_id = preview.image_id,
+            .row_index = preview.row_index,
+            .row_count = preview.row_count,
+            .col = preview.col,
+            .columns = preview.columns,
+        } };
+    }
+    block.line_provenance = provenance;
+    block.owns_line_provenance = true;
 }
 
 fn normalizeOwnedRenderedBlock(
@@ -2015,8 +2133,16 @@ const RenderEntriesBuilder = struct {
         } };
         var block_line: usize = 0;
         const block_lines = renderedHardLineCount(block.bytes);
+        std.debug.assert(block.line_provenance.len == 0 or
+            block.line_provenance.len == block_lines);
         while (block_line < block_lines) : (block_line += 1) {
-            try lines.append(alloc, source);
+            try lines.append(
+                alloc,
+                if (block.line_provenance.len > 0)
+                    block.line_provenance[block_line]
+                else
+                    source,
+            );
         }
     }
 
@@ -2097,11 +2223,20 @@ fn renderEntriesInterruptible(
         try build_checkpoint.tick(checkpoint);
         if (options.shouldOmit(entry_index, entry)) continue;
         if (options.overrideForEntry(entry_index, entry)) |override| {
-            const block = try normalizeRenderedBlockTail(
+            var block = try normalizeRenderedBlockTail(
                 alloc,
                 override.kind,
                 override.bytes,
             );
+            if (entry == .raw_bytes and entry.raw_bytes.inline_image != null) {
+                block = try appendRawImagePreview(
+                    alloc,
+                    block,
+                    entry.raw_bytes,
+                    cols,
+                    styles.image_preview,
+                );
+            }
             defer block.deinit(alloc);
             if (!renderedBlockHasContent(block)) continue;
             try builder.appendBlock(alloc, entry, block, options, checkpoint);
@@ -2641,9 +2776,12 @@ pub const RenderedBlock = struct {
     stored_tail_newlines: usize,
     allocation: []const u8 = &.{},
     owned: bool = false,
+    line_provenance: []LineProvenance = &.{},
+    owns_line_provenance: bool = false,
 
     pub fn deinit(self: RenderedBlock, alloc: Allocator) void {
         if (self.owned) alloc.free(self.allocation);
+        if (self.owns_line_provenance) alloc.free(self.line_provenance);
     }
 };
 
@@ -4328,6 +4466,113 @@ test "renderEntriesToBytes rebuilds user card at paint-time cols" {
     try std.testing.expect(std.mem.find(u8, wide, "┃") != null);
     try std.testing.expect(std.mem.find(u8, wide, "this is") != null);
     try std.testing.expect(std.mem.find(u8, narrow, "this is") != null);
+}
+
+test "compact preparation preserves image row provenance outside text bytes" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    var source_images = [_]types.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/tmp/x.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = @constCast("/tmp/snapshot.png"),
+        .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        .pixel_width = 100,
+        .pixel_height = 100,
+    }};
+    const turn = try types.dupeUserTurn(alloc, .{
+        .text = @constCast("[Image #1]"),
+        .images = &source_images,
+    });
+    var handed_off = false;
+    errdefer if (!handed_off) types.freeUserTurn(alloc, turn);
+    try entries.append(alloc, .{ .user_turn = .{
+        .id = 7,
+        .turn = turn,
+    } });
+    handed_off = true;
+    try appendAssistantTestEntry(&entries, alloc, 8, "assistant response");
+
+    var prepared = try renderEntriesForPreparation(
+        alloc,
+        entries.items,
+        20,
+        .{ .image_preview = .{
+            .protocol = .kitty,
+            .cells = .{ .width_px = 10, .height_px = 10 },
+            .max_width_cells = 10,
+            .max_height_cells = 2,
+        } },
+        .{ .capture_provenance = true },
+    );
+    defer prepared.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 6), prepared.line_provenance.len);
+    try std.testing.expect(prepared.line_provenance[0] == .entry);
+    try std.testing.expect(prepared.line_provenance[1] == .entry);
+    for (prepared.line_provenance[2..4], 0..) |source, row_index| {
+        const image = switch (source) {
+            .image => |value| value,
+            else => return error.TestExpectedImageProvenance,
+        };
+        try std.testing.expectEqual(@as(u32, 7), image.entry_id);
+        try std.testing.expectEqual(@as(usize, 1), image.image_id);
+        try std.testing.expectEqual(@as(u16, @intCast(row_index)), image.row_index);
+        try std.testing.expectEqual(@as(u16, 2), image.row_count);
+        try std.testing.expectEqual(@as(u16, 3), image.col);
+    }
+    try std.testing.expectEqual(LineProvenance.block_separator, prepared.line_provenance[4]);
+    try std.testing.expect(prepared.line_provenance[5] == .entry);
+}
+
+test "compact preparation appends tool presentation image provenance" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendRawTestEntry(&entries, alloc, 11, "● Opened preview.png\n", .tool_status);
+    entries.items[0].raw_bytes.inline_image = try types.dupeImageAttachment(alloc, .{
+        .id = 1,
+        .path = @constCast("/tmp/preview.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = @constCast("/tmp/preview.png"),
+        .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        .pixel_width = 100,
+        .pixel_height = 100,
+    });
+    try appendAssistantTestEntry(&entries, alloc, 12, "assistant response");
+
+    var prepared = try renderEntriesForPreparation(
+        alloc,
+        entries.items,
+        20,
+        .{ .image_preview = .{
+            .protocol = .kitty,
+            .cells = .{ .width_px = 10, .height_px = 10 },
+            .max_width_cells = 10,
+            .max_height_cells = 2,
+        } },
+        .{ .capture_provenance = true },
+    );
+    defer prepared.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 6), prepared.line_provenance.len);
+    try std.testing.expect(prepared.line_provenance[0] == .entry);
+    try std.testing.expect(prepared.line_provenance[1] == .entry);
+    for (prepared.line_provenance[2..4], 0..) |source, row_index| {
+        const image = switch (source) {
+            .image => |value| value,
+            else => return error.TestExpectedImageProvenance,
+        };
+        try std.testing.expectEqual(@as(u32, 11), image.entry_id);
+        try std.testing.expectEqual(@as(usize, 1), image.image_id);
+        try std.testing.expectEqual(@as(u16, @intCast(row_index)), image.row_index);
+        try std.testing.expectEqual(@as(u16, 2), image.row_count);
+        try std.testing.expectEqual(@as(u16, 3), image.col);
+    }
+    try std.testing.expectEqual(LineProvenance.block_separator, prepared.line_provenance[4]);
+    try std.testing.expect(prepared.line_provenance[5] == .entry);
 }
 
 test "renderEntriesToBytes preserves selected skill token spans through user card reflow" {

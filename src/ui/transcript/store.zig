@@ -165,7 +165,12 @@ pub fn retainedStructuredBytes(self: anytype) usize {
 
 fn entryRetainedBytes(entry: TranscriptEntry) usize {
     return switch (entry) {
-        .raw_bytes => |e| e.bytes.len,
+        .raw_bytes => |e| e.bytes.len + if (e.inline_image) |image|
+            image.path.len + image.media_type.len +
+                (if (image.snapshot_path) |value| value.len else 0) +
+                (if (image.snapshot_sha256) |value| value.len else 0)
+        else
+            0,
         .semantic_notice => |e| e.topic.len + e.body.len,
         .user_turn => |e| blk: {
             var total = e.turn.text.len;
@@ -1408,6 +1413,8 @@ pub fn replacePinnedToolStatusAtomic(
         new_bytes,
         false,
         .strict,
+        null,
+        false,
         .{},
     );
 }
@@ -1425,6 +1432,8 @@ pub fn replacePinnedToolStatusAtEndAtomic(
         new_bytes,
         true,
         .preserve_same_epoch,
+        null,
+        false,
         .{},
     );
 }
@@ -1434,6 +1443,7 @@ pub fn replacePinnedToolStatusForTerminalAtomic(
     alloc: Allocator,
     entry_id: u32,
     new_bytes: []const u8,
+    inline_image: ?types.ImageAttachment,
     additional_tool_detail_capacity: usize,
     additional_command_output_capacity: usize,
 ) !bool {
@@ -1444,6 +1454,8 @@ pub fn replacePinnedToolStatusForTerminalAtomic(
         new_bytes,
         false,
         .preserve_same_epoch,
+        inline_image,
+        true,
         .{
             .tool_details = additional_tool_detail_capacity,
             .command_output_entries = additional_command_output_capacity,
@@ -1467,6 +1479,8 @@ fn replacePinnedToolStatusAtomicInternal(
     new_bytes: []const u8,
     place_at_end: bool,
     rewrite_mode: TranscriptSourceRewriteMode,
+    inline_image: ?types.ImageAttachment,
+    replace_inline_image: bool,
     reservations: LifecycleStatusReservations,
 ) !bool {
     try self.assertCanMutateTranscript();
@@ -1478,6 +1492,7 @@ fn replacePinnedToolStatusAtomicInternal(
 
     if (reservations.empty() and
         !reposition and
+        !replace_inline_image and
         !retentionPlanningRequired(self, entry_id, new_bytes.len))
     {
         return replacePinnedToolStatusFast(
@@ -1502,6 +1517,16 @@ fn replacePinnedToolStatusAtomicInternal(
     alloc.free(shadow.entries.items[shadow_index].raw_bytes.bytes);
     shadow.entries.items[shadow_index].raw_bytes.bytes = replacement;
     shadow.entries.items[shadow_index].raw_bytes.class = .tool_status;
+    if (replace_inline_image) {
+        const owned_image = if (inline_image) |image|
+            try types.dupeImageAttachment(alloc, image)
+        else
+            null;
+        if (shadow.entries.items[shadow_index].raw_bytes.inline_image) |previous| {
+            types.freeImageAttachment(alloc, previous);
+        }
+        shadow.entries.items[shadow_index].raw_bytes.inline_image = owned_image;
+    }
     if (reposition) {
         const entry = shadow.entries.orderedRemove(shadow_index);
         shadow.entries.appendAssumeCapacity(entry);
@@ -1969,13 +1994,22 @@ fn cloneEntries(
 
 fn cloneEntry(alloc: Allocator, entry: TranscriptEntry) !TranscriptEntry {
     return switch (entry) {
-        .raw_bytes => |raw| .{ .raw_bytes = .{
-            .id = raw.id,
-            .created_at_ms = raw.created_at_ms,
-            .bytes = try alloc.dupe(u8, raw.bytes),
-            .class = raw.class,
-            .lifecycle_pinned = raw.lifecycle_pinned,
-        } },
+        .raw_bytes => |raw| blk: {
+            const bytes = try alloc.dupe(u8, raw.bytes);
+            errdefer alloc.free(bytes);
+            const inline_image = if (raw.inline_image) |image|
+                try types.dupeImageAttachment(alloc, image)
+            else
+                null;
+            break :blk .{ .raw_bytes = .{
+                .id = raw.id,
+                .created_at_ms = raw.created_at_ms,
+                .bytes = bytes,
+                .class = raw.class,
+                .lifecycle_pinned = raw.lifecycle_pinned,
+                .inline_image = inline_image,
+            } };
+        },
         .semantic_notice => |notice| blk: {
             const owned = try types.dupeSemanticNotice(alloc, .{
                 .topic = notice.topic,
@@ -2455,15 +2489,18 @@ pub fn writeUserPromptCard(
         );
     }
 
-    const card = try user_message_card.buildUserPromptCardWithSkillTokensForTerminalPresentation(
+    var card = try user_message_card.buildUserPromptCardWithImagePreviewsInterruptible(
         alloc,
         user.text,
         user.images,
         shadow.layout.cols,
         skill_tokens,
+        true,
+        shadow.command_output_render.styles.image_preview,
+        null,
     );
-    defer alloc.free(card);
-    try shadow.writeTranscriptBytes(alloc, metrics, card, true);
+    defer card.deinit(alloc);
+    try shadow.writeTranscriptBytes(alloc, metrics, card.bytes, true);
 
     const user_copy = try types.dupeUserTurn(alloc, user);
     const admission = try appendUserTurnOwnedWithSkillTokensAndRetention(

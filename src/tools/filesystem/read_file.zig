@@ -1,10 +1,12 @@
 const std = @import("std");
+const image_attachments = @import("../../core/images/image_attachments.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
 const permission_gate = @import("../../core/permissions/permission_gate.zig");
 const read_tracker = @import("../../core/workspace/read_tracker.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const types = @import("../../core/shared/types.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const write_file_impl = @import("write_file.zig");
 
@@ -153,9 +155,21 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     const rel = pathing.workspaceRelativePath(arena, ctx.workspace_root, target) catch target;
 
     if (!text_utils.isModelSafeText(text)) {
+        const rendered_inline = try capturePresentationImage(
+            ctx.allocator,
+            target,
+            ctx.presentation_image_sink,
+        );
         tool_dispatch.reportToolResultMemory(ctx, .{
             .model_view_covers_full_file = false,
         });
+        if (rendered_inline) {
+            return .{ .success = try std.fmt.allocPrint(
+                ctx.allocator,
+                "<path>{s}</path>\n<content>Image rendered inline ({d} bytes)</content>",
+                .{ rel, stat.size },
+            ) };
+        }
         return .{ .success = try std.fmt.allocPrint(
             ctx.allocator,
             "<path>{s}</path>\n<content>binary or non-utf8 file omitted ({d} bytes)</content>",
@@ -177,6 +191,25 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     });
 
     return .{ .success = try formatReadOutput(ctx.allocator, rel, &selected, records.items, scan, snapshot_covers_full_file) };
+}
+
+fn capturePresentationImage(
+    alloc: Allocator,
+    target: []const u8,
+    sink: ?*?types.ImageAttachment,
+) Allocator.Error!bool {
+    const slot = sink orelse return false;
+    const image = image_attachments.loadTerminalPreviewAttachment(
+        alloc,
+        target,
+        1,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    if (slot.*) |previous| types.freeImageAttachment(alloc, previous);
+    slot.* = image;
+    return true;
 }
 
 fn readFileFailure(alloc: Allocator, err: anyerror, path: []const u8) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
@@ -708,6 +741,34 @@ test "read_file omits binary content using active success output" {
 
     try std.testing.expectEqual(.success, result.status);
     try std.testing.expect(std.mem.find(u8, result.body, "binary or non-utf8 file omitted") != null);
+    try std.testing.expect(!result.tool_result_memory.?.model_view_covers_full_file.?);
+}
+
+test "read_file renders a requested PNG inline without opening another app" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const png = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x20\x00\x00\x00\x10preview";
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "preview.png", .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), png);
+    }
+    const path = try tmpPath(std.testing.allocator, tmp, "preview.png");
+    defer std.testing.allocator.free(path);
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    defer std.testing.allocator.free(args);
+
+    const result = try dispatchReadFile(std.testing.allocator, args);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "Image rendered inline") != null);
+    const image = result.presentation_image.?;
+    try std.testing.expectEqualStrings(path, image.path);
+    try std.testing.expectEqualStrings(path, image.snapshot_path.?);
+    try std.testing.expectEqualStrings("image/png", image.media_type);
+    try std.testing.expectEqual(@as(u32, 32), image.pixel_width);
+    try std.testing.expectEqual(@as(u32, 16), image.pixel_height);
     try std.testing.expect(!result.tool_result_memory.?.model_view_covers_full_file.?);
 }
 

@@ -325,6 +325,10 @@ fn writeUserTurnJson(writer: *std.Io.Writer, user: session.UserTurn) !void {
         try writeImageSnapshotLocatorJson(writer, image.snapshot_path);
         try writer.writeAll(",\"snapshot_sha256\":");
         try std.json.Stringify.value(image.snapshot_sha256, .{}, writer);
+        try writer.print(",\"pixel_width\":{d},\"pixel_height\":{d}", .{
+            image.pixel_width,
+            image.pixel_height,
+        });
         try writer.writeByte('}');
     }
     try writer.writeAll("]}");
@@ -1158,6 +1162,14 @@ fn validateImagesArray(alloc: Allocator, maybe_value: ?std.json.Value) ![]sessio
             try requireString(object, "media_type"),
             snapshot_path,
             snapshot_sha256,
+            if (object.get("pixel_width") != null)
+                std.math.cast(u32, try requireUsize(object, "pixel_width")) orelse return error.InvalidSessionFormat
+            else
+                0,
+            if (object.get("pixel_height") != null)
+                std.math.cast(u32, try requireUsize(object, "pixel_height")) orelse return error.InvalidSessionFormat
+            else
+                0,
         );
         owns_snapshot_path = false;
         owns_snapshot_sha256 = false;
@@ -1173,6 +1185,8 @@ fn dupeParsedImageAttachment(
     media_type_src: []const u8,
     snapshot_path_src: ?[]u8,
     snapshot_sha256_src: ?[]u8,
+    pixel_width: u32,
+    pixel_height: u32,
 ) !session.ImageAttachment {
     const path = try alloc.dupe(u8, path_src);
     errdefer alloc.free(path);
@@ -1184,6 +1198,8 @@ fn dupeParsedImageAttachment(
         .media_type = media_type,
         .snapshot_path = snapshot_path_src,
         .snapshot_sha256 = snapshot_sha256_src,
+        .pixel_width = pixel_width,
+        .pixel_height = pixel_height,
     };
 }
 

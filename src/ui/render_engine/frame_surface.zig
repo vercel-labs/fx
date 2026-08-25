@@ -4,6 +4,7 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const frame_layout = @import("frame_layout.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const paint_plan = @import("paint_plan.zig");
+const image_types = @import("../terminal/image_types.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const Allocator = std.mem.Allocator;
@@ -45,6 +46,8 @@ pub const FrameSurfaceError = error{
     UnownedFxCell,
     CursorOutOfBounds,
     WideCellInvariantViolation,
+    ImageOutOfBounds,
+    ImageOwnerConflict,
     MissingHyperlinkResource,
     MissingCombiningSuffixResource,
 };
@@ -120,6 +123,9 @@ pub const FrameSurface = struct {
     cells: []FrameCell,
     hyperlinks: std.ArrayList(SurfaceHyperlink) = .empty,
     combining_suffixes: std.ArrayList([]u8) = .empty,
+    /// Borrowed image resources placed after the text frame commits. The shadow
+    /// VT never parses or owns terminal graphics protocol bytes.
+    image_placements: std.ArrayList(image_types.Placement) = .empty,
     plan: paint_plan.PaintPlan,
     cursor_target: ?paint_plan.FrameCursorTarget,
 
@@ -194,6 +200,7 @@ pub const FrameSurface = struct {
         self.hyperlinks.deinit(self.alloc);
         for (self.combining_suffixes.items) |suffix| self.alloc.free(suffix);
         self.combining_suffixes.deinit(self.alloc);
+        self.image_placements.deinit(self.alloc);
     }
 
     pub fn cellAt(self: FrameSurface, row: u16, col: u16) ?FrameCell {
@@ -355,12 +362,23 @@ pub const FrameSurface = struct {
         }
     }
 
+    pub fn addImagePlacement(
+        self: *FrameSurface,
+        placement: image_types.Placement,
+    ) FrameSurfaceError!void {
+        try self.validateImagePlacement(placement);
+        try self.image_placements.append(self.alloc, placement);
+    }
+
     pub fn validate(self: FrameSurface) FrameSurfaceError!void {
         if (self.cells.len != @as(usize, self.rows) * @as(usize, self.cols)) return error.InvalidGridSize;
         if (self.cursor_target) |cursor| {
             if (cursor.row == 0 or cursor.row > self.rows or cursor.col == 0 or cursor.col > self.cols) {
                 return error.CursorOutOfBounds;
             }
+        }
+        for (self.image_placements.items) |placement| {
+            try self.validateImagePlacement(placement);
         }
 
         var row: u16 = 1;
@@ -370,6 +388,31 @@ pub const FrameSurface = struct {
                 const cell = self.cellAt(row, col).?;
                 if (!self.ownerLegalAt(row, cell.owner)) return error.UnownedFxCell;
                 try self.validateWideCell(row, col, cell);
+            }
+        }
+    }
+
+    fn validateImagePlacement(
+        self: FrameSurface,
+        placement: image_types.Placement,
+    ) FrameSurfaceError!void {
+        if (placement.row == 0 or placement.col == 0 or
+            placement.rows == 0 or placement.columns == 0 or
+            placement.bottom() > self.rows or placement.right() > self.cols)
+        {
+            return error.ImageOutOfBounds;
+        }
+        if (!self.plan.transcript_band.containsRow(placement.row) or
+            !self.plan.transcript_band.containsRow(placement.bottom()))
+        {
+            return error.ImageOwnerConflict;
+        }
+        var row = placement.row;
+        while (row <= placement.bottom()) : (row += 1) {
+            var col = placement.col;
+            while (col <= placement.right()) : (col += 1) {
+                const cell = self.cellAt(row, col) orelse return error.ImageOutOfBounds;
+                if (cell.owner != .transcript) return error.ImageOwnerConflict;
             }
         }
     }

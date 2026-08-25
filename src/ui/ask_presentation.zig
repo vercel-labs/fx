@@ -10,6 +10,7 @@ const transcript_painter = @import("transcript/painter.zig");
 const transcript_runtime = @import("transcript/runtime.zig");
 const ui_render = @import("render.zig");
 const ui_terminal = @import("terminal/terminal.zig");
+const image_graphics = @import("terminal/image_graphics.zig");
 
 const Allocator = std.mem.Allocator;
 const Metrics = types.Metrics;
@@ -21,6 +22,7 @@ const prepare_terminal_sequence = "\x1b[0m\x1b]8;;\x1b\\\x1b[?7l";
 pub const Runtime = struct {
     alloc: Allocator,
     shell: TranscriptRuntime,
+    terminal_images: image_graphics.Runtime,
     metrics: Metrics = .{},
     no_color: bool,
     terminal_prepared: bool = false,
@@ -64,6 +66,7 @@ pub const Runtime = struct {
                 .layout = layout,
                 .transcript_release = .{ .policy = .append_only },
             },
+            .terminal_images = image_graphics.Runtime.initDetected(),
             .no_color = no_color,
         };
         errdefer self.deinit();
@@ -72,6 +75,7 @@ pub const Runtime = struct {
         try self.shell.enableShadowVt(alloc);
         self.shell.setCommandOutputRenderPolicy(.{
             .code_highlight_theme = if (ui_render.is_light) .light else .dark,
+            .image_preview = self.terminal_images.previewConfig(),
         });
         const start = normalizeStartCursor(layout, cursor);
         self.shell.shadow_vt.?.cursor_row = start.row;
@@ -100,6 +104,7 @@ pub const Runtime = struct {
 
     pub fn deinit(self: *Runtime) void {
         if (!self.finished) self.restoreTerminal() catch {};
+        self.terminal_images.deinit(self.alloc);
         self.shell.deinit(self.alloc);
         self.finished = true;
     }
@@ -275,6 +280,7 @@ pub const Runtime = struct {
                 .document_append = transition.document_append,
                 .body_painter = .{ .ctx = &paint_context, .paint = PaintContext.paint },
                 .presentation = if (self.no_color) .neutral else .styled,
+                .image_runtime = &self.terminal_images,
             },
         );
 
@@ -297,6 +303,11 @@ pub const Runtime = struct {
 
     fn restoreTerminal(self: *Runtime) !void {
         if (!self.terminal_prepared) return;
+        self.terminal_images.clear(
+            self.alloc,
+            self.shell.frameSink(),
+            &self.metrics,
+        );
         self.terminal_prepared = false;
         try self.writeTerminalBytes(restore_terminal_sequence);
     }

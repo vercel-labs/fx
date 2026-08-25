@@ -322,6 +322,9 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
         alloc,
         execution.tool_result_memory,
     );
+    if (execution.presentation_image) |image| {
+        duplicated_execution.presentation_image = try types.dupeImageAttachment(alloc, image);
+    }
 
     return .{
         .call_id = call_id,
@@ -383,6 +386,7 @@ fn freeOwnedToolExecutionResult(alloc: Allocator, result: ToolExecutionResult) v
     if (result.interactive_notice) |notice| types.freeSemanticNotice(alloc, notice);
     freeContextNotices(alloc, result.context_notices);
     if (result.command_result_json) |value| alloc.free(value);
+    if (result.presentation_image) |image| types.freeImageAttachment(alloc, image);
     if (result.tool_result_memory) |memory| {
         if (memory.output_handle) |value| alloc.free(value);
         if (memory.preview) |value| alloc.free(value);

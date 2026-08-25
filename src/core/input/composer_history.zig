@@ -165,7 +165,9 @@ const Snapshot = struct {
                 !std.mem.eql(u8, left.path, right.path) or
                 !std.mem.eql(u8, left.media_type, right.media_type) or
                 !optionalBytesEql(left.snapshot_path, right.snapshot_path) or
-                !optionalBytesEql(left.snapshot_sha256, right.snapshot_sha256))
+                !optionalBytesEql(left.snapshot_sha256, right.snapshot_sha256) or
+                left.pixel_width != right.pixel_width or
+                left.pixel_height != right.pixel_height)
             {
                 return false;
             }
