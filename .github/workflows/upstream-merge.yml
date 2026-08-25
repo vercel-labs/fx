@@ -1,0 +1,95 @@
+name: Upstream Merge
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [upstream-push]
+
+concurrency:
+  group: upstream-merge
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM_REPO: vercel-labs/fx
+  UPSTREAM_BRANCH: main
+  MERGE_BRANCH: upstream-merge
+  BASE_BRANCH: main
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure remotes and identity
+        env:
+          GH_TOKEN: ${{ secrets.CODE_GH_PAT || github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          git fetch --no-tags --prune origin "${BASE_BRANCH}"
+          git fetch --no-tags --prune upstream "${UPSTREAM_BRANCH}"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git"
+          git config user.name "oh-my-fx-upstream-bot"
+          git config user.email "upstream@oh-my-fx.invalid"
+
+      - name: Carry forward merge branch
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin "${MERGE_BRANCH}" >/dev/null 2>&1; then
+            git fetch origin "${MERGE_BRANCH}"
+            git switch --create "${MERGE_BRANCH}" --track "origin/${MERGE_BRANCH}"
+            git merge --no-ff --no-edit "origin/${BASE_BRANCH}"
+          else
+            git switch --create "${MERGE_BRANCH}" "origin/${BASE_BRANCH}"
+          fi
+
+      - name: Merge upstream without committing
+        run: |
+          set -euo pipefail
+          git merge --no-ff --no-commit "upstream/${UPSTREAM_BRANCH}"
+
+      - name: Prefer upstream outside fork-owned paths
+        run: |
+          set -euo pipefail
+          if git diff --name-only --diff-filter=U | grep -q .; then
+            while IFS= read -r path; do
+              case "$path" in
+                .github/workflows/upstream-merge.yml|.github/merge-policy.json|.fx/*|AGENTS.md|README.md|CHANGELOG.md|flake.nix|flake.lock|assets/omfx.svg)
+                  git checkout --ours -- "$path" ;;
+                *)
+                  git checkout --theirs -- "$path" ;;
+              esac
+              git add -- "$path"
+            done < <(git diff --name-only --diff-filter=U)
+          fi
+
+      - name: Commit and push merge branch
+        run: |
+          set -euo pipefail
+          if git diff --cached --quiet; then
+            git commit --no-edit
+          else
+            git commit -m "Merge upstream/main into oh-my-fx"
+          fi
+          git push --force-with-lease origin "HEAD:${MERGE_BRANCH}"
+
+      - name: Open or update squash PR
+        env:
+          GH_TOKEN: ${{ secrets.CODE_GH_PAT || github.token }}
+        run: |
+          set -euo pipefail
+          gh pr create --base "${BASE_BRANCH}" --head "${MERGE_BRANCH}" \
+            --title "Merge upstream/main into oh-my-fx" \
+            --body "Upstream-first refresh from ${UPSTREAM_REPO}/${UPSTREAM_BRANCH}. Review and squash-merge this PR." \
+            2>/dev/null || true

@@ -1,3 +1,10 @@
+<p align="center">
+<img src="assets/omfx.svg" alt="oh-my-fx — Why should Pi have all the fun?" width="560">
+</p>
+
+<details>
+<summary>Original vercel-labs/fx README</summary>
+
 ```
  ⠀⠀⠀⠀⠀⠀⣠⣾⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀
  ⠀⠀⠀⠀⠀⢰⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
@@ -148,3 +155,5 @@ Third-party licenses and attributions are listed in
 ## Credits
 
 Interface sounds by [cuelume](https://github.com/Danilaa1/cuelume).
+
+</details>

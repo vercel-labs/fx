@@ -1,0 +1,23 @@
+{
+  "prefer_ours_globs": [
+    ".github/workflows/upstream-merge.yml",
+    ".github/merge-policy.json",
+    ".fx/**",
+    "AGENTS.md",
+    "README.md",
+    "CHANGELOG.md",
+    "flake.nix",
+    "flake.lock",
+    "assets/omfx.svg"
+  ],
+  "prefer_theirs_globs": [
+    "src/**",
+    "sdk/**",
+    "tests/**",
+    "build.zig",
+    "build.zig.zon",
+    "scripts/**"
+  ],
+  "purge_globs": [],
+  "perma_removed_paths": []
+}
