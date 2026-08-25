@@ -157,3 +157,12 @@ Third-party licenses and attributions are listed in
 Interface sounds by [cuelume](https://github.com/Danilaa1/cuelume).
 
 </details>
+
+## Credits
+
+oh-my-fx is inspired by:
+
+- [fx](https://github.com/vercel-labs/fx)
+- [Pi](https://github.com/earendil-works/pi)
+- [Oh My Pi](https://github.com/can1357/oh-my-pi)
+- [Crush](https://github.com/charmbracelet/crush)
