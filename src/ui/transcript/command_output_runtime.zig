@@ -17,7 +17,9 @@ const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const types = @import("../../core/shared/types.zig");
+const tool_args = @import("../../core/tooling/tool_args.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
 const render_engine = @import("../render_engine.zig");
 const assistant_wrap = @import("../render_engine/assistant_wrap.zig");
@@ -143,6 +145,10 @@ test "command output render policy has no presentation mode" {
 }
 
 pub const compact_output_row_limit: usize = 5;
+
+/// Command text cap for the terminal output block's command row.
+/// Matches the status-line projection in tool_presentation.zig.
+const max_command_block_bytes: usize = 120;
 
 pub const CommandOutputEntryProjection = struct {
     entry_id: u32,
@@ -1632,6 +1638,7 @@ pub fn renderCompactCommandOutput(
         policy,
         cols,
         null,
+        null,
     );
 }
 
@@ -1641,6 +1648,7 @@ pub fn renderCompactCommandOutputWithProcessPresentation(
     policy: CommandOutputRenderPolicy,
     cols: u16,
     process_presentation: ?types.CommandProcessPresentation,
+    command: ?[]const u8,
 ) !CommandOutputProjection {
     var projection: CommandOutputProjection = .{};
     errdefer projection.deinit(alloc);
@@ -1685,6 +1693,7 @@ pub fn renderCompactCommandOutputWithProcessPresentation(
     const projection_enabled = cols > 0;
     const terminal_hidden_records = if (projection_enabled) hidden_records else 0;
     const terminal_process = if (projection_enabled) process_presentation else null;
+    const terminal_command = if (projection_enabled) command else null;
 
     for (block.lines.items, 0..) |line, index| {
         const entry_id = commandOutputLineEntryId(block, index) orelse continue;
@@ -1723,6 +1732,7 @@ pub fn renderCompactCommandOutputWithProcessPresentation(
                 byte_start,
                 terminal_process,
                 terminal_hidden_records,
+                terminal_command,
             );
         }
 
@@ -1753,6 +1763,7 @@ pub fn renderCompactCommandOutputWithProcessPresentation(
                 byte_start,
                 terminal_process,
                 terminal_hidden_records,
+                terminal_command,
             );
         }
         try projection.entries.append(alloc, .{
@@ -1802,6 +1813,7 @@ fn appendCompactTerminalRows(
     entry_start: usize,
     process_presentation: ?types.CommandProcessPresentation,
     hidden_records: usize,
+    command: ?[]const u8,
 ) !void {
     if (process_presentation) |presentation| {
         if (out.items.len > entry_start) try out.append(alloc, '\n');
@@ -1814,6 +1826,14 @@ fn appendCompactTerminalRows(
         const hint = try foldedHint(alloc, hidden_records, cols);
         defer alloc.free(hint);
         try appendDimmedCommandRows(out, alloc, styles, hint);
+    }
+    if (command) |text| {
+        if (out.items.len > entry_start) try out.append(alloc, '\n');
+        const prompt = try std.fmt.allocPrint(alloc, "$ {s}", .{text});
+        defer alloc.free(prompt);
+        const wrapped = try assistant_wrap.wrapLiteralCommandOutput(alloc, prompt, cols);
+        defer alloc.free(wrapped);
+        try appendDimmedCommandRows(out, alloc, styles, wrapped);
     }
 }
 
@@ -1835,6 +1855,35 @@ pub fn processPresentationForBlock(
         {
             return detail.command_process_presentation;
         }
+    }
+    return null;
+}
+
+/// The caller owns the returned allocation and must free it with `alloc`.
+pub fn capturedCommandForBlock(
+    shell: anytype,
+    alloc: Allocator,
+    block: CommandOutputBlock,
+) ?[]u8 {
+    const Shell = @TypeOf(shell.*);
+    if (comptime !@hasField(Shell, "tool_details")) return null;
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
+    for (shell.tool_details.items) |detail| {
+        if (!detail.isCapturedCommand()) continue;
+        const lifecycle_matches = detail.lifecycle_id != null and block.lifecycle_id != null and
+            sameLifecycleId(detail.lifecycle_id, block.lifecycle_id);
+        const entry_matches = detail.command_output_entry_id != null and
+            detail.command_output_entry_id == block.entry_id;
+        if (!lifecycle_matches and !entry_matches) continue;
+        const arguments_json = detail.arguments_json orelse continue;
+        const args = tool_args.parseToolArgsObject(scratch, arguments_json) catch continue;
+        const command = tool_args.optionalStringArg(args, "command") orelse continue;
+        if (command.len == 0) continue;
+        const encoded = text_utils.encodeTerminalSafe(scratch, command, max_command_block_bytes) catch continue;
+        return alloc.dupe(u8, encoded.bytes) catch null;
     }
     return null;
 }
@@ -2259,6 +2308,7 @@ test "compact process row consumes payload budget before final hint" {
         },
         80,
         .{ .exit_code = 7 },
+        null,
     );
     defer projection.deinit(alloc);
 
@@ -2285,12 +2335,15 @@ pub fn syncCommandOutputBlockEntries(shell: anytype, alloc: Allocator) !bool {
         if (!result.found_existing) result.value_ptr.* = index;
     }
     for (shell.command_output_blocks.items) |block| {
+        const command = capturedCommandForBlock(shell, alloc, block);
+        defer if (command) |text| alloc.free(text);
         var projection = try renderCompactCommandOutputWithProcessPresentation(
             alloc,
             block,
             shell.command_output_render,
             cols,
             processPresentationForBlock(shell, block),
+            command,
         );
         defer projection.deinit(alloc);
         for (block.lines.items, 0..) |_, line_index| {

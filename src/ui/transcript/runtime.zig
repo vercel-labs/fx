@@ -2155,16 +2155,20 @@ test "nonzero streamed command reuses its active output block" {
         runtime.toolDetailForEntry(status_entry_id).?.command_output_entry_id,
     );
     try std.testing.expect(command_output_runtime.processPresentationForBlock(&runtime, block) != null);
+    const command = command_output_runtime.capturedCommandForBlock(&runtime, alloc, block);
+    defer if (command) |text| alloc.free(text);
+    try std.testing.expectEqualStrings("printf lines; exit 7", command.?);
     var projection = try command_output_runtime.renderCompactCommandOutputWithProcessPresentation(
         alloc,
         block,
         .{ .styles = styles },
         80,
         command_output_runtime.processPresentationForBlock(&runtime, block),
+        command,
     );
     defer projection.deinit(alloc);
     try std.testing.expectEqual(
-        @as(usize, command_output_runtime.compact_output_row_limit + 1),
+        @as(usize, command_output_runtime.compact_output_row_limit + 2),
         std.mem.count(u8, projection.bytes.items, "\n") + 1,
     );
     try std.testing.expect(std.mem.find(u8, projection.bytes.items, "│ line-4") != null);
@@ -2174,6 +2178,10 @@ test "nonzero streamed command reuses its active output block" {
         @as(usize, 1),
         std.mem.count(u8, projection.bytes.items, "│ exit code 7"),
     );
+    const exit_index = std.mem.find(u8, projection.bytes.items, "│ exit code 7").?;
+    const command_index = std.mem.find(u8, projection.bytes.items, "│ $ printf lines; exit 7").?;
+    try std.testing.expect(exit_index < command_index);
+    try std.testing.expect(std.mem.endsWith(u8, projection.bytes.items, "│ $ printf lines; exit 7"));
 
     var source = try runtime.prepareTranscriptSource(alloc, null);
     defer source.deinit(alloc);

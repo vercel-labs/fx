@@ -833,12 +833,15 @@ fn buildCommandOutputOverridesInterruptible(
 
     for (self.command_output_blocks.items) |block| {
         try build_checkpoint.poll(checkpoint);
+        const command = command_output_runtime.capturedCommandForBlock(self, alloc, block);
+        defer if (command) |text| alloc.free(text);
         var projection = try command_output_runtime.renderCompactCommandOutputWithProcessPresentation(
             alloc,
             block,
             self.command_output_render,
             self.layout.cols,
             command_output_runtime.processPresentationForBlock(self, block),
+            command,
         );
         defer projection.deinit(alloc);
         for (projection.entries.items) |entry| {
