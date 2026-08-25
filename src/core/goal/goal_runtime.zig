@@ -7,7 +7,11 @@ const types = @import("../shared/types.zig");
 
 pub fn advanceAfterTurn(comptime App: type, app: *App, summary: types.TurnSummary) !void {
     const current = app.goal orelse return;
-    if (current.status != .active) return;
+    const terminal_transition_pending = if (comptime @hasField(App, "goal_terminal_transition_pending_accounting"))
+        app.goal_terminal_transition_pending_accounting and current.status.isTerminal()
+    else
+        false;
+    if (current.status != .active and !terminal_transition_pending) return;
     const total_tokens = summary.token_progress.input_tokens +| summary.token_progress.output_tokens;
     const token_delta = std.math.cast(i64, total_tokens) orelse std.math.maxInt(i64);
     const persisted_remainder = std.math.cast(u64, current.time_remainder_ms) orelse 0;
@@ -21,8 +25,18 @@ pub fn advanceAfterTurn(comptime App: type, app: *App, summary: types.TurnSummar
         io_mod.milliTimestamp(),
     );
     defer outcome.goal.deinit(app.alloc);
+    if (terminal_transition_pending) {
+        outcome.goal.status = current.status;
+        outcome.budget_limit_reached = false;
+    }
     outcome.goal.time_remainder_ms = @intCast(elapsed_ms % std.time.ms_per_s);
     try installGoal(App, app, outcome.goal);
+
+    if (comptime @hasField(App, "goal_terminal_transition_pending_accounting")) {
+        app.goal_terminal_transition_pending_accounting = false;
+    }
+
+    if (terminal_transition_pending) return;
 
     if (app.worker.queuedPromptCount() != 0) return;
     const prompt = if (outcome.budget_limit_reached)
@@ -326,4 +340,54 @@ test "turn lifecycle accounts usage, carries time, and queues budget steering" {
     try std.testing.expectEqual(@as(i64, 100), app.goal.?.tokens_used);
     try std.testing.expectEqual(@as(i64, 1), app.goal.?.time_used_seconds);
     try std.testing.expect(std.mem.find(u8, app.queued_prompt.?, "reached its token budget") != null);
+}
+
+test "turn lifecycle accounts the turn that completes a goal without restarting it" {
+    const alloc = std.testing.allocator;
+    const FakeWorker = struct {
+        fn queuedPromptCount(_: *@This()) usize {
+            return 0;
+        }
+    };
+    const FakeApp = struct {
+        alloc: std.mem.Allocator,
+        goal: ?goal_module.goal_store.Goal,
+        worker: FakeWorker = .{},
+        goal_terminal_transition_pending_accounting: bool = true,
+
+        fn replaceGoal(self: *@This(), next: ?goal_module.goal_store.Goal) !void {
+            const replacement = if (next) |goal| try goal.dupe(self.alloc) else null;
+            if (self.goal) |old_goal| {
+                var old = old_goal;
+                old.deinit(self.alloc);
+            }
+            self.goal = replacement;
+        }
+
+        fn queueGoalContinuation(_: *@This(), _: []const u8, _: []const u8) !void {
+            return error.UnexpectedContinuation;
+        }
+    };
+
+    var app: FakeApp = .{
+        .alloc = alloc,
+        .goal = .{
+            .goal_id = try alloc.dupe(u8, "goal-completed-turn"),
+            .objective = try alloc.dupe(u8, "finish and account"),
+            .status = .complete,
+            .token_budget = 200,
+            .created_at_ms = 1,
+            .updated_at_ms = 1,
+        },
+    };
+    defer if (app.goal) |*goal| goal.deinit(alloc);
+
+    try advanceAfterTurn(FakeApp, &app, .{
+        .turn_duration_ms = 1_200,
+        .token_progress = .{ .input_tokens = 71, .output_tokens = 178 },
+    });
+    try std.testing.expectEqual(goal_types.GoalStatus.complete, app.goal.?.status);
+    try std.testing.expectEqual(@as(i64, 249), app.goal.?.tokens_used);
+    try std.testing.expectEqual(@as(i64, 1), app.goal.?.time_used_seconds);
+    try std.testing.expect(!app.goal_terminal_transition_pending_accounting);
 }
