@@ -95,6 +95,11 @@ const Generation = struct {
     /// match if `(path_mask & query_mask) == query_mask`, since every letter
     /// in the query must appear somewhere in the path for a subsequence match.
     char_masks: []u32 = &.{},
+    /// Presence bitmap for lowered bytes 0x20..0x3f (space, punctuation,
+    /// digits). Companion to `char_masks`: lets the search reject entries
+    /// missing a non-letter query byte without scanning. Bits only exist
+    /// for 0x20..0x3f, so an uncovered byte imposes no constraint.
+    punct_masks: []u32 = &.{},
     /// The loader publishes an immutable prefix with release stores after
     /// every parallel-buffer entry is complete. Search pairs this with an
     /// acquire load before reading that prefix.
@@ -175,6 +180,7 @@ const Generation = struct {
             @memcpy(self.paths_buf[start .. start + len], path);
 
             var mask: u32 = 0;
+            var punct_mask: u32 = 0;
             var contains_non_ascii = false;
             for (path, 0..) |byte, byte_index| {
                 const lower = asciiToLower(byte);
@@ -182,6 +188,9 @@ const Generation = struct {
                 if (byte >= 0x80) contains_non_ascii = true;
                 if (lower >= 'a' and lower <= 'z') {
                     mask |= @as(u32, 1) << @intCast(lower - 'a');
+                }
+                if (lower >= 0x20 and lower <= 0x3f) {
+                    punct_mask |= @as(u32, 1) << @intCast(lower - 0x20);
                 }
             }
 
@@ -192,6 +201,7 @@ const Generation = struct {
                 start;
             if (contains_non_ascii) mask |= non_ascii_mask;
             self.char_masks[candidate_index] = mask;
+            self.punct_masks[candidate_index] = punct_mask;
             self.kinds[candidate_index] = accepted.kind;
             buffer_position += len;
             self.offsets[candidate_index + 1] = buffer_position;
@@ -217,6 +227,8 @@ const Generation = struct {
         errdefer alloc.free(basename_starts);
         const char_masks = try alloc.alloc(u32, totals.n);
         errdefer alloc.free(char_masks);
+        const punct_masks = try alloc.alloc(u32, totals.n);
+        errdefer alloc.free(punct_masks);
         const kinds = try alloc.alloc(CandidateKind, totals.n);
         errdefer alloc.free(kinds);
 
@@ -225,6 +237,7 @@ const Generation = struct {
         self.offsets = offsets;
         self.basename_starts = basename_starts;
         self.char_masks = char_masks;
+        self.punct_masks = punct_masks;
         self.kinds = kinds;
     }
 
@@ -234,12 +247,14 @@ const Generation = struct {
         if (self.offsets.len > 0) alloc.free(self.offsets);
         if (self.basename_starts.len > 0) alloc.free(self.basename_starts);
         if (self.char_masks.len > 0) alloc.free(self.char_masks);
+        if (self.punct_masks.len > 0) alloc.free(self.punct_masks);
         if (self.kinds.len > 0) alloc.free(self.kinds);
         self.paths_buf = &.{};
         self.lower_buf = &.{};
         self.offsets = &.{};
         self.basename_starts = &.{};
         self.char_masks = &.{};
+        self.punct_masks = &.{};
         self.kinds = &.{};
         self.ready_count.store(0, .release);
     }
@@ -994,6 +1009,21 @@ fn alphaMask(bytes: []const u8) u32 {
     return m;
 }
 
+/// Returns a presence bitmap for bytes 0x20..0x3f (space through '?':
+/// whitespace, most punctuation, digits). Bytes outside that range
+/// contribute no bits, so the mask can only under-constrain a query,
+/// never falsely reject one.
+fn punctMask(bytes: []const u8) u32 {
+    var m: u32 = 0;
+    for (bytes) |b| {
+        const lower = asciiToLower(b);
+        if (lower >= 0x20 and lower <= 0x3f) {
+            m |= @as(u32, 1) << @intCast(lower - 0x20);
+        }
+    }
+    return m;
+}
+
 const non_ascii_mask: u32 = @as(u32, 1) << 31;
 const max_search_results: usize = 64;
 
@@ -1108,6 +1138,7 @@ fn rankTopN(generation: *const Generation, query: PreparedQuery, out: []u32) usi
 
     const query_ascii = query.ascii;
     const query_mask = if (query_ascii) |ascii| alphaMask(ascii) else 0;
+    const query_punct_mask = if (query_ascii) |ascii| punctMask(ascii) else 0;
     var scalar_scratch: FoldedPathScratch = undefined;
 
     const total = generation.count();
@@ -1118,6 +1149,9 @@ fn rankTopN(generation: *const Generation, query: PreparedQuery, out: []u32) usi
         const score = if ((path_mask & non_ascii_mask) == 0) ascii_path: {
             const ascii = query_ascii orelse continue;
             if ((path_mask & query_mask) != query_mask) continue;
+            if (query_punct_mask != 0) {
+                if ((generation.punct_masks[candidate_index] & query_punct_mask) != query_punct_mask) continue;
+            }
             break :ascii_path scoreAsciiMatch(
                 generation.pathAt(candidate_index),
                 generation.lowerPathAt(candidate_index),
@@ -1174,8 +1208,15 @@ noinline fn scoreAsciiRange(
     var previous_position: usize = 0;
     var run_length: usize = 0;
     var position = range_start;
+    if (query.len != 0) {
+        if (std.mem.indexOfScalarPos(u8, path_lower, range_start, query[0])) |first_hit| {
+            position = first_hit;
+        } else return null;
+    }
     while (position < path_lower.len and query_index < query.len) : (position += 1) {
-        if (path_lower[position] != query[query_index]) continue;
+        if (path_lower[position] != query[query_index]) {
+            position = std.mem.indexOfScalarPos(u8, path_lower, position + 1, query[query_index]) orelse return null;
+        }
 
         if (query_index == 0) {
             facts.first_position = position - range_start;
