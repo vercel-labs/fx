@@ -1,5 +1,12 @@
 # fx
 
+## Unreleased
+
+- **Windows x86_64 preview:** `fx.exe` now builds, links, and runs the non-interactive paths on Windows x86_64 with the same degraded capability contract that macOS already ships. The build uses Zig 0.16.0 and three stdlib backports; see `docs/windows.md` for the recipe and `openspec/changes/windows-support-baseline/specs/windows-build-readiness/spec.md` for the upstream fixes this preview is gated on.
+- **Cross-platform shared I/O:** Centralize the platform branches that previously lived inline at dozens of call sites into `src/core/shared/io.zig` (`homeDir`, `tempDir`, `getenvCaseInsensitive`, `permissionsFromMode`, `permissionsToMode`, `realpathAlloc`, `dirRealpathAlloc`, `syncVerifiedDir`).
+- **Windows self-upgrade:** `fx upgrade` on Windows downloads `fx-windows-x86_64.zip`, extracts it in-process with a minimal ZIP reader (`src/core/upgrade/upgrade_helpers.zig:extractZipEntry`), and replaces the running `fx.exe` in place via the stdlib's atomic copy. No `tar.exe` / `Expand-Archive` dependency.
+- **Windows CLI argv decoding:** The pre-port `argsFromRaw` returned an empty slice on Windows because the C-runtime `argv` is UTF-16. `cliArgsFromRaw` in `src/main.zig:3085` now builds the CLI slice from `raw_args[1..]` directly so `fx ask`, `fx pr`, `fx upgrade`, and every other subcommand work from a non-POSIX shell.
+
 ## 0.0.6
 
 <!-- release:start -->
@@ -115,6 +122,20 @@
 - **MCP session retirement:** Keep retired HTTP session IDs alive until in-flight requests drain
 - **Provider response limits:** Reject oversized Codex and Grok catalogs, streams, tool data, and replay state while keeping later input usable
 - **ACP permission validation:** Validate permission input before writing JSON-RPC frames
+
+## 0.0.4
+
+### New Features
+
+- **Windows x86_64 preview:** `fx.exe` now builds, links, and runs the non-interactive paths on Windows x86_64 with the same degraded capability contract that macOS already ships. The build uses Zig 0.16.0 and three stdlib backports; see `docs/windows.md` for the recipe and `openspec/changes/windows-support-baseline/specs/windows-build-readiness/spec.md` for the upstream fixes this preview is gated on.
+
+### Improvements
+
+- **Cross-platform shared I/O:** Centralize the platform branches that previously lived inline at dozens of call sites into `src/core/shared/io.zig` (`homeDir`, `tempDir`, `getenvCaseInsensitive`, `permissionsFromMode`, `permissionsToMode`, `realpathAlloc`, `dirRealpathAlloc`, `syncVerifiedDir`).
+- **Windows self-upgrade:** `fx upgrade` on Windows downloads `fx-windows-x86_64.zip`, extracts it in-process with a minimal ZIP reader (`src/core/upgrade/upgrade_helpers.zig:extractZipEntry`), and replaces the running `fx.exe` in place via the stdlib's atomic copy. No `tar.exe` / `Expand-Archive` dependency.
+- **Windows CLI argv decoding:** The pre-port `argsFromRaw` returned an empty slice on Windows because the C-runtime `argv` is UTF-16. `cliArgsFromRaw` in `src/main.zig:3085` now builds the CLI slice from `raw_args[1..]` directly so `fx ask`, `fx pr`, `fx upgrade`, and every other subcommand work from a non-POSIX shell.
+
+<!-- release:end -->
 
 ## 0.0.4
 

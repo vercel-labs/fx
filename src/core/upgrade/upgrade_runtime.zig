@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const helpers = @import("upgrade_helpers.zig");
@@ -222,7 +223,12 @@ fn upgradeWorkerInner(
     };
     progress.markFinishing();
 
-    const checksum_url = try std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz.sha256", .{ cdn_base, target.artifactRef(), helpers.platform });
+    const checksum_url = try std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.{s}.sha256", .{
+        cdn_base,
+        target.artifactRef(),
+        helpers.platform,
+        if (comptime builtin.os.tag == .windows) "zip" else "tar.gz",
+    });
     defer alloc.free(checksum_url);
 
     helpers.verifyChecksum(&client, archive_path, checksum_url) catch |err| {
@@ -233,12 +239,22 @@ fn upgradeWorkerInner(
         return;
     };
 
-    helpers.extractTarGz(alloc, archive_path, tmp_dir) catch {
-        result.err = .extraction_failed;
-        return;
-    };
+    if (comptime builtin.os.tag == .windows) {
+        helpers.extractZipEntry(alloc, archive_path, tmp_dir, "fx.exe") catch {
+            result.err = .extraction_failed;
+            return;
+        };
+    } else {
+        helpers.extractTarGz(alloc, archive_path, tmp_dir) catch {
+            result.err = .extraction_failed;
+            return;
+        };
+    }
 
-    const extracted_bin = try std.fmt.allocPrint(alloc, "{s}/fx", .{tmp_dir});
+    const extracted_bin = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
+        tmp_dir,
+        if (comptime builtin.os.tag == .windows) "fx.exe" else "fx",
+    });
     defer alloc.free(extracted_bin);
 
     var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -247,7 +263,7 @@ fn upgradeWorkerInner(
         return;
     };
 
-    helpers.replaceBinary(extracted_bin, self_exe) catch {
+    helpers.replaceBinary(alloc, extracted_bin, self_exe) catch {
         result.err = .replace_failed;
         return;
     };

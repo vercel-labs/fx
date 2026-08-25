@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const chatgpt_session = @import("chatgpt_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
@@ -276,7 +277,10 @@ fn browserCallbackReady(
 ) !bool {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     var fds = [_]std.posix.pollfd{.{
-        .fd = @intCast(@intFromPtr(listener.socket.handle)),
+        .fd = if (comptime builtin.os.tag == .windows)
+            @ptrCast(listener.socket.handle)
+        else
+            @intCast(@intFromPtr(listener.socket.handle)),
         .events = std.posix.POLL.IN,
         .revents = 0,
     }};

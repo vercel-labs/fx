@@ -472,6 +472,7 @@ fn signalProcess(
     pid_text: []const u8,
     expected: process_supervisor.ProcessInstanceToken,
 ) background_process_provider.ProviderError!void {
+    if (comptime builtin.os.tag == .windows) return error.Unsupported;
     switch (matchToken(context, alloc, pid_text, expected)) {
         .matched => {},
         .missing, .mismatched => {

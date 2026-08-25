@@ -331,6 +331,7 @@ pub const Tracker = struct {
         parent: TrackedProcess,
         tid: std.posix.pid_t,
     ) !void {
+        if (comptime builtin.os.tag == .windows) return;
         const path = try std.fmt.allocPrint(
             self.alloc,
             "/proc/{d}/task/{d}/children",

@@ -453,7 +453,7 @@ pub const TerminalState = struct {
         }
         var fds = [_]std.posix.pollfd{.{
             .fd = if (comptime builtin.os.tag == .windows)
-                @intCast(@intFromPtr(self.stdin_fd))
+                @ptrCast(self.stdin_fd)
             else
                 self.stdin_fd,
             .events = std.posix.POLL.IN,

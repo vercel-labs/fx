@@ -56,6 +56,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .link_libcpp = false,
             .stack_check = false,
             .stack_protector = false,
             .omit_frame_pointer = true,
@@ -65,6 +66,18 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("build_options", build_options.createModule());
+
+    // The Windows x86_64 build uses Win32 APIs (ShellExecuteW for URL
+    // opening, OpenClipboard / SetClipboardData for clipboard, CredWriteW
+    // / CredReadW for Credential Vault) that live outside the stdlib's
+    // already-linked libraries. Add them only for the Windows target so
+    // Linux / macOS keeps the existing link line.
+    if (target.result.os.tag == .windows) {
+        exe.root_module.linkSystemLibrary("shell32", .{});
+        exe.root_module.linkSystemLibrary("advapi32", .{});
+        exe.root_module.linkSystemLibrary("user32", .{});
+        exe.root_module.linkSystemLibrary("crypt32", .{});
+    }
 
     b.installArtifact(exe);
 

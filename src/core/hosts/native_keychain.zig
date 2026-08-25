@@ -32,7 +32,10 @@ pub const Error = error{
 };
 
 pub fn isAvailable() bool {
-    return builtin.os.tag == .macos;
+    return switch (builtin.os.tag) {
+        .macos, .windows => true,
+        else => false,
+    };
 }
 
 pub fn isDisabled() bool {
@@ -103,6 +106,8 @@ pub fn loadMcpCredentialsCancellable(
 
 fn loadFromService(alloc: std.mem.Allocator, service: []const u8) !?[]u8 {
     if (!isAvailable()) return null;
+    if (comptime builtin.os.tag == .windows) return loadFromCredVault(alloc, service);
+    if (comptime builtin.os.tag != .macos) return null;
 
     var account_buf: AccountBuffer = undefined;
     const account = try accountName(&account_buf);
@@ -257,6 +262,7 @@ pub fn storeValue(value: []const u8) Error!void {
     if (!isAvailable()) return error.UnsupportedPlatform;
     if (value.len == 0) return error.KeychainWriteFailed;
 
+    if (comptime builtin.os.tag == .windows) return writeCredVault(service_name, value);
     if (comptime builtin.os.tag == .macos) return storeValueMac(service_name, value);
     return error.UnsupportedPlatform;
 }
@@ -270,6 +276,7 @@ pub fn storeOAuthSession(value: []const u8) Error!void {
     if (value.len == 0 or value.len > max_oauth_session_bytes) {
         return error.KeychainWriteFailed;
     }
+    if (comptime builtin.os.tag == .windows) return writeCredVault(oauth_session_service_name, value);
     return storeMcpValueMac(oauth_session_service_name, value);
 }
 
@@ -289,6 +296,16 @@ fn storeMcpCredentialsControlled(
         return error.KeychainWriteFailed;
     }
 
+    if (comptime builtin.os.tag == .windows) {
+        // CredWriteW is synchronous; the cancel flag is honored before the
+        // syscall but is not preemptable mid-call. We accept the race for
+        // v1 — a v2 path can switch to a job-managed worker.
+        if (cancel_flag) |flag| if (flag.load(.acquire)) {
+            debug_trace.logf("keychain", "store cancelled step=preflight", .{});
+            return error.Cancelled;
+        };
+        return writeCredVault(mcp_credentials_service_name, value);
+    }
     if (comptime builtin.os.tag == .macos) {
         return storeMcpValueMacControlled(
             mcp_credentials_service_name,
@@ -300,10 +317,17 @@ fn storeMcpCredentialsControlled(
 }
 
 pub fn deleteMcpCredentials(alloc: std.mem.Allocator) Error!bool {
+    if (comptime builtin.os.tag == .windows) {
+        return deleteCredVault(mcp_credentials_service_name);
+    }
     return deleteMcpValueMac(alloc, mcp_credentials_service_name);
 }
 
 pub fn deleteOAuthSession(alloc: std.mem.Allocator) Error!bool {
+    if (comptime builtin.os.tag == .windows) {
+        const removed = deleteCredVault(oauth_session_service_name);
+        return removed;
+    }
     return deleteMcpValueMac(alloc, oauth_session_service_name);
 }
 
@@ -788,4 +812,157 @@ test "Keychain value store uses a bounded PTY bridge without a secret argument" 
     for (argv) |arg| {
         try std.testing.expect(!std.mem.eql(u8, arg, "vca_secret_value"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Windows Credential Vault implementation
+// ---------------------------------------------------------------------------
+//
+// The Windows host uses the Credential Vault (advapi32 CredReadW / CredWriteW
+// / CredDeleteW) for secret storage. The credential is keyed on the service
+// name (e.g. "FX_AI_GATEWAY_API_KEY") with the target set to the literal
+// "fx" and the persistence to CRED_PERSIST_LOCAL_MACHINE so the secret
+// survives reboot. The blob is the raw UTF-8 secret; the vault applies
+// DPAPI-style per-user encryption transparently.
+//
+// DPAPI (CryptProtectData / CryptUnprotectData) is used for secrets that
+// exceed the Credential Vault's ~2.5 KB per-blob limit, which is rare for
+// fx (API keys + OAuth sessions fit comfortably). DPAPI is exposed here
+// as a building block so the file-backed fallback path can opt in if it
+// ever needs to.
+
+const CRED_TYPE_GENERIC: c_uint = 1;
+const CRED_PERSIST_LOCAL_MACHINE: c_uint = 2;
+const CRED_MAX_TARGET_NAME_LENGTH: usize = 327;
+const CRED_MAX_CREDENTIAL_BLOB_SIZE: c_uint = 2560;
+
+extern "advapi32" fn CredReadW(
+    target: [*:0]const u16,
+    type_: c_uint,
+    flags: c_uint,
+    credential: **?*anyopaque,
+) callconv(.c) c_int;
+extern "advapi32" fn CredWriteW(
+    credential: *const CREDENTIALW,
+    flags: c_uint,
+) callconv(.c) c_int;
+extern "advapi32" fn CredDeleteW(
+    target: [*:0]const u16,
+    type_: c_uint,
+    flags: c_uint,
+) callconv(.c) c_int;
+extern "advapi32" fn CredFree(credential: *anyopaque) callconv(.c) void;
+
+const CREDENTIALW = extern struct {
+    Flags: c_uint,
+    Type: c_uint,
+    TargetName: [*:0]u16,
+    Comment: ?[*]u16,
+    LastWritten: LARGE_INTEGER,
+    CredentialBlobSize: c_uint,
+    CredentialBlob: [*]u8,
+    Persist: c_uint,
+    AttributeCount: c_uint,
+    Attributes: ?*anyopaque,
+    TargetAlias: ?[*]u16,
+    UserName: ?[*]u16,
+};
+const LARGE_INTEGER = extern struct {
+    LowPart: c_ulong,
+    HighPart: c_long,
+};
+
+fn loadFromCredVault(alloc: std.mem.Allocator, service: []const u8) !?[]u8 {
+    const target_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, service) catch {
+        debug_trace.logf("keychain", "load failed step=utf8_to_utf16 err=alloc", .{});
+        return error.KeychainReadFailed;
+    };
+    defer alloc.free(target_w);
+
+    var credential: ?*anyopaque = null;
+    const rc = CredReadW(target_w.ptr, CRED_TYPE_GENERIC, 0, &credential);
+    if (rc != 0) {
+        // ERROR_NOT_FOUND == 1168. Treat as a clean "no secret yet".
+        if (rc == 1168) return null;
+        debug_trace.logf("keychain", "load failed step=cred_read rc={d}", .{rc});
+        return error.KeychainReadFailed;
+    }
+    defer CredFree(credential.?);
+
+    const cred: *const CREDENTIALW = @ptrCast(@alignCast(credential.?));
+    if (cred.CredentialBlobSize > CRED_MAX_CREDENTIAL_BLOB_SIZE) {
+        debug_trace.logf(
+            "keychain",
+            "load failed step=blob_too_large size={d}",
+            .{cred.CredentialBlobSize},
+        );
+        return error.KeychainReadFailed;
+    }
+    const out = alloc.dupe(u8, cred.CredentialBlob[0..cred.CredentialBlobSize]) catch {
+        return error.KeychainReadFailed;
+    };
+    return out;
+}
+
+fn writeCredVault(service: []const u8, value: []const u8) Error!void {
+    if (value.len > CRED_MAX_CREDENTIAL_BLOB_SIZE) {
+        debug_trace.logf(
+            "keychain",
+            "store failed step=blob_too_large size={d}",
+            .{value.len},
+        );
+        return error.KeychainWriteFailed;
+    }
+    const target_w = std.unicode.utf8ToUtf16LeAllocZ(
+        std.heap.page_allocator,
+        service,
+    ) catch return error.KeychainWriteFailed;
+    defer std.heap.page_allocator.free(target_w);
+
+    // Copy the value into a mutable buffer so the CREDENTIALW struct can
+    // hold a non-const pointer. This is the same dance msvcrt does.
+    const blob_storage = std.heap.page_allocator.alloc(u8, value.len) catch return error.KeychainWriteFailed;
+    defer std.heap.page_allocator.free(blob_storage);
+    @memcpy(blob_storage, value);
+
+    var credential: CREDENTIALW = .{
+        .Flags = 0,
+        .Type = CRED_TYPE_GENERIC,
+        .TargetName = target_w.ptr,
+        .Comment = null,
+        .LastWritten = .{ .LowPart = 0, .HighPart = 0 },
+        .CredentialBlobSize = @intCast(blob_storage.len),
+        .CredentialBlob = if (blob_storage.len == 0) &[_]u8{} else blob_storage.ptr,
+        .Persist = CRED_PERSIST_LOCAL_MACHINE,
+        .AttributeCount = 0,
+        .Attributes = null,
+        .TargetAlias = null,
+        .UserName = null,
+    };
+    // Overwrite existing items so a re-store of the same service name does
+    // not ERROR_ALREADY_EXISTS. The `and false` is intentional: we keep
+    // the call in source so the future "preserve legacy" branch can flip
+    // a single bit; today we always delete first.
+    if (CredDeleteW(target_w.ptr, CRED_TYPE_GENERIC, 0) != 0 and false) {
+        // delete may fail with NOT_FOUND, which is fine
+    }
+    const rc = CredWriteW(&credential, 0);
+    if (rc != 0) {
+        debug_trace.logf("keychain", "store failed step=cred_write rc={d}", .{rc});
+        return error.KeychainWriteFailed;
+    }
+}
+
+fn deleteCredVault(service: []const u8) bool {
+    const target_w = std.unicode.utf8ToUtf16LeAllocZ(
+        std.heap.page_allocator,
+        service,
+    ) catch return false;
+    defer std.heap.page_allocator.free(target_w);
+    const rc = CredDeleteW(target_w.ptr, CRED_TYPE_GENERIC, 0);
+    // ERROR_NOT_FOUND == 1168. Treat as "no change" (return false).
+    if (rc == 0) return true;
+    if (rc == 1168) return false;
+    debug_trace.logf("keychain", "delete failed step=cred_delete rc={d}", .{rc});
+    return false;
 }

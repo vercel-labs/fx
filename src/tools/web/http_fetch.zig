@@ -1591,6 +1591,7 @@ fn classifyWriteErrno(err: posix.E) SyscallErrorAction {
 }
 
 fn rawRead(fd: posix.fd_t, buf: []u8, options: FetchOptions) !usize {
+    if (comptime builtin.os.tag == .windows) return error.PlatformUnsupported;
     return rawReadWith(fd, buf, options, default_poller, default_read_syscall);
 }
 
@@ -1601,6 +1602,7 @@ fn rawReadWith(
     poller: Poller,
     syscall: ReadSyscall,
 ) !usize {
+    if (comptime builtin.os.tag == .windows) return error.PlatformUnsupported;
     while (true) {
         try pollFdWith(fd, posix.POLL.IN, options, poller);
         switch (syscall.read_fn(syscall.ctx, fd, buf)) {
@@ -1646,10 +1648,12 @@ fn rawWriteAllWith(fd: posix.fd_t, bytes: []const u8, options: FetchOptions, pol
 }
 
 fn pollFd(fd: posix.fd_t, events: i16, options: FetchOptions) !void {
+    if (comptime builtin.os.tag == .windows) return error.PlatformUnsupported;
     return pollFdWith(fd, events, options, default_poller);
 }
 
 fn pollFdWith(fd: posix.fd_t, events: i16, options: FetchOptions, poller: Poller) !void {
+    if (comptime builtin.os.tag == .windows) return error.PlatformUnsupported;
     while (true) {
         var fds = [_]PollFd{.{
             .fd = fd,
@@ -1673,6 +1677,7 @@ fn pollFdWith(fd: posix.fd_t, events: i16, options: FetchOptions, poller: Poller
 }
 
 fn classifyPollEvents(fd: posix.fd_t, events: i16, revents: i16) !void {
+    if (comptime builtin.os.tag == .windows) return error.PlatformUnsupported;
     if ((revents & posix.POLL.NVAL) != 0) return error.InvalidDescriptor;
     if ((revents & events) != 0) return;
     if (events == posix.POLL.IN and (revents & posix.POLL.HUP) != 0) return;

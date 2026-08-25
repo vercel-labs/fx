@@ -25,6 +25,12 @@ It's open source (Apache-2.0), model-agnostic, and suitable for both local and c
 curl -fsSL https://fx.sh/setup.sh | bash
 ```
 
+On Windows x86_64, fx ships a **preview** build with a deliberately
+small feature surface (no interactive terminal, no HTTP fetch, no
+DPAPI / Credential Vault yet). See [`docs/windows.md`](docs/windows.md)
+for the capability matrix, the build recipe, and the `iwr -useb
+https://fx.sh/setup.ps1 | iex` one-liner.
+
 ## Run fx
 
 Sign in with Vercel AI Gateway:

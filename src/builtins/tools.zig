@@ -1,5 +1,5 @@
 const std = @import("std");
-const io_mod = @import("../../core/shared/io.zig");
+const io_mod = @import("../core/shared/io.zig");
 const std_builtin = @import("builtin");
 const builtin_gateway = @import("gateway.zig");
 const terminal_contracts = @import("../core/terminal/contracts.zig");

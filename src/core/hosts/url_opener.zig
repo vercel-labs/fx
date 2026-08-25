@@ -54,24 +54,72 @@ fn launchUrl(
 ) LaunchOutcome {
     var macos_argv = [_][]const u8{ "open", url };
     var linux_argv = [_][]const u8{ "xdg-open", url };
-    const argv: []const []const u8 = switch (os_tag) {
-        .macos => &macos_argv,
-        .linux => &linux_argv,
+    switch (os_tag) {
+        .macos => {
+            const result = launcher.launch(launcher.ctx, alloc, &macos_argv) catch |err| {
+                debug_trace.logf("core", "url opener launcher failed err={s}", .{@errorName(err)});
+                return .failed;
+            };
+            return outcomeFromTerm(result.term);
+        },
+        .linux => {
+            const result = launcher.launch(launcher.ctx, alloc, &linux_argv) catch |err| {
+                debug_trace.logf("core", "url opener launcher failed err={s}", .{@errorName(err)});
+                return .failed;
+            };
+            return outcomeFromTerm(result.term);
+        },
+        .windows => return launchUrlWindows(alloc, url),
         else => return .unsupported,
-    };
+    }
+}
 
-    const result = launcher.launch(launcher.ctx, alloc, argv) catch |err| {
-        debug_trace.logf("core", "url opener launcher failed err={s}", .{@errorName(err)});
-        return .failed;
-    };
-    switch (result.term) {
+fn outcomeFromTerm(term: std.process.Child.Term) LaunchOutcome {
+    switch (term) {
         .exited => |code| if (code == 0) return .opened,
         else => {},
     }
-
-    logUnsuccessfulTerm(result.term);
+    logUnsuccessfulTerm(term);
     return .failed;
 }
+
+fn launchUrlWindows(alloc: Allocator, url: []const u8) LaunchOutcome {
+    // Use ShellExecuteW(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL). The
+    // verb "open" resolves to the user's default browser via the shell's
+    // association table. We link against shell32 in build.zig so the call
+    // resolves at link time.
+    const url_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, url) catch return .failed;
+    defer alloc.free(url_w);
+    // Build a UTF-16LE "open" verb in-place. The buffer is small and
+    // lives for the duration of this call, which is bounded by the
+    // ShellExecuteW return value (synchronous).
+    var verb_buf: [5]u16 = .{ 'o', 'p', 'e', 'n', 0 };
+    const SW_SHOWNORMAL: c_int = 1;
+    const verb_ptr: [*:0]const u16 = @ptrCast(&verb_buf);
+    const result = ShellExecuteW(null, verb_ptr, url_w.ptr, null, null, SW_SHOWNORMAL);
+    // ShellExecuteW returns an HINSTANCE with a value > 32 on success.
+    if (@intFromPtr(result) <= 32) {
+        debug_trace.logf(
+            "core",
+            "url opener ShellExecuteW failed err={d}",
+            .{@intFromPtr(result)},
+        );
+        return .failed;
+    }
+    return .opened;
+}
+
+// Win32 ShellExecuteW is declared in <shellapi.h>. The stdlib does not
+// re-export it, so we declare the prototype here. shell32.dll is added to
+// the link line in build.zig.
+extern "shell32" fn ShellExecuteW(
+    hwnd: ?*anyopaque,
+    lpOperation: [*:0]const u16,
+    lpFile: [*:0]const u16,
+    lpParameters: ?[*:0]const u16,
+    lpDirectory: ?[*:0]const u16,
+    nShowCmd: c_int,
+) callconv(.c) ?*anyopaque;
 
 fn logUnsuccessfulTerm(term: std.process.Child.Term) void {
     switch (term) {

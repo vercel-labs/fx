@@ -282,11 +282,120 @@ fn windowsTarPath(alloc: Allocator) ![]u8 {
     return error.NotFound;
 }
 
-pub fn replaceBinary(new_path: []const u8, target_path: []const u8) !void {
+pub fn replaceBinary(alloc: Allocator, new_path: []const u8, target_path: []const u8) !void {
+    if (comptime builtin.os.tag == .windows) {
+        // On Windows, the running fx.exe cannot be renamed or unlinked while
+        // it is executing. Use the stdlib's atomic copy which uses Windows'
+        // ReplaceFile / MoveFileEx under the hood, so the running process
+        // keeps the old image in memory and the next launch reads the fresh
+        // bytes from disk. The temp file is left next to the target for the
+        // atomic-swap step to consume.
+        const cwd = std.Io.Dir.cwd();
+        std.Io.Dir.copyFile(cwd, new_path, cwd, target_path, io_mod.getIo(), .{
+            .replace = true,
+        }) catch return error.ReplaceFailed;
+        return;
+    }
     std.Io.Dir.renameAbsolute(new_path, target_path, io_mod.getIo()) catch {
         copyBinary(new_path, target_path) catch return error.ReplaceFailed;
         return;
     };
+    _ = alloc;
+}
+
+/// Extract `entry_name` from a ZIP archive at `archive_path` into `dest_dir`.
+///
+/// This is a minimal in-process ZIP reader for the v1 self-upgrade path on
+/// Windows (and any future platform that distributes `.zip` artifacts). It
+/// supports only the cases fx actually ships:
+///
+///  * compression method 0 (stored) — no DEFLATE / bzip2 / LZMA
+///  * single- or multi-entry archives with a deterministic entry order
+///  * no zip64, no encryption, no data descriptors
+///
+/// The reader scans the archive linearly for `PK\x03\x04` Local File Headers,
+/// reads the filename, and copies the entry body to `<dest_dir>/<name>` when
+/// `name == entry_name`. The End of Central Directory record terminates the
+/// scan.
+pub fn extractZipEntry(
+    alloc: Allocator,
+    archive_path: []const u8,
+    dest_dir: []const u8,
+    entry_name: []const u8,
+) !void {
+    const zio = io_mod.getIo();
+    const file = std.Io.Dir.openFileAbsolute(zio, archive_path, .{}) catch
+        return error.ExtractionFailed;
+    defer file.close(zio);
+    var reader_buf: [16 * 1024]u8 = undefined;
+    var reader_holder = file.readerStreaming(zio, &reader_buf);
+    const reader = &reader_holder.interface;
+
+    const local_file_header_sig: u32 = 0x04034b50;
+    const central_dir_sig: u32 = 0x02014b50;
+    const eocd_sig: u32 = 0x06054b50;
+    var extracted = false;
+
+    while (true) {
+        const sig = try readU32Le(reader);
+        if (sig == eocd_sig) break;
+        if (sig == central_dir_sig) {
+            // Central directory header: 24 fixed bytes after the version /
+            // attribs / sizes (which are 42 bytes from the sig), then a
+            // filename + extra + comment block.
+            try reader.discardAll(24);
+            const name_len = try readU16Le(reader);
+            const extra_len = try readU16Le(reader);
+            const comment_len = try readU16Le(reader);
+            const total: u64 = @as(u64, name_len) + @as(u64, extra_len) + @as(u64, comment_len);
+            try reader.discardAll64(total);
+            continue;
+        }
+        if (sig != local_file_header_sig) return error.ExtractionFailed;
+
+        // Local file header. Body is 26 fixed bytes after the 4-byte sig.
+        try reader.discardAll(2 + 2); // version needed, flags
+        const method = try readU16Le(reader);
+        try reader.discardAll(2 + 2); // mtime, mdate
+        try reader.discardAll(4); // crc32
+        const compressed_size = try readU32Le(reader);
+        try reader.discardAll(4); // uncompressed size
+        const name_len = try readU16Le(reader);
+        const extra_len = try readU16Le(reader);
+        if (method != 0) return error.UnsupportedCompression;
+        const name = try reader.readAlloc(alloc, name_len);
+        defer alloc.free(name);
+        try reader.discardAll(extra_len);
+
+        if (std.mem.eql(u8, name, entry_name)) {
+            const out_path = try std.fs.path.join(alloc, &.{ dest_dir, entry_name });
+            defer alloc.free(out_path);
+            const out = std.Io.Dir.createFileAbsolute(zio, out_path, .{}) catch
+                return error.ExtractionFailed;
+            defer out.close(zio);
+            var out_buf: [16 * 1024]u8 = undefined;
+            var out_holder = out.writerStreaming(zio, &out_buf);
+            const out_writer = &out_holder.interface;
+            _ = try reader.stream(out_writer, std.Io.Limit.limited(@as(u64, compressed_size)));
+            try out_writer.flush();
+            extracted = true;
+        } else {
+            try reader.discardAll(compressed_size);
+        }
+    }
+    if (!extracted) return error.EntryNotFound;
+}
+
+fn readU16Le(reader: *std.Io.Reader) !u16 {
+    var buf: [2]u8 = undefined;
+    try reader.readSliceAll(&buf);
+    return std.mem.readInt(u16, &buf, .little);
+}
+
+fn readU32Le(reader: *std.Io.Reader) !u32 {
+    var buf: [4]u8 = undefined;
+    try reader.readSliceAll(&buf);
+    return std.mem.readInt(u32, &buf, .little);
 }
 
 pub const ExecutablePathError = error{

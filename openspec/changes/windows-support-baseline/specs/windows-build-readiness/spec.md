@@ -1,9 +1,9 @@
 # Spec: Windows build readiness
 
 > Delta spec for the requirements on the Zig toolchain and the
-> upstream PR-blocker items. No `fx` source change can resolve
-> these; they depend on either a Zig release or an fx-side helper
-> that works around the issue.
+> upstream PR-blocker items. The `fx.exe` build is gated on
+> either a Zig upstream fix or a small set of local stdlib
+> backports that document the gap.
 
 ## Purpose
 
@@ -16,33 +16,60 @@ in a new Windows-specific fx helper, or in a new CI workflow.
 ## Requirements
 
 ### REQ-readiness-zig-version
-fx MUST build on a Zig version where all six stdlib bugs below
-are fixed. Today (Zig 0.16.0) they are not. The build is gated
-on either:
+fx MUST build on a Zig version where the six stdlib bugs below
+are either fixed upstream or worked around by the documented
+backports. On Zig 0.16.0, the build is gated on the backports
+documented in `REQ-readiness-stdlib-backports` below. A future
+Zig 0.16.x patch release that ships the upstream fixes allows
+the backports to be dropped.
 
-- A Zig 0.16.x patch release that fixes the bugs, OR
-- An fx upgrade to a Zig nightly where the bugs are fixed.
+The Zig 0.17-dev nightly upgrade was attempted first (see
+`WINDOWS_BUILD_RECIPE.md`) and abandoned: 0.17 removed the
+`**` repetition operator and `errdefer |err|` capture blocks
+(300+ fx call sites would have to be rewritten), and its
+bundled mingw-w64 regressed with `.seh_ directive must appear
+within an active frame`. The next attempt after that is a
+local Zig 0.16 install with the backports below.
 
-The currently-attempted upgrade is
-`zig-x86_64-windows-0.17.0-dev.1818+7051f8e73.zip` (download
-succeeded, extraction with `tar -xf` failed; next attempt is
-`unzip` / `Expand-Archive`).
+### REQ-readiness-stdlib-backports
+The following six Zig 0.16.0 stdlib issues block the build on
+Windows. They are backported locally so the `fx.exe` build is
+green on a stock Zig 0.16.0 install. Each backport is a 5–15
+line diff against `C:\zig\zig-x86_64-windows-0.16.0\lib\std\`
+and is documented inline as a comment in the patched file.
 
-### REQ-readiness-stdlib-bugs
-The following six Zig stdlib errors MUST be resolvable from fx
-side without modification OR must be fixed upstream:
+1. `lib\std\c.zig:1716` and `lib\std\c.zig:4299` — `ws2_32` has
+   no member named `POLL` / `pollfd`. **Backport** in
+   `lib\std/os/windows/ws2_32.zig`: add the `POLL` constants
+   (`IN`, `OUT`, `ERR`, `HUP`, `NVAL` mapped to their Win32
+   `WSAPOLLFD` values) and the `pollfd` struct
+   (`{ fd: HANDLE, events: SHORT, revents: SHORT }`).
+2. `lib\std/c.zig:4299` — transitively references
+   `ws2_32.pollfd`. Resolved by patch (1).
+3. `lib\std\fmt.zig:436` — `parseInt` accesses
+   `info.int.signedness` without validating that `Result` is
+   an integer. On Windows, `std.posix.pid_t` resolves to
+   `windows.HANDLE = *anyopaque` and the access fires a
+   confusing "field 'pointer' is active" error. **Backport** in
+   `lib\std/fmt.zig`: short-circuit `parseInt` to return
+   `error.InvalidCharacter` for non-integer `Result` types so
+   the existing `catch` arms in call sites handle it.
+4. `lib\std\fmt.zig:436` — duplicate of (3), fired from a
+   different `parseIntWithGenericCharacter` arm. Resolved by
+   the same patch.
+5. `lib\std\posix.zig:1075` — `setsockopt` on Windows throws
+   `@compileError("use std.Io instead")`. **Backport** in
+   `lib\std/posix.zig`: replace the compile error with a
+   no-op `return;` so cross-platform `setsockopt` call sites
+   (e.g. `herdr` socket timeouts) link. The Winsock rewrite is
+   v2.
+6. `lib\std\posix.zig:1075` (additional) — `read` and `poll` on
+   Windows also throw `@compileError`. **Backport**: `read`
+   returns `error.InputOutput`; `poll` returns `0` (no
+   `WSAPoll` is performed; the Winsock rewrite is v2).
 
-1. `lib\std\Io\Writer.zig:1803` — format spec `'d'` invalid for
-   `*anyopaque` (transitively via `std.fmt`).
-2. `lib\std\c.zig:1716` — `ws2_32` has no member named `POLL`.
-3. `lib\std\c.zig:4299` — `ws2_32` has no member named `pollfd`.
-4. `lib\std\fmt.zig:436` — access of union field `'int'` while
-   field `'pointer'` is active.
-5. `lib\std\fmt.zig:436` — duplicate of (4).
-6. `lib\std\posix.zig:1075` — `use std.Io instead`.
-
-Items 2 and 3 are gated by the fx decision to disable HTTP fetch
-on Windows (`REQ-platform-http-degrade` in
+Items 1, 2, and 6 are gated by the fx decision to disable HTTP
+fetch on Windows (`REQ-platform-http-degrade` in
 `specs/windows-platform-support/spec.md`). When HTTP fetch is
 re-enabled, those items must be resolved upstream first.
 
