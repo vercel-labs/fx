@@ -57,4 +57,4 @@ benchmarks/baseline.json
 .vibe/
 .windsurf/
 .zencoder/
-.staging/
+.staging/.staging-save/
