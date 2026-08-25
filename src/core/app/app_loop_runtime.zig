@@ -5,6 +5,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const loop_command = @import("../loop/command.zig");
 const loop_interval = @import("../loop/interval.zig");
 const loop_scheduler = @import("../loop/scheduler.zig");
+const loop_test_controls = @import("../loop/test_controls.zig");
 const loop_types = @import("../loop/types.zig");
 
 pub fn Runtime(comptime App: type) type {
@@ -77,10 +78,11 @@ pub fn Runtime(comptime App: type) type {
 
         fn schedule(app: *App, create: loop_command.Create) !void {
             const now_ms = io_mod.monotonic_milli_timestamp();
+            const interval_secs = loop_test_controls.interval_secs(create.interval_secs);
             var seed: u64 = undefined;
             io_mod.getIo().random(std.mem.asBytes(&seed));
             const id = scheduler(app).schedule(.{
-                .interval_secs = create.interval_secs,
+                .interval_secs = interval_secs,
                 .prompt = create.prompt,
                 .recurring = create.recurring,
                 .now_ms = now_ms,
@@ -95,7 +97,7 @@ pub fn Runtime(comptime App: type) type {
                 }
             };
 
-            const cadence = try loop_interval.interval_to_human_alloc(app.alloc, create.interval_secs);
+            const cadence = try loop_interval.interval_to_human_alloc(app.alloc, interval_secs);
             defer app.alloc.free(cadence);
             const body = if (create.recurring)
                 try std.fmt.allocPrint(
