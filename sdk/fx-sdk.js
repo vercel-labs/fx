@@ -4,6 +4,9 @@ const strictDecoder = new TextDecoder("utf-8", { fatal: true });
 const workspaceInfoLimit = 4 * 1024;
 const workspaceCommandLimit = 64 * 1024;
 const workspaceOutputLimit = 64 * 1024;
+const attachedCommandLimit = 64 * 1024;
+const attachedEventLimit = 1024 * 1024;
+const attachedQueueLimit = 256;
 const streamReadsPerTaskYield = 32;
 
 function validWorkspacePath(path) {
@@ -217,6 +220,8 @@ function createRuntime(options) {
   const stdin = new ByteQueue();
   const streams = new Map();
   const workspaceExecs = new Set();
+  const attachedCommands = [];
+  const attachedEvents = [];
   const workspace = prepareWorkspaceAdapter(options.workspace);
   const args = ["fx", ...(options.args || [])];
   const env = Object.entries(options.env || {}).map(([key, value]) => `${key}=${value}`);
@@ -226,6 +231,7 @@ function createRuntime(options) {
   let exitCode = null;
   let aborted = false;
   let lineBuffer = "";
+  let attachedEventHandler = null;
   const exited = new Promise((resolve) => { exitedResolve = resolve; });
   const markExited = (code) => {
     if (exitCode !== null) return;
@@ -343,6 +349,29 @@ function createRuntime(options) {
     if (timeoutMs === 0) return 0;
     return stdin.wait(timeoutMs >= 0 ? timeoutMs : undefined).then(() =>
       stdin.chunks.length ? 1 : (stdin.closed ? -1 : 0));
+  }
+
+  function attachedNext(outPtr, outCap) {
+    const command = attachedCommands[0];
+    if (!command) return 0;
+    if (outCap < command.length) return command.length;
+    const output = checkedBytes(outPtr, outCap);
+    if (!output) return -1;
+    output.set(command);
+    attachedCommands.shift();
+    return command.length;
+  }
+
+  function attachedEmit(ptr, len) {
+    const value = checkedBytes(ptr, len);
+    if (!value || len > attachedEventLimit) return -1;
+    let event;
+    try { event = JSON.parse(decoder.decode(value)); } catch { return -1; }
+    queueMicrotask(() => {
+      if (attachedEventHandler) attachedEventHandler(event);
+      else attachedEvents.push(event);
+    });
+    return 0;
   }
 
   function headersFromJson(ptr, len) {
@@ -765,6 +794,9 @@ function createRuntime(options) {
 
   const fx = {
     fx_term_poll_input: new WebAssembly.Suspending(termPollInput),
+    fx_attached_api_next: attachedNext,
+    fx_attached_api_discard() { attachedCommands.shift(); },
+    fx_attached_api_emit: attachedEmit,
     fx_prompt_history_available() { return options.promptHistoryStore ? 1 : 0; },
     fx_workspace_available() { return workspace.present ? 1 : 0; },
     fx_workspace_info: workspaceInfo,
@@ -803,6 +835,20 @@ function createRuntime(options) {
     wake() { stdin.wake(); },
     closeStdin() { stdin.close(); },
     abortHostEffects,
+    sendAttachedControl(command) {
+      if (attachedCommands.length >= attachedQueueLimit) throw new Error("fx attached control queue is full");
+      const encoded = encoder.encode(JSON.stringify(command));
+      if (!encoded.length || encoded.length > attachedCommandLimit) throw new Error("fx attached control command exceeds 64 KiB");
+      attachedCommands.push(encoded);
+      stdin.wake();
+    },
+    setAttachedEventHandler(handler) {
+      attachedEventHandler = handler;
+      if (handler && attachedEvents.length) {
+        const buffered = attachedEvents.splice(0);
+        buffered.forEach((event) => handler(event));
+      }
+    },
     abort() {
       aborted = true;
       abortHostEffects();
@@ -824,6 +870,198 @@ function createRuntime(options) {
       };
     },
   };
+}
+
+function createAttachedTerminalSession(runtime, emit) {
+  let state = null;
+  let nextControlId = 1;
+  let readyResolve;
+  let readyReject;
+  const pending = new Map();
+  const turns = new Map();
+  const bufferedUpdates = new Map();
+  const listeners = new Set();
+  const ready = new Promise((resolve, reject) => {
+    readyResolve = resolve;
+    readyReject = reject;
+  });
+
+  const request = (type, detail = {}) => new Promise((resolve, reject) => {
+    const id = nextControlId++;
+    pending.set(id, { resolve, reject });
+    try {
+      runtime.sendAttachedControl({ version: 1, id, type, ...detail });
+    } catch (error) {
+      pending.delete(id);
+      reject(error);
+    }
+  });
+
+  const session = {
+    ready,
+    get state() { return state && { ...state }; },
+    get id() { return state?.sessionId ?? null; },
+    get model() { return state?.model ?? null; },
+    get permissionMode() { return state?.permissionMode ?? null; },
+    get workspaceRoot() { return state?.workspaceRoot ?? null; },
+    onEvent(listener) {
+      if (typeof listener !== "function") throw new TypeError("session event listener must be a function");
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    refresh() { return request("session.state"); },
+    cancel(turnId) {
+      const turn = turns.get(turnId);
+      if (turn) return turn.cancel();
+      const error = new Error("the attached API can cancel only its own active turns");
+      error.code = "not_owned";
+      return Promise.reject(error);
+    },
+    prompt(input, promptOptions = {}) {
+      if (typeof input !== "string") throw new TypeError("terminal session prompt must be a string");
+      if (!input.length) throw new TypeError("terminal session prompt must not be empty");
+      const signal = promptOptions.signal;
+      if (signal !== undefined && (typeof signal?.addEventListener !== "function" || typeof signal?.removeEventListener !== "function")) {
+        throw new TypeError("prompt signal must be an AbortSignal");
+      }
+
+      const queue = [];
+      const waiters = [];
+      let turnId = null;
+      let started = false;
+      let finished = false;
+      let cancelRequested = false;
+      let cancelSent = false;
+      let cancelResolve;
+      let cancelReject;
+      let finishResolve;
+      const finishedResult = new Promise((resolve) => {
+        finishResolve = resolve;
+      });
+      const finishIterator = () => {
+        finished = true;
+        waiters.splice(0).forEach((resolve) => resolve({ done: true }));
+      };
+      const turn = {
+        get id() { return turnId; },
+        get started() { return started; },
+        push(update) {
+          if (update.sessionUpdate === "user_message") {
+            started = true;
+            maybeCancel();
+          }
+          const waiter = waiters.shift();
+          if (waiter) waiter({ value: update, done: false });
+          else queue.push(update);
+          if (update.sessionUpdate === "turn_finished") {
+            turns.delete(turnId);
+            finishIterator();
+            finishResolve({ stopReason: update.outcome });
+            if (cancelRequested && !cancelSent) cancelResolve({ cancelled: false });
+          }
+        },
+        cancel() {
+          if (finished) return Promise.resolve({ cancelled: false });
+          if (cancelRequested) return turn.cancelled;
+          cancelRequested = true;
+          turn.cancelled = new Promise((resolve, reject) => {
+            cancelResolve = resolve;
+            cancelReject = reject;
+          });
+          accepted.then(maybeCancel, cancelReject);
+          maybeCancel();
+          void turn.cancelled.catch(() => {});
+          return turn.cancelled;
+        },
+        [Symbol.asyncIterator]() {
+          return {
+            next() {
+              if (queue.length) return Promise.resolve({ value: queue.shift(), done: false });
+              if (finished) return Promise.resolve({ done: true });
+              return new Promise((resolve) => waiters.push(resolve));
+            },
+          };
+        },
+      };
+      const accepted = request("session.prompt", { prompt: input }).then((result) => {
+        turnId = result.turnId;
+        turns.set(turnId, turn);
+        const buffered = bufferedUpdates.get(turnId);
+        if (buffered) {
+          bufferedUpdates.delete(turnId);
+          buffered.forEach((update) => turn.push(update));
+        }
+        maybeCancel();
+        return result;
+      });
+      const maybeCancel = () => {
+        if (!cancelRequested || cancelSent || !started || turnId === null || finished) return;
+        cancelSent = true;
+        const cancellation = request("session.cancel", { turnId });
+        cancellation.then((result) => {
+          runtime.abortHostEffects();
+          cancelResolve(result);
+        }, cancelReject);
+      };
+      turn.result = accepted.then(() => finishedResult).catch((error) => {
+        finishIterator();
+        throw error;
+      });
+      turn.stopReason = turn.result.then((result) => result.stopReason);
+      void turn.stopReason.catch(() => {});
+      const abort = () => turn.cancel();
+      signal?.addEventListener("abort", abort, { once: true });
+      turn.result.finally(() => signal?.removeEventListener("abort", abort)).catch(() => {});
+      if (signal?.aborted) turn.cancel();
+      return turn;
+    },
+  };
+
+  runtime.setAttachedEventHandler((event) => {
+    emit(event.type, event);
+    if (event.type === "session.state") {
+      state = event;
+      readyResolve(session);
+    } else if (event.type === "control.response") {
+      const waiter = pending.get(event.id);
+      if (waiter) {
+        pending.delete(event.id);
+        if (event.error) {
+          const error = new Error(event.error.message);
+          error.code = event.error.code;
+          waiter.reject(error);
+        } else {
+          if (event.result?.type === "session.state") {
+            state = event.result;
+            readyResolve(session);
+          }
+          waiter.resolve(event.result);
+        }
+      }
+    } else if (event.type === "session.update") {
+      const turn = turns.get(event.turnId);
+      if (turn) turn.push(event.update);
+      else if (event.update?.source === "structured") {
+        const buffered = bufferedUpdates.get(event.turnId) || [];
+        buffered.push(event.update);
+        bufferedUpdates.set(event.turnId, buffered);
+      }
+    }
+    for (const listener of listeners) {
+      try { listener(event); } catch {}
+    }
+  });
+
+  runtime.exited.then((code) => {
+    const error = new Error(`fx terminal exited with code ${code}`);
+    if (!state) readyReject(error);
+    for (const waiter of pending.values()) waiter.reject(error);
+    pending.clear();
+    for (const turn of turns.values()) turn.push({ sessionUpdate: "turn_finished", outcome: "interrupted" });
+    turns.clear();
+    bufferedUpdates.clear();
+  });
+  return session;
 }
 
 async function instantiate(options) {
@@ -870,6 +1108,7 @@ export async function createFxTerminal(options) {
   };
   emit("runtime.start", { surface: "terminal" });
   const runtime = await instantiate({ ...options, emit, stdout, onTerminalPoll });
+  const session = createAttachedTerminalSession(runtime, emit);
   runtime.exited.then((code) => {
     if (!interactiveScheduled) rejectInteractive(new Error(`fx terminal exited with code ${code} before becoming interactive`));
   });
@@ -901,6 +1140,7 @@ export async function createFxTerminal(options) {
   return {
     interactive,
     exited: runtime.exited,
+    session,
     write(data) {
       if (interruptKey && typeof data === "string" && data.includes(interruptKey)) runtime.abortHostEffects();
       runtime.write(data);

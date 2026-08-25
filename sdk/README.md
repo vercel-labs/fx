@@ -208,7 +208,7 @@ const runtime = await createFxTerminal({
   },
 });
 
-await runtime.interactive;
+await Promise.all([runtime.interactive, runtime.session.ready]);
 
 window.addEventListener("resize", () => {
   fit.fit();
@@ -222,11 +222,52 @@ The terminal runtime provides:
 | --- | --- |
 | `interactive` | Resolves after the terminal is ready for input |
 | `exited` | Resolves with the terminal exit code |
+| `session` | Structured API attached to the same live terminal session |
 | `write(data)` | Writes input directly to fx |
 | `resize()` | Notifies fx of terminal geometry changes |
 | `abort()` | Stops the terminal and releases subscriptions |
 
 Try the hosted terminal at [fx.sh/try](https://fx.sh/try).
+
+### Structured access to a terminal session
+
+`runtime.session` controls and observes the same Fx instance as the terminal.
+It shares conversation history, workspace context, tools, permission mode,
+model selection, and session persistence; it does not create a second
+headless agent.
+
+```js
+await runtime.session.ready;
+
+const turn = runtime.session.prompt("Summarize the work so far.");
+for await (const update of turn) {
+  if (update.sessionUpdate === "agent_message_chunk") {
+    console.log(update.content.text);
+  }
+}
+
+console.log(await turn.stopReason); // "completed"
+```
+
+The attached session provides:
+
+| Member | Description |
+| --- | --- |
+| `ready` | Resolves after the live session state is available |
+| `prompt(text, options?)` | Queues an async iterable turn on the shared worker FIFO |
+| `cancel(turnId)` | Cancels an active turn submitted by this attached API |
+| `refresh()` | Returns the current session state |
+| `onEvent(listener)` | Observes structured state and update events for terminal and API turns |
+| `id`, `model`, `permissionMode`, `workspaceRoot`, `state` | Live shared state |
+
+Terminal and programmatic prompts are ordered by one FIFO and only one turn
+runs at a time. Permission requests, questions, and terminal configuration
+remain owned by the terminal UI. A turn's `cancel()` method can cancel that
+API turn after it becomes active, but cannot interrupt a terminal-owned turn
+or remove a queued prompt. Changes made with `/model`, `/permissions`,
+`/clear`, or `/resume` are reflected by `session.state` events. All semantic
+updates are delivered through `onEvent` and prompt iterators, so hosts never
+need to screen-scrape terminal output.
 
 ## Backend selection
 
