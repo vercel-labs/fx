@@ -77,6 +77,7 @@ pub fn build(b: *std.Build) void {
         exe.root_module.linkSystemLibrary("advapi32", .{});
         exe.root_module.linkSystemLibrary("user32", .{});
         exe.root_module.linkSystemLibrary("crypt32", .{});
+        exe.root_module.linkSystemLibrary("ws2_32", .{});
     }
 
     b.installArtifact(exe);

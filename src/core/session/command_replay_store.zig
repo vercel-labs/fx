@@ -1,6 +1,8 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const io_mod = @import("../shared/io.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const artifact_digest = @import("artifact_digest.zig");
 const session_child_store = @import("session_child_store.zig");
@@ -11,6 +13,32 @@ const Stream = command_output_content.Stream;
 const replay_magic = "FXRPLY01";
 const frame_header_bytes: usize = 9;
 const max_frame_payload_bytes: usize = 1024 * 1024;
+const max_agent_line_bytes: usize = max_frame_payload_bytes;
+const agent_projection_overlap_bytes: usize = 64;
+pub const max_public_handle_bytes: usize = 128;
+pub const CapturePolicy = enum {
+    best_effort,
+    required,
+};
+const model_handle_prefix = "\n<command_output_handle>";
+const model_handle_suffix = "</command_output_handle>\n" ++
+    "Full captured command output is available through read_tool_result with this handle.";
+pub const model_handle_notice_reserve_bytes = model_handle_prefix.len +
+    max_public_handle_bytes +
+    model_handle_suffix.len;
+
+pub fn appendModelHandleNotice(
+    alloc: Allocator,
+    model_output: []const u8,
+    handle: []const u8,
+) ![]u8 {
+    if (handle.len > max_public_handle_bytes) return error.InvalidReplayHandle;
+    return std.fmt.allocPrint(
+        alloc,
+        "{s}{s}{s}{s}",
+        .{ model_output, model_handle_prefix, handle, model_handle_suffix },
+    );
+}
 
 const DecodedFrameHeader = struct {
     stream: Stream,
@@ -32,8 +60,187 @@ fn decodeFrameHeader(header: []const u8) !DecodedFrameHeader {
     return .{ .stream = stream, .payload_len = payload_len };
 }
 
+const ReplayFile = union(enum) {
+    saved: session_child_store.ManagedFile,
+    ephemeral: std.Io.File,
+
+    fn deinit(self: *ReplayFile) void {
+        switch (self.*) {
+            .saved => |*file| file.deinit(),
+            .ephemeral => |file| file.close(io_mod.getIo()),
+        }
+        self.* = undefined;
+    }
+
+    fn writeAll(self: *ReplayFile, bytes: []const u8) !void {
+        switch (self.*) {
+            .saved => |*file| try file.writeAll(bytes),
+            .ephemeral => |file| try file.writeStreamingAll(io_mod.getIo(), bytes),
+        }
+    }
+
+    fn sync(self: *ReplayFile) !void {
+        switch (self.*) {
+            .saved => |*file| try file.sync(),
+            .ephemeral => |file| try file.sync(io_mod.getIo()),
+        }
+    }
+
+    fn size(self: *ReplayFile) !usize {
+        const raw_size = switch (self.*) {
+            .saved => |*file| (try file.stat()).size,
+            .ephemeral => |file| (try file.stat(io_mod.getIo())).size,
+        };
+        return std.math.cast(usize, raw_size) orelse error.ReplayTooLarge;
+    }
+
+    fn readRange(
+        self: *ReplayFile,
+        alloc: Allocator,
+        start: u64,
+        len: usize,
+    ) ![]u8 {
+        return switch (self.*) {
+            .saved => |*file| file.readRange(alloc, start, len),
+            .ephemeral => |file| readFileRange(alloc, file, start, len),
+        };
+    }
+
+    fn readRangeInto(self: *ReplayFile, start: u64, out: []u8) !usize {
+        return switch (self.*) {
+            .saved => |*file| file.readRangeInto(start, out),
+            .ephemeral => |file| readFileRangeInto(file, start, out),
+        };
+    }
+};
+
+fn readFileRange(
+    alloc: Allocator,
+    file: std.Io.File,
+    start: u64,
+    len: usize,
+) ![]u8 {
+    if (len == 0) return alloc.dupe(u8, "");
+    const out = try alloc.alloc(u8, len);
+    errdefer alloc.free(out);
+    const read_len = try readFileRangeInto(file, start, out);
+    if (read_len == out.len) return out;
+    return alloc.realloc(out, read_len);
+}
+
+fn readFileRangeInto(file: std.Io.File, start: u64, out: []u8) !usize {
+    if (out.len == 0) return 0;
+    return file.readPositionalAll(io_mod.getIo(), out, start);
+}
+
+pub const EphemeralStore = struct {
+    alloc: Allocator,
+    temp_dir: []const u8,
+    files: std.StringHashMapUnmanaged(std.Io.File) = .empty,
+    mutex: std.Io.Mutex = .init,
+
+    pub fn init(alloc: Allocator) EphemeralStore {
+        return .{ .alloc = alloc, .temp_dir = "/tmp" };
+    }
+
+    pub fn initForTesting(alloc: Allocator, temp_dir: []const u8) EphemeralStore {
+        return .{ .alloc = alloc, .temp_dir = temp_dir };
+    }
+
+    pub fn deinit(self: *EphemeralStore) void {
+        var iterator = self.files.iterator();
+        while (iterator.next()) |entry| {
+            entry.value_ptr.*.close(io_mod.getIo());
+            self.alloc.free(entry.key_ptr.*);
+        }
+        self.files.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn createSpoolWithStem(
+        self: *EphemeralStore,
+        alloc: Allocator,
+        stem: []const u8,
+    ) !OpenSpool {
+        if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+            return error.EphemeralReplayUnavailable;
+        }
+        const handle = try std.fmt.allocPrint(alloc, "{s}.bin", .{stem});
+        errdefer alloc.free(handle);
+        const temp_name = try std.fmt.allocPrint(alloc, ".{s}.tmp", .{stem});
+        defer alloc.free(temp_name);
+        const temp_path = try std.fs.path.join(alloc, &.{ self.temp_dir, temp_name });
+        defer alloc.free(temp_path);
+        var writer_file = std.Io.Dir.createFileAbsolute(io_mod.getIo(), temp_path, .{
+            .read = true,
+            .exclusive = true,
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => return error.ReplayNameCollision,
+            else => return error.EphemeralReplayUnavailable,
+        };
+        errdefer writer_file.close(io_mod.getIo());
+        std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), temp_path) catch
+            return error.EphemeralReplayUnavailable;
+        const stored_file = try duplicateFile(writer_file);
+        errdefer stored_file.close(io_mod.getIo());
+        const owned_handle = try self.alloc.dupe(u8, handle);
+        errdefer self.alloc.free(owned_handle);
+
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.files.contains(handle)) return error.ReplayNameCollision;
+        try self.files.put(self.alloc, owned_handle, stored_file);
+        @import("../shared/debug_trace.zig").logf(
+            "session",
+            "command replay ephemeral backing opened handle_bytes={d}",
+            .{handle.len},
+        );
+        return .{
+            .file = .{ .ephemeral = writer_file },
+            .handle = handle,
+            .framed_bytes = 0,
+        };
+    }
+
+    fn open(self: *EphemeralStore, handle: []const u8) !ReplayFile {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const file = self.files.get(handle) orelse return error.ResultHandleNotFound;
+        return .{ .ephemeral = try duplicateFile(file) };
+    }
+
+    fn delete(self: *EphemeralStore, handle: []const u8) void {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const removed = self.files.fetchRemove(handle) orelse return;
+        removed.value.close(io);
+        self.alloc.free(removed.key);
+    }
+};
+
+fn duplicateFile(file: std.Io.File) !std.Io.File {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.EphemeralReplayUnavailable;
+    }
+    const duplicated = std.c.fcntl(file.handle, std.c.F.DUPFD_CLOEXEC, @as(std.c.fd_t, 0));
+    if (duplicated < 0) return error.EphemeralReplayUnavailable;
+    return .{
+        .handle = @intCast(duplicated),
+        .flags = file.flags,
+    };
+}
+
+const ReplayBacking = union(enum) {
+    saved: *session_child_store.SessionChildCapability,
+    ephemeral: *EphemeralStore,
+};
+
 const OpenSpool = struct {
-    file: session_child_store.ManagedFile,
+    file: ReplayFile,
     handle: []u8,
     framed_bytes: usize,
 };
@@ -64,7 +271,8 @@ const CaptureState = union(enum) {
 pub const Capture = struct {
     inline_limit: usize,
     comparison_limit: usize,
-    capability: ?*session_child_store.SessionChildCapability,
+    backing: ?ReplayBacking,
+    capture_policy: CapturePolicy = .best_effort,
     state: CaptureState = .{ .buffered = .empty },
     had_output: bool = false,
     sealed: bool = false,
@@ -80,9 +288,32 @@ pub const Capture = struct {
         capture.* = .{
             .inline_limit = inline_limit,
             .comparison_limit = inline_limit,
-            .capability = capability,
+            .backing = if (capability) |value| .{ .saved = value } else null,
         };
         return capture;
+    }
+
+    pub fn createEphemeral(
+        alloc: Allocator,
+        inline_limit: usize,
+        store: *EphemeralStore,
+    ) !*Capture {
+        const capture = try alloc.create(Capture);
+        capture.* = .{
+            .inline_limit = inline_limit,
+            .comparison_limit = inline_limit,
+            .backing = .{ .ephemeral = store },
+        };
+        return capture;
+    }
+
+    pub fn setPolicyBeforeCapture(self: *Capture, replay_policy: CapturePolicy) void {
+        std.debug.assert(!self.had_output and !self.sealed);
+        self.capture_policy = replay_policy;
+    }
+
+    pub fn policy(self: *const Capture) CapturePolicy {
+        return self.capture_policy;
     }
 
     /// Records bytes only after the downstream callback accepted them.
@@ -99,6 +330,28 @@ pub const Capture = struct {
             self.makeUnavailable(alloc, err);
             return;
         };
+        self.updateDigest(stream, bytes);
+    }
+
+    /// Records required command output. Any storage failure becomes visible so
+    /// the execution owner can stop the command instead of losing later bytes.
+    pub fn appendAcceptedRequired(
+        self: *Capture,
+        alloc: Allocator,
+        stream: Stream,
+        bytes: []const u8,
+    ) !void {
+        if (bytes.len == 0 or self.sealed) return;
+        if (self.state == .unavailable) return error.CommandOutputCaptureFailed;
+        self.had_output = true;
+        self.appendAcceptedFallible(alloc, stream, bytes) catch |err| {
+            self.makeUnavailable(alloc, err);
+            return error.CommandOutputCaptureFailed;
+        };
+        self.updateDigest(stream, bytes);
+    }
+
+    fn updateDigest(self: *Capture, stream: Stream, bytes: []const u8) void {
         if (!self.digest_started) {
             self.content_hasher.update(replay_magic);
             self.digest_started = true;
@@ -159,8 +412,8 @@ pub const Capture = struct {
         header: []const u8,
         bytes: []const u8,
     ) !void {
-        const capability = self.capability orelse return error.ReplayStoreUnavailable;
-        var spool = try createSpool(alloc, capability);
+        const backing = self.backing orelse return error.ReplayStoreUnavailable;
+        var spool = try createSpool(alloc, backing);
         var transferred = false;
         errdefer if (!transferred) {
             spool.file.deinit();
@@ -186,27 +439,16 @@ pub const Capture = struct {
         transferred = true;
     }
 
-    /// Closes and synchronizes any spool before the capture leaves tool runtime.
-    pub fn seal(self: *Capture, alloc: Allocator) void {
+    fn sealFallible(self: *Capture, alloc: Allocator) !void {
         if (self.sealed) return;
         self.sealed = true;
         switch (self.state) {
             .streaming => |*spool| {
-                spool.file.sync() catch |err| {
-                    self.makeUnavailable(alloc, err);
-                    return;
-                };
+                try spool.file.sync();
                 var digest: [Sha256.digest_length]u8 = undefined;
                 var hasher = self.content_hasher;
                 hasher.final(&digest);
-                self.contentAddressSpool(
-                    alloc,
-                    spool,
-                    digest,
-                ) catch |err| {
-                    self.makeUnavailable(alloc, err);
-                    return;
-                };
+                try self.contentAddressSpool(alloc, spool, digest);
                 const descriptor = OwnedDescriptor{
                     .handle = spool.handle,
                     .framed_bytes = spool.framed_bytes,
@@ -216,6 +458,19 @@ pub const Capture = struct {
             },
             else => {},
         }
+    }
+
+    /// Closes and synchronizes any spool before the capture leaves tool runtime.
+    pub fn seal(self: *Capture, alloc: Allocator) void {
+        self.sealFallible(alloc) catch |err| self.makeUnavailable(alloc, err);
+    }
+
+    pub fn sealRequired(self: *Capture, alloc: Allocator) !void {
+        self.sealFallible(alloc) catch |err| {
+            self.makeUnavailable(alloc, err);
+            return error.CommandOutputCaptureFailed;
+        };
+        if (self.state == .unavailable) return error.CommandOutputCaptureFailed;
     }
 
     pub fn hasOutput(self: *const Capture) bool {
@@ -265,8 +520,8 @@ pub const Capture = struct {
         descriptor: OwnedDescriptor,
         max_payload_bytes: usize,
     ) !command_output_content.CanonicalOutput {
-        const capability = self.capability orelse return error.ReplayStoreUnavailable;
-        var reader = try Reader.open(alloc, capability, descriptor.view());
+        const backing = self.backing orelse return error.ReplayStoreUnavailable;
+        var reader = try Reader.openBacking(alloc, backing, descriptor.view());
         defer reader.deinit();
         var output: command_output_content.CanonicalOutput = .{};
         errdefer output.deinit(alloc);
@@ -364,13 +619,47 @@ pub const Capture = struct {
         };
     }
 
+    /// Retains required replay as one durable descriptor. The caller receives
+    /// a borrowed view and the capture remains the cleanup owner until handoff.
+    pub fn retainRequired(
+        self: *Capture,
+        alloc: Allocator,
+    ) !?types.CommandOutputReplayDescriptor {
+        try self.sealRequired(alloc);
+        if (!self.had_output) {
+            self.abort(alloc);
+            return null;
+        }
+        return switch (self.state) {
+            .buffered => |*buffered| blk: {
+                const descriptor = self.materializeInline(alloc, buffered) catch |err| {
+                    self.makeUnavailable(alloc, err);
+                    return error.CommandOutputCaptureFailed;
+                };
+                self.state = .{ .retained = descriptor };
+                break :blk descriptor.view();
+            },
+            .sealed_file => |descriptor| blk: {
+                self.state = .{ .retained = descriptor };
+                break :blk descriptor.view();
+            },
+            .retained => |descriptor| if (descriptor) |value|
+                value.view()
+            else
+                return error.CommandOutputCaptureFailed,
+            .unavailable => return error.CommandOutputCaptureFailed,
+            .streaming => unreachable,
+            .consumed => null,
+        };
+    }
+
     fn materializeInline(
         self: *Capture,
         alloc: Allocator,
         buffered: *std.ArrayList(u8),
     ) !OwnedDescriptor {
-        const capability = self.capability orelse return error.ReplayStoreUnavailable;
-        var spool = try createSpool(alloc, capability);
+        const backing = self.backing orelse return error.ReplayStoreUnavailable;
+        var spool = try createSpool(alloc, backing);
         var transferred = false;
         errdefer if (!transferred) {
             spool.file.deinit();
@@ -398,8 +687,9 @@ pub const Capture = struct {
         spool: *OpenSpool,
         digest: [Sha256.digest_length]u8,
     ) !void {
-        const capability = self.capability orelse
-            return error.ReplayStoreUnavailable;
+        const backing = self.backing orelse return error.ReplayStoreUnavailable;
+        if (backing == .ephemeral) return;
+        const capability = backing.saved;
         const target_handle = try contentAddressedHandle(
             alloc,
             spool.handle,
@@ -496,44 +786,71 @@ pub const Capture = struct {
     }
 
     fn deleteSpool(self: *Capture, handle: []const u8) void {
-        const capability = self.capability orelse return;
-        capability.delete(.command_artifacts, handle) catch |err| {
-            @import("../shared/debug_trace.zig").logf(
-                "session",
-                "command replay orphan cleanup failed handle_bytes={d} err={s}",
-                .{ handle.len, @errorName(err) },
-            );
-        };
+        const backing = self.backing orelse return;
+        switch (backing) {
+            .saved => |capability| capability.delete(.command_artifacts, handle) catch |err| {
+                @import("../shared/debug_trace.zig").logf(
+                    "session",
+                    "command replay orphan cleanup failed handle_bytes={d} err={s}",
+                    .{ handle.len, @errorName(err) },
+                );
+            },
+            .ephemeral => |store| store.delete(handle),
+        }
     }
 };
 
 fn createSpool(
     alloc: Allocator,
-    capability: *session_child_store.SessionChildCapability,
+    backing: ReplayBacking,
 ) !OpenSpool {
-    var attempt: usize = 0;
-    while (attempt < 8) : (attempt += 1) {
-        const handle = try std.fmt.allocPrint(
-            alloc,
-            "fx-command-replay-{d}-{d}-{d}.bin",
-            .{ @intFromPtr(std.c.getpid()), io_mod.nanoTimestamp(), attempt },
-        );
-        const file = capability.createExclusiveFile(
-            alloc,
-            .command_artifacts,
-            handle,
-        ) catch |err| {
-            alloc.free(handle);
-            if (err == error.PathAlreadyExists) continue;
-            return err;
-        };
-        return .{
-            .file = file,
-            .handle = handle,
-            .framed_bytes = 0,
+    for (0..8) |_| {
+        const stem = try randomReplayStem(alloc);
+        defer alloc.free(stem);
+        return createSpoolWithStem(alloc, backing, stem) catch |err| switch (err) {
+            error.ReplayNameCollision => continue,
+            else => return err,
         };
     }
     return error.ReplayNameCollision;
+}
+
+fn randomReplayStem(alloc: Allocator) ![]u8 {
+    var random: [16]u8 = undefined;
+    try std.Io.randomSecure(io_mod.getIo(), &random);
+    const random_hex = std.fmt.bytesToHex(random, .lower);
+    return std.fmt.allocPrint(
+        alloc,
+        "fx-command-replay-{s}",
+        .{&random_hex},
+    );
+}
+
+fn createSpoolWithStem(
+    alloc: Allocator,
+    backing: ReplayBacking,
+    stem: []const u8,
+) !OpenSpool {
+    return switch (backing) {
+        .ephemeral => |store| store.createSpoolWithStem(alloc, stem),
+        .saved => |capability| blk: {
+            const handle = try std.fmt.allocPrint(alloc, "{s}.bin", .{stem});
+            errdefer alloc.free(handle);
+            const file = capability.createExclusiveFile(
+                alloc,
+                .command_artifacts,
+                handle,
+            ) catch |err| switch (err) {
+                error.PathAlreadyExists => return error.ReplayNameCollision,
+                else => return err,
+            };
+            break :blk .{
+                .file = .{ .saved = file },
+                .handle = handle,
+                .framed_bytes = 0,
+            };
+        },
+    };
 }
 
 fn contentAddressedHandle(
@@ -578,7 +895,7 @@ pub const Byte = struct {
 };
 
 pub const Reader = struct {
-    file: session_child_store.ManagedFile,
+    file: ReplayFile,
     size: usize,
     offset: usize,
     byte_buffer: [8192]u8 = undefined,
@@ -592,36 +909,80 @@ pub const Reader = struct {
         capability: *session_child_store.SessionChildCapability,
         descriptor: types.CommandOutputReplayDescriptor,
     ) !Reader {
-        var reader: Reader = undefined;
-        try openInto(&reader, alloc, capability, descriptor);
-        return reader;
+        return openBacking(alloc, .{ .saved = capability }, descriptor);
     }
 
-    // noinline keeps the comptime-known error returns behind a call
-    // boundary; inlined into a `!Reader` result location they each
-    // materialize a Reader-sized (~8KB) error-union constant.
-    noinline fn openInto(
-        reader: *Reader,
+    fn openBacking(
+        alloc: Allocator,
+        backing: ReplayBacking,
+        descriptor: types.CommandOutputReplayDescriptor,
+    ) !Reader {
+        var file = switch (backing) {
+            .saved => |capability| ReplayFile{ .saved = try capability.openFileReadOnly(
+                alloc,
+                .command_artifacts,
+                descriptor.handle,
+            ) },
+            .ephemeral => |store| try store.open(descriptor.handle),
+        };
+        const size = file.size() catch |err| {
+            file.deinit();
+            return err;
+        };
+        if (size != descriptor.framed_bytes) {
+            file.deinit();
+            return error.ReplaySizeMismatch;
+        }
+        return initialize(alloc, file, size);
+    }
+
+    pub fn openHandle(
         alloc: Allocator,
         capability: *session_child_store.SessionChildCapability,
-        descriptor: types.CommandOutputReplayDescriptor,
-    ) !void {
-        var file = try capability.openFileReadOnly(
+        handle: []const u8,
+    ) !Reader {
+        if (!hasContentDigest(handle)) return error.ResultHandleNotFound;
+        var file = ReplayFile{ .saved = capability.openFileReadOnly(
             alloc,
             .command_artifacts,
-            descriptor.handle,
-        );
-        errdefer file.deinit();
-        const stat = try file.stat();
-        const size = std.math.cast(usize, stat.size) orelse
-            return error.ReplayTooLarge;
-        if (size != descriptor.framed_bytes) return error.ReplaySizeMismatch;
+            handle,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return error.ResultHandleNotFound,
+            else => return err,
+        } };
+        const size = file.size() catch |err| {
+            file.deinit();
+            return err;
+        };
+        return initialize(alloc, file, size);
+    }
+
+    pub fn openEphemeralHandle(
+        alloc: Allocator,
+        store: *EphemeralStore,
+        handle: []const u8,
+    ) !Reader {
+        var file = try store.open(handle);
+        const size = file.size() catch |err| {
+            file.deinit();
+            return err;
+        };
+        return initialize(alloc, file, size);
+    }
+
+    noinline fn initialize(
+        alloc: Allocator,
+        file: ReplayFile,
+        size: usize,
+    ) !Reader {
+        var owned_file = file;
+        errdefer owned_file.deinit();
         if (size < replay_magic.len) return error.InvalidReplayHeader;
-        const magic = try readExactRange(alloc, &file, 0, replay_magic.len);
+        const magic = try readExactRange(alloc, &owned_file, 0, replay_magic.len);
         defer alloc.free(magic);
         if (!std.mem.eql(u8, magic, replay_magic)) return error.InvalidReplayHeader;
-        reader.* = .{
-            .file = file,
+        return .{
+            .file = owned_file,
             .size = size,
             .offset = replay_magic.len,
         };
@@ -711,8 +1072,259 @@ pub const Reader = struct {
     }
 };
 
+fn projectedOutput(
+    alloc: Allocator,
+    stream: Stream,
+    payload: []const u8,
+) ![]u8 {
+    const masked = try text_utils.maskSecrets(alloc, payload);
+    defer if (masked.ptr != payload.ptr) alloc.free(@constCast(masked));
+    const max_encoded_bytes = std.math.mul(usize, masked.len, 12) catch
+        return error.OutOfMemory;
+    var encoded = try text_utils.encodeTerminalSafe(
+        alloc,
+        masked,
+        max_encoded_bytes,
+    );
+    defer encoded.deinit(alloc);
+    const stream_name = @tagName(stream);
+    return std.fmt.allocPrint(
+        alloc,
+        "[{s}]\n{s}\n[/{s}]\n",
+        .{ stream_name, encoded.bytes, stream_name },
+    );
+}
+
+const AgentProjectionReader = struct {
+    reader: *Reader,
+    line: std.ArrayList(u8) = .empty,
+    stream: ?Stream = null,
+    pending_byte: ?Byte = null,
+    discarding_sensitive_line: bool = false,
+
+    fn deinit(self: *AgentProjectionReader, alloc: Allocator) void {
+        self.line.deinit(alloc);
+        self.* = undefined;
+    }
+
+    /// Projects logical lines so masking cannot be bypassed by a secret split
+    /// across callback frames. Non-secret oversized lines stream in bounded
+    /// chunks; suspicious oversized lines are suppressed conservatively.
+    fn next(self: *AgentProjectionReader, alloc: Allocator) !?[]u8 {
+        while (true) {
+            const next_byte = if (self.pending_byte) |byte| blk: {
+                self.pending_byte = null;
+                break :blk byte;
+            } else (try self.reader.nextByte()) orelse {
+                if (self.stream == null) return null;
+                return try self.finishLine(alloc);
+            };
+
+            if (self.stream) |stream| {
+                if (stream != next_byte.stream) {
+                    self.pending_byte = next_byte;
+                    return try self.finishLine(alloc);
+                }
+            } else {
+                self.stream = next_byte.stream;
+            }
+
+            if (self.discarding_sensitive_line) {
+                if (next_byte.value == '\n') return try self.finishLine(alloc);
+                continue;
+            }
+            if (self.line.items.len == max_agent_line_bytes) {
+                const masked = try text_utils.maskSecrets(alloc, self.line.items);
+                defer if (masked.ptr != self.line.items.ptr) alloc.free(@constCast(masked));
+                if (masked.ptr != self.line.items.ptr or
+                    text_utils.secretMayCrossBoundary(
+                        self.line.items,
+                        agent_projection_overlap_bytes,
+                    ))
+                {
+                    self.line.clearRetainingCapacity();
+                    self.discarding_sensitive_line = true;
+                    if (next_byte.value == '\n') return try self.finishLine(alloc);
+                    continue;
+                }
+                self.pending_byte = next_byte;
+                return try self.finishChunk(alloc);
+            }
+            try self.line.append(alloc, next_byte.value);
+            if (next_byte.value == '\n') return try self.finishLine(alloc);
+        }
+    }
+
+    fn finishLine(self: *AgentProjectionReader, alloc: Allocator) ![]u8 {
+        const stream = self.stream.?;
+        defer {
+            self.line.clearRetainingCapacity();
+            self.stream = null;
+            self.discarding_sensitive_line = false;
+        }
+        if (self.discarding_sensitive_line) {
+            const stream_name = @tagName(stream);
+            return std.fmt.allocPrint(
+                alloc,
+                "[{s}]\n[secret-bearing output line omitted after {d} bytes]\n[/{s}]\n",
+                .{ stream_name, max_agent_line_bytes, stream_name },
+            );
+        }
+        return projectedOutput(alloc, stream, self.line.items);
+    }
+
+    fn finishChunk(self: *AgentProjectionReader, alloc: Allocator) ![]u8 {
+        std.debug.assert(self.line.items.len == max_agent_line_bytes);
+        const flush_len = self.line.items.len - agent_projection_overlap_bytes;
+        const projected = try projectedOutput(
+            alloc,
+            self.stream.?,
+            self.line.items[0..flush_len],
+        );
+        std.mem.copyForwards(
+            u8,
+            self.line.items[0..agent_projection_overlap_bytes],
+            self.line.items[flush_len..],
+        );
+        self.line.shrinkRetainingCapacity(agent_projection_overlap_bytes);
+        return projected;
+    }
+};
+
+pub fn readAgentPageManaged(
+    alloc: Allocator,
+    capability: *session_child_store.SessionChildCapability,
+    handle: []const u8,
+    start_byte: usize,
+    byte_count: usize,
+) ![]u8 {
+    var reader = try Reader.openHandle(alloc, capability, handle);
+    defer reader.deinit();
+    return readAgentPage(alloc, &reader, handle, start_byte, byte_count);
+}
+
+pub fn readAgentPageEphemeral(
+    alloc: Allocator,
+    store: *EphemeralStore,
+    handle: []const u8,
+    start_byte: usize,
+    byte_count: usize,
+) ![]u8 {
+    var reader = try Reader.openEphemeralHandle(alloc, store, handle);
+    defer reader.deinit();
+    return readAgentPage(alloc, &reader, handle, start_byte, byte_count);
+}
+
+fn readAgentPage(
+    alloc: Allocator,
+    reader: *Reader,
+    handle: []const u8,
+    start_byte: usize,
+    byte_count: usize,
+) ![]u8 {
+    const requested_start = if (start_byte == 0) 0 else start_byte - 1;
+    var projected_offset: usize = 0;
+    var page_start: ?usize = null;
+    var page_closed = false;
+    var page: std.ArrayList(u8) = .empty;
+    defer page.deinit(alloc);
+    var projector: AgentProjectionReader = .{ .reader = reader };
+    defer projector.deinit(alloc);
+
+    while (try projector.next(alloc)) |block| {
+        defer alloc.free(block);
+        const block_end = try std.math.add(usize, projected_offset, block.len);
+        if (!page_closed and block_end > requested_start and page.items.len < byte_count) {
+            const local_start = if (requested_start > projected_offset)
+                requested_start - projected_offset
+            else
+                0;
+            const safe_start = text_utils.utf8ForwardBoundary(block, local_start);
+            if (page_start == null) page_start = projected_offset + safe_start;
+            const available = block.len - safe_start;
+            const remaining = byte_count - page.items.len;
+            const raw_end = safe_start + @min(available, remaining);
+            const safe_end = text_utils.utf8BackwardBoundary(block, raw_end);
+            if (safe_end > safe_start) {
+                try page.appendSlice(alloc, block[safe_start..safe_end]);
+            }
+            if (safe_end < raw_end or page.items.len == byte_count) {
+                page_closed = true;
+            }
+        }
+        projected_offset = block_end;
+    }
+
+    const response_start = page_start orelse @min(requested_start, projected_offset);
+    const response_end = try std.math.add(usize, response_start, page.items.len);
+    return std.fmt.allocPrint(
+        alloc,
+        "<command_output handle=\"{s}\" start_byte=\"{d}\" end_byte=\"{d}\" total_bytes=\"{d}\">\n{s}</command_output>",
+        .{ handle, response_start + 1, response_end, projected_offset, page.items },
+    );
+}
+
+pub fn searchAgentQueryManaged(
+    alloc: Allocator,
+    capability: *session_child_store.SessionChildCapability,
+    handle: []const u8,
+    query: []const u8,
+    max_response_bytes: usize,
+) ![]u8 {
+    const trimmed_query = std.mem.trim(u8, query, " \t\r\n");
+    if (trimmed_query.len == 0) return error.InvalidQuery;
+    var reader = try Reader.openHandle(alloc, capability, handle);
+    defer reader.deinit();
+    return searchAgentQuery(alloc, &reader, handle, trimmed_query, max_response_bytes);
+}
+
+pub fn searchAgentQueryEphemeral(
+    alloc: Allocator,
+    store: *EphemeralStore,
+    handle: []const u8,
+    query: []const u8,
+    max_response_bytes: usize,
+) ![]u8 {
+    const trimmed_query = std.mem.trim(u8, query, " \t\r\n");
+    if (trimmed_query.len == 0) return error.InvalidQuery;
+    var reader = try Reader.openEphemeralHandle(alloc, store, handle);
+    defer reader.deinit();
+    return searchAgentQuery(alloc, &reader, handle, trimmed_query, max_response_bytes);
+}
+
+fn searchAgentQuery(
+    alloc: Allocator,
+    reader: *Reader,
+    handle: []const u8,
+    trimmed_query: []const u8,
+    max_response_bytes: usize,
+) ![]u8 {
+    var matches: std.ArrayList(u8) = .empty;
+    defer matches.deinit(alloc);
+    var match_count: usize = 0;
+    var projector: AgentProjectionReader = .{ .reader = reader };
+    defer projector.deinit(alloc);
+
+    while (try projector.next(alloc)) |block| {
+        defer alloc.free(block);
+        if (std.mem.find(u8, block, trimmed_query) == null) continue;
+        const remaining = max_response_bytes -| matches.items.len;
+        if (remaining == 0) break;
+        const end = text_utils.utf8BackwardBoundary(block, @min(block.len, remaining));
+        if (end > 0) try matches.appendSlice(alloc, block[0..end]);
+        match_count += 1;
+        if (match_count >= 50 or matches.items.len >= max_response_bytes) break;
+    }
+    if (match_count == 0) try matches.appendSlice(alloc, "(no matches)\n");
+    return std.fmt.allocPrint(
+        alloc,
+        "<command_output_query handle=\"{s}\">\nquery: {f}\n{s}</command_output_query>",
+        .{ handle, std.json.fmt(trimmed_query, .{}), matches.items },
+    );
+}
+
 fn readExactInto(
-    file: *session_child_store.ManagedFile,
+    file: *ReplayFile,
     start: usize,
     out: []u8,
 ) !void {
@@ -724,7 +1336,7 @@ fn readExactInto(
 
 fn readExactRange(
     alloc: Allocator,
-    file: *session_child_store.ManagedFile,
+    file: *ReplayFile,
     start: usize,
     len: usize,
 ) ![]u8 {
@@ -748,7 +1360,7 @@ test "command replay capture spills without losing callback order" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        io_mod.permissionsFromMode(0o700),
+        std.Io.File.Permissions.fromMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,
@@ -790,7 +1402,7 @@ test "command replay capture spills without losing callback order" {
     );
     try std.testing.expectEqual(
         @as(u32, 0o600),
-        io_mod.permissionsToMode(replay_stat.permissions) & 0o777,
+        replay_stat.permissions.toMode() & 0o777,
     );
     var reader = try Reader.open(alloc, &capability, descriptor);
     defer reader.deinit();
@@ -826,6 +1438,409 @@ test "command replay capture spills without losing callback order" {
     try std.testing.expect((try byte_reader.nextByte()) == null);
 }
 
+test "required command replay reports unavailable backing instead of dropping output" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const capture = try Capture.create(arena, 0, null);
+    defer capture.abort(arena);
+
+    try std.testing.expectError(
+        error.CommandOutputCaptureFailed,
+        capture.appendAcceptedRequired(arena, .stdout, "required\n"),
+    );
+    try std.testing.expectError(
+        error.CommandOutputCaptureFailed,
+        capture.appendAcceptedRequired(arena, .stderr, "still required\n"),
+    );
+}
+
+test "saved and ephemeral replay backings share collision handling" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const display_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(display_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        display_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+
+    const stem = "fx-command-replay-fixed-collision";
+    var saved = try createSpoolWithStem(alloc, .{ .saved = &capability }, stem);
+    defer {
+        saved.file.deinit();
+        capability.delete(.command_artifacts, saved.handle) catch {};
+        alloc.free(saved.handle);
+    }
+    try std.testing.expectError(
+        error.ReplayNameCollision,
+        createSpoolWithStem(alloc, .{ .saved = &capability }, stem),
+    );
+
+    const temp_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(temp_path);
+    var ephemeral_store = EphemeralStore.initForTesting(alloc, temp_path);
+    defer ephemeral_store.deinit();
+    var ephemeral = try createSpoolWithStem(
+        alloc,
+        .{ .ephemeral = &ephemeral_store },
+        stem,
+    );
+    defer {
+        ephemeral.file.deinit();
+        ephemeral_store.delete(ephemeral.handle);
+        alloc.free(ephemeral.handle);
+    }
+    try std.testing.expectError(
+        error.ReplayNameCollision,
+        createSpoolWithStem(
+            alloc,
+            .{ .ephemeral = &ephemeral_store },
+            stem,
+        ),
+    );
+}
+
+test "ephemeral command replay unlinks backing before publication and remains readable" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const temp_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(temp_path);
+    var store = EphemeralStore.initForTesting(alloc, temp_path);
+    defer store.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const capture = try Capture.createEphemeral(arena, 0, &store);
+    try capture.appendAcceptedRequired(arena, .stdout, "TOKEN=private-value\nephemeral needle\n");
+    const descriptor = (try capture.retainRequired(arena)) orelse
+        return error.TestExpectedReplay;
+    defer capture.releaseRetained(arena);
+
+    var inspect_dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), temp_path, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer inspect_dir.close(io_mod.getIo());
+    var entries = inspect_dir.iterate();
+    try std.testing.expect(try entries.next(io_mod.getIo()) == null);
+
+    var reader = try Reader.openEphemeralHandle(alloc, &store, descriptor.handle);
+    defer reader.deinit();
+    const frame = (try reader.next(alloc)) orelse return error.TestExpectedReplay;
+    defer alloc.free(frame.payload);
+    try std.testing.expectEqual(Stream.stdout, frame.stream);
+    try std.testing.expectEqualStrings(
+        "TOKEN=private-value\nephemeral needle\n",
+        frame.payload,
+    );
+
+    const page = try readAgentPageEphemeral(
+        alloc,
+        &store,
+        descriptor.handle,
+        1,
+        4096,
+    );
+    defer alloc.free(page);
+    try std.testing.expect(std.mem.find(u8, page, "TOKEN=[redacted]") != null);
+    try std.testing.expect(std.mem.find(u8, page, "private-value") == null);
+    try std.testing.expect(std.mem.find(u8, page, "ephemeral needle") != null);
+}
+
+test "agent command replay masks secrets split across callback frames" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const temp_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(temp_path);
+    var store = EphemeralStore.initForTesting(alloc, temp_path);
+    defer store.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const capture = try Capture.createEphemeral(arena, 0, &store);
+    try capture.appendAcceptedRequired(arena, .stdout, "TOKEN=private-");
+    try capture.appendAcceptedRequired(arena, .stdout, "value\nneedle split across frames\n");
+    const descriptor = (try capture.retainRequired(arena)) orelse
+        return error.TestExpectedReplay;
+    defer capture.releaseRetained(arena);
+
+    const page = try readAgentPageEphemeral(
+        alloc,
+        &store,
+        descriptor.handle,
+        1,
+        4096,
+    );
+    defer alloc.free(page);
+    try std.testing.expect(std.mem.find(u8, page, "TOKEN=[redacted]") != null);
+    try std.testing.expect(std.mem.find(u8, page, "private-") == null);
+    try std.testing.expect(std.mem.find(u8, page, "value") == null);
+
+    const query = try searchAgentQueryEphemeral(
+        alloc,
+        &store,
+        descriptor.handle,
+        "split across frames",
+        4096,
+    );
+    defer alloc.free(query);
+    try std.testing.expect(std.mem.find(u8, query, "needle split across frames") != null);
+}
+
+test "agent command replay pages stay contiguous across utf8 boundaries" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const temp_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(temp_path);
+    var store = EphemeralStore.initForTesting(alloc, temp_path);
+    defer store.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const capture = try Capture.createEphemeral(arena, 0, &store);
+    try capture.appendAcceptedRequired(arena, .stdout, "ab\xe2\x98\x83cd\n");
+    const descriptor = (try capture.retainRequired(arena)) orelse
+        return error.TestExpectedReplay;
+    defer capture.releaseRetained(arena);
+
+    const first = try readAgentPageEphemeral(
+        alloc,
+        &store,
+        descriptor.handle,
+        1,
+        12,
+    );
+    defer alloc.free(first);
+    try std.testing.expect(std.mem.find(u8, first, "start_byte=\"1\"") != null);
+    try std.testing.expect(std.mem.find(u8, first, "end_byte=\"11\"") != null);
+    const first_body_start = (std.mem.find(u8, first, ">\n") orelse
+        return error.TestExpectedReplay) + 2;
+    const first_body_end = std.mem.findPos(
+        u8,
+        first,
+        first_body_start,
+        "</command_output>",
+    ) orelse return error.TestExpectedReplay;
+    const first_body = first[first_body_start..first_body_end];
+    try std.testing.expect(std.mem.find(u8, first_body, "ab") != null);
+    try std.testing.expect(std.mem.find(u8, first_body, "cd") == null);
+
+    const second = try readAgentPageEphemeral(
+        alloc,
+        &store,
+        descriptor.handle,
+        12,
+        4096,
+    );
+    defer alloc.free(second);
+    try std.testing.expect(std.mem.find(u8, second, "start_byte=\"12\"") != null);
+    try std.testing.expect(std.mem.find(u8, second, "\xe2\x98\x83cd") != null);
+}
+
+test "agent command replay keeps split utf8 valid and omits oversized secret-bearing lines" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const temp_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(temp_path);
+    var store = EphemeralStore.initForTesting(alloc, temp_path);
+    defer store.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const capture = try Capture.createEphemeral(arena, 0, &store);
+    try capture.appendAcceptedRequired(arena, .stdout, "utf8 split \xe2");
+    try capture.appendAcceptedRequired(arena, .stdout, "\x98\x83\nTOKEN=");
+    const oversized = try arena.alloc(u8, max_agent_line_bytes / 2 + 1);
+    @memset(oversized, 's');
+    try capture.appendAcceptedRequired(arena, .stdout, oversized);
+    try capture.appendAcceptedRequired(arena, .stdout, oversized);
+    try capture.appendAcceptedRequired(arena, .stdout, "\nafter oversized line\n");
+    const descriptor = (try capture.retainRequired(arena)) orelse
+        return error.TestExpectedReplay;
+    defer capture.releaseRetained(arena);
+
+    const page = try readAgentPageEphemeral(
+        alloc,
+        &store,
+        descriptor.handle,
+        1,
+        4096,
+    );
+    defer alloc.free(page);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(page));
+    try std.testing.expect(std.mem.find(u8, page, "utf8 split \xe2\x98\x83") != null);
+    try std.testing.expect(std.mem.find(u8, page, "output line omitted") != null);
+    try std.testing.expect(std.mem.find(u8, page, "TOKEN=") == null);
+    try std.testing.expect(std.mem.find(u8, page, "ssssssss") == null);
+    try std.testing.expect(std.mem.find(u8, page, "after oversized line") != null);
+}
+
+test "agent command replay omits oversized sensitive assignments split after delimiters" {
+    const alloc = std.testing.allocator;
+    const delimiters = [_][]const u8{ "=", "=\"", "='" };
+
+    for (delimiters) |delimiter| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const temp_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(temp_path);
+        var store = EphemeralStore.initForTesting(alloc, temp_path);
+        defer store.deinit();
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const key =
+            "MY_VERY_LONG_TOKEN_KEY_THAT_CONTINUES_BEYOND_THE_RETAINED_" ++
+            "SIXTY_FOUR_BYTE_SUFFIX";
+        const prefix_len = max_agent_line_bytes - key.len - delimiter.len;
+        const prefix = try arena.alloc(u8, prefix_len);
+        @memset(prefix, 'x');
+
+        const capture = try Capture.createEphemeral(arena, 0, &store);
+        try capture.appendAcceptedRequired(arena, .stdout, prefix);
+        try capture.appendAcceptedRequired(arena, .stdout, key);
+        try capture.appendAcceptedRequired(arena, .stdout, delimiter);
+        try capture.appendAcceptedRequired(arena, .stdout, "secret-after-boundary\nafter line\n");
+        const descriptor = (try capture.retainRequired(arena)) orelse
+            return error.TestExpectedReplay;
+        defer capture.releaseRetained(arena);
+
+        const page = try readAgentPageEphemeral(
+            alloc,
+            &store,
+            descriptor.handle,
+            1,
+            4096,
+        );
+        defer alloc.free(page);
+        try std.testing.expect(std.mem.find(u8, page, "output line omitted") != null);
+        try std.testing.expect(std.mem.find(u8, page, "MY_VERY_LONG_TOKEN_KEY") == null);
+        try std.testing.expect(std.mem.find(u8, page, "secret-after-boundary") == null);
+        try std.testing.expect(std.mem.find(u8, page, "after line") != null);
+    }
+}
+
+test "agent command replay streams non-secret oversized lines without omission" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const temp_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(temp_path);
+    var store = EphemeralStore.initForTesting(alloc, temp_path);
+    defer store.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const capture = try Capture.createEphemeral(arena, 0, &store);
+    const chunk = try arena.alloc(u8, max_agent_line_bytes / 2);
+    @memset(chunk, 'x');
+    try capture.appendAcceptedRequired(arena, .stdout, "https://example.com ");
+    try capture.appendAcceptedRequired(arena, .stdout, chunk);
+    try capture.appendAcceptedRequired(arena, .stdout, chunk);
+    try capture.appendAcceptedRequired(arena, .stdout, "NONSECRET-LATE-SENTINEL\n");
+    const descriptor = (try capture.retainRequired(arena)) orelse
+        return error.TestExpectedReplay;
+    defer capture.releaseRetained(arena);
+
+    const query = try searchAgentQueryEphemeral(
+        alloc,
+        &store,
+        descriptor.handle,
+        "NONSECRET-LATE-SENTINEL",
+        4096,
+    );
+    defer alloc.free(query);
+    try std.testing.expect(std.mem.find(u8, query, "NONSECRET-LATE-SENTINEL") != null);
+    try std.testing.expect(std.mem.find(u8, query, "(no matches)") == null);
+    try std.testing.expect(std.mem.find(u8, query, "[stdout]") != null);
+    try std.testing.expect(std.mem.find(u8, query, "output line omitted") == null);
+}
+
+test "saved command replay pages and searches beyond eight mebibytes with bounded memory" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const session_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(session_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        session_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const capture = try Capture.create(arena, 1024, &capability);
+    var chunk = [_]u8{'x'} ** 8192;
+    chunk[chunk.len - 1] = '\n';
+    for (0..1025) |_| try capture.appendAcceptedRequired(arena, .stdout, &chunk);
+    try capture.appendAcceptedRequired(arena, .stderr, "TAIL-SENTINEL-9MIB\n");
+    const descriptor = (try capture.retainRequired(arena)) orelse
+        return error.TestExpectedReplay;
+    defer capture.releaseRetained(arena);
+
+    const page = try readAgentPageManaged(
+        alloc,
+        &capability,
+        descriptor.handle,
+        4 * 1024 * 1024,
+        4096,
+    );
+    defer alloc.free(page);
+    try std.testing.expect(page.len < 5000);
+    try std.testing.expect(std.mem.findScalar(u8, page, 'x') != null);
+
+    const query = try searchAgentQueryManaged(
+        alloc,
+        &capability,
+        descriptor.handle,
+        "TAIL-SENTINEL-9MIB",
+        64 * 1024,
+    );
+    defer alloc.free(query);
+    try std.testing.expect(std.mem.find(u8, query, "TAIL-SENTINEL-9MIB") != null);
+}
+
 test "command replay reader rejects descriptor and frame corruption" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -833,7 +1848,7 @@ test "command replay reader rejects descriptor and frame corruption" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        io_mod.permissionsFromMode(0o700),
+        std.Io.File.Permissions.fromMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,
@@ -919,7 +1934,7 @@ test "command replay cleanup removes tentative and retained spools exactly once"
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        io_mod.permissionsFromMode(0o700),
+        std.Io.File.Permissions.fromMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,

@@ -1,22 +1,20 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
-const command_contract = @import("../execution/command_contract.zig");
-const command_environment = @import("../execution/command_environment.zig");
-const process_tree = @import("../execution/process_tree.zig");
+const command_contract = @import("command_contract.zig");
+const command_environment = @import("command_environment.zig");
+const process_tree = @import("process_tree.zig");
 const background_process_provider = @import(
-    "../execution/background_process_provider.zig",
+    "background_process_provider.zig",
 );
-const devbox_executor = @import("../execution/devbox_executor.zig");
-const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
+const self_exe = @import("../shared/self_exe.zig");
 const background_launch_output = @import("../background/background_launch_output.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const artifact_digest = @import("../session/artifact_digest.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
-const workspace_access = @import("../workspace/workspace_access.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
 
 const Allocator = std.mem.Allocator;
@@ -24,122 +22,9 @@ pub const CommandOutputStream = command_contract.CommandOutputStream;
 pub const CommandOutputCallback = command_contract.CommandOutputCallback;
 pub const CommandExecutionResult = command_contract.RunCommandResult;
 
-pub const PublicMode = enum {
-    os,
-    none,
-
-    pub fn parse(raw: []const u8) ?PublicMode {
-        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-        if (std.ascii.eqlIgnoreCase(trimmed, "os")) return .os;
-        if (std.ascii.eqlIgnoreCase(trimmed, "none")) return .none;
-        return null;
-    }
-
-    pub fn label(self: PublicMode) []const u8 {
-        return switch (self) {
-            .os => "os",
-            .none => "none",
-        };
-    }
-};
-
-pub const ConfigModeParseResult = union(enum) {
-    mode: PublicMode,
-    invalid,
-    retired,
-    unsupported_os,
-};
-
-pub const retired_sandbox_config_message = "sandbox values `vercel` and `just-bash` are not supported as public sandbox modes in this build. Choose `os` or `none`.";
-pub const unsupported_os_sandbox_message = "operating system sandbox is not available on this host because Fx has no OS sandbox implementation here. Choose `none` to run commands without sandbox isolation.";
-
-pub const BackendKind = types.BackendKind;
-
-/// Returns the backend captured for execution without changing configured
-/// sandbox state.
-pub fn effectiveBackend(
-    permission_mode: types.PermissionMode,
-    configured_backend: BackendKind,
-) BackendKind {
-    return switch (permission_mode) {
-        .ask, .auto => configured_backend,
-        .yolo => .none,
-    };
-}
-
-/// Converts the already-validated merged sandbox value into process-local
-/// backend state. An absent setting selects automatic host resolution; the
-/// permission mode never influences the configured backend.
-pub fn backendFromConfig(configured: ?[]const u8) BackendKind {
-    const raw = configured orelse return .auto;
-    return switch (parseConfigMode(raw)) {
-        .mode => |mode| backendForPublicMode(mode),
-        .invalid, .retired, .unsupported_os => .auto,
-    };
-}
-
-pub fn parseConfigMode(raw: []const u8) ConfigModeParseResult {
-    return parseConfigModeForHost(raw, host.current());
-}
-
-fn parseConfigModeForOs(raw: []const u8, os_tag: std.Target.Os.Tag) ConfigModeParseResult {
-    return parseConfigModeForHost(raw, host.nativeForOs(os_tag));
-}
-
-fn parseConfigModeForHost(raw: []const u8, host_capabilities: host.Capabilities) ConfigModeParseResult {
-    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    if (std.ascii.eqlIgnoreCase(trimmed, "none")) return .{ .mode = .none };
-    if (std.ascii.eqlIgnoreCase(trimmed, "os") or std.ascii.eqlIgnoreCase(trimmed, "macos")) {
-        if (!host_capabilities.os_sandbox) return .unsupported_os;
-        return .{ .mode = .os };
-    }
-    if (std.ascii.eqlIgnoreCase(trimmed, "auto")) {
-        return .{ .mode = if (host_capabilities.os_sandbox) .os else .none };
-    }
-    if (std.ascii.eqlIgnoreCase(trimmed, "vercel") or std.ascii.eqlIgnoreCase(trimmed, "just-bash")) return .retired;
-    return .invalid;
-}
-
-pub fn backendForPublicMode(mode: PublicMode) BackendKind {
-    return switch (mode) {
-        .os => .macos,
-        .none => .none,
-    };
-}
-
-pub fn publicModeForBackend(requested: BackendKind) PublicMode {
-    return publicModeForBackendForProbe(requested, .{ .host_capabilities = host.current() });
-}
-
-fn publicModeForBackendForProbe(requested: BackendKind, probe: BackendProbe) PublicMode {
-    return switch (resolveBackendForProbe(requested, probe)) {
-        .macos => .os,
-        .none, .auto, .vercel, .just_bash => .none,
-    };
-}
-
-pub fn osSandboxAvailable() bool {
-    return host.current().os_sandbox;
-}
-
-fn osSandboxUnsupportedOn(os_tag: std.Target.Os.Tag) bool {
-    return !host.nativeForOs(os_tag).os_sandbox;
-}
-
-pub fn configErrorMessage(err: anyerror) ?[]const u8 {
-    return switch (err) {
-        error.RetiredSandboxValue => retired_sandbox_config_message,
-        error.UnsupportedSandboxValue => unsupported_os_sandbox_message,
-        else => null,
-    };
-}
-
 /// Foreground command execution configuration. Borrowed slices and callbacks
 /// must remain valid for the duration of executeCommand.
 pub const Config = struct {
-    backend: BackendKind = .none,
-    workspace_root: []const u8,
-    access_scope: ?workspace_access.AccessScope = null,
     max_command_output_bytes: usize,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     output_chunk_lifecycle_id: ?types.ToolLifecycleId = null,
@@ -148,13 +33,10 @@ pub const Config = struct {
     accepted_output_chunk_ctx: ?*anyopaque = null,
     on_accepted_output_chunk: ?CommandOutputCallback = null,
     callback_projection: CallbackProjection = .model_safe,
-    permissive: bool = false,
     timeout_ms: ?usize = null,
     timeout_started_ms: ?i64 = null,
-    devbox_provider: ?devbox_executor.Provider = null,
     command_artifact_capability: ?*session_child_store.SessionChildCapability = null,
     command_artifact_dir: ?[]const u8 = null,
-    allow_localhost_listen: bool = false,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
 };
@@ -196,20 +78,10 @@ const foreground_session_replace_error_name_bytes = blk: {
     }
     break :blk max_len;
 };
-const macos_localhost_listen_policy =
-    "\n(allow network-bind (local ip \"localhost:*\"))" ++
-    "\n(allow network-inbound (local ip \"localhost:*\"))";
-const macos_background_profile_dir = "/private/tmp";
-const macos_background_profile_prefix = "fx-sandbox-";
-const macos_background_profile_suffix = ".sb";
 const script_from_stdin_launcher =
     "script=$(command cat; command printf .)\n" ++
     "script=${script%.}\n" ++
     "eval \"$script\" </dev/null";
-
-const BackendProbe = struct {
-    host_capabilities: host.Capabilities,
-};
 
 pub fn isForegroundSessionInvocation(args: []const [:0]const u8) bool {
     if (comptime !supports_foreground_session) return false;
@@ -487,21 +359,6 @@ fn exitForegroundSessionSupervisor(term: std.process.Child.Term) noreturn {
     }
 }
 
-/// Resolves auto backend selection from host OS and locally available tools.
-pub fn resolveBackend(requested: BackendKind) BackendKind {
-    return resolveBackendForHost(requested, host.current());
-}
-
-fn resolveBackendForHost(requested: BackendKind, host_capabilities: host.Capabilities) BackendKind {
-    if (requested != .auto) return requested;
-    if (host_capabilities.os_sandbox) return .macos;
-    return .none;
-}
-
-fn resolveBackendForProbe(requested: BackendKind, probe: BackendProbe) BackendKind {
-    return resolveBackendForHost(requested, probe.host_capabilities);
-}
-
 /// Executes one command and returns an owned formatted result.
 pub fn executeCommand(
     cfg: Config,
@@ -515,17 +372,8 @@ pub fn executeCommand(
 
     var effective_cfg = cfg;
     if (effective_cfg.timeout_started_ms == null) effective_cfg.timeout_started_ms = io_mod.milliTimestamp();
-    try BackendControl.init(effective_cfg).check();
-    const backend = resolveBackend(effective_cfg.backend);
-    const requested_public = publicModeForBackend(effective_cfg.backend);
-    const resolved_public = publicModeForBackend(backend);
-    debug_trace.logf("core", "sandbox backend resolved requested={s} resolved={s}", .{ requested_public.label(), resolved_public.label() });
-    return switch (backend) {
-        .macos => executeMacOS(arena, scratch, effective_cfg, command, cwd),
-        .vercel => executeVercel(arena, scratch, effective_cfg, command, cwd),
-        .just_bash => executeJustBash(arena, scratch, effective_cfg, "just-bash", command, cwd),
-        .none, .auto => executeRawBash(arena, scratch, effective_cfg, command, cwd),
-    };
+    try ExecutionControl.init(effective_cfg).check();
+    return executeRawBash(arena, scratch, effective_cfg, command, cwd);
 }
 
 pub fn executeCommandInEnvironment(
@@ -547,55 +395,21 @@ pub fn executeCommandInEnvironment(
 
     var effective_cfg = cfg;
     if (effective_cfg.timeout_started_ms == null) effective_cfg.timeout_started_ms = io_mod.milliTimestamp();
-    try BackendControl.init(effective_cfg).check();
-    const backend = resolveBackend(effective_cfg.backend);
+    try ExecutionControl.init(effective_cfg).check();
     const invocation = try shell_resolver.capturedInvocation(environment, command);
     debug_trace.logf(
         "core",
-        "sandbox explicit command environment={s} shell={s}",
+        "command runner explicit environment={s} shell={s}",
         .{ @tagName(std.meta.activeTag(environment)), invocation.path },
     );
-    return switch (backend) {
-        .macos => executeMacOSInvocation(
-            arena,
-            scratch,
-            effective_cfg,
-            command,
-            cwd,
-            &invocation,
-        ),
-        .none, .auto => executeRawInvocation(
-            arena,
-            scratch,
-            effective_cfg,
-            command,
-            cwd,
-            &invocation,
-        ),
-        .vercel, .just_bash => blk: {
-            const projected = try shell_resolver.formatInvocationCommand(scratch, &invocation);
-            break :blk switch (backend) {
-                .vercel => executeVercelWithResultCommand(
-                    arena,
-                    scratch,
-                    effective_cfg,
-                    projected,
-                    command,
-                    cwd,
-                ),
-                .just_bash => executeJustBashWithResultCommand(
-                    arena,
-                    scratch,
-                    effective_cfg,
-                    "just-bash",
-                    projected,
-                    command,
-                    cwd,
-                ),
-                else => unreachable,
-            };
-        },
-    };
+    return executeRawInvocation(
+        arena,
+        scratch,
+        effective_cfg,
+        command,
+        cwd,
+        &invocation,
+    );
 }
 
 pub fn spawnPreparedBackground(
@@ -604,276 +418,26 @@ pub fn spawnPreparedBackground(
     cwd: []const u8,
     output: *const background_launch_output.Output,
 ) !background_process_provider.PreparedProcess {
-    var scratch_state = std.heap.ArenaAllocator.init(arena);
-    defer scratch_state.deinit();
-    const scratch = scratch_state.allocator();
-
     var effective_cfg = cfg;
     if (effective_cfg.timeout_started_ms == null) {
         effective_cfg.timeout_started_ms = io_mod.milliTimestamp();
     }
-    try BackendControl.init(effective_cfg).check();
-    const backend = resolveBackend(effective_cfg.backend);
-    const isolation: background_process_provider.Isolation = switch (backend) {
-        .macos => blk: {
-            if (!host.current().os_sandbox) {
-                return error.UnsupportedSandboxValue;
-            }
-            const profile = if (effective_cfg.permissive)
-                try buildMacOSPermissiveProfileForScope(
-                    scratch,
-                    configAccessScope(effective_cfg),
-                    .{
-                        .allow_localhost_listen = effective_cfg.allow_localhost_listen,
-                    },
-                )
-            else
-                try buildMacOSProfileForScope(
-                    scratch,
-                    configAccessScope(effective_cfg),
-                    .{
-                        .allow_localhost_listen = effective_cfg.allow_localhost_listen,
-                    },
-                );
-            const profile_path = try writeMacOSBackgroundProfile(
-                scratch,
-                profile,
-            );
-            break :blk .{ .macos_profile = profile_path };
-        },
-        .vercel, .just_bash, .none, .auto => .none,
-    };
-    defer switch (isolation) {
-        .macos_profile => |profile_path| std.Io.Dir.deleteFileAbsolute(
-            io_mod.getIo(),
-            profile_path,
-        ) catch {},
-        .none => {},
-    };
+    try ExecutionControl.init(effective_cfg).check();
     return effective_cfg.background_process_provider.spawnPrepared(
         arena,
         .{
             .cwd = cwd,
             .output = output.providerCapability(),
-            .isolation = isolation,
+            .isolation = .none,
         },
     );
 }
-
-fn executeMacOS(
-    alloc: Allocator,
-    scratch: Allocator,
-    cfg: Config,
-    command: []const u8,
-    cwd: []const u8,
-) !command_contract.RunCommandResult {
-    if (!host.current().os_sandbox) return unsupportedOsSandboxResult(alloc, command, cwd);
-
-    const shell_argv = [_][]const u8{
-        "sh",
-        "-lc",
-        script_from_stdin_launcher,
-    };
-    const argv = try buildDirectMacOSArgv(scratch, cfg, &shell_argv);
-    const result = try executeProcessWithScript(
-        scratch,
-        cfg,
-        argv,
-        cwd,
-        command,
-    );
-    return formatCollectedOutput(alloc, command, cwd, result);
-}
-
-fn executeMacOSInvocation(
-    alloc: Allocator,
-    scratch: Allocator,
-    cfg: Config,
-    command: []const u8,
-    cwd: []const u8,
-    invocation: *const shell_resolver.Invocation,
-) !command_contract.RunCommandResult {
-    if (!host.current().os_sandbox) return unsupportedOsSandboxResult(alloc, command, cwd);
-    const argv = try buildDirectMacOSArgv(scratch, cfg, invocation.argv());
-    const result = try executeProcessWithClosedInput(scratch, cfg, argv, cwd);
-    return formatCollectedOutput(alloc, command, cwd, result);
-}
-
-fn unsupportedOsSandboxResult(alloc: Allocator, command: []const u8, cwd: []const u8) !command_contract.RunCommandResult {
-    return formatExitOutput(alloc, command, cwd, 1, "", unsupported_os_sandbox_message, null);
-}
-
-const MacOSProfileOptions = struct {
-    allow_localhost_listen: bool = false,
-};
-
-fn buildMacOSProfile(arena: Allocator, workspace_root: []const u8, options: MacOSProfileOptions) ![]const u8 {
-    return buildMacOSProfileForScope(arena, workspace_access.AccessScope.primaryOnly(workspace_root), options);
-}
-
-fn buildMacOSProfileForScope(arena: Allocator, scope: workspace_access.AccessScope, options: MacOSProfileOptions) ![]const u8 {
-    const localhost_listen_policy = if (options.allow_localhost_listen) macos_localhost_listen_policy else "";
-    var out: std.Io.Writer.Allocating = .init(arena);
-    defer out.deinit();
-    try out.writer.writeAll(
-        \\(version 1)
-        \\(deny default)
-        \\(allow file-read*)
-    );
-    try writeMacOSScopeWrites(arena, &out.writer, scope);
-    try out.writer.print(
-        \\(allow file-write* (subpath "/tmp"))
-        \\(allow file-write* (subpath "/private/tmp"))
-        \\(allow file-write* (subpath "/dev"))
-        \\(allow process-exec)
-        \\(allow process-fork)
-        \\(allow sysctl-read)
-        \\(allow mach-lookup)
-        \\(allow network-outbound){s}
-        \\(allow signal)
-        \\(allow iokit-open)
-    , .{localhost_listen_policy});
-    return out.toOwnedSlice();
-}
-
-const permissive_cache_dirs = [_][]const u8{
-    ".fx",
-    ".npm",
-    ".cache",
-    ".local",
-    ".cargo",
-    ".rustup",
-    ".bun",
-    ".pnpm-store",
-    ".yarn",
-    ".mix",
-    ".hex",
-    ".pub-cache",
-    ".cocoapods",
-    ".nuget",
-    ".gem",
-    ".bundle",
-    "go",
-    "Library/Caches/Homebrew",
-    "Library/Caches/pip",
-    ".nvm",
-    ".pyenv",
-    ".rbenv",
-    ".volta",
-    ".sdkman",
-};
-
-fn buildMacOSPermissiveProfile(arena: Allocator, workspace_root: []const u8, options: MacOSProfileOptions) ![]const u8 {
-    return buildMacOSPermissiveProfileForScope(arena, workspace_access.AccessScope.primaryOnly(workspace_root), options);
-}
-
-fn buildMacOSPermissiveProfileForScope(arena: Allocator, scope: workspace_access.AccessScope, options: MacOSProfileOptions) ![]const u8 {
-    const home = io_mod.getenv("HOME") orelse return buildMacOSProfileForScope(arena, scope, options);
-
-    var out: std.Io.Writer.Allocating = .init(arena);
-    defer out.deinit();
-
-    try out.writer.writeAll(
-        \\(version 1)
-        \\(deny default)
-        \\(allow file-read*)
-    );
-    try writeMacOSScopeWrites(arena, &out.writer, scope);
-    try out.writer.writeAll(
-        \\(allow file-write* (subpath "/tmp"))
-        \\(allow file-write* (subpath "/private/tmp"))
-        \\(allow file-write* (subpath "/dev"))
-    );
-
-    for (permissive_cache_dirs) |dir| {
-        const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ home, dir });
-        const quoted = try schemeQuote(arena, path);
-        try out.writer.print("\n(allow file-write* (subpath {s}))", .{quoted});
-    }
-
-    try out.writer.writeAll(
-        \\
-        \\(allow process-exec)
-        \\(allow process-fork)
-        \\(allow sysctl-read)
-        \\(allow mach-lookup)
-        \\(allow network-outbound)
-    );
-    if (options.allow_localhost_listen) try out.writer.writeAll(macos_localhost_listen_policy);
-    try out.writer.writeAll(
-        \\
-        \\(allow signal)
-        \\(allow iokit-open)
-    );
-
-    return try out.toOwnedSlice();
-}
-
-pub fn buildDirectMacOSArgv(
-    arena: Allocator,
-    cfg: Config,
-    argv: []const []const u8,
-) ![]const []const u8 {
-    const profile = if (cfg.permissive)
-        try buildMacOSPermissiveProfileForScope(
-            arena,
-            configAccessScope(cfg),
-            .{ .allow_localhost_listen = cfg.allow_localhost_listen },
-        )
-    else
-        try buildMacOSProfileForScope(
-            arena,
-            configAccessScope(cfg),
-            .{ .allow_localhost_listen = cfg.allow_localhost_listen },
-        );
-
-    var wrapped: std.ArrayList([]const u8) = .empty;
-    try wrapped.appendSlice(arena, &.{ "/usr/bin/sandbox-exec", "-p", profile });
-    try wrapped.appendSlice(arena, argv);
-    return wrapped.toOwnedSlice(arena);
-}
-
-fn configAccessScope(cfg: Config) workspace_access.AccessScope {
-    return cfg.access_scope orelse workspace_access.AccessScope.primaryOnly(cfg.workspace_root);
-}
-
-fn writeMacOSScopeWrites(
-    arena: Allocator,
-    writer: *std.Io.Writer,
-    scope: workspace_access.AccessScope,
-) !void {
-    const primary = try schemeQuote(arena, scope.primary_directory);
-    try writer.print("\n(allow file-write* (subpath {s}))", .{primary});
-    for (scope.additional_directories) |entry| {
-        if (!entry.active) continue;
-        const quoted = try schemeQuote(arena, entry.path);
-        try writer.print("\n(allow file-write* (subpath {s}))", .{quoted});
-    }
-}
-
-fn writeMacOSBackgroundProfile(arena: Allocator, profile: []const u8) ![]const u8 {
-    try config_runtime.makeAbsolutePath(macos_background_profile_dir);
-
-    const filename = try std.fmt.allocPrint(
-        arena,
-        "{s}{d}-{d}{s}",
-        .{ macos_background_profile_prefix, currentProcessId(), io_mod.nanoTimestamp(), macos_background_profile_suffix },
-    );
-    defer arena.free(filename);
-
-    const path = try std.fs.path.join(arena, &.{ macos_background_profile_dir, filename });
-    var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{ .truncate = true });
-    defer file.close(io_mod.getIo());
-    try file.writeStreamingAll(io_mod.getIo(), profile);
-    return path;
-}
-
-const BackendControl = struct {
+const ExecutionControl = struct {
     cancel_flag: ?*std.atomic.Value(bool),
     timeout_ms: ?usize,
     started_ms: i64,
 
-    fn init(cfg: Config) BackendControl {
+    fn init(cfg: Config) ExecutionControl {
         return .{
             .cancel_flag = cfg.cancel_flag,
             .timeout_ms = cfg.timeout_ms,
@@ -881,7 +445,7 @@ const BackendControl = struct {
         };
     }
 
-    fn check(self: BackendControl) !void {
+    fn check(self: ExecutionControl) !void {
         if (cancelRequested(self.cancel_flag)) return error.CancelledBeforeExecution;
         if (self.timeout_ms) |timeout_ms| {
             const now_ms = io_mod.milliTimestamp();
@@ -895,88 +459,6 @@ fn cancelRequested(cancel_flag: ?*std.atomic.Value(bool)) bool {
     return if (cancel_flag) |flag| flag.load(.seq_cst) else false;
 }
 
-fn executeVercel(
-    alloc: Allocator,
-    scratch: Allocator,
-    cfg: Config,
-    command: []const u8,
-    cwd: []const u8,
-) !command_contract.RunCommandResult {
-    return executeVercelWithResultCommand(
-        alloc,
-        scratch,
-        cfg,
-        command,
-        command,
-        cwd,
-    );
-}
-
-fn executeVercelWithResultCommand(
-    alloc: Allocator,
-    scratch: Allocator,
-    cfg: Config,
-    execution_command: []const u8,
-    result_command: []const u8,
-    cwd: []const u8,
-) !command_contract.RunCommandResult {
-    const provider = cfg.devbox_provider orelse {
-        debug_trace.logf("core", "vercel sandbox unavailable: no devbox provider, falling back to raw bash", .{});
-        return executeRawBashWithResultCommand(
-            alloc,
-            scratch,
-            cfg,
-            execution_command,
-            result_command,
-            cwd,
-        );
-    };
-    return switch (try provider.execute(
-        alloc,
-        execution_command,
-        cwd,
-        devboxControl(cfg),
-    )) {
-        .success => |remote| blk: {
-            var owned = remote;
-            defer owned.deinit(alloc);
-            try emitProviderOutput(cfg, .stdout, owned.stdout);
-            try emitProviderOutput(cfg, .stderr, owned.stderr);
-            break :blk try formatExitOutput(
-                alloc,
-                result_command,
-                cwd,
-                owned.exit_code,
-                owned.stdout,
-                owned.stderr,
-                owned.duration_ms,
-            );
-        },
-        .unavailable => blk: {
-            debug_trace.logf("core", "vercel sandbox unavailable: no auth token, falling back to raw bash", .{});
-            break :blk try executeRawBashWithResultCommand(
-                alloc,
-                scratch,
-                cfg,
-                execution_command,
-                result_command,
-                cwd,
-            );
-        },
-        .request_failed => blk: {
-            debug_trace.logf("core", "vercel sandbox request failed, falling back to raw bash", .{});
-            break :blk try executeRawBashWithResultCommand(
-                alloc,
-                scratch,
-                cfg,
-                execution_command,
-                result_command,
-                cwd,
-            );
-        },
-    };
-}
-
 fn emitAcceptedOutputChunk(
     cfg: Config,
     stream: CommandOutputStream,
@@ -986,111 +468,6 @@ fn emitAcceptedOutputChunk(
     const ctx = cfg.accepted_output_chunk_ctx orelse return;
     const callback = cfg.on_accepted_output_chunk orelse return;
     try callback(ctx, cfg.output_chunk_lifecycle_id, stream, bytes);
-}
-
-fn emitProviderOutput(
-    cfg: Config,
-    stream: CommandOutputStream,
-    bytes: []const u8,
-) !void {
-    var offset: usize = 0;
-    while (offset < bytes.len) {
-        const end = @min(bytes.len, offset + pending_output_flush_bytes);
-        const chunk = bytes[offset..end];
-        try emitAcceptedOutputChunk(cfg, stream, chunk);
-        if (cfg.output_chunk_ctx) |ctx| {
-            if (cfg.on_output_chunk) |callback| {
-                try emitOutputChunk(
-                    ctx,
-                    callback,
-                    cfg.output_chunk_lifecycle_id,
-                    stream,
-                    chunk,
-                    cfg.callback_projection,
-                );
-            }
-        }
-        offset = end;
-    }
-}
-
-fn devboxControl(cfg: Config) devbox_executor.Control {
-    return .{
-        .cancel_flag = cfg.cancel_flag,
-        .timeout_ms = cfg.timeout_ms,
-        .started_ms = cfg.timeout_started_ms orelse io_mod.milliTimestamp(),
-    };
-}
-
-fn executeJustBash(
-    alloc: Allocator,
-    scratch: Allocator,
-    cfg: Config,
-    executable_path: []const u8,
-    command: []const u8,
-    cwd: []const u8,
-) !command_contract.RunCommandResult {
-    return executeJustBashWithResultCommand(
-        alloc,
-        scratch,
-        cfg,
-        executable_path,
-        command,
-        command,
-        cwd,
-    );
-}
-
-fn executeJustBashWithResultCommand(
-    alloc: Allocator,
-    scratch: Allocator,
-    cfg: Config,
-    executable_path: []const u8,
-    execution_command: []const u8,
-    result_command: []const u8,
-    cwd: []const u8,
-) !command_contract.RunCommandResult {
-    const argv = [_][]const u8{ executable_path, "-c", execution_command, "--root", cfg.workspace_root, "--cwd", cwd, "--json" };
-    var transport_cfg = cfg;
-    if (cfg.callback_projection == .raw or cfg.on_accepted_output_chunk != null) {
-        transport_cfg.output_chunk_ctx = null;
-        transport_cfg.on_output_chunk = null;
-        transport_cfg.accepted_output_chunk_ctx = null;
-        transport_cfg.on_accepted_output_chunk = null;
-    }
-    const result = executeProcess(scratch, transport_cfg, &argv, cwd) catch |err| switch (err) {
-        error.OutOfMemory,
-        error.Cancelled,
-        error.TimeoutExpired,
-        => return err,
-        else => {
-            debug_trace.logf("core", "just-bash execution failed err={s}, falling back to raw bash", .{@errorName(err)});
-            return executeRawBashWithResultCommand(
-                alloc,
-                scratch,
-                cfg,
-                execution_command,
-                result_command,
-                cwd,
-            );
-        },
-    };
-    if (result.cancelled) return formatCollectedOutput(alloc, result_command, cwd, result);
-
-    return parseJustBashJson(alloc, scratch, cfg, result.stdout, result.stderr, result.term, result_command, cwd, result.duration_ms) catch |err| switch (err) {
-        error.JustBashParseError, error.JustBashExecutionFailed => {
-            debug_trace.logf("core", "just-bash response parse failed err={s}, falling back to raw bash", .{@errorName(err)});
-            return executeRawBashWithResultCommand(
-                alloc,
-                scratch,
-                cfg,
-                execution_command,
-                result_command,
-                cwd,
-            );
-        },
-        else => return err,
-    };
 }
 
 const CollectedProcess = struct {
@@ -1583,7 +960,7 @@ fn executeProcessWithDetachedSession(
 
     try waitForForegroundSessionReady(&child, cfg);
     phase = .group_ready;
-    try BackendControl.init(cfg).check();
+    try ExecutionControl.init(cfg).check();
 
     var script_write = child.stdin orelse return error.SpawnFailed;
     child.stdin = null;
@@ -1637,7 +1014,7 @@ fn foregroundSessionExecutable(scratch: Allocator) ![]const u8 {
             return error.TestProductExecutableMissing;
         return std.mem.sliceTo(path_z, 0);
     }
-    return std.process.executablePathAlloc(io_mod.getIo(), scratch);
+    return self_exe.pathForReexec(scratch);
 }
 
 fn waitForForegroundSessionReady(
@@ -1646,7 +1023,7 @@ fn waitForForegroundSessionReady(
 ) !void {
     const ready_read = child.stderr orelse return error.SpawnFailed;
     const setup_started_ms = io_mod.milliTimestamp();
-    const control = BackendControl.init(cfg);
+    const control = ExecutionControl.init(cfg);
 
     while (true) {
         try control.check();
@@ -1934,15 +1311,14 @@ fn artifactPath(alloc: Allocator, dir: []const u8, stem: []const u8, suffix: []c
 }
 
 fn fallbackCommandArtifactDir(alloc: Allocator) ![]u8 {
-    const temp_root = try io_mod.tempDir(alloc);
-    defer alloc.free(temp_root);
+    const temp_root = io_mod.getenv("TMPDIR") orelse "/tmp";
     const pid_text = try std.fmt.allocPrint(alloc, "{d}", .{currentProcessId()});
     defer alloc.free(pid_text);
     return std.fs.path.join(alloc, &.{ temp_root, command_artifact_fallback_dir_name, pid_text });
 }
 
 fn currentProcessId() u64 {
-    if (comptime builtin.os.tag == .windows) return 0;
+    if (comptime builtin.os.tag == .windows) return 0; // not used on Windows; matches the v1 contract
     return @intCast(std.c.getpid());
 }
 
@@ -2027,8 +1403,6 @@ test "explicit captured profiles execute exact shells without synthetic stderr" 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const cfg = Config{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 16 * 1024,
     };
     const command = "printf 'profile-stdout'; printf 'profile-stderr' >&2";
@@ -2067,27 +1441,6 @@ test "explicit captured profiles execute exact shells without synthetic stderr" 
             zsh_user.output,
         );
     } else |_| {}
-}
-
-fn parseJustBashJson(alloc: Allocator, scratch: Allocator, cfg: Config, stdout_raw: []const u8, stderr_raw: []const u8, term: std.process.Child.Term, command: []const u8, cwd: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {
-    _ = stderr_raw;
-    switch (term) {
-        .exited => {},
-        else => return error.JustBashExecutionFailed,
-    }
-
-    var parsed = std.json.parseFromSlice(std.json.Value, scratch, stdout_raw, .{}) catch return error.JustBashParseError;
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.JustBashParseError;
-
-    const exit_code_val = parsed.value.object.get("exitCode") orelse return error.JustBashParseError;
-    const stdout_val = parsed.value.object.get("stdout") orelse return error.JustBashParseError;
-    const stderr_val = parsed.value.object.get("stderr") orelse return error.JustBashParseError;
-    if (exit_code_val != .integer or stdout_val != .string or stderr_val != .string) return error.JustBashParseError;
-
-    try emitProviderOutput(cfg, .stdout, stdout_val.string);
-    try emitProviderOutput(cfg, .stderr, stderr_val.string);
-    return formatExitOutput(alloc, command, cwd, exit_code_val.integer, stdout_val.string, stderr_val.string, duration_ms);
 }
 
 fn formatExitOutput(alloc: Allocator, command: []const u8, cwd: []const u8, exit_code: i64, stdout_raw: []const u8, stderr_raw: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {
@@ -2454,7 +1807,7 @@ fn collectOutput(
     var emitter: OutputChunkEmitter = .{};
     defer emitter.deinit(arena);
 
-    const started_ms = BackendControl.init(cfg).started_ms;
+    const started_ms = ExecutionControl.init(cfg).started_ms;
     var signal_started_ms: ?i64 = null;
     var force_kill_sent = false;
     var streams_finished = false;
@@ -2709,6 +2062,9 @@ fn signalChild(
 }
 
 fn signalProcessGroup(pid: std.posix.pid_t, force: bool) !void {
+    // Windows has no process groups; the negative-pid kill is a no-op there.
+    // Callers must rely on `child.kill` for the direct child.
+    if (comptime builtin.os.tag == .windows) return error.ProcessGroupUnsupported;
     std.posix.kill(-pid, if (force) std.posix.SIG.KILL else std.posix.SIG.TERM) catch |err| switch (err) {
         error.ProcessNotFound => {},
         else => return err,
@@ -2716,7 +2072,6 @@ fn signalProcessGroup(pid: std.posix.pid_t, force: bool) !void {
 }
 
 fn terminateRemainingProcessGroup(pid: std.posix.pid_t) void {
-    if (comptime builtin.os.tag == .windows) return;
     signalProcessGroup(pid, true) catch |err| {
         debug_trace.logf(
             "core",
@@ -2785,399 +2140,6 @@ fn shellQuote(arena: Allocator, input: []const u8) ![]const u8 {
     return try out.toOwnedSlice();
 }
 
-fn schemeQuote(arena: Allocator, input: []const u8) ![]const u8 {
-    var out: std.Io.Writer.Allocating = .init(arena);
-    defer out.deinit();
-    try out.writer.writeByte('"');
-    for (input) |ch| {
-        switch (ch) {
-            '\\' => try out.writer.writeAll("\\\\"),
-            '"' => try out.writer.writeAll("\\\""),
-            '\n' => try out.writer.writeAll("\\n"),
-            '\r' => try out.writer.writeAll("\\r"),
-            '\t' => try out.writer.writeAll("\\t"),
-            else => try out.writer.writeByte(ch),
-        }
-    }
-    try out.writer.writeByte('"');
-    return try out.toOwnedSlice();
-}
-
-/// Returns true when a command is likely to need broader cache/package paths.
-pub fn needsBroaderFileAccess(command: []const u8) bool {
-    const trimmed = std.mem.trimStart(u8, command, " \t");
-    if (trimmed.len == 0) return false;
-
-    const first_space = std.mem.findScalar(u8, trimmed, ' ') orelse trimmed.len;
-    const first_word = trimmed[0..first_space];
-    const rest = trimmed[first_space..];
-
-    if (std.mem.eql(u8, first_word, "go")) return goNeedsBroaderAccess(rest);
-    if (std.mem.eql(u8, first_word, "dart")) return dartNeedsBroaderAccess(rest);
-    if (std.mem.eql(u8, first_word, "swift")) return swiftNeedsBroaderAccess(rest);
-    if (std.mem.eql(u8, first_word, "cargo")) return cargoNeedsBroaderAccess(rest);
-    if (std.mem.eql(u8, first_word, "python") or std.mem.eql(u8, first_word, "python3")) return pythonNeedsBroaderAccess(rest);
-
-    return std.mem.eql(u8, first_word, "npx") or
-        std.mem.eql(u8, first_word, "npm") or
-        std.mem.eql(u8, first_word, "pnpm") or
-        std.mem.eql(u8, first_word, "pnpx") or
-        std.mem.eql(u8, first_word, "yarn") or
-        std.mem.eql(u8, first_word, "bun") or
-        std.mem.eql(u8, first_word, "bunx") or
-        std.mem.eql(u8, first_word, "pip") or
-        std.mem.eql(u8, first_word, "pip3") or
-        std.mem.eql(u8, first_word, "pipx") or
-        std.mem.eql(u8, first_word, "uv") or
-        std.mem.eql(u8, first_word, "rustup") or
-        std.mem.eql(u8, first_word, "brew") or
-        std.mem.eql(u8, first_word, "gem") or
-        std.mem.eql(u8, first_word, "bundle") or
-        std.mem.eql(u8, first_word, "composer") or
-        std.mem.eql(u8, first_word, "dotnet") or
-        std.mem.eql(u8, first_word, "pod") or
-        std.mem.eql(u8, first_word, "flutter") or
-        std.mem.eql(u8, first_word, "mix");
-}
-
-fn subcommand(rest: []const u8) []const u8 {
-    const trimmed = std.mem.trimStart(u8, rest, " \t");
-    const end = std.mem.findScalar(u8, trimmed, ' ') orelse trimmed.len;
-    return trimmed[0..end];
-}
-
-fn goNeedsBroaderAccess(rest: []const u8) bool {
-    const sub = subcommand(rest);
-    return std.mem.eql(u8, sub, "install") or
-        std.mem.eql(u8, sub, "get") or
-        std.mem.eql(u8, sub, "mod");
-}
-
-fn dartNeedsBroaderAccess(rest: []const u8) bool {
-    return std.mem.eql(u8, subcommand(rest), "pub");
-}
-
-fn swiftNeedsBroaderAccess(rest: []const u8) bool {
-    return std.mem.eql(u8, subcommand(rest), "package");
-}
-
-fn cargoNeedsBroaderAccess(rest: []const u8) bool {
-    const sub = subcommand(rest);
-    return std.mem.eql(u8, sub, "install") or
-        std.mem.eql(u8, sub, "fetch") or
-        std.mem.eql(u8, sub, "add") or
-        std.mem.eql(u8, sub, "update") or
-        std.mem.eql(u8, sub, "search");
-}
-
-fn pythonNeedsBroaderAccess(rest: []const u8) bool {
-    const trimmed = std.mem.trimStart(u8, rest, " \t");
-    if (!std.mem.startsWith(u8, trimmed, "-m")) return false;
-    const after_m = std.mem.trimStart(u8, trimmed[2..], " \t");
-    const mod_end = std.mem.findScalar(u8, after_m, ' ') orelse after_m.len;
-    const module = after_m[0..mod_end];
-    return std.mem.eql(u8, module, "pip") or
-        std.mem.eql(u8, module, "venv");
-}
-
-/// Checks stderr envelopes for sandbox-style permission failures.
-pub fn looksLikeSandboxError(output: []const u8) bool {
-    if (std.mem.startsWith(u8, output, "exit_code=0\n")) return false;
-    if (output.len == 0) return false;
-
-    const indicators = [_][]const u8{
-        "EPERM",
-        "EACCES",
-        "EROFS",
-        "Permission denied",
-        "Operation not permitted",
-        "permission denied",
-        "operation not permitted",
-        "error writing to the directory",
-        "root-owned files",
-        "sudo chown",
-    };
-
-    const stderr_open = "<stderr>\n";
-    const stderr_close = "\n</stderr>";
-    var remaining = output;
-    while (std.mem.find(u8, remaining, stderr_open)) |start| {
-        const section_start = start + stderr_open.len;
-        const after = remaining[section_start..];
-        const section_len = std.mem.find(u8, after, stderr_close) orelse after.len;
-        const stderr_section = after[0..section_len];
-        for (indicators) |indicator| {
-            if (std.mem.find(u8, stderr_section, indicator) != null) return true;
-        }
-        remaining = after[section_len..];
-    }
-
-    return false;
-}
-
-test "public sandbox mode parse accepts only os and none" {
-    try std.testing.expectEqual(PublicMode.os, PublicMode.parse(" OS\n").?);
-    try std.testing.expectEqual(PublicMode.none, PublicMode.parse("none").?);
-    try std.testing.expect(PublicMode.parse("macos") == null);
-    try std.testing.expect(PublicMode.parse("auto") == null);
-    try std.testing.expect(PublicMode.parse("vercel") == null);
-    try std.testing.expect(PublicMode.parse("just-bash") == null);
-}
-
-test "config sandbox parse accepts canonical and compatibility values" {
-    try std.testing.expectEqual(PublicMode.os, parseConfigModeForOs("os", .macos).mode);
-    try std.testing.expectEqual(PublicMode.os, parseConfigModeForOs("macos", .macos).mode);
-    try std.testing.expectEqual(PublicMode.os, parseConfigModeForOs("auto", .macos).mode);
-    try std.testing.expectEqual(PublicMode.none, parseConfigModeForOs("none", .linux).mode);
-    try std.testing.expectEqual(PublicMode.none, parseConfigModeForOs("auto", .linux).mode);
-    try std.testing.expectEqual(ConfigModeParseResult.unsupported_os, parseConfigModeForOs("os", .linux));
-    try std.testing.expectEqual(ConfigModeParseResult.retired, parseConfigModeForOs("vercel", .macos));
-    try std.testing.expectEqual(ConfigModeParseResult.retired, parseConfigModeForOs("just-bash", .macos));
-    try std.testing.expectEqual(ConfigModeParseResult.invalid, parseConfigModeForOs("Just_Bash", .macos));
-    try std.testing.expectEqual(ConfigModeParseResult.invalid, parseConfigModeForOs("bogus", .macos));
-}
-
-test "absent sandbox config selects automatic host resolution" {
-    try std.testing.expectEqual(BackendKind.auto, backendFromConfig(null));
-    try std.testing.expectEqual(BackendKind.none, backendFromConfig("none"));
-    try std.testing.expectEqual(BackendKind.auto, backendFromConfig("bogus"));
-}
-
-test "os sandbox config maps to the platform backend" {
-    if (builtin.os.tag == .macos) {
-        try std.testing.expectEqual(BackendKind.macos, backendFromConfig("os"));
-    } else {
-        try std.testing.expectEqual(BackendKind.auto, backendFromConfig("os"));
-    }
-}
-
-test "backend public labels hide internal implementation names" {
-    try std.testing.expectEqualStrings("os", publicModeForBackendForProbe(.macos, .{ .host_capabilities = host.nativeForOs(.macos) }).label());
-    try std.testing.expectEqualStrings("none", publicModeForBackendForProbe(.none, .{ .host_capabilities = host.nativeForOs(.macos) }).label());
-    try std.testing.expectEqualStrings("os", publicModeForBackendForProbe(.auto, .{ .host_capabilities = host.nativeForOs(.macos) }).label());
-    try std.testing.expectEqualStrings("none", publicModeForBackendForProbe(.auto, .{ .host_capabilities = host.nativeForOs(.linux) }).label());
-}
-
-test "config construction carries explicit output cap" {
-    const cfg = Config{
-        .workspace_root = "/tmp",
-        .max_command_output_bytes = 4096,
-    };
-    try std.testing.expectEqual(@as(usize, 4096), cfg.max_command_output_bytes);
-}
-
-test "resolve backend keeps explicit choices" {
-    try std.testing.expectEqual(BackendKind.macos, resolveBackend(.macos));
-    try std.testing.expectEqual(BackendKind.vercel, resolveBackend(.vercel));
-    try std.testing.expectEqual(BackendKind.just_bash, resolveBackend(.just_bash));
-    try std.testing.expectEqual(BackendKind.none, resolveBackend(.none));
-}
-
-test "resolve backend auto probes os sandbox then none" {
-    try std.testing.expectEqual(BackendKind.macos, resolveBackendForProbe(.auto, .{
-        .host_capabilities = host.nativeForOs(.macos),
-    }));
-    try std.testing.expectEqual(BackendKind.none, resolveBackendForProbe(.auto, .{
-        .host_capabilities = host.nativeForOs(.linux),
-    }));
-    try std.testing.expectEqual(BackendKind.none, resolveBackendForProbe(.auto, .{
-        .host_capabilities = host.nativeForOs(.linux),
-    }));
-    try std.testing.expectEqual(BackendKind.none, resolveBackendForProbe(.auto, .{
-        .host_capabilities = host.nativeForOs(.linux),
-    }));
-}
-
-test "effective backend preserves configuration outside yolo" {
-    try std.testing.expectEqual(BackendKind.macos, effectiveBackend(.ask, .macos));
-    try std.testing.expectEqual(BackendKind.macos, effectiveBackend(.auto, .macos));
-}
-
-test "effective backend is none in yolo without changing configuration" {
-    const configured = BackendKind.macos;
-    try std.testing.expectEqual(BackendKind.none, effectiveBackend(.yolo, configured));
-    try std.testing.expectEqual(BackendKind.macos, configured);
-}
-
-test "resolve backend auto and explicit choices are deterministic under probe" {
-    try std.testing.expectEqual(BackendKind.vercel, resolveBackendForProbe(.vercel, .{
-        .host_capabilities = host.nativeForOs(.linux),
-    }));
-    try std.testing.expectEqual(BackendKind.none, resolveBackendForProbe(.none, .{
-        .host_capabilities = host.nativeForOs(.macos),
-    }));
-    try std.testing.expectEqual(BackendKind.macos, resolveBackendForProbe(.auto, .{
-        .host_capabilities = host.nativeForOs(.macos),
-    }));
-}
-
-test "host capabilities control explicit os sandbox support" {
-    try std.testing.expect(osSandboxUnsupportedOn(.linux));
-    try std.testing.expect(!osSandboxUnsupportedOn(.macos));
-}
-
-test "macos profiles contain required write allowances" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const profile = try buildMacOSProfile(arena_state.allocator(), "/tmp/workspace", .{});
-
-    try std.testing.expect(std.mem.find(u8, profile, "(deny default)") != null);
-    try std.testing.expect(std.mem.find(u8, profile, "(allow file-read*)") != null);
-    try std.testing.expect(std.mem.find(u8, profile, "(allow file-write* (subpath \"/tmp/workspace\"))") != null);
-    try std.testing.expect(std.mem.find(u8, profile, "(allow file-write* (subpath \"/tmp\"))") != null);
-    try std.testing.expect(std.mem.find(u8, profile, "(allow network-outbound)") != null);
-    try std.testing.expect(std.mem.find(u8, profile, "(allow network-bind") == null);
-    try std.testing.expect(std.mem.find(u8, profile, "(allow network-inbound") == null);
-}
-
-test "macos localhost listen profile keeps filesystem allowances unchanged" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const profile = try buildMacOSProfile(arena_state.allocator(), "/tmp/workspace", .{ .allow_localhost_listen = true });
-
-    try std.testing.expect(std.mem.find(u8, profile, "(deny default)") != null);
-    try std.testing.expect(std.mem.find(u8, profile, "(allow file-read*)") != null);
-    try std.testing.expect(std.mem.find(u8, profile, "(allow file-write* (subpath \"/tmp/workspace\"))") != null);
-    try std.testing.expect(std.mem.find(u8, profile, "(allow file-write* (subpath \"/tmp\"))") != null);
-    try std.testing.expect(std.mem.find(u8, profile, "(allow network-outbound)") != null);
-    try std.testing.expect(std.mem.find(u8, profile, "(allow network-bind (local ip \"localhost:*\"))") != null);
-    try std.testing.expect(std.mem.find(u8, profile, "(allow network-inbound (local ip \"localhost:*\"))") != null);
-    try std.testing.expect(std.mem.find(u8, profile, "(allow file-write* (subpath \"/Users/") == null);
-}
-
-test "macos profiles scheme-quote dynamic paths" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const profile = try buildMacOSProfile(arena_state.allocator(), "/tmp/work\"space\\line\nrow\rtab\tend", .{});
-
-    try std.testing.expect(std.mem.find(u8, profile, "(subpath \"/tmp/work\\\"space\\\\line\\nrow\\rtab\\tend\")") != null);
-    const quoted_home_cache = try schemeQuote(arena_state.allocator(), "/Users/me/cache\"dir\\line\nrow\rtab\t.npm");
-    try std.testing.expectEqualStrings("\"/Users/me/cache\\\"dir\\\\line\\nrow\\rtab\\t.npm\"", quoted_home_cache);
-}
-
-test "macos profiles include only active added roots with scheme escaping" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const entries = [_]workspace_access.Entry{
-        .{ .path = @constCast("/tmp/shared\"dir\\line"), .saved = true, .command_line = false, .available = true, .active = true },
-        .{ .path = @constCast("/tmp/offline"), .saved = true, .command_line = false, .available = false, .active = false },
-    };
-    const profile = try buildMacOSProfileForScope(arena_state.allocator(), .{
-        .primary_directory = "/tmp/workspace",
-        .additional_directories = &entries,
-    }, .{});
-
-    try std.testing.expect(std.mem.find(u8, profile, "(subpath \"/tmp/shared\\\"dir\\\\line\")") != null);
-    try std.testing.expect(std.mem.find(u8, profile, "/tmp/offline") == null);
-}
-
-test "macos foreground shell uses direct sandbox argv with a fixed launcher" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const shell_argv = [_][]const u8{
-        "sh",
-        "-lc",
-        script_from_stdin_launcher,
-    };
-    const argv = try buildDirectMacOSArgv(arena_state.allocator(), .{
-        .workspace_root = "/tmp/workspace",
-        .max_command_output_bytes = 4096,
-    }, &shell_argv);
-
-    try std.testing.expectEqual(@as(usize, 6), argv.len);
-    try std.testing.expectEqualStrings("/usr/bin/sandbox-exec", argv[0]);
-    try std.testing.expectEqualStrings("-p", argv[1]);
-    try std.testing.expectEqualStrings("sh", argv[3]);
-    try std.testing.expectEqualStrings("-lc", argv[4]);
-    try std.testing.expectEqualStrings(
-        script_from_stdin_launcher,
-        argv[5],
-    );
-}
-
-test "macos background launch passes typed isolation and removes its profile" {
-    if (builtin.os.tag != .macos) return;
-
-    const Capture = struct {
-        profile_path: ?[]u8 = null,
-        profile_present: bool = false,
-        cwd_ok: bool = false,
-        output_context: ?*const anyopaque = null,
-
-        fn spawn(
-            raw: ?*anyopaque,
-            alloc: Allocator,
-            request: background_process_provider.SpawnRequest,
-        ) background_process_provider.ProviderError!background_process_provider.PreparedProcess {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.cwd_ok = std.mem.eql(u8, request.cwd, "/tmp");
-            self.output_context = request.output.context;
-            switch (request.isolation) {
-                .macos_profile => |path| {
-                    self.profile_present = absoluteFileExists(path);
-                    self.profile_path = try alloc.dupe(u8, path);
-                },
-                .none => return error.Unsupported,
-            }
-            return error.Unsupported;
-        }
-    };
-
-    const alloc = std.testing.allocator;
-    var output = try background_launch_output.prepareExternal(alloc);
-    defer output.deinit(alloc, true);
-    var capture = Capture{};
-    defer if (capture.profile_path) |path| alloc.free(path);
-    var process_provider = background_process_provider.unavailable_provider;
-    process_provider.context = &capture;
-    process_provider.spawn_prepared_fn = Capture.spawn;
-    const expected_output_context = output.providerCapability().context;
-
-    try std.testing.expectError(error.Unsupported, spawnPreparedBackground(.{
-        .backend = .macos,
-        .workspace_root = "/tmp",
-        .max_command_output_bytes = 4096,
-        .background_process_provider = process_provider,
-    }, alloc, "/tmp", &output));
-    try std.testing.expect(capture.cwd_ok);
-    try std.testing.expectEqual(
-        expected_output_context,
-        capture.output_context.?,
-    );
-    try std.testing.expect(capture.profile_present);
-    try std.testing.expect(!absoluteFileExists(capture.profile_path.?));
-}
-
-test "permissive profile includes home cache package paths" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const profile = try buildMacOSPermissiveProfile(arena_state.allocator(), "/tmp/workspace", .{});
-    const home = io_mod.getenv("HOME") orelse return;
-
-    const npm = try std.fmt.allocPrint(arena_state.allocator(), "{s}/.npm", .{home});
-    const cargo = try std.fmt.allocPrint(arena_state.allocator(), "{s}/.cargo", .{home});
-    const brew = try std.fmt.allocPrint(arena_state.allocator(), "{s}/Library/Caches/Homebrew", .{home});
-    try std.testing.expect(std.mem.find(u8, profile, npm) != null);
-    try std.testing.expect(std.mem.find(u8, profile, cargo) != null);
-    try std.testing.expect(std.mem.find(u8, profile, brew) != null);
-    const bare_home_subpath = try std.fmt.allocPrint(arena_state.allocator(), "(subpath \"{s}\")", .{home});
-    try std.testing.expect(std.mem.find(u8, profile, bare_home_subpath) == null);
-}
-
-test "permissive macos localhost listen profile does not broaden home writes" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const profile = try buildMacOSPermissiveProfile(arena_state.allocator(), "/tmp/workspace", .{ .allow_localhost_listen = true });
-    const home = io_mod.getenv("HOME") orelse return;
-
-    try std.testing.expect(std.mem.find(u8, profile, "(allow network-bind (local ip \"localhost:*\"))") != null);
-    try std.testing.expect(std.mem.find(u8, profile, "(allow network-inbound (local ip \"localhost:*\"))") != null);
-    const npm = try std.fmt.allocPrint(arena_state.allocator(), "{s}/.npm", .{home});
-    try std.testing.expect(std.mem.find(u8, profile, npm) != null);
-    const bare_home_subpath = try std.fmt.allocPrint(arena_state.allocator(), "(subpath \"{s}\")", .{home});
-    try std.testing.expect(std.mem.find(u8, profile, bare_home_subpath) == null);
-}
-
 test "format output covers stdout stderr empty signal and unknown statuses" {
     const result = try formatOutput(std.testing.allocator, "printf hello", "/tmp", .{ .exited = 0 }, " hello\n", "", 3);
     defer std.testing.allocator.free(result.output);
@@ -3200,8 +2162,6 @@ test "format output covers stdout stderr empty signal and unknown statuses" {
 
 test "raw process execution returns foreground output" {
     const result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 4096,
     }, std.testing.allocator, "printf 'hello'", "/tmp");
     defer std.testing.allocator.free(result.output);
@@ -3217,6 +2177,29 @@ test "raw process execution returns foreground output" {
     try std.testing.expectEqual(@as(usize, 5), command_result.stdout_bytes);
     try std.testing.expectEqual(@as(usize, 0), command_result.stderr_bytes);
     try std.testing.expect(!command_result.truncated);
+}
+
+test "authorized command executes exactly once" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(cwd);
+    const marker = try std.fs.path.join(alloc, &.{ cwd, "attempts" });
+    defer alloc.free(marker);
+    const quoted_marker = try shellQuote(alloc, marker);
+    defer alloc.free(quoted_marker);
+    const command = try std.fmt.allocPrint(alloc, "printf x >> {s}", .{quoted_marker});
+    defer alloc.free(command);
+
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 4096,
+    }, alloc, command, cwd);
+    defer alloc.free(result.output);
+
+    const attempts = try readAbsoluteFile(alloc, marker, 16);
+    defer alloc.free(attempts);
+    try std.testing.expectEqualStrings("x", attempts);
 }
 
 fn spawnForegroundSessionBootstrapForTest(
@@ -3304,8 +2287,6 @@ test "captured foreground command runs beneath a detached session supervisor" {
         "print(f\"pid={pid} pgid={pgid} sid={sid}\"); " ++
         "sys.exit(0 if pid != pgid and pgid == sid else 1)'";
     const result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 4096,
     }, std.testing.allocator, command, "/tmp");
     defer std.testing.allocator.free(result.output);
@@ -3363,8 +2344,6 @@ test "foreground session protocol bytes do not enter captured output" {
     const stdout_text = "stdout-bytes";
     const stderr_text = "stderr-bytes";
     const result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 4096,
     }, std.testing.allocator, "printf 'stdout-bytes'; printf 'stderr-bytes' >&2", "/tmp");
     defer std.testing.allocator.free(result.output);
@@ -3384,8 +2363,6 @@ test "target replacement marker prefix remains ordinary stderr" {
 
     const stderr_text = foreground_session_replace_failure_prefix ++ "target-data\n";
     const result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 4096,
     }, std.testing.allocator, "printf '\\000FX_FOREGROUND_EXEC_FAILED:target-data\\n' >&2; exit 125", "/tmp");
     defer std.testing.allocator.free(result.output);
@@ -3409,8 +2386,6 @@ test "invalid readiness directly kills and reaps helper pid" {
     defer child.kill(io_mod.getIo());
     const pid = child.id orelse return error.TestUnexpectedResult;
     const cfg = Config{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1024,
     };
 
@@ -3435,8 +2410,6 @@ test "readiness EOF directly kills and reaps helper pid" {
     defer child.kill(io_mod.getIo());
     const pid = child.id orelse return error.TestUnexpectedResult;
     const cfg = Config{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1024,
     };
 
@@ -3458,8 +2431,6 @@ test "pre-ready cancellation directly kills and reaps helper pid" {
     const pid = child.id orelse return error.TestUnexpectedResult;
     var cancel = std.atomic.Value(bool).init(true);
     const cfg = Config{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1024,
         .cancel_flag = &cancel,
     };
@@ -3481,8 +2452,6 @@ test "pre-ready configured timeout directly kills and reaps helper pid" {
     defer child.kill(io_mod.getIo());
     const pid = child.id orelse return error.TestUnexpectedResult;
     const cfg = Config{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1024,
         .timeout_ms = 1,
         .timeout_started_ms = io_mod.milliTimestamp() - 10,
@@ -3504,8 +2473,6 @@ test "foreground session setup has a bounded internal ceiling" {
     var child = try spawnUnreadyForegroundSessionChildForTest(&argv);
     defer child.kill(io_mod.getIo());
     const cfg = Config{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1024,
     };
 
@@ -3534,8 +2501,6 @@ test "detached session preserves replacement failure with a zero output budget" 
         executeProcessWithDetachedSession(
             scratch_state.allocator(),
             .{
-                .backend = .none,
-                .workspace_root = "/tmp",
                 .max_command_output_bytes = 0,
             },
             &argv,
@@ -3564,8 +2529,6 @@ test "raw process execution transports long scripts without exposing stdin" {
     try std.testing.expect(script.items.len > 20 * 1024);
 
     const result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 4096,
     }, alloc, script.items, "/tmp");
     defer alloc.free(result.output);
@@ -3588,8 +2551,6 @@ test "large stdout writes command artifact and returns bounded preview" {
 
     const output_text = "HEAD-1234567890-TAIL";
     const result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = workspace,
         .max_command_output_bytes = 16,
         .command_artifact_dir = artifact_dir,
     }, alloc, "printf 'HEAD-1234567890-TAIL'", workspace);
@@ -3621,8 +2582,6 @@ test "large stderr writes command artifact and returns bounded preview" {
 
     const output_text = "ERR-1234567890-END";
     const result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = workspace,
         .max_command_output_bytes = 16,
         .command_artifact_dir = artifact_dir,
     }, alloc, "printf 'ERR-1234567890-END' >&2", workspace);
@@ -3671,7 +2630,7 @@ test "managed command artifact confirms an indeterminate rename target" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        io_mod.permissionsFromMode(0o700),
+        std.Io.File.Permissions.fromMode(0o700),
     );
     const workspace = try io_mod.dirRealpathAlloc(
         alloc,
@@ -3715,8 +2674,6 @@ test "managed command artifact confirms an indeterminate rename target" {
     defer capability.deinit();
 
     const result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = workspace,
         .max_command_output_bytes = 8,
         .command_artifact_capability = &capability,
     }, alloc, "printf 'managed-command-output'", workspace);
@@ -3753,7 +2710,7 @@ test "managed command artifact rejects an unconfirmed rename target" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        io_mod.permissionsFromMode(0o700),
+        std.Io.File.Permissions.fromMode(0o700),
     );
     const workspace = try io_mod.dirRealpathAlloc(
         alloc,
@@ -3794,8 +2751,6 @@ test "managed command artifact rejects an unconfirmed rename target" {
     try std.testing.expectError(
         error.SessionChildCommitIndeterminate,
         executeCommand(.{
-            .backend = .none,
-            .workspace_root = workspace,
             .max_command_output_bytes = 8,
             .command_artifact_capability = &capability,
         }, alloc, "printf 'managed-command-output'", workspace),
@@ -3893,8 +2848,6 @@ test "line buffered streaming emits lines and tail" {
     defer capture.deinit();
 
     const result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 4096,
         .output_chunk_ctx = @ptrCast(&capture),
         .on_output_chunk = StreamCapture.onChunk,
@@ -3912,8 +2865,6 @@ test "line buffered streaming preserves stderr stream and tail" {
     defer capture.deinit();
 
     const result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 4096,
         .output_chunk_ctx = @ptrCast(&capture),
         .on_output_chunk = StreamCapture.onChunk,
@@ -3932,8 +2883,6 @@ test "raw callback projection preserves bytes without changing command result" {
     var safe_capture = StreamCapture{ .alloc = std.testing.allocator };
     defer safe_capture.deinit();
     const safe_result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 4096,
         .output_chunk_ctx = @ptrCast(&safe_capture),
         .on_output_chunk = StreamCapture.onChunk,
@@ -3944,8 +2893,6 @@ test "raw callback projection preserves bytes without changing command result" {
     var raw_capture = StreamCapture{ .alloc = std.testing.allocator };
     defer raw_capture.deinit();
     const raw_result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 4096,
         .output_chunk_ctx = @ptrCast(&raw_capture),
         .on_output_chunk = StreamCapture.onChunk,
@@ -3966,8 +2913,6 @@ test "accepted callbacks preserve repeated newline-free stream order" {
     var capture = StreamCapture{ .alloc = std.testing.allocator };
     defer capture.deinit();
     const cfg = Config{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 4096,
         .accepted_output_chunk_ctx = @ptrCast(&capture),
         .on_accepted_output_chunk = StreamCapture.onChunk,
@@ -4001,8 +2946,6 @@ test "cancellation requested by a failing output callback dominates its error" {
     var trigger = FailOutput{ .cancel_flag = &cancel };
 
     try std.testing.expectError(error.Cancelled, executeCommand(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 4096,
         .cancel_flag = &cancel,
         .output_chunk_ctx = @ptrCast(&trigger),
@@ -4021,8 +2964,6 @@ test "cancellation preserves the termination grace beneath the session superviso
     };
     const started_ms = io_mod.milliTimestamp();
     const result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 4096,
         .cancel_flag = &cancel,
         .output_chunk_ctx = @ptrCast(&trigger),
@@ -4060,7 +3001,7 @@ test "cancellation preserves the termination grace in an invoked script" {
         );
         try script.setPermissions(
             io_mod.getIo(),
-            io_mod.permissionsFromMode(0o700),
+            std.Io.File.Permissions.fromMode(0o700),
         );
     }
 
@@ -4071,8 +3012,6 @@ test "cancellation preserves the termination grace in an invoked script" {
     };
     const started_ms = io_mod.milliTimestamp();
     const result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = workspace,
         .max_command_output_bytes = 4096,
         .cancel_flag = &cancel,
         .output_chunk_ctx = @ptrCast(&trigger),
@@ -4105,8 +3044,6 @@ test "cap-crossing cancellation returns a synchronized bounded result" {
     };
     const expected = "HEAD-1234567890-TAIL\nCANCEL-READY\n";
     const result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = workspace,
         .max_command_output_bytes = 16,
         .cancel_flag = &cancel,
         .output_chunk_ctx = @ptrCast(&trigger),
@@ -4140,7 +3077,7 @@ test "cancelled managed command confirms an indeterminate artifact target" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        io_mod.permissionsFromMode(0o700),
+        std.Io.File.Permissions.fromMode(0o700),
     );
     const workspace = try io_mod.dirRealpathAlloc(
         alloc,
@@ -4184,8 +3121,6 @@ test "cancelled managed command confirms an indeterminate artifact target" {
         .needle = "CANCEL-READY",
     };
     const result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = workspace,
         .max_command_output_bytes = 8,
         .cancel_flag = &cancel,
         .output_chunk_ctx = @ptrCast(&trigger),
@@ -4255,8 +3190,6 @@ test "below-cap cancellation retains complete artifact and non-truncated metadat
     try std.testing.expect(expected.len <= cap);
 
     const result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = workspace,
         .max_command_output_bytes = cap,
         .cancel_flag = &cancel,
         .output_chunk_ctx = @ptrCast(&trigger),
@@ -4292,8 +3225,6 @@ test "zero-output cancellation remains a bare error" {
     defer thread.join();
 
     try std.testing.expectError(error.Cancelled, executeCommand(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1024,
         .cancel_flag = &cancel,
         .timeout_ms = 1000,
@@ -4331,7 +3262,6 @@ test "artifact write failure after cancellation remains a bare error" {
 
     var cancel = std.atomic.Value(bool).init(false);
     const cfg = Config{
-        .workspace_root = workspace,
         .max_command_output_bytes = 1024,
         .cancel_flag = &cancel,
     };
@@ -4379,8 +3309,6 @@ test "artifact write failure after cancellation remains a bare error" {
 
 test "timeout source is distinct from cancellation" {
     try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1024,
         .timeout_ms = 120,
     }, std.testing.allocator, "sleep 5", "/tmp"));
@@ -4391,8 +3319,6 @@ test "timeout remains dominant when its output callback fails" {
 
     var trigger = FailOutput{};
     try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1024,
         .output_chunk_ctx = @ptrCast(&trigger),
         .on_output_chunk = FailOutput.onChunk,
@@ -4422,8 +3348,6 @@ test "timeout terminates foreground process group descendants" {
     defer alloc.free(command);
 
     try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
-        .backend = .none,
-        .workspace_root = workspace,
         .max_command_output_bytes = 1024,
         .timeout_ms = 500,
     }, alloc, command, workspace));
@@ -4485,8 +3409,6 @@ test "natural command completion terminates background child inheriting pipes" {
     defer alloc.free(command);
 
     const result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = workspace,
         .max_command_output_bytes = 1024,
         .timeout_ms = 2000,
     }, alloc, command, workspace);
@@ -4523,8 +3445,6 @@ test "natural command completion terminates background child with redirected str
     defer alloc.free(command);
 
     const result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = workspace,
         .max_command_output_bytes = 1024,
         .timeout_ms = 2000,
     }, alloc, command, workspace);
@@ -4568,8 +3488,6 @@ test "natural command completion terminates redirected descendant after setsid" 
     defer alloc.free(command);
 
     const result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = workspace,
         .max_command_output_bytes = 1024,
         .timeout_ms = 2000,
     }, alloc, command, workspace);
@@ -4626,8 +3544,6 @@ test "cancellation preserves grace and removes an escaped descendant" {
     };
     const started_ms = io_mod.milliTimestamp();
     const result = try executeCommand(.{
-        .backend = .none,
-        .workspace_root = workspace,
         .max_command_output_bytes = 4096,
         .cancel_flag = &cancel,
         .output_chunk_ctx = @ptrCast(&trigger),
@@ -4651,11 +3567,9 @@ test "cancellation preserves grace and removes an escaped descendant" {
     try expectProcessGone(pid);
 }
 
-test "backend control reuses configured timeout start time" {
+test "execution control reuses configured timeout start time" {
     const started_ms = io_mod.milliTimestamp() - 50;
-    const control = BackendControl.init(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
+    const control = ExecutionControl.init(.{
         .max_command_output_bytes = 1024,
         .timeout_ms = 1000,
         .timeout_started_ms = started_ms,
@@ -4666,427 +3580,8 @@ test "backend control reuses configured timeout start time" {
 test "cancel and timeout tie chooses cancellation" {
     var cancel = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.CancelledBeforeExecution, executeCommand(.{
-        .backend = .none,
-        .workspace_root = "/tmp",
         .max_command_output_bytes = 1024,
         .cancel_flag = &cancel,
         .timeout_ms = 1,
     }, std.testing.allocator, "sleep 5", "/tmp"));
-}
-
-test "vercel backend checks cancellation and timeout before remote work" {
-    var cancel = std.atomic.Value(bool).init(true);
-    try std.testing.expectError(error.CancelledBeforeExecution, executeCommand(.{
-        .backend = .vercel,
-        .workspace_root = "/tmp",
-        .max_command_output_bytes = 1024,
-        .cancel_flag = &cancel,
-        .timeout_ms = 1000,
-    }, std.testing.allocator, "printf no", "/tmp"));
-
-    try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
-        .backend = .vercel,
-        .workspace_root = "/tmp",
-        .max_command_output_bytes = 1024,
-        .timeout_ms = 0,
-    }, std.testing.allocator, "printf no", "/tmp"));
-}
-
-const FakeDevboxOutcome = enum {
-    success,
-    unavailable,
-    request_failed,
-};
-
-const FakeDevboxProvider = struct {
-    outcome: FakeDevboxOutcome,
-    calls: usize = 0,
-    stdout: ?[]const u8 = null,
-    stderr: ?[]const u8 = null,
-};
-
-fn fakeDevboxExecute(
-    raw_ctx: ?*anyopaque,
-    alloc: Allocator,
-    command: []const u8,
-    cwd: []const u8,
-    control: devbox_executor.Control,
-) devbox_executor.ProviderError!devbox_executor.VercelOutcome {
-    try control.check();
-    const state: *FakeDevboxProvider = @ptrCast(@alignCast(raw_ctx orelse return .request_failed));
-    state.calls += 1;
-    return switch (state.outcome) {
-        .success => blk: {
-            const stdout = if (state.stdout) |value|
-                try alloc.dupe(u8, value)
-            else
-                try std.fmt.allocPrint(alloc, "remote:{s}:{s}", .{ cwd, command });
-            errdefer alloc.free(stdout);
-            const stderr = try alloc.dupe(u8, state.stderr orelse "");
-            break :blk .{ .success = .{
-                .exit_code = 0,
-                .stdout = stdout,
-                .stderr = stderr,
-                .duration_ms = 7,
-            } };
-        },
-        .unavailable => .unavailable,
-        .request_failed => .request_failed,
-    };
-}
-
-test "vercel backend executes through configured devbox provider" {
-    var fake_provider = FakeDevboxProvider{ .outcome = .success };
-    const result = try executeCommand(.{
-        .backend = .vercel,
-        .workspace_root = "/tmp",
-        .max_command_output_bytes = 1024,
-        .devbox_provider = .{
-            .ctx = @ptrCast(&fake_provider),
-            .execute_fn = fakeDevboxExecute,
-        },
-    }, std.testing.allocator, "printf remote", "/tmp");
-    defer std.testing.allocator.free(result.output);
-
-    try std.testing.expectEqual(@as(usize, 1), fake_provider.calls);
-    try std.testing.expect(std.mem.find(u8, result.output, "exit_code=0\n") != null);
-    try std.testing.expect(std.mem.find(u8, result.output, "<stdout>\nremote:/tmp:printf remote\n</stdout>\n") != null);
-    try std.testing.expectEqual(@as(?u64, 7), result.command_result.?.foreground.duration_ms);
-}
-
-test "vercel raw callbacks preserve provider bytes without changing model output" {
-    const stdout = "  provider stdout\n</stdout>\n\x1b[31mred\x1b[0m\n\x00\xff  ";
-    const stderr = "  provider stderr\n</stderr>\n  ";
-
-    var safe_provider = FakeDevboxProvider{
-        .outcome = .success,
-        .stdout = stdout,
-        .stderr = stderr,
-    };
-    const safe_result = try executeCommand(.{
-        .backend = .vercel,
-        .workspace_root = "/tmp",
-        .max_command_output_bytes = 4096,
-        .devbox_provider = .{
-            .ctx = @ptrCast(&safe_provider),
-            .execute_fn = fakeDevboxExecute,
-        },
-    }, std.testing.allocator, "provider command", "/tmp");
-    defer std.testing.allocator.free(safe_result.output);
-
-    var raw_provider = FakeDevboxProvider{
-        .outcome = .success,
-        .stdout = stdout,
-        .stderr = stderr,
-    };
-    var capture = StreamCapture{ .alloc = std.testing.allocator };
-    defer capture.deinit();
-    const raw_result = try executeCommand(.{
-        .backend = .vercel,
-        .workspace_root = "/tmp",
-        .max_command_output_bytes = 4096,
-        .devbox_provider = .{
-            .ctx = @ptrCast(&raw_provider),
-            .execute_fn = fakeDevboxExecute,
-        },
-        .output_chunk_ctx = @ptrCast(&capture),
-        .on_output_chunk = StreamCapture.onChunk,
-        .callback_projection = .raw,
-    }, std.testing.allocator, "provider command", "/tmp");
-    defer std.testing.allocator.free(raw_result.output);
-
-    try std.testing.expectEqual(@as(usize, 1), safe_provider.calls);
-    try std.testing.expectEqual(@as(usize, 1), raw_provider.calls);
-    try std.testing.expectEqual(@as(usize, 2), capture.chunks.items.len);
-    try std.testing.expectEqual(.stdout, capture.streams.items[0]);
-    try std.testing.expectEqualSlices(u8, stdout, capture.chunks.items[0]);
-    try std.testing.expectEqual(.stderr, capture.streams.items[1]);
-    try std.testing.expectEqualSlices(u8, stderr, capture.chunks.items[1]);
-    try std.testing.expectEqualSlices(u8, safe_result.output, raw_result.output);
-}
-
-test "provider accepted callbacks keep replay frames bounded" {
-    const bytes = try std.testing.allocator.alloc(u8, 1024 * 1024 + 17);
-    defer std.testing.allocator.free(bytes);
-    @memset(bytes, 'x');
-
-    var capture = StreamCapture{ .alloc = std.testing.allocator };
-    defer capture.deinit();
-    try emitProviderOutput(.{
-        .backend = .vercel,
-        .workspace_root = "/tmp",
-        .max_command_output_bytes = 4096,
-        .accepted_output_chunk_ctx = @ptrCast(&capture),
-        .on_accepted_output_chunk = StreamCapture.onChunk,
-    }, .stdout, bytes);
-
-    var captured_bytes: usize = 0;
-    for (capture.chunks.items) |chunk| {
-        try std.testing.expect(chunk.len <= pending_output_flush_bytes);
-        captured_bytes += chunk.len;
-    }
-    try std.testing.expectEqual(bytes.len, captured_bytes);
-}
-
-test "vercel backend falls back to raw bash when provider is unavailable" {
-    var fake_provider = FakeDevboxProvider{ .outcome = .unavailable };
-    const result = try executeCommand(.{
-        .backend = .vercel,
-        .workspace_root = "/tmp",
-        .max_command_output_bytes = 1024,
-        .devbox_provider = .{
-            .ctx = @ptrCast(&fake_provider),
-            .execute_fn = fakeDevboxExecute,
-        },
-    }, std.testing.allocator, "printf local", "/tmp");
-    defer std.testing.allocator.free(result.output);
-
-    try std.testing.expectEqual(@as(usize, 1), fake_provider.calls);
-    try std.testing.expect(std.mem.find(u8, result.output, "exit_code=0\n") != null);
-    try std.testing.expect(std.mem.find(u8, result.output, "<stdout>\nlocal\n</stdout>\n") != null);
-}
-
-test "just_bash backend checks cancellation and timeout before spawning" {
-    var cancel = std.atomic.Value(bool).init(true);
-    try std.testing.expectError(error.CancelledBeforeExecution, executeCommand(.{
-        .backend = .just_bash,
-        .workspace_root = "/tmp",
-        .max_command_output_bytes = 1024,
-        .cancel_flag = &cancel,
-        .timeout_ms = 1000,
-    }, std.testing.allocator, "printf no", "/tmp"));
-
-    try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
-        .backend = .just_bash,
-        .workspace_root = "/tmp",
-        .max_command_output_bytes = 1024,
-        .timeout_ms = 0,
-    }, std.testing.allocator, "printf no", "/tmp"));
-}
-
-test "just_bash post-spawn cancellation does not parse or execute fallback" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try tmp.dir.createDirPath(io_mod.getIo(), "artifacts");
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-    const artifact_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "artifacts");
-    defer alloc.free(artifact_dir);
-    const launch_path = try std.fs.path.join(alloc, &.{ workspace, "launches.txt" });
-    defer alloc.free(launch_path);
-    const fallback_path = try std.fs.path.join(alloc, &.{ workspace, "fallback.txt" });
-    defer alloc.free(fallback_path);
-    const quoted_launch = try shellQuote(alloc, launch_path);
-    defer alloc.free(quoted_launch);
-    const quoted_fallback = try shellQuote(alloc, fallback_path);
-    defer alloc.free(quoted_fallback);
-
-    const fake_script = try std.fmt.allocPrint(
-        alloc,
-        "#!/bin/sh\nprintf launch >> {s}\ncase \"$2\" in\n  *TIMEOUT_CASE*)\n    trap 'printf \"JUST-BASH-TIMEOUT-TAIL\\n\"; exit 0' TERM\n    printf 'JUST-BASH-TIMEOUT-READY\\n'\n    ;;\n  *)\n    printf 'JUST-BASH-READY\\n'\n    trap 'exit 0' TERM\n    ;;\nesac\nwhile :; do :; done\n",
-        .{quoted_launch},
-    );
-    defer alloc.free(fake_script);
-    {
-        var fake = try tmp.dir.createFile(io_mod.getIo(), "workspace/fake-just-bash", .{ .truncate = true });
-        defer fake.close(io_mod.getIo());
-        try fake.writeStreamingAll(io_mod.getIo(), fake_script);
-        try fake.setPermissions(io_mod.getIo(), io_mod.permissionsFromMode(0o700));
-    }
-    const fake_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/fake-just-bash");
-    defer alloc.free(fake_path);
-
-    var cancel = std.atomic.Value(bool).init(false);
-    var trigger = CancelAfterOutput{
-        .flag = &cancel,
-        .needle = "JUST-BASH-READY",
-    };
-    const command = try std.fmt.allocPrint(alloc, "printf fallback > {s}", .{quoted_fallback});
-    defer alloc.free(command);
-    var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
-    var cfg = Config{
-        .backend = .just_bash,
-        .workspace_root = workspace,
-        .max_command_output_bytes = 128,
-        .cancel_flag = &cancel,
-        .output_chunk_ctx = @ptrCast(&trigger),
-        .on_output_chunk = CancelAfterOutput.onChunk,
-        .command_artifact_dir = artifact_dir,
-    };
-
-    const result = try executeJustBash(
-        alloc,
-        scratch_state.allocator(),
-        cfg,
-        fake_path,
-        command,
-        workspace,
-    );
-    defer alloc.free(result.output);
-
-    try std.testing.expect(trigger.seen);
-    try std.testing.expect(result.cancelled);
-    const foreground = result.command_result.?.foreground;
-    try std.testing.expect(!foreground.truncated);
-    const output_path = foreground.output_file orelse return error.TestExpectedEqual;
-    const artifact = try readAbsoluteFile(alloc, output_path, 128);
-    defer alloc.free(artifact);
-    try std.testing.expectEqualStrings("JUST-BASH-READY\n", artifact);
-    const launches = try readAbsoluteFile(alloc, launch_path, 64);
-    defer alloc.free(launches);
-    try std.testing.expectEqualStrings("launch", launches);
-    try std.testing.expect(!absoluteFileExists(fallback_path));
-
-    cancel.store(false, .seq_cst);
-    var failing_trigger = FailOutput{ .cancel_flag = &cancel };
-    cfg.output_chunk_ctx = @ptrCast(&failing_trigger);
-    cfg.on_output_chunk = FailOutput.onChunk;
-    try std.testing.expectError(error.Cancelled, executeJustBash(
-        alloc,
-        scratch_state.allocator(),
-        cfg,
-        fake_path,
-        command,
-        workspace,
-    ));
-    try std.testing.expect(failing_trigger.seen);
-    const launches_after_failure = try readAbsoluteFile(alloc, launch_path, 64);
-    defer alloc.free(launches_after_failure);
-    try std.testing.expectEqualStrings("launchlaunch", launches_after_failure);
-    try std.testing.expect(!absoluteFileExists(fallback_path));
-
-    cancel.store(false, .seq_cst);
-    const timeout_tail = "JUST-BASH-TIMEOUT-TAIL";
-    var timeout_trigger = FailOutput{
-        .cancel_flag = &cancel,
-        .needle = timeout_tail,
-    };
-    const timeout_command = try std.fmt.allocPrint(
-        alloc,
-        "printf TIMEOUT_CASE >/dev/null; printf fallback > {s}",
-        .{quoted_fallback},
-    );
-    defer alloc.free(timeout_command);
-    cfg.output_chunk_ctx = @ptrCast(&timeout_trigger);
-    cfg.timeout_ms = 120;
-    try std.testing.expectError(error.TimeoutExpired, executeJustBash(
-        alloc,
-        scratch_state.allocator(),
-        cfg,
-        fake_path,
-        timeout_command,
-        workspace,
-    ));
-    try std.testing.expect(timeout_trigger.seen);
-    const launches_after_timeout = try readAbsoluteFile(alloc, launch_path, 64);
-    defer alloc.free(launches_after_timeout);
-    try std.testing.expectEqualStrings("launchlaunchlaunch", launches_after_timeout);
-    try std.testing.expect(!absoluteFileExists(fallback_path));
-}
-
-test "looks like sandbox error checks stderr only and ignores success" {
-    try std.testing.expect(!looksLikeSandboxError("exit_code=0\n<stderr>\nPermission denied\n</stderr>\n"));
-    try std.testing.expect(!looksLikeSandboxError("exit_code=1\n<stdout>\nPermission denied\n</stdout>\n"));
-    try std.testing.expect(looksLikeSandboxError("exit_code=1\n<stderr>\nEPERM\n</stderr>\n"));
-    try std.testing.expect(looksLikeSandboxError("exit_code=1\n<stderr>\nOperation not permitted\n</stderr>\n"));
-}
-
-test "broader access detection covers first words and subcommands" {
-    try std.testing.expect(needsBroaderFileAccess("npm install"));
-    try std.testing.expect(needsBroaderFileAccess("pnpm add react"));
-    try std.testing.expect(needsBroaderFileAccess("cargo install ripgrep"));
-    try std.testing.expect(needsBroaderFileAccess("cargo fetch"));
-    try std.testing.expect(needsBroaderFileAccess("go get example.com/mod"));
-    try std.testing.expect(needsBroaderFileAccess("go mod tidy"));
-    try std.testing.expect(needsBroaderFileAccess("python -m pip install requests"));
-    try std.testing.expect(needsBroaderFileAccess("python3 -m venv .venv"));
-
-    try std.testing.expect(!needsBroaderFileAccess("cargo test"));
-    try std.testing.expect(!needsBroaderFileAccess("go test ./..."));
-    try std.testing.expect(!needsBroaderFileAccess("python script.py"));
-    try std.testing.expect(!needsBroaderFileAccess("git status"));
-}
-
-test "just_bash raw callback emits parsed inner streams without wrapper JSON" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-    const script =
-        "#!/bin/sh\n" ++
-        "printf '%s' '{\"exitCode\":0,\"stdout\":\"  INNER-OUT\\n</stdout>\\n\\u001b[31mRED\\u001b[0m\\n  \",\"stderr\":\"  INNER-ERR\\n</stderr>\\n  \"}'\n";
-    {
-        var fake = try tmp.dir.createFile(io_mod.getIo(), "workspace/fake-just-bash", .{ .truncate = true });
-        defer fake.close(io_mod.getIo());
-        try fake.writeStreamingAll(io_mod.getIo(), script);
-        try fake.setPermissions(io_mod.getIo(), io_mod.permissionsFromMode(0o700));
-    }
-    const fake_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/fake-just-bash");
-    defer alloc.free(fake_path);
-
-    var capture = StreamCapture{ .alloc = alloc };
-    defer capture.deinit();
-    var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
-    const submitted_command = "ignored command";
-    const projected_command = "/bin/zsh -f -c 'ignored command'";
-    const result = try executeJustBashWithResultCommand(
-        alloc,
-        scratch_state.allocator(),
-        .{
-            .backend = .just_bash,
-            .workspace_root = workspace,
-            .max_command_output_bytes = 4096,
-            .output_chunk_ctx = @ptrCast(&capture),
-            .on_output_chunk = StreamCapture.onChunk,
-            .callback_projection = .raw,
-        },
-        fake_path,
-        projected_command,
-        submitted_command,
-        workspace,
-    );
-    defer alloc.free(result.output);
-
-    try std.testing.expectEqualStrings(
-        submitted_command,
-        result.command_result.?.foreground.command,
-    );
-
-    try std.testing.expectEqual(@as(usize, 2), capture.chunks.items.len);
-    try std.testing.expectEqual(.stdout, capture.streams.items[0]);
-    try std.testing.expectEqualStrings(
-        "  INNER-OUT\n</stdout>\n\x1b[31mRED\x1b[0m\n  ",
-        capture.chunks.items[0],
-    );
-    try std.testing.expectEqual(.stderr, capture.streams.items[1]);
-    try std.testing.expectEqualStrings(
-        "  INNER-ERR\n</stderr>\n  ",
-        capture.chunks.items[1],
-    );
-    for (capture.chunks.items) |chunk| {
-        try std.testing.expect(std.mem.find(u8, chunk, "exitCode") == null);
-    }
-}
-
-test "just_bash JSON parser handles success and parse failure" {
-    const cfg = Config{
-        .backend = .just_bash,
-        .workspace_root = "/tmp",
-        .max_command_output_bytes = 1024,
-    };
-    const result = try parseJustBashJson(std.testing.allocator, std.testing.allocator, cfg, "{\"exitCode\":3,\"stdout\":\"out\\n\",\"stderr\":\"err\\n\"}", "", .{ .exited = 0 }, "cmd", "/tmp", 9);
-    defer std.testing.allocator.free(result.output);
-    try std.testing.expect(std.mem.find(u8, result.output, "exit_code=3\n") != null);
-    try std.testing.expect(std.mem.find(u8, result.output, "<stdout>\nout\n</stdout>\n") != null);
-    try std.testing.expectError(error.JustBashParseError, parseJustBashJson(std.testing.allocator, std.testing.allocator, cfg, "not-json", "", .{ .exited = 0 }, "cmd", "/tmp", null));
 }
