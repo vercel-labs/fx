@@ -875,7 +875,7 @@ fn deleteSnapshotFile(dir: std.Io.Dir, name: []const u8, reason: []const u8) voi
     };
 }
 
-fn deleteSnapshotPath(path: []const u8, reason: []const u8) void {
+pub fn deleteSnapshotPath(path: []const u8, reason: []const u8) void {
     const parent_path = std.fs.path.dirname(path) orelse {
         debug_trace.logf(
             "images",

@@ -182,7 +182,7 @@ pub fn writeInitializeResponse(w: *std.Io.Writer) !void {
     try w.print("{d}", .{protocol_version});
     try w.writeAll(",\"agentCapabilities\":{");
     try w.writeAll("\"loadSession\":true,");
-    try w.writeAll("\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":true},");
+    try w.writeAll("\"promptCapabilities\":{\"image\":true,\"audio\":false,\"embeddedContext\":true},");
     try w.writeAll("\"mcpCapabilities\":{\"http\":true,\"sse\":true},");
     try w.writeAll("\"sessionCapabilities\":{\"list\":{},\"resume\":{},\"close\":{}}");
     try w.writeAll("},\"agentInfo\":{\"name\":\"fx\",\"title\":\"fx\",\"version\":");
@@ -308,7 +308,8 @@ test "writeInitializeResponse contains required fields" {
         build_options.app_version,
         parsed.value.object.get("agentInfo").?.object.get("version").?.string,
     );
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"image\":false") != null);
+    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"image\":true") != null);
+    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"audio\":false") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"list\":{}") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"resume\":{}") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"close\":{}") != null);
