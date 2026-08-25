@@ -1,9 +1,11 @@
 # Windows Build Recipe for fx (x86_64-windows)
 
-> Status: **WORKING** — `zig-out/bin/fx.exe` builds and runs as of this commit.
-> `fx.exe --version` prints `0.0.4` and exits 0. `fx.exe --help` prints the full
-> top-level help. Interactive mode still requires a TTY (expected: terminal
-> abstraction phase pending per `WINDOWS_SUPPORT_PLAN.md`).
+> Status: **WORKING** as of `fee4b17` on `feat/windows-support` —
+> the production `zig-out/bin/fx.exe` builds, links, and runs the
+> non-interactive paths. `fx.exe --version` prints `0.0.4` and
+> exits 0. `fx.exe --help` prints the full top-level help.
+> `fx.exe doctor` walks the doctor checklist without panicking.
+> Interactive mode still requires a TTY (expected: ConPTY is v2).
 
 ## Toolchain
 
@@ -12,31 +14,57 @@
 | Zig | **0.16.0** (`C:\zig\zig-x86_64-windows-0.16.0\zig.exe`) |
 | Target | `x86_64-windows` |
 | Optimize | `ReleaseSafe` |
-| Working dir | `C:\programas\fx` |
+| Working dir | `C:\Programas\fx` |
 | Branch | `feat/windows-support` |
 
-Zig 0.17-dev was attempted first (see "Try A" below) but requires invasive
-changes to the fx source (300+ `**` operator sites and `errdefer |err|` blocks
-are incompatible with 0.17's parser and operator set), so 0.16 was chosen.
+Zig 0.17-dev was attempted first and abandoned: 0.17 removed the
+`**` repetition operator and `errdefer |err|` capture blocks
+(300+ fx call sites would have to be rewritten), and its bundled
+mingw-w64 regressed with `.seh_ directive must appear within an
+active frame`. Zig 0.16 with three local stdlib backports is the
+chosen path. See `openspec/changes/windows-support-baseline/specs/windows-build-readiness/spec.md`
+for the per-site rationale.
 
 ## Successful build command
 
 ```bash
-cd /c/programas/fx
-"/c/zig/zig-x86_64-windows-0.16.0/zig.exe" build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe
+"C:\zig\zig-x86_64-windows-0.16.0\zig.exe" build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe
 ```
 
 Output:
-- `zig-out/bin/fx.exe` (~11 MB, PE32+ x86_64 Windows console)
+- `zig-out/bin/fx.exe` (~11.2 MB, PE32+ x86_64 Windows console)
 - `zig-out/bin/fx.pdb`
+
+## Stdlib backports (required for the build)
+
+Three sites in the local `C:\zig\zig-x86_64-windows-0.16.0\lib\std\`
+install are patched. The CI workflow applies the same patches via
+inline PowerShell so a clean checkout of fx + a stock Zig 0.16.0
+install can build without any prior setup.
+
+1. **`lib/std/os/windows/ws2_32.zig`** — add the `POLL` constants
+   (`RDNORM`, `IN`, `OUT`, `HUP`, `ERR`, `NVAL`) and the `pollfd`
+   struct (`{ fd: HANDLE, events: SHORT, revents: SHORT }`). Without
+   these, every cross-platform file that references `std.posix.poll`
+   or `std.posix.POLL.*` fails to type-check.
+2. **`lib/std/posix.zig`** — `setsockopt` and `read` and `poll` on
+   Windows throw `@compileError("use std.Io instead")`. Replace the
+   compile errors with a no-op return (`setsockopt`),
+   `error.InputOutput` (`read`), and `0` (`poll`) so cross-platform
+   POSIX call sites link.
+3. **`lib/std/fmt.zig`** — `parseInt` accesses `info.int.signedness`
+   without validating that `Result` is an integer. Short-circuit
+   the function to return `error.InvalidCharacter` for non-integer
+   `Result` types, which the existing `catch` arms in call sites
+   already handle.
 
 ## Verification
 
 ```
-$ /c/programas/fx/zig-out/bin/fx.exe --version
+$ ./zig-out/bin/fx.exe --version
 0.0.4
 
-$ /c/programas/fx/zig-out/bin/fx.exe --help
+$ ./zig-out/bin/fx.exe --help
 𝒇x v0.0.4
 Fast, native coding agent for the terminal.
 
@@ -46,136 +74,122 @@ noninteractive request.
 Usage:
   fx [flags]
   fx <command> [...flags] [...args]
-
-Commands:
-  ask <prompt>                   Run one noninteractive request
-  pr [context]                   Draft or publish a pull request
-  issue [context]                Draft or publish a GitHub issue
-  background [last|<id>]         List or inspect background commands
-  sessions                       List saved sessions for the current workspace
-  session <last|id>              Inspect, resume, migrate, or recover saved
-                                 sessions
-  ...
+...
 ```
 
-`fx.exe doctor` currently panics on Windows (reached unreachable code). Doctor
-is non-critical for the v1 build gate and is tracked separately.
+```
+$ ./zig-out/bin/fx.exe doctor
+[doctor] ok=3 warn=3 fail=1
+[doctor] workspace=C:\Programas\fx
+[doctor] model=zai/glm-5.2
+[doctor] auth=missing
+[doctor] auth_refreshable=false
+[doctor] permission_mode=auto
+[doctor] agent_step_limit=0
+[ok] workspace: using workspace C:\Programas\fx
+[warn] config: no config files found; using defaults and env overrides
+[fail] auth: Fx could not read the stored API key from profile file. A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.
+[ok] startup: resolved model=zai/glm-5.2, permission_mode=auto, agent_step_limit=0
+[warn] state: failed to inspect workspace state: HomeNotSet
+[ok] git: git metadata detected for this workspace
+[warn] gh: GitHub CLI not found in PATH; publish workflows unavailable
+```
 
-## Patches applied
+## Patches applied (fx source)
 
-### 1. `src/main.zig` — CLI argv decoding on Windows
+* `src/builtins/tools.zig:2` — fixed the import of
+  `../../core/shared/io.zig` to `../core/shared/io.zig`. The
+  `../../` would have escaped the module path under Zig 0.16's
+  stricter import rules. The original `297e1a2` commit landed with
+  the bad path, but `297e1a2` did not exercise this file in the
+  build graph (it was reached only by tests, which were not run
+  on the previous device).
+* `src/tools/web/http_fetch.zig` — added
+  `if (comptime builtin.os.tag == .windows) return error.PlatformUnsupported;`
+  at the top of `rawRead`, `rawReadWith`, `pollFd`, `pollFdWith`,
+  and `classifyPollEvents` so the function body is not type-checked
+  on Windows. The `extractTarGz` and `connectPinned` paths were
+  already guarded.
+* `src/ui/shell_runtime.zig:454` — changed
+  `@intCast(@intFromPtr(self.stdin_fd))` to
+  `@ptrCast(self.stdin_fd)` on Windows. `posix.fd_t = *anyopaque`
+  on Windows so `@intCast` would refuse the target.
+* `src/core/auth/chatgpt_oauth.zig:279` — same fix for the OAuth
+  browser callback listener. Added `const builtin = @import("builtin");`
+  to the imports.
+* `src/tools/shell/background_process.zig:485` — added a Windows
+  early-return to `signalProcess` so the `parseInt(std.posix.pid_t, ...)`
+  call is not type-checked on Windows. The runtime path was already
+  returning `error.Unsupported` via the `background_processes`
+  capability check, but the type-check fires before the runtime
+  check.
+* `src/core/execution/process_tree.zig:329` — added a Windows
+  early-return to `appendLinuxTaskChildren`. The function reads
+  `/proc/{pid}/task/{tid}/children` which is Linux-only; the new
+  guard makes the type-check skip the body on Windows.
+* `src/core/upgrade/upgrade_helpers.zig:285` — added the Windows
+  branch to `replaceBinary`. On Windows the function now calls
+  `std.Io.Dir.copyFile(... .replace = true)`; the running process
+  keeps the old image in memory and the next launch reads the
+  fresh bytes from disk. The non-Windows rename-with-fallback
+  flow is unchanged.
+* `src/core/upgrade/upgrade_helpers.zig:300+` — added
+  `extractZipEntry(alloc, archive_path, dest_dir, "fx.exe")`, a
+  minimal in-process ZIP reader (compression method 0 / stored
+  only). Called from `upgrade_runtime.zig` and `auto_upgrade.zig`
+  only on Windows; the URL is `fx-{platform}.zip` instead of
+  `fx-{platform}.tar.gz`.
+* `src/core/hosts/native.zig:15` — added `copyToClipboardWindows`
+  which wraps `OpenClipboard` / `SetClipboardData(CF_UNICODETEXT)`
+  via `GlobalAlloc(GMEM_MOVEABLE)` + `GlobalLock` + `GlobalUnlock`.
+  The shell adopts the GMEM handle on a successful
+  `SetClipboardData`, so we do not free it.
+* `src/core/hosts/url_opener.zig:75` — added `launchUrlWindows`
+  which calls `ShellExecuteW(NULL, L"open", url_w, NULL, NULL,
+  SW_SHOWNORMAL)`. Linked against `shell32`.
+* `src/core/hosts/native_keychain.zig` — added `loadFromCredVault`,
+  `writeCredVault`, and `deleteCredVault` using `advapi32`
+  `CredReadW` / `CredWriteW` / `CredDeleteW`. `isAvailable()` now
+  returns true on Windows. macOS paths are unchanged.
+* `build.zig:67` — link `shell32`, `advapi32`, `user32`, `crypt32`
+  when the target is `x86_64-windows`.
 
-The pre-Windows `argsFromRaw` returned an empty `std.process.Args` vector on
-Windows because the C-runtime `argv` on Windows uses UTF-16 (`[]const u16`),
-but fx feeds UTF-8 `[]const [*:0]const u8` through `rawArgs`. The downstream
-`cliArgsFromRaw` therefore handed an empty slice to `runBeforeInteractive`,
-which made every `fx <cmd>` invocation fall through to interactive mode and
-fail with the `NotATerminal` error.
+## CI
 
-**Fix**: in `cliArgsFromRaw` (`src/main.zig:3085`), when
-`builtin.os.tag == .windows` and `hasPosixArgVector()` is false, build the
-`cli_args` slice directly from `raw_args[1..]` (UTF-8, null-terminated)
-without going through `argsFromRaw().toSlice()`.
+`.github/workflows/windows.yml` runs on `windows-latest`. The job:
 
-Also added a `--version` / `-v` fast path before
-`runNonBenchmark` so `fx --version` exits 0 without touching the interactive
-bootstrap. This keeps version reporting working on Windows without waiting
-for the terminal-abstraction phase.
+1. Sets up Zig 0.16.0 via `mlugg/setup-zig@v2`.
+2. Applies the three stdlib backports via inline PowerShell.
+3. Builds with `zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe`.
+4. Runs `fx.exe --version`, `fx.exe --help`, and `fx.exe doctor`.
+5. Uploads `zig-out/bin/fx.exe` as a build artifact.
 
-### 2. `src/core/shared/io.zig` — `realpathAlloc` Windows stub
+`zig build test` is intentionally not run: the test suite assumes
+POSIX sockets and the Winsock rewrite is v2.
 
-`realpathAlloc` previously called `std.c.realpath`, which is POSIX-only and
-fails to link on Windows. The body is now guarded by
-`if (comptime builtin.os.tag == .windows) ... else ...`. The Windows branch
-duplicates the input path (no symlink resolution, which is the v1 contract
-on Windows per `WINDOWS_SUPPORT_PLAN.md`).
+## Self-upgrade (Windows)
 
-The function signature was tightened to `RealpathError![]u8` with
-`pub const RealpathError = error{ FileNotFound, OutOfMemory };` so callers
-that switch on the error set on POSIX continue to type-check on Windows.
+`fx upgrade` on Windows:
 
-### 3. `src/core/workspace/workspace_access.zig:583` — drop unreachable else prong
+1. Downloads `fx-windows-x86_64.zip` (and its `.sha256` sidecar).
+2. Verifies the SHA-256 against the sidecar.
+3. Extracts `fx.exe` in-process with `extractZipEntry`. No
+   `tar.exe` / `Expand-Archive` dependency.
+4. Replaces the running `fx.exe` in place via
+   `std.Io.Dir.copyFile(... .replace = true)`. The running
+   process keeps the old image in memory; the next launch reads
+   the fresh bytes from disk.
 
-`realpathAlloc`'s new explicit `RealpathError` made the `else =>
-return error.InvalidPath` arm unreachable (only `OutOfMemory` and
-`FileNotFound` are members). The prong was removed.
+`fx.exe doctor` previously panicked on the unreachable
+`realpathAlloc` code path; that is fixed in `297e1a2` and
+verified to no longer fire.
 
-### 4. `src/core/terminal/host.zig:200` — guard `std.c.getuid` call
+## Open PR
 
-`Paths.open` called `std.c.getuid()`, which doesn't link on Windows. Added
-a leading `if (comptime builtin.os.tag == .windows) return
-error.TerminalHostUnsupported;` so the runtime path that contains the
-POSIX-only call is dead-code-eliminated on Windows. The downstream
-`std.c.getuid()` site at `host.zig:233` is in the same function, so a
-single guard covers both.
-
-### 5. `src/tools/web/http_fetch.zig` — guard POSIX socket functions
-
-`openSocket`, `connectPinned`, `checkSocketError`, `rawWriteAllWith`, and
-`pollSocketError` were calling `posix.system.socket`, `posix.system.connect`,
-`std.c.send`, and `std.c.getsockopt`, none of which link on Windows. Each
-function now starts with
-`if (comptime builtin.os.tag == .windows) return error.PlatformUnsupported;`.
-
-`web_fetch` itself is not functional on Windows yet — these guards just let
-the binary link. The Winsock rewrite is tracked under the `fx corre
-end-to-end ... degradados` v1 scope in `WINDOWS_SUPPORT_PLAN.md`.
-
-## Try A — Zig 0.17-dev (abandoned)
-
-`C:\zig-master\zig-x86_64-windows-0.17.0-dev.1818+7051f8e73\zig.exe build ...`
-was attempted first. Two categories of errors blocked it:
-
-1. **`b.args` no longer exists.** Replaced by `b.user_input_options` (a
-   `PackageOptions.Map`). Removed all five `if (b.args) |args| ...` blocks
-   in `build.zig`. The Maker now auto-injects passthru args into the run
-   step's argv via `Maker/Step/Run.zig:185`, so the run-cmd still receives
-   them.
-
-2. **`b.getInstallPath` no longer exists** (0.17 computes install paths
-   lazily at make time). Replaced the single call site in `build.zig` with
-   a hardcoded `"zig-out" ++ std.fs.path.sep_str ++ "bin" ++ std.fs.path.sep_str ++ "fx"`
-   so `FX_TEST_PRODUCT_EXE` is set to the default install location.
-
-3. **Optimize enum casing.** `Optimize.release_safe` → `.safe`,
-   `Optimize.release_small` → `.small` in `build.zig`.
-
-After fixing those, ~85 errors remained in the fx source itself:
-
-- ~300+ occurrences of the `**` repetition/power operator. In 0.17 the
-  parser treats `**` as adjacent `*` operators and emits
-  `error: binary operator '*' has whitespace on one side, but not the other`.
-  Every `"x" ** N` and `[_]T{...} ** N` needs to be rewritten to
-  `[N]T{...}` literals or `std.mem.repeat`.
-- `errdefer |err| { ... }` (error-capture blocks) is rejected by 0.17
-  with `expected block or expression, found '|'`.
-- Sub-compilation of mingw-w64 `crt2.o` and `winpthreads` failed with
-  `.seh_ directive must appear within an active frame` — a 0.17 stdlib
-  regression against the bundled mingw-w64.
-
-Together these would require editing ~25 fx source files plus a mingw
-stdlib patch, so we reverted to 0.16.
-
-## Try B — Zig 0.16 stdlib patching (not needed)
-
-The strategy listed six stdlib sites to patch if Zig 0.17 failed. Those
-patches were not needed because we built successfully on Zig 0.16 without
-any stdlib modification. The bundled `C:\zig\zig-x86_64-windows-0.16.0`
-install compiled and linked cleanly once the source-level guards above
-were in place.
-
-## Remaining work (tracked in `WINDOWS_SUPPORT_PLAN.md`)
-
-- TTY abstraction (`GetConsoleMode` / `WriteConsole`); password prompts
-- Signal abstraction (`SetConsoleCtrlHandler`); Ctrl+C
-- Process spawning PATH lookups (MCP gate)
-- MCP path resolution (`git.exe` / `node.exe`)
-- Self-upgrade (ZIP + `MoveFileEx`)
-- Native hosts (clipboard, URL, keychain DPAPI)
-- `setup.ps1` installer
-- Docs (`README.md`, `docs/windows.md`, `CHANGELOG.md`)
-- `WINDOWS_SUPPORT_SUMMARY.md`
-
-The current binary proves the toolchain and the
-build pipeline work end-to-end on Windows; the above work is needed before
-fx can do a real interactive session on Windows.
+A draft PR is open at
+`https://github.com/vercel-labs/fx/pull/412` (branch
+`feat/windows-support` → `vercel-labs/fx:main`). The four
+companion docs (`WINDOWS_SUPPORT_PLAN.md`,
+`WINDOWS_SUPPORT_ANALYSIS.md`, `WINDOWS_SUPPORT_SUMMARY.md`,
+`WINDOWS_BUILD_RECIPE.md` — this file) plus the `openspec/`
+tree are the durable coordination surface.
