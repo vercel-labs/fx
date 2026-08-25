@@ -93,7 +93,7 @@ fn jsonResponse(alloc: Allocator, goal: goal_store.Goal, report: ReportMode) ![]
         try out.writer.writeAll(",\"remaining_tokens\":null");
     }
     if (report == .include and goal.status == .complete) {
-        try out.writer.writeAll(",\"completion_budget_report\":\"Goal achieved. Report final usage from this tool result's structured goal fields.\"");
+        try out.writer.writeAll(",\"completion_budget_report\":\"Goal achieved. This tool result contains usage through prior finalized turns; the host accounts the current turn after the response finishes. Do not describe this value as final current-turn usage.\"");
     }
     try out.writer.writeAll("}");
     return try out.toOwnedSlice();
