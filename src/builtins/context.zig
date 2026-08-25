@@ -4,6 +4,7 @@ const change_tracker = @import("../core/workspace/change_tracker.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
+const js_host_workspace = @import("../core/hosts/js_host_workspace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const model_context_encoding = @import("../core/shared/model_context_encoding.zig");
 const pathing = @import("../core/workspace/pathing.zig");
@@ -179,6 +180,7 @@ const SelectionOptions = struct {
     initial_omissions: []const context_contract.ContextOmissionInput = &.{},
     initial_omission_summary: ?context_contract.ContextOmissionSummary = null,
     home: ?[]const u8 = null,
+    host_instructions: ?*const js_host_workspace.InstructionSnapshot = null,
     initial: bool,
     load_project_instruction_files: bool = true,
     context_limits: context_limits.Values = .{},
@@ -248,7 +250,38 @@ fn loadsProjectInstructionFiles() bool {
 }
 
 fn gatherProjectContext(alloc: Allocator, input: InitialContextInput) context_contract.ProviderError!ProviderContext {
+    if (comptime host_target.is_wasm) return gatherJsHostProjectContext(alloc, input);
     return gatherProjectContextWithHome(alloc, input, io_mod.getenv("HOME"));
+}
+
+fn gatherJsHostProjectContext(
+    alloc: Allocator,
+    input: InitialContextInput,
+) context_contract.ProviderError!ProviderContext {
+    const info = js_host_workspace.loadImportedInfo(alloc) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return gatherProjectContextWithHome(alloc, input, null);
+    };
+    var instructions = js_host_workspace.loadImportedInstructions(
+        alloc,
+        input.context_limits.project_instruction_file_bytes.effectiveBytes(),
+    ) catch |err| blk: {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        break :blk js_host_workspace.InstructionSnapshot{};
+    };
+    defer instructions.deinit(alloc);
+
+    return selectProjectContext(alloc, .{
+        .workspace_root = info.root(),
+        .targets = input.targets,
+        .initial_omissions = input.omissions,
+        .initial_omission_summary = input.omission_summary,
+        .home = info.home(),
+        .host_instructions = &instructions,
+        .initial = true,
+        .load_project_instruction_files = false,
+        .context_limits = input.context_limits,
+    });
 }
 
 fn gatherProjectContextWithHome(
@@ -300,7 +333,42 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
         try scratch.addRankingEndpoint(options.workspace_root);
     }
 
-    if (options.load_project_instruction_files) {
+    if (options.host_instructions) |instructions| {
+        if (options.initial) {
+            if (options.home) |home| {
+                global_source_path = try std.fs.path.join(arena, &.{ home, ".fx", "AGENTS.md" });
+                global_rule = try loadHostRuleForSelection(
+                    &scratch,
+                    global_source_path.?,
+                    instructions.global,
+                    instructions.available,
+                    options.context_limits.project_instruction_file_bytes,
+                );
+                if (!pathing.pathInside(home, options.workspace_root)) {
+                    try scratch.addOmission(options.workspace_root, .home_outside_workspace);
+                }
+            } else {
+                try scratch.addOmission("HOME", .home_unavailable);
+            }
+
+            if (std.fs.path.isAbsolute(options.workspace_root)) {
+                const project_source = try std.fs.path.join(arena, &.{ options.workspace_root, "AGENTS.md" });
+                if (global_source_path == null or
+                    !std.mem.eql(u8, global_source_path.?, project_source))
+                {
+                    project_rule = try loadHostRuleForSelection(
+                        &scratch,
+                        project_source,
+                        instructions.project,
+                        instructions.available,
+                        options.context_limits.project_instruction_file_bytes,
+                    );
+                }
+            } else {
+                try scratch.addOmission(options.workspace_root, .unsafe_target);
+            }
+        }
+    } else if (options.load_project_instruction_files) {
         if (options.initial) {
             if (options.home) |home| {
                 const canonical_home: ?[]u8 = io_mod.realpathAlloc(arena, home) catch |err| blk: {
@@ -451,6 +519,36 @@ fn loadRuleForSelection(
             return null;
         },
     }
+}
+
+fn loadHostRuleForSelection(
+    scratch: *SelectionScratch,
+    source: []const u8,
+    instruction: js_host_workspace.Instruction,
+    available: bool,
+    limit: context_limits.Resolved,
+) !?LoadedRule {
+    if (!available) {
+        try scratch.addOmission(source, .unreadable);
+        return null;
+    }
+    const body = switch (instruction) {
+        .missing, .blank => return null,
+        .body => |body| body,
+    };
+    if (body.observed_bytes > context_limits.emergency_ceiling_bytes) {
+        try scratch.addOmission(source, .oversized);
+        return null;
+    }
+    const content = body.text;
+    if (!std.unicode.utf8ValidateSlice(content)) {
+        try scratch.addOmission(source, .unreadable);
+        return null;
+    }
+    const prefix_len = context_limits.lineSafePrefixLength(content, limit.effectiveBytes());
+    const trimmed = std.mem.trim(u8, content[0..prefix_len], trim_chars);
+    try scratch.addDelivered(source);
+    return .{ .source = source, .body = trimmed, .observed_bytes = body.observed_bytes };
 }
 
 fn collectLaunchAncestorCandidates(
@@ -1647,6 +1745,75 @@ test "later added-root targets are evaluated without loading added instructions"
 
 test "native hosts still load project instruction files" {
     try std.testing.expect(loadsProjectInstructionFiles());
+}
+
+test "browser workspace instructions preserve provenance precedence and file limits" {
+    const alloc = std.testing.allocator;
+    const global_storage = try alloc.dupe(u8, "GLOBAL-ONE\n");
+    const project_storage = alloc.dupe(u8, "PROJECT-ONE\n") catch |err| {
+        alloc.free(global_storage);
+        return err;
+    };
+    var snapshot = js_host_workspace.InstructionSnapshot{
+        .available = true,
+        .global = .{ .body = .{
+            .storage = global_storage,
+            .text = global_storage,
+            .observed_bytes = "GLOBAL-ONE\nGLOBAL-TWO\n".len,
+        } },
+        .project = .{ .body = .{
+            .storage = project_storage,
+            .text = project_storage,
+            .observed_bytes = "PROJECT-ONE\nPROJECT-TWO\n".len,
+        } },
+    };
+    defer snapshot.deinit(alloc);
+    var limits = context_limits.Values{};
+    limits.project_instruction_file_bytes = .{ .value = .{ .bytes = 12 }, .source = .user_workspace };
+
+    var context = try selectProjectContext(alloc, .{
+        .workspace_root = "/workspace",
+        .targets = &.{},
+        .home = "/home/visitor",
+        .host_instructions = &snapshot,
+        .initial = true,
+        .load_project_instruction_files = false,
+        .context_limits = limits,
+    });
+    defer context.deinit(alloc);
+
+    const visible = context.modelVisibleBytes();
+    const global_index = std.mem.indexOf(u8, visible, "GLOBAL-ONE") orelse return error.TestExpectedEqual;
+    const project_index = std.mem.indexOf(u8, visible, "PROJECT-ONE") orelse return error.TestExpectedEqual;
+    try std.testing.expect(global_index < project_index);
+    try std.testing.expect(std.mem.find(u8, visible, "GLOBAL-TWO") == null);
+    try std.testing.expect(std.mem.find(u8, visible, "PROJECT-TWO") == null);
+    try std.testing.expect(std.mem.find(u8, visible, "from=\"/home/visitor/.fx/AGENTS.md\"") != null);
+    try std.testing.expect(std.mem.find(u8, visible, "from=\"/workspace/AGENTS.md\"") != null);
+    try std.testing.expectEqual(@as(usize, 2), context.delivered_sources.len);
+    try std.testing.expectEqual(@as(usize, 2), context.notices.len);
+    try std.testing.expect(std.mem.find(u8, visible, "project_instruction_file_bytes") != null);
+}
+
+test "browser workspace without instruction capability reports explicit omissions" {
+    const alloc = std.testing.allocator;
+    const snapshot = js_host_workspace.InstructionSnapshot{};
+    var context = try selectProjectContext(alloc, .{
+        .workspace_root = "/workspace",
+        .targets = &.{},
+        .home = "/workspace",
+        .host_instructions = &snapshot,
+        .initial = true,
+        .load_project_instruction_files = false,
+    });
+    defer context.deinit(alloc);
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        std.mem.count(u8, context.modelVisibleBytes(), "reason=\"unreadable rule file\""),
+    );
+    try std.testing.expectEqual(@as(usize, 0), context.delivered_sources.len);
+    try std.testing.expectEqual(@as(usize, 2), context.notices.len);
 }
 
 test "hosts without instruction files keep client omissions and skip home probes" {
