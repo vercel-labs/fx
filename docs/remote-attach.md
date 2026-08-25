@@ -1,12 +1,12 @@
 # Semantic remote attachment
 
-fx can keep an agent session resident on one machine while another fx process presents and controls it. Attachment carries structured conversation and runtime information. It does not carry terminal bytes, ANSI output, a terminal grid, cursor state, resize events, or a hosted shell.
+fx can keep an agent session resident on one machine while another fx process presents and controls it. Attachment carries structured conversation and runtime information. An interactive client renders its own terminal UI from that semantic state; the connection does not carry terminal bytes, ANSI output, a terminal grid, cursor state, resize events, or a hosted shell.
 
 ## Ownership model
 
 `fx serve` owns the workspace, credentials, tools, provider requests, permission policy, and writable session store. Each active session has one resident agent actor using the same ACP prompt and tool execution path as `fx acp`. The actor remains alive when presentation connections detach.
 
-`fx attach` owns only its connection, decoded snapshot and events, local input, and append-only presentation. It does not open the remote session store. A server permits multiple observers and one controller per session. Each attachment receives a new random ID. A controller lease is fenced by a monotonically changing control epoch, so requests from a detached or replaced controller fail before mutation.
+`fx attach` owns only its connection, ephemeral decoded projection, local terminal UI and input. It does not open the remote session store. With terminal stdin and stdout it uses the normal inline fx conversation presentation; redirected streams retain a plain append-only presentation for automation. A server permits multiple observers, one local Unix primary presentation, and one transient parent controller per session. Each attachment receives a new random ID. The effective controller lease is fenced by a monotonically changing control epoch, so requests from a detached or replaced controller fail before mutation. A parent controller takes authority from the primary while connected; detach or wire loss returns authority to the primary.
 
 ## Local usage
 
@@ -23,19 +23,25 @@ install -d -m 700 /tmp/fx-agent-$UID
 fx serve --listen unix:///tmp/fx-agent-$UID/agent.sock
 ```
 
-Attach to an existing saved session:
+Keep a child presentation connected with fallback control:
+
+```sh
+fx attach unix:///tmp/fx-agent-$UID/agent.sock --session <session-id> --primary
+```
+
+Attach from the parent to take control until it disconnects:
 
 ```sh
 fx attach unix:///tmp/fx-agent-$UID/agent.sock --session <session-id>
 ```
 
-Attach read-only:
+`--primary` is accepted only on the same-user Unix transport. Attach permanently read-only:
 
 ```sh
 fx attach unix:///tmp/fx-agent-$UID/agent.sock --session <session-id> --observe
 ```
 
-Ordinary input lines submit prompts. The first presentation supports:
+In the inline conversation UI, edit a prompt and press Enter to submit it. A primary child becomes read-only while a parent controls the session and regains its preserved draft when the parent disconnects. Left/Right arrows, Home, End, Delete, Backspace, Ctrl+A, Ctrl+E, and Ctrl+U edit the composer. Bracketed multiline paste stays in the composer until Enter submits the complete prompt. Ctrl+C aborts active work and detaches while idle. The presentation supports:
 
 - `/abort`
 - `/allow`
@@ -46,7 +52,7 @@ Ordinary input lines submit prompts. The first presentation supports:
 - `/mode <id>`
 - `/detach`
 
-EOF and `/detach` release only the presentation. Already accepted work continues in the server. Model and mode changes are accepted only while the resident session is idle, so a configuration request cannot wait behind active provider work.
+`/allow`, `/always`, and `/deny` are available only for a pending permission request. Elicitations accept `/respond <json>` instead. EOF, Ctrl+D on an empty composer, and `/detach` release only the presentation. Already accepted work continues in the server. The UI redraws from its bounded semantic projection when the terminal resizes and restores terminal modes when it exits while leaving the inline conversation in scrollback. Read-only attachments hide the composer and accept only q, Ctrl+D, Ctrl+C, or EOF to detach locally. Model and mode changes are accepted only while the resident session is idle, so a configuration request cannot wait behind active provider work.
 
 ## Protocol
 
@@ -65,7 +71,7 @@ Standard ACP update objects remain the semantic event vocabulary. Attachment lif
 
 `fx/attach` registers the connection before capturing a snapshot. It returns an authoritative snapshot at revision R, then the server flushes events buffered after R before entering live delivery. Each live `fx/event` carries its revision and a complete nested ACP notification or request.
 
-The snapshot includes structured history, the current assistant partial, tool records and their latest progress or result, run state, configuration, pending permission or elicitation, operation status, and the controller fence. Durable execution history is projected as structured ACP tool records for remote actors instead of relying only on flattened transcript prose.
+The snapshot includes structured history, the current assistant partial, tool records and their latest progress or result, run state, configuration, pending permission or elicitation, operation status, and the current primary/controller lease. Revisioned `fx/control_changed` events transfer authority without rebuilding transcript state or clearing a primary draft. Durable execution history is projected as structured ACP tool records for remote actors instead of relying only on flattened transcript prose.
 
 Prompts use caller-generated operation IDs. Repeating the same ID with the same prompt returns the existing operation without another provider request. Reusing the ID with different content is rejected. `fx/operation/inspect` reconciles a result when the original response was lost.
 
@@ -117,13 +123,13 @@ Serve capabilities authorize actions and resources but do not uniquely identify 
 The first vertical slice is covered by deterministic tests and built-binary probes:
 
 - `zig fmt --check src/` and `zig build -Doptimize=ReleaseSafe`
-- focused Zig tests for capability parsing, allocation cleanup, attachment fencing, atomic snapshot registration, UTF-8-safe chunk reassembly, frame and queue limits, operation eviction, connection and host-shutdown ownership, configuration shutdown, projection exhaustion, semantic sanitization, and client protocol failures
-- `bun test --max-concurrency 1 remote-attach.test.ts`: six tests covering 195 assertions
-- built-binary Unix create, serve, attach, detach, restart, and sole-writer contention
+- focused Zig tests for capability parsing, allocation cleanup, attachment fencing, atomic snapshot registration, UTF-8-safe chunk reassembly, frame and queue limits, operation eviction, connection and host-shutdown ownership, configuration shutdown, projection exhaustion, client revision fencing, composer editing, wrapping, semantic sanitization, and protocol failures
+- `bun test --max-concurrency 1 remote-attach.test.ts`: protocol scenarios plus a real tmux TTY conversation flow
+- built-binary Unix create, serve, interactive prompt, resize, attach, detach, restart, and sole-writer contention
 - built-binary WebSocket capability rejection and authorization through a deterministic capability-injecting loopback proxy
 - an actual Tailscale Serve HTTPS/WSS negative probe, which rejected a caller lacking the configured app grant with `WebSocketUpgradeRejected`; no tailnet policy was modified to manufacture a positive grant
 
-The end-to-end scenarios attach before and during work, preserve a held assistant partial and pending tool permission across detach, reconcile a lost prompt response by operation ID with one provider request, reject stale attachment IDs and epochs, reject observer mutations, and verify that a presentation process with an empty HOME creates no session store. Exact-commit Full CI across supported Linux and macOS runners remains the release authority.
+The end-to-end scenarios attach before and during work, preserve a held assistant partial and pending tool permission across detach, reconcile a lost prompt response by operation ID with one provider request, reject stale attachment IDs and epochs, reject observer mutations, type and edit a prompt while TTY stdin remains open, redraw after resize, restore the terminal on detach, and verify that a presentation process with an empty HOME creates no session store. Exact-commit Full CI across supported Linux and macOS runners remains the release authority.
 
 ## Security and lifecycle limitations
 

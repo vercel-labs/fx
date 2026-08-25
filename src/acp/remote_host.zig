@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const acp_server = @import("server.zig");
 const acp_types = @import("types.zig");
 const jsonrpc = @import("jsonrpc.zig");
+const prompt_projection = @import("prompt_projection.zig");
 const contracts = @import("../core/remote/contracts.zig");
 const endpoint_mod = @import("../core/remote/endpoint.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -566,7 +567,8 @@ const Actor = struct {
     stopping: bool = false,
     revision: u64 = 0,
     control_epoch: u64 = 0,
-    controller_id: ?[32]u8 = null,
+    primary_id: ?[32]u8 = null,
+    takeover_id: ?[32]u8 = null,
     projection: Projection = .{},
     attachments: [contracts.max_attachments_per_actor]?*Attachment = @splat(null),
     operations: std.ArrayList(contracts.OperationRecord) = .empty,
@@ -861,6 +863,16 @@ const Actor = struct {
         }
     }
 
+    fn publishUserMessage(self: *Actor, text: []const u8) !void {
+        self.revision +|= 1;
+        var event: std.Io.Writer.Allocating = .init(self.alloc);
+        defer event.deinit();
+        try event.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"update\":{\"sessionUpdate\":\"user_message_chunk\",\"content\":{\"type\":\"text\",\"text\":");
+        try jsonrpc.writeJsonStr(text, &event.writer);
+        try event.writer.writeAll("}}}}");
+        try self.broadcastEvent(event.writer.buffered());
+    }
+
     fn publishRunState(self: *Actor) !void {
         self.revision +|= 1;
         var event: std.Io.Writer.Allocating = .init(self.alloc);
@@ -894,20 +906,74 @@ const Actor = struct {
         return self.attachLocked(queue, role);
     }
 
+    fn effectiveControllerId(self: *const Actor) ?[32]u8 {
+        return self.takeover_id orelse self.primary_id;
+    }
+
+    fn writeOptionalAttachmentId(writer: *std.Io.Writer, id: ?[32]u8) !void {
+        if (id) |value| try jsonrpc.writeJsonStr(&value, writer) else try writer.writeAll("null");
+    }
+
+    fn failControlPublication(self: *Actor, skip: ?*Attachment) void {
+        for (self.attachments) |maybe_attachment| {
+            const target = maybe_attachment orelse continue;
+            if (skip != null and target == skip.?) continue;
+            target.queue.close();
+            target.queue.interruptOwner();
+        }
+    }
+
+    fn publishControlState(self: *Actor, skip: ?*Attachment) !void {
+        self.revision +|= 1;
+        var event: std.Io.Writer.Allocating = .init(self.alloc);
+        defer event.deinit();
+        try event.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"fx/control_changed\",\"params\":{\"controlEpoch\":");
+        try event.writer.print("{d},\"controllerAttachmentId\":", .{self.control_epoch});
+        try writeOptionalAttachmentId(&event.writer, self.effectiveControllerId());
+        try event.writer.writeAll(",\"primaryAttachmentId\":");
+        try writeOptionalAttachmentId(&event.writer, self.primary_id);
+        try event.writer.writeAll("}}");
+        for (self.attachments) |maybe_attachment| {
+            const target = maybe_attachment orelse continue;
+            if (skip != null and target == skip.?) continue;
+            var out: std.Io.Writer.Allocating = .init(self.alloc);
+            defer out.deinit();
+            try out.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"fx/event\",\"params\":{\"attachmentId\":");
+            try jsonrpc.writeJsonStr(target.idSlice(), &out.writer);
+            try out.writer.print(",\"revision\":{d},\"event\":", .{self.revision});
+            try out.writer.writeAll(event.writer.buffered());
+            try out.writer.writeAll("}}\n");
+            target.enqueue(self.alloc, out.writer.buffered()) catch {
+                target.queue.close();
+                target.queue.interruptOwner();
+            };
+        }
+    }
+
     fn attachLocked(self: *Actor, queue: *OutboundQueue, role: contracts.Role) !*Attachment {
         if (self.stopping) return error.ActorStopping;
         if (!self.projection.complete) return error.ProjectionUnavailable;
-        if (role == .controller and self.controller_id != null) return error.ControllerBusy;
+        if (role == .primary and self.primary_id != null) return error.PrimaryBusy;
+        if (role == .controller and self.takeover_id != null) return error.ControllerBusy;
         const slot = for (&self.attachments) |*entry| {
             if (entry.* == null) break entry;
         } else return error.AttachmentCapacityExceeded;
         var id_buffer: [32]u8 = undefined;
         _ = try contracts.randomId(io_mod.getIo(), &id_buffer);
         const attachment = try self.alloc.create(Attachment);
-        if (role == .controller) {
-            self.control_epoch +|= 1;
-            self.controller_id = id_buffer;
+        var control_changed = false;
+        switch (role) {
+            .observer => {},
+            .primary => {
+                self.primary_id = id_buffer;
+                control_changed = true;
+            },
+            .controller => {
+                self.takeover_id = id_buffer;
+                control_changed = true;
+            },
         }
+        if (control_changed) self.control_epoch +|= 1;
         attachment.* = .{
             .id = id_buffer,
             .role = role,
@@ -915,6 +981,13 @@ const Actor = struct {
             .queue = queue,
         };
         slot.* = attachment;
+        if (control_changed) self.publishControlState(attachment) catch {
+            // The state and attachment are already committed. Existing clients
+            // cannot safely continue across the missing revision, so fail them
+            // closed while the new attachment receives the same state in its
+            // authoritative snapshot.
+            self.failControlPublication(attachment);
+        };
         return attachment;
     }
 
@@ -927,11 +1000,18 @@ const Actor = struct {
                 break;
             }
         }
-        if (self.controller_id) |controller_id| {
-            if (std.mem.eql(u8, &controller_id, attachment.idSlice())) {
-                self.controller_id = null;
-                self.control_epoch +|= 1;
-            }
+        var control_changed = false;
+        if (self.primary_id) |primary_id| if (std.mem.eql(u8, &primary_id, attachment.idSlice())) {
+            self.primary_id = null;
+            control_changed = true;
+        };
+        if (self.takeover_id) |takeover_id| if (std.mem.eql(u8, &takeover_id, attachment.idSlice())) {
+            self.takeover_id = null;
+            control_changed = true;
+        };
+        if (control_changed) {
+            self.control_epoch +|= 1;
+            self.publishControlState(null) catch self.failControlPublication(null);
         }
         self.changed.broadcast(io);
         self.mutex.unlock(io);
@@ -941,9 +1021,9 @@ const Actor = struct {
 
     fn validateController(self: *Actor, attachment: *Attachment, attachment_id: []const u8, epoch: u64) !void {
         if (!std.mem.eql(u8, attachment.idSlice(), attachment_id)) return error.StaleAttachment;
-        if (attachment.role != .controller) return error.NotController;
-        if (epoch != attachment.control_epoch or epoch != self.control_epoch) return error.StaleControlEpoch;
-        const current = self.controller_id orelse return error.NotController;
+        if (attachment.role == .observer) return error.NotController;
+        if (epoch != self.control_epoch) return error.StaleControlEpoch;
+        const current = self.effectiveControllerId() orelse return error.NotController;
         if (!std.mem.eql(u8, &current, attachment.idSlice())) return error.NotController;
     }
 
@@ -970,7 +1050,8 @@ const Actor = struct {
         epoch: u64,
         operation_id: []const u8,
         prompt_value: std.json.Value,
-    ) !struct { replayed: bool, operation: contracts.OperationRecord } {
+        operation_writer: *std.Io.Writer,
+    ) !bool {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -986,7 +1067,8 @@ const Actor = struct {
         for (self.operations.items) |operation| {
             if (!std.mem.eql(u8, operation.id, operation_id)) continue;
             if (!std.mem.eql(u8, &operation.payload_digest, &digest)) return error.OperationIdConflict;
-            return .{ .replayed = true, .operation = operation };
+            try self.writeOperationJson(operation_writer, operation);
+            return true;
         }
         if (self.active_operation_internal_id != null) return error.PromptAlreadyActive;
         if (self.operations.items.len >= contracts.max_operations_per_actor) try self.evictOldestTerminalOperation();
@@ -1002,6 +1084,7 @@ const Actor = struct {
         };
         var operation_added = true;
         var history_added = false;
+        var accepted_prompt_text: ?[]const u8 = null;
         var route_added = false;
         errdefer {
             if (route_added) _ = self.pending_routes.pop();
@@ -1016,14 +1099,15 @@ const Actor = struct {
             self.active_operation_internal_id = null;
             self.projection.run_state = .idle;
         }
-        if (promptText(prompt_value)) |text| {
-            const owned_text = try contracts.sanitizeSemanticAlloc(self.alloc, text);
-            self.projection.history.append(self.alloc, .{ .role = .user, .text = owned_text }) catch |err| {
-                self.alloc.free(owned_text);
-                return err;
-            };
-            history_added = true;
-        }
+        const projected_text = try prompt_projection.project_text_alloc(self.alloc, prompt_value);
+        defer self.alloc.free(projected_text);
+        const owned_text = try contracts.sanitizeSemanticAlloc(self.alloc, projected_text);
+        self.projection.history.append(self.alloc, .{ .role = .user, .text = owned_text }) catch |err| {
+            self.alloc.free(owned_text);
+            return err;
+        };
+        history_added = true;
+        accepted_prompt_text = owned_text;
         const internal_id = self.next_internal_id;
         self.next_internal_id +|= 1;
         try self.pending_routes.append(self.alloc, .{ .internal_id = internal_id, .operation_index = operation_index });
@@ -1038,11 +1122,13 @@ const Actor = struct {
         try request.writer.writeAll(prompt_json.writer.buffered());
         try request.writer.writeAll("}}\n");
         try self.sendRaw(request.writer.buffered());
+        try self.writeOperationJson(operation_writer, self.operations.items[operation_index]);
         operation_added = false;
         history_added = false;
         route_added = false;
+        if (accepted_prompt_text) |text| try self.publishUserMessage(text);
         try self.publishRunState();
-        return .{ .replayed = false, .operation = self.operations.items[operation_index] };
+        return false;
     }
 
     fn abort(self: *Actor, attachment: *Attachment, attachment_id: []const u8, epoch: u64) !void {
@@ -1138,13 +1224,6 @@ const Actor = struct {
         if (!waiter.succeeded) return error.ConfigurationRejected;
     }
 
-    fn promptText(value: std.json.Value) ?[]const u8 {
-        if (value != .array or value.array.items.len == 0) return null;
-        const first = value.array.items[0];
-        if (first != .object) return null;
-        return Projection.stringField(first, "text");
-    }
-
     fn writeSnapshotJson(self: *Actor, writer: *std.Io.Writer, snapshot_id: []const u8) !void {
         if (!self.projection.complete) return error.ProjectionUnavailable;
         try writer.writeAll("{\"schemaVersion\":1,\"snapshotId\":");
@@ -1153,7 +1232,12 @@ const Actor = struct {
         try jsonrpc.writeJsonStr(self.session_id, writer);
         try writer.print(",\"revision\":{d},\"runState\":", .{self.revision});
         try jsonrpc.writeJsonStr(@tagName(self.projection.run_state), writer);
-        try writer.writeAll(",\"history\":[");
+        try writer.writeAll(",\"control\":{\"controlEpoch\":");
+        try writer.print("{d},\"controllerAttachmentId\":", .{self.control_epoch});
+        try writeOptionalAttachmentId(writer, self.effectiveControllerId());
+        try writer.writeAll(",\"primaryAttachmentId\":");
+        try writeOptionalAttachmentId(writer, self.primary_id);
+        try writer.writeAll("},\"history\":[");
         for (self.projection.history.items, 0..) |item, index| {
             if (index > 0) try writer.writeByte(',');
             try writer.writeAll("{\"role\":");
@@ -1372,14 +1456,16 @@ const Connection = struct {
     actor: ?*Actor = null,
     attachment: ?*Attachment = null,
     pending_snapshot: bool = false,
+    allow_primary: bool = false,
 
-    fn run(alloc: Allocator, host: *Host, wire: Wire, principal: contracts.Principal, task_token: *?TaskToken) !void {
+    fn run(alloc: Allocator, host: *Host, wire: Wire, principal: contracts.Principal, allow_primary: bool, task_token: *?TaskToken) !void {
         var connection = Connection{
             .alloc = alloc,
             .host = host,
             .wire = wire,
             .principal = principal,
             .queue = OutboundQueue.init(alloc),
+            .allow_primary = allow_primary,
             .writer = undefined,
         };
         connection.queue.overflow_context = &connection;
@@ -1484,6 +1570,7 @@ const Connection = struct {
         const session_id = Projection.stringField(parsed.value, "sessionId") orelse return self.invalidMutation(id, error.InvalidParams);
         const role_name = Projection.stringField(parsed.value, "role") orelse "controller";
         const role = contracts.Role.parse(role_name) orelse return self.invalidMutation(id, error.InvalidParams);
+        if (role == .primary and !self.allow_primary) return self.writer.writeError(self.alloc, id, .{ .code = jsonrpc.ErrorCode.invalid_request, .message = "Primary attachment requires a local Unix endpoint" });
         if (!self.principal.authorizes(role, session_id)) return self.writer.writeError(self.alloc, id, .{ .code = jsonrpc.ErrorCode.invalid_request, .message = "Not authorized" });
         const actor = self.host.actor(session_id) catch return self.writer.writeError(self.alloc, id, .{ .code = jsonrpc.ErrorCode.invalid_params, .message = "Session unavailable" });
         const io = io_mod.getIo();
@@ -1495,7 +1582,7 @@ const Connection = struct {
         const attachment = actor.attachLocked(&self.queue, role) catch |err| {
             return self.writer.writeError(self.alloc, id, .{
                 .code = jsonrpc.ErrorCode.invalid_request,
-                .message = if (err == error.ControllerBusy) "Controller already attached" else "Attachment unavailable",
+                .message = if (err == error.ControllerBusy) "Controller already attached" else if (err == error.PrimaryBusy) "Primary attachment already connected" else "Attachment unavailable",
             });
         };
         var attached = true;
@@ -1509,6 +1596,9 @@ const Connection = struct {
         try actor.writeSnapshotJson(&snapshot.writer, attachment.idSlice());
         if (snapshot.writer.buffered().len > contracts.max_snapshot_bytes) return error.SnapshotTooLarge;
         const snapshot_revision = actor.revision;
+        const snapshot_control_epoch = actor.control_epoch;
+        const snapshot_controller_id = actor.effectiveControllerId();
+        const snapshot_primary_id = actor.primary_id;
         actor.mutex.unlock(io);
         actor_locked = false;
 
@@ -1518,7 +1608,11 @@ const Connection = struct {
         try jsonrpc.writeJsonStr(attachment.idSlice(), &result.writer);
         try result.writer.writeAll(",\"role\":");
         try jsonrpc.writeJsonStr(@tagName(role), &result.writer);
-        try result.writer.print(",\"controlEpoch\":{d},", .{attachment.control_epoch});
+        try result.writer.print(",\"controlEpoch\":{d},\"controllerAttachmentId\":", .{snapshot_control_epoch});
+        try Actor.writeOptionalAttachmentId(&result.writer, snapshot_controller_id);
+        try result.writer.writeAll(",\"primaryAttachmentId\":");
+        try Actor.writeOptionalAttachmentId(&result.writer, snapshot_primary_id);
+        try result.writer.writeByte(',');
         const chunked = snapshot.writer.buffered().len > contracts.max_frame_bytes - 2048;
         if (chunked) {
             const chunk_count = std.math.divCeil(usize, snapshot.writer.buffered().len, contracts.snapshot_chunk_bytes) catch unreachable;
@@ -1595,11 +1689,13 @@ const Connection = struct {
         const mutation = mutationFields(parsed.value) catch return self.invalidMutation(id, error.InvalidParams);
         const operation_id = Projection.stringField(parsed.value, "operationId") orelse return self.invalidMutation(id, error.InvalidParams);
         const prompt = parsed.value.object.get("prompt") orelse return self.invalidMutation(id, error.InvalidParams);
-        const outcome = actor.beginPrompt(attachment, mutation.attachment_id, mutation.epoch, operation_id, prompt) catch |err| return self.invalidMutation(id, err);
+        var operation: std.Io.Writer.Allocating = .init(self.alloc);
+        defer operation.deinit();
+        const replayed = actor.beginPrompt(attachment, mutation.attachment_id, mutation.epoch, operation_id, prompt, &operation.writer) catch |err| return self.invalidMutation(id, err);
         var result: std.Io.Writer.Allocating = .init(self.alloc);
         defer result.deinit();
-        try result.writer.print("{{\"replayed\":{s},\"operation\":", .{if (outcome.replayed) "true" else "false"});
-        try actor.writeOperationJson(&result.writer, outcome.operation);
+        try result.writer.print("{{\"replayed\":{s},\"operation\":", .{if (replayed) "true" else "false"});
+        try result.writer.writeAll(operation.writer.buffered());
         try result.writer.writeByte('}');
         try self.writer.writeResponse(self.alloc, id, result.writer.buffered());
     }
@@ -1685,7 +1781,9 @@ const Connection = struct {
         try jsonrpc.writeJsonStr(attachment.idSlice(), &result.writer);
         try result.writer.writeAll(",\"role\":");
         try jsonrpc.writeJsonStr(@tagName(attachment.role), &result.writer);
-        try result.writer.print(",\"controlEpoch\":{d},\"revision\":{d},\"runState\":", .{ attachment.control_epoch, actor.revision });
+        try result.writer.print(",\"controlEpoch\":{d},\"controllerAttachmentId\":", .{actor.control_epoch});
+        try Actor.writeOptionalAttachmentId(&result.writer, actor.effectiveControllerId());
+        try result.writer.print(",\"revision\":{d},\"runState\":", .{actor.revision});
         try jsonrpc.writeJsonStr(@tagName(actor.projection.run_state), &result.writer);
         try result.writer.writeByte('}');
         try self.writer.writeResponse(self.alloc, id, result.writer.buffered());
@@ -1831,7 +1929,7 @@ const UnixTask = struct {
             wire_state.wire().close();
             return;
         };
-        Connection.run(self.alloc, self.host, wire_state.wire(), principal, &self.task_token) catch {};
+        Connection.run(self.alloc, self.host, wire_state.wire(), principal, true, &self.task_token) catch {};
     }
 };
 
@@ -2104,7 +2202,7 @@ const WebSocketTask = struct {
         try websocket.flush();
         var wire_state = WebSocketWire{ .stream = self.stream, .websocket = websocket };
         principal_owned = false;
-        Connection.run(self.alloc, self.host, wire_state.wire(), principal, &self.task_token) catch {};
+        Connection.run(self.alloc, self.host, wire_state.wire(), principal, false, &self.task_token) catch {};
     }
 
     fn validWebSocketKey(key: []const u8) bool {
@@ -2290,6 +2388,176 @@ test "slow attachment overflow does not harm another observer or actor" {
     const delivered = healthy_queue.take().?;
     defer alloc.free(delivered);
     try std.testing.expect(std.mem.find(u8, delivered, "test/event") != null);
+}
+
+test "primary control yields to takeover and returns after detach" {
+    const alloc = std.testing.allocator;
+    var actor = Actor{
+        .alloc = alloc,
+        .cfg = undefined,
+        .session_id = try alloc.dupe(u8, "session"),
+        .pipe = BytePipe.init(alloc),
+    };
+    defer {
+        actor.projection.deinit(alloc);
+        actor.operations.deinit(alloc);
+        actor.pending_routes.deinit(alloc);
+        actor.pipe.deinit();
+        alloc.free(actor.session_id);
+    }
+    var primary_queue = OutboundQueue.init(alloc);
+    defer primary_queue.deinit();
+    var takeover_queue = OutboundQueue.init(alloc);
+    defer takeover_queue.deinit();
+
+    const primary = try actor.attachLocked(&primary_queue, .primary);
+    primary.buffering = false;
+    const primary_epoch = actor.control_epoch;
+    try actor.validateController(primary, primary.idSlice(), primary_epoch);
+
+    const takeover = try actor.attachLocked(&takeover_queue, .controller);
+    takeover.buffering = false;
+    try std.testing.expect(actor.control_epoch > primary_epoch);
+    try std.testing.expectError(
+        error.NotController,
+        actor.validateController(primary, primary.idSlice(), actor.control_epoch),
+    );
+    try actor.validateController(takeover, takeover.idSlice(), actor.control_epoch);
+    try std.testing.expect(primary_queue.messages.items.len > 0);
+    try std.testing.expect(std.mem.find(u8, primary_queue.messages.items[primary_queue.messages.items.len - 1], "fx/control_changed") != null);
+
+    actor.detach(takeover);
+    try actor.validateController(primary, primary.idSlice(), actor.control_epoch);
+    try std.testing.expect(std.mem.find(u8, primary_queue.messages.items[primary_queue.messages.items.len - 1], "fx/control_changed") != null);
+    actor.detach(primary);
+}
+
+test "control publication failure closes clients that can miss the revision" {
+    const alloc = std.testing.allocator;
+    var actor = Actor{
+        .alloc = alloc,
+        .cfg = undefined,
+        .session_id = try alloc.dupe(u8, "session"),
+        .pipe = BytePipe.init(alloc),
+    };
+    defer {
+        actor.projection.deinit(alloc);
+        actor.operations.deinit(alloc);
+        actor.pending_routes.deinit(alloc);
+        actor.pipe.deinit();
+        alloc.free(actor.session_id);
+    }
+    var observer_queue = OutboundQueue.init(alloc);
+    defer observer_queue.deinit();
+    var primary_queue = OutboundQueue.init(alloc);
+    defer primary_queue.deinit();
+    const observer = try actor.attachLocked(&observer_queue, .observer);
+    const primary = try actor.attachLocked(&primary_queue, .primary);
+
+    actor.failControlPublication(primary);
+    try std.testing.expect(observer_queue.closed);
+    try std.testing.expect(!primary_queue.closed);
+
+    actor.detach(primary);
+    actor.detach(observer);
+}
+
+test "accepted prompt projects canonical text once across idempotent replay" {
+    const alloc = std.testing.allocator;
+    var actor = Actor{
+        .alloc = alloc,
+        .cfg = undefined,
+        .session_id = try alloc.dupe(u8, "session"),
+        .pipe = BytePipe.init(alloc),
+    };
+    defer {
+        actor.projection.deinit(alloc);
+        for (actor.operations.items) |*operation| operation.deinit(alloc);
+        actor.operations.deinit(alloc);
+        actor.pending_routes.deinit(alloc);
+        actor.pipe.deinit();
+        alloc.free(actor.session_id);
+    }
+    var queue = OutboundQueue.init(alloc);
+    defer queue.deinit();
+    const controller = try actor.attachLocked(&queue, .controller);
+    defer actor.detach(controller);
+    controller.buffering = false;
+
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "[{\"type\":\"resource\",\"resource\":{\"uri\":\"https://example.com/context.md\",\"text\":\"context\"}},{\"type\":\"text\",\"text\":\"first\"},{\"type\":\"text\",\"text\":\"second\"}]",
+        .{},
+    );
+    defer parsed.deinit();
+    var first_operation: std.Io.Writer.Allocating = .init(alloc);
+    defer first_operation.deinit();
+    const first_replayed = try actor.beginPrompt(
+        controller,
+        controller.idSlice(),
+        controller.control_epoch,
+        "operation-1",
+        parsed.value,
+        &first_operation.writer,
+    );
+    try std.testing.expect(!first_replayed);
+    try std.testing.expect(std.mem.find(u8, first_operation.writer.buffered(), "\"operationId\":\"operation-1\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), actor.projection.history.items.len);
+    try std.testing.expectEqualStrings(
+        "File: https://example.com/context.md\ncontext\nfirst\nsecond",
+        actor.projection.history.items[0].text,
+    );
+
+    var user_events: usize = 0;
+    for (queue.messages.items) |message| {
+        if (std.mem.find(u8, message, "user_message_chunk") != null) user_events += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), user_events);
+    const messages_before_replay = queue.messages.items.len;
+
+    var replay_operation: std.Io.Writer.Allocating = .init(alloc);
+    defer replay_operation.deinit();
+    const replayed = try actor.beginPrompt(
+        controller,
+        controller.idSlice(),
+        controller.control_epoch,
+        "operation-1",
+        parsed.value,
+        &replay_operation.writer,
+    );
+    try std.testing.expect(replayed);
+    try std.testing.expectEqualStrings(first_operation.writer.buffered(), replay_operation.writer.buffered());
+    try std.testing.expectEqual(@as(usize, 1), actor.projection.history.items.len);
+    try std.testing.expectEqual(messages_before_replay, queue.messages.items.len);
+
+    // A replay response owns its serialized bytes before the actor unlocks.
+    // Filling and then evicting the source record cannot invalidate the reply.
+    actor.operations.items[0].state = .completed;
+    actor.pending_routes.clearRetainingCapacity();
+    actor.active_operation_internal_id = null;
+    for (1..contracts.max_operations_per_actor) |index| {
+        const operation_id = try std.fmt.allocPrint(alloc, "terminal-{d}", .{index});
+        try actor.operations.append(alloc, .{
+            .id = operation_id,
+            .payload_digest = @splat(0),
+            .state = .completed,
+        });
+    }
+    var capacity_replay: std.Io.Writer.Allocating = .init(alloc);
+    defer capacity_replay.deinit();
+    try std.testing.expect(try actor.beginPrompt(
+        controller,
+        controller.idSlice(),
+        actor.control_epoch,
+        "operation-1",
+        parsed.value,
+        &capacity_replay.writer,
+    ));
+    try std.testing.expectEqual(contracts.max_operations_per_actor, actor.operations.items.len);
+    try actor.evictOldestTerminalOperation();
+    try std.testing.expect(std.mem.find(u8, capacity_replay.writer.buffered(), "\"operationId\":\"operation-1\"") != null);
+    try std.testing.expect(!std.mem.eql(u8, actor.operations.items[0].id, "operation-1"));
 }
 
 test "projection and nested event serialization strip terminal controls" {

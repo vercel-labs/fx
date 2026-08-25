@@ -111,11 +111,14 @@ Run the agent and tools on one machine while another fx process presents the str
 # Remote workspace owner
 fx serve
 
-# Presentation client
+# Persistent child presentation with fallback control
+fx attach unix://$HOME/.fx/agent.sock --session <session-id> --primary
+
+# Parent presentation; takes control until it detaches
 fx attach unix://$HOME/.fx/agent.sock --session <session-id>
 ```
 
-Detaching leaves accepted work running in the server. The client receives semantic history, assistant updates, tool progress, status, and permission requests rather than terminal output. WebSocket attachment can be exposed through a loopback-only Tailscale Serve backend with app-capability authorization. See [Semantic remote attachment](docs/remote-attach.md) for lifecycle, protocol, deployment, and security details.
+Terminal attachments use fx's normal inline conversation presentation for remote history, live assistant output, tool progress, status, permissions, and the composer. A local Unix `--primary` attachment keeps fallback control: while a parent controller is connected, the child stays live and read-only; parent detach or connection loss restores the child's preserved draft and input authority. The UI redraws locally on resize, and the connection still carries semantic events rather than terminal bytes. Redirected input and output use a plain append-only presentation for automation. Detaching leaves accepted work running in the server. WebSocket attachment can be exposed through a loopback-only Tailscale Serve backend with app-capability authorization. See [Semantic remote attachment](docs/remote-attach.md) for lifecycle, protocol, deployment, and security details.
 
 ## Embed fx
 

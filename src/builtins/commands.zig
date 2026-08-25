@@ -56,13 +56,15 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .attach,
         .token = "attach",
-        .usage = "attach <endpoint> --session <id> [--observe]",
+        .usage = "attach <endpoint> --session <id> [--observe|--primary]",
         .summary = "Attach to a running fx session",
         .options = &.{
             .{ .flag = "--session <id>", .description = "Select the remote session" },
             .{ .flag = "--observe", .description = "Attach without mutation authority" },
+            .{ .flag = "--primary", .description = "Keep local fallback control on a Unix endpoint" },
         },
         .details = &.{
+            "Interactive terminals show a conversation UI; redirected streams use plain semantic output.",
             "The remote fx process owns the workspace, tools, credentials, and session store.",
             "Detach leaves accepted work running on the remote host.",
         },

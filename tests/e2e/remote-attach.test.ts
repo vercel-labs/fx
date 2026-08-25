@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Socket } from "node:net";
@@ -12,13 +12,18 @@ import {
   fakeGatewayToolCall,
   heldFakeGatewayFinalText,
   startFakeGateway,
+  TmuxSession,
+  tmuxAvailable,
 } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
 const children: ChildProcess[] = [];
 const cleanups: Array<() => void> = [];
+const tmuxSessions: TmuxSession[] = [];
+const TMUX_SKIP = !tmuxAvailable();
 
 afterEach(async () => {
+  for (const session of tmuxSessions.splice(0)) await session.kill();
   const running = children.splice(0);
   for (const child of running) if (child.exitCode === null) child.kill("SIGTERM");
   await Bun.sleep(100);
@@ -262,15 +267,33 @@ test("semantic attach detaches without aborting and reconciles idempotently", as
     ...mutation(controller), kind: "mode", value: "ask",
   });
   expect(configured.result.accepted).toBe(true);
-  const prompt = [{ type: "text", text: "Continue \u001b[31mwhile detached" }];
+  const prompt = [
+    {
+      type: "resource",
+      resource: { uri: "https://example.com/context.md", text: "embedded context" },
+    },
+    { type: "text", text: "Continue \u001b[31mwhile detached" },
+    { type: "text", text: "with the complete prompt" },
+  ];
+  const acceptedPromptText = "File: https://example.com/context.md\nembedded context\nContinue [31mwhile detached\nwith the complete prompt";
   const accepted = await controller.client.request("fx/prompt", {
     ...mutation(controller), operationId: "operation-detach-1", prompt,
   });
   expect(accepted.result.operation.state).toBe("running");
+  const isAcceptedUserTurn = (message: any) =>
+    eventMethod(message) === "session/update" &&
+    message.params.event.params?.update?.sessionUpdate === "user_message_chunk";
+  const controllerUserTurn = await controller.client.waitFor(isAcceptedUserTurn);
+  const observerUserTurn = await observer.client.waitFor(isAcceptedUserTurn);
+  expect(controllerUserTurn.params.event.params.update.content.text).toBe(acceptedPromptText);
+  expect(observerUserTurn.params.event.params.update.content.text).toBe(acceptedPromptText);
   await waitFor(() => gateway.requestCount() === 1, "first provider request");
   await Bun.sleep(500);
   const duringRun = await attach(server.socket, sessionId, "observer");
   expect(duringRun.snapshot.runState).toBe("running");
+  expect(duringRun.snapshot.history.filter((item: any) => item.role === "user")).toEqual([
+    { role: "user", text: acceptedPromptText },
+  ]);
   expect(duringRun.snapshot.assistantPartial).toContain("REMOTE_PARTIAL_RUNNING");
 
   const concurrent = await controller.client.request("fx/prompt", {
@@ -290,6 +313,8 @@ test("semantic attach detaches without aborting and reconciles idempotently", as
   });
   expect(replayed.result.replayed).toBe(true);
   expect(gateway.requestCount()).toBe(1);
+  await Bun.sleep(50);
+  expect(controller.client.drain().filter(isAcceptedUserTurn)).toHaveLength(0);
   const conflict = await controller.client.request("fx/prompt", {
     ...mutation(controller), operationId: "operation-detach-1", prompt: [{ type: "text", text: "different" }],
   });
@@ -316,6 +341,7 @@ test("semantic attach detaches without aborting and reconciles idempotently", as
   const observedEvents = [...observer.client.drain(), completion]
     .filter((message: any) => message.method === "fx/event");
   const revisions = observedEvents.map((message: any) => message.params.revision as number);
+  expect(observedEvents.filter(isAcceptedUserTurn)).toHaveLength(0);
   expect(new Set(revisions).size).toBe(revisions.length);
   expect(revisions.every((revision) => revision > 0)).toBe(true);
   expect(JSON.stringify(observedEvents)).not.toContain("\u001b");
@@ -333,7 +359,7 @@ test("semantic attach detaches without aborting and reconciles idempotently", as
   expect(replacement).toBeDefined();
   const snapshot = replacement!.snapshot;
   expect(snapshot.configuration.mode).toBe("ask");
-  expect(snapshot.history.some((item: any) => item.role === "user" && item.text === "Continue [31mwhile detached")).toBe(true);
+  expect(snapshot.history.some((item: any) => item.role === "user" && item.text === acceptedPromptText)).toBe(true);
   expect(snapshot.history.some((item: any) => item.role === "assistant" && item.text.includes("REMOTE_PARTIAL_RUNNING"))).toBe(true);
   expect(snapshot.history.some((item: any) => item.role === "assistant" && item.text.includes("REMOTE_CONTINUED_AFTER_DETACH"))).toBe(true);
   expect(JSON.stringify(snapshot)).not.toContain("\\u001b");
@@ -406,6 +432,467 @@ test("semantic attach detaches without aborting and reconciles idempotently", as
   )).toBe(true);
   afterRestart.client.close();
   expect(restarted.stderr()).toBe("");
+}, 60_000);
+
+test("non-TTY attach renders an accepted user turn exactly once", async () => {
+  const root = isolatedRoot("fx-remote-plain-user-turn-");
+  const gateway = startFakeGateway([fakeGatewayFinalText("REMOTE_PLAIN_RESPONSE")]);
+  cleanups.push(() => gateway.stop());
+  const env = gatewayEnv(root, gateway);
+  const sessionId = await createSession(root.workspace, env);
+  const server = await startServer(root, env);
+  const clientHome = join(root.root, "plain-client-home");
+  mkdirSync(clientHome);
+  const presentation = spawn(FX_BIN, ["attach", `unix://${server.socket}`, "--session", sessionId], {
+    cwd: root.workspace,
+    env: { ...env, HOME: clientHome },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  children.push(presentation);
+  let stdout = "";
+  let stderr = "";
+  presentation.stdout!.on("data", (chunk) => stdout += chunk.toString());
+  presentation.stderr!.on("data", (chunk) => stderr += chunk.toString());
+  await waitFor(() => stdout.includes("Attached to"), "plain attach snapshot");
+  presentation.stdin!.write("plain accepted prompt\n");
+  await waitFor(() => stdout.includes("REMOTE_PLAIN_RESPONSE"), "plain attach response");
+  expect(stdout.match(/You: plain accepted prompt/g)).toHaveLength(1);
+  expect(gateway.requestCount()).toBe(1);
+  presentation.stdin!.write("/detach\n");
+  presentation.stdin!.end();
+  expect(await new Promise<number | null>((resolve) => presentation.on("close", resolve))).toBe(0);
+  expect(stderr).toBe("");
+  expect(server.stderr()).toBe("");
+  expect(existsSync(join(clientHome, ".fx", "sessions"))).toBe(false);
+}, 60_000);
+
+test.skipIf(TMUX_SKIP)("interactive attach TUI submits with live stdin, handles permission, redraws, and restores", async () => {
+  const root = isolatedRoot("fx-remote-tui-");
+  const external = join(root.root, "external");
+  const permissionTarget = join(external, "tui-approved.txt");
+  mkdirSync(external);
+  writeFileSync(permissionTarget, "before");
+  writeFileSync(
+    join(root.home, ".fx", "settings.json"),
+    JSON.stringify({ permission: { edit: { [`${external}/**`]: "ask" } } }),
+    { mode: 0o600 },
+  );
+  const gateway = startFakeGateway([
+    fakeGatewayFinalText("REMOTE_TUI_RESPONSE_OK"),
+    fakeGatewayFinalText("REMOTE_TUI_PASTE_OK"),
+    fakeGatewayToolCall("remote_tui_write", "write_file", { path: permissionTarget, content: "approved" }),
+    fakeGatewayFinalText("REMOTE_TUI_PERMISSION_OK"),
+  ]);
+  cleanups.push(() => gateway.stop());
+  const env = { ...gatewayEnv(root, gateway), FX_PERMISSION_MODE: "ask" };
+  const sessionId = await createSession(root.workspace, env);
+  const server = await startServer(root, env);
+  const clientHome = join(root.root, "tui-client-home");
+  mkdirSync(clientHome);
+  const stderrPath = join(root.root, "attach-stderr.log");
+  const restorePath = join(root.root, "attach-restored-termios.log");
+  const statusPath = join(root.root, "attach-status.log");
+  writeFileSync(stderrPath, "");
+
+  const tui = await TmuxSession.create({
+    isolated: true,
+    cmd: `/bin/sh -c '${JSON.stringify(FX_BIN)} attach ${JSON.stringify(`unix://${server.socket}`)} --session ${JSON.stringify(sessionId)}; status=$?; stty -a >${JSON.stringify(restorePath)}; printf "%s\\n" "$status" >${JSON.stringify(statusPath)}; sleep 10; exit $status'`,
+    cwd: root.workspace,
+    env: { ...env, HOME: clientHome, NO_COLOR: "1" },
+    stderrPath,
+    width: 86,
+    height: 24,
+  });
+  tmuxSessions.push(tui);
+  await tui.waitForText(/remote control/, TIMEOUT).catch((cause) => {
+    throw new Error(`${cause instanceof Error ? cause.message : cause}\nstderr:\n${readFileSync(stderrPath, "utf8")}`);
+  });
+  await tui.sendLiteral("remote TUI prompx");
+  await tui.sendKeys("BSpace");
+  await tui.sendLiteral("t");
+  await tui.sendKeys("Enter");
+  const responseGrid = await tui.waitForText("REMOTE_TUI_RESPONSE_OK", TIMEOUT);
+  expect(responseGrid).toContain("┃ remote TUI prompt");
+  expect(gateway.requestCount()).toBe(1);
+  expect(gateway.requests[0]?.body).toContain("remote TUI prompt");
+  expect(gateway.requests[0]?.body).not.toContain("remote TUI prompx");
+
+  const fragmentedPaste = Buffer.from("\u001b[200~remote pasted line 1\u0003\nremote pasted line 2\u0004\u001b[201~");
+  const pasteInjectionLog = join(root.root, "fragmented-paste.log");
+  await tui.sendFragmentedHexBytes(
+    [...fragmentedPaste].map((byte) => byte.toString(16).padStart(2, "0")),
+    2,
+    pasteInjectionLog,
+  );
+  expect(readFileSync(pasteInjectionLog, "utf8")).toContain("delay_before_ms=2");
+  expect(gateway.requestCount()).toBe(1);
+  expect(tui.paneStatus().dead).toBe(false);
+  await tui.sendKeys("Enter");
+  await tui.waitForText("REMOTE_TUI_PASTE_OK", TIMEOUT).catch((cause) => {
+    throw new Error(`${cause instanceof Error ? cause.message : cause}\nstderr:\n${readFileSync(stderrPath, "utf8")}\nstatus: ${JSON.stringify(tui.paneStatus())}`);
+  });
+  expect(gateway.requestCount()).toBe(2);
+  expect(gateway.requests[1]?.body).toContain("remote pasted line 1\\nremote pasted line 2");
+
+  await tui.resizeWindow(54, 2);
+  const tinyGrid = await tui.capturePaneGrid();
+  expect(tinyGrid).toHaveLength(2);
+  expect(tinyGrid.every((line) => line.length <= 54)).toBe(true);
+  await tui.resizeWindow(54, 18);
+  const resized = await tui.waitForText(/remote control/, TIMEOUT).catch((cause) => {
+    throw new Error(`${cause instanceof Error ? cause.message : cause}\nstderr:\n${readFileSync(stderrPath, "utf8")}\nstatus: ${JSON.stringify(tui.paneStatus())}`);
+  });
+  expect(resized).toContain("┃");
+  const resizedScrollback = await tui.captureFullScrollback();
+  expect(resizedScrollback.split("REMOTE_TUI_RESPONSE_OK")).toHaveLength(2);
+  const resizedGrid = await tui.capturePaneGrid();
+  expect(resizedGrid).toHaveLength(18);
+  expect(resizedGrid.every((line) => line.length <= 54)).toBe(true);
+
+  await tui.sendText("Write the TUI-approved file");
+  const pending = await tui.waitForText("Input required", TIMEOUT);
+  expect(pending).toContain("/allow");
+  await tui.resizeWindow(4, 4);
+  const tinyPendingGrid = await tui.capturePaneGrid();
+  expect(tinyPendingGrid).toHaveLength(4);
+  expect(tinyPendingGrid.every((line) => line.length <= 4)).toBe(true);
+  expect(tui.paneStatus().dead).toBe(false);
+  await tui.sendText("/allow");
+  await tui.resizeWindow(54, 18);
+  await tui.waitForText("REMOTE_TUI_PERMISSION_OK", TIMEOUT);
+  await waitFor(
+    () => readFileSync(permissionTarget, "utf8") === "approved",
+    "TUI-approved remote write",
+  );
+  expect(gateway.requestCount()).toBe(4);
+
+  await tui.sendText("/detach");
+  await waitFor(() => existsSync(statusPath) && existsSync(restorePath), "attach terminal restoration");
+  expect(readFileSync(statusPath, "utf8").trim()).toBe("0");
+  const restoredTermios = readFileSync(restorePath, "utf8");
+  expect(restoredTermios).toMatch(/(?:^|[ ;])icanon(?:[ ;]|$)/);
+  expect(restoredTermios).toMatch(/(?:^|[ ;])echo(?:[ ;]|$)/);
+  const restoredGrid = await tui.capturePaneGrid();
+  expect(restoredGrid.join("\n")).not.toContain("fx attach · controller");
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+  expect(server.stderr()).toBe("");
+  expect(existsSync(join(clientHome, ".fx", "sessions"))).toBe(false);
+}, 60_000);
+
+test.skipIf(TMUX_SKIP)("inline attach commits over-height history once across redraw and resize", async () => {
+  const root = isolatedRoot("fx-remote-inline-scrollback-");
+  const answer = `${Array.from({ length: 48 }, (_, index) => `history filler ${index + 1}`).join("\n")}\nFINALIZED_ANSWER_ONCE`;
+  const gateway = startFakeGateway([fakeGatewayFinalText(answer)]);
+  cleanups.push(() => gateway.stop());
+  const env = gatewayEnv(root, gateway);
+  const sessionId = await createSession(root.workspace, env);
+  const server = await startServer(root, env);
+  const stderrPath = join(root.root, "inline-scrollback-stderr.log");
+  const clientHome = join(root.root, "inline-client-home");
+  mkdirSync(clientHome);
+  writeFileSync(stderrPath, "");
+  const tui = await TmuxSession.create({
+    isolated: true,
+    cmd: `${FX_BIN} attach unix://${server.socket} --session ${sessionId}`,
+    cwd: root.workspace,
+    env: { ...env, HOME: clientHome, NO_COLOR: "1" },
+    stderrPath,
+    width: 62,
+    height: 10,
+  });
+  tmuxSessions.push(tui);
+  await tui.waitForText(/remote control/, TIMEOUT);
+  await tui.sendText("FINALIZED_PROMPT_ONCE");
+  await tui.waitForText("FINALIZED_ANSWER_ONCE", TIMEOUT);
+  await waitFor(async () => {
+    const grid = (await tui.capturePaneGrid()).join("\n");
+    return grid.includes("FINALIZED_ANSWER_ONCE") && grid.includes("remote control · idle");
+  }, "finalized inline response");
+  await tui.sendLiteral("mutable draft redraw");
+  await Bun.sleep(100);
+  await tui.resizeWindow(54, 8);
+  await tui.resizeWindow(68, 12);
+  const scrollback = await tui.captureFullScrollback();
+  expect(scrollback.split("FINALIZED_PROMPT_ONCE")).toHaveLength(2);
+  expect(scrollback.split("FINALIZED_ANSWER_ONCE"), scrollback).toHaveLength(2);
+  expect(gateway.requestCount()).toBe(1);
+  expect(tui.paneStatus().dead).toBe(false);
+
+  await tui.sendKeys("C-u");
+  await tui.sendText("/detach");
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+  expect(server.stderr()).toBe("");
+}, 60_000);
+
+test.skipIf(TMUX_SKIP)("streaming partial is erased across resize before exact-once finalization", async () => {
+  const root = isolatedRoot("fx-remote-stream-resize-");
+  const held = heldFakeGatewayFinalText();
+  cleanups.push(() => held.dispose());
+  const gateway = startFakeGateway([() => held.response]);
+  cleanups.push(() => gateway.stop());
+  const env = gatewayEnv(root, gateway);
+  const sessionId = await createSession(root.workspace, env);
+  const server = await startServer(root, env);
+  const stderrPath = join(root.root, "stream-resize-stderr.log");
+  const clientHome = join(root.root, "stream-resize-home");
+  mkdirSync(clientHome);
+  writeFileSync(stderrPath, "");
+  const tui = await TmuxSession.create({
+    isolated: true,
+    cmd: `${FX_BIN} attach unix://${server.socket} --session ${sessionId}`,
+    cwd: root.workspace,
+    env: { ...env, HOME: clientHome, NO_COLOR: "1" },
+    stderrPath,
+    width: 72,
+    height: 18,
+  });
+  tmuxSessions.push(tui);
+  await tui.waitForText(/remote control/, TIMEOUT);
+  await tui.sendText("hold response through resize");
+  await waitFor(() => gateway.requestCount() === 1, "held stream request");
+  held.push(`STREAM_RESIZE_MARKER ${"partial filler ".repeat(8)}\n\n`);
+  await tui.waitForText("STREAM_RESIZE_MARKER", TIMEOUT).catch(async (cause) => {
+    throw new Error(`${cause instanceof Error ? cause.message : cause}\nfull scrollback:\n${await tui.captureFullScrollback()}`);
+  });
+  await tui.resizeWindow(38, 18);
+  await tui.waitForText(/remote control/, TIMEOUT);
+  held.release("STREAM_FINAL_SUFFIX");
+  await tui.waitForText("STREAM_FINAL_SUFFIX", TIMEOUT);
+  await waitFor(async () => (await tui.capturePaneGrid()).join("\n").includes("remote control · idle"), "stream finalization");
+  const scrollback = await tui.captureFullScrollback();
+  expect(scrollback.split("STREAM_RESIZE_MARKER")).toHaveLength(2);
+  expect(scrollback.split("STREAM_FINAL_SUFFIX")).toHaveLength(2);
+  expect(gateway.requestCount()).toBe(1);
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+  expect(server.stderr()).toBe("");
+  await tui.sendText("/detach");
+}, 60_000);
+
+test.skipIf(TMUX_SKIP)("finalized long tool result wraps once in a narrow terminal", async () => {
+  const root = isolatedRoot("fx-remote-long-tool-");
+  const longResultPath = join(root.workspace, "long-tool-result.txt");
+  writeFileSync(longResultPath, `TOOL_RESULT_MARK ${"bounded detail ".repeat(12)}`);
+  const gateway = startFakeGateway([
+    fakeGatewayToolCall("long_result_tool", "read_file", { path: longResultPath }),
+    fakeGatewayFinalText("LONG_TOOL_FINAL_ANSWER"),
+  ]);
+  cleanups.push(() => gateway.stop());
+  const env = { ...gatewayEnv(root, gateway), FX_PERMISSION_MODE: "yolo" };
+  const sessionId = await createSession(root.workspace, env);
+  const server = await startServer(root, env);
+  const stderrPath = join(root.root, "long-tool-stderr.log");
+  const clientHome = join(root.root, "long-tool-home");
+  mkdirSync(clientHome);
+  writeFileSync(stderrPath, "");
+  const tui = await TmuxSession.create({
+    isolated: true,
+    cmd: `${FX_BIN} attach unix://${server.socket} --session ${sessionId}`,
+    cwd: root.workspace,
+    env: { ...env, HOME: clientHome, NO_COLOR: "1" },
+    stderrPath,
+    width: 30,
+    height: 18,
+  });
+  tmuxSessions.push(tui);
+  await tui.waitForText(/remote control/, TIMEOUT);
+  await tui.sendText("read the long tool result");
+  await tui.waitForText("LONG_TOOL_FINAL_ANSWER", TIMEOUT);
+  const scrollback = await tui.captureFullScrollback();
+  expect(scrollback.split("TOOL_RESULT_MARK"), scrollback).toHaveLength(2);
+  expect(scrollback.split("LONG_TOOL_FINAL_ANSWER")).toHaveLength(2);
+  expect((await tui.capturePaneGrid()).every((line) => line.length <= 30)).toBe(true);
+  expect(gateway.requestCount()).toBe(2);
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+  expect(server.stderr()).toBe("");
+  await tui.sendText("/detach");
+}, 60_000);
+
+test.skipIf(TMUX_SKIP)("interactive observer is read-only, clears compact rows, and restores", async () => {
+  const root = isolatedRoot("fx-remote-tui-observer-");
+  const gateway = startFakeGateway([fakeGatewayFinalText("REMOTE_OBSERVER_HISTORY")]);
+  cleanups.push(() => gateway.stop());
+  const env = gatewayEnv(root, gateway);
+  const sessionId = await createSession(root.workspace, env);
+  const server = await startServer(root, env);
+  const controller = await attach(server.socket, sessionId, "controller");
+  await controller.client.request("fx/prompt", {
+    ...mutation(controller),
+    operationId: "observer-history",
+    prompt: [{ type: "text", text: "seed observer history" }],
+  });
+  await controller.client.waitFor((message: any) =>
+    eventMethod(message) === "fx/operation" && message.params.event.params?.state === "completed"
+  );
+  expect(gateway.requestCount()).toBe(1);
+  controller.client.close();
+
+  const clientHome = join(root.root, "observer-client-home");
+  mkdirSync(clientHome);
+  const stderrPath = join(root.root, "observer-stderr.log");
+  const restorePath = join(root.root, "observer-restored-termios.log");
+  const statusPath = join(root.root, "observer-status.log");
+  writeFileSync(stderrPath, "");
+  const tui = await TmuxSession.create({
+    isolated: true,
+    cmd: `/bin/sh -c '${JSON.stringify(FX_BIN)} attach ${JSON.stringify(`unix://${server.socket}`)} --session ${JSON.stringify(sessionId)} --observe; status=$?; stty -a >${JSON.stringify(restorePath)}; printf "%s\\n" "$status" >${JSON.stringify(statusPath)}; sleep 10; exit $status'`,
+    cwd: root.workspace,
+    env: { ...env, HOME: clientHome, NO_COLOR: "1" },
+    stderrPath,
+    width: 72,
+    height: 16,
+  });
+  tmuxSessions.push(tui);
+  await tui.waitForText(/read-only/, TIMEOUT);
+  const fullGrid = await tui.waitForText("REMOTE_OBSERVER_HISTORY", TIMEOUT);
+  expect(fullGrid).not.toContain("┃\n");
+
+  await tui.sendLiteral("attempt edit");
+  await Bun.sleep(100);
+  expect(tui.paneStatus().dead).toBe(false);
+  expect(gateway.requestCount()).toBe(1);
+
+  await tui.resizeWindow(72, 2);
+  const compactGrid = await tui.capturePaneGrid();
+  expect(compactGrid).toHaveLength(2);
+  expect(compactGrid.join("\n")).not.toContain("REMOTE_OBSERVER_HISTORY");
+  await tui.resizeWindow(72, 16);
+  await tui.waitForText("REMOTE_OBSERVER_HISTORY", TIMEOUT);
+
+  await tui.sendKeys("q");
+  await waitFor(() => existsSync(statusPath) && existsSync(restorePath), "observer terminal restoration");
+  expect(readFileSync(statusPath, "utf8").trim()).toBe("0");
+  const restoredTermios = readFileSync(restorePath, "utf8");
+  expect(restoredTermios).toMatch(/(?:^|[ ;])icanon(?:[ ;]|$)/);
+  expect(restoredTermios).toMatch(/(?:^|[ ;])echo(?:[ ;]|$)/);
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+  expect(server.stderr()).toBe("");
+  expect(existsSync(join(clientHome, ".fx", "sessions"))).toBe(false);
+}, 60_000);
+
+test.skipIf(TMUX_SKIP)("primary child yields to parent takeover and regains its draft after detach", async () => {
+  const root = isolatedRoot("fx-remote-primary-");
+  const gateway = startFakeGateway([
+    fakeGatewayFinalText("REMOTE_PARENT_CONTROL_OK"),
+    fakeGatewayFinalText("REMOTE_PRIMARY_FALLBACK_OK"),
+  ]);
+  cleanups.push(() => gateway.stop());
+  const env = gatewayEnv(root, gateway);
+  const sessionId = await createSession(root.workspace, env);
+  const server = await startServer(root, env);
+  const childHome = join(root.root, "primary-child-home");
+  const parentHome = join(root.root, "takeover-parent-home");
+  mkdirSync(childHome);
+  mkdirSync(parentHome);
+  const childStderr = join(root.root, "primary-child-stderr.log");
+  const parentStderr = join(root.root, "takeover-parent-stderr.log");
+  const childStatus = join(root.root, "primary-child-status.log");
+  const parentStatus = join(root.root, "takeover-parent-status.log");
+  writeFileSync(childStderr, "");
+  writeFileSync(parentStderr, "");
+
+  const child = await TmuxSession.create({
+    isolated: true,
+    cmd: `/bin/sh -c '${JSON.stringify(FX_BIN)} attach ${JSON.stringify(`unix://${server.socket}`)} --session ${JSON.stringify(sessionId)} --primary; status=$?; printf "%s\\n" "$status" >${JSON.stringify(childStatus)}; sleep 10; exit $status'`,
+    cwd: root.workspace,
+    env: { ...env, HOME: childHome, NO_COLOR: "1" },
+    stderrPath: childStderr,
+    width: 82,
+    height: 20,
+  });
+  tmuxSessions.push(child);
+  await child.waitForText(/remote control/, TIMEOUT);
+  await child.sendLiteral("preserved child draft");
+
+  const parent = await TmuxSession.create({
+    isolated: true,
+    cmd: `/bin/sh -c '${JSON.stringify(FX_BIN)} attach ${JSON.stringify(`unix://${server.socket}`)} --session ${JSON.stringify(sessionId)}; status=$?; printf "%s\\n" "$status" >${JSON.stringify(parentStatus)}; sleep 10; exit $status'`,
+    cwd: root.workspace,
+    env: { ...env, HOME: parentHome, NO_COLOR: "1" },
+    stderrPath: parentStderr,
+    width: 82,
+    height: 20,
+  });
+  tmuxSessions.push(parent);
+  await parent.waitForText(/remote control/, TIMEOUT);
+  const controlledChild = await child.waitForText(/controlled remotely · read-only/, TIMEOUT);
+  expect(controlledChild).toContain("preserved child draft");
+
+  await child.sendLiteral("qQblocked");
+  await child.sendKeys("Enter");
+  await Bun.sleep(100);
+  expect(child.paneStatus().dead).toBe(false);
+  expect(gateway.requestCount()).toBe(0);
+
+  await parent.sendText("parent drives child");
+  const parentGrid = await parent.waitForText("REMOTE_PARENT_CONTROL_OK", TIMEOUT);
+  const childGrid = await child.waitForText("REMOTE_PARENT_CONTROL_OK", TIMEOUT);
+  expect(parentGrid).toContain("┃ parent drives child");
+  expect(childGrid).toContain("┃ parent drives child");
+  expect(gateway.requestCount()).toBe(1);
+
+  await parent.sendText("/detach");
+  await waitFor(() => existsSync(parentStatus), "parent detach");
+  await waitFor(async () => {
+    const grid = (await child.capturePaneGrid()).join("\n");
+    return grid.includes("remote control") && !grid.includes("controlled remotely");
+  }, "primary fallback control");
+  await child.sendKeys("Enter");
+  await child.waitForText("REMOTE_PRIMARY_FALLBACK_OK", TIMEOUT);
+  expect(gateway.requestCount()).toBe(2);
+  expect(gateway.requests[1]?.body).toContain("preserved child draft");
+
+  await child.sendText("/detach");
+  await waitFor(() => existsSync(childStatus), "primary detach");
+  expect(readFileSync(childStderr, "utf8")).toBe("");
+  expect(readFileSync(parentStderr, "utf8")).toBe("");
+  expect(server.stderr()).toBe("");
+  expect(existsSync(join(childHome, ".fx", "sessions"))).toBe(false);
+  expect(existsSync(join(parentHome, ".fx", "sessions"))).toBe(false);
+}, 60_000);
+
+test.skipIf(TMUX_SKIP)("interactive attach restores terminal state after SIGTERM", async () => {
+  const root = isolatedRoot("fx-remote-tui-sigterm-");
+  const gateway = startFakeGateway([]);
+  cleanups.push(() => gateway.stop());
+  const env = gatewayEnv(root, gateway);
+  const sessionId = await createSession(root.workspace, env);
+  const server = await startServer(root, env);
+  const clientHome = join(root.root, "signal-client-home");
+  mkdirSync(clientHome);
+  const stderrPath = join(root.root, "signal-stderr.log");
+  const restorePath = join(root.root, "signal-restored-termios.log");
+  const statusPath = join(root.root, "signal-status.log");
+  writeFileSync(stderrPath, "");
+
+  const command = `printf "REMOTE_ATTACH_BASELINE\\n"; ${FX_BIN} attach unix://${server.socket} --session ${sessionId}; status=$?; stty -a >${restorePath}; printf "%s\\n" "$status" >${statusPath}; sleep 10`;
+  const tui = await TmuxSession.create({
+    isolated: true,
+    cmd: `/bin/sh -c '${command}'`,
+    cwd: root.workspace,
+    env: { ...env, HOME: clientHome, NO_COLOR: "1" },
+    stderrPath,
+    width: 72,
+    height: 16,
+  });
+  tmuxSessions.push(tui);
+  await tui.waitForText(/remote control/, TIMEOUT);
+  const wrapperPid = tui.processPid();
+  const childText = execFileSync("pgrep", ["-P", String(wrapperPid)], { encoding: "utf8" }).trim();
+  const childPids = childText.split(/\s+/).filter(Boolean);
+  expect(childPids).toHaveLength(1);
+  process.kill(Number(childPids[0]), "SIGTERM");
+
+  await waitFor(() => existsSync(statusPath) && existsSync(restorePath), "SIGTERM terminal restoration");
+  expect(readFileSync(statusPath, "utf8").trim()).toBe("143");
+  const restoredTermios = readFileSync(restorePath, "utf8");
+  expect(restoredTermios).toMatch(/(?:^|[ ;])icanon(?:[ ;]|$)/);
+  expect(restoredTermios).toMatch(/(?:^|[ ;])echo(?:[ ;]|$)/);
+  const restoredGrid = await tui.capturePaneGrid();
+  expect(restoredGrid.join("\n")).toContain("REMOTE_ATTACH_BASELINE");
+  expect(restoredGrid.join("\n")).not.toContain("fx attach · controller");
+  expect(readFileSync(stderrPath, "utf8")).toMatch(/^Terminated\n?$/);
+  expect(server.stderr()).toBe("");
+  expect(existsSync(join(clientHome, ".fx", "sessions"))).toBe(false);
 }, 60_000);
 
 test("lost prompt response reconciles without duplicate provider work", async () => {

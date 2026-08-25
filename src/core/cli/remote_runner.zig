@@ -12,6 +12,7 @@ pub const AttachOptions = struct {
     endpoint: []const u8,
     session_id: []const u8,
     observe: bool = false,
+    primary: bool = false,
 };
 
 pub const ServeFn = *const fn (?*anyopaque, Allocator, acp_runner.Config, ServeOptions) anyerror!void;

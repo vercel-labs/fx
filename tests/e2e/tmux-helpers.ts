@@ -213,6 +213,7 @@ export function heldFakeGatewayFinalText(initialText?: string) {
   let timer: ReturnType<typeof setInterval> | undefined;
   let response: Response | undefined;
   let pendingText: string | undefined;
+  const pendingDeltas: string[] = [];
 
   const stopTimer = () => {
     if (timer) clearInterval(timer);
@@ -223,6 +224,17 @@ export function heldFakeGatewayFinalText(initialText?: string) {
     closed = true;
     stopTimer();
     controller?.close();
+  };
+  const push = (text: string) => {
+    if (closed) return;
+    if (!controller) {
+      pendingDeltas.push(text);
+      return;
+    }
+    controller.enqueue(encoder.encode(
+      `data: ${JSON.stringify({ type: "text-start", id: "answer_1" })}\n\n` +
+        `data: ${JSON.stringify({ type: "text-delta", id: "answer_1", delta: text })}\n\n`,
+    ));
   };
   const finish = (text: string) => {
     if (closed) return;
@@ -252,14 +264,8 @@ export function heldFakeGatewayFinalText(initialText?: string) {
           value.close();
           return;
         }
-        if (initialText !== undefined) {
-          setTimeout(() => {
-            if (!closed) value.enqueue(encoder.encode(
-              `data: ${JSON.stringify({ type: "text-start", id: "answer_1" })}\n\n` +
-              `data: ${JSON.stringify({ type: "text-delta", id: "answer_1", delta: initialText })}\n\n`,
-            ));
-          }, 100);
-        }
+        if (initialText !== undefined) setTimeout(() => push(initialText), 100);
+        for (const delta of pendingDeltas.splice(0)) push(delta);
         const keepAlive = () => {
           if (!closed) value.enqueue(encoder.encode(": hold-response\n\n"));
         };
@@ -279,6 +285,7 @@ export function heldFakeGatewayFinalText(initialText?: string) {
       response ??= createResponse();
       return response;
     },
+    push,
     release: finish,
     dispose: close,
   };

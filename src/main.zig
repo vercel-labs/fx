@@ -3379,6 +3379,7 @@ fn runRemoteAttach(_: ?*anyopaque, alloc: Allocator, options: remote_runner.Atta
         .endpoint = options.endpoint,
         .session_id = options.session_id,
         .observe = options.observe,
+        .primary = options.primary,
     });
 }
 

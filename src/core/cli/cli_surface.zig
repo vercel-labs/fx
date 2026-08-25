@@ -318,6 +318,7 @@ const AttachOptions = struct {
     endpoint: []const u8,
     session_id: []const u8,
     observe: bool = false,
+    primary: bool = false,
 };
 
 const WorkflowOptions = struct {
@@ -892,13 +893,14 @@ fn runNonInteractiveWithDeps(
         },
         .attach => |rest| {
             const options = parseAttachArgs(rest) catch {
-                try writeStderr(deps, "usage: fx attach <endpoint> --session <id> [--observe]\n");
+                try writeStderr(deps, "usage: fx attach <endpoint> --session <id> [--observe|--primary]\n");
                 return .handled_failure;
             };
             try cfg.remote_runner.attach(alloc, .{
                 .endpoint = options.endpoint,
                 .session_id = options.session_id,
                 .observe = options.observe,
+                .primary = options.primary,
             });
             return .handled_success;
         },
@@ -3112,6 +3114,7 @@ fn parseAttachArgs(args: []const [:0]const u8) !AttachOptions {
     if (args.len == 0 or args[0].len == 0) return error.InvalidAttachArgs;
     var session_id: ?[]const u8 = null;
     var observe = false;
+    var primary = false;
     var index: usize = 1;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
@@ -3123,11 +3126,19 @@ fn parseAttachArgs(args: []const [:0]const u8) !AttachOptions {
             if (session_id != null or arg["--session=".len..].len == 0) return error.InvalidAttachArgs;
             session_id = arg["--session=".len..];
         } else if (std.mem.eql(u8, arg, "--observe")) {
-            if (observe) return error.InvalidAttachArgs;
+            if (observe or primary) return error.InvalidAttachArgs;
             observe = true;
+        } else if (std.mem.eql(u8, arg, "--primary")) {
+            if (primary or observe) return error.InvalidAttachArgs;
+            primary = true;
         } else return error.InvalidAttachArgs;
     }
-    return .{ .endpoint = args[0], .session_id = session_id orelse return error.InvalidAttachArgs, .observe = observe };
+    return .{
+        .endpoint = args[0],
+        .session_id = session_id orelse return error.InvalidAttachArgs,
+        .observe = observe,
+        .primary = primary,
+    };
 }
 
 fn parseAcpArgs(args: []const [:0]const u8) !AcpOptions {
@@ -3780,6 +3791,19 @@ test "parse remote serve and attach options rejects ambiguous authority" {
     try std.testing.expectEqualStrings("wss://builder.example/fx", attach.endpoint);
     try std.testing.expectEqualStrings("session-1", attach.session_id);
     try std.testing.expect(attach.observe);
+    const primary = try parseAttachArgs(&.{
+        @as([:0]const u8, "unix:///tmp/a"),
+        @as([:0]const u8, "--session=x"),
+        @as([:0]const u8, "--primary"),
+    });
+    try std.testing.expect(primary.primary);
+    try std.testing.expect(!primary.observe);
+    try std.testing.expectError(error.InvalidAttachArgs, parseAttachArgs(&.{
+        @as([:0]const u8, "unix:///tmp/a"),
+        @as([:0]const u8, "--session=x"),
+        @as([:0]const u8, "--primary"),
+        @as([:0]const u8, "--observe"),
+    }));
     try std.testing.expectError(error.InvalidAttachArgs, parseAttachArgs(&.{@as([:0]const u8, "unix:///tmp/a")}));
     try std.testing.expectError(error.InvalidAttachArgs, parseAttachArgs(&.{
         @as([:0]const u8, "unix:///tmp/a"),

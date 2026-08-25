@@ -18,10 +18,12 @@ pub const default_capability = "fx.sh/cap/remote-attach";
 
 pub const Role = enum {
     observer,
+    primary,
     controller,
 
     pub fn parse(value: []const u8) ?Role {
         if (std.mem.eql(u8, value, "observer")) return .observer;
+        if (std.mem.eql(u8, value, "primary")) return .primary;
         if (std.mem.eql(u8, value, "controller")) return .controller;
         return null;
     }

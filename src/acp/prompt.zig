@@ -8,6 +8,7 @@ const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const io_mod = @import("../core/shared/io.zig");
 const jsonrpc = @import("jsonrpc.zig");
+const prompt_projection = @import("prompt_projection.zig");
 const acp_types = @import("types.zig");
 const server = @import("server.zig");
 const sessions = @import("sessions.zig");
@@ -830,8 +831,9 @@ fn parsePromptInput(alloc: Allocator, params_json: []const u8) !ParsedPromptInpu
         return .{ .text = try alloc.dupe(u8, ""), .continue_recovery = continue_recovery };
     if (prompt_arr != .array) return .{ .text = try alloc.dupe(u8, ""), .continue_recovery = continue_recovery };
 
-    var text_buf: std.ArrayList(u8) = .empty;
-    defer text_buf.deinit(alloc);
+    const projected_text = try prompt_projection.project_text_alloc(alloc, prompt_arr);
+    var projected_text_owned = true;
+    defer if (projected_text_owned) alloc.free(projected_text);
     var targets: std.ArrayList(context_contract.ApplicableTarget) = .empty;
     defer {
         for (targets.items) |target| alloc.free(@constCast(target.path));
@@ -849,16 +851,7 @@ fn parsePromptInput(alloc: Allocator, params_json: []const u8) !ParsedPromptInpu
         const block_type = block.object.get("type") orelse continue;
         if (block_type != .string) continue;
 
-        if (std.mem.eql(u8, block_type.string, "text")) {
-            if (block.object.get("text")) |text_val| {
-                if (text_val == .string) {
-                    if (text_buf.items.len > 0) try text_buf.append(alloc, '\n');
-                    try text_buf.appendSlice(alloc, text_val.string);
-                }
-            }
-        } else if (std.mem.eql(u8, block_type.string, "image")) {
-            return error.UnsupportedPromptImage;
-        } else if (std.mem.eql(u8, block_type.string, "resource")) {
+        if (std.mem.eql(u8, block_type.string, "resource")) {
             if (block.object.get("resource")) |resource| {
                 if (resource == .object) {
                     const uri = if (resource.object.get("uri")) |uri_value|
@@ -891,26 +884,16 @@ fn parsePromptInput(alloc: Allocator, params_json: []const u8) !ParsedPromptInpu
                             }
                         }
                     }
-                    if (resource.object.get("text")) |text_val| {
-                        if (text_val == .string) {
-                            if (text_buf.items.len > 0) try text_buf.append(alloc, '\n');
-                            if (uri.len > 0) {
-                                try text_buf.appendSlice(alloc, "File: ");
-                                try text_buf.appendSlice(alloc, uri);
-                                try text_buf.append(alloc, '\n');
-                            }
-                            try text_buf.appendSlice(alloc, text_val.string);
-                        }
-                    }
                 }
             }
         }
     }
 
     var result = ParsedPromptInput{
-        .text = try alloc.dupe(u8, text_buf.items),
+        .text = projected_text,
         .continue_recovery = continue_recovery,
     };
+    projected_text_owned = false;
     errdefer result.deinit(alloc);
     result.targets = try targets.toOwnedSlice(alloc);
     result.omissions = try omissions.toOwnedSlice(alloc);

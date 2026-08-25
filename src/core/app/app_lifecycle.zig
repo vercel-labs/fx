@@ -43,14 +43,20 @@ const alternate_screen_enter = "\x1b[?1049h";
 const alternate_mouse_tracking_enter = "\x1b[?1000h\x1b[?1006h";
 const terminal_takeover_reset = "\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1004l\x1b[?1006l\x1b[?1l\x1b>\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b[4l\x1b[?6l\x1b[?7h\x1b[0m\x1b[?25h";
 
-/// Original handlers, written at bootstrap and restored at shutdown.
-/// Signal context never mutates them.
+/// Original handlers and terminal state, written at bootstrap and restored at
+/// shutdown. Signal context only reads the captured terminal state.
 var old_sigterm_action: ?std.posix.Sigaction = null;
 var old_sighup_action: ?std.posix.Sigaction = null;
+var abnormal_exit_stdin_fd: std.posix.fd_t = std.posix.STDIN_FILENO;
+var abnormal_exit_termios: ?std.posix.termios = null;
 
 /// Restores terminal state, installs the default disposition, and re-raises.
-/// Must remain async-signal-safe: only `write(2)`, `sigaction(2)`, and `raise(3)`.
+/// Must remain async-signal-safe: only `tcsetattr(2)`, `write(2)`,
+/// `sigaction(2)`, and `raise(3)`.
 fn abnormalExitHandlerWithRestore(comptime restore: []const u8, sig: std.posix.SIG) void {
+    if (abnormal_exit_termios) |*termios| {
+        _ = std.c.tcsetattr(abnormal_exit_stdin_fd, .NOW, termios);
+    }
     // Signal context cannot recover from a failed async-signal-safe write.
     _ = std.c.write(
         std.posix.STDOUT_FILENO,
@@ -78,9 +84,11 @@ fn tmuxAbnormalExitHandler(sig: std.posix.SIG) callconv(.c) void {
 /// Install handlers for SIGTERM and SIGHUP so an externally-terminated
 /// fx restores terminal state before dying. SIGINT is not included
 /// because raw mode disables terminal-generated SIGINT.
-pub fn installAbnormalExitHandlers(tmux: ?[]const u8) void {
+pub fn installAbnormalExitHandlers(tmux: ?[]const u8, terminal: *const TerminalState) void {
     if (!shell_runtime.supports_resize_signal) return;
 
+    abnormal_exit_stdin_fd = terminal.stdin_fd;
+    abnormal_exit_termios = terminal.original_termios;
     const handler: std.posix.Sigaction.handler_fn = if (tmux == null)
         abnormalExitHandler
     else
@@ -111,6 +119,7 @@ pub fn uninstallAbnormalExitHandlers() void {
         std.posix.sigaction(std.posix.SIG.HUP, &old, null);
         old_sighup_action = null;
     }
+    abnormal_exit_termios = null;
 }
 
 pub const StartupState = struct {
@@ -470,9 +479,9 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         cfg.terminal_title,
     );
 
+    installAbnormalExitHandlers(io_mod.getenv("TMUX"), cfg.terminal);
     try cfg.terminal.enableRawMode();
     cfg.terminal.installResizeSignal(cfg.resize_handler);
-    installAbnormalExitHandlers(io_mod.getenv("TMUX"));
     cfg.shell.layout = try cfg.terminal.queryLayout(cfg.footer_rows);
 
     record_tape.configureFromEnv(
@@ -583,11 +592,11 @@ pub fn shutdownInteractiveShell(
 ) void {
     leaveAlternateScreens(terminal, shell, metrics);
     terminal.uninstallResizeSignal();
-    uninstallAbnormalExitHandlers();
     _ = writeLifecycleTerminalBytes(shell, metrics, normalExitRestoreSequence(io_mod.getenv("TMUX"))) catch {};
     terminal_title.clear();
     record_tape.shutdown();
     finishLeavingInteractiveMode(terminal, shell, metrics);
+    uninstallAbnormalExitHandlers();
 }
 
 /// Cooked-mode handoff for Ctrl-Z / SIGTSTP. Same terminal restore as
