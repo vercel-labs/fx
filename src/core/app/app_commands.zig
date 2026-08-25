@@ -2,6 +2,7 @@ const std = @import("std");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const app_loop_runtime = @import("app_loop_runtime.zig");
 const io_mod = @import("../shared/io.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
@@ -355,6 +356,7 @@ pub fn Handlers(comptime App: type) type {
                 .logout = commandLogout,
                 .setup = commandSetup,
                 .show_status = commandShowStatus,
+                .handle_loop = command_handle_loop,
                 .show_background = commandShowBackground,
                 .stop_background = commandStopBackground,
                 .open_background = commandOpenBackground,
@@ -695,6 +697,11 @@ pub fn Handlers(comptime App: type) type {
         fn commandShowStatus(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try session_commands.Commands(App).showStatus(app);
+        }
+
+        fn command_handle_loop(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app_loop_runtime.Runtime(App).handle_command(app, rest);
         }
 
         fn commandShowBackground(ctx: *anyopaque) !void {

@@ -14,6 +14,7 @@ const host_target = @import("../hosts/target.zig");
 const diff = @import("../output/diff.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
+const app_loop_runtime = @import("app_loop_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
@@ -1557,6 +1558,9 @@ pub fn Runtime(comptime App: type) type {
 
             closeWritableSession(app, log_options);
             app.stopStream();
+            if (comptime @hasField(App, "loops")) {
+                app_loop_runtime.Runtime(App).reset(app);
+            }
             app.shell.clearTranscript(app.alloc);
             app.session.reset(app.alloc);
             app.input_runtime.inputResetState().resetForSession(app.alloc);
