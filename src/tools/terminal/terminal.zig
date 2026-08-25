@@ -490,6 +490,47 @@ fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
     input.deinit();
     alloc.destroy(input);
 }
+fn formatValidationError(alloc: Allocator, action: Action, err: anyerror) Allocator.Error![]u8 {
+    if (err == error.MissingLoginShell) {
+        return std.fmt.allocPrint(
+            alloc,
+            "terminal {s} shell is unavailable: no supported Bash or zsh executable was found",
+            .{@tagName(action)},
+        );
+    }
+    return std.fmt.allocPrint(
+        alloc,
+        "terminal {s} arguments are invalid: {s}",
+        .{ @tagName(action), @errorName(err) },
+    );
+}
+test "terminal shell failures are not reported as invalid arguments" {
+    const missing = try formatValidationError(
+        std.testing.allocator,
+        .exec,
+        error.MissingLoginShell,
+    );
+    defer std.testing.allocator.free(missing);
+    try std.testing.expectEqualStrings(
+        "terminal exec shell is unavailable: no supported Bash or zsh executable was found",
+        missing,
+    );
+
+    const invalid = try formatValidationError(
+        std.testing.allocator,
+        .start,
+        error.RelativeShellPath,
+    );
+    defer std.testing.allocator.free(invalid);
+    try std.testing.expectEqualStrings(
+        "terminal start arguments are invalid: RelativeShellPath",
+        invalid,
+    );
+    try std.testing.expectEqual(
+        contracts.StructuredErrorCode.shell_unavailable,
+        mapErrorCode(error.MissingLoginShell),
+    );
+}
 
 pub fn validate(
     ctx: tool_dispatch.DispatchContext,
@@ -520,11 +561,7 @@ pub fn validate(
             );
         };
         _ = commandEnvironment(arena, ctx, input.profile) catch |err| {
-            return try std.fmt.allocPrint(
-                ctx.allocator,
-                "terminal exec arguments are invalid: {s}",
-                .{@errorName(err)},
-            );
+            return try formatValidationError(ctx.allocator, input.action, err);
         };
         return null;
     }
@@ -532,18 +569,10 @@ pub fn validate(
         return try ctx.allocator.dupe(u8, "terminal start fields \"profile\" and \"shell\" are mutually exclusive");
     }
     const request = semanticRequest(arena, ctx, input) catch |err| {
-        return @as(?[]u8, try std.fmt.allocPrint(
-            ctx.allocator,
-            "terminal {s} arguments are invalid: {s}",
-            .{ @tagName(input.action), @errorName(err) },
-        ));
+        return try formatValidationError(ctx.allocator, input.action, err);
     };
     request.validate() catch |err| {
-        return @as(?[]u8, try std.fmt.allocPrint(
-            ctx.allocator,
-            "terminal {s} arguments are invalid: {s}",
-            .{ @tagName(input.action), @errorName(err) },
-        ));
+        return try formatValidationError(ctx.allocator, input.action, err);
     };
     return null;
 }
@@ -1292,6 +1321,7 @@ fn mapErrorCode(err: anyerror) contracts.StructuredErrorCode {
         error.ControlDenied,
         => .authority_denied,
         error.TerminalAuthorityRetired => .authority_retired,
+        error.MissingLoginShell => .shell_unavailable,
         error.Cancelled => .cancelled,
         else => .invalid_request,
     };
