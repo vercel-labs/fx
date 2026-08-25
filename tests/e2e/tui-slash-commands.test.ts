@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -54,6 +55,7 @@ async function launchAndWait(): Promise<TmuxSession> {
 async function launchNoKeyAndWait(): Promise<{
   terminal: TmuxSession;
   stderrPath: string;
+  home: string;
 }> {
   const root = mkdtempSync(join(tmpdir(), "fx-slash-commands-no-key-"));
   const home = join(root, "home");
@@ -76,10 +78,50 @@ async function launchNoKeyAndWait(): Promise<{
     },
   });
   await terminal.waitForComposer(10_000);
-  return { terminal, stderrPath };
+  return { terminal, stderrPath, home };
 }
 
 describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
+  test(
+    "/goal sets, reads, and durably stores a goal without model credentials",
+    async () => {
+      const launched = await launchNoKeyAndWait();
+      session = launched.terminal;
+
+      await session.sendText("/goal verify the lifecycle");
+      await session.waitForText("Goal set: verify the lifecycle", 5_000);
+      await session.sendText("/goal");
+      const pane = await session.waitForText("Status: active", 5_000);
+      expect(pane).toContain("Goal: verify the lifecycle");
+
+      expect(readFileSync(launched.stderrPath, "utf8")).toBe("");
+      const sessionId = readdirSync(join(launched.home, ".fx", "sessions"), {
+        withFileTypes: true,
+      }).find((entry) => entry.isDirectory() && entry.name !== "latest")?.name;
+      expect(sessionId).toBeDefined();
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(5_000)).toBe(true);
+      session = await TmuxSession.create({
+        cmd: `${FX_BIN} resume ${sessionId}`,
+        cwd: join(launched.home, "..", "workspace"),
+        env: {
+          HOME: launched.home,
+          AI_GATEWAY_API_KEY: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_SKIP_ONBOARDING: "1",
+          VERCEL_OIDC_TOKEN: undefined,
+        },
+      });
+      await session.waitForComposer(10_000);
+      await session.sendText("/goal");
+      const resumed = await session.waitForText("Status: active", 5_000);
+      expect(resumed).toContain("Goal: verify the lifecycle");
+    },
+    TIMEOUT,
+  );
+
   test(
     "/undo reports the exact empty state",
     async () => {

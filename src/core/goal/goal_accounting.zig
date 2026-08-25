@@ -105,8 +105,8 @@ pub fn accountProgress(
     now_ms: i64,
 ) !AccountingOutcome {
     var updated = try goal.dupe(alloc);
-    updated.tokens_used += token_delta;
-    updated.time_used_seconds += time_delta_seconds;
+    updated.tokens_used +|= token_delta;
+    updated.time_used_seconds +|= time_delta_seconds;
     updated.updated_at_ms = now_ms;
     const budget_limit_reached = blk: {
         const budget = updated.token_budget orelse break :blk false;

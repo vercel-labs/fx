@@ -15,6 +15,7 @@ const tracked_file_mutations = @import("../core/tooling/tracked_file_mutations.z
 const types = @import("../core/shared/types.zig");
 const lexical_relevance = @import("../core/shared/lexical_relevance.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
+const goal_module = @import("../core/goal/goal.zig");
 const ask_user_question_impl = @import("../tools/agent/ask_user_question.zig");
 const subagent_impl = @import("../tools/agent/subagent.zig");
 const vision_impl = @import("../tools/agent/vision.zig");
@@ -1535,6 +1536,29 @@ pub const all = [_]tool_dispatch.Tool{
 };
 
 pub const registry = tool_dispatch.Registry{ .tools = all[0..] };
+
+test "production registry dispatches get_goal with a session context" {
+    const alloc = std.testing.allocator;
+    var goal: goal_module.goal_store.Goal = .{
+        .goal_id = try alloc.dupe(u8, "goal-production"),
+        .objective = try alloc.dupe(u8, "verify production dispatch"),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+    };
+    defer goal.deinit(alloc);
+    var goal_ctx: goal_module.GoalToolContext = .{ .goal = goal };
+    var result = try tool_dispatch.dispatchAuthorizedToolCall(.{
+        .allocator = alloc,
+        .goal_ctx = &goal_ctx,
+    }, registry, types.ToolCall{
+        .id = "call-get-goal",
+        .name = "get_goal",
+        .arguments_json = "{}",
+    });
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "verify production dispatch") != null);
+}
 
 test "built-in model-facing tool contract stays byte exact" {
     const alloc = std.testing.allocator;

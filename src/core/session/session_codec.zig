@@ -6,6 +6,7 @@ const types = @import("../shared/types.zig");
 const captured_command = @import("../tooling/captured_command.zig");
 const model_provider = @import("../config/model_provider.zig");
 const credential_authority = @import("../auth/credential_authority.zig");
+const goal_store = @import("../goal/goal_store.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -131,6 +132,7 @@ pub const DurableSessionState = struct {
     /// Active control state. It is never projected into model history and a
     /// restored checkpoint requires explicit host authority before any send.
     recovery_checkpoint: ?RecoveryCheckpoint = null,
+    goal: ?goal_store.Goal = null,
 
     pub fn deinit(self: *DurableSessionState, alloc: Allocator) void {
         alloc.free(self.id);
@@ -142,6 +144,7 @@ pub const DurableSessionState = struct {
         if (self.last_subagent_work_id) |id| alloc.free(id);
         if (self.usage) |*usage| usage.deinit(alloc);
         if (self.recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
+        if (self.goal) |*goal| goal.deinit(alloc);
         self.* = undefined;
     }
 
@@ -173,6 +176,11 @@ pub const DurableSessionState = struct {
             try checkpoint.dupe(alloc)
         else
             null;
+        const goal = if (self.goal) |value| try value.dupe(alloc) else null;
+        errdefer if (goal) |value| {
+            var owned = value;
+            owned.deinit(alloc);
+        };
         const permission_state = try session_permission_state.dupe(
             alloc,
             self.permission_state,
@@ -194,6 +202,7 @@ pub const DurableSessionState = struct {
             .last_subagent_work_id = last_subagent_work_id,
             .usage = usage,
             .recovery_checkpoint = recovery_checkpoint,
+            .goal = goal,
         };
     }
 };
@@ -643,6 +652,10 @@ fn writeState(writer: *std.Io.Writer, state: DurableSessionState) !void {
         try writer.writeAll(",\"recovery_checkpoint\":");
         try writeRecoveryCheckpoint(writer, checkpoint);
     }
+    if (state.goal) |goal| {
+        try writer.writeAll(",\"goal\":");
+        try goal_store.writeJson(writer, goal);
+    }
     try writer.writeByte('}');
 }
 
@@ -868,6 +881,8 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
     errdefer if (last_subagent_work_id) |work_id| alloc.free(work_id);
     var recovery_checkpoint: ?RecoveryCheckpoint = null;
     errdefer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
+    var goal: ?goal_store.Goal = null;
+    errdefer if (goal) |*value| value.deinit(alloc);
     while (try json_reader.peekNextTokenType() != .object_end) {
         const key = try readStringOwned(&json_reader, alloc, 64);
         defer alloc.free(key);
@@ -921,6 +936,16 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
                 .parse_numbers = false,
             });
             recovery_checkpoint = try parseRecoveryCheckpoint(alloc, value);
+        } else if (std.mem.eql(u8, key, "goal")) {
+            if (goal != null) return error.InvalidSessionFormat;
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const value = try std.json.Value.jsonParse(arena.allocator(), &json_reader, .{
+                .max_value_len = limits.max_value_bytes,
+                .allocate = .alloc_always,
+                .parse_numbers = false,
+            });
+            goal = try goal_store.fromJson(alloc, value);
         } else return error.InvalidSessionFormat;
     }
     errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
@@ -950,6 +975,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
         .last_subagent_work_id = last_subagent_work_id,
         .usage = usage,
         .recovery_checkpoint = recovery_checkpoint,
+        .goal = goal,
     };
     try validateStateWithPermissionMigration(state, true);
     return state;
@@ -3548,6 +3574,15 @@ test "recovery checkpoint round trips while legacy state stays absent" {
         .total_input_tokens = 0,
         .total_output_tokens = 0,
         .recovery_checkpoint = checkpoint,
+        .goal = .{
+            .goal_id = @constCast("goal_1"),
+            .objective = @constCast("finish the release"),
+            .token_budget = 1000,
+            .tokens_used = 250,
+            .time_used_seconds = 12,
+            .created_at_ms = 1,
+            .updated_at_ms = 2,
+        },
     };
 
     var encoded: std.Io.Writer.Allocating = .init(alloc);
@@ -3573,6 +3608,9 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     try std.testing.expect(restored.fast_mode);
     try std.testing.expectEqual(@as(usize, 4), restored.consumed_provider_attempts);
     try std.testing.expect(restored.outstanding_reservation);
+    try std.testing.expectEqualStrings("goal_1", decoded.goal.?.goal_id);
+    try std.testing.expectEqualStrings("finish the release", decoded.goal.?.objective);
+    try std.testing.expectEqual(@as(i64, 250), decoded.goal.?.tokens_used);
 
     const legacy =
         "{\"id\":\"legacy\",\"origin_workspace_root\":\"/tmp/origin\",\"workspace_root\":\"/tmp/current\",\"created_at_ms\":1,\"updated_at_ms\":2,\"conversation_language\":\"en\",\"preferences\":{\"model\":\"openai/gpt-test\",\"effort\":\"auto\",\"fast_mode\":false},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0}";
@@ -3581,6 +3619,7 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     defer legacy_state.deinit(alloc);
     try std.testing.expectEqual(model_provider.ProviderId.gateway, legacy_state.preferences.provider);
     try std.testing.expectEqual(@as(?RecoveryCheckpoint, null), legacy_state.recovery_checkpoint);
+    try std.testing.expect(legacy_state.goal == null);
 }
 
 test "session permission state round trips while legacy state stays empty" {

@@ -561,6 +561,7 @@ const App = struct {
     auto_upgrade_enabled: bool = true,
     effort: ReasoningEffort = .auto,
     goal: ?goal_module.goal_store.Goal = null,
+    goal_tool_context: goal_module.GoalToolContext = .{},
     diff_entries: std.ArrayList(@import("core/output/diff.zig").DiffEntry) = .empty,
     next_diff_id: u32 = 1,
 
@@ -1139,6 +1140,7 @@ const App = struct {
             null,
             null,
             draft.images,
+            null,
             draft.turn_id,
             true,
         )) return error.PendingPromptQueueRejected;
@@ -1301,6 +1303,7 @@ const App = struct {
             review_draft,
             null,
             null,
+            null,
             0,
             false,
         );
@@ -1320,6 +1323,7 @@ const App = struct {
             null,
             checkpoint,
             null,
+            null,
             checkpoint.turn_id,
             false,
         )) return false;
@@ -1337,6 +1341,7 @@ const App = struct {
         review_draft: ?worker_runtime.QueueReviewDraft,
         recovery_checkpoint: ?*const session_codec.RecoveryCheckpoint,
         prompt_images: ?[]const types.ImageAttachment,
+        root_user_intent_override: ?[]const u8,
         turn_id: u64,
         user_prompt_already_presented: bool,
     ) !bool {
@@ -1378,11 +1383,14 @@ const App = struct {
 
         const history_copy = try self.session.snapshotContextHistory(std.heap.c_allocator);
         errdefer types.freeHistoryTurnSlice(std.heap.c_allocator, history_copy);
-        const root_user_intent_context = try auto_classifier_context.buildCanonicalRootUserContext(
-            std.heap.c_allocator,
-            prompt_copy,
-            self.session.history.items,
-        );
+        const root_user_intent_context = if (root_user_intent_override) |intent|
+            try std.heap.c_allocator.dupe(u8, intent)
+        else
+            try auto_classifier_context.buildCanonicalRootUserContext(
+                std.heap.c_allocator,
+                prompt_copy,
+                self.session.history.items,
+            );
         errdefer std.heap.c_allocator.free(root_user_intent_context);
 
         const images_copy = try types.dupeImageAttachmentSlice(
@@ -2336,10 +2344,23 @@ const App = struct {
         return SessionAppRuntime.commitRuntimePreferences(self, patch);
     }
 
+    pub fn persistGoalState(self: *App) !void {
+        try SessionAppRuntime.commitGoalState(self);
+    }
+
+    pub fn replaceGoal(self: *App, next: ?goal_module.goal_store.Goal) !void {
+        try goal_module.goal_runtime.replaceOwned(App, self, next);
+    }
+
+    pub fn queueGoalContinuation(self: *App, prompt: []const u8, objective: []const u8) !void {
+        _ = try self.snapshotAndQueuePrompt(prompt, &.{}, null, null, null, objective, 0, false);
+    }
+
     pub fn appendFinishedPrompt(self: *App, finished: types.FinishedPrompt) !void {
         try SessionAppRuntime.appendFinishedPrompt(self, finished);
         if (finished.summary) |summary| {
             _ = try self.shell.appendTurnSummaryEntry(self.alloc, summary);
+            try goal_module.goal_runtime.advanceAfterTurn(App, self, summary);
         }
     }
 

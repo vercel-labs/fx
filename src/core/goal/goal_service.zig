@@ -72,22 +72,15 @@ pub fn set(
     };
 
     if (trimmed_objective) |obj| {
+        // A new objective always starts a fresh goal record: new id, zeroed
+        // accounting, created now. The replaced terminal goal is returned as
+        // `previous_goal` so the host can surface its final usage.
+        var previous: ?goal_store.Goal = null;
         if (existing) |existing_goal| {
             if (!existing_goal.status.isTerminal()) return error.UnfinishedGoal;
-            const previous = try existing_goal.dupe(alloc);
-            var updated = try existing_goal.dupe(alloc);
-            errdefer updated.deinit(alloc);
-            alloc.free(updated.objective);
-            updated.objective = try alloc.dupe(u8, obj);
-            updated.status = request.status orelse .active;
-            updated.token_budget = effective_budget;
-            updated.updated_at_ms = now_ms;
-            return .{
-                .goal = updated,
-                .previous_goal = previous,
-                .objective_changed = true,
-            };
+            previous = try existing_goal.dupe(alloc);
         }
+        errdefer if (previous) |*prev| prev.deinit(alloc);
         const goal_id = try goal_store.newGoalId(alloc, now_ms, rand_u64);
         errdefer alloc.free(goal_id);
         return .{
@@ -99,6 +92,7 @@ pub fn set(
                 .created_at_ms = now_ms,
                 .updated_at_ms = now_ms,
             },
+            .previous_goal = previous,
             .objective_changed = true,
         };
     }
@@ -149,12 +143,15 @@ test "set fails when an unfinished goal exists" {
     }, 100, 0x1));
 }
 
-test "set replaces a terminal goal with a new objective" {
+test "set replaces a terminal goal with a fresh record" {
     const alloc = std.testing.allocator;
     var existing: goal_store.Goal = .{
         .goal_id = try alloc.dupe(u8, "g1"),
         .objective = try alloc.dupe(u8, "old"),
         .status = .complete,
+        .token_budget = 100,
+        .tokens_used = 100,
+        .time_used_seconds = 55,
         .created_at_ms = 1,
         .updated_at_ms = 1,
     };
@@ -164,7 +161,14 @@ test "set replaces a terminal goal with a new objective" {
     defer o.deinit(alloc);
     try std.testing.expectEqualStrings("new", o.goal.objective);
     try std.testing.expectEqual(goal_types.GoalStatus.active, o.goal.status);
-    try std.testing.expect(o.previous_goal != null);
+    try std.testing.expect(!std.mem.eql(u8, "g1", o.goal.goal_id));
+    try std.testing.expectEqual(@as(i64, 0), o.goal.tokens_used);
+    try std.testing.expectEqual(@as(i64, 0), o.goal.time_used_seconds);
+    try std.testing.expectEqual(@as(i64, 100), o.goal.created_at_ms);
+    try std.testing.expect(o.goal.token_budget == null);
+    const prev = o.previous_goal orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("g1", prev.goal_id);
+    try std.testing.expectEqual(@as(i64, 100), prev.tokens_used);
     try std.testing.expect(o.objective_changed);
 }
 

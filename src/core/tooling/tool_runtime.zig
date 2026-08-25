@@ -53,6 +53,7 @@ const tool_admission = @import("tool_admission.zig");
 const tool_args = @import("tool_args.zig");
 const command_result_mapping = @import("command_result_mapping.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
+const goal_module = @import("../goal/goal.zig");
 const tool_specs = @import("tool_specs.zig");
 const tool_result_errors = @import("tool_result_errors.zig");
 const tool_result_limits = @import("tool_result_limits.zig");
@@ -160,6 +161,7 @@ pub const Context = struct {
     effort: types.ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
     tool_registry: tool_dispatch.Registry = .{},
+    goal_ctx: ?*goal_module.GoalToolContext = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
     subagent_caller_id: ?[]const u8 = null,
     permission_mode: PermissionMode,
@@ -898,6 +900,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .web_fetch_artifact_store = ctx.web_fetch_artifact_store,
         .web_fetch_artifact_error = ctx.web_fetch_artifact_error,
         .tool_capabilities = capabilities,
+        .goal_ctx = ctx.goal_ctx,
         .web_search_backend = ctx.web_search_backend,
         .web_search_progress_ctx = ctx.web_search_progress_ctx,
         .on_web_search_progress = ctx.on_web_search_progress,
