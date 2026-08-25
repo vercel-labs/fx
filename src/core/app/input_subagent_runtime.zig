@@ -649,6 +649,7 @@ pub fn SubagentRuntime(comptime App: type) type {
                         skill.name,
                         skill.path,
                         skill_runtime.skillDisplaySource(app.skills.items, skill),
+                        skill_runtime.skillPathDiscriminatorSpan(app.skills.items, skill),
                     );
                     app.skills.closeMenu();
                 },

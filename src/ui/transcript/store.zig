@@ -207,6 +207,7 @@ fn dupeSkillTokenSpans(alloc: Allocator, skill_tokens: []const SkillTokenSpan) !
             .name = name,
             .path = try alloc.dupe(u8, skill_tokens[filled].path),
             .display_source = skill_tokens[filled].display_source,
+            .display_path = skill_tokens[filled].display_path,
             .owns_trailing_separator = skill_tokens[filled].owns_trailing_separator,
         };
     }

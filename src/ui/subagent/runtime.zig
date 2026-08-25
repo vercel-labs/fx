@@ -1461,6 +1461,7 @@ pub const Runtime = struct {
         name: []const u8,
         path: []const u8,
         display_source: ?skill_contract.SkillSource,
+        display_path: ?skill_contract.SkillPathDiscriminator,
     ) !bool {
         _ = self.childRouteId() orelse return false;
         const replace_end = self.child.editor.edit_state.input.items.len;
@@ -1480,6 +1481,7 @@ pub const Runtime = struct {
             name,
             path,
             display_source,
+            display_path,
         );
         self.child.edited(alloc);
         return true;

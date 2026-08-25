@@ -37,11 +37,38 @@ pub fn skillTokenSourceLabel(token: SkillTokenSpan) ?[]const u8 {
     return skill_runtime.skillSourceShortLabel(source);
 }
 
+pub fn skillTokenPathLabel(token: SkillTokenSpan) ?[]const u8 {
+    const discriminator = token.display_path orelse return null;
+    return discriminator.slice(token.path);
+}
+
+pub fn skillPathLabelVisibleWidth(label: []const u8) usize {
+    var width: usize = 0;
+    var i: usize = 0;
+    while (i < label.len) {
+        const byte = label[i];
+        if (byte < 0x20 or byte == 0x7f) {
+            width +|= 1;
+            i += 1;
+            continue;
+        }
+        const unit = display_width.displayUnitAt(label, i);
+        if (unit.byte_len == 0) break;
+        width +|= unit.cell_width;
+        i += unit.byte_len;
+    }
+    return width;
+}
+
 fn skillTokenVisibleWidth(token: SkillTokenSpan) usize {
     var width = display_width.visibleWidth(token.name);
     if (skillTokenSourceLabel(token)) |label| {
         width +|= display_width.visibleWidth(skill_source_separator);
         width +|= display_width.visibleWidth(label);
+    }
+    if (skillTokenPathLabel(token)) |label| {
+        width +|= display_width.visibleWidth(skill_source_separator);
+        width +|= skillPathLabelVisibleWidth(label);
     }
     return width;
 }
@@ -1363,5 +1390,22 @@ test "skill token width includes an ambiguous source label" {
     try std.testing.expectEqual(
         display_width.visibleWidth("review · workspace .codex"),
         skillTokenVisibleWidth(ambiguous),
+    );
+}
+
+test "skill token width includes a same-source path discriminator" {
+    const token = SkillTokenSpan{
+        .raw_start = 0,
+        .raw_end = "$review".len,
+        .name = "review",
+        .path = "/tmp/.codex/skills/path-alpha",
+        .display_source = .global_codex,
+        .display_path = .{ .start = "/tmp/.codex/skills/".len, .end = "/tmp/.codex/skills/path-alpha".len },
+    };
+
+    try std.testing.expectEqualStrings("path-alpha", skillTokenPathLabel(token).?);
+    try std.testing.expectEqual(
+        display_width.visibleWidth("review · global .codex · path-alpha"),
+        skillTokenVisibleWidth(token),
     );
 }

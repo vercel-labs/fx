@@ -116,6 +116,7 @@ const Snapshot = struct {
                 .name = name,
                 .path = path,
                 .display_source = token.display_source,
+                .display_path = token.display_path,
                 .owns_trailing_separator = token.owns_trailing_separator,
             });
         }
@@ -318,6 +319,7 @@ const Snapshot = struct {
                 .name = name,
                 .path = path,
                 .display_source = token.display_source,
+                .display_path = token.display_path,
                 .owns_trailing_separator = token.owns_trailing_separator,
             });
         }

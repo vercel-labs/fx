@@ -21,6 +21,16 @@ pub const SkillSource = enum {
     global_claw,
 };
 
+pub const SkillPathDiscriminator = struct {
+    start: usize,
+    end: usize,
+
+    pub fn slice(self: SkillPathDiscriminator, path: []const u8) ?[]const u8 {
+        if (self.start >= self.end or self.end > path.len) return null;
+        return path[self.start..self.end];
+    }
+};
+
 /// One default skill root. `path` is relative to a workspace ancestor or the
 /// home directory, depending on which table declares the spec.
 pub const RootSpec = struct {

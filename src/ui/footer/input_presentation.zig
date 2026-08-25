@@ -873,30 +873,13 @@ fn appendLayoutUnitContent(
             }
             try row.appendSlice(alloc, ui_render.tag_style);
             try row_text.appendClipped(alloc, row, token.name, @intCast(@min(emit_cells, std.math.maxInt(u16))));
+            const emitted_name_cells = @min(display_width.visibleWidth(token.name), emit_cells);
+            var qualifier_cells = emit_cells - emitted_name_cells;
             if (visual_layout.skillTokenSourceLabel(token)) |source_label| {
-                const emitted_name_cells = @min(display_width.visibleWidth(token.name), emit_cells);
-                const label_cells = emit_cells - emitted_name_cells;
-                if (label_cells > 0) {
-                    try row_text.appendClipped(
-                        alloc,
-                        row,
-                        visual_layout.skill_source_separator,
-                        @intCast(@min(label_cells, std.math.maxInt(u16))),
-                    );
-                    const emitted_separator_cells = @min(
-                        display_width.visibleWidth(visual_layout.skill_source_separator),
-                        label_cells,
-                    );
-                    const source_cells = label_cells - emitted_separator_cells;
-                    if (source_cells > 0) {
-                        try row_text.appendClipped(
-                            alloc,
-                            row,
-                            source_label,
-                            @intCast(@min(source_cells, std.math.maxInt(u16))),
-                        );
-                    }
-                }
+                try appendSkillTokenQualifier(alloc, row, source_label, &qualifier_cells);
+            }
+            if (visual_layout.skillTokenPathLabel(token)) |path_label| {
+                try appendSkillTokenQualifier(alloc, row, path_label, &qualifier_cells);
             }
             try row.appendSlice(alloc, ui_render.reset_style);
             remaining_cells.* -= emit_cells;
@@ -916,6 +899,30 @@ fn appendLayoutUnitContent(
             omitted_positive_unit.* = unit.cell_width > emit_cells;
         },
     }
+}
+
+fn appendSkillTokenQualifier(
+    alloc: Allocator,
+    row: *std.ArrayList(u8),
+    label: []const u8,
+    remaining_cells: *usize,
+) !void {
+    if (remaining_cells.* == 0) return;
+    try row_text.appendClipped(
+        alloc,
+        row,
+        visual_layout.skill_source_separator,
+        @intCast(@min(remaining_cells.*, std.math.maxInt(u16))),
+    );
+    remaining_cells.* -|= display_width.visibleWidth(visual_layout.skill_source_separator);
+    if (remaining_cells.* == 0) return;
+    try row_text.appendSanitizedSingleLineClipped(
+        alloc,
+        row,
+        label,
+        @intCast(@min(remaining_cells.*, std.math.maxInt(u16))),
+    );
+    remaining_cells.* -|= visual_layout.skillPathLabelVisibleWidth(label);
 }
 
 fn finishComposedInputRow(alloc: Allocator, row: *std.ArrayList(u8), width: u16) !void {

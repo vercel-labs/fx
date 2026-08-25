@@ -85,6 +85,7 @@ pub const PreparedSkillsMenu = struct {
     layout: SkillsMenuLayout,
     source_filter: skill_runtime.SkillMenuSourceFilter,
     catalog_empty: bool,
+    all_skills: []const skill_runtime.Skill,
     window_start: usize,
     visible_skills: []*const skill_runtime.Skill,
     scope_column_width: usize,
@@ -131,6 +132,7 @@ pub fn prepareSkillsMenu(
         .layout = layout,
         .source_filter = projection.source_filter,
         .catalog_empty = projection.items.len == 0,
+        .all_skills = projection.items,
         .window_start = window_start,
         .visible_skills = visible_skills,
         .scope_column_width = scopeColumnWidth(visible_skills),
@@ -184,6 +186,7 @@ pub fn composeSkillsMenuRow(
     return composeSkillTitleRow(
         alloc,
         skill,
+        prepared.all_skills,
         display_index == layout.selected,
         prepared.scope_column_width,
         width,
@@ -268,6 +271,7 @@ fn appendSourceTab(
 fn composeSkillTitleRow(
     alloc: Allocator,
     skill: skill_runtime.Skill,
+    all_skills: []const skill_runtime.Skill,
     selected: bool,
     scope_col: usize,
     width: u16,
@@ -292,7 +296,16 @@ fn composeSkillTitleRow(
     // otherwise, applied to the whole row (name and scope). No marker glyph.
     const style = if (selected) ui_render.selected_completion_style else ui_render.dim_style;
     try row.appendSlice(alloc, style);
-    try row_text.appendSingleLineEllipsized(alloc, &row, skill.name, name_budget);
+    if (skill_runtime.skillPathDiscriminator(all_skills, skill)) |discriminator| {
+        var identity: std.ArrayList(u8) = .empty;
+        defer identity.deinit(alloc);
+        try identity.appendSlice(alloc, skill.name);
+        try identity.appendSlice(alloc, " · ");
+        try row_text.appendSanitizedSingleLine(alloc, &identity, discriminator);
+        try row_text.appendSingleLinePrefixBiasedEllipsized(alloc, &row, identity.items, name_budget);
+    } else {
+        try row_text.appendSingleLineEllipsized(alloc, &row, skill.name, name_budget);
+    }
 
     if (show_scope) {
         try row_text.appendSpacesToColumn(alloc, &row, content_width - scope_width);
@@ -398,6 +411,29 @@ test "skills menu renders source tabs and single-line results" {
     try std.testing.expect(std.mem.find(u8, selected.items, "●") == null);
     try std.testing.expect(std.mem.find(u8, selected.items, "○") == null);
     try std.testing.expect(std.mem.find(u8, selected.items, "Workspace skill description.") == null);
+}
+
+test "skills menu distinguishes same-name skills from the same source by path" {
+    const alloc = std.testing.allocator;
+    const skills = [_]skill_runtime.Skill{
+        .{ .name = "same-name-control", .description = "alpha", .path = "/tmp/.codex/skills/path-alpha/SKILL.md", .source = .global_codex },
+        .{ .name = "same-name-control", .description = "beta", .path = "/tmp/.codex/skills/path-beta/SKILL.md", .source = .global_codex },
+    };
+    const projection: SkillsMenuProjection = .{ .active = true, .items = &skills };
+    var prepared = try prepareSkillsMenu(alloc, projection, 8);
+    defer prepared.deinit(alloc);
+
+    var alpha = try composeSkillsMenuRow(alloc, prepared, 2, 92);
+    defer alpha.deinit(alloc);
+    var beta = try composeSkillsMenuRow(alloc, prepared, 3, 92);
+    defer beta.deinit(alloc);
+
+    try std.testing.expect(std.mem.find(u8, alpha.items, "same-name-control · path-alpha") != null);
+    try std.testing.expect(std.mem.find(u8, beta.items, "same-name-control · path-beta") != null);
+    try std.testing.expect(std.mem.find(u8, alpha.items, "Codex · Global") != null);
+    try std.testing.expect(std.mem.find(u8, beta.items, "Codex · Global") != null);
+    try std.testing.expect(std.mem.find(u8, alpha.items, "/tmp/") == null);
+    try std.testing.expect(std.mem.find(u8, beta.items, "/tmp/") == null);
 }
 
 test "skills menu narrow header always shows the active source" {
@@ -595,7 +631,7 @@ test "skills menu result rows preserve content within one through four columns" 
 
     for (1..5) |width| {
         const terminal_width: u16 = @intCast(width);
-        var title = try composeSkillTitleRow(alloc, skill, true, 0, terminal_width);
+        var title = try composeSkillTitleRow(alloc, skill, &.{skill}, true, 0, terminal_width);
         defer title.deinit(alloc);
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(title.items) <= width);
         try std.testing.expect(std.mem.find(u8, title.items, "●") == null);

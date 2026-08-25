@@ -521,6 +521,10 @@ fn copyVisualRowToBuffer(source: visual_layout.Source, target_row: usize, out: [
                             appendBytesToBuffer(out, &len, visual_layout.skill_source_separator);
                             appendBytesToBuffer(out, &len, source_label);
                         }
+                        if (visual_layout.skillTokenPathLabel(token)) |path_label| {
+                            appendBytesToBuffer(out, &len, visual_layout.skill_source_separator);
+                            appendSanitizedSkillPathToBuffer(out, &len, path_label);
+                        }
                         remaining_cells -= unit.cell_width;
                         omitted_positive_unit = false;
                     } else {
@@ -553,6 +557,18 @@ fn appendBytesToBuffer(out: []u8, len: *usize, bytes: []const u8) void {
     if (bytes.len > out.len - len.*) return;
     @memcpy(out[len.* .. len.* + bytes.len], bytes);
     len.* += bytes.len;
+}
+
+fn appendSanitizedSkillPathToBuffer(out: []u8, len: *usize, label: []const u8) void {
+    for (label) |byte| {
+        const sanitized = if (byte == '\n' or byte == '\r')
+            ' '
+        else if (byte < 0x20 or byte == 0x7f)
+            '?'
+        else
+            byte;
+        appendBytesToBuffer(out, len, &.{sanitized});
+    }
 }
 
 fn appendSpacesToBuffer(out: []u8, len: *usize, count: usize) void {

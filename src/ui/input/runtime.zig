@@ -3368,7 +3368,7 @@ test "registered paste skill and image spans are atomic editor boundaries" {
         var runtime = InputRuntime{};
         defer runtime.deinit(alloc);
         try runtime.edit_state.input.appendSlice(alloc, "review hello");
-        try runtime.skillBindingState().bindSkillToken(alloc, 0, "review".len, "review", "/tmp/review/SKILL.md", null);
+        try runtime.skillBindingState().bindSkillToken(alloc, 0, "review".len, "review", "/tmp/review/SKILL.md", null, null);
 
         runtime.edit_state.cursor = 0;
         _ = moveHorizontalForTest(&runtime, .word_right);
@@ -3440,6 +3440,7 @@ test "forward delete removes a skill token with its owned separator" {
         "review",
         "/tmp/review/SKILL.md",
         null,
+        null,
     );
     try runtime.insertionState().insertSlice(alloc, "hello", .preserve);
 
@@ -3466,6 +3467,7 @@ test "forward word delete removes a skill token with its owned separator" {
         "review",
         "/tmp/review/SKILL.md",
         null,
+        null,
     );
     try runtime.insertionState().insertSlice(alloc, "hello", .preserve);
 
@@ -3489,6 +3491,7 @@ test "typing a separator claims the skill token gap as user input" {
         "review".len,
         "review",
         "/tmp/review/SKILL.md",
+        null,
         null,
     );
 
@@ -3519,6 +3522,7 @@ test "typing a text scalar claims the skill token gap as user input" {
         "review",
         "/tmp/review/SKILL.md",
         null,
+        null,
     );
 
     try std.testing.expectEqual(
@@ -3547,6 +3551,7 @@ test "replacing a removed skill gap makes the new separator user owned" {
         "review".len,
         "review",
         "/tmp/review/SKILL.md",
+        null,
         null,
     );
 

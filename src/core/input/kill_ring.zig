@@ -181,6 +181,7 @@ pub const State = struct {
                 .name = token.name,
                 .path = token.path,
                 .display_source = token.display_source,
+                .display_path = token.display_path,
                 .owns_trailing_separator = token.owns_trailing_separator,
             });
         }
@@ -296,6 +297,7 @@ pub const State = struct {
                 token.name,
                 token.path,
                 token.display_source,
+                token.display_path,
                 token.owns_trailing_separator,
             );
         }
@@ -360,6 +362,7 @@ pub const State = struct {
         name: []const u8,
         path: []const u8,
         display_source: ?skill_contract.SkillSource,
+        display_path: ?skill_contract.SkillPathDiscriminator,
         owns_trailing_separator: bool,
     ) !void {
         const owned_name = try alloc.dupe(u8, name);
@@ -372,6 +375,7 @@ pub const State = struct {
             .name = owned_name,
             .path = owned_path,
             .display_source = display_source,
+            .display_path = display_path,
             .owns_trailing_separator = owns_trailing_separator,
         });
     }
@@ -508,6 +512,7 @@ fn capturePayload(
             token.name,
             token.path,
             token.display_source,
+            token.display_path,
             token.owns_trailing_separator and
                 token.raw_end < actual.end and
                 token.raw_end < active.edit.input.items.len and

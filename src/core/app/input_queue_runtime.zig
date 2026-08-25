@@ -651,6 +651,7 @@ fn dupeVisualSkillTokens(
             .name = name,
             .path = path,
             .display_source = span.display_source,
+            .display_path = span.display_path,
             .owns_trailing_separator = span.owns_trailing_separator,
         });
     }
@@ -690,6 +691,7 @@ fn dupeSkillDisplaySpans(
             .name = name,
             .path = path,
             .display_source = tokens[filled].display_source,
+            .display_path = tokens[filled].display_path,
             .owns_trailing_separator = tokens[filled].owns_trailing_separator,
         };
     }
@@ -730,6 +732,7 @@ fn projectSkillDisplaySpansForCommit(
             .name = name,
             .path = path,
             .display_source = span.display_source,
+            .display_path = span.display_path,
             .owns_trailing_separator = span.owns_trailing_separator,
         });
     }

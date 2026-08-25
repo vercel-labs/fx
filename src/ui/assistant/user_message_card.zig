@@ -258,11 +258,27 @@ fn renderSkillTokensForCard(
             try out.writer.writeAll(visual_layout.skill_source_separator);
             try out.writer.writeAll(source_label);
         }
+        if (visual_layout.skillTokenPathLabel(token)) |path_label| {
+            try out.writer.writeAll(visual_layout.skill_source_separator);
+            try writeSanitizedSkillPathLabel(&out.writer, path_label);
+        }
         try out.writer.writeAll(restore_prompt_text_style);
         pos = token.raw_end;
     }
     try out.writer.writeAll(text[pos..]);
     return try out.toOwnedSlice();
+}
+
+fn writeSanitizedSkillPathLabel(writer: *std.Io.Writer, label: []const u8) !void {
+    for (label) |byte| {
+        if (byte == '\n' or byte == '\r') {
+            try writer.writeByte(' ');
+        } else if (byte < 0x20 or byte == 0x7f) {
+            try writer.writeByte('?');
+        } else {
+            try writer.writeByte(byte);
+        }
+    }
 }
 
 // Dupes `content` into the row list.
@@ -541,6 +557,44 @@ test "buildUserPromptCardWithSkillTokens labels an ambiguous source" {
 
     try std.testing.expect(std.mem.find(u8, card, "review · workspace .codex") != null);
     try std.testing.expect(std.mem.find(u8, card, "$review") == null);
+}
+
+test "buildUserPromptCardWithSkillTokens labels a same-source path discriminator" {
+    setStyle(false, null);
+    const alloc = std.testing.allocator;
+    const path = "/tmp/.codex/skills/path-alpha";
+    const tokens = [_]visual_layout.SkillTokenSpan{.{
+        .raw_start = 4,
+        .raw_end = 11,
+        .name = "review",
+        .path = path,
+        .display_source = .global_codex,
+        .display_path = .{ .start = "/tmp/.codex/skills/".len, .end = path.len },
+    }};
+    const card = try buildUserPromptCardWithSkillTokens(alloc, "use $review now", &.{}, 80, &tokens);
+    defer alloc.free(card);
+
+    try std.testing.expect(std.mem.find(u8, card, "review · global .codex · path-alpha") != null);
+    try std.testing.expect(std.mem.find(u8, card, "$review") == null);
+}
+
+test "buildUserPromptCardWithSkillTokens sanitizes a path discriminator" {
+    setStyle(false, null);
+    const alloc = std.testing.allocator;
+    const path = "/tmp/path\x1b[31m-alpha";
+    const tokens = [_]visual_layout.SkillTokenSpan{.{
+        .raw_start = 4,
+        .raw_end = 11,
+        .name = "review",
+        .path = path,
+        .display_source = .global_codex,
+        .display_path = .{ .start = "/tmp/".len, .end = path.len },
+    }};
+    const card = try buildUserPromptCardWithSkillTokens(alloc, "use $review", &.{}, 80, &tokens);
+    defer alloc.free(card);
+
+    try std.testing.expect(std.mem.find(u8, card, "path?[31m-alpha") != null);
+    try std.testing.expect(std.mem.find(u8, card, "\x1b[31m-alpha") == null);
 }
 
 test "buildUserPromptCardWithSkillTokens only strips selected duplicate skill spans" {

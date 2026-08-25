@@ -288,6 +288,7 @@ fn dupeSkillDisplaySpansFromTokens(
             .name = name_copy,
             .path = path_copy,
             .display_source = token.display_source,
+            .display_path = token.display_path,
             .owns_trailing_separator = token.owns_trailing_separator,
         });
         appended = true;
@@ -314,6 +315,7 @@ fn promptCardSkillTokensFromDisplaySpans(
             .name = span.name,
             .path = span.path,
             .display_source = span.display_source,
+            .display_path = span.display_path,
             .owns_trailing_separator = span.owns_trailing_separator,
         };
     }

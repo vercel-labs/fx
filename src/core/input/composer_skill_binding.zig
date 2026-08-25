@@ -23,6 +23,7 @@ pub const State = struct {
         name: []const u8,
         path: []const u8,
         display_source: ?skill_contract.SkillSource,
+        display_path: ?skill_contract.SkillPathDiscriminator,
     ) registered_entities.BindError!void {
         try self.insertion.entities.bindSkillToken(
             alloc,
@@ -32,6 +33,7 @@ pub const State = struct {
             name,
             path,
             display_source,
+            display_path,
         );
         self.insertion.history.reset(alloc);
         self.insertion.vertical_navigation.reset();
@@ -111,6 +113,7 @@ test "composer skill binding owns canonical mutation and transient cleanup" {
         "review",
         "/tmp/review/SKILL.md",
         .workspace_codex,
+        null,
     );
 
     try std.testing.expectEqualStrings("$review next", fixture.edit.input.items);
@@ -169,6 +172,7 @@ fn checkAllocationFailureIsAtomic(
         "review".len,
         "review",
         "/tmp/review/SKILL.md",
+        null,
         null,
     ) catch |err| {
         try std.testing.expectEqualStrings("review tail", fixture.edit.input.items);

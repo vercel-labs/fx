@@ -660,6 +660,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                 completion.skill.name,
                 completion.skill.path,
                 skill_runtime.skillDisplaySource(app.skills.items, completion.skill),
+                skill_runtime.skillPathDiscriminatorSpan(app.skills.items, completion.skill),
             );
             app.input_runtime.picker.resetInlinePickerEpisode();
             if (comptime @hasField(App, "queued_prompt_review")) {

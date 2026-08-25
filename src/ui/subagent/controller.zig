@@ -260,12 +260,14 @@ pub const Controller = struct {
         name: []const u8,
         path: []const u8,
         display_source: ?skill_contract.SkillSource,
+        display_path: ?skill_contract.SkillPathDiscriminator,
     ) !bool {
         return self.runtime.bindSelectedChildSkill(
             alloc,
             name,
             path,
             display_source,
+            display_path,
         );
     }
 

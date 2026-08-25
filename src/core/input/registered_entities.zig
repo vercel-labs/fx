@@ -15,6 +15,7 @@ pub const SkillTokenSpan = struct {
     name: []const u8,
     path: []const u8,
     display_source: ?skill_contract.SkillSource = null,
+    display_path: ?skill_contract.SkillPathDiscriminator = null,
     owns_trailing_separator: bool = false,
 };
 
@@ -472,6 +473,7 @@ pub const State = struct {
         name: []const u8,
         path: []const u8,
         display_source: ?skill_contract.SkillSource,
+        display_path: ?skill_contract.SkillPathDiscriminator,
     ) BindError!void {
         if (replace_start > replace_end or replace_end > editor.input.items.len) {
             return error.InvalidSkillTokenRange;
@@ -521,6 +523,7 @@ pub const State = struct {
             .name = owned_name,
             .path = owned_path,
             .display_source = display_source,
+            .display_path = display_path,
             .owns_trailing_separator = append_separator,
         });
         _ = editor.setCursor(replace_start + inserted_len);
@@ -755,6 +758,7 @@ test "skill binding and separator claim form one atomic state transition" {
         editor.input.items.len,
         "review",
         "/skills/review.md",
+        null,
         null,
     );
     try std.testing.expectEqualStrings("$review ", editor.input.items);

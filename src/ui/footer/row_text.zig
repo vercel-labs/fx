@@ -69,6 +69,39 @@ pub fn appendSingleLinePrefixBiasedEllipsized(alloc: Allocator, out: *std.ArrayL
     return appendProjectedSingleLine(alloc, out, text, width, .prefix_biased);
 }
 
+pub fn appendSanitizedSingleLine(alloc: Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
+    var i: usize = 0;
+    while (i < text.len) {
+        const byte = text[i];
+        if (byte == '\n' or byte == '\r') {
+            try out.append(alloc, ' ');
+            i += 1;
+            continue;
+        }
+        if (byte < 0x20 or byte == 0x7f) {
+            try out.append(alloc, '?');
+            i += 1;
+            continue;
+        }
+        const unit = display_width.displayUnitAt(text, i);
+        if (unit.byte_len == 0) break;
+        try out.appendSlice(alloc, text[i .. i + unit.byte_len]);
+        i += unit.byte_len;
+    }
+}
+
+pub fn appendSanitizedSingleLineClipped(
+    alloc: Allocator,
+    out: *std.ArrayList(u8),
+    text: []const u8,
+    width: u16,
+) !void {
+    var sanitized: std.ArrayList(u8) = .empty;
+    defer sanitized.deinit(alloc);
+    try appendSanitizedSingleLine(alloc, &sanitized, text);
+    try appendClipped(alloc, out, sanitized.items, width);
+}
+
 fn appendProjectedSingleLine(
     alloc: Allocator,
     out: *std.ArrayList(u8),
@@ -224,4 +257,13 @@ test "single line ellipsis projections preserve semantic tails" {
     defer zero.deinit(alloc);
     try appendSingleLineMiddleEllipsized(alloc, &zero, "abcdef", 0);
     try std.testing.expectEqual(@as(usize, 0), zero.items.len);
+}
+
+test "sanitized single line text neutralizes terminal controls" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try appendSanitizedSingleLine(alloc, &out, "path\x1b[31m-alpha\nnext\tpart");
+    try std.testing.expectEqualStrings("path?[31m-alpha next?part", out.items);
 }

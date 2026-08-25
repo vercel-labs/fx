@@ -1138,13 +1138,14 @@ pub fn composeMixedSlashCompletionOptionRow(
 ) !std.ArrayList(u8) {
     return switch (mixedSlashCompletionEntry(registry, prefix, skills, match_idx) orelse return .empty) {
         .command => |command_idx| composeSlashCompletionOptionRow(alloc, registry, prefix, command_idx, selected, start_col, command_width, width),
-        .skill => |skill| composeSkillCompletionOptionRow(alloc, skill, selected, start_col, command_width, width),
+        .skill => |skill| composeSkillCompletionOptionRow(alloc, skill, skills, selected, start_col, command_width, width),
     };
 }
 
 fn composeSkillCompletionOptionRow(
     alloc: Allocator,
     skill: skill_runtime.Skill,
+    all_skills: []const skill_runtime.Skill,
     selected: bool,
     start_col: u16,
     command_width: usize,
@@ -1170,11 +1171,17 @@ fn composeSkillCompletionOptionRow(
         try row.append(alloc, ' ');
     }
 
-    const source = skill_runtime.skillSourceShortLabel(skill.source);
+    var metadata: std.ArrayList(u8) = .empty;
+    defer metadata.deinit(alloc);
+    try metadata.appendSlice(alloc, skill_runtime.skillSourceShortLabel(skill.source));
+    if (skill_runtime.skillPathDiscriminator(all_skills, skill)) |discriminator| {
+        try metadata.appendSlice(alloc, " · ");
+        try row_text.appendSanitizedSingleLine(alloc, &metadata, discriminator);
+    }
     if (before_label_width + visible < width_usize) {
         try row.appendSlice(alloc, ui_render.dim_style);
         const desc_remaining: u16 = @intCast(width_usize - before_label_width - visible);
-        try row_text.appendClipped(alloc, &row, source, desc_remaining);
+        try row_text.appendClipped(alloc, &row, metadata.items, desc_remaining);
         try row.appendSlice(alloc, ui_render.reset_style);
     }
 
@@ -1376,6 +1383,22 @@ test "mixed slash completion includes matching skills with source labels" {
     try std.testing.expect(std.mem.find(u8, row.items, "fx-test-strategy") != null);
     try std.testing.expect(std.mem.find(u8, row.items, "codex") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 50);
+}
+
+test "mixed slash completion distinguishes same-source duplicate skill paths" {
+    const alloc = std.testing.allocator;
+    const skills = [_]skill_runtime.Skill{
+        .{ .name = "same-name-control", .description = "alpha", .path = "/tmp/.codex/skills/path-alpha", .source = .global_codex },
+        .{ .name = "same-name-control", .description = "beta", .path = "/tmp/.codex/skills/path-beta", .source = .global_codex },
+    };
+
+    var alpha = try composeMixedSlashCompletionOptionRow(alloc, picker_test_slash_registry, "/same-name", &skills, 0, true, 1, 18, 70);
+    defer alpha.deinit(alloc);
+    var beta = try composeMixedSlashCompletionOptionRow(alloc, picker_test_slash_registry, "/same-name", &skills, 1, false, 1, 18, 70);
+    defer beta.deinit(alloc);
+
+    try std.testing.expect(std.mem.find(u8, alpha.items, "global .codex · path-alpha") != null);
+    try std.testing.expect(std.mem.find(u8, beta.items, "global .codex · path-beta") != null);
 }
 
 test "mixed slash completion uses skill relevance order" {

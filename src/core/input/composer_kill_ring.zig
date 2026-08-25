@@ -313,6 +313,7 @@ test "structured kill and yank remain edit history boundaries" {
         "review",
         "/skills/review.md",
         null,
+        null,
     );
 
     var before_kill = try fixture.history.prepare(alloc, 0, "", "x", 0, 1);

@@ -237,6 +237,7 @@ fn buildQueuedCardProjection(comptime App: type, app: *App) !QueuedCardProjectio
                 .name = span.name,
                 .path = span.path,
                 .display_source = span.display_source,
+                .display_path = span.display_path,
                 .owns_trailing_separator = span.owns_trailing_separator,
             };
         }

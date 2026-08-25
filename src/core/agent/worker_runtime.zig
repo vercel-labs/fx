@@ -38,6 +38,7 @@ pub const SkillDisplaySpan = struct {
     name: []u8,
     path: []u8,
     display_source: ?skill_contract.SkillSource = null,
+    display_path: ?skill_contract.SkillPathDiscriminator = null,
     owns_trailing_separator: bool = false,
 };
 
@@ -2463,6 +2464,7 @@ pub fn dupeSkillDisplaySpans(alloc: std.mem.Allocator, spans: []const SkillDispl
             .name = try alloc.dupe(u8, spans[filled].name),
             .path = try alloc.dupe(u8, spans[filled].path),
             .display_source = spans[filled].display_source,
+            .display_path = spans[filled].display_path,
             .owns_trailing_separator = spans[filled].owns_trailing_separator,
         };
     }

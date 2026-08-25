@@ -1004,6 +1004,76 @@ pub fn skillDisplaySource(skills: []const Skill, selected: Skill) ?SkillSource {
     return null;
 }
 
+/// Returns the shortest component-aligned path suffix that distinguishes a
+/// skill from same-name candidates in the same source. Cross-source collisions
+/// already have distinct source labels and do not need a path discriminator.
+pub fn skillPathDiscriminator(skills: []const Skill, selected: Skill) ?[]const u8 {
+    const selected_path = skillDisplayDirectoryPath(selected.path);
+    if (selected_path.len == 0) return null;
+
+    var has_same_source_collision = false;
+    for (skills) |skill| {
+        if (!std.mem.eql(u8, skill.name, selected.name) or skill.source != selected.source) continue;
+        if (std.mem.eql(u8, skill.path, selected.path)) continue;
+        has_same_source_collision = true;
+        break;
+    }
+    if (!has_same_source_collision) return null;
+
+    var suffix_start = pathComponentStart(selected_path, selected_path.len);
+    while (true) {
+        const suffix = selected_path[suffix_start..];
+        var unique = true;
+        for (skills) |skill| {
+            if (!std.mem.eql(u8, skill.name, selected.name) or skill.source != selected.source) continue;
+            if (std.mem.eql(u8, skill.path, selected.path)) continue;
+            if (pathEndsWithComponentSuffix(skillDisplayDirectoryPath(skill.path), suffix)) {
+                unique = false;
+                break;
+            }
+        }
+        if (unique or suffix_start == 0) return suffix;
+        suffix_start = pathComponentStart(selected_path, suffix_start);
+    }
+}
+
+pub fn skillPathDiscriminatorSpan(skills: []const Skill, selected: Skill) ?skill_contract.SkillPathDiscriminator {
+    const discriminator = skillPathDiscriminator(skills, selected) orelse return null;
+    const start = @intFromPtr(discriminator.ptr) - @intFromPtr(selected.path.ptr);
+    return .{ .start = start, .end = start + discriminator.len };
+}
+
+fn skillDisplayDirectoryPath(path: []const u8) []const u8 {
+    var end = path.len;
+    while (end > 0 and isPathSeparator(path[end - 1])) end -= 1;
+    if (end == 0) return path[0..0];
+
+    const basename_start = pathComponentStart(path[0..end], end);
+    if (!std.mem.eql(u8, path[basename_start..end], "SKILL.md")) return path[0..end];
+
+    end = basename_start;
+    while (end > 0 and isPathSeparator(path[end - 1])) end -= 1;
+    return path[0..end];
+}
+
+fn pathComponentStart(path: []const u8, before: usize) usize {
+    var end = @min(before, path.len);
+    while (end > 0 and isPathSeparator(path[end - 1])) end -= 1;
+    var start = end;
+    while (start > 0 and !isPathSeparator(path[start - 1])) start -= 1;
+    return start;
+}
+
+fn pathEndsWithComponentSuffix(path: []const u8, suffix: []const u8) bool {
+    if (suffix.len > path.len or !std.mem.endsWith(u8, path, suffix)) return false;
+    const start = path.len - suffix.len;
+    return start == 0 or isPathSeparator(path[start - 1]);
+}
+
+fn isPathSeparator(byte: u8) bool {
+    return byte == '/' or byte == '\\';
+}
+
 pub fn skillMenuFilterCount(skills: []const Skill, filter: SkillMenuSourceFilter) usize {
     return skillMenuFilterQueryCount(skills, filter, "");
 }
@@ -1887,6 +1957,31 @@ test "skill display source is present only for ambiguous names" {
     try std.testing.expectEqual(SkillSource.global_fx, skillDisplaySource(&skills, skills[0]).?);
     try std.testing.expectEqual(SkillSource.workspace_shared, skillDisplaySource(&skills, skills[1]).?);
     try std.testing.expectEqual(@as(?SkillSource, null), skillDisplaySource(&skills, skills[2]));
+}
+
+test "skill path discriminator distinguishes same-source duplicate names" {
+    const skills = [_]Skill{
+        .{ .name = "review", .description = "alpha", .path = "/tmp/.codex/skills/path-alpha/SKILL.md", .source = .global_codex },
+        .{ .name = "review", .description = "beta", .path = "/tmp/.codex/skills/path-beta/SKILL.md", .source = .global_codex },
+        .{ .name = "review", .description = "workspace", .path = "/tmp/workspace/.codex/skills/review", .source = .workspace_codex },
+        .{ .name = "deploy", .description = "unique", .path = "/tmp/.codex/skills/deploy", .source = .global_codex },
+    };
+
+    try std.testing.expectEqualStrings("path-alpha", skillPathDiscriminator(&skills, skills[0]).?);
+    try std.testing.expectEqualStrings("path-beta", skillPathDiscriminator(&skills, skills[1]).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), skillPathDiscriminator(&skills, skills[2]));
+    try std.testing.expectEqual(@as(?[]const u8, null), skillPathDiscriminator(&skills, skills[3]));
+    try std.testing.expectEqualStrings("path-alpha", skillPathDiscriminatorSpan(&skills, skills[0]).?.slice(skills[0].path).?);
+}
+
+test "skill path discriminator expands only as far as a unique suffix" {
+    const skills = [_]Skill{
+        .{ .name = "review", .description = "app", .path = "/tmp/workspace/app/.codex/skills/review", .source = .workspace_codex },
+        .{ .name = "review", .description = "ancestor", .path = "/tmp/workspace/.codex/skills/review", .source = .workspace_codex },
+    };
+
+    try std.testing.expectEqualStrings("app/.codex/skills/review", skillPathDiscriminator(&skills, skills[0]).?);
+    try std.testing.expectEqualStrings("workspace/.codex/skills/review", skillPathDiscriminator(&skills, skills[1]).?);
 }
 
 test "skill menu display order groups by source without copying inventory" {

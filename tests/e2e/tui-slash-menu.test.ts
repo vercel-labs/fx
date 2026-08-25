@@ -513,6 +513,25 @@ function createExactSkillsMenuFixture() {
   };
 }
 
+function createSameSourceDuplicateSkillsFixture() {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-same-source-skills-")));
+  workDirs.push(root);
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const stderrPath = join(root, "stderr.log");
+  for (const directory of ["path-alpha", "path-beta"]) {
+    const skillDir = join(home, ".codex", "skills", directory);
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(
+      join(skillDir, "SKILL.md"),
+      `---\nname: same-name-control\ndescription: ${directory} workflow\n---\n\n${directory} body\n`,
+    );
+  }
+  mkdirSync(workspace, { recursive: true });
+  writeFileSync(stderrPath, "");
+  return { home, workspace, stderrPath };
+}
+
 function createManySkillsMenuFixture(count: number) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-skills-menu-many-")));
   workDirs.push(root);
@@ -3314,6 +3333,61 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     45_000,
+  );
+
+  test(
+    "same-source duplicate skills expose their path in the picker and bound token",
+    async () => {
+      const fixture = createSameSourceDuplicateSkillsFixture();
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+        },
+        stderrPath: fixture.stderrPath,
+        width: 92,
+        height: 28,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("/skills show same-name-control");
+      let grid = await waitForSkillsMenu(session, 2);
+      let pane = grid.join("\n");
+      expect(pane).toContain("same-name-control · path-alpha");
+      expect(pane).toContain("same-name-control · path-beta");
+
+      await session.sendKeys("Enter");
+      pane = await session.waitForPane(
+        (current) =>
+          composerContains(current, "same-name-control") &&
+          current.includes("global .codex · path-alpha"),
+        5_000,
+      );
+      expect(pane).not.toContain("global .codex · path-beta");
+
+      await session.sendKeys("C-u");
+      await session.sendText("/skills show same-name-control");
+      await waitForSkillsMenu(session, 2);
+      await session.sendKeys("Down");
+      await session.sendKeys("Enter");
+      pane = await session.waitForPane(
+        (current) =>
+          composerContains(current, "same-name-control") &&
+          current.includes("global .codex · path-beta"),
+        5_000,
+      );
+      expect(pane).not.toContain("global .codex · path-alpha");
+
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+    },
+    TEST_TIMEOUT,
   );
 
   test(

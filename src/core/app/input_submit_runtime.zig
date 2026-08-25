@@ -928,6 +928,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     .name = token.name,
                     .path = token.path,
                     .display_source = token.display_source,
+                    .display_path = token.display_path,
                     .owns_trailing_separator = token.owns_trailing_separator,
                 });
             }
@@ -962,6 +963,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 if (!std.mem.eql(u8, raw.name, submitted.name) or
                     !std.mem.eql(u8, raw.path, submitted.path) or
                     raw.display_source != submitted.display_source or
+                    !std.meta.eql(raw.display_path, submitted.display_path) or
                     raw.owns_trailing_separator != submitted.owns_trailing_separator)
                 {
                     return false;
@@ -1363,6 +1365,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     .name = token.name,
                     .path = token.path,
                     .display_source = token.display_source,
+                    .display_path = token.display_path,
                     .owns_trailing_separator = token.owns_trailing_separator,
                 });
             }
