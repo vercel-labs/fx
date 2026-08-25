@@ -563,6 +563,7 @@ const App = struct {
     goal: ?goal_module.goal_store.Goal = null,
     goal_tool_context: goal_module.GoalToolContext = .{},
     goal_terminal_transition_pending_accounting: bool = false,
+    goal_budget_wrapup_pending_accounting: bool = false,
     diff_entries: std.ArrayList(@import("core/output/diff.zig").DiffEntry) = .empty,
     next_diff_id: u32 = 1,
 
@@ -1628,6 +1629,7 @@ const App = struct {
             alloc,
             permission_mode,
             self.permission_engine.rules,
+            true,
         );
     }
 
@@ -1641,6 +1643,7 @@ const App = struct {
             alloc,
             permission_mode,
             permission_rules,
+            false,
         );
     }
 
@@ -1649,11 +1652,13 @@ const App = struct {
         alloc: Allocator,
         permission_mode: types.PermissionMode,
         permission_rules: types.PermissionRuleSet,
+        goal_available: bool,
     ) !tool_projection.EffectiveToolProjection {
         return app_mcp_runtime.buildModelToolProjection(&self.mcp, alloc, self.toolAdvertisementSet(), .{
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = self.session_persistence.subagent_host != null,
+            .goal_available = goal_available,
         });
     }
 
@@ -2361,7 +2366,12 @@ const App = struct {
         try SessionAppRuntime.appendFinishedPrompt(self, finished);
         if (finished.summary) |summary| {
             _ = try self.shell.appendTurnSummaryEntry(self.alloc, summary);
-            try goal_module.goal_runtime.advanceAfterTurn(App, self, summary);
+            try goal_module.goal_runtime.advanceAfterTurn(
+                App,
+                self,
+                summary,
+                finished.terminal_outcome,
+            );
         }
     }
 

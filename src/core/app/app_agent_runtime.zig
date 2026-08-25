@@ -99,6 +99,7 @@ pub fn Runtime(comptime App: type) type {
         fn childToolContext(root_context: tool_runtime.Context) tool_runtime.Context {
             var child_context = root_context;
             child_context.tracker = null;
+            child_context.goal_ctx = null;
             return child_context;
         }
 

@@ -1432,6 +1432,13 @@ pub fn Runtime(comptime App: type) type {
             app.total_input_tokens = 0;
             app.total_output_tokens = 0;
             app.total_web_search_requests = 0;
+            if (comptime @hasField(App, "goal")) {
+                if (app.goal) |old_goal| {
+                    var old = old_goal;
+                    old.deinit(app.alloc);
+                }
+                app.goal = null;
+            }
         }
 
         pub fn clearSession(app: *App) !void {
@@ -4819,14 +4826,6 @@ pub fn Runtime(comptime App: type) type {
                 value.deinit(app.alloc);
             }
             const usage = try app.session.usage.snapshot(app.alloc);
-            const goal = if (comptime @hasField(App, "goal"))
-                if (app.goal) |value| try value.dupe(app.alloc) else null
-            else
-                null;
-            errdefer if (goal) |value| {
-                var owned = value;
-                owned.deinit(app.alloc);
-            };
             return .{
                 .id = id,
                 .origin_workspace_root = origin,
@@ -4840,7 +4839,7 @@ pub fn Runtime(comptime App: type) type {
                 .total_output_tokens = 0,
                 .permission_state = permission_state,
                 .usage = usage,
-                .goal = goal,
+                .goal = null,
             };
         }
 
