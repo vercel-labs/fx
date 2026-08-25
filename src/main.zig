@@ -562,6 +562,7 @@ const App = struct {
     effort: ReasoningEffort = .auto,
     goal: ?goal_module.goal_store.Goal = null,
     goal_tool_context: goal_module.GoalToolContext = .{},
+    goal_terminal_transition_pending_accounting: bool = false,
     diff_entries: std.ArrayList(@import("core/output/diff.zig").DiffEntry) = .empty,
     next_diff_id: u32 = 1,
 

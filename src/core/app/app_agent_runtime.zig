@@ -338,7 +338,14 @@ pub fn Runtime(comptime App: type) type {
 
         fn commitGoalMutation(raw: ?*anyopaque, goal: goal_module.goal_store.Goal) anyerror!void {
             const app: *App = @ptrCast(@alignCast(raw orelse return error.GoalMutationUnavailable));
+            const terminal_transition = if (app.goal) |current|
+                current.status == .active and goal.status.isTerminal()
+            else
+                false;
             try app.replaceGoal(goal);
+            if (comptime @hasField(App, "goal_terminal_transition_pending_accounting")) {
+                app.goal_terminal_transition_pending_accounting = terminal_transition;
+            }
             app.goal_tool_context.goal = app.goal;
         }
 
