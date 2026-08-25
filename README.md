@@ -100,6 +100,8 @@ Automatic permission review uses the selected model on the same connection. An o
 
 Saved custom sessions retain the connection name and a non-secret endpoint/authentication fingerprint. Changing or removing that connection prevents an implicit resume against a different destination. Existing history remains readable. Built-in sessions retain their existing provider representation; custom sessions require a build that supports configured connections. Invalid profile configuration fails model startup rather than falling back to Gateway. An unsafe profile directory still permits interactive inspection and local recovery, but model requests stay disabled until you repair the profile and restart fx.
 
+Use `/goal <objective>` to attach a persistent objective to the current session. `/goal` shows its status and usage, `/goal pause` and `/goal resume` control automatic continuation, and `/goal clear` removes it. During agent turns, fx accounts input and output tokens against the goal and continues active work until the agent marks it complete or blocked, the user pauses it, or its token budget is reached.
+
 ## Embed fx
 
 fx builds as a native binary or WebAssembly. Applications embedding fx can provide network transport, session storage, configuration, permission handling, and terminal I/O.

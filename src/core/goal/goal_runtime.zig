@@ -3,6 +3,53 @@ const goal_module = @import("goal.zig");
 const goal_types = goal_module.goal_types;
 const goal_service = goal_module.goal_service;
 const io_mod = @import("../shared/io.zig");
+const types = @import("../shared/types.zig");
+
+pub fn advanceAfterTurn(comptime App: type, app: *App, summary: types.TurnSummary) !void {
+    const current = app.goal orelse return;
+    if (current.status != .active) return;
+    const total_tokens = summary.token_progress.input_tokens +| summary.token_progress.output_tokens;
+    const token_delta = std.math.cast(i64, total_tokens) orelse std.math.maxInt(i64);
+    const persisted_remainder = std.math.cast(u64, current.time_remainder_ms) orelse 0;
+    const elapsed_ms = summary.turn_duration_ms +| persisted_remainder;
+    const elapsed_seconds = std.math.cast(i64, elapsed_ms / std.time.ms_per_s) orelse std.math.maxInt(i64);
+    var outcome = try goal_module.goal_accounting.accountProgress(
+        app.alloc,
+        current,
+        token_delta,
+        elapsed_seconds,
+        io_mod.milliTimestamp(),
+    );
+    defer outcome.goal.deinit(app.alloc);
+    outcome.goal.time_remainder_ms = @intCast(elapsed_ms % std.time.ms_per_s);
+    try installGoal(App, app, outcome.goal);
+
+    if (app.worker.queuedPromptCount() != 0) return;
+    const prompt = if (outcome.budget_limit_reached)
+        try goal_module.goal_steering.budgetLimitPrompt(app.alloc, outcome.goal)
+    else
+        try goal_module.goal_steering.continuationPrompt(app.alloc, outcome.goal);
+    defer app.alloc.free(prompt);
+    try app.queueGoalContinuation(prompt, outcome.goal.objective);
+}
+
+pub fn replaceOwned(comptime App: type, app: *App, next: ?goal_module.goal_store.Goal) !void {
+    const replacement = if (next) |goal| try goal.dupe(app.alloc) else null;
+    const previous = app.goal;
+    app.goal = replacement;
+    app.persistGoalState() catch |err| {
+        if (app.goal) |new_goal| {
+            var owned = new_goal;
+            owned.deinit(app.alloc);
+        }
+        app.goal = previous;
+        return err;
+    };
+    if (previous) |old_goal| {
+        var owned = old_goal;
+        owned.deinit(app.alloc);
+    }
+}
 
 /// Host-side glue for the `/goal` slash command. Parses the subcommand and
 /// mutates the app's in-memory goal state via `goal_service`.
@@ -62,10 +109,8 @@ fn showGoalStatus(comptime App: type, app: *App) !void {
 
 fn handleClear(comptime App: type, app: *App) !void {
     if (comptime @hasField(App, "goal")) {
-        if (app.goal) |goal| {
-            var g = goal;
-            g.deinit(app.alloc);
-            app.goal = null;
+        if (app.goal != null) {
+            try installGoal(App, app, null);
             try app.writeDomainNotice(.{
                 .topic = "goal",
                 .tone = .neutral,
@@ -92,9 +137,7 @@ fn handlePause(comptime App: type, app: *App) !void {
                 };
                 var o = outcome;
                 defer o.deinit(app.alloc);
-                var old = goal;
-                old.deinit(app.alloc);
-                app.goal = try o.goal.dupe(app.alloc);
+                try installGoal(App, app, o.goal);
                 try app.writeDomainNotice(.{
                     .topic = "goal",
                     .tone = .neutral,
@@ -128,9 +171,7 @@ fn handleResume(comptime App: type, app: *App) !void {
                 };
                 var o = outcome;
                 defer o.deinit(app.alloc);
-                var old = goal;
-                old.deinit(app.alloc);
-                app.goal = try o.goal.dupe(app.alloc);
+                try installGoal(App, app, o.goal);
                 try app.writeDomainNotice(.{
                     .topic = "goal",
                     .tone = .neutral,
@@ -180,11 +221,7 @@ fn handleSetObjective(comptime App: type, app: *App, objective: []const u8) !voi
     defer o.deinit(app.alloc);
 
     if (comptime @hasField(App, "goal")) {
-        if (app.goal) |old| {
-            var g = old;
-            g.deinit(app.alloc);
-        }
-        app.goal = try o.goal.dupe(app.alloc);
+        try installGoal(App, app, o.goal);
     }
 
     const body = try std.fmt.allocPrint(app.alloc, "Goal set: {s}", .{objective});
@@ -194,6 +231,19 @@ fn handleSetObjective(comptime App: type, app: *App, objective: []const u8) !voi
         .tone = .neutral,
         .body = body,
     }, true);
+}
+
+fn installGoal(comptime App: type, app: *App, goal: ?goal_module.goal_store.Goal) !void {
+    if (comptime @hasDecl(App, "replaceGoal")) {
+        try app.replaceGoal(goal);
+        return;
+    }
+    const replacement = if (goal) |value| try value.dupe(app.alloc) else null;
+    if (app.goal) |old_goal| {
+        var old = old_goal;
+        old.deinit(app.alloc);
+    }
+    app.goal = replacement;
 }
 
 fn reportServiceError(comptime App: type, app: *App, err: goal_service.ServiceError) !void {
@@ -212,4 +262,68 @@ fn reportServiceError(comptime App: type, app: *App, err: goal_service.ServiceEr
         .tone = .@"error",
         .body = msg,
     }, true);
+}
+
+test "turn lifecycle accounts usage, carries time, and queues budget steering" {
+    const alloc = std.testing.allocator;
+    const FakeWorker = struct {
+        queued: usize = 0,
+        fn queuedPromptCount(self: *@This()) usize {
+            return self.queued;
+        }
+    };
+    const FakeApp = struct {
+        alloc: std.mem.Allocator,
+        goal: ?goal_module.goal_store.Goal,
+        worker: FakeWorker = .{},
+        queued_prompt: ?[]u8 = null,
+
+        fn replaceGoal(self: *@This(), next: ?goal_module.goal_store.Goal) !void {
+            const replacement = if (next) |goal| try goal.dupe(self.alloc) else null;
+            if (self.goal) |old_goal| {
+                var old = old_goal;
+                old.deinit(self.alloc);
+            }
+            self.goal = replacement;
+        }
+
+        fn queueGoalContinuation(self: *@This(), prompt: []const u8, _: []const u8) !void {
+            if (self.queued_prompt) |old| self.alloc.free(old);
+            self.queued_prompt = try self.alloc.dupe(u8, prompt);
+            self.worker.queued += 1;
+        }
+    };
+
+    var app: FakeApp = .{
+        .alloc = alloc,
+        .goal = .{
+            .goal_id = try alloc.dupe(u8, "goal-lifecycle"),
+            .objective = try alloc.dupe(u8, "finish lifecycle"),
+            .token_budget = 100,
+            .created_at_ms = 1,
+            .updated_at_ms = 1,
+        },
+    };
+    defer {
+        if (app.goal) |*goal| goal.deinit(alloc);
+        if (app.queued_prompt) |prompt| alloc.free(prompt);
+    }
+
+    try advanceAfterTurn(FakeApp, &app, .{
+        .turn_duration_ms = 600,
+        .token_progress = .{ .input_tokens = 20, .output_tokens = 30 },
+    });
+    try std.testing.expectEqual(@as(i64, 50), app.goal.?.tokens_used);
+    try std.testing.expectEqual(@as(i64, 0), app.goal.?.time_used_seconds);
+    try std.testing.expectEqual(@as(i64, 600), app.goal.?.time_remainder_ms);
+    app.worker.queued = 0;
+
+    try advanceAfterTurn(FakeApp, &app, .{
+        .turn_duration_ms = 600,
+        .token_progress = .{ .input_tokens = 25, .output_tokens = 25 },
+    });
+    try std.testing.expectEqual(goal_types.GoalStatus.budget_limited, app.goal.?.status);
+    try std.testing.expectEqual(@as(i64, 100), app.goal.?.tokens_used);
+    try std.testing.expectEqual(@as(i64, 1), app.goal.?.time_used_seconds);
+    try std.testing.expect(std.mem.find(u8, app.queued_prompt.?, "reached its token budget") != null);
 }
