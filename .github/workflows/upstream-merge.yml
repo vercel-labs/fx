@@ -55,23 +55,36 @@ jobs:
           fi
 
       - name: Merge upstream without committing
+        id: merge
+        continue-on-error: true
         run: |
-          set -euo pipefail
+          set -u
           git merge --no-ff --no-commit "upstream/${UPSTREAM_BRANCH}"
 
-      - name: Prefer upstream outside fork-owned paths
+      - name: Run upstream-first merge agent
+        if: steps.merge.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.CODE_GH_PAT || github.token }}
         run: |
           set -euo pipefail
-          if git diff --name-only --diff-filter=U | grep -q .; then
-            while IFS= read -r path; do
-              case "$path" in
-                .github/workflows/upstream-merge.yml|.github/merge-policy.json|.fx/*|AGENTS.md|README.md|CHANGELOG.md|flake.nix|flake.lock|assets/omfx.svg)
-                  git checkout --ours -- "$path" ;;
-                *)
-                  git checkout --theirs -- "$path" ;;
-              esac
-              git add -- "$path"
-            done < <(git diff --name-only --diff-filter=U)
+          cat > .github/auto-goal.md <<'EOF'
+          Resolve the current upstream merge. Prefer upstream architecture and behavior by default. Preserve only intentional oh-my-fx fork behavior and adapt it to upstream. Read .github/merge-policy.json. Do not use blanket ours/theirs. Resolve all conflicts, run focused verification, write MERGE_REPORT.md, stage all files, and commit the merge.
+          EOF
+          npx -y @just-every/code@latest exec --cd "$GITHUB_WORKSPACE" --skip-git-repo-check -s workspace-write --goal-file .github/auto-goal.md
+
+      - name: Ensure merge is resolved
+        run: |
+          set -euo pipefail
+          test -z "$(git diff --name-only --diff-filter=U)"
+          git diff --check
+
+      - name: Commit resolved merge
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            git commit --no-edit
+          elif ! git diff --cached --quiet; then
+            git commit -m "Merge upstream/main into oh-my-fx"
           fi
 
       - name: Commit and push merge branch
