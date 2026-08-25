@@ -5,6 +5,7 @@ const goal_store = goal_module.goal_store;
 const goal_tool = goal_module.goal_tool;
 const model_tool_schema = @import("../../core/tooling/model_tool_schema.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const message = @import("../../core/shared/message.zig");
 
 const Allocator = std.mem.Allocator;
 const ToolInput = tool_dispatch.ToolInput;
@@ -163,7 +164,9 @@ fn decodeCreate(ctx: DispatchContext, args_json: []const u8) tool_dispatch.Dispa
     }
     const token_budget: ?i64 = blk: {
         const v = parsed.value.object.get("token_budget") orelse break :blk null;
-        if (v != .integer) break :blk null;
+        if (v != .integer) {
+            return .{ .failure = try ctx.allocator.dupe(u8, "create_goal field \"token_budget\" must be an integer") };
+        }
         break :blk v.integer;
     };
     const input = try ctx.allocator.create(CreateInput);
@@ -221,7 +224,12 @@ fn decodeUpdate(ctx: DispatchContext, args_json: []const u8) tool_dispatch.Dispa
     if (obj != .string) {
         return .{ .failure = try ctx.allocator.dupe(u8, "update_goal field \"status\" must be a string") };
     }
-    const status = goal_types.statusFromWireStr(obj.string);
+    const status: goal_types.GoalStatus = if (std.mem.eql(u8, obj.string, "complete"))
+        .complete
+    else if (std.mem.eql(u8, obj.string, "blocked"))
+        .blocked
+    else
+        return .{ .failure = try ctx.allocator.dupe(u8, "update_goal field \"status\" must be complete or blocked") };
     const input = try ctx.allocator.create(UpdateInput);
     input.* = .{ .status = status };
     return .{ .input = .{ .ptr = input, .deinit_fn = updateDeinit } };
@@ -249,4 +257,52 @@ fn readsOnly(_: ToolInput) bool {
 
 fn isIrreversible(_: ToolInput) bool {
     return false;
+}
+
+test "registered goal tools mutate and read one session context" {
+    const alloc = std.testing.allocator;
+    const MutationSink = struct {
+        goal: ?goal_store.Goal = null,
+
+        fn commit(raw: ?*anyopaque, goal: goal_store.Goal) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.goal) |old_goal| {
+                var old = old_goal;
+                old.deinit(std.testing.allocator);
+            }
+            self.goal = try goal.dupe(std.testing.allocator);
+        }
+    };
+    var sink: MutationSink = .{};
+    defer if (sink.goal) |*goal| goal.deinit(alloc);
+    var goal_ctx: goal_tool.GoalToolContext = .{
+        .now_ms = 10,
+        .mutation_ctx = &sink,
+        .on_mutation = MutationSink.commit,
+    };
+    const registry: tool_dispatch.Registry = .{ .tools = &.{ create_goal, get_goal } };
+    var created = try tool_dispatch.dispatchAuthorizedToolCall(.{
+        .allocator = alloc,
+        .goal_ctx = &goal_ctx,
+    }, registry, message.ToolCall{
+        .id = "call-create",
+        .name = "create_goal",
+        .arguments_json = "{\"objective\":\"ship it\",\"token_budget\":500}",
+    });
+    defer created.deinit(alloc);
+    try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.success, created.status);
+    goal_ctx.goal = sink.goal;
+
+    var read = try tool_dispatch.dispatchAuthorizedToolCall(.{
+        .allocator = alloc,
+        .goal_ctx = &goal_ctx,
+    }, registry, message.ToolCall{
+        .id = "call-get",
+        .name = "get_goal",
+        .arguments_json = "{}",
+    });
+    defer read.deinit(alloc);
+    try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.success, read.status);
+    try std.testing.expect(std.mem.find(u8, read.body, "ship it") != null);
+    try std.testing.expect(std.mem.find(u8, read.body, "\"remaining_tokens\":500") != null);
 }

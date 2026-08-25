@@ -4405,6 +4405,7 @@ pub fn isPristineStartedSession(loaded: *const LoadedWritableSession) bool {
         loaded.state.total_input_tokens == 0 and
         loaded.state.total_output_tokens == 0 and
         loaded.state.recovery_checkpoint == null and
+        loaded.state.goal == null and
         loaded.migration_source_schema_version == null and
         loaded.migration_source_bytes == null;
 }

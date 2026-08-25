@@ -21,6 +21,13 @@ pub const GoalToolContext = struct {
     now_ms: i64 = 0,
     /// Max allowed goal token budget, applied when a budget is omitted.
     max_goal_token_budget: ?i64 = null,
+    mutation_ctx: ?*anyopaque = null,
+    on_mutation: ?*const fn (?*anyopaque, goal_store.Goal) anyerror!void = null,
+
+    fn commit(self: *GoalToolContext, goal: goal_store.Goal) !void {
+        const callback = self.on_mutation orelse return error.GoalMutationUnavailable;
+        try callback(self.mutation_ctx, goal);
+    }
 };
 
 /// Reads the current goal (get_goal tool).
@@ -31,37 +38,38 @@ pub fn handleGet(ctx: *const GoalToolContext, alloc: Allocator) ![]u8 {
 
 /// Creates a new goal (create_goal tool). Fails if an unfinished goal exists.
 pub fn handleCreate(
-    ctx: *const GoalToolContext,
+    ctx: *GoalToolContext,
     alloc: Allocator,
     objective: []const u8,
     token_budget: ?i64,
     rand_u64: u64,
 ) ![]u8 {
     const existing = ctx.goal;
-    const outcome = goal_service.set(alloc, existing, .{
+    const outcome = try goal_service.set(alloc, existing, .{
         .objective = objective,
         .token_budget = token_budget,
         .max_goal_token_budget = ctx.max_goal_token_budget,
-    }, ctx.now_ms, rand_u64) catch |err| return errorJson(alloc, err);
+    }, ctx.now_ms, rand_u64);
     var o = outcome;
     defer o.deinit(alloc);
+    try ctx.commit(o.goal);
     return jsonResponse(alloc, o.goal, .omit);
 }
 
 /// Marks the existing goal complete or blocked (update_goal tool).
 pub fn handleUpdate(
-    ctx: *const GoalToolContext,
+    ctx: *GoalToolContext,
     alloc: Allocator,
     status: goal_types.GoalStatus,
 ) ![]u8 {
     if (status != .complete and status != .blocked) {
-        return errorJson(alloc, error.InvalidStatus);
+        return error.InvalidStatus;
     }
-    const existing = ctx.goal orelse return errorJson(alloc, error.NoGoal);
-    const outcome = goal_service.set(alloc, existing, .{ .status = status }, ctx.now_ms, 0) catch |err|
-        return errorJson(alloc, err);
+    const existing = ctx.goal orelse return error.NoGoal;
+    const outcome = try goal_service.set(alloc, existing, .{ .status = status }, ctx.now_ms, 0);
     var o = outcome;
     defer o.deinit(alloc);
+    try ctx.commit(o.goal);
     const report: ReportMode = if (status == .complete) .include else .omit;
     return jsonResponse(alloc, o.goal, report);
 }
@@ -96,25 +104,6 @@ fn jsonNullGoal(alloc: Allocator) ![]u8 {
     return alloc.dupe(u8, s);
 }
 
-fn errorJson(alloc: Allocator, err: goal_service.ServiceError) ![]u8 {
-    const msg = switch (err) {
-        error.NoGoal => "no goal exists for this session; create one with create_goal first",
-        error.UnfinishedGoal => "cannot create a new goal because this session has an unfinished goal; complete the existing goal first with update_goal",
-        error.InvalidStatus => "update_goal can only mark the existing goal complete or blocked",
-        error.ObjectiveEmpty => "goal objective must not be empty",
-        error.ObjectiveTooLong => "goal objective must be at most 4000 characters",
-        error.BudgetNotPositive => "goal token budget must be positive when provided",
-        error.BudgetExceedsMax => "goal token budget exceeds the maximum allowed goal token budget",
-        error.OutOfMemory => "out of memory",
-    };
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeAll("{\"error\":");
-    try std.json.Stringify.value(msg, .{}, &out.writer);
-    try out.writer.writeAll("}");
-    return try out.toOwnedSlice();
-}
-
 test "handleGet returns null goal when none exists" {
     const alloc = std.testing.allocator;
     const ctx: GoalToolContext = .{};
@@ -141,29 +130,25 @@ test "handleGet returns goal json when present" {
     try std.testing.expect(std.mem.find(u8, out, "\"remaining_tokens\":800") != null);
 }
 
-test "handleCreate returns error json for empty objective" {
+test "handleCreate rejects an empty objective" {
     const alloc = std.testing.allocator;
-    const ctx: GoalToolContext = .{};
-    const out = try handleCreate(&ctx, alloc, "  ", null, 0x1);
-    defer alloc.free(out);
-    try std.testing.expect(std.mem.find(u8, out, "objective must not be empty") != null);
+    var ctx: GoalToolContext = .{};
+    try std.testing.expectError(error.ObjectiveEmpty, handleCreate(&ctx, alloc, "  ", null, 0x1));
 }
 
 test "handleCreate returns goal json on success" {
     const alloc = std.testing.allocator;
-    const ctx: GoalToolContext = .{ .now_ms = 10 };
+    var ctx: GoalToolContext = .{ .now_ms = 10, .on_mutation = discardTestMutation };
     const out = try handleCreate(&ctx, alloc, "ship the release", 500, 0x1);
     defer alloc.free(out);
     try std.testing.expect(std.mem.find(u8, out, "ship the release") != null);
     try std.testing.expect(std.mem.find(u8, out, "\"status\":\"active\"") != null);
 }
 
-test "handleUpdate returns error json when no goal" {
+test "handleUpdate rejects a missing goal" {
     const alloc = std.testing.allocator;
-    const ctx: GoalToolContext = .{};
-    const out = try handleUpdate(&ctx, alloc, .complete);
-    defer alloc.free(out);
-    try std.testing.expect(std.mem.find(u8, out, "no goal exists") != null);
+    var ctx: GoalToolContext = .{};
+    try std.testing.expectError(error.NoGoal, handleUpdate(&ctx, alloc, .complete));
 }
 
 test "handleUpdate returns error for invalid status" {
@@ -175,10 +160,8 @@ test "handleUpdate returns error for invalid status" {
         .updated_at_ms = 2,
     };
     defer goal.deinit(alloc);
-    const ctx: GoalToolContext = .{ .goal = goal };
-    const out = try handleUpdate(&ctx, alloc, .active);
-    defer alloc.free(out);
-    try std.testing.expect(std.mem.find(u8, out, "complete or blocked") != null);
+    var ctx: GoalToolContext = .{ .goal = goal };
+    try std.testing.expectError(error.InvalidStatus, handleUpdate(&ctx, alloc, .active));
 }
 
 test "handleUpdate marks complete with budget report" {
@@ -192,9 +175,11 @@ test "handleUpdate marks complete with budget report" {
         .updated_at_ms = 2,
     };
     defer goal.deinit(alloc);
-    const ctx: GoalToolContext = .{ .goal = goal, .now_ms = 5 };
+    var ctx: GoalToolContext = .{ .goal = goal, .now_ms = 5, .on_mutation = discardTestMutation };
     const out = try handleUpdate(&ctx, alloc, .complete);
     defer alloc.free(out);
     try std.testing.expect(std.mem.find(u8, out, "\"status\":\"complete\"") != null);
     try std.testing.expect(std.mem.find(u8, out, "completion_budget_report") != null);
 }
+
+fn discardTestMutation(_: ?*anyopaque, _: goal_store.Goal) anyerror!void {}

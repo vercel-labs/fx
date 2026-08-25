@@ -567,6 +567,7 @@ const App = struct {
     auto_upgrade_enabled: bool = true,
     effort: ReasoningEffort = .auto,
     goal: ?goal_module.goal_store.Goal = null,
+    goal_tool_context: goal_module.GoalToolContext = .{},
     diff_entries: std.ArrayList(@import("core/output/diff.zig").DiffEntry) = .empty,
     next_diff_id: u32 = 1,
 
@@ -1159,6 +1160,7 @@ const App = struct {
             skill_tokens,
             null,
             draft.images,
+            null,
             draft.turn_id,
             true,
         )) return error.PendingPromptQueueRejected;
@@ -1312,6 +1314,7 @@ const App = struct {
             skill_tokens,
             null,
             null,
+            null,
             0,
             false,
         );
@@ -1334,6 +1337,7 @@ const App = struct {
             &.{},
             checkpoint,
             null,
+            null,
             checkpoint.turn_id,
             false,
         )) return false;
@@ -1351,6 +1355,7 @@ const App = struct {
         skill_tokens: []const registered_entities.SkillTokenSpan,
         recovery_checkpoint: ?*const session_codec.RecoveryCheckpoint,
         prompt_images: ?[]const types.ImageAttachment,
+        root_user_intent_override: ?[]const u8,
         turn_id: u64,
         user_prompt_already_presented: bool,
     ) !bool {
@@ -1359,6 +1364,7 @@ const App = struct {
             skill_tokens,
             recovery_checkpoint,
             prompt_images,
+            root_user_intent_override,
             turn_id,
             user_prompt_already_presented,
         );
@@ -1375,6 +1381,7 @@ const App = struct {
         skill_tokens: []const registered_entities.SkillTokenSpan,
         recovery_checkpoint: ?*const session_codec.RecoveryCheckpoint,
         prompt_images: ?[]const types.ImageAttachment,
+        root_user_intent_override: ?[]const u8,
         turn_id: u64,
         user_prompt_already_presented: bool,
     ) !worker_runtime.QueuedPrompt {
@@ -1422,11 +1429,14 @@ const App = struct {
 
         const history_copy = try self.session.snapshotHistory(std.heap.c_allocator);
         errdefer types.freeHistoryTurnSlice(std.heap.c_allocator, history_copy);
-        const root_user_intent_context = try auto_classifier_context.buildCanonicalRootUserContext(
-            std.heap.c_allocator,
-            prompt_copy,
-            self.session.agent.history.items,
-        );
+        const root_user_intent_context = if (root_user_intent_override) |intent|
+            try std.heap.c_allocator.dupe(u8, intent)
+        else
+            try auto_classifier_context.buildCanonicalRootUserContext(
+                std.heap.c_allocator,
+                prompt_copy,
+                self.session.agent.history.items,
+            );
         errdefer std.heap.c_allocator.free(root_user_intent_context);
 
         const images_copy = try types.dupeImageAttachmentSlice(
@@ -2600,13 +2610,29 @@ const App = struct {
         return SessionAppRuntime.fastModeModelBound(self);
     }
 
+    pub fn persistGoalState(self: *App) !void {
+        try SessionAppRuntime.commitGoalState(self);
+    }
+
+    pub fn replaceGoal(self: *App, next: ?goal_module.goal_store.Goal) !void {
+        try goal_module.goal_runtime.replaceOwned(App, self, next);
+    }
+
+    pub fn queueGoalContinuation(self: *App, prompt: []const u8, objective: []const u8) !void {
+        _ = try self.snapshotAndQueuePrompt(prompt, &.{}, null, null, objective, 0, false);
+    }
+
     pub fn finishPromptPresentation(self: *App, finished: types.FinishedPrompt) !assistant_pacer.FinishResult {
-        return app_callbacks.Bindings(App).finishPromptPresentation(self, finished);
+        const result = try app_callbacks.Bindings(App).finishPromptPresentation(self, finished);
+        if (result == .committed) {
+            if (finished.summary) |summary| try goal_module.goal_runtime.advanceAfterTurn(App, self, summary);
+        }
+        return result;
     }
 
     pub fn pacerFinish(ctx: *anyopaque, finished: types.FinishedPrompt) anyerror!assistant_pacer.FinishResult {
         const self: *App = @ptrCast(@alignCast(ctx));
-        const result = try app_callbacks.Bindings(App).finishPromptPresentation(self, finished);
+        const result = try self.finishPromptPresentation(finished);
         if (result == .committed) self.notificationPresentationFinished();
         return result;
     }
