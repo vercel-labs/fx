@@ -81,6 +81,39 @@ async function launchNoKeyAndWait(): Promise<{
 
 describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
   test(
+    "/loop schedules, lists, stops, and clears tasks for a new session",
+    async () => {
+      const launched = await launchNoKeyAndWait();
+      session = launched.terminal;
+
+      await session.sendText("/loop 5m check the deploy");
+      const scheduled = await session.waitForText("every 5 minutes", 5_000);
+      const id = scheduled.match(/Scheduled task ([0-9a-f]{12})/)?.[1];
+      expect(id).toBeDefined();
+
+      await session.sendText("/loop list");
+      const listed = await session.waitForText("check the deploy", 5_000);
+      expect(listed).toContain(id!);
+
+      await session.sendText(`/loop stop ${id}`);
+      const stopped = await session.waitForText(`Stopped scheduled task ${id}.`, 5_000);
+      expect(stopped).toContain(`Stopped scheduled task ${id}.`);
+
+      await session.sendText("/loop 5m task from the old session");
+      await session.waitForText("every 5 minutes", 5_000);
+      await session.sendText("/new");
+      await session.waitForComposer(5_000);
+      await session.sendText("/loop list");
+      const resetList = await session.waitForText("No scheduled tasks.", 5_000);
+      expect(resetList).not.toContain("task from the old session");
+
+      expect(session.paneStatus()).toEqual({ dead: false, status: null });
+      expect(readFileSync(launched.stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "/undo reports the exact empty state",
     async () => {
       session = await launchAndWait();
