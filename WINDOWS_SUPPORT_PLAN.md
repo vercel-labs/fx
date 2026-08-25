@@ -19,8 +19,8 @@
 | Zig instalado | `C:\zig\zig-x86_64-windows-0.16.0\zig.exe` |
 | Build | ✅ `fx.exe --version` → `0.0.4`, exit 0; `fx.exe doctor` ok |
 | Binary size | ~11.2 MB PE32+ x86_64 |
-| PR | [#412](https://github.com/vercel-labs/fx/pull/412) draft, **`mergeable: CONFLICTING`** |
-| PR checks | Socket Security: pass. Windows CI: no ha corrido (cambios sin pushear al upstream) |
+| PR | [#412](https://github.com/vercel-labs/fx/pull/412) draft, **`mergeable: MERGEABLE`** ✅ |
+| PR checks | Socket Security: pass. Windows CI: no ha corrido (workflow en el fork, no en upstream; los checks del fork solo corren desde vercel-labs/fx) |
 
 ---
 
@@ -72,64 +72,71 @@
 
 ---
 
-## 2. Diagnóstico del PR conflictivo
+## 2. Diagnóstico del PR conflictivo — RESUELTO ✅
 
-`gh pr view 412 --repo vercel-labs/fx --json mergeable` →
-`CONFLICTING`.
+Estado original: `gh pr view 412 --repo vercel-labs/fx --json mergeable`
+→ `CONFLICTING`.
 
 Causa raíz: el branch se creó contra `d2c6f2d` (un PR
 anterior). Desde entonces, `vercel-labs/fx:main` ha avanzado
-**186 commits** que tocan 28+ archivos en común con mi branch:
+**186 commits** que tocan 28+ archivos en común con mi branch.
 
-```
-CHANGELOG.md
-README.md
-src/builtins/mcp.zig
-src/builtins/tools.zig
-src/core/agent/runtime/execution_memory.zig
-src/core/agent/runtime/tests/tool_flow.zig
-src/core/app/app_commands.zig
-src/core/app/app_lifecycle.zig
-src/core/app/app_session_runtime.zig
-src/core/auth/chatgpt_oauth.zig
-src/core/auth/login_flow.zig
-src/core/cli/cli_ask.zig
-src/core/cli/cli_surface.zig
-src/core/config/config_runtime.zig
-src/core/config/settings_store.zig
-src/core/images/image_attachments.zig
-src/core/mcp/mcp_auth.zig
-src/core/mcp/mcp_auth_store.zig
-src/core/session/command_replay_store.zig
-src/core/session/session_resume_view.zig
-src/core/session/session_store.zig
-src/core/shared/io.zig
-src/core/subagent/manager.zig
-src/core/terminal/native_session.zig
-src/core/terminal/store.zig
-src/core/tooling/tool_runtime.zig
-src/core/upgrade/auto_upgrade.zig
-src/main.zig
-src/tools/filesystem/file_info.zig
-src/tools/filesystem/glob_files.zig
-```
+**Resolución (commit `660d660`, pusheado):** `git rebase upstream/main`
+resolvió 63 de 67 archivos automáticamente. Los 4 que quedaron en
+conflicto real, más la restauración de un archivo perdido y los
+fixes de integración post-rebase, son:
 
-Intento de rebase local: `git rebase upstream/main` resuelve
-63 de 67 archivos modificados automáticamente. Los 4 que
-quedan en conflicto real son:
+### Conflict resolution
 
-* `src/core/agent/runtime/tests/tool_flow.zig` — un test nuevo
-  añadido en `297e1a2` (`sandbox widening allow mints broader
-  authority...`) se solapa con cambios de tests upstream.
-* `src/core/auth/chatgpt_oauth.zig` — mi cambio de `@intCast` →
-  `@ptrCast` se solapa con la versión upstream.
-* `src/core/execution/command_runner.zig` — cambios upstream
-  restructuraron este archivo.
-* `src/core/session/command_replay_store.zig` — cambios
-  upstream movieron lógica que mi branch también tocó.
+* `src/core/agent/runtime/tests/tool_flow.zig` — kept the
+  297e1a2 'sandbox widening' test (HEAD added nothing at the
+  same position).
+* `src/core/auth/chatgpt_oauth.zig` — took upstream's
+  `browser_callback.Accepted` refactor; dropped the
+  `@intCast` → `@ptrCast` workaround (the new abstraction
+  handles `fd_t` internally).
+* `src/core/execution/command_runner.zig` — took upstream's
+  restructured file; dropped the 297e1a2 sandbox.zig
+  changes (which were for a file that no longer exists in
+  that form).
+* `src/core/session/command_replay_store.zig` — took
+  upstream's version (with the random-stem retry loop).
 
-Recomendación: rebase interactivo con `git rebase -i upstream/main`,
-resolver los 4 conflictos, y `git push --force-with-lease origin feat/windows-support`.
+### Post-rebase integration fixes
+
+* `src/core/execution/devbox_executor.zig` — el rebase perdió
+  este archivo porque upstream movió/renombró `sandbox.zig` sin
+  una rename-detection match. Restaurado del árbol pre-rebase
+  de `297e1a2` con los tipos v1 (Provider, ProviderError,
+  VercelOutcome) que `command_runner.zig` aún referencia.
+* `src/core/auth/chatgpt_oauth.zig` — added the `.grok` arm
+  a `SignInCompletion` switch en `saveSignIn` (upstream
+  agregó la variante `.grok`).
+* `src/core/auth/grok_oauth.zig` — guarded
+  `StdinManualCodeReader.poll` con comptime Windows check
+  retornando `error.PlatformUnsupported`. El poll usa
+  `std.posix.STDIN_FILENO` que es `*anyopaque` en Windows.
+* `src/core/auth/grok_session.zig` — replaced 3 calls
+  directos a `.toMode()` / `.fromMode()` con
+  `io_mod.permissionsToMode` / `io_mod.permissionsFromMode`.
+  Upstream usa `std.Io.File.Permissions` directamente; en
+  Windows ese enum no tiene fromMode/toMode.
+* `src/core/execution/command_runner.zig` — added comptime
+  Windows guards a `currentProcessId` (returns 0) y
+  `signalProcessGroup` (returns `error.ProcessGroupUnsupported`).
+  Ambos referencian `std.posix.pid_t` que es
+  `windows.HANDLE = *anyopaque` en Windows.
+* `build.zig` — link `ws2_32` on Windows. El lld-link error
+  surgió cuando se adoptó el `command_runner.zig` de upstream
+  porque algunos símbolos stdlib (setsockopt via libc)
+  resuelven a `ws2_32`.
+* `src/core/session/command_replay_store.zig` — additionally
+  taken upstream después de la resolución inicial. La versión
+  HEAD referenciaba `EphemeralStore` (un tipo que faltaba
+  en la rama rebased); la versión upstream lo define.
+
+**Resultado:** `gh pr view 412 --repo vercel-labs/fx --json mergeable`
+→ `MERGEABLE` ✅.
 
 ---
 
