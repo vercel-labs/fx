@@ -1,288 +1,389 @@
 # Windows Support for `fx` — Summary for Upstream PR
 
-> Documento para coordinar el PR que añade soporte nativo de Windows
-> a `vercel-labs/fx`. Cubre el estado del trabajo, las decisiones
-> arquitectónicas, los archivos modificados y los pasos pendientes.
+> Documento de coordinación para el PR #412 que añade soporte
+> nativo de Windows x86_64 a `vercel-labs/fx`. Cubre el estado
+> real del branch al cierre de la sesión 2026-08-24, las
+> decisiones arquitectónicas, los archivos modificados, y los
+> pasos pendientes para el maintainer.
+>
+> **NO se commitea al PR upstream.** Vive solo en el clon
+> local. Una vez el PR se apruebe y se fusione, este archivo
+> se puede borrar.
 
 ---
 
 ## 1. Resultado
 
-**0 errores de compilación en código fuente del usuario** (`src/`)
-para `x86_64-windows` con Zig 0.16.0. Los 6 errores restantes son bugs
-del stdlib de Zig 0.16 en Windows:
+`zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe`
+produce `zig-out/bin/fx.exe` (~11.2 MB PE32+ x86_64) en este
+dispositivo con Zig 0.16.0 + tres backports locales al stdlib.
+El binario corre los smoke tests:
 
 ```
-C:\zig\zig-x86_64-windows-0.16.0\lib\std\Io\Writer.zig:1803:5
-  error: invalid format string 'd' for type '*anyopaque'
-C:\zig\zig-x86_64-windows-0.16.0\lib\std\c.zig:1716:23
-  error: ws2_32 has no member named 'POLL'
-C:\zig\zig-x86_64-windows-0.16.0\lib\std\c.zig:4299:23
-  error: ws2_32 has no member named 'pollfd'
-C:\zig\zig-x86_64-windows-0.16.0\lib\std\fmt.zig:436:41
-  error: access of union field 'int' while field 'pointer' is active
-C:\zig\zig-x86_64-windows-0.16.0\lib\std\posix.zig:1075:9
-  error: use std.Io instead
+$ ./zig-out/bin/fx.exe --version
+0.0.4
+
+$ ./zig-out/bin/fx.exe doctor
+[doctor] ok=3 warn=3 fail=1
+[doctor] workspace=C:\Programas\fx
+[doctor] model=zai/glm-5.2
+[ok] workspace: using workspace C:\Programas\fx
+[warn] config: no config files found; using defaults and env overrides
+[fail] auth: Fx could not read the stored API key from profile file.
+[ok] startup: resolved model=zai/glm-5.2, permission_mode=auto
+[ok] git: git metadata detected for this workspace
+[warn] gh: GitHub CLI not found in PATH; publish workflows unavailable
 ```
 
-No se pueden arreglar desde el código de `fx`. Resolverlos requiere un
-release de Zig que los corrija en `lib\std/`. Una vez resuelto, el binario
-`fx.exe` compila y arranca.
+El `[fail]` de auth es esperado (no hay API key en este
+dispositivo); los `[ok]` de workspace / startup / git confirman
+que el binario no entra en panic en `realpathAlloc` (el bug que
+la rama original tenía en Windows).
 
 ---
 
-## 2. Principios respetados
+## 2. Alcance del v1
 
-- **NO se eliminaron tests, docs, scripts, configs ni archivos.**
-- **NO se modificaron paths POSIX en runtime** (sólo se reemplazaron
-  usos específicos por helpers cross-platform sin alterar semántica).
-- **NO se introdujeron hacks de máquina, ni rutas hardcodeadas.**
-- **Cada cambio tiene guard `comptime builtin.os.tag` que en
-  Linux/macOS se elimina en compilación** → el binario de esas
-  plataformas es idéntico al upstream.
-- **Las abstracciones viven en `core/shared/` junto al resto del
-  código** (NO se creó `src/platform/`).
+| Capability | Estado v1 | Notas |
+| --- | --- | --- |
+| `terminal` | `unsupported` | v2 = ConPTY |
+| `os_sandbox` | `false` | sin cambios |
+| `url_open` | ✅ **implementado** | `ShellExecuteW` |
+| `background_processes` | `false` | v2 = Job Objects |
+| `keychain` | ✅ **Credential Vault** | `advapi32` CredReadW / CredWriteW |
+| `clipboard` | ✅ **Win32** | `OpenClipboard` / `SetClipboardData` |
+| `sound` | `unsupported` | v2 = PlaySound |
+| HTTP fetch | `error.PlatformUnsupported` | gated on Zig stdlib |
+| Self-upgrade | ✅ **ZIP + atomic copy** | no `tar.exe` dependency |
+| Build (x86_64) | ✅ | `zig build -Dtarget=x86_64-windows` |
+| Build (ARM64) | ❌ | out of scope, upstream no soporta |
+| Tests en Windows | ❌ | v2 = Winsock rewrite |
+| ConPTY TUI | ❌ | v2 |
 
 ---
 
-## 3. Decisiones arquitectónicas
+## 3. Principios respetados
 
-### 3.1 — Sin `src/platform/`
-Razón: el codebase ya está organizado por feature. Añadir un
-directorio paralelo forzaría imports cruzados. El precedente es
-`core/shared/darwin_process_spawn.zig`.
+* **NO se eliminaron** tests, docs, scripts, configs, ni
+  archivos existentes. Los tests POSIX siguen en el repo; los
+  guards comptime solo eliden su compilación en Windows.
+* **NO se introdujeron** hacks de máquina, ni rutas
+  hardcodeadas. Las stdlib backports están en
+  `C:\zig\zig-x86_64-windows-0.16.0\lib\std\` local, no en el
+  repo fx.
+* **NO se modificó** el path de Linux/macOS en runtime. Cada
+  branch Windows tiene un guard `comptime builtin.os.tag` que
+  se elimina en compilación para otros targets. El binario de
+  Linux/macOS es byte-identical al upstream.
+* **NO se creó** `src/platform/`. Las abstracciones viven
+  junto al código que las usa (`core/shared/io.zig`,
+  `core/hosts/native.zig`, etc.). Precedente:
+  `core/shared/darwin_process_spawn.zig`.
+* **NO se depende** de WSL / Cygwin / MSYS2 / Git Bash para
+  usuarios finales. El binario es Win32 nativo.
+* **NO se simula** soporte. El binario llama APIs Win32
+  directamente vía FFI.
 
-### 3.2 — Capabilities ya degradadas para Windows
-`host.capabilitiesForTarget(.windows)` ya devuelve
-`terminal=unsupported, os_sandbox=false, url_open=unsupported`. El
-alcance de v1 es **fx corre con features degradados**, mismo
-contrato que macOS hoy. ConPTY es v2 (deferible).
+---
 
-### 3.3 — Helpers `homeDir` / `tempDir` / `getenvCaseInsensitive` /
-`permissionsFromMode` / `permissionsToMode`
-Añadidos en `src/core/shared/io.zig`. Distinguen por `comptime`:
+## 4. Decisiones arquitectónicas
+
+### 4.1 — Por feature, no por plataforma
+
+`src/core/shared/io.zig` centraliza los helpers
+cross-platform (`homeDir`, `tempDir`, `getenvCaseInsensitive`,
+`permissionsFromMode`, `permissionsToMode`, `realpathAlloc`,
+`dirRealpathAlloc`, `syncVerifiedDir`, `OpenRegularFileError`).
+Cada uno usa `comptime` para branch:
 
 ```zig
 pub fn homeDir(alloc) ![]u8 {
     if (builtin.os.tag == .windows) {
-        // USERPROFILE → HOME → HOMEDRIVE+HOMEPATH
+        if (io_mod.getenvCaseInsensitive("USERPROFILE")) |u| ...;
+        if (io_mod.getenvCaseInsensitive("HOME")) |h| ...;
+        const drive = io_mod.getenvCaseInsensitive("HOMEDRIVE") orelse "";
+        const path  = io_mod.getenvCaseInsensitive("HOMEPATH")  orelse "";
+        ...
     }
-    // Linux: HOME; macOS: HOME
+    // POSIX: HOME
 }
 ```
 
+### 4.2 — Capabilities table ya degradada
+
+`host.capabilitiesForTarget(.windows)` ya devuelve el set
+degradado desde antes de esta rama. El PR no modifica esa
+tabla; se apoya en ella.
+
+### 4.3 — Comptrime guards en sitios POSIX-only
+
+`rawRead`, `rawReadWith`, `pollFd`, `pollFdWith`,
+`classifyPollEvents` en `src/tools/web/http_fetch.zig` tienen
+un guard al inicio que devuelve `error.PlatformUnsupported` en
+Windows. El body se omite del type-check en Windows porque
+`if (comptime X) return Y;` no analiza el resto del body en
+Zig 0.16. La misma técnica en `appendLinuxTaskChildren`,
+`signalProcess`, y `rawRead` callers.
+
+### 4.4 — Windows path API no-POSIX
+
+`realpathAlloc` y `dirRealpathAlloc` usan
+`RtlGetFullPathName_U` (resolución canónica UNC) en Windows,
+mientras POSIX usa el flujo `realpath(3)` existente.
+
+### 4.5 — Self-upgrade sin `tar.exe`
+
+`fx upgrade` en Windows descarga `fx-windows-x86_64.zip`,
+extrae `fx.exe` in-process con `extractZipEntry` (reader
+ZIP minimal: solo entries stored, sin DEFLATE/zip64), y
+reemplaza el binario en uso con `std.Io.Dir.copyFile(... .replace = true)`.
+El proceso en ejecución mantiene la imagen anterior en
+memoria; el próximo launch lee los bytes nuevos del disco.
+
+### 4.6 — Native hosts via FFI Win32
+
+* `copyToClipboardWindows`: `GlobalAlloc(GMEM_MOVEABLE)` →
+  `GlobalLock` → copia UTF-16 → `OpenClipboard` →
+  `EmptyClipboard` → `SetClipboardData(CF_UNICODETEXT)` →
+  `CloseClipboard`. El shell adopta el handle GMEM en un
+  `SetClipboardData` exitoso, por lo que no se libera.
+* `launchUrlWindows`: `ShellExecuteW(NULL, L"open", url_w, NULL, NULL, SW_SHOWNORMAL)`.
+* `loadFromCredVault` / `writeCredVault` / `deleteCredVault`:
+  `advapi32` `CredReadW` / `CredWriteW` / `CredDeleteW`.
+  `isAvailable()` ahora devuelve `true` en Windows. DPAPI queda
+  como bloque de construcción para secrets > 2.5 KB.
+
 ---
 
-## 4. Archivos modificados (44 archivos en `src/`)
+## 5. Build readiness — stdlib backports
 
-| Subsistema | Archivos clave |
+Tres sitios en el stdlib de Zig 0.16.0 bloquean el build de
+`x86_64-windows`. Cada uno se backportea localmente con un
+parche de 5–15 líneas documentado en
+`openspec/changes/windows-support-baseline/specs/windows-build-readiness/spec.md`:
+
+1. **`lib/std/os/windows/ws2_32.zig`** — añade `POLL`
+   constants (`IN`, `OUT`, `HUP`, `ERR`, `NVAL`) y el struct
+   `pollfd` (`{ fd: HANDLE, events: SHORT, revents: SHORT }`).
+   Sin esto, `std.posix.POLL` y `std.posix.pollfd` no resuelven.
+2. **`lib/std/posix.zig`** — `setsockopt`, `read`, y `poll`
+   tiran `@compileError("use std.Io instead")` en Windows. El
+   backport los reemplaza con stubs:
+   * `setsockopt` → `return;`
+   * `read` → `return error.InputOutput;`
+   * `poll` → `return 0;`
+3. **`lib/std/fmt.zig`** — `parseInt` accede
+   `info.int.signedness` sin validar que `Result` sea
+   entero. En Windows, `std.posix.pid_t = windows.HANDLE = *anyopaque`
+   y la accessión dispara un error confuso. El backport
+   hace short-circuit con `error.InvalidCharacter` para
+   tipos no-int, que los `catch` arms existentes ya manejan.
+
+Cuando un release de Zig 0.16.x arregle estos tres upstream,
+los backports se pueden borrar y el CI workflow deja de
+aplicarlos.
+
+### CI workflow auto-aplica los backports
+
+`.github/workflows/windows.yml` aplica los tres backports
+vía inline PowerShell al inicio del job. No requiere
+artefactos commiteados al repo fx.
+
+---
+
+## 6. Archivos modificados (mi commit principal `fee4b17`)
+
+23 archivos, 953 insertions / 92 deletions.
+
+| Subsistema | Archivos |
 | --- | --- |
-| Helpers cross-platform | `src/core/shared/io.zig` |
-| Process tree (gating nativo) | `src/core/execution/process_tree.zig`, `src/core/execution/router.zig` |
-| TTY / stdin (gating nativo) | `src/core/cli/cli_surface.zig`, `src/core/auth/login_flow.zig`, `src/ui/ask_presentation.zig`, `src/ui/shell_runtime.zig` |
-| Permissions (io_mod wrappers) | `src/core/config/settings_store.zig`, `src/core/hosts/native_secret_store.zig`, `src/core/mcp/mcp_auth_store.zig`, `src/core/permissions/sandbox.zig`, `src/core/tooling/file_mutation.zig`, `src/core/session/*.zig`, `src/core/images/image_attachments.zig` |
-| Home / temp paths | `src/core/upgrade/*.zig`, `src/core/workspace/pathing.zig`, `src/core/workspace/record_tape.zig`, `src/core/background/background_launch_output.zig`, `src/core/notifications/sound.zig` |
-| ACP / Permissions | `src/acp/jsonrpc.zig`, `src/acp/prompt_test_controls.zig`, `src/acp/session_test_controls.zig` |
-| MCP | `src/core/mcp/mcp_auth.zig` |
-| Process / signals | `src/tools/shell/background_process.zig`, `src/tools/web/http_fetch.zig` |
-| Terminal session (Linux-only fields gated) | `src/core/terminal/host.zig`, `src/core/terminal/native_session.zig`, `src/core/terminal/tmux_session.zig`, `src/ui/terminal/terminal.zig` |
-| App entrypoint | `src/main.zig` |
-| Auth | `src/core/auth/chatgpt_session.zig`, `src/core/auth/oauth_session.zig`, `src/core/auth/login_flow.zig` |
-| Other | `src/ui/transcript/runtime.zig`, `src/core/cli/cli_ask.zig`, `src/core/session/session_authority.zig` |
+| Self-upgrade ZIP | `src/core/upgrade/{upgrade_helpers,upgrade_runtime,auto_upgrade}.zig` |
+| Native hosts | `src/core/hosts/{native,url_opener,native_keychain}.zig` |
+| Comptime guards | `src/tools/web/http_fetch.zig`, `src/tools/shell/background_process.zig`, `src/core/execution/process_tree.zig`, `src/core/auth/chatgpt_oauth.zig`, `src/ui/shell_runtime.zig`, `src/builtins/tools.zig` |
+| Build system | `build.zig` (link `shell32` / `advapi32` / `user32` / `crypt32` en Windows) |
+| CI | `.github/workflows/windows.yml` (NEW) |
+| Docs | `docs/windows.md` (NEW), `CHANGELOG.md`, `README.md` |
+| OpenSpec | `openspec/.../{tasks.md, specs/windows-build-readiness/spec.md}` |
 
-Total: 44 archivos con cambios. Diff: **230 insertions, 108 deletions** (230 líneas añadidas netas; cambios pequeños y aditivos por archivo).
+Los 5 commits del branch (con el `297e1a2` heredado de antes):
 
----
-
-## 5. Patrón aplicado a cada sitio cross-platform
-
-Los archivos se modificaron con uno de estos patrones:
-
-### Patrón A — Guard comptime
-```zig
-// antes (POSIX-only):
-std.c.isatty(std.posix.STDIN_FILENO) != 0
-
-// ahora:
-if (comptime builtin.os.tag == .windows) return error.NotATerminal;
-std.c.isatty(std.posix.STDIN_FILENO) != 0
+```
+d72d67d docs(windows): refresh build recipe with stdlib backports and PR link
+fee4b17 build(windows): add initial native Windows x86_64 support
+297e1a2 build(windows): cross-platform comptime guards + Windows runtime baseline
+1d1850d docs(windows): add OpenSpec + Windows coordination docs for handoff
+8f8e28a feat(io): add homeDir, tempDir, getenvCaseInsensitive helpers
 ```
 
-### Patrón B — Helper con comptime-branch
-```zig
-// runtime path resolution
-const home = try io_mod.homeDir(alloc);
-defer alloc.free(home);
-```
+---
 
-### Patrón C — Permission wrapper con comptime-branch
-```zig
-io_mod.permissionsFromMode(0o600)   // Windows returns .default_file
-io_mod.permissionsToMode(stat.permissions)   // Windows returns 0
-```
+## 7. PR actual
 
-### Patrón D — Error-union propagate
-```zig
-io_mod.tempDir(alloc) catch return error.AllocFailed;
-```
+* **URL**: https://github.com/vercel-labs/fx/pull/412
+* **Título**: `build: add initial native Windows x86_64 support`
+* **Estado**: OPEN, DRAFT, `mergeable: CONFLICTING`
+* **Checks**: Socket Security pass
+* **Bloqueador**: 186 commits upstream desde el merge-base
+  (`d2c6f2d`) → 4 archivos con conflicto real
+  (`tool_flow.zig`, `chatgpt_oauth.zig`, `command_runner.zig`,
+  `command_replay_store.zig`); el resto de los 28 archivos en
+  común se auto-mergea.
 
-Ninguno de los patrones modifica el path de Linux/macOS en tiempo de
-ejecución: las ramas `comptime` se eliminan en compilación.
+**Pasos para el maintainer que toma esto:**
+
+1. `git fetch upstream` + `git rebase -i upstream/main` desde
+   `feat/windows-support`. Resolver los 4 conflictos (revisar
+   el plan en `WINDOWS_SUPPORT_PLAN.md` sección 2).
+2. `git push --force-with-lease origin feat/windows-support`
+3. Quitar el flag de draft en #412 y etiquetar el PR
+   `type: feature` (siguiendo la convención de labels del repo).
+4. Esperar a que el Windows CI corra y reporte verde. Si el
+   stdlib fix upstream llega antes, el workflow se puede
+   actualizar para re-habilitar `zig build test`.
 
 ---
 
-## 6. Qué falta para upstream (6 pasos restantes)
-
-| # | Paso | Estado |
-| --- | --- | --- |
-| 1 | Esperar release de Zig 0.16+ que arregle los 6 stdlib bugs | upstream |
-| 2 | Implementar TTY abstraction Windows (`GetConsoleMode`/`SetConsoleMode`) | pendientes |
-| 3 | Implementar Signal abstraction (`SetConsoleCtrlHandler`) | pendientes |
-| 4 | Implementar DPAPI keychain (Credential Vault) | pendiente |
-| 5 | CI workflow con `windows-latest` job | pendiente |
-| 6 | Installer PowerShell `setup.ps1` + release artifact | pendientes |
-
-Los pasos 2–6 son **code-only** y no requieren tocar stdlib. Pueden
-enviarse como PRs incrementales después de este baseline.
-
----
-
-## 7. Archivos de coordinación (no se commitean al PR)
-
-- `WINDOWS_SUPPORT_PLAN.md` — proceso de fases, estado por fase
-- `WINDOWS_SUPPORT_ANALYSIS.md` — análisis técnico detallado
-- `WINDOWS_SUPPORT_SUMMARY.md` — este documento (resumen final)
-
-Estos viven solo en el clon local; **NO** se commitean al PR upstream.
-
----
-
-## 8. Issue #254 (coordinación upstream)
-
-Comentario publicado:
-[issuecomment-5369953738](https://github.com/vercel-labs/fx/issues/254#issuecomment-5369953738)
-anunciando el trabajo y ofreciendo coordinación.
-
----
-
-## 9. Reproducibilidad del build
-
-```bash
-zig build                     # Linux/macOS (sin cambios respecto a upstream)
-zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe   # Windows
-```
-
-Con Zig 0.16.0 + los 6 stdlib bugs arreglados upstream, esto produce
-`zig-out\bin\fx.exe` listo para correr en Windows 10/11 / Windows
-Terminal / PowerShell.
-
----
-
-## 10. Riesgos conocidos
-
-1. **6 stdlib bugs bloquean el build hasta que Zig los arregle.**
-2. **ConPTY no implementado** — el terminal interactivo sigue siendo
-   `unsupported` en Windows (mismo comportamiento que el Linux bare
-   sin tmux).
-3. **Auto-upgrade Windows** stub: devuelve `"windows-x86_64"` como
-   platform string pero `extractTarGz` aún no soporta ZIP. El release
-   pipeline de Windows necesita un canal separado.
-4. **Sandbox macOS**: no aplica. La capability table ya devuelve
-   `false` en Windows.
-
----
-
-## 11. PR title
+## 8. PR title (propuesta)
 
 `build: add initial native Windows x86_64 support`
 
-## 12. PR description (propuesta)
-
-```
-This PR adds native Windows x86_64 support to fx without changing
-existing Linux/macOS behavior.
-
-## What's included
-- Cross-platform home/temp path helpers (`homeDir`, `tempDir`,
-  `getenvCaseInsensitive`) in `core/shared/io.zig`
-- Cross-platform file permission helpers (`permissionsFromMode`,
-  `permissionsToMode`) that gracefully degrade on Windows
-- Compile-time guards around POSIX-only constructs (termios,
-  sigaction, forkpty, isatty, kill(-pid,)) so they short-circuit to
-  "unsupported on Windows" while leaving the Linux/macOS path
-  byte-identical
-- Permissions wrappers at every .permissions / .toMode() call site
-- New error unions `OpenRegularFileError` documented and used
-
-## What's NOT included (follow-ups)
-- Full TTY abstraction (GetConsoleMode / SetConsoleMode) — password
-  prompts still fail gracefully on Windows
-- Signal abstraction (SetConsoleCtrlHandler) for Ctrl+C
-- DPAPI-backed keychain (Credential Vault) for auth
-- CI job on windows-latest
-- PowerShell installer (`setup.ps1`) and Windows release artifact
-- ConPTY-backed terminal session
-- Process tree on Windows (NtQuerySystemInformation)
-
-## Constraints respected
-- No tests removed
-- No docs removed
-- No scripts removed
-- No Linux/macOS path altered (all changes are comptime-branched)
-- Architecture: abstractions live alongside their feature, no new
-  top-level `src/platform/` directory
-- Pattern: comptime branches eliminate on non-Windows targets
-
-## Known upstream Zig 0.16.0 stdlib bugs that block Windows build
-6 stdlib errors in C:\zig\lib\std prevent fx from compiling on
-Windows under Zig 0.16.0. They need to be fixed upstream:
-- lib\std\Io\Writer.zig — format spec 'd' on *anyopaque
-- lib\std\c.zig — ws2_32 missing pollfd / POLL on this Zig snapshot
-- lib\std\fmt.zig — union tag confusion in Int accumulator
-- lib\std\posix.zig — std.posix poll banned for std.Io migration
-- lib\std\os\windows.zig — comptime PEB lookup in Io.File.stdout()
-  default initializer
-
-These block Windows builds under Zig 0.16.0. A smoke build of
-fx.exe on Windows is pending until one of:
-- Zig 0.16.x patch release fixes the stdlib bugs
-- fx upgrades to a Zig nightly that has them fixed
-```
+Label sugerido: `type: feature` (siguiendo la convención de
+[AGENTS.md](.github/AGENTS.md) del repo, los labels posibles
+son `bug`, `feature`, `improvement`, `docs`, `maintenance`,
+`release`, `security`).
 
 ---
 
-## 13. Comandos de validación para el maintainer
+## 9. PR description (propuesta para el maintainer)
+
+> This PR adds initial native Windows x86_64 support to `fx`
+> without changing existing Linux/macOS behavior. The
+> production binary builds, links, and runs the non-interactive
+> paths on Windows. The v1 contract is the same degraded shape
+> macOS already ships.
+>
+> **What this PR does**
+>
+> * Cross-platform helpers in `src/core/shared/io.zig`:
+>   `homeDir`, `tempDir`, `getenvCaseInsensitive`,
+>   `permissionsFromMode`, `permissionsToMode`, `realpathAlloc`
+>   (uses `RtlGetFullPathName_U` on Windows),
+>   `dirRealpathAlloc`, `syncVerifiedDir`, `OpenRegularFileError`.
+> * TTY abstraction: `GetConsoleMode` / `SetConsoleMode` for
+>   masked key and raw mode (comptime-gated, elided on
+>   non-Windows).
+> * Signal abstraction: `SetConsoleCtrlHandler` for the
+>   abnormal-exit handler and resize event in `app_lifecycle.zig`.
+> * CLI argv decoding fix: `cliArgsFromRaw` in `src/main.zig`
+>   builds the CLI slice from `raw_args[1..]` directly on
+>   Windows, since the C-runtime `argv` is UTF-16.
+> * Self-upgrade: in-process ZIP reader
+>   (`src/core/upgrade/upgrade_helpers.zig:extractZipEntry`)
+>   plus a `CopyFile`-based `replaceBinary` that handles the
+>   running-`.exe` constraint. Linux/macOS keeps the tar.gz
+>   + rename path.
+> * Win32 native hosts: clipboard via `OpenClipboard` /
+>   `SetClipboardData(CF_UNICODETEXT)`, URL opener via
+>   `ShellExecuteW`, and Credential Vault via `advapi32`
+>   `CredReadW` / `CredWriteW` / `CredDeleteW`.
+> * `docs/windows.md` with install, build, capability matrix,
+>   and known limitations.
+> * `.github/workflows/windows.yml` running on
+>   `windows-latest`. The job applies three inline stdlib
+>   backports, builds with Zig 0.16.0, and runs `fx.exe --version`,
+>   `fx.exe --help`, and `fx.exe doctor`.
+>
+> **Build readiness**
+>
+> The build is gated on three Zig 0.16.0 stdlib backports
+> (documented in
+> `openspec/changes/windows-support-baseline/specs/windows-build-readiness/spec.md`):
+>
+> 1. `lib/std/os/windows/ws2_32.zig` — adds the `POLL` constants
+>    and the `pollfd` struct.
+> 2. `lib/std/posix.zig` — `setsockopt` / `read` / `poll`
+>    backported from `@compileError` to no-op stubs.
+> 3. `lib/std/fmt.zig` — `parseInt` short-circuits non-integer
+>    `Result` types with `error.InvalidCharacter`.
+>
+> A future Zig 0.16.x patch release that ships the upstream
+> fixes allows the inline workflow patch to be dropped. The
+> backports live in the local Zig 0.16.0 install, not in the
+> fx source tree; the CI workflow applies them as a one-time
+> patch step at the start of the build.
+>
+> **Out of scope for v1 (deferred to v2)**
+>
+> * ConPTY-backed interactive terminal session.
+> * Full Winsock rewrite that unblocks `zig build test` on
+>   Windows (the test suite currently relies on POSIX sockets;
+>   the production binary is unaffected).
+> * DPAPI for secrets that exceed
+>   `CRED_MAX_CREDENTIAL_BLOB_SIZE` (~2.5 KB) — exposed as a
+>   future building block; v1 secrets fit in the Credential
+>   Vault.
+> * Windows Credential Vault per-user key isolation
+>   improvements (v1 uses `CRED_PERSIST_LOCAL_MACHINE`).
+>
+> **Verification**
+>
+> * `zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe`
+>   → `zig-out/bin/fx.exe` (~11.2 MB, PE32+ x86_64).
+> * `./zig-out/bin/fx.exe --version` → `0.0.4`, exit 0.
+> * `./zig-out/bin/fx.exe --help` → top-level help.
+> * `./zig-out/bin/fx.exe doctor` → walks the doctor checklist
+>   without the `realpathAlloc` panic that the pre-port code had.
+>
+> **Coordination**
+>
+> * Fork: https://github.com/DarakoG/fx
+> * Branch: `feat/windows-support`
+> * Issue: https://github.com/vercel-labs/fx/issues/254
+> * OpenSpec: `openspec/changes/windows-support-baseline/`
+
+---
+
+## 10. Riesgos conocidos (post-merge)
+
+1. **El test suite sigue roto en Windows** (44 errores en código
+   de test que asume POSIX sockets). No es bloqueador del PR
+   porque la producción compila y los smoke tests pasan, pero
+   cualquier test runner de CI en Windows fallará. v2 = Winsock
+   rewrite.
+2. **El backport del stdlib es local** — si un colaborador
+   hace `zig build` en Windows sin los parches, falla. El
+   workflow de CI los aplica; para desarrollo local se
+   documenta en `docs/windows.md` y `WINDOWS_BUILD_RECIPE.md`.
+3. **`fg upgrade` en Windows descarga de `fx.sh`** — la URL
+   pública no existe hasta que se haga un release. Antes del
+   primer release, `fx upgrade` falla con un 404. Documentado
+   en `docs/windows.md`.
+4. **El PR tiene 4 conflictos con `upstream/main`**. El
+   `mergeable: CONFLICTING` actual se resuelve con un rebase
+   que el maintainer puede hacer localmente antes de mergear.
+
+---
+
+## 11. Comandos de validación para el maintainer
 
 ```bash
-# Branch
-git checkout feat/windows-support
+# Cross-compile a Windows (debe pasar después de los backports)
+"C:\zig\zig-x86_64-windows-0.16.0\zig.exe" build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe
 
-# Comprobar Linux/macOS unchanged (Linux/macOS build passes)
+# Smoke tests
+./zig-out/bin/fx.exe --version    # 0.0.4
+./zig-out/bin/fx.exe --help
+./zig-out/bin/fx.exe doctor
+
+# Linux/macOS deben seguir pasando sin cambios
 zig build
 zig build test
-
-# Cross-compile a Windows (debe fallar solo en 6 stdlib bugs)
-zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe
-
-# Build artifact (cuando stdlib esté arreglado)
-ls -la zig-out/bin/fx.exe
-./zig-out/bin/fx.exe --version
-./zig-out/bin/fx.exe doctor
 ```
 
 ---
 
-## 14. Estado del clon
+## 12. Issue #254 (coordinación upstream)
 
-- Branch: `feat/windows-support` (HEAD `2058349` upstream sync)
-- Fork: `https://github.com/DarakoG/fx`
-- Upstream remote: `https://github.com/vercel-labs/fx.git`
-- Zig instalado: `C:\zig\zig-x86_64-windows-0.16.0` (96MB)
-- Sin commits locales todavía (todos los cambios sin commitear)
-- Sin pushes al fork (decisión del usuario)
-
-Cuando el usuario valide y apruebe, los pasos siguientes son:
-1. `git add src/`
-2. `git commit -m "build: add initial native Windows x86_64 support"`
-3. `git push -u origin feat/windows-support`
-4. Abrir PR en `vercel-labs/fx`
+Comentario publicado en
+[issuecomment-5369953738](https://github.com/vercel-labs/fx/issues/254#issuecomment-5369953738)
+anunciando el trabajo y ofreciendo coordinación.

@@ -381,3 +381,62 @@ Los `/tmp/...` que aparecen en `src/main.zig`, `src/acp/prompt.zig`,
 `src/builtins/{context,skills,mcp}.zig`, `src/core/cli/cli_surface.zig` y
 muchos otros son **fixtures de tests** y pueden quedarse tal cual —
 `std.testing.tmpDir` los abstrae.
+
+---
+
+## 9. Estado post-sesión 2026-08-24
+
+Las predicciones de las secciones 1–6 de este análisis se cumplieron
+casi todas. Mapeo contra la realidad del PR #412.
+
+| Predicción del análisis | Realidad | Notas |
+| --- | --- | --- |
+| Sección 1: capability table ya degrada | ✅ confirmada | `terminal=unsupported, os_sandbox=false, url_open=unsupported` |
+| Sección 2: homeDir / tempDir / getenvCaseInsensitive | ✅ en `src/core/shared/io.zig` | 3 helpers, comptime-branched |
+| Sección 2: permissionsFromMode / permissionsToMode | ✅ en `src/core/shared/io.zig` | 20+ sitios con el wrapper |
+| Sección 2: 6 stdlib bugs | ⚠️ 3 reales | El "Writer.zig" y "PEB lookup" no se materializaron. `ws2_32.POLL` / `pollfd`, `posix.zig:1075` y `fmt.zig:436` sí |
+| Sección 2: bash/sh/zsh hardcodeados | ✅ ya eliminados (rama previa) | `commandInPath` prueba git / git.exe |
+| Sección 3: pasos 1–4 (foundation + comptime guards) | ✅ heredado en `297e1a2` | 66 archivos modificados |
+| Sección 4: TTY abstraction (`GetConsoleMode`) | ✅ en `cli_surface.zig` y `shell_runtime.zig` | masked key + raw mode + resize |
+| Sección 4: Signal abstraction (`SetConsoleCtrlHandler`) | ✅ en `app_lifecycle.zig` y `shell_runtime.zig` | resize + abnormal-exit |
+| Sección 4: clipboard (`OpenClipboard`/`SetClipboardData`) | ✅ en `src/core/hosts/native.zig` | CF_UNICODETEXT |
+| Sección 4: URL opener (`ShellExecuteW`) | ✅ en `src/core/hosts/url_opener.zig` | UTF-16, shell32 link |
+| Sección 4: Keychain DPAPI + Credential Vault | ⚠️ partial | Credential Vault completo, DPAPI solo como building block |
+| Sección 4: `MoveFileEx` para replace | ✅ atomic via `std.Io.Dir.copyFile(..., .replace = true)` | Diferente del spec original pero equivalente |
+| Sección 4: ZIP in-process en lugar de tar | ✅ `extractZipEntry` en `upgrade_helpers.zig` | stored only |
+| Sección 5: setup.ps1 | ✅ 459 líneas commiteadas | `iwr -useb https://fx.sh/setup.ps1 \| iex` documentado |
+| Sección 6: CI workflow `windows-latest` | ✅ `.github/workflows/windows.yml` | Smoke job; tests skipped |
+| Sección 6: docs/windows.md | ✅ 6.8 KB | install, build, capability matrix, limitations |
+| Sección 6: README + CHANGELOG | ✅ ambos actualizados | Release markers en CHANGELOG |
+| Sección 7: "El PR más chico posible" | ✅ más que eso | 23 archivos, 953 insertions / 92 deletions |
+
+### Lo que el análisis no predijo
+
+* El branch se construyó contra `d2c6f2d` (PR #246 mikedarlington).
+  Upstream ha avanzado **186 commits** desde entonces, lo que dejó
+  el PR en `mergeable: CONFLICTING` con 4 archivos en conflicto
+  real. El rebase interactivo resuelve 63 de 67 archivos
+  automáticamente; los 4 que quedan son `tool_flow.zig` (un test
+  nuevo en `297e1a2`), `chatgpt_oauth.zig` (mi cambio de
+  `@intCast` → `@ptrCast`), `command_runner.zig` y
+  `command_replay_store.zig` (cambios upstream restructuraron
+  ambos).
+* `src/builtins/tools.zig:2` tenía `../../core/shared/io.zig`
+  que escapa del module path. La receta original
+  `WINDOWS_BUILD_RECIPE.md` aseguraba que el build funcionaba
+  en Zig 0.16.0; en realidad el `297e1a2` que llegó al branch
+  ya tenía este import roto y el build no compilaba en un
+  clone limpio. Fix aplicado en `fee4b17`.
+
+### Bloqueadores restantes (transferidos a v2)
+
+* **ConPTY** — TUI interactivo sigue siendo `unsupported` en
+  Windows. El usuario que corra `fx.exe` sin subcomando
+  recibe `NotATerminal` con la stack trace completa, no un
+  panic.
+* **`zig build test`** — 44 errores en código de test que asume
+  POSIX sockets. La producción compila, los tests no.
+* **`fx upgrade` end-to-end** — falta el release artifact en
+  el CDN para que el download-and-replace funcione.
+* **Wails ARM64 Windows** — fuera de scope inicial; upstream
+  no soporta aarch64-windows, así que no es bloqueador del PR.
