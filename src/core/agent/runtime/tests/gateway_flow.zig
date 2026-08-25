@@ -5963,6 +5963,45 @@ test "processQueuedPrompt injects final verification only into the completion af
     try expectBodyNotContains(&gateway, 2, "Before finalizing, verify");
 }
 
+test "processQueuedPrompt retains final verification across physical recovery" {
+    const alloc = std.testing.allocator;
+    const mutation_calls = [_]ToolCall{toolCall("call_write", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
+    const interrupted_starts = [_]ToolCall{toolCall("call_read_interrupted", "read_file", "{}")};
+    const recovered_calls = [_]ToolCall{toolCall("call_read_recovered", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &mutation_calls },
+        .{
+            .streamed_tool_starts = &interrupted_starts,
+            .stream_error_after_tool_starts = error.ReadFailed,
+        },
+        .{
+            .streamed_tool_starts = &recovered_calls,
+            .tool_calls = &recovered_calls,
+        },
+        .{ .content = "Finished" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.final_verification_enabled = true;
+    config.gateway_retry_count = 3;
+    config.max_provider_attempts = 3;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 0, "Before finalizing, verify");
+    try expectBodyContains(&gateway, 1, "Before finalizing, verify");
+    try expectBodyContains(&gateway, 2, "Before finalizing, verify");
+    try expectBodyContains(&gateway, 2, "did not execute the incomplete tool call");
+    try expectBodyNotContains(&gateway, 3, "Before finalizing, verify");
+    try expectBodyContains(&gateway, 3, "call_read_recovered");
+    try expectBodyContains(&gateway, 3, "\"output\":{\"type\":\"text\",\"value\":\"ok\"}");
+}
+
 test "processQueuedPrompt excludes successful non-file executors from final verification" {
     const alloc = std.testing.allocator;
     const cases = [_]struct {
