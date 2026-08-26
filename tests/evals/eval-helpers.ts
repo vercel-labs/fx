@@ -63,6 +63,7 @@ export interface HeadlessResult {
   output: string;
   exit_code: number;
   model: string;
+  mode: string;
   session_id: string;
   steps: number;
   tool_calls: Array<{

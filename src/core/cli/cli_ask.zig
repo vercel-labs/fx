@@ -110,6 +110,20 @@ const supports_headless_interrupt = switch (std_builtin.os.tag) {
 const HeadlessInterruptInstallError = error{HeadlessInterruptBusy};
 const headless_interrupt_exit_code: u8 = 130;
 const headless_termination_exit_code: u8 = 143;
+const read_only_mode_id = "read_only";
+const read_only_mode = mode_registry.ModeSpec{
+    .id = read_only_mode_id,
+    .name = "Read Only",
+    .description = "Inspect the workspace without modifying it",
+    .permission_mode = .ask,
+    .tool_policy = .read_only,
+    .tool_policy_denial_message = "Read-only mode only allows read-only inspection tools.",
+};
+const read_only_modes = [_]mode_registry.ModeSpec{read_only_mode};
+const read_only_registry = mode_registry.Registry{
+    .default_mode_id = read_only_mode_id,
+    .modes = read_only_modes[0..],
+};
 
 const headless_interrupt = if (supports_headless_interrupt) struct {
     var coordinator_mutex: std.Io.Mutex = .init;
@@ -290,6 +304,7 @@ pub const PromptRunResult = struct {
     final_output: []u8 = &.{},
     interrupted: bool = false,
     model: []u8 = &.{},
+    mode: []u8 = &.{},
     session_id: []u8 = &.{},
     tool_calls: []ToolCallRecord = &.{},
     step_count: usize = 0,
@@ -302,6 +317,7 @@ pub const PromptRunResult = struct {
         alloc.free(self.assistant_output);
         if (self.final_output.len > 0) alloc.free(self.final_output);
         if (self.model.len > 0) alloc.free(self.model);
+        if (self.mode.len > 0) alloc.free(self.mode);
         if (self.session_id.len > 0) alloc.free(self.session_id);
         freeToolCallRecords(alloc, self.tool_calls);
     }
@@ -314,6 +330,7 @@ const AskOptions = struct {
     prompt: []u8,
     resume_target: ?ResumeTarget = null,
     permission_override: ?PermissionMode = null,
+    read_only: bool = false,
     image_paths: std.ArrayList([]u8) = .empty,
     images: std.ArrayList(ImageAttachment) = .empty,
     system_prompt_override: ?[]u8 = null,
@@ -1258,6 +1275,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
     if (options.system_prompt_override) |sp| {
         effective_cfg.prompt_policy.system_prompt = sp;
     }
+    if (options.read_only) effective_cfg.mode_registry = read_only_registry;
 
     const output_mode = selectOutputMode(
         options.quiet,
@@ -1387,6 +1405,7 @@ fn missingCredentialResult(
     alloc: Allocator,
     options: RunOptions,
     provider: model_provider.ProviderId,
+    mode_id: []const u8,
 ) !PromptRunResult {
     const message = if (provider == .codex)
         credentials.missing_chatgpt_credential_message
@@ -1397,9 +1416,13 @@ fn missingCredentialResult(
     try options.deps.write_stderr(options.deps.stderr_ctx, "fx ask: ");
     try options.deps.write_stderr(options.deps.stderr_ctx, message);
     try options.deps.write_stderr(options.deps.stderr_ctx, "\n");
+    const assistant_output = try alloc.dupe(u8, "");
+    errdefer alloc.free(assistant_output);
+    const result_mode = try alloc.dupe(u8, mode_id);
     return .{
         .exit_code = 1,
-        .assistant_output = try alloc.dupe(u8, ""),
+        .assistant_output = assistant_output,
+        .mode = result_mode,
         .error_code = "MissingCredentials",
     };
 }
@@ -1419,8 +1442,15 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer startup.deinit(alloc);
     try checkHeadlessCancellation(options.deps);
 
-    var permission_mode = toCorePermissionMode(startup.permission_mode);
     const mode_id: []const u8 = cfg.mode_registry.default_mode_id;
+    const mode_is_read_only = if (cfg.mode_registry.lookup(mode_id)) |mode|
+        mode.tool_policy == .read_only
+    else
+        false;
+    var effective_deps = options.deps;
+    if (mode_is_read_only) effective_deps.start_subagent_background_recovery = false;
+
+    var permission_mode = toCorePermissionMode(startup.permission_mode);
     if (permission_override) |explicit| permission_mode = explicit;
 
     if (permission_mode == .yolo and !startup.yolo_acknowledged) {
@@ -1450,12 +1480,12 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     try checkHeadlessCancellation(options.deps);
 
     if (!options.continue_recovery and options.resume_target == null and startup.credential == null) {
-        return missingCredentialResult(alloc, options, startup.provider);
+        return missingCredentialResult(alloc, options, startup.provider, mode_id);
     }
 
     var owned_resumed_model: ?[]u8 = null;
     defer if (owned_resumed_model) |model| alloc.free(model);
-    var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
+    var ctx = AskContext.init(alloc, cfg, effective_deps, startup.workspace_root);
     defer ctx.deinit();
     if (options.save_session) {
         _ = try ctx.session.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
@@ -1547,7 +1577,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         );
         routed_credential = resolution.credential;
         if (routed_credential == null) {
-            return missingCredentialResult(alloc, options, ctx.provider);
+            return missingCredentialResult(alloc, options, ctx.provider, mode_id);
         }
         break :routed &routed_credential.?;
     };
@@ -1630,19 +1660,21 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     }
 
     try ctx.checkCancellation();
-    ctx.mcp = try options.deps.load_mcp_runtime(alloc, ctx.mcp_elicitation_capabilities);
-    if (ctx.mcp) |mcp| mcp.connectRequiredForAsk(ctx.toolRegistry());
-    try ctx.checkCancellation();
-    if (ctx.mcp) |mcp| {
-        if (try mcp.requiredStartupFailure(
-            alloc,
-            @intCast(@max(io_mod.milliTimestamp(), 0)),
-        )) |failure| {
-            defer alloc.free(failure);
-            try ctx.writeStderr("fx ask: ");
-            try ctx.writeStderr(failure);
-            try ctx.writeStderr("\n");
-            return error.McpRequiredServerUnavailable;
+    if (!mode_is_read_only) {
+        ctx.mcp = try options.deps.load_mcp_runtime(alloc, ctx.mcp_elicitation_capabilities);
+        if (ctx.mcp) |mcp| mcp.connectRequiredForAsk(ctx.toolRegistry());
+        try ctx.checkCancellation();
+        if (ctx.mcp) |mcp| {
+            if (try mcp.requiredStartupFailure(
+                alloc,
+                @intCast(@max(io_mod.milliTimestamp(), 0)),
+            )) |failure| {
+                defer alloc.free(failure);
+                try ctx.writeStderr("fx ask: ");
+                try ctx.writeStderr(failure);
+                try ctx.writeStderr("\n");
+                return error.McpRequiredServerUnavailable;
+            }
         }
     }
     const session_child_capability = if (ctx.writable) |*writable|
@@ -1760,11 +1792,14 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         error.NonInteractivePermissionRequired => {
             const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
             errdefer alloc.free(assistant_output);
+            const mode = try alloc.dupe(u8, ctx.mode_id);
+            errdefer alloc.free(mode);
             const tool_calls = try takeToolCallRecords(&ctx, alloc);
             return .{
                 .exit_code = 1,
                 .assistant_output = assistant_output,
                 .interrupted = ctx.processInterruptRequested(),
+                .mode = mode,
                 .tool_calls = tool_calls,
                 .error_code = "NonInteractivePermissionRequired",
             };
@@ -1795,6 +1830,8 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
     errdefer if (final_output.len > 0) alloc.free(final_output);
     const model = try alloc.dupe(u8, ctx.model);
     errdefer alloc.free(model);
+    const mode = try alloc.dupe(u8, ctx.mode_id);
+    errdefer alloc.free(mode);
     const session_id = if (ctx.writable) |writable|
         try alloc.dupe(u8, writable.active_id)
     else
@@ -1809,6 +1846,7 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .final_output = final_output,
         .interrupted = ctx.processInterruptRequested(),
         .model = model,
+        .mode = mode,
         .session_id = session_id,
         .tool_calls = tool_calls,
         .step_count = ctx.step_count,
@@ -2439,6 +2477,19 @@ fn executeToolCallAuthorized(
     request: agent_runtime.ToolExecutionRequest,
 ) !ToolExecutionResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (try ctx.cfg.mode_registry.toolPolicyDeniedJson(
+        request.result_allocator,
+        ctx.deps.tool_set,
+        ctx.mode_id,
+        request.call.name,
+    )) |reason| {
+        const result = ToolExecutionResult{
+            .status = .failure,
+            .model_output = reason,
+        };
+        captureToolExecutionResult(ctx, request, result);
+        return result;
+    }
     var tool_ctx = ctx.toolContext();
     tool_ctx.root_user_intent_context = request.root_user_intent_context;
     tool_ctx.root_user_messages = request.root_user_messages;
@@ -3351,6 +3402,8 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
         } else if (std.mem.eql(u8, arg, "--yolo")) {
             if (opts.permission_override != null) return error.InvalidAskArgs;
             opts.permission_override = .yolo;
+        } else if (std.mem.eql(u8, arg, "--read-only")) {
+            opts.read_only = true;
         } else if (std.mem.eql(u8, arg, "--resume") or std.mem.eql(u8, arg, "--resume-id")) {
             if (opts.resume_target != null) return error.InvalidAskArgs;
             const exact_id = std.mem.eql(u8, arg, "--resume-id");
@@ -3540,6 +3593,8 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
     try out.writer.print(",\"exit_code\":{d}", .{result.exit_code});
     try out.writer.writeAll(",\"model\":");
     try std.json.Stringify.value(result.model, .{}, &out.writer);
+    try out.writer.writeAll(",\"mode\":");
+    try std.json.Stringify.value(result.mode, .{}, &out.writer);
     try out.writer.writeAll(",\"session_id\":");
     try std.json.Stringify.value(result.session_id, .{}, &out.writer);
     try out.writer.print(",\"steps\":{d}", .{result.step_count});
@@ -3622,7 +3677,7 @@ fn renderErrorJsonResult(alloc: Allocator, err_name: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
 
-    try out.writer.writeAll("{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":");
+    try out.writer.writeAll("{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"mode\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":");
     try std.json.Stringify.value(err_name, .{}, &out.writer);
     try out.writer.writeAll("}\n");
     return try out.toOwnedSlice();
@@ -3833,7 +3888,7 @@ fn testModelPromptOverlay(model: []const u8) ?[]const u8 {
 
 fn testConfig() Config {
     return .{
-        .command_usage = "ask [--auto|--yolo] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--] <prompt>",
+        .command_usage = "ask [--auto|--yolo] [--read-only] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--] <prompt>",
         .default_model = "model",
         .default_agent_step_limit = 4,
         .gateway_retry_count = 1,
@@ -4025,6 +4080,66 @@ fn testProcessQueuedPromptChecksFullTerminal(deps: *const agent_runtime.AgentRun
         if (std.mem.eql(u8, function.name, "terminal")) break function;
     } else return error.TestExpectedEqual;
     try std.testing.expect(std.mem.find(u8, advertised_terminal.description, "Use start") != null);
+    try testPushAssistantText(deps, "assistant text");
+}
+
+fn testProcessQueuedPromptChecksReadOnly(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
+    try std.testing.expect(semantic_presentation == null);
+    const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
+    try std.testing.expectEqualStrings(read_only_mode_id, ctx.mode_id);
+    try std.testing.expectEqual(PermissionMode.auto, ctx.permission_mode);
+    try std.testing.expect(ctx.mcp == null);
+    try std.testing.expect(!ctx.deps.start_subagent_background_recovery);
+    const expected_advertised_names = [_][]const u8{
+        "read_file",
+        "glob_files",
+        "grep_files",
+        "list_files",
+    };
+    try std.testing.expectEqual(expected_advertised_names.len, cfg.advertised_tool_names.len);
+    try std.testing.expectEqual(expected_advertised_names.len, cfg.advertised_functions.len);
+    for (expected_advertised_names, cfg.advertised_tool_names, cfg.advertised_functions) |expected, advertised_name, advertised_function| {
+        try std.testing.expectEqualStrings(expected, advertised_name);
+        try std.testing.expectEqualStrings(expected, advertised_function.name);
+    }
+    try std.testing.expectEqualStrings("", cfg.custom_tool_guidance);
+    try std.testing.expect(ctx.cfg.mode_registry.toolAllowed(ctx.deps.tool_set, ctx.mode_id, "read_file"));
+    try std.testing.expect(ctx.cfg.mode_registry.toolAllowed(ctx.deps.tool_set, ctx.mode_id, "vision"));
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const validate = deps.validate_tool_call orelse return error.TestExpectedEqual;
+    inline for (&.{ "write_file", "mcp_dynamic_mutation" }) |tool_name| {
+        const validation = try validate(deps.ctx, arena, .{
+            .id = tool_name,
+            .name = tool_name,
+            .arguments_json = "{}",
+        });
+        switch (validation) {
+            .failure => |reason| {
+                try std.testing.expect(std.mem.find(u8, reason, "tool_execution_failed") != null);
+                try std.testing.expect(std.mem.find(u8, reason, read_only_mode.tool_policy_denial_message.?) != null);
+            },
+            else => return error.TestExpectedEqual,
+        }
+    }
+
+    const execution = try deps.execute_tool_call(deps.ctx, .{
+        .call_allocator = arena,
+        .result_allocator = arena,
+        .call = .{
+            .id = "direct-write",
+            .name = "write_file",
+            .arguments_json = "{}",
+        },
+        .authority = .ordinary,
+        .session_grants = &.{},
+        .advertised_dynamic_tool_names = &.{},
+        .max_tool_result_bytes = ctx.max_tool_result_bytes,
+    });
+    try std.testing.expectEqual(agent_runtime.ToolExecutionStatus.failure, execution.status);
+    try std.testing.expect(std.mem.find(u8, execution.model_output, read_only_mode.tool_policy_denial_message.?) != null);
     try testPushAssistantText(deps, "assistant text");
 }
 
@@ -4407,6 +4522,10 @@ fn testPresentKeyNoContextStartup(alloc: Allocator, transport: oauth_transport.P
 
 fn testNoMcpRuntime(_: Allocator, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
     return null;
+}
+
+fn testUnexpectedMcpRuntime(_: Allocator, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
+    return error.TestUnexpectedMcpLoad;
 }
 
 fn testPromptRunDeps(stdout_capture: *TestCapture, stderr_capture: *TestCapture, load_startup_state: LoadStartupStateFn) RunDeps {
@@ -4814,6 +4933,7 @@ test "fx ask deps reject malformed native web_search calls" {
 test "parse options preserves active ask flags and operands" {
     var options = try parseOptionsWithStdin(std.testing.allocator, &.{
         "--auto",
+        "--read-only",
         "--image",
         "a.png",
         "--system",
@@ -4834,6 +4954,7 @@ test "parse options preserves active ask flags and operands" {
     defer options.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(?PermissionMode, .auto), options.permission_override);
+    try std.testing.expect(options.read_only);
     try std.testing.expect(options.json_output);
     try std.testing.expect(options.prompt_permissions);
     try std.testing.expect(options.quiet);
@@ -4865,6 +4986,26 @@ test "parse options accepts yolo and rejects permission flag conflicts" {
             .tty,
         ),
     );
+}
+
+test "parse options keeps read-only independent from permissions and honors the option sentinel" {
+    var read_only_yolo = try parseOptionsWithStdin(
+        std.testing.allocator,
+        &.{ "--read-only", "--yolo", "inspect" },
+        .tty,
+    );
+    defer read_only_yolo.deinit(std.testing.allocator);
+    try std.testing.expect(read_only_yolo.read_only);
+    try std.testing.expectEqual(@as(?PermissionMode, .yolo), read_only_yolo.permission_override);
+
+    var literal = try parseOptionsWithStdin(
+        std.testing.allocator,
+        &.{ "--", "--read-only" },
+        .tty,
+    );
+    defer literal.deinit(std.testing.allocator);
+    try std.testing.expect(!literal.read_only);
+    try std.testing.expectEqualStrings("--read-only", literal.prompt);
 }
 
 test "headless yolo warning reaches stderr before acknowledgment persistence" {
@@ -5231,14 +5372,14 @@ test "stdin prompt errors keep exact structured names" {
     const overflow = try renderErrorJsonResult(alloc, "PromptResourceLimitExceeded");
     defer alloc.free(overflow);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptResourceLimitExceeded\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"mode\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptResourceLimitExceeded\"}\n",
         overflow,
     );
 
     const read_failure = try renderErrorJsonResult(alloc, "PromptInputReadFailed");
     defer alloc.free(read_failure);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptInputReadFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"mode\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptInputReadFailed\"}\n",
         read_failure,
     );
 }
@@ -5255,7 +5396,7 @@ test "image preparation failure has stable text and JSON contracts" {
     const json = try renderErrorJsonResult(alloc, @errorName(error.ImagePreparationFailed));
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"ImagePreparationFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"mode\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"ImagePreparationFailed\"}\n",
         json,
     );
 }
@@ -5286,7 +5427,7 @@ test "stdin read failure has distinct text and JSON output contracts" {
         try runWithDeps(alloc, &.{"--json"}, testConfig(), deps),
     );
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptInputReadFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"mode\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptInputReadFailed\"}\n",
         stdout_capture.bytes.items,
     );
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
@@ -6766,6 +6907,35 @@ test "runWithDeps projects exec-only terminal when saved setup has no capability
     try std.testing.expectEqualStrings("assistant text", stdout_capture.bytes.items);
 }
 
+test "runWithDeps enforces invocation-scoped read-only mode before validation and execution" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var deps = testPromptRunDepsWithProcess(
+        &stdout_capture,
+        &stderr_capture,
+        testProcessQueuedPromptChecksReadOnly,
+    );
+    deps.load_mcp_runtime = testUnexpectedMcpRuntime;
+    deps.start_subagent_background_recovery = true;
+
+    const exit_code = try runWithDeps(
+        alloc,
+        &.{ "--json", "--no-save", "--auto", "--read-only", "inspect" },
+        testConfig(),
+        deps,
+    );
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stdout_capture.bytes.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(read_only_mode_id, parsed.value.object.get("mode").?.string);
+    try std.testing.expectEqualStrings("assistant text", parsed.value.object.get("output").?.string);
+}
+
 test "runWithDeps uses the supplied tool set for advertisement and runtime" {
     const alloc = std.testing.allocator;
     const tools = [_]tool_dispatch.Tool{builtin_tools.read_file};
@@ -7957,6 +8127,7 @@ test "render final JSON preserves shape escaping order and newline" {
         .exit_code = 0,
         .assistant_output = try alloc.dupe(u8, "hello \"zig\"\n"),
         .model = try alloc.dupe(u8, "model-x"),
+        .mode = try alloc.dupe(u8, read_only_mode_id),
         .session_id = try alloc.dupe(u8, "123"),
         .tool_calls = tool_calls,
         .step_count = 2,
@@ -7967,7 +8138,7 @@ test "render final JSON preserves shape escaping order and newline" {
     defer alloc.free(json);
 
     try std.testing.expectEqualStrings(
-        "{\"output\":\"hello \\\"zig\\\"\\n\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model-x\",\"session_id\":\"123\",\"steps\":2,\"tool_calls\":[{\"name\":\"read_file\",\"status\":\"success\"}]}\n",
+        "{\"output\":\"hello \\\"zig\\\"\\n\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model-x\",\"mode\":\"read_only\",\"session_id\":\"123\",\"steps\":2,\"tool_calls\":[{\"name\":\"read_file\",\"status\":\"success\"}]}\n",
         json,
     );
 }
@@ -7977,6 +8148,7 @@ test "render final JSON emits empty tool call array" {
     const result = PromptRunResult{
         .exit_code = 1,
         .assistant_output = try alloc.dupe(u8, ""),
+        .mode = try alloc.dupe(u8, "ask"),
     };
     defer result.deinit(alloc);
 
@@ -7984,7 +8156,7 @@ test "render final JSON emits empty tool call array" {
     defer alloc.free(json);
 
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[]}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"mode\":\"ask\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[]}\n",
         json,
     );
 }
@@ -8711,7 +8883,7 @@ test "json run with missing API key prints diagnostic then final object" {
     try std.testing.expectEqual(@as(u8, 1), exit_code);
     try std.testing.expectEqualStrings("fx ask: " ++ credentials.missing_credential_message ++ "\n", stderr_capture.bytes.items);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"MissingCredentials\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"mode\":\"inspect\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"MissingCredentials\"}\n",
         stdout_capture.bytes.items,
     );
 }
@@ -8919,8 +9091,8 @@ test "default fx ask preserves project context gathering error mappings" {
         json: ?[]const u8,
     }{
         .{ .err = error.OutOfMemory, .json = null },
-        .{ .err = error.NoSpaceLeft, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"NoSpaceLeft\"}\n" },
-        .{ .err = error.WriteFailed, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"WriteFailed\"}\n" },
+        .{ .err = error.NoSpaceLeft, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"mode\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"NoSpaceLeft\"}\n" },
+        .{ .err = error.WriteFailed, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"mode\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"WriteFailed\"}\n" },
     };
 
     for (cases) |case| {
@@ -8973,7 +9145,7 @@ test "quiet suppresses streaming while quiet json captures final output" {
 
     const json_exit = try runWithDeps(alloc, &.{ "--quiet", "--json", "hello" }, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup));
     try std.testing.expectEqual(@as(u8, 0), json_exit);
-    try std.testing.expect(std.mem.startsWith(u8, stdout_capture.bytes.items, "{\"output\":\"assistant text\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model\",\"session_id\":\""));
+    try std.testing.expect(std.mem.startsWith(u8, stdout_capture.bytes.items, "{\"output\":\"assistant text\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model\",\"mode\":\"inspect\",\"session_id\":\""));
     try std.testing.expect(std.mem.endsWith(u8, stdout_capture.bytes.items, "\",\"steps\":0,\"tool_calls\":[]}\n"));
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 }
