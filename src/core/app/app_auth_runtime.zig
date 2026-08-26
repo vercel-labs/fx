@@ -1003,6 +1003,145 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
+        /// Activates `target` with `model`, resolving the credential from
+        /// `preferred_source` first. Used by the model menu and /model when a
+        /// selection is served by a different credential than the active one.
+        /// Returns true when the provider or credential changed.
+        pub fn switchToModel(
+            app: *App,
+            target: model_provider.ProviderId,
+            preferred_source: ?credentials.Source,
+            model: []const u8,
+            origin_label: []const u8,
+        ) !bool {
+            if (comptime !provider_runtime.supported(App) or
+                !@hasDecl(App, "fetchProviderCatalog") or
+                !@hasDecl(@TypeOf(app.model_cache), "adoptOwnedCatalog"))
+            {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .warning,
+                    .body = "Provider switching is unavailable in this host.",
+                }, true);
+                return false;
+            }
+            if (comptime host_target.is_wasm) {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .warning,
+                    .body = "Provider switching is unavailable in this WASM session.",
+                }, true);
+                return false;
+            }
+            if (app.stream.active or app.worker.queuedPromptCount() > 0) {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .warning,
+                    .body = "Cannot switch models while active or queued work finishes.",
+                }, true);
+                return false;
+            }
+
+            const resolution = credentials.resolveForProvider(
+                app.alloc,
+                app.auth.oauthTransport(),
+                app.auth.secretStore(),
+                .refresh_if_needed,
+                target,
+                preferred_source,
+            ) catch |err| {
+                debug_trace.logf("provider", "model route credential failed target={t} err={s}", .{ target, @errorName(err) });
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .@"error",
+                    .body = "Could not prepare the credential for that model's source. The current model is unchanged.",
+                }, true);
+                return false;
+            };
+            var credential = resolution.credential orelse {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .warning,
+                    .body = credentials.missing_interactive_credential_message,
+                }, true);
+                return false;
+            };
+            defer credential.deinit(app.alloc);
+            if (!model_provider.authorizesCredential(target, credential.source)) {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .@"error",
+                    .body = "The available credential cannot authorize that model's source. The current model is unchanged.",
+                }, true);
+                return false;
+            }
+
+            const access = credentials.catalogAccessForCredentialAndAccount(
+                credential.source,
+                credential.token,
+                credential.gatewayTeam(),
+                credential.accountId(),
+            );
+            const fetched = app.fetchProviderCatalog(target, access) catch |err| {
+                debug_trace.logf("provider", "model route catalog failed target={t} err={s}", .{ target, @errorName(err) });
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .@"error",
+                    .body = "Could not load that model's catalog. The current model is unchanged.",
+                }, true);
+                return false;
+            };
+            var catalog = switch (fetched) {
+                .catalog => |catalog| catalog,
+                .failure => |failure| {
+                    debug_trace.logf("provider", "model route catalog rejected target={t} category={t}", .{ target, failure.category });
+                    try app.writeDomainNotice(.{
+                        .topic = "provider",
+                        .tone = .@"error",
+                        .body = "That model's catalog could not be validated. The current model is unchanged.",
+                    }, true);
+                    return false;
+                },
+            };
+            defer model_catalog.freeModelCatalog(app.alloc, &catalog);
+
+            var owned_model = try app.alloc.dupe(u8, model);
+            errdefer app.alloc.free(owned_model);
+
+            app.model_cache.adoptOwnedCatalog(access, &catalog);
+            app.provider_selection.adoptOwned(target, &owned_model);
+            _ = app.auth.adoptCredential(app.alloc, &credential);
+            reconcileGatewayCredential(app);
+
+            if (comptime @hasDecl(App, "persistRuntimePreferences")) {
+                var persistence = app.persistRuntimePreferences(.{
+                    .provider = target,
+                    .model = provider_runtime.model(app),
+                });
+                defer persistence.deinit(app.alloc);
+                if (persistence.settings_error != null or persistence.session_error != null) {
+                    debug_trace.logf("provider", "model switch persistence failed", .{});
+                }
+            } else {
+                var persistence = config_runtime.attemptUserPreferences(app.alloc, switch (target) {
+                    .openpaths, .gateway => .{ .provider = target, .model = provider_runtime.model(app) },
+                    .codex => .{ .provider = .codex, .codex_model = provider_runtime.model(app) },
+                    .grok => .{ .provider = .grok, .grok_model = provider_runtime.model(app) },
+                });
+                defer persistence.deinit(app.alloc);
+            }
+
+            const body = try std.fmt.allocPrint(
+                app.alloc,
+                "Switched to {s} via {s}.",
+                .{ provider_runtime.model(app), origin_label },
+            );
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = "model", .tone = .neutral, .body = body }, true);
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
         fn beginTeamPicker(app: *App) !void {
             if (!app.auth.pickerView().fx_login_session_available) return;
             try app.flushBeforeBlockingExternalWork();

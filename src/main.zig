@@ -1745,11 +1745,106 @@ const App = struct {
                 self.auth.modelCatalogAccess(),
             );
         } else {
+            self.applyModelMergeSources() catch |err| {
+                debug_trace.logf("model_cache", "merge_sources unavailable err={s}", .{@errorName(err)});
+            };
             self.model_cache.startWarmup(
                 builtin_providers.modelCatalog(self.provider_selection.selection().provider),
                 self.auth.modelCatalogAccess(),
             );
         }
+    }
+
+    /// Installs secondary catalogs merged into the /model menu: every credential
+    /// source available locally but different from the active one. Credentials
+    /// stay alive until `setMergeSources` has copied what it needs.
+    fn applyModelMergeSources(self: *App) !void {
+        const alloc = std.heap.c_allocator;
+        var sources: std.ArrayList(model_cache_runtime.MergeSource) = .empty;
+        var loaded_credentials: std.ArrayList(credentials.Credential) = .empty;
+        defer {
+            for (loaded_credentials.items) |*credential| credential.deinit(alloc);
+            loaded_credentials.deinit(alloc);
+            sources.deinit(alloc);
+        }
+
+        const active_source = self.auth.credentialSource();
+        for ([_]credentials.Source{
+            .openpaths_api_key,
+            .openrouter_api_key,
+            .chatgpt_subscription,
+            .grok_subscription,
+            .fx_login,
+            .ai_gateway_api_key,
+        }) |source| {
+            if (active_source) |active| {
+                if (active == source) continue;
+            }
+            const exists = credentials.sourceExists(alloc, self.auth.secretStore(), source) catch continue;
+            if (!exists) continue;
+            const credential = (credentials.loadSource(
+                alloc,
+                self.auth.oauthTransport(),
+                self.auth.secretStore(),
+                source,
+            ) catch continue) orelse continue;
+            try loaded_credentials.append(alloc, credential);
+            const stored = &loaded_credentials.items[loaded_credentials.items.len - 1];
+            const origin = model_cache_runtime.ModelOrigin.fromSource(source);
+            try sources.append(alloc, .{
+                .origin = origin,
+                .catalog = builtin_providers.modelCatalog(origin.provider()),
+                .access = credentials.catalogAccessForCredentialAndAccount(
+                    stored.source,
+                    stored.token,
+                    stored.gatewayTeam(),
+                    stored.accountId(),
+                ),
+            });
+            debug_trace.logf("model_cache", "merge_source added origin={t}", .{origin});
+        }
+        debug_trace.logf("model_cache", "merge_sources installed count={d}", .{sources.items.len});
+        try self.model_cache.setMergeSources(sources.items);
+    }
+
+    /// Switches provider and credential so `model` is served by its origin,
+    /// then reports success. Returns false when no switch is needed or it was
+    /// refused.
+    pub fn switchModelAcrossProviders(
+        self: *App,
+        model: []const u8,
+        origin: ?model_cache_runtime.ModelOrigin,
+    ) !bool {
+        const target_origin = origin orelse return false;
+        if (!target_origin.requiresSwitch(
+            self.provider_selection.selection().provider,
+            self.auth.credentialSource(),
+        )) return false;
+        return self.switchToModelOrigin(model, target_origin);
+    }
+
+    pub fn switchToModelOrigin(
+        self: *App,
+        model: []const u8,
+        origin: model_cache_runtime.ModelOrigin,
+    ) !bool {
+        return app_auth_runtime.Runtime(App).switchToModel(
+            self,
+            origin.provider(),
+            switch (origin) {
+                .openpaths_api_key => .openpaths_api_key,
+                .openrouter_api_key => .openrouter_api_key,
+                .chatgpt_subscription => .chatgpt_subscription,
+                .grok_subscription => .grok_subscription,
+                else => null,
+            },
+            model,
+            origin.label(),
+        );
+    }
+
+    pub fn cachedModelOrigin(self: *App, model: []const u8) ?model_cache_runtime.ModelOrigin {
+        return self.model_cache.originForModel(model);
     }
 
     pub fn ensureModelCache(self: *App) void {

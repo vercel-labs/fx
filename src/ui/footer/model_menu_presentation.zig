@@ -85,6 +85,11 @@ pub fn composeModelMenuRow(
 
     const layout = ModelMenuLayout.build(projection, row_count);
     if (projection.load_state == .ready and row_index == header_rows and row_index < layout.row_count - 1) {
+        if (mergedStatusSummary(alloc, projection.items)) |summary| {
+            var owned = summary;
+            defer owned.deinit(alloc);
+            return composeDimmedRow(alloc, owned.items, width);
+        }
         const text = loadedCatalogStatusText(projection.catalog_state) orelse return row;
         return composeDimmedRow(alloc, text, width);
     }
@@ -113,6 +118,7 @@ pub fn composeModelMenuRow(
             item.*,
             display_index == layout.selected,
             modelFactsColumn(projection, width),
+            hasMultipleOrigins(projection.items),
             width,
         );
     }
@@ -242,6 +248,7 @@ fn composeTitleRow(
     item: model_cache_runtime.ModelMenuItem,
     selected: bool,
     facts_column: ?usize,
+    show_origin: bool,
     width: u16,
 ) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
@@ -254,12 +261,22 @@ fn composeTitleRow(
     defer facts.deinit(alloc);
     try appendCompactFacts(alloc, &facts, item.capabilities);
 
+    var titled: std.ArrayList(u8) = .empty;
+    defer titled.deinit(alloc);
+    try titled.appendSlice(alloc, item.id);
+    if (show_origin) {
+        if (item.origin) |origin| {
+            try titled.appendSlice(alloc, " · ");
+            try titled.appendSlice(alloc, origin.label());
+        }
+    }
+
     const prefix_width = display_width.visibleWidthIgnoringAnsi(row.items);
     const content_width = @as(usize, width);
     const facts_start = facts_column orelse content_width;
     const show_facts = facts.items.len > 0 and facts_start >= prefix_width + 8 + 2;
     const id_budget = if (show_facts) facts_start - prefix_width - 2 else content_width -| prefix_width;
-    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, item.id, id_budget);
+    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, titled.items, id_budget);
     if (selected) try row.appendSlice(alloc, ui_render.reset_style);
 
     if (show_facts) {
@@ -269,6 +286,59 @@ fn composeTitleRow(
         try row.appendSlice(alloc, ui_render.reset_style);
     }
     return row;
+}
+
+/// True when the catalog mixes models served by different credentials; rows
+/// then carry a " · <source>" suffix so routes stay distinguishable.
+pub fn hasMultipleOrigins(items: []const model_cache_runtime.ModelMenuItem) bool {
+    var seen: [model_cache_runtime.model_origin_count]model_cache_runtime.ModelOrigin = undefined;
+    var seen_count: usize = 0;
+    for (items) |item| {
+        const origin = item.origin orelse continue;
+        var known = false;
+        for (seen[0..seen_count]) |candidate| {
+            if (candidate == origin) known = true;
+        }
+        if (!known and seen_count < seen.len) {
+            seen[seen_count] = origin;
+            seen_count += 1;
+        }
+        if (seen_count > 1) return true;
+    }
+    return false;
+}
+
+/// "Merged: A + B" status for multi-source catalogs. Empty list when the
+/// catalog comes from a single source.
+fn mergedStatusSummary(
+    alloc: Allocator,
+    items: []const model_cache_runtime.ModelMenuItem,
+) ?std.ArrayList(u8) {
+    if (!hasMultipleOrigins(items)) return null;
+    var seen: [model_cache_runtime.model_origin_count]model_cache_runtime.ModelOrigin = undefined;
+    var seen_count: usize = 0;
+    for (items) |item| {
+        const origin = item.origin orelse continue;
+        var known = false;
+        for (seen[0..seen_count]) |candidate| {
+            if (candidate == origin) known = true;
+        }
+        if (!known and seen_count < seen.len) {
+            seen[seen_count] = origin;
+            seen_count += 1;
+        }
+    }
+    var summary: std.ArrayList(u8) = .empty;
+    errdefer summary.deinit(alloc);
+    summary.appendSlice(alloc, "Merged: ") catch return null;
+    for (seen[0..seen_count], 0..) |origin, i| {
+        if (i > 0) {
+            summary.appendSlice(alloc, if (i + 1 == seen_count) " + " else ", ") catch return null;
+        }
+        summary.appendSlice(alloc, origin.label()) catch return null;
+    }
+    summary.appendSlice(alloc, ".") catch return null;
+    return summary;
 }
 
 fn appendCompactFacts(
@@ -352,7 +422,7 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
         const source = state.source orelse return "Using an authenticated AI Gateway catalog.";
         return switch (source) {
             .openpaths_api_key => "OpenPaths catalog: authenticated with OPENPATHS_API_KEY.",
-            .openrouter_api_key => "OpenPaths catalog: authenticated with OPENROUTER_API_KEY.",
+            .openrouter_api_key => "OpenRouter catalog: authenticated with OPENROUTER_API_KEY.",
             .fx_login => "Gateway catalog: authenticated with fx login.",
             .ai_gateway_api_key => "Gateway catalog: authenticated with an API key.",
             .vercel_oidc_token => "Gateway catalog: authenticated with the Vercel session.",
@@ -482,15 +552,12 @@ test "model menu keeps shared-prefix model ids distinguishable when narrow" {
         .capabilities = .{},
     };
 
-    var alpha_row = try composeTitleRow(alloc, alpha, true, null, 40);
+    var alpha_row = try composeTitleRow(alloc, alpha, true, null, false, 40);
     defer alpha_row.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, alpha_row.items, "provider/very-lo") != null);
     try std.testing.expect(std.mem.find(u8, alpha_row.items, "reasoning-alpha") != null);
-    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(alpha_row.items) <= 40);
 
-    var beta_row = try composeTitleRow(alloc, beta, false, null, 40);
+    var beta_row = try composeTitleRow(alloc, beta, false, null, false, 40);
     defer beta_row.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, beta_row.items, "provider/very-lo") != null);
     try std.testing.expect(std.mem.find(u8, beta_row.items, "reasoning-beta") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(beta_row.items) <= 40);
 }

@@ -1926,11 +1926,18 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn applyInlineSettingsModelSelection(app: *App) !void {
-            const selected = (try app.model_cache.menu.selectedModelAlloc(app.alloc)) orelse return;
-            defer app.alloc.free(selected);
+            const selected = (try app.model_cache.menu.selectedItemAlloc(app.alloc)) orelse return;
+            defer if (selected.id.len > 0) app.alloc.free(selected.id);
+            if (comptime @hasDecl(App, "switchModelAcrossProviders")) {
+                if (try app.switchModelAcrossProviders(selected.id, selected.origin)) {
+                    app.model_cache.closeMenu();
+                    app.shell.render_requests.request(.footer);
+                    return;
+                }
+            }
             try session_commands.Commands(App).selectModelFromPicker(
                 app,
-                selected,
+                selected.id,
                 app.effort,
                 app.fast_mode,
             );
@@ -2151,16 +2158,25 @@ pub fn Runtime(comptime App: type) type {
         fn submitModelMenuSelection(app: *App) !bool {
             if (comptime !@hasField(App, "model_cache")) return false;
             if (!app.model_cache.menu.active) return false;
-            const selected = (try app.model_cache.menu.selectedModelAlloc(app.alloc)) orelse {
+            const selected = (try app.model_cache.menu.selectedItemAlloc(app.alloc)) orelse {
                 app.shell.render_requests.request(.footer);
                 return true;
             };
-            defer app.alloc.free(selected);
+            defer if (selected.id.len > 0) app.alloc.free(selected.id);
 
             app.model_cache.closeMenu();
+
+            if (comptime @hasDecl(App, "switchModelAcrossProviders")) {
+                if (try app.switchModelAcrossProviders(selected.id, selected.origin)) {
+                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                    paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+                    return true;
+                }
+            }
+
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
-            try completion_rt.beginExactModelSelection(app, selected);
+            try completion_rt.beginExactModelSelection(app, selected.id);
             return true;
         }
 

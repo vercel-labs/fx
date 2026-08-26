@@ -338,7 +338,18 @@ pub fn Commands(comptime App: type) type {
 
             const resolved = try resolveModelQuery(app, query);
             defer app.alloc.free(resolved);
-            try setResolvedModel(app, resolved, true);
+            var routed = false;
+            if (comptime @hasDecl(App, "switchModelAcrossProviders") and
+                @hasDecl(App, "cachedModelOrigin") and
+                provider_runtime.supported(App))
+            {
+                if (app.cachedModelOrigin(resolved)) |origin| {
+                    routed = try app.switchModelAcrossProviders(resolved, origin);
+                }
+            }
+            if (!routed) {
+                try setResolvedModel(app, resolved, true);
+            }
         }
 
         pub fn handlePermissions(app: *App, rest: []const u8) !void {

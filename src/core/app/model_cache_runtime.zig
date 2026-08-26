@@ -10,6 +10,7 @@ const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
+const model_provider = @import("../config/model_provider.zig");
 const test_builtin_gateway = if (@import("builtin").is_test)
     @import("../../builtins/gateway.zig")
 else
@@ -102,6 +103,110 @@ pub const ModelMenuCatalogState = struct {
     };
 };
 
+/// Which credential serves a catalog entry. Drives the per-row origin tag in
+/// the model menu and the automatic credential switch when a model from a
+/// different source is selected.
+pub const ModelOrigin = enum {
+    openpaths_api_key,
+    openrouter_api_key,
+    fx_login,
+    ai_gateway_api_key,
+    vercel_oidc_token,
+    stored_key,
+    chatgpt_subscription,
+    grok_subscription,
+
+    pub fn fromSource(source: credentials.Source) ModelOrigin {
+        return switch (source) {
+            .openpaths_api_key => .openpaths_api_key,
+            .openrouter_api_key => .openrouter_api_key,
+            .fx_login => .fx_login,
+            .ai_gateway_api_key => .ai_gateway_api_key,
+            .vercel_oidc_token => .vercel_oidc_token,
+            .stored_key => .stored_key,
+            .chatgpt_subscription => .chatgpt_subscription,
+            .grok_subscription => .grok_subscription,
+        };
+    }
+
+    pub fn label(self: ModelOrigin) []const u8 {
+        return switch (self) {
+            .openpaths_api_key => "OpenPaths",
+            .openrouter_api_key => "OpenRouter",
+            .fx_login => "Vercel",
+            .ai_gateway_api_key => "Gateway key",
+            .vercel_oidc_token => "Vercel",
+            .stored_key => "Gateway key",
+            .chatgpt_subscription => "ChatGPT plan",
+            .grok_subscription => "Grok plan",
+        };
+    }
+
+    pub fn provider(self: ModelOrigin) model_provider.ProviderId {
+        return switch (self) {
+            .openpaths_api_key, .openrouter_api_key => .openpaths,
+            .chatgpt_subscription => .codex,
+            .grok_subscription => .grok,
+            .fx_login, .ai_gateway_api_key, .vercel_oidc_token, .stored_key => .gateway,
+        };
+    }
+
+    /// True when serving this origin needs a different provider or credential
+    /// than the currently active one.
+    pub fn requiresSwitch(
+        self: ModelOrigin,
+        active_provider: model_provider.ProviderId,
+        active_source: ?credentials.Source,
+    ) bool {
+        if (active_provider != self.provider()) return true;
+        return active_source == null or active_source.? != self.toSource();
+    }
+
+    fn toSource(self: ModelOrigin) credentials.Source {
+        return switch (self) {
+            .openpaths_api_key => .openpaths_api_key,
+            .openrouter_api_key => .openrouter_api_key,
+            .fx_login => .fx_login,
+            .ai_gateway_api_key => .ai_gateway_api_key,
+            .vercel_oidc_token => .vercel_oidc_token,
+            .stored_key => .stored_key,
+            .chatgpt_subscription => .chatgpt_subscription,
+            .grok_subscription => .grok_subscription,
+        };
+    }
+};
+
+/// A secondary catalog merged into the menu. `access` carries the credential
+/// source so the OpenPaths fetcher picks the right base URL.
+pub const MergeSource = struct {
+    origin: ModelOrigin,
+    catalog: model_catalog.Provider,
+    access: credentials.CatalogAccess,
+};
+
+const OwnedMergeSource = struct {
+    origin: ModelOrigin,
+    catalog: model_catalog.Provider,
+    access: OwnedCatalogAccess,
+
+    fn init(alloc: Allocator, source: MergeSource) !OwnedMergeSource {
+        return .{
+            .origin = source.origin,
+            .catalog = source.catalog,
+            .access = try OwnedCatalogAccess.init(alloc, source.access),
+        };
+    }
+
+    fn deinit(self: *OwnedMergeSource, alloc: Allocator) void {
+        self.access.deinit(alloc);
+    }
+};
+
+pub const SelectedModel = struct {
+    id: []u8,
+    origin: ?ModelOrigin,
+};
+
 pub const ModelProviderFilter = enum {
     all,
     anthropic,
@@ -111,12 +216,15 @@ pub const ModelProviderFilter = enum {
     others,
 };
 
+pub const model_origin_count = std.meta.fields(ModelOrigin).len;
+
 pub const model_provider_filter_count = std.meta.fields(ModelProviderFilter).len;
 
 pub const ModelMenuItem = struct {
     id: []u8,
     provider: []const u8,
     capabilities: model_capabilities.Capabilities,
+    origin: ?ModelOrigin = null,
 
     fn deinit(self: ModelMenuItem, alloc: Allocator) void {
         alloc.free(self.id);
@@ -196,9 +304,14 @@ pub const ModelMenu = struct {
     }
 
     pub fn selectedModelAlloc(self: *const ModelMenu, alloc: Allocator) !?[]u8 {
+        const selected = (try self.selectedItemAlloc(alloc)) orelse return null;
+        return selected.id;
+    }
+
+    pub fn selectedItemAlloc(self: *const ModelMenu, alloc: Allocator) !?SelectedModel {
         if (!self.active or self.load_state != .ready) return null;
         const item = self.itemAt(self.selected_index) orelse return null;
-        return try alloc.dupe(u8, item.id);
+        return .{ .id = try alloc.dupe(u8, item.id), .origin = item.origin };
     }
 
     fn clearSnapshot(self: *ModelMenu, alloc: Allocator) void {
@@ -245,9 +358,11 @@ fn modelMenuItemMatches(
 ) bool {
     if (!providerMatchesFilter(item.provider, provider_filter)) return false;
     const query_text = std.mem.trim(u8, query, " \t\r\n");
-    return query_text.len == 0 or
-        text_utils.containsIgnoreCase(item.id, query_text) or
-        text_utils.containsIgnoreCase(item.provider, query_text);
+    if (query_text.len == 0) return true;
+    if (text_utils.containsIgnoreCase(item.id, query_text)) return true;
+    if (text_utils.containsIgnoreCase(item.provider, query_text)) return true;
+    if (item.origin) |origin| return text_utils.containsIgnoreCase(origin.label(), query_text);
+    return false;
 }
 
 fn providerMatchesFilter(provider: []const u8, filter: ModelProviderFilter) bool {
@@ -274,6 +389,8 @@ pub const Runtime = struct {
     alloc: Allocator,
     models_path: []const u8,
     catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty,
+    origins: std.ArrayList(?ModelOrigin) = .empty,
+    owned_merge_sources: []OwnedMergeSource = &.{},
     mutex: std.Io.Mutex = .init,
     thread: ?std.Thread = null,
     state: ModelCacheState = .idle,
@@ -292,9 +409,36 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.cancelAndJoin();
         self.menu.deinit(self.alloc);
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
+        self.origins.deinit(self.alloc);
+        freeMergeSources(self.alloc, &self.owned_merge_sources);
+    }
+
+    /// Replaces the secondary catalogs merged into the menu on the next load.
+    /// Sources are owned copies; call before `startWarmup`. Any in-flight load
+    /// is cancelled first so sources are never freed under the loader thread.
+    pub fn setMergeSources(self: *Self, sources: []const MergeSource) !void {
+        self.cancelAndJoin();
+        const owned = try self.alloc.alloc(OwnedMergeSource, sources.len);
+        var count: usize = 0;
+        errdefer {
+            for (owned[0..count]) |*source| source.deinit(self.alloc);
+            self.alloc.free(owned);
+        }
+        for (sources) |source| {
+            owned[count] = try OwnedMergeSource.init(self.alloc, source);
+            count += 1;
+        }
+        freeMergeSources(self.alloc, &self.owned_merge_sources);
+        self.owned_merge_sources = owned;
+    }
+
+    fn freeMergeSources(alloc: Allocator, sources: *[]OwnedMergeSource) void {
+        if (sources.len == 0) return;
+        for (sources.*) |*source| source.deinit(alloc);
+        alloc.free(sources.*);
+        sources.* = &.{};
     }
 
     pub fn startWarmup(
@@ -351,6 +495,11 @@ pub const Runtime = struct {
             },
         };
 
+        var origins: std.ArrayList(?ModelOrigin) = .empty;
+        defer origins.deinit(self.alloc);
+        const fallback_origin = primaryOriginFromAccess(loaded.provenance.access);
+        self.fetchMergeSourcesInto(&loaded.catalog, &origins, fallback_origin, null);
+
         self.mutex.lockUncancelable(io_mod.getIo());
         if (loaded.catalog.items.len == 0 and self.outcome.loaded != null and self.catalog.items.len > 0) {
             model_catalog.freeModelCatalog(self.alloc, &loaded.catalog);
@@ -369,6 +518,7 @@ pub const Runtime = struct {
         }
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
         self.catalog = loaded.catalog;
+        replaceOriginsLocked(self, &origins);
         self.outcome = .{ .loaded = loaded.provenance };
         self.state = .ready;
         self.completion_pending = true;
@@ -439,6 +589,7 @@ pub const Runtime = struct {
         if (!preserve_public) {
             model_catalog.freeModelCatalog(self.alloc, &self.catalog);
             self.catalog = .empty;
+            self.origins.clearAndFree(self.alloc);
             self.outcome = .{};
         }
         self.state = .idle;
@@ -457,20 +608,31 @@ pub const Runtime = struct {
         owned_catalog: *std.ArrayList(model_catalog.ModelCatalogEntry),
     ) void {
         self.cancelAndJoin();
+        self.cancel_requested.store(false, .seq_cst);
+
+        const metadata = model_catalog.AccessMetadata.init(access);
+        const fallback_origin = primaryOriginFromAccess(metadata);
+
+        // Merge secondary sources outside the lock; the caller already did the
+        // blocking provider work, so these best-effort fetches stay inline.
+        var moved = owned_catalog.*;
+        owned_catalog.* = .empty;
+        var origins: std.ArrayList(?ModelOrigin) = .empty;
+        defer origins.deinit(self.alloc);
+        fillOrigins(self.alloc, &origins, moved.items.len, fallback_origin) catch {};
+        self.fetchMergeSourcesInto(&moved, &origins, fallback_origin, fallback_origin);
 
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         self.menu.deinit(self.alloc);
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
-        self.catalog = owned_catalog.*;
-        owned_catalog.* = .empty;
-        self.outcome = .{ .loaded = .{
-            .access = model_catalog.AccessMetadata.init(access),
-        } };
+        self.catalog = moved;
+        replaceOriginsLocked(self, &origins);
+        self.outcome = .{ .loaded = .{ .access = metadata } };
         self.state = .ready;
         self.completion_pending = true;
         self.last_attempt_ms = io_mod.milliTimestamp();
-        self.requested_access = model_catalog.AccessMetadata.init(access);
+        self.requested_access = metadata;
         self.cancel_requested.store(false, .seq_cst);
     }
 
@@ -526,6 +688,20 @@ pub const Runtime = struct {
         if (self.state != .ready or self.catalog.items.len == 0) return null;
 
         return try model_catalog.projectModelIds(alloc, self.catalog.items);
+    }
+
+    /// Credential origin for a cached model id, or null when unknown.
+    pub fn originForModel(self: *Self, model: []const u8) ?ModelOrigin {
+        self.finishThreadIfDone();
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.state != .ready) return null;
+        for (self.catalog.items, 0..) |*entry, i| {
+            if (!std.mem.eql(u8, entry.id, model)) continue;
+            if (i < self.origins.items.len) return self.origins.items[i] orelse self.primaryOriginLocked();
+            return self.primaryOriginLocked();
+        }
+        return null;
     }
 
     pub fn metadataForModel(self: *Self, model: []const u8) ?model_capabilities.GatewayMetadata {
@@ -635,6 +811,12 @@ pub const Runtime = struct {
                 return;
             },
         };
+        self.cancel_requested.store(false, .seq_cst);
+
+        var origins: std.ArrayList(?ModelOrigin) = .empty;
+        defer origins.deinit(self.alloc);
+        const fallback_origin = primaryOriginFromAccess(loaded.provenance.access);
+        self.fetchMergeSourcesInto(&loaded.catalog, &origins, fallback_origin, null);
 
         self.mutex.lockUncancelable(io_mod.getIo());
         if (loaded.catalog.items.len == 0 and self.outcome.loaded != null and self.catalog.items.len > 0) {
@@ -653,9 +835,52 @@ pub const Runtime = struct {
         }
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
         self.catalog = loaded.catalog;
+        replaceOriginsLocked(self, &origins);
         self.outcome = .{ .loaded = loaded.provenance };
         self.state = .ready;
         self.mutex.unlock(io_mod.getIo());
+    }
+
+    fn primaryOriginLocked(self: *Self) ?ModelOrigin {
+        const loaded = self.outcome.loaded orelse return null;
+        return primaryOriginFromAccess(loaded.access);
+    }
+
+    /// Fetches every configured secondary catalog best-effort and appends its
+    /// entries to `catalog`, keeping `origins` aligned. Runs on the loader
+    /// thread (or inline for cooperative hosts) without the runtime lock held.
+    fn fetchMergeSourcesInto(
+        self: *Self,
+        catalog: *std.ArrayList(model_catalog.ModelCatalogEntry),
+        origins: *std.ArrayList(?ModelOrigin),
+        fallback_origin: ?ModelOrigin,
+        skip_origin: ?ModelOrigin,
+    ) void {
+        fillOrigins(self.alloc, origins, catalog.items.len, fallback_origin) catch return;
+        for (self.owned_merge_sources) |*source| {
+            if (source.origin == skip_origin) continue;
+            if (self.cancel_requested.load(.seq_cst)) return;
+            const result = source.catalog.fetch(self.alloc, .{
+                .access = source.access.access,
+                .endpoint = self.models_path,
+                .cancel_flag = &self.cancel_requested,
+                .view = .picker,
+            }) catch continue;
+            switch (result) {
+                .catalog => |source_catalog| appendMovedCatalog(
+                    self.alloc,
+                    catalog,
+                    origins,
+                    source_catalog,
+                    source.origin,
+                ) catch {
+                    var failed = source_catalog;
+                    model_catalog.freeModelCatalog(self.alloc, &failed);
+                    return;
+                },
+                .failure => {},
+            }
+        }
     }
 
     fn markFailed(self: *Self, failure: model_catalog.FailedOutcome) void {
@@ -698,7 +923,13 @@ pub const Runtime = struct {
                 menu.clearSnapshot(self.alloc);
                 menu.load_state = .failed;
             },
-            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items),
+            .ready => try hydrateMenuSnapshot(
+                self.alloc,
+                menu,
+                self.catalog.items,
+                self.origins.items,
+                self.primaryOriginLocked(),
+            ),
         }
         menu.catalog_state = modelMenuCatalogState(self.outcome);
     }
@@ -736,6 +967,8 @@ fn hydrateMenuSnapshot(
     alloc: Allocator,
     menu: *ModelMenu,
     catalog: []const model_catalog.ModelCatalogEntry,
+    origins: []const ?ModelOrigin,
+    fallback_origin: ?ModelOrigin,
 ) !void {
     var items: std.ArrayList(ModelMenuItem) = .empty;
     errdefer {
@@ -744,7 +977,7 @@ fn hydrateMenuSnapshot(
     }
     try items.ensureTotalCapacity(alloc, catalog.len);
 
-    for (catalog) |entry| {
+    for (catalog, 0..) |entry, i| {
         const item = item: {
             const id = try alloc.dupe(u8, entry.id);
             errdefer alloc.free(id);
@@ -755,6 +988,7 @@ fn hydrateMenuSnapshot(
                     id,
                     model_catalog_metadata.fromCatalogEntry(entry),
                 ),
+                .origin = if (i < origins.len) origins[i] else fallback_origin,
             };
         };
         items.append(alloc, item) catch |err| {
@@ -766,6 +1000,49 @@ fn hydrateMenuSnapshot(
     menu.clearSnapshot(alloc);
     menu.items = items;
     menu.load_state = .ready;
+}
+
+fn primaryOriginFromAccess(access: model_catalog.AccessMetadata) ?ModelOrigin {
+    const source = access.source orelse return null;
+    return ModelOrigin.fromSource(source);
+}
+
+/// Moves `source_entries` onto `catalog`, appending `origin` per entry so the
+/// parallel origin list stays aligned. Frees only the source list buffer; entry
+/// strings transfer ownership.
+fn appendMovedCatalog(
+    alloc: Allocator,
+    catalog: *std.ArrayList(model_catalog.ModelCatalogEntry),
+    origins: *std.ArrayList(?ModelOrigin),
+    source_entries: std.ArrayList(model_catalog.ModelCatalogEntry),
+    origin: ModelOrigin,
+) !void {
+    const aligned = origins.items.len;
+    errdefer origins.shrinkRetainingCapacity(aligned);
+    var source_entries_mut = source_entries;
+    defer source_entries_mut.deinit(alloc);
+    try catalog.ensureUnusedCapacity(alloc, source_entries_mut.items.len);
+    for (source_entries_mut.items) |entry| {
+        try catalog.append(alloc, entry);
+        try origins.append(alloc, origin);
+    }
+}
+
+fn fillOrigins(
+    alloc: Allocator,
+    origins: *std.ArrayList(?ModelOrigin),
+    count: usize,
+    origin: ?ModelOrigin,
+) !void {
+    try origins.ensureTotalCapacity(alloc, count);
+    while (origins.items.len < count) try origins.append(alloc, origin);
+}
+
+/// Swaps in a freshly built origin list. Caller holds the runtime lock.
+fn replaceOriginsLocked(self: *Runtime, fresh: *std.ArrayList(?ModelOrigin)) void {
+    self.origins.deinit(self.alloc);
+    self.origins = fresh.*;
+    fresh.* = .empty;
 }
 
 fn modelProvider(model: []const u8) []const u8 {
@@ -1343,7 +1620,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
         },
     };
     runtime.state = .ready;
-    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries);
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, &.{}, null);
     runtime.menu.active = true;
 
     try std.testing.expectEqual(ModelMenuLoadState.ready, runtime.menu.load_state);
@@ -1382,6 +1659,44 @@ test "model menu owns resolved catalog state and filters without changing catalo
     try std.testing.expectEqualStrings("standalone", selected);
 }
 
+test "merged menus tag origins filter by route and flag cross-provider picks" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+
+    var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+    defer model_catalog.freeModelCatalog(alloc, &entries);
+    for ([_][]const u8{ "openai/gpt-5", "meta/llama-4" }) |raw| {
+        const id = try alloc.dupe(u8, raw);
+        errdefer alloc.free(id);
+        const model_type = try alloc.dupe(u8, "language");
+        errdefer alloc.free(model_type);
+        try entries.append(alloc, .{ .id = id, .model_type = model_type });
+    }
+
+    const origins = [_]?ModelOrigin{ .ai_gateway_api_key, .grok_subscription };
+    runtime.menu.active = true;
+    try hydrateMenuSnapshot(alloc, &runtime.menu, entries.items, &origins, null);
+
+    try std.testing.expectEqual(@as(?ModelOrigin, .ai_gateway_api_key), runtime.menu.itemAt(0).?.origin);
+    try std.testing.expectEqual(@as(?ModelOrigin, .grok_subscription), runtime.menu.itemAt(1).?.origin);
+
+    // Querying by route label finds the Grok-served row only.
+    runtime.menu.setQuery("grok");
+    try std.testing.expectEqual(@as(usize, 1), runtime.menu.filteredItemCount());
+    runtime.menu.setQuery("");
+
+    const selected = (try runtime.menu.selectedItemAlloc(alloc)).?;
+    defer alloc.free(selected.id);
+    try std.testing.expectEqualStrings("openai/gpt-5", selected.id);
+    try std.testing.expectEqual(ModelOrigin.ai_gateway_api_key, selected.origin.?);
+
+    try std.testing.expect(!ModelOrigin.openpaths_api_key.requiresSwitch(.openpaths, .openpaths_api_key));
+    try std.testing.expect(ModelOrigin.openrouter_api_key.requiresSwitch(.openpaths, .openpaths_api_key));
+    try std.testing.expect(ModelOrigin.chatgpt_subscription.requiresSwitch(.gateway, .fx_login));
+    try std.testing.expect(!ModelOrigin.grok_subscription.requiresSwitch(.grok, .grok_subscription));
+}
+
 test "model menu snapshot construction cleans every allocation failure" {
     const backing = std.testing.allocator;
     const entries = [_]model_catalog.ModelCatalogEntry{
@@ -1391,14 +1706,14 @@ test "model menu snapshot construction cleans every allocation failure" {
 
     var probe = std.testing.FailingAllocator.init(backing, .{});
     var menu: ModelMenu = .{};
-    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries);
+    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries, &.{}, null);
     menu.deinit(probe.allocator());
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
     for (0..probe.alloc_index) |fail_index| {
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
         var failed_menu: ModelMenu = .{};
-        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries)) {
+        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries, &.{}, null)) {
             failed_menu.deinit(failing.allocator());
         } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
         try std.testing.expect(failing.has_induced_failure);
