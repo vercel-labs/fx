@@ -9,6 +9,7 @@ const hooks = @import("../core/hooks/hooks.zig");
 const herdr = @import("hooks/herdr.zig");
 
 pub const notifications = @import("hooks/notifications.zig");
+pub const user = @import("hooks/user.zig");
 pub const Client = herdr.Client;
 
 pub fn Runtime(comptime App: type) type {

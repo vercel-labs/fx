@@ -19,6 +19,7 @@ const RegisteredPreToolUseHandler = struct {
         ctx: *anyopaque,
         input: definitions.PreToolUseInput,
     ) definitions.HandlerError!definitions.PreToolUseAction,
+    release_action: ?*const fn (*anyopaque, definitions.PreToolUseAction) void,
 };
 
 const RegisteredStopHandler = struct {
@@ -27,6 +28,7 @@ const RegisteredStopHandler = struct {
         ctx: *anyopaque,
         input: definitions.StopInput,
     ) definitions.HandlerError!definitions.StopAction,
+    release_action: ?*const fn (*anyopaque, definitions.StopAction) void,
 };
 
 fn RegisteredSideEffectHandler(comptime Input: type) type {
@@ -78,6 +80,7 @@ pub const Runtime = struct {
         try self.pre_tool_use_handlers.append(self.alloc, .{
             .hook = hook,
             .run = handler.run,
+            .release_action = handler.release_action,
         });
     }
 
@@ -96,6 +99,7 @@ pub const Runtime = struct {
         try self.stop_handlers.append(self.alloc, .{
             .hook = hook,
             .run = handler.run,
+            .release_action = handler.release_action,
         });
     }
 
@@ -298,6 +302,7 @@ const PreToolUseDispatch = struct {
                 error.Cancelled => error.Cancelled,
             };
         };
+        defer if (handler.release_action) |release| release(handler.hook.ctx, action);
         return applyPreToolUseAction(
             self.alloc,
             action,
@@ -417,6 +422,7 @@ const StopDispatch = struct {
             trace.fail(err);
             return .{ .done = .allow };
         };
+        defer if (handler.release_action) |release| release(handler.hook.ctx, action);
         return applyStopAction(
             self.alloc,
             action,

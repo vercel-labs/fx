@@ -1,4 +1,5 @@
 pub const common = @import("common.zig");
+pub const config = @import("config.zig");
 pub const definitions = @import("definitions.zig");
 pub const prompt = @import("prompt.zig");
 pub const runtime = @import("runtime.zig");
