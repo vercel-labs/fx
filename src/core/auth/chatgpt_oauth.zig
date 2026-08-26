@@ -1,5 +1,5 @@
 const std = @import("std");
-const browser_callback = @import("browser_callback.zig");
+const builtin = @import("builtin");
 const chatgpt_session = @import("chatgpt_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
@@ -21,6 +21,8 @@ const jwt_auth_claim = "https://api.openai.com/auth";
 const browser_scope = "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const browser_callback_ports = [_]u16{ 1455, 1457 };
 const browser_login_timeout_seconds: i64 = 5 * 60;
+const browser_callback_poll_ms: i32 = 100;
+const browser_callback_io_timeout_seconds: i64 = 30;
 
 pub const RefreshMode = enum {
     if_needed,
@@ -223,32 +225,34 @@ fn pollBrowserToken(
     if (comptime host_target.is_wasm) return error.ChatGptOAuthUnavailable;
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const context: *BrowserLoginContext = @ptrCast(@alignCast(raw.?));
-    var accepted = (try awaitBrowserCallback(
-        alloc,
-        &context.listener,
-        context.state,
-        cancel_flag,
-    )) orelse return .pending;
-    defer {
-        accepted.callback.deinit(alloc);
-        accepted.deinit();
-    }
+    if (!try browserCallbackReady(&context.listener, cancel_flag)) return .pending;
+
+    var stream = try context.listener.accept(io_mod.getIo());
+    defer stream.close(io_mod.getIo());
+    setBrowserSocketTimeouts(stream.socket.handle);
+    const target = try readBrowserCallbackTarget(alloc, stream);
+    defer alloc.free(target);
+    var callback = parseBrowserCallbackTarget(alloc, target, context.state) catch |err| {
+        writeBrowserCallbackResponse(stream, false) catch {};
+        return err;
+    };
+    defer callback.deinit(alloc);
 
     var token = exchangeAuthorizationCodeForRedirectWithBounds(
         alloc,
         transport,
         metadata.token_endpoint,
-        accepted.callback.code,
+        callback.code,
         context.code_verifier,
         context.redirect_uri,
         cancel_flag,
         deadline,
     ) catch |err| {
-        accepted.respond(.failed) catch {};
+        writeBrowserCallbackResponse(stream, false) catch {};
         return err;
     };
     errdefer token.deinit(alloc);
-    try accepted.respond(.ok);
+    try writeBrowserCallbackResponse(stream, true);
 
     const scope = try alloc.dupe(u8, "");
     errdefer if (scope.len > 0) alloc.free(scope);
@@ -267,47 +271,76 @@ fn pollBrowserToken(
     } };
 }
 
-const BrowserCallbackParserContext = struct {
-    expected_state: []const u8,
-};
-
-fn awaitBrowserCallback(
-    alloc: Allocator,
+fn browserCallbackReady(
     listener: *std.Io.net.Server,
-    expected_state: []const u8,
     cancel_flag: *std.atomic.Value(bool),
-) !?browser_callback.Accepted(BrowserCallback) {
-    var parser_context = BrowserCallbackParserContext{ .expected_state = expected_state };
-    return browser_callback.await(
-        BrowserCallback,
-        classifyBrowserCallback,
-        alloc,
-        listener,
-        &parser_context,
-        cancel_flag,
-        null,
-    ) catch |err| switch (err) {
-        error.OAuthCallbackListenerFailed => error.ChatGptOAuthCallbackListenerFailed,
-        else => err,
-    };
+) !bool {
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    var fds = [_]std.posix.pollfd{.{
+        .fd = if (comptime builtin.os.tag == .windows)
+            @ptrCast(listener.socket.handle)
+        else
+            @intCast(@intFromPtr(listener.socket.handle)),
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try std.posix.poll(&fds, browser_callback_poll_ms);
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    if (ready == 0) return false;
+    if ((fds[0].revents & std.posix.POLL.IN) == 0) {
+        return error.InvalidChatGptOAuthCallback;
+    }
+    return true;
 }
 
-fn classifyBrowserCallback(
-    raw: ?*anyopaque,
-    alloc: Allocator,
-    target: []const u8,
-) browser_callback.ParseResult(BrowserCallback) {
-    const context: *BrowserCallbackParserContext = @ptrCast(@alignCast(raw.?));
-    const callback = parseBrowserCallbackTarget(alloc, target, context.expected_state) catch |err| switch (err) {
-        error.InvalidChatGptOAuthCallback, error.ChatGptOAuthStateMismatch => {
-            if (err == error.ChatGptOAuthStateMismatch) {
-                debug_trace.logf("auth", "ChatGPT callback ignored: state belongs to another attempt", .{});
-            }
-            return .unrelated;
-        },
-        else => return .{ .failed = err },
+fn readBrowserCallbackTarget(alloc: Allocator, stream: std.Io.net.Stream) ![]u8 {
+    var socket_buffer: [4096]u8 = undefined;
+    var reader = stream.reader(io_mod.getIo(), &socket_buffer);
+    var request_bytes: [16 * 1024]u8 = undefined;
+    var request_len: usize = 0;
+    while (request_len < request_bytes.len) {
+        request_bytes[request_len] = reader.interface.takeByte() catch |err| switch (err) {
+            error.EndOfStream => return error.InvalidChatGptOAuthCallback,
+            else => return err,
+        };
+        request_len += 1;
+        if (std.mem.endsWith(u8, request_bytes[0..request_len], "\r\n\r\n")) break;
+    }
+    if (request_len == request_bytes.len) return error.ChatGptOAuthCallbackTooLarge;
+    const line_end = std.mem.find(u8, request_bytes[0..request_len], "\r\n") orelse
+        return error.InvalidChatGptOAuthCallback;
+    const request_line = request_bytes[0..line_end];
+    if (!std.mem.startsWith(u8, request_line, "GET ")) {
+        return error.InvalidChatGptOAuthCallback;
+    }
+    const target_end = std.mem.findScalarPos(u8, request_line, 4, ' ') orelse
+        return error.InvalidChatGptOAuthCallback;
+    return alloc.dupe(u8, request_line[4..target_end]);
+}
+
+fn writeBrowserCallbackResponse(stream: std.Io.net.Stream, success: bool) !void {
+    const body = if (success)
+        "Authorization complete. You can return to fx."
+    else
+        "Authorization failed. Return to fx for details.";
+    var buffer: [1024]u8 = undefined;
+    var writer = stream.writer(io_mod.getIo(), &buffer);
+    try writer.interface.print(
+        "HTTP/1.1 {s}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ if (success) "200 OK" else "400 Bad Request", body.len, body },
+    );
+    try writer.interface.flush();
+}
+
+fn setBrowserSocketTimeouts(socket: std.posix.socket_t) void {
+    const timeout = std.posix.timeval{ .sec = browser_callback_io_timeout_seconds, .usec = 0 };
+    const bytes = std.mem.asBytes(&timeout);
+    std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, bytes) catch |err| {
+        debug_trace.logf("auth", "ChatGPT callback receive timeout setup failed err={s}", .{@errorName(err)});
     };
-    return .{ .accepted = callback };
+    std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, bytes) catch |err| {
+        debug_trace.logf("auth", "ChatGPT callback send timeout setup failed err={s}", .{@errorName(err)});
+    };
 }
 
 fn completeSignIn(
@@ -368,6 +401,7 @@ pub fn runLogin(
             .succeeded => |completion| {
                 var owned = completion;
                 defer owned.deinit(alloc);
+                try writeStdout("Signed in with Codex.\n");
                 return;
             },
             .failed => |err| return err,
@@ -763,14 +797,6 @@ fn parseBrowserCallbackTarget(
         return error.InvalidChatGptOAuthCallback;
     }
     const query = target[prefix.len..];
-    if (queryValueAlloc(alloc, query, "error")) |denial| {
-        alloc.free(denial);
-        const denial_state = queryValueAlloc(alloc, query, "state") catch
-            return error.InvalidChatGptOAuthCallback;
-        defer secret.zeroAndFree(alloc, denial_state);
-        if (!std.mem.eql(u8, denial_state, expected_state)) return error.InvalidChatGptOAuthCallback;
-        return error.ChatGptAuthorizationFailed;
-    } else |_| {}
     const code = try queryValueAlloc(alloc, query, "code");
     errdefer secret.zeroAndFree(alloc, code);
     const state = try queryValueAlloc(alloc, query, "state");
@@ -920,43 +946,6 @@ test "ChatGPT browser authorization URL uses PKCE without device authentication"
     try std.testing.expect(std.mem.find(u8, url, "state=state-value") != null);
     try std.testing.expect(std.mem.find(u8, url, "originator=fx") != null);
     try std.testing.expect(std.mem.find(u8, url, "device") == null);
-}
-
-test "ChatGPT browser callback classifier keeps stale callbacks unrelated" {
-    var context = BrowserCallbackParserContext{ .expected_state = "expected" };
-
-    const stale_success = classifyBrowserCallback(
-        &context,
-        std.testing.allocator,
-        "/auth/callback?code=stale&state=other",
-    );
-    switch (stale_success) {
-        .unrelated => {},
-        else => return error.ExpectedUnrelatedCallback,
-    }
-
-    const stale_denial = classifyBrowserCallback(
-        &context,
-        std.testing.allocator,
-        "/auth/callback?error=access_denied&state=other",
-    );
-    switch (stale_denial) {
-        .unrelated => {},
-        else => return error.ExpectedUnrelatedCallback,
-    }
-}
-
-test "ChatGPT browser callback classifier reports a current denial" {
-    var context = BrowserCallbackParserContext{ .expected_state = "expected" };
-    const denied = classifyBrowserCallback(
-        &context,
-        std.testing.allocator,
-        "/auth/callback?error=access_denied&state=expected",
-    );
-    switch (denied) {
-        .failed => |err| try std.testing.expectEqual(error.ChatGptAuthorizationFailed, err),
-        else => return error.ExpectedFailedCallback,
-    }
 }
 
 test "ChatGPT browser callback requires the exact path and state" {

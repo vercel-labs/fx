@@ -2992,6 +2992,11 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
         try writeTopLevelHelpFast(raw_env);
         exitFast(0);
     }
+    if (cli_args.len == 1 and (std.mem.eql(u8, cli_args[0], "--version") or std.mem.eql(u8, cli_args[0], "-v"))) {
+        try writeStdoutFast(version);
+        try writeStdoutFast("\n");
+        exitFast(0);
+    }
     try runNonBenchmark(raw_args, raw_env, cli_args);
 }
 
@@ -3067,10 +3072,14 @@ fn rawArgs(c_argc: c_int, c_argv: [*][*:0]c_char) []const [*:0]const u8 {
 }
 
 fn argsFromRaw(raw_args: []const [*:0]const u8) std.process.Args {
+    if (comptime builtin.os.tag == .windows) return .{ .vector = &.{} };
     return .{ .vector = raw_args };
 }
 
 fn environBlockFromRaw(raw_env: RawEnviron) std.process.Environ.Block {
+    if (comptime builtin.os.tag == .windows) {
+        return .global;
+    }
     var count: usize = 0;
     while (raw_env[count] != null) : (count += 1) {}
     return .{ .slice = raw_env[0..count :null] };
@@ -3158,6 +3167,23 @@ fn cliArgsFromRaw(raw_args: []const [*:0]const u8, stack_buf: [][:0]const u8) ![
             }
             return stack_buf[0..cli_len];
         }
+    }
+
+    if (comptime builtin.os.tag == .windows) {
+        if (raw_args.len <= 1) return &.{};
+        const cli_len = raw_args.len - 1;
+        if (cli_len <= stack_buf.len) {
+            for (raw_args[1..], 0..) |arg, i| {
+                stack_buf[i] = std.mem.sliceTo(arg, 0);
+            }
+            return stack_buf[0..cli_len];
+        }
+        const alloc = processAllocator();
+        const result = try alloc.alloc([:0]const u8, cli_len);
+        for (raw_args[1..], 0..) |arg, i| {
+            result[i] = std.mem.sliceTo(arg, 0);
+        }
+        return result;
     }
 
     const args = try argsFromRaw(raw_args).toSlice(processAllocator());
@@ -3450,8 +3476,12 @@ fn handleSigWinchWeb() callconv(.c) void {
 
 const handle_sigwinch: app_lifecycle.ResizeHandler = if (host_target.is_wasm)
     handleSigWinchWeb
+else if (@import("builtin").os.tag == .windows)
+    @as(app_lifecycle.ResizeHandler, @ptrCast(&handleSigWinchWebStub))
 else
     handleSigWinchNative;
+
+fn handleSigWinchWebStub() callconv(.c) void {}
 
 test "interactive startup does not begin with synthetic resize pending" {
     try std.testing.expect(!resize_interlock.resizePending());

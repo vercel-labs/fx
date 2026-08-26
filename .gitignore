@@ -27,10 +27,12 @@ benchmarks/baseline.json
 # Local agent/editor/tooling directories from this workspace
 .adal/
 .agents/
+.atl/
 .augment/
 .bob/
 .claude/
 .codebuddy/
+.codegraph/
 .commandcode/
 .continue/
 .cortex/
@@ -55,3 +57,4 @@ benchmarks/baseline.json
 .vibe/
 .windsurf/
 .zencoder/
+.staging/.staging-save/

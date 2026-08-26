@@ -43,7 +43,10 @@ fn ensureCueSoundPath(cue: Cue) ?[]const u8 {
     defer sound_path_mutex.unlock(io_mod.getIo());
     if (materialized_paths[idx]) |path| return path;
 
-    const dir = io_mod.getenv("TMPDIR") orelse "/tmp";
+    const dir: []const u8 = if (builtin.os.tag == .windows)
+        io_mod.getenv("TEMP") orelse io_mod.getenv("TMP") orelse return null
+    else
+        io_mod.getenv("TMPDIR") orelse "/tmp";
     const sep: []const u8 = if (dir.len > 0 and dir[dir.len - 1] == '/') "" else "/";
     const path = std.fmt.bufPrint(&sound_path_bufs[idx], "{s}{s}{s}", .{ dir, sep, materializedName(cue) }) catch return null;
     const chime = embeddedChime(cue);

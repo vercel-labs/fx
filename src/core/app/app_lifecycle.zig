@@ -21,6 +21,7 @@ const shell_runtime = @import("../../ui/shell_runtime.zig");
 const ui_terminal = @import("../../ui/terminal/terminal.zig");
 const terminal_diff = @import("../../ui/render_engine/terminal_diff.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
+const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
 const Metrics = types.Metrics;
@@ -81,6 +82,17 @@ fn tmuxAbnormalExitHandler(sig: std.posix.SIG) callconv(.c) void {
 pub fn installAbnormalExitHandlers(tmux: ?[]const u8) void {
     if (!shell_runtime.supports_resize_signal) return;
 
+    if (comptime builtin.os.tag == .windows) {
+        // `SetConsoleCtrlHandler` reuses the same handler list across calls;
+        // the static C-ABI trampoline installed by shell_runtime is keyed off
+        // whatever restore bytes we publish here. `tmux` is ignored on Windows:
+        // tmux on Windows is not a supported interactive mode in v1.
+        _ = &tmux;
+        shell_runtime.setWindowsAbnormalExitRestore(abnormal_exit_restore);
+        _ = shell_runtime.installWindowsAbnormalExitCtrlHandler();
+        return;
+    }
+
     const handler: std.posix.Sigaction.handler_fn = if (tmux == null)
         abnormalExitHandler
     else
@@ -102,6 +114,12 @@ pub fn installAbnormalExitHandlers(tmux: ?[]const u8) void {
 
 pub fn uninstallAbnormalExitHandlers() void {
     if (!shell_runtime.supports_resize_signal) return;
+
+    if (comptime builtin.os.tag == .windows) {
+        shell_runtime.uninstallWindowsAbnormalExitCtrlHandler();
+        shell_runtime.clearWindowsAbnormalExitRestore();
+        return;
+    }
 
     if (old_sigterm_action) |old| {
         std.posix.sigaction(std.posix.SIG.TERM, &old, null);
@@ -605,7 +623,8 @@ fn suspendTerminalForJobControl(
 
 /// Raise SIGTSTP after restoring cooked mode; on SIGCONT rebuild interactive
 /// terminal state and request a full repaint. Platforms without job-control
-/// signals (same set as `supports_resize_signal`) are a no-op.
+/// signals (same set as `supports_resize_signal`) are a no-op. Windows has
+/// resize signals but no SIGTSTP, so it short-circuits here too.
 pub fn suspendToJobControl(
     terminal: *TerminalState,
     shell: *TranscriptRuntime,
@@ -613,6 +632,7 @@ pub fn suspendToJobControl(
     footer_rows: u16,
 ) !void {
     if (!shell_runtime.supports_resize_signal) return;
+    if (comptime builtin.os.tag == .windows) return;
 
     suspendTerminalForJobControl(terminal, shell, metrics);
     _ = std.c.raise(std.posix.SIG.TSTP);

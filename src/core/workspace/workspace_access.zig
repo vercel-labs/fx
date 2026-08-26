@@ -582,8 +582,7 @@ fn canonicalExistingDirectory(
 
     const canonical = io_mod.realpathAlloc(alloc, absolute) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.FileNotFound => return error.PathNotFound,
-        else => return error.InvalidPath,
+        error.FileNotFound, error.NameTooLong => return error.PathNotFound,
     };
     errdefer alloc.free(canonical);
 

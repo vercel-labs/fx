@@ -1,7 +1,7 @@
 const std = @import("std");
 const io_mod = @import("../core/shared/io.zig");
 
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_file_permissions = io_mod.permissionsFromMode(0o600);
 
 const Controls = struct {
     terminal_ready_path: []const u8,

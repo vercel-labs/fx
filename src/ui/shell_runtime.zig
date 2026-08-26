@@ -10,6 +10,7 @@ const cursor_probe = @import("terminal/cursor_probe.zig");
 const resize_runtime = @import("resize_runtime.zig");
 const ui_terminal = @import("terminal/terminal.zig");
 const wasm_terminal = if (builtin.os.tag == .wasi) @import("terminal/wasm_terminal.zig") else struct {};
+const windows = std.os.windows;
 
 const Allocator = std.mem.Allocator;
 const Layout = types.Layout;
@@ -34,8 +35,135 @@ extern "c" fn grantpt(fd: c_int) c_int;
 extern "c" fn unlockpt(fd: c_int) c_int;
 extern "c" fn ptsname(fd: c_int) ?[*:0]u8;
 
+// Win32 console APIs. std.os.windows.kernel32 only declares CreateProcessW,
+// so everything else is declared here. The linkages are valid for any target
+// (Zig defers resolution to link time), but every call site is guarded by
+// `if (comptime builtin.os.tag == .windows)`.
+extern "kernel32" fn GetConsoleMode(
+    hConsoleHandle: windows.HANDLE,
+    lpMode: *windows.DWORD,
+) callconv(.winapi) windows.BOOL;
+
+extern "kernel32" fn SetConsoleMode(
+    hConsoleHandle: windows.HANDLE,
+    dwMode: windows.DWORD,
+) callconv(.winapi) windows.BOOL;
+
+extern "kernel32" fn SetConsoleCtrlHandler(
+    handlerRoutine: ?*const fn (windows.DWORD) callconv(.c) windows.BOOL,
+    add: windows.BOOL,
+) callconv(.winapi) windows.BOOL;
+
+/// Windows console mode DWORD bits that toggle line-mode input handling.
+/// `enableRawMode` clears all three; `disableRawMode` restores the captured
+/// mask, which preserves whatever combination was active at startup.
+const WIN_ENABLE_PROCESSED_INPUT: u32 = 0x0001;
+const WIN_ENABLE_LINE_INPUT: u32 = 0x0002;
+const WIN_ENABLE_ECHO_INPUT: u32 = 0x0004;
+
+/// Console ctrl event types we inspect inside the static C-ABI thunks.
+const WIN_CTRL_C_EVENT: u32 = 0;
+const WIN_CTRL_BREAK_EVENT: u32 = 1;
+const WIN_CTRL_CLOSE_EVENT: u32 = 2;
+const WIN_CTRL_LOGOFF_EVENT: u32 = 5;
+const WIN_CTRL_SHUTDOWN_EVENT: u32 = 6;
+const WIN_WINDOW_BUFFER_SIZE_EVENT: u32 = 4;
+
+/// Routing table for the resize console ctrl handler. Set once at
+/// `installResizeSignal` time and read on every ctrl event. Storing the
+/// interlock pointer here lets the C-ABI thunk reach the Zig-owned state
+/// without per-handler trampolines.
+var g_resize_interlock: ?*ResizeApprovalInterlock = null;
+
+/// Routing table for the abnormal-exit console ctrl handler. Stores the
+/// restore-bytes slice that `WriteConsoleA` flushes before `std.process.exit`
+/// inside the static C-ABI thunk. Updated atomically on install/uninstall.
+const AbnormalExitRestoreSlot = struct {
+    bytes: ?[]const u8,
+};
+var g_abnormal_exit_restore: AbnormalExitRestoreSlot = .{ .bytes = null };
+
+/// C-ABI trampoline that the console ctrl handler list calls. Only fires the
+/// resize path for `WINDOW_BUFFER_SIZE_EVENT`; everything else falls through
+/// to the next handler (the abnormal-exit handler) and ultimately to the
+/// default disposition.
+export fn windowsResizeCtrlHandler(ctrl_type: windows.DWORD) callconv(.c) windows.BOOL {
+    if (ctrl_type != WIN_WINDOW_BUFFER_SIZE_EVENT) return windows.BOOL.FALSE;
+    if (g_resize_interlock) |interlock| interlock.noteResizeSignal();
+    return windows.BOOL.TRUE;
+}
+
+/// C-ABI trampoline for SIGTERM/SIGINT-equivalent signals (Ctrl+C,
+/// Ctrl+Break) plus console close/logoff/shutdown. Mirrors the POSIX
+/// `abnormalExitHandlerWithRestore` semantics: synchronously write the
+/// restore bytes once, then exit. ReadConsoleInputW may be racing, so we
+/// use `WriteConsoleA` which is documented safe inside a console ctrl
+/// handler.
+export fn windowsAbnormalExitCtrlHandler(ctrl_type: windows.DWORD) callconv(.c) windows.BOOL {
+    switch (ctrl_type) {
+        WIN_CTRL_C_EVENT, WIN_CTRL_BREAK_EVENT, WIN_CTRL_CLOSE_EVENT, WIN_CTRL_LOGOFF_EVENT, WIN_CTRL_SHUTDOWN_EVENT => {},
+        else => return windows.BOOL.FALSE,
+    }
+    if (g_abnormal_exit_restore.bytes) |bytes| {
+        const handle = std.Io.File.stdout().handle;
+        // Escape sequences are pure ASCII, so `WriteConsoleA`'s code-page
+        // conversion is a no-op and the byte count is the byte count.
+        _ = WriteConsoleA(handle, bytes.ptr, @intCast(bytes.len), null, null);
+    }
+    std.process.exit(1);
+}
+
+extern "kernel32" fn WriteConsoleA(
+    hConsoleOutput: windows.HANDLE,
+    lpBuffer: [*]const u8,
+    nNumberOfCharsToWrite: windows.DWORD,
+    lpNumberOfCharsWritten: ?*windows.DWORD,
+    lpReserved: ?*anyopaque,
+) callconv(.winapi) windows.BOOL;
+
+/// Stores the interlock used by the Windows resize console ctrl handler.
+/// Must be called once at startup (before `installResizeSignal`) so the
+/// `windowsResizeCtrlHandler` thunk has a target to post resize events to.
+/// No-op on non-Windows targets.
+pub fn setWindowsResizeInterlock(interlock: *ResizeApprovalInterlock) void {
+    g_resize_interlock = interlock;
+}
+
+/// Stores the restore-bytes slice the Windows abnormal-exit console ctrl
+/// handler flushes via `WriteConsoleA` before calling `std.process.exit`.
+/// Must be called once at startup (before `installAbnormalExitHandlers`).
+/// No-op on non-Windows targets.
+pub fn setWindowsAbnormalExitRestore(bytes: []const u8) void {
+    g_abnormal_exit_restore.bytes = bytes;
+}
+
+/// Clears the abnormal-exit restore slot so the uninstalled thunk does not
+/// emit stale bytes if a stray event arrives during shutdown. No-op on
+/// non-Windows targets.
+pub fn clearWindowsAbnormalExitRestore() void {
+    g_abnormal_exit_restore.bytes = null;
+}
+
+/// Installs the static `windowsAbnormalExitCtrlHandler` thunk in the console
+/// ctrl handler list so SIGINT/SIGTERM/SIGBREAK equivalents flush the
+/// published restore bytes before exiting. Mirrors the POSIX
+/// `abnormalExitHandlerWithRestore` path in `app_lifecycle`. No-op on
+/// non-Windows targets.
+pub fn installWindowsAbnormalExitCtrlHandler() bool {
+    return SetConsoleCtrlHandler(&windowsAbnormalExitCtrlHandler, windows.BOOL.TRUE).toBool();
+}
+
+/// Removes the static `windowsAbnormalExitCtrlHandler` thunk from the
+/// console ctrl handler list. Pair with `installWindowsAbnormalExitCtrlHandler`
+/// during shutdown. No-op on non-Windows targets.
+pub fn uninstallWindowsAbnormalExitCtrlHandler() void {
+    _ = SetConsoleCtrlHandler(&windowsAbnormalExitCtrlHandler, windows.BOOL.FALSE);
+}
+
 pub const supports_resize_signal = resize_runtime.supports_resize_signal;
 pub const ResizeHandler = if (builtin.os.tag == .wasi)
+    *const fn () callconv(.c) void
+else if (builtin.os.tag == .windows)
     *const fn () callconv(.c) void
 else
     std.posix.Sigaction.handler_fn;
@@ -63,15 +191,24 @@ pub const AlternateScreenOwner = enum {
     terminal_session,
 };
 
+/// Returns true when the supplied handle is a real Windows console (as
+/// opposed to a redirected file or pipe). `GetConsoleMode` returns `FALSE`
+/// on non-console handles because the input/output path is not a tty.
+fn isWindowsConsoleHandle(handle: windows.HANDLE) bool {
+    var mode: windows.DWORD = 0;
+    return GetConsoleMode(handle, &mode).toBool();
+}
+
 pub const TerminalState = struct {
-    stdin_fd: std.posix.fd_t = std.posix.STDIN_FILENO,
-    original_termios: std.posix.termios = undefined,
+    stdin_fd: if (builtin.os.tag == .windows) *anyopaque else std.posix.fd_t = if (builtin.os.tag == .windows) undefined else std.posix.STDIN_FILENO,
+    original_termios: if (builtin.os.tag == .windows) void else std.posix.termios = if (builtin.os.tag == .windows) {} else undefined,
+    original_console_mode: if (builtin.os.tag == .windows) windows.DWORD else void = if (builtin.os.tag == .windows) 0 else {},
     raw_enabled: bool = false,
     alternate_screen_owner: AlternateScreenOwner = .none,
     alternate_frame_layout: frame_layout.CommittedLayoutSnapshot = .{},
     alternate_mouse_tracking_active: bool = false,
     signal_handler_installed: bool = false,
-    old_winch_action: ?std.posix.Sigaction = null,
+    old_winch_action: if (builtin.os.tag == .windows) void else ?std.posix.Sigaction = if (builtin.os.tag == .windows) {} else null,
 
     pub fn fileApprovalScreenActive(self: TerminalState) bool {
         return self.alternate_screen_owner == .file_approval;
@@ -94,7 +231,13 @@ pub const TerminalState = struct {
     }
 
     pub fn ensureInteractive(self: TerminalState) !void {
-        if (comptime builtin.os.tag == .wasi) return;
+        if (comptime builtin.os.tag == .wasi) return error.NotATerminal;
+        if (comptime builtin.os.tag == .windows) {
+            const stdin_is_console = isWindowsConsoleHandle(std.Io.File.stdin().handle);
+            const stdout_is_console = isWindowsConsoleHandle(std.Io.File.stdout().handle);
+            if (!stdin_is_console or !stdout_is_console) return error.NotATerminal;
+            return;
+        }
         if (std.c.isatty(self.stdin_fd) == 0 or std.c.isatty(std.posix.STDOUT_FILENO) == 0) {
             return error.NotATerminal;
         }
@@ -102,11 +245,38 @@ pub const TerminalState = struct {
 
     pub fn captureOriginalTermios(self: *TerminalState) !void {
         if (comptime builtin.os.tag == .wasi) return;
+        if (comptime builtin.os.tag == .windows) {
+            var mode: windows.DWORD = 0;
+            if (!GetConsoleMode(std.Io.File.stdin().handle, &mode).toBool()) {
+                return error.NotATerminal;
+            }
+            self.original_console_mode = mode;
+            self.stdin_fd = std.Io.File.stdin().handle;
+            return;
+        }
         self.original_termios = try std.posix.tcgetattr(self.stdin_fd);
     }
 
     pub fn enableRawMode(self: *TerminalState) !void {
-        if (comptime builtin.os.tag == .wasi) {
+        if (comptime builtin.os.tag == .wasi) return error.NotATerminal;
+        if (comptime builtin.os.tag == .windows) {
+            var mode: windows.DWORD = 0;
+            if (!GetConsoleMode(std.Io.File.stdin().handle, &mode).toBool()) {
+                return error.NotATerminal;
+            }
+            self.original_console_mode = mode;
+            self.stdin_fd = std.Io.File.stdin().handle;
+            // Clear the three cooked-mode bits; everything else (mouse,
+            // quick-edit, virtual terminal processing, ...) is preserved
+            // exactly as it was at startup. disableRawMode restores the
+            // full mask, so the user's saved bits come back unchanged.
+            const raw_mode = mode &
+                ~(WIN_ENABLE_ECHO_INPUT |
+                    WIN_ENABLE_LINE_INPUT |
+                    WIN_ENABLE_PROCESSED_INPUT);
+            if (!SetConsoleMode(std.Io.File.stdin().handle, raw_mode).toBool()) {
+                return error.NotATerminal;
+            }
             self.raw_enabled = true;
             return;
         }
@@ -141,7 +311,9 @@ pub const TerminalState = struct {
 
     pub fn disableRawMode(self: *TerminalState) void {
         if (!self.raw_enabled) return;
-        if (comptime builtin.os.tag != .wasi) {
+        if (comptime builtin.os.tag == .windows) {
+            _ = SetConsoleMode(std.Io.File.stdin().handle, self.original_console_mode);
+        } else if (comptime builtin.os.tag != .wasi) {
             std.posix.tcsetattr(self.stdin_fd, .FLUSH, self.original_termios) catch {};
         }
         self.raw_enabled = false;
@@ -149,6 +321,18 @@ pub const TerminalState = struct {
 
     pub fn installResizeSignal(self: *TerminalState, handler: ResizeHandler) void {
         if (!supports_resize_signal) return;
+        if (comptime builtin.os.tag == .windows) {
+            // The `handler` argument has the wrong signature for
+            // `SetConsoleCtrlHandler` on Windows (no DWORD arg, no BOOL return).
+            // We instead install a static C-ABI thunk that posts
+            // `WINDOW_BUFFER_SIZE_EVENT` to whatever interlock the caller wired
+            // via `setWindowsResizeInterlock` at startup. `handler` is unused
+            // on Windows.
+            _ = &handler;
+            _ = SetConsoleCtrlHandler(&windowsResizeCtrlHandler, windows.BOOL.TRUE);
+            self.signal_handler_installed = true;
+            return;
+        }
 
         const act: std.posix.Sigaction = .{
             .handler = .{ .handler = handler },
@@ -164,6 +348,11 @@ pub const TerminalState = struct {
 
     pub fn uninstallResizeSignal(self: *TerminalState) void {
         if (!supports_resize_signal or !self.signal_handler_installed) return;
+        if (comptime builtin.os.tag == .windows) {
+            _ = SetConsoleCtrlHandler(&windowsResizeCtrlHandler, windows.BOOL.FALSE);
+            self.signal_handler_installed = false;
+            return;
+        }
         if (self.old_winch_action) |old| {
             std.posix.sigaction(std.posix.SIG.WINCH, &old, null);
         }
@@ -265,7 +454,10 @@ pub const TerminalState = struct {
             };
         }
         var fds = [_]std.posix.pollfd{.{
-            .fd = self.stdin_fd,
+            .fd = if (comptime builtin.os.tag == .windows)
+                @ptrCast(self.stdin_fd)
+            else
+                self.stdin_fd,
             .events = std.posix.POLL.IN,
             .revents = 0,
         }};

@@ -8056,7 +8056,7 @@ test "tmux recovery propagates proof capability failure without durable loss" {
     );
     try proof_file.setPermissions(
         std.testing.io,
-        std.Io.File.Permissions.fromMode(0o640),
+        io_mod.permissionsFromMode(0o640),
     );
     proof_file.close(std.testing.io);
 
@@ -8079,7 +8079,7 @@ test "tmux recovery propagates proof capability failure without durable loss" {
     defer proof_file.close(std.testing.io);
     try proof_file.setPermissions(
         std.testing.io,
-        std.Io.File.Permissions.fromMode(0o600),
+        io_mod.permissionsFromMode(0o600),
     );
 
     {

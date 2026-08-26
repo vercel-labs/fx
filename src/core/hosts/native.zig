@@ -13,6 +13,9 @@ pub const clipboard = host.Clipboard{
 pub const secret_store = native_secret_store.provider;
 
 fn copyToClipboard(_: ?*anyopaque, text: []const u8) host.ClipboardError!bool {
+    if (builtin.os.tag == .windows) {
+        return copyToClipboardWindows(text);
+    }
     const argv = clipboardCommand(builtin.os.tag) orelse return false;
     const io = io_mod.getIo();
     var child = std.process.spawn(io, .{
@@ -48,6 +51,63 @@ fn copyToClipboard(_: ?*anyopaque, text: []const u8) host.ClipboardError!bool {
         logUnsuccessfulTerm(term);
         return error.CopyFailed;
     }
+    return true;
+}
+
+fn copyToClipboardWindows(text: []const u8) host.ClipboardError!bool {
+    // Win32 clipboard: OpenClipboard → EmptyClipboard → SetClipboardData
+    // (CF_UNICODETEXT backed by a GMEM_MOVEABLE buffer) → CloseClipboard.
+    // The shell transfers ownership of the GMEM_MOVEABLE handle to the
+    // clipboard on a successful SetClipboardData, so we must not call
+    // GlobalFree on it.
+    const user32 = struct {
+        extern "user32" fn OpenClipboard(hwnd: ?*anyopaque) callconv(.c) c_int;
+        extern "user32" fn CloseClipboard() callconv(.c) c_int;
+        extern "user32" fn EmptyClipboard() callconv(.c) c_int;
+        extern "user32" fn SetClipboardData(format: c_uint, hmem: ?*anyopaque) callconv(.c) ?*anyopaque;
+    };
+    const kernel32 = struct {
+        extern "kernel32" fn GlobalAlloc(flags: c_uint, bytes: usize) callconv(.c) ?*anyopaque;
+        extern "kernel32" fn GlobalLock(hmem: *anyopaque) callconv(.c) ?*anyopaque;
+        extern "kernel32" fn GlobalUnlock(hmem: *anyopaque) callconv(.c) c_int;
+    };
+    const CF_UNICODETEXT: c_uint = 13;
+    const GMEM_MOVEABLE: c_uint = 0x0002;
+
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(std.heap.page_allocator, text) catch {
+        debug_trace.logf("host", "clipboard utf8→utf16 alloc failed", .{});
+        return error.CopyFailed;
+    };
+    defer std.heap.page_allocator.free(wide);
+
+    // Total size in bytes includes the UTF-16 payload plus the terminating
+    // NUL (which the slice already has) but Win32 wants a fully 16-bit-
+    // aligned size for the trailing NUL word.
+    const bytes: usize = (wide.len + 1) * @sizeOf(u16);
+    const hmem = kernel32.GlobalAlloc(GMEM_MOVEABLE, bytes) orelse {
+        debug_trace.logf("host", "clipboard GlobalAlloc failed", .{});
+        return error.CopyFailed;
+    };
+    const locked = kernel32.GlobalLock(hmem) orelse {
+        debug_trace.logf("host", "clipboard GlobalLock failed", .{});
+        return error.CopyFailed;
+    };
+    const locked_w: [*]u16 = @ptrCast(@alignCast(locked));
+    @memcpy(locked_w[0..wide.len], wide);
+    locked_w[wide.len] = 0;
+    _ = kernel32.GlobalUnlock(hmem);
+
+    if (user32.OpenClipboard(null) == 0) {
+        debug_trace.logf("host", "clipboard OpenClipboard failed", .{});
+        return error.CopyFailed;
+    }
+    defer _ = user32.CloseClipboard();
+    _ = user32.EmptyClipboard();
+    if (user32.SetClipboardData(CF_UNICODETEXT, hmem) == null) {
+        debug_trace.logf("host", "clipboard SetClipboardData failed", .{});
+        return error.CopyFailed;
+    }
+    // hmem is now owned by the clipboard; do not free.
     return true;
 }
 
@@ -230,6 +290,7 @@ fn clipboardCommand(os_tag: std.Target.Os.Tag) ?[]const []const u8 {
     return switch (os_tag) {
         .macos => &.{"pbcopy"},
         .linux => &.{ "xclip", "-selection", "clipboard" },
+        .windows => null, // copyToClipboardWindows bypasses this path
         else => null,
     };
 }

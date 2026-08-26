@@ -106,14 +106,23 @@ fn configureAutomatic(
     initial_rows: u16,
     fx_version: []const u8,
 ) !void {
-    const home = if (io_mod.getenv("HOME")) |value| blk: {
+    const home_owned = io_mod.homeDir(alloc) catch |err| switch (err) {
+        error.HomeNotFound => null,
+        else => return err,
+    };
+    defer if (home_owned) |value| alloc.free(value);
+    const home = if (home_owned) |value| blk: {
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
         break :blk if (trimmed.len > 0) trimmed else null;
     } else null;
     const root = if (home) |value|
         try profile_paths.recordingsDir(alloc, value)
     else
-        try std.fs.path.join(alloc, &.{ io_mod.getenv("TMPDIR") orelse "/tmp", "fx-recordings" });
+        blk: {
+        const tmp_base = try io_mod.tempDir(alloc);
+        defer alloc.free(tmp_base);
+        break :blk try std.fs.path.join(alloc, &.{ tmp_base, "fx-recordings" });
+    };
     defer alloc.free(root);
     try io_mod.makeDirRecursive(root);
 
@@ -181,7 +190,7 @@ fn openTape(path: []const u8, exclusive: bool, private: bool) !std.Io.File {
             return std.Io.Dir.createFileAbsolute(zio, path, .{
                 .truncate = !exclusive,
                 .exclusive = exclusive,
-                .permissions = .fromMode(0o600),
+.permissions = io_mod.permissionsFromMode(0o600),
             });
         }
         return std.Io.Dir.createFileAbsolute(zio, path, .{ .truncate = !exclusive, .exclusive = exclusive });
@@ -190,7 +199,7 @@ fn openTape(path: []const u8, exclusive: bool, private: bool) !std.Io.File {
         return std.Io.Dir.cwd().createFile(zio, path, .{
             .truncate = !exclusive,
             .exclusive = exclusive,
-            .permissions = .fromMode(0o600),
+            .permissions = io_mod.permissionsFromMode(0o600),
         });
     }
     return std.Io.Dir.cwd().createFile(zio, path, .{ .truncate = !exclusive, .exclusive = exclusive });
@@ -674,7 +683,7 @@ test "requested recording creates a private tape under home" {
             defer file.close(io_mod.getIo());
             if (@import("builtin").os.tag != .windows) {
                 const stat = try file.stat(io_mod.getIo());
-                try testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o077);
+                try testing.expectEqual(@as(std.posix.mode_t, 0), io_mod.permissionsToMode(stat.permissions) & 0o077);
             }
         },
         else => return error.TestExpectedActiveRecording,

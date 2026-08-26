@@ -1454,7 +1454,12 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
     defer ctx.deinit();
     if (options.save_session) {
-        _ = try ctx.session.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
+        const home_dir = io_mod.homeDir(alloc) catch |err| switch (err) {
+            error.HomeNotFound => null,
+            else => return err,
+        };
+        defer if (home_dir) |value| alloc.free(value);
+        _ = try ctx.session.initializeProfileUsage(alloc, home_dir);
         ctx.session.attachProfileUsagePublisher(alloc);
     }
     ctx.use_process_interrupt_flag = options.deps.install_headless_interrupt;
@@ -7559,7 +7564,7 @@ test "saved ask ignores existing legacy task files" {
         tasks_path,
         .{
             .truncate = true,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
+            .permissions = io_mod.permissionsFromMode(0o600),
         },
     );
     tasks_file.close(io_mod.getIo());

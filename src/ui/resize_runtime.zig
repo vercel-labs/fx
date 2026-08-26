@@ -39,6 +39,7 @@ pub const supports_resize_signal = switch (builtin.os.tag) {
     .dragonfly,
     .freebsd,
     .serenity,
+    .windows,
     => true,
     else => false,
 };

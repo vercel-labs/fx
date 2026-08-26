@@ -130,7 +130,7 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) LoadError!?[]u8 {
         debug_trace.logf("stored_key", "load failed step=stat err={s}", .{@errorName(err)});
         return error.StoredKeyUnreadable;
     };
-    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) {
+    if (stat.kind != .file or io_mod.permissionsToMode(stat.permissions) & 0o077 != 0) {
         debug_trace.logf("stored_key", "load failed step=permissions err=StoredKeyInsecure", .{});
         return error.StoredKeyInsecure;
     }
@@ -206,7 +206,7 @@ test "stored key file round-trips byte-identically at mode 0600" {
     try storeInDir(std.testing.allocator, &fx_dir, written);
 
     const stat = try tmp.dir.statFile(std.testing.io, profile_paths.api_key_file_name, .{});
-    try std.testing.expect(stat.permissions.toMode() & 0o777 == 0o600);
+    try std.testing.expect(io_mod.permissionsToMode(stat.permissions) & 0o777 == 0o600);
 
     const read_back = (try loadFromDir(std.testing.allocator, &fx_dir.dir)) orelse
         return error.TestUnexpectedMissingStoredKey;
@@ -227,7 +227,7 @@ test "stored key file refusal stays distinguishable from absence" {
     try storeInDir(std.testing.allocator, &fx_dir, "vt2-secret-value");
     for ([_]std.posix.mode_t{ 0o640, 0o604, 0o644 }) |mode| {
         var file = try tmp.dir.openFile(std.testing.io, profile_paths.api_key_file_name, .{ .mode = .read_write });
-        try file.setPermissions(std.testing.io, std.Io.File.Permissions.fromMode(mode));
+        try file.setPermissions(std.testing.io, io_mod.permissionsFromMode(mode));
         file.close(std.testing.io);
 
         try std.testing.expectError(

@@ -1318,6 +1318,7 @@ fn fallbackCommandArtifactDir(alloc: Allocator) ![]u8 {
 }
 
 fn currentProcessId() u64 {
+    if (comptime builtin.os.tag == .windows) return 0; // not used on Windows; matches the v1 contract
     return @intCast(std.c.getpid());
 }
 
@@ -2061,6 +2062,9 @@ fn signalChild(
 }
 
 fn signalProcessGroup(pid: std.posix.pid_t, force: bool) !void {
+    // Windows has no process groups; the negative-pid kill is a no-op there.
+    // Callers must rely on `child.kill` for the direct child.
+    if (comptime builtin.os.tag == .windows) return error.ProcessGroupUnsupported;
     std.posix.kill(-pid, if (force) std.posix.SIG.KILL else std.posix.SIG.TERM) catch |err| switch (err) {
         error.ProcessNotFound => {},
         else => return err,

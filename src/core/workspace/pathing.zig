@@ -214,11 +214,15 @@ pub fn resolveWorkspaceOrExternalPath(
     workspace_root: []const u8,
     input_path: []const u8,
 ) ![]const u8 {
+    const home_dir = io_mod.homeDir(arena) catch |err| switch (err) {
+        error.HomeNotFound => null,
+        else => return err,
+    };
     return resolveWorkspaceOrExternalPathWithHome(
         arena,
         workspace_root,
         input_path,
-        io_mod.getenv("HOME"),
+        home_dir,
         .existing,
     );
 }
@@ -228,11 +232,15 @@ pub fn resolveWorkspaceOrExternalCreatePath(
     workspace_root: []const u8,
     input_path: []const u8,
 ) ![]const u8 {
+    const home_dir = io_mod.homeDir(arena) catch |err| switch (err) {
+        error.HomeNotFound => null,
+        else => return err,
+    };
     return resolveWorkspaceOrExternalPathWithHome(
         arena,
         workspace_root,
         input_path,
-        io_mod.getenv("HOME"),
+        home_dir,
         .create,
     );
 }
@@ -366,7 +374,10 @@ fn resolveBoundedFileTargetInput(
             .external_intent = true,
         },
         .home_relative => |relative| blk: {
-            const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+            const home = if (comptime builtin_mod.os.tag == .windows)
+                io_mod.getenv("USERPROFILE") orelse io_mod.getenv("HOME") orelse return error.HomeNotSet
+            else
+                io_mod.getenv("HOME") orelse return error.HomeNotSet;
             if (home.len == 0 or !std.fs.path.isAbsolute(home)) return error.InvalidPath;
             break :blk .{
                 .absolute = try normalizeBaseRelativePathInto(scratch, home, relative),

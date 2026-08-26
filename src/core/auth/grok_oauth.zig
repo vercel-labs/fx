@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const browser_callback = @import("browser_callback.zig");
 const grok_session = @import("grok_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -420,6 +421,7 @@ const StdinManualCodeReader = struct {
 
     fn poll(self: *StdinManualCodeReader) !?[]const u8 {
         if (self.closed) return null;
+        if (comptime builtin.os.tag == .windows) return error.PlatformUnsupported;
         var fds = [_]std.posix.pollfd{.{
             .fd = std.posix.STDIN_FILENO,
             .events = std.posix.POLL.IN,

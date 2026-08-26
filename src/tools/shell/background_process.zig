@@ -85,7 +85,7 @@ fn spawnPrepared(
     };
 
     const child_id = child.id orelse return error.SpawnFailed;
-    const pid = try std.fmt.allocPrint(alloc, "{d}", .{child_id});
+    const pid = try std.fmt.allocPrint(alloc, "{d}", .{@intFromPtr(child_id)});
     var pid_owned = true;
     errdefer if (pid_owned) alloc.free(pid);
 
@@ -472,6 +472,7 @@ fn signalProcess(
     pid_text: []const u8,
     expected: process_supervisor.ProcessInstanceToken,
 ) background_process_provider.ProviderError!void {
+    if (comptime builtin.os.tag == .windows) return error.Unsupported;
     switch (matchToken(context, alloc, pid_text, expected)) {
         .matched => {},
         .missing, .mismatched => {
@@ -488,6 +489,7 @@ fn signalProcess(
 }
 
 fn signalPidTree(root_pid: std.posix.pid_t) std.posix.KillError!void {
+    if (comptime @import("builtin").os.tag == .windows) return error.ProcessNotFound;
     const descendants = collectDescendantPids(
         std.heap.page_allocator,
         root_pid,
@@ -1202,7 +1204,7 @@ test "unreleased background cleanup reaps an exited child before token liveness"
     };
     process_supervisor.process_token_match_for_test = Stub.match;
     defer process_supervisor.process_token_match_for_test = null;
-    const pid = try std.fmt.allocPrint(alloc, "{d}", .{child.id.?});
+    const pid = try std.fmt.allocPrint(alloc, "{d}", .{@intFromPtr(child.id.?)});
     const token = try process_supervisor.ProcessInstanceToken.parse(
         "linux:00112233445566778899aabbccddeeff:12345",
     );
@@ -1261,7 +1263,7 @@ test "unreleased background wrapper cleanup is bounded" {
     };
     process_supervisor.process_token_match_for_test = Stub.match;
     defer process_supervisor.process_token_match_for_test = null;
-    const pid = try std.fmt.allocPrint(alloc, "{d}", .{child.id.?});
+    const pid = try std.fmt.allocPrint(alloc, "{d}", .{@intFromPtr(child.id.?)});
     const token = try process_supervisor.ProcessInstanceToken.parse(
         "linux:00112233445566778899aabbccddeeff:12345",
     );

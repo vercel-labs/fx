@@ -262,7 +262,7 @@ fn writeTempFileWithMtime(alloc: Allocator, tmp: *std.testing.TmpDir, sub_path: 
 }
 
 fn setMode(path: []const u8, mode: std.posix.mode_t) !void {
-    try std.Io.Dir.cwd().setFilePermissions(io_mod.getIo(), path, std.Io.File.Permissions.fromMode(mode), .{});
+    try std.Io.Dir.cwd().setFilePermissions(io_mod.getIo(), path, io_mod.permissionsFromMode(mode), .{});
 }
 
 fn expectNoExtension(body: []const u8) !void {

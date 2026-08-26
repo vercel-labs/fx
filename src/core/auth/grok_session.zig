@@ -121,7 +121,7 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, report_open_failure: bool)
     defer file.close(io_mod.getIo());
 
     const stat = try file.stat(io_mod.getIo());
-    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) {
+    if (stat.kind != .file or io_mod.permissionsToMode(stat.permissions) & 0o077 != 0) {
         debug_trace.logf("auth", "Grok session load failed step=permissions err=InsecureAuthFile", .{});
         return null;
     }
@@ -191,12 +191,12 @@ fn openExistingPrivateFxDir(home_dir: *io_mod.VerifiedDir) !io_mod.VerifiedDir {
 
     const initial_stat = try dir.stat(io_mod.getIo());
     if (initial_stat.kind != .directory) return error.DurablePathUnsafe;
-    if (initial_stat.permissions.toMode() & 0o200 == 0) return error.PrivateStatePermissionsUnsupported;
-    dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700)) catch {
+    if (io_mod.permissionsToMode(initial_stat.permissions) & 0o200 == 0) return error.PrivateStatePermissionsUnsupported;
+    dir.setPermissions(io_mod.getIo(), io_mod.permissionsFromMode(0o700)) catch {
         return error.PrivateStatePermissionsUnsupported;
     };
     const stat = try dir.stat(io_mod.getIo());
-    if (stat.kind != .directory or stat.permissions.toMode() & 0o777 != 0o700) {
+    if (stat.kind != .directory or io_mod.permissionsToMode(stat.permissions) & 0o777 != 0o700) {
         return error.PrivateStatePermissionsUnsupported;
     }
     return .{ .dir = dir };

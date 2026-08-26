@@ -1354,7 +1354,7 @@ test "saving MCP config replaces the file durably" {
     {
         var seed = try fx_dir.openFile(io_mod.getIo(), "mcp.json", .{ .mode = .read_write });
         defer seed.close(io_mod.getIo());
-        try seed.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o644));
+        try seed.setPermissions(io_mod.getIo(), io_mod.permissionsFromMode(0o644));
     }
 
     // Hold the pre-save file open. A rename-over leaves this descriptor on the
@@ -1376,7 +1376,7 @@ test "saving MCP config replaces the file durably" {
     try std.testing.expect(std.mem.find(u8, written, "stale") == null);
 
     const stat = try fx_dir.statFile(io_mod.getIo(), "mcp.json", .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(u32, 0o600), io_mod.permissionsToMode(stat.permissions) & 0o777);
 
     var it = fx_dir.iterate();
     var entries: usize = 0;
@@ -1906,9 +1906,9 @@ test "adding an MCP server creates the profile directory privately" {
     try expectLine(result, "Saved MCP server 'fs'.", true);
 
     const dir_stat = try tmp.dir.statFile(io_mod.getIo(), "home/.fx", .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(u32, 0o700), dir_stat.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(u32, 0o700), io_mod.permissionsToMode(dir_stat.permissions) & 0o777);
     const file_stat = try tmp.dir.statFile(io_mod.getIo(), "home/.fx/mcp.json", .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(u32, 0o600), file_stat.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(u32, 0o600), io_mod.permissionsToMode(file_stat.permissions) & 0o777);
 }
 
 test "built-in MCP command preserves usage and missing-home notices" {

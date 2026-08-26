@@ -1817,6 +1817,7 @@ fn runPasteSetup(
 }
 
 fn setupTerminalAvailableDefault(_: ?*anyopaque) bool {
+    if (comptime builtin.os.tag == .windows) return false;
     return std.c.isatty(std.posix.STDIN_FILENO) != 0 and
         std.c.isatty(std.posix.STDERR_FILENO) != 0;
 }
@@ -1827,6 +1828,7 @@ fn readMaskedKeyDefault(
     write_mask: WriteFn,
     write_ctx: ?*anyopaque,
 ) ![]u8 {
+    if (comptime builtin.os.tag == .windows) return readMaskedKeyWindows(alloc, write_mask, write_ctx);
     var raw = try MaskedKeyRawMode.enable();
     defer raw.disable();
 
@@ -1864,11 +1866,91 @@ fn readMaskedKeyDefault(
     return error.SetupKeyTooLong;
 }
 
+/// Windows path for masked key entry. Goes through `ReadConsoleInputW`
+/// with `KEY_EVENT` records rather than reading the input handle as a
+/// stream, because the cooked-mode echo state must be cleared (via
+/// `SetConsoleMode`) and only console-input records respect the resulting
+/// raw mode. `SetupCancelled` mirrors the POSIX cancel triggers (Ctrl+C,
+/// Ctrl+D/Esc), and `SetupKeyTooLong` mirrors the 8 KiB cap.
+fn readMaskedKeyWindows(
+    alloc: Allocator,
+    write_mask: WriteFn,
+    write_ctx: ?*anyopaque,
+) ![]u8 {
+    var raw = try MaskedKeyRawMode.enable();
+    defer raw.disable();
+
+    var input: std.ArrayList(u8) = .empty;
+    errdefer {
+        if (input.capacity > 0) secret.zeroAndFree(alloc, input.allocatedSlice());
+    }
+
+    while (input.items.len < 8 * 1024) {
+        const ch = try windows_read_one_key();
+        switch (ch) {
+            '\r', '\n' => {
+                if (input.items.len == 0) continue;
+                const owned = try alloc.dupe(u8, input.items);
+                secret.zeroAndFree(alloc, input.allocatedSlice());
+                input = .empty;
+                return owned;
+            },
+            3, 4, 0x1b => return error.SetupCancelled,
+            8, 127 => if (input.items.len > 0) {
+                _ = input.pop();
+                try write_mask(write_ctx, "\x08 \x08");
+            },
+            0x20...0x7e => {
+                try input.append(alloc, ch);
+                try write_mask(write_ctx, "•");
+            },
+            else => {},
+        }
+    }
+    return error.SetupKeyTooLong;
+}
+
+/// Reads a single printable (or control) ASCII byte from the Windows
+/// console input queue. Returns `null` if the queue empties or the wait
+/// is interrupted. Backspace is reported as 0x08 to match the POSIX path.
+fn windows_read_one_key() !u8 {
+    const stdin_handle = std.Io.File.stdin().handle;
+    var record: windows_key_event_record = undefined;
+    while (true) {
+        var read_count: u32 = 0;
+        const ok = ReadConsoleInputW(
+            stdin_handle,
+            &record,
+            1,
+            &read_count,
+        );
+        if (!ok.toBool() or read_count == 0) return error.SetupCancelled;
+        if (record.EventType != WINDOWS_KEY_EVENT) continue;
+        if (!record.KeyEvent.bKeyDown.toBool()) continue;
+        const ch = record.KeyEvent.uChar.AsciiChar;
+        if (ch == 0) continue;
+        return ch;
+    }
+}
+
 const MaskedKeyRawMode = struct {
-    original: std.posix.termios = undefined,
+    original: if (builtin.os.tag == .windows) u32 else std.posix.termios = if (builtin.os.tag == .windows) 0 else undefined,
     active: bool = false,
 
     fn enable() !MaskedKeyRawMode {
+        if (comptime builtin.os.tag == .windows) {
+            const stdin_handle = std.Io.File.stdin().handle;
+            var current: u32 = 0;
+            if (!GetConsoleMode(stdin_handle, &current).toBool()) {
+                return error.NotATerminal;
+            }
+            const raw_mode = current &
+                ~(MASKED_RAW_ECHO | MASKED_RAW_LINE | MASKED_RAW_PROCESSED);
+            if (!SetConsoleMode(stdin_handle, raw_mode).toBool()) {
+                return error.NotATerminal;
+            }
+            return .{ .original = current, .active = true };
+        }
         if (std.c.isatty(std.posix.STDIN_FILENO) == 0 or
             std.c.isatty(std.posix.STDERR_FILENO) == 0)
         {
@@ -1908,9 +1990,58 @@ const MaskedKeyRawMode = struct {
 
     fn disable(self: *MaskedKeyRawMode) void {
         if (!self.active) return;
-        std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+        if (comptime builtin.os.tag == .windows) {
+            _ = SetConsoleMode(std.Io.File.stdin().handle, self.original);
+        } else {
+            std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+        }
         self.active = false;
     }
+};
+
+// Console mode DWORD bits. Duplicated from shell_runtime.zig to keep this
+// file's Windows-only section self-contained.
+const MASKED_RAW_ECHO: u32 = 0x0004;
+const MASKED_RAW_LINE: u32 = 0x0002;
+const MASKED_RAW_PROCESSED: u32 = 0x0001;
+const WINDOWS_KEY_EVENT: u16 = 0x0001;
+
+extern "kernel32" fn GetConsoleMode(
+    hConsoleHandle: std.os.windows.HANDLE,
+    lpMode: *u32,
+) callconv(.winapi) std.os.windows.BOOL;
+
+extern "kernel32" fn SetConsoleMode(
+    hConsoleHandle: std.os.windows.HANDLE,
+    dwMode: u32,
+) callconv(.winapi) std.os.windows.BOOL;
+
+extern "kernel32" fn ReadConsoleInputW(
+    hConsoleInput: std.os.windows.HANDLE,
+    lpBuffer: *windows_key_event_record,
+    nLength: u32,
+    lpNumberOfEventsRead: *u32,
+) callconv(.winapi) std.os.windows.BOOL;
+
+const windows_char_union = extern union {
+    UnicodeChar: u16,
+    AsciiChar: u8,
+};
+
+const windows_key_event_record = extern struct {
+    EventType: u16 align(1),
+    _pad0: u16 = 0,
+    KeyEvent: windows_key_event align(1),
+};
+
+const windows_key_event = extern struct {
+    bKeyDown: std.os.windows.BOOL,
+    _pad1: u16 = 0,
+    wRepeatCount: u16,
+    wVirtualKeyCode: u16,
+    wVirtualScanCode: u16,
+    uChar: windows_char_union,
+    dwControlKeyState: u32,
 };
 
 fn writeConfigDiagnostics(
