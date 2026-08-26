@@ -484,6 +484,7 @@ const CollectedProcess = struct {
     stdout_preview: StreamPreviewSnapshot = .{},
     stderr_preview: StreamPreviewSnapshot = .{},
     cancelled: bool = false,
+    timed_out: bool = false,
 };
 
 const StreamPreviewSnapshot = struct {
@@ -782,8 +783,7 @@ fn finishCollectedProcess(
     source: TerminationSource,
 ) !CollectedProcess {
     switch (source) {
-        .timed_out => return error.TimeoutExpired,
-        .natural => {},
+        .natural, .timed_out => {},
         .cancelled => {
             if (output.totalBytes() == 0) return error.Cancelled;
             if (output.artifact == null) {
@@ -795,13 +795,20 @@ fn finishCollectedProcess(
         },
     }
 
-    var result = output.finish(term) catch |err| {
-        if (source != .cancelled) return err;
-        debug_trace.logf("core", "cancelled command artifact finalization failed err={s}", .{@errorName(err)});
-        return error.Cancelled;
+    var result = output.finish(term) catch |err| switch (source) {
+        .natural => return err,
+        .cancelled => {
+            debug_trace.logf("core", "cancelled command artifact finalization failed err={s}", .{@errorName(err)});
+            return error.Cancelled;
+        },
+        .timed_out => {
+            debug_trace.logf("core", "timed out command artifact finalization failed err={s}", .{@errorName(err)});
+            return error.TimeoutExpired;
+        },
     };
     result.duration_ms = duration_ms;
     result.cancelled = source == .cancelled;
+    result.timed_out = source == .timed_out;
     return result;
 }
 
@@ -1485,11 +1492,25 @@ fn formatCollectedOutput(alloc: Allocator, command: []const u8, cwd: []const u8,
 }
 
 fn formatCollectedOutputValue(alloc: Allocator, command: []const u8, cwd: []const u8, result: CollectedProcess) !command_contract.RunCommandResult {
-    if (result.output_file == null) return formatOutput(alloc, command, cwd, result.term, result.stdout, result.stderr, result.duration_ms);
+    if (result.output_file == null) return command_contract.formatForegroundCommandResult(alloc, .{
+        .command = command,
+        .cwd = cwd,
+        .status = foregroundCommandStatusFromTerm(result.term),
+        .timed_out = result.timed_out,
+        .stdout_display = result.stdout,
+        .stderr_display = result.stderr,
+        .stdout_bytes = result.stdout_bytes,
+        .stderr_bytes = result.stderr_bytes,
+        .duration_ms = result.duration_ms,
+    });
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeTermLine(&out.writer, result.term);
+    if (result.timed_out) {
+        try out.writer.writeAll("timed_out=true\n");
+    } else {
+        try writeTermLine(&out.writer, result.term);
+    }
     try out.writer.print("truncated={s}\n", .{if (result.truncated) "true" else "false"});
     try out.writer.print("stdout_bytes={d}\n", .{result.stdout_bytes});
     try out.writer.print("stderr_bytes={d}\n", .{result.stderr_bytes});
@@ -1507,8 +1528,9 @@ fn formatCollectedOutputValue(alloc: Allocator, command: []const u8, cwd: []cons
         .command_result = .{ .foreground = .{
             .command = command,
             .cwd = cwd,
-            .exit_code = termExitCode(result.term),
-            .signal = termSignal(result.term),
+            .exit_code = if (result.timed_out) null else termExitCode(result.term),
+            .signal = if (result.timed_out) null else termSignal(result.term),
+            .timed_out = result.timed_out,
             .duration_ms = result.duration_ms,
             .stdout_bytes = result.stdout_bytes,
             .stderr_bytes = result.stderr_bytes,
@@ -3304,10 +3326,56 @@ test "artifact write failure after cancellation remains a bare error" {
 }
 
 test "timeout source is distinct from cancellation" {
-    try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
+    const result = try executeCommand(.{
         .max_command_output_bytes = 1024,
         .timeout_ms = 120,
-    }, std.testing.allocator, "sleep 5", "/tmp"));
+    }, std.testing.allocator, "sleep 5", "/tmp");
+    defer std.testing.allocator.free(result.output);
+
+    const foreground = result.command_result.?.foreground;
+    try std.testing.expect(foreground.timed_out);
+    try std.testing.expectEqual(@as(?i64, null), foreground.exit_code);
+    try std.testing.expectEqual(@as(?u32, null), foreground.signal);
+    // Some shells report the signal they delivered to the foreground child on
+    // stderr. That diagnostic is legitimate captured timeout output, so only
+    // require the stable timeout marker here.
+    try std.testing.expect(std.mem.startsWith(u8, result.output, "timed_out=true\n"));
+}
+
+test "timed out command keeps spilled partial output" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "session/logs/commands");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const artifact_dir = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "session/logs/commands",
+    );
+    defer alloc.free(artifact_dir);
+
+    const output_text = "HEAD-1234567890-TAIL";
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 16,
+        .timeout_ms = 250,
+        .command_artifact_dir = artifact_dir,
+    }, alloc, "printf 'HEAD-1234567890-TAIL'; sleep 5", workspace);
+    defer alloc.free(result.output);
+
+    const foreground = result.command_result.?.foreground;
+    try std.testing.expect(foreground.timed_out);
+    try std.testing.expectEqual(output_text.len, foreground.stdout_bytes);
+    try std.testing.expect(foreground.truncated);
+    const stdout_path = foreground.stdout_file orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.startsWith(u8, stdout_path, artifact_dir));
+    const artifact = try readAbsoluteFile(alloc, stdout_path, 128);
+    defer alloc.free(artifact);
+    try std.testing.expectEqualStrings(output_text, artifact);
 }
 
 test "timeout remains dominant when its output callback fails" {
@@ -3343,10 +3411,12 @@ test "timeout terminates foreground process group descendants" {
     );
     defer alloc.free(command);
 
-    try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
+    const result = try executeCommand(.{
         .max_command_output_bytes = 1024,
         .timeout_ms = 500,
-    }, alloc, command, workspace));
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    try std.testing.expect(result.command_result.?.foreground.timed_out);
 
     const pid_text = try readAbsoluteFile(alloc, ready_path, 64);
     defer alloc.free(pid_text);

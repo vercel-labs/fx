@@ -1436,6 +1436,22 @@ fn toolRunCommand(
         );
     }
 
+    if (try command_result_mapping.Foreground.timedOutFailure(
+        arena,
+        result,
+        ctx.command_timeout_ms,
+    )) |failure| {
+        return finishCommandToolResult(
+            arena,
+            replay_capture,
+            replay_init.unavailable and
+                (ctx.command_replay_unavailable or replay_callback.had_accepted_output),
+            &replay_transferred,
+            result,
+            failure,
+        );
+    }
+
     if (try command_result_mapping.Foreground.nonZeroFailure(arena, result)) |failure| {
         return finishCommandToolResult(
             arena,
@@ -6475,13 +6491,12 @@ test "run_command timeout returns model-visible failure" {
     };
 
     const result = try executeTestRunCommand(rt.context(), arena, tool_call);
-
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
     try expectContains(result.model_output, "timeout=true\n");
     try expectContains(result.model_output, "timeout_ms=1000\n");
     try expectContains(result.model_output, "command timed out and was terminated\n");
-    try expectNotContains(result.model_output, "PRE-TIMEOUT-OUT");
-    try expectNotContains(result.model_output, "PRE-TIMEOUT-ERR");
+    try expectContains(result.model_output, "<stdout>\nPRE-TIMEOUT-OUT\n</stdout>\n");
+    try expectContains(result.model_output, "<stderr>\nPRE-TIMEOUT-ERR");
     const structured = result.command_result_json orelse return error.TestExpectedEqual;
     try expectCommandResultField(structured, "kind", "foreground");
     try expectCommandResultField(
@@ -6490,8 +6505,8 @@ test "run_command timeout returns model-visible failure" {
         "printf 'PRE-TIMEOUT-OUT\n'; printf 'PRE-TIMEOUT-ERR\n' >&2; sleep 5",
     );
     try expectCommandResultBool(structured, "timed_out", true);
-    try expectCommandResultInt(structured, "stdout_bytes", 0);
-    try expectCommandResultInt(structured, "stderr_bytes", 0);
+    try expectCommandResultInt(structured, "stdout_bytes", 16);
+    try expectCommandResultInt(structured, "stderr_bytes", 16);
 
     const capture = result.command_replay_capture orelse
         return error.TestExpectedReplay;
@@ -6605,8 +6620,8 @@ test "run_command timeout returns model-visible failure" {
     const decoded = try session_codec.parseHistoryTurn(alloc, parsed.value);
     defer session_runtime.freeHistoryTurn(alloc, decoded);
     const decoded_result = decoded.assistant.execution.tool_steps[0].tool_results[0];
-    try expectNotContains(decoded_result.output, "PRE-TIMEOUT-OUT");
-    try expectNotContains(decoded_result.output, "PRE-TIMEOUT-ERR");
+    try expectContains(decoded_result.output, "PRE-TIMEOUT-OUT");
+    try expectContains(decoded_result.output, "PRE-TIMEOUT-ERR");
     const decoded_replay = decoded_result.command_output_replay orelse
         return error.TestExpectedReplay;
     const decoded_descriptor = switch (decoded_replay) {

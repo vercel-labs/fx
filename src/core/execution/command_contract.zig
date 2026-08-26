@@ -78,6 +78,7 @@ pub const ForegroundCommandResultSnapshot = struct {
     command: []const u8,
     cwd: []const u8,
     status: ForegroundCommandStatus,
+    timed_out: bool = false,
     stdout_display: []const u8,
     stderr_display: []const u8,
     stdout_bytes: usize,
@@ -95,7 +96,7 @@ pub fn formatForegroundCommandResult(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    try writeForegroundStatusLine(&out.writer, snapshot.status);
+    try writeForegroundStatusLine(&out.writer, snapshot.status, snapshot.timed_out);
     try writeForegroundOutputEnvelopes(&out.writer, stdout_text, stderr_text);
 
     return .{
@@ -103,8 +104,9 @@ pub fn formatForegroundCommandResult(
         .command_result = .{ .foreground = .{
             .command = snapshot.command,
             .cwd = snapshot.cwd,
-            .exit_code = foregroundExitCode(snapshot.status),
-            .signal = foregroundSignal(snapshot.status),
+            .exit_code = if (snapshot.timed_out) null else foregroundExitCode(snapshot.status),
+            .signal = if (snapshot.timed_out) null else foregroundSignal(snapshot.status),
+            .timed_out = snapshot.timed_out,
             .duration_ms = snapshot.duration_ms,
             .stdout_bytes = snapshot.stdout_bytes,
             .stderr_bytes = snapshot.stderr_bytes,
@@ -112,7 +114,15 @@ pub fn formatForegroundCommandResult(
     };
 }
 
-fn writeForegroundStatusLine(writer: *std.Io.Writer, status: ForegroundCommandStatus) !void {
+fn writeForegroundStatusLine(
+    writer: *std.Io.Writer,
+    status: ForegroundCommandStatus,
+    timed_out: bool,
+) !void {
+    if (timed_out) {
+        try writer.writeAll("timed_out=true\n");
+        return;
+    }
     switch (status) {
         .exit_code => |code| try writer.print("exit_code={d}\n", .{code}),
         .signal => |signal| try writer.print("signal={d}\n", .{signal}),

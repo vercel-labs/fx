@@ -100,6 +100,37 @@ pub const Foreground = struct {
         };
     }
 
+    pub fn timedOutFailure(
+        arena: Allocator,
+        result: command_contract.RunCommandResult,
+        timeout_ms: ?usize,
+    ) !?ToolExecutionResult {
+        const command_result = result.command_result orelse return null;
+        const foreground = switch (command_result) {
+            .foreground => |foreground| foreground,
+            .background => return null,
+        };
+        if (!foreground.timed_out) return null;
+
+        var out: std.Io.Writer.Allocating = .init(arena);
+        defer out.deinit();
+        try out.writer.writeAll("timeout=true\n");
+        if (timeout_ms) |ms| try out.writer.print("timeout_ms={d}\n", .{ms});
+        try out.writer.writeAll("command timed out and was terminated\n");
+        const timeout_prefix = "timed_out=true\n";
+        const partial_output = if (std.mem.startsWith(u8, result.output, timeout_prefix))
+            result.output[timeout_prefix.len..]
+        else
+            result.output;
+        if (partial_output.len > 0) try out.writer.writeAll(partial_output);
+
+        return .{
+            .status = .failure,
+            .model_output = try out.toOwnedSlice(),
+            .command_result_json = try command_result.toJson(arena),
+        };
+    }
+
     pub fn outputCaptureFailure(arena: Allocator) !ToolExecutionResult {
         const details = [_]tool_result_errors.Detail{
             .{ .name = "output_capture_failed", .value = .{ .boolean = true } },
@@ -398,6 +429,28 @@ test "command result mapping preserves timeout JSON" {
         timeout.model_output,
     );
     try expectContains(timeout.command_result_json.?, "\"timed_out\":true");
+}
+
+test "command result mapping preserves captured timeout output" {
+    const alloc = std.testing.allocator;
+    const mapped = try Foreground.timedOutFailure(alloc, .{
+        .output = "timed_out=true\n<stdout>\nbefore-timeout\n</stdout>\n",
+        .command_result = .{ .foreground = .{
+            .command = "printf before-timeout; sleep 5",
+            .cwd = "/tmp/workspace",
+            .timed_out = true,
+            .duration_ms = 1001,
+            .stdout_bytes = 15,
+        } },
+    }, 1000) orelse return error.TestExpectedEqual;
+    defer alloc.free(mapped.model_output);
+    defer alloc.free(mapped.command_result_json.?);
+
+    try expectContains(mapped.model_output, "timeout=true\n");
+    try expectContains(mapped.model_output, "timeout_ms=1000\n");
+    try expectContains(mapped.model_output, "<stdout>\nbefore-timeout\n</stdout>\n");
+    try expectContains(mapped.command_result_json.?, "\"timed_out\":true");
+    try expectContains(mapped.command_result_json.?, "\"stdout_bytes\":15");
 }
 
 test "foreground output capture failure is structured and recoverable" {

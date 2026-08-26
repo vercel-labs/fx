@@ -374,6 +374,19 @@ fn executeDirectReadOnlyWithLimitAndTestControls(
                 workers.len,
             },
         );
+        if (shared.cause == .timed_out) {
+            return formatDirectResult(
+                alloc,
+                plan,
+                final_term,
+                output.stdout.items,
+                output.stderr.items,
+                output.stdout_bytes,
+                output.stderr_bytes,
+                elapsedMs(started_ms, io_mod.milliTimestamp()),
+                true,
+            );
+        }
         return failure;
     }
     try output.flushCallbacks();
@@ -402,6 +415,7 @@ fn executeDirectReadOnlyWithLimitAndTestControls(
         output.stdout_bytes,
         output.stderr_bytes,
         duration_ms,
+        false,
     );
 }
 
@@ -771,11 +785,13 @@ fn formatDirectResult(
     stdout_bytes: usize,
     stderr_bytes: usize,
     duration_ms: u64,
+    timed_out: bool,
 ) !command_contract.RunCommandResult {
     return command_contract.formatForegroundCommandResult(alloc, .{
         .command = plan.command,
         .cwd = plan.cwd,
         .status = foregroundCommandStatusFromTerm(term),
+        .timed_out = timed_out,
         .stdout_display = stdout_projected,
         .stderr_display = stderr_projected,
         .stdout_bytes = stdout_bytes,
@@ -1782,15 +1798,18 @@ test "direct executor flushes partial callback output before timeout" {
     }};
     var capture = CallbackCapture{};
 
-    try std.testing.expectError(
-        error.TimeoutExpired,
-        executeDirectReadOnly(.{
-            .max_command_output_bytes = 1,
-            .timeout_ms = 500,
-            .timeout_started_ms = io_mod.milliTimestamp(),
-            .output_chunk_ctx = &capture,
-            .on_output_chunk = CallbackCapture.onChunk,
-        }, std.testing.allocator, injectedPlan("/tmp", &stages)),
-    );
+    const result = try executeDirectReadOnly(.{
+        .max_command_output_bytes = 1,
+        .timeout_ms = 500,
+        .timeout_started_ms = io_mod.milliTimestamp(),
+        .output_chunk_ctx = &capture,
+        .on_output_chunk = CallbackCapture.onChunk,
+    }, std.testing.allocator, injectedPlan("/tmp", &stages));
+    defer std.testing.allocator.free(result.output);
+
     try std.testing.expectEqualStrings("PARTIAL", capture.stdout[0..capture.stdout_len]);
+    const foreground = result.command_result.?.foreground;
+    try std.testing.expect(foreground.timed_out);
+    try std.testing.expectEqual(@as(usize, 7), foreground.stdout_bytes);
+    try std.testing.expect(std.mem.find(u8, result.output, "<stdout>\nPARTIAL\n</stdout>") != null);
 }
