@@ -310,7 +310,7 @@ describe("cli: help", () => {
 Run one noninteractive request
 
 Usage:
-  fx ask [--auto|--yolo] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
+  fx ask [--auto|--yolo] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--bare] [--mcp-config PATH] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
 
 Options:
   --auto                Automatically review unresolved permission requests
@@ -321,6 +321,8 @@ Options:
   --prompt-permissions  Prompt for Y/N permission approval when stdin is a TTY
   --no-save             Do not save the session; incompatible with --resume and --resume-id
   --no-color            Render TTY output without colors or hyperlinks
+  --bare                Skip skills, AGENTS.md, and MCP discovery; read credentials only from the environment
+  --mcp-config PATH     Load MCP servers from PATH instead of ~/.fx/mcp.json
   --resume <last|id>    Continue the last session or a session by id
   --resume-id <id>      Continue a session by exact id
   --continue-recovery   Resume the paused model response in the selected session
@@ -330,6 +332,7 @@ The prompt may be passed as arguments or piped on stdin when no prompt args are 
 TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.
 Operational progress and diagnostics are written to stderr. JSON output keeps raw Markdown in \`output\`.
 With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
+--bare also enables via FX_BARE=1; it requires AI_GATEWAY_API_KEY or VERCEL_OIDC_TOKEN and never reads OAuth logins or stored keys.
 `;
 
       for (const alias of ["--help", "-h"]) {
@@ -438,6 +441,164 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
       TIMEOUT,
     );
   }
+});
+
+describe("cli: bare mode", () => {
+  const BARE_MISSING_CREDENTIALS =
+    "fx ask --bare never reads OAuth logins or stored keys. Set AI_GATEWAY_API_KEY (or VERCEL_OIDC_TOKEN) in the environment.";
+
+  test(
+    "fx ask --bare refuses to run without environment credentials",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-bare-auth-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      try {
+        const env = {
+          ...NO_GATEWAY_AUTH,
+          HOME: realpathSync(home),
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+        };
+        const cwd = realpathSync(workspace);
+
+        const bare = await runFx(["ask", "--bare", "--no-save", "hello"], {
+          cwd,
+          env,
+          timeoutMs: TIMEOUT,
+        });
+        expect(bare.code).toBe(1);
+        expect(bare.stderr).toContain(BARE_MISSING_CREDENTIALS);
+
+        const envFlag = await runFx(["ask", "--no-save", "hello"], {
+          cwd,
+          env: { ...env, FX_BARE: "1" },
+          timeoutMs: TIMEOUT,
+        });
+        expect(envFlag.code).toBe(1);
+        expect(envFlag.stderr).toContain(BARE_MISSING_CREDENTIALS);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask --mcp-config reports a missing config file before startup",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-bare-mcp-missing-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      try {
+        const env = {
+          ...NO_GATEWAY_AUTH,
+          HOME: realpathSync(home),
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+        };
+        const cwd = realpathSync(workspace);
+        const missingPath = join(root, "does-not-exist.json");
+
+        const result = await runFx(
+          ["ask", "--bare", "--mcp-config", missingPath, "--no-save", "hello"],
+          { cwd, env, timeoutMs: TIMEOUT },
+        );
+        expect(result.code).toBe(1);
+        expect(result.stderr).toContain(
+          `fx ask: MCP config ${missingPath}: file not found`,
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask --bare skips AGENTS.md delivery and MCP server startup",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-bare-discovery-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const launchMarker = join(root, "mcp-launched");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(
+        join(workspace, "AGENTS.md"),
+        "# AGENTS.md\n\nBARE_MODE_SENTINEL_TOKEN must not ship to the model.\n",
+      );
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({}),
+      );
+      writeFileSync(
+        join(home, ".fx", "mcp.json"),
+        JSON.stringify({
+          mcp: {
+            fixture: {
+              type: "local",
+              command: [
+                "/bin/sh",
+                "-c",
+                `touch "${launchMarker}"; exec "${process.execPath}" "${join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs")}"`,
+              ],
+              enabled: true,
+              required: true,
+            },
+          },
+        }),
+      );
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("bare answered"),
+        fakeGatewayFinalText("normal answered"),
+      ]);
+      try {
+        const cwd = realpathSync(workspace);
+        const env = {
+          HOME: realpathSync(home),
+          AI_GATEWAY_API_KEY: "bare-discovery-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+        };
+
+        const bare = await runFx(
+          ["ask", "--bare", "--json", "--no-save", "Reply briefly."],
+          { cwd, env, timeoutMs: TIMEOUT },
+        );
+        expect(bare.code).toBe(0);
+        expect(JSON.parse(bare.stdout).output.trim()).toBe("bare answered");
+        expect(existsSync(launchMarker)).toBe(false);
+        expect(gateway.requests).toHaveLength(1);
+        expect(gateway.requests[0].body).not.toContain(
+          "BARE_MODE_SENTINEL_TOKEN",
+        );
+
+        const normal = await runFx(
+          ["ask", "--json", "--no-save", "Reply briefly."],
+          { cwd, env, timeoutMs: TIMEOUT },
+        );
+        expect(normal.code).toBe(0);
+        expect(JSON.parse(normal.stdout).output.trim()).toBe(
+          "normal answered",
+        );
+        expect(existsSync(launchMarker)).toBe(true);
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[1].body).toContain("BARE_MODE_SENTINEL_TOKEN");
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe("cli: version", () => {

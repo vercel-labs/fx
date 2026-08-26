@@ -407,6 +407,16 @@ pub fn loadRuntime(
     const config_path = try configPathFromHome(alloc, home);
     defer alloc.free(config_path);
 
+    return loadRuntimeFromPath(alloc, elicitation_capabilities, config_path);
+}
+
+/// Load servers from an explicit config file instead of the profile default.
+/// Used by `fx ask --mcp-config`.
+pub fn loadRuntimeFromPath(
+    alloc: Allocator,
+    elicitation_capabilities: elicitation.Capabilities,
+    config_path: []const u8,
+) !?*mcp_runtime.McpRuntime {
     var configs = try loadConfigFromPath(alloc, config_path);
     defer freeConfigs(alloc, &configs);
 
@@ -2330,6 +2340,32 @@ test "save and reload preserves mixed stdio and sse configs" {
     try std.testing.expect(!reloaded.items[0].enabled);
     try std.testing.expectEqual(McpTransport.sse, reloaded.items[1].transport);
     try std.testing.expectEqualStrings("https://mcp.example.com", try reloaded.items[1].remoteUrl());
+}
+
+test "loadRuntimeFromPath loads an explicit config and tolerates a missing file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmpRoot(alloc, tmp);
+    defer alloc.free(root);
+    const path = try tmpPath(alloc, root, "mcp.json");
+    defer alloc.free(path);
+
+    const missing = try loadRuntimeFromPath(alloc, .{}, "/nonexistent/fx-mcp-config.json");
+    try std.testing.expect(missing == null);
+
+    var configs = try loadConfigFromJson(alloc,
+        \\{"mcp":{"local":{"type":"local","command":["node","server.js"]}}}
+    );
+    defer freeConfigs(alloc, &configs);
+    try saveConfigsToPath(alloc, path, configs.items);
+
+    const runtime = (try loadRuntimeFromPath(alloc, .{}, path)) orelse
+        return error.TestUnexpectedResult;
+    defer alloc.destroy(runtime);
+    defer runtime.deinit();
+    try std.testing.expectEqual(@as(usize, 1), runtime.servers.items.len);
 }
 
 test "save and reload preserves HTTP identity and headers" {

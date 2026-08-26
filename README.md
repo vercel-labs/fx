@@ -97,6 +97,8 @@ Use `fx ask` for a single request:
 fx ask "explain the changes in this repository"
 ```
 
+For scripted and CI use, `fx ask --bare` skips skills, AGENTS.md discovery, and MCP server startup, and reads credentials only from the environment, so every machine produces the same run without touching your login or keychain. `FX_BARE=1` enables the same mode. Bare mode requires `AI_GATEWAY_API_KEY` or `VERCEL_OIDC_TOKEN`; OAuth logins and stored keys are never read. Pair `--mcp-config <path>` with `--bare` to load MCP servers from an explicit file instead of `~/.fx/mcp.json`; under `--bare` only servers that do not require OAuth are usable.
+
 Foreground terminal commands run with an explicit finite deadline. fx uses durable terminal sessions for services, watchers, GUI applications, and other long-lived work, and keeps captured foreground output available through an opaque bounded-read handle for the active session or `--no-save` process.
 
 fx starts in `auto` permission mode. Routine understood development actions run directly. Each unresolved action receives one narrow safety review based on the current user request and the exact pending action. A clear result authorizes only that action. A caution or unavailable review holds the action and returns advice to the agent without opening a permission prompt or ending the turn. See [Permissions](https://fx.sh/docs/configure-fx/permissions) for other modes and persistent rules.

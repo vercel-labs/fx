@@ -3362,6 +3362,7 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .tool_set = builtin_tools.advertisement_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
+        .load_mcp_runtime_from_path = builtin_mcp.loadRuntimeFromPath,
         .acp_runner = .{ .run_fn = runAcpServer },
     };
 }
@@ -3397,6 +3398,7 @@ fn localEntryConfig() app_entry_runtime.Config {
         .tool_set = builtin_tools.advertisement_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
+        .load_mcp_runtime_from_path = builtin_mcp.loadRuntimeFromPath,
         .acp_runner = .{ .run_fn = runAcpServer },
     };
 }
@@ -3432,6 +3434,7 @@ fn emptyEntryConfig() app_entry_runtime.Config {
         .tool_set = builtin_tools.advertisement_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
+        .load_mcp_runtime_from_path = builtin_mcp.loadRuntimeFromPath,
         .acp_runner = .{ .run_fn = runAcpServer },
     };
 }

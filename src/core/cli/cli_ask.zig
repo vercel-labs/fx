@@ -241,6 +241,7 @@ pub const Config = struct {
     max_history_turns: usize,
     mode_registry: mode_registry.Registry,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
+    load_mcp_runtime_from_path: mcp_runtime.LoadRuntimeFromPathFn,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
@@ -315,6 +316,7 @@ const AskOptions = struct {
     image_paths: std.ArrayList([]u8) = .empty,
     images: std.ArrayList(ImageAttachment) = .empty,
     system_prompt_override: ?[]u8 = null,
+    mcp_config_path: ?[]u8 = null,
     json_output: bool = false,
     prompt_permissions: bool = false,
     timeout_ms: ?usize = null,
@@ -323,6 +325,7 @@ const AskOptions = struct {
     no_save: bool = false,
     no_color: bool = false,
     continue_recovery: bool = false,
+    bare: bool = false,
 
     fn deinit(self: *AskOptions, alloc: Allocator) void {
         alloc.free(self.prompt);
@@ -331,6 +334,7 @@ const AskOptions = struct {
         for (self.images.items) |image| types.freeImageAttachment(alloc, image);
         self.images.deinit(alloc);
         if (self.system_prompt_override) |s| alloc.free(s);
+        if (self.mcp_config_path) |p| alloc.free(p);
     }
 };
 
@@ -378,6 +382,7 @@ const NotifyAttentionFn = *const fn (?*anyopaque) void;
 const PermissionApprovalPromptFn = *const fn (?*anyopaque, ?*anyopaque, WriteFn, []const u8, ?*anyopaque, NotifyAttentionFn) anyerror!PermissionApprovalPromptResult;
 const IsTtyFn = *const fn (?*anyopaque) bool;
 const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupState;
+const LoadStartupStateWithoutCredentialsFn = *const fn (Allocator, []const u8, usize) anyerror!app_lifecycle.StartupState;
 const InitializeSessionStoresFn = *const fn (*AskContext) anyerror!void;
 const LoadSkillsFn = *const fn (
     Allocator,
@@ -400,11 +405,13 @@ const RunDeps = struct {
     stdout_is_tty: IsTtyFn = realStdoutIsTty,
     stderr_is_tty: IsTtyFn = realStderrIsTty,
     load_startup_state: LoadStartupStateFn = loadStartupStateDefault,
+    load_startup_state_without_credentials: LoadStartupStateWithoutCredentialsFn = app_lifecycle.loadStartupStateWithoutCredentials,
     initialize_session_stores: InitializeSessionStoresFn = initializeSessionStoresDefault,
     load_skills: LoadSkillsFn = app_runtime_setup.loadSkills,
     context_registry: context_contract.Registry,
     tool_set: tool_set_contract.ToolSet,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
+    load_mcp_runtime_from_path: mcp_runtime.LoadRuntimeFromPathFn,
     process_queued_prompt: ProcessQueuedPromptFn = processQueuedPromptDefault,
     persist_yolo_acknowledgment: PersistYoloAcknowledgmentFn = persistYoloAcknowledgmentDefault,
     discard_pristine_session_ctx: ?*anyopaque = null,
@@ -439,6 +446,8 @@ const RunOptions = struct {
     resume_target: ?ResumeTarget = null,
     color_enabled: bool = true,
     continue_recovery: bool = false,
+    bare: bool = false,
+    mcp_config_path: ?[]const u8 = null,
     deps: RunDeps,
 };
 
@@ -1126,6 +1135,7 @@ pub fn run(alloc: Allocator, args: []const [:0]const u8, cfg: Config, context_re
         .context_registry = context_registry,
         .tool_set = tool_set,
         .load_mcp_runtime = cfg.load_mcp_runtime,
+        .load_mcp_runtime_from_path = cfg.load_mcp_runtime_from_path,
         .install_headless_interrupt = true,
     });
 }
@@ -1243,6 +1253,9 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
     defer options.deinit(alloc);
 
     if (interrupt_scope.requested()) return headless_interrupt.exitCode();
+    if (options.mcp_config_path) |path| {
+        if (!try preflightMcpConfig(deps, path)) return 1;
+    }
     if (options.image_paths.items.len > 0) {
         const workspace_root = try io_mod.realpathAlloc(alloc, ".");
         defer alloc.free(workspace_root);
@@ -1270,6 +1283,8 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         .resume_target = options.resume_target,
         .color_enabled = !options.no_color,
         .continue_recovery = options.continue_recovery,
+        .bare = options.bare,
+        .mcp_config_path = options.mcp_config_path,
         .deps = deps,
     }) catch |err| {
         if (interrupt_scope.requested()) return headless_interrupt.exitCode();
@@ -1310,6 +1325,27 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         headless_interrupt.exitCode()
     else
         result.exit_code;
+}
+
+fn preflightMcpConfig(
+    deps: RunDeps,
+    path: []const u8,
+) !bool {
+    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        const reason = switch (err) {
+            error.FileNotFound => "file not found",
+            else => @errorName(err),
+        };
+        try deps.write_stderr(deps.stderr_ctx, "fx ask: MCP config ");
+        try deps.write_stderr(deps.stderr_ctx, path);
+        try deps.write_stderr(deps.stderr_ctx, ": ");
+        try deps.write_stderr(deps.stderr_ctx, reason);
+        try deps.write_stderr(deps.stderr_ctx, "\n");
+        return false;
+    };
+    file.close(io_mod.getIo());
+    return true;
 }
 
 fn preflightAskImages(
@@ -1361,6 +1397,7 @@ pub fn runPrompt(alloc: Allocator, prompt: []const u8, auto_permission: bool, cf
             .context_registry = context_registry,
             .tool_set = tool_set,
             .load_mcp_runtime = cfg.load_mcp_runtime,
+            .load_mcp_runtime_from_path = cfg.load_mcp_runtime_from_path,
         },
     });
     defer result.deinit(alloc);
@@ -1375,6 +1412,7 @@ pub fn runPromptCapture(alloc: Allocator, prompt: []const u8, auto_permission: b
             .context_registry = context_registry,
             .tool_set = tool_set,
             .load_mcp_runtime = cfg.load_mcp_runtime,
+            .load_mcp_runtime_from_path = cfg.load_mcp_runtime_from_path,
         },
     });
 }
@@ -1384,7 +1422,12 @@ fn missingCredentialResult(
     options: RunOptions,
     provider: model_provider.ProviderId,
 ) !PromptRunResult {
-    const message = if (provider == .codex)
+    const message = if (options.bare)
+        (if (provider == .gateway)
+            credentials.missing_bare_credential_message
+        else
+            credentials.missing_bare_subscription_credential_message)
+    else if (provider == .codex)
         credentials.missing_chatgpt_credential_message
     else if (provider == .grok)
         credentials.missing_grok_credential_message
@@ -1405,13 +1448,20 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer alloc.free(owned_prompt);
 
     try checkHeadlessCancellation(options.deps);
-    var startup = try options.deps.load_startup_state(
-        alloc,
-        cfg.gateway_provider.oauth_transport,
-        cfg.secret_store,
-        cfg.default_model,
-        cfg.default_agent_step_limit,
-    );
+    var startup = if (options.bare)
+        try options.deps.load_startup_state_without_credentials(
+            alloc,
+            cfg.default_model,
+            cfg.default_agent_step_limit,
+        )
+    else
+        try options.deps.load_startup_state(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            cfg.secret_store,
+            cfg.default_model,
+            cfg.default_agent_step_limit,
+        );
     defer startup.deinit(alloc);
     try checkHeadlessCancellation(options.deps);
 
@@ -1445,8 +1495,14 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     );
     try checkHeadlessCancellation(options.deps);
 
-    if (!options.continue_recovery and options.resume_target == null and startup.credential == null) {
-        return missingCredentialResult(alloc, options, startup.provider);
+    if (!options.continue_recovery and options.resume_target == null) {
+        if (options.bare) {
+            if (startup.provider != .gateway or !credentials.envCredentialAvailable()) {
+                return missingCredentialResult(alloc, options, startup.provider);
+            }
+        } else if (startup.credential == null) {
+            return missingCredentialResult(alloc, options, startup.provider);
+        }
     }
 
     var owned_resumed_model: ?[]u8 = null;
@@ -1485,7 +1541,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.permission_mode = permission_mode;
     ctx.mode_id = mode_id;
     ctx.permission_rules = try takeCorePermissionRules(alloc, &startup);
-    ctx.context_enabled = startup.context_enabled;
+    ctx.context_enabled = startup.context_enabled and !options.bare;
     if (options.output_mode.isTerminal()) {
         presenter = try ask_presentation.Runtime.init(alloc, .{
             .text = owned_prompt,
@@ -1525,22 +1581,29 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
 
     var routed_credential: ?credentials.Credential = null;
     defer if (routed_credential) |*credential| credential.deinit(alloc);
-    const startup_matches_final_model = if (startup.credential) |credential|
-        model_provider.authorizesCredential(ctx.provider, credential.source)
+    const startup_matches_final_model = if (!options.bare)
+        (if (startup.credential) |credential|
+            model_provider.authorizesCredential(ctx.provider, credential.source)
+        else
+            false)
     else
         false;
     const credential: *const credentials.Credential = if (startup_matches_final_model)
         &startup.credential.?
     else routed: {
-        const preferred = if (startup.credential) |value| value.source else null;
-        const resolution = try credentials.resolveForProvider(
-            alloc,
-            cfg.gateway_provider.oauth_transport,
-            cfg.secret_store,
-            .refresh_if_needed,
-            ctx.provider,
-            preferred,
-        );
+        const resolution = if (options.bare)
+            try credentials.resolveEnvOnly(alloc, ctx.provider)
+        else blk: {
+            const preferred = if (startup.credential) |value| value.source else null;
+            break :blk try credentials.resolveForProvider(
+                alloc,
+                cfg.gateway_provider.oauth_transport,
+                cfg.secret_store,
+                .refresh_if_needed,
+                ctx.provider,
+                preferred,
+            );
+        };
         routed_credential = resolution.credential;
         if (routed_credential == null) {
             return missingCredentialResult(alloc, options, ctx.provider);
@@ -1601,17 +1664,20 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
 
     try ctx.checkCancellation();
-    var loaded_skills = try options.deps.load_skills(
-        alloc,
-        startup.workspace_root,
-        cfg.skill_root_policy,
-    );
+    var loaded_skills: app_runtime_setup.LoadedSkills = if (options.bare)
+        .{}
+    else
+        try options.deps.load_skills(
+            alloc,
+            startup.workspace_root,
+            cfg.skill_root_policy,
+        );
     defer loaded_skills.deinit(alloc);
     try ctx.checkCancellation();
     skill_runtime.traceDiagnostics("ask_startup", loaded_skills.diagnostics);
     ctx.skills_dir = loaded_skills.dir;
     loaded_skills.dir = &.{};
-    if (startup.context_enabled) {
+    if (ctx.context_enabled) {
         try ctx.checkCancellation();
         const context_targets = try context_contract.applicableTargetsForImages(alloc, current_images);
         defer if (context_targets.len > 0) alloc.free(context_targets);
@@ -1626,7 +1692,11 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     }
 
     try ctx.checkCancellation();
-    ctx.mcp = try options.deps.load_mcp_runtime(alloc, ctx.mcp_elicitation_capabilities);
+    if (options.mcp_config_path) |mcp_path| {
+        ctx.mcp = try options.deps.load_mcp_runtime_from_path(alloc, ctx.mcp_elicitation_capabilities, mcp_path);
+    } else if (!options.bare) {
+        ctx.mcp = try options.deps.load_mcp_runtime(alloc, ctx.mcp_elicitation_capabilities);
+    }
     if (ctx.mcp) |mcp| mcp.connectRequiredForAsk(ctx.toolRegistry());
     try ctx.checkCancellation();
     if (ctx.mcp) |mcp| {
@@ -3304,6 +3374,13 @@ fn onBackgroundUrlReady(raw_ctx: *anyopaque, task_id: u64, url: []const u8) void
     ctx.writeStderr(line) catch {};
 }
 
+fn envFlagEnabled(name: []const u8) bool {
+    const raw = io_mod.getenv(name) orelse return false;
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    if (value.len == 0) return false;
+    return !(std.mem.eql(u8, value, "0") or std.ascii.eqlIgnoreCase(value, "false"));
+}
+
 fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: StdinSource) !AskOptions {
     var opts: AskOptions = .{ .prompt = &.{} };
     errdefer opts.deinit(alloc);
@@ -3364,12 +3441,28 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
         } else if (std.mem.eql(u8, arg, "--continue-recovery")) {
             if (opts.continue_recovery) return error.InvalidAskArgs;
             opts.continue_recovery = true;
+        } else if (std.mem.eql(u8, arg, "--bare")) {
+            opts.bare = true;
+        } else if (std.mem.eql(u8, arg, "--mcp-config")) {
+            if (opts.mcp_config_path != null) return error.InvalidAskArgs;
+            i += 1;
+            if (i >= args.len) return error.InvalidAskArgs;
+            const path = std.mem.trim(u8, args[i], " \t\r\n");
+            if (path.len == 0) return error.InvalidAskArgs;
+            opts.mcp_config_path = try alloc.dupe(u8, path);
+        } else if (std.mem.startsWith(u8, arg, "--mcp-config=")) {
+            if (opts.mcp_config_path != null) return error.InvalidAskArgs;
+            const path = std.mem.trim(u8, arg["--mcp-config=".len..], " \t\r\n");
+            if (path.len == 0) return error.InvalidAskArgs;
+            opts.mcp_config_path = try alloc.dupe(u8, path);
         } else if (arg.len > 1 and arg[0] == '-') {
             return error.InvalidAskArgs;
         } else {
             try prompt_parts.append(alloc, arg);
         }
     }
+
+    opts.bare = opts.bare or envFlagEnabled("FX_BARE");
 
     if (opts.continue_recovery) {
         if (opts.resume_target == null or opts.no_save or
@@ -3829,6 +3922,7 @@ fn testConfig() Config {
         .max_history_turns = 2,
         .mode_registry = test_mode_registry,
         .load_mcp_runtime = testNoMcpRuntime,
+        .load_mcp_runtime_from_path = testNoMcpRuntimeFromPath,
     };
 }
 
@@ -4364,6 +4458,10 @@ fn testNoMcpRuntime(_: Allocator, _: mcp_elicitation.Capabilities) !?*mcp_runtim
     return null;
 }
 
+fn testNoMcpRuntimeFromPath(_: Allocator, _: mcp_elicitation.Capabilities, _: []const u8) !?*mcp_runtime.McpRuntime {
+    return null;
+}
+
 fn testPromptRunDeps(stdout_capture: *TestCapture, stderr_capture: *TestCapture, load_startup_state: LoadStartupStateFn) RunDeps {
     return .{
         .stdout_ctx = stdout_capture,
@@ -4376,6 +4474,7 @@ fn testPromptRunDeps(stdout_capture: *TestCapture, stderr_capture: *TestCapture,
         .context_registry = test_no_context_registry,
         .tool_set = builtin_tools.advertisement_set,
         .load_mcp_runtime = testNoMcpRuntime,
+        .load_mcp_runtime_from_path = testNoMcpRuntimeFromPath,
         .process_queued_prompt = testProcessQueuedPrompt,
     };
 }
@@ -4819,6 +4918,63 @@ test "parse options accepts yolo and rejects permission flag conflicts" {
             &.{ "--auto", "--yolo", "hello" },
             .tty,
         ),
+    );
+}
+
+test "parse options enables bare via --bare flag or FX_BARE env" {
+    const alloc = std.testing.allocator;
+    const empty_env = try TestAskHome.stableEmptyEnv();
+    defer io_mod.setEnvironMap(empty_env);
+
+    var flagged = try parseOptionsWithStdin(alloc, &.{ "--bare", "hello" }, .tty);
+    defer flagged.deinit(alloc);
+    try std.testing.expect(flagged.bare);
+
+    var env = std.process.Environ.Map.init(alloc);
+    defer env.deinit();
+    try env.put("FX_BARE", "1");
+    io_mod.setEnvironMap(&env);
+    var from_env = try parseOptionsWithStdin(alloc, &.{"hello"}, .tty);
+    defer from_env.deinit(alloc);
+    try std.testing.expect(from_env.bare);
+
+    try env.put("FX_BARE", "false");
+    var disabled = try parseOptionsWithStdin(alloc, &.{"hello"}, .tty);
+    defer disabled.deinit(alloc);
+    try std.testing.expect(!disabled.bare);
+
+    io_mod.setEnvironMap(empty_env);
+    var no_env = try parseOptionsWithStdin(alloc, &.{"hello"}, .tty);
+    defer no_env.deinit(alloc);
+    try std.testing.expect(!no_env.bare);
+}
+
+test "parse options accepts --mcp-config in space and equals forms" {
+    const alloc = std.testing.allocator;
+
+    var spaced = try parseOptionsWithStdin(alloc, &.{ "--mcp-config", "/tmp/mcp.json", "hello" }, .tty);
+    defer spaced.deinit(alloc);
+    try std.testing.expectEqualStrings("/tmp/mcp.json", spaced.mcp_config_path.?);
+
+    var equals = try parseOptionsWithStdin(alloc, &.{ "--mcp-config=/tmp/other.json", "hello" }, .tty);
+    defer equals.deinit(alloc);
+    try std.testing.expectEqualStrings("/tmp/other.json", equals.mcp_config_path.?);
+
+    try std.testing.expectError(
+        error.InvalidAskArgs,
+        parseOptionsWithStdin(alloc, &.{ "--mcp-config", "/a.json", "--mcp-config", "/b.json", "hello" }, .tty),
+    );
+    try std.testing.expectError(
+        error.InvalidAskArgs,
+        parseOptionsWithStdin(alloc, &.{"--mcp-config"}, .tty),
+    );
+    try std.testing.expectError(
+        error.InvalidAskArgs,
+        parseOptionsWithStdin(alloc, &.{ "--mcp-config", "   ", "hello" }, .tty),
+    );
+    try std.testing.expectError(
+        error.InvalidAskArgs,
+        parseOptionsWithStdin(alloc, &.{ "--mcp-config=", "hello" }, .tty),
     );
 }
 
@@ -8426,6 +8582,7 @@ test "fx ask JSON permission-denied capture is best effort under allocation fail
             .context_registry = test_no_context_registry,
             .tool_set = builtin_tools.advertisement_set,
             .load_mcp_runtime = testNoMcpRuntime,
+            .load_mcp_runtime_from_path = testNoMcpRuntimeFromPath,
         },
         "/tmp/workspace",
     );
@@ -8539,6 +8696,7 @@ fn checkAskJsonCaptureAllocationFailures(alloc: Allocator) !void {
         .context_registry = test_no_context_registry,
         .tool_set = builtin_tools.advertisement_set,
         .load_mcp_runtime = testNoMcpRuntime,
+        .load_mcp_runtime_from_path = testNoMcpRuntimeFromPath,
     }, "/tmp/workspace");
     defer ctx.deinit();
     ctx.output_mode = .json;
@@ -8626,6 +8784,7 @@ test "fx ask JSON clips ask_user_question text at a UTF-8 boundary" {
         .context_registry = test_no_context_registry,
         .tool_set = builtin_tools.advertisement_set,
         .load_mcp_runtime = testNoMcpRuntime,
+        .load_mcp_runtime_from_path = testNoMcpRuntimeFromPath,
     }, "/tmp/workspace");
     defer ctx.deinit();
     ctx.output_mode = .json;
