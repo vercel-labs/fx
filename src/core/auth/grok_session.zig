@@ -16,7 +16,7 @@ const max_account_id_bytes: usize = 1024;
 const auth_file_name = profile_paths.grok_auth_file_name;
 
 pub fn refreshDeadlineMs(expires_at_ms: i64) i64 {
-    return @max(expires_at_ms - expiry_skew_ms, 0);
+    return @max(expires_at_ms -| expiry_skew_ms, 0);
 }
 
 pub fn validAccountId(account_id: []const u8) bool {
@@ -288,4 +288,18 @@ test "Grok account identity is bounded and safe for HTTP headers" {
 test "Grok session refresh deadline keeps a one minute safety margin" {
     try std.testing.expectEqual(@as(i64, 40_000), refreshDeadlineMs(100_000));
     try std.testing.expectEqual(@as(i64, 0), refreshDeadlineMs(10_000));
+}
+
+test "Grok session reads an extreme stored expiry as expired instead of aborting" {
+    // Nothing bounds the value the auth file carries, and subtracting the
+    // safety margin from the smallest i64 overflows before the clamp below it
+    // ever runs.
+    try std.testing.expectEqual(@as(i64, 0), refreshDeadlineMs(std.math.minInt(i64)));
+
+    const alloc = std.testing.allocator;
+    var session = try parse(alloc,
+        \\{"version":1,"access_token":"access","refresh_token":"refresh","expires_at_ms":-9223372036854775808,"account_id":"acct"}
+    );
+    defer session.deinit(alloc);
+    try std.testing.expect(session.expired(0));
 }
