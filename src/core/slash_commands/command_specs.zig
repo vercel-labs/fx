@@ -28,6 +28,7 @@ pub const TopLevelKind = enum {
     usage,
     upgrade,
     replay,
+    worktree,
     workspace,
 };
 

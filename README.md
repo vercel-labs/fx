@@ -85,6 +85,24 @@ fx session resume last
 fx session resume --id <id>
 ```
 
+Use native Git worktree workflows to isolate parallel tasks without manually changing directories:
+
+```bash
+# Inspect the repository, active branch, and every linked worktree.
+fx worktree list
+
+# Create a branch and linked worktree, then start a new fx session there.
+fx worktree create feature/search ../feature-search --base main --start
+
+# Open an existing worktree and resume its latest associated session.
+fx worktree open feature/search --resume
+
+# Remove the linked worktree but keep its Git branch.
+fx worktree remove feature/search --confirm
+```
+
+`fx worktree open` accepts a full branch name, worktree path, or unique directory name. Worktree sessions keep that worktree as their workspace root when saved and resumed. Cleanup is explicit: `remove` requires `--confirm`, refuses the primary and currently active worktrees, and never deletes the branch. Add `--force` only when Git must remove a dirty or locked linked worktree.
+
 Each interactive session names its terminal tab. The title prefers the session name, falls back to the workspace name, and keeps the active model as secondary context. Renaming or resuming a session updates the tab, and exiting clears the fx-owned title. Noninteractive commands do not emit terminal-title controls.
 
 Run `/feedback` to open the feedback form at `fx.sh/feedback`. It does not create a diagnostic or change the clipboard.
