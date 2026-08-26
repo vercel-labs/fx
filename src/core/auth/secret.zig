@@ -26,3 +26,82 @@ test "zeroAndFree overwrites bytes before release" {
     std.crypto.secureZero(u8, @volatileCast(value[0..]));
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, &value);
 }
+
+/// Test helper. Records whether any allocation still held a credential in
+/// plaintext at the moment it was returned to the allocator. The scan runs
+/// before the backing allocator sees the block, so a debug build's own poison
+/// does not hide the answer.
+pub const ScanAllocator = struct {
+    backing: std.mem.Allocator,
+    marker: []const u8,
+    released_with_plaintext: usize = 0,
+
+    pub fn allocator(self: *ScanAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = scanAlloc,
+            .resize = scanResize,
+            .remap = scanRemap,
+            .free = scanFree,
+        } };
+    }
+
+    fn scanAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *ScanAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.vtable.alloc(self.backing.ptr, len, alignment, ret_addr);
+    }
+
+    fn scanResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *ScanAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.vtable.resize(self.backing.ptr, memory, alignment, new_len, ret_addr);
+    }
+
+    fn scanRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *ScanAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.vtable.remap(self.backing.ptr, memory, alignment, new_len, ret_addr);
+    }
+
+    fn scanFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *ScanAllocator = @ptrCast(@alignCast(ctx));
+        if (std.mem.indexOf(u8, memory, self.marker) != null) {
+            self.released_with_plaintext += 1;
+        }
+        self.backing.vtable.free(self.backing.ptr, memory, alignment, ret_addr);
+    }
+};
+
+// The needle is short and sits at the start of the credential, so it is found in
+// a partially written buffer too. Searching for the whole credential would miss
+// exactly the case this guards: a buffer abandoned mid-growth holds a truncated
+// prefix, not the complete value.
+pub const scan_needle = "OAUTH_TEST_CREDENTIAL_MARKER";
+
+// Long enough that the encoded body outgrows the writer's initial buffer. A
+// short credential fits in the first allocation and never exercises the growth
+// path, which leaves the test vacuous.
+pub const scan_marker = scan_needle ++ ("x" ** 1024);
+
+test "the scan allocator sees a credential abandoned while a writer grows" {
+    // `Allocator.free` overwrites a block with `undefined` in a safety build
+    // before any wrapping allocator sees it, so the observable half is the
+    // growth path: every buffer a writer outgrows is handed back through
+    // `remap`/`rawFree` with its contents intact.
+    var scan = ScanAllocator{ .backing = std.testing.allocator, .marker = scan_needle };
+    const alloc = scan.allocator();
+
+    // Appended in pieces, the way a form or JSON body is assembled. One
+    // `writeAll` of the whole value sizes the buffer in a single step and
+    // abandons nothing.
+    var grown: std.Io.Writer.Allocating = .init(alloc);
+    defer grown.deinit();
+    for (0..scan_marker.len) |i| try grown.writer.writeByte(scan_marker[i]);
+    try std.testing.expect(scan.released_with_plaintext > 0);
+
+    // Reserved up front and wiped at the end, the same shape the callers use:
+    // nothing is abandoned, so the count does not move.
+    const before = scan.released_with_plaintext;
+    var reserved: std.Io.Writer.Allocating = try .initCapacity(alloc, scan_marker.len * 2);
+    defer reserved.deinit();
+    defer zero(reserved.written());
+    for (0..scan_marker.len) |i| try reserved.writer.writeByte(scan_marker[i]);
+    try std.testing.expectEqual(before, scan.released_with_plaintext);
+}

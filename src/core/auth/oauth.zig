@@ -428,56 +428,6 @@ fn check_token_set_allocation_failures(alloc: Allocator) !void {
     defer token.deinit(alloc);
 }
 
-/// Records whether any allocation still held a credential in plaintext at the
-/// moment it was returned to the allocator.
-const CredentialScanAllocator = struct {
-    backing: Allocator,
-    marker: []const u8,
-    released_with_plaintext: usize = 0,
-
-    fn allocator(self: *CredentialScanAllocator) Allocator {
-        return .{ .ptr = self, .vtable = &.{
-            .alloc = scanAlloc,
-            .resize = scanResize,
-            .remap = scanRemap,
-            .free = scanFree,
-        } };
-    }
-
-    fn scanAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const self: *CredentialScanAllocator = @ptrCast(@alignCast(ctx));
-        return self.backing.vtable.alloc(self.backing.ptr, len, alignment, ret_addr);
-    }
-
-    fn scanResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        const self: *CredentialScanAllocator = @ptrCast(@alignCast(ctx));
-        return self.backing.vtable.resize(self.backing.ptr, memory, alignment, new_len, ret_addr);
-    }
-
-    fn scanRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        const self: *CredentialScanAllocator = @ptrCast(@alignCast(ctx));
-        return self.backing.vtable.remap(self.backing.ptr, memory, alignment, new_len, ret_addr);
-    }
-
-    fn scanFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        const self: *CredentialScanAllocator = @ptrCast(@alignCast(ctx));
-        if (std.mem.indexOf(u8, memory, self.marker) != null) {
-            self.released_with_plaintext += 1;
-        }
-        self.backing.vtable.free(self.backing.ptr, memory, alignment, ret_addr);
-    }
-};
-
-// The needle is short and sits at the start of the credential, so it is found in
-// a partially written buffer too. Searching for the whole credential would miss
-// exactly the case this guards: a buffer abandoned mid-growth holds a truncated
-// prefix, not the complete value.
-const credential_needle = "OAUTH_TEST_CREDENTIAL_MARKER";
-
-// Long enough that the form body outgrows the writer's initial buffer. A short
-// credential fits in the first allocation and never exercises the growth path.
-const credential_marker = credential_needle ++ ("x" ** 1024);
-
 fn credentialProbeMetadata() Metadata {
     return .{
         .issuer = @constCast("https://vercel.test"),
@@ -490,9 +440,9 @@ test "oauth request bodies carrying a credential are wiped before release" {
     // The response in each of these calls is already wiped with
     // `secret.zeroAndFree`. The request form carries the credential itself, so
     // it must not outlive the call in plaintext either.
-    var scan = CredentialScanAllocator{
+    var scan = secret.ScanAllocator{
         .backing = std.testing.allocator,
-        .marker = credential_needle,
+        .marker = secret.scan_needle,
     };
     const alloc = scan.allocator();
     const metadata = credentialProbeMetadata();
@@ -503,7 +453,7 @@ test "oauth request bodies carrying a credential are wiped before release" {
             .expected_url = "https://vercel.test/token",
             .response_body = "{\"access_token\":\"a\",\"token_type\":\"bearer\",\"expires_in\":3600}",
         };
-        var tokens = try refreshToken(alloc, probe.provider(), metadata, "client", credential_marker);
+        var tokens = try refreshToken(alloc, probe.provider(), metadata, "client", secret.scan_marker);
         tokens.deinit(alloc);
     }
 
@@ -526,7 +476,7 @@ test "oauth request bodies carrying a credential are wiped before release" {
             probe.provider(),
             metadata,
             "client",
-            credential_marker,
+            secret.scan_marker,
             &cancel_flag,
             deadline,
         );
@@ -544,7 +494,7 @@ test "oauth request bodies carrying a credential are wiped before release" {
             probe.provider(),
             "https://vercel.test/revoke",
             "client",
-            credential_marker,
+            secret.scan_marker,
             .refresh_token,
         );
     }
