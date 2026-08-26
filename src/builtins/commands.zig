@@ -54,6 +54,22 @@ pub const top_level_specs = [_]TopLevelSpec{
         },
     },
     .{
+        .kind = .attach,
+        .token = "attach",
+        .usage = "attach <endpoint> --session <id> [--observe|--primary]",
+        .summary = "Attach to a running fx session",
+        .options = &.{
+            .{ .flag = "--session <id>", .description = "Select the remote session" },
+            .{ .flag = "--observe", .description = "Attach without mutation authority" },
+            .{ .flag = "--primary", .description = "Keep local fallback control on a Unix endpoint" },
+        },
+        .details = &.{
+            "Interactive terminals show a conversation UI; redirected streams use plain semantic output.",
+            "The remote fx process owns the workspace, tools, credentials, and session store.",
+            "Detach leaves accepted work running on the remote host.",
+        },
+    },
+    .{
         .kind = .acp,
         .token = "acp",
         .usage = "acp [--model <id>] [--log-file <path>]",
@@ -61,6 +77,20 @@ pub const top_level_specs = [_]TopLevelSpec{
         .options = &.{
             .{ .flag = "--model <id>", .description = "Override the default model" },
             .{ .flag = "--log-file <path>", .description = "Write ACP logs to a file" },
+        },
+    },
+    .{
+        .kind = .serve,
+        .token = "serve",
+        .usage = "serve [--listen <endpoint>] [--tailscale-capability <key>]",
+        .summary = "Serve resident fx sessions for semantic attachment",
+        .options = &.{
+            .{ .flag = "--listen <endpoint>", .description = "Listen on unix:///path or loopback ws://127.0.0.1:port/path" },
+            .{ .flag = "--tailscale-capability <key>", .description = "Require this Tailscale Serve app capability for WebSocket upgrades" },
+        },
+        .details = &.{
+            "WebSocket listeners are loopback-only and must run behind Tailscale Serve.",
+            "Funnel and source-IP authorization are not supported.",
         },
     },
     .{
@@ -277,6 +307,8 @@ pub const top_level_help_fast_buffer_bytes: usize = 32 * 1024;
 pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .ask, .usage = "ask <prompt>" },
+        .{ .kind = .attach, .usage = "attach <endpoint> --session <id>" },
+        .{ .kind = .serve, .usage = "serve" },
     } },
     .{ .entries = &.{
         .{ .kind = .pr, .usage = "pr [context]" },

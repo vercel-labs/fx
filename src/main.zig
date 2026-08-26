@@ -18,7 +18,10 @@ const app_auth_runtime = @import("core/app/app_auth_runtime.zig");
 const app_host_config_runtime = @import("core/app/app_host_config_runtime.zig");
 const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
 const acp_runner = @import("core/cli/acp_runner.zig");
+const remote_runner = @import("core/cli/remote_runner.zig");
 const acp_server = @import("acp/server.zig");
+const remote_host = @import("acp/remote_host.zig");
+const remote_attach = @import("ui/remote_attach.zig");
 const app_input_runtime = @import("core/app/app_input_runtime.zig");
 const input_submit_runtime = @import("core/app/input_submit_runtime.zig");
 const core_input_runtime = @import("core/input/runtime.zig");
@@ -3221,6 +3224,7 @@ fn needsFullEntryConfig(args: []const [:0]const u8) bool {
     const command = cli_surface.commandAfterGlobalLaunchArgs(args) orelse return false;
     return std.mem.eql(u8, command, "ask") or
         std.mem.eql(u8, command, "acp") or
+        std.mem.eql(u8, command, "serve") or
         std.mem.eql(u8, command, "pr") or
         std.mem.eql(u8, command, "issue");
 }
@@ -3228,7 +3232,8 @@ fn needsFullEntryConfig(args: []const [:0]const u8) bool {
 fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
     if (needsFullEntryConfig(args)) return true;
     const command = cli_surface.commandAfterGlobalLaunchArgs(args) orelse return false;
-    return std.mem.eql(u8, command, "login") or
+    return std.mem.eql(u8, command, "attach") or
+        std.mem.eql(u8, command, "login") or
         std.mem.eql(u8, command, "logout") or
         std.mem.eql(u8, command, "teams") or
         std.mem.eql(u8, command, "provider") or
@@ -3363,6 +3368,7 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
         .acp_runner = .{ .run_fn = runAcpServer },
+        .remote_runner = native_remote_runner,
     };
 }
 
@@ -3398,6 +3404,7 @@ fn localEntryConfig() app_entry_runtime.Config {
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
         .acp_runner = .{ .run_fn = runAcpServer },
+        .remote_runner = native_remote_runner,
     };
 }
 
@@ -3433,11 +3440,33 @@ fn emptyEntryConfig() app_entry_runtime.Config {
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
         .acp_runner = .{ .run_fn = runAcpServer },
+        .remote_runner = native_remote_runner,
     };
 }
 
+const native_remote_runner = remote_runner.Runner{
+    .serve_fn = runRemoteServer,
+    .attach_fn = runRemoteAttach,
+};
+
 fn runAcpServer(_: ?*anyopaque, alloc: Allocator, cfg: acp_runner.Config) anyerror!void {
     return acp_server.run(alloc, cfg);
+}
+
+fn runRemoteServer(_: ?*anyopaque, alloc: Allocator, cfg: acp_runner.Config, options: remote_runner.ServeOptions) anyerror!void {
+    return remote_host.run(alloc, cfg, .{
+        .listen = options.listen,
+        .tailscale_capability = options.tailscale_capability,
+    });
+}
+
+fn runRemoteAttach(_: ?*anyopaque, alloc: Allocator, options: remote_runner.AttachOptions) anyerror!void {
+    return remote_attach.run(alloc, .{
+        .endpoint = options.endpoint,
+        .session_id = options.session_id,
+        .observe = options.observe,
+        .primary = options.primary,
+    });
 }
 
 fn handleSigWinchNative(_: std.posix.SIG) callconv(.c) void {

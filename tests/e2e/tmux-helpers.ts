@@ -206,13 +206,14 @@ export function fakeGatewayFinalText(text: string) {
   ]);
 }
 
-export function heldFakeGatewayFinalText() {
+export function heldFakeGatewayFinalText(initialText?: string) {
   const encoder = new TextEncoder();
   let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
   let closed = false;
   let timer: ReturnType<typeof setInterval> | undefined;
   let response: Response | undefined;
   let pendingText: string | undefined;
+  const pendingDeltas: string[] = [];
 
   const stopTimer = () => {
     if (timer) clearInterval(timer);
@@ -223,6 +224,17 @@ export function heldFakeGatewayFinalText() {
     closed = true;
     stopTimer();
     controller?.close();
+  };
+  const push = (text: string) => {
+    if (closed) return;
+    if (!controller) {
+      pendingDeltas.push(text);
+      return;
+    }
+    controller.enqueue(encoder.encode(
+      `data: ${JSON.stringify({ type: "text-start", id: "answer_1" })}\n\n` +
+        `data: ${JSON.stringify({ type: "text-delta", id: "answer_1", delta: text })}\n\n`,
+    ));
   };
   const finish = (text: string) => {
     if (closed) return;
@@ -252,6 +264,8 @@ export function heldFakeGatewayFinalText() {
           value.close();
           return;
         }
+        if (initialText !== undefined) setTimeout(() => push(initialText), 100);
+        for (const delta of pendingDeltas.splice(0)) push(delta);
         const keepAlive = () => {
           if (!closed) value.enqueue(encoder.encode(": hold-response\n\n"));
         };
@@ -271,6 +285,7 @@ export function heldFakeGatewayFinalText() {
       response ??= createResponse();
       return response;
     },
+    push,
     release: finish,
     dispose: close,
   };
