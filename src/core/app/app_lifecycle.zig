@@ -1111,8 +1111,9 @@ fn configuredProviderSelection(
     default_model: []const u8,
     settings: *const config_runtime.Settings,
 ) !model_provider.ProviderSelection {
-    const provider = settings.provider orelse .gateway;
+    const provider = settings.provider orelse model_provider.defaultId();
     const model = switch (provider) {
+        .openpaths => settings.model orelse model_provider.openpaths_default_model,
         .gateway => settings.model orelse default_model,
         .codex => settings.codex_model orelse return error.CodexModelNotSelected,
         .grok => settings.grok_model orelse return error.GrokModelNotSelected,

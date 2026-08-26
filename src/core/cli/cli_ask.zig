@@ -224,6 +224,8 @@ pub const Config = struct {
     gateway_provider: gateway_provider.Provider,
     codex_agent_stream: ?agent_stream_provider.Provider = null,
     codex_model_catalog: ?model_catalog.Provider = null,
+    openpaths_agent_stream: ?agent_stream_provider.Provider = null,
+    openpaths_model_catalog: ?model_catalog.Provider = null,
     grok_agent_stream: ?agent_stream_provider.Provider = null,
     grok_model_catalog: ?model_catalog.Provider = null,
     background_process_provider: background_process_provider.Provider =
@@ -284,6 +286,10 @@ fn runAskChild(
             .grok = .{
                 .agent_stream_provider = ctx.cfg.grok_agent_stream orelse agent_stream_provider.unavailable_provider,
                 .permission_reviewer_provider = ctx.cfg.grok_permission_reviewer_provider,
+            },
+            .openpaths = .{
+                .agent_stream_provider = ctx.cfg.openpaths_agent_stream orelse agent_stream_provider.unavailable_provider,
+                .permission_reviewer_provider = ctx.cfg.permission_reviewer_provider,
             },
         },
         .system_prompt = ctx.cfg.prompt_policy.system_prompt,
@@ -1063,6 +1069,7 @@ const AskContext = struct {
             .gateway => self.cfg.permission_reviewer_provider,
             .codex => self.cfg.codex_permission_reviewer_provider,
             .grok => self.cfg.grok_permission_reviewer_provider,
+            .openpaths => self.cfg.permission_reviewer_provider,
         } orelse
             return permission_auto_classifier.Classifier.disabled();
         return permission_auto_classifier.Classifier.withProvider(provider, .{
@@ -1078,6 +1085,7 @@ const AskContext = struct {
 
     fn agentStreamProvider(self: *const AskContext) agent_stream_provider.Provider {
         return switch (self.provider) {
+            .openpaths => self.cfg.openpaths_agent_stream orelse agent_stream_provider.unavailable_provider,
             .gateway => self.cfg.gateway_provider.agent_stream,
             .codex => self.cfg.codex_agent_stream orelse agent_stream_provider.unavailable_provider,
             .grok => self.cfg.grok_agent_stream orelse agent_stream_provider.unavailable_provider,
@@ -2134,6 +2142,7 @@ fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8
     const catalog = selectModelCatalog(
         ctx.provider,
         ctx.cfg.gateway_provider.model_catalog,
+        ctx.cfg.openpaths_model_catalog,
         ctx.cfg.codex_model_catalog,
         ctx.cfg.grok_model_catalog,
     ) orelse return model_capabilities.capabilitiesForModel(model);
@@ -2152,10 +2161,12 @@ fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8
 fn selectModelCatalog(
     provider: model_provider.ProviderId,
     gateway: model_catalog.Provider,
+    openpaths: ?model_catalog.Provider,
     codex: ?model_catalog.Provider,
     grok: ?model_catalog.Provider,
 ) ?model_catalog.Provider {
     return switch (provider) {
+        .openpaths => openpaths orelse return null,
         .gateway => gateway,
         .codex => codex,
         .grok => grok,
@@ -2170,28 +2181,33 @@ fn availableModelCapabilities(raw_ctx: *anyopaque, model: []const u8) model_capa
 test "provider catalog selection never falls back across origins" {
     var gateway_tag: u8 = 0;
     var codex_tag: u8 = 0;
+    var openpaths_tag: u8 = 0;
     var gateway = test_builtin_gateway.model_catalog_provider;
     gateway.context = &gateway_tag;
     var codex = test_builtin_gateway.model_catalog_provider;
     codex.context = &codex_tag;
+    var openpaths = test_builtin_gateway.model_catalog_provider;
+    openpaths.context = &openpaths_tag;
     var grok_tag: u8 = 0;
     var grok = test_builtin_gateway.model_catalog_provider;
     grok.context = &grok_tag;
     const cases = [_]struct {
         provider: model_provider.ProviderId,
+        openpaths: ?model_catalog.Provider,
         codex: ?model_catalog.Provider,
         grok: ?model_catalog.Provider,
         expected_context: ?*anyopaque,
     }{
-        .{ .provider = .gateway, .codex = codex, .grok = grok, .expected_context = &gateway_tag },
-        .{ .provider = .codex, .codex = codex, .grok = grok, .expected_context = &codex_tag },
-        .{ .provider = .codex, .codex = null, .grok = grok, .expected_context = null },
-        .{ .provider = .grok, .codex = codex, .grok = grok, .expected_context = &grok_tag },
-        .{ .provider = .grok, .codex = codex, .grok = null, .expected_context = null },
+        .{ .provider = .openpaths, .openpaths = openpaths, .codex = codex, .grok = grok, .expected_context = &openpaths_tag },
+        .{ .provider = .openpaths, .openpaths = null, .codex = codex, .grok = grok, .expected_context = null },
+        .{ .provider = .gateway, .openpaths = openpaths, .codex = codex, .grok = grok, .expected_context = &gateway_tag },
+        .{ .provider = .codex, .openpaths = openpaths, .codex = codex, .grok = grok, .expected_context = &codex_tag },
+        .{ .provider = .codex, .openpaths = openpaths, .codex = null, .grok = grok, .expected_context = null },
+        .{ .provider = .grok, .openpaths = openpaths, .codex = codex, .grok = grok, .expected_context = &grok_tag },
+        .{ .provider = .grok, .openpaths = openpaths, .codex = codex, .grok = null, .expected_context = null },
     };
-
     for (cases) |case| {
-        const selected = selectModelCatalog(case.provider, gateway, case.codex, case.grok);
+        const selected = selectModelCatalog(case.provider, gateway, case.openpaths, case.codex, case.grok);
         if (case.expected_context) |expected| {
             try std.testing.expect(selected != null);
             try std.testing.expect(selected.?.context.? == expected);

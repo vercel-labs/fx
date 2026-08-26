@@ -38,6 +38,8 @@ pub const CatalogPublicOnly = union(enum) {
 pub const CatalogPublicOnlyReason = std.meta.Tag(CatalogPublicOnly);
 
 pub const CatalogAuthenticatedSource = enum {
+    openpaths_api_key,
+    openrouter_api_key,
     vercel_oidc_token,
     ai_gateway_api_key,
     fx_login,
@@ -47,6 +49,8 @@ pub const CatalogAuthenticatedSource = enum {
 
     fn credentialSource(self: CatalogAuthenticatedSource) Source {
         return switch (self) {
+            .openpaths_api_key => .openpaths_api_key,
+            .openrouter_api_key => .openrouter_api_key,
             .vercel_oidc_token => .vercel_oidc_token,
             .ai_gateway_api_key => .ai_gateway_api_key,
             .fx_login => .fx_login,
@@ -163,6 +167,8 @@ pub fn catalogAccessForCredentialAndAccount(
 ) CatalogAccess {
     const selected_source = source orelse return .{ .public_only = .no_credential };
     const authenticated_source: CatalogAuthenticatedSource = switch (selected_source) {
+        .openpaths_api_key => .openpaths_api_key,
+        .openrouter_api_key => .openrouter_api_key,
         .vercel_oidc_token => .vercel_oidc_token,
         .ai_gateway_api_key => .ai_gateway_api_key,
         .stored_key => .stored_key,
@@ -180,12 +186,14 @@ pub fn catalogAccessForCredentialAndAccount(
         .authenticated = .{
             .source = authenticated_source,
             .credential = credential,
-            .team_context = if (authenticated_source == .chatgpt_subscription or authenticated_source == .grok_subscription) null else team_context,
+            .team_context = if (authenticated_source == .chatgpt_subscription or
+                authenticated_source == .grok_subscription or
+                authenticated_source == .openpaths_api_key or
+                authenticated_source == .openrouter_api_key) null else team_context,
             .account_id = if (authenticated_source == .grok_subscription) account_id else null,
         },
     };
 }
-
 /// Current native product copy. Store mechanics and availability come from the
 /// injected host port; Core retains the stable user-facing source name.
 pub const stored_key_backend_label = if (builtin.os.tag == .macos) "macOS Keychain" else "profile file";
@@ -196,8 +204,8 @@ pub const LoadMode = enum { stored, refresh_if_needed };
 
 const FxLoginRefreshMode = enum { if_needed, force };
 
-pub const missing_credential_message = "Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
-pub const missing_interactive_credential_message = "Fx needs access to Vercel AI Gateway. Run /login to sign in, /setup to use an API key, or set AI_GATEWAY_API_KEY.";
+pub const missing_credential_message = "Fx needs a model provider credential. Run fx login to sign in, fx setup to use an API key, or set OPENPATHS_API_KEY, OPENROUTER_API_KEY, or AI_GATEWAY_API_KEY.";
+pub const missing_interactive_credential_message = "Fx needs a model provider credential. Run /login to sign in, /setup to use an API key, or set OPENPATHS_API_KEY, OPENROUTER_API_KEY, or AI_GATEWAY_API_KEY.";
 pub const missing_chatgpt_credential_message = "fx needs a Codex subscription login for this model. Run fx login codex.";
 pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login and choose Sign in with Codex.";
 pub const missing_grok_credential_message = "fx needs a Grok subscription login for this model. Run fx login grok.";
@@ -291,6 +299,23 @@ pub fn resolveForProvider(
             };
             return .{ .credential = credential };
         },
+        .openpaths => {
+            const ordered = [_]Source{ .openpaths_api_key, .openrouter_api_key };
+            if (preferred) |source| {
+                for (ordered) |candidate| {
+                    if (candidate != source) continue;
+                    if (try loadSource(alloc, transport, secret_store, source)) |credential| {
+                        return .{ .credential = credential };
+                    }
+                }
+            }
+            for (ordered) |source| {
+                if (try loadSource(alloc, transport, secret_store, source)) |credential| {
+                    return .{ .credential = credential };
+                }
+            }
+            return .{};
+        },
         .gateway => {},
     }
     return resolvePreferring(
@@ -301,7 +326,6 @@ pub fn resolveForProvider(
         if (preferred == .chatgpt_subscription or preferred == .grok_subscription) null else preferred,
     );
 }
-
 /// `preferred` is the source the user last chose in the hub. It wins over the
 /// precedence order below, including over the environment, because it is an
 /// explicit choice rather than a default. A preferred source that no longer
@@ -399,6 +423,8 @@ pub fn loadSource(
     source: Source,
 ) !?Credential {
     return switch (source) {
+        .openpaths_api_key => loadEnvCredential(alloc, "OPENPATHS_API_KEY", source),
+        .openrouter_api_key => loadEnvCredential(alloc, "OPENROUTER_API_KEY", source),
         .vercel_oidc_token => loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", source),
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
         .fx_login => loadFxLoginCredential(alloc, transport),
@@ -414,6 +440,8 @@ pub fn sourceExists(
     source: Source,
 ) !bool {
     return switch (source) {
+        .openpaths_api_key => nonEmptyEnvValue("OPENPATHS_API_KEY") != null,
+        .openrouter_api_key => nonEmptyEnvValue("OPENROUTER_API_KEY") != null,
         .vercel_oidc_token => nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
         .ai_gateway_api_key => nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null,
         .fx_login => blk: {
@@ -650,6 +678,8 @@ fn credentialRefreshAfterMs(expires_at_ms: i64, refreshed_at_ms: ?i64) i64 {
 
 pub fn sourceLabel(source: Source) []const u8 {
     return switch (source) {
+        .openpaths_api_key => "OPENPATHS_API_KEY",
+        .openrouter_api_key => "OPENROUTER_API_KEY",
         .vercel_oidc_token => "VERCEL_OIDC_TOKEN",
         .ai_gateway_api_key => "AI_GATEWAY_API_KEY",
         .fx_login => "fx login",

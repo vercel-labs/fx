@@ -23,6 +23,8 @@ pub const CredentialRefreshMode = enum {
 };
 
 const credential_source_order = [_]credentials.Source{
+    .openpaths_api_key,
+    .openrouter_api_key,
     .vercel_oidc_token,
     .ai_gateway_api_key,
     .fx_login,
@@ -1422,6 +1424,18 @@ pub const Runtime = struct {
                     self,
                     loadRuntimeCredentialSource,
                 ),
+            .openpaths => if (self.credentialSource() == .openpaths_api_key or
+                self.credentialSource() == .openrouter_api_key)
+                false
+            else blk: {
+                for ([_]credentials.Source{ .openpaths_api_key, .openrouter_api_key }) |source| {
+                    if (!self.source_inventory.contains(source)) continue;
+                    if (try self.selectSourceWithLoader(alloc, source, self, loadRuntimeCredentialSource) != null) {
+                        break :blk true;
+                    }
+                }
+                break :blk @as(?bool, null);
+            },
             .gateway => if (self.credentialSource() != .chatgpt_subscription and self.credentialSource() != .grok_subscription)
                 false
             else

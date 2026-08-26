@@ -52,6 +52,7 @@ const builtin_context = @import("builtins/context.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_providers = @import("builtins/providers.zig");
 const openai_codex_models = @import("gateway/openai_codex_models.zig");
+const openpaths_provider = @import("gateway/openpaths.zig");
 const openai_codex_permission_reviewer = @import("gateway/openai_codex_permission_reviewer.zig");
 const xai_grok_models = @import("gateway/xai_grok_models.zig");
 const xai_grok_permission_reviewer = @import("gateway/xai_grok_permission_reviewer.zig");
@@ -1605,6 +1606,16 @@ const App = struct {
                     builtin_providers.agentStream(.grok),
                 .permission_reviewer_provider = if (comptime host_profile.tools and !host_target.is_wasm)
                     xai_grok_permission_reviewer.provider
+                else
+                    null,
+            },
+            .openpaths = .{
+                .agent_stream_provider = if (comptime host_target.is_wasm)
+                    agent_stream_provider.unavailable_provider
+                else
+                    builtin_providers.agentStream(.openpaths),
+                .permission_reviewer_provider = if (comptime host_profile.tools and !host_target.is_wasm)
+                    builtin_gateway.permission_reviewer.provider
                 else
                     null,
             },
@@ -3238,8 +3249,11 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .codex_agent_stream = builtin_providers.agentStream(.codex),
         .codex_cli_model_catalog = openai_codex_models.cli_model_catalog_provider,
         .codex_model_catalog = openai_codex_models.model_catalog_provider,
+        .openpaths_agent_stream = builtin_providers.agentStream(.openpaths),
+        .openpaths_model_catalog = openpaths_provider.model_catalog_provider,
         .grok_agent_stream = builtin_providers.agentStream(.grok),
         .grok_cli_model_catalog = xai_grok_models.cli_model_catalog_provider,
+        .openpaths_cli_model_catalog = openpaths_provider.cli_model_catalog_provider,
         .grok_model_catalog = xai_grok_models.model_catalog_provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
@@ -3281,8 +3295,11 @@ fn localEntryConfig() app_entry_runtime.Config {
         .codex_agent_stream = builtin_providers.agentStream(.codex),
         .codex_cli_model_catalog = openai_codex_models.cli_model_catalog_provider,
         .codex_model_catalog = openai_codex_models.model_catalog_provider,
+        .openpaths_agent_stream = builtin_providers.agentStream(.openpaths),
+        .openpaths_model_catalog = openpaths_provider.model_catalog_provider,
         .grok_agent_stream = builtin_providers.agentStream(.grok),
         .grok_cli_model_catalog = xai_grok_models.cli_model_catalog_provider,
+        .openpaths_cli_model_catalog = openpaths_provider.cli_model_catalog_provider,
         .grok_model_catalog = xai_grok_models.model_catalog_provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
@@ -3321,8 +3338,11 @@ fn emptyEntryConfig() app_entry_runtime.Config {
         .codex_agent_stream = builtin_providers.agentStream(.codex),
         .codex_cli_model_catalog = openai_codex_models.cli_model_catalog_provider,
         .codex_model_catalog = openai_codex_models.model_catalog_provider,
+        .openpaths_agent_stream = builtin_providers.agentStream(.openpaths),
+        .openpaths_model_catalog = openpaths_provider.model_catalog_provider,
         .grok_agent_stream = builtin_providers.agentStream(.grok),
         .grok_cli_model_catalog = xai_grok_models.cli_model_catalog_provider,
+        .openpaths_cli_model_catalog = openpaths_provider.cli_model_catalog_provider,
         .grok_model_catalog = xai_grok_models.model_catalog_provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,

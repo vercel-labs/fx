@@ -48,6 +48,7 @@ const runtime_interruption = @import("interruption.zig");
 const runtime_parallel_execution = @import("parallel_execution.zig");
 const runtime_tool_batch = @import("tool_batch.zig");
 const model_response_recovery = @import("model_response_recovery.zig");
+const model_fallback = @import("../../config/model_fallback.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -1473,6 +1474,34 @@ fn disableFastRouteAfterFailure(
     return true;
 }
 
+/// Circuit-breaks a dead primary model to its configured fallback for the rest
+/// of the turn. Only fires when nothing user-visible was emitted, so the swap
+/// can never splice output across two different models.
+noinline fn applyCircuitBreakerFallback(
+    fallback_slot: *?[]const u8,
+    route_model: *[]const u8,
+    cause: model_response_recovery.FailureCause,
+    replay_safe: bool,
+    latest_diagnostic: *?types.ModelFailureDiagnostic,
+    trace_ctx: TraceContext,
+) bool {
+    if (!replay_safe) return false;
+    if (cause != .provider_unavailable and cause != .transport_interrupted) return false;
+    if (fallback_slot.* != null) return false;
+    const fallback_model = model_fallback.fallbackFor(route_model.*) orelse return false;
+    debug_trace.eventf(
+        "agent",
+        "recovery_circuit_break",
+        trace_ctx,
+        "failed_model={s} fallback_model={s}",
+        .{ route_model.*, fallback_model },
+    );
+    fallback_slot.* = fallback_model;
+    route_model.* = fallback_model;
+    latest_diagnostic.* = types.ModelFailureDiagnostic.init("circuit-broke to fallback model");
+    return true;
+}
+
 fn routeFailureDetail(completion: types.GatewayCompletion) []const u8 {
     return if (completion.provider_failure_detail) |detail| debug_trace.preview(detail, 240) else "";
 }
@@ -2883,6 +2912,7 @@ fn processQueuedPromptLoop(
         var successful_request_messages: []const ChatMessage = &.{};
         var successful_source_messages: []const ChatMessage = &.{};
         var successful_gateway_model: []const u8 = "";
+        var circuit_fallback_model: ?[]const u8 = null;
         var successful_vision_route: runtime_vision_contracts.VisionRoute = .native_images;
         var successful_vision_mode: runtime_gateway_step.VisionToolMode = .unavailable;
         var reset_stream_for_next_attempt = false;
@@ -2924,7 +2954,7 @@ fn processQueuedPromptLoop(
                 reset_stream_for_next_attempt = false;
             }
 
-            gateway_model = job.model;
+            gateway_model = circuit_fallback_model orelse job.model;
             if (recoveryPauseRequested(config)) {
                 recovery_strategy = .pause;
                 try persistRecoveryCheckpoint(
@@ -3212,6 +3242,14 @@ fn processQueuedPromptLoop(
                     recovery_cause;
                 const failure_diagnostic = types.ModelFailureDiagnostic.init(@errorName(err));
                 latest_recovery_diagnostic = failure_diagnostic;
+                _ = applyCircuitBreakerFallback(
+                    &circuit_fallback_model,
+                    &gateway_model,
+                    failure_cause,
+                    streamReplaySafe(&stream_ctx),
+                    &latest_recovery_diagnostic,
+                    step_ctx,
+                );
                 if (recoveryPauseRequested(config)) {
                     try persistRecoveryCheckpoint(
                         deps,
@@ -3761,6 +3799,14 @@ fn processQueuedPromptLoop(
                     streamReplaySafe(&stream_ctx),
                     step_ctx,
                 );
+                _ = applyCircuitBreakerFallback(
+                    &circuit_fallback_model,
+                    &gateway_model,
+                    cause,
+                    streamReplaySafe(&stream_ctx),
+                    &latest_recovery_diagnostic,
+                    step_ctx,
+                );
                 const decision = model_response_recovery.decide(.{
                     .cause = cause,
                     .delivery = .possibly_sent,
@@ -3970,6 +4016,14 @@ fn processQueuedPromptLoop(
                     job.model,
                     cause,
                     providerFailureReplaySafe(attempt_completion, &stream_ctx),
+                    step_ctx,
+                );
+                _ = applyCircuitBreakerFallback(
+                    &circuit_fallback_model,
+                    &gateway_model,
+                    cause,
+                    providerFailureReplaySafe(attempt_completion, &stream_ctx),
+                    &latest_recovery_diagnostic,
                     step_ctx,
                 );
                 if (decision.strategy == .pause) {

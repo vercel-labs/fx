@@ -79,6 +79,7 @@ pub fn Runtime(comptime App: type) type {
                 const required_source: credentials.Source = switch (provider) {
                     .codex => .chatgpt_subscription,
                     .grok => .grok_subscription,
+                    .openpaths => app.auth.credentialSource() orelse .openpaths_api_key,
                     .gateway => app.auth.credentialSource() orelse .fx_login,
                 };
                 const route_change = app.auth.selectForProvider(app.alloc, provider) catch |err| switch (err) {
@@ -917,7 +918,7 @@ pub fn Runtime(comptime App: type) type {
             };
             defer settings.deinit(app.alloc);
             const saved_model = switch (target) {
-                .gateway => settings.model,
+                .openpaths, .gateway => settings.model,
                 .codex => settings.codex_model,
                 .grok => settings.grok_model,
             };
@@ -1411,7 +1412,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
             switch (provider) {
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
-                .gateway => unreachable,
+                .openpaths, .gateway => unreachable,
             }
 
             try std.testing.expectEqual(@as(usize, 0), app.auth.start_count);

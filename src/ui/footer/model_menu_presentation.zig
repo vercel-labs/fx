@@ -351,6 +351,8 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
     if (state.access_level == .authenticated) {
         const source = state.source orelse return "Using an authenticated AI Gateway catalog.";
         return switch (source) {
+            .openpaths_api_key => "OpenPaths catalog: authenticated with OPENPATHS_API_KEY.",
+            .openrouter_api_key => "OpenPaths catalog: authenticated with OPENROUTER_API_KEY.",
             .fx_login => "Gateway catalog: authenticated with fx login.",
             .ai_gateway_api_key => "Gateway catalog: authenticated with an API key.",
             .vercel_oidc_token => "Gateway catalog: authenticated with the Vercel session.",

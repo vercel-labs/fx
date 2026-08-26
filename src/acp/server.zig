@@ -366,6 +366,8 @@ pub fn streamProviderFor(
     provider: model_provider.ProviderId,
 ) @import("../core/agent/stream_provider.zig").Provider {
     return switch (provider) {
+        .openpaths => state.cfg.openpaths_agent_stream orelse
+            @import("../core/agent/stream_provider.zig").unavailable_provider,
         .gateway => state.cfg.gateway_provider.agent_stream,
         .codex => state.cfg.codex_agent_stream orelse
             @import("../core/agent/stream_provider.zig").unavailable_provider,
@@ -379,6 +381,7 @@ pub fn catalogProviderFor(
     provider: model_provider.ProviderId,
 ) ?@import("../core/gateway/model_catalog.zig").Provider {
     return switch (provider) {
+        .openpaths => state.cfg.openpaths_model_catalog,
         .gateway => state.cfg.gateway_provider.model_catalog,
         .codex => state.cfg.codex_model_catalog,
         .grok => state.cfg.grok_model_catalog,
@@ -1710,7 +1713,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 try config_runtime.loadMergedSettings(alloc, state.workspace_root);
             defer settings.deinit(alloc);
             const saved_model = switch (target) {
-                .gateway => settings.model,
+                .openpaths, .gateway => settings.model,
                 .codex => settings.codex_model,
                 .grok => settings.grok_model,
             };

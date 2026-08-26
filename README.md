@@ -27,6 +27,15 @@ curl -fsSL https://fx.sh/setup.sh | bash
 
 ## Run fx
 
+OpenPaths is the default provider. With `OPENPATHS_API_KEY` (or `OPENROUTER_API_KEY`) in the environment, fx works immediately with no login or setup:
+
+```bash
+export OPENPATHS_API_KEY=...   # or OPENROUTER_API_KEY
+fx
+```
+
+The default model is `openpaths/stealth/ox-alpha`. When that model is unavailable, fx circuit-breaks to `deepseek-v4-flash-vision-exp` for the rest of the turn and shows a recovered banner. `/model` lists the provider's live catalog, and **Switch provider** in `/setup` moves between OpenPaths, Gateway, Codex, and Grok.
+
 Sign in with Vercel AI Gateway:
 
 ```bash
@@ -97,13 +106,30 @@ Use `fx ask` for a single request:
 fx ask "explain the changes in this repository"
 ```
 
-For long-running autonomous work, ask fx to continue with the next implementation steps after each completed turn:
+## fx infinity
+
+fx infinity is the infinite run harness: one `fx ask` invocation that keeps working across turns until you interrupt it. After every completed turn, the saved session receives a generated follow-up prompt built from the latest work summary, so progress compounds instead of stopping at the first answer.
 
 ```bash
-fx ask --auto-next-steps "fix the failing tests and improve the implementation"
+# keep executing the next logical implementation steps, forever
+fx ask --auto-next-steps --yolo "fix the failing tests and improve the implementation"
+
+# finish the current plan, then brainstorm and ship improvements, forever
+fx ask --auto-next-idea --yolo "polish the terminal renderer"
+
+# both: alternate between next steps and next ideas until interrupted
+fx ask --auto-next-steps --auto-next-idea --yolo "harden the gateway client"
 ```
 
-Add `--auto-next-idea` to have fx brainstorm and implement follow-up improvements after the current work. Using both flags keeps the saved session running through the cycle until you interrupt it with Ctrl+C. Autonomous mode retries failed turns with backoff and requires session saving, so it cannot be combined with `--no-save`.
+How the cycle runs:
+
+- `--auto-next-steps`: after each turn, breaks the overall goal into concrete next steps and executes them in order, running relevant tests along the way.
+- `--auto-next-idea`: after the current plan is done, shifts into ideation mode, brainstorms at least three concrete improvements, picks the highest-impact one, and starts executing immediately.
+- Together they form an unbounded loop; every third single-flag turn also re-reviews recent work against the original objective before acting.
+- Failed turns retry automatically with exponential backoff (1s doubling to 16s), resuming the same saved session. Non-retryable failures exit nonzero.
+- Stop anytime with Ctrl+C. Sessions are always saved, so `fx ask --resume last` picks the harness back up later.
+
+Autonomous mode requires session saving and cannot be combined with `--no-save`. Pair it with `--json` to get one parseable result object per turn on stdout.
 
 fx starts in `auto` permission mode. Routine understood development actions run directly; unresolved sensitive actions receive one bounded automatic review. A blocked action may return an exact approval request that the agent can send to fx's real permission screen. Ordinary question text never grants permission. See [Permissions](https://fx.sh/docs/configure-fx/permissions) for other modes and persistent rules.
 

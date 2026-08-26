@@ -124,7 +124,7 @@ pub fn collect(
     try appendAuthCheck(&checks, alloc, snapshot.auth);
     try appendResolvedStartupCheck(&snapshot, &checks, alloc, .{
         .model = switch (snapshot.provider) {
-            .gateway => detailed.settings.model,
+            .openpaths, .gateway => detailed.settings.model,
             .codex => detailed.settings.codex_model,
             .grok => detailed.settings.grok_model,
         },

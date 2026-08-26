@@ -23,6 +23,8 @@ pub const Config = struct {
     gateway_provider: gateway_provider.Provider,
     codex_agent_stream: ?agent_stream_provider.Provider = null,
     codex_model_catalog: ?model_catalog.Provider = null,
+    openpaths_agent_stream: ?agent_stream_provider.Provider = null,
+    openpaths_model_catalog: ?model_catalog.Provider = null,
     grok_agent_stream: ?agent_stream_provider.Provider = null,
     grok_model_catalog: ?model_catalog.Provider = null,
     background_process_provider: background_process_provider.Provider =

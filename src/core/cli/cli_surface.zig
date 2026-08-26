@@ -180,9 +180,12 @@ pub const Config = struct {
     codex_agent_stream: ?agent_stream_provider.Provider = null,
     codex_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
     codex_model_catalog: ?model_catalog.Provider = null,
+    openpaths_agent_stream: ?agent_stream_provider.Provider = null,
+    openpaths_model_catalog: ?model_catalog.Provider = null,
     grok_agent_stream: ?agent_stream_provider.Provider = null,
     grok_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
     grok_model_catalog: ?model_catalog.Provider = null,
+    openpaths_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     url_opener: host.UrlOpener,
@@ -691,6 +694,7 @@ fn activateProviderSelection(
     const already_selected = (settings.provider orelse .gateway) == target;
     if (caller == .provider_command and already_selected and resolution.credential != null) {
         try writeStdout(deps, switch (target) {
+            .openpaths => "OpenPaths is already selected.\n",
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
@@ -738,14 +742,19 @@ fn activateProviderSelection(
             deps,
             caller,
             switch (target) {
-                .codex => "Codex credential is unavailable",
+                .openpaths => "OpenPaths credential is unavailable",
                 .grok => "Grok credential is unavailable",
+                .codex => "Codex credential is unavailable",
                 .gateway => "configure a Gateway credential first",
             },
         );
         return false;
     };
     const catalog_provider = switch (target) {
+        .openpaths => cfg.openpaths_model_catalog orelse {
+            try writeProviderActivationError(alloc, deps, caller, "OpenPaths model catalog is unavailable");
+            return false;
+        },
         .codex => cfg.codex_model_catalog orelse {
             try writeProviderActivationError(alloc, deps, caller, "Codex model catalog is unavailable");
             return false;
@@ -777,6 +786,7 @@ fn activateProviderSelection(
     };
     defer model_catalog.freeModelCatalog(alloc, &loaded.catalog);
     const saved_model = switch (target) {
+        .openpaths => settings.model,
         .gateway => settings.model,
         .codex => settings.codex_model,
         .grok => settings.grok_model,
@@ -786,6 +796,7 @@ fn activateProviderSelection(
         return false;
     };
     var attempt = config_runtime.attemptUserPreferences(alloc, switch (target) {
+        .openpaths => .{ .provider = target, .model = selected_model },
         .gateway => .{ .provider = target, .model = selected_model },
         .codex => .{ .provider = target, .codex_model = selected_model },
         .grok => .{ .provider = target, .grok_model = selected_model },
@@ -802,10 +813,11 @@ fn activateProviderSelection(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
-        .gateway => unreachable,
+        .openpaths, .gateway => unreachable,
     };
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
+            .openpaths => "Provider set to OpenPaths.\n",
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
@@ -905,6 +917,8 @@ fn runNonInteractiveWithDeps(
                 .codex_model_catalog = cfg.codex_model_catalog,
                 .grok_agent_stream = cfg.grok_agent_stream,
                 .grok_model_catalog = cfg.grok_model_catalog,
+                .openpaths_agent_stream = cfg.openpaths_agent_stream,
+                .openpaths_model_catalog = cfg.openpaths_model_catalog,
                 .background_process_provider = cfg.background_process_provider,
                 .secret_store = cfg.secret_store,
                 .prompt_policy = cfg.prompt_policy,
@@ -1169,6 +1183,10 @@ fn runNonInteractiveWithDeps(
 
             const catalog_access = startup.modelCatalogAccess();
             const catalog_provider = switch (startup.provider) {
+                .openpaths => cfg.openpaths_cli_model_catalog orelse {
+                    try writeStderr(deps, "fx models: OpenPaths model catalog is unavailable\n");
+                    return .handled_failure;
+                },
                 .codex => cfg.codex_cli_model_catalog orelse {
                     try writeStderr(deps, "fx models: Codex model catalog is unavailable\n");
                     return .handled_failure;
@@ -2991,6 +3009,8 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .gateway_provider = cfg.gateway_provider,
         .codex_agent_stream = cfg.codex_agent_stream,
         .codex_model_catalog = cfg.codex_model_catalog,
+        .openpaths_agent_stream = cfg.openpaths_agent_stream,
+        .openpaths_model_catalog = cfg.openpaths_model_catalog,
         .grok_agent_stream = cfg.grok_agent_stream,
         .grok_model_catalog = cfg.grok_model_catalog,
         .background_process_provider = cfg.background_process_provider,
@@ -4960,7 +4980,7 @@ test "runIfRequested local json success appends exactly one newline" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json") }, testConfig(), deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs a model provider credential. Run fx login to sign in, fx setup to use an API key, or set OPENPATHS_API_KEY, OPENROUTER_API_KEY, or AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
         capture.stdout.written(),
     );
     try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
@@ -5053,7 +5073,7 @@ test "writeRenderedJsonLine falls back to heap and appends exactly one newline" 
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs a model provider credential. Run fx login to sign in, fx setup to use an API key, or set OPENPATHS_API_KEY, OPENROUTER_API_KEY, or AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
         capture.stdout.written(),
     );
 }
