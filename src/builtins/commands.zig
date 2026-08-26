@@ -30,7 +30,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .ask,
         .token = "ask",
-        .usage = "ask [--auto|--yolo] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
+        .usage = "ask [--auto|--yolo] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--prompt-file PATH] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
         .summary = "Run one noninteractive request",
         .options = &.{
             .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
@@ -40,6 +40,7 @@ pub const top_level_specs = [_]TopLevelSpec{
             .{ .flag = "--quiet", .description = "Suppress assistant output" },
             .{ .flag = "--prompt-permissions", .description = "Prompt for Y/N permission approval when stdin is a TTY" },
             .{ .flag = "--no-save", .description = "Do not save the session; incompatible with --resume and --resume-id" },
+            .{ .flag = "--prompt-file PATH", .description = "Read the prompt from a file instead of arguments or stdin" },
             .{ .flag = "--no-color", .description = "Render TTY output without colors or hyperlinks" },
             .{ .flag = "--resume <last|id>", .description = "Continue the last session or a session by id" },
             .{ .flag = "--resume-id <id>", .description = "Continue a session by exact id" },
@@ -47,7 +48,7 @@ pub const top_level_specs = [_]TopLevelSpec{
             .{ .flag = "--", .description = "Treat every following argument as prompt text" },
         },
         .details = &.{
-            "The prompt may be passed as arguments or piped on stdin when no prompt args are given.",
+            "The prompt may be passed as arguments, piped on stdin when no prompt args are given, or read from a file with --prompt-file.",
             "TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.",
             "Operational progress and diagnostics are written to stderr. JSON `output` keeps accumulated assistant Markdown; `final_output` contains only the completed final response, or an empty string when absent.",
             "With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.",

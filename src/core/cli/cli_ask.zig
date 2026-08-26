@@ -317,6 +317,7 @@ const AskOptions = struct {
     image_paths: std.ArrayList([]u8) = .empty,
     images: std.ArrayList(ImageAttachment) = .empty,
     system_prompt_override: ?[]u8 = null,
+    prompt_file_path: ?[]u8 = null,
     json_output: bool = false,
     prompt_permissions: bool = false,
     timeout_ms: ?usize = null,
@@ -333,6 +334,7 @@ const AskOptions = struct {
         for (self.images.items) |image| types.freeImageAttachment(alloc, image);
         self.images.deinit(alloc);
         if (self.system_prompt_override) |s| alloc.free(s);
+        if (self.prompt_file_path) |p| alloc.free(p);
     }
 };
 
@@ -1220,6 +1222,26 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
                 return 1;
             }
             try deps.write_stderr(deps.stderr_ctx, "fx ask: failed to read prompt from stdin\n");
+            return 1;
+        },
+        error.PromptFileNotFound => {
+            if (hasJsonFlag(args)) {
+                const json = try renderErrorJsonResult(alloc, @errorName(err));
+                defer alloc.free(json);
+                try deps.write_stdout(deps.stdout_ctx, json);
+                return 1;
+            }
+            try deps.write_stderr(deps.stderr_ctx, "fx ask: --prompt-file: file not found\n");
+            return 1;
+        },
+        error.PromptFileReadFailed => {
+            if (hasJsonFlag(args)) {
+                const json = try renderErrorJsonResult(alloc, @errorName(err));
+                defer alloc.free(json);
+                try deps.write_stdout(deps.stdout_ctx, json);
+                return 1;
+            }
+            try deps.write_stderr(deps.stderr_ctx, "fx ask: --prompt-file: failed to read file\n");
             return 1;
         },
         error.InvalidAskArgs => {
@@ -3371,6 +3393,11 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
             if (i >= args.len) return error.MissingPrompt;
             if (opts.system_prompt_override) |old| alloc.free(old);
             opts.system_prompt_override = try alloc.dupe(u8, args[i]);
+        } else if (std.mem.eql(u8, arg, "--prompt-file")) {
+            if (opts.prompt_file_path != null) return error.InvalidAskArgs;
+            i += 1;
+            if (i >= args.len) return error.MissingPrompt;
+            opts.prompt_file_path = try alloc.dupe(u8, args[i]);
         } else if (std.mem.eql(u8, arg, "--json")) {
             opts.json_output = true;
         } else if (std.mem.eql(u8, arg, "--prompt-permissions")) {
@@ -3399,11 +3426,15 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
 
     if (opts.continue_recovery) {
         if (opts.resume_target == null or opts.no_save or
-            prompt_parts.items.len != 0 or opts.image_paths.items.len != 0)
+            prompt_parts.items.len != 0 or opts.image_paths.items.len != 0 or
+            opts.prompt_file_path != null)
         {
             return error.InvalidAskArgs;
         }
         opts.prompt = try alloc.dupe(u8, "");
+    } else if (opts.prompt_file_path) |path| {
+        if (prompt_parts.items.len != 0) return error.InvalidAskArgs;
+        opts.prompt = try readPromptFromFile(alloc, path);
     } else if (prompt_parts.items.len > 0) {
         opts.prompt = try joinPromptSlices(alloc, prompt_parts.items);
     } else {
@@ -3473,6 +3504,31 @@ fn joinPromptSlices(alloc: Allocator, args: []const []const u8) ![]u8 {
 
 fn readPromptFromStdinSource(alloc: Allocator, stdin: StdinSource) ![]u8 {
     return readPromptFromStdinSourceWithLimit(alloc, stdin, stdin_prompt_resource_byte_limit);
+}
+
+fn readPromptFromFile(alloc: Allocator, path: []const u8) ![]u8 {
+    const zio = io_mod.getIo();
+    var file = std.Io.Dir.cwd().openFile(zio, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.PromptFileNotFound,
+        else => return error.PromptFileReadFailed,
+    };
+    defer file.close(zio);
+
+    var read_buf: [8192]u8 = undefined;
+    var r = file.reader(zio, &read_buf);
+    const input = readPromptFromReader(alloc, &r.interface, stdin_prompt_resource_byte_limit) catch |err| switch (err) {
+        error.PromptInputReadFailed => return error.PromptFileReadFailed,
+        else => return err,
+    };
+    errdefer alloc.free(input);
+
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    if (trimmed.len == 0) return error.MissingPrompt;
+    if (trimmed.len == input.len) return input;
+
+    const owned = try alloc.dupe(u8, trimmed);
+    alloc.free(input);
+    return owned;
 }
 
 fn readPromptFromStdinSourceWithLimit(
@@ -5187,8 +5243,49 @@ test "parse options rejects unknown flags and accepts dash prompts after sentine
 test "parse options reports missing operands and empty tty input as missing prompt" {
     try std.testing.expectError(error.MissingPrompt, parseOptionsWithStdin(std.testing.allocator, &.{"--image"}, .tty));
     try std.testing.expectError(error.MissingPrompt, parseOptionsWithStdin(std.testing.allocator, &.{"--system"}, .tty));
+    try std.testing.expectError(error.MissingPrompt, parseOptionsWithStdin(std.testing.allocator, &.{"--prompt-file"}, .tty));
     try std.testing.expectError(error.MissingPrompt, parseOptionsWithStdin(std.testing.allocator, &.{"--timeout"}, .tty));
     try std.testing.expectError(error.MissingPrompt, parseOptionsWithStdin(std.testing.allocator, &.{}, .tty));
+}
+
+test "parse options reject a repeated --prompt-file and a --prompt-file combined with a positional prompt" {
+    try std.testing.expectError(
+        error.InvalidAskArgs,
+        parseOptionsWithStdin(std.testing.allocator, &.{ "--prompt-file", "a.txt", "--prompt-file", "b.txt" }, .tty),
+    );
+    try std.testing.expectError(
+        error.InvalidAskArgs,
+        parseOptionsWithStdin(std.testing.allocator, &.{ "--prompt-file", "a.txt", "also positional" }, .tty),
+    );
+}
+
+test "read prompt from file trims whitespace, rejects a whitespace-only file, and reports a missing file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile(io_mod.getIo(), "prompt.txt", .{ .read = true });
+    try file.writeStreamingAll(io_mod.getIo(), "  hello from a file  \n");
+    file.close(io_mod.getIo());
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "prompt.txt");
+    defer alloc.free(path);
+
+    const prompt = try readPromptFromFile(alloc, path);
+    defer alloc.free(prompt);
+    try std.testing.expectEqualStrings("hello from a file", prompt);
+
+    var blank_file = try tmp.dir.createFile(io_mod.getIo(), "blank.txt", .{ .read = true });
+    try blank_file.writeStreamingAll(io_mod.getIo(), "   \n\t\n");
+    blank_file.close(io_mod.getIo());
+    const blank_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "blank.txt");
+    defer alloc.free(blank_path);
+    try std.testing.expectError(error.MissingPrompt, readPromptFromFile(alloc, blank_path));
+
+    const missing_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(missing_path);
+    const missing_file_path = try std.fs.path.join(alloc, &.{ missing_path, "does-not-exist.txt" });
+    defer alloc.free(missing_file_path);
+    try std.testing.expectError(error.PromptFileNotFound, readPromptFromFile(alloc, missing_file_path));
 }
 
 test "stdin prompt resource limit accepts exact bytes and rejects one over without a partial prompt" {
@@ -5287,6 +5384,37 @@ test "stdin read failure has distinct text and JSON output contracts" {
     );
     try std.testing.expectEqualStrings(
         "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptInputReadFailed\"}\n",
+        stdout_capture.bytes.items,
+    );
+    try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
+}
+
+test "prompt-file missing file has distinct text and JSON output contracts" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    const deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup);
+
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        try runWithDeps(alloc, &.{ "--prompt-file", "/does/not/exist.txt" }, testConfig(), deps),
+    );
+    try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
+    try std.testing.expectEqualStrings(
+        "fx ask: --prompt-file: file not found\n",
+        stderr_capture.bytes.items,
+    );
+
+    stdout_capture.bytes.clearRetainingCapacity();
+    stderr_capture.bytes.clearRetainingCapacity();
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        try runWithDeps(alloc, &.{ "--json", "--prompt-file", "/does/not/exist.txt" }, testConfig(), deps),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptFileNotFound\"}\n",
         stdout_capture.bytes.items,
     );
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
