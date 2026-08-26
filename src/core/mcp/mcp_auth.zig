@@ -781,7 +781,7 @@ test "PKCE base64url encoding covers complete and partial groups" {
 }
 
 pub fn bearerHeaderAlloc(alloc: Allocator, access_token: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "Bearer {s}", .{access_token});
+    return secret.bearerHeaderAlloc(alloc, access_token);
 }
 
 pub fn validateClientMetadataUrl(url: []const u8) !void {

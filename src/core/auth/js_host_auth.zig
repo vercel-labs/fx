@@ -95,14 +95,8 @@ pub fn executeBearerGet(
     url: []const u8,
     access_token: []const u8,
 ) !oauth_transport.Response {
-    // Sized exactly rather than formatted, because allocPrint grows an
-    // oversized buffer and releases it once the exact length is known, leaving
-    // a plaintext copy of the token behind in the abandoned allocation.
-    const prefix = "Bearer ";
-    const authorization = try alloc.alloc(u8, prefix.len + access_token.len);
+    const authorization = try secret.bearerHeaderAlloc(alloc, access_token);
     defer secret.zeroAndFree(alloc, authorization);
-    @memcpy(authorization[0..prefix.len], prefix);
-    @memcpy(authorization[prefix.len..], access_token);
     return executeRequest(alloc, "GET", url, &.{.{
         .name = "authorization",
         .value = authorization,

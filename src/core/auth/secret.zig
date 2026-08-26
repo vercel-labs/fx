@@ -14,6 +14,18 @@ pub noinline fn zero(value: []const u8) void {
     std.crypto.secureZero(u8, @constCast(@volatileCast(value)));
 }
 
+/// Build an `Authorization: Bearer` value in an exactly sized allocation. The
+/// obvious `allocPrint` grows an oversized buffer and releases it once the real
+/// length is known, leaving a plaintext copy of the token in the abandoned
+/// block. The caller owns the result and releases it with `zeroAndFree`.
+pub fn bearerHeaderAlloc(alloc: std.mem.Allocator, access_token: []const u8) ![]u8 {
+    const prefix = "Bearer ";
+    const header = try alloc.alloc(u8, prefix.len + access_token.len);
+    @memcpy(header[0..prefix.len], prefix);
+    @memcpy(header[prefix.len..], access_token);
+    return header;
+}
+
 test "zero overwrites bytes in place and tolerates an empty slice" {
     var value = [_]u8{ 1, 2, 3 };
     zero(value[0..]);
@@ -26,7 +38,6 @@ test "zeroAndFree overwrites bytes before release" {
     std.crypto.secureZero(u8, @volatileCast(value[0..]));
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, &value);
 }
-
 /// Test helper. Records whether any allocation still held a credential in
 /// plaintext at the moment it was returned to the allocator. The scan runs
 /// before the backing allocator sees the block, so a debug build's own poison
@@ -104,4 +115,15 @@ test "the scan allocator sees a credential abandoned while a writer grows" {
     defer zero(reserved.written());
     for (0..scan_marker.len) |i| try reserved.writer.writeByte(scan_marker[i]);
     try std.testing.expectEqual(before, scan.released_with_plaintext);
+}
+
+test "the bearer header leaves no abandoned copy of the token" {
+    var scan = ScanAllocator{ .backing = std.testing.allocator, .marker = scan_needle };
+    const alloc = scan.allocator();
+
+    const header = try bearerHeaderAlloc(alloc, scan_marker);
+    try std.testing.expectStringStartsWith(header, "Bearer " ++ scan_needle);
+    try std.testing.expectEqual(@as(usize, "Bearer ".len + scan_marker.len), header.len);
+    zeroAndFree(alloc, header);
+    try std.testing.expectEqual(@as(usize, 0), scan.released_with_plaintext);
 }

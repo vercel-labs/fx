@@ -1035,7 +1035,7 @@ fn fetchTeams(alloc: Allocator, access_token: []const u8, issuer_url: []const u8
     defer if (e2e_endpoint) |endpoint| alloc.free(endpoint);
     const endpoint = e2e_endpoint orelse teams_endpoint;
 
-    const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{access_token});
+    const auth_header = try secret.bearerHeaderAlloc(alloc, access_token);
     defer secret.zeroAndFree(alloc, auth_header);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
