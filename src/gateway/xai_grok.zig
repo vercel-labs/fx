@@ -41,6 +41,7 @@ pub fn buildRequest(
     request: stream_provider.RequestData,
 ) ![]u8 {
     try validateModel(request.model);
+    try types.validateProviderMessageText(request.messages);
     if (request.budget) |budget| {
         if (budget.cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
         _ = budget.deadline;
@@ -550,6 +551,42 @@ test "xAI Grok request uses Responses input and converts AI SDK tool schemas" {
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning\":{\"effort\":\"high\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"service_tier\"") == null);
     try std.testing.expect(std.mem.find(u8, body, "\"max_output_tokens\":4096") != null);
+}
+
+test "xAI Grok request normalizes unsafe tool output to a string" {
+    const messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "call_1", .name = "run_command", .arguments_json = "{}" }} },
+        .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "run_command", .content = "bad\xff" },
+    };
+    const body = try buildRequest(std.testing.allocator, .{
+        .model = "grok-4.20",
+        .messages = &messages,
+        .tool_choice = .none,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const output = parsed.value.object.get("input").?.array.items[1].object.get("output").?;
+    try std.testing.expect(output == .string);
+    try std.testing.expectEqualStrings(
+        "binary or non-utf8 tool output omitted (4 bytes)",
+        output.string,
+    );
+}
+
+test "xAI Grok request rejects unsafe user text locally" {
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "bad\xff" }};
+    try std.testing.expectError(
+        error.InvalidProviderMessageText,
+        buildRequest(std.testing.allocator, .{
+            .model = "grok-4.20",
+            .messages = &messages,
+            .tool_choice = .none,
+            .provider_options = .{},
+        }),
+    );
 }
 
 test "xAI Grok standard requests omit the priority service tier" {

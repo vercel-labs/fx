@@ -2,6 +2,7 @@ const std = @import("std");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 const types = @import("../core/shared/types.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 
@@ -79,7 +80,7 @@ pub fn writeInput(
                 try writer.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
                 try std.json.Stringify.value(message.tool_call_id orelse "", .{}, writer);
                 try writer.writeAll(",\"output\":");
-                try std.json.Stringify.value(message.content orelse "", .{}, writer);
+                try text_utils.writeModelSafeTextJson(writer, message.content orelse "");
                 try writer.writeByte('}');
             },
         }
