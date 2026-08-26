@@ -559,7 +559,7 @@ fn refreshSession(
         .account_id = account_id,
     };
     token.access_token = &.{};
-    errdefer replacement.deinit(alloc);
+    errdefer secret.zeroAndFree(alloc, replacement.access_token);
     try mutation.save(alloc, replacement);
 
     session.deinit(alloc);
@@ -1078,4 +1078,132 @@ test "Grok browser callback requires the exact path and state" {
             "expected",
         ),
     );
+}
+
+test "Grok refresh releases every credential exactly once when the save fails" {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        fn execute(
+            _: ?*anyopaque,
+            a: Allocator,
+            request: oauth_transport.Request,
+        ) !oauth_transport.Response {
+            const body = switch (request.method) {
+                .post_form => "{\"access_token\":\"new-access\",\"refresh_token\":\"new-refresh\",\"expires_in\":3600}",
+                .get => "{\"sub\":\"acct_test\"}",
+                else => return error.UnexpectedRequest,
+            };
+            return .{ .disposition = .accepted, .body = try a.dupe(u8, body) };
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var lock_file = try tmp.dir.createFile(io_mod.getIo(), "lock", .{ .truncate = true });
+    defer lock_file.close(io_mod.getIo());
+
+    // An unwritable profile directory is the ordinary disk condition that makes
+    // the save fail after the replacement session already owns the credentials.
+    tmp.dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o500)) catch
+        return error.SkipZigTest;
+    defer tmp.dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700)) catch {};
+
+    var mutation = grok_session.Mutation{
+        .fx_dir = .{ .dir = tmp.dir },
+        .lock = .{ .file = lock_file },
+    };
+    var session = grok_session.Session{
+        .access_token = try alloc.dupe(u8, "old-access"),
+        .refresh_token = try alloc.dupe(u8, "old-refresh"),
+        .expires_at_ms = 0,
+        .account_id = try alloc.dupe(u8, "acct_test"),
+    };
+    defer session.deinit(alloc);
+
+    try std.testing.expectError(
+        error.DurableReplacePreRenameFailed,
+        refreshSession(alloc, .{ .execute_fn = State.execute }, &mutation, &session),
+    );
+    try std.testing.expectEqualStrings("old-refresh", session.refresh_token);
+}
+
+test "Grok refresh replaces the stored session when the save succeeds" {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        fn execute(
+            _: ?*anyopaque,
+            a: Allocator,
+            request: oauth_transport.Request,
+        ) !oauth_transport.Response {
+            const body = switch (request.method) {
+                .post_form => "{\"access_token\":\"new-access\",\"refresh_token\":\"new-refresh\",\"expires_in\":3600}",
+                .get => "{\"sub\":\"acct_test\"}",
+                else => return error.UnexpectedRequest,
+            };
+            return .{ .disposition = .accepted, .body = try a.dupe(u8, body) };
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var lock_file = try tmp.dir.createFile(io_mod.getIo(), "lock", .{ .truncate = true });
+    defer lock_file.close(io_mod.getIo());
+
+    var mutation = grok_session.Mutation{
+        .fx_dir = .{ .dir = tmp.dir },
+        .lock = .{ .file = lock_file },
+    };
+    var session = grok_session.Session{
+        .access_token = try alloc.dupe(u8, "old-access"),
+        .refresh_token = try alloc.dupe(u8, "old-refresh"),
+        .expires_at_ms = 0,
+        .account_id = try alloc.dupe(u8, "acct_test"),
+    };
+    defer session.deinit(alloc);
+
+    try refreshSession(alloc, .{ .execute_fn = State.execute }, &mutation, &session);
+    try std.testing.expectEqualStrings("new-access", session.access_token);
+    try std.testing.expectEqualStrings("new-refresh", session.refresh_token);
+    try std.testing.expectEqualStrings("acct_test", session.account_id);
+}
+
+test "Grok refresh rejects a changed account without leaking the fetched id" {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        fn execute(
+            _: ?*anyopaque,
+            a: Allocator,
+            request: oauth_transport.Request,
+        ) !oauth_transport.Response {
+            const body = switch (request.method) {
+                .post_form => "{\"access_token\":\"new-access\",\"refresh_token\":\"new-refresh\",\"expires_in\":3600}",
+                .get => "{\"sub\":\"acct_other\"}",
+                else => return error.UnexpectedRequest,
+            };
+            return .{ .disposition = .accepted, .body = try a.dupe(u8, body) };
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var lock_file = try tmp.dir.createFile(io_mod.getIo(), "lock", .{ .truncate = true });
+    defer lock_file.close(io_mod.getIo());
+
+    var mutation = grok_session.Mutation{
+        .fx_dir = .{ .dir = tmp.dir },
+        .lock = .{ .file = lock_file },
+    };
+    var session = grok_session.Session{
+        .access_token = try alloc.dupe(u8, "old-access"),
+        .refresh_token = try alloc.dupe(u8, "old-refresh"),
+        .expires_at_ms = 0,
+        .account_id = try alloc.dupe(u8, "acct_test"),
+    };
+    defer session.deinit(alloc);
+
+    try std.testing.expectError(
+        error.GrokAccountChanged,
+        refreshSession(alloc, .{ .execute_fn = State.execute }, &mutation, &session),
+    );
+    try std.testing.expectEqualStrings("old-access", session.access_token);
 }
