@@ -1,0 +1,602 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>oh-my-fx — Tiny, open, native coding agent</title>
+<meta name="description" content="Tiny, open, native coding agent. A minimal CLI written in Zig, optimized for research and embeddability as part of larger systems. oh-my-fx is a Nix-flaked fork of vercel-labs/fx.">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0b0b0b" media="(prefers-color-scheme: dark)">
+<meta property="og:title" content="oh-my-fx — Tiny, open, native coding agent">
+<meta property="og:description" content="Tiny, open, native coding agent. A minimal CLI written in Zig, optimized for research and embeddability as part of larger systems.">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23000'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='16' font-weight='700' fill='%23fff' text-anchor='middle'%3Efx%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/css/xterm.css">
+<script type="importmap">
+{
+  "imports": {
+    "@xterm/xterm": "https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/+esm",
+    "@xterm/addon-fit": "https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/+esm"
+  }
+}
+</script>
+<style>
+@font-face {
+  font-family: "Departure Mono";
+  src: url("departure-mono.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Plantin Now";
+  src: url("plantin-now.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+:root {
+  color-scheme: light;
+  --fx-ink: #0b0b0b;
+  --fx-paper: #e8e8e8;
+  --fx-orange: #e4572e;
+  --fx-amber: #f3a712;
+  --fx-green: #57a773;
+  --fx-blue: #3d7dd8;
+  --background: #fff;
+  --foreground: #0b0b0b;
+  --muted-foreground: #525252;
+  --border: #e5e5e5;
+  --card: #fafafa;
+  --popover: #fafafa;
+  --popover-foreground: #0b0b0b;
+  --fx-auto: #57a773;
+  --fx-bright: #e4572e;
+  --fx-status: #626262;
+  --fx-dim: #9e9e9e;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --fx-ink: #0b0b0b;
+    --fx-paper: #e8e8e8;
+    --fx-orange: #e4572e;
+    --fx-amber: #f3a712;
+    --fx-green: #57a773;
+    --fx-blue: #3d7dd8;
+    --background: #0b0b0b;
+    --foreground: #e8e8e8;
+    --muted-foreground: #a1a1a1;
+    --border: #262626;
+    --card: #0a0a0a;
+    --popover: #0a0a0a;
+    --popover-foreground: #e8e8e8;
+    --fx-auto: #57a773;
+    --fx-bright: #e4572e;
+    --fx-status: #8a8a8a;
+    --fx-dim: #8a8a8a;
+  }
+}
+* { box-sizing: border-box; }
+html { background: var(--background); }
+body {
+  margin: 0;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: "Departure Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: inherit; text-decoration: none; }
+button { font: inherit; }
+
+/* Hero banner */
+.hero-svg {
+  display: block;
+  width: min(280px, 100%);
+  height: auto;
+  margin: 0 auto;
+}
+.nav { display: flex; align-items: center; justify-content: center; gap: 20px; color: var(--muted-foreground); margin: 28px 0 0; }
+.nav a { font-size: 15px; font-weight: 700; }
+.nav a:nth-child(1) { color: var(--fx-orange); }
+.nav a:nth-child(2) { color: var(--fx-amber); }
+.nav a:nth-child(3) { color: var(--fx-green); }
+.nav a:nth-child(4) { color: var(--fx-blue); }
+.nav a:hover { color: var(--foreground); }
+
+/* Main column */
+main {
+  padding: 40px 24px 64px;
+}
+@media (min-width: 641px) {
+  main { padding: 56px 32px 96px; }
+}
+@media (max-width: 1100px) {
+  main { margin: 0 auto; max-width: 744px; }
+}
+.hero {
+  min-height: calc(100vh - 120px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.try-note {
+  margin: 0 0 16px;
+  font-size: 13px;
+  font-style: italic;
+  color: var(--muted-foreground);
+  text-align: center;
+}
+
+/* Headline */
+.hero-head { margin-bottom: 40px; text-align: center; }
+h1 {
+  margin: 8px 0 20px;
+  color: var(--muted-foreground);
+  font-family: monospace;
+  font-size: inherit;
+  font-weight: 700;
+  letter-spacing: normal;
+}
+.install {
+  margin: 1em 0 0;
+  color: var(--foreground);
+  white-space: nowrap;
+  font-size: clamp(10px, 3.2vw, 14px);
+}
+@media (min-width: 641px) { .install { font-size: 14px; } }
+@media (max-width: 640px) { .install { white-space: normal; } }
+.batteries {
+  color: var(--fx-blue);
+  font-family: "Plantin Now", Georgia, "Times New Roman", serif;
+  font-weight: 400;
+  font-size: 14px;
+  animation: fx-rainbow 14s linear infinite;
+}
+@keyframes fx-rainbow {
+  0%, 100% { color: var(--fx-orange); }
+  25% { color: var(--fx-amber); }
+  50% { color: var(--fx-green); }
+  75% { color: var(--fx-blue); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .batteries { animation: none; }
+}
+.install-alt {
+  color: var(--muted-foreground);
+  font-size: 13px;
+  margin: 14px 0 0;
+}
+.copy {
+  font-family: inherit;
+  font-weight: 400;
+  color: inherit;
+  cursor: copy;
+  -webkit-user-select: all;
+  user-select: all;
+}
+.copy:hover { color: var(--foreground); }
+.version {
+  margin: 14px 0 0;
+  font-size: 13px;
+  color: var(--muted-foreground);
+}
+.version a:hover { color: var(--foreground); }
+.version .fg { color: var(--fx-amber); }
+.version a { color: var(--fx-blue); }
+.try-note code, .install-alt code { color: var(--fx-green); }
+#features .fg { color: var(--fx-blue); }
+::selection { background: var(--fx-amber); color: var(--fx-ink); }
+.version .note {
+  position: relative;
+  display: inline-block;
+}
+.info-btn {
+  padding: 0 2px;
+  border: 0;
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: help;
+}
+.info-btn:hover, .info-btn:focus-visible { color: var(--foreground); }
+.tooltip {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 10;
+  width: max-content;
+  max-width: 260px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--popover);
+  color: var(--popover-foreground);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: normal;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms;
+}
+.note:hover .tooltip, .note:focus-within .tooltip { opacity: 1; }
+
+/* Terminal window */
+.term {
+  width: 100%;
+  max-width: 680px;
+  height: 320px;
+  margin-bottom: 48px;
+}
+.term-window {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--background);
+}
+.term-bar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  height: 44px;
+  color: var(--muted-foreground);
+  font-size: 14px;
+}
+.term-bar .dots {
+  position: absolute;
+  left: 20px;
+  display: flex;
+  gap: 8px;
+}
+.term-bar .dots span {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--muted-foreground);
+  opacity: 0.4;
+}
+@media (prefers-color-scheme: dark) {
+  .term-bar .dots span { opacity: 0.6; }
+}
+.fx-static {
+  flex: 1;
+  overflow: hidden;
+  margin: 0;
+  padding: 14px 20px;
+  font: 14px/19px "Departure Mono", ui-monospace, monospace;
+  color: var(--fx-dim);
+  white-space: pre;
+}
+.fx-static .bright { color: var(--fx-bright); font-weight: 400; }
+.fx-static .status { color: var(--fx-status); }
+.fx-static .auto { color: var(--fx-auto); }
+.cursor { color: var(--fx-bright); animation: fx-static-cursor-blink 1.2s step-end infinite; }
+@keyframes fx-static-cursor-blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+#term-live { display: none; flex: 1; min-height: 0; }
+#term-live .xterm { width: 100%; height: 100%; padding: 12px 12px 12px 20px; font-variant-ligatures: none; }
+#term-live .xterm-viewport { background: transparent !important; }
+.term-window.live #term-live { display: block; }
+.term-window.live .term-static { display: none; }
+.term-window.live { cursor: text; }
+.term-window.live:focus-within { border-color: var(--foreground); }
+.term-window.live .term-static { pointer-events: none; }
+.fallback-note {
+  display: none;
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+.term-window.fallback ~ .fallback-note { display: block; }
+.term-window.live .term-bar .about {
+  position: absolute;
+  right: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 0;
+  background: transparent;
+  color: var(--muted-foreground);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: help;
+}
+.term-window.live .term-bar .about:hover { color: var(--foreground); }
+.repl-note {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 20;
+  width: max-content;
+  max-width: 260px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--popover);
+  color: var(--popover-foreground);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: normal;
+  text-align: left;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms;
+}
+.term-bar .about:hover + .repl-note, .term-bar .about:focus + .repl-note { opacity: 1; }
+
+/* Features */
+#features {
+  max-width: 560px;
+  line-height: 1.75;
+}
+#features h2 {
+  margin: 0 0 4px;
+  font-size: 14px;
+  font-weight: 700;
+  text-align: center;
+  color: var(--foreground);
+}
+#features .feature:nth-child(4n+1) h2 { color: var(--fx-orange); }
+#features .feature:nth-child(4n+2) h2 { color: var(--fx-amber); }
+#features .feature:nth-child(4n+3) h2 { color: var(--fx-green); }
+#features .feature:nth-child(4n+4) h2 { color: var(--fx-blue); }
+#features p { margin: 0 0 40px; color: var(--muted-foreground); }
+#features p:last-child { margin-bottom: 0; }
+#features a { color: var(--fx-blue); text-decoration: underline; text-decoration-color: var(--border); text-underline-offset: 4px; }
+#features a:nth-of-type(1) { color: var(--fx-orange); }
+#features a:nth-of-type(2) { color: var(--fx-amber); }
+#features a:nth-of-type(3) { color: var(--fx-green); }
+#features a:hover { text-decoration-color: var(--foreground); }
+</style>
+</head>
+<body>
+  <main>
+  <div class="hero">
+    <div class="hero-head">
+      <img class="hero-svg" src="omfx.svg" alt="oh-my-fx — Why should Pi have all the fun?" width="560">
+      <nav class="nav" aria-label="Primary">
+        <a href="https://fx.sh/docs">docs</a>
+        <a href="https://fx.sh/docs/using-fx/cli">cli</a>
+        <a href="https://fx.sh/docs/lib">lib</a>
+        <a class="source" href="https://github.com/y0usaf/oh-my-fx">source</a>
+      </nav>
+      <h1>Tiny, open, native coding agent. <span class="batteries">Batteries now included.</span></h1>
+      <p class="install">
+        <span class="prompt">$ </span><code class="copy" title="Click to select — press Ctrl/Cmd+C to copy">curl -fsSL https://ohmyfx.sh/setup.sh | bash</code>
+      </p>
+      <p class="install-alt">or <code>nix run github:y0usaf/oh-my-fx</code></p>
+      <p class="version">
+        <span>v0.0.5</span> <a href="https://github.com/y0usaf/oh-my-fx" title="tracks vercel-labs/fx">(tracking)</a><span aria-hidden="true"> · </span>fork of vercel-labs/fx<span aria-hidden="true"> · </span>status: <span class="fg">experimental</span>
+        <span class="note">
+          <button type="button" class="info-btn" aria-label="Stability note" aria-describedby="version-note">(i)</button>
+          <span role="tooltip" id="version-note" class="tooltip">tracks vercel-labs/fx upstream; use at your own risk, it will be changing frequently</span>
+        </span>
+      </p>
+    </div>
+
+    <p class="try-note" role="note">You do have to <code>/login</code> to try <em>(please Vercel give me an account like fx.sh!)</em></p>
+
+    <div class="term">
+      <div class="term-window" role="application" aria-label="oh-my-fx terminal">
+        <div class="term-bar">
+          <div class="dots" aria-hidden="true"><span></span><span></span><span></span></div>
+          <div>oh-my-fx</div>
+          <button type="button" class="about" aria-label="About this terminal" aria-describedby="repl-note">(i)</button>
+          <div class="repl-note" id="repl-note" role="tooltip">This runs the real fx CLI as WebAssembly (JSPI) in your browser, talking to the Vercel AI Gateway on the site's key — no sign-in needed.</div>
+        </div>
+        <div id="term-live"></div>
+        <pre class="fx-static term-static"><span class="bright">𝒇x</span> v0.0.5 · Run /help for commands
+
+<span class="cursor">┃</span>
+
+<span class="status"><span class="auto">auto</span> · glm-5.2</span></pre>
+      </div>
+      <p class="fallback-note">Static preview — the live terminal needs WebAssembly JSPI. Use Chrome/Edge 137+ or Safari 27+.</p>
+    </div>
+
+    <section id="features">
+      <div class="feature">
+        <h2>Tiny ~6mb binary</h2>
+        <p>Designed for instant installation and embedding in resource constrained environments and agent sandboxes.</p>
+      </div>
+      <div class="feature">
+        <h2>Instant time to prompt</h2>
+        <p>fx cold starts in <span class="fg">10µs</span> and does no unnecessary work or I/O prior to accepting user input, making it ideal for programmatic use.</p>
+      </div>
+      <div class="feature">
+        <h2>Wasm support</h2>
+        <p>Optimal fx.wasm builds produced by the Zig toolchain, which further reduce fx's size, making the network stack pluggable.</p>
+      </div>
+      <div class="feature">
+        <h2>Minimal memory footprint</h2>
+        <p>fx contributes single-digit megabytes of memory baseline, allowing you to pack many instances in one machine.</p>
+      </div>
+      <div class="feature">
+        <h2>Shell-like UI and ergonomics</h2>
+        <p>fx preserves scroll history by default, produces minimal output, and makes sparing use of complex TUI or paints</p>
+      </div>
+      <div class="feature">
+        <h2>Context efficient</h2>
+        <p>Minimal system prompt and tools, to save on token costs and to yield optimal time-to-first-token performance (TTFT).</p>
+      </div>
+      <div class="feature">
+        <h2>Embeddable and extensible</h2>
+        <p>Small core, extended via skills, plugins, MCPs, with a Unix-like philosophy to extensibility.</p>
+      </div>
+      <div class="feature">
+        <h2>Model and provider agnostic</h2>
+        <p>Designed to work with <a href="https://fx.sh/docs">local models</a>, <a href="https://fx.sh/docs">gateways</a>, direct provider API access or <a href="https://fx.sh/docs">subscriptions</a>.</p>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script type="module">
+import { Terminal } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import { createFxTerminal, supportsJspi, xtermAdapter } from "./browser.js";
+
+const windowEl = document.querySelector(".term-window");
+const container = document.querySelector("#term-live");
+
+if (!supportsJspi()) {
+  windowEl.classList.add("fallback");
+  console.warn("fx terminal unavailable: WebAssembly JSPI not supported (Chrome/Edge 137+, Safari 27+). Showing static preview.");
+} else {
+  try {
+    // Render the terminal now, synchronously, so the window is live and
+    // focusable from the first paint. The wasm boots underneath it.
+    const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+    const theme = dark
+      ? { background: "#0b0b0b", foreground: "#e8e8e8", cursor: "#e8e8e8", cursorAccent: "#0b0b0b", selectionBackground: "#2b2b2b" }
+      : { background: "#ffffff", foreground: "#0b0b0b", cursor: "#0b0b0b", cursorAccent: "#ffffff", selectionBackground: "#e5e5e5" };
+
+    windowEl.classList.add("live");
+
+    const terminal = new Terminal({
+      cursorBlink: true,
+      cursorStyle: "block",
+      fontFamily: '"Departure Mono", ui-monospace, monospace',
+      fontSize: 14,
+      fontWeight: 400,
+      fontWeightBold: 400,
+      lineHeight: 1.25,
+      letterSpacing: 0,
+      scrollback: 5000,
+      scrollOnUserInput: true,
+      theme,
+    });
+    const fitAddon = new FitAddon();
+    terminal.loadAddon(fitAddon);
+    terminal.open(container);
+    fitAddon.fit();
+
+    let fitFrame = null;
+    const resizeObserver = new ResizeObserver(() => {
+      if (fitFrame !== null) return;
+      fitFrame = requestAnimationFrame(() => {
+        fitFrame = null;
+        fitAddon.fit();
+      });
+    });
+    resizeObserver.observe(container);
+
+    // Click anywhere on the window (bar included) sends keys to the terminal.
+    const focusTerminal = (event) => {
+      if (event.target.closest(".about")) return;
+      terminal.focus();
+    };
+    windowEl.addEventListener("pointerdown", focusTerminal);
+    windowEl.addEventListener("click", focusTerminal);
+    terminal.focus();
+
+    // Font metrics are cosmetic; refresh when they arrive, never gate on them.
+    document.fonts.load('14px "Departure Mono"')
+      .then(() => fitAddon.fit())
+      .catch(() => {});
+
+    const response = await fetch("./fx-term.wasm");
+    if (!response.ok) throw new Error("wasm fetch failed: " + response.status);
+    const module = await WebAssembly.compile(await response.arrayBuffer());
+
+    const configStore = {
+      get(id) { return localStorage.getItem(`fx.core.config.${id}`); },
+      set(id, value) { localStorage.setItem(`fx.core.config.${id}`, value); },
+    };
+    // Browser OAuth host: lets /login codex|grok complete device-login flows.
+    const oauthSessionStore = {
+      async load() {
+        const raw = localStorage.getItem("fx.oauth.session");
+        if (!raw) return null;
+        const rec = JSON.parse(raw);
+        return {
+          bytes: new Uint8Array(atob(rec.b64).split("").map((c) => c.charCodeAt(0))),
+          revision: rec.revision,
+        };
+      },
+      async commit(value, expectedRevision) {
+        const cur = JSON.parse(localStorage.getItem("fx.oauth.session") || "null");
+        if (cur && cur.revision !== expectedRevision) {
+          const error = new Error("oauth session revision conflict");
+          error.code = "FX_OAUTH_SESSION_REVISION_CONFLICT";
+          throw error;
+        }
+        const revision = String(Date.now());
+        localStorage.setItem(
+          "fx.oauth.session",
+          JSON.stringify({ b64: btoa(String.fromCharCode(...value)), revision }),
+        );
+        return { revision };
+      },
+      async remove(expectedRevision) {
+        const cur = JSON.parse(localStorage.getItem("fx.oauth.session") || "null");
+        if (cur && cur.revision !== expectedRevision) return "missing";
+        localStorage.removeItem("fx.oauth.session");
+        return true;
+      },
+    };
+    const openUrl = (url) => {
+      window.open(url, "_blank", "noopener");
+      return true;
+    };
+    const promptHistoryStore = {
+      load(workspaceRoot, limit) {
+        const values = JSON.parse(localStorage.getItem(`fx.term.history.${workspaceRoot}`) || "[]");
+        return values.slice(-limit);
+      },
+      append(workspaceRoot, value) {
+        const key = `fx.term.history.${workspaceRoot}`;
+        const values = JSON.parse(localStorage.getItem(key) || "[]");
+        if (values.at(-1) === value) return "duplicate";
+        values.push(value);
+        localStorage.setItem(key, JSON.stringify(values.slice(-100)));
+      },
+      clear(workspaceRoot) { localStorage.removeItem(`fx.term.history.${workspaceRoot}`); },
+    };
+
+    // Model access: the terminal routes all gateway traffic through the
+    // Worker that also serves this page (same origin) — default location.origin
+    // needs no configuration after deploy. The page holds NO key; the Worker
+    // injects GATEWAY_KEY server-side. For off-origin testing, override with
+    // ?worker=http://host:port or localStorage "FX_WORKER_BASE".
+    const WORKER_BASE =
+      new URLSearchParams(location.search).get("worker") ||
+      localStorage.getItem("FX_WORKER_BASE") ||
+      location.origin;
+    // Placeholder: fx needs a non-empty key to start a turn; the Worker
+    // discards it and injects the real GATEWAY_KEY server-side.
+    const env = {
+      AI_GATEWAY_API_KEY: "worker",
+      FX_GATEWAY_CHAT_URL: WORKER_BASE + "/v3/ai/language-model",
+      FX_GATEWAY_BASE_URL: WORKER_BASE,
+    };
+
+    const runtime = await createFxTerminal({
+      wasm: module,
+      terminal: xtermAdapter(terminal),
+      env,
+      configStore,
+      promptHistoryStore,
+      oauthSessionStore,
+      openUrl,
+    });
+    runtime.interactive.then(() => terminal.focus());
+    window.__fxTerminal = { runtime, terminal, fitAddon, resizeObserver, oauthSessionStore, openUrl };
+  } catch (err) {
+    if (typeof terminal !== "undefined") terminal.dispose?.();
+    windowEl.classList.remove("live");
+    windowEl.classList.add("fallback");
+    console.warn("fx terminal unavailable:", err);
+  }
+}
+</script>
+</body>
+</html>

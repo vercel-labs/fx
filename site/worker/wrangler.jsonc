@@ -1,0 +1,23 @@
+{
+  // oh-my-fx — one Worker: static site (assets) + gateway proxy.
+  // Deploy:
+  //   cd worker
+  //   npx wrangler secret put GATEWAY_KEY      (once; fresh key)
+  //   npx wrangler deploy                      (or CI)
+  "name": "oh-my-fx",
+  "main": "worker.js",
+  "compatibility_date": "2026-01-01",
+  "assets": {
+    "directory": "../site",
+    "binding": "ASSETS"
+  },
+  "routes": [
+    { "pattern": "ohmyfx.sh", "custom_domain": true },
+    { "pattern": "www.ohmyfx.sh", "custom_domain": true }
+  ],
+  "vars": {
+    "SITE_ORIGIN": "*",
+    "UPSTREAM_BASE": "https://ai-gateway.vercel.sh",
+    "RATE_LIMIT": "20"
+  }
+}

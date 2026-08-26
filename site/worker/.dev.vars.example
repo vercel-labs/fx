@@ -1,0 +1,2 @@
+# Copy to worker/.dev.vars (gitignored) and paste your Vercel AI Gateway key.
+GATEWAY_KEY=
