@@ -97,6 +97,14 @@ Use `fx ask` for a single request:
 fx ask "explain the changes in this repository"
 ```
 
+For long-running autonomous work, ask fx to continue with the next implementation steps after each completed turn:
+
+```bash
+fx ask --auto-next-steps "fix the failing tests and improve the implementation"
+```
+
+Add `--auto-next-idea` to have fx brainstorm and implement follow-up improvements after the current work. Using both flags keeps the saved session running through the cycle until you interrupt it with Ctrl+C. Autonomous mode retries failed turns with backoff and requires session saving, so it cannot be combined with `--no-save`.
+
 fx starts in `auto` permission mode. Routine understood development actions run directly; unresolved sensitive actions receive one bounded automatic review. A blocked action may return an exact approval request that the agent can send to fx's real permission screen. Ordinary question text never grants permission. See [Permissions](https://fx.sh/docs/configure-fx/permissions) for other modes and persistent rules.
 
 JSON and quiet requests stay noninteractive by default. Add `--prompt-permissions` to allow the existing Y/N approval prompt when stdin is a TTY. Prompt text is written to stderr, so JSON stdout stays parseable and quiet stdout stays empty. Piped or redirected stdin remains noninteractive and fails instead of waiting for approval.

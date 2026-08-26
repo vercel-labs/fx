@@ -30,11 +30,13 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .ask,
         .token = "ask",
-        .usage = "ask [--auto|--yolo] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
+        .usage = "ask [--auto|--yolo] [--auto-next-steps] [--auto-next-idea] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
         .summary = "Run one noninteractive request",
         .options = &.{
             .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
             .{ .flag = "--yolo", .description = "Disable fx permission checks" },
+            .{ .flag = "--auto-next-steps", .description = "Continue with the next logical implementation steps after each turn" },
+            .{ .flag = "--auto-next-idea", .description = "Brainstorm and implement follow-up improvements after each turn" },
             .{ .flag = "--image PATH", .description = "Attach an image file; repeat for multiple images" },
             json_option,
             .{ .flag = "--quiet", .description = "Suppress assistant output" },
@@ -51,6 +53,7 @@ pub const top_level_specs = [_]TopLevelSpec{
             "TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.",
             "Operational progress and diagnostics are written to stderr. JSON output keeps raw Markdown in `output`.",
             "With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.",
+            "Autonomous flags keep the saved session running until interrupted; they cannot be combined with --no-save.",
         },
     },
     .{

@@ -338,6 +338,8 @@ const AskOptions = struct {
     no_save: bool = false,
     no_color: bool = false,
     continue_recovery: bool = false,
+    auto_next_steps: bool = false,
+    auto_next_idea: bool = false,
 
     fn deinit(self: *AskOptions, alloc: Allocator) void {
         alloc.free(self.prompt);
@@ -1275,55 +1277,184 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         deps.stdout_is_tty(deps.stdout_ctx),
         options.no_color,
     );
-    const result = runPromptInternal(alloc, options.prompt, options.permission_override, effective_cfg, .{
-        .output_mode = output_mode,
-        .prompt_permissions = options.prompt_permissions,
-        .images = if (options.images.items.len > 0) options.images.items else &.{},
-        .command_timeout_ms = options.timeout_ms,
-        .save_session = !options.no_save,
-        .resume_target = options.resume_target,
-        .color_enabled = !options.no_color,
-        .continue_recovery = options.continue_recovery,
-        .deps = deps,
-    }) catch |err| {
+    var current_prompt = try alloc.dupe(u8, options.prompt);
+    defer alloc.free(current_prompt);
+    var follow_up_session_id: ?[]u8 = null;
+    defer if (follow_up_session_id) |session_id| alloc.free(session_id);
+
+    var first_turn = true;
+    var autonomous_turn: usize = 0;
+    var retry_attempt: usize = 0;
+    while (true) {
         if (interrupt_scope.requested()) return headless_interrupt.exitCode();
-        if (err == error.OutOfMemory) return err;
-        if (err == error.OneOffSessionNotResumable and !options.json_output) {
-            try deps.write_stderr(
-                deps.stderr_ctx,
-                "fx ask: one-off child sessions cannot accept additional prompts; create a persistent child to continue the conversation\n",
-            );
+
+        const resume_target = if (first_turn)
+            options.resume_target
+        else
+            ResumeTarget{ .id = follow_up_session_id.? };
+        const images = if (first_turn and options.images.items.len > 0) options.images.items else &.{};
+        const continue_recovery = first_turn and options.continue_recovery;
+        const result = runPromptInternal(alloc, current_prompt, options.permission_override, effective_cfg, .{
+            .output_mode = output_mode,
+            .prompt_permissions = options.prompt_permissions,
+            .images = images,
+            .command_timeout_ms = options.timeout_ms,
+            .save_session = !options.no_save,
+            .resume_target = resume_target,
+            .color_enabled = !options.no_color,
+            .continue_recovery = continue_recovery,
+            .deps = deps,
+        }) catch |err| {
+            if (interrupt_scope.requested() or err == error.Cancelled) return headless_interrupt.exitCode();
+            if (err == error.OutOfMemory) return err;
+            if (!options.auto_next_steps and !options.auto_next_idea) {
+                if (err == error.OneOffSessionNotResumable and !options.json_output) {
+                    try deps.write_stderr(
+                        deps.stderr_ctx,
+                        "fx ask: one-off child sessions cannot accept additional prompts; create a persistent child to continue the conversation\n",
+                    );
+                    return 1;
+                }
+                if (!options.json_output) {
+                    const notice = askErrorNotice(err) orelse return err;
+                    try deps.write_stderr(deps.stderr_ctx, "fx ask: ");
+                    try deps.write_stderr(deps.stderr_ctx, notice);
+                    try deps.write_stderr(deps.stderr_ctx, "\n");
+                    return 1;
+                }
+                const json = try renderErrorJsonResult(alloc, @errorName(err));
+                defer alloc.free(json);
+                try deps.write_stdout(deps.stdout_ctx, json);
+                return 1;
+            }
+
+            retry_attempt += 1;
+            try writeAutonomousRetryNotice(deps, retry_attempt, @errorName(err));
+            io_mod.sleep(autonomousRetryDelayNs(retry_attempt));
+            continue;
+        };
+        defer result.deinit(alloc);
+
+        if (result.interrupted or interrupt_scope.requested()) {
+            const exit_code = headless_interrupt.exitCode();
+            return exit_code;
+        }
+
+        if (options.json_output) {
+            const json = try renderFinalJsonResult(alloc, result);
+            defer alloc.free(json);
+            if (interrupt_scope.requested()) {
+                return headless_interrupt.exitCode();
+            }
+            try deps.write_stdout(deps.stdout_ctx, json);
+        }
+
+        if (!options.auto_next_steps and !options.auto_next_idea) {
+            const exit_code = result.exit_code;
+            return if (interrupt_scope.requested()) headless_interrupt.exitCode() else exit_code;
+        }
+
+        if (result.exit_code != 0) {
+            if (!autonomousResultCanRetry(result)) {
+                const exit_code = result.exit_code;
+                return exit_code;
+            }
+            const has_session = result.session_id.len > 0;
+            if (has_session) {
+                if (follow_up_session_id) |session_id| alloc.free(session_id);
+                follow_up_session_id = try alloc.dupe(u8, result.session_id);
+            }
+            retry_attempt += 1;
+            const retry_prompt = try buildAutonomousRetryPrompt(alloc, result.assistant_output, retry_attempt);
+            alloc.free(current_prompt);
+            current_prompt = retry_prompt;
+            try writeAutonomousRetryNotice(deps, retry_attempt, result.error_code orelse "turn failed");
+            io_mod.sleep(autonomousRetryDelayNs(retry_attempt));
+            first_turn = !has_session;
+            continue;
+        }
+
+        retry_attempt = 0;
+        if (result.session_id.len == 0) {
+            try deps.write_stderr(deps.stderr_ctx, "fx ask: autonomous mode requires a resumable saved session\n");
             return 1;
         }
-        if (!options.json_output) {
-            const notice = askErrorNotice(err) orelse return err;
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: ");
-            try deps.write_stderr(deps.stderr_ctx, notice);
-            try deps.write_stderr(deps.stderr_ctx, "\n");
-            return 1;
-        }
-        const json = try renderErrorJsonResult(alloc, @errorName(err));
-        defer alloc.free(json);
-        try deps.write_stdout(deps.stdout_ctx, json);
-        return 1;
-    };
-    defer result.deinit(alloc);
-
-    if (result.interrupted or interrupt_scope.requested()) {
-        return headless_interrupt.exitCode();
+        if (follow_up_session_id) |session_id| alloc.free(session_id);
+        follow_up_session_id = try alloc.dupe(u8, result.session_id);
+        autonomous_turn += 1;
+        const next_prompt = try buildAutonomousFollowUpPrompt(
+            alloc,
+            options.auto_next_steps,
+            options.auto_next_idea,
+            autonomous_turn,
+            result.assistant_output,
+        );
+        alloc.free(current_prompt);
+        current_prompt = next_prompt;
+        first_turn = false;
     }
+}
 
-    if (options.json_output) {
-        const json = try renderFinalJsonResult(alloc, result);
-        defer alloc.free(json);
-        if (interrupt_scope.requested()) return headless_interrupt.exitCode();
-        try deps.write_stdout(deps.stdout_ctx, json);
+fn autonomousRetryDelayNs(attempt: usize) u64 {
+    const capped_attempt = @min(attempt, 5);
+    return (@as(u64, 1) << @intCast(capped_attempt - 1)) * 1_000_000_000;
+}
+
+fn writeAutonomousRetryNotice(deps: RunDeps, attempt: usize, reason: []const u8) !void {
+    var notice: [256]u8 = undefined;
+    const text = std.fmt.bufPrint(&notice, "[auto] retrying autonomous turn {d} ({s})\n", .{ attempt, reason }) catch
+        "[auto] retrying autonomous turn\n";
+    try deps.write_stderr(deps.stderr_ctx, text);
+}
+
+fn autonomousResultCanRetry(result: PromptRunResult) bool {
+    const error_code = result.error_code orelse return true;
+    return !std.mem.eql(u8, error_code, "MissingCredentials") and
+        !std.mem.eql(u8, error_code, "NonInteractivePermissionRequired");
+}
+
+fn buildAutonomousRetryPrompt(alloc: Allocator, summary: []const u8, attempt: usize) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.print(
+        "You are in AUTONOMOUS MODE. The previous attempt did not complete successfully. Inspect the current state, diagnose the failure, and retry the work now. This is retry {d}; do not ask for confirmation. Run focused verification before stopping.",
+        .{attempt},
+    );
+    if (std.mem.trim(u8, summary, " \t\r\n").len > 0) {
+        try out.writer.writeAll("\n\nThe previous attempt's output was:\n\n");
+        try out.writer.writeAll(summary);
     }
+    return out.toOwnedSlice();
+}
 
-    return if (interrupt_scope.requested())
-        headless_interrupt.exitCode()
-    else
-        result.exit_code;
+fn buildAutonomousFollowUpPrompt(
+    alloc: Allocator,
+    auto_next_steps: bool,
+    auto_next_idea: bool,
+    turn: usize,
+    summary: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("You are in AUTONOMOUS MODE. Do not ask for permission or confirmation.\n\n");
+    if (auto_next_steps) {
+        try out.writer.writeAll(
+            "Continue working autonomously on the current objectives. Break the overall goal into concrete next steps, execute them carefully in order, and run relevant tests as needed.\n\n",
+        );
+    }
+    if (auto_next_idea) {
+        try out.writer.writeAll(
+            "After finishing the current plan, shift into ideation mode and brainstorm at least three concrete improvements for this project. Pick the highest-impact idea and start executing it immediately.\n\n",
+        );
+    }
+    if (auto_next_steps and auto_next_idea) {
+        try out.writer.writeAll("Repeat this cycle indefinitely until a human interrupts you.\n\n");
+    } else if (turn % 3 == 0) {
+        try out.writer.writeAll("Review the recent work and original objective before choosing the next action. Keep the work focused and verify it.\n\n");
+    }
+    try out.writer.writeAll("Use the latest summary of work below as context when outlining your follow-up actions:\n\n");
+    try out.writer.writeAll(if (std.mem.trim(u8, summary, " \t\r\n").len > 0) summary else "No summary was produced; inspect the current repository state and continue.");
+    return out.toOwnedSlice();
 }
 
 fn preflightAskImages(
@@ -3408,6 +3539,10 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
         } else if (std.mem.eql(u8, arg, "--continue-recovery")) {
             if (opts.continue_recovery) return error.InvalidAskArgs;
             opts.continue_recovery = true;
+        } else if (std.mem.eql(u8, arg, "--auto-next-steps")) {
+            opts.auto_next_steps = true;
+        } else if (std.mem.eql(u8, arg, "--auto-next-idea")) {
+            opts.auto_next_idea = true;
         } else if (arg.len > 1 and arg[0] == '-') {
             return error.InvalidAskArgs;
         } else {
@@ -3429,6 +3564,7 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
     }
     if (!text_utils.isModelSafeText(opts.prompt)) return error.InvalidPromptText;
     if (opts.no_save and opts.resume_target != null) return error.NoSaveResumeConflict;
+    if (opts.no_save and (opts.auto_next_steps or opts.auto_next_idea)) return error.InvalidAskArgs;
 
     return opts;
 }
@@ -4810,8 +4946,9 @@ test "parse options preserves active ask flags and operands" {
         "--prompt-permissions",
         "--quiet",
         "--verbose",
-        "--no-save",
         "--no-color",
+        "--auto-next-steps",
+        "--auto-next-idea",
         "--timeout",
         "123",
         "hello",
@@ -4824,7 +4961,6 @@ test "parse options preserves active ask flags and operands" {
     try std.testing.expect(options.prompt_permissions);
     try std.testing.expect(options.quiet);
     try std.testing.expect(options.verbose);
-    try std.testing.expect(options.no_save);
     try std.testing.expect(options.no_color);
     try std.testing.expectEqual(@as(?usize, 123 * std.time.ms_per_s), options.timeout_ms);
     try std.testing.expectEqualStrings("second", options.system_prompt_override.?);
@@ -4832,6 +4968,40 @@ test "parse options preserves active ask flags and operands" {
     try std.testing.expectEqualStrings("a.png", options.image_paths.items[0]);
     try std.testing.expectEqual(@as(usize, 0), options.images.items.len);
     try std.testing.expectEqualStrings("hello world", options.prompt);
+    try std.testing.expect(options.auto_next_steps);
+    try std.testing.expect(options.auto_next_idea);
+}
+
+test "autonomous follow-up prompts combine steps and ideas" {
+    const prompt = try buildAutonomousFollowUpPrompt(
+        std.testing.allocator,
+        true,
+        true,
+        1,
+        "Implemented the first change.",
+    );
+    defer std.testing.allocator.free(prompt);
+    try std.testing.expect(std.mem.find(u8, prompt, "AUTONOMOUS MODE") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "concrete next steps") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "at least three concrete improvements") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "Repeat this cycle indefinitely") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "Implemented the first change.") != null);
+}
+
+test "autonomous retry prompt preserves the previous summary" {
+    const prompt = try buildAutonomousRetryPrompt(std.testing.allocator, "The test command failed.", 2);
+    defer std.testing.allocator.free(prompt);
+    try std.testing.expect(std.mem.find(u8, prompt, "retry 2") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "The test command failed.") != null);
+}
+
+test "autonomous mode rejects no-save sessions" {
+    const options = parseOptionsWithStdin(
+        std.testing.allocator,
+        &.{ "--no-save", "--auto-next-steps", "hello" },
+        .tty,
+    );
+    try std.testing.expectError(error.InvalidAskArgs, options);
 }
 
 test "parse options accepts yolo and rejects permission flag conflicts" {
