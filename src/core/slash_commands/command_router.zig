@@ -144,6 +144,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
 
 pub fn parse(registry: SlashRegistry, cmd: []const u8) ParsedCommand {
     for (registry.commands) |spec| {
+        if (!spec.dispatchable) continue;
         if (spec.accepts_payload) {
             if (command_specs.matchedSlashPrefix(registry, cmd, spec.kind)) |prefix| {
                 return parsedCommand(spec.kind, command_payload(cmd, prefix));
@@ -420,6 +421,7 @@ test "parse covers every registered slash command token and alias" {
 test "parse payload acceptance follows slash spec metadata" {
     var buf: [128]u8 = undefined;
     for (testSlashRegistry().commands) |spec| {
+        if (!spec.dispatchable) continue;
         const command_with_payload = try std.fmt.bufPrint(&buf, "{s} sample", .{spec.command});
         const parsed = parse(testSlashRegistry(), command_with_payload);
         if (spec.accepts_payload) {
