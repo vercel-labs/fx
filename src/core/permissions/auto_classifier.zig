@@ -6,6 +6,8 @@ const io_mod = @import("../shared/io.zig");
 const permissions = @import("permissions.zig");
 const session_usage = @import("../session/session_usage.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const command_environment = @import("../execution/command_environment.zig");
+const shell_resolver = @import("../terminal/shell_resolver.zig");
 const types = @import("../shared/types.zig");
 
 pub const tool_name = "permission_decision";
@@ -99,6 +101,12 @@ pub const CommandAction = struct {
     resolved_cwd: []const u8,
     background: bool,
     target_os: std.Target.Os.Tag,
+    /// The interpreter the approved string will actually run under. A user
+    /// shell re-reads the command through the operator's aliases, functions and
+    /// rc files, so a reviewer that never sees this is judging a different
+    /// command than the one that executes. Deliberately has no default: a caller
+    /// must state the environment rather than inherit a benign-looking one.
+    environment: command_environment.Environment,
 };
 
 pub const FileMutationAction = struct {
@@ -589,6 +597,46 @@ const SerializedEvidence = struct {
     }
 };
 
+/// Names the interpreter in the evidence, and marks the evidence incomplete when
+/// a shell-routed environment cannot say which shell. Incomplete action evidence
+/// already fails closed to `.invalid`, so an unnameable interpreter cannot be
+/// auto-approved.
+fn writeEnvironment(
+    writer: *std.Io.Writer,
+    alloc: std.mem.Allocator,
+    environment: command_environment.Environment,
+    action_complete: *bool,
+) !void {
+    try writer.print("environment: {s}\n", .{@tagName(std.meta.activeTag(environment))});
+    switch (environment) {
+        .legacy, .workspace_clean => {},
+        .clean, .user => |shell_path| {
+            if (shell_path.len == 0) {
+                action_complete.* = false;
+                try writer.writeAll("environment_shell: <unknown>\n");
+                return;
+            }
+            try writeBoundedField(writer, alloc, "environment_shell", shell_path, max_action_field_bytes, action_complete);
+
+            // The path alone reads like an ordinary `bash -c`, where aliases do
+            // not apply. What fx runs is a login shell with alias expansion, and
+            // that is the difference that decides what the command means, so the
+            // reviewer gets the startup words themselves.
+            var invocation = shell_resolver.capturedInvocation(environment, "") catch {
+                action_complete.* = false;
+                try writer.writeAll("environment_invocation: <unknown>\n");
+                return;
+            };
+            // `setCommand` appended the placeholder; the words before it are the
+            // startup semantics, and the command is already its own field.
+            if (invocation.len > 0) invocation.len -= 1;
+            const startup = try shell_resolver.formatInvocationCommand(alloc, &invocation);
+            defer alloc.free(startup);
+            try writeBoundedField(writer, alloc, "environment_invocation", startup, max_action_field_bytes, action_complete);
+        },
+    }
+}
+
 const RenderedPriorToolResult = struct {
     text: []u8,
     complete: bool,
@@ -736,6 +784,7 @@ fn serializeEvidence(
                 "background: {}\ntarget_os: {s}\n",
                 .{ command.background, @tagName(command.target_os) },
             );
+            try writeEnvironment(&out.writer, alloc, command.environment, &action_complete);
         },
         .file_mutation => |file| {
             try out.writer.writeAll("action: prepared_file_mutation\n");
@@ -1335,6 +1384,7 @@ test "action provenance records only exact current-turn tool-result copies" {
         .resolved_cwd = "/tmp/workspace",
         .background = false,
         .target_os = .linux,
+        .environment = .legacy,
     } };
     const messages = [_]types.ChatMessage{
         .{ .role = .assistant, .content = command },
@@ -1523,6 +1573,7 @@ test "host validation cautions an untrusted exact action copy despite reviewer c
             .resolved_cwd = "/tmp/workspace",
             .background = false,
             .target_os = .linux,
+            .environment = .legacy,
         } },
     };
 
@@ -1643,6 +1694,7 @@ test "automatic review does not send redacted action evidence" {
             .resolved_cwd = "/tmp/workspace",
             .background = false,
             .target_os = .linux,
+            .environment = .legacy,
         } },
     });
 
@@ -1832,6 +1884,7 @@ test "automatic review serializes the pending call structurally" {
             .resolved_cwd = "/tmp/workspace",
             .background = false,
             .target_os = .linux,
+            .environment = .legacy,
         } },
     });
     defer outcome.deinit(std.testing.allocator);
@@ -1906,6 +1959,7 @@ test "subagent automatic review sends only the current root request" {
             .resolved_cwd = "/tmp/workspace",
             .background = false,
             .target_os = .linux,
+            .environment = .legacy,
         } },
     });
     defer outcome.deinit(std.testing.allocator);
@@ -1958,6 +2012,7 @@ test "automatic review rejects an oversized complete packet without sending" {
             .resolved_cwd = "/tmp/workspace",
             .background = false,
             .target_os = .linux,
+            .environment = .legacy,
         } },
     });
     try std.testing.expectEqual(std.meta.Tag(ParseOutcome).invalid, std.meta.activeTag(outcome));
@@ -2092,6 +2147,7 @@ test "automatic review excludes assistant preamble and images" {
             .resolved_cwd = "/tmp/workspace",
             .background = false,
             .target_os = .linux,
+            .environment = .legacy,
         } },
     });
     defer outcome.deinit(std.testing.allocator);
@@ -2145,6 +2201,7 @@ test "automatic review ignores legacy authority completeness" {
             .resolved_cwd = "/tmp/workspace",
             .background = false,
             .target_os = .linux,
+            .environment = .legacy,
         } },
     });
     try std.testing.expectEqual(std.meta.Tag(ParseOutcome).invalid, std.meta.activeTag(outcome));
@@ -2168,6 +2225,7 @@ test "automatic review ignores legacy authority completeness" {
             .resolved_cwd = "/tmp/workspace",
             .background = false,
             .target_os = .linux,
+            .environment = .legacy,
         } },
     });
     try std.testing.expectEqual(
@@ -2281,9 +2339,166 @@ test "expired review budget fails closed before transport" {
             .resolved_cwd = "/tmp/workspace",
             .background = false,
             .target_os = .linux,
+            .environment = .legacy,
         } },
     });
 
     try std.testing.expectEqual(std.meta.Tag(ParseOutcome).invalid, std.meta.activeTag(outcome));
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
+test "command evidence names the exact shell invocation that will interpret the command" {
+    const Capture = struct {
+        payload: [8192]u8 = undefined,
+        len: usize = 0,
+
+        fn send(
+            raw_ctx: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            payload: []const u8,
+            _: std.Io.Clock.Timestamp,
+            _: *std.atomic.Value(bool),
+        ) anyerror!TransportOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+            const n = @min(payload.len, self.payload.len);
+            @memcpy(self.payload[0..n], payload[0..n]);
+            self.len = n;
+            return .{ .completion = .{ .completion = .{
+                .tool_calls = &.{.{
+                    .id = "review",
+                    .name = tool_name,
+                    .arguments_json = "{\"risk\":\"low\",\"authorization\":\"medium\",\"decision\":\"allow\",\"rationale\":\"safe\"}",
+                }},
+            } } };
+        }
+    };
+
+    var capture = Capture{};
+    const reviewer = Reviewer.withTransport(.{
+        .context = @ptrCast(&capture),
+        .send_fn = Capture.send,
+        .build_fn = buildTestReviewPayload,
+    }, null, 1000);
+
+    const pending_assistant = types.ChatMessage{
+        .role = .assistant,
+        .content = "checking the repository",
+        .tool_calls = &.{.{
+            .id = "call_git",
+            .name = "run_command",
+            .arguments_json = "{\"command\":\"git status\"}",
+        }},
+    };
+
+    // Both supported user shells load operator definitions, but through
+    // different startup flags. The evidence has to preserve each exact shape:
+    // Bash needs explicit alias expansion, while zsh gets it from interactive
+    // startup. The zsh case protects the default macOS path without requiring a
+    // zsh process on the test runner.
+    for ([_]struct {
+        shell: []const u8,
+        expected_invocation: []const u8,
+    }{
+        .{
+            .shell = "/bin/bash",
+            .expected_invocation = "'/bin/bash' '--login' '-O' 'expand_aliases' '-c'",
+        },
+        .{
+            .shell = "/bin/zsh",
+            .expected_invocation = "'/bin/zsh' '-l' '-i' '-c'",
+        },
+    }) |case| {
+        capture.len = 0;
+        var outcome = try reviewer.review(std.testing.allocator, .{
+            .review_turn = .{
+                .model = "openai/gpt-5",
+                .pending_assistant = pending_assistant,
+                .target_call_id = "call_git",
+                .origin = .root,
+                .current_root_request = "Check the repo status.",
+            },
+            .targets = &.{},
+            .action = .{ .command = .{
+                .command = "git status",
+                .resolved_cwd = "/tmp/workspace",
+                .background = false,
+                .target_os = .linux,
+                .environment = .{ .user = case.shell },
+            } },
+        });
+        defer outcome.deinit(std.testing.allocator);
+
+        const payload = capture.payload[0..capture.len];
+        try std.testing.expect(std.mem.find(u8, payload, "environment: user") != null);
+        try std.testing.expect(std.mem.find(u8, payload, case.shell) != null);
+
+        const invocation_line = std.mem.find(u8, payload, "environment_invocation:") orelse
+            return error.TestExpectedInvocation;
+        const rest = payload[invocation_line..];
+        const line_end = std.mem.findScalar(u8, rest, '\n') orelse rest.len;
+        const invocation = rest[0..line_end];
+        try std.testing.expect(std.mem.find(u8, invocation, case.expected_invocation) != null);
+    }
+}
+
+test "a shell-routed command whose shell is unnamed cannot be auto-approved" {
+    const AlwaysAllow = struct {
+        fn send(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: std.Io.Clock.Timestamp,
+            _: *std.atomic.Value(bool),
+        ) anyerror!TransportOutcome {
+            return .{ .completion = .{ .completion = .{
+                .tool_calls = &.{.{
+                    .id = "review",
+                    .name = tool_name,
+                    .arguments_json = "{\"risk\":\"low\",\"authorization\":\"medium\",\"decision\":\"allow\",\"rationale\":\"safe\"}",
+                }},
+            } } };
+        }
+    };
+
+    var ctx: usize = 0;
+    const reviewer = Reviewer.withTransport(.{
+        .context = @ptrCast(&ctx),
+        .send_fn = AlwaysAllow.send,
+        .build_fn = buildTestReviewPayload,
+    }, null, 1000);
+
+    const pending_assistant = types.ChatMessage{
+        .role = .assistant,
+        .content = "checking the repository",
+        .tool_calls = &.{.{
+            .id = "call_git",
+            .name = "run_command",
+            .arguments_json = "{\"command\":\"git status\"}",
+        }},
+    };
+
+    // Even with the model saying allow, evidence that cannot name the interpreter
+    // is incomplete, and incomplete action evidence goes to a human.
+    var outcome = try reviewer.review(std.testing.allocator, .{
+        .review_turn = .{
+            .model = "openai/gpt-5",
+            .pending_assistant = pending_assistant,
+            .target_call_id = "call_git",
+            .origin = .root,
+            .current_root_request = "Check the repo status.",
+        },
+        .targets = &.{},
+        .action = .{ .command = .{
+            .command = "git status",
+            .resolved_cwd = "/tmp/workspace",
+            .background = false,
+            .target_os = .linux,
+            .environment = .{ .user = "" },
+        } },
+    });
+    defer outcome.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(std.meta.Tag(ParseOutcome).invalid, std.meta.activeTag(outcome));
 }
