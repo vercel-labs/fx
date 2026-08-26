@@ -38,6 +38,12 @@ pub const RecoveryToolState = enum {
     uncertain,
 };
 
+pub const RecoveryCheckpointPhase = enum {
+    request_reservation,
+    request_settlement,
+    recovery,
+};
+
 pub const TurnAuthority = struct {
     provider: model_provider.ProviderId,
     model: []u8,
@@ -60,13 +66,14 @@ pub const TurnAuthority = struct {
 };
 
 pub const RecoveryCheckpoint = struct {
-    version: u8 = 2,
+    version: u8 = 3,
     turn_id: u64,
     user: session.UserTurn,
     assistant_source: []u8,
     execution: session.ExecutionMemory = .{},
-    cause: types.ModelRecoveryCause,
-    action: types.ModelRecoveryAction,
+    phase: RecoveryCheckpointPhase = .recovery,
+    cause: ?types.ModelRecoveryCause = null,
+    action: ?types.ModelRecoveryAction = null,
     tool_state: RecoveryToolState = .none,
     authority: TurnAuthority,
     requested_fast_mode: bool,
@@ -97,6 +104,7 @@ pub const RecoveryCheckpoint = struct {
             .user = user,
             .assistant_source = assistant_source,
             .execution = execution,
+            .phase = self.phase,
             .cause = self.cause,
             .action = self.action,
             .tool_state = self.tool_state,
@@ -566,12 +574,15 @@ fn validateStateWithPermissionMigration(
             return error.InvalidDurableField;
     }
     if (state.recovery_checkpoint) |checkpoint| {
-        if (checkpoint.version != 2 or
+        if (checkpoint.version < 1 or checkpoint.version > 3 or
             checkpoint.turn_id == 0 or
             checkpoint.max_provider_attempts == 0 or
             checkpoint.consumed_provider_attempts > checkpoint.max_provider_attempts or
             (checkpoint.outstanding_reservation and
-                checkpoint.consumed_provider_attempts >= checkpoint.max_provider_attempts))
+                checkpoint.consumed_provider_attempts >= checkpoint.max_provider_attempts) or
+            (checkpoint.version == 1 and
+                (checkpoint.cause == null or checkpoint.action == null)) or
+            !validRecoveryCheckpointPhase(checkpoint))
         {
             return error.InvalidDurableField;
         }
@@ -587,6 +598,17 @@ fn validateStateWithPermissionMigration(
             }
         }
     }
+}
+
+fn validRecoveryCheckpointPhase(checkpoint: RecoveryCheckpoint) bool {
+    return switch (checkpoint.phase) {
+        .request_reservation => checkpoint.outstanding_reservation and
+            checkpoint.action == null,
+        .request_settlement => !checkpoint.outstanding_reservation and
+            checkpoint.action == null,
+        .recovery => !checkpoint.outstanding_reservation and
+            checkpoint.cause != null and checkpoint.action != null,
+    };
 }
 
 pub fn validateModelPreference(value: []const u8) !void {
@@ -745,6 +767,7 @@ fn parsePermissionState(
 }
 
 pub fn writeRecoveryCheckpoint(writer: *std.Io.Writer, checkpoint: RecoveryCheckpoint) !void {
+    if (checkpoint.version < 1 or checkpoint.version > 3) return error.InvalidDurableField;
     try writer.print("{{\"version\":{d},\"turn_id\":{d},\"user\":", .{
         checkpoint.version,
         checkpoint.turn_id,
@@ -754,30 +777,49 @@ pub fn writeRecoveryCheckpoint(writer: *std.Io.Writer, checkpoint: RecoveryCheck
     try writeDurableBytes(writer, checkpoint.assistant_source);
     try writer.writeAll(",\"execution\":");
     try writeExecutionMemory(writer, checkpoint.execution);
+    if (checkpoint.version >= 2) {
+        try writer.writeAll(",\"phase\":");
+        try writeJsonString(writer, @tagName(checkpoint.phase));
+    }
     try writer.writeAll(",\"cause\":");
-    try writeJsonString(writer, @tagName(checkpoint.cause));
+    if (checkpoint.version == 1) {
+        try writeJsonString(writer, @tagName(checkpoint.cause orelse return error.InvalidDurableField));
+    } else {
+        try writeOptionalEnum(writer, checkpoint.cause);
+    }
     try writer.writeAll(",\"action\":");
-    try writeJsonString(writer, @tagName(checkpoint.action));
+    if (checkpoint.version == 1) {
+        try writeJsonString(writer, @tagName(checkpoint.action orelse return error.InvalidDurableField));
+    } else {
+        try writeOptionalEnum(writer, checkpoint.action);
+    }
     try writer.writeAll(",\"tool_state\":");
     try writeJsonString(writer, @tagName(checkpoint.tool_state));
-    try writer.writeAll(",\"authority\":{\"provider\":");
-    try writeJsonString(writer, @tagName(checkpoint.authority.provider));
-    try writer.writeAll(",\"model\":");
-    try writeDurableBytes(writer, checkpoint.authority.model);
-    try writer.writeAll(",\"credential_source\":");
-    if (checkpoint.authority.credential_source) |source| {
-        try writeJsonString(writer, @tagName(source));
+    if (checkpoint.version < 3) {
+        try writer.writeAll(",\"route_model\":");
+        try writeDurableBytes(writer, checkpoint.authority.model);
+        try writer.writeAll(",\"route_provider\":");
+        try writeJsonString(writer, @tagName(checkpoint.authority.provider));
     } else {
-        try writer.writeAll("null");
+        try writer.writeAll(",\"authority\":{\"provider\":");
+        try writeJsonString(writer, @tagName(checkpoint.authority.provider));
+        try writer.writeAll(",\"model\":");
+        try writeDurableBytes(writer, checkpoint.authority.model);
+        try writer.writeAll(",\"credential_source\":");
+        if (checkpoint.authority.credential_source) |source| {
+            try writeJsonString(writer, @tagName(source));
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"credential_identity\":");
+        if (checkpoint.authority.credential_identity) |identity| {
+            const hex = std.fmt.bytesToHex(identity.bytes, .lower);
+            try writeJsonString(writer, &hex);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeByte('}');
     }
-    try writer.writeAll(",\"credential_identity\":");
-    if (checkpoint.authority.credential_identity) |identity| {
-        const hex = std.fmt.bytesToHex(identity.bytes, .lower);
-        try writeJsonString(writer, &hex);
-    } else {
-        try writer.writeAll("null");
-    }
-    try writer.writeByte('}');
     try writer.print(",\"requested_fast_mode\":{s},\"fast_mode\":{s},\"max_provider_attempts\":{d},\"consumed_provider_attempts\":{d},\"outstanding_reservation\":{s}}}", .{
         if (checkpoint.requested_fast_mode) "true" else "false",
         if (checkpoint.fast_mode) "true" else "false",
@@ -958,6 +1000,8 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
 pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !RecoveryCheckpoint {
     const raw_object = try requireObject(value);
     const version = try requireU64(raw_object, "version");
+    const has_phase = raw_object.get("phase") != null;
+    const has_authority = raw_object.get("authority") != null;
     const object = switch (version) {
         1 => if (raw_object.get("route_provider") != null)
             try exactObject(value, &.{
@@ -971,10 +1015,25 @@ pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !Recover
                 "cause",     "action",                "tool_state",                 "route_model",             "requested_fast_mode",
                 "fast_mode", "max_provider_attempts", "consumed_provider_attempts", "outstanding_reservation",
             }),
-        2 => try exactObject(value, &.{
-            "version",   "turn_id",               "user",                       "assistant_source",        "execution",
-            "cause",     "action",                "tool_state",                 "authority",               "requested_fast_mode",
-            "fast_mode", "max_provider_attempts", "consumed_provider_attempts", "outstanding_reservation",
+        2 => if (has_phase and !has_authority)
+            try exactObject(value, &.{
+                "version",                 "turn_id",             "user",      "assistant_source",      "execution",
+                "phase",                   "cause",               "action",    "tool_state",            "route_model",
+                "route_provider",          "requested_fast_mode", "fast_mode", "max_provider_attempts", "consumed_provider_attempts",
+                "outstanding_reservation",
+            })
+        else if (!has_phase and has_authority)
+            try exactObject(value, &.{
+                "version",   "turn_id",               "user",                       "assistant_source",        "execution",
+                "cause",     "action",                "tool_state",                 "authority",               "requested_fast_mode",
+                "fast_mode", "max_provider_attempts", "consumed_provider_attempts", "outstanding_reservation",
+            })
+        else
+            return error.InvalidDurableField,
+        3 => try exactObject(value, &.{
+            "version",             "turn_id",   "user",                  "assistant_source",           "execution",
+            "phase",               "cause",     "action",                "tool_state",                 "authority",
+            "requested_fast_mode", "fast_mode", "max_provider_attempts", "consumed_provider_attempts", "outstanding_reservation",
         }),
         else => return error.InvalidDurableField,
     };
@@ -984,7 +1043,8 @@ pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !Recover
     errdefer alloc.free(assistant_source);
     const execution = try parseExecutionMemory(alloc, object.get("execution") orelse return error.InvalidSessionFormat);
     errdefer session.freeExecutionMemory(alloc, execution);
-    const authority = if (version == 1) legacy: {
+    const uses_legacy_route = version == 1 or (version == 2 and has_phase);
+    const authority = if (uses_legacy_route) legacy: {
         const model = try parseDurableBytes(alloc, object.get("route_model") orelse return error.InvalidSessionFormat);
         break :legacy TurnAuthority{
             .provider = if (object.get("route_provider")) |provider_value| blk: {
@@ -1002,16 +1062,39 @@ pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !Recover
         return error.InvalidDurableField;
     const consumed_provider_attempts = std.math.cast(usize, try requireU64(object, "consumed_provider_attempts")) orelse
         return error.InvalidDurableField;
+    const outstanding_reservation = try requireBool(object, "outstanding_reservation");
+    const has_explicit_phase = version == 3 or (version == 2 and has_phase);
+    const phase = if (has_explicit_phase)
+        std.meta.stringToEnum(
+            RecoveryCheckpointPhase,
+            try requireString(object, "phase"),
+        ) orelse return error.InvalidDurableField
+    else if (outstanding_reservation)
+        RecoveryCheckpointPhase.request_reservation
+    else
+        RecoveryCheckpointPhase.recovery;
+    const legacy_cause = !has_explicit_phase;
+    const cause = if (legacy_cause)
+        std.meta.stringToEnum(types.ModelRecoveryCause, try requireString(object, "cause")) orelse
+            return error.InvalidDurableField
+    else
+        try parseOptionalEnum(types.ModelRecoveryCause, object.get("cause") orelse return error.InvalidSessionFormat);
+    const action = if (phase == .request_reservation)
+        null
+    else if (legacy_cause)
+        std.meta.stringToEnum(types.ModelRecoveryAction, try requireString(object, "action")) orelse
+            return error.InvalidDurableField
+    else
+        try parseOptionalEnum(types.ModelRecoveryAction, object.get("action") orelse return error.InvalidSessionFormat);
     return .{
-        .version = 2,
+        .version = 3,
         .turn_id = try requireU64(object, "turn_id"),
         .user = user,
         .assistant_source = assistant_source,
         .execution = execution,
-        .cause = std.meta.stringToEnum(types.ModelRecoveryCause, try requireString(object, "cause")) orelse
-            return error.InvalidDurableField,
-        .action = std.meta.stringToEnum(types.ModelRecoveryAction, try requireString(object, "action")) orelse
-            return error.InvalidDurableField,
+        .phase = phase,
+        .cause = cause,
+        .action = action,
         .tool_state = std.meta.stringToEnum(RecoveryToolState, try requireString(object, "tool_state")) orelse
             return error.InvalidDurableField,
         .authority = authority,
@@ -1019,7 +1102,24 @@ pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !Recover
         .fast_mode = try requireBool(object, "fast_mode"),
         .max_provider_attempts = max_provider_attempts,
         .consumed_provider_attempts = consumed_provider_attempts,
-        .outstanding_reservation = try requireBool(object, "outstanding_reservation"),
+        .outstanding_reservation = outstanding_reservation,
+    };
+}
+
+fn writeOptionalEnum(writer: *std.Io.Writer, value: anytype) !void {
+    if (value) |item| {
+        try writeJsonString(writer, @tagName(item));
+    } else {
+        try writer.writeAll("null");
+    }
+}
+
+fn parseOptionalEnum(comptime T: type, value: std.json.Value) !?T {
+    return switch (value) {
+        .null => null,
+        .string => |text| std.meta.stringToEnum(T, text) orelse
+            return error.InvalidDurableField,
+        else => error.InvalidDurableField,
     };
 }
 
@@ -3328,8 +3428,7 @@ test "recovery checkpoint round trips while legacy state stays absent" {
         .turn_id = 42,
         .user = .{ .text = @constCast("keep working") },
         .assistant_source = @constCast("partial answer"),
-        .cause = .response_interrupted,
-        .action = .continuing_response,
+        .phase = .request_reservation,
         .tool_state = .confirmed,
         .authority = .{
             .provider = .codex,
@@ -3376,8 +3475,9 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     try std.testing.expectEqual(@as(u64, 42), restored.turn_id);
     try std.testing.expectEqualStrings("keep working", restored.user.text);
     try std.testing.expectEqualStrings("partial answer", restored.assistant_source);
-    try std.testing.expectEqual(types.ModelRecoveryCause.response_interrupted, restored.cause);
-    try std.testing.expectEqual(types.ModelRecoveryAction.continuing_response, restored.action);
+    try std.testing.expectEqual(RecoveryCheckpointPhase.request_reservation, restored.phase);
+    try std.testing.expect(restored.cause == null);
+    try std.testing.expect(restored.action == null);
     try std.testing.expectEqual(RecoveryToolState.confirmed, restored.tool_state);
     try std.testing.expectEqual(model_provider.ProviderId.codex, restored.authority.provider);
     try std.testing.expectEqualStrings("gpt-5.4-mini", restored.authority.model);
@@ -3388,6 +3488,96 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     try std.testing.expect(restored.fast_mode);
     try std.testing.expectEqual(@as(usize, 4), restored.consumed_provider_attempts);
     try std.testing.expect(restored.outstanding_reservation);
+
+    var version_one_checkpoint = checkpoint;
+    version_one_checkpoint.version = 1;
+    version_one_checkpoint.phase = .recovery;
+    version_one_checkpoint.cause = .response_interrupted;
+    version_one_checkpoint.action = .continuing_response;
+    version_one_checkpoint.outstanding_reservation = false;
+    var version_one_state = state;
+    version_one_state.recovery_checkpoint = version_one_checkpoint;
+    var version_one_encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer version_one_encoded.deinit();
+    _ = try encodeState(version_one_state, &version_one_encoded.writer);
+    try std.testing.expect(std.mem.find(
+        u8,
+        version_one_encoded.written(),
+        "\"phase\"",
+    ) == null);
+    var version_one_source = std.Io.Reader.fixed(version_one_encoded.written());
+    var version_one_decoded = try decodeState(alloc, &version_one_source, .{});
+    defer version_one_decoded.deinit(alloc);
+    const version_one_restored = version_one_decoded.recovery_checkpoint.?;
+    try std.testing.expectEqual(@as(u8, 3), version_one_restored.version);
+    try std.testing.expectEqual(RecoveryCheckpointPhase.recovery, version_one_restored.phase);
+    try std.testing.expectEqual(
+        types.ModelRecoveryCause.response_interrupted,
+        version_one_restored.cause,
+    );
+    try std.testing.expectEqual(
+        types.ModelRecoveryAction.continuing_response,
+        version_one_restored.action,
+    );
+
+    var phase_version_two_checkpoint = checkpoint;
+    phase_version_two_checkpoint.version = 2;
+    var phase_version_two_state = state;
+    phase_version_two_state.recovery_checkpoint = phase_version_two_checkpoint;
+    var phase_version_two_encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer phase_version_two_encoded.deinit();
+    _ = try encodeState(phase_version_two_state, &phase_version_two_encoded.writer);
+    try std.testing.expect(std.mem.find(
+        u8,
+        phase_version_two_encoded.written(),
+        "\"route_model\":\"gpt-5.4-mini\"",
+    ) != null);
+    var phase_version_two_source = std.Io.Reader.fixed(phase_version_two_encoded.written());
+    var phase_version_two_decoded = try decodeState(alloc, &phase_version_two_source, .{});
+    defer phase_version_two_decoded.deinit(alloc);
+    const phase_version_two_restored = phase_version_two_decoded.recovery_checkpoint.?;
+    try std.testing.expectEqual(@as(u8, 3), phase_version_two_restored.version);
+    try std.testing.expectEqual(RecoveryCheckpointPhase.request_reservation, phase_version_two_restored.phase);
+    try std.testing.expectEqualStrings("gpt-5.4-mini", phase_version_two_restored.authority.model);
+    try std.testing.expect(phase_version_two_restored.authority.credential_source == null);
+
+    var authority_version_two_checkpoint = checkpoint;
+    authority_version_two_checkpoint.phase = .recovery;
+    authority_version_two_checkpoint.cause = .response_interrupted;
+    authority_version_two_checkpoint.action = .continuing_response;
+    authority_version_two_checkpoint.outstanding_reservation = false;
+    var authority_version_two_state = state;
+    authority_version_two_state.recovery_checkpoint = authority_version_two_checkpoint;
+    var authority_version_three_encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer authority_version_three_encoded.deinit();
+    _ = try encodeState(authority_version_two_state, &authority_version_three_encoded.writer);
+    const authority_version_two_number = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        authority_version_three_encoded.written(),
+        "\"recovery_checkpoint\":{\"version\":3",
+        "\"recovery_checkpoint\":{\"version\":2",
+    );
+    defer alloc.free(authority_version_two_number);
+    const authority_version_two_bytes = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        authority_version_two_number,
+        ",\"phase\":\"recovery\"",
+        "",
+    );
+    defer alloc.free(authority_version_two_bytes);
+    var authority_version_two_source = std.Io.Reader.fixed(authority_version_two_bytes);
+    var authority_version_two_decoded = try decodeState(alloc, &authority_version_two_source, .{});
+    defer authority_version_two_decoded.deinit(alloc);
+    const authority_version_two_restored = authority_version_two_decoded.recovery_checkpoint.?;
+    try std.testing.expectEqual(@as(u8, 3), authority_version_two_restored.version);
+    try std.testing.expectEqual(RecoveryCheckpointPhase.recovery, authority_version_two_restored.phase);
+    try std.testing.expectEqualStrings("gpt-5.4-mini", authority_version_two_restored.authority.model);
+    try std.testing.expectEqual(
+        types.CredentialSource.chatgpt_subscription,
+        authority_version_two_restored.authority.credential_source.?,
+    );
 
     const legacy =
         "{\"id\":\"legacy\",\"origin_workspace_root\":\"/tmp/origin\",\"workspace_root\":\"/tmp/current\",\"created_at_ms\":1,\"updated_at_ms\":2,\"conversation_language\":\"en\",\"preferences\":{\"model\":\"openai/gpt-test\",\"effort\":\"auto\",\"fast_mode\":false},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0}";

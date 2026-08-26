@@ -1430,8 +1430,9 @@ noinline fn effectiveRecoveryToolEvidence(
 }
 
 fn restoredRecoveryCause(
-    cause: types.ModelRecoveryCause,
+    maybe_cause: ?types.ModelRecoveryCause,
 ) model_response_recovery.FailureCause {
+    const cause = maybe_cause orelse return .transport_interrupted;
     return switch (cause) {
         .network_interrupted => .transport_interrupted,
         .response_interrupted => .response_interrupted,
@@ -1457,7 +1458,7 @@ fn restoredRecoveryToolEvidence(
 fn restoredRecoveryStrategy(
     checkpoint: session_codec.RecoveryCheckpoint,
 ) ?model_response_recovery.Strategy {
-    if (checkpoint.cause == .request_limit_reached) return null;
+    if (checkpoint.cause == types.ModelRecoveryCause.request_limit_reached) return null;
     return switch (checkpoint.tool_state) {
         .proven_unexecuted => .regenerate_tool,
         .confirmed => .continue_after_confirmed_tool,
@@ -1605,8 +1606,8 @@ fn checkpointCause(
 
 fn checkpointAction(
     strategy: ?model_response_recovery.Strategy,
-) types.ModelRecoveryAction {
-    return switch (strategy orelse .retry_request) {
+) ?types.ModelRecoveryAction {
+    return switch (strategy orelse return null) {
         .retry_request => .retrying_request,
         .continue_response => .continuing_response,
         .regenerate_tool => .regenerating_tool,
@@ -1668,6 +1669,7 @@ fn persistRecoveryCheckpoint(
     attempt_limit: usize,
     consumed_attempts: usize,
     outstanding_reservation: bool,
+    phase: session_codec.RecoveryCheckpointPhase,
     cause: model_response_recovery.FailureCause,
     strategy: ?model_response_recovery.Strategy,
     tool_evidence: model_response_recovery.ToolEvidence,
@@ -1686,8 +1688,12 @@ fn persistRecoveryCheckpoint(
         },
         .assistant_source = @constCast(assistant_source),
         .execution = execution,
-        .cause = checkpointCause(cause),
-        .action = checkpointAction(strategy),
+        .phase = phase,
+        .cause = if (phase == .recovery or strategy != null)
+            checkpointCause(cause)
+        else
+            null,
+        .action = if (phase == .recovery) checkpointAction(strategy) else null,
         .tool_state = checkpointToolState(tool_evidence),
         .authority = .{
             .provider = job.provider,
@@ -1711,13 +1717,14 @@ fn persistRecoveryCheckpoint(
         "agent",
         "recovery_checkpoint_set",
         trace_ctx,
-        "provider_attempts={d}/{d} outstanding={s} cause={s} action={s}",
+        "phase={s} provider_attempts={d}/{d} outstanding={s} cause={s} action={s}",
         .{
+            @tagName(phase),
             consumed_attempts,
             attempt_limit,
             if (outstanding_reservation) "true" else "false",
-            @tagName(cause),
-            @tagName(strategy orelse .retry_request),
+            if (phase == .recovery or strategy != null) @tagName(cause) else "none",
+            if (phase == .recovery) @tagName(strategy orelse .retry_request) else "none",
         },
     );
 }
@@ -2920,6 +2927,7 @@ fn processQueuedPromptLoop(
                     semantic_limit,
                     semantic_attempt,
                     false,
+                    .recovery,
                     recovery_cause,
                     recovery_strategy,
                     preserved_tool_evidence,
@@ -2956,6 +2964,7 @@ fn processQueuedPromptLoop(
                     semantic_limit,
                     semantic_attempt,
                     false,
+                    .recovery,
                     recovery_cause,
                     recovery_strategy,
                     preserved_tool_evidence,
@@ -3085,6 +3094,7 @@ fn processQueuedPromptLoop(
                     semantic_limit,
                     semantic_attempt,
                     true,
+                    .request_reservation,
                     recovery_cause,
                     recovery_strategy,
                     effectiveRecoveryToolEvidence(
@@ -3183,6 +3193,7 @@ fn processQueuedPromptLoop(
                         semantic_limit,
                         consumed_attempts,
                         false,
+                        .recovery,
                         failure_cause,
                         .pause,
                         effectiveRecoveryToolEvidence(
@@ -3279,6 +3290,7 @@ fn processQueuedPromptLoop(
                     semantic_limit,
                     consumed_attempts,
                     false,
+                    .recovery,
                     failure_cause,
                     recovery_decision.strategy,
                     effectiveRecoveryToolEvidence(
@@ -3320,6 +3332,7 @@ fn processQueuedPromptLoop(
                         semantic_limit,
                         consumed_attempts,
                         false,
+                        .recovery,
                         failure_cause,
                         .pause,
                         effectiveRecoveryToolEvidence(
@@ -3545,6 +3558,7 @@ fn processQueuedPromptLoop(
                     semantic_limit,
                     semantic_attempt + 1,
                     false,
+                    .recovery,
                     recovery_cause,
                     .pause,
                     .uncertain,
@@ -3606,6 +3620,7 @@ fn processQueuedPromptLoop(
                     semantic_limit,
                     settled_attempts,
                     false,
+                    .request_settlement,
                     recovery_cause,
                     recovery_strategy,
                     effectiveRecoveryToolEvidence(
@@ -3689,7 +3704,7 @@ fn processQueuedPromptLoop(
                     failure.detail orelse "",
                 );
                 latest_recovery_diagnostic = diagnostic;
-                const route_changed = disableFastRouteAfterFailure(
+                _ = disableFastRouteAfterFailure(
                     &route_fast_mode,
                     &gateway_model,
                     job.model,
@@ -3728,6 +3743,7 @@ fn processQueuedPromptLoop(
                         semantic_limit,
                         semantic_attempt + 1,
                         false,
+                        .recovery,
                         cause,
                         .pause,
                         effectiveRecoveryToolEvidence(
@@ -3751,33 +3767,32 @@ fn processQueuedPromptLoop(
                     return;
                 }
                 if (decision.reserve_provider_attempt) {
-                    if (route_changed) {
-                        try persistRecoveryCheckpoint(
-                            deps,
+                    try persistRecoveryCheckpoint(
+                        deps,
+                        arena,
+                        job,
+                        within_turn_suffix.items,
+                        try recoveryCheckpointAssistantSource(
                             arena,
-                            job,
-                            within_turn_suffix.items,
-                            try recoveryCheckpointAssistantSource(
-                                arena,
-                                stop_state,
-                                stream_ctx.raw_text.items,
-                            ),
-                            gateway_model,
-                            selected_fast_mode,
-                            route_fast_mode,
-                            semantic_limit,
-                            semantic_attempt + 1,
-                            false,
-                            cause,
-                            decision.strategy,
-                            effectiveRecoveryToolEvidence(
-                                preserved_tool_evidence,
-                                response_completion,
-                                &stream_ctx,
-                            ),
-                            step_ctx,
-                        );
-                    }
+                            stop_state,
+                            stream_ctx.raw_text.items,
+                        ),
+                        gateway_model,
+                        selected_fast_mode,
+                        route_fast_mode,
+                        semantic_limit,
+                        semantic_attempt + 1,
+                        false,
+                        .recovery,
+                        cause,
+                        decision.strategy,
+                        effectiveRecoveryToolEvidence(
+                            preserved_tool_evidence,
+                            response_completion,
+                            &stream_ctx,
+                        ),
+                        step_ctx,
+                    );
                     try pushAutoRetryStatus(
                         deps,
                         semantic_attempt + 1,
@@ -3899,7 +3914,7 @@ fn processQueuedPromptLoop(
                         decision.reserve_provider_attempt,
                     );
                 }
-                const route_changed = disableFastRouteAfterFailure(
+                _ = disableFastRouteAfterFailure(
                     &route_fast_mode,
                     &gateway_model,
                     job.model,
@@ -3924,6 +3939,7 @@ fn processQueuedPromptLoop(
                         semantic_limit,
                         semantic_attempt + 1,
                         false,
+                        .recovery,
                         cause,
                         .pause,
                         effectiveRecoveryToolEvidence(
@@ -3946,33 +3962,32 @@ fn processQueuedPromptLoop(
                     return;
                 }
                 if (decision.reserve_provider_attempt) {
-                    if (route_changed) {
-                        try persistRecoveryCheckpoint(
-                            deps,
+                    try persistRecoveryCheckpoint(
+                        deps,
+                        arena,
+                        job,
+                        within_turn_suffix.items,
+                        try recoveryCheckpointAssistantSource(
                             arena,
-                            job,
-                            within_turn_suffix.items,
-                            try recoveryCheckpointAssistantSource(
-                                arena,
-                                stop_state,
-                                partial_assistant,
-                            ),
-                            gateway_model,
-                            selected_fast_mode,
-                            route_fast_mode,
-                            semantic_limit,
-                            semantic_attempt + 1,
-                            false,
-                            cause,
-                            decision.strategy,
-                            effectiveRecoveryToolEvidence(
-                                preserved_tool_evidence,
-                                attempt_completion,
-                                &stream_ctx,
-                            ),
-                            step_ctx,
-                        );
-                    }
+                            stop_state,
+                            partial_assistant,
+                        ),
+                        gateway_model,
+                        selected_fast_mode,
+                        route_fast_mode,
+                        semantic_limit,
+                        semantic_attempt + 1,
+                        false,
+                        .recovery,
+                        cause,
+                        decision.strategy,
+                        effectiveRecoveryToolEvidence(
+                            preserved_tool_evidence,
+                            attempt_completion,
+                            &stream_ctx,
+                        ),
+                        step_ctx,
+                    );
                     try pushAutoRetryStatus(
                         deps,
                         semantic_attempt + 1,
