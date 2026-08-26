@@ -500,6 +500,7 @@ pub const FakeAgentRuntimeDeps = struct {
     executed_names: std.ArrayList([]u8) = .empty,
     executed_call_ids: std.ArrayList([]u8) = .empty,
     rejected_names: std.ArrayList([]u8) = .empty,
+    usage_reports: std.ArrayList(types.Usage) = .empty,
     inner_usage_names: std.ArrayList([]u8) = .empty,
     inner_usages: std.ArrayList(types.ToolUsage) = .empty,
     validated_names: std.ArrayList([]u8) = .empty,
@@ -679,6 +680,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.executed_names);
         freeStringList(self.alloc, &self.executed_call_ids);
         freeStringList(self.alloc, &self.rejected_names);
+        self.usage_reports.deinit(self.alloc);
         freeStringList(self.alloc, &self.inner_usage_names);
         self.inner_usages.deinit(self.alloc);
         freeStringList(self.alloc, &self.validated_names);
@@ -764,6 +766,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .resolve_model_capabilities = resolveModelCapabilities,
             .format_tool_execution_error = formatError,
             .record_tool_call_rejected = recordRejected,
+            .report_usage = reportUsage,
             .report_inner_tool_usage = reportCapturedInnerToolUsage,
             .usage = self.usage,
             .usage_allocator = self.alloc,
@@ -1464,6 +1467,11 @@ pub const FakeAgentRuntimeDeps = struct {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         self.inner_usage_names.append(self.alloc, self.alloc.dupe(u8, tool_name) catch return) catch return;
         self.inner_usages.append(self.alloc, usage) catch return;
+    }
+
+    fn reportUsage(raw: *anyopaque, usage: types.Usage) void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.usage_reports.append(self.alloc, usage) catch return;
     }
 
     fn recordRejected(raw: *anyopaque, _: Allocator, call: ToolCall, _: []const u8, _: ?[]const u8) !void {

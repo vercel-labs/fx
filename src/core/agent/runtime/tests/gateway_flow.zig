@@ -3177,6 +3177,22 @@ test "processQueuedPrompt emits submitted prompt token update before streamed ou
     try std.testing.expect(input_idx.? < text_idx.?);
 }
 
+test "processQueuedPrompt reports a settled completion without provider token usage" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "done" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.usage_reports.items.len);
+    try std.testing.expect(hooks.usage_reports.items[0].input_tokens == null);
+    try std.testing.expect(hooks.usage_reports.items[0].output_tokens == null);
+}
+
 test "processQueuedPrompt excludes assistant-authored subagent prompts from input progress" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{
