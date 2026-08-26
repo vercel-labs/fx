@@ -1708,7 +1708,14 @@ fn runGithubWorkflow(
     deps: RunDeps,
     workflow: github_workflows.Workflow,
 ) !RunResult {
-    const opts = try parseWorkflowArgs(alloc, args);
+    const opts = parseWorkflowArgs(alloc, args) catch |err| {
+        if (err != error.InvalidWorkflowArgs) return err;
+        try writeTopLevelUsage(cfg.command_catalog, deps, switch (workflow) {
+            .pull_request => .pr,
+            .issue => .issue,
+        });
+        return .handled_failure;
+    };
     defer opts.deinit(alloc);
 
     const prompt = switch (workflow) {
@@ -3409,6 +3416,13 @@ fn parseWorkflowArgs(alloc: Allocator, args: []const [:0]const u8) !WorkflowOpti
             create = true;
             continue;
         }
+        if (std.mem.eql(u8, args[start_index], "--")) {
+            start_index += 1;
+            break;
+        }
+        if (std.mem.startsWith(u8, args[start_index], "-")) {
+            return error.InvalidWorkflowArgs;
+        }
         break;
     }
 
@@ -4124,6 +4138,26 @@ test "parse workflow args consumes leading flags and joins remaining context exa
     try std.testing.expect(!later_flag.auto_permission);
     try std.testing.expect(!later_flag.create);
     try std.testing.expectEqualStrings("context --auto", later_flag.context);
+
+    var dashed_context = try parseWorkflowArgs(std.testing.allocator, &.{
+        @constCast("--auto"),
+        @constCast("--"),
+        @constCast("--create"),
+        @constCast("details"),
+    });
+    defer dashed_context.deinit(std.testing.allocator);
+    try std.testing.expect(dashed_context.auto_permission);
+    try std.testing.expect(!dashed_context.create);
+    try std.testing.expectEqualStrings("--create details", dashed_context.context);
+
+    try std.testing.expectError(
+        error.InvalidWorkflowArgs,
+        parseWorkflowArgs(std.testing.allocator, &.{@constCast("--bogus")}),
+    );
+    try std.testing.expectError(
+        error.InvalidWorkflowArgs,
+        parseWorkflowArgs(std.testing.allocator, &.{ @constCast("--create"), @constCast("-x") }),
+    );
 
     var empty = try parseWorkflowArgs(std.testing.allocator, &.{});
     defer empty.deinit(std.testing.allocator);

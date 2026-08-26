@@ -3843,6 +3843,27 @@ describe("cli: interactive startup", () => {
 
 describe("cli: pr", () => {
   test(
+    "fx pr rejects an unknown leading option before gateway auth",
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), "fx-e2e-noauth-"));
+      try {
+        const r = await runFx(["pr", "--bogus"], {
+          env: { ...NO_GATEWAY_AUTH, HOME: home, FX_DISABLE_KEYCHAIN: "1" },
+        });
+        expect(r.code).not.toBe(0);
+        expect(r.stdout).toBe("");
+        expect(r.stderr).toBe(
+          "usage: fx pr [--auto] [--create] [--] [context]\n",
+        );
+        expect(readdirSync(home)).toEqual([]);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "fx pr without gateway auth exits non-zero",
     async () => {
       const home = mkdtempSync(join(tmpdir(), "fx-e2e-noauth-"));
@@ -3861,6 +3882,27 @@ describe("cli: pr", () => {
 });
 
 describe("cli: issue", () => {
+  test(
+    "fx issue rejects an unknown leading option before gateway auth",
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), "fx-e2e-noauth-"));
+      try {
+        const r = await runFx(["issue", "--bogus"], {
+          env: { ...NO_GATEWAY_AUTH, HOME: home, FX_DISABLE_KEYCHAIN: "1" },
+        });
+        expect(r.code).not.toBe(0);
+        expect(r.stdout).toBe("");
+        expect(r.stderr).toBe(
+          "usage: fx issue [--auto] [--create] [--] [context]\n",
+        );
+        expect(readdirSync(home)).toEqual([]);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   test(
     "fx issue without gateway auth exits non-zero",
     async () => {

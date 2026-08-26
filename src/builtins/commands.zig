@@ -66,24 +66,30 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .pr,
         .token = "pr",
-        .usage = "pr [--auto] [--create] [context]",
+        .usage = "pr [--auto] [--create] [--] [context]",
         .summary = "Draft or publish a pull request",
         .options = &.{
             .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
             .{ .flag = "--create", .description = "Publish the drafted pull request via the GitHub CLI" },
+            .{ .flag = "--", .description = "Treat every following argument as context" },
         },
         .details = &.{
             "Must run inside a git repository. Without --create, the drafted PR is printed only.",
+            "Use -- before context that starts with -.",
         },
     },
     .{
         .kind = .issue,
         .token = "issue",
-        .usage = "issue [--auto] [--create] [context]",
+        .usage = "issue [--auto] [--create] [--] [context]",
         .summary = "Draft or publish a GitHub issue",
         .options = &.{
             .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
             .{ .flag = "--create", .description = "Publish the drafted issue via the GitHub CLI" },
+            .{ .flag = "--", .description = "Treat every following argument as context" },
+        },
+        .details = &.{
+            "Use -- before context that starts with -.",
         },
     },
     .{
