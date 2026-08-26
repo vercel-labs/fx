@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
 const command_environment = @import("../execution/command_environment.zig");
+const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -23,15 +24,38 @@ fn shellKind(path: []const u8) ?ShellKind {
     return null;
 }
 
-fn fallbackLoginShell() []const u8 {
-    return if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash";
+fn shellIsExecutable(path: []const u8) bool {
+    const cwd = std.Io.Dir.cwd();
+    const stat = cwd.statFile(io_mod.getIo(), path, .{}) catch return false;
+    if (stat.kind != .file) return false;
+    cwd.access(io_mod.getIo(), path, .{ .execute = true }) catch return false;
+    return true;
+}
+
+fn firstExecutableShell(candidates: []const []const u8) ?[]const u8 {
+    for (candidates) |candidate| {
+        if (shellIsExecutable(candidate)) return candidate;
+    }
+    return null;
+}
+
+/// Platform-ordered fallback shells, filtered to executable regular files so a
+/// missing interpreter surfaces as MissingLoginShell instead of a later
+/// spawn failure.
+fn fallbackLoginShell() ?[]const u8 {
+    const candidates: []const []const u8 = if (builtin.os.tag == .macos)
+        &.{ "/bin/zsh", "/bin/bash" }
+    else
+        &.{ "/bin/bash", "/bin/zsh" };
+    return firstExecutableShell(candidates);
 }
 
 fn supportedLoginShell(configured_login_shell: ?[]const u8) ResolveError![]const u8 {
-    const path = configured_login_shell orelse return error.MissingLoginShell;
+    const path = configured_login_shell orelse
+        return fallbackLoginShell() orelse error.MissingLoginShell;
     if (!std.fs.path.isAbsolute(path)) return error.RelativeShellPath;
-    if (shellKind(path) != null) return path;
-    return fallbackLoginShell();
+    if (shellKind(path) != null and shellIsExecutable(path)) return path;
+    return fallbackLoginShell() orelse error.MissingLoginShell;
 }
 
 pub const Invocation = struct {
@@ -102,9 +126,38 @@ pub fn resolve(
     return result;
 }
 
+const PasswdLoginShell = union(enum) {
+    missing_entry,
+    unavailable,
+    shell: []const u8,
+};
+
+/// Login shell for the current uid. A passwd entry is authoritative; SHELL is
+/// consulted only when the uid has no passwd entry, as is common in hardened
+/// containers started with an arbitrary --user value.
 pub fn configuredLoginShellInto(buffer: []u8) ?[]const u8 {
+    return configuredLoginShellFromSources(
+        passwdLoginShellInto(buffer),
+        io_mod.getenv("SHELL"),
+        buffer,
+    );
+}
+
+fn configuredLoginShellFromSources(
+    passwd: PasswdLoginShell,
+    shell_env: ?[]const u8,
+    buffer: []u8,
+) ?[]const u8 {
+    return switch (passwd) {
+        .shell => |shell| shell,
+        .unavailable => null,
+        .missing_entry => validatedShellValue(shell_env, buffer),
+    };
+}
+
+fn passwdLoginShellInto(buffer: []u8) PasswdLoginShell {
     if (comptime !builtin.link_libc or builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        return null;
+        return .unavailable;
     }
     var entry: std.c.passwd = undefined;
     var scratch: [4096]u8 = undefined;
@@ -115,11 +168,19 @@ pub fn configuredLoginShellInto(buffer: []u8) ?[]const u8 {
         &scratch,
         scratch.len,
         &found,
-    ) != 0) return null;
-    const record = found orelse return null;
-    const shell_ptr = record.shell orelse return null;
+    ) != 0) return .unavailable;
+    const record = found orelse return .missing_entry;
+    const shell_ptr = record.shell orelse return .unavailable;
     const shell = std.mem.span(shell_ptr);
+    if (shell.len == 0 or shell.len > buffer.len) return .unavailable;
+    @memcpy(buffer[0..shell.len], shell);
+    return .{ .shell = buffer[0..shell.len] };
+}
+
+fn validatedShellValue(value: ?[]const u8, buffer: []u8) ?[]const u8 {
+    const shell = value orelse return null;
     if (shell.len == 0 or shell.len > buffer.len) return null;
+    if (!std.fs.path.isAbsolute(shell) or !shellIsExecutable(shell)) return null;
     @memcpy(buffer[0..shell.len], shell);
     return buffer[0..shell.len];
 }
@@ -181,7 +242,7 @@ pub fn capturedInvocation(environment_value: Environment, command: []const u8) R
         },
         .user => |path| {
             var invocation = try resolve(path, .user_login);
-            if (std.mem.eql(u8, std.fs.path.basename(path), "bash")) {
+            if (std.mem.eql(u8, std.fs.path.basename(invocation.path), "bash")) {
                 removeInteractiveFlag(&invocation);
                 invocation.append("-O");
                 invocation.append("expand_aliases");
@@ -297,6 +358,21 @@ fn appendShellWord(
     try output.append(alloc, '\'');
 }
 
+/// Creates an executable shell fixture. The caller owns the returned path.
+fn createExecutableTestShell(
+    alloc: Allocator,
+    dir: std.Io.Dir,
+    name: []const u8,
+) ![]u8 {
+    var file = try dir.createFile(std.testing.io, name, .{});
+    defer file.close(std.testing.io);
+    try file.setPermissions(
+        std.testing.io,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    return io_mod.dirRealpathAlloc(alloc, dir, name);
+}
+
 test "resolver builds Bash and zsh interactive argv" {
     const bash = try resolve("/bin/bash", .user_login);
     try std.testing.expectEqualSlices(
@@ -338,11 +414,22 @@ test "resolver makes clean startup explicit" {
     );
 }
 
-test "resolver rejects missing relative and unsupported shells" {
-    try std.testing.expectError(
-        error.MissingLoginShell,
-        resolve(null, .user_login),
-    );
+test "resolver falls back to an existing platform shell without a passwd shell" {
+    const expected_fallback = fallbackLoginShell() orelse return error.SkipZigTest;
+    const resolved = try resolve(null, .user_login);
+    try std.testing.expectEqualStrings(expected_fallback, resolved.path);
+    switch (shellKind(expected_fallback) orelse return error.TestUnexpectedResult) {
+        .bash => try std.testing.expectEqualSlices(
+            []const u8,
+            &.{ expected_fallback, "--login", "-i" },
+            resolved.argv(),
+        ),
+        .zsh => try std.testing.expectEqualSlices(
+            []const u8,
+            &.{ expected_fallback, "-l", "-i" },
+            resolved.argv(),
+        ),
+    }
     try std.testing.expectError(
         error.RelativeShellPath,
         resolve(null, .{ .executable = .{ .path = "zsh" } }),
@@ -353,23 +440,90 @@ test "resolver rejects missing relative and unsupported shells" {
     );
 }
 
+test "SHELL fallback is limited to a missing passwd entry" {
+    const executable_shell = fallbackLoginShell() orelse return error.SkipZigTest;
+    var buffer: [4096]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        executable_shell,
+        configuredLoginShellFromSources(.missing_entry, executable_shell, &buffer).?,
+    );
+    try std.testing.expect(
+        configuredLoginShellFromSources(.unavailable, executable_shell, &buffer) == null,
+    );
+    try std.testing.expectEqualStrings(
+        "/configured/login/bash",
+        configuredLoginShellFromSources(
+            .{ .shell = "/configured/login/bash" },
+            executable_shell,
+            &buffer,
+        ).?,
+    );
+}
+
+test "validated SHELL fallback accepts only executable regular absolute values" {
+    const alloc = std.testing.allocator;
+    const executable_shell = fallbackLoginShell() orelse return error.SkipZigTest;
+    var buffer: [4096]u8 = undefined;
+    try std.testing.expect(validatedShellValue(null, &buffer) == null);
+    try std.testing.expect(validatedShellValue("", &buffer) == null);
+    try std.testing.expect(validatedShellValue("zsh", &buffer) == null);
+    try std.testing.expect(validatedShellValue("/fx-no-such-shell/bash", &buffer) == null);
+    var tiny: [2]u8 = undefined;
+    try std.testing.expect(validatedShellValue(executable_shell, &tiny) == null);
+    const accepted = validatedShellValue(executable_shell, &buffer) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(executable_shell, accepted);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "zsh", .default_dir);
+    const directory_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "zsh");
+    defer alloc.free(directory_path);
+    try std.testing.expect(validatedShellValue(directory_path, &buffer) == null);
+
+    var file = try tmp.dir.createFile(std.testing.io, "bash", .{});
+    defer file.close(std.testing.io);
+    const file_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "bash");
+    defer alloc.free(file_path);
+    try std.testing.expect(validatedShellValue(file_path, &buffer) == null);
+
+    try file.setPermissions(
+        std.testing.io,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    try std.testing.expectEqualStrings(
+        file_path,
+        validatedShellValue(file_path, &buffer).?,
+    );
+}
+
+test "fallback shell selection skips missing earlier candidates" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const missing_bash = try std.fs.path.join(alloc, &.{ root, "bash" });
+    defer alloc.free(missing_bash);
+    const zsh_path = try createExecutableTestShell(alloc, tmp.dir, "zsh");
+    defer alloc.free(zsh_path);
+
+    try std.testing.expectEqualStrings(
+        zsh_path,
+        firstExecutableShell(&.{ missing_bash, zsh_path }).?,
+    );
+    try std.testing.expect(firstExecutableShell(&.{missing_bash}) == null);
+}
+
 test "login shell resolution falls back without accepting explicit unsupported shells" {
     const fallback = try resolve("/opt/homebrew/bin/fish", .user_login);
-    try std.testing.expectEqualStrings(fallbackLoginShell(), fallback.path);
-    if (builtin.os.tag == .macos) {
-        try std.testing.expectEqualSlices(
-            []const u8,
-            &.{ "/bin/zsh", "-l", "-i" },
-            fallback.argv(),
-        );
-    } else {
-        try std.testing.expectEqualSlices(
-            []const u8,
-            &.{ "/bin/bash", "--login", "-i" },
-            fallback.argv(),
-        );
-    }
-
+    const expected_fallback = fallbackLoginShell() orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(expected_fallback, fallback.path);
+    try std.testing.expectEqualStrings(
+        expected_fallback,
+        (try resolve("/fx-no-such-shell/bash", .user_login)).path,
+    );
     try std.testing.expectError(
         error.UnsupportedShell,
         resolve(null, .{ .executable = .{ .path = "/opt/homebrew/bin/fish" } }),
@@ -377,30 +531,58 @@ test "login shell resolution falls back without accepting explicit unsupported s
 }
 
 test "captured profiles use exact non-PTY argv" {
-    const bash_clean = try capturedInvocation(.{ .clean = "/bin/bash" }, "printf clean");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bash_path = try createExecutableTestShell(alloc, tmp.dir, "bash");
+    defer alloc.free(bash_path);
+    const zsh_path = try createExecutableTestShell(alloc, tmp.dir, "zsh");
+    defer alloc.free(zsh_path);
+
+    const bash_clean = try capturedInvocation(.{ .clean = bash_path }, "printf clean");
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{ "/bin/bash", "--noprofile", "--norc", "-c", "printf clean" },
+        &.{ bash_path, "--noprofile", "--norc", "-c", "printf clean" },
         bash_clean.argv(),
     );
-    const bash_user = try capturedInvocation(.{ .user = "/bin/bash" }, "printf user");
+    const bash_user = try capturedInvocation(.{ .user = bash_path }, "printf user");
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{ "/bin/bash", "--login", "-O", "expand_aliases", "-c", "printf user" },
+        &.{ bash_path, "--login", "-O", "expand_aliases", "-c", "printf user" },
         bash_user.argv(),
     );
-    const zsh_clean = try capturedInvocation(.{ .clean = "/bin/zsh" }, "printf clean");
+    const zsh_clean = try capturedInvocation(.{ .clean = zsh_path }, "printf clean");
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{ "/bin/zsh", "-f", "-c", "printf clean" },
+        &.{ zsh_path, "-f", "-c", "printf clean" },
         zsh_clean.argv(),
     );
-    const zsh_user = try capturedInvocation(.{ .user = "/bin/zsh" }, "printf user");
+    const zsh_user = try capturedInvocation(.{ .user = zsh_path }, "printf user");
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{ "/bin/zsh", "-l", "-i", "-c", "printf user" },
+        &.{ zsh_path, "-l", "-i", "-c", "printf user" },
         zsh_user.argv(),
     );
+}
+
+test "captured fallback flags follow the resolved shell" {
+    const fallback = fallbackLoginShell() orelse return error.SkipZigTest;
+    const invocation = try capturedInvocation(
+        .{ .user = "/fx-no-such-shell/bash" },
+        "printf fallback",
+    );
+    switch (shellKind(fallback) orelse return error.TestUnexpectedResult) {
+        .bash => try std.testing.expectEqualSlices(
+            []const u8,
+            &.{ fallback, "--login", "-O", "expand_aliases", "-c", "printf fallback" },
+            invocation.argv(),
+        ),
+        .zsh => try std.testing.expectEqualSlices(
+            []const u8,
+            &.{ fallback, "-l", "-i", "-c", "printf fallback" },
+            invocation.argv(),
+        ),
+    }
 }
 
 test "captured invocation provider projection shell-quotes every argv word" {
@@ -414,17 +596,25 @@ test "captured invocation provider projection shell-quotes every argv word" {
 }
 
 test "profile normalization defaults captured and persistent execution to user" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bash_path = try createExecutableTestShell(alloc, tmp.dir, "bash");
+    defer alloc.free(bash_path);
+    const zsh_path = try createExecutableTestShell(alloc, tmp.dir, "zsh");
+    defer alloc.free(zsh_path);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try std.testing.expect((try environment(arena, "/bin/bash", null)).eql(.{ .user = "/bin/bash" }));
-    try std.testing.expect((try environment(arena, "/bin/zsh", null)).eql(.{ .user = "/bin/zsh" }));
-    try std.testing.expect((try environment(arena, "/bin/zsh", .clean)).eql(.{ .clean = "/bin/zsh" }));
-    try std.testing.expect((try environment(arena, "/bin/zsh", .user)).eql(.{ .user = "/bin/zsh" }));
-    try std.testing.expectEqual(contracts.ShellSpec.user_login, try profileShell(arena, "/bin/zsh", .user));
+    try std.testing.expect((try environment(arena, bash_path, null)).eql(.{ .user = bash_path }));
+    try std.testing.expect((try environment(arena, zsh_path, null)).eql(.{ .user = zsh_path }));
+    try std.testing.expect((try environment(arena, zsh_path, .clean)).eql(.{ .clean = zsh_path }));
+    try std.testing.expect((try environment(arena, zsh_path, .user)).eql(.{ .user = zsh_path }));
+    try std.testing.expectEqual(contracts.ShellSpec.user_login, try profileShell(arena, zsh_path, .user));
     try std.testing.expectEqualStrings(
-        "/bin/zsh",
-        (try profileShell(arena, "/bin/zsh", .clean)).executable.path,
+        zsh_path,
+        (try profileShell(arena, zsh_path, .clean)).executable.path,
     );
 }
 
@@ -433,7 +623,7 @@ test "unsupported login shell profiles fall back for captured and persistent exe
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const fallback = fallbackLoginShell();
+    const fallback = fallbackLoginShell() orelse return error.SkipZigTest;
     const user_environment = try environment(arena, "/opt/homebrew/bin/fish", .user);
     const clean_environment = try environment(arena, "/opt/homebrew/bin/fish", .clean);
     try std.testing.expect(user_environment.eql(.{ .user = fallback }));
