@@ -1795,8 +1795,30 @@ fn isPostVisionAssistantPrefillRejection(
 fn waitForRecoveryDelay(
     cancel_flag: *std.atomic.Value(bool),
     delay_ns: u64,
-) bool {
+    cooperative_pulse: ?agent_stream_provider.CooperativePulse,
+) !bool {
     if (comptime builtin.is_test) return !cancel_flag.load(.seq_cst);
+    if (comptime host_target.is_wasm) {
+        if (cooperative_pulse) |pulse| {
+            const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+                .clock = .awake,
+                .raw = .fromNanoseconds(@intCast(delay_ns)),
+            });
+            const quantum: i96 = 25 * std.time.ns_per_ms;
+            while (true) {
+                if (cancel_flag.load(.seq_cst)) return false;
+                try pulse.pulse();
+                if (cancel_flag.load(.seq_cst)) return false;
+
+                const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+                if (!std.Io.Clock.Timestamp.compare(now, .lt, deadline)) return true;
+                const remaining_ns = now.raw.durationTo(deadline.raw).toNanoseconds();
+                if (remaining_ns <= 0) return true;
+                try io_mod.getIo().sleep(.fromNanoseconds(@min(remaining_ns, quantum)), .awake);
+            }
+        }
+    }
+
     var remaining = delay_ns;
     const quantum = 25 * std.time.ns_per_ms;
     while (remaining > 0) {
@@ -3299,9 +3321,10 @@ fn processQueuedPromptLoop(
                         failure_diagnostic,
                     );
                 }
-                const delay_completed = !will_auto_retry or waitForRecoveryDelay(
+                const delay_completed = !will_auto_retry or try waitForRecoveryDelay(
                     config.cancel_flag,
                     recovery_decision.delay_ns,
+                    deps.cooperative_transport_pulse,
                 );
                 if (recoveryPauseRequested(config)) {
                     try persistRecoveryCheckpoint(
@@ -3786,7 +3809,11 @@ fn processQueuedPromptLoop(
                         decision,
                         diagnostic,
                     );
-                    if (waitForRecoveryDelay(config.cancel_flag, decision.delay_ns)) {
+                    if (try waitForRecoveryDelay(
+                        config.cancel_flag,
+                        decision.delay_ns,
+                        deps.cooperative_transport_pulse,
+                    )) {
                         preserved_tool_evidence = effectiveRecoveryToolEvidence(
                             preserved_tool_evidence,
                             response_completion,
@@ -3981,7 +4008,11 @@ fn processQueuedPromptLoop(
                         decision,
                         diagnostic,
                     );
-                    if (waitForRecoveryDelay(config.cancel_flag, decision.delay_ns)) {
+                    if (try waitForRecoveryDelay(
+                        config.cancel_flag,
+                        decision.delay_ns,
+                        deps.cooperative_transport_pulse,
+                    )) {
                         preserved_tool_evidence = effectiveRecoveryToolEvidence(
                             preserved_tool_evidence,
                             attempt_completion,

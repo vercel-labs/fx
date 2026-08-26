@@ -17,8 +17,10 @@ const output = [];
 const streamedDecoder = new TextDecoder();
 let streamedText = "";
 const liveDraft = "queued draft";
+const backoffDraft = "retry backoff draft";
 const queuedAnswer = "§";
 let draftVisibleAt;
+let backoffDraftVisibleAt;
 let queuedVisibleAt;
 const originalSetTimeout = globalThis.setTimeout;
 let observeZeroTimeouts = false;
@@ -39,6 +41,7 @@ const terminal = {
     output.push(chunk);
     streamedText += streamedDecoder.decode(chunk, { stream: true });
     if (draftVisibleAt === undefined && streamedText.includes(liveDraft)) draftVisibleAt = performance.now();
+    if (backoffDraftVisibleAt === undefined && streamedText.includes(backoffDraft)) backoffDraftVisibleAt = performance.now();
     if (queuedVisibleAt === undefined && streamedText.includes("queued 1")) queuedVisibleAt = performance.now();
     process.stdout.write(chunk);
   },
@@ -72,13 +75,27 @@ const firstStreamRelease = new Promise((resolve) => {
 });
 let secondRequestAt;
 let secondRequestBody;
+let finalRetryFailureAt;
+let recoveredRequestAt;
+let cancellationAttemptAt;
 let requestCount = 0;
 const mockFetch = async (_url, init) => {
   requestedModel = new Headers(init.headers).get("ai-language-model-id");
   requestCount += 1;
-  if (requestCount === 2) {
-    secondRequestAt = performance.now();
-    secondRequestBody = JSON.parse(new TextDecoder().decode(init.body));
+  if (requestCount === 2 || requestCount === 3) {
+    if (requestCount === 2) {
+      secondRequestAt = performance.now();
+      secondRequestBody = JSON.parse(new TextDecoder().decode(init.body));
+    } else {
+      finalRetryFailureAt = performance.now();
+    }
+    return Response.json(
+      { error: { message: `temporary provider failure ${requestCount - 1}` } },
+      { status: 503, headers: { "retry-after": "1" } },
+    );
+  }
+  if (requestCount === 4) {
+    recoveredRequestAt = performance.now();
     return new Response(new ReadableStream({
       start(controller) {
         controller.enqueue(encoded.encode(`data: {"type":"text-delta","delta":"${queuedAnswer}"}\n`));
@@ -88,6 +105,14 @@ const mockFetch = async (_url, init) => {
       },
     }), { status: 200, headers: { "content-type": "text/event-stream" } });
   }
+  if (requestCount === 5) {
+    cancellationAttemptAt = performance.now();
+    return Response.json(
+      { error: { message: "temporary provider failure before cancellation" } },
+      { status: 503, headers: { "retry-after": "2" } },
+    );
+  }
+  if (requestCount > 5) throw new Error(`unexpected provider request ${requestCount}`);
   return new Response(new ReadableStream({
     async start(controller) {
       controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"hello"}\n'));
@@ -160,10 +185,35 @@ while (streamFinishedAt === undefined) {
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
 const queuedDeadline = performance.now() + 5000;
-while (secondRequestAt === undefined || !streamedText.includes(queuedAnswer)) {
-  if (performance.now() >= queuedDeadline) throw new Error("timed out waiting for queued fx-term response");
+while (finalRetryFailureAt === undefined) {
+  if (performance.now() >= queuedDeadline) throw new Error("timed out waiting for repeated 503 response");
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
+await new Promise((resolve) => setTimeout(resolve, 5));
+runtime.write(backoffDraft);
+while (backoffDraftVisibleAt === undefined) {
+  if (recoveredRequestAt !== undefined) throw new Error("terminal rendered retry-backoff input only after the next provider attempt");
+  if (performance.now() >= queuedDeadline) throw new Error("timed out waiting for retry-backoff input");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+while (recoveredRequestAt === undefined || !streamedText.includes(queuedAnswer)) {
+  if (performance.now() >= queuedDeadline) throw new Error("timed out waiting for queued fx-term recovery");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+runtime.write("\x15cancel retry\r");
+const cancellationDeadline = performance.now() + 5000;
+while (cancellationAttemptAt === undefined) {
+  if (performance.now() >= cancellationDeadline) throw new Error("timed out waiting for cancellable retry backoff");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+await new Promise((resolve) => setTimeout(resolve, 5));
+runtime.write("\x03");
+while (!streamedText.toLowerCase().includes("cancelled")) {
+  if (performance.now() >= cancellationDeadline) throw new Error("timed out waiting for retry-backoff cancellation");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+await new Promise((resolve) => setTimeout(resolve, 100));
+if (requestCount !== 5) throw new Error(`retry-backoff cancellation allowed request ${requestCount}`);
 runtime.write("/exit\r");
 const exitCode = await Promise.race([
   runtime.exited,
@@ -180,13 +230,16 @@ if (!(streamStartedAt < streamFinishedAt)) throw new Error("terminal fetch did n
 if (!(draftVisibleAt < streamFinishedAt)) throw new Error("terminal rendered follow-up input only after continuous streaming finished");
 if (!(queuedVisibleAt < streamFinishedAt)) throw new Error("terminal queued follow-up input only after continuous streaming finished");
 if (!(secondRequestAt >= streamFinishedAt)) throw new Error("terminal started queued follow-up before continuous streaming finished");
+if (!(finalRetryFailureAt < backoffDraftVisibleAt && backoffDraftVisibleAt < recoveredRequestAt)) {
+  throw new Error("terminal did not render typed input between repeated 503 attempts");
+}
 const queuedUser = secondRequestBody.prompt?.filter((message) => message.role === "user").at(-1);
 const queuedText = queuedUser?.content?.filter((part) => part.type === "text").map((part) => part.text);
 if (queuedText?.length !== 1 || queuedText[0] !== liveDraft) {
   throw new Error(`queued follow-up request changed the submitted draft: ${JSON.stringify(queuedText)}`);
 }
-if (requestCount !== 2) throw new Error(`terminal sent ${requestCount} requests instead of the active and queued turns`);
+if (requestCount !== 5) throw new Error(`terminal sent ${requestCount} requests instead of the expected retry and cancellation attempts`);
 if (zeroTimeoutCount !== 0) throw new Error(`terminal allocated ${zeroTimeoutCount} zero-timeout poll timer(s)`);
 if (!events.some((event) => event.type === "config.restore" && event.configId === "model")) throw new Error("terminal model restore event was not emitted");
 if (!events.some((event) => event.type === "config.restore" && event.configId === "mode")) throw new Error("terminal mode restore event was not emitted");
-console.error(`term SDK smoke passed: exit=${exitCode}, bytes=${Buffer.byteLength(text)}`);
+console.error(`term SDK smoke passed: exit=${exitCode}, bytes=${Buffer.byteLength(text)}, retry-backoff input and cancellation responsive`);

@@ -226,6 +226,9 @@ The terminal runtime provides:
 | `resize()` | Notifies fx of terminal geometry changes |
 | `abort()` | Stops the terminal and releases subscriptions |
 
+Terminal input and Ctrl+C remain responsive while a provider response is
+streaming or waiting for a retry.
+
 Try the hosted terminal at [fx.sh/try](https://fx.sh/try).
 
 ## Backend selection
