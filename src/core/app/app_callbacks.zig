@@ -360,15 +360,7 @@ pub fn Bindings(comptime App: type) type {
                     );
                 }
             }
-            if (comptime @hasDecl(App, "releaseAgentTerminalLease")) {
-                deps.release_agent_terminal_lease = agentReleaseTerminalLease;
-            }
             return deps;
-        }
-
-        fn agentReleaseTerminalLease(ctx: *anyopaque, session_id: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            return app.releaseAgentTerminalLease(session_id);
         }
 
         fn refreshGatewayCredential(

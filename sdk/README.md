@@ -305,11 +305,7 @@ The WebAssembly runtime intentionally does not provide:
 - Automatic upgrades
 - Clipboard integration
 - Arbitrary WASI filesystem access
-- Public web fetch, web search, and general outbound network access
-
-The embedded runtime tells the model not to retry unavailable network work
-through terminal commands. Use locally installed fx when the full native tool
-suite is required.
+- Web search
 
 The optional browser workspace exposes foreground terminal execution through
 the typed contract:

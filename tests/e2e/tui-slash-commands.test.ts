@@ -279,10 +279,10 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
   );
 
   test(
-    "/model Enter lists available models inline",
+    "/models lists available models",
     async () => {
       session = await launchAndWait();
-      await session.sendText("/model");
+      await session.sendText("/models");
       const pane = await session.waitForText(/anthropic|model/i, 10_000);
       expect(pane.length).toBeGreaterThan(0);
     },
@@ -312,7 +312,6 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
         "/issue",
         "/history",
         "/rules",
-        "/models",
       ].entries()) {
         await session.sendText(command);
         const expectedCount = index + 1;

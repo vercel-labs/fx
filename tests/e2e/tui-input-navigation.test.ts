@@ -322,12 +322,9 @@ tmuxTest(
     await waitForExactComposerRow(active, "┃ /");
 
     await active.sendKeys("Enter");
-    await active.waitForText("Commands 36", READY_TIMEOUT);
+    await active.waitForText("Commands 37", READY_TIMEOUT);
     await active.sendKeys("Escape");
-    await active.waitForPane(
-      (pane) => hasEmptyComposer(pane) && !pane.includes("Enter Open"),
-      READY_TIMEOUT,
-    );
+    await active.waitForText("Run /help for commands", READY_TIMEOUT);
     expect(active.isAlive()).toBe(true);
     expectCleanStderr();
   },
@@ -343,7 +340,7 @@ tmuxTest(
       (pane) =>
         pane.includes("/help") &&
         pane.includes("/quit") &&
-        pane.includes("Run /help for commands"),
+        !pane.includes("Run /help for commands"),
       READY_TIMEOUT,
     );
 
@@ -351,13 +348,10 @@ tmuxTest(
     const afterUnknown = await active.capturePane();
     expect(afterUnknown).toContain("/help");
     expect(afterUnknown).toContain("/quit");
-    expect(afterUnknown).toContain("Run /help for commands");
+    expect(afterUnknown).not.toContain("Run /help for commands");
 
     await active.sendKeys("Escape");
-    await active.waitForPane(
-      (pane) => hasEmptyComposer(pane) && !pane.includes("Enter Open"),
-      READY_TIMEOUT,
-    );
+    await active.waitForText("Run /help for commands", READY_TIMEOUT);
     expect(active.isAlive()).toBe(true);
     expectCleanStderr();
   },
@@ -1355,7 +1349,6 @@ tmuxTest(
     await active.waitForPane((pane) => pane.includes("turn 2 complete"), READY_TIMEOUT);
 
     await active.resizeWindow(88, 24);
-    await active.waitForText("turn 2 complete", READY_TIMEOUT);
     const resized = await active.captureFullScrollback();
     expect(resized).toContain("[Image 1] first turn");
     expect(resized).toContain("[Image 2] second turn");
@@ -1706,12 +1699,7 @@ tmuxTest(
     await typeLiteral(active, "       /he");
     await active.waitForPane((pane) => pane.includes("/he"), READY_TIMEOUT);
     await active.sendKeys("Enter");
-    await active.waitForPane(
-      (pane) => hasEmptyComposer(pane) && pane.includes("Tab Ente"),
-      READY_TIMEOUT,
-    );
-    await active.resizeWindow(80, 24, 300);
-    await active.waitForText("Commands 36", READY_TIMEOUT);
+    await active.waitForPane((pane) => pane.includes("Command"), READY_TIMEOUT);
     expect(gateway?.requests).toHaveLength(0);
     expectCleanStderr();
   },

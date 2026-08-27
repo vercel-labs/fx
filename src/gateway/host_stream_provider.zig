@@ -150,7 +150,7 @@ fn gatewayUsageOutcome(
     const reference = gatewayUsageReference(request, completion) orelse
         return .{ .unavailable = .possibly_billed };
     return if (completion.billing != null)
-        .{ .exact = .gateway }
+        .{ .immediate = reference }
     else
         .{ .deferred = reference };
 }

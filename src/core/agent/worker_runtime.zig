@@ -82,20 +82,13 @@ pub const QueuedPrompt = struct {
     /// assistant source. Recovery still restores the source for overlap and
     /// persistence, but publishes only novel continuation text.
     recovery_source_already_presented: bool = false,
-    /// The interactive transcript already contains this exact user turn.
-    /// Worker begin publishes only its identity so the UI can consume the
-    /// pending owner without painting a duplicate card.
-    user_prompt_already_presented: bool = false,
 };
 
 pub const ActivePromptSnapshotOwnership = struct {
-    /// Owns snapshot deletion until the files are transferred to accepted
-    /// history or handed to a reference-counted finished-turn owner.
     images: []const types.ImageAttachment,
     state: enum {
         active,
         handed_off,
-        preserved,
         discarded,
     } = .active,
     shared_ownership: ?types.SnapshotFileOwnership = null,
@@ -123,23 +116,6 @@ pub const ActivePromptSnapshotOwnership = struct {
         const ownership = (try self.ensureSharedOwnership(alloc)).?;
         self.state = .handed_off;
         return ownership;
-    }
-
-    fn preserve(self: *ActivePromptSnapshotOwnership) bool {
-        if (self.images.len == 0) return false;
-        switch (self.state) {
-            .active => {
-                if (self.shared_ownership) |ownership| ownership.transfer();
-                self.state = .preserved;
-                return true;
-            },
-            .handed_off => {
-                if (self.shared_ownership) |ownership| ownership.transfer();
-                return true;
-            },
-            .preserved => return true,
-            .discarded => return false,
-        }
     }
 
     fn deinit(self: *ActivePromptSnapshotOwnership) void {
@@ -204,36 +180,6 @@ const SnapshotFileOwnershipState = struct {
         self.transferred.store(true, .seq_cst);
     }
 };
-
-fn historyTurnImages(turn: types.HistoryTurn) []const types.ImageAttachment {
-    return switch (turn) {
-        .assistant => |value| value.user.images,
-        .background_command => |value| value.user.images,
-        .interrupted => |value| value.user.images,
-        .compacted_summary => &.{},
-    };
-}
-
-fn sameImageSnapshots(
-    left: []const types.ImageAttachment,
-    right: []const types.ImageAttachment,
-) bool {
-    if (left.len == 0 or left.len != right.len) return false;
-    for (left) |image| {
-        const other = image_attachments.findById(right, image.id) orelse return false;
-        if (!optionalBytesEqual(image.snapshot_path, other.snapshot_path) or
-            !optionalBytesEqual(image.snapshot_sha256, other.snapshot_sha256))
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn optionalBytesEqual(left: ?[]const u8, right: ?[]const u8) bool {
-    if (left == null or right == null) return left == null and right == null;
-    return std.mem.eql(u8, left.?, right.?);
-}
 
 pub const PermissionSnapshot = struct {
     mode: types.PermissionMode,
@@ -506,7 +452,6 @@ pub const PendingQuestionBatchSnapshot = struct {
 pub const WorkerEvent = union(enum) {
     begin_prompt: types.UserTurn,
     begin_prompt_with_skill_bindings: BeginPromptWithSkillBindings,
-    begin_presented_prompt: u64,
     append_user_feedback: []u8,
     assistant_presentation: assistant_presentation.Event,
     notification: notification_contract.Notification,
@@ -566,7 +511,6 @@ pub const WorkerRuntime = struct {
     active_agent_turn_settings: ?AgentTurnSettings = null,
     active_context_snapshot: ?*const context_contract.GatheredContextSnapshot = null,
     active_prompt_snapshot_ownership: ?*ActivePromptSnapshotOwnership = null,
-    preserve_prompt_snapshot_turn_id: ?u64 = null,
 
     pub fn deinit(self: *WorkerRuntime, alloc: std.mem.Allocator) void {
         if (self.pending_permission_response) |response| {
@@ -1062,11 +1006,7 @@ pub const WorkerRuntime = struct {
         if (self.worker_stop_requested or self.queued_prompts.items.len == 0) return null;
 
         const queued = self.queued_prompts.items[0];
-        if (queued.recovery_checkpoint == null and queued.user_prompt_already_presented) {
-            try self.worker_events.append(alloc, .{
-                .begin_presented_prompt = queued.turn_id,
-            });
-        } else if (queued.recovery_checkpoint == null) {
+        if (queued.recovery_checkpoint == null) {
             const begin_prompt = try types.dupeUserTurn(alloc, .{ .text = queued.prompt, .images = queued.images });
             errdefer types.freeUserTurn(alloc, begin_prompt);
             if (queued.skill_bindings.len > 0 or queued.skill_display_spans.len > 0) {
@@ -1197,31 +1137,6 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
 
-        self.clearQueuedPromptsLocked(alloc, retained_images);
-    }
-
-    /// Clears the queue while atomically transferring deletion responsibility
-    /// for a matching active or finished turn to the supplied retained images.
-    pub fn clearQueuedPromptsForSessionTransition(
-        self: *WorkerRuntime,
-        alloc: std.mem.Allocator,
-        turn_id: u64,
-        retained_images: []const types.ImageAttachment,
-    ) void {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-
-        if (retained_images.len > 0) {
-            _ = self.preservePromptSnapshotsLocked(turn_id, retained_images);
-        }
-        self.clearQueuedPromptsLocked(alloc, retained_images);
-    }
-
-    fn clearQueuedPromptsLocked(
-        self: *WorkerRuntime,
-        alloc: std.mem.Allocator,
-        retained_images: []const types.ImageAttachment,
-    ) void {
         const dropped = self.queued_prompt_count;
         if (dropped > 0) {
             debug_trace.logf("worker", "clear queued prompts dropped={d}", .{dropped});
@@ -1407,13 +1322,7 @@ pub const WorkerRuntime = struct {
         self: *WorkerRuntime,
         ownership: *ActivePromptSnapshotOwnership,
     ) void {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
         std.debug.assert(self.active_prompt_snapshot_ownership == null);
-        if (self.preserve_prompt_snapshot_turn_id == self.active_turn_id) {
-            _ = ownership.preserve();
-            self.preserve_prompt_snapshot_turn_id = null;
-        }
         self.active_prompt_snapshot_ownership = ownership;
     }
 
@@ -1421,8 +1330,6 @@ pub const WorkerRuntime = struct {
         self: *WorkerRuntime,
         alloc: std.mem.Allocator,
     ) !?types.SnapshotFileOwnership {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
         const ownership = self.active_prompt_snapshot_ownership orelse return null;
         return ownership.handoff(alloc);
     }
@@ -1431,44 +1338,9 @@ pub const WorkerRuntime = struct {
         self: *WorkerRuntime,
         ownership: *ActivePromptSnapshotOwnership,
     ) void {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
         std.debug.assert(self.active_prompt_snapshot_ownership == ownership);
         self.active_prompt_snapshot_ownership = null;
         ownership.deinit();
-    }
-
-    fn preservePromptSnapshotsLocked(
-        self: *WorkerRuntime,
-        turn_id: u64,
-        images: []const types.ImageAttachment,
-    ) bool {
-        if (turn_id == 0 or images.len == 0) return false;
-
-        var preserved = false;
-        if (self.active_turn_id == turn_id) {
-            if (self.active_prompt_snapshot_ownership) |ownership| {
-                if (sameImageSnapshots(ownership.images, images)) {
-                    preserved = ownership.preserve();
-                }
-            } else {
-                // The unique active turn bridges queue take to ownership
-                // registration while both operations remain mutex-serialized.
-                self.preserve_prompt_snapshot_turn_id = turn_id;
-                preserved = true;
-            }
-        }
-        for (self.worker_events.items) |*event| {
-            if (event.* != .finish_prompt) continue;
-            const finished = &event.finish_prompt;
-            const finished_images = historyTurnImages(finished.turn);
-            if (!sameImageSnapshots(finished_images, images)) continue;
-            if (finished.snapshot_file_ownership) |ownership| {
-                ownership.transfer();
-                preserved = true;
-            }
-        }
-        return preserved;
     }
 
     pub fn propagateGrant(self: *WorkerRuntime, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !void {
@@ -2130,106 +2002,6 @@ test "active prompt snapshot ownership discards every pre-transfer boundary" {
     }
 }
 
-test "session transfer preserves active and finished prompt snapshots" {
-    const alloc = std.testing.allocator;
-    const phases = [_]enum { take_before_begin, active, finished }{
-        .take_before_begin,
-        .active,
-        .finished,
-    };
-    for (phases) |phase| {
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        const name = switch (phase) {
-            .take_before_begin => "take-before-begin.bin",
-            .active => "active.bin",
-            .finished => "finished.bin",
-        };
-        {
-            var file = try tmp.dir.createFile(std.testing.io, name, .{});
-            defer file.close(std.testing.io);
-            try file.writeStreamingAll(std.testing.io, "snapshot");
-        }
-        const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
-        defer alloc.free(path);
-        const images = [_]types.ImageAttachment{.{
-            .id = 1,
-            .path = @constCast("/tmp/source.png"),
-            .media_type = @constCast("image/png"),
-            .snapshot_path = path,
-            .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-        }};
-
-        var runtime = WorkerRuntime{};
-        defer runtime.deinit(alloc);
-        runtime.active_turn_id = 41;
-        var active = ActivePromptSnapshotOwnership.init(&images);
-        if (phase != .take_before_begin) runtime.beginActivePromptSnapshots(&active);
-        if (phase == .finished) {
-            const ownership = (try runtime.handoffActivePromptSnapshots(alloc)) orelse
-                return error.TestExpectedSnapshotOwnership;
-            try runtime.pushEvent(alloc, .{ .finish_prompt = .{
-                .turn = .{ .assistant = .{
-                    .user = .{ .text = @constCast("prompt"), .images = @constCast(&images) },
-                    .assistant = @constCast("done"),
-                } },
-                .snapshot_file_ownership = ownership,
-            } });
-            ownership.release();
-            runtime.endActivePromptSnapshots(&active);
-            runtime.active_turn_id = 0;
-        }
-
-        runtime.clearQueuedPromptsForSessionTransition(alloc, 41, &images);
-        if (phase == .take_before_begin) runtime.beginActivePromptSnapshots(&active);
-        if (phase != .finished) runtime.endActivePromptSnapshots(&active);
-        runtime.discardEvents(alloc);
-        try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
-        try std.Io.Dir.deleteFileAbsolute(std.testing.io, path);
-    }
-}
-
-test "session transfer discards mismatched active prompt snapshots" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    {
-        var file = try tmp.dir.createFile(std.testing.io, "active.bin", .{});
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, "snapshot");
-    }
-    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "active.bin");
-    defer alloc.free(path);
-    const active_images = [_]types.ImageAttachment{.{
-        .id = 1,
-        .path = @constCast("/tmp/source.png"),
-        .media_type = @constCast("image/png"),
-        .snapshot_path = path,
-        .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-    }};
-    const unrelated_images = [_]types.ImageAttachment{.{
-        .id = 1,
-        .path = @constCast("/tmp/other.png"),
-        .media_type = @constCast("image/png"),
-        .snapshot_path = @constCast("/tmp/other.bin"),
-        .snapshot_sha256 = @constCast("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-    }};
-
-    var runtime = WorkerRuntime{};
-    defer runtime.deinit(alloc);
-    runtime.active_turn_id = 42;
-    var active = ActivePromptSnapshotOwnership.init(&active_images);
-    runtime.beginActivePromptSnapshots(&active);
-
-    runtime.clearQueuedPromptsForSessionTransition(alloc, 42, &unrelated_images);
-    runtime.endActivePromptSnapshots(&active);
-
-    try std.testing.expectError(
-        error.FileNotFound,
-        std.Io.Dir.accessAbsolute(std.testing.io, path, .{}),
-    );
-}
-
 test "accepted active prompt ownership does not delete history files" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2720,7 +2492,6 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
                 .skill_display_spans = skill_display_spans,
             } };
         },
-        .begin_presented_prompt => |turn_id| .{ .begin_presented_prompt = turn_id },
         .append_user_feedback => |text| .{ .append_user_feedback = try alloc.dupe(u8, text) },
         .assistant_presentation => |presentation| .{
             .assistant_presentation = try presentation.clone(alloc),
@@ -2794,7 +2565,6 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
             freeSkillBindings(alloc, begin.skill_bindings);
             freeSkillDisplaySpans(alloc, begin.skill_display_spans);
         },
-        .begin_presented_prompt => {},
         .append_user_feedback => |text| alloc.free(text),
         .assistant_presentation => |presentation| {
             var owned = presentation;
@@ -2970,7 +2740,6 @@ fn dupeToolResultMemory(
         .model_view_covers_full_file = memory.model_view_covers_full_file,
         .command_output_replay = command_output_replay,
         .command_process_presentation = memory.command_process_presentation,
-        .terminal_action_presentation = memory.terminal_action_presentation,
     };
 }
 
@@ -4114,26 +3883,6 @@ test "waitAndTakeNextPrompt assigns turn id and resets cancellation for next pro
     defer freeEventList(alloc, &events);
     try std.testing.expectEqual(@as(usize, 1), events.items.len);
     try std.testing.expect(events.items[0] == .begin_prompt);
-}
-
-test "already-presented queued prompt emits identity without duplicating user payload" {
-    const alloc = std.testing.allocator;
-    var runtime = WorkerRuntime{};
-    defer runtime.deinit(alloc);
-
-    var queued = try makePrompt(alloc, "already visible", "model");
-    queued.turn_id = 9001;
-    queued.user_prompt_already_presented = true;
-    try runtime.enqueuePrompt(alloc, queued);
-
-    const job = (try runtime.tryTakeNextPrompt(alloc)).?;
-    defer freeQueuedPrompt(alloc, job);
-    var events = runtime.takeEvents();
-    defer freeEventList(alloc, &events);
-
-    try std.testing.expectEqual(@as(usize, 1), events.items.len);
-    try std.testing.expect(events.items[0] == .begin_presented_prompt);
-    try std.testing.expectEqual(@as(u64, 9001), events.items[0].begin_presented_prompt);
 }
 
 test "requestRecoveryPause wakes the active operation without losing pause intent" {

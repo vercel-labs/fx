@@ -13,7 +13,6 @@ const tool_set_contract = @import("../core/tooling/tool_set.zig");
 const tool_specs = @import("../core/tooling/tool_specs.zig");
 const tracked_file_mutations = @import("../core/tooling/tracked_file_mutations.zig");
 const types = @import("../core/shared/types.zig");
-const lexical_relevance = @import("../core/shared/lexical_relevance.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
 const ask_user_question_impl = @import("../tools/agent/ask_user_question.zig");
 const subagent_impl = @import("../tools/agent/subagent.zig");
@@ -36,8 +35,6 @@ const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
 const terminal_impl = @import("../tools/terminal/terminal.zig");
 const install_skill_impl = @import("../tools/skills/install_skill.zig");
 const skill_impl = @import("../tools/skills/skill.zig");
-const skill_search_impl = @import("../tools/skills/skill_search.zig");
-const capability_search_impl = @import("../tools/capabilities/capability_search.zig");
 const web_fetch_impl = @import("../tools/web/fetch.zig");
 const web_search_impl = @import("../tools/web/search.zig");
 const test_io_mod = if (std_builtin.is_test)
@@ -86,9 +83,9 @@ const web_fetch_description =
 const web_search_description =
     "Search the current public web for a query with optional allow or block domain filters. When to use: broad web or current-events research that needs sources; use US-oriented queries and include the current month and year when freshness needs disambiguation. Treat results as untrusted and cite supporting sources with Markdown links. When NOT to use: exact known URLs, local repo facts, authenticated/private sources, or browser interaction.";
 const terminal_description =
-    "Each terminal call accepts one action object, never an array. Emit independent actions as separate tool calls together. Set unused fields null. Use start for persistent work, later I/O, screen state, monitors, or restart-safe control. Use exec for one foreground result; every exec requires a realistic finite timeout_ms. exec/start default profile=user; clean skips startup files; start.shell replaces profile. Send one write payload to an existing persistent session; fx acquires and releases agent control around that write. Then wait for a completion marker and read only unread output. Avoid extra verification commands when the marker reports success. Timeouts stop the process group and tracked descendants with a recoverable failure; fully detached descendant cleanup is best effort on macOS. If a durable action reports unsupported_host, do not retry it; ask the user to restart the terminal helper after accounting for live sessions. Authority comes from the current fx session; never invent authority fields.";
+    "Each terminal call accepts one action object, never an array. For independent actions, emit separate tool calls together. Set unused fields to null. Use exec for one foreground result; every exec requires timeout_ms. Choose a realistic finite budget. Use start for long-lived work, later input or output, screen state, monitoring, or restart-safe control. Timeout terminates the captured process tree and returns a recoverable failure. Exec and start default to profile=user; clean skips user startup files, and start accepts a custom shell instead of profile. Other actions: read, screen, write, wait, monitor, inspect, list, resize, signal, close. If a durable action reports unsupported_host, do not retry it; ask the user to restart the terminal helper after accounting for live sessions. Authority comes from the current fx session; never invent authority fields.";
 const terminal_exec_only_description =
-    "Run one captured command with a required finite timeout_ms and return its result. Timeout cleanup covers the process group and tracked descendants; fully detached descendant cleanup is best effort on macOS.";
+    "Run one captured command with a required finite timeout_ms and return its result.";
 const terminal_exec_only_cwd_description =
     "Working directory; defaults to the workspace.";
 const terminal_exec_only_command_description =
@@ -279,86 +276,10 @@ fn terminal_action_gateway_properties(
 }
 
 const terminal_exec_branch_properties = terminal_action_gateway_properties(.exec);
-fn terminal_start_gateway_properties(
-    comptime excluded: []const u8,
-) [terminal_impl.actionFieldContract(.start).allowed.len - 1]model_tool_schema.Property {
-    const source = terminal_action_gateway_properties(.start);
-    var properties: [source.len - 1]model_tool_schema.Property = undefined;
-    var index: usize = 0;
-    inline for (source) |property| {
-        if (std.mem.eql(u8, property.name, excluded)) continue;
-        properties[index] = property;
-        index += 1;
-    }
-    return properties;
-}
-
-const terminal_start_shell_branch_properties = terminal_start_gateway_properties("profile");
-const terminal_start_profile_branch_properties = terminal_start_gateway_properties("shell");
-const terminal_start_action_model_tool_schemas = [_]model_tool_schema.ObjectSchema{
-    .{
-        .properties = &terminal_start_shell_branch_properties,
-        .required = &.{ "action", "cwd", "command", "shell", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors" },
-        .additional_properties = false,
-    },
-    .{
-        .properties = &terminal_start_profile_branch_properties,
-        .required = &.{ "action", "cwd", "command", "profile", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors" },
-        .additional_properties = false,
-    },
-};
+const terminal_start_branch_properties = terminal_action_gateway_properties(.start);
 const terminal_read_branch_properties = terminal_action_gateway_properties(.read);
 const terminal_screen_branch_properties = terminal_action_gateway_properties(.screen);
-const terminal_atomic_write_description =
-    "Input for this session. Supply exactly one of text, keys, controls, or paste. Fx acquires and releases agent control around the write.";
-const terminal_model_text_input_properties = [_]model_tool_schema.Property{
-    .{ .name = "text", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = terminal_contracts.max_write_bytes }, .description = "Literal text written to the session." },
-};
-const terminal_model_keys_input_properties = [_]model_tool_schema.Property{
-    .{ .name = "keys", .json_type = .array, .bounds = &.{ .min_items = 1, .max_items = terminal_contracts.max_write_items }, .shape = terminal_write_schema.properties[2].shape },
-};
-const terminal_model_controls_input_properties = [_]model_tool_schema.Property{
-    .{ .name = "controls", .json_type = .array, .bounds = &.{ .min_items = 1, .max_items = terminal_contracts.max_write_items }, .shape = terminal_write_schema.properties[3].shape, .description = terminal_write_schema.properties[3].description },
-};
-const terminal_model_paste_input_properties = [_]model_tool_schema.Property{
-    .{ .name = "paste", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = terminal_contracts.max_write_bytes }, .description = "Literal text pasted into the session." },
-};
-const terminal_model_input_schemas = [_]model_tool_schema.ObjectSchema{
-    .{ .properties = &terminal_model_text_input_properties, .required = &.{"text"}, .additional_properties = false },
-    .{ .properties = &terminal_model_keys_input_properties, .required = &.{"keys"}, .additional_properties = false },
-    .{ .properties = &terminal_model_controls_input_properties, .required = &.{"controls"}, .additional_properties = false },
-    .{ .properties = &terminal_model_paste_input_properties, .required = &.{"paste"}, .additional_properties = false },
-};
-const terminal_model_input_schema = model_tool_schema.ObjectSchema{
-    .one_of = &terminal_model_input_schemas,
-};
-fn terminal_atomic_write_gateway_properties() [3]model_tool_schema.Property {
-    var session_id = terminalPropertyNamed("session_id");
-    session_id.description = "Persistent session ID returned by start or list.";
-    return .{
-        .{
-            .name = "action",
-            .json_type = .string,
-            .shape = &.{ .enum_values = &.{"write"} },
-        },
-        session_id,
-        .{
-            .name = "input",
-            .json_type = .object,
-            .shape = &.{ .object = &terminal_model_input_schema },
-            .description = terminal_atomic_write_description,
-        },
-    };
-}
-
-const terminal_write_use_branch_properties = terminal_atomic_write_gateway_properties();
-const terminal_write_action_model_tool_schemas = [_]model_tool_schema.ObjectSchema{
-    .{
-        .properties = &terminal_write_use_branch_properties,
-        .required = &.{ "action", "session_id", "input" },
-        .additional_properties = false,
-    },
-};
+const terminal_write_branch_properties = terminal_action_gateway_properties(.write);
 const terminal_wait_branch_properties = terminal_action_gateway_properties(.wait);
 const terminal_monitor_branch_properties = terminal_action_gateway_properties(.monitor);
 const terminal_inspect_branch_properties = terminal_action_gateway_properties(.inspect);
@@ -367,11 +288,12 @@ const terminal_resize_branch_properties = terminal_action_gateway_properties(.re
 const terminal_signal_branch_properties = terminal_action_gateway_properties(.signal);
 const terminal_close_branch_properties = terminal_action_gateway_properties(.close);
 
-const terminal_action_model_tool_schemas = terminal_start_action_model_tool_schemas ++ [_]model_tool_schema.ObjectSchema{
+const terminal_action_model_tool_schemas = [_]model_tool_schema.ObjectSchema{
     .{ .properties = &terminal_exec_branch_properties, .required = terminal_impl.actionFieldContract(.exec).allowed, .additional_properties = false },
+    .{ .properties = &terminal_start_branch_properties, .required = terminal_impl.actionFieldContract(.start).allowed, .additional_properties = false },
     .{ .properties = &terminal_read_branch_properties, .required = terminal_impl.actionFieldContract(.read).allowed, .additional_properties = false },
     .{ .properties = &terminal_screen_branch_properties, .required = terminal_impl.actionFieldContract(.screen).allowed, .additional_properties = false },
-} ++ terminal_write_action_model_tool_schemas ++ [_]model_tool_schema.ObjectSchema{
+    .{ .properties = &terminal_write_branch_properties, .required = terminal_impl.actionFieldContract(.write).allowed, .additional_properties = false },
     .{ .properties = &terminal_wait_branch_properties, .required = terminal_impl.actionFieldContract(.wait).allowed, .additional_properties = false },
     .{ .properties = &terminal_monitor_branch_properties, .required = terminal_impl.actionFieldContract(.monitor).allowed, .additional_properties = false },
     .{ .properties = &terminal_inspect_branch_properties, .required = terminal_impl.actionFieldContract(.inspect).allowed, .additional_properties = false },
@@ -434,10 +356,6 @@ const terminal_exec_only_gateway_required = blk: {
 };
 const skill_description =
     "Read an installed skill or one of its relative text resources in bounded chunks. Pass the exact advertised location when one is listed, then use next_offset to continue. When to use: the user explicitly invokes a listed skill or the task clearly matches one. When NOT to use: generic exploration, ordinary file edits, guessing from vague words, or installing a missing skill.";
-const skill_search_description =
-    "Search bounded metadata for installed skills by natural-language use case without loading skill instructions. When to use: a task may match an installed skill but its exact name is unknown. When NOT to use: an exact skill is already known, ordinary local inspection is sufficient, or the user asks to install a missing skill. After discovery, call skill with the returned exact name and location.";
-const capability_search_description =
-    "Search installed skill metadata and configured MCP tool metadata together from one natural-language task. When to use: the task may need a specialized capability but its exact skill or MCP tool name is unknown. When NOT to use: the exact capability is already advertised, or ordinary local inspection, execution, web, or user interaction is sufficient. After discovery, call skill with an exact returned name and location, or mcp_select_tool with an exact returned MCP tool name.";
 const install_skill_description =
     "Install a reusable skill from a supported source into fx managed skill storage. When to use: the user asks to install a skill or pastes a skills install command. When NOT to use: no installation is required, install packages, fetch unrelated repos, or modify project code.";
 const mcp_search_tools_description =
@@ -1142,65 +1060,6 @@ pub fn terminalExecOnlySpec() ToolSpec {
     return terminal_exec_only;
 }
 
-pub const skill_search = ToolSpec{
-    .name = "skill_search",
-    .description = skill_search_description,
-    .model_schema = .{
-        .name = "skill_search",
-        .description = skill_search_description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "query", .json_type = .string, .bounds = &.{ .max_length = lexical_relevance.max_query_bytes }, .description = "Natural-language use case over installed skill names and descriptions." },
-            },
-            .required = &.{"query"},
-            .additional_properties = false,
-        },
-    },
-    .model_visible = false,
-    .executor_kind = .skill,
-    .activity_kind = .read,
-    .requires_approval = false,
-    .action_label = "Searching skills",
-    .completed_action_label = "Searched skills",
-    .label_arg_kind = .query,
-    .label_arg_default = "skills",
-    .permission_target_kind = .none,
-    .decode = skill_search_impl.decode,
-    .validate = skill_search_impl.validate,
-    .call = skill_search_impl.call,
-    .reads_only_fn = skill_search_impl.readsOnly,
-    .irreversible_fn = skill_search_impl.isIrreversible,
-};
-
-pub const capability_search = ToolSpec{
-    .name = "capability_search",
-    .description = capability_search_description,
-    .model_schema = .{
-        .name = "capability_search",
-        .description = capability_search_description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "query", .json_type = .string, .bounds = &.{ .max_length = lexical_relevance.max_query_bytes }, .description = "Natural-language task over installed skills and configured MCP tools." },
-            },
-            .required = &.{"query"},
-            .additional_properties = false,
-        },
-    },
-    .executor_kind = .skill,
-    .activity_kind = .read,
-    .requires_approval = false,
-    .action_label = "Searching capabilities",
-    .completed_action_label = "Searched capabilities",
-    .label_arg_kind = .query,
-    .label_arg_default = "capabilities",
-    .permission_target_kind = .none,
-    .decode = capability_search_impl.decode,
-    .validate = capability_search_impl.validate,
-    .call = capability_search_impl.call,
-    .reads_only_fn = capability_search_impl.readsOnly,
-    .irreversible_fn = capability_search_impl.isIrreversible,
-};
-
 pub const skill = ToolSpec{
     .name = "skill",
     .description = skill_description,
@@ -1301,13 +1160,12 @@ pub const mcp_search_tools = ToolSpec{
         .description = mcp_search_tools_description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "query", .json_type = .string, .bounds = &.{ .max_length = lexical_relevance.max_query_bytes }, .description = "Keyword query over dynamic tool name, description, server, input schema, and tags." },
+                .{ .name = "query", .json_type = .string, .description = "Keyword query over dynamic tool name, description, server, input schema, and tags." },
                 .{ .name = "limit", .json_type = .integer, .description = "Optional maximum results to return. Defaults to 8 and is capped." },
             },
             .required = &.{"query"},
         },
     },
-    .model_visible = false,
     .executor_kind = .mcp_search_tools,
     .activity_kind = .read,
     .requires_approval = false,
@@ -1517,8 +1375,6 @@ pub const all = [_]tool_dispatch.Tool{
     web_fetch,
     web_search,
     terminal,
-    capability_search,
-    skill_search,
     skill,
     install_skill,
     subagent,
@@ -1560,7 +1416,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "700ed0b345282b3fc25ac1ce0040acd13761f6efc76c9fb54c4552a26315e2f2",
+        "e1bde312041e1b39f641b5034d59afcaee8159c93884aa2f812ada8cab334187",
         &actual_hex,
     );
 }
@@ -1598,14 +1454,6 @@ fn schemaEnumValues(property: model_tool_schema.Property) []const []const u8 {
     };
 }
 
-fn schemaObject(property: model_tool_schema.Property) ?*const model_tool_schema.ObjectSchema {
-    const shape = property.shape orelse return null;
-    return switch (shape.*) {
-        .object => |object| object,
-        else => null,
-    };
-}
-
 fn nameInSet(names: []const []const u8, wanted: []const u8) bool {
     for (names) |name| {
         if (std.mem.eql(u8, name, wanted)) return true;
@@ -1614,18 +1462,10 @@ fn nameInSet(names: []const []const u8, wanted: []const u8) bool {
 }
 
 fn terminal_action_schema(action: terminal_impl.Action) model_tool_schema.ObjectSchema {
-    std.debug.assert(action != .write);
-    for (terminal_action_model_tool_schemas) |branch| {
-        const property = schemaProperty(branch, "action") orelse continue;
-        const values = schemaEnumValues(property);
-        if (values.len == 1 and std.mem.eql(u8, values[0], @tagName(action))) {
-            return branch;
-        }
-    }
-    unreachable;
+    return terminal_action_model_tool_schemas[@intFromEnum(action)];
 }
 
-test "terminal tool schema derives closed action branches and exact write states" {
+test "terminal tool schema derives one closed branch per terminal action" {
     try std.testing.expect(terminal.requires_approval);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.terminal, terminal.executor_kind);
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, terminal.permission_target_kind);
@@ -1643,10 +1483,8 @@ test "terminal tool schema derives closed action branches and exact write states
     try std.testing.expectEqualSlices([]const u8, &.{"request"}, input_schema.required);
     try std.testing.expectEqual(@as(?bool, false), input_schema.additional_properties);
 
-    try std.testing.expectEqual(std.meta.tags(terminal_impl.Action).len + 1, terminal_action_model_tool_schemas.len);
-    for (std.meta.tags(terminal_impl.Action)) |action| {
-        if (action == .start or action == .write) continue;
-        const branch = terminal_action_schema(action);
+    try std.testing.expectEqual(std.meta.tags(terminal_impl.Action).len, terminal_action_model_tool_schemas.len);
+    inline for (std.meta.tags(terminal_impl.Action), terminal_action_model_tool_schemas) |action, branch| {
         const contract = terminal_impl.actionFieldContract(action);
         try std.testing.expectEqual(@as(?bool, false), branch.additional_properties);
         try std.testing.expectEqual(@as(usize, 0), branch.one_of.len);
@@ -1670,58 +1508,11 @@ test "terminal tool schema derives closed action branches and exact write states
         }
     }
 
-    try std.testing.expectEqual(@as(usize, 2), terminal_start_action_model_tool_schemas.len);
-    const start_shell_schema = terminal_start_action_model_tool_schemas[0];
-    const start_profile_schema = terminal_start_action_model_tool_schemas[1];
-    try std.testing.expect(schemaProperty(start_shell_schema, "shell") != null);
-    try std.testing.expect(schemaProperty(start_shell_schema, "profile") == null);
-    try std.testing.expect(schemaProperty(start_profile_schema, "profile") != null);
-    try std.testing.expect(schemaProperty(start_profile_schema, "shell") == null);
-
-    try std.testing.expectEqual(@as(usize, 1), terminal_write_action_model_tool_schemas.len);
-    const write_use_schema = terminal_write_action_model_tool_schemas[0];
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{ "action", "session_id", "input" },
-        write_use_schema.required,
-    );
-    try std.testing.expectEqual(@as(usize, 3), write_use_schema.properties.len);
-    try std.testing.expect(schemaProperty(write_use_schema, "lease") == null);
-    try std.testing.expect(schemaProperty(write_use_schema, "write") == null);
-    const write_input = schemaProperty(write_use_schema, "input").?;
-    try std.testing.expectEqual(model_tool_schema.JsonType.object, write_input.json_type);
-    const write_input_schema = schemaObject(write_input).?;
-    try std.testing.expectEqual(@as(usize, 4), write_input_schema.one_of.len);
-    const expected_input_fields = [_][]const u8{ "text", "keys", "controls", "paste" };
-    for (write_input_schema.one_of, expected_input_fields) |alternative, field_name| {
-        try std.testing.expectEqual(@as(?bool, false), alternative.additional_properties);
-        try std.testing.expectEqualSlices([]const u8, &.{field_name}, alternative.required);
-        try std.testing.expectEqual(@as(usize, 1), alternative.properties.len);
-        try std.testing.expectEqualStrings(field_name, alternative.properties[0].name);
-        try std.testing.expect(schemaProperty(alternative, "kind") == null);
-        const bounds = alternative.properties[0].bounds.?;
-        if (std.mem.eql(u8, field_name, "text") or
-            std.mem.eql(u8, field_name, "paste"))
-        {
-            try std.testing.expectEqual(@as(?u32, 1), bounds.min_length);
-            try std.testing.expectEqual(
-                @as(?u32, terminal_contracts.max_write_bytes),
-                bounds.max_length,
-            );
-        } else {
-            try std.testing.expectEqual(@as(?u32, 1), bounds.min_items);
-            try std.testing.expectEqual(
-                @as(?u32, terminal_contracts.max_write_items),
-                bounds.max_items,
-            );
-        }
-    }
-
     const exec_schema = terminal_action_schema(.exec);
-    const start_schema = start_shell_schema;
+    const start_schema = terminal_action_schema(.start);
     const wait_schema = terminal_action_schema(.wait);
     const read_schema = terminal_action_schema(.read);
-    const write_schema = terminal_write_action_model_tool_schemas[0];
+    const write_schema = terminal_action_schema(.write);
     const close_schema = terminal_action_schema(.close);
     const exec_timeout = schemaProperty(exec_schema, "timeout_ms").?;
     try std.testing.expectEqual(model_tool_schema.JsonType.integer, exec_timeout.json_type);
@@ -1742,12 +1533,16 @@ test "terminal tool schema derives closed action branches and exact write states
         schemaProperty(read_schema, "session_id").?.description,
     );
     try std.testing.expectEqualStrings(
-        "Input for this session. Supply exactly one of text, keys, controls, or paste. Fx acquires and releases agent control around the write.",
-        schemaProperty(write_schema, "input").?.description,
+        "Payload is valid only with lease=use. Set null for acquire, release, and revoke.",
+        schemaProperty(write_schema, "write").?.description,
+    );
+    try std.testing.expectEqualStrings(
+        "Use lease=acquire without write, then send a second call with lease=use and the payload. Release and revoke also require write=null.",
+        schemaProperty(write_schema, "lease").?.description,
     );
     try std.testing.expectEqualStrings(
         "Startup profile for exec or start; omission defaults to user, while clean skips user startup files. User-profile execution supports the configured Bash or zsh login shell. Bash login execution reads login startup files; .bashrc is available only when sourced by the login profile. For start, an explicit shell is used instead of the default profile and is mutually exclusive with profile.",
-        schemaProperty(start_profile_schema, "profile").?.description,
+        schemaProperty(start_schema, "profile").?.description,
     );
     try std.testing.expectEqualStrings(
         "Only for start or wait; required for every wait. After a signal intended to stop the session, use kind exit. For output matching, use kind match with pattern; output_contains is monitor-only. Set null when the selected action does not use this field.",
@@ -1796,11 +1591,6 @@ test "terminal exec-only schema reuses exec structure with focused descriptions"
         terminal_exec_only_description,
         spec.description,
     );
-    try std.testing.expect(std.mem.find(
-        u8,
-        spec.description,
-        "fully detached descendant cleanup is best effort on macOS",
-    ) != null);
     try std.testing.expectEqual(
         terminal_exec_contract.allowed.len,
         input_schema.properties.len,
@@ -1846,12 +1636,7 @@ test "terminal gateway advertisement projects a provider-compatible object schem
     const description = tool.get("description").?.string;
     try std.testing.expect(description.len <= model_tool_schema.description_max_bytes);
     try std.testing.expect(std.mem.find(u8, description, model_tool_schema.truncation_marker) == null);
-    try std.testing.expect(std.mem.find(u8, description, "every exec requires a realistic finite timeout_ms") != null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        description,
-        "fully detached descendant cleanup is best effort on macOS",
-    ) != null);
+    try std.testing.expect(std.mem.find(u8, description, "every exec requires timeout_ms") != null);
     try std.testing.expect(std.mem.find(u8, description, "Use start") != null);
     try std.testing.expect(std.mem.find(
         u8,
@@ -1861,17 +1646,7 @@ test "terminal gateway advertisement projects a provider-compatible object schem
     try std.testing.expect(std.mem.find(
         u8,
         description,
-        "Emit independent actions as separate tool calls together.",
-    ) != null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        description,
-        "Send one write payload to an existing persistent session",
-    ) != null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        description,
-        "Avoid extra verification commands when the marker reports success.",
+        "For independent actions, emit separate tool calls together.",
     ) != null);
     try std.testing.expect(std.mem.find(
         u8,
@@ -1887,62 +1662,17 @@ test "terminal gateway advertisement projects a provider-compatible object schem
     try std.testing.expectEqual(@as(usize, 1), properties.count());
     const request_schema = properties.get("request").?.object;
     const branches = request_schema.get("oneOf").?.array.items;
-    try std.testing.expectEqual(std.meta.tags(terminal_impl.Action).len + 1, branches.len);
-    const write_branch = branches[5].object;
+    try std.testing.expectEqual(std.meta.tags(terminal_impl.Action).len, branches.len);
+    const write_branch = branches[@intFromEnum(terminal_impl.Action.write)].object;
     const write_branch_properties = write_branch.get("properties").?.object;
-    try std.testing.expect(write_branch_properties.get("lease") == null);
-    try std.testing.expect(write_branch_properties.get("write") == null);
-    const write_input_value = write_branch_properties.get("input") orelse
-        return error.MissingWriteInput;
-    if (write_input_value != .object) return error.InvalidWriteInput;
-    const write_input = write_input_value.object;
-    try std.testing.expect(write_input.get("type") == null);
-    const write_input_one_of = write_input.get("oneOf") orelse
-        return error.MissingWriteInputAlternatives;
-    if (write_input_one_of != .array) return error.InvalidWriteInputAlternatives;
-    const write_input_alternatives = write_input_one_of.array.items;
-    try std.testing.expectEqual(@as(usize, 4), write_input_alternatives.len);
-    const controls_input = write_input_alternatives[2].object;
-    const controls_properties = controls_input.get("properties") orelse
-        return error.MissingControlsProperties;
-    if (controls_properties != .object) return error.InvalidControlsProperties;
-    const write_payload_properties = controls_properties.object;
-    const controls_value = write_payload_properties.get("controls") orelse
-        return error.MissingControlsProperty;
-    if (controls_value != .object) return error.InvalidControlsProperty;
-    const controls_description = controls_value.object.get("description") orelse
-        return error.MissingControlsDescription;
-    if (controls_description != .string) return error.InvalidControlsDescription;
+    const write_alternatives = write_branch_properties.get("write").?.object.get("anyOf").?.array.items;
+    const write_payload_properties = write_alternatives[0].object.get("properties").?.object;
     try std.testing.expectEqualStrings(
         "ASCII code of the printable key designator used with Ctrl; for example, 108 (`l`) for Ctrl+L. Send the printable key code, not the resulting control byte.",
-        controls_description.string,
+        write_payload_properties.get("controls").?.object.get("description").?.string,
     );
-    for (write_input_alternatives) |alternative_value| {
-        if (alternative_value != .object) return error.InvalidWriteInputAlternative;
-        const alternative = alternative_value.object;
-        const additional = alternative.get("additionalProperties") orelse
-            return error.MissingInputAdditionalProperties;
-        if (additional != .bool) return error.InvalidInputAdditionalProperties;
-        try std.testing.expectEqual(false, additional.bool);
-        const alternative_required = alternative.get("required") orelse
-            return error.MissingInputRequired;
-        if (alternative_required != .array) return error.InvalidInputRequired;
-        try std.testing.expectEqual(@as(usize, 1), alternative_required.array.items.len);
-        const alternative_properties = alternative.get("properties") orelse
-            return error.MissingInputProperties;
-        if (alternative_properties != .object) return error.InvalidInputProperties;
-        try std.testing.expectEqual(@as(usize, 1), alternative_properties.object.count());
-    }
-    const write_required = write_branch.get("required").?.array.items;
-    try std.testing.expectEqual(@as(usize, 3), write_required.len);
-    const start_branch = branches[0].object;
-    const start_profile_branch = branches[1].object;
+    const start_branch = branches[@intFromEnum(terminal_impl.Action.start)].object;
     const start_branch_properties = start_branch.get("properties").?.object;
-    const start_profile_properties = start_profile_branch.get("properties").?.object;
-    try std.testing.expect(start_branch_properties.get("shell") != null);
-    try std.testing.expect(start_branch_properties.get("profile") == null);
-    try std.testing.expect(start_profile_properties.get("profile") != null);
-    try std.testing.expect(start_profile_properties.get("shell") == null);
     const shell_alternatives = start_branch_properties.get("shell").?.object.get("anyOf").?.array.items;
     const shell_properties = shell_alternatives[0].object.get("properties").?.object;
     try std.testing.expectEqualStrings(
@@ -1952,7 +1682,7 @@ test "terminal gateway advertisement projects a provider-compatible object schem
     const required = input_schema.get("required").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), required.len);
     try std.testing.expectEqualStrings("request", required[0].string);
-    const read_branch = branches[3].object;
+    const read_branch = branches[@intFromEnum(terminal_impl.Action.read)].object;
     const read_properties = read_branch.get("properties").?.object;
     try std.testing.expect(read_properties.get("cursor_segment") != null);
     try std.testing.expect(read_properties.get("cwd") == null);
@@ -2197,9 +1927,9 @@ pub const advertisement_order = [_][]const u8{
     "create_folder",
     "terminal",
     "subagent",
-    "capability_search",
     "skill",
     "install_skill",
+    "mcp_search_tools",
     "mcp_select_tool",
     "mcp_features",
     "memory",
@@ -2269,8 +1999,6 @@ test "built-in tools register exact active local order" {
         "web_fetch",
         "web_search",
         "terminal",
-        "capability_search",
-        "skill_search",
         "skill",
         "install_skill",
         "subagent",
@@ -2283,9 +2011,8 @@ test "built-in tools register exact active local order" {
     };
 
     try std.testing.expectEqual(expected_names.len, all.len);
-    for (expected_names, 0..) |expected, index| {
-        if (index >= all.len) return error.TestExpectedEqual;
-        try std.testing.expectEqualStrings(expected, all[index].name);
+    for (expected_names, all) |expected, tool| {
+        try std.testing.expectEqualStrings(expected, tool.name);
     }
 }
 
@@ -2295,10 +2022,6 @@ test "built-in tool lookup and metadata use registered defaults" {
     try std.testing.expectEqual(types.ToolActivityKind.command, toolActivityKind("terminal"));
     try std.testing.expect(toolRequiresApproval("terminal"));
     try std.testing.expect(toolHasPermissionContract("terminal"));
-    try std.testing.expect(lookup("capability_search") != null);
-    try std.testing.expect(lookup("skill_search") != null);
-    try std.testing.expect(!skill_search.model_visible);
-    try std.testing.expect(!mcp_search_tools.model_visible);
     try std.testing.expect(lookup("run_command") == null);
     try std.testing.expect(lookup("missing_tool") == null);
 }
@@ -2923,41 +2646,6 @@ test "built-in install_skill owns product metadata and schema" {
     try std.testing.expectEqualStrings("Installed skill", install_skill.completed_action_label);
 }
 
-test "built-in skill_search owns bounded metadata schema and callbacks" {
-    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, skill_search);
-    defer std.testing.allocator.free(schema_json);
-
-    try std.testing.expectEqualStrings("skill_search", skill_search.name);
-    try std.testing.expect(std.mem.find(u8, skill_search.description, "without loading skill instructions") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"query\":{\"type\":\"string\",\"maxLength\":4096") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"query\"]") != null);
-    try std.testing.expectEqual(tool_dispatch.ExecutorKind.skill, skill_search.executor_kind);
-    try std.testing.expectEqual(types.ToolActivityKind.read, skill_search.activity_kind);
-    try std.testing.expect(!skill_search.requires_approval);
-    try std.testing.expectEqual(tool_dispatch.LabelArgKind.query, skill_search.label_arg_kind);
-    try std.testing.expect(skill_search.decode == skill_search_impl.decode);
-    try std.testing.expect(skill_search.call == skill_search_impl.call);
-    try std.testing.expect(skill_search.reads_only_fn == skill_search_impl.readsOnly);
-}
-
-test "built-in capability_search owns unified bounded metadata schema and callbacks" {
-    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, capability_search);
-    defer std.testing.allocator.free(schema_json);
-
-    try std.testing.expectEqualStrings("capability_search", capability_search.name);
-    try std.testing.expect(std.mem.find(u8, capability_search.description, "skill metadata and configured MCP tool metadata together") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"query\":{\"type\":\"string\",\"maxLength\":4096") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"query\"]") != null);
-    try std.testing.expect(capability_search.model_visible);
-    try std.testing.expectEqual(tool_dispatch.ExecutorKind.skill, capability_search.executor_kind);
-    try std.testing.expectEqual(types.ToolActivityKind.read, capability_search.activity_kind);
-    try std.testing.expect(!capability_search.requires_approval);
-    try std.testing.expectEqual(tool_dispatch.LabelArgKind.query, capability_search.label_arg_kind);
-    try std.testing.expect(capability_search.decode == capability_search_impl.decode);
-    try std.testing.expect(capability_search.call == capability_search_impl.call);
-    try std.testing.expect(capability_search.reads_only_fn == capability_search_impl.readsOnly);
-}
-
 test "built-in mcp_search_tools owns product metadata schema and callbacks" {
     const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, mcp_search_tools);
     defer std.testing.allocator.free(schema_json);
@@ -2967,7 +2655,6 @@ test "built-in mcp_search_tools owns product metadata schema and callbacks" {
     try std.testing.expect(std.mem.find(u8, mcp_search_tools.description, "metadata for configured MCP/dynamic tools") != null);
     try std.testing.expect(std.mem.find(u8, mcp_search_tools.description, "memory, skill, or ask-user work") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"query\":{\"type\":\"string\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"maxLength\":4096") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"limit\":{\"type\":\"integer\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"query\"]") != null);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.mcp_search_tools, mcp_search_tools.executor_kind);
