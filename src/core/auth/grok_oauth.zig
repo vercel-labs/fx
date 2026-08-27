@@ -17,6 +17,7 @@ const token_url = "https://auth.x.ai/oauth2/token";
 const issuer_url = "https://auth.x.ai";
 const userinfo_url = "https://auth.x.ai/oauth2/userinfo";
 const revoke_url = "https://auth.x.ai/oauth2/revoke";
+const team_principal_type = "Team";
 const e2e_token_url_env = "FX_E2E_GROK_TOKEN_URL";
 const e2e_issuer_url_env = "FX_E2E_GROK_ISSUER_URL";
 const e2e_userinfo_url_env = "FX_E2E_GROK_USERINFO_URL";
@@ -523,19 +524,34 @@ fn takeAccess(session: *grok_session.Session) Access {
     };
 }
 
+fn buildRefreshPayload(
+    alloc: Allocator,
+    refresh_token: []const u8,
+    access_token: []const u8,
+) ![]u8 {
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    errdefer body.deinit();
+    var form: FormBody = .{};
+    try form.append(&body.writer, "grant_type", "refresh_token");
+    try form.append(&body.writer, "client_id", client_id);
+    try form.append(&body.writer, "refresh_token", refresh_token);
+    if (try teamPrincipalIdFromAccessToken(alloc, access_token)) |principal_id| {
+        defer alloc.free(principal_id);
+        try form.append(&body.writer, "principal_type", team_principal_type);
+        try form.append(&body.writer, "principal_id", principal_id);
+    }
+    return body.toOwnedSlice();
+}
+
 fn refreshSession(
     alloc: Allocator,
     transport: oauth_transport.Provider,
     mutation: *grok_session.Mutation,
     session: *grok_session.Session,
 ) !void {
-    var body: std.Io.Writer.Allocating = .init(alloc);
-    defer body.deinit();
-    var form: FormBody = .{};
-    try form.append(&body.writer, "grant_type", "refresh_token");
-    try form.append(&body.writer, "client_id", client_id);
-    try form.append(&body.writer, "refresh_token", session.refresh_token);
-    var token = try requestRefreshToken(alloc, transport, body.written());
+    const payload = try buildRefreshPayload(alloc, session.refresh_token, session.access_token);
+    defer secret.zeroAndFree(alloc, payload);
+    var token = try requestRefreshToken(alloc, transport, payload);
     defer token.deinit(alloc);
 
     const account_id = try fetchAccountId(alloc, transport, token.access_token);
@@ -712,6 +728,9 @@ fn fetchAccountId(
     transport: oauth_transport.Provider,
     access_token: []const u8,
 ) ![]u8 {
+    if (try teamPrincipalIdFromAccessToken(alloc, access_token)) |principal_id| {
+        return principal_id;
+    }
     const endpoint_url = try configuredEndpoint(alloc, e2e_userinfo_url_env, userinfo_url);
     defer alloc.free(endpoint_url);
     const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{access_token});
@@ -732,6 +751,38 @@ fn fetchAccountId(
     errdefer alloc.free(account_id);
     if (!grok_session.validAccountId(account_id)) return error.InvalidGrokUserInfoResponse;
     return account_id;
+}
+
+fn teamPrincipalIdFromAccessToken(alloc: Allocator, access_token: []const u8) !?[]u8 {
+    var parts = std.mem.splitScalar(u8, access_token, '.');
+    _ = parts.next() orelse return null;
+    const payload = parts.next() orelse return null;
+    _ = parts.next() orelse return null;
+    if (parts.next() != null) return null;
+
+    const decoded_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(payload) catch
+        return null;
+    const decoded = try alloc.alloc(u8, decoded_len);
+    defer alloc.free(decoded);
+    std.base64.url_safe_no_pad.Decoder.decode(decoded, payload) catch return null;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, decoded, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const object = parsed.value.object;
+    const principal_type = object.get("principal_type") orelse
+        object.get("principalType") orelse return null;
+    if (principal_type != .string or
+        !std.mem.eql(u8, principal_type.string, team_principal_type)) return null;
+    const principal_id = object.get("principal_id") orelse
+        object.get("principalId") orelse return error.InvalidGrokAccessToken;
+    if (principal_id != .string or !grok_session.validAccountId(principal_id.string)) {
+        return error.InvalidGrokAccessToken;
+    }
+    return try alloc.dupe(u8, principal_id.string);
 }
 
 fn revokeToken(
@@ -908,6 +959,14 @@ fn writeStdout(text: []const u8) !void {
     try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
 }
 
+fn testAccessToken(alloc: Allocator, payload: []const u8) ![]u8 {
+    const encoded_len = std.base64.url_safe_no_pad.Encoder.calcSize(payload.len);
+    const encoded = try alloc.alloc(u8, encoded_len);
+    defer alloc.free(encoded);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, payload);
+    return std.fmt.allocPrint(alloc, "header.{s}.signature", .{encoded});
+}
+
 test "Grok E2E OAuth endpoint overrides accept only loopback HTTP" {
     try std.testing.expect(isLoopbackHttpUrl("http://127.0.0.1:1234/token"));
     try std.testing.expect(isLoopbackHttpUrl("http://localhost:1234/token"));
@@ -934,6 +993,33 @@ test "Grok account identity comes from authenticated userinfo" {
     defer std.testing.allocator.free(account_id);
     try std.testing.expect(state.authorization_seen);
     try std.testing.expectEqualStrings("acct_test", account_id);
+}
+
+test "Grok team account identity comes from the access token" {
+    const State = struct {
+        request_seen: bool = false,
+
+        fn execute(raw: ?*anyopaque, alloc: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.request_seen = true;
+            return .{ .disposition = .rejected, .body = try alloc.dupe(u8, "") };
+        }
+    };
+    const access_token = try testAccessToken(
+        std.testing.allocator,
+        "{\"principal_type\":\"Team\",\"principal_id\":\"team_test\"}",
+    );
+    defer std.testing.allocator.free(access_token);
+    var state = State{};
+    const account_id = try fetchAccountId(
+        std.testing.allocator,
+        .{ .context = &state, .execute_fn = State.execute },
+        access_token,
+    );
+    defer std.testing.allocator.free(account_id);
+
+    try std.testing.expect(!state.request_seen);
+    try std.testing.expectEqualStrings("team_test", account_id);
 }
 
 test "Grok account identity rejects unsafe userinfo bytes" {
@@ -986,6 +1072,28 @@ test "Grok refresh uses form encoding and accepts omitted token rotation" {
     try std.testing.expect(std.mem.find(u8, state.payload[0..state.payload_len], "grant_type=refresh_token") != null);
     try std.testing.expect(response.refresh_token == null);
     try std.testing.expectEqual(@as(?i64, 3600), response.expires_in);
+}
+
+test "Grok team refresh retains the selected principal" {
+    const access_token = try testAccessToken(
+        std.testing.allocator,
+        "{\"principalType\":\"Team\",\"principalId\":\"team-test\"}",
+    );
+    defer std.testing.allocator.free(access_token);
+    const payload = try buildRefreshPayload(std.testing.allocator, "refresh", access_token);
+    defer secret.zeroAndFree(std.testing.allocator, payload);
+
+    try std.testing.expect(std.mem.find(u8, payload, "grant_type=refresh_token") != null);
+    try std.testing.expect(std.mem.find(u8, payload, "principal_type=Team") != null);
+    try std.testing.expect(std.mem.find(u8, payload, "principal_id=team-test") != null);
+}
+
+test "Grok personal refresh omits team principal fields" {
+    const payload = try buildRefreshPayload(std.testing.allocator, "refresh", "opaque-access-token");
+    defer secret.zeroAndFree(std.testing.allocator, payload);
+
+    try std.testing.expect(std.mem.find(u8, payload, "principal_type") == null);
+    try std.testing.expect(std.mem.find(u8, payload, "principal_id") == null);
 }
 
 test "Grok browser authorization URL uses PKCE without device authentication" {
