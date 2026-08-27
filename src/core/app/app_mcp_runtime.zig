@@ -1181,6 +1181,16 @@ test "transactional reload retains old runtime and publishes only accepted candi
         },
         .retained_required_failure => return error.TestUnexpectedResult,
     }
+    try std.testing.expectError(
+        error.McpAuthorityChanged,
+        state.callTool(
+            alloc,
+            "mcp_candidate_echo",
+            "{}",
+            1024,
+            .{ .expected_runtime_generation = original_generation },
+        ),
+    );
 
     test_reload_mode = .empty;
     var empty = try state.reload(alloc, "/workspace", .{}, loadTestReloadRuntime, previewTestWorkspaceAuthority, .{}, 40);

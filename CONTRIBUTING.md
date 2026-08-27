@@ -178,9 +178,11 @@ top-level `mcpServers`, accepts `command` plus `args`, and is opened as a
 bounded no-follow regular file. Profile entries win native name collisions;
 ACP request entries win ACP name collisions without deduplicating the request
 array. Workspace entries are always optional and never load stored credentials.
-Workspace `command`, `args`, `env`, and HTTP header values expand `${VAR}` and
-`${VAR:-default}` from the fx process environment. Missing required variables
-leave that server unloaded and appear in `/mcp list` without exposing values.
+Approved workspace `command`, `args`, `env`, and HTTP header values expand
+`${VAR}` and `${VAR:-default}` from the fx process environment. Pending and
+rejected entries do not read environment values. Missing required variables
+leave an approved server unloaded and appear in `/mcp list` without exposing
+values.
 
 Interactive sessions keep pending workspace servers disconnected and request
 project trust before any project-defined process or network effect. Pending
@@ -189,8 +191,9 @@ resource, prompt, completion, and authentication commands require explicit
 Choices live only in profile `settings.json` under the canonical workspace key,
 using `enabledMcpjsonServers`, `disabledMcpjsonServers`, and
 `enableAllProjectMcpServers`. Repository files cannot persist their own
-approval. `fx ask` and ACP connect pending workspace servers without persisting
-approval; rejected servers remain disabled.
+approval. `fx ask` and ACP skip pending workspace servers. Noninteractive users
+approve them first with `fx mcp trust approve <name>`; rejected servers remain
+disabled.
 
 The core feature surface is Tools, Resources and Resource Templates, Prompts,
 Completion, pagination, cache-aware discovery, subscriptions, progress,
@@ -258,12 +261,28 @@ The noninteractive MCP surface supports:
 
 * `fx mcp remove <name>`
 
+* `fx mcp trust approve <name>`
+
+* `fx mcp trust reject <name>`
+
+* `fx mcp trust approve-all`
+
+* `fx mcp trust reset`
+
 The local form saves a stdio command. The HTTP form saves a remote Streamable
 HTTP endpoint. List reads effective profile and workspace configuration plus
 stored authentication state without connecting servers. Path prints the profile
 configuration path. Remove uses the same locked canonical profile writer as
-add. Auth and logout run the existing remote credential lifecycle. None of these
-commands constructs the TUI or contacts the Gateway.
+add. Trust updates the canonical workspace entry in profile settings. Auth and
+logout run the existing remote credential lifecycle. None of these commands
+constructs the TUI or contacts the Gateway.
+
+MongoDB Atlas Managed MCP configuration service accounts use the OAuth
+client-credentials grant. fx does not implement that grant directly. Use
+MongoDB's `mongodb-atlas-mcp-remote` stdio wrapper with inherited
+`MDB_MCP_API_CLIENT_ID` and `MDB_MCP_API_CLIENT_SECRET` environment variables.
+The Atlas App Connection browser flow is user-delegated access and must not be
+treated as equivalent to configuration service-account credentials.
 
 Remote authentication supports configured bearer tokens and OAuth credential
 discovery, persistence, refresh, scope challenges, and logout. Credential and

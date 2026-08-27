@@ -45,6 +45,7 @@ const mode_registry = @import("../modes/mode_registry.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_health = @import("../mcp/health.zig");
+const project_config = @import("../mcp/project_config.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
@@ -2205,6 +2206,32 @@ fn runTopLevelMcp(
         );
         return .handled_success;
     }
+    if (std.mem.eql(u8, operation, "trust")) {
+        const action = parseTopLevelProjectMcpAction(rest[1..]) catch {
+            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+            return .handled_failure;
+        };
+        const workspace_root = io_mod.realpathAlloc(alloc, ".") catch |err| {
+            try writeMcpOperationFailure(alloc, deps, "trust", err);
+            return .handled_failure;
+        };
+        defer alloc.free(workspace_root);
+        var attempt = config_runtime.attemptProjectMcpMutation(
+            alloc,
+            workspace_root,
+            action,
+        );
+        defer attempt.deinit(alloc);
+        switch (attempt) {
+            .failure => |failure| {
+                try writeMcpOperationFailure(alloc, deps, "trust", failure.err);
+                return .handled_failure;
+            },
+            .outcome => {},
+        }
+        try writeMcpTrustSuccess(alloc, deps, workspace_root, action);
+        return .handled_success;
+    }
     if (std.mem.eql(u8, operation, "path")) {
         if (rest.len != 1) {
             try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
@@ -2385,6 +2412,56 @@ fn runTopLevelMcp(
 
     try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
     return .handled_failure;
+}
+
+fn parseTopLevelProjectMcpAction(
+    args: []const [:0]const u8,
+) error{InvalidProjectMcpTrustArgs}!project_config.ProjectMcpAction {
+    if (args.len == 1 and std.mem.eql(u8, args[0], "approve-all")) return .approve_all;
+    if (args.len == 1 and std.mem.eql(u8, args[0], "reset")) return .reset;
+    if (args.len != 2 or args[1].len == 0) return error.InvalidProjectMcpTrustArgs;
+    if (std.mem.eql(u8, args[0], "approve")) return .{ .approve = args[1] };
+    if (std.mem.eql(u8, args[0], "reject")) return .{ .reject = args[1] };
+    return error.InvalidProjectMcpTrustArgs;
+}
+
+fn writeMcpTrustSuccess(
+    alloc: Allocator,
+    deps: RunDeps,
+    workspace_root: []const u8,
+    action: project_config.ProjectMcpAction,
+) !void {
+    var encoded_root = try text_utils.encodeTerminalSafe(alloc, workspace_root, 512);
+    defer encoded_root.deinit(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    switch (action) {
+        .approve => |name| {
+            var encoded_name = try text_utils.encodeTerminalSafe(alloc, name, 160);
+            defer encoded_name.deinit(alloc);
+            try out.writer.print(
+                "Approved project MCP server '{s}' for {s}.\n",
+                .{ encoded_name.bytes, encoded_root.bytes },
+            );
+        },
+        .reject => |name| {
+            var encoded_name = try text_utils.encodeTerminalSafe(alloc, name, 160);
+            defer encoded_name.deinit(alloc);
+            try out.writer.print(
+                "Rejected project MCP server '{s}' for {s}.\n",
+                .{ encoded_name.bytes, encoded_root.bytes },
+            );
+        },
+        .approve_all => try out.writer.print(
+            "Approved all project MCP servers for {s}.\n",
+            .{encoded_root.bytes},
+        ),
+        .reset => try out.writer.print(
+            "Reset project MCP trust for {s}.\n",
+            .{encoded_root.bytes},
+        ),
+    }
+    try writeStdout(deps, out.written());
 }
 
 fn openTopLevelMcpUrl(
@@ -4626,6 +4703,49 @@ test "top-level MCP list loads configuration without discovery and remove uses i
     }
 }
 
+test "top-level MCP trust persists project approval without interactive startup" {
+    const alloc = std.testing.allocator;
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try environ.put("HOME", home);
+    try environ.put("PATH", "");
+    const stable_environ = try stableCliTestEnviron();
+    io_mod.setEnvironMap(&environ);
+    defer io_mod.setEnvironMap(stable_environ);
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+    var deps = capture.deps();
+    deps.load_startup_state_without_credentials = failingStartupStateWithoutCredentials;
+
+    const result = try runIfRequestedWithDeps(
+        alloc,
+        &.{ @constCast("mcp"), @constCast("trust"), @constCast("approve"), @constCast("fixture") },
+        testConfig(),
+        deps,
+    );
+    try std.testing.expectEqual(RunResult.handled_success, result);
+    const expected = try std.fmt.allocPrint(
+        alloc,
+        "Approved project MCP server 'fixture' for {s}.\n",
+        .{workspace_root},
+    );
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, capture.stdout.written());
+    try std.testing.expectEqualStrings("", capture.stderr.written());
+
+    var choices = try config_runtime.loadProjectMcpChoices(alloc, workspace_root);
+    defer choices.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), choices.choices.approved.len);
+    try std.testing.expectEqualStrings("fixture", choices.choices.approved[0]);
+}
+
 test "workspace launch modifiers preserve supported command help" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
@@ -5814,6 +5934,14 @@ fn stubLoadStartupStateWithoutCredentials(
     errdefer state.deinit(alloc);
     state.workspace_root = try alloc.dupe(u8, "/tmp/fx");
     return state;
+}
+
+fn failingStartupStateWithoutCredentials(
+    _: Allocator,
+    _: []const u8,
+    _: usize,
+) !app_lifecycle.StartupState {
+    return error.StartupShouldNotRun;
 }
 
 fn stubLoadCatalogStartupState(

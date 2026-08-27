@@ -279,10 +279,6 @@ pub fn Bindings(comptime App: type) type {
                 .tool_registry = if (comptime @hasDecl(App, "toolRegistry")) app.toolRegistry() else .{},
                 .context_registry = if (comptime @hasDecl(App, "contextRegistry")) app.contextRegistry() else null,
                 .context_enabled = if (comptime @hasField(App, "context_enabled")) app.context_enabled else false,
-                .current_mcp_generation = if (comptime @hasDecl(App, "acquireMcpRuntime"))
-                    agentCurrentMcpGeneration
-                else
-                    null,
                 .snapshot_root_permission_mode = if (comptime @hasField(App, "permission_engine"))
                     agentSnapshotRootPermissionMode
                 else
@@ -368,13 +364,6 @@ pub fn Bindings(comptime App: type) type {
                 deps.release_agent_terminal_lease = agentReleaseTerminalLease;
             }
             return deps;
-        }
-
-        fn agentCurrentMcpGeneration(raw_ctx: *anyopaque) ?u64 {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            var lease = app.acquireMcpRuntime() orelse return null;
-            defer lease.deinit();
-            return lease.runtime.generation;
         }
 
         fn agentReleaseTerminalLease(ctx: *anyopaque, session_id: []const u8) !void {

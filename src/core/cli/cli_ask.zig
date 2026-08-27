@@ -1647,15 +1647,15 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             try ctx.writeStderr(issue.message);
             try ctx.writeStderr("\n");
         }
-        const project_names = try mcp.pendingWorkspaceNamesForPhase(alloc, .ask_startup);
+        const project_names = try mcp.pendingWorkspaceNames(alloc);
         defer mcp_contract.freeOwnedStrings(alloc, project_names);
         if (project_names.len > 0) {
-            try ctx.writeStderr("fx ask: loaded project MCP servers: ");
+            try ctx.writeStderr("fx ask: skipped unapproved project MCP servers: ");
             for (project_names, 0..) |name, index| {
                 if (index > 0) try ctx.writeStderr(", ");
                 try ctx.writeStderr(name);
             }
-            try ctx.writeStderr("\n");
+            try ctx.writeStderr(". Approve with fx mcp trust approve <name> before retrying.\n");
         }
         mcp.connectRequiredForAsk(ctx.toolRegistry());
     }

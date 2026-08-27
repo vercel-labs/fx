@@ -997,16 +997,27 @@ fn handleLoadFailure(
 }
 
 pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
-    var store = session_store.Store.initReadOnly(
-        alloc,
-        state.workspace_root,
-    ) catch {
+    const cwd_filter = parseListSessionsCwd(alloc, msg) catch |err| switch (err) {
+        error.InvalidParams => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Invalid params",
+        }),
+        else => return err,
+    };
+    defer if (cwd_filter) |cwd| alloc.free(cwd);
+    var store = (if (state.cfg.home_override) |home|
+        session_store.Store.initReadOnlyFromHome(alloc, home, cwd_filter orelse state.workspace_root)
+    else
+        session_store.Store.initReadOnly(alloc, cwd_filter orelse state.workspace_root)) catch {
         try state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
         return;
     };
     defer store.deinit(alloc);
 
-    var session_list = store.listForWorkspace(alloc) catch {
+    var session_list = (if (cwd_filter != null)
+        store.listForWorkspace(alloc)
+    else
+        store.list(alloc)) catch {
         try state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
         return;
     };
@@ -1019,12 +1030,30 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
     defer out.deinit();
 
     try out.writer.writeAll("{\"sessions\":[");
-    for (session_list.items, 0..) |summary, i| {
-        if (i > 0) try out.writer.writeAll(",");
+    var wrote_session = false;
+    for (session_list.items) |summary| {
+        const workspace_root = summary.workspace_root orelse {
+            debug_trace.logf(
+                "acp",
+                "session operation=list outcome=omitted id={s} reason=workspace_unknown",
+                .{summary.id},
+            );
+            continue;
+        };
+        if (!std.fs.path.isAbsolute(workspace_root)) {
+            debug_trace.logf(
+                "acp",
+                "session operation=list outcome=omitted id={s} reason=workspace_not_absolute",
+                .{summary.id},
+            );
+            continue;
+        }
+        if (wrote_session) try out.writer.writeAll(",");
+        wrote_session = true;
         try out.writer.writeAll("{\"sessionId\":");
         try writeJsonStr(summary.id, &out.writer);
         try out.writer.writeAll(",\"cwd\":");
-        try writeJsonStr(state.workspace_root, &out.writer);
+        try writeJsonStr(workspace_root, &out.writer);
         try out.writer.writeAll(",\"updatedAt\":");
         const iso = try formatIso8601(alloc, summary.updated_at_ms);
         defer alloc.free(iso);
@@ -1034,6 +1063,23 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
     try out.writer.writeAll("]}");
 
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+}
+
+fn parseListSessionsCwd(
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+) !?[]u8 {
+    const raw = msg.params_raw orelse return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch
+        return error.InvalidParams;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidParams;
+    const cwd = parsed.value.object.get("cwd") orelse return null;
+    if (cwd == .null) return null;
+    if (cwd != .string or !std.fs.path.isAbsolute(cwd.string)) {
+        return error.InvalidParams;
+    }
+    return try alloc.dupe(u8, cwd.string);
 }
 
 fn sendHistoryTurnAsUpdates(state: *server.ServerState, alloc: Allocator, session_id: []const u8, turn: types.HistoryTurn) !void {
@@ -1626,12 +1672,13 @@ test "ACP project MCP loading expands workspace environment templates" {
     defer test_home.deinit();
     try test_home.map.put("ACP_MCP_COMMAND", "node");
     try test_home.map.put("ACP_MCP_TOKEN", "secret-value");
+    var approved_names = [_][]u8{@constCast("expanded")};
 
     var result = try workspace_config.load(
         alloc,
         workspace_path,
         .workspace,
-        .{},
+        .{ .approved = &approved_names },
     );
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);

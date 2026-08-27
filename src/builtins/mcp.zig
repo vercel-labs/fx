@@ -1405,12 +1405,13 @@ test "workspace MCP loading expands command args environment and HTTP headers" {
     defer environment.deinit();
     try environment.map.put("MCP_COMMAND", "node");
     try environment.map.put("MCP_TOKEN", "secret-value");
+    var approved_names = [_][]u8{ @constCast("local"), @constCast("remote") };
 
     var result = try workspace_config.load(
         alloc,
         workspace_root,
         .workspace,
-        .{},
+        .{ .approved = &approved_names },
     );
     defer result.deinit(alloc);
 
@@ -1434,8 +1435,16 @@ test "workspace MCP missing environment variable is actionable and secret free" 
     );
     const workspace_root = try tmpDirPath(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace_root);
-
-    const environment = try TestHome.install(alloc, "/tmp");
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"workspaces\":{{\"{s}\":{{\"enableAllProjectMcpServers\":true}}}}}}",
+        .{workspace_root},
+    );
+    defer alloc.free(settings);
+    try writeTempFile(&tmp, "home/.fx/settings.json", settings);
+    const home_path = try tmpDirPath(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const environment = try TestHome.install(alloc, home_path);
     defer environment.deinit();
 
     const runtime = try loadRuntime(alloc, workspace_root, .{}) orelse
@@ -2445,6 +2454,38 @@ test "addProfileServerToPath roundtrips local replacement and remove" {
     var after = try loadConfigFromPath(alloc, path);
     defer freeConfigs(alloc, &after);
     try std.testing.expectEqual(@as(usize, 0), after.items.len);
+}
+
+test "profile mutation preserves canonical files with suspicious sibling maps" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const path = try configPathFromHome(alloc, home);
+    defer alloc.free(path);
+    const original =
+        "{\"mcp\":{\"canonical\":{\"command\":\"one\"}},\"MCP-Servers\":{\"shadow\":{\"command\":\"two\"}},\"metadata\":{\"owner\":\"team\"}}";
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "home/.fx/mcp.json",
+        .data = original,
+    });
+
+    try std.testing.expectError(
+        error.McpConfigAmbiguousServerKey,
+        addProfileServerToPath(
+            alloc,
+            path,
+            try command_provider_contract.parseAddIntent(&.{ "new", "node" }),
+        ),
+    );
+
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
+    defer file.close(io_mod.getIo());
+    const after = try io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
+    defer alloc.free(after);
+    try std.testing.expectEqualStrings(original, after);
 }
 
 test "MCP add intent rejects invalid server names" {

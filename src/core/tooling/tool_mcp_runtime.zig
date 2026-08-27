@@ -76,6 +76,7 @@ pub const Access = union(enum) {
 };
 
 pub const CallOptions = struct {
+    expected_runtime_generation: ?u64 = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     progress: ?ProgressSink = null,
     input_responder: ?InputResponder = null,
@@ -259,7 +260,7 @@ pub const CallResult = struct {
 };
 
 pub const ValidationResult = union(enum) {
-    valid,
+    valid: u64,
     invalid: []const u8,
     not_available,
 };

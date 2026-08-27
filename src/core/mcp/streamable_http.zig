@@ -376,19 +376,17 @@ fn postCore(alloc: Allocator, options: PostOptions) !PostResponse {
             response.head,
         );
         defer if (authenticate) |value| alloc.free(value);
-        if (status == .unauthorized or authenticate != null) {
-            return .{
-                .body = try alloc.dupe(u8, ""),
-                .auth_rejection = if (status == .unauthorized)
-                    .unauthorized
-                else
-                    .insufficient_scope,
-                .www_authenticate = if (authenticate) |value|
-                    try alloc.dupe(u8, value)
-                else
-                    null,
-            };
-        }
+        return .{
+            .body = try alloc.dupe(u8, ""),
+            .auth_rejection = if (status == .unauthorized)
+                .unauthorized
+            else
+                .insufficient_scope,
+            .www_authenticate = if (authenticate) |value|
+                try alloc.dupe(u8, value)
+            else
+                null,
+        };
     }
 
     const version_error = options.allow_version_error and status == .bad_request;
@@ -1078,7 +1076,11 @@ fn validateFinalResponse(
     if (jsonrpc != .string or !std.mem.eql(u8, jsonrpc.string, "2.0")) {
         return error.InvalidJsonResponse;
     }
-    const id_value = parsed.value.object.get("id") orelse return error.InvalidJsonResponse;
+    const id_value = parsed.value.object.get("id") orelse {
+        if (allow_discovery_error_id_mismatch and
+            isLegacySessionlessDiscoveryError(parsed.value.object)) return;
+        return error.InvalidJsonResponse;
+    };
     const matching_id = id_value == .integer and id_value.integer == request_id;
     const classifiable_discovery_error = allow_discovery_error_id_mismatch and
         parsed.value.object.contains("error") and
@@ -1089,6 +1091,18 @@ fn validateFinalResponse(
     if (!parsed.value.object.contains("result") and !parsed.value.object.contains("error")) {
         return error.InvalidJsonResponse;
     }
+}
+
+const legacy_sessionless_invalid_request_code: i64 = -32004;
+
+fn isLegacySessionlessDiscoveryError(object: std.json.ObjectMap) bool {
+    if (object.contains("result")) return false;
+    const error_value = object.get("error") orelse return false;
+    if (error_value != .object) return false;
+    const code = error_value.object.get("code") orelse return false;
+    const message = error_value.object.get("message") orelse return false;
+    return code == .integer and code.integer == legacy_sessionless_invalid_request_code and
+        message == .string and std.mem.eql(u8, message.string, "invalid request");
 }
 
 fn waitForCancellation(cancellation: operation_control.CancellationSources) anyerror!void {
@@ -1580,6 +1594,36 @@ test "modern MCP JSON responses are bounded and retain request ownership" {
     try std.testing.expectEqualStrings(
         string_id_discovery_error,
         string_id_discovery_error_body,
+    );
+
+    const mongodb_session_error =
+        "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32004,\"message\":\"invalid request\"}}";
+    var mongodb_session_error_reader = std.Io.Reader.fixed(mongodb_session_error);
+    const mongodb_session_error_body = try readJsonResponse(
+        alloc,
+        &mongodb_session_error_reader,
+        7,
+        mongodb_session_error.len,
+        true,
+    );
+    defer alloc.free(mongodb_session_error_body);
+    try std.testing.expectEqualStrings(
+        mongodb_session_error,
+        mongodb_session_error_body,
+    );
+
+    const unrelated_missing_id_error =
+        "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}";
+    var unrelated_missing_id_reader = std.Io.Reader.fixed(unrelated_missing_id_error);
+    try std.testing.expectError(
+        error.InvalidJsonResponse,
+        readJsonResponse(
+            alloc,
+            &unrelated_missing_id_reader,
+            7,
+            unrelated_missing_id_error.len,
+            true,
+        ),
     );
 
     const string_id_success =

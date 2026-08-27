@@ -488,7 +488,8 @@ pub const FakeAgentRuntimeDeps = struct {
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
     root_permission_mode: ?PermissionMode = null,
-    current_mcp_generation: ?u64 = null,
+    validation_mcp_runtime_generation: ?u64 = null,
+    validation_mcp_tool_name: ?[]const u8 = null,
     execute_mutex: std.Io.Mutex = .init,
     log: std.ArrayList([]u8) = .empty,
     texts: std.ArrayList([]u8) = .empty,
@@ -513,6 +514,7 @@ pub const FakeAgentRuntimeDeps = struct {
     validated_names: std.ArrayList([]u8) = .empty,
     availability_checked_names: std.ArrayList([]u8) = .empty,
     execution_classification_complete: std.ArrayList(bool) = .empty,
+    execution_mcp_runtime_generations: std.ArrayList(?u64) = .empty,
     last_validated_arguments: ?[]u8 = null,
     last_permission_arguments: ?[]u8 = null,
     last_executed_arguments: ?[]u8 = null,
@@ -698,6 +700,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.validated_names);
         freeStringList(self.alloc, &self.availability_checked_names);
         self.execution_classification_complete.deinit(self.alloc);
+        self.execution_mcp_runtime_generations.deinit(self.alloc);
         if (self.last_validated_arguments) |value| self.alloc.free(value);
         if (self.last_permission_arguments) |value| self.alloc.free(value);
         if (self.last_executed_arguments) |value| self.alloc.free(value);
@@ -741,10 +744,6 @@ pub const FakeAgentRuntimeDeps = struct {
             .context_enabled = self.context_enabled,
             .snapshot_root_permission_mode = if (self.root_permission_mode != null)
                 snapshotRootPermissionMode
-            else
-                null,
-            .current_mcp_generation = if (self.current_mcp_generation != null)
-                snapshotCurrentMcpGeneration
             else
                 null,
             .finalize_turn = finalizeTurn,
@@ -988,7 +987,16 @@ pub const FakeAgentRuntimeDeps = struct {
                 return .{ .failure = try std.fmt.allocPrint(arena, "{s} arguments failed registered-tool validation", .{call.name}) };
             }
         }
-        return .valid;
+        const mcp_runtime_generation = if (self.validation_mcp_tool_name) |name|
+            if (std.mem.eql(u8, name, call.name))
+                self.validation_mcp_runtime_generation
+            else
+                null
+        else
+            null;
+        return .{ .valid = .{
+            .mcp_runtime_generation = mcp_runtime_generation,
+        } };
     }
 
     fn checkToolAvailability(raw: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
@@ -1156,11 +1164,6 @@ pub const FakeAgentRuntimeDeps = struct {
             .feedback = if (feedback.len == 0) null else try arena.dupe(u8, feedback),
             .auto_review_result = auto_review_result,
         };
-    }
-
-    fn snapshotCurrentMcpGeneration(raw: *anyopaque) ?u64 {
-        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        return self.current_mcp_generation;
     }
 
     fn testVisionPathAuthority(
@@ -1349,6 +1352,10 @@ pub const FakeAgentRuntimeDeps = struct {
             try self.execution_classification_complete.append(
                 self.alloc,
                 request.classification_complete,
+            );
+            try self.execution_mcp_runtime_generations.append(
+                self.alloc,
+                request.expected_mcp_runtime_generation,
             );
             try self.execute_timeout_started_ms.append(
                 self.alloc,

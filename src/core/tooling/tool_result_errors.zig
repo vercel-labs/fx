@@ -301,6 +301,7 @@ pub fn formatToolExecutionErrorJson(
 pub fn executionErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.McpInputTimedOut => "MCP elicitation timed out while user input was pending",
+        error.McpAuthorityChanged => "MCP configuration or authority changed before execution",
         else => null,
     };
 }
@@ -308,6 +309,7 @@ pub fn executionErrorMessage(err: anyerror) ?[]const u8 {
 pub fn executionErrorSuggestion(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.McpInputTimedOut => "Tell the user the form timed out with input pending, then retry only if they want to complete it again.",
+        error.McpAuthorityChanged => "Retry the tool on the next model step so fx can validate it against the current MCP runtime.",
         else => null,
     };
 }
@@ -603,6 +605,19 @@ test "MCP input timeout tells the model that user input was pending" {
 
     try std.testing.expect(std.mem.find(u8, payload, "user input was pending") != null);
     try std.testing.expect(std.mem.find(u8, payload, "form timed out with input pending") != null);
+}
+
+test "MCP authority change tells the model to retry on the next step" {
+    const alloc = std.testing.allocator;
+    const payload = try formatToolExecutionErrorJson(
+        alloc,
+        "mcp_server_tool",
+        error.McpAuthorityChanged,
+    );
+    defer alloc.free(payload);
+
+    try std.testing.expect(std.mem.find(u8, payload, "MCP configuration or authority changed before execution") != null);
+    try std.testing.expect(std.mem.find(u8, payload, "next model step") != null);
 }
 
 test "filesystem access denial JSON preserves recovery details" {

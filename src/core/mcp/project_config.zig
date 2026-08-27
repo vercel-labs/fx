@@ -187,24 +187,37 @@ pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8) !ProfilePar
     if (parsed.value != .object) return error.McpConfigRootMustBeObject;
 
     const object = parsed.value.object;
-    if (object.get("mcp")) |servers| {
-        var result = ProfileParseResult{
-            .configs = try parseProfileServerMap(alloc, servers),
-        };
+    const canonical = object.get("mcp");
+    const alias = object.get("mcpServers");
+    if (canonical orelse alias) |servers| {
+        var result = ProfileParseResult{ .configs = try parseProfileServerMap(alloc, servers) };
         errdefer result.deinit(alloc);
-        if (object.get("mcpServers")) |alias| {
-            if (profileAliasIsNonEmpty(alias)) {
+        switch (scanSuspiciousProfileKeys(object)) {
+            .clear => if (canonical != null and alias != null and profileAliasIsNonEmpty(alias.?)) {
                 result.diagnostic = ProfileDiagnostic.init(
                     .ignored_mcp_servers_alias,
                     "mcpServers",
                     0,
                 );
-            }
+            },
+            .found => |found| {
+                result.diagnostic = ProfileDiagnostic.init(
+                    .suspicious_server_key,
+                    found.key,
+                    found.additional_matches,
+                );
+                result.mutation_allowed = false;
+            },
+            .indeterminate => {
+                result.diagnostic = ProfileDiagnostic.init(
+                    .suspicious_key_scan_indeterminate,
+                    null,
+                    0,
+                );
+                result.mutation_allowed = false;
+            },
         }
         return result;
-    }
-    if (object.get("mcpServers")) |servers| {
-        return .{ .configs = try parseProfileServerMap(alloc, servers) };
     }
 
     return switch (scanSuspiciousProfileKeys(object)) {
@@ -273,6 +286,7 @@ fn scanSuspiciousProfileKeys(object: std.json.ObjectMap) SuspiciousKeyScan {
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         const value = entry.value_ptr.*;
+        if (std.mem.eql(u8, key, "mcp") or std.mem.eql(u8, key, "mcpServers")) continue;
         if (key.len > max_profile_key_bytes) {
             if (serverMapShape(value) != .clear) return .indeterminate;
             continue;
@@ -344,13 +358,13 @@ fn isSuspiciousNormalizedKey(raw: []const u8) bool {
         std.mem.eql(u8, key, "servers");
 }
 
-fn parseWorkspaceJson(
+pub fn parseWorkspaceJson(
     alloc: Allocator,
     json_text: []const u8,
     scope: mcp_contract.ConfigScope,
     choices: ProjectMcpChoices,
 ) Allocator.Error!WorkspaceParseResult {
-    return parseWorkspaceJsonInternal(alloc, json_text, scope, choices, null);
+    return parseWorkspaceJsonInternal(alloc, json_text, scope, choices);
 }
 
 pub fn parseWorkspaceJsonWithEnvironment(
@@ -360,7 +374,10 @@ pub fn parseWorkspaceJsonWithEnvironment(
     choices: ProjectMcpChoices,
     environment: *const std.process.Environ.Map,
 ) Allocator.Error!WorkspaceParseResult {
-    return parseWorkspaceJsonInternal(alloc, json_text, scope, choices, environment);
+    var result = try parseWorkspaceJsonInternal(alloc, json_text, scope, choices);
+    errdefer result.deinit(alloc);
+    try expandApprovedWorkspaceConfigs(alloc, &result, environment);
+    return result;
 }
 
 fn parseWorkspaceJsonInternal(
@@ -368,7 +385,6 @@ fn parseWorkspaceJsonInternal(
     json_text: []const u8,
     scope: mcp_contract.ConfigScope,
     choices: ProjectMcpChoices,
-    environment: ?*const std.process.Environ.Map,
 ) Allocator.Error!WorkspaceParseResult {
     var result: WorkspaceParseResult = .{};
     errdefer result.deinit(alloc);
@@ -391,7 +407,6 @@ fn parseWorkspaceJsonInternal(
         return result;
     }
 
-    var expansion_budget = WorkspaceExpansionBudget.init();
     var it = servers.object.iterator();
     while (it.next()) |entry| {
         const admission = resolveAdmission(entry.key_ptr.*, choices);
@@ -414,45 +429,6 @@ fn parseWorkspaceJsonInternal(
                 continue;
             },
         };
-        if (environment) |values| {
-            var mutable = config;
-            var entry_budget = expansion_budget;
-            if (try expandWorkspaceConfig(alloc, &mutable, values, &entry_budget)) |failure| {
-                defer mutable.deinit(alloc);
-                const server_name = try alloc.dupe(u8, entry.key_ptr.*);
-                errdefer alloc.free(server_name);
-                switch (failure) {
-                    .missing => |missing| {
-                        errdefer alloc.free(missing.variable_name);
-                        try result.diagnostics.append(alloc, .{
-                            .server_name = server_name,
-                            .environment_variable = missing.variable_name,
-                            .environment_field = missing.field,
-                            .cause = .missing_environment_variable,
-                        });
-                    },
-                    .invalid => {
-                        try result.diagnostics.append(alloc, .{
-                            .server_name = server_name,
-                            .cause = .invalid_entry,
-                        });
-                    },
-                    .limit_exceeded => {
-                        try result.diagnostics.append(alloc, .{
-                            .server_name = server_name,
-                            .cause = .environment_expansion_limit_exceeded,
-                        });
-                    },
-                }
-                continue;
-            }
-            result.configs.append(alloc, mutable) catch |err| {
-                mutable.deinit(alloc);
-                return err;
-            };
-            expansion_budget = entry_budget;
-            continue;
-        }
         result.configs.append(alloc, config) catch |err| {
             var mutable = config;
             mutable.deinit(alloc);
@@ -460,6 +436,54 @@ fn parseWorkspaceJsonInternal(
         };
     }
     return result;
+}
+
+pub fn expandApprovedWorkspaceConfigs(
+    alloc: Allocator,
+    result: *WorkspaceParseResult,
+    environment: *const std.process.Environ.Map,
+) Allocator.Error!void {
+    var expansion_budget = WorkspaceExpansionBudget.init();
+    var index: usize = 0;
+    while (index < result.configs.items.len) {
+        const config = &result.configs.items[index];
+        if (config.workspace_admission != .approved) {
+            index += 1;
+            continue;
+        }
+        const failure = try expandWorkspaceConfig(
+            alloc,
+            config,
+            environment,
+            &expansion_budget,
+        ) orelse {
+            index += 1;
+            continue;
+        };
+        const server_name = try alloc.dupe(u8, config.name);
+        errdefer alloc.free(server_name);
+        switch (failure) {
+            .missing => |missing| {
+                errdefer alloc.free(missing.variable_name);
+                try result.diagnostics.append(alloc, .{
+                    .server_name = server_name,
+                    .environment_variable = missing.variable_name,
+                    .environment_field = missing.field,
+                    .cause = .missing_environment_variable,
+                });
+            },
+            .invalid => try result.diagnostics.append(alloc, .{
+                .server_name = server_name,
+                .cause = .invalid_entry,
+            }),
+            .limit_exceeded => try result.diagnostics.append(alloc, .{
+                .server_name = server_name,
+                .cause = .environment_expansion_limit_exceeded,
+            }),
+        }
+        var removed = result.configs.orderedRemove(index);
+        removed.deinit(alloc);
+    }
 }
 
 const max_rendered_environment_name_bytes: usize = 128;
@@ -474,7 +498,10 @@ const WorkspaceExpansionBudget = struct {
     }
 
     fn consume(self: *WorkspaceExpansionBudget, byte_count: usize) bool {
-        if (byte_count > self.remaining) return false;
+        if (byte_count > self.remaining) {
+            self.remaining = 0;
+            return false;
+        }
         self.remaining -= byte_count;
         return true;
     }
@@ -484,11 +511,12 @@ const WorkspaceTemplateExpansion = union(enum) {
     expanded: []u8,
     missing: []u8,
     invalid,
+    limit_exceeded,
 
     pub fn deinit(self: *WorkspaceTemplateExpansion, alloc: Allocator) void {
         switch (self.*) {
             .expanded, .missing => |value| alloc.free(value),
-            .invalid => {},
+            .invalid, .limit_exceeded => {},
         }
         self.* = undefined;
     }
@@ -498,6 +526,7 @@ fn expandWorkspaceTemplate(
     alloc: Allocator,
     input: []const u8,
     environment: *const std.process.Environ.Map,
+    budget: *WorkspaceExpansionBudget,
 ) Allocator.Error!WorkspaceTemplateExpansion {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(alloc);
@@ -505,11 +534,11 @@ fn expandWorkspaceTemplate(
     var cursor: usize = 0;
     while (cursor < input.len) {
         const relative_start = std.mem.find(u8, input[cursor..], "${") orelse {
-            if (!try appendExpandedBytes(alloc, &output, input[cursor..])) return .invalid;
+            if (!try appendExpandedBytes(alloc, &output, input[cursor..], budget)) return .limit_exceeded;
             return .{ .expanded = try output.toOwnedSlice(alloc) };
         };
         const start = cursor + relative_start;
-        if (!try appendExpandedBytes(alloc, &output, input[cursor..start])) return .invalid;
+        if (!try appendExpandedBytes(alloc, &output, input[cursor..start], budget)) return .limit_exceeded;
         const expression_start = start + 2;
         const relative_end = std.mem.findScalar(u8, input[expression_start..], '}') orelse
             return .invalid;
@@ -524,7 +553,7 @@ fn expandWorkspaceTemplate(
         const replacement = environment.get(variable_name) orelse default_value orelse {
             return .{ .missing = try alloc.dupe(u8, variable_name) };
         };
-        if (!try appendExpandedBytes(alloc, &output, replacement)) return .invalid;
+        if (!try appendExpandedBytes(alloc, &output, replacement, budget)) return .limit_exceeded;
         cursor = end + 1;
     }
     return .{ .expanded = try output.toOwnedSlice(alloc) };
@@ -534,12 +563,14 @@ fn appendExpandedBytes(
     alloc: Allocator,
     output: *std.ArrayList(u8),
     bytes: []const u8,
+    budget: *WorkspaceExpansionBudget,
 ) Allocator.Error!bool {
     if (output.items.len > max_expanded_workspace_value_bytes or
         bytes.len > max_expanded_workspace_value_bytes - output.items.len)
     {
         return false;
     }
+    if (!budget.consume(bytes.len)) return false;
     try output.appendSlice(alloc, bytes);
     return true;
 }
@@ -590,13 +621,9 @@ fn expandOwnedConstWorkspaceValue(
     field: WorkspaceEnvironmentField,
     budget: *WorkspaceExpansionBudget,
 ) Allocator.Error!?WorkspaceExpansionFailure {
-    var expansion = try expandWorkspaceTemplate(alloc, value.*, environment);
+    var expansion = try expandWorkspaceTemplate(alloc, value.*, environment, budget);
     switch (expansion) {
         .expanded => |expanded| {
-            if (!budget.consume(expanded.len)) {
-                expansion.deinit(alloc);
-                return .limit_exceeded;
-            }
             alloc.free(value.*);
             value.* = expanded;
             expansion = undefined;
@@ -610,6 +637,7 @@ fn expandOwnedConstWorkspaceValue(
             } };
         },
         .invalid => return .invalid,
+        .limit_exceeded => return .limit_exceeded,
     }
 }
 
@@ -1297,6 +1325,22 @@ test "profile document keeps canonical mcp and reports ignored nonempty alias" {
     try std.testing.expect(result.mutation_allowed);
 }
 
+test "profile document blocks suspicious sibling keys beside canonical mcp" {
+    const alloc = std.testing.allocator;
+    var result = try parseProfileDocument(
+        alloc,
+        "{\"mcp\":{\"canonical\":{\"command\":\"one\"}},\"MCP-Servers\":{\"shadow\":{\"command\":\"two\"}},\"metadata\":{\"owner\":\"team\"}}",
+    );
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
+    try std.testing.expectEqualStrings("canonical", result.configs.items[0].name);
+    try std.testing.expect(result.diagnostic != null);
+    try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_server_key, result.diagnostic.?.cause);
+    try std.testing.expectEqualStrings("MCP-Servers", result.diagnostic.?.key().?);
+    try std.testing.expect(!result.mutation_allowed);
+}
+
 test "profile document reports the first exact server-like unsupported key" {
     const alloc = std.testing.allocator;
     var result = try parseProfileDocument(
@@ -1397,22 +1441,25 @@ test "workspace template expansion is explicit bounded and deterministic" {
         .{ .input = "${SET}/${SET}", .expected = "value/value" },
     };
     for (cases) |case| {
-        var expansion = try expandWorkspaceTemplate(alloc, case.input, &environment);
+        var budget = WorkspaceExpansionBudget.init();
+        var expansion = try expandWorkspaceTemplate(alloc, case.input, &environment, &budget);
         defer expansion.deinit(alloc);
         switch (expansion) {
             .expanded => |value| try std.testing.expectEqualStrings(case.expected, value),
-            .missing, .invalid => return error.TestUnexpectedResult,
+            .missing, .invalid, .limit_exceeded => return error.TestUnexpectedResult,
         }
     }
 
-    var missing = try expandWorkspaceTemplate(alloc, "Bearer ${REQUIRED}", &environment);
+    var missing_budget = WorkspaceExpansionBudget.init();
+    var missing = try expandWorkspaceTemplate(alloc, "Bearer ${REQUIRED}", &environment, &missing_budget);
     defer missing.deinit(alloc);
     switch (missing) {
         .missing => |name| try std.testing.expectEqualStrings("REQUIRED", name),
-        .expanded, .invalid => return error.TestUnexpectedResult,
+        .expanded, .invalid, .limit_exceeded => return error.TestUnexpectedResult,
     }
 
-    var malformed = try expandWorkspaceTemplate(alloc, "${NOT-CLOSED", &environment);
+    var malformed_budget = WorkspaceExpansionBudget.init();
+    var malformed = try expandWorkspaceTemplate(alloc, "${NOT-CLOSED", &environment, &malformed_budget);
     defer malformed.deinit(alloc);
     try std.testing.expect(malformed == .invalid);
 
@@ -1422,15 +1469,17 @@ test "workspace template expansion is explicit bounded and deterministic" {
     try environment.put(&long_name, "long-name-value");
     const long_template = try std.fmt.allocPrint(alloc, "${{{s}}}", .{long_name});
     defer alloc.free(long_template);
+    var long_budget = WorkspaceExpansionBudget.init();
     var long_expansion = try expandWorkspaceTemplate(
         alloc,
         long_template,
         &environment,
+        &long_budget,
     );
     defer long_expansion.deinit(alloc);
     switch (long_expansion) {
         .expanded => |value| try std.testing.expectEqualStrings("long-name-value", value),
-        .missing, .invalid => return error.TestUnexpectedResult,
+        .missing, .invalid, .limit_exceeded => return error.TestUnexpectedResult,
     }
 }
 
@@ -1439,12 +1488,13 @@ test "workspace environment diagnostics isolate entries and profile values stay 
     var environment = std.process.Environ.Map.init(alloc);
     defer environment.deinit();
     try environment.put("COMMAND", "node");
+    var approved_names = [_][]u8{ @constCast("good"), @constCast("bad") };
 
     var workspace = try parseWorkspaceJsonWithEnvironment(
         alloc,
         "{\"mcpServers\":{\"good\":{\"command\":\"${COMMAND}\"},\"bad\":{\"command\":\"${REQUIRED}\"}}}",
         .workspace,
-        .{},
+        .{ .approved = &approved_names },
         &environment,
     );
     defer workspace.deinit(alloc);
@@ -1464,6 +1514,30 @@ test "workspace environment diagnostics isolate entries and profile values stay 
     try std.testing.expectEqualStrings("${COMMAND}", profile.configs.items[0].command.?);
 }
 
+test "workspace environment expansion requires approved admission" {
+    const alloc = std.testing.allocator;
+    var environment = std.process.Environ.Map.init(alloc);
+    defer environment.deinit();
+    try environment.put("COMMAND", "node");
+    try environment.put("VALUE", "expanded");
+
+    var workspace = try parseWorkspaceJsonWithEnvironment(
+        alloc,
+        "{\"mcpServers\":{\"local\":{\"command\":\"${COMMAND}\",\"args\":[\"${VALUE}\"],\"env\":{\"TOKEN\":\"${VALUE}\"}},\"remote\":{\"type\":\"http\",\"url\":\"https://example.test/mcp\",\"headers\":{\"Authorization\":\"Bearer ${VALUE}\"}}}}",
+        .workspace,
+        .{},
+        &environment,
+    );
+    defer workspace.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), workspace.configs.items.len);
+    try std.testing.expectEqualStrings("${COMMAND}", workspace.configs.items[0].command.?);
+    try std.testing.expectEqualStrings("${VALUE}", workspace.configs.items[0].args[0]);
+    try std.testing.expectEqualStrings("${VALUE}", workspace.configs.items[0].env[0].value);
+    try std.testing.expectEqualStrings("Bearer ${VALUE}", workspace.configs.items[1].headers[0].value);
+    try std.testing.expectEqual(@as(usize, 0), workspace.diagnostics.items.len);
+}
+
 test "workspace environment expansion enforces one aggregate file budget" {
     const alloc = std.testing.allocator;
     var environment = std.process.Environ.Map.init(alloc);
@@ -1472,12 +1546,13 @@ test "workspace environment expansion enforces one aggregate file budget" {
     defer alloc.free(large);
     @memset(large, 'x');
     try environment.put("LARGE", large);
+    var approved_names = [_][]u8{ @constCast("first"), @constCast("second") };
 
     var workspace = try parseWorkspaceJsonWithEnvironment(
         alloc,
         "{\"mcpServers\":{\"first\":{\"command\":\"${LARGE}\"},\"second\":{\"command\":\"${LARGE}\"}}}",
         .workspace,
-        .{},
+        .{ .approved = &approved_names },
         &environment,
     );
     defer workspace.deinit(alloc);
@@ -1492,17 +1567,72 @@ test "workspace environment expansion enforces one aggregate file budget" {
     try std.testing.expectEqualStrings("second", workspace.diagnostics.items[0].server_name.?);
 }
 
-test "workspace Authorization header expansion does not broaden profile headers" {
+test "workspace environment expansion never refunds rejected entry work" {
+    const alloc = std.testing.allocator;
+    var environment = std.process.Environ.Map.init(alloc);
+    defer environment.deinit();
+    const large = try alloc.alloc(u8, 600 * 1024);
+    defer alloc.free(large);
+    @memset(large, 'x');
+    try environment.put("LARGE", large);
+    var approved_names = [_][]u8{ @constCast("rejected_late"), @constCast("later") };
+
+    var workspace = try parseWorkspaceJsonWithEnvironment(
+        alloc,
+        "{\"mcpServers\":{\"rejected_late\":{\"command\":\"${LARGE}\",\"args\":[\"${MISSING}\"]},\"later\":{\"command\":\"${LARGE}\"}}}",
+        .workspace,
+        .{ .approved = &approved_names },
+        &environment,
+    );
+    defer workspace.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), workspace.configs.items.len);
+    try std.testing.expectEqual(@as(usize, 2), workspace.diagnostics.items.len);
+    try std.testing.expectEqual(
+        WorkspaceDiagnosticCause.missing_environment_variable,
+        workspace.diagnostics.items[0].cause,
+    );
+    try std.testing.expectEqual(
+        WorkspaceDiagnosticCause.environment_expansion_limit_exceeded,
+        workspace.diagnostics.items[1].cause,
+    );
+}
+
+test "workspace environment expansion rejects exhausted budget before allocation" {
     const alloc = std.testing.allocator;
     var environment = std.process.Environ.Map.init(alloc);
     defer environment.deinit();
     try environment.put("TOKEN", "secret");
 
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var value: []const u8 = "${TOKEN}";
+    var budget = WorkspaceExpansionBudget{ .remaining = 0 };
+    const failure = expandOwnedConstWorkspaceValue(
+        failing.allocator(),
+        &value,
+        &environment,
+        .command,
+        &budget,
+    ) catch |err| {
+        try std.testing.expect(err != error.OutOfMemory);
+        return;
+    };
+    try std.testing.expect(failure != null);
+    try std.testing.expect(failure.? == .limit_exceeded);
+}
+
+test "workspace Authorization header expansion does not broaden profile headers" {
+    const alloc = std.testing.allocator;
+    var environment = std.process.Environ.Map.init(alloc);
+    defer environment.deinit();
+    try environment.put("TOKEN", "secret");
+    var approved_names = [_][]u8{@constCast("remote")};
+
     var workspace = try parseWorkspaceJsonWithEnvironment(
         alloc,
         "{\"mcpServers\":{\"remote\":{\"type\":\"http\",\"url\":\"https://example.test/mcp\",\"headers\":{\"Authorization\":\"Bearer ${TOKEN}\"}}}}",
         .workspace,
-        .{},
+        .{ .approved = &approved_names },
         &environment,
     );
     defer workspace.deinit(alloc);
@@ -1631,9 +1761,8 @@ test "authority projection detects only removed workspace names" {
     try std.testing.expectEqualStrings("approved", interactive[0]);
     const headless = try authorityNames(alloc, &configs, .acp_startup);
     defer freeOwnedStrings(alloc, headless);
-    try std.testing.expectEqual(@as(usize, 2), headless.len);
+    try std.testing.expectEqual(@as(usize, 1), headless.len);
     try std.testing.expectEqualStrings("approved", headless[0]);
-    try std.testing.expectEqualStrings("pending", headless[1]);
 }
 
 test "workspace parsing releases every partial allocation failure" {

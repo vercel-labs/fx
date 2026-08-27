@@ -201,7 +201,7 @@ pub const Context = struct {
     mcp_call_tool: ?tool_mcp_runtime.CallToolFn = null,
     mcp_search_tools: ?tool_mcp_runtime.SearchToolsFn = null,
     mcp_tool_schema: ?tool_mcp_runtime.ToolSchemaFn = null,
-    mcp_current_generation: ?*const fn (*anyopaque) ?u64 = null,
+    expected_mcp_runtime_generation: ?u64 = null,
     mcp_call_feature: ?tool_mcp_runtime.FeatureCallFn = null,
     mcp_access: tool_mcp_runtime.Access = .unrestricted,
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
@@ -322,16 +322,16 @@ pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_co
             .advertised_dynamic_tool_names = ctx.advertised_dynamic_tool_names,
             .runtime = mcpRuntimeCapabilities(ctx),
         }, arena, call.name, call.arguments_json)) {
-            .valid => .valid,
+            .valid => |generation| .{ .valid = .{ .mcp_runtime_generation = generation } },
             .invalid => |reason| .{ .failure = reason },
             .not_available => .not_registered,
         };
     };
     switch (spec.executor_kind) {
         // Preserve execution-time argument failures for MCP control tool calls.
-        .mcp_search_tools, .mcp_select_tool, .mcp_features => return .valid,
+        .mcp_search_tools, .mcp_select_tool, .mcp_features => return .{ .valid = .{} },
         // File mutation arguments are decoded once by shared permission preflight.
-        .write_file, .edit_file => return .valid,
+        .write_file, .edit_file => return .{ .valid = .{} },
         else => {},
     }
 
@@ -339,7 +339,7 @@ pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_co
     dispatch_ctx.captured_command_host = spec.captured_command_host;
     return switch (try tool_dispatch.validateRegisteredToolCall(dispatch_ctx, ctx.tool_registry, call)) {
         .not_registered => .not_registered,
-        .valid => .valid,
+        .valid => .{ .valid = .{} },
         .failure => |reason| .{ .failure = reason },
     };
 }
@@ -388,6 +388,7 @@ pub fn executeToolCallAuthorized(
             request.advertised_dynamic_tool_names;
     }
     execution_ctx.max_tool_result_bytes = request.max_tool_result_bytes;
+    execution_ctx.expected_mcp_runtime_generation = request.expected_mcp_runtime_generation;
     execution_ctx.current_turn_messages = request.current_turn_messages;
     execution_ctx.output_chunk_lifecycle_id = request.lifecycle_id;
     execution_ctx.command_timeout_started_ms = request.command_timeout_started_ms;
@@ -677,6 +678,7 @@ fn executeRegisteredTool(
     var dispatch_ctx = typedDispatchContextForCall(ctx, arena, call);
     dispatch_ctx.execution_authority = authority;
     dispatch_ctx.mcp_call_options = .{
+        .expected_runtime_generation = ctx.expected_mcp_runtime_generation,
         .cancel_flag = dispatch_ctx.cancel_flag,
         .progress = .{
             .context = @ptrCast(&mcp_progress_bridge),
@@ -3837,10 +3839,7 @@ test "tool runtime validates and executes only tools from supplied registry" {
     const list_only_registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.list_files} };
     var list_rt = TestRuntime{ .tool_registry = list_only_registry };
     defer list_rt.deinit(alloc);
-    try std.testing.expectEqual(
-        tool_contracts.ToolCallValidationResult.valid,
-        try validateToolCall(list_rt.context(), arena, call),
-    );
+    try std.testing.expect((try validateToolCall(list_rt.context(), arena, call)) == .valid);
 }
 
 fn registryOwnedWebFetchCall(
@@ -4503,14 +4502,11 @@ test "validateToolCall preserves the registered captured command host" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
 
-    try std.testing.expectEqual(
-        tool_contracts.ToolCallValidationResult.valid,
-        try validateToolCall(rt.context(), arena_state.allocator(), .{
-            .id = "workspace-terminal",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"printf ok\"}",
-        }),
-    );
+    try std.testing.expect((try validateToolCall(rt.context(), arena_state.allocator(), .{
+        .id = "workspace-terminal",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf ok\"}",
+    })) == .valid);
 }
 
 test "validateToolCall rejects selected MCP arguments through runtime capability" {
@@ -4533,6 +4529,19 @@ test "validateToolCall rejects selected MCP arguments through runtime capability
     });
     try std.testing.expect(invalid == .failure);
     try std.testing.expectEqualStrings("path must be a string", invalid.failure);
+
+    const valid = try validateToolCall(rt.context(), arena_state.allocator(), .{
+        .id = "mcp-valid",
+        .name = "mcp_fs_read",
+        .arguments_json = "{\"path\":\"README.md\"}",
+    });
+    switch (valid) {
+        .valid => |witness| try std.testing.expectEqual(
+            @as(?u64, 41),
+            witness.mcp_runtime_generation,
+        ),
+        .not_registered, .failure => return error.TestUnexpectedResult,
+    }
 }
 
 test "checkToolAvailability rejects missing web_search runtime without catalog or network work" {
@@ -7486,6 +7495,7 @@ test "configured ask rule prompts the worker" {
 const McpFixture = struct {
     const CountingContext = struct {
         calls: usize = 0,
+        runtime_generation: u64 = 41,
     };
 
     const PermissionContext = struct {
@@ -7497,6 +7507,7 @@ const McpFixture = struct {
         calls: usize = 0,
         admission_generation: u64 = 0,
         action_generation: u64 = 0,
+        expected_runtime_generation: ?u64 = null,
     };
 
     fn hasTrue(_: *anyopaque, _: []const u8, _: tool_mcp_runtime.Access) bool {
@@ -7507,11 +7518,12 @@ const McpFixture = struct {
         return false;
     }
 
-    fn validateArguments(_: *anyopaque, arena: Allocator, _: []const u8, arguments_json: []const u8, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.ValidationResult {
+    fn validateArguments(raw_ctx: *anyopaque, arena: Allocator, _: []const u8, arguments_json: []const u8, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.ValidationResult {
         if (std.mem.eql(u8, arguments_json, "{\"path\":7}")) {
             return .{ .invalid = try arena.dupe(u8, "path must be a string") };
         }
-        return .valid;
+        const ctx: *CountingContext = @ptrCast(@alignCast(raw_ctx));
+        return .{ .valid = ctx.runtime_generation };
     }
 
     fn callOk(_: *anyopaque, arena: Allocator, _: []const u8, _: []const u8, _: usize, _: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
@@ -7533,6 +7545,7 @@ const McpFixture = struct {
         ctx.calls += 1;
         ctx.admission_generation = scope.admission_authority_generation;
         ctx.action_generation = scope.action_authority_generation;
+        ctx.expected_runtime_generation = options.expected_runtime_generation;
         return .{ .model_output = try arena.dupe(u8, "mcp ok") };
     }
 
@@ -7766,6 +7779,7 @@ test "MCP execution binds the last live action generation before transport" {
         },
         .advertised_dynamic_tool_names = &integrations,
         .max_tool_result_bytes = rt.max_tool_result_bytes,
+        .expected_mcp_runtime_generation = 73,
     });
     defer alloc.free(result.model_output);
 
@@ -7774,6 +7788,7 @@ test "MCP execution binds the last live action generation before transport" {
     try std.testing.expectEqual(@as(usize, 1), authority.calls);
     try std.testing.expectEqual(@as(u64, 17), authority.admission_generation);
     try std.testing.expectEqual(@as(u64, 41), authority.action_generation);
+    try std.testing.expectEqual(@as(?u64, 73), authority.expected_runtime_generation);
     const original_scope = switch (tool_ctx.mcp_access) {
         .scoped => |scope| scope,
         else => return error.McpScopedAccessExpected,

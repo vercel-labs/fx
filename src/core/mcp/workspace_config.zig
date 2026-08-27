@@ -28,18 +28,28 @@ pub fn load(
         else => return invalidResult(alloc),
     };
     defer alloc.free(bytes);
+    var result = try project_config.parseWorkspaceJson(
+        alloc,
+        bytes,
+        scope,
+        choices,
+    );
+    errdefer result.deinit(alloc);
+    const has_approved = for (result.configs.items) |config| {
+        if (config.workspace_admission == .approved) break true;
+    } else false;
+    if (!has_approved) return result;
     var environment = io_mod.cloneEnvironMap(alloc) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => std.process.Environ.Map.init(alloc),
     };
     defer environment.deinit();
-    return project_config.parseWorkspaceJsonWithEnvironment(
+    try project_config.expandApprovedWorkspaceConfigs(
         alloc,
-        bytes,
-        scope,
-        choices,
+        &result,
         &environment,
     );
+    return result;
 }
 
 fn invalidResult(alloc: std.mem.Allocator) !project_config.WorkspaceParseResult {

@@ -1517,6 +1517,47 @@ test "selected dynamic MCP allow returned after cancellation never executes" {
     try std.testing.expectEqual(@as(usize, 0), hooks.rejected_names.items.len);
 }
 
+test "selected dynamic MCP execution carries its validation generation" {
+    const alloc = std.testing.allocator;
+    const select_calls = [_]ToolCall{
+        toolCall("select", "mcp_select_tool", "{\"name\":\"mcp_fixture_echo\"}"),
+    };
+    const dynamic_calls = [_]ToolCall{
+        toolCall("dynamic", "mcp_fixture_echo", "{}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &select_calls },
+        .{ .tool_calls = &dynamic_calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{ .once, .once };
+    hooks.validation_mcp_tool_name = "mcp_fixture_echo";
+    hooks.validation_mcp_runtime_generation = 41;
+    hooks.exec_plans = &.{
+        .{ .result = .{
+            .model_output = "selected",
+            .selected_dynamic_tool_name = "mcp_fixture_echo",
+            .selected_dynamic_tool_schema_json = "{\"type\":\"function\",\"name\":\"mcp_fixture_echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}",
+        } },
+        .{ .result = .{ .model_output = "called" } },
+    };
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqualSlices(
+        ?u64,
+        &.{ null, 41 },
+        hooks.execution_mcp_runtime_generations.items,
+    );
+}
+
 test "resumed persistent child review rejects child-authored authority provenance" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"README.md\"}")};

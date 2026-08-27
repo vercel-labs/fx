@@ -1009,7 +1009,8 @@ fn prepareDeferredDynamicCandidate(
     const validate = ctx.deps.validate_tool_call orelse return false;
     return switch (try validate(ctx.deps.ctx, alloc, call)) {
         .not_registered => false,
-        .valid, .failure => true,
+        .valid => true,
+        .failure => true,
     };
 }
 
@@ -6254,8 +6255,25 @@ fn processQueuedPromptLoop(
                 }
             else
                 true;
-            if (requires_legacy_classification) {
-                if (try runtime_tool_admission.registeredToolValidationFailure(deps, arena, tool_call)) |execution| {
+            var expected_mcp_runtime_generation: ?u64 = null;
+            const requires_action_validation = requires_legacy_classification or
+                tool_mcp_runtime.isAdvertisedDynamicToolName(
+                    advertised_dynamic_tool_names,
+                    tool_call.name,
+                );
+            if (requires_action_validation) {
+                const validation_failure: ?ToolExecutionResult = switch (try runtime_tool_admission.toolCallValidation(deps, arena, tool_call)) {
+                    .not_registered => null,
+                    .valid => |witness| valid: {
+                        expected_mcp_runtime_generation = witness.mcp_runtime_generation;
+                        break :valid null;
+                    },
+                    .failure => |reason| .{
+                        .model_output = reason,
+                        .status = .failure,
+                    },
+                };
+                if (validation_failure) |execution| {
                     try terminal_validation_retry.observe(
                         arena,
                         tool_call,
@@ -7086,6 +7104,7 @@ fn processQueuedPromptLoop(
                 .live_authority = if (live_authority) |resolved| resolved.authority else null,
                 .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
                 .max_tool_result_bytes = config.max_tool_result_bytes,
+                .expected_mcp_runtime_generation = expected_mcp_runtime_generation,
                 .classification_complete = if (preparation_batch.preparations[tool_call_index]) |preparation|
                     switch (preparation) {
                         .candidate => |candidate| preparedCandidateClassificationComplete(candidate),

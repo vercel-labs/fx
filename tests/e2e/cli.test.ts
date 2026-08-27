@@ -5086,8 +5086,7 @@ describe("cli: MCP profile add", () => {
         /workspace-only source=workspace scope=workspace/,
       );
       expect(before.stdout).not.toMatch(/shared source=workspace scope=workspace/);
-      expect(before.stdout).toContain(".mcp.json server 'broken'");
-      expect(before.stdout).toContain("MISSING_LIST_COMMAND");
+      expect(before.stdout).not.toContain("MISSING_LIST_COMMAND");
       expect(existsSync(profileMarker)).toBe(false);
       expect(existsSync(workspaceMarker)).toBe(false);
 
@@ -5135,6 +5134,8 @@ describe("cli: MCP profile add", () => {
         "fx mcp logout NAME",
         "fx mcp path",
         "fx mcp remove NAME",
+        "fx mcp trust approve|reject NAME",
+        "fx mcp trust approve-all|reset",
       ]) expect(help.stdout).toContain(command);
 
       const local = await runFx(
@@ -5199,20 +5200,19 @@ describe("cli: MCP profile add", () => {
       expect(Object.keys(canonical.mcp).sort()).toEqual(["new", "old"]);
       expect(canonical).not.toHaveProperty("mcpServers");
 
-      writeFileSync(
-        profilePath,
-        JSON.stringify({
-          "MCP-Servers": { blocked: { command: "blocked-server" } },
-        }),
-        { mode: 0o600 },
-      );
+      const ambiguous = JSON.stringify({
+        mcp: { canonical: { command: "canonical-server" } },
+        "MCP-Servers": { blocked: { command: "blocked-server" } },
+        metadata: { owner: "team" },
+      });
+      writeFileSync(profilePath, ambiguous, { mode: 0o600 });
       const refused = await runFx(
         ["mcp", "add", "unsafe", "must-not-save"],
         { env: { HOME: home, ...NO_GATEWAY_AUTH } },
       );
       expect(refused.code).not.toBe(0);
       expect(refused.stderr).toContain("McpConfigAmbiguousServerKey");
-      expect(readFileSync(profilePath, "utf8")).not.toContain("must-not-save");
+      expect(readFileSync(profilePath, "utf8")).toBe(ambiguous);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

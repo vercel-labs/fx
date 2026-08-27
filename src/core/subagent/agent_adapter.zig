@@ -304,7 +304,6 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .finalize_turn = finalizeTurn,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .live_tool_authority = context.turn.liveToolAuthorityProvider(),
-        .current_mcp_generation = currentMcpGeneration,
         .tool_activity_recorder = context.turn.toolActivityRecorder(),
         .prepare_parent_turn_context = prepareParentTurnContext,
         .acknowledge_parent_turn_context = acknowledgeParentTurnContext,
@@ -340,14 +339,6 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .usage = &context.turn.sessionRuntime().usage,
         .usage_allocator = context.turn.alloc,
     };
-}
-
-fn currentMcpGeneration(raw: *anyopaque) ?u64 {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    const callback = context.config.tool_context.mcp_current_generation orelse
-        return null;
-    const mcp_ctx = context.config.tool_context.mcp_ctx orelse return null;
-    return callback(mcp_ctx);
 }
 
 fn releaseAgentTerminalLease(raw: *anyopaque, session_id: []const u8) !void {

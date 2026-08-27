@@ -173,7 +173,6 @@ pub const AgentRuntimeDeps = struct {
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
     live_tool_authority: ?LiveToolAuthorityProvider = null,
-    current_mcp_generation: ?*const fn (ctx: *anyopaque) ?u64 = null,
     /// Samples host-owned root permission mode at an action boundary.
     snapshot_root_permission_mode: ?*const fn (ctx: *anyopaque) PermissionMode = null,
     tool_activity_recorder: ?ToolActivityRecorder = null,

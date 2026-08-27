@@ -132,7 +132,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .mcp,
         .token = "mcp",
-        .usage = "mcp <add|auth|list|logout|path|remove> ...",
+        .usage = "mcp <command> ...",
         .summary = "Manage MCP servers without opening the interactive shell",
         .details = &.{
             "Commands:",
@@ -143,6 +143,8 @@ pub const top_level_specs = [_]TopLevelSpec{
             "  fx mcp logout NAME",
             "  fx mcp path",
             "  fx mcp remove NAME",
+            "  fx mcp trust approve|reject NAME",
+            "  fx mcp trust approve-all|reset",
             "",
             "By default, list reads configuration without opening MCP transports.",
             "Use --connect to connect and discover servers before rendering health.",
@@ -324,7 +326,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .status, .usage = "status" },
         .{ .kind = .doctor, .usage = "doctor" },
-        .{ .kind = .mcp, .usage = "mcp <add|auth|list|logout|path|remove> ..." },
+        .{ .kind = .mcp, .usage = "mcp <command> ..." },
         .{ .kind = .models, .usage = "models" },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
@@ -457,7 +459,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|yolo|reset]", .completion_description = "choose what fx is allowed to do", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .allowlist, .command = "/allowlist", .help_entry = "/allowlist [view [effective|local|user]|[local|user] add|remove|reset ...]", .completion_description = "manage trusted commands, tools, and URLs", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .undo, .command = "/undo", .help_entry = "/undo", .completion_description = "undo the latest tracked file operation", .presentation_category = .session },
-    .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|resource|prompt|add|remove|path|reload|auth|logout]", .completion_description = "manage local and remote MCP servers, resources, and prompts", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
+    .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|resource|prompt|add|remove|path|reload|auth|logout|trust]", .completion_description = "manage local and remote MCP servers, resources, prompts, and project trust", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .skills, .command = "/skills", .help_entry = "/skills [list|add|install|show|create|remove|path] [name|url|path] ($ opens skill search)", .completion_description = "browse and manage skills", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .copy, .command = "/copy", .help_entry = "/copy", .completion_description = "copy the last assistant response", .presentation_category = .session },
     .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "open the fx feedback form", .presentation_category = .product, .show_in_welcome = true },

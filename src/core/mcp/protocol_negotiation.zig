@@ -400,6 +400,7 @@ test "HTTP discovery state machine accepts stock SDK null-id errors as legacy fa
         "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32000,\"message\":\"Server not initialized\"}}",
         "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32000,\"message\":\"Bad Request: Unsupported protocol version\"}}",
         "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}",
+        "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32004,\"message\":\"invalid request\"}}",
     };
     for (responses) |text| {
         var response = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
