@@ -17,6 +17,7 @@ const subagent_domain = @import("../subagent/domain.zig");
 const subagent_input = @import("../subagent/input_action.zig");
 const catalog_screen_layout = @import("../../ui/catalog_screen_layout.zig");
 const input_presentation = @import("../../ui/footer/input_presentation.zig");
+const picker_presentation = @import("../../ui/footer/picker_presentation.zig");
 const model_menu_presentation = @import("../../ui/footer/model_menu_presentation.zig");
 const skills_menu_presentation = @import("../../ui/footer/skills_menu_presentation.zig");
 const render_input = @import("../../ui/footer/render_input.zig");
@@ -788,16 +789,22 @@ pub fn SubagentRuntime(comptime App: type) type {
                 app.shell.layout.cols,
                 &.{},
             );
-            const layout = catalog_screen_layout.screenLayout(
-                app.shell.layout.rows,
+            const capped = input_presentation.cappedInputRows(
                 scan.total_rows,
-                scan.cursor_row,
+                app.shell.layout.content_bottom,
+                true,
+            );
+            const row_budget = picker_presentation.inlinePickerRowBudgetCapped(
+                app.shell.layout.rows,
+                capped.input_extra,
+                0,
+                model_menu_presentation.max_inline_rows,
             );
             _ = app.model_cache.menu.moveVisibleItems(
                 delta,
                 model_menu_presentation.visibleNavigationItemsForBudget(
                     render_input.modelMenuProjection(&app.model_cache),
-                    layout.menu_row_budget,
+                    row_budget,
                 ),
             );
             app_render_runtime.Runtime(App).requestSubagentSurfaceFrame(
@@ -849,7 +856,7 @@ fn classifyChildSubmission(
     if (command_specs.matchesSlashExact(registry, command, .quit)) {
         return .exit_app;
     }
-    if (command_specs.matchesSlashExact(registry, command, .models)) {
+    if (command_specs.matchesSlashExact(registry, command, .model)) {
         return .open_models;
     }
     if (command_specs.matchesSlashExact(registry, command, .skills)) {
@@ -994,8 +1001,8 @@ test "child exit submission recognizes only canonical local exit commands" {
             .aliases = &.{"/exit"},
         },
         .{
-            .kind = .models,
-            .command = "/models",
+            .kind = .model,
+            .command = "/model",
         },
         .{
             .kind = .skills,
@@ -1008,8 +1015,9 @@ test "child exit submission recognizes only canonical local exit commands" {
     try std.testing.expectEqual(.exit_app, classifyChildSubmission(registry, "  /exit\t"));
     try std.testing.expectEqual(.message, classifyChildSubmission(registry, "/quit now"));
     try std.testing.expectEqual(.message, classifyChildSubmission(registry, "explain /quit"));
-    try std.testing.expectEqual(.open_models, classifyChildSubmission(registry, "/models"));
-    try std.testing.expectEqual(.message, classifyChildSubmission(registry, "/models now"));
+    try std.testing.expectEqual(.open_models, classifyChildSubmission(registry, "/model"));
+    try std.testing.expectEqual(.message, classifyChildSubmission(registry, "/model explicit-id"));
+    try std.testing.expectEqual(.message, classifyChildSubmission(registry, "/models"));
     try std.testing.expectEqual(.open_skills, classifyChildSubmission(registry, "/skills"));
     try std.testing.expectEqual(.message, classifyChildSubmission(registry, "/skills now"));
 }

@@ -567,7 +567,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         });
         await session.waitForText("Run /help", TIMEOUT);
         await session.sendLiteral("/model");
-        await session.sendKeys("Enter");
+        await session.sendKeys("Tab");
         await session.waitForText("xai/grok-build-1", TIMEOUT);
 
         await session.sendKeys("Escape");
@@ -587,7 +587,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
 
         await session.sendKeys("C-u");
         await session.sendLiteral("/model");
-        await session.sendKeys("Enter");
+        await session.sendKeys("Tab");
         await session.waitForText("xai/grok-build-1", TIMEOUT);
 
         await session.sendKeys("C-u");
@@ -889,7 +889,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           TIMEOUT,
         );
         await session.sendLiteral("/model");
-        await session.sendKeys("Enter");
+        await session.sendKeys("Tab");
         await session.waitForText("anthropic/claude-opus-4.8", TIMEOUT);
         expect(readFileSync(settingsPath, "utf8")).toBe(initialSettings);
         await session.sendKeys("Enter");
@@ -1184,7 +1184,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         });
         await session.waitForComposer(TIMEOUT);
         await session.sendLiteral("/model");
-        await session.sendKeys("Enter");
+        await session.sendKeys("Tab");
         const pickerPane = await session.waitForText("xai/grok-build-1", TIMEOUT);
         expect(pickerPane).toContain("xai/grok-build-1");
         await session.sendKeys("Enter");

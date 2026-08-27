@@ -904,12 +904,16 @@ pub const Reader = struct {
     byte_stream: Stream = .stdout,
     frame_remaining: usize = 0,
 
+    // Fallible constructors use noinline out-parameter boundaries so errors do
+    // not materialize Reader's unused 8 KiB payload.
     pub fn open(
         alloc: Allocator,
         capability: *session_child_store.SessionChildCapability,
         descriptor: types.CommandOutputReplayDescriptor,
     ) !Reader {
-        return openBacking(alloc, .{ .saved = capability }, descriptor);
+        var reader: Reader = undefined;
+        try openBackingInto(&reader, alloc, .{ .saved = capability }, descriptor);
+        return reader;
     }
 
     fn openBacking(
@@ -917,6 +921,17 @@ pub const Reader = struct {
         backing: ReplayBacking,
         descriptor: types.CommandOutputReplayDescriptor,
     ) !Reader {
+        var reader: Reader = undefined;
+        try openBackingInto(&reader, alloc, backing, descriptor);
+        return reader;
+    }
+
+    noinline fn openBackingInto(
+        out: *Reader,
+        alloc: Allocator,
+        backing: ReplayBacking,
+        descriptor: types.CommandOutputReplayDescriptor,
+    ) !void {
         var file = switch (backing) {
             .saved => |capability| ReplayFile{ .saved = try capability.openFileReadOnly(
                 alloc,
@@ -933,7 +948,7 @@ pub const Reader = struct {
             file.deinit();
             return error.ReplaySizeMismatch;
         }
-        return initialize(alloc, file, size);
+        try initializeInto(out, alloc, file, size);
     }
 
     pub fn openHandle(
@@ -941,6 +956,17 @@ pub const Reader = struct {
         capability: *session_child_store.SessionChildCapability,
         handle: []const u8,
     ) !Reader {
+        var reader: Reader = undefined;
+        try openHandleInto(&reader, alloc, capability, handle);
+        return reader;
+    }
+
+    noinline fn openHandleInto(
+        out: *Reader,
+        alloc: Allocator,
+        capability: *session_child_store.SessionChildCapability,
+        handle: []const u8,
+    ) !void {
         if (!hasContentDigest(handle)) return error.ResultHandleNotFound;
         var file = ReplayFile{ .saved = capability.openFileReadOnly(
             alloc,
@@ -954,7 +980,7 @@ pub const Reader = struct {
             file.deinit();
             return err;
         };
-        return initialize(alloc, file, size);
+        try initializeInto(out, alloc, file, size);
     }
 
     pub fn openEphemeralHandle(
@@ -962,26 +988,38 @@ pub const Reader = struct {
         store: *EphemeralStore,
         handle: []const u8,
     ) !Reader {
+        var reader: Reader = undefined;
+        try openEphemeralHandleInto(&reader, alloc, store, handle);
+        return reader;
+    }
+
+    noinline fn openEphemeralHandleInto(
+        out: *Reader,
+        alloc: Allocator,
+        store: *EphemeralStore,
+        handle: []const u8,
+    ) !void {
         var file = try store.open(handle);
         const size = file.size() catch |err| {
             file.deinit();
             return err;
         };
-        return initialize(alloc, file, size);
+        try initializeInto(out, alloc, file, size);
     }
 
-    noinline fn initialize(
+    noinline fn initializeInto(
+        out: *Reader,
         alloc: Allocator,
         file: ReplayFile,
         size: usize,
-    ) !Reader {
+    ) !void {
         var owned_file = file;
         errdefer owned_file.deinit();
         if (size < replay_magic.len) return error.InvalidReplayHeader;
         const magic = try readExactRange(alloc, &owned_file, 0, replay_magic.len);
         defer alloc.free(magic);
         if (!std.mem.eql(u8, magic, replay_magic)) return error.InvalidReplayHeader;
-        return .{
+        out.* = .{
             .file = owned_file,
             .size = size,
             .offset = replay_magic.len,
@@ -1922,6 +1960,38 @@ test "command replay reader rejects descriptor and frame corruption" {
             max_frame_payload_bytes,
         ),
     );
+}
+
+test "failed ephemeral replay reader construction leaves its backing reusable" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const temp_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(temp_path);
+    var store = EphemeralStore.initForTesting(alloc, temp_path);
+    defer store.deinit();
+
+    var spool = try store.createSpoolWithStem(alloc, "fx-command-replay-invalid-header");
+    defer {
+        spool.file.deinit();
+        store.delete(spool.handle);
+        alloc.free(spool.handle);
+    }
+    try spool.file.writeAll("not-a-replay");
+    try spool.file.sync();
+
+    try std.testing.expectError(
+        error.InvalidReplayHeader,
+        Reader.openEphemeralHandle(alloc, &store, spool.handle),
+    );
+    try std.testing.expectError(
+        error.InvalidReplayHeader,
+        Reader.openEphemeralHandle(alloc, &store, spool.handle),
+    );
+}
+
+test "command replay reader storage does not grow" {
+    try std.testing.expectEqual(@as(usize, 8256), @sizeOf(Reader));
 }
 
 test "command replay cleanup removes tentative and retained spools exactly once" {

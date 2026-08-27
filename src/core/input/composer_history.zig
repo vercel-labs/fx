@@ -400,6 +400,30 @@ pub const State = struct {
         }
     }
 
+    /// Transfers ownership of the latest entry's image snapshot files when it
+    /// describes the same accepted image set. Metadata remains independently
+    /// owned by the history entry.
+    pub fn claimLatestImageSnapshots(
+        self: *State,
+        expected: []const types.ImageAttachment,
+    ) bool {
+        if (expected.len == 0 or self.entries.items.len == 0) return false;
+        const latest = &self.entries.items[self.entries.items.len - 1];
+        if (latest.images.items.len != expected.len) return false;
+        for (latest.images.items, expected) |recorded, pending| {
+            if (recorded.id != pending.id or
+                !std.mem.eql(u8, recorded.path, pending.path) or
+                !std.mem.eql(u8, recorded.media_type, pending.media_type) or
+                !Snapshot.optionalBytesEql(recorded.snapshot_path, pending.snapshot_path) or
+                !Snapshot.optionalBytesEql(recorded.snapshot_sha256, pending.snapshot_sha256))
+            {
+                return false;
+            }
+        }
+        latest.owns_image_snapshots = true;
+        return true;
+    }
+
     pub fn installTextEntries(
         self: *State,
         alloc: Allocator,

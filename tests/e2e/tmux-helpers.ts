@@ -1174,6 +1174,36 @@ export class TmuxSession {
     );
   }
 
+  async waitForStableScrollback(
+    predicate: (scrollback: string) => boolean,
+    timeoutMs = 15_000,
+    stableMs = 100,
+  ): Promise<string> {
+    const deadline = Date.now() + timeoutMs;
+    let stableSince: number | null = null;
+    let previousScrollback = "";
+    let lastScrollback = "";
+    while (Date.now() < deadline) {
+      const scrollback = await this.captureFullScrollback();
+      lastScrollback = scrollback;
+      if (predicate(scrollback)) {
+        if (scrollback !== previousScrollback) {
+          previousScrollback = scrollback;
+          stableSince = Date.now();
+        } else if (stableSince !== null && Date.now() - stableSince >= stableMs) {
+          return scrollback;
+        }
+      } else {
+        previousScrollback = "";
+        stableSince = null;
+      }
+      await sleep(25);
+    }
+    throw new Error(
+      `Timed out waiting for stable scrollback in ${this.name}.\nLast scrollback:\n${lastScrollback}`,
+    );
+  }
+
   async waitForSessionEnd(timeoutMs = 10_000): Promise<boolean> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {

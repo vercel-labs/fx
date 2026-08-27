@@ -294,7 +294,7 @@ describe("fx ask presentation", () => {
     };
     const terminalTool = firstRequest.tools.find(({ name }) => name === "terminal");
     expect(terminalTool?.description).toBe(
-      "Run one captured command with a required finite timeout_ms and return its result.",
+      "Run one captured command with a required finite timeout_ms and return its result. Timeout cleanup covers the process group and tracked descendants; fully detached descendant cleanup is best effort on macOS.",
     );
     const terminalSchema = terminalTool?.inputSchema;
     expect(terminalSchema?.properties?.action?.enum).toEqual(["exec"]);
@@ -439,6 +439,51 @@ describe("fx ask presentation", () => {
     expect(json.stderr).toBe("");
   }, TIMEOUT);
 
+  test("JSON separates accumulated assistant Markdown from the completed final response", async () => {
+    const root = createRoot();
+    writeFileSync(join(root.workspace, "fixture.txt"), "fixture contents\n");
+    const intermediate = "I will inspect the fixture first.\n";
+    const final = "The fixture inspection is complete.";
+    const gateway = startFakeGateway([
+      fakeGatewaySerializedToolCall(
+        "read_fixture_for_final_output",
+        "read_file",
+        JSON.stringify({ path: "fixture.txt" }),
+        intermediate,
+      ),
+      fakeGatewayFinalText(final),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Inspect fixture.txt."],
+      {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    const output = JSON.parse(result.stdout) as {
+      output: string;
+      final_output: string;
+      tool_calls: Array<{ name: string; status: string }>;
+    };
+    expect(output.output).toContain(intermediate.trim());
+    expect(output.output).toContain(final.trim());
+    expect(output.output.indexOf(intermediate.trim())).toBeLessThan(
+      output.output.indexOf(final.trim()),
+    );
+    expect(output.final_output).toBe(final);
+    expect(output.final_output).not.toContain(intermediate.trim());
+    expect(output.tool_calls).toEqual([
+      { name: "read_file", status: "success" },
+    ]);
+    expect(gateway.requests).toHaveLength(2);
+    expect(result.stderr).toContain("Reading fixture.txt");
+  }, TIMEOUT);
+
   test.skipIf(!tmuxAvailable())(
     "TTY stdout uses the Minimal transcript and compact tool group",
     async () => {
@@ -464,6 +509,7 @@ describe("fx ask presentation", () => {
       gateways.push(gateway);
 
       const session = await TmuxSession.create({
+        isolated: true,
         cmd: terminalCommand([
           "ask",
           "--auto",
@@ -515,6 +561,7 @@ describe("fx ask presentation", () => {
       gateways.push(gateway);
 
       const session = await TmuxSession.create({
+        isolated: true,
         cmd: terminalCommand([
           "ask",
           "--auto",
@@ -549,6 +596,7 @@ describe("fx ask presentation", () => {
       gateways.push(gateway);
 
       const session = await TmuxSession.create({
+        isolated: true,
         cmd: terminalCommand([
           "ask",
           "--no-color",
@@ -586,6 +634,7 @@ describe("fx ask presentation", () => {
       writeFileSync(stderrPath, "");
 
       const session = await TmuxSession.create({
+        isolated: true,
         cmd: `${terminalCommand([
           "ask",
           "--no-save",
@@ -643,6 +692,7 @@ describe("fx ask presentation", () => {
       writeFileSync(stderrPath, "");
 
       const session = await TmuxSession.create({
+        isolated: true,
         cmd: terminalCommand([
           "ask",
           "--no-save",
@@ -724,6 +774,7 @@ describe("fx ask presentation", () => {
       writeFileSync(stderrPath, "");
 
       const session = await TmuxSession.create({
+        isolated: true,
         cmd: terminalCommand([
           "ask",
           "--no-save",
@@ -805,6 +856,7 @@ describe("fx ask presentation", () => {
       writeFileSync(stderrPath, "");
 
       const session = await TmuxSession.create({
+        isolated: true,
         cmd: terminalCommand([
           "ask",
           "--no-save",
@@ -857,6 +909,7 @@ describe("fx ask presentation", () => {
       gateways.push(gateway);
 
       const session = await TmuxSession.create({
+        isolated: true,
         cmd: terminalCommand([
           "ask",
           "--auto",

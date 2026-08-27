@@ -349,7 +349,7 @@ pub const Reviewer = struct {
     timeout_ms: u32 = default_timeout_ms,
     model: []const u8 = gateway_reviewer_model,
 
-    pub const default_timeout_ms: u32 = 15_000;
+    pub const default_timeout_ms: u32 = 30_000;
 
     pub fn disabled() Reviewer {
         return .{};
@@ -1192,8 +1192,8 @@ test "automatic review schema is strict and advisory" {
     try std.testing.expect(std.mem.find(u8, tools_json, "\"additionalProperties\":false") != null);
 }
 
-test "automatic reviewer defaults to the tested ten second budget" {
-    try std.testing.expectEqual(@as(u32, 15_000), Reviewer.default_timeout_ms);
+test "automatic reviewer defaults to the tested thirty second budget" {
+    try std.testing.expectEqual(@as(u32, 30_000), Reviewer.default_timeout_ms);
 }
 
 test "automatic reviewer classifier routes through the registered provider" {

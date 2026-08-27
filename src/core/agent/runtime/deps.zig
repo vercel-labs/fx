@@ -177,6 +177,7 @@ pub const AgentRuntimeDeps = struct {
     snapshot_root_permission_mode: ?*const fn (ctx: *anyopaque) PermissionMode = null,
     tool_activity_recorder: ?ToolActivityRecorder = null,
     finalize_turn: *const fn (ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) anyerror!void = acknowledgePromptFinalization,
+    release_agent_terminal_lease: *const fn (ctx: *anyopaque, session_id: []const u8) anyerror!void = terminalLeaseCleanupUnavailable,
     prepare_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator) anyerror!?PreparedParentTurnContext = null,
     acknowledge_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator, acknowledgements: []const ParentTurnDeliveryAck) void = null,
     append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void,
@@ -229,3 +230,7 @@ pub const AgentRuntimeDeps = struct {
         return self.push_system_notice(self.ctx, text);
     }
 };
+
+fn terminalLeaseCleanupUnavailable(_: *anyopaque, _: []const u8) !void {
+    return error.TerminalLeaseCleanupUnavailable;
+}

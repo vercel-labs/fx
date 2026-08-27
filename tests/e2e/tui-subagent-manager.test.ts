@@ -4325,7 +4325,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
   );
 
   test(
-    "persistent child executes models locally and configures the selected model",
+    "persistent child executes model browse locally and configures the selected model",
     async () => {
       const fixture = createFixture();
       const childName = "child-local-models";
@@ -4337,7 +4337,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
       });
       const gateway = startDynamicFakeGateway((body) =>
         fakeGatewayFinalText(
-          body.includes("/models")
+          body.includes("/model")
             ? "CHILD_MODELS_REACHED_MODEL"
             : "CHILD_LOCAL_MODELS_READY",
         ), {
@@ -4389,7 +4389,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForText("CHILD_LOCAL_MODELS_READY", TIMEOUT);
 
         const requestCountBeforeModels = gateway.requestCount();
-        await active.sendText("/models");
+        await active.sendText("/model");
         await active.waitForText("Loading models", TIMEOUT);
         await active.sendKeys("C-x");
         const mainWhileModelsLoad = await active.waitForPane(
@@ -4406,12 +4406,12 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForText("Agents & processes", TIMEOUT);
         await active.sendKeys("Enter");
         await active.waitForText("CHILD_LOCAL_MODELS_READY", TIMEOUT);
-        await active.sendText("/models");
+        await active.sendText("/model");
         const models = await active.waitForText(selectedModel, TIMEOUT);
         expect(models).toContain("Models 2");
         expect(gateway.requestCount()).toBe(requestCountBeforeModels);
         expect(
-          gateway.requests.some((request) => request.body.includes("/models")),
+          gateway.requests.some((request) => request.body.includes("/model")),
         ).toBe(false);
 
         await active.sendLiteralText("missing-child-model-filter");
@@ -4426,7 +4426,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           TIMEOUT,
         );
         expect(escapedModels).not.toContain("Navigate     Tab Provider");
-        await active.sendText("/models");
+        await active.sendText("/model");
         await active.waitForText(selectedModel, TIMEOUT);
 
         await active.sendKeys("C-x");
@@ -4441,7 +4441,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForText("Agents & processes", TIMEOUT);
         await active.sendKeys("Enter");
         await active.waitForText("CHILD_LOCAL_MODELS_READY", TIMEOUT);
-        await active.sendText("/models");
+        await active.sendText("/model");
         await active.waitForText(selectedModel, TIMEOUT);
         expect(gateway.requestCount()).toBe(requestCountBeforeModels);
 

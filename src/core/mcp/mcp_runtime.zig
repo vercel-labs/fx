@@ -16,6 +16,7 @@ const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
 const context_limits = @import("../config/context_limits.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
+const lexical_relevance = @import("../shared/lexical_relevance.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const legacy_http_sse = @import("legacy_http_sse.zig");
 const legacy_streamable_http = @import("legacy_streamable_http.zig");
@@ -57,6 +58,8 @@ const default_mcp_search_limit: usize = 8;
 const max_mcp_search_limit: usize = 20;
 const max_mcp_tool_tags: usize = 16;
 const mcp_server_instruction_search_bytes = context_limits.Name.mcp_server_instructions_bytes.defaultBytes();
+const mcp_tool_description_search_bytes: usize = 2 * 1024;
+const mcp_tool_schema_search_bytes: usize = 4 * 1024;
 const max_pending_legacy_url_waiters: usize = 32;
 const max_early_legacy_url_completions_per_window: usize = 64;
 const max_legacy_url_completion_candidates: usize = 1024;
@@ -5911,6 +5914,26 @@ pub const McpRuntime = struct {
         limits: context_limits.Values,
         access: tool_mcp_runtime.Access,
     ) !tool_mcp_runtime.SearchResult {
+        const prepared_query = try lexical_relevance.prepare(query);
+        return self.searchToolsPrepared(
+            alloc,
+            &prepared_query,
+            limit,
+            permission_rules,
+            limits,
+            access,
+        );
+    }
+
+    pub fn searchToolsPrepared(
+        self: *McpRuntime,
+        alloc: Allocator,
+        query: *const lexical_relevance.PreparedQuery,
+        limit: usize,
+        permission_rules: types.PermissionRuleSet,
+        limits: context_limits.Values,
+        access: tool_mcp_runtime.Access,
+    ) !tool_mcp_runtime.SearchResult {
         if (self.isDiscovering()) {
             return .{ .model_output = try alloc.dupe(
                 u8,
@@ -5934,7 +5957,15 @@ pub const McpRuntime = struct {
             var auth_witnesses: std.ArrayList(CatalogAuthWitness) = .empty;
             defer auth_witnesses.deinit(alloc);
             var more_available = false;
-            server_loop: for (self.servers.items) |*server| {
+            if (try renderAuthenticationRequired(
+                alloc,
+                self.servers.items,
+                &operation_access,
+                query.raw,
+            )) |output| {
+                break :result tool_mcp_runtime.SearchResult{ .model_output = output, .notice = null };
+            }
+            for (self.servers.items) |*server| {
                 if (server.state != .ready) continue;
                 if (!serverCatalogAvailable(server)) continue;
                 if (!operation_access.allows(.{ .tool_server = server.config.name })) continue;
@@ -5942,50 +5973,84 @@ pub const McpRuntime = struct {
                     instructions[0..context_limits.utf8PrefixLength(instructions, mcp_server_instruction_search_bytes)]
                 else
                     "";
-                var server_matched = false;
                 for (server.tool_catalog.tools.items) |*tool| {
                     if (!operation_access.allows(.{ .tool = tool.prefixed_name })) continue;
                     if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) continue;
-                    const exact_identity = queryContainsCompleteIdentity(query, tool.original_name) or
-                        queryContainsCompleteIdentity(query, tool.prefixed_name);
-                    if (!exact_identity and
-                        !toolMatchesQuery(
-                            tool,
-                            server.config.name,
-                            searchable_instructions,
-                            query,
-                        )) continue;
-                    server_matched = true;
-                    if (match_count >= capped_limit) {
-                        more_available = true;
-                        break;
-                    }
-                    match_storage[match_count] = .{
+                    const searchable_description = tool.description[0..context_limits.utf8PrefixLength(
+                        tool.description,
+                        mcp_tool_description_search_bytes,
+                    )];
+                    const searchable_schema = tool.input_schema_json[0..context_limits.utf8PrefixLength(
+                        tool.input_schema_json,
+                        mcp_tool_schema_search_bytes,
+                    )];
+                    const exact_identities = [_][]const u8{
+                        tool.original_name,
+                        tool.prefixed_name,
+                    };
+                    const strong_fields = [_][]const u8{
+                        server.config.name,
+                        tool.original_name,
+                        tool.prefixed_name,
+                        "mcp",
+                    };
+                    const weak_fields = [_][]const u8{
+                        searchable_description,
+                        searchable_schema,
+                        searchable_instructions,
+                    };
+                    const candidate_score = lexical_relevance.score(
+                        query,
+                        &exact_identities,
+                        &strong_fields,
+                        &weak_fields,
+                    ) orelse continue;
+                    const candidate = ToolSearchMatch{
                         .server = server,
                         .tool = tool,
+                        .score = candidate_score,
                     };
-                    match_count += 1;
-                }
-                if (server_matched) {
-                    if (catalogAuthWitness(server)) |generation| {
-                        try auth_witnesses.append(alloc, .{
-                            .server = server,
-                            .generation = generation,
-                        });
+
+                    var insertion_index = match_count;
+                    while (insertion_index > 0 and
+                        lexical_relevance.order(candidate.score, match_storage[insertion_index - 1].score) == .gt)
+                    {
+                        insertion_index -= 1;
+                    }
+
+                    if (match_count < capped_limit) {
+                        var move_index = match_count;
+                        while (move_index > insertion_index) : (move_index -= 1) {
+                            match_storage[move_index] = match_storage[move_index - 1];
+                        }
+                        match_storage[insertion_index] = candidate;
+                        match_count += 1;
+                    } else {
+                        more_available = true;
+                        if (insertion_index < capped_limit) {
+                            var move_index = capped_limit - 1;
+                            while (move_index > insertion_index) : (move_index -= 1) {
+                                match_storage[move_index] = match_storage[move_index - 1];
+                            }
+                            match_storage[insertion_index] = candidate;
+                        }
                     }
                 }
-                if (more_available) break :server_loop;
             }
             const matches = match_storage[0..match_count];
-            if (matches.len == 0) {
-                if (try renderAuthenticationRequired(
-                    alloc,
-                    self.servers.items,
-                    &operation_access,
-                    query,
-                )) |output| {
-                    break :result tool_mcp_runtime.SearchResult{ .model_output = output, .notice = null };
+            for (matches) |match| {
+                const generation = catalogAuthWitness(match.server) orelse continue;
+                var witnessed = false;
+                for (auth_witnesses.items) |witness| {
+                    if (witness.server == match.server) {
+                        witnessed = true;
+                        break;
+                    }
                 }
+                if (!witnessed) try auth_witnesses.append(alloc, .{
+                    .server = match.server,
+                    .generation = generation,
+                });
             }
 
             const full = try renderSearchResult(
@@ -11296,8 +11361,9 @@ fn buildToolSchemaJsonWithLimitMarker(
 }
 
 const ToolSearchMatch = struct {
-    server: *const McpServer,
+    server: *McpServer,
     tool: *const McpTool,
+    score: lexical_relevance.Score,
 };
 
 fn renderSearchResult(
@@ -11453,53 +11519,6 @@ fn writeEncodedJsonScalar(alloc: Allocator, writer: *std.Io.Writer, value: []con
     const encoded = try encodeScalarAlloc(alloc, value);
     defer alloc.free(encoded);
     try std.json.Stringify.value(encoded, .{}, writer);
-}
-
-fn toolContainsToken(
-    tool: *const McpTool,
-    server_name: []const u8,
-    token: []const u8,
-) bool {
-    for ([_][]const u8{
-        server_name,
-        tool.original_name,
-        tool.description,
-        tool.input_schema_json,
-        "mcp",
-    }) |field| {
-        if (text_utils.containsIgnoreCase(field, token)) return true;
-    }
-    return false;
-}
-
-fn toolMatchesQuery(
-    tool: *const McpTool,
-    server_name: []const u8,
-    server_instructions: []const u8,
-    query: []const u8,
-) bool {
-    var found_token = false;
-    var start: ?usize = null;
-    for (query, 0..) |byte, index| {
-        if (isSearchByte(byte)) {
-            if (start == null) start = index;
-            continue;
-        }
-        if (start) |s| {
-            found_token = true;
-            const token = query[s..index];
-            if (!toolContainsToken(tool, server_name, token) and
-                !text_utils.containsIgnoreCase(server_instructions, token)) return false;
-            start = null;
-        }
-    }
-    if (start) |s| {
-        found_token = true;
-        const token = query[s..];
-        if (!toolContainsToken(tool, server_name, token) and
-            !text_utils.containsIgnoreCase(server_instructions, token)) return false;
-    }
-    return found_token or query.len == 0;
 }
 
 fn queryContainsCompleteIdentity(query: []const u8, identity: []const u8) bool {
@@ -17776,6 +17795,58 @@ test "MCP search matches each retained source field" {
     try std.testing.expect(missing.notice == null);
 }
 
+test "MCP search bounds untrusted description and schema fields" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "bounded"),
+        .command = try alloc.dupe(u8, "fixture"),
+    });
+    runtime.servers.items[0].state = .ready;
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    try parseAndStoreTools(
+        alloc,
+        &runtime.servers.items[0],
+        .{},
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"probe","description":"initial","inputSchema":{"type":"object"}}]}}
+    ,
+        &used,
+    );
+
+    const description = "zearly123 " ++ ("x" ** mcp_tool_description_search_bytes) ++ " zlate987";
+    const schema =
+        "{\"type\":\"object\",\"properties\":{\"zearly456\":{\"type\":\"string\"},\"padding\":{\"description\":\"" ++
+        ("x" ** mcp_tool_schema_search_bytes) ++
+        "zlate654\"}}}";
+    const tool = &runtime.servers.items[0].tool_catalog.tools.items[0];
+    alloc.free(tool.description);
+    tool.description = try alloc.dupe(u8, description);
+    alloc.free(tool.input_schema_json);
+    tool.input_schema_json = try alloc.dupe(u8, schema);
+
+    const cases = [_]struct {
+        query: []const u8,
+        expected_match: bool,
+    }{
+        .{ .query = "zearly123", .expected_match = true },
+        .{ .query = "zlate987", .expected_match = false },
+        .{ .query = "zearly456", .expected_match = true },
+        .{ .query = "zlate654", .expected_match = false },
+    };
+    for (cases) |case| {
+        var result = try runtime.searchTools(alloc, case.query, 5, .{}, .{}, .unrestricted);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(
+            case.expected_match,
+            std.mem.find(u8, result.model_output, "mcp_bounded_probe") != null,
+        );
+    }
+}
+
 test "MCP search keeps bounded matches off the allocator" {
     const alloc = std.testing.allocator;
     var runtime = McpRuntime.init(alloc);
@@ -17815,6 +17886,48 @@ test "MCP search keeps bounded matches off the allocator" {
         result.model_output,
     );
     try std.testing.expectEqual(@as(usize, 18), counting.allocations);
+}
+
+test "MCP search keeps the globally strongest matches across servers" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "first"),
+        .command = try alloc.dupe(u8, "fixture"),
+    });
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "linear"),
+        .command = try alloc.dupe(u8, "fixture"),
+    });
+    for (runtime.servers.items) |*server| server.state = .ready;
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    try parseAndStoreTools(
+        alloc,
+        &runtime.servers.items[0],
+        .{},
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"launch","description":"Deploy infrastructure","inputSchema":{"type":"object"}}]}}
+    ,
+        &used,
+    );
+    try parseAndStoreTools(
+        alloc,
+        &runtime.servers.items[1],
+        .{},
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"Deploy Linear data","inputSchema":{"type":"object"}}]}}
+    ,
+        &used,
+    );
+
+    var result = try runtime.searchTools(alloc, "linear deploy", 1, .{}, .{}, .unrestricted);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "{\"tools\":[{\"name\":\"mcp_linear_echo\",\"server\":\"linear\",\"description\":\"Deploy Linear data\",\"purpose\":\"Deploy Linear data\",\"usage\":[\"mcp\",\"linear\",\"echo\"]}],\"count\":1,\"more_available\":true}",
+        result.model_output,
+    );
 }
 
 test "MCP search preserves exact identities and scopes authentication guidance" {
@@ -17863,11 +17976,16 @@ test "MCP search preserves exact identities and scopes authentication guidance" 
 
     var partial = try runtime.searchTools(alloc, "mcp_linear_echoes", 5, .{}, .{}, .unrestricted);
     defer partial.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"tools\":[],\"count\":0}", partial.model_output);
+    try std.testing.expect(std.mem.find(u8, partial.model_output, "authentication_required") == null);
 
-    var unrelated = try runtime.searchTools(alloc, "linear issue", 5, .{}, .{}, .unrestricted);
-    defer unrelated.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"tools\":[],\"count\":0}", unrelated.model_output);
+    var noisy = try runtime.searchTools(alloc, "linear issue", 5, .{}, .{}, .unrestricted);
+    defer noisy.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, noisy.model_output, "mcp_linear_echo") != null);
+
+    var auth_collision = try runtime.searchTools(alloc, "slack data", 5, .{}, .{}, .unrestricted);
+    defer auth_collision.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, auth_collision.model_output, "\"server\":\"slack\"") != null);
+    try std.testing.expect(std.mem.find(u8, auth_collision.model_output, "mcp_linear_echo") == null);
 
     var targeted = try runtime.searchTools(alloc, "authenticate slack now", 5, .{}, .{}, .unrestricted);
     defer targeted.deinit(alloc);
@@ -17880,7 +17998,7 @@ test "MCP search preserves exact identities and scopes authentication guidance" 
 
     var adjacent = try runtime.searchTools(alloc, "authenticate xa/by now", 5, .{}, .{}, .unrestricted);
     defer adjacent.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"tools\":[],\"count\":0}", adjacent.model_output);
+    try std.testing.expect(std.mem.find(u8, adjacent.model_output, "authentication_required") == null);
 }
 
 test "MCP search returns metadata without advertising every executable schema" {

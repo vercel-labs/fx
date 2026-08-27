@@ -64,6 +64,19 @@ const toolCall = test_support.toolCall;
 const vision_agent_test_tools = test_support.vision_agent_test_tools;
 const VisionAgentToolRuntime = test_support.VisionAgentToolRuntime;
 
+const PostEffectTerminalFailure = struct {
+    effect_count: usize = 0,
+
+    fn execute(
+        raw: *anyopaque,
+        _: runtime_tool_contracts.ToolExecutionRequest,
+    ) !runtime_tool_contracts.ToolExecutionResult {
+        const self: *PostEffectTerminalFailure = @ptrCast(@alignCast(raw));
+        self.effect_count += 1;
+        return error.OutOfMemory;
+    }
+};
+
 const read_file_advertised_names = [_][]const u8{"read_file"};
 const terminal_advertised_names = [_][]const u8{"terminal"};
 const read_file_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.read_file.model_schema};
@@ -1044,6 +1057,63 @@ test "borrowed nested terminal completion is flat before authority execution and
     try std.testing.expectEqualStrings(
         flat_arguments,
         execution.tool_steps[0].tool_calls[0].arguments_json,
+    );
+}
+
+test "terminal acquire stays tracked when execution fails after its effect" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const session_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(session_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        session_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+
+    const calls = [_]ToolCall{toolCall(
+        "terminal_acquire",
+        "terminal",
+        "{\"action\":\"write\",\"session_id\":\"terminal-one\",\"write\":null,\"lease\":\"acquire\"}",
+    )};
+    var gateway = FakeGateway.init(alloc, &.{.{ .tool_calls = &calls }});
+    defer gateway.deinit();
+    var post_effect = PostEffectTerminalFailure{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.permission_decisions = &.{.once};
+    hooks.tool_execution_override = .{
+        .context = &post_effect,
+        .execute_fn = PostEffectTerminalFailure.execute,
+    };
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.session_child_capability = &capability;
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        runFakePrompt(&gateway, &hooks, config, fixture.job()),
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), post_effect.effect_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.terminal_lease_cleanup_ids.items.len);
+    try std.testing.expectEqualStrings(
+        "terminal-one",
+        hooks.terminal_lease_cleanup_ids.items[0],
     );
 }
 

@@ -362,7 +362,6 @@ pub fn Handlers(comptime App: type) type {
                 .attach_image = commandAttachImage,
                 .manage_images = commandManageImages,
                 .handle_model = commandHandleModel,
-                .show_models = commandShowModels,
                 .handle_permissions = commandHandlePermissions,
                 .handle_allowlist = commandHandleAllowlist,
                 .show_stats = commandShowStats,
@@ -731,15 +730,6 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleModel(ctx: *anyopaque, query: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try session_commands.Commands(App).handleModel(app, query);
-        }
-
-        fn commandShowModels(ctx: *anyopaque) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            app.ensureModelCache();
-            if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-            closeHelpMenuIfPresent(app);
-            try app.model_cache.openMenu();
-            app.shell.render_requests.request(.footer);
         }
 
         fn commandHandlePermissions(ctx: *anyopaque, rest: []const u8) !void {
@@ -3690,30 +3680,6 @@ const SkillsInstallReplayApp = struct {
     }
 };
 
-const ModelCatalogCommandFakeApp = struct {
-    alloc: std.mem.Allocator,
-    model_cache: model_cache_runtime.Runtime,
-    skills: skill_runtime.Runtime = .{},
-    shell: transcript_runtime.TranscriptRuntime = .{},
-    ensure_count: usize = 0,
-
-    fn init(alloc: std.mem.Allocator) !ModelCatalogCommandFakeApp {
-        return ModelCatalogCommandFakeApp{
-            .alloc = alloc,
-            .model_cache = model_cache_runtime.Runtime.init(alloc, "/v1/models"),
-        };
-    }
-
-    fn deinit(self: *ModelCatalogCommandFakeApp) void {
-        self.model_cache.deinit();
-        self.shell.deinit(self.alloc);
-    }
-
-    fn ensureModelCache(self: *ModelCatalogCommandFakeApp) void {
-        self.ensure_count += 1;
-    }
-};
-
 const ChangeCommandFakeApp = struct {
     alloc: std.mem.Allocator,
     change_tracker: change_tracker_mod.ChangeTracker = .{},
@@ -4196,22 +4162,6 @@ test "skills install groups command notice fragments for entry replay" {
     try std.testing.expect(std.mem.startsWith(u8, rendered, "● Skills: Installing from "));
     try std.testing.expect(std.mem.find(u8, rendered, "\n\n● Skills: Installed: root-skill") != null);
     try std.testing.expect(std.mem.endsWith(u8, rendered, "  Installed: nested-skill"));
-}
-
-test "models command opens the catalog without writing transcript output" {
-    const alloc = std.testing.allocator;
-    var app = try ModelCatalogCommandFakeApp.init(alloc);
-    defer app.deinit();
-    app.skills.openMenu();
-
-    try Handlers(ModelCatalogCommandFakeApp).commandShowModels(@ptrCast(&app));
-
-    try std.testing.expectEqual(@as(usize, 1), app.ensure_count);
-    try std.testing.expect(!app.skills.menu.active);
-    try std.testing.expect(app.model_cache.menu.active);
-    try std.testing.expectEqual(model_cache_runtime.ModelMenuLoadState.loading, app.model_cache.menu.load_state);
-    try std.testing.expectEqual(@as(usize, 0), app.shell.entries.items.len);
-    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
 test "help command opens the catalog without writing transcript output" {

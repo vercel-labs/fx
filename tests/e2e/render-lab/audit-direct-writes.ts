@@ -62,7 +62,7 @@ const allowlist: AllowRule[] = [
   rule("src/core/terminal/tmux_session.zig", "runLauncher", /fixed_descriptor/, "subprocess_protocol_transport", "private tmux launcher PTY descriptor"),
   rule("src/core/terminal/client.zig", "(?:runFixture|writeFixtureJson)", /stdio_acquisition_write/, "tests", "private terminal client fixture output"),
   rule("src/terminal_client_fixture.zig", "(?:writeCompletionJson|writeJson)", /stdio_acquisition_write/, "tests", "private test-fixture output"),
-  rule("src/core/shared/darwin_process_spawn.zig", "process_spawn", /fixed_descriptor/, "subprocess_protocol_transport", "child stdio file-action mapping"),
+  rule("src/core/shared/darwin_process_spawn.zig", "process_spawn_inheriting_fd", /fixed_descriptor/, "subprocess_protocol_transport", "child stdio and witness file-action mapping"),
   rule("src/core/app/app_entry_runtime.zig", "(?:writeRealStdout|writeRealStderr)", /stdio_acquisition_write/, "noninteractive_output", "post-terminal handoff or failure output"),
   rule("src/core/app/app_upgrade_runtime.zig", "writeStderrDefault", /stdio_acquisition_write/, "noninteractive_output", "post-terminal upgrade relaunch failure output"),
   rule("src/core/upgrade/upgrade_runtime.zig", "progressWait", /stdio_(?:acquisition|write)/, "noninteractive_output", "upgrade progress output"),

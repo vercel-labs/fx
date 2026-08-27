@@ -278,6 +278,7 @@ pub fn applyToolResultMemory(
     const source_memory = source orelse return;
     prepared.command_output_replay = source_memory.command_output_replay;
     prepared.command_process_presentation = source_memory.command_process_presentation;
+    prepared.terminal_action_presentation = source_memory.terminal_action_presentation;
     const source_covers_full_file =
         source_memory.model_view_covers_full_file orelse return;
     prepared.model_view_covers_full_file =
@@ -486,6 +487,7 @@ test "command sidebands merge without file-view metadata" {
     applyToolResultMemory(&prepared, .{
         .command_output_replay = .unavailable,
         .command_process_presentation = .{ .signal = 9 },
+        .terminal_action_presentation = .{ .returned = .safety_ceiling },
     });
     switch (prepared.command_output_replay.?) {
         .unavailable => {},
@@ -494,6 +496,10 @@ test "command sidebands merge without file-view metadata" {
     try std.testing.expectEqual(
         types.CommandProcessPresentation{ .signal = 9 },
         prepared.command_process_presentation.?,
+    );
+    try std.testing.expectEqual(
+        types.TerminalActionPresentation{ .returned = .safety_ceiling },
+        prepared.terminal_action_presentation.?,
     );
     try std.testing.expect(prepared.model_view_covers_full_file == null);
 }

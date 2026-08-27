@@ -22,12 +22,16 @@ const InvocationAdmission = struct {
     attempt_evidence: *AttemptEvidence,
     trace_ctx: TraceContext,
     model: []const u8,
+    caller_admission: agent_stream_provider.Admission,
     observation: ?session_usage.InvocationObservation = null,
 
     fn admit(raw: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (self.observation != null) return error.ProviderAdmissionRepeated;
         self.observation = try session_usage.InvocationObservation.begin(self.usage);
+        if (self.caller_admission.admit_fn != null) {
+            try self.caller_admission.admit();
+        }
         self.attempt_evidence.provider_admitted = true;
         debug_trace.eventf(
             "agent",
@@ -53,6 +57,7 @@ pub fn streamModelCompletion(
         .attempt_evidence = request_value.attempt_evidence,
         .trace_ctx = request_value.trace_ctx,
         .model = request_value.model,
+        .caller_admission = request_value.admission,
     };
     var request = request_value;
     request.admission = .{ .context = &admission, .admit_fn = InvocationAdmission.admit };
@@ -287,6 +292,146 @@ test "provider preflight failure does not reserve usage" {
     try std.testing.expectEqual(@as(u64, 0), snapshot.settled_through_sequence);
 }
 
+test "caller admission publishes before provider attempt is admitted" {
+    const CallerAdmission = struct {
+        calls: usize = 0,
+        attempt_evidence: *AttemptEvidence,
+
+        fn admit(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.attempt_evidence.provider_admitted);
+            self.calls += 1;
+        }
+    };
+    const Provider = struct {
+        opens: usize = 0,
+
+        fn stream(
+            raw: ?*anyopaque,
+            _: Allocator,
+            request: agent_stream_provider.ModelRequest,
+        ) anyerror!agent_stream_provider.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try request.admission.admit();
+            self.opens += 1;
+            return .{ .completed = .{ .completion = .{ .finish_reason = .stop } } };
+        }
+    };
+    const Callbacks = struct {
+        fn event(_: *anyopaque, _: agent_stream_provider.Event) void {}
+    };
+
+    const alloc = std.testing.allocator;
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var delivery = DeliveryCertainty.init();
+    var attempt_evidence: AttemptEvidence = .{};
+    var caller_admission = CallerAdmission{ .attempt_evidence = &attempt_evidence };
+    var provider: Provider = .{};
+    var callback_ctx: u8 = 0;
+
+    var result = try streamModelCompletion(
+        .{ .context = &provider, .stream_fn = Provider.stream },
+        alloc,
+        .{
+            .credential = .{ .secret = "test-key" },
+            .model = "test/model",
+            .retry_count = 1,
+            .messages = &.{},
+            .tool_choice = .auto,
+            .provider_options = .{},
+            .trace_ctx = .{},
+            .content_capture_limit = null,
+            .delivery = &delivery,
+            .attempt_evidence = &attempt_evidence,
+            .events = .{ .context = &callback_ctx, .emit_fn = Callbacks.event },
+            .admission = .{ .context = &caller_admission, .admit_fn = CallerAdmission.admit },
+            .cancel_flag = &cancel_flag,
+        },
+        &usage,
+        alloc,
+    );
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), caller_admission.calls);
+    try std.testing.expectEqual(@as(usize, 1), provider.opens);
+    try std.testing.expect(attempt_evidence.provider_admitted);
+}
+
+test "caller admission failure settles usage and prevents request open" {
+    const CallerAdmission = struct {
+        calls: usize = 0,
+
+        fn admit(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.InFlightPublicationFailed;
+        }
+    };
+    const Provider = struct {
+        opens: usize = 0,
+
+        fn stream(
+            raw: ?*anyopaque,
+            _: Allocator,
+            request: agent_stream_provider.ModelRequest,
+        ) anyerror!agent_stream_provider.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try request.admission.admit();
+            self.opens += 1;
+            return .{ .completed = .{ .completion = .{ .finish_reason = .stop } } };
+        }
+    };
+    const Callbacks = struct {
+        fn event(_: *anyopaque, _: agent_stream_provider.Event) void {}
+    };
+
+    const alloc = std.testing.allocator;
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var delivery = DeliveryCertainty.init();
+    var attempt_evidence: AttemptEvidence = .{};
+    var caller_admission: CallerAdmission = .{};
+    var provider: Provider = .{};
+    var callback_ctx: u8 = 0;
+
+    try std.testing.expectError(
+        error.InFlightPublicationFailed,
+        streamModelCompletion(
+            .{ .context = &provider, .stream_fn = Provider.stream },
+            alloc,
+            .{
+                .credential = .{ .secret = "test-key" },
+                .model = "test/model",
+                .retry_count = 1,
+                .messages = &.{},
+                .tool_choice = .auto,
+                .provider_options = .{},
+                .trace_ctx = .{},
+                .content_capture_limit = null,
+                .delivery = &delivery,
+                .attempt_evidence = &attempt_evidence,
+                .events = .{ .context = &callback_ctx, .emit_fn = Callbacks.event },
+                .admission = .{ .context = &caller_admission, .admit_fn = CallerAdmission.admit },
+                .cancel_flag = &cancel_flag,
+            },
+            &usage,
+            alloc,
+        ),
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), caller_admission.calls);
+    try std.testing.expectEqual(@as(usize, 0), provider.opens);
+    try std.testing.expect(!attempt_evidence.provider_admitted);
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(session_usage.Availability.complete, snapshot.billing);
+    try std.testing.expect(snapshot.api_duration_complete);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
+}
+
 test "possibly sent gateway failure marks billing incomplete" {
     const Gateway = struct {
         fn stream(
@@ -340,7 +485,7 @@ test "possibly sent gateway failure marks billing incomplete" {
     try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
 }
 
-test "provider-local immediate usage bypasses durable Gateway observations" {
+test "provider-local exact usage reaches session accounting" {
     const LocalProvider = struct {
         calls: usize = 0,
 
@@ -356,10 +501,21 @@ test "provider-local immediate usage bypasses durable Gateway observations" {
             return .{ .completed = .{
                 .completion = .{
                     .generation_id = "resp_provider_local",
+                    .billing = .{
+                        .created_at_ms = 1,
+                        .model = "codex/gpt-test",
+                        .total_cost = 0,
+                        .input_tokens = 3,
+                        .output_tokens = 1,
+                        .cache_read_tokens = 0,
+                        .cache_write_tokens = 0,
+                        .reasoning_tokens = null,
+                        .billable_web_search_calls = 0,
+                    },
                     .finish_reason = .stop,
                     .usage = .{ .input_tokens = 3, .output_tokens = 1 },
                 },
-                .usage = .{ .immediate = null },
+                .usage = .{ .exact = .codex },
             } };
         }
     };
@@ -378,45 +534,49 @@ test "provider-local immediate usage bypasses durable Gateway observations" {
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
 
-    for (0..65) |_| {
-        var delivery = DeliveryCertainty.init();
-        var attempt_evidence: AttemptEvidence = .{};
-        var result = try streamModelCompletion(
-            provider,
-            alloc,
-            .{
-                .credential = .{
-                    .secret = "subscription-token",
-                    .source = .chatgpt_subscription,
-                    .account_id = "acct_test",
-                },
-                .session_id = "session-test",
-                .model = "gpt-test",
-                .retry_count = 1,
-                .messages = &.{},
-                .tool_choice = .auto,
-                .provider_options = .{},
-                .trace_ctx = .{},
-                .content_capture_limit = null,
-                .delivery = &delivery,
-                .attempt_evidence = &attempt_evidence,
-                .events = .{ .context = &callback_ctx, .emit_fn = Callbacks.event },
-                .cancel_flag = &cancel_flag,
-                .provider_attempt_owner = .agent,
+    var delivery = DeliveryCertainty.init();
+    var attempt_evidence: AttemptEvidence = .{};
+    var result = try streamModelCompletion(
+        provider,
+        alloc,
+        .{
+            .credential = .{
+                .secret = "subscription-token",
+                .source = .chatgpt_subscription,
+                .account_id = "acct_test",
             },
-            null,
-            alloc,
-        );
-        defer result.deinit(alloc);
-        try std.testing.expect(std.meta.activeTag(result) == .completed);
-    }
+            .session_id = "session-test",
+            .model = "gpt-test",
+            .retry_count = 1,
+            .messages = &.{},
+            .tool_choice = .auto,
+            .provider_options = .{},
+            .trace_ctx = .{},
+            .content_capture_limit = null,
+            .delivery = &delivery,
+            .attempt_evidence = &attempt_evidence,
+            .events = .{ .context = &callback_ctx, .emit_fn = Callbacks.event },
+            .cancel_flag = &cancel_flag,
+            .provider_attempt_owner = .agent,
+        },
+        &usage,
+        alloc,
+    );
+    defer result.deinit(alloc);
+    try std.testing.expect(std.meta.activeTag(result) == .completed);
 
-    try std.testing.expectEqual(@as(usize, 65), local_provider.calls);
+    try std.testing.expectEqual(@as(usize, 1), local_provider.calls);
     var snapshot = try usage.snapshot(alloc);
     defer snapshot.deinit(alloc);
     try std.testing.expectEqual(session_usage.Availability.complete, snapshot.billing);
     try std.testing.expect(snapshot.api_duration_complete);
-    try std.testing.expectEqual(@as(u64, 1), snapshot.next_sequence);
-    try std.testing.expectEqual(@as(u64, 0), snapshot.settled_through_sequence);
+    try std.testing.expectEqual(@as(u64, 2), snapshot.next_sequence);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
+    try std.testing.expectEqual(@as(u64, 3), snapshot.input_tokens);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 1), snapshot.request_count);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.models.len);
+    try std.testing.expectEqualStrings("codex/gpt-test", snapshot.models[0].model);
     try std.testing.expectEqual(@as(usize, 0), snapshot.pending.len);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.publication_backlog.len);
 }

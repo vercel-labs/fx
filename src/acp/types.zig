@@ -345,12 +345,14 @@ test "model recovery info update is structured and clearable" {
         .cause = .system_resumed,
         .action = .paused,
         .required_action = .continue_later,
+        .delay_seconds = 4,
         .diagnostic = core_types.ModelFailureDiagnostic.init("ConnectionResetByPeer"),
     }, true);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"state\":\"paused\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"cause\":\"system_resumed\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"requiredAction\":\"continue_later\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"attempt\":4") != null);
+    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"delaySeconds\":4") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"durable\":true") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "ConnectionResetByPeer") != null);
 

@@ -45,6 +45,7 @@ pub fn makePersistedToolResult(
         .created_at_ms = io_mod.milliTimestamp(),
         .command_output_replay = command_output_replay,
         .command_process_presentation = if (memory) |info| info.command_process_presentation else null,
+        .terminal_action_presentation = if (memory) |info| info.terminal_action_presentation else null,
     };
     if (memory) |info| {
         if (info.committed_file_presentation) |presentation| {

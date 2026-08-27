@@ -302,7 +302,7 @@ pub fn streamPrepared(
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
     var events = request.events;
-    const completion = try consumeSse(
+    var completion = try consumeSse(
         alloc,
         reader,
         &events,
@@ -313,9 +313,29 @@ pub fn streamPrepared(
         request.cancel_flag,
         request.content_capture_limit,
     );
+    errdefer {
+        var owned = stream_provider.Result{ .completed = .{
+            .completion = completion,
+            .ownership = .owned,
+        } };
+        owned.deinit(alloc);
+    }
+    const usage_outcome: stream_provider.UsageOutcome = usage: {
+        if (completion.generation_id == null) {
+            break :usage .{ .unavailable = .possibly_billed };
+        }
+        completion.billing = try responses_protocol.buildSubscriptionBilling(
+            alloc,
+            .grok,
+            request.model,
+            @max(io_mod.milliTimestamp(), 0),
+            completion.usage,
+        ) orelse break :usage .{ .unavailable = .possibly_billed };
+        break :usage .{ .exact = .grok };
+    };
     return .{ .completed = .{
         .completion = completion,
-        .usage = .{ .immediate = null },
+        .usage = usage_outcome,
         .ownership = .owned,
     } };
 }

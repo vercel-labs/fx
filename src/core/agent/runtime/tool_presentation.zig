@@ -10,6 +10,10 @@ const debug_trace = @import("../../shared/debug_trace.zig");
 const diff = @import("../../output/diff.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
+const command_result_mapping = if (@import("builtin").is_test)
+    @import("../../tooling/command_result_mapping.zig")
+else
+    struct {};
 const test_builtin_tools = if (@import("builtin").is_test)
     @import("../../../builtins/tools.zig")
 else
@@ -930,9 +934,29 @@ pub fn finishExecutedToolStatus(
 ) !void {
     if (!status_started) return;
     const activity_kind = activityKindForCall(arena, hooks.tool_registry, call);
-    const command_process_ran = activity_kind == .command and
-        result_memory.command_process_presentation != null;
-    const base_line = switch (if (command_process_ran) .success else result.status) {
+    const command_decision = if (activity_kind == .command)
+        try commandOutcomeDecision(arena, result_memory.command_process_presentation)
+    else
+        null;
+    const terminal_action_decision = if (std.mem.eql(u8, call.name, "terminal"))
+        try terminalActionOutcomeDecision(arena, result_memory.terminal_action_presentation)
+    else
+        null;
+    const outcome_decision = command_decision orelse terminal_action_decision;
+    const base_line = if (outcome_decision) |decision| blk: {
+        const base = try hooks.describe_tool_action_denied(
+            hooks.ctx,
+            arena,
+            call,
+            display_target,
+            decision.label,
+            advertised_dynamic_tool_names,
+        );
+        break :blk if (decision.detail) |detail|
+            try std.fmt.allocPrint(arena, "{s}: {s}", .{ base, detail })
+        else
+            base;
+    } else switch (result.status) {
         .success => if (file_mutation_contract.resultIsNoop(call.name, result.model_output))
             result.model_output
         else
@@ -996,7 +1020,9 @@ pub fn finishExecutedToolStatus(
         .terminal = .{
             .id = .{ .turn_id = turn_id, .call_id = call.id },
             .outcome = .{
-                .kind = if (result.status == .success or command_process_ran)
+                .kind = if (outcome_decision) |decision|
+                    decision.outcome
+                else if (result.status == .success)
                     .completed
                 else
                     .failed,
@@ -1007,6 +1033,68 @@ pub fn finishExecutedToolStatus(
             .command_artifact_handle = command_artifact_handle,
         },
     });
+}
+
+pub const ToolOutcomeDecision = struct {
+    outcome: types.ToolOutcomeKind,
+    label: []const u8,
+    detail: ?[]const u8 = null,
+};
+
+pub fn commandOutcomeDecision(
+    arena: Allocator,
+    presentation: ?types.CommandProcessPresentation,
+) !?ToolOutcomeDecision {
+    const value = presentation orelse return null;
+    return switch (value) {
+        .exit_code => |code| if (code == 0)
+            .{ .outcome = .completed, .label = "Ran" }
+        else
+            .{
+                .outcome = .failed,
+                .label = try std.fmt.allocPrint(arena, "Exited {d}", .{code}),
+            },
+        .signal => |signal| .{
+            .outcome = .failed,
+            .label = try std.fmt.allocPrint(arena, "Signaled {d}", .{signal}),
+        },
+        .timed_out => .{ .outcome = .failed, .label = "Timed out" },
+        .output_capture_failed => .{
+            .outcome = .failed,
+            .label = "Output capture failed",
+        },
+    };
+}
+
+pub fn terminalActionOutcomeDecision(
+    arena: Allocator,
+    presentation: ?types.TerminalActionPresentation,
+) !?ToolOutcomeDecision {
+    const value = presentation orelse return null;
+    return switch (value) {
+        .returned => |returned| switch (returned) {
+            .started => .{ .outcome = .completed, .label = "Started" },
+            .condition_met => .{ .outcome = .completed, .label = "Condition met for" },
+            .safety_ceiling => .{ .outcome = .completed, .label = "Wait limit reached for" },
+            .cancelled => .{ .outcome = .cancelled, .label = "Cancelled" },
+            .exited => |code| .{
+                .outcome = if (code == 0) .completed else .failed,
+                .label = try std.fmt.allocPrint(arena, "Exited {d}", .{code}),
+            },
+            .signal => |signal| .{
+                .outcome = .failed,
+                .label = try std.fmt.allocPrint(arena, "Terminated by signal {d}", .{signal}),
+            },
+        },
+        .failed => |failed| if (failed == .cancelled)
+            .{ .outcome = .cancelled, .label = "Cancelled" }
+        else
+            .{
+                .outcome = .failed,
+                .label = "Failed",
+                .detail = failed.detail(),
+            },
+    };
 }
 
 fn failureStatusDetail(
@@ -2135,7 +2223,7 @@ test "command completion publishes its combined artifact handle" {
     }
 }
 
-test "nonzero command process is presented as Ran without changing model failure" {
+test "command process failures name the typed cause without changing model failure" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -2143,32 +2231,186 @@ test "nonzero command process is presented as Ran without changing model failure
     defer capture.deinit();
     const hooks = capture.hooks();
 
+    const cases = [_]struct {
+        id: []const u8,
+        presentation: types.CommandProcessPresentation,
+        expected_summary: []const u8,
+    }{
+        .{
+            .id = "command_nonzero",
+            .presentation = .{ .exit_code = 7 },
+            .expected_summary = "Exited 7 run_command",
+        },
+        .{
+            .id = "command_signal",
+            .presentation = .{ .signal = 9 },
+            .expected_summary = "Signaled 9 run_command",
+        },
+    };
+    for (cases) |case| {
+        try finishExecutedToolStatus(
+            &hooks,
+            arena_state.allocator(),
+            6,
+            .{ .id = case.id, .name = "run_command", .arguments_json = "{}" },
+            true,
+            null,
+            .{ .status = .failure, .model_output = "tool_execution_failed" },
+            "tool_execution_failed",
+            .{
+                .output_bytes = 21,
+                .stored_output_bytes = 21,
+                .command_process_presentation = case.presentation,
+            },
+            null,
+            &.{},
+        );
+    }
+
+    try std.testing.expectEqual(@as(usize, cases.len), capture.events.items.len);
+    for (capture.events.items, cases) |event, case| {
+        const terminal = event.terminal;
+        try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
+        try std.testing.expectEqualStrings(case.expected_summary, terminal.outcome.summary);
+        try std.testing.expectEqualStrings("tool_execution_failed", terminal.result.?);
+        try std.testing.expectEqual(
+            case.presentation,
+            terminal.result_memory.?.command_process_presentation.?,
+        );
+    }
+}
+
+test "command timeout and output capture failure name their actual cause" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+
+    const timeout = try command_result_mapping.Foreground.timeoutFailure(
+        arena,
+        "sleep 5",
+        "/tmp",
+        25,
+        null,
+    );
     try finishExecutedToolStatus(
         &hooks,
-        arena_state.allocator(),
-        6,
-        .{ .id = "command_nonzero", .name = "run_command", .arguments_json = "{}" },
+        arena,
+        7,
+        .{ .id = "command_timeout", .name = "run_command", .arguments_json = "{}" },
         true,
         null,
-        .{ .status = .failure, .model_output = "tool_execution_failed" },
-        "tool_execution_failed",
-        .{
-            .output_bytes = 21,
-            .stored_output_bytes = 21,
-            .command_process_presentation = .{ .exit_code = 7 },
-        },
+        timeout,
+        timeout.model_output,
+        timeout.tool_result_memory orelse .{},
         null,
         &.{},
     );
 
-    const terminal = capture.events.items[0].terminal;
-    try std.testing.expectEqual(types.ToolOutcomeKind.completed, terminal.outcome.kind);
-    try std.testing.expectEqualStrings("started run_command", terminal.outcome.summary);
-    try std.testing.expectEqualStrings("tool_execution_failed", terminal.result.?);
-    try std.testing.expectEqual(
-        types.CommandProcessPresentation{ .exit_code = 7 },
-        terminal.result_memory.?.command_process_presentation.?,
+    const capture_failure = try command_result_mapping.Foreground.outputCaptureFailure(arena);
+    try finishExecutedToolStatus(
+        &hooks,
+        arena,
+        7,
+        .{ .id = "command_capture", .name = "run_command", .arguments_json = "{}" },
+        true,
+        null,
+        capture_failure,
+        capture_failure.model_output,
+        capture_failure.tool_result_memory orelse .{},
+        null,
+        &.{},
     );
+
+    try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+    try std.testing.expectEqualStrings(
+        "Timed out run_command",
+        capture.events.items[0].terminal.outcome.summary,
+    );
+    try std.testing.expectEqualStrings(
+        "Output capture failed run_command",
+        capture.events.items[1].terminal.outcome.summary,
+    );
+    for (capture.events.items) |event| {
+        try std.testing.expectEqual(types.ToolOutcomeKind.failed, event.terminal.outcome.kind);
+    }
+}
+
+test "terminal action outcomes map to one typed visible decision" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cases = [_]struct {
+        presentation: types.TerminalActionPresentation,
+        outcome: types.ToolOutcomeKind,
+        label: []const u8,
+        detail: ?[]const u8 = null,
+    }{
+        .{
+            .presentation = .{ .returned = .started },
+            .outcome = .completed,
+            .label = "Started",
+        },
+        .{
+            .presentation = .{ .returned = .condition_met },
+            .outcome = .completed,
+            .label = "Condition met for",
+        },
+        .{
+            .presentation = .{ .returned = .safety_ceiling },
+            .outcome = .completed,
+            .label = "Wait limit reached for",
+        },
+        .{
+            .presentation = .{ .returned = .cancelled },
+            .outcome = .cancelled,
+            .label = "Cancelled",
+        },
+        .{
+            .presentation = .{ .returned = .{ .exited = 0 } },
+            .outcome = .completed,
+            .label = "Exited 0",
+        },
+        .{
+            .presentation = .{ .returned = .{ .exited = 7 } },
+            .outcome = .failed,
+            .label = "Exited 7",
+        },
+        .{
+            .presentation = .{ .returned = .{ .signal = 9 } },
+            .outcome = .failed,
+            .label = "Terminated by signal 9",
+        },
+        .{
+            .presentation = .{ .failed = .session_not_found },
+            .outcome = .failed,
+            .label = "Failed",
+            .detail = "terminal session not found",
+        },
+        .{
+            .presentation = .{ .failed = .cancelled },
+            .outcome = .cancelled,
+            .label = "Cancelled",
+        },
+    };
+
+    for (cases) |case| {
+        const decision = (try terminalActionOutcomeDecision(
+            arena,
+            case.presentation,
+        )).?;
+        try std.testing.expectEqual(case.outcome, decision.outcome);
+        try std.testing.expectEqualStrings(case.label, decision.label);
+        if (case.detail) |expected| {
+            try std.testing.expectEqualStrings(expected, decision.detail.?);
+        } else {
+            try std.testing.expect(decision.detail == null);
+        }
+    }
 }
 
 test "cancelled command ignores malformed artifact metadata" {

@@ -3,6 +3,58 @@ const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
+const max_darwin_process_fds: usize = std.c.OPEN_MAX;
+
+const DarwinPipeIdentity = struct {
+    handle: u64,
+    peer_handle: u64,
+
+    fn eql(self: DarwinPipeIdentity, other: DarwinPipeIdentity) bool {
+        return self.handle == other.handle and self.peer_handle == other.peer_handle;
+    }
+};
+
+/// Kernel-owned command membership that survives environment replacement,
+/// exec, process-group changes, and forks. The caller owns `deinit`.
+pub const DarwinProcessWitness = struct {
+    supervisor_fd: ?std.posix.fd_t,
+    child_fd: ?std.posix.fd_t,
+    identity: DarwinPipeIdentity,
+
+    pub fn init() !DarwinProcessWitness {
+        if (comptime builtin.os.tag != .macos) return error.ProcessTreeUnsupported;
+        var pipe: [2]std.posix.fd_t = undefined;
+        switch (std.posix.errno(std.posix.system.pipe(&pipe))) {
+            .SUCCESS => {},
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+        errdefer closeFd(pipe[0]);
+        errdefer closeFd(pipe[1]);
+        try setCloseOnExec(pipe[0]);
+        try setCloseOnExec(pipe[1]);
+        return .{
+            .supervisor_fd = pipe[0],
+            .child_fd = pipe[1],
+            .identity = try captureDarwinPipeIdentity(std.c.getpid(), pipe[1]),
+        };
+    }
+
+    pub fn childFd(self: DarwinProcessWitness) std.posix.fd_t {
+        return self.child_fd orelse unreachable;
+    }
+
+    pub fn closeChildCopy(self: *DarwinProcessWitness) void {
+        const fd = self.child_fd orelse return;
+        closeFd(fd);
+        self.child_fd = null;
+    }
+
+    pub fn deinit(self: *DarwinProcessWitness) void {
+        if (self.child_fd) |fd| closeFd(fd);
+        if (self.supervisor_fd) |fd| closeFd(fd);
+        self.* = undefined;
+    }
+};
 
 const Identity = union(enum) {
     linux_start_ticks: u64,
@@ -31,6 +83,7 @@ const ProcessSnapshot = struct {
     identity: Identity,
     parent_pid: std.posix.pid_t,
     parent_unique_id: ?u64 = null,
+    started_at_us: ?u64 = null,
 };
 
 pub const DeliverySummary = struct {
@@ -67,6 +120,9 @@ pub const Tracker = struct {
     processes: std.ArrayList(TrackedProcess) = .empty,
     macos_child_buffer: []std.posix.pid_t = &.{},
     macos_pid_buffer: []std.posix.pid_t = &.{},
+    macos_fd_buffer: []Darwin.ProcFdInfo = &.{},
+    darwin_process_witness: ?DarwinPipeIdentity = null,
+    macos_root_started_at_us: ?u64 = null,
 
     pub fn init(alloc: Allocator) !Tracker {
         var tracker = Tracker{ .alloc = alloc };
@@ -102,7 +158,16 @@ pub const Tracker = struct {
         if (self.macos_pid_buffer.len > 0) {
             self.alloc.free(self.macos_pid_buffer);
         }
+        if (self.macos_fd_buffer.len > 0) self.alloc.free(self.macos_fd_buffer);
         self.* = undefined;
+    }
+
+    pub fn bindProcessWitness(
+        self: *Tracker,
+        witness: *const DarwinProcessWitness,
+    ) void {
+        if (comptime builtin.os.tag != .macos) return;
+        self.darwin_process_witness = witness.identity;
     }
 
     pub fn refresh(self: *Tracker, root_pid: std.posix.pid_t) !void {
@@ -120,6 +185,7 @@ pub const Tracker = struct {
                     .pid = root_pid,
                     .identity = snapshot.identity,
                 };
+                self.macos_root_started_at_us = snapshot.started_at_us;
                 traverse_root = true;
             }
         }
@@ -408,8 +474,16 @@ pub const Tracker = struct {
 
     fn trackLineageProcess(self: *Tracker, pid: std.posix.pid_t) !bool {
         const snapshot = captureSnapshot(self.alloc, pid) catch return false;
+        if (!couldBelongByStart(
+            self.macos_root_started_at_us,
+            snapshot.started_at_us,
+        )) return false;
         const parent_unique_id = snapshot.parent_unique_id orelse return false;
-        if (!self.containsMacOSUniqueId(parent_unique_id)) return false;
+        if (!self.containsMacOSUniqueId(parent_unique_id) and
+            !try self.processHasBoundWitness(pid))
+        {
+            return false;
+        }
         if (self.root) |root| {
             if (root.pid == pid and root.identity.eql(snapshot.identity)) return false;
         }
@@ -424,6 +498,35 @@ pub const Tracker = struct {
             .identity = snapshot.identity,
         });
         return true;
+    }
+
+    fn processHasBoundWitness(self: *Tracker, pid: std.posix.pid_t) !bool {
+        if (comptime builtin.os.tag != .macos) return false;
+        const expected = self.darwin_process_witness orelse return false;
+        if (self.macos_fd_buffer.len == 0) {
+            self.macos_fd_buffer = try self.alloc.alloc(
+                Darwin.ProcFdInfo,
+                max_darwin_process_fds,
+            );
+        }
+        const read_len = Darwin.proc_pidinfo(
+            pid,
+            Darwin.proc_pid_list_fds,
+            0,
+            self.macos_fd_buffer.ptr,
+            @intCast(self.macos_fd_buffer.len * @sizeOf(Darwin.ProcFdInfo)),
+        );
+        if (read_len <= 0) return false;
+        const fd_count = @min(
+            @as(usize, @intCast(read_len)) / @sizeOf(Darwin.ProcFdInfo),
+            self.macos_fd_buffer.len,
+        );
+        for (self.macos_fd_buffer[0..fd_count]) |fd| {
+            if (fd.proc_fd < 0 or fd.proc_fdtype != Darwin.prox_fd_type_pipe) continue;
+            const actual = captureDarwinPipeIdentity(pid, fd.proc_fd) catch continue;
+            if (expected.eql(actual)) return true;
+        }
+        return false;
     }
 
     fn containsMacOSUniqueId(self: *Tracker, unique_id: u64) bool {
@@ -442,6 +545,61 @@ fn identityHasMacOSUniqueId(identity: Identity, unique_id: u64) bool {
         .macos_unique_id => |actual| actual == unique_id,
         else => false,
     };
+}
+
+fn setCloseOnExec(fd: std.posix.fd_t) !void {
+    while (true) switch (std.posix.errno(std.posix.system.fcntl(
+        fd,
+        std.posix.F.SETFD,
+        @as(usize, std.posix.FD_CLOEXEC),
+    ))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        else => return error.FileControlFailed,
+    };
+}
+
+fn closeFd(fd: std.posix.fd_t) void {
+    switch (std.posix.errno(std.posix.system.close(fd))) {
+        .SUCCESS, .INTR => {},
+        else => {},
+    }
+}
+
+fn captureDarwinPipeIdentity(
+    pid: std.posix.pid_t,
+    fd: std.posix.fd_t,
+) !DarwinPipeIdentity {
+    if (comptime builtin.os.tag != .macos) return error.ProcessTreeUnsupported;
+    var info: Darwin.PipeFdInfo = undefined;
+    const read_len = Darwin.proc_pidfdinfo(
+        pid,
+        fd,
+        Darwin.proc_pid_fd_pipe_info,
+        &info,
+        @sizeOf(Darwin.PipeFdInfo),
+    );
+    if (read_len == 0) return error.ProcessNotFound;
+    if (read_len != @sizeOf(Darwin.PipeFdInfo)) {
+        return error.ProcessIdentityUnavailable;
+    }
+    return .{
+        .handle = info.pipeinfo.pipe_handle,
+        .peer_handle = info.pipeinfo.pipe_peerhandle,
+    };
+}
+
+fn couldBelongByStart(root_started_at_us: ?u64, candidate_started_at_us: ?u64) bool {
+    const root = root_started_at_us orelse return true;
+    const candidate = candidate_started_at_us orelse return false;
+    return candidate >= root;
+}
+
+fn darwinStartTimeUs(seconds: u64, microseconds: u64) u64 {
+    const scaled = @mulWithOverflow(seconds, @as(u64, std.time.us_per_s));
+    if (scaled[1] != 0) return std.math.maxInt(u64);
+    const total = @addWithOverflow(scaled[0], microseconds);
+    return if (total[1] == 0) total[0] else std.math.maxInt(u64);
 }
 
 fn shouldTraverseParent(expected: Identity, actual: Identity) bool {
@@ -760,6 +918,10 @@ fn captureMacOSSnapshot(pid: std.posix.pid_t) !ProcessSnapshot {
         .identity = .{ .macos_unique_id = unique.p_uniqueid },
         .parent_pid = @intCast(info.pbi_ppid),
         .parent_unique_id = unique.p_puniqueid,
+        .started_at_us = darwinStartTimeUs(
+            info.pbi_start_tvsec,
+            info.pbi_start_tvusec,
+        ),
     };
 }
 
@@ -767,6 +929,59 @@ const Darwin = struct {
     // Stable libproc process-identity flavor; the SDK omits this constant from
     // its public header, but XNU defines the record as API with a fixed size.
     const proc_pid_unique_identifier_info: c_int = 17;
+    const proc_pid_list_fds: c_int = 1;
+    const proc_pid_fd_pipe_info: c_int = 6;
+    const prox_fd_type_pipe: u32 = 6;
+
+    const ProcFdInfo = extern struct {
+        proc_fd: i32,
+        proc_fdtype: u32,
+    };
+
+    const ProcFileInfo = extern struct {
+        fi_openflags: u32,
+        fi_status: u32,
+        fi_offset: i64,
+        fi_type: i32,
+        fi_guardflags: u32,
+    };
+
+    const VinfoStat = extern struct {
+        vst_dev: u32,
+        vst_mode: u16,
+        vst_nlink: u16,
+        vst_ino: u64,
+        vst_uid: u32,
+        vst_gid: u32,
+        vst_atime: i64,
+        vst_atimensec: i64,
+        vst_mtime: i64,
+        vst_mtimensec: i64,
+        vst_ctime: i64,
+        vst_ctimensec: i64,
+        vst_birthtime: i64,
+        vst_birthtimensec: i64,
+        vst_size: i64,
+        vst_blocks: i64,
+        vst_blksize: i32,
+        vst_flags: u32,
+        vst_gen: u32,
+        vst_rdev: u32,
+        vst_qspare: [2]i64,
+    };
+
+    const PipeInfo = extern struct {
+        pipe_stat: VinfoStat,
+        pipe_handle: u64,
+        pipe_peerhandle: u64,
+        pipe_status: i32,
+        rfu_1: i32,
+    };
+
+    const PipeFdInfo = extern struct {
+        pfi: ProcFileInfo,
+        pipeinfo: PipeInfo,
+    };
 
     const ProcUniqueIdentifierInfo = extern struct {
         p_uuid: [16]u8,
@@ -821,6 +1036,14 @@ const Darwin = struct {
         buffer: *anyopaque,
         buffersize: c_int,
     ) c_int;
+
+    extern "c" fn proc_pidfdinfo(
+        pid: c_int,
+        fd: c_int,
+        flavor: c_int,
+        buffer: *anyopaque,
+        buffersize: c_int,
+    ) c_int;
 };
 
 test "tracked identity distinguishes process instances" {
@@ -828,4 +1051,17 @@ test "tracked identity distinguishes process instances" {
     try std.testing.expect(linux.eql(.{ .linux_start_ticks = 42 }));
     try std.testing.expect(!linux.eql(.{ .linux_start_ticks = 43 }));
     try std.testing.expect(!linux.eql(.{ .macos_unique_id = 42 }));
+}
+
+test "Darwin witness scan excludes processes older than command root" {
+    try std.testing.expect(couldBelongByStart(null, null));
+    try std.testing.expect(!couldBelongByStart(100, null));
+    try std.testing.expect(!couldBelongByStart(100, 99));
+    try std.testing.expect(couldBelongByStart(100, 100));
+    try std.testing.expect(couldBelongByStart(100, 101));
+    try std.testing.expectEqual(@as(u64, 2_000_003), darwinStartTimeUs(2, 3));
+    try std.testing.expectEqual(
+        std.math.maxInt(u64),
+        darwinStartTimeUs(std.math.maxInt(u64), 1),
+    );
 }
