@@ -64,7 +64,7 @@ export MODAL_PROXY_TOKEN_SECRET=...
 FX_PROVIDER=modal fx
 ```
 
-`FX_PROVIDER` pins the provider for that process while preserving a separate saved model for each provider. `/model` shows the active provider's catalog: Fireworks is fetched from the authenticated account, while Modal exposes the four configured Robomart endpoints. After choosing a reasoning model, `/model` opens a second stage with the effort values accepted by that provider and model. The same choices appear under **Reasoning effort** in `/settings`.
+`FX_PROVIDER` pins the provider for that process while preserving a separate saved model for each provider. `/model` shows the active provider's catalog: Fireworks is fetched from the authenticated account, while Modal exposes the four configured Robomart endpoints. After choosing a reasoning model, `/model` opens a second stage with that provider and model's supported effort values. The same choices appear under **Reasoning effort** in `/settings`.
 
 To use an AI Gateway API key instead:
 

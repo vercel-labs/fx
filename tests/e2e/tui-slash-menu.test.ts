@@ -3024,24 +3024,22 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendLiteralText(`/model ${selectedModel}`);
       await session.sendKeys("Enter");
-      let effortPane = await session.waitForPane(
+      const effortPane = await session.waitForPane(
         (current) =>
           composerContains(current, `/model ${selectedModel}`) &&
-          current.includes("minimal") &&
-          current.includes("high"),
+          current.includes("low") &&
+          current.includes("high") &&
+          current.includes("max"),
         10_000,
       );
-      for (const effort of ["default", "none", "minimal", "low", "medium", "high"]) {
+      for (const effort of ["default", "low", "high", "max"]) {
         expect(effortPane).toContain(effort);
       }
+      for (const unsupported of ["none", "minimal", "medium", "xhigh"]) {
+        expect(effortPane).not.toContain(unsupported);
+      }
 
-      for (let index = 0; index < 6; index += 1) await session.sendKeys("Down");
-      effortPane = await session.waitForText("xhigh", 5_000);
-      expect(effortPane).toContain("xhigh");
-      await session.sendKeys("Down");
-      effortPane = await session.waitForText("max", 5_000);
-      expect(effortPane).toContain("max");
-      await session.sendKeys("Up");
+      for (let index = 0; index < 3; index += 1) await session.sendKeys("Down");
       await session.sendKeys("Enter");
       await session.waitForPane(hasEmptyComposer, 5_000);
 
@@ -3049,7 +3047,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         effort?: string;
         models?: { modal?: string };
       };
-      expect(settings.effort).toBe("xhigh");
+      expect(settings.effort).toBe("max");
       expect(settings.models?.modal).toBe(selectedModel);
       expect(session.isAlive()).toBe(true);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");

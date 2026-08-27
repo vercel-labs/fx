@@ -3,19 +3,23 @@ const model_catalog = @import("../core/gateway/model_catalog.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const types = @import("../core/shared/types.zig");
 
-const flexible_reasoning_efforts = [_]types.ReasoningEffort{
+const low_high_max_reasoning_efforts = [_]types.ReasoningEffort{
+    types.ReasoningEffort.literal("low"),
+    types.ReasoningEffort.literal("high"),
+    types.ReasoningEffort.literal("max"),
+};
+const qwen_reasoning_efforts = [_]types.ReasoningEffort{
+    types.ReasoningEffort.literal("low"),
+    types.ReasoningEffort.literal("medium"),
+    types.ReasoningEffort.literal("xhigh"),
+};
+const inkling_reasoning_efforts = [_]types.ReasoningEffort{
     types.ReasoningEffort.literal("none"),
     types.ReasoningEffort.literal("minimal"),
     types.ReasoningEffort.literal("low"),
     types.ReasoningEffort.literal("medium"),
     types.ReasoningEffort.literal("high"),
     types.ReasoningEffort.literal("xhigh"),
-    types.ReasoningEffort.literal("max"),
-};
-const kimi_k3_reasoning_efforts = [_]types.ReasoningEffort{
-    types.ReasoningEffort.literal("low"),
-    types.ReasoningEffort.literal("high"),
-    types.ReasoningEffort.literal("max"),
 };
 
 pub const Definition = struct {
@@ -30,25 +34,25 @@ pub const definitions = [_]Definition{
         .id = "glm-5-3-flash",
         .wire_model = "zai-org/GLM-5.3-Flash",
         .endpoint = "https://robomart-rsi--ep-glm-5-3-flash-server.us-west.modal.direct/v1/chat/completions",
-        .reasoning_efforts = &flexible_reasoning_efforts,
+        .reasoning_efforts = &low_high_max_reasoning_efforts,
     },
     .{
         .id = "qwen3-8-2-4t-a95b",
         .wire_model = "Qwen/Qwen3.8-2.4T-A95B",
         .endpoint = "https://robomart-rsi--ep-qwen3-8-2-4t-a95b-server.us-west.modal.direct/v1/chat/completions",
-        .reasoning_efforts = &flexible_reasoning_efforts,
+        .reasoning_efforts = &qwen_reasoning_efforts,
     },
     .{
         .id = "inkling-nvfp4",
         .wire_model = "thinkingmachines/Inkling-NVFP4",
         .endpoint = "https://robomart-rsi--ep-inkling-nvfp4-server.us-west.modal.direct/v1/chat/completions",
-        .reasoning_efforts = &flexible_reasoning_efforts,
+        .reasoning_efforts = &inkling_reasoning_efforts,
     },
     .{
         .id = "kimi-k3",
         .wire_model = "moonshotai/Kimi-K3",
         .endpoint = "https://robomart-rsi--ep-kimi-k3-server.us-west.modal.direct/v1/chat/completions",
-        .reasoning_efforts = &kimi_k3_reasoning_efforts,
+        .reasoning_efforts = &low_high_max_reasoning_efforts,
     },
 };
 
@@ -134,8 +138,15 @@ test "Modal catalog exposes the four endpoint aliases" {
     try std.testing.expectEqual(@as(usize, 4), catalog.items.len);
     try std.testing.expectEqualStrings("glm-5-3-flash", catalog.items[0].id);
     try std.testing.expect(catalog.items[0].has_reasoning);
-    try std.testing.expectEqual(@as(usize, 7), catalog.items[0].reasoning_efforts.items.len);
-    try std.testing.expectEqualStrings("xhigh", catalog.items[0].reasoning_efforts.items[5].label());
+    try std.testing.expectEqual(@as(usize, 3), catalog.items[0].reasoning_efforts.items.len);
+    try std.testing.expectEqualStrings("low", catalog.items[0].reasoning_efforts.items[0].label());
+    try std.testing.expectEqualStrings("max", catalog.items[0].reasoning_efforts.items[2].label());
+    try std.testing.expectEqual(@as(usize, 3), catalog.items[1].reasoning_efforts.items.len);
+    try std.testing.expectEqualStrings("medium", catalog.items[1].reasoning_efforts.items[1].label());
+    try std.testing.expectEqualStrings("xhigh", catalog.items[1].reasoning_efforts.items[2].label());
+    try std.testing.expectEqual(@as(usize, 6), catalog.items[2].reasoning_efforts.items.len);
+    try std.testing.expectEqualStrings("none", catalog.items[2].reasoning_efforts.items[0].label());
+    try std.testing.expectEqualStrings("xhigh", catalog.items[2].reasoning_efforts.items[5].label());
     try std.testing.expectEqualStrings("kimi-k3", catalog.items[3].id);
     try std.testing.expectEqual(@as(usize, 3), catalog.items[3].reasoning_efforts.items.len);
     try std.testing.expectEqualStrings("low", catalog.items[3].reasoning_efforts.items[0].label());
