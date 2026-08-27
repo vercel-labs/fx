@@ -102,7 +102,30 @@ jobs:
           GH_TOKEN: ${{ secrets.CODE_GH_PAT || github.token }}
         run: |
           set -euo pipefail
-          gh pr create --base "${BASE_BRANCH}" --head "${MERGE_BRANCH}" \
-            --title "Merge upstream/main into oh-my-fx" \
-            --body "Upstream-first refresh from ${UPSTREAM_REPO}/${UPSTREAM_BRANCH}. Review and merge this PR with a merge commit. Do not squash-merge." \
-            2>/dev/null || true
+
+          owner="${GITHUB_REPOSITORY%%/*}"
+          head="${owner}:${MERGE_BRANCH}"
+          title="Merge upstream/main into oh-my-fx"
+          body="Upstream-first refresh from ${UPSTREAM_REPO}/${UPSTREAM_BRANCH}. Review and merge this PR with a merge commit. Do not squash-merge."
+
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${MERGE_BRANCH}" >/dev/null
+          number="$(
+            gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
+              -f state=open \
+              -f base="${BASE_BRANCH}" \
+              -f head="${head}" \
+              --jq '.[0].number // empty'
+          )"
+
+          if [ -n "${number}" ]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/pulls/${number}" \
+              -f title="${title}" \
+              -f body="${body}" >/dev/null
+            echo "Updated PR #${number}"
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/pulls" \
+              -f title="${title}" \
+              -f head="${MERGE_BRANCH}" \
+              -f base="${BASE_BRANCH}" \
+              -f body="${body}"
+          fi
