@@ -1379,12 +1379,23 @@ fn discoverResourceMetadata(
     challenged_url: ?[]const u8,
 ) !ResourceMetadata {
     if (challenged_url) |url| {
-        try validateOAuthUrlForResource(url, resource);
-        var response = try request(alloc, .GET, url, null, null, &.{});
-        defer response.deinit(alloc);
-        if (response.status != .ok) return error.ProtectedResourceMetadataUnavailable;
-        try validateJsonContentType(response.content_type);
-        return parseResourceMetadata(alloc, response.body, resource);
+        return requestResourceMetadata(alloc, resource, url);
+    }
+
+    const authenticate = requestAuthenticateHeader(alloc, resource) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => null,
+    };
+    defer if (authenticate) |value| alloc.free(value);
+    if (authenticate) |header| {
+        var challenge = parseChallenge(alloc, header) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => Challenge{},
+        };
+        defer challenge.deinit(alloc);
+        if (challenge.resource_metadata) |url| {
+            return requestResourceMetadata(alloc, resource, url);
+        }
     }
 
     const urls = try protectedResourceMetadataUrls(alloc, resource);
@@ -1397,6 +1408,19 @@ fn discoverResourceMetadata(
         return parseResourceMetadata(alloc, response.body, resource);
     }
     return error.ProtectedResourceMetadataUnavailable;
+}
+
+fn requestResourceMetadata(
+    alloc: Allocator,
+    resource: []const u8,
+    url: []const u8,
+) !ResourceMetadata {
+    try validateOAuthUrlForResource(url, resource);
+    var response = try request(alloc, .GET, url, null, null, &.{});
+    defer response.deinit(alloc);
+    if (response.status != .ok) return error.ProtectedResourceMetadataUnavailable;
+    try validateJsonContentType(response.content_type);
+    return parseResourceMetadata(alloc, response.body, resource);
 }
 
 fn discoverAuthorizationMetadata(
@@ -1788,6 +1812,35 @@ fn percentEncode(writer: *std.Io.Writer, value: []const u8) !void {
             try writer.writeByte(hex[byte & 0x0f]);
         }
     }
+}
+
+fn requestAuthenticateHeader(
+    alloc: Allocator,
+    url: []const u8,
+) !?[]u8 {
+    const uri = std.Uri.parse(url) catch return error.InvalidMcpAuthEndpoint;
+    if (!isSecureOrLoopback(uri) or uri.user != null or
+        uri.password != null or uri.fragment != null)
+    {
+        return error.InsecureMcpAuthEndpoint;
+    }
+    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+    defer client.deinit();
+    var http_request = try client.request(.GET, uri, .{
+        .redirect_behavior = .unhandled,
+        .keep_alive = false,
+        .headers = .{ .accept_encoding = .omit },
+    });
+    defer http_request.deinit();
+    if (http_request.connection) |connection| {
+        setSocketTimeouts(
+            connection.stream_writer.stream.socket.handle,
+            request_timeout_seconds,
+        );
+    }
+    try http_request.sendBodiless();
+    const response = try http_request.receiveHead(&.{});
+    return collectAuthenticateHeader(alloc, response.head);
 }
 
 fn request(

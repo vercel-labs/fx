@@ -195,6 +195,7 @@ function startAuthFixture(
     authorizationServerTrailingSlash?: boolean;
     authorizationResponseIssuer?: string;
     omitScopes?: boolean;
+    protectedResourceMetadataPath?: string;
   } = {},
 ) {
   const transport = options.transport ?? "http";
@@ -237,6 +238,8 @@ function startAuthFixture(
       const origin = `http://127.0.0.1:${server.port}`;
       const resourcePath = transport === "sse" ? "/sse" : "/mcp";
       const resource = `${origin}${resourcePath}`;
+      const protectedResourceMetadataPath = options.protectedResourceMetadataPath ??
+        `/.well-known/oauth-protected-resource${resourcePath}`;
       const protectedRoute = url.pathname === resourcePath ||
         (transport === "sse" && url.pathname === "/messages");
 
@@ -248,8 +251,8 @@ function startAuthFixture(
             status: 401,
             headers: {
               "www-authenticate": options.omitScopes
-                ? `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}"`
-                : `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}", scope="tools.read"`,
+                ? `Bearer resource_metadata="${origin}${protectedResourceMetadataPath}"`
+                : `Bearer resource_metadata="${origin}${protectedResourceMetadataPath}", scope="tools.read"`,
             },
           });
         }
@@ -384,10 +387,7 @@ function startAuthFixture(
         }
         return upstreamResponse;
       }
-      if (
-        url.pathname ===
-          `/.well-known/oauth-protected-resource${resourcePath}`
-      ) {
+      if (url.pathname === protectedResourceMetadataPath) {
         return Response.json({
           resource,
           authorization_servers: [
@@ -814,6 +814,40 @@ async function preserveAuthTuiFailure(
 }
 
 describe("MCP remote authentication lifecycle", () => {
+  test("top-level MCP auth follows challenge-advertised protected resource metadata", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, {
+      protectedResourceMetadataPath: "/tenant/.well-known/oauth-protected-resource",
+    });
+    const root = createRoot(auth);
+    const env = {
+      ...baseEnv(root),
+      AI_GATEWAY_API_KEY: undefined,
+    };
+
+    const authenticated = await runFx(["mcp", "auth", "fixture"], {
+      cwd: root.workspace,
+      env,
+      timeoutMs: 20_000,
+    });
+    if (authenticated.code !== 0) {
+      throw new Error(JSON.stringify({
+        authenticated,
+        authorizationRequests: auth.authorizationRequests,
+        tokenExchanges: auth.tokenExchanges,
+        authRequests: auth.requests,
+        trace: existsSync(root.trace) ? readFileSync(root.trace, "utf8") : "",
+      }, null, 2));
+    }
+    expect(authenticated.stderr).toBe("");
+    expect(authenticated.stdout).toContain("Authenticated MCP server 'fixture'");
+    expect(auth.requests.some((request) =>
+      request.path === "/tenant/.well-known/oauth-protected-resource"
+    )).toBe(true);
+    expect(auth.authorizationRequests).toBe(1);
+    expect(auth.tokenExchanges).toBe(1);
+  }, 30_000);
+
   test("top-level MCP auth and logout complete without TUI or Gateway", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
