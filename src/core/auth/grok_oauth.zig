@@ -995,6 +995,33 @@ test "Grok account identity comes from authenticated userinfo" {
     try std.testing.expectEqualStrings("acct_test", account_id);
 }
 
+test "Grok user principal identity still comes from authenticated userinfo" {
+    const State = struct {
+        request_seen: bool = false,
+
+        fn execute(raw: ?*anyopaque, alloc: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.request_seen = true;
+            return .{ .disposition = .accepted, .body = try alloc.dupe(u8, "{\"sub\":\"user_info_id\"}") };
+        }
+    };
+    const access_token = try testAccessToken(
+        std.testing.allocator,
+        "{\"principal_type\":\"User\",\"principal_id\":\"token_user_id\"}",
+    );
+    defer std.testing.allocator.free(access_token);
+    var state = State{};
+    const account_id = try fetchAccountId(
+        std.testing.allocator,
+        .{ .context = &state, .execute_fn = State.execute },
+        access_token,
+    );
+    defer std.testing.allocator.free(account_id);
+
+    try std.testing.expect(state.request_seen);
+    try std.testing.expectEqualStrings("user_info_id", account_id);
+}
+
 test "Grok team account identity comes from the access token" {
     const State = struct {
         request_seen: bool = false,
@@ -1089,7 +1116,12 @@ test "Grok team refresh retains the selected principal" {
 }
 
 test "Grok personal refresh omits team principal fields" {
-    const payload = try buildRefreshPayload(std.testing.allocator, "refresh", "opaque-access-token");
+    const access_token = try testAccessToken(
+        std.testing.allocator,
+        "{\"principal_type\":\"User\",\"principal_id\":\"user_test\"}",
+    );
+    defer std.testing.allocator.free(access_token);
+    const payload = try buildRefreshPayload(std.testing.allocator, "refresh", access_token);
     defer secret.zeroAndFree(std.testing.allocator, payload);
 
     try std.testing.expect(std.mem.find(u8, payload, "principal_type") == null);
