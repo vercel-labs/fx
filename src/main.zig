@@ -21,6 +21,8 @@ const acp_runner = @import("core/cli/acp_runner.zig");
 const acp_server = @import("acp/server.zig");
 const app_input_runtime = @import("core/app/app_input_runtime.zig");
 const input_submit_runtime = @import("core/app/input_submit_runtime.zig");
+const app_loop_runtime = @import("core/app/app_loop_runtime.zig");
+const loop_scheduler = @import("core/loop/scheduler.zig");
 const core_input_runtime = @import("core/input/runtime.zig");
 const input_queue_runtime = @import("core/app/input_queue_runtime.zig");
 const app_bootstrap_runtime = @import("core/app/app_bootstrap_runtime.zig");
@@ -378,6 +380,7 @@ const App = struct {
     const BootstrapAppRuntime = app_bootstrap_runtime.Runtime(Self);
     const InputAppRuntime = app_input_runtime.Runtime(Self);
     const InputSubmitRuntime = input_submit_runtime.SubmitRuntime(Self);
+    const LoopAppRuntime = app_loop_runtime.Runtime(Self);
     const NotificationAppRuntime = app_notification_runtime.Runtime(
         Self,
         builtin_hooks.notifications.provider(Self),
@@ -543,6 +546,7 @@ const App = struct {
 
     worker_thread: ?std.Thread = null,
     worker: WorkerRuntime = .{},
+    loops: ?loop_scheduler.Scheduler = null,
     background: BackgroundRuntime = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
     terminal_direct: terminal_direct_runtime.Runtime = .{},
@@ -583,6 +587,7 @@ const App = struct {
     pub fn init(alloc: Allocator, launch: *cli_surface.InteractiveLaunch) !Self {
         var app = Self{
             .alloc = alloc,
+            .loops = loop_scheduler.Scheduler.init(alloc),
             .subagents = ui_subagents.Controller.init(),
             .lifecycle_runtime = hooks.Runtime.init(alloc),
             .background = BackgroundRuntime.init(if (comptime host_target.is_wasm)
@@ -834,6 +839,7 @@ const App = struct {
         };
         self.background.deinit(std.heap.c_allocator);
         self.worker.deinit(std.heap.c_allocator);
+        if (self.loops) |*loops| loops.deinit();
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         self.subagents.deinit(self.alloc);
@@ -2678,6 +2684,7 @@ const App = struct {
             try self.routeTerminalInputIngress(terminal_input);
         }
         try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).onTaskCompletion, app_callbacks.Bindings(App).workerEventHandlers(self));
+        try LoopAppRuntime.tick(self, io_mod.monotonic_milli_timestamp());
         const now_ns = io_mod.nanoTimestamp();
         if (!self.approval_prompt.isActive() and !self.question_prompt.isActive() and !self.auth.apiKeyEntryActive()) {
             try self.pacer.tick(self.alloc, now_ns, self.pacerCallbacks());
@@ -3886,6 +3893,7 @@ test {
     _ = @import("core/app/app_commands.zig");
     _ = @import("core/app/app_entry_runtime.zig");
     _ = @import("core/app/app_input_runtime.zig");
+    _ = @import("core/app/app_loop_runtime.zig");
     _ = @import("core/app/app_lifecycle.zig");
     _ = @import("core/app/model_cache_runtime.zig");
     _ = @import("core/app/app_process_runtime.zig");

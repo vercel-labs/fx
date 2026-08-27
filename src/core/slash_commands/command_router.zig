@@ -17,6 +17,7 @@ pub const ParsedCommand = union(enum) {
     logout: []const u8,
     setup,
     status,
+    loop: []const u8,
     background,
     background_stop: []const u8,
     background_open: []const u8,
@@ -60,6 +61,7 @@ pub const CommandHandlers = struct {
     logout: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     setup: *const fn (ctx: *anyopaque) anyerror!void,
     show_status: *const fn (ctx: *anyopaque) anyerror!void,
+    handle_loop: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_background: *const fn (ctx: *anyopaque) anyerror!void,
     stop_background: *const fn (ctx: *anyopaque, target: []const u8) anyerror!void,
     open_background: *const fn (ctx: *anyopaque, target: []const u8) anyerror!void,
@@ -109,6 +111,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .logout => .{ .logout = payload },
         .setup => .setup,
         .status => .status,
+        .loop => .{ .loop = payload },
         .background => .background,
         .background_stop => .{ .background_stop = payload },
         .background_open => .{ .background_open = payload },
@@ -166,6 +169,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .logout => |rest| try handlers.logout(handlers.ctx, rest),
         .setup => try handlers.setup(handlers.ctx),
         .status => try handlers.show_status(handlers.ctx),
+        .loop => |rest| try handlers.handle_loop(handlers.ctx, rest),
         .background => try handlers.show_background(handlers.ctx),
         .background_stop => |target| try handlers.stop_background(handlers.ctx, target),
         .background_open => |target| try handlers.open_background(handlers.ctx, target),
@@ -200,6 +204,14 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
 fn testSlashRegistry() SlashRegistry {
     const builtin_commands = @import("../../builtins/commands.zig");
     return builtin_commands.slash_registry;
+}
+
+test "parse extracts loop command payload" {
+    const parsed = parse(testSlashRegistry(), "/loop 5m check deploy");
+    switch (parsed) {
+        .loop => |payload| try std.testing.expectEqualStrings("5m check deploy", payload),
+        else => return error.TestExpectedLoopCommand,
+    }
 }
 
 test "parse extracts model command payload" {
@@ -504,6 +516,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .logout = unexpectedPayload,
         .setup = unexpectedNoPayload,
         .show_status = unexpectedNoPayload,
+        .handle_loop = unexpectedPayload,
         .show_background = unexpectedNoPayload,
         .stop_background = unexpectedPayload,
         .open_background = unexpectedPayload,

@@ -484,6 +484,13 @@ pub fn nanoTimestamp() i128 {
     return @intCast(ts.nanoseconds);
 }
 
+/// Milliseconds from a monotonic clock that includes system suspend when the
+/// host supports it. Use for in-process deadlines and elapsed-time scheduling.
+pub fn monotonic_milli_timestamp() i64 {
+    const ts = std.Io.Timestamp.now(getIo(), .boot);
+    return @intCast(@divFloor(ts.nanoseconds, 1_000_000));
+}
+
 pub fn writeFileAtomic(alloc: std.mem.Allocator, path: []const u8, text: []const u8) !void {
     e2eFailIfDurableMutationAttempted();
     const maybe_existing_permissions = existingFilePermissions(path);
@@ -1142,9 +1149,13 @@ test "readFileToEndZ returns null-terminated slice" {
     try std.testing.expectEqual(@as(u8, 0), data.ptr[data.len]);
 }
 
-test "timestamp wrappers return plausible real-clock values" {
+test "timestamp wrappers return plausible clock values" {
     try std.testing.expect(milliTimestamp() > 0);
     try std.testing.expect(nanoTimestamp() > 0);
+    const monotonic_before = monotonic_milli_timestamp();
+    const monotonic_after = monotonic_milli_timestamp();
+    try std.testing.expect(monotonic_before >= 0);
+    try std.testing.expect(monotonic_after >= monotonic_before);
 }
 
 test "writeFileAtomic replaces file content and leaves no temp file behind" {

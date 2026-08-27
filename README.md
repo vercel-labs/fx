@@ -68,6 +68,8 @@ fx
 
 The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands.
 
+Use `/loop 5m check the deploy` to run a prompt repeatedly while the interactive session remains open. `/loop` or `/loop list` shows scheduled tasks, `/loop stop <id>` cancels one, and `/loop once 2h <prompt>` schedules a one-time prompt. Recurring tasks expire after seven days and wait for active or queued agent work to finish before starting another iteration.
+
 The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
 
 ```json

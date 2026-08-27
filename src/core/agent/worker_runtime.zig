@@ -1135,6 +1135,14 @@ pub const WorkerRuntime = struct {
         return self.worker_processing;
     }
 
+    pub fn is_idle_for_prompt_admission(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return !self.worker_processing and
+            self.queued_prompt_count == 0 and
+            self.worker_events.items.len == 0;
+    }
+
     pub fn snapshotState(
         self: *WorkerRuntime,
         alloc: std.mem.Allocator,
@@ -3023,6 +3031,20 @@ test "request shutdown sets stop and cancel flags" {
     runtime.requestShutdown();
     try std.testing.expect(runtime.worker_stop_requested);
     try std.testing.expect(runtime.worker_cancel_requested.load(.seq_cst));
+}
+
+test "prompt admission waits for pending worker events to drain" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    try std.testing.expect(runtime.is_idle_for_prompt_admission());
+    try runtime.pushEvent(alloc, .{ .command_output_complete = null });
+    try std.testing.expect(!runtime.is_idle_for_prompt_admission());
+
+    var events = runtime.takeEvents();
+    defer freeEventList(alloc, &events);
+    try std.testing.expect(runtime.is_idle_for_prompt_admission());
 }
 
 test "takeEventBatch snapshots cancellation with detached events" {
