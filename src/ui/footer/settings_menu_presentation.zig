@@ -1,17 +1,16 @@
 const std = @import("std");
 const display_width = @import("../../core/shared/display_width.zig");
 const settings_catalog = @import("../../core/config/settings_catalog.zig");
+const picker_presentation = @import("picker_presentation.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
 const ui_render = @import("../render.zig");
+const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const Allocator = std.mem.Allocator;
 const SettingsMenuProjection = render_input.SettingsMenuProjection;
 const roomy_header_rows: u16 = 2;
-
-fn itemRowCount(_: u16) u16 {
-    return 1;
-}
+pub const max_inline_rows: u16 = roomy_header_rows + std.meta.fields(settings_catalog.SettingId).len;
 
 fn inlineModelRowCount(projection: SettingsMenuProjection) u16 {
     if (!projection.models.active) return 0;
@@ -21,11 +20,9 @@ fn inlineModelRowCount(projection: SettingsMenuProjection) u16 {
 
 const BodyRow = union(enum) {
     none,
-    category: settings_catalog.Category,
     item: struct {
         item: settings_catalog.Item,
         selected: bool,
-        description: bool,
     },
     model: usize,
 };
@@ -37,9 +34,7 @@ const Layout = struct {
     visible_items: u16 = 0,
     body_start_row: u16 = 0,
     row_count: u16 = 0,
-    compact: bool = false,
-    show_category: bool = false,
-    show_description: bool = false,
+    model_only: bool = false,
 };
 
 pub fn menuRowCount(projection: SettingsMenuProjection, width: u16, max_rows: u16) u16 {
@@ -52,6 +47,27 @@ pub fn visibleNavigationItemsForBudget(
     row_budget: u16,
 ) u16 {
     return @max(buildBrowseLayout(projection, width, row_budget).visible_items, 1);
+}
+
+pub fn visibleModelItemsForBudget(
+    projection: SettingsMenuProjection,
+    width: u16,
+    row_budget: u16,
+) u16 {
+    const layout = buildBrowseLayout(projection, width, row_budget);
+    var visible: u16 = 0;
+    var row_index = layout.body_start_row;
+    while (row_index < layout.row_count) : (row_index += 1) {
+        switch (browseBodyRowAt(
+            projection,
+            layout,
+            row_index - layout.body_start_row,
+        )) {
+            .model => visible += 1,
+            else => {},
+        }
+    }
+    return visible;
 }
 
 pub fn composeSettingsMenuRow(
@@ -70,14 +86,10 @@ pub fn composeSettingsMenuRow(
         return empty;
     }
     if (layout.match_count == 0) return composeEmptyRow(alloc, width);
-    const value_col = centeredValueColumn(projection.snapshot, width);
-    return switch (browseBodyRowAt(projection, width, layout, row_index - layout.body_start_row)) {
+    const value_col = valueColumn(projection, width);
+    return switch (browseBodyRowAt(projection, layout, row_index - layout.body_start_row)) {
         .none => empty,
-        .category => |category| composeCategoryRow(alloc, projection, category, width),
-        .item => |body| if (body.description)
-            empty
-        else
-            composeItemRow(alloc, projection.snapshot, body.item, body.selected, width, value_col),
+        .item => |body| composeItemRow(alloc, projection.snapshot, body.item, body.selected, width, value_col),
         .model => |display_index| composeModelRow(alloc, projection, display_index, width, value_col),
     };
 }
@@ -86,12 +98,8 @@ fn buildBrowseLayout(projection: SettingsMenuProjection, width: u16, max_rows: u
     if (max_rows == 0) return .{};
     const match_count = projection.filteredItemCount();
     const selected = if (match_count == 0) 0 else projection.selected_index % match_count;
-    const body_start_row: u16 = if (max_rows >= roomy_header_rows + 3)
-        roomy_header_rows
-    else if (max_rows >= 2)
-        1
-    else
-        0;
+    const show_header = max_rows > 2;
+    const body_start_row: u16 = if (show_header) roomy_header_rows else 0;
     if (match_count == 0) {
         return .{
             .body_start_row = body_start_row,
@@ -100,21 +108,10 @@ fn buildBrowseLayout(projection: SettingsMenuProjection, width: u16, max_rows: u
     }
 
     const body_budget = max_rows - body_start_row;
-    if (max_rows < roomy_header_rows + 3) {
-        return .{
-            .match_count = match_count,
-            .selected = selected,
-            .first_item = selected,
-            .visible_items = 1,
-            .body_start_row = body_start_row,
-            .row_count = max_rows,
-            .compact = true,
-            .show_category = body_budget >= 3,
-            .show_description = false,
-        };
-    }
-
-    var first_item = @min(projection.window_start, match_count - 1);
+    var first_item = if (projection.models.active)
+        selected
+    else
+        @min(projection.window_start, match_count - 1);
     if (selected < first_item) first_item = selected;
     var body = measureBrowseBody(projection, width, first_item, body_budget);
     while (selected >= first_item + body.visible_items and first_item < selected) {
@@ -131,6 +128,7 @@ fn buildBrowseLayout(projection: SettingsMenuProjection, width: u16, max_rows: u
         .first_item = first_item,
         .visible_items = body.visible_items,
         .body_start_row = body_start_row,
+        .model_only = projection.models.active and body_budget == 1,
         .row_count = body_start_row + body.rows,
     };
 }
@@ -142,67 +140,34 @@ const Measurement = struct {
 
 fn measureBrowseBody(projection: SettingsMenuProjection, width: u16, first_item: usize, row_budget: u16) Measurement {
     var result: Measurement = .{};
-    var previous_category: ?settings_catalog.Category = null;
-    const rows_per_item = itemRowCount(width);
+    _ = width;
     var display_index = first_item;
     while (projection.itemAt(display_index)) |item| : (display_index += 1) {
-        const category_rows: u16 = if (previous_category == null or previous_category.? != item.category)
-            if (previous_category == null) 1 else 2
+        const required: u16 = 1;
+        if (result.rows + required > row_budget) break;
+        const model_rows: u16 = if (item.id == .model)
+            @min(inlineModelRowCount(projection), row_budget - result.rows - required)
         else
             0;
-        const model_rows: u16 = if (item.id == .model) inlineModelRowCount(projection) else 0;
-        const required = category_rows + rows_per_item + model_rows;
-        if (result.rows + required > row_budget) break;
-        result.rows += required;
+        result.rows += required + model_rows;
         result.visible_items += 1;
-        previous_category = item.category;
+    }
+    if (projection.models.active and row_budget == 1 and result.visible_items > 0) {
+        result.rows = 1;
     }
     return result;
 }
 
-fn browseBodyRowAt(projection: SettingsMenuProjection, width: u16, layout: Layout, target: u16) BodyRow {
-    if (layout.compact) {
-        const item = projection.itemAt(layout.first_item) orelse return .none;
-        var row: u16 = 0;
-        if (layout.show_category) {
-            if (target == row) return .{ .category = item.category };
-            row += 1;
-        }
-        if (target == row) return .{ .item = .{
-            .item = item,
-            .selected = true,
-            .description = false,
-        } };
-        row += 1;
-        if (layout.show_description and target == row) {
-            return .{ .item = .{
-                .item = item,
-                .selected = true,
-                .description = true,
-            } };
-        }
-        return .none;
-    }
-
-    const rows_per_item = itemRowCount(width);
+fn browseBodyRowAt(projection: SettingsMenuProjection, layout: Layout, target: u16) BodyRow {
+    if (layout.model_only) return if (target == 0) .{ .model = 0 } else .none;
     var row: u16 = 0;
-    var previous_category: ?settings_catalog.Category = null;
     var offset: usize = 0;
     while (offset < layout.visible_items) : (offset += 1) {
         const display_index = layout.first_item + offset;
         const item = projection.itemAt(display_index) orelse return .none;
-        if (previous_category == null or previous_category.? != item.category) {
-            if (previous_category != null) {
-                if (row == target) return .none;
-                row += 1;
-            }
-            if (row == target) return .{ .category = item.category };
-            row += 1;
-        }
         if (row == target) return .{ .item = .{
             .item = item,
             .selected = display_index == layout.selected,
-            .description = false,
         } };
         row += 1;
         if (item.id == .model and projection.models.active) {
@@ -213,36 +178,56 @@ fn browseBodyRowAt(projection: SettingsMenuProjection, width: u16, layout: Layou
                 row += 1;
             }
         }
-        if (rows_per_item == 2) {
-            if (row == target) return .{ .item = .{
-                .item = item,
-                .selected = display_index == layout.selected,
-                .description = true,
-            } };
-            row += 1;
-        }
-        previous_category = item.category;
     }
     return .none;
 }
 
-fn composeBrowseHeader(alloc: Allocator, _: SettingsMenuProjection, width: u16) !std.ArrayList(u8) {
-    return composeStyledText(alloc, "Settings", width, ui_render.selected_completion_style, 0);
+fn composeBrowseHeader(alloc: Allocator, projection: SettingsMenuProjection, width: u16) !std.ArrayList(u8) {
+    var wide: std.ArrayList(u8) = .empty;
+    defer wide.deinit(alloc);
+    try appendHeaderTitle(alloc, &wide, projection.filteredItemCount());
+    inline for (std.meta.fields(settings_catalog.Category)) |field| {
+        const category: settings_catalog.Category = @enumFromInt(field.value);
+        try wide.appendSlice(alloc, "  ");
+        try appendCategoryTab(alloc, &wide, category, category == projection.category);
+    }
+    if (display_width.visibleWidthIgnoringAnsi(wide.items) <= width) {
+        return cloneClipped(alloc, wide.items, width);
+    }
+
+    var compact: std.ArrayList(u8) = .empty;
+    defer compact.deinit(alloc);
+    try appendHeaderTitle(alloc, &compact, projection.filteredItemCount());
+    try compact.appendSlice(alloc, "  ");
+    try appendCategoryTab(alloc, &compact, projection.category, true);
+    if (display_width.visibleWidthIgnoringAnsi(compact.items) <= width) {
+        return cloneClipped(alloc, compact.items, width);
+    }
+
+    compact.clearRetainingCapacity();
+    try appendCategoryTab(alloc, &compact, projection.category, true);
+    return cloneClipped(alloc, compact.items, width);
 }
 
-fn composeCategoryRow(
-    alloc: Allocator,
-    projection: SettingsMenuProjection,
-    category: settings_catalog.Category,
-    width: u16,
-) !std.ArrayList(u8) {
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    _ = projection;
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendSingleLineEllipsized(alloc, &row, category.label(), width);
+fn appendHeaderTitle(alloc: Allocator, row: *std.ArrayList(u8), count: usize) !void {
+    try row.appendSlice(alloc, ui_render.selected_completion_style);
+    var buf: [48]u8 = undefined;
+    const title = std.fmt.bufPrint(&buf, "Settings {d}", .{count}) catch "Settings";
+    try row.appendSlice(alloc, title);
     try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
+}
+
+fn appendCategoryTab(
+    alloc: Allocator,
+    row: *std.ArrayList(u8),
+    category: settings_catalog.Category,
+    active: bool,
+) !void {
+    try row.appendSlice(alloc, if (active) ui_render.selected_completion_style else ui_render.dim_style);
+    if (active) try row.append(alloc, '[');
+    try row.appendSlice(alloc, category.label());
+    if (active) try row.append(alloc, ']');
+    try row.appendSlice(alloc, ui_render.reset_style);
 }
 
 fn composeItemRow(
@@ -324,17 +309,14 @@ fn composeModelRow(
     return row;
 }
 
-fn centeredValueColumn(snapshot: settings_catalog.Snapshot, width: u16) usize {
-    const total_width: usize = width;
-    const right_column_start = total_width * 2 / 3;
-    const right_column_width = total_width - right_column_start;
-    var widest_value_width: usize = 0;
+fn valueColumn(projection: SettingsMenuProjection, width: u16) usize {
+    const indent: usize = if (width <= 2) 0 else 2;
+    var widest_label_width: usize = 0;
     var display_index: usize = 0;
-    while (settings_catalog.itemAt(snapshot, .all, "", display_index)) |item| : (display_index += 1) {
-        widest_value_width = @max(widest_value_width, display_width.visibleWidth(item.value));
+    while (projection.itemAt(display_index)) |item| : (display_index += 1) {
+        widest_label_width = @max(widest_label_width, display_width.visibleWidth(item.label));
     }
-    const value_block_width = @min(widest_value_width, right_column_width);
-    return right_column_start + (right_column_width - value_block_width) / 2;
+    return @min(indent + widest_label_width + picker_presentation.inline_picker_column_gap_width, width);
 }
 
 fn composeEmptyRow(alloc: Allocator, width: u16) !std.ArrayList(u8) {
@@ -379,17 +361,13 @@ test "settings menu renders each setting on one row at wide and narrow widths" {
         .snapshot = test_snapshot,
     };
     const wide_rows = menuRowCount(projection, 100, 40);
-    try std.testing.expectEqual(@as(u16, 20), wide_rows);
+    try std.testing.expectEqual(@as(u16, 13), wide_rows);
 
     var header = try composeSettingsMenuRow(alloc, projection, 0, 100, wide_rows);
     defer header.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, header.items, "Settings") != null);
 
-    var category = try composeSettingsMenuRow(alloc, projection, 2, 100, wide_rows);
-    defer category.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, category.items, "Interface") != null);
-
-    var item = try composeSettingsMenuRow(alloc, projection, 3, 100, wide_rows);
+    var item = try composeSettingsMenuRow(alloc, projection, 2, 100, wide_rows);
     defer item.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, item.items, "Status line context") != null);
     try std.testing.expect(std.mem.find(u8, item.items, "on") != null);
@@ -404,14 +382,14 @@ test "settings menu renders each setting on one row at wide and narrow widths" {
     try std.testing.expect(std.mem.find(u8, compact_item.items, "on") != null);
 
     const narrow_rows = menuRowCount(projection, 24, 40);
-    try std.testing.expectEqual(@as(u16, 20), narrow_rows);
-    var narrow_item = try composeSettingsMenuRow(alloc, projection, 3, 24, narrow_rows);
+    try std.testing.expectEqual(@as(u16, 13), narrow_rows);
+    var narrow_item = try composeSettingsMenuRow(alloc, projection, 2, 24, narrow_rows);
     defer narrow_item.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, narrow_item.items, "Status line") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow_item.items) <= 24);
 }
 
-test "settings menu values form a centered left aligned block" {
+test "settings menu values follow the widest matching setting label" {
     const alloc = std.testing.allocator;
     const projection: render_input.SettingsMenuProjection = .{
         .active = true,
@@ -419,13 +397,15 @@ test "settings menu values form a centered left aligned block" {
     };
     const rows = menuRowCount(projection, 100, 40);
 
-    var short = try composeSettingsMenuRow(alloc, projection, 3, 100, rows);
+    var short = try composeSettingsMenuRow(alloc, projection, 2, 100, rows);
     defer short.deinit(alloc);
-    var long = try composeSettingsMenuRow(alloc, projection, 9, 100, rows);
+    var long = try composeSettingsMenuRow(alloc, projection, 6, 100, rows);
     defer long.deinit(alloc);
 
-    const short_start = std.mem.find(u8, short.items, "off").?;
-    const long_start = std.mem.find(u8, long.items, "zai/glm-5.2").?;
+    const short_start = std.mem.find(u8, short.items, "off") orelse
+        return error.ExpectedStatuslineValue;
+    const long_start = std.mem.find(u8, long.items, "zai/glm-5.2") orelse
+        return error.ExpectedModelValue;
     const short_column = display_width.visibleWidthIgnoringAnsi(short.items[0..short_start]);
     const long_column = display_width.visibleWidthIgnoringAnsi(long.items[0..long_start]);
     try std.testing.expectEqual(
@@ -433,6 +413,88 @@ test "settings menu values form a centered left aligned block" {
         long_column,
     );
 
-    try std.testing.expect(long_column >= 100 * 2 / 3);
-    try std.testing.expect(long_column < 100);
+    try std.testing.expectEqual(@as(usize, 27), long_column);
+
+    const filtered_projection: render_input.SettingsMenuProjection = .{
+        .active = true,
+        .snapshot = test_snapshot,
+        .query = "sound",
+    };
+    const filtered_rows = menuRowCount(filtered_projection, 100, 40);
+    var filtered = try composeSettingsMenuRow(alloc, filtered_projection, 2, 100, filtered_rows);
+    defer filtered.deinit(alloc);
+    const filtered_start = std.mem.find(u8, filtered.items, "off") orelse
+        return error.ExpectedSoundValue;
+    try std.testing.expectEqual(
+        @as(usize, 17),
+        display_width.visibleWidthIgnoringAnsi(filtered.items[0..filtered_start]),
+    );
+}
+
+test "settings model choices remain visible within the inline row budget" {
+    const alloc = std.testing.allocator;
+    const model_cache_runtime = @import("../../core/app/model_cache_runtime.zig");
+    const models = [_]model_cache_runtime.ModelMenuItem{
+        .{ .id = @constCast("provider/one"), .provider = "provider", .capabilities = .{} },
+        .{ .id = @constCast("provider/two"), .provider = "provider", .capabilities = .{} },
+        .{ .id = @constCast("provider/three"), .provider = "provider", .capabilities = .{} },
+    };
+    const projection: render_input.SettingsMenuProjection = .{
+        .active = true,
+        .selected_index = 4,
+        .snapshot = test_snapshot,
+        .models = .{
+            .active = true,
+            .load_state = .ready,
+            .items = &models,
+        },
+    };
+    const row_budget: u16 = 8;
+    const rows = menuRowCount(projection, 100, row_budget);
+    var found_model = false;
+    var row_index: u16 = 0;
+    while (row_index < rows) : (row_index += 1) {
+        var row = try composeSettingsMenuRow(alloc, projection, row_index, 100, rows);
+        defer row.deinit(alloc);
+        if (std.mem.find(u8, row.items, "provider/one") != null) found_model = true;
+    }
+    try std.testing.expect(found_model);
+}
+
+test "settings menu renders category tabs and a flat full list through the VT" {
+    const alloc = std.testing.allocator;
+    const width: u16 = 120;
+    const projection: render_input.SettingsMenuProjection = .{
+        .active = true,
+        .snapshot = test_snapshot,
+    };
+    const row_budget: u16 = 13;
+    const rows = menuRowCount(projection, width, row_budget);
+    try std.testing.expectEqual(row_budget, rows);
+
+    var grid = try vt_emulator.Grid.init(alloc, width, rows);
+    defer grid.deinit();
+    var row_index: u16 = 0;
+    while (row_index < rows) : (row_index += 1) {
+        var row = try composeSettingsMenuRow(alloc, projection, row_index, width, rows);
+        defer row.deinit(alloc);
+        var cursor_buf: [32]u8 = undefined;
+        const cursor = try std.fmt.bufPrint(&cursor_buf, "\x1b[{d};1H", .{row_index + 1});
+        try grid.feed(cursor);
+        try grid.feed(row.items);
+    }
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    try grid.rowTextTrimmed(1, &text);
+    try std.testing.expect(std.mem.find(u8, text.items, "Settings 11") != null);
+    try std.testing.expect(std.mem.find(u8, text.items, "[All]") != null);
+    try std.testing.expect(std.mem.find(u8, text.items, "Interface") != null);
+    text.clearRetainingCapacity();
+    try grid.rowTextTrimmed(3, &text);
+    try std.testing.expect(std.mem.find(u8, text.items, "Status line context") != null);
+    try std.testing.expect(std.mem.find(u8, text.items, "Interface") == null);
+    text.clearRetainingCapacity();
+    try grid.rowTextTrimmed(13, &text);
+    try std.testing.expect(std.mem.find(u8, text.items, "Prompt history") != null);
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const lexical_relevance = @import("../shared/lexical_relevance.zig");
 const types = @import("../shared/types.zig");
 const context_limits = @import("../config/context_limits.zig");
 const elicitation = @import("../mcp/elicitation.zig");
@@ -10,7 +11,8 @@ const Allocator = std.mem.Allocator;
 pub const HasToolFn = *const fn (*anyopaque, []const u8, Access) bool;
 pub const ValidateToolFn = *const fn (*anyopaque, Allocator, []const u8, []const u8, Access) anyerror!ValidationResult;
 pub const CallToolFn = *const fn (*anyopaque, Allocator, []const u8, []const u8, usize, CallOptions) anyerror!?CallResult;
-pub const SearchToolsFn = *const fn (*anyopaque, Allocator, []const u8, usize, types.PermissionRuleSet, context_limits.Values, Access) anyerror!SearchResult;
+pub const PreparedQuery = lexical_relevance.PreparedQuery;
+pub const SearchToolsFn = *const fn (*anyopaque, Allocator, *const PreparedQuery, usize, types.PermissionRuleSet, context_limits.Values, Access) anyerror!SearchResult;
 pub const ToolSchemaFn = *const fn (*anyopaque, Allocator, []const u8, types.PermissionRuleSet, context_limits.Values, Access) anyerror!?ToolSchemaResult;
 pub const FeatureCallFn = *const fn (
     *anyopaque,
@@ -365,7 +367,7 @@ fn callAdvertisedDynamicTool(
 pub fn notSelectedOutput(arena: Allocator, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(
         arena,
-        "Dynamic MCP tool not selected for this model step: {s}. Use mcp_search_tools and mcp_select_tool first; the selected tool can be called on the next model step after its schema is advertised.",
+        "Dynamic MCP tool not selected for this model step: {s}. Use capability_search and mcp_select_tool first; the selected tool can be called on the next model step after its schema is advertised.",
         .{name},
     );
 }

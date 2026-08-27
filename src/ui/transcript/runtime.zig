@@ -5288,6 +5288,8 @@ pub const TranscriptRuntime = struct {
                 .deferred
             else if (deferred or permission_denied)
                 .denied
+            else if (result.terminal_action_presentation) |presentation|
+                presentation.outcomeKind()
             else if (result.status == .success or
                 (activity_kind == .command and
                     result.command_process_presentation != null))
@@ -5303,6 +5305,7 @@ pub const TranscriptRuntime = struct {
                 .truncated = result.truncated,
                 .command_output_replay = result.command_output_replay,
                 .command_process_presentation = result.command_process_presentation,
+                .terminal_action_presentation = result.terminal_action_presentation,
             },
             command_artifact_handle,
             if (deferred or permission_denied) null else command_output_entry_id,
@@ -6023,7 +6026,20 @@ pub const TranscriptRuntime = struct {
         metrics: *Metrics,
         text: []const u8,
     ) !u32 {
-        return transcript_store.streamAssistantChunk(self, alloc, metrics, text);
+        const transcript_was_pending = self.render_requests.hasReason(.transcript);
+        const entry_id = try transcript_store.streamAssistantChunk(self, alloc, metrics, text);
+        if (!transcript_was_pending and
+            self.nativeHistoryActive() and
+            std.mem.findScalar(u8, text, '\n') == null)
+        {
+            self.render_requests.clearReason(.transcript);
+            debug_trace.logf(
+                "scroll",
+                "assistant_partial_paint_deferred bytes={d} entry_id={d}",
+                .{ text.len, entry_id },
+            );
+        }
+        return entry_id;
     }
 
     pub fn retintEntriesForTheme(
@@ -9784,6 +9800,14 @@ pub const TranscriptRuntime = struct {
     pub fn markTranscriptDirty(self: *TranscriptRuntime) void {
         self.transcript_band_dirty = true;
         self.render_requests.request(.transcript);
+    }
+
+    pub fn nativeHistoryActive(self: *const TranscriptRuntime) bool {
+        return switch (self.transcript_commit_state) {
+            .invalid => false,
+            .stable => |anchor| anchor.history_visual_offset > 0,
+            .recovering => |receipt| receipt.accepted_history_visual_offset > 0,
+        };
     }
 
     pub fn markTranscriptContentDirty(self: *TranscriptRuntime) void {

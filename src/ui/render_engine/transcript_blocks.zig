@@ -1591,18 +1591,23 @@ fn renderEntryToBlockForPresentationInterruptible(
             break :blk try normalizeOwnedRenderedBlock(alloc, kind, card);
         },
         .assistant_turn => |e| blk: {
-            const wrapped = try assistant_wrap.wrapTranscriptAssistantTextInterruptible(
+            const wrapped = try assistant_wrap.wrapTranscriptAssistantTextWithFinalityInterruptible(
                 alloc,
                 e.segments.text.items,
                 cols,
                 checkpoint,
             );
-            break :blk try normalizeOwnedRenderedBlockWithAllocation(
+            const trimmed = trimAssistantBlockHead(wrapped.bytes);
+            const trimmed_head_bytes = wrapped.bytes.len - trimmed.len;
+            var block = try normalizeOwnedRenderedBlockWithAllocation(
                 alloc,
                 kind,
-                trimAssistantBlockHead(wrapped),
-                wrapped,
+                trimmed,
+                wrapped.bytes,
             );
+            block.assistant_finalized_prefix_bytes =
+                wrapped.finalized_prefix_bytes -| trimmed_head_bytes;
+            break :blk block;
         },
         .assistant_table => |e| blk: {
             const gutter = assistant_wrap.gutterWidth(cols);
@@ -1919,7 +1924,7 @@ const RenderEntriesOptions = struct {
     target_entry_id: ?u32 = null,
     target_byte_entry_id: ?u32 = null,
     finality_entry_ids: []const u32 = &.{},
-    finality_entry_start_bytes: []?usize = &.{},
+    finality_entry_floor_bytes: []?usize = &.{},
     omitted_entry_id: ?u32 = null,
     entry_actions: []const EntryRenderAction = &.{},
     summary_entry_ids: []const ?u32 = &.{},
@@ -2035,7 +2040,8 @@ const RenderEntriesBuilder = struct {
         if (options.target_byte_entry_id == entry_id) self.target_entry_start_byte = self.out.items.len;
         for (options.finality_entry_ids, 0..) |finality_entry_id, index| {
             if (finality_entry_id == entry_id) {
-                options.finality_entry_start_bytes[index] = self.out.items.len;
+                options.finality_entry_floor_bytes[index] = self.out.items.len +
+                    (block.assistant_finalized_prefix_bytes orelse 0);
             }
         }
         for (options.summary_entry_ids, 0..) |summary_entry_id, index| {
@@ -2085,6 +2091,7 @@ fn renderEntriesInterruptible(
     options: RenderEntriesOptions,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !RenderedEntries {
+    std.debug.assert(options.finality_entry_ids.len == options.finality_entry_floor_bytes.len);
     options.resetSummaryIndices();
     if (options.entry_actions.len > 0) {
         std.debug.assert(options.entry_actions.len == entries.len);
@@ -2260,7 +2267,9 @@ pub const TranscriptPreparationOptions = struct {
     target_entry_id: ?u32 = null,
     target_byte_entry_id: ?u32 = null,
     finality_entry_ids: []const u32 = &.{},
-    finality_entry_start_bytes: []?usize = &.{},
+    /// Parallel to `finality_entry_ids`. Each rendered nomination writes the
+    /// first byte that remains mutable; immutable entries use their start.
+    finality_entry_floor_bytes: []?usize = &.{},
     omitted_entry_id: ?u32 = null,
     entry_actions: []const EntryRenderAction = &.{},
     folded_summary_entry_ids: []const ?u32 = &.{},
@@ -2309,7 +2318,7 @@ pub fn renderEntriesForPreparationInterruptible(
             .target_entry_id = options.target_entry_id,
             .target_byte_entry_id = options.target_byte_entry_id,
             .finality_entry_ids = options.finality_entry_ids,
-            .finality_entry_start_bytes = options.finality_entry_start_bytes,
+            .finality_entry_floor_bytes = options.finality_entry_floor_bytes,
             .omitted_entry_id = options.omitted_entry_id,
             .entry_actions = options.entry_actions,
             .summary_entry_ids = options.folded_summary_entry_ids,
@@ -2641,6 +2650,7 @@ pub const RenderedBlock = struct {
     stored_tail_newlines: usize,
     allocation: []const u8 = &.{},
     owned: bool = false,
+    assistant_finalized_prefix_bytes: ?usize = null,
 
     pub fn deinit(self: RenderedBlock, alloc: Allocator) void {
         if (self.owned) alloc.free(self.allocation);

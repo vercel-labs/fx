@@ -52,6 +52,9 @@ pub const BuildFrameOptions = struct {
     document_append: frame_scroll_plan.FrameDocumentAppend = .{},
     terminal_transition: terminal_diff.FrameTerminalTransition = .none,
     body_painter: ?SurfacePainter = null,
+    /// Paints a bounded prompt tail after retained transcript rows and before
+    /// footer/activity surfaces. It never replaces the transcript body owner.
+    transcript_tail_painter: ?SurfacePainter = null,
     footer_painter: ?SurfacePainter = null,
     activity_painter: ?SurfacePainter = null,
     presentation: FramePresentation = .styled,
@@ -238,6 +241,9 @@ fn paintFrameSurface(
                 retained.source_area,
             );
         },
+    }
+    if (options.transcript_tail_painter) |painter| {
+        try painter.paint(painter.ctx, surface);
     }
     if (options.footer_painter) |painter| {
         try painter.paint(painter.ctx, surface);
@@ -837,6 +843,71 @@ test "buildAndFlushFrame retains styled hyperlink body and appends footer namesp
     try std.testing.expectEqualStrings("https://body.example", shell.shadow.hyperlinkUrl(2).?);
     try std.testing.expectEqualStrings("https://footer.example", shell.shadow.hyperlinkUrl(3).?);
     try std.testing.expectEqual(@as(u32, 3), shell.shadow.cellAt(3, 1).?.style.hyperlink_id);
+}
+
+test "buildAndFlushFrame retains prior transcript and paints only a pending tail card" {
+    var sink = BuilderSink{};
+    defer sink.deinit(std.testing.allocator);
+    var shell = try TestShell.init(std.testing.allocator, sink.sink());
+    shell.bind();
+    defer shell.deinit();
+    try shell.shadow.feed("\x1b[2;1HOLD");
+    shell.shadow.cursor_row = 3;
+    shell.shadow.cursor_col = 1;
+
+    var plan = testPlan();
+    plan.layout.content_bottom = 3;
+    plan.layout.divider_top_row = 4;
+    plan.layout.input_row = 4;
+    plan.layout.divider_bottom_row = 4;
+    plan.layout.hint_row = 4;
+    plan.activity = .none;
+    plan.activity_band = paint_plan.FrameBand.empty(.activity);
+    plan.transcript_band = .{ .top = 2, .bottom = 3, .owner = .transcript };
+    plan.viewport.bottom_row = 3;
+    plan.viewport.last_visible_row = 3;
+    plan.footer.top = 4;
+    plan.footer.top_divider = 4;
+    plan.footer.banner = 4;
+    plan.footer.input_base = 4;
+    plan.footer.picker_divider = 4;
+    plan.footer.picker_start = 4;
+    plan.footer.bottom_divider = 4;
+    plan.footer.hint = 4;
+    plan.footer.total_rows = 1;
+    plan.footer_band = .{ .top = 4, .bottom = 4, .owner = .footer };
+    plan.cursor_target = .{ .row = 4, .col = 1, .visible = true };
+
+    var full_body = PaintCtx{ .text = "WRONG", .owner = .transcript, .row = 2 };
+    var pending_card = PaintCtx{ .text = "PENDING", .owner = .transcript, .row = 3 };
+    var footer = PaintCtx{ .text = ">", .owner = .footer, .row = 4 };
+    var counters: TraceCounters = .{};
+    var metrics: Metrics = .{};
+    const result = try buildAndFlushFrame(std.testing.allocator, &shell, &metrics, .{
+        .plan = plan,
+        .transcript_body = .{ .retain = .{
+            .source_area = .{ .top = 2, .bottom = 2 },
+            .occupied_last_row = 2,
+        } },
+        .scroll_plan = testScrollPlan(0),
+        .body_painter = .{ .ctx = &full_body, .paint = PaintCtx.painter },
+        .transcript_tail_painter = .{ .ctx = &pending_card, .paint = PaintCtx.painter },
+        .footer_painter = .{ .ctx = &footer, .paint = PaintCtx.painter },
+        .trace_counters = &counters,
+    });
+
+    try std.testing.expect(result.is_committed());
+    try std.testing.expectEqual(@as(usize, 0), counters.body_paints);
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, "OLD") == null);
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, "WRONG") == null);
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, "PENDING") != null);
+    var row_text: std.ArrayList(u8) = .empty;
+    defer row_text.deinit(std.testing.allocator);
+    try shell.shadow.rowTextTrimmed(2, &row_text);
+    try std.testing.expectEqualStrings("OLD", row_text.items);
+    row_text.clearRetainingCapacity();
+    try shell.shadow.rowTextTrimmed(3, &row_text);
+    try std.testing.expectEqualStrings("PENDING", row_text.items);
 }
 
 test "buildAndFlushFrame retains combining suffix without repainting body" {

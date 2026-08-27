@@ -8,7 +8,7 @@ const Allocator = std.mem.Allocator;
 const max_prompt_bytes: usize = 4 * 1024;
 const header =
     "Configured MCP servers visible to this model turn are listed below.\n" ++
-    "Use mcp_search_tools with the server alias and requested use case. Then use mcp_select_tool with one exact result. Do not guess tool names.\n" ++
+    "Use capability_search with the requested use case. Then use mcp_select_tool with one exact MCP result. Do not guess tool names.\n" ++
     "<mcp_servers>\n";
 const footer = "</mcp_servers>\n";
 const empty_entry = "  <none />\n";
@@ -252,7 +252,7 @@ test "render exposes sorted server summaries without tool metadata" {
 
     try std.testing.expectEqualStrings(
         "Configured MCP servers visible to this model turn are listed below.\n" ++
-            "Use mcp_search_tools with the server alias and requested use case. Then use mcp_select_tool with one exact result. Do not guess tool names.\n" ++
+            "Use capability_search with the requested use case. Then use mcp_select_tool with one exact MCP result. Do not guess tool names.\n" ++
             "<mcp_servers>\n" ++
             "  <server name=\"alpha\" state=\"ready\" tools=\"2\" />\n" ++
             "  <server name=\"zeta\" state=\"authentication_required\" />\n" ++

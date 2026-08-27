@@ -1953,6 +1953,8 @@ fn processStatusRow(
     const full = switch (presentation) {
         .exit_code => |code| try std.fmt.allocPrint(alloc, "│ exit code {d}", .{code}),
         .signal => |signal| try std.fmt.allocPrint(alloc, "│ signal {d}", .{signal}),
+        .timed_out => try alloc.dupe(u8, "│ timed out"),
+        .output_capture_failed => try alloc.dupe(u8, "│ output capture failed"),
     };
     defer alloc.free(full);
     return alloc.dupe(u8, display_width.prefixByWidthIgnoringAnsi(full, cols));
@@ -2271,6 +2273,22 @@ test "compact process row consumes payload budget before final hint" {
     const hint_index = std.mem.find(u8, final, "│ … 2 lines more") orelse
         return error.TestExpectedHint;
     try std.testing.expect(status_index < hint_index);
+}
+
+test "compact process row names timeout and output capture causes" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        presentation: types.CommandProcessPresentation,
+        expected: []const u8,
+    }{
+        .{ .presentation = .timed_out, .expected = "│ timed out" },
+        .{ .presentation = .output_capture_failed, .expected = "│ output capture failed" },
+    };
+    for (cases) |case| {
+        const row = try processStatusRow(alloc, case.presentation, 80);
+        defer alloc.free(row);
+        try std.testing.expectEqualStrings(case.expected, row);
+    }
 }
 
 pub fn syncCommandOutputBlockEntries(shell: anytype, alloc: Allocator) !bool {

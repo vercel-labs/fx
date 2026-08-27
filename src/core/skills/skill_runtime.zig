@@ -260,7 +260,21 @@ pub const SkillMenuOrigin = enum {
     dollar,
     slash,
     paste,
+
+    pub fn isMention(self: SkillMenuOrigin) bool {
+        return switch (self) {
+            .dollar, .paste => true,
+            .command, .slash => false,
+        };
+    }
 };
+
+test "skill menu origins classify mention surfaces exhaustively" {
+    try std.testing.expect(SkillMenuOrigin.dollar.isMention());
+    try std.testing.expect(SkillMenuOrigin.paste.isMention());
+    try std.testing.expect(!SkillMenuOrigin.command.isMention());
+    try std.testing.expect(!SkillMenuOrigin.slash.isMention());
+}
 
 pub const SkillMenuTarget = struct {
     start: usize = 0,
@@ -967,7 +981,7 @@ pub fn skillSourceShortLabel(source: SkillSource) []const u8 {
 pub fn skillMenuFilterLabel(filter: SkillMenuSourceFilter) []const u8 {
     return switch (filter) {
         .all => "All",
-        .fx => "Fx",
+        .fx => "fx",
         .workspace => "Workspace",
         .opencode => "OpenCode",
         .codex => "Codex",
@@ -992,6 +1006,10 @@ pub fn skillMenuFilterForSource(source: SkillSource) SkillMenuSourceFilter {
 
 pub fn skillSourceMatchesFilter(source: SkillSource, filter: SkillMenuSourceFilter) bool {
     return filter == .all or skillMenuFilterForSource(source) == filter;
+}
+
+pub fn skill_matches_menu_query(skill: Skill, query: []const u8) bool {
+    return skillMatchRank(skill, query) != null;
 }
 
 pub fn skillDisplaySource(skills: []const Skill, selected: Skill) ?SkillSource {

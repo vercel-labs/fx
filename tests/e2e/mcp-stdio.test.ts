@@ -4016,7 +4016,7 @@ describe("modern MCP stdio compatibility", () => {
         "Dynamic MCP tool not selected for this model step",
       );
       expect(postReloadResult?.body).toContain(
-        "Use mcp_search_tools and mcp_select_tool first",
+        "Use capability_search and mcp_select_tool first",
       );
       expect(postReloadResult?.body).not.toContain(`Unsupported tool: ${TOOL_NAME}`);
       const calls = readWire(root.wireLogPath).filter((entry) =>

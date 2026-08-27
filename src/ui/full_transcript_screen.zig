@@ -8218,6 +8218,8 @@ fn appendCommandProcessPresentation(
     const text = switch (presentation) {
         .exit_code => |code| try std.fmt.allocPrint(alloc, "exit code {d}", .{code}),
         .signal => |signal| try std.fmt.allocPrint(alloc, "signal {d}", .{signal}),
+        .timed_out => try alloc.dupe(u8, "timed out"),
+        .output_capture_failed => try alloc.dupe(u8, "output capture failed"),
     };
     defer alloc.free(text);
     const rendered = try command_output_runtime.renderCommandOutputRecordWithPrimaryGutter(

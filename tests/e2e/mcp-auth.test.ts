@@ -1579,16 +1579,19 @@ describe("MCP remote authentication lifecycle", () => {
         }),
       );
       gateway = startFakeGateway([
-        fakeGatewayToolCall("search_exact", "mcp_search_tools", {
+        fakeGatewayToolCall("search_exact", "capability_search", {
           query: "Please use mcp_linear_echo for this request",
         }),
-        fakeGatewayToolCall("search_unrelated", "mcp_search_tools", {
+        fakeGatewayToolCall("search_noisy", "capability_search", {
           query: "linear issue",
         }),
-        fakeGatewayToolCall("search_targeted", "mcp_search_tools", {
+        fakeGatewayToolCall("search_auth_collision", "capability_search", {
+          query: "slack data",
+        }),
+        fakeGatewayToolCall("search_targeted", "capability_search", {
           query: "authenticate slack now",
         }),
-        fakeGatewayToolCall("search_healthy", "mcp_search_tools", {
+        fakeGatewayToolCall("search_healthy", "capability_search", {
           query: "linear echo",
         }),
         fakeGatewayFinalText("MCP search isolation observed."),
@@ -1614,9 +1617,13 @@ describe("MCP remote authentication lifecycle", () => {
       const exact = toolResultText(finalBody, "search_exact");
       expect(exact).toContain("mcp_linear_echo");
       expect(exact).not.toContain("authentication_required");
-      const unrelated = toolResultText(finalBody, "search_unrelated");
-      expect(unrelated).toContain('\"tools\":[],\"count\":0');
-      expect(unrelated).not.toContain("authentication_required");
+      const noisy = toolResultText(finalBody, "search_noisy");
+      expect(noisy).toContain("mcp_linear_echo");
+      expect(noisy).not.toContain("authentication_required");
+      const collision = toolResultText(finalBody, "search_auth_collision");
+      expect(collision).toContain("authentication_required");
+      expect(collision).toContain('\"server\":\"slack\"');
+      expect(collision).not.toContain("mcp_linear_echo");
       const targeted = toolResultText(finalBody, "search_targeted");
       expect(targeted).toContain("authentication_required");
       expect(targeted).toContain('\"server\":\"slack\"');

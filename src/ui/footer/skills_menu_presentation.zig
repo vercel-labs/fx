@@ -3,6 +3,7 @@ const display_width = @import("../../core/shared/display_width.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const list_window = @import("../../core/shared/list_window.zig");
 const ui_render = @import("../render.zig");
+const picker_presentation = @import("picker_presentation.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
 
@@ -12,8 +13,8 @@ const SkillsMenuProjection = render_input.SkillsMenuProjection;
 const header_rows: u16 = 1;
 const roomy_top_gap_rows: u16 = 1;
 const title_rows: u16 = 1;
-// Each skill is a single line now: the name sits on the left and the source
-// scope on the right, so there is no separate description row or gap.
+// Each skill is a single line now, so there is no separate description row
+// or gap.
 const description_rows: u16 = 0;
 const item_gap_rows: u16 = 0;
 
@@ -21,6 +22,7 @@ const SkillsMenuLayout = struct {
     match_count: usize = 0,
     selected: usize = 0,
     visible_items: u16 = 0,
+    show_header: bool = true,
     first_item_row: u16 = header_rows,
     description_row_count: u16 = 0,
     item_stride: u16 = title_rows,
@@ -79,6 +81,47 @@ const SkillsMenuLayout = struct {
             .row_count = first_item_row + visible_items * item_stride - item_gap_rows,
         };
     }
+
+    fn buildInline(match_count: usize, selected_index: usize, row_budget: u16) SkillsMenuLayout {
+        if (row_budget == 0) return .{};
+
+        const selected = if (match_count > 0) selected_index % match_count else 0;
+        if (match_count == 0) {
+            if (row_budget < header_rows + roomy_top_gap_rows + 1) {
+                return .{
+                    .show_header = false,
+                    .first_item_row = 0,
+                    .row_count = 1,
+                };
+            }
+            return .{
+                .first_item_row = header_rows + roomy_top_gap_rows,
+                .row_count = header_rows + roomy_top_gap_rows + 1,
+            };
+        }
+
+        if (row_budget <= 2) {
+            const visible_items: u16 = @intCast(@min(match_count, row_budget));
+            return .{
+                .match_count = match_count,
+                .selected = selected,
+                .visible_items = visible_items,
+                .show_header = false,
+                .first_item_row = 0,
+                .row_count = visible_items,
+            };
+        }
+
+        const first_item_row = header_rows + roomy_top_gap_rows;
+        const visible_items: u16 = @intCast(@min(match_count, row_budget - first_item_row));
+        return .{
+            .match_count = match_count,
+            .selected = selected,
+            .visible_items = visible_items,
+            .first_item_row = first_item_row,
+            .row_count = first_item_row + visible_items,
+        };
+    }
 };
 
 pub const PreparedSkillsMenu = struct {
@@ -87,6 +130,7 @@ pub const PreparedSkillsMenu = struct {
     catalog_empty: bool,
     window_start: usize,
     visible_skills: []*const skill_runtime.Skill,
+    inline_name_column_width: ?usize,
     scope_column_width: usize,
 
     pub fn deinit(self: *PreparedSkillsMenu, alloc: Allocator) void {
@@ -106,6 +150,25 @@ pub fn prepareSkillsMenu(
 ) !PreparedSkillsMenu {
     const match_count = visibleSkillCount(projection);
     const layout = SkillsMenuLayout.build(match_count, projection.selected_index, row_budget);
+    return prepareSkillsMenuWithLayout(alloc, projection, layout, false);
+}
+
+pub fn prepareInlineSkillsMenu(
+    alloc: Allocator,
+    projection: SkillsMenuProjection,
+    row_budget: u16,
+) !PreparedSkillsMenu {
+    const match_count = visibleSkillCount(projection);
+    const layout = SkillsMenuLayout.buildInline(match_count, projection.selected_index, row_budget);
+    return prepareSkillsMenuWithLayout(alloc, projection, layout, true);
+}
+
+fn prepareSkillsMenuWithLayout(
+    alloc: Allocator,
+    projection: SkillsMenuProjection,
+    layout: SkillsMenuLayout,
+    inline_mode: bool,
+) !PreparedSkillsMenu {
     const window_start = list_window.updateEdgeStart(
         projection.window_start,
         layout.match_count,
@@ -133,6 +196,7 @@ pub fn prepareSkillsMenu(
         .catalog_empty = projection.items.len == 0,
         .window_start = window_start,
         .visible_skills = visible_skills,
+        .inline_name_column_width = if (inline_mode) matching_name_column_width(projection) else null,
         .scope_column_width = scopeColumnWidth(visible_skills),
     };
 }
@@ -148,6 +212,28 @@ pub fn visibleNavigationRowsForBudget(
     ).visible_items;
 }
 
+pub fn inlineVisibleNavigationRowsForBudget(
+    projection: SkillsMenuProjection,
+    row_budget: u16,
+) u16 {
+    return SkillsMenuLayout.buildInline(
+        visibleSkillCount(projection),
+        projection.selected_index,
+        row_budget,
+    ).visible_items;
+}
+
+pub fn inlineMenuRowCount(
+    projection: SkillsMenuProjection,
+    row_budget: u16,
+) u16 {
+    return SkillsMenuLayout.buildInline(
+        visibleSkillCount(projection),
+        projection.selected_index,
+        row_budget,
+    ).row_count;
+}
+
 pub fn composeSkillsMenuRow(
     alloc: Allocator,
     prepared: PreparedSkillsMenu,
@@ -156,7 +242,7 @@ pub fn composeSkillsMenuRow(
 ) !std.ArrayList(u8) {
     const row: std.ArrayList(u8) = .empty;
     if (width == 0 or row_index >= prepared.layout.row_count) return row;
-    if (row_index == 0) {
+    if (prepared.layout.show_header and row_index == 0) {
         return composeHeaderRow(
             alloc,
             prepared.layout.match_count,
@@ -185,9 +271,20 @@ pub fn composeSkillsMenuRow(
         alloc,
         skill,
         display_index == layout.selected,
+        prepared.inline_name_column_width,
         prepared.scope_column_width,
         width,
     );
+}
+
+fn matching_name_column_width(projection: SkillsMenuProjection) usize {
+    var col: usize = 0;
+    for (projection.items) |skill| {
+        if (!skill_runtime.skillSourceMatchesFilter(skill.source, projection.source_filter)) continue;
+        if (!skill_runtime.skill_matches_menu_query(skill, projection.query)) continue;
+        col = @max(col, display_width.visibleWidth(skill.name));
+    }
+    return col;
 }
 
 // Widest source-scope label across the visible skills, so the scope column
@@ -269,6 +366,7 @@ fn composeSkillTitleRow(
     alloc: Allocator,
     skill: skill_runtime.Skill,
     selected: bool,
+    inline_name_width: ?usize,
     scope_col: usize,
     width: u16,
 ) !std.ArrayList(u8) {
@@ -282,11 +380,16 @@ fn composeSkillTitleRow(
     const scope_width = @max(scope_col, display_width.visibleWidth(scope));
     const prefix_width = display_width.visibleWidthIgnoringAnsi(row.items);
     const content_width: usize = @as(usize, width) -| 1;
-    const show_scope = scope_width > 0 and content_width >= prefix_width + 8 + 2 + scope_width;
-    const name_budget = if (show_scope)
-        content_width - prefix_width - scope_width - 2
+    const show_scope = if (inline_name_width) |name_col|
+        scope_width > 0 and content_width >= prefix_width + name_col + picker_presentation.inline_picker_column_gap_width + scope_width
     else
-        @as(usize, width) -| prefix_width;
+        scope_width > 0 and content_width >= prefix_width + 8 + 2 + scope_width;
+    const name_budget = if (!show_scope)
+        @as(usize, width) -| prefix_width
+    else if (inline_name_width) |name_col|
+        name_col
+    else
+        content_width - prefix_width - scope_width - 2;
 
     // Selection by brightness: bold bright white when selected, dim gray
     // otherwise, applied to the whole row (name and scope). No marker glyph.
@@ -295,7 +398,11 @@ fn composeSkillTitleRow(
     try row_text.appendSingleLineEllipsized(alloc, &row, skill.name, name_budget);
 
     if (show_scope) {
-        try row_text.appendSpacesToColumn(alloc, &row, content_width - scope_width);
+        const scope_start = if (inline_name_width) |name_col|
+            prefix_width + name_col + picker_presentation.inline_picker_column_gap_width
+        else
+            content_width - scope_width;
+        try row_text.appendSpacesToColumn(alloc, &row, scope_start);
         try row.appendSlice(alloc, scope);
     }
     try row.appendSlice(alloc, ui_render.reset_style);
@@ -330,9 +437,9 @@ fn composeEmptyRow(
 
 fn skillSourceScopeLabel(source: skill_runtime.SkillSource) []const u8 {
     return switch (source) {
-        .global_fx => "Fx · Global",
+        .global_fx => "fx · Global",
         .workspace_fx => "fx · Workspace",
-        .workspace_shared => "Fx · Workspace",
+        .workspace_shared => "fx · Workspace",
         .workspace_opencode => "OpenCode · Workspace",
         .global_opencode => "OpenCode · Global",
         .workspace_codex => "Codex · Workspace",
@@ -444,7 +551,8 @@ test "skills menu narrow header always shows the active source" {
         defer fx_prepared.deinit(alloc);
         var fx_header = try composeSkillsMenuRow(alloc, fx_prepared, 0, width);
         defer fx_header.deinit(alloc);
-        try std.testing.expect(std.mem.find(u8, fx_header.items, "[Fx]") != null);
+        try std.testing.expect(std.mem.find(u8, fx_header.items, "[fx]") != null);
+        try std.testing.expect(std.mem.find(u8, fx_header.items, "[Fx]") == null);
         try std.testing.expect(
             display_width.visibleWidthIgnoringAnsi(fx_header.items) <= width,
         );
@@ -462,6 +570,60 @@ test "skills menu navigation budget counts whole items" {
 
     // Single-line rows: header + gap (2) leave 8 for items, capped at 4 skills.
     try std.testing.expectEqual(@as(u16, 4), visibleNavigationRowsForBudget(projection, 10));
+}
+
+test "inline skills menu shows six roomy items and prioritizes selection when tiny" {
+    const alloc = std.testing.allocator;
+    const skills = [_]skill_runtime.Skill{
+        .{ .name = "one", .description = "", .path = "/tmp/one", .source = .global_fx },
+        .{ .name = "two", .description = "", .path = "/tmp/two", .source = .global_fx },
+        .{ .name = "three", .description = "", .path = "/tmp/three", .source = .global_fx },
+        .{ .name = "four", .description = "", .path = "/tmp/four", .source = .global_fx },
+        .{ .name = "five", .description = "", .path = "/tmp/five", .source = .global_fx },
+        .{ .name = "six", .description = "", .path = "/tmp/six", .source = .global_fx },
+        .{ .name = "seven", .description = "", .path = "/tmp/seven", .source = .global_fx },
+    };
+    const projection: SkillsMenuProjection = .{
+        .active = true,
+        .items = &skills,
+        .selected_index = 6,
+    };
+
+    var roomy = try prepareInlineSkillsMenu(alloc, projection, 8);
+    defer roomy.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 8), roomy.rowCount());
+    try std.testing.expectEqual(@as(u16, 6), inlineVisibleNavigationRowsForBudget(projection, 8));
+    try std.testing.expectEqual(@as(usize, 1), roomy.window_start);
+
+    var tiny = try prepareInlineSkillsMenu(alloc, projection, 1);
+    defer tiny.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 1), tiny.rowCount());
+    try std.testing.expectEqual(@as(u16, 1), inlineVisibleNavigationRowsForBudget(projection, 1));
+    var tiny_row = try composeSkillsMenuRow(alloc, tiny, 0, 20);
+    defer tiny_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, tiny_row.items, "seven") != null);
+    try std.testing.expect(std.mem.find(u8, tiny_row.items, "Skills") == null);
+}
+
+test "inline skills menu keeps an empty result visible at one row" {
+    const alloc = std.testing.allocator;
+    const skills = [_]skill_runtime.Skill{.{
+        .name = "managed",
+        .description = "",
+        .path = "/tmp/managed",
+        .source = .global_fx,
+    }};
+    const projection: SkillsMenuProjection = .{
+        .active = true,
+        .items = &skills,
+        .query = "missing",
+    };
+
+    var prepared = try prepareInlineSkillsMenu(alloc, projection, 1);
+    defer prepared.deinit(alloc);
+    var row = try composeSkillsMenuRow(alloc, prepared, 0, 24);
+    defer row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, row.items, "No skills found.") != null);
 }
 
 test "skills menu keeps the selected whole item in its window" {
@@ -549,7 +711,7 @@ test "skills menu degrades to one complete item in a tiny row budget" {
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(title.items) <= 12);
 }
 
-test "prepared skills menu keeps a mixed-source scrolled window aligned" {
+test "prepared skills menu aligns sources beside the widest visible name" {
     const alloc = std.testing.allocator;
     const skills = [_]skill_runtime.Skill{
         .{ .name = "a", .description = "compat", .path = "/tmp/a", .source = .global_claw },
@@ -563,7 +725,7 @@ test "prepared skills menu keeps a mixed-source scrolled window aligned" {
         .selected_index = 3,
     };
 
-    var prepared = try prepareSkillsMenu(alloc, projection, 4);
+    var prepared = try prepareInlineSkillsMenu(alloc, projection, 4);
     defer prepared.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), prepared.window_start);
     try std.testing.expectEqual(@as(usize, 2), prepared.visible_skills.len);
@@ -577,11 +739,49 @@ test "prepared skills menu keeps a mixed-source scrolled window aligned" {
 
     const first_scope = std.mem.find(u8, first.items, "Claw · Global") orelse return error.MissingFirstScope;
     const second_scope = std.mem.find(u8, second.items, "OpenCode · Global") orelse return error.MissingSecondScope;
-    try std.testing.expectEqual(
-        display_width.visibleWidthIgnoringAnsi(first.items[0..first_scope]),
-        display_width.visibleWidthIgnoringAnsi(second.items[0..second_scope]),
-    );
+    const first_scope_col = display_width.visibleWidthIgnoringAnsi(first.items[0..first_scope]);
+    const second_scope_col = display_width.visibleWidthIgnoringAnsi(second.items[0..second_scope]);
+    try std.testing.expectEqual(@as(usize, 17), first_scope_col);
+    try std.testing.expectEqual(first_scope_col, second_scope_col);
     try std.testing.expect(std.mem.find(u8, second.items, ui_render.selected_completion_style) != null);
+}
+
+test "inline source column stays fixed to the widest matching skill across scroll windows" {
+    const alloc = std.testing.allocator;
+    const skills = [_]skill_runtime.Skill{
+        .{ .name = "one", .description = "", .path = "/tmp/one", .source = .global_opencode },
+        .{ .name = "longest-skill-name", .description = "", .path = "/tmp/longest", .source = .global_opencode },
+        .{ .name = "three", .description = "", .path = "/tmp/three", .source = .global_opencode },
+        .{ .name = "four", .description = "", .path = "/tmp/four", .source = .global_opencode },
+    };
+
+    var first_window = try prepareInlineSkillsMenu(alloc, .{
+        .active = true,
+        .items = &skills,
+    }, 4);
+    defer first_window.deinit(alloc);
+    var first_row = try composeSkillsMenuRow(alloc, first_window, 2, 80);
+    defer first_row.deinit(alloc);
+
+    var second_window = try prepareInlineSkillsMenu(alloc, .{
+        .active = true,
+        .items = &skills,
+        .selected_index = 3,
+    }, 4);
+    defer second_window.deinit(alloc);
+    var second_row = try composeSkillsMenuRow(alloc, second_window, 2, 80);
+    defer second_row.deinit(alloc);
+
+    const first_scope = std.mem.find(u8, first_row.items, "OpenCode · Global") orelse return error.MissingFirstScope;
+    const second_scope = std.mem.find(u8, second_row.items, "OpenCode · Global") orelse return error.MissingSecondScope;
+    try std.testing.expectEqual(
+        @as(usize, 24),
+        display_width.visibleWidthIgnoringAnsi(first_row.items[0..first_scope]),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 24),
+        display_width.visibleWidthIgnoringAnsi(second_row.items[0..second_scope]),
+    );
 }
 
 test "skills menu result rows preserve content within one through four columns" {
@@ -595,7 +795,7 @@ test "skills menu result rows preserve content within one through four columns" 
 
     for (1..5) |width| {
         const terminal_width: u16 = @intCast(width);
-        var title = try composeSkillTitleRow(alloc, skill, true, 0, terminal_width);
+        var title = try composeSkillTitleRow(alloc, skill, true, null, 0, terminal_width);
         defer title.deinit(alloc);
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(title.items) <= width);
         try std.testing.expect(std.mem.find(u8, title.items, "●") == null);

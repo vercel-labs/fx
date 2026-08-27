@@ -240,7 +240,7 @@ fn usageOutcome(
         ),
     };
     return if (completion.billing != null)
-        .{ .immediate = reference }
+        .{ .exact = .gateway }
     else
         .{ .deferred = reference };
 }

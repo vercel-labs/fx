@@ -304,7 +304,7 @@ pub const State = struct {
     pub fn searchTools(
         self: *State,
         arena: Allocator,
-        query: []const u8,
+        query: *const tool_mcp_runtime.PreparedQuery,
         limit: usize,
         permission_rules: types.PermissionRuleSet,
         limits: context_limits.Values,
@@ -313,7 +313,7 @@ pub const State = struct {
         var lease = self.acquire() orelse
             return .{ .model_output = try arena.dupe(u8, "{\"tools\":[],\"count\":0}") };
         defer lease.deinit();
-        return lease.runtime.searchTools(arena, query, limit, permission_rules, limits, access);
+        return lease.runtime.searchToolsPrepared(arena, query, limit, permission_rules, limits, access);
     }
 
     pub fn toolSchema(

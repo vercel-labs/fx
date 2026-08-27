@@ -13,6 +13,9 @@ const ModelMenuProjection = render_input.ModelMenuProjection;
 const header_rows: u16 = 1;
 const roomy_top_gap_rows: u16 = 1;
 const item_rows: u16 = 1;
+const status_gap_rows: u16 = 1;
+pub const max_visible_items: u16 = 20;
+pub const max_inline_rows: u16 = header_rows + roomy_top_gap_rows + max_visible_items + status_gap_rows + 1;
 
 const ModelMenuLayout = struct {
     match_count: usize = 0,
@@ -20,6 +23,9 @@ const ModelMenuLayout = struct {
     visible_items: u16 = 0,
     first_item_row: u16 = header_rows,
     item_stride: u16 = item_rows,
+    show_header: bool = true,
+    state_row: ?u16 = null,
+    status_row: ?u16 = null,
     row_count: u16 = 0,
 
     fn build(projection: ModelMenuProjection, row_budget: u16) ModelMenuLayout {
@@ -28,16 +34,34 @@ const ModelMenuLayout = struct {
         const match_count = projection.filteredItemCount();
         const selected = if (match_count > 0) projection.selected_index % match_count else 0;
         if (projection.load_state != .ready or match_count == 0) {
+            const state_row: u16 = if (row_budget == 1)
+                0
+            else if (row_budget == 2)
+                1
+            else
+                header_rows + roomy_top_gap_rows;
+            var row_count = state_row + 1;
+            const show_status = projection.load_state == .ready and
+                loadedCatalogStatusText(projection.catalog_state) != null and
+                row_budget >= row_count + status_gap_rows + 1;
+            const status_row = if (show_status) row_count + status_gap_rows else null;
+            if (status_row) |row| row_count = row + 1;
             return .{
                 .match_count = match_count,
                 .selected = selected,
-                .row_count = @min(row_budget, header_rows + roomy_top_gap_rows + 1),
+                .show_header = row_budget > 1,
+                .state_row = state_row,
+                .status_row = status_row,
+                .row_count = row_count,
             };
         }
         if (row_budget == 1) {
             return .{
                 .match_count = match_count,
                 .selected = selected,
+                .visible_items = 1,
+                .first_item_row = 0,
+                .show_header = false,
                 .row_count = 1,
             };
         }
@@ -52,14 +76,17 @@ const ModelMenuLayout = struct {
         }
         const first_item_row = header_rows + roomy_top_gap_rows;
         const item_budget = row_budget - first_item_row;
-        const visible_items: u16 = @intCast(@min(match_count, @max(item_budget, 1)));
+        const visible_items: u16 = @intCast(@min(match_count, @max(item_budget, 1), max_visible_items));
+        const show_status = loadedCatalogStatusText(projection.catalog_state) != null and item_budget - visible_items >= status_gap_rows + 1;
+        const status_row = if (show_status) first_item_row + visible_items + status_gap_rows else null;
         return .{
             .match_count = match_count,
             .selected = selected,
             .visible_items = visible_items,
             .first_item_row = first_item_row,
             .item_stride = item_rows,
-            .row_count = first_item_row + visible_items,
+            .status_row = status_row,
+            .row_count = first_item_row + visible_items + @intFromBool(show_status) * (status_gap_rows + 1),
         };
     }
 };
@@ -81,16 +108,22 @@ pub fn composeModelMenuRow(
 ) !std.ArrayList(u8) {
     const row: std.ArrayList(u8) = .empty;
     if (width == 0 or row_index >= row_count) return row;
-    if (row_index == 0) return composeHeaderRow(alloc, projection, width);
 
     const layout = ModelMenuLayout.build(projection, row_count);
-    if (projection.load_state == .ready and row_index == header_rows and row_index < layout.row_count - 1) {
-        const text = loadedCatalogStatusText(projection.catalog_state) orelse return row;
-        return composeDimmedRow(alloc, text, width);
-    }
+    if (layout.show_header and row_index == 0) return composeHeaderRow(alloc, projection, width);
     if (projection.load_state != .ready or layout.match_count == 0) {
-        if (row_index < layout.row_count -| 1) return row;
-        return composeStateRow(alloc, projection, width);
+        if (layout.state_row == row_index) return composeStateRow(alloc, projection, width);
+        if (layout.status_row == row_index) {
+            const text = loadedCatalogStatusText(projection.catalog_state) orelse return row;
+            return composeDimmedRow(alloc, text, width);
+        }
+        return row;
+    }
+    if (layout.status_row) |status_row| {
+        if (row_index == status_row) {
+            const text = loadedCatalogStatusText(projection.catalog_state) orelse return row;
+            return composeDimmedRow(alloc, text, width);
+        }
     }
     if (row_index < layout.first_item_row) return row;
 
@@ -124,8 +157,9 @@ fn composeHeaderRow(alloc: Allocator, projection: ModelMenuProjection, width: u1
     defer row.deinit(alloc);
     try appendHeaderTitle(alloc, &row, projection.filteredItemCount());
 
-    const tab_count = model_cache_runtime.model_provider_filter_count;
-    const active_index = @min(projection.provider_index, tab_count - 1);
+    const tabs = ProviderTabs.build(projection.items);
+    const active_position = tabs.activePosition(projection.provider_index);
+    const active_index = tabs.indices[active_position];
     const title_width = display_width.visibleWidthIgnoringAnsi(row.items);
     if (title_width + 2 + providerTabWidth(active_index, active_index) > width) {
         try row.appendSlice(alloc, "  ");
@@ -133,15 +167,15 @@ fn composeHeaderRow(alloc: Allocator, projection: ModelMenuProjection, width: u1
         return cloneClippedRow(alloc, row.items, width);
     }
 
-    var start = active_index;
-    var end = active_index + 1;
+    var start = active_position;
+    var end = active_position + 1;
     while (true) {
         var expanded = false;
-        if (end < tab_count and title_width + 2 + providerRangeWidth(start, end + 1, active_index) <= width) {
+        if (end < tabs.len and title_width + 2 + providerRangeWidth(tabs, start, end + 1, active_index) <= width) {
             end += 1;
             expanded = true;
         }
-        if (start > 0 and title_width + 2 + providerRangeWidth(start - 1, end, active_index) <= width) {
+        if (start > 0 and title_width + 2 + providerRangeWidth(tabs, start - 1, end, active_index) <= width) {
             start -= 1;
             expanded = true;
         }
@@ -153,16 +187,39 @@ fn composeHeaderRow(alloc: Allocator, projection: ModelMenuProjection, width: u1
         try appendProviderOverflowMarker(alloc, &row);
         try row.appendSlice(alloc, "  ");
     }
-    for (start..end) |index| {
-        if (index > start) try row.appendSlice(alloc, "  ");
-        try appendProviderTabAt(alloc, &row, index, active_index);
+    for (start..end) |position| {
+        if (position > start) try row.appendSlice(alloc, "  ");
+        try appendProviderTabAt(alloc, &row, tabs.indices[position], active_index);
     }
-    if (end < tab_count) {
+    if (end < tabs.len) {
         try row.appendSlice(alloc, "  ");
         try appendProviderOverflowMarker(alloc, &row);
     }
     return cloneClippedRow(alloc, row.items, width);
 }
+
+const ProviderTabs = struct {
+    indices: [model_cache_runtime.model_provider_filter_count]usize = undefined,
+    len: usize = 0,
+
+    fn build(items: []const model_cache_runtime.ModelMenuItem) ProviderTabs {
+        var tabs: ProviderTabs = .{};
+        for (0..model_cache_runtime.model_provider_filter_count) |index| {
+            const filter: model_cache_runtime.ModelProviderFilter = @enumFromInt(index);
+            if (!model_cache_runtime.modelProviderFilterAvailable(items, filter)) continue;
+            tabs.indices[tabs.len] = index;
+            tabs.len += 1;
+        }
+        return tabs;
+    }
+
+    fn activePosition(self: ProviderTabs, active_index: usize) usize {
+        for (self.indices[0..self.len], 0..) |index, position| {
+            if (index == active_index) return position;
+        }
+        return 0;
+    }
+};
 
 fn appendHeaderTitle(alloc: Allocator, row: *std.ArrayList(u8), count: usize) !void {
     try row.appendSlice(alloc, ui_render.selected_completion_style);
@@ -213,16 +270,17 @@ fn providerTabWidth(index: usize, active_index: usize) usize {
 }
 
 fn providerRangeWidth(
+    tabs: ProviderTabs,
     start: usize,
     end: usize,
     active_index: usize,
 ) usize {
     var width: usize = if (start > 0) 3 else 0;
-    for (start..end) |index| {
-        if (index > start) width += 2;
-        width += providerTabWidth(index, active_index);
+    for (start..end) |position| {
+        if (position > start) width += 2;
+        width += providerTabWidth(tabs.indices[position], active_index);
     }
-    if (end < model_cache_runtime.model_provider_filter_count) width += 3;
+    if (end < tabs.len) width += 3;
     return width;
 }
 
@@ -230,11 +288,14 @@ fn modelFactsColumn(projection: ModelMenuProjection, width: u16) ?usize {
     const indent_width: usize = if (width <= 2) 0 else 2;
     const content_width: usize = width;
     var facts_width: usize = 0;
+    var longest_name_width: usize = 8;
     for (projection.items) |item| {
         facts_width = @max(facts_width, compactFactsWidth(item.capabilities));
+        longest_name_width = @max(longest_name_width, display_width.visibleWidth(item.id));
     }
     if (facts_width == 0 or content_width < indent_width + 8 + 2 + facts_width) return null;
-    return content_width - facts_width;
+    const natural_column = indent_width + longest_name_width + 2;
+    return @min(natural_column, content_width - facts_width);
 }
 
 fn composeTitleRow(
@@ -352,7 +413,7 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
         const source = state.source orelse return "Using an authenticated AI Gateway catalog.";
         return switch (source) {
             .fx_login => "Gateway catalog: authenticated with fx login.",
-            .ai_gateway_api_key => "Gateway catalog: authenticated with an API key.",
+            .ai_gateway_api_key => "Note: Gateway catalog is authenticated with an API key",
             .vercel_oidc_token => "Gateway catalog: authenticated with the Vercel session.",
             .stored_key => "Gateway catalog: authenticated with the stored API key.",
             .chatgpt_subscription => "Codex catalog: authenticated with a subscription.",
@@ -366,9 +427,9 @@ fn retryableFailureText(failure: ?model_cache_runtime.ModelMenuCatalogState.Fail
     const value = failure orelse return null;
     if (!value.retryable) return null;
     return switch (value.category) {
-        .rate_limited => "AI Gateway rate limited model discovery; retry /models.",
-        .transport, .gateway_unavailable => "Could not reach AI Gateway; retry /models.",
-        else => "Could not refresh model catalog; retry /models.",
+        .rate_limited => "AI Gateway rate limited model discovery; retry /model.",
+        .transport, .gateway_unavailable => "Could not reach AI Gateway; retry /model.",
+        else => "Could not refresh model catalog; retry /model.",
     };
 }
 
@@ -443,11 +504,15 @@ test "model menu renders provider tabs and compact model facts" {
 
 test "model menu keeps active provider visible and omits unknown metadata" {
     const alloc = std.testing.allocator;
-    const items = [_]model_cache_runtime.ModelMenuItem{.{
-        .id = @constCast("private-team-provider/model-with-a-very-long-name"),
-        .provider = "private-team-provider",
-        .capabilities = .{},
-    }};
+    const items = [_]model_cache_runtime.ModelMenuItem{
+        .{
+            .id = @constCast("private-team-provider/model-with-a-very-long-name"),
+            .provider = "private-team-provider",
+            .capabilities = .{},
+        },
+        .{ .id = @constCast("openai/gpt"), .provider = "openai", .capabilities = .{} },
+        .{ .id = @constCast("xai/grok"), .provider = "xai", .capabilities = .{} },
+    };
     const projection: ModelMenuProjection = .{
         .active = true,
         .load_state = .ready,
@@ -510,7 +575,7 @@ test "model menu states and navigation budget stay bounded" {
     const failed: ModelMenuProjection = .{ .active = true, .load_state = .failed, .catalog_state = .{ .failure = .{ .category = .transport, .retryable = true } } };
     var failed_state = try composeModelMenuRow(alloc, failed, 2, 80, menuRowCount(failed, 80, 10));
     defer failed_state.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, failed_state.items, "Could not reach AI Gateway; retry /models.") != null);
+    try std.testing.expect(std.mem.find(u8, failed_state.items, "Could not reach AI Gateway; retry /model.") != null);
 
     const items = [_]model_cache_runtime.ModelMenuItem{
         .{ .id = @constCast("a/one"), .provider = "a", .capabilities = .{} },
@@ -519,6 +584,95 @@ test "model menu states and navigation budget stay bounded" {
     };
     const ready: ModelMenuProjection = .{ .active = true, .load_state = .ready, .items = &items };
     try std.testing.expectEqual(@as(u16, 3), visibleNavigationItemsForBudget(ready, 7));
+}
+
+test "empty model menu keeps catalog provenance below the empty state" {
+    const alloc = std.testing.allocator;
+    const projection: ModelMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .catalog_state = .{
+            .access_level = .public_only,
+            .public_only_reason = .no_credential,
+            .private_models_hidden = true,
+        },
+    };
+    const rows = menuRowCount(projection, 80, 10);
+    try std.testing.expectEqual(@as(u16, 5), rows);
+
+    var state = try composeModelMenuRow(alloc, projection, 2, 80, rows);
+    defer state.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, state.items, "No models available.") != null);
+
+    var gap = try composeModelMenuRow(alloc, projection, 3, 80, rows);
+    defer gap.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), gap.items.len);
+
+    var status = try composeModelMenuRow(alloc, projection, 4, 80, rows);
+    defer status.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, status.items, "Using the public model catalog") != null);
+}
+
+test "model menu caps inline browse at twenty and prioritizes tiny selection" {
+    const alloc = std.testing.allocator;
+    var items: [25]model_cache_runtime.ModelMenuItem = undefined;
+    for (&items) |*item| {
+        item.* = .{
+            .id = @constCast("provider/model"),
+            .provider = "provider",
+            .capabilities = .{},
+        };
+    }
+    items[items.len - 1].id = @constCast("provider/selected-model");
+    const projection: ModelMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .items = &items,
+        .selected_index = items.len - 1,
+    };
+
+    try std.testing.expectEqual(@as(u16, 20), visibleNavigationItemsForBudget(projection, 40));
+    try std.testing.expectEqual(@as(u16, 22), menuRowCount(projection, 120, 40));
+
+    var tiny = try composeModelMenuRow(alloc, projection, 0, 40, 1);
+    defer tiny.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, tiny.items, "selected-model") != null);
+    try std.testing.expect(std.mem.find(u8, tiny.items, "Models") == null);
+}
+
+test "model menu places catalog note after an item gap and preserves the heading gap" {
+    const alloc = std.testing.allocator;
+    const items = [_]model_cache_runtime.ModelMenuItem{
+        .{ .id = @constCast("provider/one"), .provider = "provider", .capabilities = .{} },
+        .{ .id = @constCast("provider/two"), .provider = "provider", .capabilities = .{} },
+    };
+    const projection: ModelMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .items = &items,
+        .catalog_state = .{
+            .access_level = .authenticated,
+            .source = .ai_gateway_api_key,
+        },
+    };
+    const rows = menuRowCount(projection, 120, 10);
+    try std.testing.expectEqual(@as(u16, 6), rows);
+
+    var gap = try composeModelMenuRow(alloc, projection, 1, 120, rows);
+    defer gap.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), gap.items.len);
+
+    var first = try composeModelMenuRow(alloc, projection, 2, 120, rows);
+    defer first.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, first.items, "provider/one") != null);
+
+    var status_gap = try composeModelMenuRow(alloc, projection, 4, 120, rows);
+    defer status_gap.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), status_gap.items.len);
+
+    var status = try composeModelMenuRow(alloc, projection, 5, 120, rows);
+    defer status.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, status.items, "Note: Gateway catalog is authenticated with an API key") != null);
 }
 
 test "model menu status follows provenance and retryable failure precedence" {
@@ -536,10 +690,10 @@ test "model menu status follows provenance and retryable failure precedence" {
         .{ .state = .{ .public_only_reason = .fx_login_refresh_required, .private_models_hidden = true }, .expected = "Vercel sign-in must refresh before team-private models can load." },
         .{ .state = .{ .public_only_reason = .credential_refresh_failed, .private_models_hidden = true }, .expected = "Vercel sign-in refresh failed; using the public model catalog." },
         .{ .state = .{ .public_only_reason = .authenticated_credential_rejected, .private_models_hidden = true }, .expected = "Your Gateway credential was rejected; using the public model catalog." },
-        .{ .state = .{ .failure = .{ .category = .transport, .retryable = true } }, .expected = "Could not reach AI Gateway; retry /models." },
-        .{ .state = .{ .access_level = .public_only, .public_only_reason = .no_credential, .private_models_hidden = true, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI Gateway rate limited model discovery; retry /models." },
-        .{ .state = .{ .access_level = .authenticated, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI Gateway rate limited model discovery; retry /models." },
-        .{ .state = .{ .access_level = .authenticated, .failure = .{ .category = .runtime, .retryable = true } }, .expected = "Could not refresh model catalog; retry /models." },
+        .{ .state = .{ .failure = .{ .category = .transport, .retryable = true } }, .expected = "Could not reach AI Gateway; retry /model." },
+        .{ .state = .{ .access_level = .public_only, .public_only_reason = .no_credential, .private_models_hidden = true, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI Gateway rate limited model discovery; retry /model." },
+        .{ .state = .{ .access_level = .authenticated, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI Gateway rate limited model discovery; retry /model." },
+        .{ .state = .{ .access_level = .authenticated, .failure = .{ .category = .runtime, .retryable = true } }, .expected = "Could not refresh model catalog; retry /model." },
     };
 
     for (cases) |case| {
@@ -547,45 +701,52 @@ test "model menu status follows provenance and retryable failure precedence" {
     }
 }
 
-test "model menu fixed provider tabs fit a typical terminal width" {
+test "model menu header shows only vendor filters represented by the catalog" {
     const alloc = std.testing.allocator;
+    const items = [_]model_cache_runtime.ModelMenuItem{
+        .{ .id = @constCast("anthropic/claude"), .provider = "anthropic", .capabilities = .{} },
+        .{ .id = @constCast("openai/gpt"), .provider = "openai", .capabilities = .{} },
+        .{ .id = @constCast("deepseek/v3"), .provider = "deepseek", .capabilities = .{} },
+    };
     const projection: ModelMenuProjection = .{
         .active = true,
         .load_state = .ready,
+        .items = &items,
     };
 
-    var header = try composeModelMenuRow(alloc, projection, 0, 60, 1);
+    var header = try composeModelMenuRow(alloc, projection, 0, 60, 3);
     defer header.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, header.items, "[All]") != null);
     try std.testing.expect(std.mem.find(u8, header.items, "Anthropic") != null);
     try std.testing.expect(std.mem.find(u8, header.items, "OpenAI") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "xAI") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Z.AI") != null);
     try std.testing.expect(std.mem.find(u8, header.items, "Others") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "xAI") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "Z.AI") == null);
     try std.testing.expect(std.mem.find(u8, header.items, "…") == null);
     try std.testing.expect(std.mem.find(u8, header.items, "Provider ") == null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(header.items) <= 60);
 }
 
-test "model menu header groups secondary providers under Others" {
+test "model menu header hides redundant vendor filters for a single-vendor catalog" {
     const alloc = std.testing.allocator;
+    const items = [_]model_cache_runtime.ModelMenuItem{
+        .{ .id = @constCast("gpt-5.6-sol"), .provider = "", .capabilities = .{} },
+        .{ .id = @constCast("gpt-5.4-mini"), .provider = "", .capabilities = .{} },
+    };
     const projection: ModelMenuProjection = .{
         .active = true,
         .load_state = .ready,
+        .items = &items,
     };
 
-    var header = try composeModelMenuRow(alloc, projection, 0, 120, 1);
+    var header = try composeModelMenuRow(alloc, projection, 0, 120, 3);
     defer header.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, header.items, "[All]") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Anthropic") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "OpenAI") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "xAI") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Z.AI") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Others") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "deepseek") == null);
-    try std.testing.expect(std.mem.find(u8, header.items, "minimax") == null);
-    try std.testing.expect(std.mem.find(u8, header.items, "alibaba") == null);
-    try std.testing.expect(std.mem.find(u8, header.items, "amazon") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "Anthropic") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "OpenAI") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "xAI") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "Z.AI") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "Others") == null);
 }
 
 test "model menu facts share a left-aligned column" {
@@ -616,10 +777,18 @@ test "model menu facts share a left-aligned column" {
 
     const first_label = std.mem.find(u8, first.items, "1M context").?;
     const second_label = std.mem.find(u8, second.items, "256K context").?;
+    const expected_column = 2 + display_width.visibleWidth("much-longer-provider/model") + 2;
     try std.testing.expectEqual(
+        expected_column,
         display_width.visibleWidthIgnoringAnsi(first.items[0..first_label]),
-        display_width.visibleWidthIgnoringAnsi(second.items[0..second_label]),
     );
+    try std.testing.expectEqual(expected_column, display_width.visibleWidthIgnoringAnsi(second.items[0..second_label]));
+
+    const wide_rows = menuRowCount(projection, 160, 20);
+    var wide = try composeModelMenuRow(alloc, projection, 2, 160, wide_rows);
+    defer wide.deinit(alloc);
+    const wide_label = std.mem.find(u8, wide.items, "1M context").?;
+    try std.testing.expectEqual(expected_column, display_width.visibleWidthIgnoringAnsi(wide.items[0..wide_label]));
 }
 
 test "model menu keeps only compact facts beside the model" {

@@ -328,7 +328,7 @@ Options:
 
 The prompt may be passed as arguments or piped on stdin when no prompt args are given.
 TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.
-Operational progress and diagnostics are written to stderr. JSON output keeps raw Markdown in \`output\`.
+Operational progress and diagnostics are written to stderr. JSON \`output\` keeps accumulated assistant Markdown; \`final_output\` contains only the completed final response, or an empty string when absent.
 With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
 `;
 
@@ -4022,7 +4022,7 @@ describe("cli: ask success", () => {
       expect(jsonResult.code).toBe(1);
       expect(jsonResult.stderr).toBe("");
       expect(jsonResult.stdout).toBe(
-        '{"output":"","exit_code":1,"model":"","session_id":"","steps":0,"tool_calls":[],"error":"PromptResourceLimitExceeded"}\n',
+        '{"output":"","final_output":"","exit_code":1,"model":"","session_id":"","steps":0,"tool_calls":[],"error":"PromptResourceLimitExceeded"}\n',
       );
     },
     120_000,
@@ -4477,6 +4477,8 @@ describe("cli: ask success", () => {
       const json = JSON.parse(r.stdout.trim());
       expect(typeof json.output).toBe("string");
       expect(json.output.length).toBeGreaterThan(0);
+      expect(typeof json.final_output).toBe("string");
+      expect(json.final_output.length).toBeGreaterThan(0);
       expect(typeof json.model).toBe("string");
       expect(Array.isArray(json.tool_calls)).toBe(true);
       expect(typeof json.steps).toBe("number");
@@ -4533,9 +4535,11 @@ describe("cli: error handling", () => {
           },
         );
         expect(literal.code).toBe(0);
-        expect(JSON.parse(literal.stdout).output.trim()).toBe(
+        const literalJson = JSON.parse(literal.stdout);
+        expect(literalJson.output.trim()).toBe(
           "literal option prompt complete",
         );
+        expect(literalJson.final_output).toBe("literal option prompt complete");
         expect(gateway.requests).toHaveLength(1);
         expect(gateway.requests[0]!.body).toContain("--definitely-prompt-text");
       } finally {

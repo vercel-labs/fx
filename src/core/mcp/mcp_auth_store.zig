@@ -655,9 +655,13 @@ fn parseCredentials(
         "revocation_endpoint",
     );
     errdefer if (revocation_endpoint) |value| alloc.free(value);
-    const expires_at = object.get("expires_at_ms") orelse
+    const expires_at_value = object.get("expires_at_ms") orelse
         return error.InvalidMcpCredentialStore;
-    if (expires_at != .integer) return error.InvalidMcpCredentialStore;
+    const expires_at_ms: i64 = switch (expires_at_value) {
+        .integer => |value| value,
+        .null => std.math.maxInt(i64),
+        else => return error.InvalidMcpCredentialStore,
+    };
     return .{
         .endpoint = endpoint,
         .resource = resource,
@@ -669,7 +673,7 @@ fn parseCredentials(
         .scope = scope,
         .token_type = token_type,
         .token_endpoint_auth_method = token_endpoint_auth_method,
-        .expires_at_ms = expires_at.integer,
+        .expires_at_ms = expires_at_ms,
         .authorization_endpoint = authorization_endpoint,
         .token_endpoint = token_endpoint,
         .revocation_endpoint = revocation_endpoint,
@@ -959,6 +963,50 @@ test "credential store keeps top-level schema version strict" {
             "{\"version\":2,\"credentials\":[]}",
         ),
     );
+}
+
+test "credential store loads a null expiry as a non-expiring grant" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"version":1,"credentials":[
+        \\{"server_identity":"one","endpoint":"https://mcp.example/a","resource":"https://mcp.example/","issuer":"https://issuer.example","client_id":"client","client_secret":null,"access_token":"secret-one","refresh_token":"refresh-one","scope":"read","token_type":"Bearer","token_endpoint_auth_method":"none","expires_at_ms":null,"authorization_endpoint":"https://issuer.example/authorize","token_endpoint":"https://issuer.example/token","revocation_endpoint":null}
+        \\]}
+    ;
+    var store = try parseStore(alloc, json);
+    defer store.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), store.credentials.items.len);
+    const credentials = store.credentials.items[0].credentials;
+    try std.testing.expectEqual(std.math.maxInt(i64), credentials.expires_at_ms);
+    try std.testing.expect(!credentials.needsRefresh(4_102_444_800_000));
+}
+
+test "credential store rejects a non-integer expiry" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"version":1,"credentials":[
+        \\{"server_identity":"one","endpoint":"https://mcp.example/a","resource":"https://mcp.example/","issuer":"https://issuer.example","client_id":"client","client_secret":null,"access_token":"secret-one","refresh_token":"refresh-one","scope":"read","token_type":"Bearer","token_endpoint_auth_method":"none","expires_at_ms":"soon","authorization_endpoint":"https://issuer.example/authorize","token_endpoint":"https://issuer.example/token","revocation_endpoint":null}
+        \\]}
+    ;
+    var store = try parseStore(alloc, json);
+    defer store.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), store.credentials.items.len);
+    try std.testing.expectEqual(@as(usize, 1), store.rejected_entries);
+}
+
+test "credential store rejects a missing expiry" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"version":1,"credentials":[
+        \\{"server_identity":"one","endpoint":"https://mcp.example/a","resource":"https://mcp.example/","issuer":"https://issuer.example","client_id":"client","client_secret":null,"access_token":"secret-one","refresh_token":"refresh-one","scope":"read","token_type":"Bearer","token_endpoint_auth_method":"none","authorization_endpoint":"https://issuer.example/authorize","token_endpoint":"https://issuer.example/token","revocation_endpoint":null}
+        \\]}
+    ;
+    var store = try parseStore(alloc, json);
+    defer store.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), store.credentials.items.len);
+    try std.testing.expectEqual(@as(usize, 1), store.rejected_entries);
 }
 
 fn checkCredentialStoreIsolationAllocationFailures(alloc: Allocator) !void {

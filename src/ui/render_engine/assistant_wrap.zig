@@ -56,7 +56,7 @@ const AssistantContinuation = union(enum) {
 /// Pre-existing hard newlines in `text` are honoured. The returned slice is
 /// owned by the caller and freed with `alloc`.
 pub fn wrapAssistantText(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
-    return wrapAssistantTextWithBaseGutter(alloc, text, cols, 0, false, false, null);
+    return wrapAssistantTextWithBaseGutter(alloc, text, cols, 0, false, false, null, null);
 }
 
 fn wrapAssistantTextWithBaseGutter(
@@ -67,9 +67,17 @@ fn wrapAssistantTextWithBaseGutter(
     replace_wide_runes_at_one_content_col: bool,
     literal_command: bool,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
+    finalized_prefix_bytes: ?*usize,
 ) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
+    if (finalized_prefix_bytes) |bytes| bytes.* = 0;
+    var finalized_source_end: usize = 0;
+    if (finalized_prefix_bytes != null) {
+        if (std.mem.findScalarLast(u8, text, '\n')) |newline| {
+            finalized_source_end = newline + 1;
+        }
+    }
 
     if (cols == 0) {
         return out.toOwnedSlice(alloc);
@@ -135,6 +143,9 @@ fn wrapAssistantTextWithBaseGutter(
             try out.append(alloc, ch);
             col = base_gutter + 1;
             i += 1;
+            if (finalized_prefix_bytes) |bytes| {
+                if (i == finalized_source_end) bytes.* = out.items.len;
+            }
             continuation = if (literal_command) null else assistantContinuation(text, i);
             word_breaks = .{};
             has_word_on_row = false;
@@ -391,7 +402,38 @@ pub fn wrapTranscriptAssistantTextInterruptible(
         true,
         false,
         checkpoint,
+        null,
     );
+}
+
+/// `bytes` is owned by the caller. `finalized_prefix_bytes` ends after the
+/// last source hard newline and excludes soft wraps from the unfinished line.
+pub const TranscriptAssistantWrap = struct {
+    bytes: []u8,
+    finalized_prefix_bytes: usize,
+};
+
+pub fn wrapTranscriptAssistantTextWithFinalityInterruptible(
+    alloc: Allocator,
+    text: []const u8,
+    cols: u16,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !TranscriptAssistantWrap {
+    var finalized_prefix_bytes: usize = 0;
+    const bytes = try wrapAssistantTextWithBaseGutter(
+        alloc,
+        text,
+        cols,
+        gutterWidth(cols),
+        true,
+        false,
+        checkpoint,
+        &finalized_prefix_bytes,
+    );
+    return .{
+        .bytes = bytes,
+        .finalized_prefix_bytes = finalized_prefix_bytes,
+    };
 }
 
 /// Reflow canonical command output as literal terminal text. Every physical
@@ -412,6 +454,7 @@ pub fn wrapLiteralCommandOutput(
         gutter,
         true,
         true,
+        null,
         null,
     );
 }
@@ -444,6 +487,7 @@ pub fn wrapLiteralToolOutputInterruptible(
         true,
         true,
         checkpoint,
+        null,
     );
 }
 

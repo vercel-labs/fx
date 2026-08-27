@@ -46,6 +46,57 @@ pub const State = struct {
     }
 };
 
+pub const VisibleReviewMeasurement = struct {
+    card_rows: u16 = 0,
+    editor_active: bool = false,
+};
+
+pub fn measureVisibleReviewRows(
+    alloc: std.mem.Allocator,
+    state: *const State,
+    editor_source: visual_layout.Source,
+) !VisibleReviewMeasurement {
+    if (!state.visible or !state.active() or state.entries.len == 0) return .{};
+
+    var result: VisibleReviewMeasurement = .{};
+    for (state.entries, 0..) |entry, entry_index| {
+        const editing = state.selected_index != null and state.selected_index.? == entry_index;
+        const row_count: u16 = if (editing) blk: {
+            result.editor_active = true;
+            const summary = visual_layout.summarize(editor_source, null);
+            break :blk @intCast(@min(@max(summary.total_rows, 1), std.math.maxInt(u16)));
+        } else blk: {
+            const draft = entry.draft;
+            const display_spans = draft.reviewSkillDisplaySpans();
+            var skill_tokens: std.ArrayList(registered_entities.SkillTokenSpan) = .empty;
+            defer skill_tokens.deinit(alloc);
+            try skill_tokens.ensureTotalCapacity(alloc, display_spans.len);
+            for (display_spans) |span| {
+                skill_tokens.appendAssumeCapacity(.{
+                    .raw_start = span.raw_start,
+                    .raw_end = span.raw_end,
+                    .name = span.name,
+                    .path = span.path,
+                    .display_source = span.display_source,
+                    .owns_trailing_separator = span.owns_trailing_separator,
+                });
+            }
+            const summary = visual_layout.summarize(.{
+                .input = draft.reviewInput(),
+                .cursor = 0,
+                .terminal_cols = editor_source.terminal_cols,
+                .images = draft.images,
+                .pasted_blocks = entry.pasted_blocks.items,
+                .image_tokens = entry.image_tokens.items,
+                .skill_tokens = skill_tokens.items,
+            }, null);
+            break :blk @intCast(@min(@max(summary.total_rows, 1), std.math.maxInt(u16)));
+        };
+        result.card_rows +|= row_count;
+    }
+    return result;
+}
+
 pub const PromptAdmission = enum {
     enqueue,
     replaced,
@@ -137,7 +188,6 @@ pub fn Runtime(comptime App: type) type {
                 app.alloc,
                 app.input_runtime.kill_ring.images.items,
             );
-            app.shell.render_requests.finishSubmittedPromptTransition();
             state.clear(app.alloc);
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
@@ -186,7 +236,6 @@ pub fn Runtime(comptime App: type) type {
                 app.alloc.free(state.entries);
                 state.entries = &.{};
                 removed.deinit(app.alloc);
-                app.shell.render_requests.finishSubmittedPromptTransition();
                 debug_trace.eventf("input", "queue_review_draft_deleted", .{ .turn_id = turn_id }, "remaining=0", .{});
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
@@ -893,6 +942,159 @@ test "queued prompt review navigates newest to oldest and stays paused when hidd
     const worker_drafts = try app.worker.snapshotQueuedPromptDrafts(alloc);
     defer worker_runtime.freeQueuedPromptDrafts(alloc, worker_drafts);
     try std.testing.expectEqualStrings("second queued", worker_drafts[1].prompt);
+}
+
+test "visible queue review measurement aggregates stored cards and the live editor" {
+    const alloc = std.testing.allocator;
+    var app = ReviewTestApp{ .alloc = alloc };
+    defer app.deinit();
+    try app.worker.enqueuePrompt(alloc, try makeReviewTestPrompt(alloc, "first\nsecond"));
+    try app.worker.enqueuePrompt(alloc, try makeReviewTestPrompt(alloc, "selected"));
+
+    const rt = Runtime(ReviewTestApp);
+    try std.testing.expect(try rt.routeVertical(&app, .up));
+    try app.input_runtime.textReplacementState().replace(alloc, "selected\nthird\nfourth");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    const measured = try measureVisibleReviewRows(
+        alloc,
+        &app.queued_prompt_review,
+        .{
+            .input = app.input_runtime.edit_state.input.items,
+            .cursor = app.input_runtime.edit_state.cursor,
+            .terminal_cols = 80,
+            .images = app.pending_images.items,
+            .pasted_blocks = app.input_runtime.entities.pasted_blocks.items,
+            .image_tokens = app.input_runtime.entities.image_tokens.items,
+            .skill_tokens = app.input_runtime.entities.skill_tokens.items,
+        },
+    );
+
+    try std.testing.expectEqual(@as(u16, 5), measured.card_rows);
+    try std.testing.expect(measured.editor_active);
+}
+
+test "visible queue review aggregate matches composed entity-aware rows" {
+    const alloc = std.testing.allocator;
+    const queue_input_presentation = @import("../../ui/footer/input_presentation.zig");
+    const stored = "$skill [Image #1] [Pasted text #2, 2 lines] 界界界";
+    const image_label = "[Image #1]";
+    const paste_label = "[Pasted text #2, 2 lines]";
+    const image_start = std.mem.find(u8, stored, image_label).?;
+    const paste_start = std.mem.find(u8, stored, paste_label).?;
+    var images = [_]types.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/tmp/one.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var display_spans = [_]worker_runtime.SkillDisplaySpan{.{
+        .raw_start = 0,
+        .raw_end = "$skill".len,
+        .name = @constCast("skill"),
+        .path = @constCast("/tmp/skill/SKILL.md"),
+        .display_source = .global_fx,
+    }};
+    var pasted = [_]paste_blocks.PastedBlock{.{
+        .id = 2,
+        .text = @constCast("pasted first\npasted second"),
+        .line_count = 2,
+        .span = .{ .raw_start = paste_start, .raw_end = paste_start + paste_label.len },
+    }};
+    var image_tokens = [_]entity_spans.ImageTokenSpan{.{
+        .id = 1,
+        .span = .{ .raw_start = image_start, .raw_end = image_start + image_label.len },
+    }};
+    var entries = [_]ReviewEntry{
+        .{
+            .draft = .{
+                .turn_id = 1,
+                .prompt = @constCast(stored),
+                .images = &images,
+                .skill_display_spans = &display_spans,
+            },
+            .pasted_blocks = .{ .items = &pasted, .capacity = pasted.len },
+            .image_tokens = .{ .items = &image_tokens, .capacity = image_tokens.len },
+        },
+        .{ .draft = .{
+            .turn_id = 2,
+            .prompt = @constCast("selected"),
+            .images = &.{},
+            .skill_display_spans = &.{},
+        } },
+    };
+    const state = State{
+        .entries = &entries,
+        .selected_index = 1,
+        .reason = .manual,
+        .visible = true,
+    };
+    const live_input = "live 界 editor wraps here";
+    const live_source = visual_layout.Source{
+        .input = live_input,
+        .cursor = live_input.len,
+        .terminal_cols = 18,
+    };
+
+    const measured = try measureVisibleReviewRows(alloc, &state, live_source);
+    var stored_skill_tokens = [_]registered_entities.SkillTokenSpan{.{
+        .raw_start = 0,
+        .raw_end = "$skill".len,
+        .name = "skill",
+        .path = "/tmp/skill/SKILL.md",
+        .display_source = .global_fx,
+    }};
+    const stored_card = try queue_input_presentation.composeQueuedPromptCard(alloc, .{
+        .input = stored,
+        .cursor = 0,
+        .terminal_cols = 18,
+        .images = &images,
+        .pasted_blocks = &pasted,
+        .image_tokens = &image_tokens,
+        .skill_tokens = &stored_skill_tokens,
+    });
+    defer alloc.free(stored_card);
+    const live_card = try queue_input_presentation.composeQueuedPromptCard(alloc, live_source);
+    defer alloc.free(live_card);
+    const expected_rows: u16 = @intCast(
+        std.mem.count(u8, stored_card, "\n") + std.mem.count(u8, live_card, "\n"),
+    );
+
+    try std.testing.expectEqual(expected_rows, measured.card_rows);
+    try std.testing.expect(measured.editor_active);
+}
+
+fn measureVisibleReviewRowsWithSkillScratch(alloc: std.mem.Allocator) !void {
+    var display_spans = [_]worker_runtime.SkillDisplaySpan{.{
+        .raw_start = 0,
+        .raw_end = "$skill".len,
+        .name = @constCast("skill"),
+        .path = @constCast("/tmp/skill/SKILL.md"),
+    }};
+    var entries = [_]ReviewEntry{.{ .draft = .{
+        .turn_id = 1,
+        .prompt = @constCast("$skill"),
+        .images = &.{},
+        .skill_display_spans = &display_spans,
+    } }};
+    const state = State{
+        .entries = &entries,
+        .reason = .manual,
+        .visible = true,
+    };
+    const measured = try measureVisibleReviewRows(alloc, &state, .{
+        .input = "",
+        .cursor = 0,
+        .terminal_cols = 20,
+    });
+    try std.testing.expectEqual(@as(u16, 1), measured.card_rows);
+}
+
+test "visible queue review measurement cleans scratch on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        measureVisibleReviewRowsWithSkillScratch,
+        .{},
+    );
 }
 
 test "queued prompt review restores compact paste and commits expanded execution" {

@@ -1282,6 +1282,7 @@ fn livePresentationEventBytes(event: worker_runtime.WorkerEvent) ?usize {
             if (payload.full) |full| full.content.len +| full.lifecycle_id.call_id.len else 0,
         .begin_prompt,
         .begin_prompt_with_skill_bindings,
+        .begin_presented_prompt,
         .finish_prompt,
         .notification,
         .question_requested,

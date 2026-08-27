@@ -136,6 +136,7 @@ jobs:
   release:
     needs: [check-version, build-linux, build-macos-x86_64, build-macos-arm64]
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write
     steps:
