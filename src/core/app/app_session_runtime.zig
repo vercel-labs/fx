@@ -1531,14 +1531,8 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "queued_prompt_review")) {
                 input_queue_runtime.Runtime(App).reset(app);
             }
-            if (comptime @hasDecl(App, "clearPendingSubmissionForSessionTransition")) {
-                App.clearPendingSubmissionForSessionTransition(app);
-            } else {
-                if (comptime @hasDecl(App, "clearPendingSubmission")) {
-                    App.clearPendingSubmission(app, "session_transition");
-                }
-                app.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
-            }
+            app.shell.render_requests.finishSubmittedPromptTransition();
+            app.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
         }
 
         fn applyIdleLiveSessionTransition(
@@ -2232,7 +2226,7 @@ pub fn Runtime(comptime App: type) type {
                     picker.has_more,
                 );
             }
-            try input_completion_runtime.CompletionRuntime(App).syncSessionPickerWindowStart(app);
+            input_completion_runtime.CompletionRuntime(App).syncSessionPickerWindowStart(app);
         }
 
         pub fn loadMoreSessionPicker(app: *App) !bool {
@@ -3810,25 +3804,11 @@ pub fn Runtime(comptime App: type) type {
             const context_deferred = types.isContextDeferredToolResult(result);
             const deferred = types.isDeferredToolResult(result);
             const permission_denial_reason = tool_result_errors.toolPermissionDenialReason(result.output);
+            const process_ran = result.command_process_presentation != null;
 
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
             defer action_arena.deinit();
-            const command_decision = if (is_command)
-                try tool_presentation.commandOutcomeDecision(
-                    action_arena.allocator(),
-                    result.command_process_presentation,
-                )
-            else
-                null;
-            const terminal_action_decision = if (std.mem.eql(u8, call.name, "terminal"))
-                try tool_presentation.terminalActionOutcomeDecision(
-                    action_arena.allocator(),
-                    result.terminal_action_presentation,
-                )
-            else
-                null;
-            const outcome_decision = command_decision orelse terminal_action_decision;
-            const formatted_action_base = if (deferred)
+            const formatted_action = if (deferred)
                 try app.describeToolActionDeniedWithAdvertised(
                     action_arena.allocator(),
                     call,
@@ -3847,15 +3827,7 @@ pub fn Runtime(comptime App: type) type {
                     tool_admission.permissionDeniedStatusLabel(reason),
                     &.{},
                 )
-            else if (outcome_decision) |decision|
-                try app.describeToolActionDeniedWithAdvertised(
-                    action_arena.allocator(),
-                    call,
-                    null,
-                    decision.label,
-                    &.{},
-                )
-            else if (result.status == .success)
+            else if (result.status == .success or process_ran)
                 try app.describeToolActionCompletedWithAdvertised(
                     action_arena.allocator(),
                     call,
@@ -3870,17 +3842,6 @@ pub fn Runtime(comptime App: type) type {
                     "Failed",
                     &.{},
                 );
-            const formatted_action = if (outcome_decision) |decision|
-                if (decision.detail) |detail|
-                    try std.fmt.allocPrint(
-                        action_arena.allocator(),
-                        "{s}: {s}",
-                        .{ formatted_action_base, detail },
-                    )
-                else
-                    formatted_action_base
-            else
-                formatted_action_base;
             const action = try app.alloc.dupe(u8, formatted_action);
             defer app.alloc.free(action);
 
@@ -3888,9 +3849,7 @@ pub fn Runtime(comptime App: type) type {
                 .deferred
             else if (deferred or permission_denial_reason != null)
                 .denied
-            else if (outcome_decision) |decision|
-                decision.outcome
-            else if (result.status == .success)
+            else if (result.status == .success or process_ran)
                 .completed
             else
                 .failed;
@@ -6780,7 +6739,7 @@ test "resume falls back to saved command output when replay contains an empty fr
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
 }
 
-test "historical command replay prefers tagged frames and preserves exit outcome" {
+test "historical command replay prefers tagged frames and preserves Ran outcome" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6835,7 +6794,7 @@ test "historical command replay prefers tagged frames and preserves exit outcome
 
     try Runtime(TestApp).writeExecutionHistory(&app, .{ .tool_steps = steps[0..] });
 
-    try std.testing.expectEqualStrings("● Exited 7 run_command\n", app.completed_tool_statuses.items[0]);
+    try std.testing.expectEqualStrings("● Ran pwd\n", app.completed_tool_statuses.items[0]);
     try std.testing.expectEqual(@as(usize, 3), app.command_output_writes.items.len);
     try std.testing.expectEqual(.stdout, app.command_output_writes.items[0].stream);
     try std.testing.expectEqualStrings("first", app.command_output_writes.items[0].text);
@@ -6854,126 +6813,6 @@ test "historical command replay prefers tagged frames and preserves exit outcome
             .command_output_summary_flush,
         },
         app.replay_events.items,
-    );
-}
-
-test "historical command timeout preserves its typed outcome" {
-    const alloc = std.testing.allocator;
-    var app = try TestApp.init(alloc, "/workspace");
-    defer app.deinit();
-
-    var calls = [_]types.ToolCall{.{
-        .id = "call_timeout",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"sleep 5\"}",
-    }};
-    const output =
-        "timeout=true\n" ++
-        "timeout_ms=25\n" ++
-        "cleanup_scope=process_group_and_tracked_descendants\n" ++
-        "cleanup_guarantee=best_effort\n";
-    var results = [_]types.PersistedToolResult{.{
-        .tool_call_id = @constCast("call_timeout"),
-        .tool_name = @constCast("run_command"),
-        .status = .failure,
-        .output = @constCast(output),
-        .output_bytes = output.len,
-        .stored_output_bytes = output.len,
-        .command_process_presentation = .timed_out,
-    }};
-    var steps = [_]types.ToolExecutionStep{.{
-        .tool_calls = calls[0..],
-        .tool_results = results[0..],
-    }};
-
-    try Runtime(TestApp).writeExecutionHistory(&app, .{ .tool_steps = steps[0..] });
-
-    try std.testing.expectEqualStrings(
-        "● Timed out run_command\n",
-        app.completed_tool_statuses.items[0],
-    );
-    try std.testing.expectEqualSlices(
-        types.ToolOutcomeKind,
-        &.{.failed},
-        app.completed_tool_outcomes.items,
-    );
-}
-
-test "historical terminal actions preserve typed return and failure causes" {
-    const alloc = std.testing.allocator;
-    var app = try TestApp.init(alloc, "/workspace");
-    defer app.deinit();
-
-    var calls = [_]types.ToolCall{
-        .{
-            .id = "start_exit",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"start\",\"command\":\"true\"}",
-        },
-        .{
-            .id = "wait_ceiling",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"wait\",\"session_id\":\"terminal-1\"}",
-        },
-        .{
-            .id = "wait_missing",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"wait\",\"session_id\":\"terminal-2\"}",
-        },
-    };
-    var results = [_]types.PersistedToolResult{
-        .{
-            .tool_call_id = @constCast("start_exit"),
-            .tool_name = @constCast("terminal"),
-            .status = .success,
-            .output = @constCast("start exited"),
-            .output_bytes = 12,
-            .stored_output_bytes = 12,
-            .terminal_action_presentation = .{ .returned = .{ .exited = 0 } },
-        },
-        .{
-            .tool_call_id = @constCast("wait_ceiling"),
-            .tool_name = @constCast("terminal"),
-            .status = .success,
-            .output = @constCast("wait ceiling"),
-            .output_bytes = 12,
-            .stored_output_bytes = 12,
-            .terminal_action_presentation = .{ .returned = .safety_ceiling },
-        },
-        .{
-            .tool_call_id = @constCast("wait_missing"),
-            .tool_name = @constCast("terminal"),
-            .status = .failure,
-            .output = @constCast("wait missing"),
-            .output_bytes = 12,
-            .stored_output_bytes = 12,
-            .terminal_action_presentation = .{ .failed = .session_not_found },
-        },
-    };
-    var steps = [_]types.ToolExecutionStep{.{
-        .tool_calls = calls[0..],
-        .tool_results = results[0..],
-    }};
-
-    try Runtime(TestApp).writeExecutionHistory(&app, .{ .tool_steps = steps[0..] });
-
-    try std.testing.expectEqual(@as(usize, 3), app.completed_tool_statuses.items.len);
-    try std.testing.expectEqualStrings(
-        "● Exited 0 terminal\n",
-        app.completed_tool_statuses.items[0],
-    );
-    try std.testing.expectEqualStrings(
-        "● Wait limit reached for terminal\n",
-        app.completed_tool_statuses.items[1],
-    );
-    try std.testing.expectEqualStrings(
-        "● Failed terminal: terminal session not found\n",
-        app.completed_tool_statuses.items[2],
-    );
-    try std.testing.expectEqualSlices(
-        types.ToolOutcomeKind,
-        &.{ .completed, .completed, .failed },
-        app.completed_tool_outcomes.items,
     );
 }
 

@@ -92,12 +92,12 @@ jobs:
           set -euo pipefail
           git push --force-with-lease origin "HEAD:${MERGE_BRANCH}"
 
-      - name: Open or update squash PR
+      - name: Open or update merge PR
         env:
           GH_TOKEN: ${{ secrets.CODE_GH_PAT || github.token }}
         run: |
           set -euo pipefail
           gh pr create --base "${BASE_BRANCH}" --head "${MERGE_BRANCH}" \
             --title "Merge upstream/main into oh-my-fx" \
-            --body "Upstream-first refresh from ${UPSTREAM_REPO}/${UPSTREAM_BRANCH}. Review and squash-merge this PR." \
+            --body "Upstream-first refresh from ${UPSTREAM_REPO}/${UPSTREAM_BRANCH}. Review and merge this PR with a merge commit. Do not squash-merge." \
             2>/dev/null || true

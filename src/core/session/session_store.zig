@@ -3453,29 +3453,6 @@ pub const Store = struct {
         preference_source: MigrationPreferenceSource,
         options: ResumeOptions,
     ) !LoadedWritableSession {
-        var loaded: LoadedWritableSession = undefined;
-        try self.migrateLegacyForWriteInto(
-            &loaded,
-            alloc,
-            session_id,
-            workspace_root,
-            preference_source,
-            options,
-        );
-        return loaded;
-    }
-
-    // Keep cold fallible constructors behind noinline out-parameter boundaries
-    // so error returns do not materialize the full LoadedWritableSession payload.
-    noinline fn migrateLegacyForWriteInto(
-        self: Store,
-        out: *LoadedWritableSession,
-        alloc: Allocator,
-        session_id: []const u8,
-        workspace_root: []const u8,
-        preference_source: MigrationPreferenceSource,
-        options: ResumeOptions,
-    ) !void {
         if (self.canonical_root.mode != .writable or
             self.canonical_root.sessions == null)
         {
@@ -3517,7 +3494,7 @@ pub const Store = struct {
             .writer_lock = writer_lock,
             .session_id = owned_id,
         };
-        const loaded = self.migrateLegacyWithLatestCache(
+        return self.migrateLegacyWithLatestCache(
             alloc,
             &writable,
             workspace_root,
@@ -3527,7 +3504,6 @@ pub const Store = struct {
             writable.deinit(alloc);
             return err;
         };
-        out.* = loaded;
     }
 
     fn migrateLegacyWithLatestCache(
@@ -3563,27 +3539,6 @@ pub const Store = struct {
         preference_source: MigrationPreferenceSource,
         options: ResumeOptions,
     ) !LoadedWritableSession {
-        var loaded: LoadedWritableSession = undefined;
-        try self.resolveAuthorityTransitionForWriteInto(
-            &loaded,
-            alloc,
-            session_id,
-            workspace_root,
-            preference_source,
-            options,
-        );
-        return loaded;
-    }
-
-    noinline fn resolveAuthorityTransitionForWriteInto(
-        self: Store,
-        out: *LoadedWritableSession,
-        alloc: Allocator,
-        session_id: []const u8,
-        workspace_root: []const u8,
-        preference_source: MigrationPreferenceSource,
-        options: ResumeOptions,
-    ) !void {
         var read_dir = try self.openSessionDir(session_id);
         var transition = (try loadAuthorityTransitionOptional(
             alloc,
@@ -3598,13 +3553,11 @@ pub const Store = struct {
 
         if (transition.kind == .session_create) {
             var root = self.canonical_root;
-            const loaded = try root.resumeForWrite(
+            return root.resumeForWrite(
                 alloc,
                 session_id,
                 options.log,
             );
-            out.* = loaded;
-            return;
         }
 
         var writable = try self.openWritableSessionDir(
@@ -3682,8 +3635,7 @@ pub const Store = struct {
             errdefer loaded.deinit(alloc);
             try loaded.installCommitLifecycle(lifecycle);
             _ = loaded.publishCommitLifecycle(alloc);
-            out.* = loaded;
-            return;
+            return loaded;
         }
 
         try restoreLegacyAuthority(alloc, &writable, current);
@@ -3696,7 +3648,7 @@ pub const Store = struct {
             preference_source,
             options,
         );
-        out.* = loaded;
+        return loaded;
     }
 
     fn openWritableSessionDir(

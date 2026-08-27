@@ -309,7 +309,7 @@ async function waitForMenu(
   marker: string,
   scope: "Current workspace" | "All workspaces",
 ): Promise<string> {
-  const visibleMarker = marker.slice(-7);
+  const visibleMarker = marker.slice(0, 8);
   return session.waitForPane((pane) => {
     const plain = stripAnsi(pane);
     return plain.includes(visibleMarker) && plain.includes(`[${scope}]`) && menuCount(plain) > 0;
@@ -360,7 +360,7 @@ async function thrash(
   pid: number,
 ): Promise<void> {
   const sizes = [
-    [60, 12],
+    [48, 18],
     [160, 44],
     [80, 24],
     [112, 32],

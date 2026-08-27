@@ -97,18 +97,17 @@ pub const SessionMenuProjection = struct {
 
 pub const HelpMenuProjection = struct {
     active: bool = false,
-    category: ?command_specs.SlashPresentationCategory = null,
     registry: command_specs.SlashRegistry = .{},
     selected_index: usize = 0,
     window_start: usize = 0,
     query: []const u8 = "",
 
     pub fn filteredItemCount(self: HelpMenuProjection) usize {
-        return command_specs.helpCatalogCountForCategory(self.registry, self.category, self.query);
+        return command_specs.helpCatalogCount(self.registry, self.query);
     }
 
     pub fn itemAt(self: HelpMenuProjection, display_index: usize) ?*const command_specs.SlashSpec {
-        return command_specs.helpCatalogSpecAtForCategory(self.registry, self.category, self.query, display_index);
+        return command_specs.helpCatalogSpecAt(self.registry, self.query, display_index);
     }
 };
 
@@ -221,7 +220,6 @@ pub fn helpMenuProjection(
 ) HelpMenuProjection {
     return .{
         .active = menu.active,
-        .category = menu.category,
         .registry = registry,
         .selected_index = menu.selected_index,
         .window_start = menu.window_start,
@@ -257,6 +255,7 @@ const max_static_status_activity_rows: u16 = 3;
 
 pub const QueuedPromptCard = struct {
     bytes: []const u8,
+    row_count: u16,
     editing: bool = false,
 };
 
@@ -315,8 +314,6 @@ pub const RenderContext = struct {
         .include_skip = false,
     },
     skills_menu: SkillsMenuProjection = .{},
-    help_menu: HelpMenuProjection = .{},
-    settings_menu: SettingsMenuProjection = .{},
     model_menu: ModelMenuProjection = .{},
     session_menu: SessionMenuProjection = .{},
     statusline_menu: StatuslineMenuProjection = .{},
@@ -360,55 +357,16 @@ pub fn queuedCardSpacerRows(ctx: RenderContext) u16 {
     return 1 +| above_hint;
 }
 
-pub const QueuedBannerFacts = struct {
-    queued_count: usize = 0,
-    paused: bool = false,
-    card_count: usize = 0,
-    card_rows: u16 = 0,
-};
-
-pub fn queuedBannerRowsForFacts(facts: QueuedBannerFacts) u16 {
-    if (facts.queued_count == 0) return 0;
-    const paused_hint_rows: u16 = @intFromBool(facts.paused);
-    if (facts.card_rows > 0) {
-        const between_cards: u16 = @intCast(@min(
-            facts.card_count -| 1,
-            std.math.maxInt(u16),
-        ));
-        const spacer_rows: u16 = 1 +| paused_hint_rows;
-        return facts.card_rows +| between_cards +| paused_hint_rows +| spacer_rows;
-    }
-    return 1 +| paused_hint_rows +| collapsed_queue_banner_gap_rows;
-}
-
 pub fn queuedBannerRows(ctx: RenderContext) u16 {
-    return queuedBannerRowsForFacts(.{
-        .queued_count = ctx.queued_count,
-        .paused = ctx.queued_paused,
-        .card_count = ctx.queued_prompt_cards.len,
-        .card_rows = ctx.queued_prompt_card_rows,
-    });
-}
-
-test "queued banner row policy consumes aggregate card facts" {
-    try std.testing.expectEqual(@as(u16, 2), queuedBannerRowsForFacts(.{
-        .queued_count = 2,
-    }));
-    try std.testing.expectEqual(@as(u16, 3), queuedBannerRowsForFacts(.{
-        .queued_count = 2,
-        .paused = true,
-    }));
-    try std.testing.expectEqual(@as(u16, 7), queuedBannerRowsForFacts(.{
-        .queued_count = 2,
-        .card_count = 2,
-        .card_rows = 5,
-    }));
-    try std.testing.expectEqual(@as(u16, 9), queuedBannerRowsForFacts(.{
-        .queued_count = 2,
-        .paused = true,
-        .card_count = 2,
-        .card_rows = 5,
-    }));
+    if (ctx.queued_count == 0) return 0;
+    const paused_hint_rows: u16 = @intFromBool(ctx.queued_paused);
+    if (ctx.queued_prompt_card_rows > 0) {
+        return queuedCardContentRows(ctx) +|
+            paused_hint_rows +|
+            queuedCardSpacerRows(ctx);
+    }
+    // No cards means the banner is collapsed to its single summary row.
+    return 1 +| paused_hint_rows +| collapsed_queue_banner_gap_rows;
 }
 
 pub fn transientActivityGapRows(shell: *const TranscriptRuntime, tool_before_activity: bool) u16 {

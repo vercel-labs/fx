@@ -631,7 +631,7 @@ async function waitForSkillsMenuGrid(
   while (Date.now() < deadline) {
     last = await s.capturePaneGrid();
     const text = last.join("\n");
-    if (text.includes(`Skills ${count}`) && findInlineSkillsPicker(last) !== null) {
+    if (text.includes(`Skills ${count}`) && findSkillsScreen(last) !== null) {
       return last;
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -649,14 +649,14 @@ function expectSkillsMenuGrid(
   const text = grid.join("\n");
   expect(text).toContain(`Skills ${count}`);
   expect(text).toContain("[All]");
-  expect(text).toContain("fx");
-  expect(text).not.toContain("[Fx]");
+  expect(text).toContain("Fx");
   expect(text).toContain("Workspace");
   expect(text).toContain("Codex");
-  expect(text).toContain("fx · Global");
+  expect(text).toContain("Fx · Global");
   expect(names.some((name) => text.includes(name))).toBe(true);
   expect(text).not.toContain("Visible skills (");
-  expect(findInlineSkillsPicker(grid)).not.toBeNull();
+  expect(text).not.toContain("Run /help for commands");
+  expect(findSkillsScreen(grid)).not.toBeNull();
   expect(grid.filter(isInputRow)).toHaveLength(1);
 }
 
@@ -1039,18 +1039,14 @@ function findFooter(grid: string[]): FooterBlock | null {
   return findFooterBlocks(grid).at(-1) ?? null;
 }
 
-function findInlineSkillsPicker(
-  grid: string[],
-): { input: number; topDivider: number; header: number; bottomDivider: number; hint: number } | null {
+function findSkillsScreen(grid: string[]): { topDivider: number; header: number; bottomDivider: number; hint: number } | null {
   const header = grid.findIndex((line) => line.includes("Skills "));
-  if (header <= 1 || !isDividerRow(grid[header - 1]!)) return null;
-  const input = header - 2;
-  if (!isInputRow(grid[input]!)) return null;
+  if (header <= 0 || !isDividerRow(grid[header - 1]!)) return null;
+  if (!isInputRow(grid[0]!)) return null;
   const bottomDivider = grid.findLastIndex((line) => isDividerRow(line));
   if (bottomDivider <= header || bottomDivider + 1 >= grid.length) return null;
   if (!grid[bottomDivider + 1]!.includes("Esc Close")) return null;
   return {
-    input,
     topDivider: header - 1,
     header,
     bottomDivider,
@@ -1058,18 +1054,14 @@ function findInlineSkillsPicker(
   };
 }
 
-function findInlineHelpPicker(
-  grid: string[],
-): { input: number; topDivider: number; header: number; bottomDivider: number; hint: number } | null {
+function findHelpScreen(grid: string[]): { topDivider: number; header: number; bottomDivider: number; hint: number } | null {
   const header = grid.findIndex((line) => line.includes("Commands "));
-  if (header <= 1 || !isDividerRow(grid[header - 1]!)) return null;
-  const input = header - 2;
-  if (!isInputRow(grid[input]!)) return null;
+  if (header <= 0 || !isDividerRow(grid[header - 1]!)) return null;
+  if (!isInputRow(grid[0]!)) return null;
   const bottomDivider = grid.findLastIndex((line) => isDividerRow(line));
   if (bottomDivider <= header || bottomDivider + 1 >= grid.length) return null;
   if (!grid[bottomDivider + 1]!.includes("Enter Open")) return null;
   return {
-    input,
     topDivider: header - 1,
     header,
     bottomDivider,
@@ -1173,12 +1165,8 @@ async function runLargeSkillResizeAttempt(attempt: number): Promise<string> {
       cycle.newSize.rows === shrinkRows
     );
     expect(shrinkCycle.historyRowDelta).toBeGreaterThanOrEqual(0);
-    expect(attemptLine(shrinkAttempt, "attempt_result ")).toContain(
-      "shadow_state=committed",
-    );
-    expect(attemptLine(shrinkAttempt, "transcript_transition_finalize ")).toContain(
-      "body_disposition=paint",
-    );
+    expect(attemptLine(shrinkAttempt, "attempt_result ")).toBeUndefined();
+    expect(attemptLine(shrinkAttempt, "transcript_transition_finalize ")).toBeUndefined();
     expect(attemptLine(shrinkAttempt, "tmux_clear_history_complete")).toBeUndefined();
     const shrinkGrid = await waitForSkillsMenuGrid(s, LARGE_SKILL_COUNT);
     expectSkillsMenuGrid(shrinkGrid, LARGE_SKILL_COUNT, fixture.names);
@@ -1198,12 +1186,8 @@ async function runLargeSkillResizeAttempt(attempt: number): Promise<string> {
       (candidate) => attemptHasReason(candidate, "resize"),
     );
     expect(s.paneSize()).toEqual({ cols: 120, rows: 34 });
-    expect(attemptLine(growAttempt, "attempt_result ")).toContain(
-      "shadow_state=committed",
-    );
-    expect(attemptLine(growAttempt, "transcript_transition_commit ")).toContain(
-      "state=stable",
-    );
+    expect(attemptLine(growAttempt, "attempt_result ")).toBeUndefined();
+    expect(attemptLine(growAttempt, "transcript_transition_commit ")).toBeUndefined();
     const growGrid = await waitForSkillsMenuGrid(s, LARGE_SKILL_COUNT);
     expectSkillsMenuGrid(growGrid, LARGE_SKILL_COUNT, fixture.names);
     const growScrollback = await s.captureFullScrollback();
@@ -1228,7 +1212,7 @@ async function runLargeSkillResizeAttempt(attempt: number): Promise<string> {
     const scrollbackLines = scrollback.replace(/\n$/, "").split("\n").length;
     expect(scrollbackLines).toBeLessThan(historyLimit / 2);
     expect(finalGrid.filter(isInputRow)).toHaveLength(1);
-    expect(findInlineSkillsPicker(finalGrid)).not.toBeNull();
+    expect(findSkillsScreen(finalGrid)).not.toBeNull();
     expect(s.paneStatus()).toEqual({ dead: false, status: null });
     expect(s.isPaneAlive()).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -1360,31 +1344,19 @@ async function runRapidSkillResizeAttempt(
     expect(s.paneSize()).toEqual({ cols: 120, rows: 34 });
 
     const growCommit = attemptLine(grow.attempt, "transcript_transition_commit ");
-    expect(growCommit).toContain("state=stable");
+    expect(growCommit).toBeUndefined();
     const growGrid = await waitForSkillsMenuGrid(s, RAPID_SKILL_COUNT);
     expectSkillsMenuGrid(growGrid, RAPID_SKILL_COUNT, fixture.names);
     const growScrollback = await s.captureFullScrollback();
     expectNoTranscriptSkillInventory(growScrollback);
     writeFileSync(join(fixture.root, "scrollback-after-grow.txt"), growScrollback);
 
-    expect(attemptLine(shrink.attempt, "transcript_transition_finalize ")).toContain(
-      "body_disposition=paint",
-    );
-    expect(attemptLine(grow.attempt, "transcript_transition_finalize ")).toContain(
-      "body_disposition=paint",
-    );
-    expect(attemptLine(shrink.attempt, "attempt_result ")).toContain(
-      "shadow_state=committed",
-    );
-    expect(attemptLine(grow.attempt, "attempt_result ")).toContain(
-      "shadow_state=committed",
-    );
-    expect(attemptLine(shrink.attempt, "tmux_clear_history_complete")).toContain(
-      "tmux_clear_history_complete",
-    );
-    expect(attemptLine(grow.attempt, "tmux_clear_history_complete")).toContain(
-      "tmux_clear_history_complete",
-    );
+    expect(attemptLine(shrink.attempt, "transcript_transition_finalize ")).toBeUndefined();
+    expect(attemptLine(grow.attempt, "transcript_transition_finalize ")).toBeUndefined();
+    expect(attemptLine(shrink.attempt, "attempt_result ")).toBeUndefined();
+    expect(attemptLine(grow.attempt, "attempt_result ")).toBeUndefined();
+    expect(attemptLine(shrink.attempt, "tmux_clear_history_complete")).toBeUndefined();
+    expect(attemptLine(grow.attempt, "tmux_clear_history_complete")).toBeUndefined();
 
     await s.sendKeys("C-[");
     const dismissed = await s.waitForPane(
@@ -1403,7 +1375,7 @@ async function runRapidSkillResizeAttempt(
     const finalScrollback = await s.captureFullScrollback();
     expectNoTranscriptSkillInventory(finalScrollback);
     expect(finalGrid.filter(isInputRow)).toHaveLength(1);
-    expect(findInlineSkillsPicker(finalGrid)).not.toBeNull();
+    expect(findSkillsScreen(finalGrid)).not.toBeNull();
     expect(s.paneStatus()).toEqual({ dead: false, status: null });
     expect(s.isPaneAlive()).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -2429,7 +2401,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await session.waitForText("/help", 10_000);
       await waitForSelectedSlashLabel(session, "/help");
       const shrinkStage = await session.captureFullScrollback();
-      expect(shrinkStage).toContain("Commands 36 · Type to filter");
+      expect(shrinkStage).toContain("Commands 37 · Type to filter");
       expect(shrinkStage).toContain("1–4");
       writeFileSync(join(root, "scrollback-after-shrink.txt"), shrinkStage);
 
@@ -2542,10 +2514,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const baselineFooter = findFooter(baseline)!;
 
       await session.sendLiteral("/mod");
-      await session.waitForText("/model", 10_000);
+      await session.waitForText("/models", 10_000);
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (pane) => !pane.includes("/model"),
+        (pane) => !pane.includes("/models"),
         10_000,
       );
       await Bun.sleep(250);
@@ -2598,12 +2570,12 @@ describe.skipIf(SKIP)("tui: resize", () => {
       label: "help",
       width: 72,
       height: 16,
-      surfaceMarker: "Enter Open",
+      surfaceMarker: "Commands ",
       editedInput: "x",
       async openSurface(active) {
         await active.resizeWindow(60, 12, 500);
         await active.sendText("/help");
-        await active.waitForText("Enter Open", TIMEOUT);
+        await active.waitForText("Commands ", TIMEOUT);
       },
     },
     {
@@ -2625,7 +2597,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       width: 120,
       height: 36,
       surfaceMarker: "provider/model-a",
-      editedInput: "x",
+      editedInput: "/model x",
       fakeModels: true,
       async openSurface(active) {
         await active.sendText("/model");
@@ -3406,12 +3378,12 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("Commands 36", 5_000);
+      await session.waitForText("Commands 37", 5_000);
       await session.resizeWindow(76, 24, 400);
 
       const grid = await session.capturePaneGrid();
-      expect(grid.join("\n")).toContain("Commands 36");
-      expect(findInlineHelpPicker(grid)).not.toBeNull();
+      expect(grid.join("\n")).toContain("Commands 37");
+      expect(findHelpScreen(grid)).not.toBeNull();
 
       await session.sendKeys("Escape");
       await session.waitForPane((pane) => !pane.includes("Enter Open"), 5_000);
@@ -3428,7 +3400,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("Commands 36", 5_000);
+      await session.waitForText("Commands 37", 5_000);
 
       const captureScrollback = () =>
         execSync(`tmux capture-pane -t ${session!.name} -p -S -`, {
@@ -3436,8 +3408,9 @@ describe.skipIf(SKIP)("tui: resize", () => {
           stdio: "pipe",
         });
       const expectHelpCatalog = (grid: string[]) => {
-        expect(grid.join("\n")).toContain("Commands 36");
-        expect(findInlineHelpPicker(grid)).not.toBeNull();
+        expect(grid.join("\n")).toContain("Commands 37");
+        expect(grid.join("\n")).not.toContain("Run /help for commands");
+        expect(findHelpScreen(grid)).not.toBeNull();
       };
 
       await session.resizeWindow(72, 20, 500);
@@ -3447,14 +3420,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
       expectHelpCatalog(await session.capturePaneGrid());
 
       await session.sendKeys("Escape");
-      await session.waitForPane(
-        (pane) => hasEmptyComposer(pane) && !pane.includes("Enter Open"),
-        5_000,
-      );
+      await session.waitForText("Run /help for commands", 5_000);
       const restored = captureScrollback();
       expect(restored.match(/𝒇x v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
       expect(restored.match(/Run \/help for commands/g)).toHaveLength(1);
-      expect(restored).not.toContain("Commands 36");
+      expect(restored).not.toContain("Commands 37");
       expect(findFooter(await session.capturePaneGrid())).not.toBeNull();
     },
     TIMEOUT,
@@ -3968,21 +3938,22 @@ describe.skipIf(SKIP)("tui: resize", () => {
         expect(await session.captureFullScrollback()).toContain(marker);
 
         await session.sendText("/help");
-        await session.waitForText("Commands 36", 5_000);
+        await session.waitForText("Commands 37", 5_000);
         await session.resizeWindow(84, 28, 500);
 
         const catalog = await session.capturePaneGrid();
         expect(catalog.join("\n")).not.toContain(marker);
-        expect(findInlineHelpPicker(catalog)).not.toBeNull();
+        expect(catalog.join("\n")).not.toContain("Run /help for commands");
+        expect(findHelpScreen(catalog)).not.toBeNull();
 
         await session.sendKeys("Escape");
-        await session.waitForPane(
-          (pane) => hasEmptyComposer(pane) && !pane.includes("Enter Open"),
-          5_000,
-        );
+        await session.waitForText("Run /help for commands", 5_000);
         const scrollback = await session.captureFullScrollback();
         expect(scrollback).not.toContain(marker);
-        expect(scrollback).not.toContain("Commands 36");
+        expect(scrollback.match(/𝒇x v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
+        expect(scrollback.match(/Run \/help for commands/g)).toHaveLength(1);
+        expect(scrollback.split("\n")[0]).toMatch(/𝒇x v\d+\.\d+\.\d+\b/);
+        expect(scrollback).not.toContain("Commands 37");
         const finalGrid = await session.capturePaneGrid();
         expect(findFooter(finalGrid), finalGrid.join("\n")).not.toBeNull();
 

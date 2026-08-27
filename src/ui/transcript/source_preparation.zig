@@ -40,14 +40,12 @@ const FinalityNomination = struct {
 const ToolFinalityIdentity = struct {
     turn_id: u64,
     presentation_group_id: ?types.ToolPresentationGroupId,
-    terminal: bool,
 };
 
 const ToolTurnNomination = struct {
     earliest_entry_id: u32,
     selected_entry_id: u32,
     selected_group_id: ?types.ToolPresentationGroupId,
-    selected_group_terminal: bool,
 };
 
 fn entryHiddenByActions(
@@ -71,42 +69,13 @@ fn collectFinalityNominations(
     var nominations: std.ArrayList(FinalityNomination) = .empty;
     errdefer nominations.deinit(alloc);
 
-    const assistant_tail_entry_id: ?u32 = if (self.entries.items.len > 0) tail: {
-        const tail_index = self.entries.items.len - 1;
-        const tail_entry = self.entries.items[tail_index];
-        if (tail_entry != .assistant_turn or
-            omitted_entry_id == tail_entry.id() or
-            entryHiddenByActions(entry_actions, tail_index))
-        {
-            break :tail null;
-        }
-        break :tail tail_entry.id();
-    } else null;
-
-    var group_terminality: std.AutoHashMapUnmanaged(types.ToolPresentationGroupId, bool) = .empty;
-    defer group_terminality.deinit(alloc);
-    for (self.tool_details.items) |detail| {
-        const group = detail.presentation_group_id orelse continue;
-        const result = try group_terminality.getOrPut(alloc, group);
-        if (!result.found_existing) result.value_ptr.* = true;
-        result.value_ptr.* = result.value_ptr.* and detail.outcome != null;
-    }
-
     var entry_tool_identities: std.AutoHashMapUnmanaged(u32, ToolFinalityIdentity) = .empty;
     defer entry_tool_identities.deinit(alloc);
     for (self.tool_details.items) |detail| {
         const identity: ToolFinalityIdentity = if (detail.presentation_group_id) |group|
-            .{
-                .turn_id = group.turn_id,
-                .presentation_group_id = group,
-                .terminal = group_terminality.get(group).?,
-            }
+            .{ .turn_id = group.turn_id, .presentation_group_id = group }
         else if (detail.lifecycle_id) |lifecycle|
-            .{
-                .turn_id = lifecycle.turn_id,
-                .presentation_group_id = null,
-                .terminal = detail.outcome != null,
-            }
+            .{ .turn_id = lifecycle.turn_id, .presentation_group_id = null }
         else
             continue;
         try entry_tool_identities.put(alloc, detail.entry_id, identity);
@@ -139,8 +108,6 @@ fn collectFinalityNominations(
                     .earliest_entry_id = entry_id,
                     .selected_entry_id = entry_id,
                     .selected_group_id = identity.presentation_group_id,
-                    .selected_group_terminal = identity.presentation_group_id != null and
-                        identity.terminal,
                 };
                 continue;
             }
@@ -149,17 +116,12 @@ fn collectFinalityNominations(
             const group_id = identity.presentation_group_id orelse {
                 turn.selected_entry_id = turn.earliest_entry_id;
                 turn.selected_group_id = null;
-                turn.selected_group_terminal = false;
                 continue;
             };
             const selected_group = turn.selected_group_id.?;
-            if (group_id.anchor_step_id == selected_group.anchor_step_id) {
-                continue;
-            }
             if (group_id.anchor_step_id > selected_group.anchor_step_id) {
                 turn.selected_entry_id = entry_id;
                 turn.selected_group_id = group_id;
-                turn.selected_group_terminal = identity.terminal;
             }
         }
     }
@@ -178,26 +140,23 @@ fn collectFinalityNominations(
         const identity = entry_tool_identities.get(entry_id) orelse continue;
         const turn = turn_nominations.get(identity.turn_id).?;
         if (turn.selected_entry_id != entry_id) continue;
-        // A later assistant entry closes a concrete group once all of its
-        // tools are terminal. Any subsequent tool start after visible text
-        // receives a new presentation-group identity.
-        if (assistant_tail_entry_id != null and
-            turn.selected_group_id != null and
-            turn.selected_group_terminal)
-        {
-            continue;
-        }
         try nominations.append(alloc, .{
             .entry_id = entry_id,
             .kind = .tool_turn,
             .turn_id = identity.turn_id,
         });
     }
-    if (assistant_tail_entry_id) |entry_id| {
-        try nominations.append(alloc, .{
-            .entry_id = entry_id,
-            .kind = .assistant_tail,
-        });
+    if (self.entries.items.len > 0) {
+        const tail = self.entries.items[self.entries.items.len - 1];
+        if (tail == .assistant_turn and
+            omitted_entry_id != tail.id() and
+            !entryHiddenByActions(entry_actions, self.entries.items.len - 1))
+        {
+            try nominations.append(alloc, .{
+                .entry_id = tail.id(),
+                .kind = .assistant_tail,
+            });
+        }
     }
     return nominations;
 }
@@ -522,11 +481,11 @@ fn prepareTranscriptSourceInternal(
         defer finality_nominations.deinit(alloc);
         const finality_entry_ids = try alloc.alloc(u32, finality_nominations.items.len);
         defer alloc.free(finality_entry_ids);
-        const finality_entry_floor_bytes = try alloc.alloc(?usize, finality_nominations.items.len);
-        defer alloc.free(finality_entry_floor_bytes);
+        const finality_entry_start_bytes = try alloc.alloc(?usize, finality_nominations.items.len);
+        defer alloc.free(finality_entry_start_bytes);
         for (finality_nominations.items, 0..) |nomination, index| {
             finality_entry_ids[index] = nomination.entry_id;
-            finality_entry_floor_bytes[index] = null;
+            finality_entry_start_bytes[index] = null;
         }
         const summary_entry_ids = try alloc.alloc(?u32, self.folded_command_blocks.items.len);
         defer alloc.free(summary_entry_ids);
@@ -543,7 +502,7 @@ fn prepareTranscriptSourceInternal(
                 .target_entry_id = tracked_entry_id,
                 .target_byte_entry_id = replaceable_entry_id,
                 .finality_entry_ids = finality_entry_ids,
-                .finality_entry_floor_bytes = finality_entry_floor_bytes,
+                .finality_entry_start_bytes = finality_entry_start_bytes,
                 .omitted_entry_id = omitted_entry_id,
                 .folded_summary_entry_ids = summary_entry_ids,
                 .capture_provenance = capture_provenance,
@@ -560,28 +519,22 @@ fn prepareTranscriptSourceInternal(
         var tool_turn_floors: std.ArrayList(transcript_release.ToolTurnFloor) = .empty;
         errdefer tool_turn_floors.deinit(alloc);
         for (finality_nominations.items, 0..) |nomination, index| {
-            const floor_byte = finality_entry_floor_bytes[index] orelse blk: {
-                // An empty assistant tail contributes no mutable rendered
-                // bytes, so the complete prepared flow is final. Other empty
-                // nominations remain conservative because their state may
-                // still mutate an earlier rendered entry.
-                const fallback = switch (nomination.kind) {
-                    .assistant_tail => bytes.len,
-                    .mutation_pin, .tool_turn => 0,
-                };
+            const start_byte = finality_entry_start_bytes[index] orelse blk: {
+                // A nominated entry that produced no bytes cannot anchor the
+                // boundary; hold the whole flow rather than release past it.
                 debug_trace.logf(
                     "scroll",
-                    "finality_nomination_empty entry_id={d} kind={s} fallback={d}",
-                    .{ nomination.entry_id, @tagName(nomination.kind), fallback },
+                    "finality_nomination_unrecorded entry_id={d} kind={s}",
+                    .{ nomination.entry_id, @tagName(nomination.kind) },
                 );
-                break :blk fallback;
+                break :blk 0;
             };
             switch (nomination.kind) {
-                .mutation_pin => finality.mutation_pin_start = floor_byte,
-                .assistant_tail => finality.assistant_tail_start = @min(bytes.len, floor_byte),
+                .mutation_pin => finality.mutation_pin_start = start_byte,
+                .assistant_tail => finality.assistant_tail_start = start_byte,
                 .tool_turn => try tool_turn_floors.append(alloc, .{
                     .turn_id = nomination.turn_id,
-                    .start_byte = floor_byte,
+                    .start_byte = start_byte,
                 }),
             }
         }

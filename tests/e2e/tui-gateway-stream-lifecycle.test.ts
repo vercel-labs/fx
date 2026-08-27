@@ -986,65 +986,18 @@ function assertFirstPostEnterOutputShowsSubmittedPrompt(
   submittedPrompt: string,
 ) {
   const frames = readTapeFrames(tapePath);
-  const enterIndex = findEnterAfterSubmittedPrompt(frames, submittedPrompt);
+  const enterIndex = frames.findIndex(
+    (frame) =>
+      frame.kind === 2 &&
+      frame.payload.equals(Buffer.from("\r")),
+  );
+  expect(enterIndex).toBeGreaterThanOrEqual(0);
 
   const firstOutput = frames
     .slice(enterIndex + 1)
     .find((frame) => frame.kind === 1);
   expect(firstOutput).toBeDefined();
   expect(firstOutput!.payload.includes(Buffer.from(submittedPrompt))).toBe(true);
-}
-
-function findEnterAfterSubmittedPrompt(
-  frames: ReturnType<typeof readTapeFrames>,
-  submittedPrompt: string,
-): number {
-  const promptInputIndex = frames.findIndex((frame) =>
-    frame.kind === 2 && frame.payload.includes(Buffer.from(submittedPrompt))
-  );
-  expect(promptInputIndex).toBeGreaterThanOrEqual(0);
-  const enterIndex = frames.findIndex((frame, index) =>
-    index > promptInputIndex &&
-    frame.kind === 2 &&
-    frame.payload.equals(Buffer.from("\r"))
-  );
-  expect(enterIndex).toBeGreaterThan(promptInputIndex);
-  return enterIndex;
-}
-
-function assertSubmittedPromptRowStaysStableAfterEnter(
-  tapePath: string,
-  framesRoot: string,
-  submittedPrompt: string,
-) {
-  const frames = readTapeFrames(tapePath);
-  const enterIndex = findEnterAfterSubmittedPrompt(frames, submittedPrompt);
-  const firstOutput = frames.slice(enterIndex + 1).find((frame) => frame.kind === 1);
-  expect(firstOutput).toBeDefined();
-  const gridDir = join(framesRoot, "frames");
-  const frameNames = readdirSync(gridDir)
-    .filter((name) => name.endsWith(".grid.txt"))
-    .sort();
-  const firstGrid = readFileSync(
-    join(gridDir, `${String(firstOutput!.index).padStart(4, "0")}.grid.txt`),
-    "utf8",
-  );
-  const thinkingGrid = frameNames
-    .filter((name) => Number.parseInt(name, 10) > firstOutput!.index)
-    .map((name) => readFileSync(join(gridDir, name), "utf8"))
-    .find((grid) => grid.includes("Thinking"));
-  expect(thinkingGrid).toBeDefined();
-
-  const promptRow = (grid: string) => {
-    const row = grid.split(/\r?\n/).findIndex((line) =>
-      line.includes(submittedPrompt)
-    );
-    expect(row).toBeGreaterThanOrEqual(0);
-    return row;
-  };
-  expect(promptRow(thinkingGrid!)).toBe(
-    promptRow(firstGrid),
-  );
 }
 
 function hasBareRunningRow(value: string): boolean {
@@ -1308,7 +1261,7 @@ async function runCanonicalLifecycleFixture(
     reachedFinal = settled.matched;
     if (reachedFinal) {
       await session.sendText("/help");
-      const help = await waitForPaneOrDone(session, "Commands 36", donePath);
+      const help = await waitForPaneOrDone(session, "Commands 37", donePath);
       helpVisible = help.matched;
       requestCountAfterHelp = queuedGateway.requests.length;
       if (helpVisible) {
@@ -1866,7 +1819,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "provider route recovery counts down, times out a silent head, and recovers",
+    "provider route recovery renders retry, transient recovery, and normal summary row",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-route-recovery-")));
       const home = join(root, "home");
@@ -1878,13 +1831,16 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const workspace = realpathSync(workspacePath);
 
       const finalText = "TUI route recovery completed.";
+      let releaseFinalResponse: (() => void) | null = null;
+      const finalResponseRelease = new Promise<void>((resolve) => {
+        releaseFinalResponse = resolve;
+      });
       const queuedGateway = startFakeGateway([
-        retryAfterUnavailable(4),
+        providerErrorResponse("tui route failed once"),
         async () => {
-          await Bun.sleep(35_000);
-          return fakeGatewayFinalText("late response must be ignored");
+          await finalResponseRelease;
+          return fakeGatewayFinalText(finalText);
         },
-        fakeGatewayFinalText(finalText),
       ], {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
@@ -1910,37 +1866,32 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       });
 
       await session.waitForComposer(TIMEOUT);
-      await session.sendText("Recover from provider route failure.");
-      await session.waitForText("retrying request in 4s", TIMEOUT);
-      await session.waitForText("retrying request in 3s", TIMEOUT);
-      await session.waitForText("retrying request in 2s", TIMEOUT);
-      await session.waitForText("retrying request in 1s", TIMEOUT);
-      await waitForCondition(
-        () => queuedGateway.requests.length === 2,
-        "silent-head retry request",
+      const retryVisible = session.waitForText(
+        "provider_error: tui route failed once",
+        TIMEOUT,
       );
-      await session.waitForText("attempt 2/10", TIMEOUT);
-
-      const inFlightPane = await session.capturePane();
-      expect(inFlightPane).toContain("attempt 2/10");
-      expect(inFlightPane).not.toContain("retrying request in 1s");
+      await session.sendText("Recover from provider route failure.");
+      await Promise.all([
+        retryVisible,
+        waitForCondition(
+          () => queuedGateway.requests.length === 2,
+          "second route recovery request",
+        ),
+      ]);
 
       await session.resizeWindow(32, 24);
       const narrowPane = await session.capturePane();
       expect(narrowPane).toContain("⚠ Provider unavailable");
-      expect(narrowPane).toContain("attempt 2/10");
+      expect(narrowPane).toContain("provider_error:");
+      expect(narrowPane).toContain("attempt 1/10");
       expect(narrowPane).not.toContain("▲");
 
       await session.resizeWindow(72, 24);
-      await waitForCondition(
-        () => queuedGateway.requests.length === 3,
-        "retry after silent response head timeout",
-        TIMEOUT * 2,
-      );
+      releaseFinalResponse?.();
       await session.waitForText(finalText, TIMEOUT);
       const scrollback = await session.captureFullScrollback();
 
-      expect(queuedGateway.requests.length).toBe(3);
+      expect(queuedGateway.requests.length).toBe(2);
       expect(scrollback).not.toContain("System");
       expect(scrollback).not.toContain("Attempt 1 failed. Retrying route.");
       expect(scrollback).not.toContain("✓ recovered");
@@ -1948,7 +1899,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(scrollback).toContain(finalText);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
-    TIMEOUT * 2,
+    TIMEOUT,
   );
 
   test(
@@ -2567,10 +2518,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const workspacePath = join(root, "workspace");
       const stderrPath = join(root, "stderr.log");
       const tapePath = join(root, "session.fxtape");
-      const tracePath = join(root, "fx-trace.log");
       const framesRoot = join(root, "replay-frames");
       const submittedPrompt = "IDLE_SUBMIT_ORDER_SENTINEL";
-      const newerDraft = "RAPID_SECOND_DRAFT_SENTINEL";
       const hold: HoldState = { started: false, cancelled: false };
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspacePath, { recursive: true });
@@ -2602,103 +2551,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "input,worker",
         },
       });
 
       await session.waitForComposer(TIMEOUT);
-      await session.sendLiteral(submittedPrompt);
-      session.sendKeysImmediate(["Enter"]);
-      session.sendLiteralImmediate(newerDraft);
-      session.sendKeysImmediate(["Enter"]);
+      await session.sendText(submittedPrompt);
       await waitForCondition(
         () => heldGateway.requests.length === 1 && hold.started,
         "held idle submitted prompt stream",
-      );
-      await session.waitForText("Thinking", TIMEOUT);
-      await Bun.sleep(250);
-      await session.sendKeys("C-c");
-      const cancelledPane = await session.waitForText("cancelled", TIMEOUT);
-
-      execFileSync(FX_BIN, ["replay", tapePath, "--frames-dir", framesRoot], {
-        encoding: "utf8",
-      });
-      assertFirstPostEnterOutputShowsSubmittedPrompt(tapePath, submittedPrompt);
-      assertSubmittedPromptRowStaysStableAfterEnter(
-        tapePath,
-        framesRoot,
-        submittedPrompt,
-      );
-      assertThinkingFramesShowSubmittedPrompt(framesRoot, submittedPrompt);
-      const trace = readFileSync(tracePath, "utf8");
-      const frameCommitted = trace.indexOf("event=pending_prompt_frame_committed");
-      const promptQueued = trace.indexOf("event=prompt_enqueue");
-      const workerBegin = trace.indexOf("event=worker_begin");
-      expect(frameCommitted).toBeGreaterThanOrEqual(0);
-      expect(promptQueued).toBeGreaterThan(frameCommitted);
-      expect(workerBegin).toBeGreaterThan(promptQueued);
-      expect(composerContains(cancelledPane, newerDraft)).toBe(true);
-
-      expect(hold.cancelled).toBe(true);
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(existsSync(tapePath)).toBe(true);
-      expect(session.isAlive()).toBe(true);
-      expect(session.isPaneAlive()).toBe(true);
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "idle submitted prompt keeps its canonical row after a completed turn",
-    async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-idle-submit-multiturn-")));
-      const home = join(root, "home");
-      const workspace = join(root, "workspace");
-      const stderrPath = join(root, "stderr.log");
-      const tapePath = join(root, "session.fxtape");
-      const framesRoot = join(root, "replay-frames");
-      const seedPrompt = "MULTI_TURN_SEED_PROMPT";
-      const seedReply = "MULTI_TURN_SEED_REPLY";
-      const submittedPrompt = "MULTI_TURN_ROW_SENTINEL";
-      const hold: HoldState = { started: false, cancelled: false };
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
-
-      const queuedGateway = startFakeGateway([
-        fakeGatewayFinalText(seedReply),
-        () => heldGatewayResponse(hold),
-      ]);
-      gateway = queuedGateway;
-      session = await TmuxSession.create({
-        cwd: realpathSync(workspace),
-        width: 96,
-        height: 28,
-        stderrPath,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: "fake-idle-submit-multiturn-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_MODEL: MODEL,
-          FX_RECORD: tapePath,
-          FX_RECORD_INPUT: "1",
-        },
-      });
-
-      await session.waitForComposer(TIMEOUT);
-      await session.sendText(seedPrompt);
-      await session.waitForText(seedReply, TIMEOUT);
-      await session.waitForComposer(TIMEOUT);
-      await session.sendLiteral(submittedPrompt);
-      session.sendKeysImmediate(["Enter"]);
-      await waitForCondition(
-        () => queuedGateway.requests.length === 2 && hold.started,
-        "held multi-turn submitted prompt stream",
       );
       await session.waitForText("Thinking", TIMEOUT);
       await Bun.sleep(250);
@@ -2709,12 +2569,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         encoding: "utf8",
       });
       assertFirstPostEnterOutputShowsSubmittedPrompt(tapePath, submittedPrompt);
-      assertSubmittedPromptRowStaysStableAfterEnter(
-        tapePath,
-        framesRoot,
-        submittedPrompt,
-      );
+      assertThinkingFramesShowSubmittedPrompt(framesRoot, submittedPrompt);
+
+      expect(hold.cancelled).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(existsSync(tapePath)).toBe(true);
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
     },
@@ -7241,7 +7100,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(gateway.requestCount()).toBe(1);
 
       await session.sendText("/help");
-      await session.waitForText("Commands 36", TIMEOUT);
+      await session.waitForText("Commands 37", TIMEOUT);
       expect(gateway.requestCount()).toBe(1);
       await session.sendKeys("Escape");
     },
@@ -7297,7 +7156,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () => heldGateway.requestCount() === 1,
         "held model-catalog request",
       );
-      await session.sendText("/model");
+      await session.sendText("/models");
       await session.waitForText("Loading models", TIMEOUT);
 
       heldGateway.release();
@@ -7647,35 +7506,6 @@ describe.skipIf(!tmuxAvailable())("transcript scrollback release", () => {
       statusLine: { context: true },
       yolo_acknowledged: true,
     });
-  }
-
-  function sbHistoryText(sessionName: string): string {
-    const historySize = Number.parseInt(
-      execFileSync(
-        "tmux",
-        ["list-panes", "-t", sessionName, "-F", "#{history_size}"],
-        { encoding: "utf8" },
-      ).trim(),
-      10,
-    );
-    if (!Number.isSafeInteger(historySize) || historySize < 0) {
-      throw new Error(`invalid tmux history size: ${historySize}`);
-    }
-    if (historySize === 0) return "";
-    return execFileSync(
-      "tmux",
-      [
-        "capture-pane",
-        "-p",
-        "-t",
-        sessionName,
-        "-S",
-        String(-historySize),
-        "-E",
-        "-1",
-      ],
-      { encoding: "utf8" },
-    );
   }
 
   test(
@@ -8143,291 +7973,5 @@ describe.skipIf(!tmuxAvailable())("transcript scrollback release", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     SB_TIMEOUT + 60_000,
-  );
-
-  test(
-    "completed streamed UI blocks append without rewriting scrolled history",
-    async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-sb-ui-blocks-")));
-      const home = join(root, "home");
-      const workspace = join(root, "workspace");
-      const stderrPath = join(root, "stderr.log");
-      const tapePath = join(root, "ui-blocks.fxtape");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), sbSettings());
-      writeFileSync(stderrPath, "");
-
-      const phaseOneRows = Array.from(
-        { length: 48 },
-        (_, index) =>
-          `ANCHOR_PHASE_ONE_${String(index + 1).padStart(2, "0")} finalized row`,
-      );
-      const phaseTwoRows = Array.from(
-        { length: 24 },
-        (_, index) =>
-          `ANCHOR_PHASE_TWO_${String(index + 1).padStart(2, "0")} finalized row`,
-      );
-      const phaseOne = [
-        "# BLOCK_HEADING",
-        "BLOCK_PROSE with **bold**, *italic*, `inline code`, and [BLOCK_LINK](https://example.com).",
-        "",
-        "- BLOCK_BULLET",
-        "  1. BLOCK_NESTED_ORDERED",
-        "- [x] BLOCK_TASK_COMPLETE",
-        "",
-        "> QUOTE_BLOCK_FIRST",
-        "> QUOTE_BLOCK_SECOND",
-        "",
-        "BLOCK_DEFINITION_TERM",
-        ": BLOCK_DEFINITION_BODY",
-        "",
-        "BLOCK_FOOTNOTE_REFERENCE[^1]",
-        "",
-        "[^1]: BLOCK_FOOTNOTE_BODY",
-        "",
-        "BLOCK_BEFORE_RULE",
-        "",
-        "---",
-        "",
-        "BLOCK_AFTER_RULE",
-        "",
-        "```zig",
-        "const BLOCK_CODE_LINE = true;",
-        "```",
-        "",
-        "| BLOCK_TABLE_HEADER | State |",
-        "| --- | --- |",
-        "| row | BLOCK_TABLE_CELL |",
-        "",
-        `BLOCK_WRAPPED_LINE ${"wrapped content ".repeat(12)}`,
-        "",
-        ...phaseOneRows,
-      ].join("\n") + "\n";
-      const phaseTwo = `${phaseTwoRows.join("\n")}\n`;
-
-      let phaseOneResolve!: () => void;
-      const phaseOneSent = new Promise<void>((resolve) => {
-        phaseOneResolve = resolve;
-      });
-      let phaseTwoResolve!: () => void;
-      const phaseTwoSent = new Promise<void>((resolve) => {
-        phaseTwoResolve = resolve;
-      });
-      let releasePhaseTwo!: () => void;
-      const phaseTwoGate = new Promise<void>((resolve) => {
-        releasePhaseTwo = resolve;
-      });
-      let releaseFinish!: () => void;
-      const finishGate = new Promise<void>((resolve) => {
-        releaseFinish = resolve;
-      });
-
-      gateway = startDynamicFakeGateway(
-        () =>
-          new Response(
-            new ReadableStream<Uint8Array>({
-              async start(controller) {
-                const encoder = new TextEncoder();
-                controller.enqueue(
-                  encoder.encode(
-                    sbSseEvent({ type: "text-start", id: "answer_1" }),
-                  ),
-                );
-                for (const chunk of sbTokenChunks(phaseOne, 17)) {
-                  controller.enqueue(
-                    encoder.encode(
-                      sbSseEvent({
-                        type: "text-delta",
-                        id: "answer_1",
-                        delta: chunk,
-                      }),
-                    ),
-                  );
-                  await Bun.sleep(4);
-                }
-                phaseOneResolve();
-                await phaseTwoGate;
-                for (const chunk of sbTokenChunks(phaseTwo, 13)) {
-                  controller.enqueue(
-                    encoder.encode(
-                      sbSseEvent({
-                        type: "text-delta",
-                        id: "answer_1",
-                        delta: chunk,
-                      }),
-                    ),
-                  );
-                  await Bun.sleep(4);
-                }
-                phaseTwoResolve();
-                await finishGate;
-                controller.enqueue(
-                  encoder.encode(
-                    sbSseEvent({ type: "text-end", id: "answer_1" }),
-                  ),
-                );
-                controller.enqueue(
-                  encoder.encode(
-                    sbSseEvent({
-                      type: "finish",
-                      finishReason: { unified: "stop", raw: "stop" },
-                      usage: {
-                        inputTokens: { total: 3 },
-                        outputTokens: { total: 120 },
-                      },
-                    }),
-                  ),
-                );
-                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                controller.close();
-              },
-            }),
-            { headers: { "content-type": "text/event-stream" } },
-          ),
-      );
-      const fakeGateway = gateway as ReturnType<typeof startDynamicFakeGateway>;
-
-      session = await TmuxSession.create({
-        cmd: FX_BIN,
-        cwd: workspace,
-        width: 100,
-        height: 24,
-        minimumHistoryLines: 10_000,
-        stderrPath,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: "fake-sb-ui-blocks-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-          FX_GATEWAY_BASE_URL: fakeGateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
-          FX_MODEL: MODEL,
-          FX_RECORD: tapePath,
-          FX_RECORD_INPUT: "1",
-        },
-      });
-
-      try {
-        await session.waitForComposer(SB_TIMEOUT);
-        await session.sendText("Render every prepared UI block.");
-        await phaseOneSent;
-        await session.waitForText("ANCHOR_PHASE_ONE_47", SB_TIMEOUT);
-        await Bun.sleep(500);
-
-        const phaseOneHistory = sbHistoryText(session.name);
-        expect(phaseOneHistory).toContain("ANCHOR_PHASE_ONE_01");
-        expect(phaseOneHistory).toContain("BLOCK_HEADING");
-        expect(phaseOneHistory).toContain("BLOCK_CODE_LINE");
-        expect(phaseOneHistory).toContain("BLOCK_TABLE_CELL");
-        expect(phaseOneHistory).toContain("• BLOCK_BULLET");
-        expect(phaseOneHistory).toContain("✓ BLOCK_TASK_COMPLETE");
-        expect(phaseOneHistory).toContain("│ QUOTE_BLOCK_FIRST");
-        expect(phaseOneHistory).toContain("┌ zig ");
-        expect(phaseOneHistory).toContain("┬");
-        expect(phaseOneHistory).toContain("┼");
-        expect(phaseOneHistory).toContain("┴");
-        const beforeRule = phaseOneHistory.indexOf("BLOCK_BEFORE_RULE");
-        const afterRule = phaseOneHistory.indexOf("BLOCK_AFTER_RULE");
-        expect(beforeRule).toBeGreaterThanOrEqual(0);
-        expect(afterRule).toBeGreaterThan(beforeRule);
-        expect(phaseOneHistory.slice(beforeRule, afterRule)).toContain("─");
-
-        execFileSync("tmux", ["copy-mode", "-t", session.name]);
-        execFileSync("tmux", [
-          "send-keys",
-          "-t",
-          session.name,
-          "-X",
-          "history-top",
-        ]);
-        await Bun.sleep(100);
-        const historyBeforePhaseTwo = phaseOneHistory;
-
-        releasePhaseTwo();
-        await phaseTwoSent;
-        await session.waitForText("ANCHOR_PHASE_TWO_23", SB_TIMEOUT);
-        await Bun.sleep(500);
-        const historyAfterPhaseTwo = sbHistoryText(session.name);
-        expect(historyAfterPhaseTwo.length).toBeGreaterThan(
-          historyBeforePhaseTwo.length,
-        );
-        expect(historyAfterPhaseTwo.startsWith(historyBeforePhaseTwo)).toBe(
-          true,
-        );
-        expect(historyAfterPhaseTwo).toContain("ANCHOR_PHASE_TWO_01");
-
-        execFileSync("tmux", [
-          "send-keys",
-          "-t",
-          session.name,
-          "-X",
-          "cancel",
-        ]);
-        releaseFinish();
-        await session.waitForPane(hasEmptyComposer, SB_TIMEOUT);
-        const scrollback = await session.waitForStableScrollback(
-          (value) =>
-            countOccurrences(value, "ANCHOR_PHASE_TWO_24") === 1 &&
-            TURN_SUMMARY_WITH_TOKENS.test(value),
-          SB_TIMEOUT,
-        );
-        const orderedMarkers = [
-          "BLOCK_HEADING",
-          "BLOCK_PROSE",
-          "BLOCK_LINK",
-          "BLOCK_BULLET",
-          "BLOCK_NESTED_ORDERED",
-          "BLOCK_TASK_COMPLETE",
-          "QUOTE_BLOCK_FIRST",
-          "QUOTE_BLOCK_SECOND",
-          "BLOCK_DEFINITION_TERM",
-          "BLOCK_DEFINITION_BODY",
-          "BLOCK_FOOTNOTE_REFERENCE",
-          "BLOCK_BEFORE_RULE",
-          "BLOCK_AFTER_RULE",
-          "BLOCK_CODE_LINE",
-          "BLOCK_TABLE_HEADER",
-          "BLOCK_TABLE_CELL",
-          "BLOCK_WRAPPED_LINE",
-          "ANCHOR_PHASE_ONE_01",
-          "ANCHOR_PHASE_ONE_48",
-          "ANCHOR_PHASE_TWO_01",
-          "ANCHOR_PHASE_TWO_24",
-        ];
-        let previous = -1;
-        for (const marker of orderedMarkers) {
-          expect(countOccurrences(scrollback, marker), marker).toBe(1);
-          const index = scrollback.indexOf(marker);
-          expect(index, marker).toBeGreaterThan(previous);
-          previous = index;
-        }
-        expect(countOccurrences(scrollback, "BLOCK_FOOTNOTE_BODY")).toBe(1);
-        expect(existsSync(tapePath)).toBe(true);
-        expect(readFileSync(stderrPath, "utf8")).toBe("");
-
-        await session.sendText("/quit");
-        expect(await session.waitForSessionEnd(5_000)).toBe(true);
-        session = undefined;
-
-        const replay = JSON.parse(
-          execFileSync(FX_BIN, ["replay", tapePath, "--json"], {
-            encoding: "utf8",
-          }),
-        ) as { frame_count: number; stdout_bytes: number };
-        expect(replay.frame_count).toBeGreaterThan(0);
-        expect(replay.stdout_bytes).toBeGreaterThan(0);
-        const goldenPath = join(root, "ui-blocks-golden.txt");
-        execFileSync(FX_BIN, ["replay", tapePath, "--golden", goldenPath]);
-        expect(readFileSync(goldenPath, "utf8")).toContain(
-          "ANCHOR_PHASE_TWO_24",
-        );
-      } finally {
-        releasePhaseTwo();
-        releaseFinish();
-      }
-    },
-    SB_TIMEOUT + 30_000,
   );
 });

@@ -17,7 +17,6 @@ import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
-  fakeGatewaySse,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -59,52 +58,6 @@ function grokModalityModel(id: string, vision: boolean) {
     id,
     input_modalities: vision ? ["text", "image"] : ["text"],
     output_modalities: ["text"],
-  };
-}
-
-function startFakeDirectUsageProvider(
-  provider: "codex" | "grok",
-  model: string,
-  responseId: string,
-  inputTokens: number,
-  outputTokens: number,
-) {
-  let responses = 0;
-  const server = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    fetch(request) {
-      const path = new URL(request.url).pathname;
-      if (path === "/models") {
-        return provider === "codex"
-          ? Response.json({ models: [{
-            slug: model,
-            visibility: "list",
-            supported_in_api: true,
-            supported_reasoning_levels: [{ effort: "high" }],
-            additional_speed_tiers: [],
-            input_modalities: ["text"],
-            context_window: 272000,
-          }] })
-          : Response.json({ data: [grokSubscriptionModel(model, 500_000)] });
-      }
-      if (path === "/modalities") {
-        return Response.json({ models: [grokModalityModel(model, false)] });
-      }
-      responses += 1;
-      return new Response(
-        `data: ${JSON.stringify({ type: "response.output_text.delta", delta: `${provider.toUpperCase()}_USAGE_OK` })}\n\n` +
-          `data: ${JSON.stringify({ type: "response.completed", response: { id: responseId, status: "completed", usage: { input_tokens: inputTokens, output_tokens: outputTokens } } })}\n\n`,
-        { headers: { "content-type": "text/event-stream" } },
-      );
-    },
-  });
-  return {
-    get responses() { return responses; },
-    responsesUrl: `http://127.0.0.1:${server.port}/responses`,
-    modelsUrl: `http://127.0.0.1:${server.port}/models`,
-    modalitiesUrl: `http://127.0.0.1:${server.port}/modalities`,
-    stop() { server.stop(true); },
   };
 }
 
@@ -169,10 +122,6 @@ function readSingleUsageSnapshot(testHome: string): {
   billing: string;
   next_sequence: number;
   settled_through_sequence: number;
-  input_tokens: number;
-  output_tokens: number;
-  request_count: number | null;
-  models: Array<{ model: string; request_count: number | null }>;
   pending: unknown[];
 } {
   const sessionsDir = join(testHome, ".fx", "sessions");
@@ -186,10 +135,6 @@ function readSingleUsageSnapshot(testHome: string): {
       billing: string;
       next_sequence: number;
       settled_through_sequence: number;
-      input_tokens: number;
-      output_tokens: number;
-      request_count: number | null;
-      models: Array<{ model: string; request_count: number | null }>;
       pending: unknown[];
     };
   }).snapshot;
@@ -717,36 +662,31 @@ async function completeDisplayedGrokLogin(
   activeSession: TmuxSession,
   fixture: ReturnType<typeof startFakeGrokOAuth>,
 ) {
-  await completeDisplayedSubscriptionLogin(
-    activeSession,
-    "Authorize with Grok",
-    `${fixture.baseUrl}/oauth2/authorize?`,
+  await activeSession.resizeWindow(500, 20);
+  const pane = await activeSession.waitForPane(
+    (value) => value.includes(`${fixture.baseUrl}/oauth2/authorize?`),
+    TIMEOUT,
   );
+  const authorizationUrl = pane
+    .split(/\s+/)
+    .find((value) => value.startsWith(`${fixture.baseUrl}/oauth2/authorize?`));
+  if (!authorizationUrl) throw new Error("Grok authorization URL was not rendered");
+  const response = await fetch(authorizationUrl, { redirect: "follow" });
+  expect(response.status).toBe(200);
+  await activeSession.resizeWindow(100, 30);
 }
 
 async function completeDisplayedCodexLogin(
   activeSession: TmuxSession,
   fixture: ReturnType<typeof startFakeChatGptOAuth>,
 ) {
-  await completeDisplayedSubscriptionLogin(
-    activeSession,
-    "Authorize with Codex",
-    `${fixture.baseUrl}/oauth/authorize?`,
-  );
-}
-
-async function completeDisplayedSubscriptionLogin(
-  activeSession: TmuxSession,
-  label: string,
-  authorizationUrlPrefix: string,
-) {
-  await activeSession.waitForText(label, TIMEOUT);
+  await activeSession.waitForText("Authorize with Codex", TIMEOUT);
   const escapes = await activeSession.capturePaneEscapes();
-  const urlStart = escapes.indexOf(authorizationUrlPrefix);
+  const urlStart = escapes.indexOf(`${fixture.baseUrl}/oauth/authorize?`);
   const linkStart = escapes.lastIndexOf("\x1b]8;", urlStart);
   const urlEnd = escapes.indexOf("\x1b\\", urlStart);
   if (urlStart < 0 || linkStart < 0 || urlEnd < 0) {
-    throw new Error(`${label} hyperlink was not rendered`);
+    throw new Error("Codex authorization hyperlink was not rendered");
   }
   const authorizationUrl = escapes.slice(urlStart, urlEnd);
   const response = await fetch(authorizationUrl, { redirect: "follow" });
@@ -1159,9 +1099,6 @@ tmuxTest(
         pane.includes("Enter reopens browser · Esc cancels"),
       TIMEOUT,
     );
-    expect(signInScreen).toMatch(/^Sign in with Codex\s+Waiting for authorization…$/m);
-    expect(signInScreen).toMatch(/^  Open\s+Authorize with Codex$/m);
-    expect(signInScreen).toMatch(/^Enter reopens browser · Esc cancels$/m);
     expect(signInScreen).not.toContain("Code   ");
     expect(signInScreen).not.toContain(`${chatgptOauth.baseUrl}/oauth/authorize?`);
     const signInEscapes = await session.capturePaneEscapes();
@@ -1221,8 +1158,7 @@ tmuxTest(
       "model_source=Codex subscription",
       TIMEOUT,
     );
-    await session.sendLiteralText("/model");
-    await session.sendKeys("Tab");
+    await session.sendText("/model");
     const picker = await session.waitForPane(
       (pane) =>
         pane.includes("gpt-5.6-sol") &&
@@ -1266,8 +1202,8 @@ tmuxTest(
         `Bearer ${chatgptOauth.accessToken}`,
       );
     }
-    await session.sendText("/model");
-    const codexCatalog = await session.waitForPane(
+    await session.sendText("/models");
+    await session.waitForPane(
       (pane) =>
         pane.includes("Models") &&
         pane.includes("gpt-5.6-sol") &&
@@ -1275,10 +1211,6 @@ tmuxTest(
         !pane.includes("openai/gpt-5.6-sol"),
       TIMEOUT,
     );
-    expect(codexCatalog).toContain("[All]");
-    for (const vendor of ["Anthropic", "OpenAI", "xAI", "Z.AI", "Others"]) {
-      expect(codexCatalog).not.toContain(vendor);
-    }
     await session.sendKeys("Escape");
     await session.waitForPane((pane) => !pane.includes("Esc Close"), TIMEOUT);
     await session.waitForComposer(TIMEOUT);
@@ -2049,7 +1981,7 @@ tmuxTest(
     await session.waitForText("Signed in to Vercel", TIMEOUT);
     await waitForModelRequestCount(gateway, 3);
 
-    await session.sendText("/model");
+    await session.sendText("/models");
     await session.waitForPane(
       (pane) =>
         pane.includes("private/blue-hornbill") &&
@@ -2550,17 +2482,6 @@ tmuxTest(
       await session.sendKeys("Down");
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
-      const collapsed = await session.waitForPane(
-        (pane) =>
-          pane.includes("Authorize with Grok") &&
-          pane.includes("Browser didn't return? Press Tab to enter a code") &&
-          pane.includes("Enter reopens browser · Tab enters code · Esc cancels"),
-        TIMEOUT,
-      );
-      expect(collapsed).toMatch(/^Sign in with Grok\s+Waiting for authorization…$/m);
-      expect(collapsed).toMatch(/^  Open\s+Authorize with Grok$/m);
-      expect(collapsed).not.toContain("Paste or type the code");
-      expect(collapsed).not.toContain(`${grok.baseUrl}/oauth2/authorize?`);
       await completeDisplayedGrokLogin(session, grok);
       await session.waitForText("Switched to Grok subscription with grok-4.20.", TIMEOUT);
       await session.sendText("Answer from Grok.");
@@ -2577,17 +2498,6 @@ tmuxTest(
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       await session.waitForText("Switched to Grok subscription with grok-4.20.", TIMEOUT);
-      await session.sendText("/model");
-      const grokCatalog = await session.waitForPane(
-        (pane) => pane.includes("Models") && pane.includes("grok-4.20"),
-        TIMEOUT,
-      );
-      expect(grokCatalog).toContain("[All]");
-      for (const vendor of ["Anthropic", "OpenAI", "xAI", "Z.AI", "Others"]) {
-        expect(grokCatalog).not.toContain(vendor);
-      }
-      await session.sendKeys("Escape");
-      await session.waitForComposer(TIMEOUT);
       const settingsPath = join(home, ".fx", "settings.json");
       const persistenceDeadline = Date.now() + TIMEOUT;
       let saved: { provider: string; models: { grok: string } } | undefined;
@@ -2615,7 +2525,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "interactive Grok login auto-expands for a bracketed-paste authorization code",
+  "interactive Grok login accepts a bracketed-paste authorization code",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-grok-tui-code-"));
     stderrPath = join(home, "stderr.log");
@@ -2634,27 +2544,17 @@ tmuxTest(
       await session.sendKeys("Down");
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
-      await session.waitForText("Browser didn't return? Press Tab to enter a code", TIMEOUT);
-      await session.pasteText("grok-code");
-      await session.waitForPane(
-        (pane) => pane.includes("•••••••••") && pane.includes("Enter submits"),
-        TIMEOUT,
-      );
-      const expanded = await session.capturePane();
-      expect(expanded).toMatch(/^  Open\s+Authorize with Grok\n\s*\n  Paste the code shown by xAI$/m);
+      await session.waitForText("Paste the code shown by xAI", TIMEOUT);
       await session.resizeWindow(80, 5);
       const compactEntry = await session.waitForPane(
         (pane) =>
-          pane.includes("•••••••••") &&
+          pane.includes("Paste or type the code") &&
           pane.includes("Enter submits") &&
           pane.includes("Esc cancels"),
         TIMEOUT,
       );
       expect(compactEntry).not.toContain("Paste the code shown by xAI");
-      await session.sendKeys("Tab");
-      const collapsedWithDraft = await session.waitForText("Tab enters code", TIMEOUT);
-      expect(collapsedWithDraft).not.toContain("•••••••••");
-      await session.sendKeys("Tab");
+      await session.pasteText("grok-code");
       await session.waitForPane(
         (pane) => pane.includes("•••••••••") && pane.includes("Enter submits"),
         TIMEOUT,
@@ -3065,127 +2965,6 @@ test(
 );
 
 test(
-  "saved provider switching publishes Gateway, Codex, and Grok usage to one profile ledger",
-  async () => {
-    home = mkdtempSync(join(tmpdir(), "fx-provider-usage-ledger-"));
-    const workspace = join(home, "workspace");
-    mkdirSync(workspace, { recursive: true });
-    gateway = startFakeGateway([
-      fakeGatewaySse([
-        {
-          type: "response-metadata",
-          modelId: FAKE_GATEWAY_MODEL,
-          timestamp: new Date().toISOString(),
-        },
-        {
-          type: "text-start",
-          id: "gateway_answer",
-          providerMetadata: {
-            gateway: { generationId: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV" },
-          },
-        },
-        { type: "text-delta", id: "gateway_answer", delta: "GATEWAY_USAGE_OK" },
-        { type: "text-end", id: "gateway_answer" },
-        {
-          type: "finish",
-          finishReason: { unified: "stop", raw: "stop" },
-          usage: {
-            inputTokens: { total: 13 },
-            outputTokens: { total: 4 },
-          },
-          providerMetadata: {
-            gateway: {
-              generationId: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-              cost: "0.01",
-              routing: { canonicalSlug: FAKE_GATEWAY_MODEL },
-            },
-          },
-        },
-      ]),
-    ]);
-    const codex = startFakeDirectUsageProvider(
-      "codex",
-      "gpt-5.6-sol",
-      "response-codex-profile",
-      17,
-      7,
-    );
-    const grok = startFakeDirectUsageProvider(
-      "grok",
-      "grok-4.20",
-      "response-grok-profile",
-      19,
-      5,
-    );
-    try {
-      writeSeededChatGptLogin(home, chatgptAccessToken("acct_usage"));
-      writeSeededGrokLogin(home, "grok-usage-token", "acct_usage");
-      const env = {
-        HOME: home,
-        AI_GATEWAY_API_KEY: "gateway-usage-key",
-        VERCEL_OIDC_TOKEN: undefined,
-        FX_DISABLE_KEYCHAIN: "1",
-        FX_AUTO_UPGRADE: "0",
-        FX_GATEWAY_BASE_URL: gateway.baseUrl,
-        FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
-        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
-        FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
-        FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
-        FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
-      };
-      const settingsPath = join(home, ".fx", "settings.json");
-      const routes = [
-        { settings: { provider: "gateway", model: FAKE_GATEWAY_MODEL }, text: "GATEWAY_USAGE_OK" },
-        { settings: { provider: "codex", codex_model: "gpt-5.6-sol" }, text: "CODEX_USAGE_OK" },
-        { settings: { provider: "grok", grok_model: "grok-4.20" }, text: "GROK_USAGE_OK" },
-      ];
-      for (const route of routes) {
-        writeFileSync(settingsPath, JSON.stringify(route.settings) + "\n", { mode: 0o600 });
-        const result = await runFx(
-          ["ask", "--json", `Return ${route.text}.`],
-          { cwd: workspace, env, timeoutMs: TIMEOUT },
-        );
-        expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-        expect(result.stdout).toContain(route.text);
-      }
-
-      const usage = await runFx(
-        ["usage", "--json", "--period", "24h"],
-        { cwd: workspace, env: { HOME: home }, timeoutMs: TIMEOUT },
-      );
-      expect(usage.code, usage.stderr).toBe(0);
-      const report = JSON.parse(usage.stdout) as {
-        completeness: string;
-        totals: { input_tokens: number; output_tokens: number; request_count: number };
-        models: Array<{ model: string; totals: { request_count: number } }>;
-      };
-      expect(report.completeness).toBe("complete");
-      expect(report.totals).toMatchObject({
-        input_tokens: 49,
-        output_tokens: 16,
-        request_count: 3,
-      });
-      expect(Object.fromEntries(
-        report.models.map((model) => [model.model, model.totals.request_count]),
-      )).toEqual({
-        [FAKE_GATEWAY_MODEL]: 1,
-        "codex/gpt-5.6-sol": 1,
-        "grok/grok-4.20": 1,
-      });
-      expect(gateway.requests).toHaveLength(1);
-      expect(codex.responses).toBe(1);
-      expect(grok.responses).toBe(1);
-    } finally {
-      codex.stop();
-      grok.stop();
-    }
-  },
-  60_000,
-);
-
-test(
   "Codex automatic review uses gpt-5.4-mini while Gateway review stays untouched",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-codex-auto-review-"));
@@ -3228,15 +3007,8 @@ test(
       expect(readSingleUsageSnapshot(home)).toMatchObject({
         billing: "complete",
         api_duration_complete: true,
-        next_sequence: 4,
-        settled_through_sequence: 3,
-        input_tokens: 20,
-        output_tokens: 8,
-        request_count: 3,
-        models: [
-          { model: "codex/gpt-5.6-sol", request_count: 2 },
-          { model: "codex/gpt-5.4-mini", request_count: 1 },
-        ],
+        next_sequence: 1,
+        settled_through_sequence: 0,
         pending: [],
       });
     } finally {
@@ -3299,12 +3071,8 @@ test(
       expect(readSingleUsageSnapshot(home)).toMatchObject({
         billing: "complete",
         api_duration_complete: true,
-        next_sequence: 4,
-        settled_through_sequence: 3,
-        input_tokens: 20,
-        output_tokens: 8,
-        request_count: 3,
-        models: [{ model: "grok/grok-4.20", request_count: 3 }],
+        next_sequence: 1,
+        settled_through_sequence: 0,
         pending: [],
       });
     } finally {
@@ -3851,7 +3619,7 @@ tmuxTest(
     expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${ACQUIRED_LOGIN_TOKEN}`);
     expect(gateway.requests[0].headers.get("x-vercel-ai-gateway-team")).toBe("team_123");
 
-    await session.sendText("/model");
+    await session.sendText("/models");
     await session.waitForPane(
       (pane) =>
         pane.includes("private/blue-hornbill") &&
@@ -3912,7 +3680,7 @@ tmuxTest(
     expect(gateway.modelRequests[0].headers.get("authorization")).toBeNull();
     expect(gateway.modelRequests[0].headers.get("x-vercel-ai-gateway-team")).toBeNull();
 
-    await session.sendText("/model");
+    await session.sendText("/models");
     await session.waitForPane(
       (pane) =>
         pane.includes(FAKE_GATEWAY_MODEL) &&
@@ -3971,7 +3739,7 @@ tmuxTest(
     expect(new URL(gateway.modelRequests[0].url).searchParams.get("teamId")).toBe("team_123");
 
     await Bun.sleep(6_000);
-    await session.sendText("/model");
+    await session.sendText("/models");
     await waitForModelRequestCount(gateway, 2);
     const expiredPane = await session.waitForPane(
       (pane) =>
@@ -4007,7 +3775,7 @@ tmuxTest(
       TIMEOUT,
     );
     await session.sendKeys("C-u");
-    await session.sendText("/model");
+    await session.sendText("/models");
     const failedPane = await session.waitForPane(
       (pane) =>
         pane.includes(FAKE_GATEWAY_MODEL) &&
@@ -4085,7 +3853,7 @@ tmuxTest(
       TIMEOUT,
     );
     await session.sendKeys("C-u");
-    await session.sendText("/model");
+    await session.sendText("/models");
     await session.waitForPane(
       (pane) =>
         pane.includes("Vercel sign-in refresh failed; using the public model catalog.") &&
@@ -4259,7 +4027,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     await waitForModelRequestCount(gateway, 1);
 
-    await session.sendText("/model");
+    await session.sendText("/models");
     const pane = await session.waitForPane(
       (text) =>
         text.includes(FAKE_GATEWAY_MODEL) &&
@@ -4298,7 +4066,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     await waitForModelRequestCount(gateway, 2);
 
-    await session.sendText("/model");
+    await session.sendText("/models");
     const pane = await session.waitForPane(
       (text) =>
         text.includes(FAKE_GATEWAY_MODEL) &&
@@ -4355,7 +4123,7 @@ for (const scenario of [
       await session.waitForComposer(TIMEOUT);
       await waitForModelRequestCount(gateway, scenario.authenticated ? 2 : 1);
 
-      await session.sendText("/model");
+      await session.sendText("/models");
       const pane = await session.waitForPane(
         (text) => text.includes("No models available.") && text.includes(scenario.status),
         TIMEOUT,
