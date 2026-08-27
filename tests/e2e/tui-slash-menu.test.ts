@@ -2995,6 +2995,150 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
+    "Modal GLM model picker exposes provider-specific reasoning efforts",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const selectedModel = "glm-5-3-flash";
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_PROVIDER: "modal",
+          FX_MODEL: selectedModel,
+          MODAL_PROXY_TOKEN_ID: "fake-modal-token-id",
+          MODAL_PROXY_TOKEN_SECRET: "fake-modal-token-secret",
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("/model");
+      await waitForModelsMenu(session, 4);
+      await session.sendKeys("Escape");
+      await session.waitForPane(hasEmptyComposer, 5_000);
+
+      await session.sendLiteralText(`/model ${selectedModel}`);
+      await session.sendKeys("Enter");
+      let effortPane = await session.waitForPane(
+        (current) =>
+          composerContains(current, `/model ${selectedModel}`) &&
+          current.includes("minimal") &&
+          current.includes("high"),
+        10_000,
+      );
+      for (const effort of ["default", "none", "minimal", "low", "medium", "high"]) {
+        expect(effortPane).toContain(effort);
+      }
+
+      for (let index = 0; index < 6; index += 1) await session.sendKeys("Down");
+      effortPane = await session.waitForText("xhigh", 5_000);
+      expect(effortPane).toContain("xhigh");
+      await session.sendKeys("Down");
+      effortPane = await session.waitForText("max", 5_000);
+      expect(effortPane).toContain("max");
+      await session.sendKeys("Up");
+      await session.sendKeys("Enter");
+      await session.waitForPane(hasEmptyComposer, 5_000);
+
+      const settings = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as {
+        effort?: string;
+        models?: { modal?: string };
+      };
+      expect(settings.effort).toBe("xhigh");
+      expect(settings.models?.modal).toBe(selectedModel);
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "Fireworks GLM model picker exposes the verified Fireworks effort set",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const selectedModel = "accounts/fireworks/models/glm-5p3-flash";
+      gateway = startFakeGateway([], {
+        models: () => Response.json({
+          data: [{
+            id: selectedModel,
+            kind: "HF_BASE_MODEL",
+            supports_chat: true,
+            supports_tools: true,
+          }],
+        }),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_PROVIDER: "fireworks",
+          FX_MODEL: selectedModel,
+          FIREWORKS_API_KEY: "fake-fireworks-key",
+          FX_E2E_FIREWORKS_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("/model");
+      await waitForModelsMenu(session, 1);
+      await session.sendKeys("Escape");
+      await session.waitForPane(hasEmptyComposer, 5_000);
+
+      await session.sendLiteralText(`/model ${selectedModel}`);
+      await session.sendKeys("Enter");
+      const effortPane = await session.waitForPane(
+        (current) =>
+          composerContains(current, `/model ${selectedModel}`) &&
+          current.includes("xhigh") &&
+          current.includes("max"),
+        10_000,
+      );
+      for (const effort of ["default", "low", "medium", "high", "xhigh", "max"]) {
+        expect(effortPane).toContain(effort);
+      }
+      expect(effortPane).not.toContain("minimal");
+      expect(effortPane).not.toContain("adaptive");
+
+      await session.sendLiteralText("xhigh");
+      await session.sendKeys("Enter");
+      await session.waitForPane(hasEmptyComposer, 5_000);
+
+      const settings = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as {
+        effort?: string;
+        models?: { fireworks?: string };
+      };
+      expect(settings.effort).toBe("xhigh");
+      expect(settings.models?.fireworks).toBe(selectedModel);
+      expect(gateway.modelRequests).toHaveLength(1);
+      expect(gateway.modelRequests[0]!.headers.get("authorization")).toBe(
+        "Bearer fake-fireworks-key",
+      );
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "skills catalog retains input ownership for global view shortcuts",
     async () => {
       const fixture = createSkillsMenuFixture();
