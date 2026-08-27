@@ -28,8 +28,14 @@ import {
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewayToolCall,
   startFakeGateway,
 } from "./tmux-helpers";
+import {
+  parseGatewayRequest,
+  READ_ONLY_SERIALIZED_TOOL_NAMES,
+  serializedToolNames,
+} from "./conditional-guidance-oracle";
 
 const TIMEOUT = 15_000;
 const NO_GATEWAY_AUTH = {
@@ -310,11 +316,12 @@ describe("cli: help", () => {
 Run one noninteractive request
 
 Usage:
-  fx ask [--auto|--yolo] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
+  fx ask [--auto|--yolo] [--read-only] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
 
 Options:
   --auto                Automatically review unresolved permission requests
   --yolo                Disable fx permission checks
+  --read-only           Restrict the model to read-only inspection tools
   --image PATH          Attach an image file; repeat for multiple images
   --json                Emit machine-readable JSON instead of text
   --quiet               Suppress assistant output
@@ -4022,7 +4029,7 @@ describe("cli: ask success", () => {
       expect(jsonResult.code).toBe(1);
       expect(jsonResult.stderr).toBe("");
       expect(jsonResult.stdout).toBe(
-        '{"output":"","final_output":"","exit_code":1,"model":"","session_id":"","steps":0,"tool_calls":[],"error":"PromptResourceLimitExceeded"}\n',
+        '{"output":"","final_output":"","exit_code":1,"model":"","mode":"","session_id":"","steps":0,"tool_calls":[],"error":"PromptResourceLimitExceeded"}\n',
       );
     },
     120_000,
@@ -4284,6 +4291,139 @@ describe("cli: ask success", () => {
         expect(gateway.requests[2]?.headers.get("x-session-affinity")).toBeNull();
         expect(existsSync(join(noSaveHome, ".fx"))).toBe(false);
         expect(gateway.requests).toHaveLength(3);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    180_000,
+  );
+
+  test(
+    "read-only ask limits tools and remains scoped to one resumed invocation",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-read-only-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const readable = join(workspace, "fixture.txt");
+      const blocked = join(workspace, "blocked.txt");
+      const fixture = "READ_ONLY_FIXTURE_CONTENT";
+      mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+      mkdirSync(workspace);
+      writeFileSync(readable, `${fixture}\n`);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({
+          permission_mode: "ask",
+          yolo_acknowledged: true,
+          permission: { edit: "deny" },
+        }) + "\n",
+        { mode: 0o600 },
+      );
+
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("normal session created"),
+        fakeGatewayToolCall("read_only_read", "read_file", {
+          path: readable,
+        }),
+        (body) => {
+          expect(body).toContain(fixture);
+          return fakeGatewayToolCall("read_only_write", "write_file", {
+            path: blocked,
+            content: "must not be written",
+          });
+        },
+        (body) => {
+          expect(body).toContain("tool_execution_failed");
+          expect(body).toContain(
+            "Read-only mode only allows read-only inspection tools.",
+          );
+          return fakeGatewayFinalText("read-only policy enforced");
+        },
+        fakeGatewayFinalText("normal mode restored"),
+      ]);
+
+      try {
+        const cwd = realpathSync(workspace);
+        const env = {
+          HOME: realpathSync(home),
+          AI_GATEWAY_API_KEY: "fake-read-only-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_AUTO_UPGRADE: "0",
+        };
+        const first = await runFx(
+          ["ask", "--json", "--yolo", "Create a normal saved session."],
+          { cwd, env, timeoutMs: 60_000 },
+        );
+        expect(first.code).toBe(0);
+        expect(first.stderr).toBe("");
+        const firstJson = JSON.parse(first.stdout);
+        expect(firstJson.mode).toBe("ask");
+        expect(firstJson.session_id.length).toBeGreaterThan(0);
+
+        const restricted = await runFx(
+          [
+            "ask",
+            "--json",
+            "--yolo",
+            "--read-only",
+            "--resume-id",
+            firstJson.session_id,
+            "Read the fixture, then try the requested write.",
+          ],
+          { cwd, env, timeoutMs: 60_000 },
+        );
+        expect(restricted.code).toBe(0);
+        const progressLines = restricted.stderr.split("\n").filter((line) =>
+          line.length > 0 && !line.startsWith("[notice]")
+        );
+        expect(progressLines.length).toBeGreaterThan(0);
+        expect(new Set(progressLines).size).toBe(progressLines.length);
+        const restrictedJson = JSON.parse(restricted.stdout);
+        expect(restrictedJson.mode).toBe("read_only");
+        expect(restrictedJson.session_id).toBe(firstJson.session_id);
+        expect(restrictedJson.tool_calls).toEqual([
+          { name: "read_file", status: "success" },
+          { name: "write_file", status: "error" },
+        ]);
+        expect(existsSync(blocked)).toBe(false);
+
+        const restored = await runFx(
+          [
+            "ask",
+            "--json",
+            "--yolo",
+            "--resume-id",
+            firstJson.session_id,
+            "Confirm normal mode is restored.",
+          ],
+          { cwd, env, timeoutMs: 60_000 },
+        );
+        expect(restored.code).toBe(0);
+        expect(restored.stderr).toBe("");
+        const restoredJson = JSON.parse(restored.stdout);
+        expect(restoredJson.mode).toBe("ask");
+        expect(restoredJson.session_id).toBe(firstJson.session_id);
+
+        expect(gateway.requests).toHaveLength(5);
+        expect(
+          serializedToolNames(parseGatewayRequest(gateway.requests[0]!.body)),
+        ).toContain("write_file");
+        for (const index of [1, 2, 3]) {
+          expect(
+            serializedToolNames(
+              parseGatewayRequest(gateway.requests[index]!.body),
+            ),
+          ).toEqual([...READ_ONLY_SERIALIZED_TOOL_NAMES, "vision"]);
+        }
+        expect(
+          serializedToolNames(parseGatewayRequest(gateway.requests[4]!.body)),
+        ).toContain("write_file");
+        expect(gateway.classifierRequests).toHaveLength(0);
       } finally {
         gateway.stop();
         rmSync(root, { recursive: true, force: true });
@@ -4604,7 +4744,7 @@ describe("cli: error handling", () => {
             "fx ask: --no-save cannot be used with --resume or --resume-id",
           );
           expect(rejected.stderr).toContain(
-            "usage: fx ask [--auto|--yolo] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save]",
+            "usage: fx ask [--auto|--yolo] [--read-only] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save]",
           );
         }
         expect(gateway.requests).toHaveLength(0);

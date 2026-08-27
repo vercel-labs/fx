@@ -40,11 +40,11 @@ pub const Registry = struct {
         id: []const u8,
         tool_name: []const u8,
     ) bool {
-        if (tool_set.registry.lookup(tool_name) == null) return true;
         const mode = self.lookup(id) orelse return true;
         return switch (mode.tool_policy) {
             .full => true,
-            .read_only => nameInSet(tool_set.read_only_tool_names, tool_name),
+            .read_only => tool_set.registry.lookup(tool_name) != null and
+                nameInSet(tool_set.read_only_tool_names, tool_name),
         };
     }
 
@@ -84,7 +84,7 @@ test "mode registry looks up modes by id" {
     try std.testing.expect(registry.lookup("missing") == null);
 }
 
-test "mode registry applies tool policy to the supplied tool set" {
+test "mode registry applies read-only tool policy to the supplied tool set" {
     const Fixture = struct {
         fn decode(ctx: tool_dispatch.DispatchContext, _: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
             return .{ .failure = try ctx.allocator.dupe(u8, "unused") };
@@ -151,7 +151,8 @@ test "mode registry applies tool policy to the supplied tool set" {
     try std.testing.expect(registry.toolAllowed(tool_set, "inspect", "inspect"));
     try std.testing.expect(!registry.toolAllowed(tool_set, "inspect", "mutate"));
     try std.testing.expect(registry.toolAllowed(tool_set, "missing", "mutate"));
-    try std.testing.expect(registry.toolAllowed(tool_set, "inspect", "dynamic_tool"));
+    try std.testing.expect(registry.toolAllowed(tool_set, "full", "dynamic_tool"));
+    try std.testing.expect(!registry.toolAllowed(tool_set, "inspect", "dynamic_tool"));
 
     const denied = try registry.toolPolicyDeniedJson(
         std.testing.allocator,
@@ -161,4 +162,13 @@ test "mode registry applies tool policy to the supplied tool set" {
     ) orelse return error.TestExpectedEqual;
     defer std.testing.allocator.free(denied);
     try std.testing.expect(std.mem.find(u8, denied, "Inspection mode blocks mutations.") != null);
+
+    const dynamic_denied = try registry.toolPolicyDeniedJson(
+        std.testing.allocator,
+        tool_set,
+        "inspect",
+        "dynamic_tool",
+    ) orelse return error.TestExpectedEqual;
+    defer std.testing.allocator.free(dynamic_denied);
+    try std.testing.expect(std.mem.find(u8, dynamic_denied, "Inspection mode blocks mutations.") != null);
 }

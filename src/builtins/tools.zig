@@ -2214,6 +2214,7 @@ pub const read_only_tool_names = [_][]const u8{
     "glob_files",
     "grep_files",
     "list_files",
+    "vision",
 };
 
 pub fn isReadOnlyToolName(name: []const u8) bool {
@@ -3258,6 +3259,7 @@ test "built-in read-only tool set matches plan inspection tools" {
         "glob_files",
         "grep_files",
         "list_files",
+        "vision",
     };
 
     try std.testing.expectEqual(expected_names.len, read_only_tool_names.len);
