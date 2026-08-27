@@ -42,6 +42,14 @@ const DIRECT_LOGIN_RESPONSE = "DIRECT_LOGIN_RESPONSE";
 const LOGOUT_FALLBACK_RESPONSE = "LOGOUT_FALLBACK_RESPONSE";
 const REFRESH_RECOVERY_RESPONSE = "REFRESH_RECOVERY_RESPONSE";
 const ACQUIRED_LOGIN_TOKEN = "acquired-login-token";
+const TEAM_WARNING_CLI =
+  "Your teams could not be loaded, so this session is personal scope for now. Run fx teams to pick a team.";
+const TEAM_WARNING_TUI =
+  "Your teams could not be loaded, so this session is personal scope for now. Open /login and choose Change team.";
+// Every silence control asserts the ABSENCE of this needle, so it has to be a
+// real substring of the warnings. Untie the two and those controls start
+// checking for a string that can never appear and pass while proving nothing.
+const TEAM_WARNING_NEEDLE = "personal scope for now";
 
 function grokSubscriptionModel(id: string, contextWindow: number, efforts: string[] = []) {
   return {
@@ -316,6 +324,8 @@ function startFakeOAuth(
     rejectAllDeviceClients?: boolean;
     tokenDelayMs?: number;
     teams?: Array<{ id: string; slug: string; name: string }>;
+    /// Overrides the /v2/teams response entirely. Takes precedence over `teams`.
+    teamsResponse?: { status: number; body: string };
   } = {},
 ) {
   const providerDetail = `provider rejected ${LOGIN_TOKEN}, ${ENV_TOKEN}, and seeded-refresh-token`;
@@ -394,6 +404,11 @@ function startFakeOAuth(
           });
         }
         case "/v2/teams":
+          if (options.teamsResponse) {
+            return new Response(options.teamsResponse.body, {
+              status: options.teamsResponse.status,
+            });
+          }
           return Response.json({ teams: options.teams ?? [] });
         case "/oauth/revoke": {
           const form = await request.formData();
@@ -1813,6 +1828,52 @@ tmuxTest(
 );
 
 tmuxTest(
+  "TUI sign-in warns when the teams request fails",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-login-teams-fail-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth(
+      ACQUIRED_LOGIN_TOKEN,
+      undefined,
+      3600,
+      Number.POSITIVE_INFINITY,
+      { teamsResponse: { status: 500, body: `upstream unavailable: ${LOGIN_TOKEN}` } },
+    );
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForText("Connections", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Vercel account", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Signed in to Vercel", TIMEOUT);
+    // writeAuthNotice flushes per call, so the two notices land in separate
+    // flushes; wait for the second before capturing or this races.
+    await session.waitForText(TEAM_WARNING_NEEDLE, TIMEOUT);
+
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback).toContain("Signed in to Vercel.");
+    // The notice soft-wraps at the pane width, so the full body is never a
+    // contiguous substring here. This asserts the warning reached the screen;
+    // its exact text and ordering are pinned by the Zig unit test in
+    // src/core/app/app_auth_runtime.zig.
+    expect(scrollback).toContain(TEAM_WARNING_NEEDLE);
+    expect(scrollback).not.toContain(LOGIN_TOKEN);
+    expect(scrollback).not.toContain(ACQUIRED_LOGIN_TOKEN);
+    const persisted = JSON.parse(
+      readFileSync(join(home, ".fx", "auth.json"), "utf8"),
+    ) as Record<string, unknown>;
+    expect(persisted.team_slug).toBeUndefined();
+    expect(persisted.team_id).toBeUndefined();
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
   "API key and fx login coexist through selection, restart, login, and logout",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-lifecycle-"));
@@ -1904,9 +1965,13 @@ tmuxTest(
     expect(acquiredAuth.access_token).toBe(ACQUIRED_LOGIN_TOKEN);
     expect(acquiredAuth.refresh_token).toBe("acquired-refresh-token");
     expect(statSync(authPath).mode & 0o777).toBe(0o600);
-    expect(
-      (await session.captureFullScrollback()).match(/Signed in to Vercel\./g) ?? [],
-    ).toHaveLength(1);
+    const signedInScrollback = await session.captureFullScrollback();
+    expect(signedInScrollback.match(/Signed in to Vercel\./g) ?? []).toHaveLength(1);
+    // This account has no teams (startFakeOAuth is called with no `teams` option),
+    // so the team-fetch warning must not appear. The needle is the clause unique to
+    // that warning: "could not be loaded" is already emitted by the credential-load
+    // failure notice in the same sign-in arm.
+    expect(signedInScrollback).not.toContain(TEAM_WARNING_NEEDLE);
 
     await session.sendText("/status");
     await session.waitForText("auth=fx login", TIMEOUT);
@@ -2178,6 +2243,235 @@ test(
     expect(result.stdout.match(/Code: TEST-CODE/g) ?? []).toHaveLength(1);
     expect(result.stdout).not.toContain(oauth.providerDetail);
     expect(result.stderr).toBe("");
+  },
+  60_000,
+);
+
+function loginEnv(testHome: string, issuerUrl: string) {
+  return {
+    HOME: testHome,
+    AI_GATEWAY_API_KEY: undefined,
+    VERCEL_OIDC_TOKEN: undefined,
+    FX_DISABLE_KEYCHAIN: "1",
+    FX_SKIP_ONBOARDING: "1",
+    FX_AUTO_UPGRADE: "0",
+    FX_NO_OPEN_BROWSER: "1",
+    FX_OAUTH_CLIENT_ID: "test-client",
+    FX_E2E_OAUTH_ISSUER_URL: issuerUrl,
+  };
+}
+
+function persistedAuth(testHome: string): Record<string, unknown> {
+  return JSON.parse(
+    readFileSync(join(testHome, ".fx", "auth.json"), "utf8"),
+  ) as Record<string, unknown>;
+}
+
+test("the silence-control needle is a substring of both warnings", () => {
+  expect(TEAM_WARNING_CLI).toContain(TEAM_WARNING_NEEDLE);
+  expect(TEAM_WARNING_TUI).toContain(TEAM_WARNING_NEEDLE);
+});
+
+test(
+  "fx login warns when the teams request fails",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-login-teams-500-"));
+    oauth = startFakeOAuth(
+      ACQUIRED_LOGIN_TOKEN,
+      undefined,
+      3600,
+      Number.POSITIVE_INFINITY,
+      { teamsResponse: { status: 500, body: `upstream unavailable: ${LOGIN_TOKEN}` } },
+    );
+
+    const result = await runFx(["login"], {
+      env: loginEnv(home, oauth.issuerUrl),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain("Signed in to Vercel.");
+    expect(result.stdout).toContain(TEAM_WARNING_CLI);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).not.toContain(LOGIN_TOKEN);
+    expect(result.stdout).not.toContain(ACQUIRED_LOGIN_TOKEN);
+    const persisted = persistedAuth(home);
+    expect(persisted.team_slug).toBeUndefined();
+    expect(persisted.team_id).toBeUndefined();
+    expect(persisted.access_token).toBe(ACQUIRED_LOGIN_TOKEN);
+  },
+  60_000,
+);
+
+test(
+  "fx login warns when the teams response is not JSON",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-login-teams-garbage-"));
+    oauth = startFakeOAuth(
+      ACQUIRED_LOGIN_TOKEN,
+      undefined,
+      3600,
+      Number.POSITIVE_INFINITY,
+      { teamsResponse: { status: 200, body: `<html>${LOGIN_TOKEN}</html>` } },
+    );
+
+    const result = await runFx(["login"], {
+      env: loginEnv(home, oauth.issuerUrl),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain("Signed in to Vercel.");
+    expect(result.stdout).toContain(TEAM_WARNING_CLI);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).not.toContain(LOGIN_TOKEN);
+    expect(result.stdout).not.toContain(ACQUIRED_LOGIN_TOKEN);
+    const persisted = persistedAuth(home);
+    expect(persisted.team_slug).toBeUndefined();
+    expect(persisted.team_id).toBeUndefined();
+  },
+  60_000,
+);
+
+test(
+  "fx login warns when every teams entry is unreadable",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-login-teams-drift-"));
+    oauth = startFakeOAuth(
+      ACQUIRED_LOGIN_TOKEN,
+      undefined,
+      3600,
+      Number.POSITIVE_INFINITY,
+      { teamsResponse: { status: 200, body: '{"teams":[{"id":123,"slug":"acme"}]}' } },
+    );
+
+    const result = await runFx(["login"], {
+      env: loginEnv(home, oauth.issuerUrl),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain("Signed in to Vercel.");
+    expect(result.stdout).toContain(TEAM_WARNING_CLI);
+    expect(result.stderr).toBe("");
+    const persisted = persistedAuth(home);
+    expect(persisted.team_slug).toBeUndefined();
+  },
+  60_000,
+);
+
+test(
+  "fx login warns when only some teams entries are unreadable",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-login-teams-partial-"));
+    oauth = startFakeOAuth(
+      ACQUIRED_LOGIN_TOKEN,
+      undefined,
+      3600,
+      Number.POSITIVE_INFINITY,
+      {
+        teamsResponse: {
+          status: 200,
+          body: '{"teams":[{"id":"team_123","slug":"example-internal-team","name":"Example Internal Team"},{"id":99,"slug":"unreadable"}]}',
+        },
+      },
+    );
+
+    const result = await runFx(["login"], {
+      env: loginEnv(home, oauth.issuerUrl),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+    // The readable team is still selected, and the user is told the list was
+    // incomplete, because the team they wanted may be the one that was dropped.
+    expect(persistedAuth(home).team_slug).toBe("example-internal-team");
+    expect(result.stdout).toContain(TEAM_WARNING_CLI);
+  },
+  60_000,
+);
+
+test(
+  "fx login warns when the teams request is rejected",
+  async () => {
+    for (const status of [401, 403]) {
+      home = mkdtempSync(join(tmpdir(), `fx-login-teams-${status}-`));
+      oauth = startFakeOAuth(
+        ACQUIRED_LOGIN_TOKEN,
+        undefined,
+        3600,
+        Number.POSITIVE_INFINITY,
+        { teamsResponse: { status, body: "forbidden" } },
+      );
+
+      const result = await runFx(["login"], {
+        env: loginEnv(home, oauth.issuerUrl),
+        timeoutMs: TIMEOUT,
+      });
+
+      expect(result.code, `status ${status} stdout: ${result.stdout}`).toBe(0);
+      expect(result.stdout).toContain(TEAM_WARNING_CLI);
+      expect(result.stderr).toBe("");
+      expect(persistedAuth(home).team_slug).toBeUndefined();
+      oauth.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+    home = undefined;
+    oauth = undefined;
+  },
+  90_000,
+);
+
+test(
+  "fx login persists the team and stays quiet on success",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-login-teams-ok-"));
+    oauth = startFakeOAuth(
+      ACQUIRED_LOGIN_TOKEN,
+      undefined,
+      3600,
+      Number.POSITIVE_INFINITY,
+      {
+        teams: [
+          { id: "team_123", slug: "example-internal-team", name: "Example Internal Team" },
+        ],
+      },
+    );
+
+    const result = await runFx(["login"], {
+      env: loginEnv(home, oauth.issuerUrl),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain("Signed in to Vercel.");
+    expect(result.stdout).not.toContain(TEAM_WARNING_NEEDLE);
+    expect(result.stderr).toBe("");
+    const persisted = persistedAuth(home);
+    expect(persisted.team_slug).toBe("example-internal-team");
+    expect(persisted.team_id).toBe("team_123");
+  },
+  60_000,
+);
+
+test(
+  "fx login stays quiet for an account with no teams",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-login-teams-empty-"));
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN);
+
+    const result = await runFx(["login"], {
+      env: loginEnv(home, oauth.issuerUrl),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain("Signed in to Vercel.");
+    expect(result.stdout).not.toContain(TEAM_WARNING_NEEDLE);
+    expect(result.stderr).toBe("");
+    const persisted = persistedAuth(home);
+    expect(persisted.team_slug).toBeUndefined();
+    expect(persisted.team_id).toBeUndefined();
   },
   60_000,
 );

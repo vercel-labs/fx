@@ -389,6 +389,9 @@ pub fn Runtime(comptime App: type) type {
                             }
                             rememberCredentialSource(app, .fx_login);
 
+                            // openTeamPicker takes the selection, so read the flag first.
+                            const team_fetch_failed = selection.team_fetch_failed;
+
                             if (selection.teams.items.len > 0) {
                                 app.auth.openTeamPicker(app.alloc, selection);
                             } else {
@@ -399,6 +402,13 @@ pub fn Runtime(comptime App: type) type {
                                 .tone = .neutral,
                                 .body = "Signed in to Vercel.",
                             });
+                            if (team_fetch_failed) {
+                                try writeAuthNotice(app, .{
+                                    .topic = "auth",
+                                    .tone = .warning,
+                                    .body = login_flow.team_fetch_warning_interactive,
+                                });
+                            }
                         },
                         .chatgpt => {
                             try finishSubscriptionSignIn(app, .codex);
@@ -1457,6 +1467,7 @@ const TestAuth = struct {
     catalog_ready: bool = true,
     gateway_ready_after_refresh_count: ?usize = null,
     team_selection: TestTeamSelection = .{},
+    taken_selection: login_flow.TeamSelection = .{},
     selected_team_adopted: bool = false,
     sign_in_url: ?[]const u8 = null,
     picker_pop_count: usize = 0,
@@ -1556,7 +1567,11 @@ const TestAuth = struct {
         return .empty;
     }
 
-    fn openTeamPicker(_: *TestAuth, _: std.mem.Allocator, _: *login_flow.TeamSelection) void {}
+    fn openTeamPicker(self: *TestAuth, alloc: std.mem.Allocator, selection: *login_flow.TeamSelection) void {
+        // Mirrors the real picker, which takes ownership of the selection.
+        self.taken_selection.deinit(alloc);
+        self.taken_selection = selection.take();
+    }
 
     fn refreshFxLoginIfNeeded(self: *TestAuth, _: std.mem.Allocator) !bool {
         self.refresh_count += 1;
@@ -1692,6 +1707,7 @@ const TestApp = struct {
     } = .{},
     model_cache_warmup_count: usize = 0,
     notice_write_count: usize = 0,
+    last_notice_tone: ?types.NoticeTone = null,
     transcript: std.ArrayList(u8) = .empty,
     test_url_opener: TestUrlOpener = .{},
     preference_write_count: usize = 0,
@@ -1703,6 +1719,7 @@ const TestApp = struct {
 
     fn deinit(self: *TestApp) void {
         self.transcript.deinit(self.alloc);
+        self.auth.taken_selection.deinit(self.alloc);
     }
 
     fn startModelCacheWarmup(self: *TestApp) void {
@@ -1715,6 +1732,7 @@ const TestApp = struct {
 
     fn writeDomainNotice(self: *TestApp, notice: types.SemanticNotice, _: bool) !void {
         self.notice_write_count += 1;
+        self.last_notice_tone = notice.tone;
         try self.transcript.appendSlice(self.alloc, notice.body);
         try self.transcript.append(self.alloc, '\n');
     }
@@ -1965,6 +1983,35 @@ test "successful direct login remembers fx login after activation" {
     try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
 }
 
+test "a failed team fetch warns even when the picker consumed the selection" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.select_result = true;
+
+    // A team present alongside a failed fetch is the one combination the e2e
+    // cannot reach, because a failed fetch always yields an empty list today.
+    // It is what pins reading the flag before openTeamPicker takes the selection.
+    var teams: std.ArrayList(login_flow.Team) = .empty;
+    try teams.append(app.alloc, .{
+        .id = try app.alloc.dupe(u8, "team_123"),
+        .slug = try app.alloc.dupe(u8, "example-internal-team"),
+        .name = try app.alloc.dupe(u8, "Example Internal Team"),
+    });
+    app.auth.sign_in_transition = .{ .succeeded = .{ .vercel = .{
+        .teams = teams,
+        .team_fetch_failed = true,
+    } } };
+
+    try Runtime(TestApp).collectSignInFacts(&app);
+
+    try std.testing.expectEqual(@as(usize, 2), app.notice_write_count);
+    try std.testing.expectEqual(types.NoticeTone.warning, app.last_notice_tone.?);
+    try std.testing.expectEqualStrings(
+        "Signed in to Vercel.\n" ++ login_flow.team_fetch_warning_interactive ++ "\n",
+        app.transcript.items,
+    );
+}
+
 test "direct login source load failure leaves the environment preference unchanged" {
     var app: TestApp = .{};
     defer app.deinit();
@@ -2029,6 +2076,20 @@ test "cancelled login and rejected API key do not persist a source" {
 
     try std.testing.expectEqual(@as(usize, 0), app.preference_write_count);
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, app.auth.active_source.?);
+}
+
+test "a cancelled sign-in writes no team warning" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    // The cancelled arm carries no completion, so there is no selection to read
+    // a failed fetch from. This pins that: emitting the warning from
+    // completeSignIn instead of here would warn about a session never created.
+    app.auth.sign_in_transition = .cancelled;
+
+    try Runtime(TestApp).collectSignInFacts(&app);
+
+    try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+    try std.testing.expectEqualStrings("", app.transcript.items);
 }
 
 test "team source load failure preserves the environment source and preference" {

@@ -37,6 +37,12 @@ const LogoutError = error{SessionDeleteFailed};
 
 pub const remote_revocation_warning = "Warning: signed out locally, but the remote session could not be revoked.";
 
+/// Shared lead-in for both sign-in surfaces. The remedy differs per surface, so
+/// each one appends its own tail rather than sending a TUI user to a shell.
+pub const team_fetch_warning_prefix = "Your teams could not be loaded, so this session is personal scope for now.";
+pub const team_fetch_warning_cli = team_fetch_warning_prefix ++ " Run fx teams to pick a team.";
+pub const team_fetch_warning_interactive = team_fetch_warning_prefix ++ " Open /login and choose Change team.";
+
 pub const LogoutResult = struct {
     session_deleted: bool = false,
     local_durability_failed: bool = false,
@@ -70,6 +76,10 @@ pub const SelectedTeam = struct {
 pub const TeamSelection = struct {
     session: ?oauth_session.Session = null,
     teams: std.ArrayList(Team) = .empty,
+    /// True when the team fetch errored, as opposed to returning no teams. An
+    /// account with no teams is a normal state; a failed fetch is not, and only
+    /// the second one warrants telling the user the session is personal scope.
+    team_fetch_failed: bool = false,
 
     pub fn deinit(self: *TeamSelection, alloc: Allocator) void {
         if (self.session) |*session| session.deinit(alloc);
@@ -532,13 +542,22 @@ fn completeSignIn(
     client_id: []const u8,
     token: *oauth.TokenSet,
 ) !SignInCompletion {
-    var teams = fetchTeams(alloc, token.access_token, issuer_url) catch std.ArrayList(Team).empty;
+    var team_fetch_failed = false;
+    const parsed = fetchTeams(alloc, token.access_token, issuer_url) catch blk: {
+        team_fetch_failed = true;
+        break :blk ParsedTeams{};
+    };
+    // A partly unreadable list is also worth saying: the team they want may be
+    // one of the entries that did not survive parsing.
+    if (parsed.dropped > 0) team_fetch_failed = true;
+    var teams = parsed.teams;
     errdefer freeTeams(alloc, &teams);
     const now_ms = io_mod.milliTimestamp();
     const session = try take_login_session(alloc, issuer_url, client_id, token, null, now_ms);
     return .{ .vercel = .{
         .session = session,
         .teams = teams,
+        .team_fetch_failed = team_fetch_failed,
     } };
 }
 
@@ -579,7 +598,13 @@ pub fn runLogin(
     );
     defer token.deinit(alloc);
 
-    var teams = fetchTeams(alloc, token.access_token, prepared.metadata.issuer) catch std.ArrayList(Team).empty;
+    var team_fetch_failed = false;
+    const parsed = fetchTeams(alloc, token.access_token, prepared.metadata.issuer) catch blk: {
+        team_fetch_failed = true;
+        break :blk ParsedTeams{};
+    };
+    if (parsed.dropped > 0) team_fetch_failed = true;
+    var teams = parsed.teams;
     defer freeTeams(alloc, &teams);
     const selected_team_index = try selectTeam(alloc, teams.items, null);
     const selected_team = if (selected_team_index) |index| &teams.items[index] else null;
@@ -598,6 +623,7 @@ pub fn runLogin(
     try oauth_session.saveNewSession(alloc, session);
     try writeStdout("Signed in to Vercel.\n");
     try writeStdout("AI Gateway access may still require billing or API setup for the selected account.\n");
+    if (team_fetch_failed) try writeStdout(team_fetch_warning_cli ++ "\n");
 }
 
 fn take_login_session(
@@ -676,10 +702,10 @@ pub fn loadTeamSelection(
     };
     errdefer session.deinit(alloc);
 
-    const teams = try fetchTeams(alloc, session.access_token, session.issuer);
+    const parsed = try fetchTeams(alloc, session.access_token, session.issuer);
     return .{
         .session = session,
-        .teams = teams,
+        .teams = parsed.teams,
     };
 }
 
@@ -1023,7 +1049,7 @@ fn discardStdinLine() void {
     }
 }
 
-fn fetchTeams(alloc: Allocator, access_token: []const u8, issuer_url: []const u8) !std.ArrayList(Team) {
+fn fetchTeams(alloc: Allocator, access_token: []const u8, issuer_url: []const u8) !ParsedTeams {
     if (comptime host_target.is_wasm) return fetchTeamsFromJsHost(alloc, access_token, issuer_url);
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
@@ -1061,7 +1087,7 @@ fn fetchTeamsFromJsHost(
     alloc: Allocator,
     access_token: []const u8,
     issuer_url: []const u8,
-) !std.ArrayList(Team) {
+) !ParsedTeams {
     const e2e_endpoint = if (oauth_session.isLoopbackE2EIssuer(issuer_url))
         try std.fmt.allocPrint(alloc, "{s}/v2/teams", .{issuer_url})
     else
@@ -1075,7 +1101,14 @@ fn fetchTeamsFromJsHost(
     return parseTeams(alloc, response.body);
 }
 
-fn parseTeams(alloc: Allocator, bytes: []const u8) !std.ArrayList(Team) {
+/// Teams read from a response, plus how many entries were unreadable. A drop
+/// count of zero is the only case where the list is known to be complete.
+const ParsedTeams = struct {
+    teams: std.ArrayList(Team) = .empty,
+    dropped: usize = 0,
+};
+
+fn parseTeams(alloc: Allocator, bytes: []const u8) !ParsedTeams {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
     defer parsed.deinit();
 
@@ -1087,11 +1120,24 @@ fn parseTeams(alloc: Allocator, bytes: []const u8) !std.ArrayList(Team) {
 
     var teams: std.ArrayList(Team) = .empty;
     errdefer freeTeams(alloc, &teams);
+    var dropped: usize = 0;
     for (teams_value.array.items) |entry| {
-        if (entry != .object) continue;
-        const id = entry.object.get("id") orelse continue;
-        const slug = entry.object.get("slug") orelse continue;
-        if (id != .string or slug != .string) continue;
+        if (entry != .object) {
+            dropped += 1;
+            continue;
+        }
+        const id = entry.object.get("id") orelse {
+            dropped += 1;
+            continue;
+        };
+        const slug = entry.object.get("slug") orelse {
+            dropped += 1;
+            continue;
+        };
+        if (id != .string or slug != .string) {
+            dropped += 1;
+            continue;
+        }
         const name_value = entry.object.get("name");
         const name = if (name_value != null and name_value.? == .string and name_value.?.string.len > 0)
             name_value.?.string
@@ -1103,7 +1149,11 @@ fn parseTeams(alloc: Allocator, bytes: []const u8) !std.ArrayList(Team) {
             return err;
         };
     }
-    return teams;
+    // A non-empty array that yielded nothing usable is a response we could not
+    // read, not an account with no teams. Without this the two are identical to
+    // every caller, which is the ambiguity this whole path exists to remove.
+    if (teams.items.len == 0 and dropped > 0) return error.InvalidTeamsResponse;
+    return .{ .teams = teams, .dropped = dropped };
 }
 
 fn selectTeam(alloc: Allocator, teams: []const Team, current: ?[]const u8) !?usize {
@@ -1351,11 +1401,11 @@ fn dupeTeam(alloc: Allocator, source_id: []const u8, source_slug: []const u8, so
 }
 
 fn check_parse_teams_allocation_failures(alloc: Allocator) !void {
-    var teams = try parseTeams(
+    var parsed = try parseTeams(
         alloc,
         "{\"teams\":[{\"id\":\"team-1\",\"slug\":\"one\",\"name\":\"One\"},{\"id\":\"team-2\",\"slug\":\"two\",\"name\":\"Two\"}]}",
     );
-    defer freeTeams(alloc, &teams);
+    defer freeTeams(alloc, &parsed.teams);
 }
 
 fn check_take_login_session_allocation_failures(alloc: Allocator) !void {
@@ -1438,15 +1488,44 @@ fn writeStdoutFmt(comptime fmt: []const u8, args: anytype) !void {
 }
 
 test "login flow parses teams" {
-    var teams = try parseTeams(
+    var parsed = try parseTeams(
         std.testing.allocator,
         "{\"teams\":[{\"id\":\"team_1\",\"slug\":\"vercel-labs\",\"name\":\"Vercel Labs\"},{\"id\":\"team_2\",\"slug\":\"personal\"}]}",
     );
-    defer freeTeams(std.testing.allocator, &teams);
-    try std.testing.expectEqual(@as(usize, 2), teams.items.len);
-    try std.testing.expectEqualStrings("team_1", teams.items[0].id);
-    try std.testing.expectEqualStrings("Vercel Labs", teams.items[0].name);
-    try std.testing.expectEqualStrings("personal", teams.items[1].name);
+    defer freeTeams(std.testing.allocator, &parsed.teams);
+    try std.testing.expectEqual(@as(usize, 2), parsed.teams.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.dropped);
+    try std.testing.expectEqualStrings("team_1", parsed.teams.items[0].id);
+    try std.testing.expectEqualStrings("Vercel Labs", parsed.teams.items[0].name);
+    try std.testing.expectEqualStrings("personal", parsed.teams.items[1].name);
+}
+
+test "login flow rejects a teams array with nothing usable in it" {
+    try std.testing.expectError(error.InvalidTeamsResponse, parseTeams(
+        std.testing.allocator,
+        "{\"teams\":[{\"id\":123,\"slug\":\"acme\"}]}",
+    ));
+    try std.testing.expectError(error.InvalidTeamsResponse, parseTeams(
+        std.testing.allocator,
+        "{\"teams\":[{\"slug\":\"no-id\"},\"not-an-object\"]}",
+    ));
+}
+
+test "login flow counts entries it had to drop" {
+    var parsed = try parseTeams(
+        std.testing.allocator,
+        "{\"teams\":[{\"id\":\"team_1\",\"slug\":\"good\"},{\"id\":99,\"slug\":\"bad\"}]}",
+    );
+    defer freeTeams(std.testing.allocator, &parsed.teams);
+    try std.testing.expectEqual(@as(usize, 1), parsed.teams.items.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed.dropped);
+}
+
+test "login flow accepts a genuinely empty teams array" {
+    var parsed = try parseTeams(std.testing.allocator, "{\"teams\":[]}");
+    defer freeTeams(std.testing.allocator, &parsed.teams);
+    try std.testing.expectEqual(@as(usize, 0), parsed.teams.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.dropped);
 }
 
 const ScriptedPollResult = enum {
