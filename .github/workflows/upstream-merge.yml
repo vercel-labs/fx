@@ -87,14 +87,9 @@ jobs:
             git commit -m "Merge upstream/main into oh-my-fx"
           fi
 
-      - name: Commit and push merge branch
+      - name: Push merge branch
         run: |
           set -euo pipefail
-          if git diff --cached --quiet; then
-            git commit --no-edit
-          else
-            git commit -m "Merge upstream/main into oh-my-fx"
-          fi
           git push --force-with-lease origin "HEAD:${MERGE_BRANCH}"
 
       - name: Open or update squash PR
