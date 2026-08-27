@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
 const command_environment = @import("../execution/command_environment.zig");
+const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -28,7 +29,10 @@ fn fallbackLoginShell() []const u8 {
 }
 
 fn supportedLoginShell(configured_login_shell: ?[]const u8) ResolveError![]const u8 {
-    const path = configured_login_shell orelse return error.MissingLoginShell;
+    // A uid with no passwd entry resolves no shell at all. That is the same
+    // end state as a configured shell this resolver does not support, so it
+    // takes the same fallback instead of failing the whole terminal tool.
+    const path = configured_login_shell orelse return fallbackLoginShell();
     if (!std.fs.path.isAbsolute(path)) return error.RelativeShellPath;
     if (shellKind(path) != null) return path;
     return fallbackLoginShell();
@@ -115,10 +119,32 @@ pub fn configuredLoginShellInto(buffer: []u8) ?[]const u8 {
         &scratch,
         scratch.len,
         &found,
-    ) != 0) return null;
-    const record = found orelse return null;
-    const shell_ptr = record.shell orelse return null;
-    const shell = std.mem.span(shell_ptr);
+    ) == 0) {
+        if (found) |record| {
+            if (record.shell) |shell_ptr| {
+                if (copyShellInto(buffer, std.mem.span(shell_ptr))) |shell| return shell;
+            }
+        }
+    }
+    return environmentLoginShellInto(buffer);
+}
+
+/// `docker run --user <uid>` leaves the uid without a passwd entry, so the
+/// passwd lookup resolves no shell. SHELL still carries the operator's intent
+/// when it is set, so it is consulted before the caller falls back.
+fn environmentLoginShellInto(buffer: []u8) ?[]const u8 {
+    return absoluteShellInto(buffer, io_mod.getenv("SHELL"));
+}
+
+/// Only an absolute path is usable as a login shell; a relative SHELL would be
+/// resolved against the command's working directory rather than the operator's.
+fn absoluteShellInto(buffer: []u8, shell: ?[]const u8) ?[]const u8 {
+    const value = shell orelse return null;
+    if (!std.fs.path.isAbsolute(value)) return null;
+    return copyShellInto(buffer, value);
+}
+
+fn copyShellInto(buffer: []u8, shell: []const u8) ?[]const u8 {
     if (shell.len == 0 or shell.len > buffer.len) return null;
     @memcpy(buffer[0..shell.len], shell);
     return buffer[0..shell.len];
@@ -348,11 +374,7 @@ test "resolver makes clean startup explicit" {
     );
 }
 
-test "resolver rejects missing relative and unsupported shells" {
-    try std.testing.expectError(
-        error.MissingLoginShell,
-        resolve(null, .user_login),
-    );
+test "resolver rejects relative and unsupported shells" {
     try std.testing.expectError(
         error.RelativeShellPath,
         resolve(null, .{ .executable = .{ .path = "zsh" } }),
@@ -361,6 +383,27 @@ test "resolver rejects missing relative and unsupported shells" {
         error.UnsupportedShell,
         resolve(null, .{ .executable = .{ .path = "/bin/fish" } }),
     );
+}
+
+test "login shell resolution falls back when no shell is configured" {
+    // A uid with no passwd entry resolves nothing, which must not disable the
+    // terminal tool; it takes the same fallback an unsupported shell takes.
+    const resolved = try resolve(null, .user_login);
+    try std.testing.expectEqualStrings(fallbackLoginShell(), resolved.path);
+}
+
+test "SHELL supplies a login shell only when it is an absolute path" {
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "/bin/bash",
+        absoluteShellInto(&buffer, "/bin/bash").?,
+    );
+    try std.testing.expect(absoluteShellInto(&buffer, null) == null);
+    try std.testing.expect(absoluteShellInto(&buffer, "bash") == null);
+    try std.testing.expect(absoluteShellInto(&buffer, "") == null);
+
+    var tiny: [4]u8 = undefined;
+    try std.testing.expect(absoluteShellInto(&tiny, "/bin/bash") == null);
 }
 
 test "login shell resolution falls back without accepting explicit unsupported shells" {
