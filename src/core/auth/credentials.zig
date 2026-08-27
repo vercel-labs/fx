@@ -44,6 +44,8 @@ pub const CatalogAuthenticatedSource = enum {
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+    fireworks_api_key,
+    modal_proxy_token,
 
     fn credentialSource(self: CatalogAuthenticatedSource) Source {
         return switch (self) {
@@ -53,6 +55,8 @@ pub const CatalogAuthenticatedSource = enum {
             .stored_key => .stored_key,
             .chatgpt_subscription => .chatgpt_subscription,
             .grok_subscription => .grok_subscription,
+            .fireworks_api_key => .fireworks_api_key,
+            .modal_proxy_token => .modal_proxy_token,
         };
     }
 };
@@ -168,6 +172,8 @@ pub fn catalogAccessForCredentialAndAccount(
         .stored_key => .stored_key,
         .chatgpt_subscription => .chatgpt_subscription,
         .grok_subscription => .grok_subscription,
+        .fireworks_api_key => .fireworks_api_key,
+        .modal_proxy_token => .modal_proxy_token,
         .fx_login => blk: {
             const team = team_context orelse
                 return .{ .public_only = .fx_login_team_required };
@@ -180,8 +186,8 @@ pub fn catalogAccessForCredentialAndAccount(
         .authenticated = .{
             .source = authenticated_source,
             .credential = credential,
-            .team_context = if (authenticated_source == .chatgpt_subscription or authenticated_source == .grok_subscription) null else team_context,
-            .account_id = if (authenticated_source == .grok_subscription) account_id else null,
+            .team_context = if (authenticated_source == .chatgpt_subscription or authenticated_source == .grok_subscription or authenticated_source == .fireworks_api_key or authenticated_source == .modal_proxy_token) null else team_context,
+            .account_id = if (authenticated_source == .grok_subscription or authenticated_source == .modal_proxy_token) account_id else null,
         },
     };
 }
@@ -202,11 +208,17 @@ pub const missing_chatgpt_credential_message = "fx needs a Codex subscription lo
 pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login, open Connections, then choose Codex subscription.";
 pub const missing_grok_credential_message = "fx needs a Grok subscription login for this model. Run fx login grok.";
 pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login, open Connections, then choose Grok subscription.";
+pub const missing_fireworks_credential_message = "fx needs FIREWORKS_API_KEY for the Fireworks provider.";
+pub const missing_fireworks_interactive_credential_message = "Fireworks needs FIREWORKS_API_KEY in the launch environment.";
+pub const missing_modal_credential_message = "fx needs MODAL_PROXY_TOKEN_ID and MODAL_PROXY_TOKEN_SECRET for the Modal provider.";
+pub const missing_modal_interactive_credential_message = "Modal needs MODAL_PROXY_TOKEN_ID and MODAL_PROXY_TOKEN_SECRET in the launch environment.";
 pub const unreadable_store_message = "fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 
 test "public credential guidance spells fx lowercase" {
     try std.testing.expect(std.mem.startsWith(u8, missing_credential_message, "fx needs"));
     try std.testing.expect(std.mem.startsWith(u8, missing_interactive_credential_message, "fx needs"));
+    try std.testing.expect(std.mem.startsWith(u8, missing_fireworks_credential_message, "fx needs"));
+    try std.testing.expect(std.mem.startsWith(u8, missing_modal_credential_message, "fx needs"));
     try std.testing.expect(std.mem.startsWith(u8, unreadable_store_message, "fx could"));
 }
 
@@ -297,6 +309,8 @@ pub fn resolveForProvider(
             };
             return .{ .credential = credential };
         },
+        .fireworks => return .{ .credential = try loadSource(alloc, transport, secret_store, .fireworks_api_key) },
+        .modal => return .{ .credential = try loadSource(alloc, transport, secret_store, .modal_proxy_token) },
         .gateway => {},
     }
     return resolvePreferring(
@@ -304,7 +318,7 @@ pub fn resolveForProvider(
         transport,
         secret_store,
         mode,
-        if (preferred == .chatgpt_subscription or preferred == .grok_subscription) null else preferred,
+        if (model_provider.authorizesCredential(.gateway, preferred)) preferred else null,
     );
 }
 
@@ -394,6 +408,7 @@ fn loadPreferredSource(
             .stored => loadStoredGrokCredential(alloc),
             .refresh_if_needed => loadGrokCredential(alloc, transport, .if_needed),
         },
+        .fireworks_api_key, .modal_proxy_token => loadSource(alloc, transport, secret_store, source),
         else => loadSource(alloc, transport, secret_store, source),
     };
 }
@@ -411,6 +426,8 @@ pub fn loadSource(
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
         .chatgpt_subscription => loadChatGptCredential(alloc, transport, .if_needed),
         .grok_subscription => loadGrokCredential(alloc, transport, .if_needed),
+        .fireworks_api_key => loadEnvCredential(alloc, "FIREWORKS_API_KEY", source),
+        .modal_proxy_token => loadModalProxyCredential(alloc),
     };
 }
 
@@ -436,6 +453,8 @@ pub fn sourceExists(
         },
         .chatgpt_subscription => chatgpt_oauth.sourceExists(alloc),
         .grok_subscription => grok_oauth.sourceExists(alloc),
+        .fireworks_api_key => nonEmptyEnvValue("FIREWORKS_API_KEY") != null,
+        .modal_proxy_token => nonEmptyEnvValue("MODAL_PROXY_TOKEN_ID") != null and nonEmptyEnvValue("MODAL_PROXY_TOKEN_SECRET") != null,
         .stored_key => blk: {
             if (secret_store.isDisabled()) break :blk false;
             const stored = secret_store.load(alloc) catch |err| switch (err) {
@@ -461,6 +480,19 @@ fn loadEnvCredential(
     return .{
         .token = try alloc.dupe(u8, value),
         .source = source,
+    };
+}
+
+fn loadModalProxyCredential(alloc: std.mem.Allocator) !?Credential {
+    const token_id = nonEmptyEnvValue("MODAL_PROXY_TOKEN_ID") orelse return null;
+    const token_secret = nonEmptyEnvValue("MODAL_PROXY_TOKEN_SECRET") orelse return null;
+    const secret_copy = try alloc.dupe(u8, token_secret);
+    errdefer secret.zeroAndFree(alloc, secret_copy);
+    const id_copy = try alloc.dupe(u8, token_id);
+    return .{
+        .token = secret_copy,
+        .source = .modal_proxy_token,
+        .account_id = id_copy,
     };
 }
 
@@ -662,6 +694,8 @@ pub fn sourceLabel(source: Source) []const u8 {
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
         .chatgpt_subscription => "Codex subscription",
         .grok_subscription => "Grok subscription",
+        .fireworks_api_key => "FIREWORKS_API_KEY",
+        .modal_proxy_token => "Modal proxy token",
     };
 }
 
@@ -925,6 +959,28 @@ test "source-specific credential loading bypasses generic precedence" {
     try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .ai_gateway_api_key));
     try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .vercel_oidc_token));
     try std.testing.expect(!(try sourceExists(alloc, host.unavailable_secret_store, .stored_key)));
+}
+
+test "Fireworks and Modal credentials load only from their dedicated environment variables" {
+    const alloc = std.testing.allocator;
+    const env = try CredentialTestEnv.install(alloc, &.{
+        .{ "FIREWORKS_API_KEY", "fireworks-key" },
+        .{ "MODAL_PROXY_TOKEN_ID", "modal-id" },
+        .{ "MODAL_PROXY_TOKEN_SECRET", "modal-secret" },
+    });
+    defer env.deinit();
+
+    var fireworks = (try loadSource(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .fireworks_api_key)).?;
+    defer fireworks.deinit(alloc);
+    try std.testing.expectEqual(Source.fireworks_api_key, fireworks.source);
+    try std.testing.expectEqualStrings("fireworks-key", fireworks.token);
+    try std.testing.expect(fireworks.accountId() == null);
+
+    var modal = (try loadSource(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .modal_proxy_token)).?;
+    defer modal.deinit(alloc);
+    try std.testing.expectEqual(Source.modal_proxy_token, modal.source);
+    try std.testing.expectEqualStrings("modal-secret", modal.token);
+    try std.testing.expectEqualStrings("modal-id", modal.accountId().?);
 }
 
 test "a remembered choice outranks the environment" {

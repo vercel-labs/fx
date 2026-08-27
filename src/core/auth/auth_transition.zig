@@ -73,6 +73,8 @@ pub fn signInCompletion(
             .{ .switch_provider = .grok }
         else
             .{ .activate_source = .grok_subscription },
+        .fireworks => .{ .activate_source = .fireworks_api_key },
+        .modal => .{ .activate_source = .modal_proxy_token },
     };
 }
 

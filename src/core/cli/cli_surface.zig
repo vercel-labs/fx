@@ -206,7 +206,11 @@ const LocalSurfaceOptions = struct {
 fn parseLoginProvider(rest: []const [:0]const u8) !?model_provider.ProviderId {
     if (rest.len == 0) return null;
     if (rest.len != 1) return error.InvalidLoginProviderArgs;
-    return provider_catalog.parse(rest[0]) orelse error.InvalidLoginProviderArgs;
+    const provider = provider_catalog.parse(rest[0]) orelse return error.InvalidLoginProviderArgs;
+    return switch (provider) {
+        .gateway, .codex, .grok => provider,
+        .fireworks, .modal => error.InvalidLoginProviderArgs,
+    };
 }
 
 fn selectCatalogModel(
@@ -685,6 +689,8 @@ fn activateProviderSelection(
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
+            .fireworks => "Fireworks is already selected.\n",
+            .modal => "Modal is already selected.\n",
         });
         return true;
     }
@@ -731,6 +737,8 @@ fn activateProviderSelection(
             switch (target) {
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
+                .fireworks => "FIREWORKS_API_KEY is unavailable",
+                .modal => "Modal proxy token is unavailable",
                 .gateway => "configure a Gateway credential first",
             },
         );
@@ -740,6 +748,8 @@ fn activateProviderSelection(
         try writeProviderActivationError(alloc, deps, caller, switch (target) {
             .codex => "Codex model catalog is unavailable",
             .grok => "Grok model catalog is unavailable",
+            .fireworks => "Fireworks model catalog is unavailable",
+            .modal => "Modal model catalog is unavailable",
             .gateway => "Gateway model catalog is unavailable",
         });
         return false;
@@ -785,13 +795,15 @@ fn activateProviderSelection(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
-        .gateway => unreachable,
+        .gateway, .fireworks, .modal => unreachable,
     };
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
+            .fireworks => "Provider set to Fireworks.\n",
+            .modal => "Provider set to Modal.\n",
         });
     }
     return true;
@@ -964,6 +976,14 @@ fn runNonInteractiveWithDeps(
                     }
                     try writeStdout(deps, "Signed in with Grok.\n");
                 },
+                .fireworks => {
+                    try writeStderr(deps, "fx login: Fireworks uses FIREWORKS_API_KEY; no login flow is required\n");
+                    return .handled_failure;
+                },
+                .modal => {
+                    try writeStderr(deps, "fx login: Modal uses MODAL_PROXY_TOKEN_ID and MODAL_PROXY_TOKEN_SECRET; no login flow is required\n");
+                    return .handled_failure;
+                },
             }
             return .handled_success;
         },
@@ -1058,11 +1078,11 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <gateway|codex|grok>\n");
+                try writeStderr(deps, "usage: fx provider <gateway|codex|grok|fireworks|modal>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
+                try writeStderr(deps, "fx provider: expected gateway, codex, grok, fireworks, or modal\n");
                 return .handled_failure;
             };
             return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command))
@@ -1150,6 +1170,8 @@ fn runNonInteractiveWithDeps(
                     .gateway => "fx models: Gateway model catalog is unavailable\n",
                     .codex => "fx models: Codex model catalog is unavailable\n",
                     .grok => "fx models: Grok model catalog is unavailable\n",
+                    .fireworks => "fx models: Fireworks model catalog is unavailable\n",
+                    .modal => "fx models: Modal model catalog is unavailable\n",
                 });
                 return .handled_failure;
             };

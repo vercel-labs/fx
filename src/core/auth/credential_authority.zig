@@ -25,9 +25,11 @@ pub fn derive(
         .ai_gateway_api_key,
         .fx_login,
         .stored_key,
+        .fireworks_api_key,
         => hash.update("\x00slot\x00"),
         .chatgpt_subscription,
         .grok_subscription,
+        .modal_proxy_token,
         => {
             const account = account_id orelse return null;
             if (account.len == 0) return null;

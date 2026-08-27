@@ -1113,6 +1113,8 @@ fn configuredProviderSelection(
         .gateway => default_model,
         .codex => return error.CodexModelNotSelected,
         .grok => return error.GrokModelNotSelected,
+        .fireworks => "accounts/fireworks/models/kimi-k3",
+        .modal => "glm-5-3-flash",
     };
     return .{ .provider = provider, .model = model };
 }

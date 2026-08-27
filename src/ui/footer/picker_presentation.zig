@@ -2061,7 +2061,7 @@ test "auth picker renders the staged switch and disabled team screens" {
         .stage = .provider,
     };
     const provider_rows = authPickerRowCount(provider_view);
-    try std.testing.expectEqual(@as(u16, 5), provider_rows);
+    try std.testing.expectEqual(@as(u16, 7), provider_rows);
     var provider_header = try composeAuthPickerRow(alloc, provider_view, 0, provider_rows, 80);
     defer provider_header.deinit(alloc);
     try std.testing.expect(std.mem.startsWith(u8, provider_header.items, ui_render.dim_style));

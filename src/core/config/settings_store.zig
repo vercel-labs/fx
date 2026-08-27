@@ -1411,8 +1411,9 @@ fn putModelPreference(
         .gateway => "model",
         .codex => "codex_model",
         .grok => "grok_model",
+        .fireworks, .modal => "",
     };
-    if (root.contains(legacy_key)) {
+    if (legacy_key.len > 0 and root.contains(legacy_key)) {
         _ = root.orderedRemove(legacy_key);
         changed = true;
     }

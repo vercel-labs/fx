@@ -53,6 +53,19 @@ The OpenAI Codex route uses ChatGPT subscription access directly and never sends
 
 The Grok route uses subscription access directly at xAI and never sends its OAuth token to Vercel AI Gateway or OpenAI. Its session is stored privately at `~/.fx/grok-auth.json`, refreshed when needed, and used only with the authenticated xAI catalog and Responses API.
 
+This fork also supports direct Fireworks and Modal routes through environment credentials:
+
+```bash
+export FIREWORKS_API_KEY=...
+FX_PROVIDER=fireworks fx
+
+export MODAL_PROXY_TOKEN_ID=...
+export MODAL_PROXY_TOKEN_SECRET=...
+FX_PROVIDER=modal fx
+```
+
+`FX_PROVIDER` pins the provider for that process while preserving a separate saved model for each provider. `/model` shows the active provider's catalog: Fireworks is fetched from the authenticated account, while Modal exposes the four configured Robomart endpoints.
+
 To use an AI Gateway API key instead:
 
 ```bash

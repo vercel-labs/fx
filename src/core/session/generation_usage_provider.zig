@@ -85,6 +85,8 @@ pub const Set = struct {
     gateway: ?Provider = null,
     codex: ?Provider = null,
     grok: ?Provider = null,
+    fireworks: ?Provider = null,
+    modal: ?Provider = null,
 
     pub fn gatewayOnly(provider: Provider) Set {
         return .{ .gateway = provider };
@@ -95,6 +97,8 @@ pub const Set = struct {
             .gateway => self.gateway,
             .codex => self.codex,
             .grok => self.grok,
+            .fireworks => self.fireworks,
+            .modal => self.modal,
         };
     }
 };

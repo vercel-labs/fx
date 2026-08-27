@@ -20,6 +20,7 @@ const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
 const provider_catalog = @import("../core/auth/provider_catalog.zig");
 const credential_authority = @import("../core/auth/credential_authority.zig");
+const model_provider = @import("../core/config/model_provider.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const vercel_model_policy = @import("../gateway/vercel_model_policy.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
@@ -501,7 +502,7 @@ fn streamAgentCompletion(
     alloc: Allocator,
     request: agent_stream_provider_contract.ModelRequest,
 ) anyerror!agent_stream_provider_contract.Result {
-    if (request.credential.source == .chatgpt_subscription or request.credential.source == .grok_subscription) {
+    if (!model_provider.authorizesCredential(.gateway, request.credential.source)) {
         return error.SubscriptionCredentialCannotAuthorizeGateway;
     }
     const payload = try buildAgentRequest(alloc, request.data());
