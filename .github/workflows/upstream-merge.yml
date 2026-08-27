@@ -72,6 +72,11 @@ jobs:
           EOF
           npx -y @just-every/code@latest exec --cd "$GITHUB_WORKSPACE" --skip-git-repo-check -s workspace-write --goal-file .github/auto-goal.md
 
+      - name: Preserve fork workflow files
+        run: |
+          set -euo pipefail
+          git restore --source="origin/${BASE_BRANCH}" --staged --worktree -- .github/workflows
+
       - name: Ensure merge is resolved
         run: |
           set -euo pipefail

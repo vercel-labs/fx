@@ -1,5 +1,6 @@
 {
   "prefer_ours_globs": [
+    ".github/workflows/**",
     ".github/workflows/upstream-merge.yml",
     ".github/merge-policy.json",
     ".fx/**",
