@@ -303,10 +303,12 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn routeAuthPickerByte(app: *App, byte: u8) !bool {
             if (app.auth.signInEntryActive()) {
-                if (app.auth.signInCodeEntryActive()) {
+                if (byte == '\t') {
+                    _ = app.auth.toggleSignInCodeEntry();
+                } else if (app.auth.signInCodeEntryActive()) {
                     switch (byte) {
                         3, 4 => _ = app.auth.popPickerStage(app.alloc),
-                        '\r', '\n' => if (!try app.auth.submitSignInCode(app.alloc)) try openSignInBrowser(app),
+                        '\r', '\n' => _ = try app.auth.submitSignInCode(app.alloc),
                         8, 127 => _ = app.auth.deleteSignInCodeByte(),
                         else => _ = try app.auth.appendSignInCodeByte(app.alloc, byte),
                     }
@@ -345,7 +347,13 @@ pub fn Runtime(comptime App: type) type {
             if (!app.auth.signInEntryActive() and !app.auth.apiKeyEntryActive()) return false;
             return switch (action) {
                 .escape, .remapped_byte => false,
-                .paste_start, .paste_end => !app.auth.signInCodeEntryActive(),
+                .paste_start => blk: {
+                    if (app.auth.signInCodeEntryActive()) break :blk false;
+                    if (!app.auth.toggleSignInCodeEntry()) break :blk true;
+                    app.shell.render_requests.request(.footer);
+                    break :blk false;
+                },
+                .paste_end => !app.auth.signInCodeEntryActive(),
                 else => true,
             };
         }
@@ -1452,6 +1460,12 @@ const TestAuth = struct {
     selected_team_adopted: bool = false,
     sign_in_url: ?[]const u8 = null,
     picker_pop_count: usize = 0,
+    sign_in_entry_active: bool = false,
+    sign_in_code_entry_active: bool = false,
+    sign_in_code_toggle_count: usize = 0,
+    sign_in_code_toggle_succeeds: bool = true,
+    sign_in_code_submit_count: usize = 0,
+    sign_in_code_submit_succeeds: bool = true,
 
     fn credentialSource(self: *const TestAuth) ?credentials.Source {
         return self.active_source;
@@ -1474,6 +1488,72 @@ const TestAuth = struct {
     fn popPickerStage(self: *TestAuth, _: std.mem.Allocator) bool {
         self.picker_pop_count += 1;
         return true;
+    }
+
+    fn signInEntryActive(self: *const TestAuth) bool {
+        return self.sign_in_entry_active;
+    }
+
+    fn signInCodeEntryActive(self: *const TestAuth) bool {
+        return self.sign_in_code_entry_active;
+    }
+
+    fn toggleSignInCodeEntry(self: *TestAuth) bool {
+        self.sign_in_code_toggle_count += 1;
+        if (!self.sign_in_code_toggle_succeeds) return false;
+        self.sign_in_code_entry_active = !self.sign_in_code_entry_active;
+        return true;
+    }
+
+    fn submitSignInCode(self: *TestAuth, _: std.mem.Allocator) !bool {
+        self.sign_in_code_submit_count += 1;
+        return self.sign_in_code_submit_succeeds;
+    }
+
+    fn deleteSignInCodeByte(_: *TestAuth) bool {
+        return true;
+    }
+
+    fn appendSignInCodeByte(_: *TestAuth, _: std.mem.Allocator, _: u8) !bool {
+        return true;
+    }
+
+    fn teamPickerActive(_: *const TestAuth) bool {
+        return false;
+    }
+
+    fn deleteTeamQueryByte(_: *TestAuth) bool {
+        return false;
+    }
+
+    fn appendTeamQueryByte(_: *TestAuth, _: std.mem.Allocator, _: u8) !bool {
+        return false;
+    }
+
+    fn apiKeyEntryActive(_: *const TestAuth) bool {
+        return false;
+    }
+
+    fn deleteApiKeyByte(_: *TestAuth) bool {
+        return false;
+    }
+
+    fn appendApiKeyByte(_: *TestAuth, _: std.mem.Allocator, _: u8) !bool {
+        return false;
+    }
+
+    fn pickerView(_: *const TestAuth) auth_runtime.PickerView {
+        return .{
+            .active = false,
+            .available_sources = .empty,
+            .selected_choice = null,
+            .active_source = null,
+            .include_skip = false,
+        };
+    }
+
+    fn beginApiKeySave(_: *TestAuth, _: std.mem.Allocator) auth_runtime.ApiKeySaveStart {
+        return .empty;
     }
 
     fn openTeamPicker(_: *TestAuth, _: std.mem.Allocator, _: *login_flow.TeamSelection) void {}
@@ -1692,6 +1772,59 @@ test "interactive sign-in opens the owned browser URL through the host" {
         "https://vercel.test/verify?code=TEST-CODE",
         app.test_url_opener.openedUrl(),
     );
+}
+
+test "interactive sign-in routes Tab to the auth-owned manual code toggle" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.sign_in_entry_active = true;
+    app.auth.sign_in_url = "https://issuer.test/authorize";
+
+    try std.testing.expect(try Runtime(TestApp).routeAuthPickerByte(&app, '\t'));
+
+    try std.testing.expectEqual(@as(usize, 1), app.auth.sign_in_code_toggle_count);
+    try std.testing.expect(app.auth.sign_in_code_entry_active);
+    try std.testing.expectEqual(@as(usize, 0), app.test_url_opener.calls);
+    try std.testing.expect(app.shell.render_requests.footer_requested);
+}
+
+test "interactive hidden manual code paste reveals entry for the paste owner" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.sign_in_entry_active = true;
+
+    try std.testing.expect(!Runtime(TestApp).routeAuthPickerEscapeAction(&app, .paste_start));
+
+    try std.testing.expectEqual(@as(usize, 1), app.auth.sign_in_code_toggle_count);
+    try std.testing.expect(app.auth.sign_in_code_entry_active);
+    try std.testing.expect(app.shell.render_requests.footer_requested);
+}
+
+test "interactive sign-in without manual fallback consumes hidden paste" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.sign_in_entry_active = true;
+    app.auth.sign_in_code_toggle_succeeds = false;
+
+    try std.testing.expect(Runtime(TestApp).routeAuthPickerEscapeAction(&app, .paste_start));
+
+    try std.testing.expectEqual(@as(usize, 1), app.auth.sign_in_code_toggle_count);
+    try std.testing.expect(!app.auth.sign_in_code_entry_active);
+    try std.testing.expect(!app.shell.render_requests.footer_requested);
+}
+
+test "interactive manual code entry never reopens the browser on empty submit" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.sign_in_entry_active = true;
+    app.auth.sign_in_code_entry_active = true;
+    app.auth.sign_in_code_submit_succeeds = false;
+    app.auth.sign_in_url = "https://issuer.test/authorize";
+
+    try std.testing.expect(try Runtime(TestApp).routeAuthPickerByte(&app, '\r'));
+
+    try std.testing.expectEqual(@as(usize, 1), app.auth.sign_in_code_submit_count);
+    try std.testing.expectEqual(@as(usize, 0), app.test_url_opener.calls);
 }
 
 test "interactive sign-in preserves manual fallback when the host launcher fails" {

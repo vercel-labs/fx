@@ -440,13 +440,36 @@ fn runSupported(alloc: Allocator, config: Config) !void {
         home,
         config.process_provider,
     );
-    defer persistent_store.deinit();
+    // Both of these are reached by detached client threads through `state` and
+    // `registry`, so they may only be torn down once those threads are gone.
+    // On a path that exits with clients still live, leaving them allocated is
+    // strictly safer than freeing memory another thread is still reading; the
+    // process is on its way out and the OS reclaims it.
+    var clients_drained = false;
+    defer if (clients_drained) persistent_store.deinit();
     var registry = try native_session.Registry.init(alloc, .{
         .context = &state,
         .update_fn = updateLiveWork,
         .monitor_update_fn = updateMonitorWork,
     }, &persistent_store, &host_instance, paths.authority_root_path, paths.transport_root_path);
-    defer registry.deinit();
+    defer if (clients_drained) registry.deinit();
+    defer {
+        clients_drained = drainConnectedClients(&state, client_drain_timeout_ms);
+        if (!clients_drained) {
+            debug_trace.logf(
+                "terminal_host",
+                "host exiting immediately with {d} client thread(s) still running; preserving shared state until process exit",
+                .{state.connected_clients.load(.acquire)},
+            );
+            // The registry cannot be freed while detached clients still hold
+            // pointers into this frame. Signal its child processes, then stop
+            // this dedicated host process before returning through the stack or
+            // deinitializing the threaded I/O runtime that those clients use.
+            // The next host startup removes the stale endpoint and identity.
+            registry.shutdownSessionsOnly();
+            std.process.exit(1);
+        }
+    }
     var idle_thread = try std.Thread.spawn(.{}, idleOwner, .{&state});
     defer {
         state.stopping.store(true, .release);
@@ -461,6 +484,7 @@ fn runSupported(alloc: Allocator, config: Config) !void {
     );
 
     while (!state.stopping.load(.acquire)) {
+        if (testAcceptFailureRequested()) return error.InjectedAcceptFailure;
         if (!try listenerReady(server.socket.handle)) continue;
         if (state.stopping.load(.acquire)) break;
         var stream = server.accept(io_mod.getIo()) catch |err| switch (err) {
@@ -497,6 +521,11 @@ fn runSupported(alloc: Allocator, config: Config) !void {
     cleanupEndpoint(paths.endpointDir());
     debug_trace.logf("terminal_host", "host exited idle=true", .{});
 }
+
+/// How long a fatal host exit waits for client threads before giving up on
+/// freeing the state they share. Long enough for a client mid-request to
+/// finish, short enough that a broken host still exits.
+const client_drain_timeout_ms: u64 = 2_000;
 
 const HostState = struct {
     idle_grace_ms: u64,
@@ -579,6 +608,35 @@ fn updateMonitorWork(raw: ?*anyopaque, required: bool) void {
         std.debug.assert(previous > 0);
     }
     state.noteChanged();
+}
+
+/// Waits for every client thread to leave before the host frame that owns their
+/// shared state is destroyed. Client threads are detached and hold pointers to
+/// `HostState` and the session registry, so freeing either while one is still
+/// running is a use-after-free.
+///
+/// Bounded on purpose: a client parked in `readFrame` does not observe `stopping`
+/// until its peer speaks or disconnects, and a fatal host path must not hang
+/// waiting for it. Returns whether the drain completed; the caller keeps the
+/// shared state alive when it did not.
+fn drainConnectedClients(state: *HostState, timeout_ms: u64) bool {
+    state.stopping.store(true, .release);
+    state.noteChanged();
+
+    const poll_ns: u64 = 5 * std.time.ns_per_ms;
+    var waited_ns: u64 = 0;
+    const limit_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch
+        std.math.maxInt(u64);
+    while (true) {
+        if (state.connected_clients.load(.acquire) == 0) return true;
+        if (waited_ns >= limit_ns) return false;
+        std.Io.sleep(
+            io_mod.getIo(),
+            .{ .nanoseconds = @intCast(@min(poll_ns, limit_ns - waited_ns)) },
+            .awake,
+        ) catch return state.connected_clients.load(.acquire) == 0;
+        waited_ns += poll_ns;
+    }
 }
 
 fn idleOwner(state: *HostState) void {
@@ -1092,6 +1150,13 @@ fn maybeDelayForTest(name: []const u8) void {
         std.time.ns_per_ms,
     ) catch return;
     io_mod.sleep(delay_ns);
+}
+
+fn testAcceptFailureRequested() bool {
+    const path = io_mod.getenv("FX_TERMINAL_TEST_ACCEPT_FAILURE_PATH") orelse
+        return false;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{}) catch return false;
+    return true;
 }
 
 fn noteTestOrderedAdmission(correlation_id: contracts.CorrelationId) !void {
@@ -1675,4 +1740,41 @@ test "runtime transport directories reject symlinks non-private modes and foreig
         error.RuntimeDirectoryUnsafe,
         openVerifiedPrivateRuntimeDir(tmp.dir, "linked", std.c.getuid()),
     );
+}
+
+test "client drain reports success only when every client thread has left" {
+    var state = HostState{ .idle_grace_ms = 0 };
+
+    // No clients: the happy path, and it must not wait.
+    try std.testing.expect(drainConnectedClients(&state, 50));
+    try std.testing.expect(state.stopping.load(.acquire));
+
+    // A client that never leaves: the drain is bounded and reports failure
+    // rather than blocking the host forever on a fatal path.
+    state.stopping.store(false, .release);
+    _ = state.connected_clients.fetchAdd(1, .acq_rel);
+    try std.testing.expect(!drainConnectedClients(&state, 50));
+    try std.testing.expect(state.stopping.load(.acquire));
+
+    // The same client leaving makes the drain succeed.
+    _ = state.connected_clients.fetchSub(1, .acq_rel);
+    try std.testing.expect(drainConnectedClients(&state, 50));
+}
+
+test "a client that leaves during the drain window still drains" {
+    var state = HostState{ .idle_grace_ms = 0 };
+    _ = state.connected_clients.fetchAdd(1, .acq_rel);
+
+    const Departing = struct {
+        fn run(target: *HostState) void {
+            std.Io.sleep(io_mod.getIo(), .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+            _ = target.connected_clients.fetchSub(1, .acq_rel);
+            target.noteChanged();
+        }
+    };
+    var thread = try std.Thread.spawn(.{}, Departing.run, .{&state});
+    defer thread.join();
+
+    try std.testing.expect(drainConnectedClients(&state, 2_000));
+    try std.testing.expectEqual(@as(usize, 0), state.connected_clients.load(.acquire));
 }

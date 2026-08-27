@@ -3438,6 +3438,92 @@ test "closed tool group finality flows through fixed point resolution and sealin
     try expectGridContains(&h, "SECOND_GROUP_INTRO");
 }
 
+test "completed tool group lets streamed assistant hard lines enter history" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 80, 14, 3);
+    defer h.deinit();
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+
+    try h.shell.initViewport(&h.metrics, 8);
+    for (0..4) |index| {
+        var line: [32]u8 = undefined;
+        const text = try std.fmt.bufPrint(&line, "startup row {d}\n", .{index});
+        _ = try h.shell.appendRawTranscriptEntry(alloc, text);
+    }
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    const group = types.ToolPresentationGroupId{ .turn_id = 93, .anchor_step_id = 1 };
+    var call_ids: [18][20]u8 = undefined;
+    for (0..call_ids.len - 1) |index| {
+        const call_id = try std.fmt.bufPrint(
+            &call_ids[index],
+            "answer-a-{d:0>2}",
+            .{index},
+        );
+        try applyCompletedReadForGroupFinalityResizeTest(&h, 93, call_id, group);
+    }
+    const active_call_id = try std.fmt.bufPrint(
+        &call_ids[call_ids.len - 1],
+        "answer-a-{d:0>2}",
+        .{call_ids.len - 1},
+    );
+    const active_id = types.ToolLifecycleId{ .turn_id = 93, .call_id = active_call_id };
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = active_id,
+        .presentation_group_id = group,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+    } });
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    var held_source = try h.shell.prepareTranscriptSource(alloc, null);
+    defer held_source.deinit(alloc);
+    const held = h.shell.stableTranscriptProjectionForFlow(held_source.bytes) orelse
+        return error.TestExpectedStableTranscript;
+    try std.testing.expect(held.visual_offset > held.history_visual_offset);
+
+    _ = try h.shell.streamAssistantChunk(
+        alloc,
+        &h.metrics,
+        "FINAL_LINE_01\nFINAL_LINE_02\nFINAL_LINE_03\npartial tail",
+    );
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
+
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = active_id,
+        .outcome = .{ .kind = .completed, .summary = "Read fixed-point fixture" },
+    } });
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    try std.testing.expect(h.last_frame.planned_scroll_rows > 0);
+    try std.testing.expect(h.last_frame.committed_scroll_rows > 0);
+    try std.testing.expect(h.last_frame.document_append_bytes > 0);
+    try std.testing.expect(h.last_frame.transcript_history_floor_respected);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
+
+    var released_source = try h.shell.prepareTranscriptSource(alloc, null);
+    defer released_source.deinit(alloc);
+    const released = h.shell.stableTranscriptProjectionForFlow(released_source.bytes) orelse
+        return error.TestExpectedStableTranscript;
+    try std.testing.expect(released.history_visual_offset > held.visual_offset);
+    try expectGridContains(&h, "partial tail");
+}
+
 test "hidden auto approval lifecycle reposition adds no compact scroll rows" {
     var h = try Harness.init(std.testing.allocator, 80, 12, 4);
     defer h.deinit();
@@ -5686,7 +5772,7 @@ test "slash main page renders header categories selection range and contextual c
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridContains(&h, "Commands 37 · Type to filter");
+    try expectGridContains(&h, "Commands 36 · Type to filter");
     try expectGridContains(&h, "1–6");
     try expectGridContains(&h, "/help");
     try expectGridContains(&h, "General");
@@ -5707,7 +5793,7 @@ test "slash main page renders header categories selection range and contextual c
 
     try expectGridContains(&h, "ask");
     try expectGridContains(&h, "test-model");
-    try expectGridNotContains(&h, "Commands 37");
+    try expectGridNotContains(&h, "Commands 36");
     try expectGridNotContains(&h, "↑↓ Navigate");
 }
 
@@ -5728,7 +5814,7 @@ test "slash main page drops categories and ellipsizes descriptions when narrow" 
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridContains(&h, "Commands 2");
+    try expectGridContains(&h, "Commands 1");
     try expectGridContains(&h, "/model");
     try expectGridContains(&h, "…");
     try expectGridNotContains(&h, "Model");
@@ -6246,12 +6332,12 @@ test "inline approval footer reflow preserves concurrent transcript progress" {
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    // The assistant producer is still open, so the streamed rows are not
-    // final: the viewport follows them through an in-place repaint and no
-    // transcript row is released into scrollback.
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
+    // Complete streamed rows are final even while the producer remains open,
+    // so they enter history instead of sliding the viewport by repaint.
+    try std.testing.expectEqual(@as(u16, 2), h.last_frame.planned_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 2), h.last_frame.committed_scroll_rows);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
+    try std.testing.expect(h.last_frame.document_append_bytes > 0);
     try std.testing.expectEqual(
         @as(usize, 1),
         std.mem.count(u8, h.shell.transcript.items, append_one),
@@ -6263,20 +6349,13 @@ test "inline approval footer reflow preserves concurrent transcript progress" {
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_one));
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_two));
 
-    // Closing the producer finalizes the tail; the held rows settle through
-    // the catch-up replay, possibly across frames.
+    // Closing the producer has no completed-row debt left to settle.
     h.shell.transcript_release = h.shell.transcript_release.with_assistant_tail_writable(false);
-    var settle_frames: usize = 0;
-    var settled_scroll_rows: u32 = 0;
-    while (settle_frames < 8) : (settle_frames += 1) {
-        h.frame_redraw = true;
-        try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
-        try h.flush();
-        try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
-        if (h.last_frame.planned_scroll_rows == 0) break;
-        settled_scroll_rows += h.last_frame.planned_scroll_rows;
-    }
-    try std.testing.expect(settled_scroll_rows > 0);
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_one));
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_two));
 

@@ -15357,6 +15357,148 @@ test "lifecycle pins survive low cap until batch cleanup restores prune eligibil
     );
 }
 
+test "streaming assistant finality releases complete rows and holds only the partial tail" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(40, 10, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    var metrics: Metrics = .{};
+    _ = try runtime.streamAssistantChunk(
+        alloc,
+        &metrics,
+        "first finalized row\nsecond finalized row\npartial tail",
+    );
+
+    var partial_source = try runtime.prepareTranscriptSource(alloc, null);
+    defer partial_source.deinit(alloc);
+    const partial_start = std.mem.find(u8, partial_source.bytes, "  partial tail") orelse
+        return error.TestExpectedPartialAssistantTail;
+    try std.testing.expectEqual(
+        @as(?usize, partial_start),
+        runtime.transcript_release.finality_floor(
+            partial_source.finality,
+            runtime.finalizedToolTurnWatermark(),
+            null,
+        ),
+    );
+
+    _ = try runtime.streamAssistantChunk(alloc, &metrics, "\n");
+    var completed_source = try runtime.prepareTranscriptSource(alloc, null);
+    defer completed_source.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(?usize, completed_source.bytes.len),
+        runtime.transcript_release.finality_floor(
+            completed_source.finality,
+            runtime.finalizedToolTurnWatermark(),
+            null,
+        ),
+    );
+}
+
+test "blank streaming assistant tail keeps finality inside the prepared source" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(40, 10, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    _ = try runtime.appendRawTranscriptEntry(alloc, "stable history\n");
+    var metrics: Metrics = .{};
+    _ = try runtime.streamAssistantChunk(alloc, &metrics, "   ");
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(?usize, source.bytes.len),
+        runtime.transcript_release.finality_floor(
+            source.finality,
+            runtime.finalizedToolTurnWatermark(),
+            null,
+        ),
+    );
+}
+
+test "empty assistant tail leaves the complete prepared source final" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(40, 10, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    _ = try runtime.appendRawTranscriptEntry(alloc, "stable history\n");
+    _ = try runtime.appendAssistantTurnEntry(alloc);
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(?usize, source.bytes.len),
+        runtime.transcript_release.finality_floor(
+            source.finality,
+            runtime.finalizedToolTurnWatermark(),
+            null,
+        ),
+    );
+}
+
+test "native history defers partial assistant paints but publishes hard lines" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(40, 10, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try installStableAnchorForTest(
+        &runtime,
+        alloc,
+        "history\n",
+        testSelection(1),
+        1,
+        4,
+        1,
+        1,
+    );
+    var metrics: Metrics = .{};
+    _ = try runtime.streamAssistantChunk(alloc, &metrics, "partial");
+    try std.testing.expect(!runtime.render_requests.hasReason(.transcript));
+
+    _ = try runtime.streamAssistantChunk(alloc, &metrics, " line\n");
+    try std.testing.expect(runtime.render_requests.hasReason(.transcript));
+}
+
+test "streaming assistant finality keeps soft wraps of a partial hard line mutable" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(12, 10, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    var metrics: Metrics = .{};
+    _ = try runtime.streamAssistantChunk(
+        alloc,
+        &metrics,
+        "finalized row\npartial tail wraps across several visual rows",
+    );
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    const partial_start = std.mem.find(u8, source.bytes, "  partial") orelse
+        return error.TestExpectedWrappedPartialAssistantTail;
+    try std.testing.expectEqual(
+        @as(?usize, partial_start),
+        runtime.transcript_release.finality_floor(
+            source.finality,
+            runtime.finalizedToolTurnWatermark(),
+            null,
+        ),
+    );
+}
+
 test "finality floor holds unfenced tool turn across quiet ticks and settles after the fence" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{

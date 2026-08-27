@@ -1,6 +1,5 @@
 const std = @import("std");
 const builtin_skills = @import("../../builtins/skills.zig");
-const io_mod = @import("../../core/shared/io.zig");
 const skill_invocation = @import("../../core/skills/skill_invocation.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
@@ -163,7 +162,7 @@ fn loadByIdentity(
     limits: context_limits.Values,
     max_tool_result_bytes: ?usize,
 ) !skill_invocation.ExecuteResult {
-    var discovery = try loadVisibleSkillsForContext(alloc, workspace_root, skills_dir);
+    var discovery = try builtin_skills.loadVisibleSkillsForTool(alloc, workspace_root, skills_dir);
     defer discovery.deinit(alloc);
     skill_runtime.traceDiagnostics("skill_tool", discovery.diagnostics);
     return skill_invocation.loadByIdentity(
@@ -176,23 +175,6 @@ fn loadByIdentity(
         limits,
         max_tool_result_bytes,
     );
-}
-
-fn loadVisibleSkillsForContext(
-    alloc: Allocator,
-    workspace_root: []const u8,
-    skills_dir: []const u8,
-) !skill_runtime.SkillDiscovery {
-    if (io_mod.getenv("HOME") orelse homeFromSkillsDir(skills_dir)) |home| {
-        return skill_runtime.loadVisibleSkills(alloc, workspace_root, home, skills_dir, builtin_skills.root_policy);
-    }
-    return skill_runtime.loadVisibleSkills(alloc, workspace_root, null, skills_dir, builtin_skills.root_policy);
-}
-
-fn homeFromSkillsDir(skills_dir: []const u8) ?[]const u8 {
-    const suffix = "/.fx/skills";
-    if (!std.mem.endsWith(u8, skills_dir, suffix)) return null;
-    return skills_dir[0 .. skills_dir.len - suffix.len];
 }
 
 pub fn readsOnly(_: tool_dispatch.ToolInput) bool {

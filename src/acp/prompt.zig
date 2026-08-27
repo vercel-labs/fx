@@ -982,6 +982,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .context_registry = ctx.state.cfg.context_registry,
         .context_enabled = ctx.state.context_enabled,
         .finalize_turn = finalizeTurn,
+        .release_agent_terminal_lease = releaseAgentTerminalLease,
         .prepare_parent_turn_context = prepareParentTurnContext,
         .acknowledge_parent_turn_context = acknowledgeParentTurnContext,
         .append_runtime_context = appendRuntimeContext,
@@ -1023,6 +1024,11 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .usage = &session.session_rt.usage,
         .usage_allocator = ctx.state.alloc,
     };
+}
+
+fn releaseAgentTerminalLease(raw_ctx: *anyopaque, session_id: []const u8) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    return tool_runtime.release_agent_terminal_lease(ctx.toolContext(), session_id);
 }
 
 fn refreshGatewayCredential(
@@ -2400,10 +2406,10 @@ fn mcpCallTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, argument
     );
 }
 
-fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, query: []const u8, limit: usize, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
+fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, limit: usize, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const mcp = activeMcp(ctx) orelse return error.McpServerNotFound;
-    return mcp.searchTools(arena, query, limit, permission_rules, limits, access);
+    return mcp.searchToolsPrepared(arena, query, limit, permission_rules, limits, access);
 }
 
 fn mcpToolSchemaJson(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!?tool_mcp_runtime.ToolSchemaResult {

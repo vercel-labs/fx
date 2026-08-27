@@ -272,6 +272,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .context_registry = context.config.context_registry,
         .context_enabled = context.config.context_enabled,
         .finalize_turn = finalizeTurn,
+        .release_agent_terminal_lease = releaseAgentTerminalLease,
         .live_tool_authority = context.turn.liveToolAuthorityProvider(),
         .tool_activity_recorder = context.turn.toolActivityRecorder(),
         .prepare_parent_turn_context = prepareParentTurnContext,
@@ -308,6 +309,11 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .usage = &context.turn.sessionRuntime().usage,
         .usage_allocator = context.turn.alloc,
     };
+}
+
+fn releaseAgentTerminalLease(raw: *anyopaque, session_id: []const u8) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return tool_runtime.release_agent_terminal_lease(context.toolContext(), session_id);
 }
 
 fn refreshGatewayCredential(

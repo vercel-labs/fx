@@ -2,6 +2,9 @@ const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session_usage = @import("session_usage.zig");
+const generation_usage = @import("generation_usage_provider.zig");
+const stream_provider = @import("../agent/stream_provider.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -550,6 +553,125 @@ test "missing and corrupt usage sidecars retain canonical usage with one fixed g
     );
     try std.testing.expectEqual(@as(usize, 1), corrupt.incidents.len);
     try std.testing.expectEqual(@as(i64, 31), corrupt.incidents[0].occurred_at_ms);
+}
+
+test "torn exact settlement republishes stale backlog without reapplying totals" {
+    const Checkpoint = struct {
+        fn persist(_: *anyopaque, _: session_usage.Snapshot) !void {}
+    };
+    const RejectPublication = struct {
+        fn publish(_: *anyopaque, event: session_usage.usage_report.ProfileEvent) !void {
+            if (event == .generation) return error.InjectedPublicationFailure;
+        }
+    };
+    const PublicationProbe = struct {
+        generations: usize = 0,
+
+        fn publish(raw: *anyopaque, event: session_usage.usage_report.ProfileEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (event == .generation) self.generations += 1;
+        }
+    };
+    const LookupProbe = struct {
+        calls: usize = 0,
+
+        fn lookup(
+            raw: ?*anyopaque,
+            _: Allocator,
+            _: generation_usage.LookupInput,
+        ) generation_usage.LookupError!generation_usage.LookupOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return error.Unavailable;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    const completion: types.ModelCompletion = .{
+        .generation_id = "response-torn-1",
+        .billing = .{
+            .created_at_ms = 100,
+            .model = "codex/gpt-test",
+            .total_cost = 0,
+            .input_tokens = 17,
+            .output_tokens = 7,
+            .cache_read_tokens = 2,
+            .cache_write_tokens = 0,
+            .reasoning_tokens = 1,
+            .billable_web_search_calls = 0,
+        },
+    };
+    const exact = stream_provider.UsageOutcome{ .exact = .codex };
+
+    var checkpoint_context: u8 = 0;
+    var publication_context: u8 = 0;
+    var bridge_source = session_usage.Usage.initFresh();
+    defer bridge_source.deinit(alloc);
+    bridge_source.configureCheckpointSink(.{
+        .context = &checkpoint_context,
+        .allocator = alloc,
+        .persist = Checkpoint.persist,
+    });
+    bridge_source.configurePublicationSink(.{
+        .context = &publication_context,
+        .allocator = alloc,
+        .publish = RejectPublication.publish,
+    });
+    const bridge_observation = try session_usage.InvocationObservation.begin(&bridge_source);
+    try bridge_observation.complete(alloc, completion, exact);
+    var stale_rich = try bridge_source.snapshot(alloc);
+    defer stale_rich.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), stale_rich.pending.len);
+    try std.testing.expectEqual(@as(usize, 1), stale_rich.publication_backlog.len);
+    try std.testing.expectEqual(@as(u64, 0), stale_rich.input_tokens);
+
+    var settled_source = session_usage.Usage.initFresh();
+    defer settled_source.deinit(alloc);
+    const settled_observation = try session_usage.InvocationObservation.begin(&settled_source);
+    try settled_observation.complete(alloc, completion, exact);
+    var durable = try settled_source.snapshot(alloc);
+    defer durable.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), durable.pending.len);
+    try std.testing.expectEqual(@as(u64, 17), durable.input_tokens);
+
+    const stale_bytes = try encode(alloc, "session-torn", stale_rich);
+    defer alloc.free(stale_bytes);
+    try std.testing.expectEqual(
+        RestoreOutcome.mismatched,
+        try restoreCaptured(
+            alloc,
+            .{ .encoded = stale_bytes },
+            "session-torn",
+            200,
+            &durable,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), durable.pending.len);
+    try std.testing.expectEqual(@as(usize, 1), durable.publication_backlog.len);
+    try std.testing.expectEqual(@as(u64, 17), durable.input_tokens);
+
+    var lookup = LookupProbe{};
+    var publication = PublicationProbe{};
+    var resumed = session_usage.Usage.initFreshWithProviders(.{
+        .codex = .{ .context = &lookup, .lookup_fn = LookupProbe.lookup },
+    });
+    defer resumed.deinit(alloc);
+    resumed.configurePublicationSink(.{
+        .context = &publication,
+        .allocator = alloc,
+        .publish = PublicationProbe.publish,
+    });
+    try resumed.restore(alloc, durable, 1);
+
+    var final = try resumed.snapshot(alloc);
+    defer final.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), publication.generations);
+    try std.testing.expectEqual(@as(usize, 0), lookup.calls);
+    try std.testing.expectEqual(@as(usize, 0), final.pending.len);
+    try std.testing.expectEqual(@as(usize, 0), final.publication_backlog.len);
+    try std.testing.expectEqual(@as(u64, 17), final.input_tokens);
+    try std.testing.expectEqual(@as(u64, 7), final.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 1), final.request_count);
 }
 
 fn legacyCopyForTest(

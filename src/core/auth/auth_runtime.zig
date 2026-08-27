@@ -6,6 +6,7 @@ const grok_oauth = @import("grok_oauth.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const login_flow = @import("login_flow.zig");
+const oauth = @import("oauth.zig");
 const model_provider = @import("../config/model_provider.zig");
 const provider_catalog = @import("provider_catalog.zig");
 const oauth_transport = @import("oauth_transport.zig");
@@ -389,6 +390,7 @@ pub const PickerView = struct {
     team_query: []const u8 = &.{},
     sign_in: login_flow.SignInSnapshot = .{},
     sign_in_source: credentials.Source = .fx_login,
+    sign_in_code_visible: bool = false,
     sign_in_code_mask_count: usize = 0,
     api_key_mask_count: usize = 0,
 
@@ -783,6 +785,7 @@ pub const Runtime = struct {
     sign_in_flow: login_flow.SignInRuntime = .{},
     sign_in_source: credentials.Source = .fx_login,
     sign_in_returns_to_root: bool = false,
+    sign_in_code_visible: bool = false,
     sign_in_code_input: std.ArrayList(u8) = .empty,
     api_key_input: std.ArrayList(u8) = .empty,
     api_key_returns_to_root: bool = false,
@@ -1011,6 +1014,7 @@ pub const Runtime = struct {
             .team_query = self.team_query.items,
             .sign_in = self.sign_in_flow.snapshot(),
             .sign_in_source = self.sign_in_source,
+            .sign_in_code_visible = self.sign_in_code_visible,
             .sign_in_code_mask_count = @min(self.sign_in_code_input.items.len, max_manual_code_mask_glyphs),
             .api_key_mask_count = @min(self.api_key_input.items.len, max_api_key_mask_glyphs),
         };
@@ -1179,6 +1183,7 @@ pub const Runtime = struct {
         self.picker_selection = null;
         self.sign_in_source = source;
         self.sign_in_returns_to_root = returns_to_root;
+        self.sign_in_code_visible = false;
         return true;
     }
 
@@ -1187,7 +1192,17 @@ pub const Runtime = struct {
     }
 
     pub fn signInCodeEntryActive(self: *const Self) bool {
-        return self.signInEntryActive() and self.sign_in_flow.snapshot().accepts_manual_code;
+        return self.signInEntryActive() and
+            self.sign_in_flow.snapshot().accepts_manual_code and
+            self.sign_in_code_visible;
+    }
+
+    pub fn toggleSignInCodeEntry(self: *Self) bool {
+        if (!self.signInEntryActive() or !self.sign_in_flow.snapshot().accepts_manual_code) {
+            return false;
+        }
+        self.sign_in_code_visible = !self.sign_in_code_visible;
+        return true;
     }
 
     pub fn signInReturnsToRoot(self: *const Self) bool {
@@ -1480,6 +1495,7 @@ pub const Runtime = struct {
 
     fn clearSignInCodeInput(self: *Self, alloc: Allocator, reason: ManualCodeClearReason) void {
         const byte_count = self.sign_in_code_input.items.len;
+        self.sign_in_code_visible = false;
         if (self.sign_in_code_input.capacity > 0) {
             secret.zeroAndFree(alloc, self.sign_in_code_input.allocatedSlice());
             self.sign_in_code_input = .empty;
@@ -3113,4 +3129,107 @@ test "api key stage zeroes its allocation on every exit path" {
         runtime.deinit(alloc);
         try expectApiKeyAllocationCleared(&runtime, &backing, sentinel);
     }
+}
+
+fn makeManualCodeTestLogin(alloc: Allocator) !login_flow.PreparedLogin {
+    const issuer = try alloc.dupe(u8, "https://issuer.test");
+    errdefer alloc.free(issuer);
+    const authorization_endpoint = try alloc.dupe(u8, "https://issuer.test/authorize");
+    errdefer alloc.free(authorization_endpoint);
+    const token_endpoint = try alloc.dupe(u8, "https://issuer.test/token");
+    errdefer alloc.free(token_endpoint);
+    const device_code = try alloc.dupe(u8, "device-code");
+    errdefer alloc.free(device_code);
+    const user_code = try alloc.dupe(u8, "");
+    errdefer alloc.free(user_code);
+    const verification_uri = try alloc.dupe(u8, "https://issuer.test/authorize");
+    errdefer alloc.free(verification_uri);
+    const client_id = try alloc.dupe(u8, "client-id");
+    errdefer alloc.free(client_id);
+    return .{
+        .metadata = .{
+            .issuer = issuer,
+            .device_authorization_endpoint = authorization_endpoint,
+            .token_endpoint = token_endpoint,
+        },
+        .device = .{
+            .device_code = device_code,
+            .user_code = user_code,
+            .verification_uri = verification_uri,
+            .expires_in = 300,
+            .interval = 1,
+        },
+        .client_id = client_id,
+    };
+}
+
+fn pendingManualCodeTestPoll(
+    _: ?*anyopaque,
+    _: Allocator,
+    _: oauth_transport.Provider,
+    _: oauth.Metadata,
+    _: []const u8,
+    _: []const u8,
+    cancel_flag: *std.atomic.Value(bool),
+    _: std.Io.Clock.Timestamp,
+) !oauth.PollResult {
+    while (!cancel_flag.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
+    return error.Cancelled;
+}
+
+fn acceptManualCodeForTest(_: ?*anyopaque, _: Allocator, _: []const u8) !void {}
+
+fn enterPendingTestSignIn(runtime: *Runtime, alloc: Allocator, accepts_manual_code: bool) !void {
+    const prepared = try makeManualCodeTestLogin(alloc);
+    try std.testing.expect(try runtime.sign_in_flow.startPrepared(alloc, prepared, .{
+        .poll = .{ .poll_device_token = pendingManualCodeTestPoll },
+        .submit_manual_code = if (accepts_manual_code) acceptManualCodeForTest else null,
+    }));
+    runtime.picker_active = true;
+    runtime.picker_stage = .sign_in;
+    runtime.sign_in_source = .grok_subscription;
+}
+
+test "manual code capability starts collapsed" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    try enterPendingTestSignIn(&runtime, alloc, true);
+
+    try std.testing.expect(runtime.pickerView().sign_in.accepts_manual_code);
+    try std.testing.expect(!runtime.signInCodeEntryActive());
+}
+
+test "manual code visibility preserves a draft across Tab toggles and clears it on exit" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    try enterPendingTestSignIn(&runtime, alloc, true);
+
+    try std.testing.expect(runtime.toggleSignInCodeEntry());
+    try std.testing.expect(runtime.signInCodeEntryActive());
+    for ("draft-code") |byte| try std.testing.expect(try runtime.appendSignInCodeByte(alloc, byte));
+    try std.testing.expectEqual(@as(usize, 10), runtime.pickerView().sign_in_code_mask_count);
+
+    try std.testing.expect(runtime.toggleSignInCodeEntry());
+    try std.testing.expect(!runtime.signInCodeEntryActive());
+    try std.testing.expect(!runtime.pickerView().sign_in_code_visible);
+    try std.testing.expectEqual(@as(usize, 10), runtime.pickerView().sign_in_code_mask_count);
+
+    try std.testing.expect(runtime.toggleSignInCodeEntry());
+    try std.testing.expect(runtime.signInCodeEntryActive());
+    try std.testing.expect(runtime.popPickerStage(alloc));
+    try std.testing.expect(!runtime.pickerView().sign_in_code_visible);
+    try std.testing.expectEqual(@as(usize, 0), runtime.pickerView().sign_in_code_mask_count);
+}
+
+test "manual code visibility cannot toggle without provider capability" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    try enterPendingTestSignIn(&runtime, alloc, false);
+
+    try std.testing.expect(!runtime.toggleSignInCodeEntry());
+    try std.testing.expect(!runtime.pickerView().sign_in_code_visible);
+    try std.testing.expect(!runtime.signInCodeEntryActive());
 }

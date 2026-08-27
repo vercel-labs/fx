@@ -429,6 +429,7 @@ pub const Tool = struct {
     name: []const u8,
     description: []const u8,
     model_schema: model_tool_schema.FunctionSchema,
+    model_visible: bool = true,
     write_provider_advertisement_fn: ?WriteProviderAdvertisementFn = null,
     /// Set when the provider runs the tool instead of fx dispatch. Such a tool
     /// never reaches a call-time permission check, so advertisement is its only

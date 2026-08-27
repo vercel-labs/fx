@@ -23,6 +23,7 @@ const execCalls = [];
 let abortStarted = false;
 let abortObserved = false;
 let checkedToolProjection = false;
+let checkedBrowserCapabilityContext = false;
 const truncatedOutput = `start\n${"🙂".repeat(17_000)}\nend\n`;
 const truncatedBytes = encoder.encode(truncatedOutput).length;
 
@@ -150,6 +151,20 @@ const fetch = async (_url, init = {}) => {
     return new Response(JSON.stringify(catalog), { status: 200, headers: { "content-type": "application/json" } });
   }
   const body = JSON.parse(requestDecoder.decode(init.body));
+  if (!checkedBrowserCapabilityContext) {
+    const serializedPrompt = JSON.stringify(body.prompt || []);
+    for (const guidance of [
+      "embedded browser version of fx",
+      "Public web fetch, web search, and general outbound network access are unavailable",
+      "Do not attempt curl, wget",
+      "locally installed fx provides the full tool suite",
+    ]) {
+      if (!serializedPrompt.includes(guidance)) {
+        throw new Error(`browser capability context omitted ${guidance}: ${serializedPrompt}`);
+      }
+    }
+    checkedBrowserCapabilityContext = true;
+  }
   if (!checkedToolProjection) {
     if (body.tools?.length !== 1 || body.tools[0]?.name !== "terminal") {
       throw new Error(`workspace advertised unexpected tools: ${JSON.stringify(body.tools)}`);
@@ -203,6 +218,9 @@ const fetch = async (_url, init = {}) => {
       { id: "workspace-unknown", input: { action: "exec", command: "must-not-run", unexpected: true } },
     ]);
   }
+  if (prompt.includes("unsupported web request")) {
+    return textResponse("This embedded browser cannot access the public web. Install fx locally for the full tool suite.");
+  }
   if (prompt.includes("workspace recovery")) return textResponse("session stayed alive");
   throw new Error(`unexpected gateway request: ${JSON.stringify(body)}`);
 };
@@ -249,6 +267,7 @@ runtime.write("\x03");
 await waitFor(() => abortObserved, "workspace exec abort signal");
 await waitFor(() => grid().includes("abort mapping checked"), "workspace abort mapping");
 await prompt("workspace invalid boundaries", "invalid boundaries checked");
+await prompt("unsupported web request", "cannot access the public web");
 await prompt("workspace recovery", "session stayed alive");
 
 runtime.write("/exit\r");
@@ -258,7 +277,8 @@ const exitCode = await Promise.race([
 ]);
 if (exitCode !== 0) throw new Error(`fx-term exited with ${exitCode}`);
 if (!checkedToolProjection) throw new Error("workspace tool projection was not checked");
+if (!checkedBrowserCapabilityContext) throw new Error("browser capability context was not checked");
 if (execCalls.join(",") !== "printf adapter-success,generate-truncated-output,timeout-command,hold-command") {
   throw new Error(`unexpected workspace exec calls: ${execCalls.join(",")}`);
 }
-console.log("headless workspace passed: success, truncation, timeout, Ctrl-C abort, and strict invalid boundaries mapped through the host adapter");
+console.log("headless workspace passed: capability refusal, success, truncation, timeout, Ctrl-C abort, and strict invalid boundaries mapped through the host adapter");

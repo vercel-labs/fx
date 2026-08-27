@@ -666,6 +666,8 @@ const UnsupportedRegistry = struct {
         return .{ .alloc = alloc };
     }
 
+    pub fn shutdownSessionsOnly(_: *UnsupportedRegistry) void {}
+
     pub fn deinit(self: *UnsupportedRegistry) void {
         self.* = undefined;
     }
@@ -835,6 +837,36 @@ const SupportedRegistry = struct {
         session_owned = false;
     }
 
+    /// Kills every live session's process without freeing any session state.
+    ///
+    /// For a host that must exit while client threads are still running: those
+    /// threads may hold session pointers, so nothing here may be destroyed, but
+    /// the child processes still have to be signalled or they outlive the host
+    /// that owns them. `deinit` does both; this does only the half that is safe
+    /// while other threads are reading.
+    pub fn shutdownSessionsOnly(self: *SupportedRegistry) void {
+        const zio = io_mod.getIo();
+        // Take a reference on every live session before releasing the lock.
+        // A bare pointer copy would not stop a client that still holds the
+        // registry from recycling a reference-free slot and destroying the
+        // session this loop is about to signal, which is the use-after-free
+        // this drain exists to prevent. Recycling skips a referenced slot.
+        var pinned: [max_sessions]?*Session = @splat(null);
+        self.mutex.lockUncancelable(zio);
+        for (&self.sessions, 0..) |*entry, index| {
+            const session = entry.* orelse continue;
+            self.references[index] += 1;
+            pinned[index] = session;
+        }
+        self.mutex.unlock(zio);
+
+        for (&pinned, 0..) |maybe_session, index| {
+            const session = maybe_session orelse continue;
+            session.shutdown();
+            self.releaseReference(index, session);
+        }
+    }
+
     pub fn deinit(self: *SupportedRegistry) void {
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
@@ -880,12 +912,7 @@ const SupportedRegistry = struct {
             .start => |value| self.start(value, cancelled),
             .read => |value| self.read(value),
             .screen => |value| self.screen(value),
-            .write => |value| self.withSession(
-                .write,
-                value.session_id,
-                writeAction,
-                .{ value, cancelled },
-            ),
+            .write => |value| self.write(value, cancelled),
             .wait => |value| self.wait(value, cancelled),
             .monitor => |value| self.monitor(value, cancelled),
             .inspect => |value| self.inspect(value),
@@ -1190,13 +1217,69 @@ const SupportedRegistry = struct {
         });
     }
 
+    fn write(
+        self: *SupportedRegistry,
+        request: contracts.WriteRequest,
+        cancelled: *const std.atomic.Value(bool),
+    ) Allocator.Error!contracts.OwnedResult {
+        if (self.find(request.session_id)) |reference| {
+            defer self.releaseReference(reference.index, reference.session);
+            return writeAction(reference.session, request, cancelled) catch |err| {
+                return self.actionError(.write, request.session_id, err);
+            };
+        }
+        if (request.lease != .release) {
+            return self.failure(.write, .session_not_found, request.session_id);
+        }
+        if (cancelled.load(.acquire)) {
+            return self.failure(.write, .cancelled, request.session_id);
+        }
+        const durable = self.profile.open_terminal(request.session_id) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return self.failure(.write, .session_not_found, request.session_id);
+        };
+        defer self.profile.release_terminal(durable);
+        const authorization = durable.release_write_lease(
+            request.authority.?,
+            io_mod.milliTimestamp(),
+        ) catch |err| return self.actionError(.write, request.session_id, err);
+        return contracts.OwnedResult.init(
+            self.alloc,
+            .{ .success = .{ .write = .{
+                .session = projectedFacts(durable.facts(), authorization),
+                .accepted_bytes = 0,
+            } } },
+        ) catch return error.OutOfMemory;
+    }
+
     fn wait(
         self: *SupportedRegistry,
         request: contracts.WaitRequest,
         cancelled: *const std.atomic.Value(bool),
     ) Allocator.Error!contracts.OwnedResult {
-        const reference = self.find(request.session_id) orelse
-            return self.failure(.wait, .session_not_found, request.session_id);
+        const reference = self.find(request.session_id) orelse {
+            if (request.return_when != .exit) {
+                return self.failure(.wait, .session_not_found, request.session_id);
+            }
+            const durable = self.profile.open_terminal(request.session_id) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                return self.failure(.wait, .session_not_found, request.session_id);
+            };
+            defer self.profile.release_terminal(durable);
+            const authorization = durable.authorize(
+                request.authority.?,
+                .wait,
+            ) catch |err| return self.actionError(.wait, request.session_id, err);
+            const outcome = durable.termination_outcome() orelse
+                return self.failure(.wait, .session_not_found, request.session_id);
+            return contracts.OwnedResult.init(
+                self.alloc,
+                .{ .success = .{ .wait = .{
+                    .session = projectedFacts(durable.facts(), authorization),
+                    .outcome = outcome,
+                } } },
+            ) catch return error.OutOfMemory;
+        };
         defer self.releaseReference(reference.index, reference.session);
         const authorization = reference.session.durable.begin_wait(
             request.authority.?,
@@ -1238,20 +1321,20 @@ const SupportedRegistry = struct {
         const reference = self.find(request.session_id) orelse
             return self.failure(.monitor, .session_not_found, request.session_id);
         defer self.releaseReference(reference.index, reference.session);
-        switch (request.operation) {
-            .add => |definition| _ = reference.session.durable.authorize_monitor_definition(
+        const authorization = switch (request.operation) {
+            .add => |definition| reference.session.durable.authorize_monitor_definition(
                 request.authority.?,
                 definition,
             ) catch |err| return self.actionError(.monitor, request.session_id, err),
-            .update => |value| _ = reference.session.durable.authorize_monitor_definition(
+            .update => |value| reference.session.durable.authorize_monitor_definition(
                 request.authority.?,
                 value.definition,
             ) catch |err| return self.actionError(.monitor, request.session_id, err),
-            .pause, .@"resume", .remove => _ = reference.session.durable.authorize(
+            .pause, .@"resume", .remove => reference.session.durable.authorize(
                 request.authority.?,
                 .monitor,
             ) catch |err| return self.actionError(.monitor, request.session_id, err),
-        }
+        };
         const owner = reference.session.monitor_owner orelse
             return self.failure(.monitor, .monitor_unavailable, request.session_id);
         const monitor_sequence = owner.applyOperation(
@@ -1265,7 +1348,10 @@ const SupportedRegistry = struct {
                 return self.failure(.monitor, .invalid_request, request.session_id)
         else
             null;
-        const facts = reference.session.durable.facts();
+        const facts = projectedFacts(
+            reference.session.durable.facts(),
+            authorization,
+        );
         return contracts.OwnedResult.init(
             self.alloc,
             .{ .success = .{ .monitor = .{
@@ -4155,6 +4241,10 @@ const Session = struct {
         };
         if (!self.matchesSignalTarget(target)) return false;
 
+        const shell_group_delivery = if (failSignalStageForTest("shell_group"))
+            ProcessGroupDelivery.failed
+        else
+            self.signalVerifiedProcessGroup(target, signal);
         var descendants_delivery = descendants.signalOutsideProcessGroupChecked(
             signalValue(signal),
             target.pid,
@@ -4169,10 +4259,7 @@ const Session = struct {
         );
         return terminalSignalCompleted(
             descendants_delivery,
-            if (failSignalStageForTest("shell_group"))
-                .failed
-            else
-                self.signalVerifiedProcessGroup(target, signal),
+            shell_group_delivery,
         );
     }
 
@@ -7281,4 +7368,208 @@ test "malformed raw fallback durably replaces an invalid checkpoint with corrupt
         contracts.ScreenRecovery{ .unavailable = .corrupt },
         reopened.facts().screen_recovery,
     );
+}
+
+test "shutdownSessionsOnly signals live sessions and leaves them allocated" {
+    if (!isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-shutdown-only");
+    var probe: WorkProbe = .{};
+    var session = try Session.init(
+        alloc,
+        .{ .context = &probe, .update_fn = WorkProbe.update },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer session.deinitUnlaunched();
+
+    session.markLive();
+    session.lifecycle = .running;
+    // A real handle, so releasing it is observable rather than vacuous.
+    session.liveness_file = try std.Io.Dir.createFileAbsolute(
+        io_mod.getIo(),
+        "/dev/null",
+        .{ .truncate = false },
+    );
+
+    var registry = SupportedRegistry{
+        .alloc = alloc,
+        .tracker = .{ .context = &probe, .update_fn = WorkProbe.update },
+        .profile = &fixture.profile,
+        .host_identity = "test-host",
+        .durable_root = "/workspace",
+        .transport_root = "/workspace",
+    };
+    registry.sessions[0] = &session;
+
+    // A slot with no outstanding reference is exactly the slot a client may
+    // recycle, so this is the case the pin has to cover.
+    try std.testing.expectEqual(@as(usize, 0), registry.references[0]);
+
+    registry.shutdownSessionsOnly();
+
+    // Every reference taken to pin the session for shutdown is given back, so
+    // the drain cannot wedge a later removeOwned that waits for the count.
+    try std.testing.expectEqual(@as(usize, 0), registry.references[0]);
+
+    // The liveness handle is released, so the session was actually shut down.
+    try std.testing.expect(session.liveness_file == null);
+    // And the session is still allocated: the registry slot still points at it
+    // and the object is readable, which is what makes this safe to call while
+    // client threads still hold session pointers.
+    try std.testing.expect(registry.sessions[0] == &session);
+    try std.testing.expectEqual(contracts.Lifecycle.running, session.lifecycle);
+}
+
+test "durable release and exit wait survive resident session removal" {
+    if (!isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const persistence = testPersistence("/workspace");
+    const authority = contracts.AuthorityClaim{
+        .principal = persistence.grant.principal,
+        .actor = persistence.grant.actor,
+        .generation = persistence.grant.generation,
+        .proof = persistence.proof,
+    };
+    var durable = try terminal_store.DurableSession.create(&fixture.profile, .{
+        .session_id = "terminal-durable-fallback",
+        .host_identity = "test-host",
+        .shell = "/bin/zsh",
+        .cwd = "/workspace",
+        .command = null,
+        .backend = .native,
+        .dimensions = .{ .rows = 24, .columns = 80 },
+        .persistence = persistence,
+        .initial_monitors = &.{},
+        .now_ms = 1,
+    });
+    var durable_owned = true;
+    defer if (durable_owned) durable.deinit();
+    try durable.persist_termination(.{ .exited = 17 }, 2);
+    _ = try durable.acquire_write_lease(authority, 3);
+    durable.deinit();
+    durable_owned = false;
+
+    var probe: WorkProbe = .{};
+    var registry = SupportedRegistry{
+        .alloc = alloc,
+        .tracker = .{ .context = &probe, .update_fn = WorkProbe.update },
+        .profile = &fixture.profile,
+        .host_identity = "test-host",
+        .durable_root = "/workspace",
+        .transport_root = "/workspace",
+    };
+    var cancelled = std.atomic.Value(bool).init(false);
+    var released = try registry.write(.{
+        .session_id = "terminal-durable-fallback",
+        .lease = .release,
+        .authority = authority,
+    }, &cancelled);
+    defer released.deinit(alloc);
+    switch (released.view()) {
+        .success => |success| switch (success) {
+            .write => |write| {
+                try std.testing.expectEqual(@as(u32, 0), write.accepted_bytes);
+                try std.testing.expectEqual(
+                    contracts.WriteLease.none,
+                    write.session.attention.write_lease,
+                );
+                try std.testing.expectEqual(
+                    contracts.Lifecycle.exited,
+                    write.session.lifecycle,
+                );
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
+
+    var waited = try registry.wait(.{
+        .session_id = "terminal-durable-fallback",
+        .return_when = .exit,
+        .safety_ceiling_ms = 1_000,
+        .authority = authority,
+    }, &cancelled);
+    defer waited.deinit(alloc);
+    switch (waited.view()) {
+        .success => |success| switch (success) {
+            .wait => |wait| try std.testing.expectEqual(
+                contracts.ReturnOutcome{ .exited = 17 },
+                wait.outcome,
+            ),
+            else => return error.TestUnexpectedResult,
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
+}
+
+test "a referenced slot is never recycled out from under its holder" {
+    if (!isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-recycle-guard");
+    var probe: WorkProbe = .{};
+    var resident = try Session.init(
+        alloc,
+        .{ .context = &probe, .update_fn = WorkProbe.update },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer resident.deinitUnlaunched();
+    resident.lifecycle = .exited;
+    try std.testing.expect(resident.isRecyclable());
+
+    const incoming_id = try alloc.dupe(u8, "terminal-recycle-incoming");
+    var incoming = try Session.init(
+        alloc,
+        .{ .context = &probe, .update_fn = WorkProbe.update },
+        &fixture.profile,
+        "test-host",
+        incoming_id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer incoming.deinitUnlaunched();
+
+    var registry = SupportedRegistry{
+        .alloc = alloc,
+        .tracker = .{ .context = &probe, .update_fn = WorkProbe.update },
+        .profile = &fixture.profile,
+        .host_identity = "test-host",
+        .durable_root = "/workspace",
+        .transport_root = "/workspace",
+        .sessions = @splat(&resident),
+        .references = @splat(1),
+    };
+
+    // Every slot holds a recyclable session, so only the reference keeps them.
+    // This is what makes it safe to signal a session after releasing the lock.
+    try std.testing.expect(registry.reserve(&incoming) == null);
+
+    // Drop the references and the same slots become recyclable again, so the
+    // check above is about the reference and not about some other refusal.
+    registry.references = @splat(0);
+    const reservation = registry.reserve(&incoming) orelse
+        return error.TestExpectedRecycle;
+    try std.testing.expectEqual(@as(?*Session, &resident), reservation.evicted);
 }

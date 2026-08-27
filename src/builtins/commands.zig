@@ -49,7 +49,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .details = &.{
             "The prompt may be passed as arguments or piped on stdin when no prompt args are given.",
             "TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.",
-            "Operational progress and diagnostics are written to stderr. JSON output keeps raw Markdown in `output`.",
+            "Operational progress and diagnostics are written to stderr. JSON `output` keeps accumulated assistant Markdown; `final_output` contains only the completed final response, or an empty string when absent.",
             "With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.",
         },
     },
@@ -432,7 +432,6 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .image, .command = "/image", .aliases = &.{"/img"}, .help_entry = "/image <path> (/img)", .completion_description = "attach an image by path", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true, .accepts_payload = true },
-    .{ .kind = .models, .command = "/models", .help_entry = "/models", .completion_description = "browse available models", .presentation_category = .model },
     .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|yolo|reset]", .completion_description = "choose what fx is allowed to do", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .allowlist, .command = "/allowlist", .help_entry = "/allowlist [view [effective|local|user]|[local|user] add|remove|reset ...]", .completion_description = "manage trusted commands, tools, and URLs", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .undo, .command = "/undo", .help_entry = "/undo", .completion_description = "undo the latest tracked file operation", .presentation_category = .session },
@@ -533,7 +532,6 @@ test "built-in slash commands register exact active order" {
         "/image",
         "/images",
         "/model",
-        "/models",
         "/permissions",
         "/allowlist",
         "/undo",
@@ -578,10 +576,9 @@ test "built-in slash registry resolves primary commands and aliases" {
     const credits = slash_registry.lookup("/credits") orelse return error.TestExpectedEqual;
     try std.testing.expect(credits.requires_prompt_credential);
 
-    for ([_][]const u8{ "/model", "/models" }) |command| {
-        const catalog_command = slash_registry.lookup(command) orelse return error.TestExpectedEqual;
-        try std.testing.expect(!catalog_command.requires_prompt_credential);
-    }
+    const model_command = slash_registry.lookup("/model") orelse return error.TestExpectedEqual;
+    try std.testing.expect(!model_command.requires_prompt_credential);
+    try std.testing.expect(slash_registry.lookup("/models") == null);
 
     try std.testing.expect(command_specs.matchedSlashPrefix(slash_registry, "/model\nmodel-id", .model) == null);
 }

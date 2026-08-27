@@ -135,6 +135,7 @@ const Summary = struct {
     total: usize = 0,
     categories: [category_labels.len]usize = @splat(0),
     failed: usize = 0,
+    timed_out: usize = 0,
     denied: usize = 0,
     cancelled: usize = 0,
     deferred: usize = 0,
@@ -238,8 +239,14 @@ fn commandProcessFailed(record: *const ToolDetailRecord) bool {
     const presentation = record.command_process_presentation orelse return false;
     return switch (presentation) {
         .exit_code => |code| code != 0,
-        .signal => true,
+        .signal, .timed_out, .output_capture_failed => true,
     };
+}
+
+fn commandProcessTimedOut(record: *const ToolDetailRecord) bool {
+    if (record.activity_kind != .command) return false;
+    const presentation = record.command_process_presentation orelse return false;
+    return presentation == .timed_out;
 }
 
 fn observeTool(summary: *Summary, detail: ?*const ToolDetailRecord) void {
@@ -256,12 +263,21 @@ fn observeTool(summary: *Summary, detail: ?*const ToolDetailRecord) void {
         return;
     }
     const process_failed = commandProcessFailed(record);
+    const process_timed_out = commandProcessTimedOut(record);
     if (record.outcome) |outcome| {
         switch (outcome) {
             .completed => {
-                if (process_failed) summary.failed += 1;
+                if (process_timed_out)
+                    summary.timed_out += 1
+                else if (process_failed)
+                    summary.failed += 1;
             },
-            .failed => summary.failed += 1,
+            .failed => {
+                if (process_timed_out)
+                    summary.timed_out += 1
+                else
+                    summary.failed += 1;
+            },
             .denied => summary.denied += 1,
             .cancelled => summary.cancelled += 1,
             .deferred => summary.deferred += 1,
@@ -401,6 +417,7 @@ fn formatGroupHeader(
     }
     try appendSegment(&out.writer, summary.completion_unreported, "unreported");
     try appendSegment(&out.writer, summary.not_executed, "not executed");
+    try appendSegment(&out.writer, summary.timed_out, "timed out");
     try appendSegment(&out.writer, summary.failed, "failed");
     try appendSegment(&out.writer, summary.denied, "denied");
     try appendSegment(&out.writer, summary.cancelled, "cancelled");
@@ -1180,6 +1197,31 @@ test "minimal command details expose running completed and failed process states
             "├ Running rg snapshot\n" ++
             "├ Ran zig build\n" ++
             "└ Ran zig build test",
+        projection.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "minimal command timeout uses its typed cause in the row and group" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Timed out sleep 5\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("run_command"),
+            .activity_kind = .command,
+            .outcome = .failed,
+            .command_process_presentation = .timed_out,
+        },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 command · 1 timed out\n" ++
+            "└ Timed out sleep 5",
         projection.entry_actions.items[0].override.bytes,
     );
 }

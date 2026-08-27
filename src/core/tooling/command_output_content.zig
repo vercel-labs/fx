@@ -641,7 +641,7 @@ test "foreground result extraction is exact and rejects delimiter collisions" {
     )) == null);
     try std.testing.expect((try canonicalizeForegroundResult(
         alloc,
-        "timeout=true\ncommand timed out and was terminated\n",
+        "timeout=true\ncleanup_guarantee=best_effort\n",
     )) == null);
 }
 

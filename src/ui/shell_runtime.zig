@@ -113,7 +113,9 @@ pub const TerminalState = struct {
         var raw = self.original_termios;
 
         raw.iflag.BRKINT = false;
+        raw.iflag.IGNCR = false;
         raw.iflag.ICRNL = false;
+        raw.iflag.INLCR = false;
         raw.iflag.INPCK = false;
         raw.iflag.ISTRIP = false;
         raw.iflag.IXON = false;
@@ -633,6 +635,47 @@ test "enableRawMode preserves already queued input" {
     var buf: [1]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 1), try std.posix.read(pty.slave, &buf));
     try std.testing.expectEqual(@as(u8, 3), buf[0]);
+}
+
+test "enableRawMode preserves carriage return input" {
+    if (!supports_test_pty) return error.SkipZigTest;
+
+    const pty = try TestPty.open();
+    defer pty.close();
+
+    var original = try std.posix.tcgetattr(pty.slave);
+    original.iflag.IGNCR = true;
+    original.iflag.ICRNL = true;
+    original.iflag.INLCR = true;
+    try std.posix.tcsetattr(pty.slave, .NOW, original);
+
+    var terminal = TerminalState{ .stdin_fd = pty.slave };
+    try terminal.captureOriginalTermios();
+    try terminal.enableRawMode();
+    defer terminal.disableRawMode();
+
+    const raw = try std.posix.tcgetattr(pty.slave);
+    try std.testing.expect(!raw.iflag.IGNCR);
+    try std.testing.expect(!raw.iflag.ICRNL);
+    try std.testing.expect(!raw.iflag.INLCR);
+
+    const enter = [_]u8{'\r'};
+    try (std.Io.File{
+        .handle = pty.master,
+        .flags = .{ .nonblocking = false },
+    }).writeStreamingAll(io_mod.getIo(), &enter);
+
+    var fds = [_]std.posix.pollfd{.{
+        .fd = pty.slave,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&fds, 100));
+    try std.testing.expect((fds[0].revents & std.posix.POLL.IN) != 0);
+
+    var buf: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try std.posix.read(pty.slave, &buf));
+    try std.testing.expectEqual(@as(u8, '\r'), buf[0]);
 }
 
 test "reconstructive paint re-emits a full transcript in order" {

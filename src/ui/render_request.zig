@@ -96,7 +96,6 @@ pub const RenderRequestState = struct {
     attempt_has_invalidations: bool = false,
     attempt_affects_approval: bool = false,
     frame_admission_block_depth: usize = 0,
-    submitted_prompt_transition_pending: bool = false,
     resize_dirty: bool = false,
     resize_apply_after_ms: i64 = 0,
     pending_settled_width_reflow: bool = false,
@@ -225,22 +224,6 @@ pub const RenderRequestState = struct {
     pub fn endFrameAdmissionBlock(self: *RenderRequestState) void {
         std.debug.assert(self.frame_admission_block_depth > 0);
         self.frame_admission_block_depth -= 1;
-    }
-
-    pub fn beginSubmittedPromptTransition(self: *RenderRequestState) void {
-        if (self.submitted_prompt_transition_pending) return;
-        self.submitted_prompt_transition_pending = true;
-        self.beginFrameAdmissionBlock();
-    }
-
-    pub fn finishSubmittedPromptTransition(self: *RenderRequestState) void {
-        if (!self.submitted_prompt_transition_pending) return;
-        self.submitted_prompt_transition_pending = false;
-        self.endFrameAdmissionBlock();
-    }
-
-    pub fn submittedPromptTransitionPending(self: RenderRequestState) bool {
-        return self.submitted_prompt_transition_pending;
     }
 
     pub fn requestAnimationDue(self: *RenderRequestState, now_ms: i64) bool {
@@ -579,31 +562,6 @@ test "frame admission block defers attempts without dropping pending work" {
     var attempt = (try state.beginAttempt()).?;
     try std.testing.expect(attempt.snapshot.reasons.contains(.footer));
     try std.testing.expect(attempt.snapshot.reasons.contains(.transcript));
-    attempt.restore();
-}
-
-test "submitted prompt transition coalesces pending work until presentation" {
-    var state = RenderRequestState{};
-    state.request(.transcript);
-
-    state.beginSubmittedPromptTransition();
-    state.beginSubmittedPromptTransition();
-    try std.testing.expect(state.submittedPromptTransitionPending());
-    try std.testing.expect(state.blocksFrameCommit());
-    try std.testing.expect((try state.beginAttempt()) == null);
-
-    state.beginFrameAdmissionBlock();
-    state.request(.footer);
-    state.finishSubmittedPromptTransition();
-    state.finishSubmittedPromptTransition();
-    try std.testing.expect(!state.submittedPromptTransitionPending());
-    try std.testing.expect(state.blocksFrameCommit());
-
-    state.endFrameAdmissionBlock();
-    try std.testing.expect(!state.blocksFrameCommit());
-    var attempt = (try state.beginAttempt()).?;
-    try std.testing.expect(attempt.snapshot.reasons.contains(.transcript));
-    try std.testing.expect(attempt.snapshot.reasons.contains(.footer));
     attempt.restore();
 }
 

@@ -360,6 +360,7 @@ fn duplicateToolResultMemory(
         .model_view_covers_full_file = memory.model_view_covers_full_file,
         .command_output_replay = command_output_replay,
         .command_process_presentation = memory.command_process_presentation,
+        .terminal_action_presentation = memory.terminal_action_presentation,
     };
 }
 

@@ -37,7 +37,6 @@ pub const Config = struct {
     provider_capabilities: provider_set.Bundle.Capabilities = .{
         .fx_search = true,
         .vision_fallback = true,
-        .deferred_usage = true,
     },
     custom_tool_guidance: []const u8 = "",
     agent_step_limit: usize,

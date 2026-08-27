@@ -494,6 +494,37 @@ const test_skill = blk: {
     break :blk spec;
 };
 
+const test_skill_search = blk: {
+    var spec = test_skill;
+    spec.name = "skill_search";
+    spec.description = "Test skill search. When to use: exercise registered skill discovery. When NOT to use: load an exact skill.";
+    spec.model_schema = .{
+        .name = "skill_search",
+        .description = spec.description,
+    };
+    spec.action_label = "Searching skills";
+    spec.completed_action_label = "Searched skills";
+    spec.label_arg_kind = .query;
+    spec.label_arg_default = "skills";
+    spec.model_visible = false;
+    break :blk spec;
+};
+
+const test_capability_search = blk: {
+    var spec = test_skill_search;
+    spec.name = "capability_search";
+    spec.description = "Test capability search. When to use: discover skill and MCP metadata together. When NOT to use: load or execute a match.";
+    spec.model_schema = .{
+        .name = "capability_search",
+        .description = spec.description,
+    };
+    spec.model_visible = true;
+    spec.action_label = "Searching capabilities";
+    spec.completed_action_label = "Searched capabilities";
+    spec.label_arg_default = "capabilities";
+    break :blk spec;
+};
+
 const test_install_skill = blk: {
     var spec = test_skill;
     spec.name = "install_skill";
@@ -634,6 +665,7 @@ const test_mcp_search_tools = blk: {
     spec.label_arg_kind = .query;
     spec.label_arg_default = "dynamic tools";
     spec.permission_target_kind = .none;
+    spec.model_visible = false;
     break :blk spec;
 };
 
@@ -695,6 +727,8 @@ const test_all_tools = [_]tool_dispatch.Tool{
     test_web_fetch,
     test_web_search,
     test_terminal,
+    test_capability_search,
+    test_skill_search,
     test_skill,
     test_install_skill,
     test_subagent,
@@ -720,9 +754,9 @@ const test_order = [_][]const u8{
     "create_folder",
     "terminal",
     "subagent",
+    "capability_search",
     "skill",
     "install_skill",
-    "mcp_search_tools",
     "mcp_select_tool",
     "memory",
     "ask_user_question",
@@ -816,6 +850,7 @@ fn appendBuiltinTool(
     tool_set: tool_set_contract.ToolSet,
     options: Options,
 ) !void {
+    if (!tool.model_visible) return;
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
@@ -1075,7 +1110,9 @@ test "MCP tools stay deferred and base selection is stable across catalog churn"
     var second = try buildTestModelToolProjection(alloc, .{ .mcp_runtime = &second_runtime });
     defer second.deinit(alloc);
 
-    try expectContainsName(first.advertised_names, "mcp_search_tools");
+    try expectContainsName(first.advertised_names, "capability_search");
+    try expectNotContainsName(first.advertised_names, "skill_search");
+    try expectNotContainsName(first.advertised_names, "mcp_search_tools");
     try expectContainsName(first.advertised_names, "mcp_select_tool");
     try expectNotContainsName(first.advertised_names, "mcp_first_a");
     try std.testing.expectEqual(first.advertised_names.len, second.advertised_names.len);
