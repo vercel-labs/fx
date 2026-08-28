@@ -59,6 +59,7 @@ pub fn Runtime(comptime App: type) type {
                 const required_source: credentials.Source = switch (provider) {
                     .codex => .chatgpt_subscription,
                     .grok => .grok_subscription,
+                    .anthropic => .anthropic_api_key,
                     .gateway => app.auth.credentialSource() orelse .fx_login,
                 };
                 const route_change = app.auth.selectForProvider(app.alloc, provider) catch |err| switch (err) {
@@ -777,6 +778,7 @@ pub fn Runtime(comptime App: type) type {
                 app.auth.secretStore(),
                 .refresh_if_needed,
                 target,
+                null,
                 null,
             ) catch |err| {
                 debug_trace.logf("provider", "credential preparation failed provider={t} err={s}", .{ target, @errorName(err) });

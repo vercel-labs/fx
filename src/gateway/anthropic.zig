@@ -4,6 +4,7 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
 const Allocator = std.mem.Allocator;
 const default_base_url = "https://api.anthropic.com";
@@ -24,7 +25,6 @@ const connect_timeout_ms: i64 = 30_000;
 pub const e2e_endpoint_env = "FX_E2E_ANTHROPIC_URL";
 
 pub const agent_stream_provider = stream_provider.Provider{
-    .build_fn = buildRequest,
     .stream_fn = streamCompletion,
 };
 
@@ -48,10 +48,9 @@ fn validateModel(model: []const u8) !void {
     }
 }
 
-fn buildRequest(
-    _: ?*anyopaque,
+pub fn buildRequest(
     alloc: Allocator,
-    request: stream_provider.BuildRequest,
+    request: stream_provider.RequestData,
 ) ![]u8 {
     try validateModel(request.model);
     if (request.budget) |budget| {
@@ -84,7 +83,7 @@ fn buildRequest(
     try writer.writeAll(",\"stream\":true,\"messages\":[");
     try writeMessages(writer, request.messages);
     try writer.writeByte(']');
-    const tool_count = try writeTools(writer, alloc, request.serialized_tools, request.selected_dynamic_tool_schemas);
+    const tool_count = try writeTools(writer, alloc, request.tools);
     if (tool_count > 0) {
         try writer.writeAll(",\"tool_choice\":");
         try writeToolChoice(writer, request.tool_choice);
@@ -178,55 +177,67 @@ fn writeToolResult(writer: *std.Io.Writer, message: types.ChatMessage) !void {
 fn writeTools(
     writer: *std.Io.Writer,
     alloc: Allocator,
-    serialized_tools: []const u8,
-    selected_dynamic_schemas: []const []const u8,
+    tools: stream_provider.ToolSelection,
 ) !usize {
     var count: usize = 0;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, serialized_tools, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidToolSchema,
-    };
-    defer parsed.deinit();
-    if (parsed.value != .array) return error.InvalidToolSchema;
-
     var tools_out: std.Io.Writer.Allocating = .init(alloc);
     defer tools_out.deinit();
     try tools_out.writer.writeAll(",\"tools\":[");
-    for (parsed.value.array.items) |tool| {
-        if (try writeFunctionTool(&tools_out.writer, tool, count != 0)) count += 1;
+
+    const InputSchema = union(enum) {
+        static: model_tool_schema.ObjectSchema,
+        dynamic: std.json.Value,
+    };
+
+    const S = struct {
+        fn writeFunctionTool(
+            w: *std.Io.Writer,
+            a: Allocator,
+            name: []const u8,
+            description: []const u8,
+            input_schema: InputSchema,
+        ) !void {
+            if (name.len == 0) return error.InvalidToolSchema;
+            try w.writeAll("{\"name\":");
+            try std.json.Stringify.value(name, .{}, w);
+            if (description.len > 0) {
+                try w.writeAll(",\"description\":");
+                try std.json.Stringify.value(description, .{}, w);
+            }
+            try w.writeAll(",\"input_schema\":");
+            switch (input_schema) {
+                .static => |schema| try model_tool_schema.writeObjectSchema(a, w, schema),
+                .dynamic => |schema| try std.json.Stringify.value(schema, .{}, w),
+            }
+            try w.writeByte('}');
+        }
+        fn containsName(names: []const []const u8, expected: []const u8) bool {
+            for (names) |name| if (std.mem.eql(u8, name, expected)) return true;
+            return false;
+        }
+    };
+
+    for (tools.advertised_names) |name| {
+        const tool = tools.advertisedFunction(name) orelse continue;
+        if (count > 0) try tools_out.writer.writeByte(',');
+        try S.writeFunctionTool(&tools_out.writer, alloc, tool.name, tool.description, .{ .static = tool.input_schema });
+        count += 1;
     }
-    for (selected_dynamic_schemas) |schema_json| {
-        var selected = std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{}) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvalidToolSchema,
-        };
-        defer selected.deinit();
-        if (try writeFunctionTool(&tools_out.writer, selected.value, count != 0)) count += 1;
+    for (tools.additional_functions) |tool| {
+        if (S.containsName(tools.advertised_names, tool.name)) continue;
+        if (count > 0) try tools_out.writer.writeByte(',');
+        try S.writeFunctionTool(&tools_out.writer, alloc, tool.name, tool.description, .{ .static = tool.input_schema });
+        count += 1;
+    }
+    for (tools.selected_dynamic) |tool| {
+        if (S.containsName(tools.advertised_names, tool.name)) continue;
+        if (count > 0) try tools_out.writer.writeByte(',');
+        try S.writeFunctionTool(&tools_out.writer, alloc, tool.name, tool.description, .{ .dynamic = tool.input_schema });
+        count += 1;
     }
     try tools_out.writer.writeByte(']');
     if (count > 0) try writer.writeAll(tools_out.written());
     return count;
-}
-
-fn writeFunctionTool(writer: *std.Io.Writer, value: std.json.Value, comma: bool) !bool {
-    if (value != .object) return false;
-    const kind = value.object.get("type") orelse return false;
-    if (kind != .string or !std.mem.eql(u8, kind.string, "function")) return false;
-    const name = value.object.get("name") orelse return false;
-    if (name != .string or name.string.len == 0) return false;
-    const parameters = value.object.get("inputSchema") orelse value.object.get("parameters") orelse return false;
-    if (parameters != .object) return false;
-    if (comma) try writer.writeByte(',');
-    try writer.writeAll("{\"name\":");
-    try std.json.Stringify.value(name.string, .{}, writer);
-    if (value.object.get("description")) |description| if (description == .string) {
-        try writer.writeAll(",\"description\":");
-        try std.json.Stringify.value(description.string, .{}, writer);
-    };
-    try writer.writeAll(",\"input_schema\":");
-    try std.json.Stringify.value(parameters, .{}, writer);
-    try writer.writeByte('}');
-    return true;
 }
 
 fn writeToolChoice(writer: *std.Io.Writer, choice: types.ToolChoice) !void {
@@ -237,6 +248,21 @@ fn writeToolChoice(writer: *std.Io.Writer, choice: types.ToolChoice) !void {
     }
 }
 
+fn failureKind(status: std.http.Status) stream_provider.FailureKind {
+    return switch (status) {
+        .bad_request => .invalid_request,
+        .unauthorized => .unauthorized,
+        .forbidden => .forbidden,
+        .payload_too_large => .request_too_large,
+        .too_many_requests => .rate_limited,
+        .internal_server_error => .server_error,
+        .bad_gateway => .bad_gateway,
+        .service_unavailable => .unavailable,
+        .gateway_timeout => .gateway_timeout,
+        else => .provider_error,
+    };
+}
+
 fn writeComma(writer: *std.Io.Writer, first: *bool) !void {
     if (!first.*) try writer.writeByte(',');
     first.* = false;
@@ -245,7 +271,7 @@ fn writeComma(writer: *std.Io.Writer, first: *bool) !void {
 fn streamCompletion(
     _: ?*anyopaque,
     alloc: Allocator,
-    request: stream_provider.Request,
+    request: stream_provider.ModelRequest,
 ) !stream_provider.Result {
     var result = streamCompletionCore(alloc, request) catch |err| {
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -260,7 +286,7 @@ fn streamCompletion(
     return result;
 }
 
-fn requestDeadlineExpired(request: stream_provider.Request) bool {
+fn requestDeadlineExpired(request: stream_provider.ModelRequest) bool {
     const deadline = request.deadline orelse return false;
     const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
     return !std.Io.Clock.Timestamp.compare(now, .lt, deadline);
@@ -302,16 +328,18 @@ const OpenRequestOperation = struct {
     }
 };
 
-fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !stream_provider.Result {
+fn streamCompletionCore(alloc: Allocator, request: stream_provider.ModelRequest) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    if (request.credential_source) |source| {
-        // Referenced by name so this module compiles before the enum case lands.
-        const anthropic_api_key = std.meta.stringToEnum(types.CredentialSource, "anthropic_api_key");
-        if (anthropic_api_key == null or source != anthropic_api_key.?) {
+    if (request.credential.source) |source| {
+        if (source != .anthropic_api_key) {
             return error.AnthropicApiKeyCredentialRequired;
         }
+    } else {
+        return error.AnthropicApiKeyCredentialRequired;
     }
     try validateModel(request.model);
+    const payload = try buildRequest(alloc, request.data());
+    defer alloc.free(payload);
     const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
         if (!gateway_client.isLoopbackHttpUrl(override)) return error.InvalidE2EAnthropicEndpoint;
         break :endpoint override;
@@ -323,7 +351,7 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
     var extra_count: usize = 0;
     extra_headers_buf[extra_count] = .{ .name = "accept", .value = "text/event-stream" };
     extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "x-api-key", .value = request.api_key };
+    extra_headers_buf[extra_count] = .{ .name = "x-api-key", .value = request.credential.secret };
     extra_count += 1;
     extra_headers_buf[extra_count] = .{ .name = "anthropic-version", .value = anthropic_version };
     extra_count += 1;
@@ -333,7 +361,7 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
     var open_operation = OpenRequestOperation{
         .client = &client,
         .uri = uri,
-        .api_key = request.api_key,
+        .api_key = request.credential.secret,
         .extra_headers = extra_headers_buf[0..extra_count],
     };
     var connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
@@ -377,11 +405,11 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
     }
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
-    http_request.transfer_encoding = .{ .content_length = request.payload.len };
+    http_request.transfer_encoding = .{ .content_length = payload.len };
     var send_buffer: [8192]u8 = undefined;
     request.delivery.markPossiblySent();
     var body_writer = try http_request.sendBodyUnflushed(&send_buffer);
-    try body_writer.writer.writeAll(request.payload);
+    try body_writer.writer.writeAll(payload);
     try body_writer.end();
     if (http_request.connection) |connection| try connection.flush();
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -398,32 +426,54 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
             alloc.free(bounded_body);
             break :body try alloc.dupe(u8, "Anthropic error response exceeded the local limit");
         } else bounded_body;
-        return .{
-            .status = response.head.status,
-            .err_body = body,
+        return .{ .failed = .{
+            .kind = failureKind(response.head.status),
+            .detail = body,
             .ownership = .owned,
-        };
+        } };
     }
 
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
+    var events = request.events;
     const completion = try consumeSse(
         alloc,
         reader,
-        request.callback_ctx,
-        request.on_content_chunk,
-        request.on_tool_start,
-        request.on_reasoning_chunk,
-        request.on_tool_input_chunk,
+        &events,
+        EventBridge.content,
+        EventBridge.toolStart,
+        EventBridge.reasoning,
+        EventBridge.toolInput,
         request.cancel_flag,
         request.content_capture_limit,
     );
-    return .{
-        .status = .ok,
+    return .{ .completed = .{
         .completion = completion,
         .ownership = .owned,
-    };
+    } };
 }
+
+const EventBridge = struct {
+    fn sink(raw: *anyopaque) *stream_provider.EventSink {
+        return @ptrCast(@alignCast(raw));
+    }
+
+    fn content(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .content_delta = chunk });
+    }
+
+    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .reasoning_delta = chunk });
+    }
+
+    fn toolInput(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .tool_input_delta = chunk });
+    }
+
+    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8) void {
+        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label } });
+    }
+};
 
 const ToolAccumulator = struct {
     block_index: i64,
@@ -534,7 +584,7 @@ fn consumeSse(
     on_tool_input_chunk: ?stream_provider.StreamCallback,
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
-) !types.GatewayCompletion {
+) !types.ModelCompletion {
     var content: std.ArrayList(u8) = .empty;
     errdefer content.deinit(alloc);
     var tools: std.ArrayList(ToolAccumulator) = .empty;
@@ -949,7 +999,7 @@ test "Anthropic SSE maps stop reasons and surfaces error events" {
 
 fn ignoreTestChunk(_: *anyopaque, _: []const u8) void {}
 
-fn deinitTestCompletion(completion: *types.GatewayCompletion) void {
+fn deinitTestCompletion(completion: *types.ModelCompletion) void {
     if (completion.content) |value| std.testing.allocator.free(@constCast(value));
     if (completion.generation_id) |value| std.testing.allocator.free(@constCast(value));
     types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));

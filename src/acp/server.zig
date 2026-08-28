@@ -353,6 +353,7 @@ pub fn selectCredentialForProvider(
             .refresh_if_needed,
             provider,
             state.credential_source,
+            null,
         );
         break :blk resolution.credential orelse return false;
     };
@@ -1370,6 +1371,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             .refresh_if_needed,
             state.provider,
             preferred,
+            null,
         );
         routed_credential = resolution.credential;
         if (routed_credential == null) {
@@ -1650,6 +1652,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     state.cfg.secret_store,
                     .refresh_if_needed,
                     target,
+                    null,
                     null,
                 );
                 break :credential resolution.credential orelse

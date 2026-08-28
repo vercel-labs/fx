@@ -1559,6 +1559,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             .refresh_if_needed,
             ctx.provider,
             preferred,
+            null,
         );
         routed_credential = resolution.credential;
         if (routed_credential == null) {

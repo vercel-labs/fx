@@ -1561,6 +1561,7 @@ fn putModelPreference(
         .gateway => "model",
         .codex => "codex_model",
         .grok => "grok_model",
+        .anthropic => "anthropic_model",
     };
     if (root.contains(legacy_key)) {
         _ = root.orderedRemove(legacy_key);

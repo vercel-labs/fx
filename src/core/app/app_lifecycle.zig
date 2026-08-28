@@ -412,6 +412,7 @@ fn loadStartupStateFromOwnedWorkspace(
             mode,
             state.provider,
             settings.credential_source,
+            null,
         );
         state.credential = resolution.credential;
         state.stored_key_status = resolution.stored_key_status;
@@ -1115,6 +1116,7 @@ fn configuredProviderSelection(
         .gateway => default_model,
         .codex => return error.CodexModelNotSelected,
         .grok => return error.GrokModelNotSelected,
+        .anthropic => return error.AnthropicModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
 }
