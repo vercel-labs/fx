@@ -63,11 +63,11 @@ fn fetchCatalogForProvider(
     }
     const credential = input.access.authorizationCredential() orelse
         return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
-    const account_id = chatgpt_oauth.extractAccountId(alloc, credential) catch |err| {
+    var request_identity = chatgpt_oauth.extractRequestIdentity(alloc, credential) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
     };
-    defer alloc.free(account_id);
+    defer request_identity.deinit(alloc);
     const request_url = modelsUrl(alloc) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .runtime } };
@@ -80,7 +80,8 @@ fn fetchCatalogForProvider(
         .alloc = alloc,
         .url = request_url,
         .credential = credential,
-        .account_id = account_id,
+        .account_id = request_identity.account_id,
+        .residency = request_identity.residency,
     };
     var response = gateway_client.runBoundedHttpOperation(
         FetchResponse,
@@ -135,6 +136,7 @@ const FetchOperation = struct {
     url: []const u8,
     credential: []const u8,
     account_id: []const u8,
+    residency: ?[]const u8,
 
     pub fn run(self: *@This()) !FetchResponse {
         var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
@@ -144,6 +146,18 @@ const FetchOperation = struct {
         const body_buffer = try self.alloc.alloc(u8, max_catalog_bytes + 1);
         defer secret.zeroAndFree(self.alloc, body_buffer);
         var response_writer = std.Io.Writer.fixed(body_buffer);
+        var extra_headers_buf: [4]std.http.Header = undefined;
+        var extra_count: usize = 0;
+        extra_headers_buf[extra_count] = .{ .name = "chatgpt-account-id", .value = self.account_id };
+        extra_count += 1;
+        if (self.residency) |residency| {
+            extra_headers_buf[extra_count] = .{ .name = "x-openai-internal-codex-residency", .value = residency };
+            extra_count += 1;
+        }
+        extra_headers_buf[extra_count] = .{ .name = "originator", .value = "fx" };
+        extra_count += 1;
+        extra_headers_buf[extra_count] = .{ .name = "accept", .value = "application/json" };
+        extra_count += 1;
         const result = client.fetch(.{
             .location = .{ .url = self.url },
             .method = .GET,
@@ -152,11 +166,7 @@ const FetchOperation = struct {
                 .user_agent = .{ .override = gateway_client.user_agent },
                 .accept_encoding = .omit,
             },
-            .extra_headers = &.{
-                .{ .name = "chatgpt-account-id", .value = self.account_id },
-                .{ .name = "originator", .value = "fx" },
-                .{ .name = "accept", .value = "application/json" },
-            },
+            .extra_headers = extra_headers_buf[0..extra_count],
             .response_writer = &response_writer,
             .redirect_behavior = .unhandled,
         }) catch |err| switch (err) {

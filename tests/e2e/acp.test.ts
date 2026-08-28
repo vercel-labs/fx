@@ -522,9 +522,13 @@ function writeSeededFxAuth(home: string, teamId?: string): void {
 function acpChatGptAccessToken(
   accountId = "acct_acp_e2e",
   signature = "signature",
+  authClaims: Record<string, unknown> = {},
 ): string {
   const payload = Buffer.from(JSON.stringify({
-    "https://api.openai.com/auth": { chatgpt_account_id: accountId },
+    "https://api.openai.com/auth": {
+      chatgpt_account_id: accountId,
+      ...authClaims,
+    },
   })).toString("base64url");
   return `header.${payload}.${signature}`;
 }
@@ -577,19 +581,24 @@ function codexLatestToolResult(body: string): { callId: string; output: string }
 function startAcpFakeCodex(options: {
   unauthorizedResponses?: number;
   route?: (body: string) => string | Promise<string>;
+  authClaims?: Record<string, unknown>;
 } = {}) {
-  const accessToken = acpChatGptAccessToken("acct_acp_e2e", "stale");
-  const refreshedAccessToken = acpChatGptAccessToken("acct_acp_e2e", "fresh");
-  const requests: Array<{ path: string; authorization: string | null; body: string }> = [];
-  const modelRequests: Array<{ path: string; authorization: string | null }> = [];
-  const tokenRequests: Array<{ path: string; authorization: string | null }> = [];
+  const accessToken = acpChatGptAccessToken("acct_acp_e2e", "stale", options.authClaims);
+  const refreshedAccessToken = acpChatGptAccessToken("acct_acp_e2e", "fresh", options.authClaims);
+  const requests: Array<{ path: string; authorization: string | null; residency: string | null; body: string }> = [];
+  const modelRequests: Array<{ path: string; authorization: string | null; residency: string | null }> = [];
+  const tokenRequests: Array<{ path: string; authorization: string | null; residency: string | null }> = [];
   let unauthorizedResponses = options.unauthorizedResponses ?? 0;
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     async fetch(request) {
       const path = new URL(request.url).pathname;
-      const recorded = { path, authorization: request.headers.get("authorization") };
+      const recorded = {
+        path,
+        authorization: request.headers.get("authorization"),
+        residency: request.headers.get("x-openai-internal-codex-residency"),
+      };
       if (path === "/models") {
         modelRequests.push(recorded);
         return Response.json({ models: [
@@ -8248,6 +8257,53 @@ describe("acp: model catalog authentication", () => {
         expect(request).not.toHaveProperty("providerOptions.gateway.speed");
       } finally {
         await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "session provider changes propagate Codex residency to model discovery",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-codex-residency-");
+      const gateway = startFakeGateway([]);
+      const codex = startAcpFakeCodex({
+        authClaims: { chatgpt_compute_residency: "us" },
+      });
+      writeSeededAcpChatGptLogin(root.home, codex.accessToken);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+            FX_E2E_CHATGPT_TOKEN_URL: codex.tokenUrl,
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+
+        const changed = await client.request("session/set_config_option", {
+          configId: "provider",
+          value: "codex",
+        }, 3) as any;
+        expect(changed.result.configOptions.find((option: any) => option.id === "provider").currentValue)
+          .toBe("codex");
+        expect(codex.modelRequests).toHaveLength(1);
+        expect(codex.modelRequests[0]!.residency).toBe("us");
+        expect(gateway.requests).toHaveLength(0);
+        expect(gateway.modelRequests).toHaveLength(1);
+        for (const request of [...gateway.requests, ...gateway.modelRequests]) {
+          expect(request.headers.has("x-openai-internal-codex-residency")).toBe(false);
+        }
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        codex.stop();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
