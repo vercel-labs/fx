@@ -154,6 +154,31 @@ pub fn writeToolCallUpdate(w: *std.Io.Writer, tool_call_id: []const u8, status: 
     try writeToolCallUpdateWithCommandResult(w, tool_call_id, status, content_text, null);
 }
 
+pub fn writeToolCallDiffUpdate(
+    w: *std.Io.Writer,
+    tool_call_id: []const u8,
+    status: ToolCallStatus,
+    path: []const u8,
+    old_text: ?[]const u8,
+    new_text: []const u8,
+) !void {
+    try w.writeAll("{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":");
+    try writeJsonStr(tool_call_id, w);
+    try w.writeAll(",\"status\":");
+    try writeJsonStr(status.jsonString(), w);
+    try w.writeAll(",\"content\":[{\"type\":\"diff\",\"path\":");
+    try writeJsonStr(path, w);
+    try w.writeAll(",\"oldText\":");
+    if (old_text) |text| {
+        try writeJsonStr(text, w);
+    } else {
+        try w.writeAll("null");
+    }
+    try w.writeAll(",\"newText\":");
+    try writeJsonStr(new_text, w);
+    try w.writeAll("}]}");
+}
+
 pub fn writeToolCallUpdateWithCommandResult(
     w: *std.Io.Writer,
     tool_call_id: []const u8,
@@ -258,6 +283,31 @@ test "writeToolCallUpdate with content" {
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"tool_call_update\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"completed\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "File written successfully") != null);
+}
+
+test "writeToolCallDiffUpdate preserves the authoritative file change" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeToolCallDiffUpdate(
+        &out.writer,
+        "call_diff",
+        .in_progress,
+        "/workspace/src/main.zig",
+        "const before = true;\n",
+        "const after = true;\n",
+    );
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("tool_call_update", parsed.value.object.get("sessionUpdate").?.string);
+    try std.testing.expectEqualStrings("call_diff", parsed.value.object.get("toolCallId").?.string);
+    try std.testing.expectEqualStrings("in_progress", parsed.value.object.get("status").?.string);
+    const diff = parsed.value.object.get("content").?.array.items[0].object;
+    try std.testing.expectEqualStrings("diff", diff.get("type").?.string);
+    try std.testing.expectEqualStrings("/workspace/src/main.zig", diff.get("path").?.string);
+    try std.testing.expectEqualStrings("const before = true;\n", diff.get("oldText").?.string);
+    try std.testing.expectEqualStrings("const after = true;\n", diff.get("newText").?.string);
 }
 
 test "writeToolCallUpdate can include structured command result" {

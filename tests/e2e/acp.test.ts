@@ -5049,6 +5049,65 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP publishes committed file changes as authoritative diffs",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-file-diff-");
+      const target = join(root.workspace, "example.txt");
+      writeFileSync(target, "before\n");
+      const gateway = startFakeGateway([
+        fileToolCall("write_file_diff", target, "before\nafter\n"),
+        finalText("ACP file diff complete"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+        const prompt = await runPrompt(
+          client,
+          `Append one line to ${target} with write_file.`,
+          TIMEOUT,
+        );
+        const updates = prompt.messages
+          .filter((message: any) =>
+            message.method === "session/update" &&
+            message.params?.update?.sessionUpdate === "tool_call_update" &&
+            message.params.update.toolCallId === "write_file_diff"
+          )
+          .map((message: any) => message.params.update);
+        const diffIndex = updates.findIndex((update: any) =>
+          update.content?.[0]?.type === "diff"
+        );
+        const completedIndex = updates.findIndex((update: any) =>
+          update.status === "completed"
+        );
+
+        expect(diffIndex).toBeGreaterThanOrEqual(0);
+        expect(completedIndex).toBeGreaterThan(diffIndex);
+        expect(updates[diffIndex]).toMatchObject({
+          status: "in_progress",
+          content: [{
+            type: "diff",
+            path: target,
+            oldText: "before\n",
+            newText: "before\nafter\n",
+          }],
+        });
+        expect(updates[completedIndex]!.content).toBeUndefined();
+        expect(readFileSync(target, "utf-8")).toBe("before\nafter\n");
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP automatic ask returns to the agent before requesting permission",
     async () => {
       const acceptedRoot = createIsolatedRoot("fx-acp-auto-file-accepted-");
