@@ -647,14 +647,14 @@ const Reducer = struct {
         for (self.tools.items) |*tool| {
             if (tool.id.items.len == 0 or tool.name.items.len == 0) return error.InvalidOpenAICompatibleSseEvent;
             if (!tool.started) request.events.emit(.{ .tool_started = .{ .id = tool.id.items, .name = tool.name.items } });
-            const arguments = if (tool.arguments.items.len == 0) "{}" else tool.arguments.items;
-            if (try types.ToolArgumentIntegrity.classifySerialized(alloc, arguments) == .malformed_json) {
-                return error.InvalidOpenAICompatibleToolArguments;
-            }
+            const streamed_arguments = if (tool.arguments.items.len == 0) "{}" else tool.arguments.items;
+            const argument_integrity = try types.ToolArgumentIntegrity.classifySerialized(alloc, streamed_arguments);
+            const arguments = if (argument_integrity == .valid) streamed_arguments else "{}";
             owned_tools[count] = .{
                 .id = try alloc.dupe(u8, tool.id.items),
                 .name = try alloc.dupe(u8, tool.name.items),
                 .arguments_json = try alloc.dupe(u8, arguments),
+                .argument_integrity = argument_integrity,
             };
             count += 1;
         }
@@ -791,5 +791,39 @@ test "OpenAI compatible reducer maps text reasoning tools and usage" {
     try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", capture.tool_input.items);
     try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", completion.tool_calls[0].arguments_json);
     try std.testing.expectEqual(@as(?u64, 10), completion.usage.input_tokens);
+    try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
+}
+
+test "OpenAI compatible reducer defers malformed tool arguments to agent recovery" {
+    const Capture = struct {
+        fn emit(_: *anyopaque, _: stream_provider.Event) void {}
+    };
+    var capture: u8 = 0;
+    var cancel = std.atomic.Value(bool).init(false);
+    var delivery = stream_provider.DeliveryCertainty.init();
+    var evidence: stream_provider.AttemptEvidence = .{};
+    var reducer: Reducer = .{};
+    defer reducer.deinit(std.testing.allocator);
+    const request = stream_provider.ModelRequest{
+        .credential = .{ .secret = "key" },
+        .model = "model",
+        .retry_count = 0,
+        .messages = &.{},
+        .tool_choice = .auto,
+        .provider_options = .{},
+        .trace_ctx = .{},
+        .content_capture_limit = null,
+        .delivery = &delivery,
+        .attempt_evidence = &evidence,
+        .events = .{ .context = &capture, .emit_fn = Capture.emit },
+        .cancel_flag = &cancel,
+    };
+    try reducer.apply(std.testing.allocator, "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}]},\"finish_reason\":\"tool_calls\"}]}", request);
+    const completion = try reducer.finish(std.testing.allocator, request);
+    defer types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
+
+    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
+    try std.testing.expectEqualStrings("{}", completion.tool_calls[0].arguments_json);
+    try std.testing.expectEqual(types.ToolArgumentIntegrity.malformed_json, completion.tool_calls[0].argument_integrity);
     try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
 }
