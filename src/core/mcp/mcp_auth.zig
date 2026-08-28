@@ -1014,6 +1014,10 @@ pub fn authorizeAutomated(
     );
 }
 
+fn interactiveRedirectUri(alloc: Allocator, port: u16) ![]u8 {
+    return std.fmt.allocPrint(alloc, "http://localhost:{d}/callback", .{port});
+}
+
 pub fn authorizeInteractive(
     alloc: Allocator,
     options: InteractiveAuthorizationOptions,
@@ -1024,10 +1028,9 @@ pub fn authorizeInteractive(
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = try address.listen(io_mod.getIo(), .{ .reuse_address = true });
     defer listener.deinit(io_mod.getIo());
-    const redirect_uri = try std.fmt.allocPrint(
+    const redirect_uri = try interactiveRedirectUri(
         alloc,
-        "http://127.0.0.1:{d}/callback",
-        .{listener.socket.address.getPort()},
+        listener.socket.address.getPort(),
     );
     defer alloc.free(redirect_uri);
     var context = InteractiveAuthorizationContext{
@@ -2449,6 +2452,15 @@ test "authorization response uses exact state and issuer comparison" {
             response,
         ),
     );
+}
+
+test "interactive OAuth callback advertises localhost" {
+    const alloc = std.testing.allocator;
+    const redirect_uri = try interactiveRedirectUri(alloc, 4321);
+    defer alloc.free(redirect_uri);
+
+    try std.testing.expectEqualStrings("http://localhost:4321/callback", redirect_uri);
+    try std.testing.expect(isLoopbackEndpoint(redirect_uri));
 }
 
 test "authorization redirect target must match the registered callback" {
