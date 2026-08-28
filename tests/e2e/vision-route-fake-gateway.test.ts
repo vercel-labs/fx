@@ -716,6 +716,96 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
+    "fx ask stops a sixth silent Vision inspection across equivalent path spellings",
+    async () => {
+      const root = createIsolatedRoot();
+      const fixture = createScopedImageFixture(root);
+      const gateway = startImageGateway([
+        sseToolCall(
+          "vision",
+          { paths: ["assets/nested/fixture.png"], focus: "inspect the cost" },
+          "vision_1",
+        ),
+        sseText(visionResult(1, "first evidence")),
+        sseToolCall(
+          "vision",
+          { paths: ["./assets/nested/fixture.png"], focus: "find the price" },
+          "vision_2",
+        ),
+        sseText(visionResult(1, "second evidence")),
+        sseToolCall(
+          "vision",
+          { paths: [fixture.imagePath], focus: "read the dollar amount" },
+          "vision_3",
+        ),
+        sseText(visionResult(1, "third evidence")),
+        sseToolCall(
+          "vision",
+          { paths: ["assets/nested/fixture.png"], focus: "check the footer" },
+          "vision_4",
+        ),
+        sseText(visionResult(1, "fourth evidence")),
+        sseToolCall(
+          "vision",
+          { paths: ["./assets/nested/fixture.png"], focus: "inspect the total" },
+          "vision_5",
+        ),
+        sseText(visionResult(1, "fifth evidence")),
+        sseToolCall(
+          "vision",
+          { paths: [fixture.imagePath], focus: "look once more" },
+          "vision_6",
+        ),
+      ]);
+      try {
+        const result = await runFx(
+          [
+            "ask",
+            "--json",
+            "--no-save",
+            "--no-color",
+            "--image",
+            fixture.imagePath,
+            "Read the cost shown in the attached image.",
+          ],
+          {
+            cwd: root.workspace,
+            env: {
+              ...fakeGatewayEnv(root, gateway, GLM_MODEL),
+              FX_PERMISSION_MODE: "yolo",
+            },
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(result.code).toBe(1);
+        const json = JSON.parse(result.stdout.trim()) as {
+          output: string;
+          exit_code: number;
+          tool_calls: Array<{ name: string; status: string }>;
+        };
+        expect(json.exit_code).toBe(1);
+        expect(json.output).toBe("");
+        expect(result.stderr).toContain("Stopped a repeated Vision loop");
+        expect(json.tool_calls).toHaveLength(6);
+        expect(json.tool_calls.slice(0, 5)).toEqual(
+          Array.from({ length: 5 }, () => ({ name: "vision", status: "success" })),
+        );
+        expect(json.tool_calls[5]).toEqual({ name: "vision", status: "error" });
+        expect(gateway.catalogRequests).toBe(1);
+        expect(gateway.chatRequests).toHaveLength(11);
+        expect(gateway.chatRequests[6]!.body).toContain(
+          "Vision has already inspected this same image set successfully three times",
+        );
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "fx ask recovers when the model rejects the post-Vision prompt as assistant prefill",
     async () => {
       const root = createIsolatedRoot();
