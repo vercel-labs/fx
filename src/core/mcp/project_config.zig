@@ -1095,6 +1095,7 @@ fn parseProfileAuth(alloc: Allocator, object: std.json.ObjectMap) !?McpAuthConfi
     auth.client_id = try parseOptionalOwnedString(alloc, auth_object, "client_id");
     auth.client_secret_env = try parseOptionalOwnedString(alloc, auth_object, "client_secret_env");
     auth.client_metadata_url = try parseOptionalOwnedString(alloc, auth_object, "client_metadata_url");
+    auth.redirect_uri = try parseOptionalOwnedString(alloc, auth_object, "redirect_uri");
     if (auth_object.get("scopes")) |field| auth.scopes = try parseStringArray(alloc, field);
     if (auth.client_secret_env) |field| {
         if (!isValidEnvName(field) or auth.client_id == null) return error.McpConfigInvalidOAuth;
@@ -1104,6 +1105,7 @@ fn parseProfileAuth(alloc: Allocator, object: std.json.ObjectMap) !?McpAuthConfi
         alloc.free(canonical);
     }
     if (auth.client_metadata_url) |field| mcp_auth.validateClientMetadataUrl(field) catch return error.McpConfigInvalidOAuth;
+    if (auth.redirect_uri) |field| mcp_auth.validateInteractiveRedirectUri(field) catch return error.McpConfigInvalidOAuth;
     return auth;
 }
 

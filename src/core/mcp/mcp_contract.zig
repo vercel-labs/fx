@@ -78,6 +78,7 @@ pub const McpAuthConfig = struct {
     client_id: ?[]u8 = null,
     client_secret_env: ?[]u8 = null,
     client_metadata_url: ?[]u8 = null,
+    redirect_uri: ?[]u8 = null,
     scopes: [][]u8 = &.{},
 
     pub fn deinit(self: *McpAuthConfig, alloc: Allocator) void {
@@ -86,6 +87,7 @@ pub const McpAuthConfig = struct {
         if (self.client_id) |value| alloc.free(value);
         if (self.client_secret_env) |value| alloc.free(value);
         if (self.client_metadata_url) |value| alloc.free(value);
+        if (self.redirect_uri) |value| alloc.free(value);
         freeOwnedStrings(alloc, self.scopes);
         self.* = .{};
     }

@@ -5510,6 +5510,7 @@ pub const McpRuntime = struct {
                 .client_id = auth_config.client_id,
                 .client_secret = client_secret,
                 .client_metadata_url = auth_config.client_metadata_url,
+                .redirect_uri = auth_config.redirect_uri,
                 .scopes = auth_config.scopes,
             },
             .previous_scope = source.previous_scope,

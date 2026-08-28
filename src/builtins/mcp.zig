@@ -1090,6 +1090,7 @@ fn renderConfigJson(alloc: Allocator, configs: []const McpServerConfig) ![]u8 {
             if (auth.client_id) |field| try writeOptionalJsonField(&out.writer, &first_auth, "client_id", field);
             if (auth.client_secret_env) |field| try writeOptionalJsonField(&out.writer, &first_auth, "client_secret_env", field);
             if (auth.client_metadata_url) |field| try writeOptionalJsonField(&out.writer, &first_auth, "client_metadata_url", field);
+            if (auth.redirect_uri) |field| try writeOptionalJsonField(&out.writer, &first_auth, "redirect_uri", field);
             if (auth.scopes.len > 0) {
                 if (!first_auth) try out.writer.writeByte(',');
                 first_auth = false;
@@ -2192,7 +2193,7 @@ test "loadConfigFromJson preserves HTTP identity headers and timeouts" {
 test "remote config keeps credential references and OAuth policy without secrets" {
     const alloc = std.testing.allocator;
     const json =
-        \\{"mcp":{"api":{"type":"http","url":"https://api.example.com/mcp","header_env":{"X-Workspace":"MCP_WORKSPACE"},"bearer_token_env":"MCP_TOKEN","oauth":{"resource":"https://api.example.com/mcp","issuer":"https://login.example.com","client_id":"fx-client","client_secret_env":"MCP_CLIENT_SECRET","client_metadata_url":"https://client.example/fx.json","scopes":["tools.read","tools.call"]}}}}
+        \\{"mcp":{"api":{"type":"http","url":"https://api.example.com/mcp","header_env":{"X-Workspace":"MCP_WORKSPACE"},"bearer_token_env":"MCP_TOKEN","oauth":{"resource":"https://api.example.com/mcp","issuer":"https://login.example.com","client_id":"fx-client","client_secret_env":"MCP_CLIENT_SECRET","client_metadata_url":"https://client.example/fx.json","redirect_uri":"http://localhost:3118/callback","scopes":["tools.read","tools.call"]}}}}
     ;
     var configs = try loadConfigFromJson(alloc, json);
     defer freeConfigs(alloc, &configs);
@@ -2211,7 +2212,29 @@ test "remote config keeps credential references and OAuth policy without secrets
     try std.testing.expectEqualStrings("https://login.example.com", auth.issuer.?);
     try std.testing.expectEqualStrings("fx-client", auth.client_id.?);
     try std.testing.expectEqualStrings("MCP_CLIENT_SECRET", auth.client_secret_env.?);
+    try std.testing.expectEqualStrings("http://localhost:3118/callback", auth.redirect_uri.?);
     try std.testing.expectEqual(@as(usize, 2), auth.scopes.len);
+
+    const rendered = try renderConfigJson(alloc, configs.items);
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.find(u8, rendered, "\"redirect_uri\":\"http://localhost:3118/callback\"") != null);
+}
+
+test "profile config rejects unsafe OAuth redirect URIs" {
+    const invalid = [_][]const u8{
+        \\{"mcp":{"api":{"type":"http","url":"https://api.example.com/mcp","oauth":{"redirect_uri":"https://localhost:3118/callback"}}}}
+        ,
+        \\{"mcp":{"api":{"type":"http","url":"https://api.example.com/mcp","oauth":{"redirect_uri":"http://example.com:3118/callback"}}}}
+        ,
+        \\{"mcp":{"api":{"type":"http","url":"https://api.example.com/mcp","oauth":{"redirect_uri":"http://localhost/callback"}}}}
+        ,
+    };
+    for (invalid) |json| {
+        try std.testing.expectError(
+            error.McpConfigInvalidOAuth,
+            loadConfigFromJson(std.testing.allocator, json),
+        );
+    }
 }
 
 test "profile config rejects a mixed set containing invalid client metadata URLs" {
