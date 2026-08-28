@@ -13,6 +13,7 @@ pub const Options = struct {
     permission_rules: types.PermissionRuleSet = .{},
     mcp_runtime: ?*mcp_runtime.McpRuntime = null,
     subagent_available: bool = false,
+    goal_available: bool = false,
 };
 
 const BuildKind = enum { full, read_only };
@@ -559,6 +560,25 @@ const test_subagent = blk: {
     break :blk spec;
 };
 
+const test_get_goal = blk: {
+    var spec = test_skill;
+    spec.name = "get_goal";
+    spec.description = "Test goal lookup. When to use: exercise goal availability projection. When NOT to use: assert product-specific goal behavior.";
+    spec.model_schema = .{
+        .name = "get_goal",
+        .description = spec.description,
+    };
+    spec.executor_kind = .get_goal;
+    spec.activity_kind = .read;
+    spec.requires_approval = false;
+    spec.action_label = "Reading goal";
+    spec.completed_action_label = "Read goal";
+    spec.label_arg_kind = .none;
+    spec.label_arg_default = "goal";
+    spec.permission_target_kind = .none;
+    break :blk spec;
+};
+
 const test_mcp_select_tool = blk: {
     var spec = test_skill;
     spec.name = "mcp_select_tool";
@@ -737,6 +757,7 @@ const test_all_tools = [_]tool_dispatch.Tool{
     test_ask_user_question,
     test_vision,
     test_read_tool_result,
+    test_get_goal,
 };
 
 const test_order = [_][]const u8{
@@ -839,6 +860,13 @@ fn buildToolProjection(alloc: Allocator, tool_set: tool_set_contract.ToolSet, ki
         .custom_guidance = custom_guidance,
     };
 }
+
+fn isGoalTool(name: []const u8) bool {
+    return std.mem.eql(u8, name, "get_goal") or
+        std.mem.eql(u8, name, "create_goal") or
+        std.mem.eql(u8, name, "update_goal");
+}
+
 fn appendBuiltinTool(
     alloc: Allocator,
     advertised_names: *std.ArrayList([]const u8),
@@ -853,6 +881,7 @@ fn appendBuiltinTool(
     if (!tool.model_visible) return;
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
+    if (isGoalTool(tool.name) and !options.goal_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
     if (options.permission_mode != .yolo) {
         if (tool.provider_executed and !providerExecutionIsAllowed(tool.name, options.permission_rules)) return;
@@ -1119,6 +1148,18 @@ test "MCP tools stay deferred and base selection is stable across catalog churn"
     for (first.advertised_names, second.advertised_names) |left, right| {
         try std.testing.expectEqualStrings(left, right);
     }
+}
+
+test "goal tools require a host goal context" {
+    var unavailable = try buildTestModelToolProjection(std.testing.allocator, .{});
+    defer unavailable.deinit(std.testing.allocator);
+    try expectNotContainsName(unavailable.advertised_names, "get_goal");
+
+    var available = try buildTestModelToolProjection(std.testing.allocator, .{
+        .goal_available = true,
+    });
+    defer available.deinit(std.testing.allocator);
+    try expectContainsName(available.advertised_names, "get_goal");
 }
 
 test "subagent and terminal selection follow host capability" {

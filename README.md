@@ -107,6 +107,8 @@ JSON and quiet requests stay noninteractive by default. Add `--prompt-permission
 
 Inside a saved session, `/permissions remember <allow|deny> <tool-name> <arguments-json>` stores an exact confirmed rule without running the action. `/permissions` lists stable rule IDs, and `/permissions revoke <rule-id>` removes a stored rule even when its original workspace or file state has changed.
 
+Use `/goal <objective>` to attach a persistent objective to the current session. `/goal` shows its status and usage, `/goal pause` and `/goal resume` control automatic continuation, and `/goal clear` removes it. During agent turns, fx accounts input and output tokens against the goal and continues active work until the agent marks it complete or blocked, the user pauses it, or its token budget is reached.
+
 ## Embed fx
 
 fx builds as a native binary or WebAssembly. Applications embedding fx can provide network transport, session storage, configuration, permission handling, and terminal I/O.

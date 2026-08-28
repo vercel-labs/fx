@@ -40,6 +40,7 @@ const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_set = @import("../gateway/provider_set.zig");
+const goal_module = @import("../goal/goal.zig");
 const test_builtin_gateway = if (@import("builtin").is_test)
     @import("../../builtins/gateway.zig")
 else
@@ -98,6 +99,7 @@ pub fn Runtime(comptime App: type) type {
         fn childToolContext(root_context: tool_runtime.Context) tool_runtime.Context {
             var child_context = root_context;
             child_context.tracker = null;
+            child_context.goal_ctx = null;
             return child_context;
         }
 
@@ -200,6 +202,14 @@ pub fn Runtime(comptime App: type) type {
                 provider_set.Bundle.Capabilities{ .fx_search = true, .vision_fallback = true }
             else
                 provider_set.Bundle.Capabilities{};
+            if (comptime @hasField(App, "goal_tool_context")) {
+                app.goal_tool_context = .{
+                    .goal = app.goal,
+                    .now_ms = io_mod.milliTimestamp(),
+                    .mutation_ctx = app,
+                    .on_mutation = commitGoalMutation,
+                };
+            }
             var ctx: tool_runtime.Context = .{
                 .workspace_root = workspace_root,
                 .access_scope = if (host_workspace != null)
@@ -237,6 +247,7 @@ pub fn Runtime(comptime App: type) type {
                 .effort = agent_settings.effort,
                 .first_call_tool_choice = agent_settings.first_call_tool_choice,
                 .tool_registry = if (comptime @hasDecl(App, "toolRegistry")) app.toolRegistry() else .{},
+                .goal_ctx = if (comptime @hasField(App, "goal_tool_context")) &app.goal_tool_context else null,
                 .subagent_host = if (comptime @hasField(App, "session_persistence"))
                     app_session_runtime.Runtime(App).subagentHost(app)
                 else
@@ -324,6 +335,19 @@ pub fn Runtime(comptime App: type) type {
             }
             ctx.model_capability_resolver = app_callbacks.Bindings(App).modelCapabilityResolver(app);
             return ctx;
+        }
+
+        fn commitGoalMutation(raw: ?*anyopaque, goal: goal_module.goal_store.Goal) anyerror!void {
+            const app: *App = @ptrCast(@alignCast(raw orelse return error.GoalMutationUnavailable));
+            const terminal_transition = if (app.goal) |current|
+                current.status == .active and goal.status.isTerminal()
+            else
+                false;
+            try app.replaceGoal(goal);
+            if (comptime @hasField(App, "goal_terminal_transition_pending_accounting")) {
+                app.goal_terminal_transition_pending_accounting = terminal_transition;
+            }
+            app.goal_tool_context.goal = app.goal;
         }
 
         fn respondToMcpInput(
@@ -839,7 +863,10 @@ pub fn Runtime(comptime App: type) type {
             }, arena, messages);
         }
 
-        pub fn refreshProjectContext(app: *App, targets: []const context_contract.ApplicableTarget) context_contract.ProviderError!void {
+        pub fn refreshProjectContext(
+            app: *App,
+            targets: []const context_contract.ApplicableTarget,
+        ) (context_contract.ProviderError || error{PaintGuardViolated})!void {
             app.context_snapshot.deinit(app.alloc);
             if (!app.context_enabled) return;
 

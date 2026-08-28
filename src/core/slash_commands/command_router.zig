@@ -44,6 +44,7 @@ pub const ParsedCommand = union(enum) {
     notifications: []const u8,
     workspace: []const u8,
     version,
+    goal: []const u8,
     unknown,
 };
 
@@ -88,6 +89,7 @@ pub const CommandHandlers = struct {
     handle_notifications: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_workspace: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
+    handle_goal: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     unknown: *const fn (ctx: *anyopaque, cmd: []const u8) anyerror!void,
 };
 
@@ -136,6 +138,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .notifications => .{ .notifications = payload },
         .workspace => .{ .workspace = payload },
         .version => .version,
+        .goal => .{ .goal = payload },
     };
 }
 
@@ -193,6 +196,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .notifications => |rest| try handlers.handle_notifications(handlers.ctx, rest),
         .workspace => |rest| try handlers.handle_workspace(handlers.ctx, rest),
         .version => try handlers.show_version(handlers.ctx),
+        .goal => |rest| try handlers.handle_goal(handlers.ctx, rest),
         .unknown => try handlers.unknown(handlers.ctx, cmd),
     }
 }
@@ -532,6 +536,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .handle_notifications = unexpectedPayload,
         .handle_workspace = unexpectedPayload,
         .show_version = unexpectedNoPayload,
+        .handle_goal = unexpectedPayload,
         .unknown = unexpectedPayload,
     };
 }

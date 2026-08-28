@@ -15,6 +15,7 @@ const tracked_file_mutations = @import("../core/tooling/tracked_file_mutations.z
 const types = @import("../core/shared/types.zig");
 const lexical_relevance = @import("../core/shared/lexical_relevance.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
+const goal_module = @import("../core/goal/goal.zig");
 const ask_user_question_impl = @import("../tools/agent/ask_user_question.zig");
 const subagent_impl = @import("../tools/agent/subagent.zig");
 const vision_impl = @import("../tools/agent/vision.zig");
@@ -48,6 +49,7 @@ const test_session_child_store = if (std_builtin.is_test)
     @import("../core/session/session_child_store.zig")
 else
     struct {};
+const goal_tools_impl = @import("../tools/agent/goal_tools.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -1528,9 +1530,35 @@ pub const all = [_]tool_dispatch.Tool{
     ask_user_question,
     vision,
     read_tool_result,
+    goal_tools_impl.get_goal,
+    goal_tools_impl.create_goal,
+    goal_tools_impl.update_goal,
 };
 
 pub const registry = tool_dispatch.Registry{ .tools = all[0..] };
+
+test "production registry dispatches get_goal with a session context" {
+    const alloc = std.testing.allocator;
+    var goal: goal_module.goal_store.Goal = .{
+        .goal_id = try alloc.dupe(u8, "goal-production"),
+        .objective = try alloc.dupe(u8, "verify production dispatch"),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+    };
+    defer goal.deinit(alloc);
+    var goal_ctx: goal_module.GoalToolContext = .{ .goal = goal };
+    var result = try tool_dispatch.dispatchAuthorizedToolCall(.{
+        .allocator = alloc,
+        .goal_ctx = &goal_ctx,
+    }, registry, types.ToolCall{
+        .id = "call-get-goal",
+        .name = "get_goal",
+        .arguments_json = "{}",
+    });
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "verify production dispatch") != null);
+}
 
 test "built-in model-facing tool contract stays byte exact" {
     const alloc = std.testing.allocator;
@@ -1560,7 +1588,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "700ed0b345282b3fc25ac1ce0040acd13761f6efc76c9fb54c4552a26315e2f2",
+        "d9e838cda00404a235801e17fc798524dc535546c8220833a8d6065a54dccc38",
         &actual_hex,
     );
 }
@@ -2207,6 +2235,9 @@ pub const advertisement_order = [_][]const u8{
     "open_file",
     "web_fetch",
     "web_search",
+    "get_goal",
+    "create_goal",
+    "update_goal",
 };
 
 pub const read_only_tool_names = [_][]const u8{
@@ -2280,6 +2311,9 @@ test "built-in tools register exact active local order" {
         "ask_user_question",
         "vision",
         "read_tool_result",
+        "get_goal",
+        "create_goal",
+        "update_goal",
     };
 
     try std.testing.expectEqual(expected_names.len, all.len);

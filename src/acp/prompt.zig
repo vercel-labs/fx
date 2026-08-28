@@ -4243,6 +4243,9 @@ test "ACP full advertisement includes direct provider search with explicit permi
     });
     defer projection.deinit(std.testing.allocator);
     try std.testing.expect(tool_projection_mod.containsName(projection.advertised_names, "web_search"));
+    try std.testing.expect(!tool_projection_mod.containsName(projection.advertised_names, "get_goal"));
+    try std.testing.expect(!tool_projection_mod.containsName(projection.advertised_names, "create_goal"));
+    try std.testing.expect(!tool_projection_mod.containsName(projection.advertised_names, "update_goal"));
     try std.testing.expectEqualStrings(builtin_tools.web_search.description, projection.custom_guidance);
 }
 

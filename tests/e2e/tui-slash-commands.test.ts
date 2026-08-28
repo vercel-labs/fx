@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -54,6 +55,7 @@ async function launchAndWait(): Promise<TmuxSession> {
 async function launchNoKeyAndWait(): Promise<{
   terminal: TmuxSession;
   stderrPath: string;
+  home: string;
 }> {
   const root = mkdtempSync(join(tmpdir(), "fx-slash-commands-no-key-"));
   const home = join(root, "home");
@@ -76,10 +78,118 @@ async function launchNoKeyAndWait(): Promise<{
     },
   });
   await terminal.waitForComposer(10_000);
-  return { terminal, stderrPath };
+  return { terminal, stderrPath, home };
 }
 
 describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
+  test(
+    "/goal sets, reads, and durably stores a goal without model credentials",
+    async () => {
+      const launched = await launchNoKeyAndWait();
+      session = launched.terminal;
+
+      await session.sendText("/goal verify the lifecycle");
+      await session.waitForText("Goal set: verify the lifecycle", 5_000);
+      await session.sendText("/goal");
+      const pane = await session.waitForText("Status: active", 5_000);
+      expect(pane).toContain("Goal: verify the lifecycle");
+
+      expect(readFileSync(launched.stderrPath, "utf8")).toBe("");
+      const sessionId = readdirSync(join(launched.home, ".fx", "sessions"), {
+        withFileTypes: true,
+      }).find((entry) => entry.isDirectory() && entry.name !== "latest")?.name;
+      expect(sessionId).toBeDefined();
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(5_000)).toBe(true);
+      session = await TmuxSession.create({
+        cmd: `${FX_BIN} resume ${sessionId}`,
+        cwd: join(launched.home, "..", "workspace"),
+        env: {
+          HOME: launched.home,
+          AI_GATEWAY_API_KEY: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_SKIP_ONBOARDING: "1",
+          VERCEL_OIDC_TOKEN: undefined,
+        },
+      });
+      await session.waitForComposer(10_000);
+      await session.sendText("/goal");
+      const resumed = await session.waitForText("Status: active", 5_000);
+      expect(resumed).toContain("Goal: verify the lifecycle");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "goal tools persist accounting across automatic continuation and completion",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-goal-lifecycle-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      tempDirs.push(root);
+
+      gateway = startFakeGateway([
+        fakeGatewayToolCall("create-goal", "create_goal", {
+          objective: "verify deterministic lifecycle",
+          token_budget: 1_000,
+        }),
+        fakeGatewayFinalText("first goal stage finished"),
+        fakeGatewayToolCall("complete-goal", "update_goal", {
+          status: "complete",
+        }),
+        fakeGatewayFinalText("goal lifecycle complete"),
+      ]);
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "goal-lifecycle-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_PERMISSION_MODE: "yolo",
+        },
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("Create and finish the requested goal.");
+      await session.waitForText("goal lifecycle complete", 15_000);
+      await session.waitForComposer(5_000);
+
+      expect(gateway.requestCount()).toBe(4);
+      expect(gateway.requests[2]?.body).toContain(
+        "Continue working toward the active thread goal.",
+      );
+      expect(gateway.requests[2]?.body).toContain(
+        "verify deterministic lifecycle",
+      );
+      const continuedUsage = gateway.requests[2]?.body.match(/Tokens used: (\d+)/);
+      expect(continuedUsage).not.toBeNull();
+      const tokensAfterFirstTurn = Number(continuedUsage?.[1] ?? 0);
+      expect(tokensAfterFirstTurn).toBeGreaterThan(0);
+      expect(gateway.requests[3]?.body).toContain('"status":"complete"');
+
+      await session.sendText("/goal");
+      const pane = await session.waitForText("Status: complete", 5_000);
+      expect(pane).toContain("Goal: verify deterministic lifecycle");
+      const completedUsage = pane.match(/Tokens used: (\d+) \/ 1000 tokens/);
+      expect(completedUsage).not.toBeNull();
+      expect(Number(completedUsage?.[1] ?? 0)).toBeGreaterThan(tokensAfterFirstTurn);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
   test(
     "/undo reports the exact empty state",
     async () => {
