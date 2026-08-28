@@ -562,6 +562,35 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        fn routePrimaryComposerPointerAction(
+            app: *App,
+            pointer: input_action.MousePointer,
+        ) bool {
+            if (pointer.kind != .press or pointer.shift or pointer.alt or pointer.ctrl) return false;
+            if (!app.shell.footer_viewport.has_frame) return false;
+
+            const prefix_cells: u16 = @intCast(visual_layout.inputPrefix(0).cell_width);
+            const position = app.shell.footer_viewport.geometry.inputPointerPosition(
+                pointer.row,
+                pointer.column,
+                prefix_cells,
+            ) orelse return false;
+            const point = visual_layout.cursorPointAtPosition(.{
+                .input = app.input_runtime.edit_state.input.items,
+                .cursor = app.input_runtime.edit_state.cursor,
+                .terminal_cols = app.shell.layout.cols,
+                .pasted_blocks = app.input_runtime.entities.pasted_blocks.items,
+                .skill_tokens = app.input_runtime.entities.skill_tokens.items,
+            }, position.row_index, position.content_column) orelse return false;
+
+            dismissActiveMenusThenRedraw(app);
+            app.input_runtime.vertical_navigation.reset();
+            if (app.input_runtime.edit_state.setCursor(point.raw_offset)) {
+                app.shell.render_requests.request(.footer);
+            }
+            return true;
+        }
+
         pub fn expireTerminalInputGestures(app: *App, now: i64) void {
             expireCtrlCExitArm(app, now);
             expireEscClearArm(app, now);
@@ -1144,6 +1173,12 @@ pub fn Runtime(comptime App: type) type {
                     resolved,
                     approval_focused_edit,
                 );
+                return .done;
+            }
+
+            if (resolved == .mouse_pointer and
+                routePrimaryComposerPointerAction(app, resolved.mouse_pointer))
+            {
                 return .done;
             }
 
@@ -10720,6 +10755,37 @@ test "app_input_runtime keeps in-progress SGR mouse reports past bare escape tim
     try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
     try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.mouse.sgr_bytes);
     try std.testing.expectEqual(@as(usize, 0), app.approval_screen.document_scroll_rows);
+}
+
+test "primary composer pointer press places the caret without starting a drag selection" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.edit_state.setText(alloc, "alpha beta");
+    _ = app.input_runtime.edit_state.selectAll();
+    app.shell.footer_viewport.has_frame = true;
+    app.shell.footer_viewport.geometry = .{
+        .top = 21,
+        .top_divider = 21,
+        .input_base = 22,
+        .input_first = 22,
+        .input_window_first = 0,
+        .bottom_divider = 23,
+        .hint = 24,
+    };
+
+    const prefix_cells: u16 = @intCast(visual_layout.inputPrefix(0).cell_width);
+    var report: [48]u8 = undefined;
+    const click = try std.fmt.bufPrint(
+        &report,
+        "\x1b[<0;{d};22M\x1b[<0;{d};22m",
+        .{ prefix_cells + 4, prefix_cells + 4 },
+    );
+    try feedRoutingBytes(&app, click);
+
+    try std.testing.expectEqual(@as(usize, 3), app.input_runtime.edit_state.cursor);
+    try std.testing.expect(app.input_runtime.edit_state.selection_anchor == null);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
 test "file approval enter waits for the matching committed modal frame" {

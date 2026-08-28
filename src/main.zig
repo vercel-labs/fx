@@ -11,6 +11,7 @@ const auth_runtime = @import("core/auth/auth_runtime.zig");
 const api_key_validator = @import("core/auth/api_key_validator.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
 const js_host_auth = @import("core/auth/js_host_auth.zig");
+const js_host_clipboard = @import("core/hosts/js_host_clipboard.zig");
 const credentials = @import("core/auth/credentials.zig");
 const secret = @import("core/auth/secret.zig");
 const model_cache_runtime = @import("core/app/model_cache_runtime.zig");
@@ -479,7 +480,12 @@ const App = struct {
     }
 
     pub fn clipboard(_: *const Self) host.Clipboard {
-        return if (comptime host_profile.clipboard) native_host.clipboard else host.unavailable_clipboard;
+        return if (comptime host_profile.clipboard)
+            native_host.clipboard
+        else if (comptime host_profile.js_host_clipboard)
+            js_host_clipboard.clipboard
+        else
+            host.unavailable_clipboard;
     }
 
     pub fn terminalTitle(self: *const Self) host.TerminalTitle {

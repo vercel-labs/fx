@@ -64,7 +64,8 @@
 
     const terminal = new Terminal({
       cursorBlink: true,
-      cursorStyle: "block",
+      cursorStyle: "bar",
+      cursorWidth: 1,
       fontFamily: '"Geist Mono", monospace',
       fontSize: 14,
       fontWeight: 400,
@@ -116,7 +117,6 @@
       },
       clear(workspaceRoot) { localStorage.removeItem(`fx.term.history.${workspaceRoot}`); },
     };
-
     if (!supportsJspi()) {
       terminal.write("fx requires Chrome or Edge 137+ with JSPI support.\r\n");
       window.__fxTerminal = { terminal, fitAddon, resizeObserver, unsupported: true };
