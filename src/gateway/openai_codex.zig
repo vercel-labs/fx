@@ -6,6 +6,7 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const codex_websocket = @import("openai_codex_websocket.zig");
 const responses_protocol = @import("responses_protocol.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
@@ -140,7 +141,32 @@ fn streamCompletion(
     try validateModel(request.model);
     const payload = try buildRequest(alloc, request.data());
     defer alloc.free(payload);
-    return streamPrepared(alloc, request, payload) catch |err| {
+
+    var admission_policy: AdmissionPolicy = .admit;
+    if (codex_websocket.webSocketAvailable()) {
+        var output_emitted = false;
+        if (codex_websocket.streamViaWebSocket(alloc, request, payload, &output_emitted)) |result| {
+            return result;
+        } else |err| {
+            if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
+            if (err == error.OutOfMemory) return err;
+            // Once the model produced output, replaying the request over SSE
+            // could duplicate tool calls; surface the failure instead.
+            if (output_emitted or !codex_websocket.errorAllowsSseFallback(err)) {
+                request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(err, request.delivery.load());
+                return err;
+            }
+            codex_websocket.armSseFallback(err);
+            // The WebSocket attempt may have consumed this invocation's
+            // admission; the SSE fallback continues under it.
+            admission_policy = if (request.attempt_evidence.provider_admitted)
+                .already_admitted
+            else
+                .admit;
+        }
+    }
+
+    return streamPreparedWithAdmission(alloc, request, payload, admission_policy) catch |err| {
         if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
         request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(err, request.delivery.load());
         return err;
@@ -183,10 +209,21 @@ const OpenRequestOperation = struct {
     }
 };
 
+const AdmissionPolicy = enum { admit, already_admitted };
+
 pub fn streamPrepared(
     alloc: Allocator,
     request: stream_provider.ModelRequest,
     payload: []const u8,
+) !stream_provider.Result {
+    return streamPreparedWithAdmission(alloc, request, payload, .admit);
+}
+
+fn streamPreparedWithAdmission(
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+    payload: []const u8,
+    admission_policy: AdmissionPolicy,
 ) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
     const account_id = try chatgpt_oauth.extractAccountId(alloc, request.credential.secret);
@@ -230,7 +267,7 @@ pub fn streamPrepared(
         .clock = .awake,
         .raw = .fromMilliseconds(connect_timeout_ms),
     });
-    try request.admission.admit();
+    if (admission_policy == .admit) try request.admission.admit();
     var opened = try gateway_client.runBoundedHttpOperation(
         OpenedRequest,
         alloc,
