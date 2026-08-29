@@ -364,8 +364,7 @@ fn writeTerminalSafe(writer: *std.Io.Writer, alloc: Allocator, raw: []const u8) 
 }
 
 fn gatewayProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
-    const source = auth.active_source orelse return auth.gateway_connected;
-    return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription);
+    return auth.gateway_connected or model_provider.authorizesCredential(.gateway, auth.active_source);
 }
 
 fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
@@ -374,6 +373,14 @@ fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
 
 fn grokProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     return auth.grok_connected or auth.active_source == .grok_subscription;
+}
+
+fn fireworksProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
+    return auth.fireworks_connected or auth.active_source == .fireworks_api_key;
+}
+
+fn modalProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
+    return auth.modal_connected or auth.active_source == .modal_proxy_token;
 }
 
 fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.StatusSnapshot) !void {
@@ -390,6 +397,16 @@ fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.Status
     if (grokProviderConnected(auth)) {
         if (wrote_provider) try writer.writeAll(", Grok");
         if (!wrote_provider) try writer.writeAll("Grok");
+        wrote_provider = true;
+    }
+    if (fireworksProviderConnected(auth)) {
+        if (wrote_provider) try writer.writeAll(", Fireworks");
+        if (!wrote_provider) try writer.writeAll("Fireworks");
+        wrote_provider = true;
+    }
+    if (modalProviderConnected(auth)) {
+        if (wrote_provider) try writer.writeAll(", Modal");
+        if (!wrote_provider) try writer.writeAll("Modal");
         wrote_provider = true;
     }
     if (!wrote_provider) try writer.writeAll("none");
@@ -623,6 +640,16 @@ pub const StatusSnapshot = struct {
             if (grokProviderConnected(self.auth)) {
                 if (wrote_provider) try writer.writeByte(',');
                 try std.json.Stringify.value("grok", .{}, writer);
+                wrote_provider = true;
+            }
+            if (fireworksProviderConnected(self.auth)) {
+                if (wrote_provider) try writer.writeByte(',');
+                try std.json.Stringify.value("fireworks", .{}, writer);
+                wrote_provider = true;
+            }
+            if (modalProviderConnected(self.auth)) {
+                if (wrote_provider) try writer.writeByte(',');
+                try std.json.Stringify.value("modal", .{}, writer);
             }
             try writer.writeByte(']');
         }
@@ -852,6 +879,8 @@ pub const ModelListSnapshot = struct {
             .gateway => "gateway",
             .codex => provider_catalog.label(.codex),
             .grok => provider_catalog.label(.grok),
+            .fireworks => provider_catalog.label(.fireworks),
+            .modal => provider_catalog.label(.modal),
         };
     }
 
@@ -2144,6 +2173,32 @@ test "status distinguishes the selected model route from connected providers" {
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"model_source\":\"Codex subscription\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"connected_providers\":[\"vercel-ai-gateway\",\"codex\"]") != null);
+}
+
+test "status reports direct provider connections without relabeling them as Gateway" {
+    const snapshot = StatusSnapshot{
+        .model = "glm-5-3-flash",
+        .provider = .modal,
+        .auth = .{
+            .active_source = .modal_proxy_token,
+            .fireworks_connected = true,
+            .modal_connected = true,
+        },
+        .permission_mode = .yolo,
+        .workspace_root = "/tmp/fx",
+        .history_turns = 0,
+        .session_permission_grants = 0,
+        .agent_step_limit = 24,
+    };
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "model_source=Modal") != null);
+    try std.testing.expect(std.mem.find(u8, text, "connected_providers=Fireworks, Modal") != null);
+    try std.testing.expect(std.mem.find(u8, text, "connected_providers=Vercel AI Gateway") == null);
+
+    const json = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "\"connected_providers\":[\"fireworks\",\"modal\"]") != null);
 }
 
 test "MCP config diagnostic renders in status text and JSON but not interactive body" {

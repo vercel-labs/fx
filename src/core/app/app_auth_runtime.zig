@@ -59,6 +59,8 @@ pub fn Runtime(comptime App: type) type {
                 const required_source: credentials.Source = switch (provider) {
                     .codex => .chatgpt_subscription,
                     .grok => .grok_subscription,
+                    .fireworks => .fireworks_api_key,
+                    .modal => .modal_proxy_token,
                     .gateway => app.auth.credentialSource() orelse .fx_login,
                 };
                 const route_change = app.auth.selectForProvider(app.alloc, provider) catch |err| switch (err) {
@@ -71,12 +73,13 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "auth",
                         .tone = .warning,
-                        .body = if (provider == .grok)
-                            credentials.missing_grok_interactive_credential_message
-                        else if (provider == .codex)
-                            credentials.missing_chatgpt_interactive_credential_message
-                        else
-                            credentials.missing_interactive_credential_message,
+                        .body = switch (provider) {
+                            .grok => credentials.missing_grok_interactive_credential_message,
+                            .codex => credentials.missing_chatgpt_interactive_credential_message,
+                            .fireworks => credentials.missing_fireworks_interactive_credential_message,
+                            .modal => credentials.missing_modal_interactive_credential_message,
+                            .gateway => credentials.missing_interactive_credential_message,
+                        },
                     }, true);
                     app.shell.render_requests.request(.footer);
                     return false;
@@ -594,9 +597,9 @@ pub fn Runtime(comptime App: type) type {
         /// leaves the source active for this run rather than refusing a working
         /// credential the user already selected.
         fn rememberCredentialSource(app: *App, source: credentials.Source) void {
-            // ChatGPT is selected by model route, not as a global Gateway
-            // credential preference. Its saved session coexists independently.
-            if (source == .chatgpt_subscription or source == .grok_subscription) return;
+            // Direct providers are selected by model route, not as a global
+            // Gateway credential preference. Their credentials coexist independently.
+            if (!model_provider.authorizesCredential(.gateway, source)) return;
             if (comptime @hasDecl(App, "persistCredentialSourcePreference")) {
                 app.persistCredentialSourcePreference(source);
                 return;
@@ -809,6 +812,10 @@ pub fn Runtime(comptime App: type) type {
                         "Run fx login codex, then try switching again."
                     else if (target == .grok)
                         "Run fx login grok, then try switching again."
+                    else if (target == .fireworks)
+                        credentials.missing_fireworks_interactive_credential_message
+                    else if (target == .modal)
+                        credentials.missing_modal_interactive_credential_message
                     else
                         credentials.missing_interactive_credential_message,
                 }, true);
@@ -1162,11 +1169,11 @@ pub fn Runtime(comptime App: type) type {
                 @hasField(@TypeOf(app.session), "usage"))
             {
                 if (app.auth.gatewayCredential()) |credential| {
-                    const subscription = if (comptime @hasField(@TypeOf(credential), "source"))
-                        credential.source == .chatgpt_subscription or credential.source == .grok_subscription
+                    const gateway_credential = if (comptime @hasField(@TypeOf(credential), "source"))
+                        model_provider.authorizesCredential(.gateway, credential.source)
                     else
-                        false;
-                    if (subscription) {
+                        true;
+                    if (!gateway_credential) {
                         app.session.usage.clearReconciliationCredential();
                     } else {
                         if (comptime @hasDecl(
@@ -1397,7 +1404,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
             switch (provider) {
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
-                .gateway => unreachable,
+                .gateway, .fireworks, .modal => unreachable,
             }
 
             try std.testing.expectEqual(@as(usize, 0), app.auth.start_count);

@@ -94,6 +94,8 @@ pub const CredentialSource = enum {
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+    fireworks_api_key,
+    modal_proxy_token,
 };
 
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {
@@ -1693,7 +1695,6 @@ pub const ReasoningEffort = union(enum) {
 
     pub fn parse(raw: []const u8) ?ReasoningEffort {
         if (std.ascii.eqlIgnoreCase(raw, "auto") or
-            std.ascii.eqlIgnoreCase(raw, "adaptive") or
             std.ascii.eqlIgnoreCase(raw, "default")) return .auto;
         return .{ .named = Name.parse(raw) orelse return null };
     }
@@ -2609,7 +2610,7 @@ test "ConversationLanguage preserves core constructors" {
 }
 
 test "ReasoningEffort preserves default aliases and opaque names" {
-    const default_aliases = [_][]const u8{ "auto", "AUTO", "adaptive", "default" };
+    const default_aliases = [_][]const u8{ "auto", "AUTO", "default" };
     for (default_aliases) |alias| {
         const parsed = ReasoningEffort.parseDisplayLabel(alias) orelse return error.ExpectedReasoningEffort;
         try std.testing.expectEqual(ReasoningEffort.auto, parsed);
@@ -2618,7 +2619,7 @@ test "ReasoningEffort preserves default aliases and opaque names" {
         try std.testing.expect(parsed.gatewayValue() == null);
     }
 
-    const named_values = [_][]const u8{ "none", "low", "xhigh", "future-tier" };
+    const named_values = [_][]const u8{ "none", "low", "xhigh", "adaptive", "future-tier" };
     for (named_values) |raw| {
         const parsed = ReasoningEffort.parse(raw) orelse return error.ExpectedReasoningEffort;
         try std.testing.expectEqualStrings(raw, parsed.label());

@@ -418,6 +418,8 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
             .stored_key => "Gateway catalog: authenticated with the stored API key.",
             .chatgpt_subscription => "Codex catalog: authenticated with a subscription.",
             .grok_subscription => "Grok catalog: authenticated with a subscription.",
+            .fireworks_api_key => "Fireworks catalog: authenticated with FIREWORKS_API_KEY.",
+            .modal_proxy_token => "Modal catalog: authenticated with the proxy token.",
         };
     }
     return null;

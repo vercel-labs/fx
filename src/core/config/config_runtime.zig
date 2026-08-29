@@ -499,6 +499,16 @@ fn loadMergedSettingsDetailedWithOptionalHome(
         }
     }
 
+    if (io_mod.getenv("FX_PROVIDER")) |provider_override| {
+        const trimmed = std.mem.trim(u8, provider_override, " \t\r\n");
+        if (trimmed.len > 0) {
+            if (model_provider.parse(trimmed)) |provider| {
+                settings.provider = provider;
+                sources.provider = .process_override;
+            }
+        }
+    }
+
     if (io_mod.getenv("FX_MODEL")) |model_override| {
         if (std.mem.trim(u8, model_override, " \t\r\n").len > 0) {
             sources.models.set(settings.provider orelse .gateway, .process_override);
@@ -3406,6 +3416,33 @@ test "detailed settings report non-empty process model override as winning sourc
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(ConfigSource.process_override, result.sources.models.get(.gateway));
+    try std.testing.expectEqual(ModelSource.process_override, result.model_source.?);
+    try std.testing.expectEqualStrings("user/model", result.settings.models.get(.gateway).?);
+}
+
+test "process provider override scopes the process model override" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"provider\":\"gateway\",\"models\":{\"gateway\":\"user/model\"}}\n");
+
+    const home = try TestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    try home.map.put("FX_PROVIDER", "modal");
+    try home.map.put("FX_MODEL", "kimi-k3");
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(model_provider.ProviderId.modal, result.settings.provider.?);
+    try std.testing.expectEqual(ConfigSource.process_override, result.sources.provider);
+    try std.testing.expectEqual(ConfigSource.process_override, result.sources.models.get(.modal));
     try std.testing.expectEqual(ModelSource.process_override, result.model_source.?);
     try std.testing.expectEqualStrings("user/model", result.settings.models.get(.gateway).?);
 }

@@ -37,6 +37,22 @@ pub const entries = [_]Entry{
         .description = "SuperGrok or X Premium subscription",
         .subscription = true,
     },
+    .{
+        .id = .fireworks,
+        .slug = "fireworks",
+        .name = "Fireworks",
+        .route_name = "Fireworks",
+        .description = "Fireworks account API models",
+        .subscription = false,
+    },
+    .{
+        .id = .modal,
+        .slug = "modal",
+        .name = "Modal",
+        .route_name = "Modal",
+        .description = "Robomart Modal model endpoints",
+        .subscription = false,
+    },
 };
 
 pub fn parse(value: []const u8) ?model_provider.ProviderId {
@@ -61,6 +77,8 @@ test "auth provider catalog uses the model provider identity and explicit aliase
     try std.testing.expectEqual(model_provider.ProviderId.gateway, parse("gateway").?);
     try std.testing.expectEqual(model_provider.ProviderId.codex, parse("codex").?);
     try std.testing.expectEqual(model_provider.ProviderId.grok, parse("grok").?);
+    try std.testing.expectEqual(model_provider.ProviderId.fireworks, parse("fireworks").?);
+    try std.testing.expectEqual(model_provider.ProviderId.modal, parse("modal").?);
     try std.testing.expect(parse("openai-codex") == null);
     try std.testing.expect(parse("chatgpt") == null);
     try std.testing.expect(parse("unknown") == null);

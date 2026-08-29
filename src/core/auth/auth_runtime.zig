@@ -31,6 +31,8 @@ const credential_source_order = [_]credentials.Source{
     .stored_key,
     .chatgpt_subscription,
     .grok_subscription,
+    .fireworks_api_key,
+    .modal_proxy_token,
 };
 
 const SourceProbeFn = *const fn (?*anyopaque, Allocator, credentials.Source) anyerror!bool;
@@ -407,7 +409,7 @@ pub const PickerView = struct {
             else
                 4,
             .connections => connectionChoiceCount(),
-            .provider => if (comptime host_target.is_wasm) 2 else 3,
+            .provider => if (comptime host_target.is_wasm) 2 else 5,
             .sign_in, .api_key => 0,
             .change_team => blk: {
                 var count: usize = 0;
@@ -441,6 +443,8 @@ pub const PickerView = struct {
                 0 => .{ .provider = .gateway },
                 1 => .{ .provider = .codex },
                 2 => if (comptime host_target.is_wasm) null else .{ .provider = .grok },
+                3 => if (comptime host_target.is_wasm) null else .{ .provider = .fireworks },
+                4 => if (comptime host_target.is_wasm) null else .{ .provider = .modal },
                 else => null,
             },
             .sign_in, .api_key => null,
@@ -583,6 +587,8 @@ pub const StatusSnapshot = struct {
     gateway_connected: bool = false,
     chatgpt_connected: bool = false,
     grok_connected: bool = false,
+    fireworks_connected: bool = false,
+    modal_connected: bool = false,
     /// The active credential is past its refresh deadline. Distinct from `refreshable`,
     /// which answers whether this source type can refresh at all.
     expired: bool = false,
@@ -614,6 +620,18 @@ pub const StatusSnapshot = struct {
             return switch (surface) {
                 .cli => credentials.missing_grok_credential_message,
                 .interactive => credentials.missing_grok_interactive_credential_message,
+            };
+        }
+        if (self.required_source == .fireworks_api_key) {
+            return switch (surface) {
+                .cli => credentials.missing_fireworks_credential_message,
+                .interactive => credentials.missing_fireworks_interactive_credential_message,
+            };
+        }
+        if (self.required_source == .modal_proxy_token) {
+            return switch (surface) {
+                .cli => credentials.missing_modal_credential_message,
+                .interactive => credentials.missing_modal_interactive_credential_message,
             };
         }
         return switch (surface) {
@@ -667,6 +685,22 @@ pub fn loadStatusSnapshotForProvider(
         error.OutOfMemory => return err,
         else => false,
     };
+    const fireworks_connected = credentials.sourceExists(
+        alloc,
+        secret_store,
+        .fireworks_api_key,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => false,
+    };
+    const modal_connected = credentials.sourceExists(
+        alloc,
+        secret_store,
+        .modal_proxy_token,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => false,
+    };
     // Resolves in `.stored` mode: a diagnostic must not refresh, because refreshing
     // rewrites the session file and performs network I/O. It reports the expired state
     // instead of repairing it.
@@ -694,19 +728,14 @@ pub fn loadStatusSnapshotForProvider(
             break :blk credentials.Resolution{ .stored_key_status = .unavailable };
         },
     };
-    const resolved_source = if (resolution.credential) |credential| credential.source else null;
-    var gateway_connected = resolved_source != null and resolved_source != .chatgpt_subscription and resolved_source != .grok_subscription;
-    const gateway_probe_required = provider == .codex or provider == .grok or
-        resolved_source == .chatgpt_subscription or resolved_source == .grok_subscription;
-    if (gateway_probe_required) {
-        for ([_]credentials.Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .stored_key }) |source| {
-            if (credentials.sourceExists(alloc, secret_store, source) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => false,
-            }) {
-                gateway_connected = true;
-                break;
-            }
+    var gateway_connected = false;
+    for ([_]credentials.Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .stored_key }) |source| {
+        if (credentials.sourceExists(alloc, secret_store, source) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => false,
+        }) {
+            gateway_connected = true;
+            break;
         }
     }
     if (resolution.credential) |loaded| {
@@ -722,6 +751,8 @@ pub fn loadStatusSnapshotForProvider(
             .gateway_connected = gateway_connected,
             .chatgpt_connected = chatgpt_connected,
             .grok_connected = grok_connected,
+            .fireworks_connected = fireworks_connected,
+            .modal_connected = modal_connected,
             .expired = expired,
         };
     }
@@ -730,12 +761,18 @@ pub fn loadStatusSnapshotForProvider(
             .chatgpt_subscription
         else if (provider == .grok)
             .grok_subscription
+        else if (provider == .fireworks)
+            .fireworks_api_key
+        else if (provider == .modal)
+            .modal_proxy_token
         else
             null,
         .stored_key_status = resolution.stored_key_status,
         .gateway_connected = gateway_connected,
         .chatgpt_connected = chatgpt_connected,
         .grok_connected = grok_connected,
+        .fireworks_connected = fireworks_connected,
+        .modal_connected = modal_connected,
     };
 }
 
@@ -889,10 +926,14 @@ pub const Runtime = struct {
             self.source_inventory.contains(.stored_key);
         const chatgpt_connected = self.source_inventory.contains(.chatgpt_subscription);
         const grok_connected = self.source_inventory.contains(.grok_subscription);
+        const fireworks_connected = self.source_inventory.contains(.fireworks_api_key);
+        const modal_connected = self.source_inventory.contains(.modal_proxy_token);
         const credential = self.selected_credential orelse return .{
             .gateway_connected = gateway_connected,
             .chatgpt_connected = chatgpt_connected,
             .grok_connected = grok_connected,
+            .fireworks_connected = fireworks_connected,
+            .modal_connected = modal_connected,
         };
         return .{
             .active_source = credential.source,
@@ -900,6 +941,8 @@ pub const Runtime = struct {
             .gateway_connected = gateway_connected,
             .chatgpt_connected = chatgpt_connected,
             .grok_connected = grok_connected,
+            .fireworks_connected = fireworks_connected,
+            .modal_connected = modal_connected,
             .expired = credential.needsRefreshAt(now_ms),
         };
     }
@@ -1108,7 +1151,7 @@ pub const Runtime = struct {
         self.picker_stage = .switch_credential;
         const active_source = self.credentialSource();
         self.picker_selection = if (active_source) |source|
-            if (source != .chatgpt_subscription and source != .grok_subscription and self.source_inventory.contains(source))
+            if (model_provider.authorizesCredential(.gateway, source) and self.source_inventory.contains(source))
                 .{ .source = source }
             else
                 self.pickerView().choiceAt(0)
@@ -1596,7 +1639,25 @@ pub const Runtime = struct {
                     self,
                     loadRuntimeCredentialSource,
                 ),
-            .gateway => if (self.credentialSource() != .chatgpt_subscription and self.credentialSource() != .grok_subscription)
+            .fireworks => if (self.credentialSource() == .fireworks_api_key)
+                false
+            else
+                self.selectSourceWithLoader(
+                    alloc,
+                    .fireworks_api_key,
+                    self,
+                    loadRuntimeCredentialSource,
+                ),
+            .modal => if (self.credentialSource() == .modal_proxy_token)
+                false
+            else
+                self.selectSourceWithLoader(
+                    alloc,
+                    .modal_proxy_token,
+                    self,
+                    loadRuntimeCredentialSource,
+                ),
+            .gateway => if (model_provider.authorizesCredential(.gateway, self.credentialSource()))
                 false
             else
                 @as(?bool, try self.reselectByPrecedenceWithDeps(
@@ -1641,7 +1702,7 @@ pub const Runtime = struct {
 
         try self.refreshSourceInventoryWithProbe(alloc, ctx, probe);
         for (credential_source_order) |source| {
-            if (source == .chatgpt_subscription or source == .grok_subscription) continue;
+            if (!model_provider.authorizesCredential(.gateway, source)) continue;
             if (!self.source_inventory.contains(source)) continue;
             if (try self.selectSourceWithLoader(alloc, source, ctx, loader) != null) {
                 return self.credentialSource() != previous;
@@ -1703,7 +1764,7 @@ pub const Runtime = struct {
         if (!login_was_active) return false;
 
         for (credential_source_order) |source| {
-            if (source == .chatgpt_subscription or source == .grok_subscription) continue;
+            if (!model_provider.authorizesCredential(.gateway, source)) continue;
             if (!self.source_inventory.contains(source)) continue;
             if (try self.selectSourceWithLoader(alloc, source, ctx, loader) != null) return true;
             self.source_inventory.remove(source);
@@ -1799,7 +1860,7 @@ fn takeDisplayTeam(alloc: Allocator, credential: *credentials.Credential) ?[]u8 
 fn gatewaySourceCount(sources: SourceSet) usize {
     var count: usize = 0;
     for (credential_source_order) |source| {
-        if (source == .chatgpt_subscription or source == .grok_subscription or !sources.contains(source)) continue;
+        if (!model_provider.authorizesCredential(.gateway, source) or !sources.contains(source)) continue;
         count += 1;
     }
     return count;
@@ -1808,7 +1869,7 @@ fn gatewaySourceCount(sources: SourceSet) usize {
 fn gatewaySourceAtIndex(sources: SourceSet, wanted_index: usize) ?credentials.Source {
     var index: usize = 0;
     for (credential_source_order) |source| {
-        if (source == .chatgpt_subscription or source == .grok_subscription or !sources.contains(source)) continue;
+        if (!model_provider.authorizesCredential(.gateway, source) or !sources.contains(source)) continue;
         if (index == wanted_index) return source;
         index += 1;
     }
@@ -2185,6 +2246,19 @@ test "auth status snapshot preserves display team and surface-specific missing h
     const selected = runtime.statusSnapshot();
     try std.testing.expectEqualStrings("vercel-labs", selected.team.?);
     try std.testing.expect(selected.missingHelp(.cli) == null);
+}
+
+test "auth status snapshot gives provider-specific help for direct providers" {
+    const fireworks = StatusSnapshot{ .required_source = .fireworks_api_key };
+    try std.testing.expectEqualStrings(
+        credentials.missing_fireworks_credential_message,
+        fireworks.missingHelp(.cli).?,
+    );
+    const modal = StatusSnapshot{ .required_source = .modal_proxy_token };
+    try std.testing.expectEqualStrings(
+        credentials.missing_modal_interactive_credential_message,
+        modal.missingHelp(.interactive).?,
+    );
 }
 
 test "auth status snapshot distinguishes an absent store from an unreadable one" {
