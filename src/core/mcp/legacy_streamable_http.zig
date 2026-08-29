@@ -12,6 +12,29 @@ const max_sse_events: usize = 1024;
 const close_timeout_ms: i64 = 250;
 const default_reconnect_delay_ms: u32 = 1000;
 
+/// How long to wait before reopening a stream that closed cleanly.
+///
+/// `hinted_ms` is the most recent SSE retry value the server sent, held across
+/// attempts because the field sets the reconnection time until the server
+/// changes it; zero means no hint has arrived. `prior_reconnects` is how many
+/// times this loop has already reconnected.
+///
+/// An explicit hint wins outright: SEP-1699 makes it a MUST, and the
+/// conformance suite fails a client that reconnects either earlier or more
+/// than twice as late as the hint, which is what substituting our own default
+/// would look like. Without a hint the first reconnect is immediate, because a
+/// stream that closed once after delivering its work is the ordinary case and
+/// should not pay a penalty; from the second onward the default applies, and
+/// that is what bounds the storm. A stream that closes as soon as it opens
+/// would otherwise reconnect with no wait for the life of the session: a clean
+/// close is not an error, so no outer backoff sees it and the retry path in
+/// tool_subscription never runs.
+fn reconnectDelayMs(hinted_ms: u32, prior_reconnects: u32) u32 {
+    if (hinted_ms > 0) return hinted_ms;
+    if (prior_reconnects == 0) return 0;
+    return default_reconnect_delay_ms;
+}
+
 pub const Version = enum {
     v2025_11_25,
     v2025_06_18,
@@ -516,23 +539,7 @@ fn notificationGetCore(alloc: Allocator, options: OperationOptions) !OperationRe
         if (last_event_id) |value| alloc.free(value);
         last_event_id = resumed.last_event_id;
         if (resumed.retry_ms > 0) hinted_ms = resumed.retry_ms;
-        // A server-supplied retry is honored as given: SEP-1699 makes it a
-        // MUST, and the MCP conformance suite fails a client that reconnects
-        // either earlier or more than twice as late as the hint.
-        //
-        // Without a hint the first reconnect is immediate, because a stream
-        // that closed once after doing its work is the ordinary case and
-        // should not pay a penalty. From the second onward the default
-        // applies, which is what bounds the storm: a stream that closes as
-        // soon as it opens would otherwise reconnect with no wait forever,
-        // and no outer backoff sees it, because a clean close is not an error
-        // and the retry path in tool_subscription never runs.
-        const retry_ms = if (hinted_ms > 0)
-            hinted_ms
-        else if (reconnects == 0)
-            0
-        else
-            default_reconnect_delay_ms;
+        const retry_ms = reconnectDelayMs(hinted_ms, reconnects);
         reconnects +|= 1;
         const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
         if (controlExpired(options.control)) {
@@ -967,17 +974,7 @@ fn readSseWithResumption(
         .final => |body| return body,
         .resumable => |resume_state| {
             if (resume_state.retry_ms > 0) hinted_ms = resume_state.retry_ms;
-            // Same rule as the notification listener above: an explicit hint
-            // is honored as sent, the first resume is immediate because a
-            // stream that closed once after doing its work is ordinary, and
-            // the default from the second onward is what bounds a server that
-            // keeps closing a resumable stream without ever finishing.
-            const retry_ms = if (hinted_ms > 0)
-                hinted_ms
-            else if (resumes == 0)
-                0
-            else
-                default_reconnect_delay_ms;
+            const retry_ms = reconnectDelayMs(hinted_ms, resumes);
             resumes +|= 1;
             {
                 const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
@@ -1562,4 +1559,25 @@ test "a retired session refuses new leases and skips the delete on teardown" {
     try std.testing.expect(!client.acquireUse());
     try std.testing.expect(!client.shouldTerminateSession());
     client.deinit();
+}
+
+test "reconnect delay prefers a server hint and defaults only after the first reconnect" {
+    // No hint: the first reconnect is immediate and every later one carries the
+    // default. The pair is the whole storm bound, so both halves are pinned.
+    try std.testing.expectEqual(@as(u32, 0), reconnectDelayMs(0, 0));
+    try std.testing.expectEqual(default_reconnect_delay_ms, reconnectDelayMs(0, 1));
+    try std.testing.expectEqual(default_reconnect_delay_ms, reconnectDelayMs(0, 2));
+    try std.testing.expectEqual(default_reconnect_delay_ms, reconnectDelayMs(0, 9999));
+
+    // A hint is honored as sent, on the first reconnect and on every later one.
+    // The second case is the one that regressed: holding the hint only for the
+    // stream that carried it silently substituted the default afterwards.
+    try std.testing.expectEqual(@as(u32, 500), reconnectDelayMs(500, 0));
+    try std.testing.expectEqual(@as(u32, 500), reconnectDelayMs(500, 1));
+    try std.testing.expectEqual(@as(u32, 500), reconnectDelayMs(500, 9999));
+
+    // A hint is never widened toward the default, which is what the conformance
+    // suite's "very late" threshold at twice the hint would catch.
+    try std.testing.expect(reconnectDelayMs(1, 5) < default_reconnect_delay_ms);
+    try std.testing.expectEqual(@as(u32, 60_000), reconnectDelayMs(60_000, 5));
 }

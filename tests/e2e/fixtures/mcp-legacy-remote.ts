@@ -38,7 +38,8 @@ type StreamableMode =
   | "retry_hint_listener"
   | "resume_storm"
   | "retry_hint_resume"
-  | "retry_hint_once";
+  | "retry_hint_once"
+  | "retry_zero_listener";
 
 export function startLegacyStreamableHttpFixture(
   version: LegacyStreamableVersion,
@@ -129,6 +130,15 @@ export function startLegacyStreamableHttpFixture(
           // rather than substitute its own delay. 500ms is the value the MCP
           // conformance suite uses for the same check.
           return new Response("retry: 500\n\n", {
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+        if (mode === "retry_zero_listener") {
+          // An explicit `retry: 0`. Zero is not an interval a client can wait,
+          // and reconnecting with no wait is the storm this file exists to
+          // prevent, so it has to fall back to the default rather than be
+          // honored literally.
+          return new Response("retry: 0\n\n", {
             headers: { "content-type": "text/event-stream" },
           });
         }

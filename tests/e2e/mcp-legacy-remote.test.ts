@@ -526,6 +526,42 @@ describe("version-scoped legacy MCP remote transports", () => {
     expect(streamable.resumeCalls).toBeLessThanOrEqual(12);
   }, 30_000);
 
+  test("Streamable HTTP listener treats an explicit retry:0 as no interval", async () => {
+    streamable = startLegacyStreamableHttpFixture("2025-06-18", {
+      listChanged: true,
+      mode: "retry_zero_listener",
+    });
+    const root = createRoot("retry-zero-listener", "http", streamable.url);
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("activate_listener", "mcp_search_tools", {
+        query: "echo",
+      }),
+      async () => {
+        await Bun.sleep(3_000);
+        return fakeGatewayFinalText("retry zero complete.");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    const result = await runAsk(root, gateway, "Use the legacy tool.");
+
+    expect(result.code).toBe(0);
+    // Honoring this one literally would reopen the defect: zero wait is the
+    // storm. It falls back to the default instead, so the spacing after the
+    // first reconnect matches the no-hint case rather than collapsing.
+    const listenerGets = streamable.requests.filter((entry) =>
+      entry.httpMethod === "GET" && entry.at !== undefined
+    );
+    const gaps = listenerGets.slice(1).map((entry, index) =>
+      entry.at! - listenerGets[index]!.at!
+    );
+    const spacedGaps = gaps.slice(1);
+    expect(spacedGaps.length).toBeGreaterThanOrEqual(1);
+    expect(Math.min(...spacedGaps)).toBeGreaterThanOrEqual(800);
+    expect(streamable.resumeCalls).toBeLessThanOrEqual(10);
+  }, 30_000);
+
   test("Streamable HTTP listener keeps using a retry hint the server sent once", async () => {
     streamable = startLegacyStreamableHttpFixture("2025-06-18", {
       listChanged: true,
@@ -606,6 +642,19 @@ describe("version-scoped legacy MCP remote transports", () => {
     // drew 16953 resume requests in five seconds.
     expect(streamable.resumeCalls).toBeGreaterThanOrEqual(2);
     expect(streamable.resumeCalls).toBeLessThanOrEqual(10);
+    // Spacing as well as the count, matching the listener test: a count inside a
+    // window is satisfied by any delay at all, including one too small to
+    // matter, so the gap is what actually pins the default here. The first
+    // resume is deliberately immediate and excluded for the same reason.
+    const resumeGets = streamable.requests.filter((entry) =>
+      entry.httpMethod === "GET" && entry.at !== undefined
+    );
+    const gaps = resumeGets.slice(1).map((entry, index) =>
+      entry.at! - resumeGets[index]!.at!
+    );
+    const spacedGaps = gaps.slice(1);
+    expect(spacedGaps.length).toBeGreaterThanOrEqual(1);
+    expect(Math.min(...spacedGaps)).toBeGreaterThanOrEqual(800);
   }, 30_000);
 
 
