@@ -1,5 +1,7 @@
 const std = @import("std");
 const credentials = @import("../core/auth/credentials.zig");
+const catalog_disk_cache = @import("../core/gateway/catalog_disk_cache.zig");
+const debug_trace = @import("../core/shared/debug_trace.zig");
 const grok_session = @import("../core/auth/grok_session.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
@@ -16,6 +18,56 @@ const default_models_endpoint = "https://cli-chat-proxy.grok.com/v1/models";
 const default_modalities_endpoint = "https://api.x.ai/v1/language-models";
 const e2e_models_endpoint_env = "FX_E2E_XAI_GROK_MODELS_URL";
 const e2e_modalities_endpoint_env = "FX_E2E_XAI_GROK_MODALITIES_URL";
+
+const catalog_cache_config = catalog_disk_cache.Config{
+    .file_prefix = "grok-models",
+    // The parse and merge rules live in this binary, so gate cache entries on
+    // the fx build that wrote them.
+    .version = gateway_client.user_agent,
+    // The envelope stores both response bodies JSON-escaped; leave room for
+    // worst-case escaping overhead.
+    .max_body_bytes = 4 * max_catalog_bytes + 4096,
+};
+
+/// The cache is bypassed entirely when either loopback e2e endpoint override
+/// is active: e2e runs must observe every catalog request, and must not
+/// perform durable writes outside the fixture sandbox.
+fn catalogCacheEnabled() bool {
+    return io_mod.getenv(e2e_models_endpoint_env) == null and
+        io_mod.getenv(e2e_modalities_endpoint_env) == null;
+}
+
+/// Both catalog endpoints are cached as one unit so a hit always reproduces
+/// the same subscription/modalities join the network path performs.
+const CachedCatalogBodies = struct {
+    subscription: []const u8,
+    modalities: []const u8,
+};
+
+fn encodeCachedCatalogBodies(
+    alloc: std.mem.Allocator,
+    subscription: []const u8,
+    modalities: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try std.json.Stringify.value(CachedCatalogBodies{
+        .subscription = subscription,
+        .modalities = modalities,
+    }, .{}, &out.writer);
+    return alloc.dupe(u8, out.written());
+}
+
+fn parseCachedCatalog(
+    alloc: std.mem.Allocator,
+    combined: []const u8,
+) !std.ArrayList(model_catalog.ModelCatalogEntry) {
+    var parsed = try std.json.parseFromSlice(CachedCatalogBodies, alloc, combined, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    return parseCatalog(alloc, parsed.value.subscription, parsed.value.modalities);
+}
 
 pub const model_catalog_provider = model_catalog.Provider{
     .fetch_fn = fetchCatalogForProvider,
@@ -68,6 +120,30 @@ fn fetchCatalogForProvider(
     if (!grok_session.validAccountId(account_id)) {
         return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
     }
+    const cache_path: ?[]u8 = if (catalogCacheEnabled())
+        catalog_disk_cache.cachePath(alloc, catalog_cache_config, account_id) catch null
+    else
+        null;
+    defer if (cache_path) |path| alloc.free(path);
+    if (cache_path) |path| {
+        if (catalog_disk_cache.loadFresh(alloc, catalog_cache_config, path, io_mod.milliTimestamp())) |combined| {
+            defer secret.zeroAndFree(alloc, combined);
+            if (parseCachedCatalog(alloc, combined)) |catalog| {
+                debug_trace.logf("catalog", "Grok model catalog cache outcome=hit", .{});
+                return .{ .catalog = catalog };
+            } else |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                debug_trace.logf(
+                    "catalog",
+                    "Grok model catalog cache outcome=invalid error={s}",
+                    .{@errorName(err)},
+                );
+            }
+        } else {
+            debug_trace.logf("catalog", "Grok model catalog cache outcome=miss", .{});
+        }
+    }
+
     const request_url = modelsUrl(alloc) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .runtime } };
@@ -115,11 +191,36 @@ fn fetchCatalogForProvider(
     if (modalities_response.status != .ok) {
         return .{ .failure = model_catalog.failureForHttpStatus(modalities_response.status) };
     }
-    const catalog = parseCatalog(alloc, response.body, modalities_response.body) catch |err| {
+    var catalog = parseCatalog(alloc, response.body, modalities_response.body) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
+    if (cache_path) |path| {
+        storeCatalogCache(alloc, path, response.body, modalities_response.body) catch |err| {
+            if (err == error.OutOfMemory) {
+                model_catalog.freeModelCatalog(alloc, &catalog);
+                return error.OutOfMemory;
+            }
+            debug_trace.logf(
+                "catalog",
+                "Grok model catalog cache outcome=store_failed error={s}",
+                .{@errorName(err)},
+            );
+        };
+    }
     return .{ .catalog = catalog };
+}
+
+fn storeCatalogCache(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    subscription: []const u8,
+    modalities: []const u8,
+) !void {
+    const combined = try encodeCachedCatalogBodies(alloc, subscription, modalities);
+    defer secret.zeroAndFree(alloc, combined);
+    try catalog_disk_cache.store(alloc, catalog_cache_config, path, combined, io_mod.milliTimestamp());
+    debug_trace.logf("catalog", "Grok model catalog cache outcome=stored", .{});
 }
 
 fn catalogFetchFailure(err: anyerror) model_catalog.Failure {
@@ -417,6 +518,35 @@ test "Grok catalog parser joins provider-owned subscription capabilities and mod
     try std.testing.expectEqualStrings("provider-next", second.reasoning_efforts.items[0].label());
     try std.testing.expectEqualStrings("low", second.reasoning_efforts.items[1].label());
     try std.testing.expect(!second.has_vision);
+}
+
+test "Grok catalog cache round-trips combined subscription and modality bodies" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.fs.path.join(alloc, &.{ root, "cache", "grok-models-test.json" });
+    defer alloc.free(path);
+
+    const subscription_json =
+        \\{"data":[{"id":"current-a","model":"current-a","api_backend":"responses","context_window":500123,"supports_reasoning_effort":false,"reasoning_efforts":[]}]}
+    ;
+    const modalities_json =
+        \\{"models":[{"id":"current-a","input_modalities":["text","image"],"output_modalities":["text"]}]}
+    ;
+    const combined = try encodeCachedCatalogBodies(alloc, subscription_json, modalities_json);
+    defer secret.zeroAndFree(alloc, combined);
+    try catalog_disk_cache.store(alloc, catalog_cache_config, path, combined, 1_000_000);
+
+    const loaded = catalog_disk_cache.loadFresh(alloc, catalog_cache_config, path, 1_000_001) orelse
+        return error.TestExpectedCacheHit;
+    defer alloc.free(loaded);
+    var catalog = try parseCachedCatalog(alloc, loaded);
+    defer model_catalog.freeModelCatalog(alloc, &catalog);
+    try std.testing.expectEqual(@as(usize, 1), catalog.items.len);
+    try std.testing.expectEqualStrings("current-a", catalog.items[0].id);
+    try std.testing.expect(catalog.items[0].has_vision);
 }
 
 test "Grok catalog rejects missing provider-owned capability metadata" {
