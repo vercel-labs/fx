@@ -19,56 +19,139 @@ const NapiSurface = enum {
     none,
     core,
 };
+const RushModule = struct { module: *std.Build.Module, sqlite: *std.Build.Step.Compile };
+const RushModule = struct { module: *std.Build.Module };
+
+fn addRushModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) RushModule {
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", "0.1.0");
+    options.addOption([]const u8, "sysconfdir", b.getInstallPath(.prefix, "etc"));
+    options.addOption([]const u8, "datadir", b.getInstallPath(.prefix, "share"));
+    const uucode = b.dependency("rush_uucode", .{ .target = target, .optimize = optimize, .fields = @as([]const []const u8, &.{ "east_asian_width", "grapheme_break", "general_category", "is_emoji_presentation" }) }).module("uucode");
+    const vaxis = b.dependency("rush_vaxis", .{ .target = target, .optimize = optimize, .external_uucode = true }).module("vaxis");
+    vaxis.addImport("uucode", uucode);
+    const zeit = b.dependency("rush_zeit", .{ .target = target, .optimize = optimize }).module("zeit");
+    const sqlite_source = b.dependency("rush_sqlite", .{});
+    const sqlite = b.addLibrary(.{ .name = "rush-sqlite3", .linkage = .static, .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    sqlite.root_module.addCSourceFile(.{ .file = sqlite_source.path("sqlite3.c"), .flags = &.{ "-DSQLITE_THREADSAFE=1", "-DSQLITE_DEFAULT_MEMSTATUS=0" } });
+    const module = b.createModule(.{ .root_source_file = b.path("vendor/rush/src/app.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "vaxis", .module = vaxis }, .{ .name = "uucode", .module = uucode }, .{ .name = "zeit", .module = zeit } } });
+    module.addOptions("build_config", options);
+    module.addAnonymousImport("default_config", .{ .root_source_file = b.path("vendor/rush/share/rush/config.rush") });
+    module.linkLibrary(sqlite);
+    return .{ .module = module };
+}
+
+fn addRushModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) RushModule {
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", "0.1.0");
+    options.addOption([]const u8, "sysconfdir", b.getInstallPath(.prefix, "etc"));
+    options.addOption([]const u8, "datadir", b.getInstallPath(.prefix, "share"));
+    const uucode = b.dependency("rush_uucode", .{ .target = target, .optimize = optimize, .fields = @as([]const []const u8, &.{ "east_asian_width", "grapheme_break", "general_category", "is_emoji_presentation" }) }).module("uucode");
+    const vaxis = b.dependency("rush_vaxis", .{ .target = target, .optimize = optimize, .external_uucode = true }).module("vaxis");
+    vaxis.addImport("uucode", uucode);
+    const zeit = b.dependency("rush_zeit", .{ .target = target, .optimize = optimize }).module("zeit");
+    const sqlite_source = b.dependency("rush_sqlite", .{});
+    const sqlite = b.addLibrary(.{ .name = "rush-sqlite3", .linkage = .static, .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    sqlite.root_module.addCSourceFile(.{ .file = sqlite_source.path("sqlite3.c"), .flags = &.{ "-DSQLITE_THREADSAFE=1", "-DSQLITE_DEFAULT_MEMSTATUS=0" } });
+    const module = b.createModule(.{ .root_source_file = b.path("vendor/rush/src/app.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "vaxis", .module = vaxis }, .{ .name = "uucode", .module = uucode }, .{ .name = "zeit", .module = zeit } } });
+    module.addOptions("build_config", options);
+    module.addAnonymousImport("default_config", .{ .root_source_file = b.path("vendor/rush/share/rush/config.rush") });
+    module.linkLibrary(sqlite);
+    return .{ .module = module, .sqlite = sqlite };
+}
+const RushModule = struct {
+    module: *std.Build.Module,
+};
+
+fn addRushModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) RushModule {
+    const rush_build_config = b.addOptions();
+    rush_build_config.addOption([]const u8, "version", "0.1.0");
+    rush_build_config.addOption([]const u8, "sysconfdir", b.getInstallPath(.prefix, "etc"));
+    rush_build_config.addOption([]const u8, "datadir", b.getInstallPath(.prefix, "share"));
+
+    const uucode = b.dependency("rush_uucode", .{
+        .target = target,
+        .optimize = optimize,
+        .fields = @as([]const []const u8, &.{
+            "east_asian_width",
+            "grapheme_break",
+            "general_category",
+            "is_emoji_presentation",
+        }),
+    }).module("uucode");
+    const vaxis = b.dependency("rush_vaxis", .{
+        .target = target,
+        .optimize = optimize,
+        .external_uucode = true,
+    }).module("vaxis");
+    vaxis.addImport("uucode", uucode);
+    const zeit = b.dependency("rush_zeit", .{ .target = target, .optimize = optimize }).module("zeit");
+
+    const module = b.createModule(.{
+        .root_source_file = b.path("vendor/rush/src/app.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "vaxis", .module = vaxis },
+            .{ .name = "uucode", .module = uucode },
+            .{ .name = "zeit", .module = zeit },
+        },
+    });
+    module.addOptions("build_config", rush_build_config);
+    module.addAnonymousImport("default_config", .{
+        .root_source_file = b.path("vendor/rush/share/rush/config.rush"),
+    });
+
+    const sqlite = b.dependency("rush_sqlite", .{});
+    const sqlite_lib = b.addLibrary(.{
+        .name = "rush-sqlite3",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    sqlite_lib.root_module.addCSourceFile(.{
+        .file = sqlite.path("sqlite3.c"),
+        .flags = &.{ "-DSQLITE_THREADSAFE=1", "-DSQLITE_DEFAULT_MEMSTATUS=0" },
+    });
+    module.linkLibrary(sqlite_lib);
+    return .{ .module = module };
+}
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const pgso_artifact = b.option(
-        PgsoArtifact,
-        "pgso-artifact",
-        "Emit ReleaseSafe LLVM bitcode for one PGO/PGSO artifact",
-    );
-    const wasm_surface = b.option(
-        WasmSurface,
-        "wasm-surface",
-        "Build a WASI WebAssembly surface for JavaScript hosts (core or term)",
-    ) orelse .none;
-    const napi_surface = b.option(
-        NapiSurface,
-        "napi-surface",
-        "Build a Node-API addon surface (core)",
-    ) orelse .none;
+    const rush = addRushModule(b, target, optimize);
+    const UpdateChannel = enum { stable, dev };
 
-    const git_commit = readGitCommit(b);
-    const app_version = readAppVersion(b);
-    const update_channel = b.option(UpdateChannel, "update-channel", "Build update channel (stable or dev)") orelse .stable;
+    const WasmSurface = enum {
+        none,
+        core,
+        term,
+    };
 
-    const build_options = b.addOptions();
-    build_options.addOption([]const u8, "git_commit", git_commit);
-    build_options.addOption([]const u8, "app_version", app_version);
-    build_options.addOption([]const u8, "update_channel", @tagName(update_channel));
-    build_options.addOption(WasmSurface, "wasm_surface", .none);
+    const PgsoArtifact = enum {
+        fx,
+        file_index,
+        ui_activity,
+        approval_review,
+    };
 
-    const exe = b.addExecutable(.{
-        .name = "fx",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .stack_check = false,
-            .stack_protector = false,
-            .omit_frame_pointer = true,
-            .unwind_tables = .none,
-            .error_tracing = false,
-            .strip = optimize != .Debug,
-        }),
-    });
-    exe.root_module.addImport("build_options", build_options.createModule());
-
-    b.installArtifact(exe);
+    const NapiSurface = enum {
+        none,
+        core,
+    };
 
     const run_cmd = b.addRunArtifact(exe);
+    exe.root_module.addImport("rush_app", rush.module);
+    exe.root_module.addImport("rush_app", rush.module);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_cmd.addArgs(args);

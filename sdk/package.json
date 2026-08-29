@@ -1,15 +1,15 @@
 {
-  "name": "libfx",
+  "name": "libohmyfx",
   "version": "0.0.0",
-  "description": "Embed fx agents and terminals in JavaScript hosts",
+  "description": "Embed O MyFX agents and terminals in JavaScript hosts",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/vercel-labs/fx.git",
+    "url": "git+https://github.com/y0usaf/oh-my-fx.git",
     "directory": "sdk"
   },
-  "homepage": "https://github.com/vercel-labs/fx/tree/main/sdk#readme",
-  "bugs": "https://github.com/vercel-labs/fx/issues",
+  "homepage": "https://github.com/y0usaf/oh-my-fx/tree/main/sdk#readme",
+  "bugs": "https://github.com/y0usaf/oh-my-fx/issues",
   "scripts": {
     "test:node-wasm": "node tests/test-node-wasm.mjs",
     "test:node-napi": "node tests/test-node-napi.mjs",

@@ -1,4 +1,4 @@
-name: Dev Release
+name: Release Candidate
 
 on:
   workflow_run:
@@ -7,10 +7,10 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: dev-release
+  group: release-candidate
   cancel-in-progress: true
 
 jobs:
@@ -102,107 +102,59 @@ jobs:
   publish:
     needs: [build, web]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
-      BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
-      FX_WEB_DEPLOY_HOOK_URL: ${{ secrets.FX_WEB_DEPLOY_HOOK_URL }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 0
           ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           merge-multiple: true
 
-      - name: Publish immutable dev artifacts
+      - name: Confirm candidate still targets main
         run: |
           set -euo pipefail
+          MAIN_SHA=$(git ls-remote origin refs/heads/main | cut -f1)
+          if [ "$MAIN_SHA" != "$RELEASE_SHA" ]; then
+            echo "::error::main advanced to ${MAIN_SHA}; refusing to publish stale candidate ${RELEASE_SHA}"
+            exit 1
+          fi
 
-          for FILE in fx-*.tar.gz fx-*.tar.gz.sha256; do
-            [ -f "$FILE" ] || continue
-            CONTENT_TYPE="application/octet-stream"
-            [[ "$FILE" == *.sha256 ]] && CONTENT_TYPE="text/plain"
-            [[ "$FILE" == *.tar.gz ]] && CONTENT_TYPE="application/gzip"
-
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-              -X PUT "https://blob.vercel-storage.com/cli/dev/${RELEASE_SHA}/${FILE}" \
-              -H "Authorization: Bearer ${BLOB_READ_WRITE_TOKEN}" \
-              -H "x-api-version: 7" \
-              -H "x-content-type: ${CONTENT_TYPE}" \
-              -H "x-add-random-suffix: 0" \
-              -H "x-cache-control-max-age: 31536000" \
-              --data-binary "@${FILE}")
-            echo "Uploaded ${FILE} for ${RELEASE_SHA} ($HTTP_CODE)"
-            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-              echo "::error::Failed to upload ${FILE} to the dev channel ($HTTP_CODE)"
-              exit 1
-            fi
-          done
-
-      - name: Publish immutable web artifacts
+      - name: Create candidate manifest
         run: |
           set -euo pipefail
-
+          VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          jq -n --arg version "$VERSION" --arg commit "$RELEASE_SHA" \
+            '{version: $version, commit: $commit}' > dev.json
           sha256sum --check fx-sdk.js.sha256
           sha256sum --check fx-term.wasm.sha256
 
-          for FILE in fx-sdk.js fx-sdk.js.sha256 fx-term.wasm fx-term.wasm.sha256; do
-            CONTENT_TYPE="application/octet-stream"
-            [[ "$FILE" == *.js ]] && CONTENT_TYPE="text/javascript"
-            [[ "$FILE" == *.wasm ]] && CONTENT_TYPE="application/wasm"
-            [[ "$FILE" == *.sha256 ]] && CONTENT_TYPE="text/plain"
-
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-              -X PUT "https://blob.vercel-storage.com/cli/dev/${RELEASE_SHA}/web/${FILE}" \
-              -H "Authorization: Bearer ${BLOB_READ_WRITE_TOKEN}" \
-              -H "x-api-version: 7" \
-              -H "x-content-type: ${CONTENT_TYPE}" \
-              -H "x-add-random-suffix: 0" \
-              -H "x-cache-control-max-age: 31536000" \
-              --data-binary "@${FILE}")
-            echo "Uploaded web/${FILE} for ${RELEASE_SHA} ($HTTP_CODE)"
-            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-              echo "::error::Failed to upload ${FILE} to the dev web channel ($HTTP_CODE)"
-              exit 1
-            fi
-          done
-
-      - name: Point dev channel at this commit
-        id: point-dev
+      - name: Move candidate tag
         run: |
           set -euo pipefail
-          echo "updated=false" >> "$GITHUB_OUTPUT"
+          git tag --force dev "$RELEASE_SHA"
+          git push --force origin refs/tags/dev
 
-          MAIN_SHA=$(git ls-remote origin refs/heads/main | cut -f1)
-          if [ "$MAIN_SHA" != "$RELEASE_SHA" ]; then
-            echo "main advanced to ${MAIN_SHA}; leaving dev.json unchanged"
-            exit 0
-          fi
-
-          VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          jq -n --arg version "$VERSION" --arg commit "$RELEASE_SHA" \
-            '{version: $version, commit: $commit}' > /tmp/dev.json
-
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -X PUT "https://blob.vercel-storage.com/cli/dev.json" \
-            -H "Authorization: Bearer ${BLOB_READ_WRITE_TOKEN}" \
-            -H "x-api-version: 7" \
-            -H "x-content-type: application/json" \
-            -H "x-add-random-suffix: 0" \
-            -H "x-cache-control-max-age: 60" \
-            --data-binary "@/tmp/dev.json")
-          echo "Updated dev.json to ${RELEASE_SHA} ($HTTP_CODE)"
-          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-            echo "::error::Failed to update dev.json ($HTTP_CODE)"
-            exit 1
-          fi
-          echo "updated=true" >> "$GITHUB_OUTPUT"
-
-      - name: Deploy fx-web
-        if: steps.point-dev.outputs.updated == 'true' && env.FX_WEB_DEPLOY_HOOK_URL != ''
-        run: |
-          curl --fail --silent --show-error \
-            --retry 3 --retry-all-errors --max-time 30 \
-            -X POST "$FX_WEB_DEPLOY_HOOK_URL"
+      - name: Publish GitHub prerelease
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: dev
+          name: O MyFX release candidate
+          body: Automated release candidate for `${{ github.event.workflow_run.head_sha }}`.
+          prerelease: true
+          make_latest: false
+          fail_on_unmatched_files: true
+          files: |
+            dev.json
+            fx-*.tar.gz
+            fx-*.tar.gz.sha256
+            fx-sdk.js
+            fx-sdk.js.sha256
+            fx-term.wasm
+            fx-term.wasm.sha256

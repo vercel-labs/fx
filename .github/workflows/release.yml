@@ -31,7 +31,7 @@ jobs:
             echo "::error::src/main.zig version is not strict SemVer"
             exit 1
           fi
-          TAG="v${VERSION}"
+          TAG="omyfx-v${VERSION}"
           echo "version=${TAG}" >> "$GITHUB_OUTPUT"
           if git rev-parse "$TAG" >/dev/null 2>&1; then
             echo "needed=false" >> "$GITHUB_OUTPUT"
@@ -86,7 +86,6 @@ jobs:
     if: needs.check-version.outputs.needed == 'true'
     name: Build macos-x86_64
     runs-on: macos-15-intel
-    environment: apple-signing
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -98,14 +97,6 @@ jobs:
       - name: Build
         run: zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos
 
-      - name: Sign and notarize
-        env:
-          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
-          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
-          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-        run: scripts/sign-and-notarize-macos.sh zig-out/bin/fx
 
       - name: Package
         run: |
@@ -152,7 +143,7 @@ jobs:
           RELEASE_TAG: ${{ needs.check-version.outputs.version }}
         run: |
           set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$RELEASE_TAG" =~ ^omyfx-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
           git tag -- "$RELEASE_TAG"
           git push origin "refs/tags/${RELEASE_TAG}"
 
@@ -165,53 +156,15 @@ jobs:
             exit 1
           fi
           echo "Extracted release notes ($LINES lines)"
+          printf '%s' "${{ needs.check-version.outputs.version }}" > latest.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.check-version.outputs.version }}
           body_path: /tmp/release-notes.md
+          make_latest: true
           files: |
+            latest.txt
             fx-*.tar.gz
             fx-*.tar.gz.sha256
-
-      - name: Publish to CDN
-        env:
-          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
-          VERSION: ${{ needs.check-version.outputs.version }}
-        run: |
-          set -euo pipefail
-          [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-          CDN_BASE="cli"
-
-          for FILE in fx-*.tar.gz fx-*.tar.gz.sha256; do
-            [ -f "$FILE" ] || continue
-            CONTENT_TYPE="application/octet-stream"
-            [[ "$FILE" == *.sha256 ]] && CONTENT_TYPE="text/plain"
-            [[ "$FILE" == *.tar.gz ]] && [[ "$FILE" != *.sha256 ]] && CONTENT_TYPE="application/gzip"
-
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-              -X PUT "https://blob.vercel-storage.com/${CDN_BASE}/${VERSION}/${FILE}" \
-              -H "Authorization: Bearer ${BLOB_READ_WRITE_TOKEN}" \
-              -H "x-api-version: 7" \
-              -H "x-content-type: ${CONTENT_TYPE}" \
-              -H "x-add-random-suffix: 0" \
-              -H "x-cache-control-max-age: 31536000" \
-              --data-binary "@${FILE}")
-            echo "Uploaded ${FILE} -> ${CDN_BASE}/${VERSION}/${FILE} ($HTTP_CODE)"
-            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-              echo "::error::Failed to upload ${FILE} to CDN ($HTTP_CODE)"
-              exit 1
-            fi
-          done
-
-          echo -n "$VERSION" > /tmp/latest.txt
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -X PUT "https://blob.vercel-storage.com/${CDN_BASE}/latest.txt" \
-            -H "Authorization: Bearer ${BLOB_READ_WRITE_TOKEN}" \
-            -H "x-api-version: 7" \
-            -H "x-content-type: text/plain" \
-            -H "x-add-random-suffix: 0" \
-            -H "x-cache-control-max-age: 60" \
-            --data-binary "@/tmp/latest.txt")
-          echo "Updated latest.txt to $VERSION ($HTTP_CODE)"

@@ -1,13 +1,13 @@
-# libfx
+# libohmyfx
 
-`libfx` embeds fx agents and interactive terminals in JavaScript
+`libohmyfx` embeds O MyFX agents and interactive terminals in JavaScript
 applications. It supports Node.js hosts and browser environments with
 JavaScript Promise Integration (JSPI).
 
 ## Installation
 
 ```sh
-npm install libfx
+npm install libohmyfx
 ```
 
 Requirements:
@@ -28,10 +28,10 @@ The package includes:
 
 | Import | Environment | Description |
 | --- | --- | --- |
-| `libfx` | Node.js or browser | Environment-aware default |
-| `libfx/node` | Node.js | Native-first Node entry point |
-| `libfx/browser` | Browser | WebAssembly browser entry point |
-| `libfx/wasm` | Browser or Node.js | Direct WebAssembly host layer |
+| `libohmyfx` | Node.js or browser | Environment-aware default |
+| `libohmyfx/node` | Node.js | Native-first Node entry point |
+| `libohmyfx/browser` | Browser | WebAssembly browser entry point |
+| `libohmyfx/wasm` | Browser or Node.js | Direct WebAssembly host layer |
 
 Public exports:
 
@@ -47,7 +47,7 @@ The default Node entry point prefers the native addon and falls back to
 WebAssembly when necessary.
 
 ```js
-import { createFxAgent } from "libfx";
+import { createFxAgent } from "libohmyfx";
 
 const agent = await createFxAgent({
   env: {
@@ -140,7 +140,7 @@ Browser hosts always use WebAssembly.
 import {
   createFxAgent,
   supportsJspi,
-} from "libfx/browser";
+} from "libohmyfx/browser";
 
 if (!supportsJspi()) {
   throw new Error("This browser does not support WebAssembly JSPI.");
@@ -185,7 +185,7 @@ import {
   createFxTerminal,
   supportsJspi,
   xtermAdapter,
-} from "libfx/browser";
+} from "libohmyfx/browser";
 
 if (!supportsJspi()) {
   throw new Error("This browser does not support WebAssembly JSPI.");
@@ -357,5 +357,5 @@ These are local development pages and are not publicly hosted links.
 
 Maintainer references:
 
-- [SDK contributor guide](https://github.com/vercel-labs/fx/blob/main/sdk/AGENTS.md)
-- [Native Node-API design and security model](https://github.com/vercel-labs/fx/blob/main/sdk/NAPI.md)
+- [SDK contributor guide](https://github.com/y0usaf/oh-my-fx/blob/main/sdk/AGENTS.md)
+- [Native Node-API design and security model](https://github.com/y0usaf/oh-my-fx/blob/main/sdk/NAPI.md)

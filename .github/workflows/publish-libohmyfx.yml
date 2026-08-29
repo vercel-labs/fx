@@ -1,4 +1,4 @@
-name: Publish libfx
+name: Publish libohmyfx
 
 on:
   workflow_run:
@@ -14,19 +14,25 @@ on:
         options:
           - dev
           - stable
+      bootstrap:
+        description: Use the npm environment's NPM_TOKEN for the first publication only
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: publish-libfx-${{ (github.event.workflow_run.name == 'Release' || inputs.channel == 'stable') && 'stable' || 'dev' }}
+  group: publish-libohmyfx-${{ (github.event.workflow_run.name == 'Release' || inputs.channel == 'stable') && 'stable' || 'dev' }}
   cancel-in-progress: false
 
 jobs:
   metadata:
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' &&
+      (vars.LIBOHMYFX_PUBLISH_ENABLED == 'true' &&
+       github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
@@ -51,6 +57,10 @@ jobs:
           WORKFLOW_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
+          if [ "${{ inputs.bootstrap }}" = "true" ] && [ "$EVENT_NAME" != "workflow_dispatch" ]; then
+            echo "::error::npm bootstrap is allowed only for a manual dispatch"
+            exit 1
+          fi
 
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             CHANNEL="$REQUESTED_CHANNEL"
@@ -71,7 +81,7 @@ jobs:
           fi
           SHOULD_PUBLISH=true
           if [ "$CHANNEL" = "stable" ]; then
-            TAG="v${BASE_VERSION}"
+            TAG="omyfx-v${BASE_VERSION}"
             if git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}" 2>/dev/null; then
               TAG_SHA=$(git rev-list -n 1 "$TAG")
               if [ "$TAG_SHA" != "$SHA" ]; then
@@ -79,7 +89,7 @@ jobs:
                   echo "::error::Stable tag ${TAG} points to ${TAG_SHA}, not ${SHA}"
                   exit 1
                 fi
-                echo "Release workflow did not publish ${SHA}; skipping libfx stable publish"
+                echo "Release workflow did not publish ${SHA}; skipping libohmyfx stable publish"
                 SHOULD_PUBLISH=false
               fi
             else
@@ -87,7 +97,7 @@ jobs:
                 echo "::error::Stable tag ${TAG} does not exist"
                 exit 1
               fi
-              echo "Release workflow did not create ${TAG}; skipping libfx stable publish"
+              echo "Release workflow did not create ${TAG}; skipping libohmyfx stable publish"
               SHOULD_PUBLISH=false
             fi
             VERSION="$BASE_VERSION"
@@ -98,12 +108,14 @@ jobs:
             NPM_TAG=dev
           fi
 
-          echo "channel=${CHANNEL}" >> "$GITHUB_OUTPUT"
-          echo "npm_tag=${NPM_TAG}" >> "$GITHUB_OUTPUT"
-          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
-          echo "should_publish=${SHOULD_PUBLISH}" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Publishing libfx@${VERSION} on the ${CHANNEL} channel (${NPM_TAG})"
+          {
+            echo "channel=${CHANNEL}"
+            echo "npm_tag=${NPM_TAG}"
+            echo "sha=${SHA}"
+            echo "should_publish=${SHOULD_PUBLISH}"
+            echo "version=${VERSION}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Publishing libohmyfx@${VERSION} on the ${CHANNEL} channel (${NPM_TAG})"
 
   native:
     needs: metadata
@@ -248,7 +260,7 @@ jobs:
           done
 
           jq -e '
-            .name == "libfx" and
+            .name == "libohmyfx" and
             .type == "module" and
             .scripts != null and
             (.scripts | keys | all(startswith("test:"))) and
@@ -272,21 +284,21 @@ jobs:
         run: |
           set -euo pipefail
           npm pack --ignore-scripts --dry-run --json sdk/dist/libfx > /tmp/libfx-pack.json
-          node -e '
-            const report = require("/tmp/libfx-pack.json")[0];
-            const names = new Set(report.files.map(({ path }) => path));
-            const required = [
-              "package.json", "README.md", "LICENSE", "browser.js", "node.js", "fx-sdk.js",
-              "fx-core.wasm", "fx-term.wasm",
-              "libfx.linux-x64.node", "libfx.linux-arm64.node",
-              "libfx.darwin-x64.node", "libfx.darwin-arm64.node",
-            ];
-            if (names.size !== required.length) throw new Error(`unexpected package file count: ${names.size}`);
-            for (const name of required) {
-              if (!names.has(name)) throw new Error(`package is missing ${name}`);
-            }
-            console.log(`validated ${report.name}@${report.version}: ${report.files.length} files, ${report.size} bytes packed`);
-          '
+          node /dev/stdin <<'NODE'
+          const report = require("/tmp/libfx-pack.json")[0];
+          const names = new Set(report.files.map(({ path }) => path));
+          const required = [
+            "package.json", "README.md", "LICENSE", "browser.js", "node.js", "fx-sdk.js",
+            "fx-core.wasm", "fx-term.wasm",
+            "libfx.linux-x64.node", "libfx.linux-arm64.node",
+            "libfx.darwin-x64.node", "libfx.darwin-arm64.node",
+          ];
+          if (names.size !== required.length) throw new Error(`unexpected package file count: ${names.size}`);
+          for (const name of required) {
+            if (!names.has(name)) throw new Error(`package is missing ${name}`);
+          }
+          console.log(`validated ${report.name}@${report.version}: ${report.files.length} files, ${report.size} bytes packed`);
+          NODE
 
       - name: Confirm dev publish still targets main
         if: needs.metadata.outputs.channel == 'dev'
@@ -303,10 +315,11 @@ jobs:
         env:
           LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
           NPM_TAG: ${{ needs.metadata.outputs.npm_tag }}
+          NODE_AUTH_TOKEN: ${{ inputs.bootstrap && secrets.NPM_TOKEN || '' }}
         run: |
           set -euo pipefail
-          if npm view "libfx@${LIBFX_VERSION}" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
-            echo "libfx@${LIBFX_VERSION} is already published; leaving ${NPM_TAG} unchanged"
+          if npm view "libohmyfx@${LIBFX_VERSION}" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
+            echo "libohmyfx@${LIBFX_VERSION} is already published; leaving ${NPM_TAG} unchanged"
             exit 0
           fi
           npm publish sdk/dist/libfx --ignore-scripts --access public --tag "$NPM_TAG" --provenance

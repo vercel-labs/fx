@@ -14,8 +14,8 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "sign-and-notarize-macos.sh"
 RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release.yml"
-PUBLISH_LIBFX_WORKFLOW_PATH = (
-    REPO_ROOT / ".github" / "workflows" / "publish-libfx.yml"
+PUBLISH_LIBOHMYFX_WORKFLOW_PATH = (
+    REPO_ROOT / ".github" / "workflows" / "publish-libohmyfx.yml"
 )
 PGSO_WORKFLOW_PATH = (
     REPO_ROOT / ".github" / "workflows" / "pgso-macos-arm64.yml"
@@ -345,10 +345,12 @@ else:
 class MacosSigningWorkflowTests(unittest.TestCase):
     def test_every_privileged_publish_job_uses_an_environment_gate(self) -> None:
         release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
-        publish_libfx = PUBLISH_LIBFX_WORKFLOW_PATH.read_text(encoding="utf-8")
+        publish_libohmyfx = PUBLISH_LIBOHMYFX_WORKFLOW_PATH.read_text(
+            encoding="utf-8"
+        )
 
         release_job = release.split("  release:\n", 1)[1]
-        npm_publish_job = publish_libfx.split("  publish:\n", 1)[1]
+        npm_publish_job = publish_libohmyfx.split("  publish:\n", 1)[1]
 
         self.assertIn("environment: release", release_job)
         self.assertIn("environment: npm", npm_publish_job)
@@ -360,25 +362,19 @@ class MacosSigningWorkflowTests(unittest.TestCase):
 
         self.assertIn("build-macos-x86_64:", release)
         self.assertIn("runs-on: macos-15-intel", release)
-        self.assertEqual(1, release.count("environment: apple-signing"))
-        self.assertIn("scripts/sign-and-notarize-macos.sh zig-out/bin/fx", release)
         self.assertIn("sign-stable-release:", pgso)
         self.assertIn("needs: aggregate", pgso)
-        self.assertEqual(1, pgso.count("environment: apple-signing"))
-        self.assertIn(
-            "scripts/sign-and-notarize-macos.sh "
-            '"$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx"',
-            pgso,
-        )
         self.assertIn("if: inputs.package_release", pgso)
-        arm64_caller = release.split("  build-macos-arm64:\n", 1)[1].split(
-            "\n  release:\n", 1
-        )[0]
-        self.assertNotIn("secrets:", arm64_caller)
-        workflow_call = pgso.split("  workflow_dispatch:\n", 1)[0]
-        aggregate = pgso.split("  aggregate:\n", 1)[1].split(
-            "\n  sign-stable-release:\n", 1
-        )[0]
+        self.assertNotIn("environment: apple-signing", release)
+        self.assertNotIn("environment: apple-signing", pgso)
+        self.assertNotIn("sign-and-notarize-macos", release)
+        self.assertNotIn("sign-and-notarize-macos", pgso)
+        self.assertNotIn("sign-and-notarize-macos", dev_release)
+        for secret_name in SECRET_NAMES:
+            self.assertNotIn(secret_name, release)
+            self.assertNotIn(secret_name, pgso)
+            self.assertNotIn(secret_name, dev_release)
+
         sign_release = pgso.split("  sign-stable-release:\n", 1)[1]
         self.assertIn(
             "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
@@ -393,18 +389,8 @@ class MacosSigningWorkflowTests(unittest.TestCase):
             sign_release,
         )
         report_position = sign_release.index("python3 -m scripts.pgso report")
-        signing_position = sign_release.index("scripts/sign-and-notarize-macos.sh")
         package_position = sign_release.index("tar -czf")
-        self.assertLess(report_position, signing_position)
-        self.assertLess(signing_position, package_position)
-        for secret_name in SECRET_NAMES:
-            secret_reference = f"${{{{ secrets.{secret_name} }}}}"
-            self.assertIn(secret_reference, release)
-            self.assertIn(secret_reference, sign_release)
-            self.assertNotIn(secret_name, workflow_call)
-            self.assertNotIn(secret_name, aggregate)
-            self.assertNotIn(secret_name, dev_release)
-        self.assertNotIn("sign-and-notarize-macos", dev_release)
+        self.assertLess(report_position, package_position)
 
     def test_pgso_release_chain_pins_every_external_action(self) -> None:
         mutable_references: list[str] = []

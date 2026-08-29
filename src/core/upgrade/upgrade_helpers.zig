@@ -18,13 +18,13 @@ fn setRecvTimeout(conn: *std.http.Client.Connection) void {
     std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
 }
 
-pub const cdn_base = "https://releases.fx.sh";
+pub const release_base = "https://github.com/y0usaf/oh-my-fx/releases";
 
-pub fn resolveCdnBase() []const u8 {
+pub fn resolveReleaseBase() []const u8 {
     if (io_mod.getenv("FX_E2E_UPGRADE_BASE_URL")) |url| {
         if (isLoopbackE2eUpgradeBase(url)) return url;
     }
-    return cdn_base;
+    return release_base;
 }
 
 fn isLoopbackE2eUpgradeBase(url: []const u8) bool {
@@ -78,7 +78,10 @@ pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8) !Ta
         .dev => blk: {
             var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
             defer client.deinit();
-            const url = try std.fmt.allocPrint(alloc, "{s}/dev.json", .{base_url});
+            const url = if (isLoopbackE2eUpgradeBase(base_url))
+                try std.fmt.allocPrint(alloc, "{s}/dev.json", .{base_url})
+            else
+                try std.fmt.allocPrint(alloc, "{s}/download/dev/dev.json", .{base_url});
             defer alloc.free(url);
             const manifest = try fetchTextBounded(
                 &client,
@@ -95,7 +98,10 @@ pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8) !Ta
 fn fetchLatestVersion(alloc: Allocator, base_url: []const u8) ![]u8 {
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
-    const url = try std.fmt.allocPrint(alloc, "{s}/latest.txt", .{base_url});
+    const url = if (isLoopbackE2eUpgradeBase(base_url))
+        try std.fmt.allocPrint(alloc, "{s}/latest.txt", .{base_url})
+    else
+        try std.fmt.allocPrint(alloc, "{s}/latest/download/latest.txt", .{base_url});
     defer alloc.free(url);
 
     const raw = try fetchTextBounded(
@@ -110,6 +116,13 @@ fn fetchLatestVersion(alloc: Allocator, base_url: []const u8) ![]u8 {
     const duped = try alloc.dupe(u8, trimmed);
     alloc.free(raw);
     return duped;
+}
+
+pub fn artifactUrl(alloc: Allocator, base_url: []const u8, target: Target, suffix: []const u8) ![]u8 {
+    if (isLoopbackE2eUpgradeBase(base_url)) {
+        return std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz{s}", .{ base_url, target.artifactRef(), platform, suffix });
+    }
+    return std.fmt.allocPrint(alloc, "{s}/download/{s}/fx-{s}.tar.gz{s}", .{ base_url, target.artifactRef(), platform, suffix });
 }
 
 fn fetchTextBounded(
@@ -329,8 +342,28 @@ test "E2E upgrade base accepts only explicit IPv4 loopback origins" {
     try std.testing.expect(!isLoopbackE2eUpgradeBase("http://localhost:1234"));
 }
 
-test "production upgrade base uses the fx release domain" {
-    try std.testing.expectEqualStrings("https://releases.fx.sh", resolveCdnBase());
+test "production upgrades use O MyFX GitHub releases" {
+    try std.testing.expectEqualStrings("https://github.com/y0usaf/oh-my-fx/releases", resolveReleaseBase());
+}
+
+test "artifact URLs preserve the local test contract and use GitHub release downloads" {
+    const alloc = std.testing.allocator;
+    var target = try Target.initStable(alloc, "v1.2.3");
+    defer target.deinit(alloc);
+
+    const production = try artifactUrl(alloc, release_base, target, ".sha256");
+    defer alloc.free(production);
+    try std.testing.expectEqualStrings(
+        "https://github.com/y0usaf/oh-my-fx/releases/download/omyfx-v1.2.3/fx-" ++ platform ++ ".tar.gz.sha256",
+        production,
+    );
+
+    const local = try artifactUrl(alloc, "http://127.0.0.1:1234", target, "");
+    defer alloc.free(local);
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:1234/v1.2.3/fx-" ++ platform ++ ".tar.gz",
+        local,
+    );
 }
 
 test "extractChecksumHex parses sha256sum format" {

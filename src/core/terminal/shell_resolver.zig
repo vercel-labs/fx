@@ -67,6 +67,43 @@ pub const Invocation = struct {
         self.append(command);
     }
 };
+pub const rush_internal_mode = "--fx-internal-rush";
+const rush_executable_token = "fx";
+
+/// Builds the argv used to re-exec the embedded Rush app through fx.
+///
+/// `self_executable` is comptime so release callers can provide the absolute
+/// fx path from build configuration without discovering it at runtime. Tests
+/// and development builds may pass null, which deliberately uses the stable
+/// internal executable token.
+pub fn rushInvocation(
+    comptime self_executable: ?[]const u8,
+    clean_start: bool,
+) ResolveError!Invocation {
+    const executable = self_executable orelse rush_executable_token;
+    if (self_executable != null and !std.fs.path.isAbsolute(executable)) {
+        return error.RelativeShellPath;
+    }
+
+    var result = Invocation{ .path = executable };
+    result.append(executable);
+    result.append(rush_internal_mode);
+    if (!clean_start) result.append("--login");
+    result.append("-i");
+    return result;
+}
+
+pub fn capturedRushInvocation(
+    comptime self_executable: ?[]const u8,
+    clean_start: bool,
+    command: []const u8,
+) ResolveError!Invocation {
+    var invocation = try rushInvocation(self_executable, clean_start);
+    removeInteractiveFlag(&invocation);
+    invocation.setCommand(command);
+    return invocation;
+}
+
 
 pub fn resolve(
     configured_login_shell: ?[]const u8,
@@ -303,6 +340,39 @@ fn appendMarker(
         try output.append(alloc, ' ');
         try appendShellWord(output, alloc, word);
     }
+}
+test "Rush invocation uses internal mode and preserves clean/user argv" {
+    const user = try rushInvocation("/opt/bin/fx", false);
+    try std.testing.expectEqualStrings("/opt/bin/fx", user.path);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "/opt/bin/fx", rush_internal_mode, "--login", "-i" },
+        user.argv(),
+    );
+
+    const clean = try rushInvocation("/opt/bin/fx", true);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "/opt/bin/fx", rush_internal_mode, "-i" },
+        clean.argv(),
+    );
+}
+
+test "Rush captured invocation keeps command as one argv value" {
+    const invocation = try capturedRushInvocation(null, false, "printf '%s' rush");
+    try std.testing.expectEqualStrings("fx", invocation.path);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "fx", rush_internal_mode, "--login", "-c", "printf '%s' rush" },
+        invocation.argv(),
+    );
+}
+
+test "Rush absolute self executable is required when supplied" {
+    try std.testing.expectError(
+        error.RelativeShellPath,
+        rushInvocation("fx", false),
+    );
 }
 
 fn appendShellWord(

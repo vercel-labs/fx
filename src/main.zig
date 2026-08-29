@@ -2,6 +2,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
+const rush_app = @import("rush_app");
+const shell_resolver = @import("core/terminal/shell_resolver.zig");
+const rush_app = @import("rush_app");
+const shell_resolver = @import("core/terminal/shell_resolver.zig");
+const rush_app = @import("rush_app");
+const shell_resolver = @import("core/terminal/shell_resolver.zig");
+const rush_app = @import("rush_app");
 
 pub const version = "0.0.6";
 
@@ -2898,11 +2905,94 @@ pub fn runWasmTerminal(init: std.process.Init) !void {
 pub fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) callconv(.c) c_int {
     mainC(c_argc, c_argv, c_envp) catch return 1;
     return 0;
+    if (raw_args.len >= 2 and std.mem.eql(u8, std.mem.span(raw_args[1]), shell_resolver.rush_internal_mode)) {
+        var rush_args: [64][*:0]const u8 = undefined;
+        var rush_count: usize = 0;
+        for (raw_args, 0..) |arg, index| {
+            if (index == 1) continue;
+            rush_args[rush_count] = arg;
+            rush_count += 1;
+        }
+        const status = try rush_app.run(
+            processAllocator(),
+            processAllocator(),
+            .{
+                .environ = .{ .block = environBlockFromRaw(raw_env) },
+                .args = argsFromRaw(rush_args[0..rush_count]),
+            },
+        );
+        exitFast(status);
+    }
 }
 
+    if (raw_args.len >= 2 and std.mem.eql(u8, std.mem.span(raw_args[1]), shell_resolver.rush_internal_mode)) {
+        var rush_args: [64][*:0]const u8 = undefined;
+        var rush_count: usize = 0;
+        for (raw_args, 0..) |arg, index| {
+            if (index == 1) continue;
+            rush_args[rush_count] = arg;
+            rush_count += 1;
+        }
+        const status = try rush_app.run(
+            processAllocator(),
+            processAllocator(),
+            .{
+                .environ = .{ .block = environBlockFromRaw(raw_env) },
+                .args = argsFromRaw(rush_args[0..rush_count]),
+            },
+        );
+        exitFast(status);
+    }
 fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !void {
     const raw_args = rawArgs(c_argc, c_argv);
+    if (isRushInternalModeRaw(raw_args)) {
+        var rush_args: [64][*:0]const u8 = undefined;
+        const rush_arg_slice = rushArgsFromRaw(raw_args, &rush_args);
+        const status = try rush_app.run(
+            processAllocator(),
+            processAllocator(),
+            .{
+                .environ = .{ .block = environBlockFromRaw(raw_env) },
+                .args = argsFromRaw(rush_arg_slice),
+            },
+        );
+        exitFast(status);
+    }
     const raw_env: RawEnviron = @ptrCast(c_envp);
+
+    if (isRushInternalModeRaw(raw_args)) {
+        var rush_args: [64][*:0]const u8 = undefined;
+        const rush_arg_slice = rushArgsFromRaw(raw_args, &rush_args);
+        const status = try rush_app.run(
+            processAllocator(),
+            processAllocator(),
+            .{
+                .environ = .{ .block = environBlockFromRaw(raw_env) },
+                .args = argsFromRaw(rush_arg_slice),
+            },
+        );
+        exitFast(status);
+    }
+
+    if (comptime terminal_host.isSupported()) {
+PUT >2990:
+fn isRushInternalModeRaw(raw_args: []const [*:0]const u8) bool {
+    return raw_args.len >= 2 and
+        std.mem.eql(u8, std.mem.span(raw_args[1]), shell_resolver.rush_internal_mode);
+}
+
+fn rushArgsFromRaw(
+    raw_args: []const [*:0]const u8,
+    out: *[64][*:0]const u8,
+) []const [*:0]const u8 {
+    var count: usize = 0;
+    for (raw_args, 0..) |arg, index| {
+        if (index == 1) continue;
+        out[count] = arg;
+        count += 1;
+    }
+    return out[0..count];
+}
 
     if (comptime terminal_host.isSupported()) {
         if (terminal_tmux_session.isCaptureModeRaw(raw_args)) {
@@ -3054,6 +3144,23 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
             const env_block = environBlockFromRaw(raw_env);
             const process_args = argsFromRaw(raw_args);
             var threaded = std.Io.Threaded.init(alloc, .{
+fn isRushInternalModeRaw(raw_args: []const [*:0]const u8) bool {
+    return raw_args.len >= 2 and
+        std.mem.eql(u8, std.mem.span(raw_args[1]), shell_resolver.rush_internal_mode);
+}
+
+fn rushArgsFromRaw(
+    raw_args: []const [*:0]const u8,
+    out: *[64][*:0]const u8,
+) []const [*:0]const u8 {
+    var count: usize = 0;
+    for (raw_args, 0..) |arg, index| {
+        if (index == 1) continue;
+        out[count] = arg;
+        count += 1;
+    }
+    return out[0..count];
+}
                 .argv0 = .init(process_args),
                 .environ = .{ .block = env_block },
             });

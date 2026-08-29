@@ -148,6 +148,7 @@ pub const Target = union(Channel) {
 };
 
 pub fn normalizeVersion(raw: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, raw, "omyfx-v")) return raw[7..];
     if (raw.len > 0 and raw[0] == 'v') return raw[1..];
     return raw;
 }
@@ -261,6 +262,14 @@ test "stable release ordering rejects older targets and preserves channel switch
         .version = "0.0.2",
         .revision = "abcdef012345",
     }));
+}
+
+test "stable target accepts the O MyFX release tag namespace" {
+    const alloc = std.testing.allocator;
+    var target = try Target.initStable(alloc, "omyfx-v1.2.3");
+    defer target.deinit(alloc);
+    try std.testing.expectEqualStrings("1.2.3", target.version());
+    try std.testing.expectEqualStrings("omyfx-v1.2.3", target.artifactRef());
 }
 
 test "target freshness uses version for stable and revision for dev" {
