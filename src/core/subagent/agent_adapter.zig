@@ -424,6 +424,14 @@ fn appendStaticContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayLi
     try context.config.context_registry.appendDefaultStatic(.{
         .project_context = context.config.project_context,
     }, arena, messages);
+    if (context.admission.profile_instructions) |instructions| {
+        const content = try std.fmt.allocPrint(
+            arena,
+            "<subagent-profile-instructions>\n{s}\n</subagent-profile-instructions>",
+            .{instructions},
+        );
+        try messages.append(arena, .{ .role = .system, .content = content });
+    }
     var snapshot = try snapshotModelCatalogForView(
         arena,
         if (context.admission.mcp_view) |*view| view else null,

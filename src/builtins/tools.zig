@@ -464,6 +464,7 @@ const subagent_notifications_schema = model_tool_schema.ObjectSchema{
 const subagent_create_schema = model_tool_schema.ObjectSchema{
     .properties = &.{
         .{ .name = "name", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_name_bytes } },
+        .{ .name = "profile", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_profile_name_bytes }, .description = "Optional global profile from ~/.fx/agents/<name>.md. Explicit create fields override profile defaults." },
         .{ .name = "mode", .json_type = .string, .shape = &.{ .enum_values = &.{ "one_off", "persistent" } } },
         .{ .name = "prompt", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_prompt_bytes } },
         .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes } },
@@ -1299,7 +1300,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "2bd29939ef7288131a7a2c6f1cb97da0e76a351bf6a8f7e39c3010a444d31df9",
+        "13efdca918d0e4714567a818782fd501165669dc80bc635808bf128ba855c188",
         &actual_hex,
     );
 }

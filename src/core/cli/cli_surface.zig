@@ -32,6 +32,7 @@ const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const session_store = @import("../session/session_store.zig");
+const subagent_profiles = @import("../subagent/profile_registry.zig");
 const usage_report = @import("../session/usage_report.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const types = @import("../shared/types.zig");
@@ -72,6 +73,7 @@ pub const Command = union(enum) {
     permissions: []const [:0]const u8,
     mcp: []const [:0]const u8,
     models: []const [:0]const u8,
+    agents: []const [:0]const u8,
     provider: []const [:0]const u8,
     doctor: []const [:0]const u8,
     background: []const [:0]const u8,
@@ -213,6 +215,16 @@ pub const Config = struct {
 
 const LocalSurfaceOptions = struct {
     format: output_contracts.OutputFormat = .text,
+};
+
+const AgentsAction = union(enum) {
+    list,
+    show: []const u8,
+};
+
+const AgentsOptions = struct {
+    format: output_contracts.OutputFormat = .text,
+    action: AgentsAction = .list,
 };
 
 fn parseLoginProvider(rest: []const [:0]const u8) !?model_provider.ProviderId {
@@ -470,6 +482,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         'a' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .ask)) return .{ .ask = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .acp)) return .{ .acp = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .agents)) return .{ .agents = args[1..] };
         },
         'b' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .background)) return .{ .background = args[1..] };
@@ -1155,6 +1168,49 @@ fn runNonInteractiveWithDeps(
             defer alloc.free(text);
             try writeFormattedOutput(deps, text, opts.format);
             return .handled_success;
+        },
+        .agents => |rest| {
+            const options = parseAgentsArgs(rest) catch {
+                try writeTopLevelUsage(cfg.command_catalog, deps, .agents);
+                return .handled_failure;
+            };
+            switch (options.action) {
+                .list => {
+                    const profiles = subagent_profiles.list(alloc) catch |err| {
+                        try writeLookupFailure(alloc, deps, "agents", err, options.format);
+                        return .handled_failure;
+                    };
+                    defer subagent_profiles.freeSummaries(alloc, profiles);
+                    const summaries = try alloc.alloc(output_contracts.AgentProfileSummary, profiles.len);
+                    defer alloc.free(summaries);
+                    for (profiles, 0..) |profile, index| summaries[index] = .{
+                        .name = profile.name,
+                        .description = profile.description,
+                    };
+                    const text = try (output_contracts.AgentProfileListSnapshot{ .profiles = summaries }).render(alloc, options.format);
+                    defer alloc.free(text);
+                    try writeFormattedOutput(deps, text, options.format);
+                    return .handled_success;
+                },
+                .show => |name| {
+                    var profile = subagent_profiles.load(alloc, name) catch |err| {
+                        try writeLookupFailure(alloc, deps, "agents", err, options.format);
+                        return .handled_failure;
+                    };
+                    defer profile.deinit(alloc);
+                    const text = try (output_contracts.AgentProfileDetailSnapshot{
+                        .name = profile.name,
+                        .description = profile.description,
+                        .model = profile.model,
+                        .effort = profile.effort,
+                        .permission_mode = profile.permission_mode,
+                        .instructions = profile.instructions,
+                    }).render(alloc, options.format);
+                    defer alloc.free(text);
+                    try writeFormattedOutput(deps, text, options.format);
+                    return .handled_success;
+                },
+            }
         },
         .mcp => |rest| {
             return runTopLevelMcp(alloc, rest, cfg, deps);
@@ -3230,10 +3286,28 @@ fn writeLookupFailure(
         error.DurableLayoutFailed, error.SessionStoreUnavailable => {
             try writeStderr(deps, "fx session: durable session store is unavailable\n");
         },
-        error.HomeNotSet => {
+        error.HomeNotSet, error.HomeUnavailable => {
             try writeStderr(deps, "fx ");
             try writeStderr(deps, kind);
             try writeStderr(deps, ": HOME is not set\n");
+        },
+        error.InvalidProfileName => {
+            try writeStderr(deps, "fx agents: invalid profile name\n");
+        },
+        error.ProfileNotFound => {
+            try writeStderr(deps, "fx agents: profile not found\n");
+        },
+        error.ProfileUnreadable => {
+            try writeStderr(deps, "fx agents: profile is unreadable\n");
+        },
+        error.ProfileTooLarge => {
+            try writeStderr(deps, "fx agents: profile is too large\n");
+        },
+        error.InvalidProfile => {
+            try writeStderr(deps, "fx agents: profile is invalid\n");
+        },
+        error.TooManyProfiles => {
+            try writeStderr(deps, "fx agents: too many profiles\n");
         },
         else => return err,
     }
@@ -3326,9 +3400,62 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
         error.PrivateStatePermissionsUnsupported,
         => "durable session storage is unsafe or does not support required private permissions",
         error.DurableLayoutFailed, error.SessionStoreUnavailable => "durable session store is unavailable",
-        error.HomeNotSet => "HOME is not set",
+        error.HomeNotSet, error.HomeUnavailable => "HOME is not set",
+        error.InvalidProfileName => "invalid profile name",
+        error.ProfileNotFound => "profile not found",
+        error.ProfileUnreadable => "profile is unreadable",
+        error.ProfileTooLarge => "profile is too large",
+        error.InvalidProfile => "profile is invalid",
+        error.TooManyProfiles => "too many profiles",
         else => null,
     };
+}
+
+test "agent profile lookup failures keep stable text and json messages" {
+    const cases = [_]struct {
+        err: anyerror,
+        message: []const u8,
+    }{
+        .{ .err = error.HomeUnavailable, .message = "HOME is not set" },
+        .{ .err = error.InvalidProfileName, .message = "invalid profile name" },
+        .{ .err = error.ProfileNotFound, .message = "profile not found" },
+        .{ .err = error.ProfileUnreadable, .message = "profile is unreadable" },
+        .{ .err = error.ProfileTooLarge, .message = "profile is too large" },
+        .{ .err = error.InvalidProfile, .message = "profile is invalid" },
+        .{ .err = error.TooManyProfiles, .message = "too many profiles" },
+    };
+    for (cases) |case| {
+        var text_output = CaptureOutput.init(std.testing.allocator);
+        defer text_output.deinit();
+        try writeLookupFailure(
+            std.testing.allocator,
+            text_output.deps(),
+            "agents",
+            case.err,
+            .text,
+        );
+        const expected_text = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "fx agents: {s}\n",
+            .{case.message},
+        );
+        defer std.testing.allocator.free(expected_text);
+        try std.testing.expectEqualStrings(expected_text, text_output.stderr.written());
+        try std.testing.expectEqualStrings("", text_output.stdout.written());
+
+        var json_output = CaptureOutput.init(std.testing.allocator);
+        defer json_output.deinit();
+        try writeLookupFailure(
+            std.testing.allocator,
+            json_output.deps(),
+            "agents",
+            case.err,
+            .json,
+        );
+        try std.testing.expectEqualStrings("", json_output.stderr.written());
+        try std.testing.expect(std.mem.find(u8, json_output.stdout.written(), case.message) != null);
+        try std.testing.expect(std.mem.find(u8, json_output.stdout.written(), @errorName(case.err)) != null);
+    }
 }
 
 test "session detail failures separate corruption from unsupported schema" {
@@ -3519,6 +3646,36 @@ fn parseLocalSurfaceArgs(args: []const [:0]const u8) !LocalSurfaceOptions {
         return error.InvalidLocalSurfaceArgs;
     }
     return options;
+}
+
+fn parseAgentsArgs(args: []const [:0]const u8) !AgentsOptions {
+    var positional: [2][]const u8 = undefined;
+    var positional_len: usize = 0;
+    var options = AgentsOptions{};
+    var json_seen = false;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--json")) {
+            if (json_seen) return error.InvalidAgentsArgs;
+            json_seen = true;
+            options.format = .json;
+            continue;
+        }
+        if (positional_len == positional.len) return error.InvalidAgentsArgs;
+        positional[positional_len] = arg;
+        positional_len += 1;
+    }
+
+    if (positional_len == 0) return options;
+    if (std.mem.eql(u8, positional[0], "list")) {
+        if (positional_len != 1) return error.InvalidAgentsArgs;
+        return options;
+    }
+    if (std.mem.eql(u8, positional[0], "show")) {
+        if (positional_len != 2 or positional[1].len == 0) return error.InvalidAgentsArgs;
+        options.action = .{ .show = positional[1] };
+        return options;
+    }
+    return error.InvalidAgentsArgs;
 }
 
 fn parseUpgradeArgs(args: []const [:0]const u8) !UpgradeOptions {
@@ -4232,6 +4389,33 @@ test "parse local surface args accepts only json" {
     try std.testing.expectEqual(output_contracts.OutputFormat.json, opts.format);
 
     try std.testing.expectError(error.InvalidLocalSurfaceArgs, parseLocalSurfaceArgs(&.{@constCast("--wat")}));
+}
+
+test "parse agents args accepts bounded grammar and json positions" {
+    const defaults = try parseAgentsArgs(&.{});
+    try std.testing.expectEqual(output_contracts.OutputFormat.text, defaults.format);
+    try std.testing.expect(defaults.action == .list);
+
+    const listed = try parseAgentsArgs(&.{ @constCast("--json"), @constCast("list") });
+    try std.testing.expectEqual(output_contracts.OutputFormat.json, listed.format);
+    try std.testing.expect(listed.action == .list);
+
+    const shown = try parseAgentsArgs(&.{
+        @constCast("show"),
+        @constCast("reviewer"),
+        @constCast("--json"),
+    });
+    try std.testing.expectEqual(output_contracts.OutputFormat.json, shown.format);
+    try std.testing.expectEqualStrings("reviewer", shown.action.show);
+
+    try std.testing.expectError(
+        error.InvalidAgentsArgs,
+        parseAgentsArgs(&.{ @constCast("--json"), @constCast("--json") }),
+    );
+    try std.testing.expectError(
+        error.InvalidAgentsArgs,
+        parseAgentsArgs(&.{ @constCast("show"), @constCast("reviewer"), @constCast("extra") }),
+    );
 }
 
 test "parse upgrade args accepts a remembered release channel" {

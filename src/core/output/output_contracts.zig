@@ -363,6 +363,16 @@ fn writeTerminalSafe(writer: *std.Io.Writer, alloc: Allocator, raw: []const u8) 
     try writer.writeAll(encoded.bytes);
 }
 
+fn writeTerminalSafeMultiline(writer: *std.Io.Writer, alloc: Allocator, raw: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try writer.writeByte('\n');
+        first = false;
+        try writeTerminalSafe(writer, alloc, line);
+    }
+}
+
 fn gatewayProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     const source = auth.active_source orelse return auth.gateway_connected;
     return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription);
@@ -745,6 +755,115 @@ pub const PermissionsSnapshot = struct {
         return try out.toOwnedSlice();
     }
 };
+
+pub const AgentProfileSummary = struct {
+    name: []const u8,
+    description: []const u8,
+};
+
+pub const AgentProfileListSnapshot = struct {
+    profiles: []const AgentProfileSummary,
+
+    pub fn render(self: AgentProfileListSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        if (format == .json) {
+            try out.writer.print("{{\"kind\":\"agents\",\"count\":{d},\"profiles\":[", .{self.profiles.len});
+            for (self.profiles, 0..) |profile, index| {
+                if (index != 0) try out.writer.writeByte(',');
+                try out.writer.writeAll("{\"name\":");
+                try std.json.Stringify.value(profile.name, .{}, &out.writer);
+                try out.writer.writeAll(",\"description\":");
+                try std.json.Stringify.value(profile.description, .{}, &out.writer);
+                try out.writer.writeByte('}');
+            }
+            try out.writer.writeAll("]}");
+        } else if (self.profiles.len == 0) {
+            try out.writer.writeAll("[agents] no profiles found in ~/.fx/agents\n");
+        } else {
+            try out.writer.print("[agents] {d} available\n", .{self.profiles.len});
+            for (self.profiles) |profile| {
+                try out.writer.print(" - {s}: ", .{profile.name});
+                try writeTerminalSafe(&out.writer, alloc, profile.description);
+                try out.writer.writeByte('\n');
+            }
+        }
+        return out.toOwnedSlice();
+    }
+};
+
+pub const AgentProfileDetailSnapshot = struct {
+    name: []const u8,
+    description: []const u8,
+    model: ?[]const u8,
+    effort: ?types.ReasoningEffort,
+    permission_mode: ?types.PermissionMode,
+    instructions: []const u8,
+
+    pub fn render(self: AgentProfileDetailSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        if (format == .json) {
+            try out.writer.writeAll("{\"kind\":\"agent\",\"name\":");
+            try std.json.Stringify.value(self.name, .{}, &out.writer);
+            try out.writer.writeAll(",\"description\":");
+            try std.json.Stringify.value(self.description, .{}, &out.writer);
+            try out.writer.writeAll(",\"model\":");
+            try std.json.Stringify.value(self.model, .{}, &out.writer);
+            try out.writer.writeAll(",\"effort\":");
+            try std.json.Stringify.value(if (self.effort) |value| value.label() else null, .{}, &out.writer);
+            try out.writer.writeAll(",\"permission_mode\":");
+            try std.json.Stringify.value(if (self.permission_mode) |value| @tagName(value) else null, .{}, &out.writer);
+            try out.writer.writeAll(",\"instructions\":");
+            try std.json.Stringify.value(self.instructions, .{}, &out.writer);
+            try out.writer.writeByte('}');
+        } else {
+            try out.writer.print("[agent] {s}\n", .{self.name});
+            try writeTerminalSafe(&out.writer, alloc, self.description);
+            try out.writer.writeByte('\n');
+            if (self.model) |model| {
+                try out.writer.writeAll("model: ");
+                try writeTerminalSafe(&out.writer, alloc, model);
+                try out.writer.writeByte('\n');
+            }
+            if (self.effort) |effort| try out.writer.print("effort: {s}\n", .{effort.label()});
+            if (self.permission_mode) |mode| try out.writer.print("permission mode: {s}\n", .{@tagName(mode)});
+            try out.writer.writeByte('\n');
+            try writeTerminalSafeMultiline(&out.writer, alloc, self.instructions);
+            try out.writer.writeByte('\n');
+        }
+        return out.toOwnedSlice();
+    }
+};
+
+test "agent profile text visibly escapes terminal controls" {
+    const profiles = [_]AgentProfileSummary{.{
+        .name = "reviewer",
+        .description = "Review\x1b]52;c;clipboard\x07\nnext",
+    }};
+    const list_text = try (AgentProfileListSnapshot{ .profiles = &profiles }).render(std.testing.allocator, .text);
+    defer std.testing.allocator.free(list_text);
+    try std.testing.expectEqualStrings(
+        "[agents] 1 available\n - reviewer: Review\\x1b]52;c;clipboard\\x07\\x0anext\n",
+        list_text,
+    );
+
+    const detail_text = try (AgentProfileDetailSnapshot{
+        .name = "reviewer",
+        .description = "Review\x1b[2J",
+        .model = "test/model\x1b[31m",
+        .effort = null,
+        .permission_mode = null,
+        .instructions = "Inspect\ncarefully\x1b]52;c;clipboard\x07",
+    }).render(std.testing.allocator, .text);
+    defer std.testing.allocator.free(detail_text);
+    try std.testing.expectEqualStrings(
+        "[agent] reviewer\nReview\\x1b[2J\nmodel: test/model\\x1b[31m\n\nInspect\ncarefully\\x1b]52;c;clipboard\\x07\n",
+        detail_text,
+    );
+    try std.testing.expect(std.mem.findScalar(u8, detail_text, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, detail_text, 0x07) == null);
+}
 
 pub const ModelListSnapshot = struct {
     ids: []const []const u8,

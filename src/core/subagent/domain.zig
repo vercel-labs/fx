@@ -8,8 +8,10 @@ const model_provider = @import("../config/model_provider.zig");
 const Allocator = std.mem.Allocator;
 
 pub const max_name_bytes: usize = 128;
+pub const max_profile_name_bytes: usize = 128;
 pub const max_model_bytes: usize = 256;
 pub const max_prompt_bytes: usize = 64 * 1024;
+pub const max_profile_instructions_bytes: usize = 64 * 1024;
 pub const max_message_bytes: usize = 64 * 1024;
 pub const max_root_user_evidence_bytes: usize = 8 * 1024;
 pub const max_cancellation_reason_bytes: usize = 512;
@@ -88,6 +90,7 @@ pub const NotificationPolicy = struct {
 
 pub const Configuration = struct {
     name: []u8,
+    profile_instructions: ?[]u8 = null,
     model: ?[]u8 = null,
     effort: ?types.ReasoningEffort = null,
     permission_mode: types.PermissionMode = .yolo,
@@ -95,6 +98,7 @@ pub const Configuration = struct {
 
     pub fn deinit(self: *Configuration, alloc: Allocator) void {
         alloc.free(self.name);
+        if (self.profile_instructions) |instructions| alloc.free(instructions);
         if (self.model) |model| alloc.free(model);
         self.notifications.deinit(alloc);
         self.* = undefined;
@@ -104,10 +108,13 @@ pub const Configuration = struct {
     pub fn clone(self: Configuration, alloc: Allocator) !Configuration {
         const name = try alloc.dupe(u8, self.name);
         errdefer alloc.free(name);
+        const profile_instructions = if (self.profile_instructions) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (profile_instructions) |value| alloc.free(value);
         const model = if (self.model) |value| try alloc.dupe(u8, value) else null;
         errdefer if (model) |value| alloc.free(value);
         return .{
             .name = name,
+            .profile_instructions = profile_instructions,
             .model = model,
             .effort = self.effort,
             .permission_mode = self.permission_mode,
@@ -156,6 +163,7 @@ pub const LifecycleAction = enum {
 
 pub const CreateInput = struct {
     name: ?[]const u8 = null,
+    profile: ?[]const u8 = null,
     mode: ?Mode = null,
     prompt: ?[]const u8 = null,
     model: ?[]const u8 = null,
@@ -217,12 +225,14 @@ pub const CommandInput = struct {
 
 pub const CreateCommand = struct {
     configuration: Configuration,
+    profile: ?[]u8,
     mode: Mode,
     prompt: ?[]u8,
     permission_mode_explicit: bool,
 
     fn deinit(self: *CreateCommand, alloc: Allocator) void {
         self.configuration.deinit(alloc);
+        if (self.profile) |profile| alloc.free(profile);
         if (self.prompt) |prompt| alloc.free(prompt);
         self.* = undefined;
     }
@@ -340,6 +350,7 @@ pub const AdmissionSnapshot = struct {
     parent_id: []u8,
     source_id: []u8,
     model: []u8,
+    profile_instructions: ?[]u8 = null,
     provider: model_provider.ProviderId = .gateway,
     effort: types.ReasoningEffort,
     permission_mode: types.PermissionMode = .yolo,
@@ -355,6 +366,7 @@ pub const AdmissionSnapshot = struct {
         alloc.free(self.parent_id);
         alloc.free(self.source_id);
         alloc.free(self.model);
+        if (self.profile_instructions) |instructions| alloc.free(instructions);
         freeStrings(alloc, self.tool_names);
         self.rules.deinit(alloc);
         types.freePermissionGrantSlice(alloc, self.grants);
@@ -372,6 +384,8 @@ pub const AdmissionSnapshot = struct {
         errdefer alloc.free(source_id);
         const model = try alloc.dupe(u8, self.model);
         errdefer alloc.free(model);
+        const profile_instructions = if (self.profile_instructions) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (profile_instructions) |value| alloc.free(value);
         const tool_names = try cloneStrings(alloc, self.tool_names);
         errdefer freeStrings(alloc, tool_names);
         var rules = try types.dupePermissionRuleSet(alloc, self.rules);
@@ -393,6 +407,7 @@ pub const AdmissionSnapshot = struct {
             .parent_id = parent_id,
             .source_id = source_id,
             .model = model,
+            .profile_instructions = profile_instructions,
             .provider = self.provider,
             .effort = self.effort,
             .permission_mode = self.permission_mode,
@@ -411,6 +426,7 @@ pub const AdmissionInput = struct {
     parent_id: []const u8,
     source_id: []const u8,
     model: []const u8,
+    profile_instructions: ?[]const u8 = null,
     provider: model_provider.ProviderId = .gateway,
     effort: types.ReasoningEffort,
     permission_mode: types.PermissionMode = .yolo,
@@ -465,6 +481,16 @@ pub fn captureAdmission(
     errdefer alloc.free(source_id);
     const model = try alloc.dupe(u8, input.model);
     errdefer alloc.free(model);
+    if (input.profile_instructions) |instructions| {
+        if (instructions.len == 0 or instructions.len > max_profile_instructions_bytes or
+            !std.unicode.utf8ValidateSlice(instructions) or
+            std.mem.findScalar(u8, instructions, 0) != null)
+        {
+            return error.InvalidAdmissionItem;
+        }
+    }
+    const profile_instructions = if (input.profile_instructions) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (profile_instructions) |value| alloc.free(value);
     const tool_names = try cloneStrings(alloc, input.tool_names);
     errdefer freeStrings(alloc, tool_names);
     var rules = try types.dupePermissionRuleSet(alloc, input.rules);
@@ -489,6 +515,7 @@ pub fn captureAdmission(
         .parent_id = parent_id,
         .source_id = source_id,
         .model = model,
+        .profile_instructions = profile_instructions,
         .provider = input.provider,
         .effort = input.effort,
         .permission_mode = input.permission_mode,
@@ -762,11 +789,14 @@ fn validateCreate(alloc: Allocator, input: CreateInput) ValidationError!CreateCo
     const mode = input.mode orelse return error.MissingMode;
     if (mode == .one_off and input.prompt == null) return error.MissingOneOffPrompt;
     try validateName(name_raw);
+    if (input.profile) |profile| try validateBoundedText(profile, max_profile_name_bytes, error.InvalidName);
     if (input.model) |model| try validateModel(model);
     if (input.prompt) |prompt| try validateBoundedText(prompt, max_prompt_bytes, error.InvalidPrompt);
 
     const name = try alloc.dupe(u8, name_raw);
     errdefer alloc.free(name);
+    const profile = if (input.profile) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (profile) |value| alloc.free(value);
     const model = if (input.model) |value| try alloc.dupe(u8, value) else null;
     errdefer if (model) |value| alloc.free(value);
     var notifications = try validateNotificationPolicy(alloc, input.notifications orelse .{});
@@ -780,6 +810,7 @@ fn validateCreate(alloc: Allocator, input: CreateInput) ValidationError!CreateCo
             .permission_mode = input.permission_mode orelse .yolo,
             .notifications = notifications,
         },
+        .profile = profile,
         .mode = mode,
         .prompt = prompt,
         .permission_mode_explicit = input.permission_mode != null,
@@ -1289,6 +1320,7 @@ fn hashConfiguration(
     configuration: Configuration,
 ) void {
     hashString(hash, configuration.name);
+    hashOptionalString(hash, configuration.profile_instructions);
     hashOptionalString(hash, configuration.model);
     hashOptionalEffort(hash, configuration.effort);
     hashString(hash, @tagName(configuration.permission_mode));

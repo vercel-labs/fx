@@ -12,6 +12,7 @@ const control_store = @import("control_store.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
 const manager_mod = @import("manager.zig");
+const profile_registry = @import("profile_registry.zig");
 const tool_result = @import("tool_result.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -394,6 +395,34 @@ pub const Runtime = struct {
                 false,
                 options.max_result_bytes,
             );
+        }
+        if (command.* == .create) {
+            applyCreateProfile(alloc, &command.create) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                const error_code = createProfileErrorCode(err) orelse return err;
+                self.abortOperationIdentity(
+                    options.invocation_id,
+                    .model,
+                    options.identity_epoch,
+                ) catch {
+                    return boundedFailureAlloc(
+                        alloc,
+                        options.invocation_id,
+                        null,
+                        "control_commit_indeterminate",
+                        true,
+                        options.max_result_bytes,
+                    );
+                };
+                return boundedFailureAlloc(
+                    alloc,
+                    options.invocation_id,
+                    null,
+                    error_code,
+                    false,
+                    options.max_result_bytes,
+                );
+            };
         }
         if (!try self.admitModelCommand(
             alloc,
@@ -883,7 +912,10 @@ pub const Runtime = struct {
             runAfterTargetAuthorizationTestHook();
         }
 
-        if (command.* == .create) try applyCreateDefaults(alloc, &command.create, options.defaults);
+        if (command.* == .create) {
+            try applyCreateProfile(alloc, &command.create);
+            try applyCreateDefaults(alloc, &command.create, options.defaults);
+        }
         return self.executeAuthorizedCommand(
             alloc,
             command.*,
@@ -2194,6 +2226,36 @@ fn boundedFailureAlloc(
     );
 }
 
+fn createProfileErrorCode(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.InvalidProfileName => "invalid_profile_name",
+        error.ProfileNotFound => "profile_not_found",
+        error.ProfileUnreadable => "profile_unreadable",
+        error.ProfileTooLarge, error.InvalidProfile => "invalid_profile",
+        error.HomeUnavailable => "profile_home_unavailable",
+        else => null,
+    };
+}
+
+fn applyCreateProfile(
+    alloc: Allocator,
+    create: *domain.CreateCommand,
+) !void {
+    const name = create.profile orelse return;
+    if (create.configuration.profile_instructions != null) return;
+    var profile = try profile_registry.load(alloc, name);
+    defer profile.deinit(alloc);
+    create.configuration.profile_instructions = try alloc.dupe(u8, profile.instructions);
+    if (create.configuration.model == null and profile.model != null) {
+        create.configuration.model = try alloc.dupe(u8, profile.model.?);
+    }
+    if (create.configuration.effort == null) create.configuration.effort = profile.effort;
+    if (!create.permission_mode_explicit and profile.permission_mode != null) {
+        create.configuration.permission_mode = profile.permission_mode.?;
+        create.permission_mode_explicit = true;
+    }
+}
+
 fn applyCreateDefaults(
     alloc: Allocator,
     create: *domain.CreateCommand,
@@ -2400,6 +2462,7 @@ fn captureAdmission(
         .parent_id = request.parent_id,
         .source_id = request.source_id,
         .model = request.preferences.model,
+        .profile_instructions = request.configuration.profile_instructions,
         .provider = request.preferences.provider,
         .effort = request.preferences.effort,
         .permission_mode = snapshot.permission_mode,
@@ -3051,6 +3114,7 @@ test "one off caller cannot create before identity or child allocation" {
 
     var nested_create = try domain.validateCommand(alloc, .{ .create = .{
         .name = "must not exist",
+        .profile = "../must-not-be-read",
         .mode = .persistent,
     } });
     defer nested_create.deinit(alloc);
@@ -3745,6 +3809,80 @@ fn resultStringAlloc(
     const raw = parsed.value.object.get(key) orelse return error.TestUnexpectedResult;
     if (raw != .string) return error.TestUnexpectedResult;
     return alloc.dupe(u8, raw.string);
+}
+
+test "profile registry errors map to stable non-retryable result codes" {
+    try std.testing.expectEqualStrings(
+        "invalid_profile_name",
+        createProfileErrorCode(error.InvalidProfileName).?,
+    );
+    try std.testing.expectEqualStrings(
+        "profile_not_found",
+        createProfileErrorCode(error.ProfileNotFound).?,
+    );
+    try std.testing.expectEqualStrings(
+        "profile_unreadable",
+        createProfileErrorCode(error.ProfileUnreadable).?,
+    );
+    try std.testing.expectEqualStrings(
+        "invalid_profile",
+        createProfileErrorCode(error.ProfileTooLarge).?,
+    );
+    try std.testing.expectEqualStrings(
+        "invalid_profile",
+        createProfileErrorCode(error.InvalidProfile).?,
+    );
+    try std.testing.expectEqualStrings(
+        "profile_home_unavailable",
+        createProfileErrorCode(error.HomeUnavailable).?,
+    );
+    try std.testing.expect(createProfileErrorCode(error.OutOfMemory) == null);
+}
+
+test "tool host returns stable non-retryable profile lookup failures" {
+    const alloc = std.testing.allocator;
+    const root_id = "01J00000000000000000000000";
+    var env = try TestEnvironment.init(alloc);
+    defer env.deinit(alloc);
+    try env.createSession(alloc, root_id);
+    var test_authority = TestAuthority{ .root_id = root_id };
+    const host = try Runtime.create(
+        alloc,
+        &env.store,
+        root_id,
+        test_authority.resolver(),
+        .{},
+    );
+    defer host.deinit();
+
+    var missing = try domain.validateCommand(alloc, .{ .create = .{
+        .name = "worker",
+        .profile = "missing-profile",
+        .mode = .persistent,
+    } });
+    defer missing.deinit(alloc);
+    var options = testOptions(root_id, "create-missing-profile");
+    options.identity_epoch = try host.issueOperationIdentity(
+        alloc,
+        options.invocation_id,
+        .model,
+    );
+    const operation_id = try tool_result.boundOperationIdAlloc(
+        alloc,
+        options.invocation_id,
+        .model,
+        options.identity_epoch,
+    );
+    defer alloc.free(operation_id);
+    try std.testing.expect(try host.operationIdentityOutstanding(alloc, operation_id));
+
+    const missing_result = try host.execute(alloc, &missing, options);
+    defer alloc.free(missing_result);
+    const missing_code = try resultStringAlloc(alloc, missing_result, "error_code");
+    defer alloc.free(missing_code);
+    try std.testing.expectEqualStrings("profile_home_unavailable", missing_code);
+    try std.testing.expect(std.mem.find(u8, missing_result, "\"retryable\":false") != null);
+    try std.testing.expect(!try host.operationIdentityOutstanding(alloc, operation_id));
 }
 
 test "tool host materializes defaults and executes canonical persistent branches" {

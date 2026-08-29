@@ -3675,6 +3675,61 @@ describe("cli: models", () => {
   );
 });
 
+describe("cli: agents", () => {
+  test("fx agents lists and shows global subagent profiles", async () => {
+    const home = createIsolatedTestHome();
+    try {
+      const agentsDir = join(home, ".fx", "agents");
+      mkdirSync(agentsDir, { recursive: true });
+      writeFileSync(
+        join(agentsDir, "reviewer.md"),
+        [
+          "---",
+          "name: reviewer",
+          "description: Reviews code for regressions",
+          "model: anthropic/claude-sonnet-4",
+          "effort: high",
+          "permission_mode: ask",
+          "---",
+          "Review independently and report concrete findings.",
+          "",
+        ].join("\n"),
+      );
+
+      const listed = await runFx(["agents", "list", "--json"], {
+        env: { HOME: home },
+      });
+      expect(listed.code).toBe(0);
+      expect(JSON.parse(listed.stdout.trim())).toEqual({
+        kind: "agents",
+        count: 1,
+        profiles: [
+          {
+            name: "reviewer",
+            description: "Reviews code for regressions",
+          },
+        ],
+      });
+
+      const shown = await runFx(["agents", "show", "reviewer", "--json"], {
+        env: { HOME: home },
+      });
+      expect(shown.code).toBe(0);
+      expect(JSON.parse(shown.stdout.trim())).toEqual({
+        kind: "agent",
+        name: "reviewer",
+        description: "Reviews code for regressions",
+        model: "anthropic/claude-sonnet-4",
+        effort: "high",
+        permission_mode: "ask",
+        instructions: "Review independently and report concrete findings.",
+      });
+    } finally {
+      cleanupIsolatedTestHome(home);
+    }
+  });
+});
+
 describe("cli: credits", () => {
   test(
     "fx credits --json preserves Gateway HTTP denial details",

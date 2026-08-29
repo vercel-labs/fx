@@ -135,9 +135,10 @@ fn parseRoot(arena: Allocator, value: std.json.Value) (DecodeError || Allocator.
 
 fn parseCreate(arena: Allocator, value: std.json.Value) (DecodeError || Allocator.Error)!domain.CreateInput {
     const object = try objectValue(value);
-    try rejectUnknown(object, &.{ "name", "mode", "prompt", "model", "effort", "permission_mode", "notifications" });
+    try rejectUnknown(object, &.{ "name", "profile", "mode", "prompt", "model", "effort", "permission_mode", "notifications" });
     return .{
         .name = try optionalString(object, "name"),
+        .profile = try optionalString(object, "profile"),
         .mode = if (try optionalString(object, "mode")) |raw| try parseMode(raw) else null,
         .prompt = try optionalString(object, "prompt"),
         .model = try optionalString(object, "model"),

@@ -7,7 +7,8 @@ const tool_result = @import("tool_result.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
-const schema_version: u64 = 7;
+const schema_version: u64 = 8;
+const profile_schema_version: u64 = 8;
 const root_context_schema_version: u64 = 6;
 const permission_mode_schema_version: u64 = 5;
 const manager_epoch_schema_version: u64 = 4;
@@ -477,6 +478,8 @@ fn renderConfiguration(
 ) !void {
     try writer.writeAll("{\"name\":");
     try writeJsonString(writer, configuration.name);
+    try writer.writeAll(",\"profile_instructions\":");
+    try writeOptionalString(writer, configuration.profile_instructions);
     try writer.writeAll(",\"model\":");
     try writeOptionalString(writer, configuration.model);
     try writer.writeAll(",\"effort\":");
@@ -1128,7 +1131,9 @@ fn parseConfiguration(
 ) LoadError!domain.Configuration {
     const object = exactObject(
         value,
-        if (version >= permission_mode_schema_version)
+        if (version >= profile_schema_version)
+            &.{ "name", "profile_instructions", "model", "effort", "permission_mode", "notifications" }
+        else if (version >= permission_mode_schema_version)
             &.{ "name", "model", "effort", "permission_mode", "notifications" }
         else
             &.{ "name", "model", "effort", "notifications" },
@@ -1136,6 +1141,12 @@ fn parseConfiguration(
         return error.InvalidControlRecord;
     const name_raw = requireString(object, "name") catch return error.InvalidControlRecord;
     validateText(name_raw, domain.max_name_bytes) catch return error.InvalidControlRecord;
+    const profile_instructions_raw = if (version >= profile_schema_version)
+        optionalString(object, "profile_instructions") catch return error.InvalidControlRecord
+    else
+        null;
+    if (profile_instructions_raw) |instructions| validateText(instructions, domain.max_profile_instructions_bytes) catch
+        return error.InvalidControlRecord;
     const model_raw = optionalString(object, "model") catch return error.InvalidControlRecord;
     if (model_raw) |model| validateText(model, domain.max_model_bytes) catch
         return error.InvalidControlRecord;
@@ -1144,10 +1155,13 @@ fn parseConfiguration(
     ) catch return error.InvalidControlRecord;
     const name = try alloc.dupe(u8, name_raw);
     errdefer alloc.free(name);
+    const profile_instructions = if (profile_instructions_raw) |raw| try alloc.dupe(u8, raw) else null;
+    errdefer if (profile_instructions) |owned| alloc.free(owned);
     const model = if (model_raw) |raw| try alloc.dupe(u8, raw) else null;
     errdefer if (model) |owned| alloc.free(owned);
     return .{
         .name = name,
+        .profile_instructions = profile_instructions,
         .model = model,
         .effort = effort,
         .permission_mode = if (version >= permission_mode_schema_version)
@@ -1239,7 +1253,7 @@ fn parseQueue(
         messages.deinit(alloc);
     }
     for (value.array.items) |item| {
-        const object = exactObject(item, if (version == schema_version)
+        const object = exactObject(item, if (version >= root_context_schema_version + 1)
             &.{
                 "id",
                 "source_id",
@@ -1291,12 +1305,12 @@ fn parseQueue(
         {
             return error.InvalidControlRecord;
         }
-        const root_user_evidence_complete = if (version == schema_version)
+        const root_user_evidence_complete = if (version >= root_context_schema_version + 1)
             requireBool(object, "root_user_evidence_complete") catch
                 return error.InvalidControlRecord
         else
             false;
-        const root_user_messages = if (version == schema_version)
+        const root_user_messages = if (version >= root_context_schema_version + 1)
             try parseRootUserMessages(
                 alloc,
                 object.get("root_user_messages") orelse
@@ -1986,7 +2000,7 @@ test "control codec rejects malformed partial unknown and oversized records" {
     defer record.deinit(alloc);
     const bytes = try renderRecord(alloc, record);
     defer alloc.free(bytes);
-    const unknown = try std.mem.replaceOwned(u8, alloc, bytes, "\"schema_version\":7", "\"schema_version\":99");
+    const unknown = try std.mem.replaceOwned(u8, alloc, bytes, "\"schema_version\":8", "\"schema_version\":99");
     defer alloc.free(unknown);
     try std.testing.expectError(error.UnsupportedControlSchema, parseRecord(alloc, unknown));
     const unknown_field = try std.mem.replaceOwned(
@@ -2047,14 +2061,22 @@ test "schema v2 migration closes absent legacy replay identities" {
         u8,
         alloc,
         current,
-        "\"schema_version\":7",
+        "\"schema_version\":8",
         "\"schema_version\":2",
     );
     defer alloc.free(versioned_with_mode);
-    const versioned = try std.mem.replaceOwned(
+    const versioned_without_profile = try std.mem.replaceOwned(
         u8,
         alloc,
         versioned_with_mode,
+        ",\"profile_instructions\":null",
+        "",
+    );
+    defer alloc.free(versioned_without_profile);
+    const versioned = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        versioned_without_profile,
         ",\"permission_mode\":\"yolo\"",
         "",
     );
@@ -2089,14 +2111,22 @@ test "schema v3 process epochs cannot seed manager replay authority" {
         u8,
         alloc,
         current,
-        "\"schema_version\":7",
+        "\"schema_version\":8",
         "\"schema_version\":3",
     );
     defer alloc.free(legacy_with_mode);
-    const legacy = try std.mem.replaceOwned(
+    const legacy_without_profile = try std.mem.replaceOwned(
         u8,
         alloc,
         legacy_with_mode,
+        ",\"profile_instructions\":null",
+        "",
+    );
+    defer alloc.free(legacy_without_profile);
+    const legacy = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        legacy_without_profile,
         ",\"permission_mode\":\"yolo\"",
         "",
     );
@@ -2124,14 +2154,22 @@ test "schema v4 manager epochs retain replay authority and migrate child permiss
         u8,
         alloc,
         current,
-        "\"schema_version\":7",
+        "\"schema_version\":8",
         "\"schema_version\":4",
     );
     defer alloc.free(legacy_with_mode);
-    const legacy = try std.mem.replaceOwned(
+    const legacy_without_profile = try std.mem.replaceOwned(
         u8,
         alloc,
         legacy_with_mode,
+        ",\"profile_instructions\":null",
+        "",
+    );
+    defer alloc.free(legacy_without_profile);
+    const legacy = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        legacy_without_profile,
         ",\"permission_mode\":\"yolo\"",
         "",
     );
@@ -2777,7 +2815,7 @@ test "control decoder handles fuzzed bytes" {
     try std.testing.fuzz({}, fuzzControlRecord, .{ .corpus = &.{
         "",
         "{}",
-        "{\"schema_version\":7}",
+        "{\"schema_version\":8}",
         "{\"schema_version\":6}",
         "{\"schema_version\":5}",
         "{\"schema_version\":4}",
