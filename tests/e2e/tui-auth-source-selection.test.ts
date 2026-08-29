@@ -444,10 +444,13 @@ function startFakeChatGptOAuth(
     tokenDelayMs?: number;
     responseDelayMs?: number;
     unauthorizedResponses?: number;
+    websocketMode?: "serve" | "reject";
   } = {},
 ) {
   const accessToken = chatgptAccessToken();
   let responseCount = 0;
+  let websocketUpgrades = 0;
+  let websocketMessages = 0;
   let models = [
     { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "max" }, { effort: "high" }], additional_speed_tiers: ["fast"], input_modalities: ["text", "image"], context_window: 272000 },
     { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
@@ -461,8 +464,40 @@ function startFakeChatGptOAuth(
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    async fetch(request) {
+    websocket: {
+      message(ws: unknown, message: string | Uint8Array) {
+        websocketMessages += 1;
+        const text = typeof message === "string" ? message : Buffer.from(message).toString("utf8");
+        const socket = ws as { send(data: string): void; close(code?: number, reason?: string): void };
+        if (!text.startsWith('{"type":"response.create",')) {
+          socket.close(1008, "expected response.create");
+          return;
+        }
+        socket.send('{"type":"response.output_text.delta","delta":"CHATGPT_WEBSOCKET_RESPONSE"}');
+        socket.send(
+          '{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":4,"output_tokens":2}}}',
+        );
+      },
+    },
+    async fetch(request, bunServer) {
       const url = new URL(request.url);
+      if (
+        url.pathname === "/chatgpt/responses" &&
+        request.headers.get("upgrade")?.toLowerCase() === "websocket"
+      ) {
+        websocketUpgrades += 1;
+        requests.push({
+          method: request.method,
+          path: url.pathname,
+          authorization: request.headers.get("authorization"),
+          body: null,
+        });
+        if (options.websocketMode !== "serve") {
+          return new Response("websocket upgrade rejected", { status: 403 });
+        }
+        if (bunServer.upgrade(request)) return undefined as unknown as Response;
+        return new Response("websocket upgrade failed", { status: 400 });
+      }
       const body = url.pathname === "/chatgpt/responses" || url.pathname === "/chatgpt/token"
         ? await request.text()
         : null;
@@ -523,6 +558,12 @@ function startFakeChatGptOAuth(
     baseUrl,
     setModels(next: typeof models) {
       models = next;
+    },
+    get websocketUpgrades() {
+      return websocketUpgrades;
+    },
+    get websocketMessages() {
+      return websocketMessages;
     },
     stop() {
       server.stop(true);
@@ -2180,6 +2221,89 @@ test(
     expect(result.stderr).toBe("");
   },
   60_000,
+);
+
+test(
+  "Codex WebSocket transport streams a response over one upgraded connection",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-ws-"));
+    gateway = startFakeGateway([]);
+    chatgptOauth = startFakeChatGptOAuth({ websocketMode: "serve" });
+    const env = {
+      HOME: home,
+      AI_GATEWAY_API_KEY: ENV_TOKEN,
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_SKIP_ONBOARDING: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_NO_OPEN_BROWSER: "1",
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      FX_OPENAI_CODEX_TRANSPORT: "websocket",
+      ...chatgptOauth.env,
+    };
+
+    const login = await runCodexLoginWithBrowser(env);
+    expect(login.code, `stdout: ${login.stdout}\nstderr: ${login.stderr}`).toBe(0);
+
+    const ask = await runFx(["ask", "--json", "--auto", "--no-save", "Answer directly."], {
+      env,
+      timeoutMs: TIMEOUT,
+    });
+    expect(ask.code, `stdout: ${ask.stdout}\nstderr: ${ask.stderr}`).toBe(0);
+    expect(ask.stdout).toContain("CHATGPT_WEBSOCKET_RESPONSE");
+    expect(ask.stdout).not.toContain("CHATGPT_DIRECT_RESPONSE");
+    expect(chatgptOauth.websocketUpgrades).toBe(1);
+    expect(chatgptOauth.websocketMessages).toBe(1);
+    const ssePosts = chatgptOauth.requests.filter(
+      (request) => request.path === "/chatgpt/responses" && request.method === "POST",
+    );
+    expect(ssePosts).toHaveLength(0);
+    const upgradeRequest = chatgptOauth.requests.find(
+      (request) => request.path === "/chatgpt/responses" && request.method === "GET",
+    );
+    expect(upgradeRequest?.authorization).toBe(`Bearer ${chatgptOauth.accessToken}`);
+  },
+  TIMEOUT,
+);
+
+test(
+  "Codex WebSocket upgrade rejection falls back to SSE before any output",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-ws-fallback-"));
+    gateway = startFakeGateway([]);
+    chatgptOauth = startFakeChatGptOAuth({ websocketMode: "reject" });
+    const env = {
+      HOME: home,
+      AI_GATEWAY_API_KEY: ENV_TOKEN,
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_SKIP_ONBOARDING: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_NO_OPEN_BROWSER: "1",
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      FX_OPENAI_CODEX_TRANSPORT: "websocket",
+      ...chatgptOauth.env,
+    };
+
+    const login = await runCodexLoginWithBrowser(env);
+    expect(login.code, `stdout: ${login.stdout}\nstderr: ${login.stderr}`).toBe(0);
+
+    const ask = await runFx(["ask", "--json", "--auto", "--no-save", "Answer directly."], {
+      env,
+      timeoutMs: TIMEOUT,
+    });
+    expect(ask.code, `stdout: ${ask.stdout}\nstderr: ${ask.stderr}`).toBe(0);
+    expect(ask.stdout).toContain("CHATGPT_DIRECT_RESPONSE");
+    expect(chatgptOauth.websocketUpgrades).toBe(1);
+    expect(chatgptOauth.websocketMessages).toBe(0);
+    const ssePosts = chatgptOauth.requests.filter(
+      (request) => request.path === "/chatgpt/responses" && request.method === "POST",
+    );
+    expect(ssePosts).toHaveLength(1);
+  },
+  TIMEOUT,
 );
 
 test(

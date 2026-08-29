@@ -363,14 +363,20 @@ fn connectBounded(
         .session_id = request.session_id,
         .session_key = session_key,
     };
+    var connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(connect_timeout_ms),
+    });
+    if (request.deadline) |deadline| {
+        if (std.Io.Clock.Timestamp.compare(deadline, .lt, connect_deadline)) {
+            connect_deadline = deadline;
+        }
+    }
     return gateway_client.runBoundedHttpOperation(
         *WsConnection,
         alloc,
         request.cancel_flag,
-        std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
-            .clock = .awake,
-            .raw = .fromMilliseconds(connect_timeout_ms),
-        }),
+        connect_deadline,
         &operation,
     );
 }
@@ -535,11 +541,19 @@ fn runOnConnection(
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     var cancel_watch_done = std.atomic.Value(bool).init(false);
-    const cancel_watcher = try gateway_client.spawnHttpCancelWatcher(
-        &cancel_watch_done,
-        request.cancel_flag,
-        conn.netStream(),
-    );
+    const cancel_watcher = if (request.deadline) |deadline|
+        try gateway_client.spawnHttpCancelWatcherBounded(
+            &cancel_watch_done,
+            request.cancel_flag,
+            deadline,
+            conn.netStream(),
+        )
+    else
+        try gateway_client.spawnHttpCancelWatcher(
+            &cancel_watch_done,
+            request.cancel_flag,
+            conn.netStream(),
+        );
     defer {
         cancel_watch_done.store(true, .seq_cst);
         cancel_watcher.join();
@@ -590,7 +604,14 @@ fn runOnConnection(
 
 fn wsIoError(request: stream_provider.ModelRequest, err: anyerror) anyerror {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    if (deadlineExpired(request.deadline)) return error.Timeout;
     return err;
+}
+
+fn deadlineExpired(deadline: ?std.Io.Clock.Timestamp) bool {
+    const limit = deadline orelse return false;
+    const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    return !std.Io.Clock.Timestamp.compare(now, .lt, limit);
 }
 
 fn sendFrame(conn: *WsConnection, opcode: websocket.Opcode, payload: []const u8) !void {
@@ -652,6 +673,8 @@ fn nextTextMessage(
             error.EndOfStream => return null,
             else => return err,
         };
+        // Only clients mask frames (RFC 6455 5.1); a masking server is broken.
+        if (head.masked) return error.WebSocketProtocolError;
         switch (head.opcode) {
             .ping => {
                 var control: std.ArrayList(u8) = .empty;
