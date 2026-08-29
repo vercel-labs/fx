@@ -502,6 +502,12 @@ fn notificationGetCore(alloc: Allocator, options: OperationOptions) !OperationRe
     const sink = options.notifications orelse return error.MissingNotificationSink;
     var last_event_id: ?[]u8 = null;
     defer if (last_event_id) |value| alloc.free(value);
+    // The SSE retry field sets the reconnection time until the server changes
+    // it, so it outlives the stream that carried it. Holding it here is what
+    // keeps a hint sent once from being replaced by our own default on the
+    // next reconnect. Zero means no hint has arrived yet.
+    var hinted_ms: u32 = 0;
+    var reconnects: u32 = 0;
 
     while (true) {
         var next_options = options;
@@ -509,17 +515,25 @@ fn notificationGetCore(alloc: Allocator, options: OperationOptions) !OperationRe
         const resumed = try notificationGetOnceCore(alloc, next_options, sink);
         if (last_event_id) |value| alloc.free(value);
         last_event_id = resumed.last_event_id;
+        if (resumed.retry_ms > 0) hinted_ms = resumed.retry_ms;
         // A server-supplied retry is honored as given: SEP-1699 makes it a
         // MUST, and the MCP conformance suite fails a client that reconnects
-        // either earlier or more than twice as late as the hint. The default
-        // applies only when the server sent no hint at all, which is the case
-        // that storms: a stream that closes as soon as it opens reconnects
-        // with no wait, and no outer backoff sees it, because a clean close is
-        // not an error and the retry path in tool_subscription never runs.
-        const retry_ms = if (resumed.retry_ms > 0)
-            resumed.retry_ms
+        // either earlier or more than twice as late as the hint.
+        //
+        // Without a hint the first reconnect is immediate, because a stream
+        // that closed once after doing its work is the ordinary case and
+        // should not pay a penalty. From the second onward the default
+        // applies, which is what bounds the storm: a stream that closes as
+        // soon as it opens would otherwise reconnect with no wait forever,
+        // and no outer backoff sees it, because a clean close is not an error
+        // and the retry path in tool_subscription never runs.
+        const retry_ms = if (hinted_ms > 0)
+            hinted_ms
+        else if (reconnects == 0)
+            0
         else
             default_reconnect_delay_ms;
+        reconnects +|= 1;
         const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
         if (controlExpired(options.control)) {
             return error.McpRequestTimedOut;
@@ -944,17 +958,27 @@ fn readSseWithResumption(
     request_id: u64,
 ) ![]u8 {
     var stream = try readSseStream(alloc, initial_reader, options, request_id);
+    // Held across resumes for the same reason as the listener above: the retry
+    // field sets the reconnection time until the server changes it, so a hint
+    // sent on one stream still governs the next one.
+    var hinted_ms: u32 = 0;
+    var resumes: u32 = 0;
     while (true) switch (stream) {
         .final => |body| return body,
         .resumable => |resume_state| {
-            // Same default as the notification listener above, for the same
-            // reason: a server that keeps closing a resumable stream without a
-            // retry hint would otherwise be resumed with no wait at all. A
-            // hint the server did send is still honored as given.
-            const retry_ms = if (resume_state.retry_ms > 0)
-                resume_state.retry_ms
+            if (resume_state.retry_ms > 0) hinted_ms = resume_state.retry_ms;
+            // Same rule as the notification listener above: an explicit hint
+            // is honored as sent, the first resume is immediate because a
+            // stream that closed once after doing its work is ordinary, and
+            // the default from the second onward is what bounds a server that
+            // keeps closing a resumable stream without ever finishing.
+            const retry_ms = if (hinted_ms > 0)
+                hinted_ms
+            else if (resumes == 0)
+                0
             else
                 default_reconnect_delay_ms;
+            resumes +|= 1;
             {
                 const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
                 if (controlExpired(options.control)) {

@@ -36,7 +36,9 @@ type StreamableMode =
   | "url_required_error"
   | "closed_listener"
   | "retry_hint_listener"
-  | "resume_storm";
+  | "resume_storm"
+  | "retry_hint_resume"
+  | "retry_hint_once";
 
 export function startLegacyStreamableHttpFixture(
   version: LegacyStreamableVersion,
@@ -129,6 +131,29 @@ export function startLegacyStreamableHttpFixture(
           return new Response("retry: 500\n\n", {
             headers: { "content-type": "text/event-stream" },
           });
+        }
+        if (mode === "retry_hint_once") {
+          // The hint arrives exactly once. Per the SSE spec the retry field
+          // sets the reconnection time until the server changes it, so every
+          // later reconnect must still use 500ms even though the field is
+          // absent from these responses.
+          return new Response(resumeCalls === 1 ? "retry: 500\n\n" : "", {
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+        if (mode === "retry_hint_resume") {
+          // The resume path's mirror of retry_hint_listener: every resumption
+          // response carries the server's own interval and still closes
+          // without a final response, so readSseWithResumption keeps resuming
+          // and the observed spacing is the hint rather than our default.
+          return new Response(
+            `retry: 500\nid: resume-${resumeCalls}\ndata: ${JSON.stringify({
+              jsonrpc: "2.0",
+              method: "notifications/progress",
+              params: { progressToken: 4, progress: 1, total: 2 },
+            })}\n\n`,
+            { headers: { "content-type": "text/event-stream" } },
+          );
         }
         if (mode === "resume_storm") {
           // A resumable close with no final response: the client resumes,
@@ -573,7 +598,7 @@ export function startLegacyStreamableHttpFixture(
             },
           }]);
         }
-        if (mode === "resume" || mode === "resume_storm") {
+        if (mode === "resume" || mode === "resume_storm" || mode === "retry_hint_resume") {
           return sseResponse([
             {
               id: "call-event-1",
