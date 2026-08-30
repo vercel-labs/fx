@@ -86,7 +86,8 @@ Gateway requests can be routed to specific upstream providers per model with `pr
 {
   "providerRouting": {
     "default": { "order": ["wafer"] },
-    "anthropic/claude-sonnet-5": { "only": ["baseten"], "order": ["baseten", "bedrock"] }
+    "anthropic/claude-sonnet-5": { "only": ["baseten"], "order": ["baseten", "bedrock"] },
+    "zai/glm-5.3": { "only": ["togetherai"], "order": ["togetherai"] }
   }
 }
 ```

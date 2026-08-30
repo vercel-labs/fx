@@ -228,6 +228,7 @@ pub const ServerState = struct {
     agent_step_limit: usize = 0,
     max_tool_result_bytes: usize = 64 * 1024,
     context_limits: config_runtime.context_limits.Values = .{},
+    provider_routing: config_runtime.provider_routing.Map = .{},
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
@@ -273,6 +274,7 @@ pub const ServerState = struct {
         if (self.selected_model.len > 0) self.alloc.free(self.selected_model);
         if (self.configured_model.len > 0) self.alloc.free(self.configured_model);
         self.permission_rules.deinit(self.alloc);
+        self.provider_routing.deinit(self.alloc);
         self.background.deinit(std.heap.c_allocator);
         self.skills.deinit(self.alloc);
         self.context_snapshot.deinit(self.alloc);
@@ -1404,6 +1406,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.max_tool_result_bytes = startup.max_tool_result_bytes;
     state.context_limits = startup.context_limits;
     state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);
+    state.provider_routing = startup.takeProviderRouting();
     state.fast_mode = startup.fast_mode and
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
     state.effort = startup.effort;

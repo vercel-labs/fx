@@ -790,6 +790,7 @@ fn buildAgentConfig(state: *server.ServerState, session: *server.ActiveSessionSt
         else
             false,
         .context_limits = state.context_limits,
+        .gateway_provider_routing = &state.provider_routing,
     };
 }
 
@@ -4183,6 +4184,7 @@ test "ACP prompt agent config carries request options from active session" {
     try std.testing.expect(tool_projection_mod.containsName(config.advertised_tool_names, "read_file"));
     try std.testing.expectEqualStrings("acp custom tool guidance", config.custom_tool_guidance);
     try std.testing.expectEqualStrings("ACP test model overlay", config.model_prompt_overlay.?);
+    try std.testing.expect(config.gateway_provider_routing == &state.provider_routing);
     var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
     const tool_ctx = ctx.toolContext();
     try std.testing.expect(!tool_ctx.web_search_runtime_ready);

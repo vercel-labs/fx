@@ -489,6 +489,30 @@ pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.
         try writer.writeByte('}');
     }
     try writer.writeByte('}');
+    // Chat Completions / REST also accept a top-level `provider` object.
+    if (options.gateway_order.len > 0 or options.gateway_only.len > 0) {
+        try writer.writeAll(",\"provider\":{");
+        var wrote_provider_field = false;
+        if (options.gateway_order.len > 0) {
+            try writer.writeAll("\"order\":[");
+            for (options.gateway_order, 0..) |slug, index| {
+                if (index > 0) try writer.writeByte(',');
+                try std.json.Stringify.value(slug, .{}, writer);
+            }
+            try writer.writeByte(']');
+            wrote_provider_field = true;
+        }
+        if (options.gateway_only.len > 0) {
+            if (wrote_provider_field) try writer.writeByte(',');
+            try writer.writeAll("\"only\":[");
+            for (options.gateway_only, 0..) |slug, index| {
+                if (index > 0) try writer.writeByte(',');
+                try std.json.Stringify.value(slug, .{}, writer);
+            }
+            try writer.writeByte(']');
+        }
+        try writer.writeByte('}');
+    }
 }
 
 pub fn validateToolMessageHistory(alloc: std.mem.Allocator, messages: []const ChatMessage) !void {
@@ -1372,6 +1396,7 @@ test "buildGatewayRequestBodyWithOptions emits gateway provider routing" {
     defer alloc.free(body);
 
     try std.testing.expect(std.mem.find(u8, body, "\"providerOptions\":{\"gateway\":{\"order\":[\"wafer\",\"baseten\"],\"only\":[\"baseten\"]}}") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"provider\":{\"order\":[\"wafer\",\"baseten\"],\"only\":[\"baseten\"]}") != null);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();

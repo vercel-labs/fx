@@ -803,6 +803,77 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
   );
 
   test(
+    "interactive session applies profile provider routing for the selected gateway model",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-provider-routing-"));
+      const model = "zai/glm-5.3";
+      const gateway = startFakeGateway(
+        [fakeGatewayFinalText("PROVIDER_ROUTING_TUI_COMPLETE")],
+        {
+          models: [{ id: model, type: "language", tags: ["tool-use"] }],
+        },
+      );
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        const stderrPath = join(root, "stderr.log");
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        writeFileSync(
+          join(home, ".fx", "settings.json"),
+          JSON.stringify({
+            models: { gateway: model },
+            providerRouting: {
+              [model]: {
+                only: ["togetherai"],
+                order: ["togetherai"],
+              },
+            },
+          }),
+          { mode: 0o600 },
+        );
+
+        session = await TmuxSession.create({
+          cwd: realpathSync(workspace),
+          env: {
+            ...NO_AUTH,
+            HOME: home,
+            AI_GATEWAY_API_KEY: "fake-provider-routing-key",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          },
+          stderrPath,
+        });
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("Use the configured upstream provider.");
+        await session.waitForText("PROVIDER_ROUTING_TUI_COMPLETE", TIMEOUT);
+
+        expect(gateway.requests).toHaveLength(1);
+        expect(gateway.requests[0]!.headers.get("ai-language-model-id")).toBe(model);
+        expect(JSON.parse(gateway.requests[0]!.body)).toMatchObject({
+          providerOptions: {
+            gateway: {
+              only: ["togetherai"],
+              order: ["togetherai"],
+            },
+          },
+        });
+
+        await session.sendText("/quit");
+        await session.waitForSessionEnd(TIMEOUT);
+        session = null;
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  test(
     "Opus 4.8 Fast pricing drives picker request and persistence",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-anthropic-capabilities-"));

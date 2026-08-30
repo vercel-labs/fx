@@ -623,6 +623,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "credential_source",
         "yolo_acknowledged",
         "permission",
+        "providerRouting",
         "additional_directories",
     }) |profile_key| {
         if (std.mem.eql(u8, key, profile_key)) return true;
@@ -1957,6 +1958,32 @@ test "loadMergedSettings merges project defaults before profile layers" {
     try std.testing.expectEqualStrings("override-model", settings.models.get(.gateway).?);
     try std.testing.expectEqual(types.PermissionMode.auto, settings.permission_mode.?);
     try std.testing.expectEqual(@as(usize, 8), settings.max_agent_steps.?);
+}
+
+test "provider routing loads glm-5.3 togetherai pins from profile settings" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"providerRouting\":{\"default\":{\"order\":[\"wafer\"]},\"deepseek/deepseek-v4-flash-0731\":{\"only\":[\"wafer\"]},\"zai/glm-5.3\":{\"only\":[\"togetherai\"],\"order\":[\"togetherai\"]}},\"models\":{\"gateway\":\"zai/glm-5.3\"}}",
+    );
+
+    var settings = try loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_root);
+    defer settings.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("zai/glm-5.3", settings.models.get(.gateway).?);
+    const exact = settings.provider_routing.lookup("zai/glm-5.3").?;
+    try std.testing.expectEqualStrings("togetherai", exact.only[0]);
+    try std.testing.expectEqualStrings("togetherai", exact.order[0]);
 }
 
 test "provider routing merges profile layers with exact match over default" {

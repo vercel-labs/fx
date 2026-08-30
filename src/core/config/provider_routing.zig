@@ -128,8 +128,9 @@ pub const Map = struct {
     /// Exact model-id match wins over `default`. Returns null when no
     /// applicable entry exists.
     pub fn lookup(self: *const Map, model: []const u8) ?Routing {
+        const needle = std.mem.trim(u8, model, " \t\r\n");
         for (self.models.items) |entry| {
-            if (std.mem.eql(u8, entry.model, model)) return entry.routing;
+            if (std.mem.eql(u8, entry.model, needle)) return entry.routing;
         }
         return self.default;
     }
@@ -200,7 +201,7 @@ pub fn parseJsonObject(value: std.json.Value, alloc: Allocator) ParseError!Map {
 
     var iterator = value.object.iterator();
     while (iterator.next()) |entry| {
-        const key = entry.key_ptr.*;
+        const key = std.mem.trim(u8, entry.key_ptr.*, " \t\r\n");
         if (key.len == 0 or key.len > max_model_key_bytes) return error.InvalidProviderRoutingModelKey;
 
         const routing = try parseRoutingEntry(entry.value_ptr.*, alloc);
@@ -247,6 +248,22 @@ test "parses default and per-model entries" {
     try std.testing.expectEqualStrings("baseten", exact.only[0]);
     try std.testing.expectEqual(@as(usize, 2), exact.order.len);
     try std.testing.expectEqualStrings("bedrock", exact.order[1]);
+}
+
+test "trims model keys and lookup needles" {
+    const alloc = std.testing.allocator;
+    const json_text =
+        \\{"zai/glm-5.3": {"only": ["togetherai"], "order": ["togetherai"]}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_text, .{});
+    defer parsed.deinit();
+
+    var map = try parseJsonObject(parsed.value, alloc);
+    defer map.deinit(alloc);
+
+    const route = map.lookup("  zai/glm-5.3\n").?;
+    try std.testing.expectEqualStrings("togetherai", route.only[0]);
+    try std.testing.expectEqualStrings("togetherai", route.order[0]);
 }
 
 test "exact match wins over default and misses fall back" {

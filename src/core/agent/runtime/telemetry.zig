@@ -304,17 +304,29 @@ pub fn traceGatewayProviderOptions(ctx: TraceContext, model: []const u8, fast_mo
         "default"
     else
         "unsupported_or_missing";
+    const gateway_order_first = if (provider_opts.gateway_order.len > 0)
+        provider_opts.gateway_order[0]
+    else
+        "none";
+    const gateway_only_first = if (provider_opts.gateway_only.len > 0)
+        provider_opts.gateway_only[0]
+    else
+        "none";
     debug_trace.eventf(
         "gateway",
         "provider_options",
         ctx,
-        "model={s} fast_mode={s} effort={s} reasoning={s} fast={s}",
+        "model={s} fast_mode={s} effort={s} reasoning={s} fast={s} gateway_order_count={d} gateway_order_first={s} gateway_only_count={d} gateway_only_first={s}",
         .{
             model,
             if (fast_mode) "true" else "false",
             effort.label(),
             reasoning_outcome,
             fast_outcome,
+            provider_opts.gateway_order.len,
+            gateway_order_first,
+            provider_opts.gateway_only.len,
+            gateway_only_first,
         },
     );
 }

@@ -906,6 +906,59 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
+  test("fx ask applies profile provider routing for the selected gateway model", async () => {
+    const root = createFixtureRoot("profile-provider-routing");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() =>
+      fakeGatewayFinalText("PROFILE_PROVIDER_ROUTING_COMPLETE")
+    );
+    writeFileSync(
+      join(root.home, ".fx", "settings.json"),
+      JSON.stringify({
+        models: { gateway: MODEL },
+        providerRouting: {
+          [MODEL]: {
+            only: ["togetherai"],
+            order: ["togetherai"],
+          },
+        },
+      }),
+    );
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Use profile routing."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_MODEL: undefined,
+          },
+          timeoutMs: 30_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain(
+        "PROFILE_PROVIDER_ROUTING_COMPLETE",
+      );
+      expect(result.stderr).toBe("");
+      expect(gateway.requests).toHaveLength(1);
+      expect(gateway.requests[0]!.headers.get("ai-language-model-id")).toBe(MODEL);
+      expect(JSON.parse(gateway.requests[0]!.body)).toMatchObject({
+        providerOptions: {
+          gateway: {
+            only: ["togetherai"],
+            order: ["togetherai"],
+          },
+        },
+      });
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("fx ask projects explicit permission mode on initial and continuing requests", async () => {
     for (const mode of ["ask", "auto"] as const) {
       const root = createFixtureRoot(`permission-mode-${mode}`);
