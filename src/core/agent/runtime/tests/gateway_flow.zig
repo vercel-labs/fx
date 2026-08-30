@@ -6129,12 +6129,14 @@ test "processQueuedPrompt no-tool length preserves completed presentation with l
     );
 }
 
-test "processQueuedPrompt review continuation appends active review prompt after write tool" {
+test "processQueuedPrompt injects final verification only into the completion after mutation" {
     const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
+    const mutation_calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
+    const continuation_calls = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"a\"}")};
     const completions = [_]FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .content = "Reviewed" },
+        .{ .tool_calls = &mutation_calls },
+        .{ .tool_calls = &continuation_calls },
+        .{ .content = "Verified" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
@@ -6142,11 +6144,225 @@ test "processQueuedPrompt review continuation appends active review prompt after
     defer hooks.deinit();
     var fixture = PromptFixture{};
     var config = fixture.config();
-    config.review_enabled = true;
+    config.final_verification_enabled = true;
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    try expectBodyContains(&gateway, 1, "Review the changes you just made. Re-read any modified files and briefly note any issues (syntax errors, missing imports, logic bugs). If everything looks correct, say so.");
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 0, "Before finalizing, verify");
+    try expectBodyContains(&gateway, 1, "Before finalizing, verify the completed change against the user's request.");
+    try expectBodyContains(&gateway, 1, "exercise at least one combined transition");
+    try expectBodyContains(&gateway, 1, "effects completed rather than merely began");
+    try expectBodyNotContains(&gateway, 2, "Before finalizing, verify");
+}
+
+test "processQueuedPrompt retains final verification across physical recovery" {
+    const alloc = std.testing.allocator;
+    const mutation_calls = [_]ToolCall{toolCall("call_write", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
+    const interrupted_starts = [_]ToolCall{toolCall("call_read_interrupted", "read_file", "{}")};
+    const recovered_calls = [_]ToolCall{toolCall("call_read_recovered", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &mutation_calls },
+        .{
+            .streamed_tool_starts = &interrupted_starts,
+            .stream_error_after_tool_starts = error.ReadFailed,
+        },
+        .{
+            .streamed_tool_starts = &recovered_calls,
+            .tool_calls = &recovered_calls,
+        },
+        .{ .content = "Finished" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.final_verification_enabled = true;
+    config.gateway_retry_count = 3;
+    config.max_provider_attempts = 3;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 0, "Before finalizing, verify");
+    try expectBodyContains(&gateway, 1, "Before finalizing, verify");
+    try expectBodyContains(&gateway, 2, "Before finalizing, verify");
+    try expectBodyContains(&gateway, 2, "did not execute the incomplete tool call");
+    try expectBodyNotContains(&gateway, 3, "Before finalizing, verify");
+    try expectBodyContains(&gateway, 3, "call_read_recovered");
+    try expectBodyContains(&gateway, 3, "\"output\":{\"type\":\"text\",\"value\":\"ok\"}");
+}
+
+test "processQueuedPrompt excludes successful non-file executors from final verification" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        tool_name: []const u8,
+        arguments_json: []const u8,
+    }{
+        .{ .tool_name = "memory", .arguments_json = "{}" },
+        .{ .tool_name = "install_skill", .arguments_json = "{}" },
+        .{ .tool_name = "terminal", .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}" },
+    };
+    for (cases) |case| {
+        const calls = [_]ToolCall{toolCall("call_non_file_write", case.tool_name, case.arguments_json)};
+        const completions = [_]FakeCompletion{
+            .{ .tool_calls = &calls },
+            .{ .content = "Completed" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var config = fixture.config();
+        config.final_verification_enabled = true;
+
+        var job = fixture.job();
+        if (std.mem.eql(u8, case.tool_name, "terminal")) {
+            hooks.permission_decisions = &.{.once};
+            job.permission_mode = .auto;
+        }
+        try runFakePrompt(&gateway, &hooks, config, job);
+
+        try expectBodyNotContains(&gateway, 1, "Before finalizing, verify");
+    }
+}
+
+test "processQueuedPrompt injects once for mixed batches with a filesystem mutation" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("call_memory", "memory", "{}"),
+        toolCall("call_create", "create_folder", "{}"),
+        toolCall("call_read", "read_file", "{}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Verified" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.final_verification_enabled = true;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countNeedle(gateway.request_bodies.items[1], "Before finalizing, verify"),
+    );
+}
+
+test "processQueuedPrompt does not append final verification after a read-only batch" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Read" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.final_verification_enabled = true;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try expectBodyNotContains(&gateway, 1, "Before finalizing, verify");
+}
+
+test "processQueuedPrompt does not retrigger final verification for repair mutations" {
+    const alloc = std.testing.allocator;
+    const first_calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
+    const repair_calls = [_]ToolCall{toolCall("call_2", "write_file", "{\"path\":\"a\",\"content\":\"y\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &first_calls },
+        .{ .tool_calls = &repair_calls },
+        .{ .content = "Verified after repair" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.final_verification_enabled = true;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    const prompt_prefix = "Before finalizing, verify";
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(gateway.request_bodies.items[1], prompt_prefix));
+    try std.testing.expectEqual(@as(usize, 0), countNeedle(gateway.request_bodies.items[2], prompt_prefix));
+}
+
+test "processQueuedPrompt excludes failed write results from final verification" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Write failed" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.exec_plans = &.{.{ .result = .{
+        .status = .failure,
+        .model_output = "write failed",
+    } }};
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try expectBodyNotContains(&gateway, 1, "Before finalizing, verify");
+}
+
+test "processQueuedPrompt excludes canonical tool error output from final verification" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_1", "create_folder", "{}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Create failed" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.exec_plans = &.{.{ .result = .{
+        .status = .success,
+        .model_output = "Tool create_folder failed: permission denied",
+    } }};
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try expectBodyNotContains(&gateway, 1, "Before finalizing, verify");
+}
+
+test "processQueuedPrompt honors disabled final verification after mutation" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Written" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.final_verification_enabled = false;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try expectBodyNotContains(&gateway, 1, "Before finalizing, verify");
 }
 
 test "processQueuedPrompt trace records history shape returned tool calls and waits" {
@@ -6181,7 +6397,9 @@ test "processQueuedPrompt trace records history shape returned tool calls and wa
     var job = fixture.job();
     job.history = history[0..];
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    var config = fixture.config();
+    config.final_verification_enabled = true;
+    try runFakePrompt(&gateway, &hooks, config, job);
     debug_trace.shutdown();
 
     const trace = try readTraceFile(alloc, trace_path, 131072);
@@ -6199,6 +6417,7 @@ test "processQueuedPrompt trace records history shape returned tool calls and wa
     try std.testing.expect(std.mem.find(u8, trace, "event=after_permission_decision") != null);
     try std.testing.expect(std.mem.find(u8, trace, "event=before_tool_execution") != null);
     try std.testing.expect(std.mem.find(u8, trace, "event=after_tool_execution") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=final_verification_injected") != null);
     try std.testing.expect(std.mem.find(u8, trace, "\"path\"") == null);
     try std.testing.expect(std.mem.find(u8, trace, "\"content\"") == null);
     try std.testing.expect(std.mem.find(u8, trace, "\"metadata\"") == null);

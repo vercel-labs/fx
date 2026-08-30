@@ -21,11 +21,22 @@ const ToolCall = types.ToolCall;
 const TraceContext = debug_trace.TraceContext;
 const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
+const final_verification_prompt =
+    "Before finalizing, verify the completed change against the user's request. " ++
+    "Re-read the changed contract and modified files. If correctness depends on " ++
+    "interacting states or events, exercise at least one combined transition. " ++
+    "Confirm promised effects completed rather than merely began. Fix any " ++
+    "discrepancy, then report concrete verification evidence.";
+
+pub const FinalVerificationState = struct {
+    scheduled: bool = false,
+    pending: bool = false,
+};
 
 pub const StepBatchState = struct {
     step_error_count: usize = 0,
     step_total_count: usize = 0,
-    step_had_writes: bool = false,
+    step_had_mutation: bool = false,
     pending_user_suffix: std.ArrayList(ChatMessage) = .empty,
 
     pub fn allToolResultsFailed(self: StepBatchState) bool {
@@ -37,7 +48,7 @@ pub const ToolResultAccounting = struct {
     increment_total: bool = true,
     increment_error: bool = false,
     record_completion: bool = false,
-    mark_write: bool = false,
+    mark_mutation: bool = false,
     status: ?types.PersistedToolStatus = null,
 };
 
@@ -68,7 +79,7 @@ pub fn appendToolResultContent(
 ) !void {
     if (accounting.increment_total) batch.step_total_count += 1;
     if (accounting.increment_error) batch.step_error_count += 1;
-    if (accounting.mark_write) batch.step_had_writes = true;
+    if (accounting.mark_mutation) batch.step_had_mutation = true;
     try within_turn_suffix.append(arena, .{
         .role = .tool,
         .content = model_output,
@@ -466,8 +477,42 @@ pub fn processCommittedFileResult(
         .{ tool_call.id, tool_call.name, execution.model_output.len },
     );
     batch.step_total_count += 1;
-    batch.step_had_writes = true;
+    batch.step_had_mutation = true;
     completed_tool_names.appendAssumeCapacity(committed_file_tool_name);
+}
+
+fn executorMutatesWorkspaceFiles(kind: tool_dispatch.ExecutorKind) bool {
+    return switch (kind) {
+        .write_file,
+        .edit_file,
+        .delete_file,
+        .rename_file,
+        .copy_file,
+        .create_folder,
+        => true,
+        .list_files,
+        .glob_files,
+        .grep_files,
+        .read_file,
+        .read_tool_result,
+        .file_info,
+        .memory,
+        .semantic_search,
+        .open_file,
+        .web_fetch,
+        .web_search,
+        .run_command,
+        .terminal,
+        .skill,
+        .install_skill,
+        .subagent,
+        .mcp_search_tools,
+        .mcp_select_tool,
+        .mcp_features,
+        .ask_user_question,
+        .vision,
+        => false,
+    };
 }
 
 pub fn appendOrdinaryExecutedResult(
@@ -481,7 +526,10 @@ pub fn appendOrdinaryExecutedResult(
     memory: types.ToolResultMemory,
     execution: ToolExecutionResult,
 ) !void {
-    const activity = runtime_tool_presentation.activityKindForCall(arena, tool_registry, tool_call);
+    const mutates_workspace_files = if (tool_registry.lookup(tool_call.name)) |tool|
+        executorMutatesWorkspaceFiles(tool.executor_kind)
+    else
+        false;
     try appendToolResultContent(
         arena,
         within_turn_suffix,
@@ -493,7 +541,9 @@ pub fn appendOrdinaryExecutedResult(
         .{
             .increment_error = execution.status == .failure or tool_result_errors.isToolOutputError(model_output),
             .record_completion = true,
-            .mark_write = activity == .write or activity == .edit,
+            .mark_mutation = mutates_workspace_files and
+                execution.status == .success and
+                !tool_result_errors.isToolOutputError(model_output),
             .status = runtime_execution_memory.persistedStatusForCurrentFxLocalResult(
                 execution.status,
                 model_output,
@@ -502,16 +552,64 @@ pub fn appendOrdinaryExecutedResult(
     );
 }
 
-pub fn appendReviewContinuationSuffix(
-    review_enabled: bool,
-    arena: Allocator,
-    within_turn_suffix: *std.ArrayList(ChatMessage),
+pub fn scheduleFinalVerification(
+    enabled: bool,
+    state: *FinalVerificationState,
+    step_ctx: TraceContext,
     batch: *const StepBatchState,
-) !void {
-    if (review_enabled and batch.step_had_writes) {
-        const review_prompt = "Review the changes you just made. Re-read any modified files and briefly note any issues (syntax errors, missing imports, logic bugs). If everything looks correct, say so.";
-        try within_turn_suffix.append(arena, .{ .role = .user, .content = review_prompt });
-    }
+) void {
+    if (!enabled or state.scheduled or !batch.step_had_mutation) return;
+
+    state.scheduled = true;
+    state.pending = true;
+    debug_trace.eventf(
+        "agent",
+        "final_verification_scheduled",
+        step_ctx,
+        "trigger=file_mutation",
+        .{},
+    );
+}
+
+pub fn finalVerificationRequestSuffix(
+    arena: Allocator,
+    state: *const FinalVerificationState,
+    step_ctx: TraceContext,
+    within_turn_suffix: []const ChatMessage,
+) ![]const ChatMessage {
+    if (!state.pending) return within_turn_suffix;
+
+    const request_suffix = try arena.alloc(ChatMessage, within_turn_suffix.len + 1);
+    @memcpy(request_suffix[0..within_turn_suffix.len], within_turn_suffix);
+    request_suffix[within_turn_suffix.len] = .{
+        .role = .user,
+        .content = final_verification_prompt,
+        .cache_policy = .no_cache,
+    };
+    debug_trace.eventf(
+        "agent",
+        "final_verification_injected",
+        step_ctx,
+        "trigger=file_mutation",
+        .{},
+    );
+    return request_suffix;
+}
+
+pub fn consumeFinalVerification(
+    state: *FinalVerificationState,
+    step_ctx: TraceContext,
+) void {
+    if (!state.pending) return;
+
+    state.pending = false;
+    debug_trace.eventf(
+        "agent",
+        "final_verification_consumed",
+        step_ctx,
+        "scope=next_completion",
+        .{},
+    );
 }
 
 test "appendPermissionFeedback marks typed approval feedback" {
@@ -594,4 +692,47 @@ test "drained batch feedback follows all tool results and keeps its source call"
     try std.testing.expectEqual(.user, suffix.items[3].role);
     try std.testing.expectEqualStrings("call_first", suffix.items[3].tool_call_id.?);
     try std.testing.expect(suffix.items[3].permission_feedback);
+}
+
+test "filesystem mutation executor classification includes every file mutator" {
+    const kinds = [_]tool_dispatch.ExecutorKind{
+        .write_file,
+        .edit_file,
+        .delete_file,
+        .rename_file,
+        .copy_file,
+        .create_folder,
+    };
+    for (kinds) |kind| {
+        try std.testing.expect(executorMutatesWorkspaceFiles(kind));
+    }
+}
+
+test "filesystem mutation executor classification excludes every non-file executor" {
+    const kinds = [_]tool_dispatch.ExecutorKind{
+        .list_files,
+        .glob_files,
+        .grep_files,
+        .read_file,
+        .read_tool_result,
+        .file_info,
+        .memory,
+        .semantic_search,
+        .open_file,
+        .web_fetch,
+        .web_search,
+        .run_command,
+        .terminal,
+        .skill,
+        .install_skill,
+        .subagent,
+        .mcp_search_tools,
+        .mcp_select_tool,
+        .mcp_features,
+        .ask_user_question,
+        .vision,
+    };
+    for (kinds) |kind| {
+        try std.testing.expect(!executorMutatesWorkspaceFiles(kind));
+    }
 }
