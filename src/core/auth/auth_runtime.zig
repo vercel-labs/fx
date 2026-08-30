@@ -1636,7 +1636,16 @@ pub const Runtime = struct {
                     self,
                     loadRuntimeCredentialSource,
                 ),
-            .gateway => if (self.credentialSource() != .chatgpt_subscription and self.credentialSource() != .grok_subscription)
+            .orcarouter => if (self.credentialSource() == .orcarouter_api_key)
+                false
+            else
+                self.selectSourceWithLoader(
+                    alloc,
+                    .orcarouter_api_key,
+                    self,
+                    loadRuntimeCredentialSource,
+                ),
+            .gateway => if (self.credentialSource() != .chatgpt_subscription and self.credentialSource() != .grok_subscription and self.credentialSource() != .orcarouter_api_key)
                 false
             else
                 @as(?bool, try self.reselectByPrecedenceWithDeps(

@@ -51,12 +51,14 @@ pub const Set = struct {
     gateway: Bundle,
     codex: Bundle,
     grok: Bundle,
+    orcarouter: Bundle,
 
     pub fn select(self: Set, provider: model_provider.ProviderId) Bundle {
         return switch (provider) {
             .gateway => self.gateway,
             .codex => self.codex,
             .grok => self.grok,
+            .orcarouter => self.orcarouter,
         };
     }
 
@@ -65,6 +67,7 @@ pub const Set = struct {
             .gateway = self.gateway.deferred_usage,
             .codex = self.codex.deferred_usage,
             .grok = self.grok.deferred_usage,
+            .orcarouter = self.orcarouter.deferred_usage,
         };
     }
 };
@@ -74,6 +77,7 @@ pub fn gateway_only(gateway: Bundle) Set {
         .gateway = gateway,
         .codex = .{},
         .grok = .{},
+        .orcarouter = .{},
     };
 }
 
@@ -144,7 +148,16 @@ test "provider set selects each provider's complete route" {
         .model_catalog = .{ .context = &grok_tag, .fetch_fn = Fake.model_catalog_fetch },
         .permission_reviewer = .{ .context = &grok_tag, .review_fn = Fake.review },
     };
-    var providers = Set{ .gateway = gateway, .codex = codex, .grok = grok };
+    const orcarouter = Bundle{
+        .agent_stream = stream_provider.Provider{
+            .context = &grok_tag,
+            .stream_fn = stream_provider.unavailable_provider.stream_fn,
+        },
+        .cli_model_catalog = .{ .context = &grok_tag, .fetch_fn = Fake.cli_catalog },
+        .model_catalog = .{ .context = &grok_tag, .fetch_fn = Fake.model_catalog_fetch },
+        .permission_reviewer = .{ .context = &grok_tag, .review_fn = Fake.review },
+    };
+    var providers = Set{ .gateway = gateway, .codex = codex, .grok = grok, .orcarouter = orcarouter };
 
     try std.testing.expect(providers.select(.gateway).agent_stream.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
     try std.testing.expect(providers.select(.gateway).capabilities.fx_search);
@@ -158,6 +171,7 @@ test "provider set selects each provider's complete route" {
     try std.testing.expect(providers.select(.codex).model_catalog.?.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
     try std.testing.expect(providers.select(.grok).permission_reviewer.?.context.? == @as(*anyopaque, @ptrCast(&grok_tag)));
     try std.testing.expect(providers.select(.codex).agent_stream_or_unavailable().context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
+    try std.testing.expect(providers.select(.orcarouter).agent_stream_or_unavailable().context.? == @as(*anyopaque, @ptrCast(&grok_tag)));
 
     providers.codex.model_catalog = null;
     try std.testing.expect(providers.select(.codex).model_catalog == null);
