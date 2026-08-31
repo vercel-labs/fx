@@ -1122,11 +1122,14 @@ fn configuredProviderSelection(
     settings: *const config_runtime.Settings,
 ) !model_provider.ProviderSelection {
     const provider = settings.provider orelse .gateway;
-    const model = settings.models.get(provider) orelse switchModelFromEnv() orelse switch (provider) {
+    const model = settings.models.get(provider) orelse switch (provider) {
         .gateway => default_model,
-        .codex => return error.CodexModelNotSelected,
-        .grok => return error.GrokModelNotSelected,
-        .anthropic => return error.AnthropicModelNotSelected,
+        .codex, .grok, .anthropic => switchModelFromEnv() orelse switch (provider) {
+            .codex => return error.CodexModelNotSelected,
+            .grok => return error.GrokModelNotSelected,
+            .anthropic => return error.AnthropicModelNotSelected,
+            .gateway => unreachable,
+        },
     };
     return .{ .provider = provider, .model = model };
 }
