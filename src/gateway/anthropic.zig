@@ -373,6 +373,7 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.ModelRequest)
             connect_deadline = deadline;
         }
     }
+    try request.admission.admit();
     var opened = try gateway_client.runBoundedHttpOperation(
         OpenedRequest,
         alloc,
