@@ -277,6 +277,7 @@ pub fn build(b: *std.Build) void {
     test_approval_review_bench_step.dependOn(
         &run_approval_review_bench_tests.step,
     );
+    test_step.dependOn(&run_approval_review_bench_tests.step);
 
     const pgso_ir_step = b.step(
         "pgso-ir",
