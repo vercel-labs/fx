@@ -48,6 +48,7 @@ pub const entries = [_]Entry{
     .{
         .id = .openai_compatible,
         .slug = "openai-compatible",
+        .aliases = &.{"openai"},
         .name = "OpenAI Compatible",
         .route_name = "OpenAI Compatible",
         .description = "OpenAI-compatible Chat Completions API key via OPENAI_API_KEY",

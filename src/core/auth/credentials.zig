@@ -203,6 +203,8 @@ pub const missing_credential_message = "fx needs access to Vercel AI Gateway. Ru
 pub const missing_interactive_credential_message = "fx needs access to Vercel AI Gateway. Run /login to sign in, /setup to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_anthropic_credential_message = "fx needs an Anthropic API key. Set ANTHROPIC_API_KEY, or anthropic_api_key in ~/.fx/settings.json.";
 pub const missing_anthropic_interactive_credential_message = "fx needs an Anthropic API key. Set ANTHROPIC_API_KEY, or anthropic_api_key in ~/.fx/settings.json.";
+pub const missing_openai_credential_message = "fx needs an OpenAI-compatible API key. Set OPENAI_API_KEY (or LITELLM_API_KEY), or save a key with fx api-key.";
+pub const missing_openai_interactive_credential_message = missing_openai_credential_message;
 pub const missing_chatgpt_credential_message = "fx needs a Codex subscription login for this model. Run fx login codex.";
 pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login, open Connections, then choose Codex subscription.";
 pub const missing_grok_credential_message = "fx needs a Grok subscription login for this model. Run fx login grok.";
@@ -223,6 +225,10 @@ pub fn missingCredentialMessage(provider: model_provider.ProviderId, interactive
             missing_anthropic_interactive_credential_message
         else
             missing_anthropic_credential_message,
+        .openai_compatible => if (interactive)
+            missing_openai_interactive_credential_message
+        else
+            missing_openai_credential_message,
         .gateway => if (interactive)
             missing_interactive_credential_message
         else
@@ -326,7 +332,7 @@ pub fn resolveForProvider(
         },
         .gateway => {},
         .anthropic => return .{ .credential = try loadAnthropicApiKeyCredential(alloc, profile_anthropic_api_key) },
-        .openai_compatible => {}, // TODO: env/stored-key resolution lands in the auth commit
+        .openai_compatible => return .{ .credential = try loadOpenAiCompatibleApiKeyCredential(alloc, secret_store) },
     }
     return resolvePreferring(
         alloc,
@@ -539,6 +545,18 @@ fn loadAnthropicApiKeyCredential(alloc: std.mem.Allocator, profile_key: ?[]const
         }
     }
     return null;
+}
+
+fn loadOpenAiCompatibleApiKeyCredential(alloc: std.mem.Allocator, secret_store: host.SecretStore) !?Credential {
+    if (nonEmptyEnvValue("OPENAI_API_KEY")) |value| {
+        return .{ .token = try alloc.dupe(u8, value), .source = .stored_key };
+    }
+    if (nonEmptyEnvValue("LITELLM_API_KEY")) |value| {
+        return .{ .token = try alloc.dupe(u8, value), .source = .stored_key };
+    }
+    if (secret_store.isDisabled()) return null;
+    const value = (try secret_store.load(alloc)) orelse return null;
+    return .{ .token = value, .source = .stored_key };
 }
 
 fn loadStoredKeyCredential(

@@ -81,6 +81,7 @@ pub fn gateway_only(gateway: Bundle) Set {
         .codex = .{},
         .grok = .{},
         .anthropic = .{},
+        .openai_compatible = .{},
     };
 }
 
@@ -151,7 +152,7 @@ test "provider set selects each provider's complete route" {
         .model_catalog = .{ .context = &grok_tag, .fetch_fn = Fake.model_catalog_fetch },
         .permission_reviewer = .{ .context = &grok_tag, .review_fn = Fake.review },
     };
-    var providers = Set{ .gateway = gateway, .codex = codex, .grok = grok, .anthropic = .{} };
+    var providers = Set{ .gateway = gateway, .codex = codex, .grok = grok, .anthropic = .{}, .openai_compatible = .{} };
 
     try std.testing.expect(providers.select(.gateway).agent_stream.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
     try std.testing.expect(providers.select(.gateway).capabilities.fx_search);
