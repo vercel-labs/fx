@@ -39,6 +39,7 @@ const control_poll_ms: i32 = 50;
 const marker_frame_timeout_ms: i64 = 5_000;
 const marker_ack_timeout_ms: i64 = tmux_session.marker_acknowledgement_timeout_ms;
 const command_release_byte: u8 = 2;
+const output_drain_ack_byte: u8 = 3;
 const control_nonce_len: usize = 32;
 const marker_frame_len: usize = control_nonce_len + 1;
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
@@ -533,42 +534,38 @@ pub fn runLauncher(alloc: Allocator) !void {
     control.done.store(true, .release);
     watchdog_thread.join();
     control_thread.join();
-    closeFd(std.posix.STDOUT_FILENO);
-    if (control.failed) {
-        try writeControlFd(
-            std.posix.STDERR_FILENO,
-            .startup_failed,
-            @intFromEnum(StartupFailure.control_failed),
-        );
-        return;
-    }
+    try finishPtyOutput(std.posix.STDOUT_FILENO);
     const trusted_term = control.phase == .command_started or
         (control.phase == .shell_ready and parsed.value.command == null);
-    if (!trusted_term) {
-        try writeControlFd(
-            std.posix.STDERR_FILENO,
-            .startup_failed,
-            @intFromEnum(StartupFailure.profile_failed),
-        );
-        return;
+    const terminal_frame: ControlFrame = if (control.failed)
+        .{
+            .kind = .startup_failed,
+            .value = @intFromEnum(StartupFailure.control_failed),
+        }
+    else if (!trusted_term)
+        .{
+            .kind = .startup_failed,
+            .value = @intFromEnum(StartupFailure.profile_failed),
+        }
+    else switch (term) {
+        .exited => |code| .{ .kind = .command_exited, .value = code },
+        .signal => |signal| .{
+            .kind = .command_signal,
+            .value = @intFromEnum(signal),
+        },
+        .stopped, .unknown => .{ .kind = .invalid_term, .value = 0 },
+    };
+    try writeControlFd(
+        std.posix.STDERR_FILENO,
+        terminal_frame.kind,
+        terminal_frame.value,
+    );
+    var drain_ack: [1]u8 = undefined;
+    try readExactFd(std.posix.STDIN_FILENO, &drain_ack);
+    if (drain_ack[0] != output_drain_ack_byte) {
+        return error.InvalidOutputDrainAcknowledgement;
     }
-    switch (term) {
-        .exited => |code| try writeControlFd(
-            std.posix.STDERR_FILENO,
-            .command_exited,
-            code,
-        ),
-        .signal => |signal| try writeControlFd(
-            std.posix.STDERR_FILENO,
-            .command_signal,
-            @intFromEnum(signal),
-        ),
-        .stopped, .unknown => try writeControlFd(
-            std.posix.STDERR_FILENO,
-            .invalid_term,
-            0,
-        ),
-    }
+    closeFd(std.posix.STDOUT_FILENO);
 }
 
 fn signalLauncherProcessGroup(pid: std.c.pid_t, signal: std.c.SIG) !void {
@@ -3222,6 +3219,16 @@ const SignalTarget = struct {
     token: process_supervisor.ProcessInstanceToken,
 };
 
+const OutputBoundary = enum(u8) {
+    none,
+    startup,
+    completion,
+};
+
+fn shouldCommitOutputBoundary(boundary: OutputBoundary) bool {
+    return boundary == .startup;
+}
+
 const ProcessGroupDelivery = enum {
     delivered,
     missing,
@@ -3267,8 +3274,8 @@ const Session = struct {
     control_thread: ?std.Thread = null,
     output_done: std.Io.Event = .unset,
     output_active: std.atomic.Value(bool) = .init(false),
-    command_boundary_requested: std.atomic.Value(bool) = .init(false),
-    command_boundary_done: std.Io.Event = .unset,
+    output_boundary_requested: std.atomic.Value(OutputBoundary) = .init(.none),
+    output_boundary_done: std.Io.Event = .unset,
     command_start_cursor: ?contracts.RawCursor = null,
     backend_done: std.Io.Event = .unset,
     backend_join_mutex: std.Io.Mutex = .init,
@@ -4784,14 +4791,37 @@ const Session = struct {
     }
 
     fn establishStartupBoundary(self: *Session) bool {
-        self.command_boundary_done.reset();
-        self.command_boundary_requested.store(true, .release);
+        return self.establishOutputBoundary(.startup);
+    }
+
+    fn establishOutputBoundary(
+        self: *Session,
+        boundary: OutputBoundary,
+    ) bool {
+        std.debug.assert(boundary != .none);
+        self.output_boundary_done.reset();
+        self.output_boundary_requested.store(boundary, .release);
         if (!self.output_active.load(.acquire)) {
-            self.command_boundary_requested.store(false, .release);
+            self.output_boundary_requested.store(.none, .release);
             return false;
         }
-        self.command_boundary_done.waitUncancelable(io_mod.getIo());
+        self.output_boundary_done.waitUncancelable(io_mod.getIo());
         return self.output_active.load(.acquire);
+    }
+
+    fn acknowledgeOutputDrain(self: *Session) bool {
+        const zio = io_mod.getIo();
+        self.write_mutex.lockUncancelable(zio);
+        defer self.write_mutex.unlock(zio);
+        self.mutex.lockUncancelable(zio);
+        const file = self.liveness_file;
+        self.mutex.unlock(zio);
+        if (file == null) return false;
+        file.?.writeStreamingAll(
+            zio,
+            &.{output_drain_ack_byte},
+        ) catch return false;
+        return true;
     }
 
     fn commitStartupBoundary(self: *Session) void {
@@ -5832,6 +5862,7 @@ extern "c" fn grantpt(fd: c_int) c_int;
 extern "c" fn unlockpt(fd: c_int) c_int;
 extern "c" fn ptsname(fd: c_int) ?[*:0]u8;
 extern "c" fn tcsetpgrp(fd: c_int, pgrp: std.c.pid_t) c_int;
+extern "c" fn tcdrain(fd: c_int) c_int;
 
 fn openPty() !Pty {
     if (!isSupported()) return error.TerminalHostUnsupported;
@@ -5861,6 +5892,38 @@ fn openPty() !Pty {
     return .{ .master = master, .slave = slave };
 }
 
+fn drainPtyOutput(fd: std.posix.fd_t) !void {
+    while (true) switch (std.c.errno(tcdrain(fd))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        else => return error.PtyOutputDrainFailed,
+    };
+}
+
+fn finishPtyOutput(fd: std.posix.fd_t) !void {
+    const ignore_ttou: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    var previous_ttou: std.posix.Sigaction = undefined;
+    std.posix.sigaction(
+        std.posix.SIG.TTOU,
+        &ignore_ttou,
+        &previous_ttou,
+    );
+    defer std.posix.sigaction(
+        std.posix.SIG.TTOU,
+        &previous_ttou,
+        null,
+    );
+
+    if (tcsetpgrp(fd, std.c.getpid()) != 0) {
+        return error.PtyForegroundRestoreFailed;
+    }
+    try drainPtyOutput(fd);
+}
+
 test "PTY output drains use a nonblocking master" {
     if (comptime !isSupported()) return;
     const pty = try openPty();
@@ -5876,6 +5939,96 @@ test "PTY output drains use a nonblocking master" {
     const flags: usize = @intCast(result);
     const nonblocking = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
     try std.testing.expect(flags & nonblocking != 0);
+}
+
+test "PTY hangup remains readable until the master is drained" {
+    const decision = classifyOutputPoll(std.posix.POLL.HUP);
+    switch (decision) {
+        .read => |readiness| {
+            try std.testing.expect(readiness.hung_up);
+            try std.testing.expect(!readiness.has_error);
+        },
+        .idle, .invalid => return error.TestExpectedEqual,
+    }
+}
+
+test "completion output boundary drains without moving startup cursor" {
+    try std.testing.expect(shouldCommitOutputBoundary(.startup));
+    try std.testing.expect(!shouldCommitOutputBoundary(.completion));
+}
+
+const PtyDrainProbe = struct {
+    master: std.posix.fd_t,
+    output: [64]u8 = undefined,
+    output_len: usize = 0,
+    failed: bool = false,
+
+    fn run(self: *PtyDrainProbe) void {
+        var chunk: [16]u8 = undefined;
+        while (true) switch (readOutputFdChunk(
+            self.master,
+            &chunk,
+            100,
+        ) catch {
+            self.failed = true;
+            return;
+        }) {
+            .data => |count| {
+                if (self.output_len + count > self.output.len) {
+                    self.failed = true;
+                    return;
+                }
+                @memcpy(
+                    self.output[self.output_len..][0..count],
+                    chunk[0..count],
+                );
+                self.output_len += count;
+            },
+            .idle => continue,
+            .ended => return,
+        };
+    }
+};
+
+test "PTY reader preserves final bytes written immediately before close" {
+    if (comptime !isSupported()) return;
+    const pty = try openPty();
+    defer closeFd(pty.master);
+    var slave_open = true;
+    defer if (slave_open) closeFd(pty.slave);
+
+    const argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "printf 'READY\\nDONE\\n'",
+    };
+    const slave_file = std.Io.File{
+        .handle = pty.slave,
+        .flags = .{ .nonblocking = false },
+    };
+    var child = try std.process.spawn(std.testing.io, .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .{ .file = slave_file },
+        .stderr = .ignore,
+    });
+    var probe = PtyDrainProbe{ .master = pty.master };
+    var reader = try std.Thread.spawn(.{}, PtyDrainProbe.run, .{&probe});
+    const term = try child.wait(std.testing.io);
+    try std.testing.expectEqual(
+        std.process.Child.Term{ .exited = 0 },
+        term,
+    );
+    try drainPtyOutput(pty.slave);
+    closeFd(pty.slave);
+    slave_open = false;
+    reader.join();
+
+    try std.testing.expect(!probe.failed);
+    try std.testing.expectEqualStrings(
+        "READY\r\nDONE\r\n",
+        probe.output[0..probe.output_len],
+    );
 }
 
 fn resizeFd(fd: std.posix.fd_t, dimensions: contracts.Dimensions) !void {
@@ -6020,8 +6173,8 @@ fn readControlFile(file: std.Io.File) !ControlFrame {
 fn outputMain(session: *Session) void {
     defer {
         session.output_active.store(false, .release);
-        if (session.command_boundary_requested.swap(false, .acq_rel)) {
-            session.command_boundary_done.set(io_mod.getIo());
+        if (session.output_boundary_requested.swap(.none, .acq_rel) != .none) {
+            session.output_boundary_done.set(io_mod.getIo());
         }
         session.output_done.set(io_mod.getIo());
     }
@@ -6031,11 +6184,14 @@ fn outputMain(session: *Session) void {
     else
         return;
     while (true) {
-        if (session.command_boundary_requested.load(.acquire)) {
+        const boundary = session.output_boundary_requested.load(.acquire);
+        if (boundary != .none) {
             while (readOutputChunk(session, fd, &buffer, 0) catch return) {}
-            session.commitStartupBoundary();
-            session.command_boundary_requested.store(false, .release);
-            session.command_boundary_done.set(io_mod.getIo());
+            if (shouldCommitOutputBoundary(boundary)) {
+                session.commitStartupBoundary();
+            }
+            session.output_boundary_requested.store(.none, .release);
+            session.output_boundary_done.set(io_mod.getIo());
             continue;
         }
         _ = readOutputChunk(
@@ -6156,7 +6312,11 @@ fn controlMain(session: *Session) void {
             .startup_failed,
             .invalid_term,
             => {
+                const drained = session.establishOutputBoundary(.completion) and
+                    session.acknowledgeOutputDrain();
+                if (!drained) session.markLost();
                 session.output_done.waitUncancelable(io_mod.getIo());
+                if (!drained) break;
             },
             .prepared, .shell_ready, .command_started => {},
         }
@@ -6204,12 +6364,43 @@ fn controlMain(session: *Session) void {
     session.write_mutex.unlock(zio);
 }
 
-fn readOutputChunk(
-    session: *Session,
+const OutputPollReadiness = struct {
+    hung_up: bool,
+    has_error: bool,
+};
+
+const OutputPollDecision = union(enum) {
+    idle,
+    read: OutputPollReadiness,
+    invalid,
+};
+
+const OutputReadChunk = union(enum) {
+    data: usize,
+    idle,
+    ended,
+};
+
+fn classifyOutputPoll(revents: i16) OutputPollDecision {
+    if ((revents & std.posix.POLL.NVAL) != 0) return .invalid;
+    const readiness = OutputPollReadiness{
+        .hung_up = (revents & std.posix.POLL.HUP) != 0,
+        .has_error = (revents & std.posix.POLL.ERR) != 0,
+    };
+    if ((revents & std.posix.POLL.IN) != 0 or
+        readiness.hung_up or
+        readiness.has_error)
+    {
+        return .{ .read = readiness };
+    }
+    return .idle;
+}
+
+fn readOutputFdChunk(
     fd: std.posix.fd_t,
     buffer: []u8,
     timeout_ms: i32,
-) !bool {
+) !OutputReadChunk {
     var total: usize = 0;
     var poll_timeout = timeout_ms;
     while (total < buffer.len) {
@@ -6219,27 +6410,53 @@ fn readOutputChunk(
             .revents = 0,
         }};
         _ = try std.posix.poll(&poll_fds, poll_timeout);
-        const revents = poll_fds[0].revents;
-        if (revents == 0) break;
-        if (revents & std.posix.POLL.IN == 0) {
-            if (total == 0) return error.EndOfStream;
-            break;
-        }
+        const readiness = switch (classifyOutputPoll(poll_fds[0].revents)) {
+            .idle => break,
+            .invalid => {
+                if (total == 0) return error.InvalidDescriptor;
+                break;
+            },
+            .read => |value| value,
+        };
         const count = std.posix.read(fd, buffer[total..]) catch |err| {
-            if (err == error.WouldBlock) break;
+            if (err == error.WouldBlock) {
+                if (total != 0) break;
+                if (readiness.hung_up) return .ended;
+                if (readiness.has_error) return error.InputOutput;
+                return .idle;
+            }
+            if (err == error.InputOutput) {
+                if (total == 0) return .ended;
+                break;
+            }
             if (total != 0) break;
             return err;
         };
         if (count == 0) {
-            if (total == 0) return error.EndOfStream;
+            if (total == 0) return .ended;
             break;
         }
         total += count;
         poll_timeout = 1;
     }
-    if (total == 0) return false;
-    session.appendOutput(buffer[0..total]);
-    return true;
+    if (total == 0) return .idle;
+    return .{ .data = total };
+}
+
+fn readOutputChunk(
+    session: *Session,
+    fd: std.posix.fd_t,
+    buffer: []u8,
+    timeout_ms: i32,
+) !bool {
+    return switch (try readOutputFdChunk(fd, buffer, timeout_ms)) {
+        .data => |count| blk: {
+            session.appendOutput(buffer[0..count]);
+            break :blk true;
+        },
+        .idle => false,
+        .ended => error.EndOfStream,
+    };
 }
 
 fn maybeDelayForTest(name: []const u8) void {

@@ -1515,6 +1515,58 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP executes one code program through nested repository reads",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-code-mode-");
+      writeFileSync(join(root.workspace, "alpha.txt"), "ACP_CODE_ALPHA\n");
+      writeFileSync(join(root.workspace, "beta.txt"), "ACP_CODE_BETA\n");
+      const source = [
+        "const [alpha, beta] = await Promise.all([",
+        "  tools.read_file({ path: 'alpha.txt' }),",
+        "  tools.read_file({ path: 'beta.txt' }),",
+        "]);",
+        "return {",
+        "  alpha: alpha.includes('ACP_CODE_ALPHA'),",
+        "  beta: beta.includes('ACP_CODE_BETA'),",
+        "};",
+      ].join("\n");
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("acp_code_1", "code", { source }),
+        finalText("ACP_CODE_COMPLETE"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+        const result = await runPrompt(
+          client,
+          "Use code mode to inspect both fixtures.",
+          TIMEOUT,
+        );
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(2);
+        const toolResult = acpToolResultText(
+          gateway.requests[1]!.body,
+          "acp_code_1",
+        );
+        expect(toolResult).toContain(
+          '{"result":{"alpha":true,"beta":true}',
+        );
+        expect(toolResult).toContain('"tool":"read_file"');
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP forwards exact Markdown source without rendered duplicates",
     async () => {
       const root = createIsolatedRoot("fx-acp-markdown-source-");

@@ -68,6 +68,36 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    const code_mode_protocol_module = b.createModule(.{
+        .root_source_file = b.path(
+            "src/core/agent/code_mode_protocol.zig",
+        ),
+    });
+    const code_host = b.addExecutable(.{
+        .name = "fx-code-host",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/code_host/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .stack_check = false,
+            .stack_protector = false,
+            .omit_frame_pointer = true,
+            .unwind_tables = .none,
+            .error_tracing = false,
+            .strip = optimize != .Debug,
+        }),
+    });
+    code_host.root_module.addImport(
+        "code_mode_protocol",
+        code_mode_protocol_module,
+    );
+    addQuickJsCore(b, code_host.root_module);
+    const install_code_host = b.addInstallArtifact(code_host, .{});
+    b.getInstallStep().dependOn(&install_code_host.step);
+    const code_host_step = b.step("code-host", "Build the isolated code host");
+    code_host_step.dependOn(&install_code_host.step);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
@@ -86,9 +116,34 @@ pub fn build(b: *std.Build) void {
         "FX_TEST_PRODUCT_EXE",
         b.getInstallPath(.bin, "fx"),
     );
+    run_exe_tests.setEnvironmentVariable(
+        "FX_TEST_CODE_HOST_EXE",
+        b.getInstallPath(.bin, "fx-code-host"),
+    );
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
+
+    const code_host_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/code_host/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    code_host_tests.root_module.addImport(
+        "code_mode_protocol",
+        code_mode_protocol_module,
+    );
+    addQuickJsCore(b, code_host_tests.root_module);
+    const run_code_host_tests = b.addRunArtifact(code_host_tests);
+    test_step.dependOn(&run_code_host_tests.step);
+    const test_code_host_step = b.step(
+        "test-code-host",
+        "Run the isolated code host tests",
+    );
+    test_code_host_step.dependOn(&run_code_host_tests.step);
 
     if (wasm_surface != .none) {
         addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
@@ -306,6 +361,29 @@ pub fn build(b: *std.Build) void {
         );
         pgso_ir_step.dependOn(&missing_artifact.step);
     }
+}
+
+fn addQuickJsCore(b: *std.Build, module: *std.Build.Module) void {
+    module.addIncludePath(b.path("third_party/quickjs"));
+    module.addCSourceFiles(.{
+        .files = &.{
+            "third_party/quickjs/quickjs.c",
+            "third_party/quickjs/dtoa.c",
+            "third_party/quickjs/libregexp.c",
+            "third_party/quickjs/libunicode.c",
+        },
+        .flags = &.{
+            "-std=gnu11",
+            "-D_GNU_SOURCE",
+            "-DQUICKJS_NG_BUILD",
+            "-funsigned-char",
+            "-Wno-sign-compare",
+            "-Wno-unused-parameter",
+            "-Wno-unused-but-set-variable",
+            "-Wno-unused-result",
+        },
+    });
+    module.linkSystemLibrary("m", .{});
 }
 
 fn addWasmArtifact(

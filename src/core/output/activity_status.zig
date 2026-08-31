@@ -20,6 +20,7 @@ fn streamStatusVerb(stream: StreamState) []const u8 {
         .subagent => "delegating",
         .open => "opening",
         .ask => "asking",
+        .composite => "working",
     };
 }
 

@@ -1806,6 +1806,7 @@ pub const ToolActivityKind = enum {
     command,
     subagent,
     ask,
+    composite,
 };
 
 pub const QuestionOption = struct {

@@ -255,6 +255,38 @@ pub fn extractTarGz(alloc: Allocator, archive_path: []const u8, dest_dir: []cons
     }
 }
 
+pub fn replaceInstalledSet(
+    alloc: Allocator,
+    extracted_dir: []const u8,
+    installed_main: []const u8,
+) !void {
+    const installed_dir = std.fs.path.dirname(installed_main) orelse
+        return error.ReplaceFailed;
+    const main_name = if (builtin.os.tag == .windows) "fx.exe" else "fx";
+    const helper_name = if (builtin.os.tag == .windows)
+        "fx-code-host.exe"
+    else
+        "fx-code-host";
+    const extracted_helper = try std.fs.path.join(
+        alloc,
+        &.{ extracted_dir, helper_name },
+    );
+    defer alloc.free(extracted_helper);
+    const installed_helper = try std.fs.path.join(
+        alloc,
+        &.{ installed_dir, helper_name },
+    );
+    defer alloc.free(installed_helper);
+    const extracted_main = try std.fs.path.join(
+        alloc,
+        &.{ extracted_dir, main_name },
+    );
+    defer alloc.free(extracted_main);
+
+    try replaceBinary(extracted_helper, installed_helper);
+    try replaceBinary(extracted_main, installed_main);
+}
+
 pub fn replaceBinary(new_path: []const u8, target_path: []const u8) !void {
     std.Io.Dir.renameAbsolute(new_path, target_path, io_mod.getIo()) catch {
         copyBinary(new_path, target_path) catch return error.ReplaceFailed;
@@ -375,4 +407,47 @@ test "replaceBinary moves replacement over target path" {
     const replaced = try readAbsoluteFile(alloc, target_path);
     defer alloc.free(replaced);
     try std.testing.expectEqualStrings("new", replaced);
+}
+
+test "replaceInstalledSet installs helper before main and preserves main when helper is missing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "extracted");
+    try tmp.dir.createDirPath(io_mod.getIo(), "installed");
+    try writeTempFile(tmp.dir, "extracted/fx", "new-main");
+    try writeTempFile(tmp.dir, "extracted/fx-code-host", "new-helper");
+    try writeTempFile(tmp.dir, "installed/fx", "old-main");
+    try writeTempFile(tmp.dir, "installed/fx-code-host", "old-helper");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const extracted = try std.fs.path.join(alloc, &.{ root, "extracted" });
+    defer alloc.free(extracted);
+    const installed_main = try std.fs.path.join(alloc, &.{ root, "installed", "fx" });
+    defer alloc.free(installed_main);
+
+    try replaceInstalledSet(alloc, extracted, installed_main);
+    const main = try readAbsoluteFile(alloc, installed_main);
+    defer alloc.free(main);
+    const installed_helper = try std.fs.path.join(alloc, &.{ root, "installed", "fx-code-host" });
+    defer alloc.free(installed_helper);
+    const helper = try readAbsoluteFile(alloc, installed_helper);
+    defer alloc.free(helper);
+    try std.testing.expectEqualStrings("new-main", main);
+    try std.testing.expectEqualStrings("new-helper", helper);
+
+    try writeTempFile(tmp.dir, "extracted/fx", "newer-main");
+    const missing_helper = try std.fs.path.join(
+        alloc,
+        &.{ extracted, "fx-code-host" },
+    );
+    defer alloc.free(missing_helper);
+    std.Io.Dir.cwd().deleteFile(io_mod.getIo(), missing_helper) catch {};
+    try std.testing.expectError(
+        error.ReplaceFailed,
+        replaceInstalledSet(alloc, extracted, installed_main),
+    );
+    const preserved = try readAbsoluteFile(alloc, installed_main);
+    defer alloc.free(preserved);
+    try std.testing.expectEqualStrings("new-main", preserved);
 }

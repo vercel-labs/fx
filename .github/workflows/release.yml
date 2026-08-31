@@ -69,8 +69,8 @@ jobs:
         run: |
           package_dir="$RUNNER_TEMP/fx-package-${{ matrix.name }}"
           mkdir -p "$package_dir"
-          cp zig-out/bin/fx LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
-          tar -czf fx-${{ matrix.name }}.tar.gz -C "$package_dir" fx LICENSE THIRD_PARTY_NOTICES.md
+          cp zig-out/bin/fx zig-out/bin/fx-code-host LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
+          tar -czf fx-${{ matrix.name }}.tar.gz -C "$package_dir" fx fx-code-host LICENSE THIRD_PARTY_NOTICES.md
           sha256sum fx-${{ matrix.name }}.tar.gz > fx-${{ matrix.name }}.tar.gz.sha256
 
       - name: Upload artifact
@@ -105,14 +105,16 @@ jobs:
           APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
           APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
           APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-        run: scripts/sign-and-notarize-macos.sh zig-out/bin/fx
+        run: |
+          scripts/sign-and-notarize-macos.sh zig-out/bin/fx
+          FX_SIGNING_IDENTIFIER=com.vercel.fx.code-host scripts/sign-and-notarize-macos.sh zig-out/bin/fx-code-host
 
       - name: Package
         run: |
           package_dir="$RUNNER_TEMP/fx-package-macos-x86_64"
           mkdir -p "$package_dir"
-          cp zig-out/bin/fx LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
-          tar -czf fx-macos-x86_64.tar.gz -C "$package_dir" fx LICENSE THIRD_PARTY_NOTICES.md
+          cp zig-out/bin/fx zig-out/bin/fx-code-host LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
+          tar -czf fx-macos-x86_64.tar.gz -C "$package_dir" fx fx-code-host LICENSE THIRD_PARTY_NOTICES.md
           shasum -a 256 fx-macos-x86_64.tar.gz > fx-macos-x86_64.tar.gz.sha256
 
       - name: Upload artifact
@@ -147,6 +149,14 @@ jobs:
       - name: Require native arm64 host
         run: test "$(uname -m)" = arm64
 
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: "0.16.0"
+
+      - name: Build code host
+        run: zig build code-host -Doptimize=ReleaseSafe -Dtarget=aarch64-macos
+
       - name: Download eligible candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -166,15 +176,17 @@ jobs:
           APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
           APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
           APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-        run: scripts/sign-and-notarize-macos.sh "$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx"
+        run: |
+          scripts/sign-and-notarize-macos.sh "$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx"
+          FX_SIGNING_IDENTIFIER=com.vercel.fx.code-host scripts/sign-and-notarize-macos.sh zig-out/bin/fx-code-host
 
       - name: Package stable release candidate
         run: |
           archive="$RUNNER_TEMP/fx-macos-aarch64.tar.gz"
           package_dir="$RUNNER_TEMP/fx-release-package"
           mkdir -p "$package_dir"
-          cp "$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx" LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
-          tar -czf "$archive" -C "$package_dir" fx LICENSE THIRD_PARTY_NOTICES.md
+          cp "$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx" zig-out/bin/fx-code-host LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
+          tar -czf "$archive" -C "$package_dir" fx fx-code-host LICENSE THIRD_PARTY_NOTICES.md
           cd "$RUNNER_TEMP"
           shasum -a 256 fx-macos-aarch64.tar.gz > fx-macos-aarch64.tar.gz.sha256
 

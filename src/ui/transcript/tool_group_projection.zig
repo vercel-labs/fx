@@ -163,7 +163,7 @@ fn categoryIndex(kind: types.ToolActivityKind) ?usize {
         .open => 4,
         .command => command_category_index,
         .subagent => 6,
-        .ask => null,
+        .ask, .composite => null,
     };
 }
 
@@ -1135,6 +1135,31 @@ test "minimal tool group summary uses semantic category order and outcomes" {
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
     try std.testing.expect(projection.entry_actions.items[2] == .hide);
     try std.testing.expectEqual(types.ToolActivityKind.read, details[0].activity_kind.?);
+}
+
+test "composite parent counts once without duplicating nested categories" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran code\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Read alpha\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Read beta\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● Ran printf marker\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("code"), .activity_kind = .composite, .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 3, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 4, .tool_name = @constCast("terminal"), .activity_kind = .command, .outcome = .completed },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+    const summary = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        summary,
+        "● 4 tool calls · 2 read · 1 command\n",
+    ));
 }
 
 test "small minimal tool groups surface canonical action targets" {

@@ -323,6 +323,11 @@ jobs:
           mib=$(awk -v b="$bytes" 'BEGIN { printf "%.2f", b / 1048576 }')
           echo "${{ matrix.name }}: $bytes bytes ($mib MiB)"
           echo "${{ matrix.name }}: $bytes bytes ($mib MiB)" >> "$GITHUB_STEP_SUMMARY"
+          helper_bytes=$(stat -c%s zig-out/bin/fx-code-host)
+          helper_mib=$(awk -v b="$helper_bytes" 'BEGIN { printf "%.3f", b / 1048576 }')
+          echo "${{ matrix.name }} code host: $helper_bytes bytes ($helper_mib MiB)"
+          echo "${{ matrix.name }} code host: $helper_bytes bytes ($helper_mib MiB)" >> "$GITHUB_STEP_SUMMARY"
+          test "$helper_bytes" -le 1703936
 
   lint-scripts:
     name: Shellcheck

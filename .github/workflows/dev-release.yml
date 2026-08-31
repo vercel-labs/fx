@@ -50,8 +50,8 @@ jobs:
         run: |
           package_dir="$RUNNER_TEMP/fx-package-${{ matrix.name }}"
           mkdir -p "$package_dir"
-          cp zig-out/bin/fx LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
-          tar -czf fx-${{ matrix.name }}.tar.gz -C "$package_dir" fx LICENSE THIRD_PARTY_NOTICES.md
+          cp zig-out/bin/fx zig-out/bin/fx-code-host LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
+          tar -czf fx-${{ matrix.name }}.tar.gz -C "$package_dir" fx fx-code-host LICENSE THIRD_PARTY_NOTICES.md
           sha256sum fx-${{ matrix.name }}.tar.gz > fx-${{ matrix.name }}.tar.gz.sha256
 
       - name: Upload artifact

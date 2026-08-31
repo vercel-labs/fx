@@ -258,6 +258,25 @@ else:
             self.assertIn("xcrun notarytool submit", events)
             self.assertIn("xcrun notarytool log", events)
 
+    def test_accepts_a_distinct_code_host_signing_identifier(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fx-macos-signing-test-") as tmp:
+            root = pathlib.Path(tmp)
+            identifier = "com.vercel.fx.code-host"
+            result, _, _, event_log = self.run_script(
+                root,
+                {
+                    "FX_SIGNING_IDENTIFIER": identifier,
+                    "FX_SIGNING_TEST_IDENTIFIER": identifier,
+                },
+            )
+
+            output = result.stdout + result.stderr
+            self.assertEqual(0, result.returncode, output)
+            self.assertIn(
+                f"--identifier {identifier}",
+                event_log.read_text(encoding="utf-8"),
+            )
+
     def test_imports_pkcs12_private_key_for_codesign_and_security(self) -> None:
         self.assertTrue(SCRIPT_PATH.is_file(), "macOS signing helper is missing")
         with tempfile.TemporaryDirectory(prefix="fx-macos-signing-test-") as tmp:

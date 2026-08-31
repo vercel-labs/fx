@@ -9222,6 +9222,74 @@ test.skipIf(!tmuxAvailable())(
   NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 6 + 30_000,
 );
 
+test("concurrent native completions preserve every final PTY line", async () => {
+  if (!existsSync("/bin/zsh")) return;
+  const home = makeHome();
+  const paths = hostPaths(home);
+  const host = startHost(home, undefined, 10_000);
+  await waitFor(() => existsSync(paths.socket));
+  const connections = await Promise.all(
+    Array.from({ length: 8 }, () =>
+      handshake(paths.socket, { minimum: 4, current: 5 })
+    ),
+  );
+
+  const started = await Promise.all(connections.map((connected, index) => {
+    const name = `C${index + 1}`;
+    return startNativeCommandFixture(
+      connected.client,
+      connected.revision!,
+      510_000 + index * 100,
+      {
+        cwd: home,
+        command:
+          `name=${name}; printf '%s:READY\\n' "$name"; ` +
+          `for i in $(seq 1 10); do printf '%s:%s\\n' "$name" "$i"; ` +
+          `sleep 0.2; done; printf '%s:DONE\\n' "$name"`,
+        shell: {
+          executable: { path: "/bin/zsh", clean_start: true },
+        },
+        returnWhen: { exit: {} },
+      },
+    );
+  }));
+
+  for (const [index, result] of started.entries()) {
+    const name = `C${index + 1}`;
+    expect(result.outcome).toEqual({ exited: 0 });
+    const sessionId = (result.session as { session_id: string }).session_id;
+    const output = (
+      await readSession(
+        connections[index]!.client,
+        connections[index]!.revision!,
+        520_000 + index,
+        sessionId,
+      )
+    ).output;
+    const expected = [
+      `${name}:READY`,
+      ...Array.from({ length: 10 }, (_, line) => `${name}:${line + 1}`),
+      `${name}:DONE`,
+      "",
+    ].join("\r\n");
+    expect(output).toBe(expected);
+    success(
+      await requestAction(
+        connections[index]!.client,
+        connections[index]!.revision!,
+        530_000 + index,
+        "close",
+        { session_id: sessionId, policy: "graceful" },
+      ),
+      "close",
+    );
+  }
+
+  for (const connected of connections) connected.client.close();
+  host.kill("SIGKILL");
+  await waitForExit(host);
+}, NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 4 + 30_000);
+
 test("concurrent sessions survive disconnect and complete waits independently", async () => {
   if (!existsSync("/bin/zsh")) return;
   const home = makeHome();

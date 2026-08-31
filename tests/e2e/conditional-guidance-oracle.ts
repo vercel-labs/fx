@@ -5,6 +5,7 @@ export const CANONICAL_BUILTIN_NAMES = [
   "edit_file",
   "write_file",
   "terminal",
+  "code",
   "subagent",
   "capability_search",
   "skill",

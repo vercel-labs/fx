@@ -30,6 +30,7 @@ const install_skill_impl = @import("../tools/skills/install_skill.zig");
 const skill_impl = @import("../tools/skills/skill.zig");
 const skill_search_impl = @import("../tools/skills/skill_search.zig");
 const capability_search_impl = @import("../tools/capabilities/capability_search.zig");
+const code_impl = @import("../tools/code/code.zig");
 const web_fetch_impl = @import("../tools/web/fetch.zig");
 const web_search_impl = @import("../tools/web/search.zig");
 const test_io_mod = if (std_builtin.is_test)
@@ -73,6 +74,8 @@ const terminal_exec_only_profile_description =
     "Profile for exec; omission defaults to user, while clean skips user initialization files. User execution supports the configured Bash or zsh login shell. Bash login execution reads login initialization files; .bashrc is available only when sourced by the login profile.";
 const terminal_exec_only_timeout_description =
     "Maximum foreground runtime in milliseconds. Choose the shortest realistic finite budget; use terminal start for work that must remain alive.";
+const code_description =
+    "Run one bounded restricted JavaScript program to compose several existing fx tools. Available async capabilities are tools.read_file, tools.glob_files, tools.grep_files, tools.read_tool_result, and tools.terminal with action=exec only. Each awaited call resolves directly to that tool's result; a failed call rejects. Terminal exec resolves to {command_result, output}; use profile=clean for self-contained commands and choose a timeout that includes shell startup. Await dependent calls; use Promise.all only for independent calls; return one JSON-serializable value. Use a direct tool call for one operation, persistent terminal work, or an action requiring interactive approval. Imports, packages, filesystem, network, environment, subprocess, timers, eval, Function, workers, and shared memory are unavailable.";
 
 const terminal_shell_schema = model_tool_schema.ObjectSchema{
     .properties = &.{
@@ -1250,6 +1253,38 @@ pub const read_tool_result = ToolSpec{
     .irreversible_fn = read_tool_result_impl.isIrreversible,
 };
 
+pub const code = ToolSpec{
+    .name = "code",
+    .description = code_description,
+    .model_schema = .{
+        .name = "code",
+        .description = code_description,
+        .input_schema = .{
+            .properties = &.{.{
+                .name = "source",
+                .json_type = .string,
+                .description = "Restricted JavaScript body. Use await with tools.* and return one JSON-serializable value.",
+                .bounds = &.{ .min_length = 1, .max_length = code_impl.max_source_bytes },
+            }},
+            .required = &.{"source"},
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .code,
+    .activity_kind = .composite,
+    .requires_approval = false,
+    .action_label = "Running code",
+    .completed_action_label = "Ran code",
+    .label_arg_kind = .none,
+    .label_arg_default = "",
+    .permission_target_kind = .none,
+    .decode = code_impl.decode,
+    .validate = code_impl.validate,
+    .call = code_impl.call,
+    .reads_only_fn = code_impl.readsOnly,
+    .irreversible_fn = code_impl.isIrreversible,
+};
+
 pub const all = [_]tool_dispatch.Tool{
     glob_files,
     grep_files,
@@ -1271,6 +1306,7 @@ pub const all = [_]tool_dispatch.Tool{
     ask_user_question,
     vision,
     read_tool_result,
+    code,
 };
 
 pub const registry = tool_dispatch.Registry{ .tools = all[0..] };
@@ -1303,7 +1339,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "8432b9a24402fd2154afbb332220f5364997633056c00c40fe0992df3457f264",
+        "2f98e24ee1477a1931692c258f9f92e07ab9e3fbfca4012a41e483804c1707d5",
         &actual_hex,
     );
 }
@@ -1324,6 +1360,19 @@ test "registry classifies every built-in progress label" {
             tool_dispatch.classifyProgressLabel(registry, completed),
         );
     }
+}
+
+test "code tool advertises one bounded source field without outer approval" {
+    const spec = lookup("code") orelse return error.TestExpectedCodeTool;
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.code, spec.executor_kind);
+    try std.testing.expect(!spec.requires_approval);
+    try std.testing.expectEqualStrings("Running code", spec.action_label);
+    try std.testing.expectEqualStrings("Ran code", spec.completed_action_label);
+    try std.testing.expectEqual(@as(usize, 1), spec.model_schema.input_schema.properties.len);
+    const source = spec.model_schema.input_schema.properties[0];
+    try std.testing.expectEqualStrings("source", source.name);
+    try std.testing.expectEqual(model_tool_schema.JsonType.string, source.json_type);
+    try std.testing.expectEqual(@as(?usize, 64 * 1024), source.bounds.?.max_length);
 }
 
 fn schemaProperty(schema: model_tool_schema.ObjectSchema, name: []const u8) ?model_tool_schema.Property {
@@ -1932,6 +1981,7 @@ pub const advertisement_order = [_][]const u8{
     "edit_file",
     "write_file",
     "terminal",
+    "code",
     "subagent",
     "capability_search",
     "skill",
@@ -2006,6 +2056,7 @@ test "built-in tools register exact active local order" {
         "ask_user_question",
         "vision",
         "read_tool_result",
+        "code",
     };
 
     try std.testing.expectEqual(expected_names.len, all.len);

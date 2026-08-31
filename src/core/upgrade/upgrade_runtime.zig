@@ -237,16 +237,13 @@ fn upgradeWorkerInner(
         return;
     };
 
-    const extracted_bin = try std.fmt.allocPrint(alloc, "{s}/fx", .{tmp_dir});
-    defer alloc.free(extracted_bin);
-
     var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const self_exe = helpers.currentExecutablePath(&self_exe_buf) catch {
         result.err = .self_exe_not_found;
         return;
     };
 
-    helpers.replaceBinary(extracted_bin, self_exe) catch {
+    helpers.replaceInstalledSet(alloc, tmp_dir, self_exe) catch {
         result.err = .replace_failed;
         return;
     };

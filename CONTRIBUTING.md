@@ -35,6 +35,10 @@ zig build test
 zig build run
 ```
 
+Native builds install both `zig-out/bin/fx` and the isolated
+`zig-out/bin/fx-code-host` companion. The main binary does not load or spawn
+the companion unless the model selects the `code` tool.
+
 ## Verification Workflow
 
 Keep the local development loop focused: run the narrowest test that covers the changed path, build fx, and exercise the change using `./zig-out/bin/fx`. The installed `fx` on `PATH` is not valid development evidence.

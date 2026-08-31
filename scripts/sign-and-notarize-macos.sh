@@ -5,7 +5,7 @@ set -euo pipefail
 umask 077
 
 signing_identity="Developer ID Application: Vercel, Inc (JW6Y669B67)"
-signing_identifier="com.vercel.fx"
+signing_identifier="${FX_SIGNING_IDENTIFIER:-com.vercel.fx}"
 signing_team_id="JW6Y669B67"
 
 openssl_bin="${FX_SIGNING_OPENSSL_BIN:-/usr/bin/openssl}"

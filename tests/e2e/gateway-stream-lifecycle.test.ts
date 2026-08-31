@@ -734,10 +734,10 @@ describe("gateway stream lifecycle", () => {
       expect(serializedToolNames(oracleRequest)).toEqual(
         AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
       );
-      expect(request.tools).toHaveLength(17);
+      expect(request.tools).toHaveLength(18);
       expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
       expect(customProviderGuidanceState(oracleRequest)).toEqual({
-        providerToolIndices: [14],
+        providerToolIndices: [15],
         guidanceMessageIndices: [1],
       });
       expect(request.prompt[0]?.role).toBe("system");
@@ -2246,6 +2246,371 @@ describe("gateway stream lifecycle", () => {
         name: "edit_file",
         status: "success",
       });
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("code tool batches repository reads through the existing agent runtime", async () => {
+    const root = createFixtureRoot("code-batched-reads");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(join(root.workspace, "alpha.txt"), "CODE_ALPHA_MARKER\n");
+    writeFileSync(join(root.workspace, "beta.txt"), "CODE_BETA_MARKER\n");
+    const source = [
+      "const [alpha, beta] = await Promise.all([",
+      "  tools.read_file({ path: 'alpha.txt' }),",
+      "  tools.read_file({ path: 'beta.txt' }),",
+      "]);",
+      "return {",
+      "  alpha: alpha.includes('CODE_ALPHA_MARKER'),",
+      "  beta: beta.includes('CODE_BETA_MARKER'),",
+      "};",
+    ].join("\n");
+    const responses: Response[] = [
+      fakeGatewayToolCall("code-batch-1", "code", { source }),
+      fakeGatewayFinalText("CODE_BATCH_COMPLETE"),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the code batch."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_TRACE_SCOPES: "agent,core,gateway,stream,tool,permission",
+          },
+          timeoutMs: 30_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(result.stderr).toContain("Running code");
+      expect(result.stderr).toContain("Reading alpha.txt");
+      expect(result.stderr).toContain("Reading beta.txt");
+      const parsed = parseAskJson(result.stdout);
+      expect(parsed.output).toBe("CODE_BATCH_COMPLETE");
+      expect(parsed.tool_calls).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ name: "code", status: "success" }),
+        ]),
+      );
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[1]!.body).toContain(
+        "{\\\"alpha\\\":true,\\\"beta\\\":true}",
+      );
+      expect(gateway.requests[1]!.body).toContain("\\\"calls\\\"");
+      expect(gateway.requests[1]!.body).toContain("\\\"tool\\\":\\\"read_file\\\"");
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("call_id=code-batch-1/code-0");
+      expect(trace).toContain("call_id=code-batch-1/code-1");
+      expect(trace).toContain(
+        "event=code_parallel_read_start turn_id=1 step_id=1 parent_call_id=code-batch-1 count=2",
+      );
+      expect(trace).toContain(
+        "event=code_parallel_read_finish turn_id=1 step_id=1 parent_call_id=code-batch-1 count=2",
+      );
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("code tool receives structured foreground command status and output", async () => {
+    const root = createFixtureRoot("code-foreground-shell");
+    const tracePath = join(root.root, "trace.log");
+    const source = [
+      "const command = await tools.terminal({",
+      "  action: 'exec',",
+      "  command: \"printf 'CODE_SHELL_MARKER\\n'\",",
+      "  timeout_ms: 30000,",
+      "  profile: 'clean',",
+      "});",
+      "return {",
+      "  exit_code: command.command_result.exit_code,",
+      "  observed: command.output.includes('CODE_SHELL_MARKER'),",
+      "};",
+    ].join("\n");
+    const responses: Response[] = [
+      fakeGatewayToolCall("code-shell-1", "code", { source }),
+      fakeGatewayFinalText("CODE_SHELL_COMPLETE"),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the code shell fixture."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_TRACE_SCOPES: "agent,core,gateway,stream,tool,permission",
+          },
+          timeoutMs: 30_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(result.stderr).toContain("CODE_SHELL_MARKER");
+      expect(parseAskJson(result.stdout).output).toBe("CODE_SHELL_COMPLETE");
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[1]!.body).toContain(
+        "{\\\"exit_code\\\":0,\\\"observed\\\":true}",
+      );
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("call_id=code-shell-1/code-0");
+      expect(trace).toMatch(
+        /event=execution_result .*call_id=code-shell-1\/code-0 name=terminal .*result_kind=model_output/,
+      );
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("code tool returns approval required without executing a sensitive nested call", async () => {
+    const root = createFixtureRoot("code-approval-required");
+    const tracePath = join(root.root, "trace.log");
+    const sideEffect = join(root.workspace, "must-not-exist.txt");
+    writeFileSync(join(root.workspace, "must-not-read.txt"), "STOP_REQUIRED\n");
+    const source = [
+      "try {",
+      "  await tools.terminal({",
+      "    action: 'exec',",
+      "    command: 'touch must-not-exist.txt',",
+      "    timeout_ms: 30000,",
+      "    profile: 'clean',",
+      "  });",
+      "} catch (_) {}",
+      "return await tools.read_file({ path: 'must-not-read.txt' });",
+    ].join("\n");
+    const responses: Response[] = [
+      fakeGatewayToolCall("code-approval-1", "code", { source }),
+      fakeGatewayFinalText("CODE_APPROVAL_COMPLETE"),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--no-save", "Try the sensitive code call."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_TRACE_SCOPES: "agent,core,gateway,stream,tool,permission",
+            FX_PERMISSION_MODE: "ask",
+          },
+          timeoutMs: 30_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(existsSync(sideEffect)).toBe(false);
+      expect(parseAskJson(result.stdout).output).toBe("CODE_APPROVAL_COMPLETE");
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[1]!.body).toContain("approval_required");
+      expect(gateway.requests[1]!.body).toContain(
+        '\\"status\\":\\"approval_required\\"',
+      );
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).not.toContain(
+        "event=before_tool_execution turn_id=1 step_id=1 call_id=code-approval-1/code-0",
+      );
+      expect(trace).not.toContain("call_id=code-approval-1/code-1");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("code tool stops after an indeterminate nested command without replay", async () => {
+    const root = createFixtureRoot("code-indeterminate-stop");
+    const tracePath = join(root.root, "trace.log");
+    const effectPath = join(root.workspace, "code-indeterminate-effect.txt");
+    const source = [
+      "try {",
+      "  await tools.terminal({",
+      "    action: 'exec',",
+      "    command: \"printf 'first\\n' >> code-indeterminate-effect.txt\",",
+      "    timeout_ms: 30000,",
+      "    profile: 'clean',",
+      "  });",
+      "} catch (_) {}",
+      "await tools.terminal({",
+      "  action: 'exec',",
+      "  command: \"printf 'second\\n' >> code-indeterminate-effect.txt\",",
+      "  timeout_ms: 30000,",
+      "  profile: 'clean',",
+      "});",
+      "return 'must not complete';",
+    ].join("\n");
+    const responses: Response[] = [
+      fakeGatewayToolCall("code-indeterminate-1", "code", { source }),
+      fakeGatewayFinalText("CODE_INDETERMINATE_HANDLED"),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run uncertain code once."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_COMMAND_TEST_INDETERMINATE_AFTER_EXIT: "1",
+            FX_TRACE_SCOPES: "agent,core,gateway,stream,tool,permission",
+          },
+          timeoutMs: 30_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toBe(
+        "CODE_INDETERMINATE_HANDLED",
+      );
+      expect(readFileSync(effectPath, "utf8")).toBe("first\n");
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[1]!.body).toContain(
+        "code_nested_outcome_indeterminate",
+      );
+      expect(gateway.requests[1]!.body).toContain(
+        "Inspect current state before deciding whether to retry",
+      );
+      expect(gateway.requests[1]!.body).toContain(
+        '\\"status\\":\\"indeterminate\\"',
+      );
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("call_id=code-indeterminate-1/code-0");
+      expect(trace).not.toContain("call_id=code-indeterminate-1/code-1");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("code tool honors an exact configured shell allow in automatic mode", async () => {
+    const root = createFixtureRoot("code-configured-allow");
+    const tracePath = join(root.root, "trace.log");
+    const command = "printf 'CODE_CONFIGURED_ALLOW\\n'";
+    writeFileSync(
+      join(root.home, ".fx", "settings.json"),
+      JSON.stringify({ permission: { bash: { [command]: "allow" } } }),
+    );
+    const source = [
+      "const command = await tools.terminal({",
+      "  action: 'exec',",
+      `  command: ${JSON.stringify(command)},`,
+      "  timeout_ms: 30000,",
+      "  profile: 'clean',",
+      "});",
+      "return {",
+      "  exit_code: command.command_result.exit_code,",
+      "  observed: command.output.includes('CODE_CONFIGURED_ALLOW'),",
+      "};",
+    ].join("\n");
+    const responses: Response[] = [
+      fakeGatewayToolCall("code-allow-1", "code", { source }),
+      fakeGatewayFinalText("CODE_ALLOW_COMPLETE"),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Run the configured code call."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 30_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(result.stderr).toContain("CODE_CONFIGURED_ALLOW");
+      expect(parseAskJson(result.stdout).output).toBe("CODE_ALLOW_COMPLETE");
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[1]!.body).toContain(
+        "{\\\"exit_code\\\":0,\\\"observed\\\":true}",
+      );
+      expect(gateway.classifierRequests).toHaveLength(0);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("saved code result resumes without replaying nested effects", async () => {
+    const root = createFixtureRoot("code-resume-no-replay");
+    const firstTracePath = join(root.root, "first-trace.log");
+    const resumeTracePath = join(root.root, "resume-trace.log");
+    const effectPath = join(root.workspace, "code-resume-effect.txt");
+    const source = [
+      "const command = await tools.terminal({",
+      "  request: {",
+      "    action: 'exec',",
+      "    command: \"printf 'once\\n' >> code-resume-effect.txt\",",
+      "    cwd: null,",
+      "    timeout_ms: 30000,",
+      "    profile: 'clean',",
+      "  },",
+      "});",
+      "return { exit_code: command.command_result.exit_code };",
+    ].join("\n");
+    const responses: Response[] = [
+      fakeGatewayToolCall("code-resume-1", "code", { source }),
+      fakeGatewayFinalText("CODE_FIRST_TURN_COMPLETE"),
+      fakeGatewayFinalText("CODE_RESUME_COMPLETE"),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const first = await runFx(
+        ["ask", "--json", "--yolo", "Run and save the code fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, firstTracePath),
+          timeoutMs: 30_000,
+        },
+      );
+      const firstJson = parseAskJson(first.stdout) as ReturnType<
+        typeof parseAskJson
+      > & { session_id: string };
+      expect(first.code).toBe(0);
+      expect(firstJson.output).toBe("CODE_FIRST_TURN_COMPLETE");
+      expect(readFileSync(effectPath, "utf8")).toBe("once\n");
+
+      const resumed = await runFx(
+        [
+          "ask",
+          "--json",
+          "--yolo",
+          "--resume-id",
+          firstJson.session_id,
+          "Continue without rerunning prior code.",
+        ],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, resumeTracePath),
+          timeoutMs: 30_000,
+        },
+      );
+      const resumedJson = parseAskJson(resumed.stdout);
+      expect(resumed.code).toBe(0);
+      expect(resumedJson.output).toBe("CODE_RESUME_COMPLETE");
+      expect(readFileSync(effectPath, "utf8")).toBe("once\n");
+      expect(gateway.requests).toHaveLength(3);
+      expect(gateway.requests[2]!.body).toContain("code-resume-1");
+      expect(gateway.requests[2]!.body).toContain("code-resume-effect.txt");
+      expect(gateway.requests[2]!.body).toContain("\\\"calls\\\"");
+      const resumeTrace = readFileSync(resumeTracePath, "utf8");
+      expect(resumeTrace).not.toContain("call_id=code-resume-1/code-0");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

@@ -54,6 +54,8 @@ const runtime_parallel_execution = @import("parallel_execution.zig");
 const runtime_tool_batch = @import("tool_batch.zig");
 const model_response_recovery = @import("model_response_recovery.zig");
 const tool_mcp_runtime = @import("../../tooling/tool_mcp_runtime.zig");
+const code_impl = @import("../../../tools/code/code.zig");
+const runtime_code_controller = @import("code_controller.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -283,6 +285,29 @@ fn project_terminal_request_messages(
     return projected orelse source;
 }
 
+fn normalized_terminal_request_value(
+    arena: Allocator,
+    request: std.json.Value,
+) Allocator.Error!?std.json.Value {
+    return switch (request) {
+        .object => request,
+        .string => |encoded| blk: {
+            const decoded = std.json.parseFromSliceLeaky(
+                std.json.Value,
+                arena,
+                encoded,
+                .{},
+            ) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => null,
+            };
+            if (decoded != .object) return null;
+            break :blk decoded;
+        },
+        else => null,
+    };
+}
+
 fn normalized_terminal_request_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
@@ -293,8 +318,10 @@ fn normalized_terminal_request_arguments(
     };
     defer parsed.deinit();
     if (parsed.value != .object or parsed.value.object.count() != 1) return null;
-    const request = parsed.value.object.getPtr("request") orelse return null;
-    if (request.* != .object) return null;
+    var request = (try normalized_terminal_request_value(
+        parsed.arena.allocator(),
+        parsed.value.object.get("request") orelse return null,
+    )) orelse return null;
     _ = try normalize_terminal_model_input(
         parsed.arena.allocator(),
         &request.object,
@@ -302,7 +329,7 @@ fn normalized_terminal_request_arguments(
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(request.*, .{}, &out.writer) catch return error.OutOfMemory;
+    std.json.Stringify.value(request, .{}, &out.writer) catch return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
 
@@ -745,6 +772,77 @@ test "terminal request normalization unwraps only exact eligible native calls" {
     try std.testing.expectEqual(calls[0].provenance, normalized[0].provenance);
     try std.testing.expectEqualStrings(calls[1].arguments_json, normalized[1].arguments_json);
 
+    const stringified_calls = [_]ToolCall{.{
+        .id = "stringified-request",
+        .name = "terminal",
+        .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"read\\\"," ++
+            "\\\"session_id\\\":\\\"terminal-a\\\"," ++
+            "\\\"cursor_segment\\\":1,\\\"cursor_offset\\\":0}\"}",
+    }};
+    const stringified = try normalize_terminal_request_tool_calls(
+        arena,
+        native_registry,
+        true,
+        &stringified_calls,
+    );
+    try std.testing.expect(stringified.ptr != stringified_calls[0..].ptr);
+    try std.testing.expectEqualStrings(
+        "{\"action\":\"read\",\"session_id\":\"terminal-a\"," ++
+            "\"cursor_segment\":1,\"cursor_offset\":0}",
+        stringified[0].arguments_json,
+    );
+
+    const unknown_stringified_calls = [_]ToolCall{.{
+        .id = "stringified-unknown",
+        .name = "terminal",
+        .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"read\\\"," ++
+            "\\\"mystery\\\":null}\"}",
+    }};
+    const unknown_stringified = try normalize_terminal_request_tool_calls(
+        arena,
+        native_registry,
+        true,
+        &unknown_stringified_calls,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"action\":\"read\",\"mystery\":null}",
+        unknown_stringified[0].arguments_json,
+    );
+
+    const nested_string_calls = [_]ToolCall{.{
+        .id = "nested-string",
+        .name = "terminal",
+        .arguments_json = "{\"request\":\"\\\"not-an-object\\\"\"}",
+    }};
+    const nested_string = try normalize_terminal_request_tool_calls(
+        arena,
+        native_registry,
+        true,
+        &nested_string_calls,
+    );
+    try std.testing.expectEqual(nested_string_calls[0..].ptr, nested_string.ptr);
+
+    const malformed_string_calls = [_]ToolCall{.{
+        .id = "malformed-string",
+        .name = "terminal",
+        .arguments_json = "{\"request\":\"{\"}",
+    }};
+    const malformed_string = try normalize_terminal_request_tool_calls(
+        arena,
+        native_registry,
+        true,
+        &malformed_string_calls,
+    );
+    try std.testing.expectEqual(malformed_string_calls[0..].ptr, malformed_string.ptr);
+
+    const ineligible_stringified = try normalize_terminal_request_tool_calls(
+        arena,
+        native_registry,
+        false,
+        &stringified_calls,
+    );
+    try std.testing.expectEqual(stringified_calls[0..].ptr, ineligible_stringified.ptr);
+
     const inferred_write_calls = [_]ToolCall{.{
         .id = "inferred-write",
         .name = "terminal",
@@ -845,6 +943,7 @@ fn check_terminal_request_normalization_allocation_failures(alloc: Allocator) !v
         .{ .id = "one", .name = "terminal", .arguments_json = "{\"request\":{\"action\":\"exec\",\"command\":\"true\"}}" },
         .{ .id = "two", .name = "terminal", .arguments_json = "{\"request\":{\"action\":\"start\"}}" },
         .{ .id = "atomic", .name = "terminal", .arguments_json = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"text\":\"input\"}}}" },
+        .{ .id = "stringified", .name = "terminal", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"read\\\",\\\"session_id\\\":\\\"terminal-a\\\",\\\"cursor_segment\\\":1,\\\"cursor_offset\\\":0}\"}" },
     };
     const normalized = try normalize_terminal_request_tool_calls(alloc, registry, true, &source);
     if (normalized.ptr == source[0..].ptr) return error.TestUnexpectedResult;
@@ -867,6 +966,10 @@ fn check_terminal_request_normalization_allocation_failures(alloc: Allocator) !v
     try std.testing.expectEqualStrings(
         "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
         normalized[2].arguments_json,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"action\":\"read\",\"session_id\":\"terminal-a\",\"cursor_segment\":1,\"cursor_offset\":0}",
+        normalized[3].arguments_json,
     );
 }
 
@@ -2606,6 +2709,867 @@ fn traceRouteFailure(
             routeFailureDetail(completion),
         },
     );
+}
+
+const CodeNestedDispatchContext = struct {
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    config: Config,
+    job: *const QueuedPrompt,
+    turn_id: u64,
+    step_ctx: TraceContext,
+    presentation_group_id: ?types.ToolPresentationGroupId,
+    outer_call_id: []const u8,
+    model: []const u8,
+    root_user_intent_context: []const u8,
+    current_turn_messages: []const ChatMessage,
+    pending_assistant: ChatMessage,
+    session_grants: []const PermissionGrant,
+    permission_mode: types.PermissionMode,
+    advertised_dynamic_tool_names: []const []const u8,
+    records: *std.ArrayList(CodeCallRecord),
+
+    fn dispatch(
+        raw: *anyopaque,
+        requests: []const runtime_code_controller.NestedRequest,
+        responses: []runtime_code_controller.NestedResponse,
+    ) runtime_code_controller.DispatchError!void {
+        const self: *CodeNestedDispatchContext = @ptrCast(@alignCast(raw));
+        const normalized = self.arena.alloc(
+            runtime_code_controller.NestedRequest,
+            requests.len,
+        ) catch return error.OutOfMemory;
+        const allowed = self.arena.alloc(bool, requests.len) catch
+            return error.OutOfMemory;
+        var all_allowed = true;
+        for (requests, normalized, allowed) |request, *canonical, *is_allowed| {
+            if (canonicalProgrammaticRequest(self.arena, request) catch
+                return error.OutOfMemory) |value|
+            {
+                canonical.* = value;
+                is_allowed.* = true;
+            } else {
+                canonical.* = request;
+                is_allowed.* = false;
+                all_allowed = false;
+            }
+        }
+        if (all_allowed and requests.len > 1 and self.allReadOnly(normalized)) {
+            return self.dispatchReadBatch(normalized, responses) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Cancelled => error.Cancelled,
+                else => error.DispatchFailed,
+            };
+        }
+        for (requests, normalized, allowed, responses) |request, canonical, is_allowed, *response| {
+            const outcome: runtime_code_controller.NestedResponse = if (is_allowed)
+                self.execute(canonical) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Cancelled => return error.Cancelled,
+                    else => return error.DispatchFailed,
+                }
+            else
+                .{ .failure = "tool is not available inside code mode" };
+            try self.records.append(self.arena, .{
+                .id = request.id,
+                .tool = request.name,
+                .status = switch (outcome) {
+                    .success => .success,
+                    .failure => .failure,
+                    .approval_required => .approval_required,
+                    .indeterminate => .indeterminate,
+                },
+            });
+            response.* = outcome;
+        }
+    }
+
+    fn allReadOnly(
+        self: *CodeNestedDispatchContext,
+        requests: []const runtime_code_controller.NestedRequest,
+    ) bool {
+        for (requests) |request| {
+            const call = ToolCall{
+                .id = "code-read-classifier",
+                .name = request.name,
+                .arguments_json = request.arguments_json,
+            };
+            if (!runtime_parallel_execution.isReadOnlyCall(
+                self.deps.tool_registry,
+                call,
+            )) return false;
+        }
+        return true;
+    }
+
+    fn dispatchReadBatch(
+        self: *CodeNestedDispatchContext,
+        requests: []const runtime_code_controller.NestedRequest,
+        responses: []runtime_code_controller.NestedResponse,
+    ) !void {
+        const calls = try self.arena.alloc(ToolCall, requests.len);
+        const ready_indices = try self.arena.alloc(usize, requests.len);
+        const display_targets = try self.arena.alloc(?[]const u8, requests.len);
+        const status_started = try self.arena.alloc(bool, requests.len);
+        var ready_count: usize = 0;
+        for (requests, 0..) |request, index| {
+            const call_id = try std.fmt.allocPrint(
+                self.arena,
+                "{s}/code-{d}",
+                .{ self.outer_call_id, request.id },
+            );
+            const call = ToolCall{
+                .id = call_id,
+                .name = request.name,
+                .arguments_json = request.arguments_json,
+            };
+            if (self.deps.validate_tool_call) |validate| {
+                switch (try validate(self.deps.ctx, self.arena, call)) {
+                    .not_registered => {
+                        responses[index] = .{ .failure = "unknown tool" };
+                        try self.record(request, .failure);
+                        continue;
+                    },
+                    .failure => |reason| {
+                        responses[index] = .{ .failure = reason };
+                        try self.record(request, .failure);
+                        continue;
+                    },
+                    .valid => {},
+                }
+            }
+            if (self.deps.check_tool_availability) |check| {
+                if (try check(self.deps.ctx, self.arena, call)) |reason| {
+                    responses[index] = .{ .failure = reason };
+                    try self.record(request, .failure);
+                    continue;
+                }
+            }
+            const review_context = buildReviewTurnContext(
+                self.config,
+                self.model,
+                self.job.prompt,
+                self.root_user_intent_context,
+                self.current_turn_messages,
+                self.pending_assistant,
+                call.id,
+            );
+            const permission = try runtime_tool_admission.requestToolPermissionTraced(
+                self.deps,
+                self.arena,
+                call,
+                review_context,
+                self.permission_mode,
+                self.session_grants,
+                null,
+                null,
+                self.advertised_dynamic_tool_names,
+                self.config.workspace_root,
+                self.step_ctx,
+            );
+            if (permission.tool_failure) |failure| {
+                responses[index] = .{ .failure = failure };
+                try self.record(request, .failure);
+                continue;
+            }
+            if (permission.decision.isDenied() or
+                permission.execution_authority == null or
+                permission.execution_authority.? != .ordinary)
+            {
+                responses[index] = .{ .failure = "read permission denied" };
+                try self.record(request, .failure);
+                continue;
+            }
+            const display_target = if (self.deps.resolve_tool_action_display_target) |resolve|
+                try resolve(self.deps.ctx, self.arena, call)
+            else
+                null;
+            display_targets[ready_count] = display_target;
+            status_started[ready_count] = try runtime_tool_presentation.startToolVisibleLifecycle(
+                self.deps,
+                self.arena,
+                self.turn_id,
+                self.presentation_group_id,
+                call,
+                display_target,
+                self.advertised_dynamic_tool_names,
+            );
+            calls[ready_count] = call;
+            ready_indices[ready_count] = index;
+            ready_count += 1;
+        }
+        if (ready_count == 0) return;
+
+        debug_trace.eventf(
+            "tool",
+            "code_parallel_read_start",
+            self.step_ctx,
+            "parent_call_id={s} count={d}",
+            .{ self.outer_call_id, ready_count },
+        );
+        var parallel_context = runtime_parallel_execution.ParallelHookExecContext{
+            .hooks = self.deps,
+            .turn_id = self.turn_id,
+            .root_user_intent_context = self.root_user_intent_context,
+            .current_turn_messages = self.current_turn_messages,
+            .session_grants = self.session_grants,
+            .permission_mode = self.permission_mode,
+            .advertised_dynamic_tool_names = self.advertised_dynamic_tool_names,
+            .max_tool_result_bytes = self.config.max_tool_result_bytes,
+        };
+        var run_result = try runtime_parallel_execution.runParallelReadOnlyCalls(
+            self.arena,
+            calls[0..ready_count],
+            .{
+                .exec_ctx = &parallel_context,
+                .execute = runtime_parallel_execution.parallelHookExecute,
+                .format_ctx = &parallel_context,
+                .format_error = runtime_parallel_execution.parallelHookFormatError,
+                .cancel_flag = self.config.cancel_flag,
+            },
+        );
+        defer run_result.deinit(self.arena);
+        for (run_result.attempts, 0..) |attempt, ready_index| {
+            const request_index = ready_indices[ready_index];
+            const request = requests[request_index];
+            switch (attempt) {
+                .cancelled => return error.Cancelled,
+                .completed => |completed| {
+                    const execution = completed.execution;
+                    var prepared = try runtime_execution_memory.prepareToolModelOutput(
+                        self.arena,
+                        self.config,
+                        calls[ready_index],
+                        execution.model_output,
+                    );
+                    runtime_execution_memory.applyToolResultMemory(
+                        &prepared.memory,
+                        execution.tool_result_memory,
+                    );
+                    try runtime_tool_presentation.finishExecutedToolStatus(
+                        self.deps,
+                        self.arena,
+                        self.turn_id,
+                        calls[ready_index],
+                        status_started[ready_index],
+                        display_targets[ready_index],
+                        execution,
+                        prepared.model_output,
+                        prepared.memory,
+                        execution.diff_entry,
+                        self.advertised_dynamic_tool_names,
+                    );
+                    runtime_parallel_execution.reportInnerToolUsage(
+                        self.deps,
+                        calls[ready_index].name,
+                        execution,
+                    );
+                    responses[request_index] = if (execution.status == .success)
+                        .{ .success = try jsonString(
+                            self.arena,
+                            execution.model_output,
+                        ) }
+                    else
+                        .{ .failure = execution.model_output };
+                    try self.record(
+                        request,
+                        if (execution.status == .success) .success else .failure,
+                    );
+                },
+            }
+        }
+        debug_trace.eventf(
+            "tool",
+            "code_parallel_read_finish",
+            self.step_ctx,
+            "parent_call_id={s} count={d}",
+            .{ self.outer_call_id, ready_count },
+        );
+    }
+
+    fn record(
+        self: *CodeNestedDispatchContext,
+        request: runtime_code_controller.NestedRequest,
+        status: CodeCallStatus,
+    ) !void {
+        try self.records.append(self.arena, .{
+            .id = request.id,
+            .tool = request.name,
+            .status = status,
+        });
+    }
+
+    fn execute(
+        self: *CodeNestedDispatchContext,
+        request: runtime_code_controller.NestedRequest,
+    ) !runtime_code_controller.NestedResponse {
+        const call_id = try std.fmt.allocPrint(
+            self.arena,
+            "{s}/code-{d}",
+            .{ self.outer_call_id, request.id },
+        );
+        const call = ToolCall{
+            .id = call_id,
+            .name = request.name,
+            .arguments_json = request.arguments_json,
+        };
+        if (self.deps.validate_tool_call) |validate| {
+            switch (try validate(self.deps.ctx, self.arena, call)) {
+                .not_registered => return .{ .failure = "unknown tool" },
+                .failure => |reason| return .{ .failure = reason },
+                .valid => {},
+            }
+        }
+        if (self.deps.check_tool_availability) |check| {
+            if (try check(self.deps.ctx, self.arena, call)) |reason| {
+                return .{ .failure = reason };
+            }
+        }
+        const read_only = runtime_parallel_execution.isReadOnlyCall(
+            self.deps.tool_registry,
+            call,
+        );
+        if (!read_only and self.permission_mode == .ask) {
+            return .{ .approval_required = "approval_required: issue this exact tool call directly" };
+        }
+        const review_context = buildReviewTurnContext(
+            self.config,
+            self.model,
+            self.job.prompt,
+            self.root_user_intent_context,
+            self.current_turn_messages,
+            self.pending_assistant,
+            call.id,
+        );
+        const maybe_permission = try runtime_tool_admission.requestToolPermissionTraced(
+            self.deps,
+            self.arena,
+            call,
+            review_context,
+            self.permission_mode,
+            self.session_grants,
+            null,
+            null,
+            self.advertised_dynamic_tool_names,
+            self.config.workspace_root,
+            self.step_ctx,
+        );
+        if (maybe_permission.tool_failure) |failure| {
+            return .{ .failure = failure };
+        }
+        if (maybe_permission.decision.isDenied()) {
+            const reason = maybe_permission.denial_reason orelse
+                maybe_permission.decision.denialReason() orelse
+                .permission_required;
+            const denied = switch (reason) {
+                .review_caution, .review_unavailable => try tool_result_errors.toolReviewHeldJson(
+                    self.arena,
+                    call.name,
+                    reason,
+                    if (maybe_permission.auto_review_result) |result|
+                        result.rationale
+                    else
+                        null,
+                ),
+                .user_denied,
+                .auto_denied,
+                .policy_denied,
+                .permission_required,
+                => try tool_result_errors.toolPermissionDeniedJson(
+                    self.arena,
+                    call.name,
+                    reason,
+                ),
+            };
+            return .{ .failure = denied };
+        }
+        const authority = maybe_permission.execution_authority orelse
+            return error.MissingToolExecutionAuthority;
+        const lifecycle_id = types.ToolLifecycleId{
+            .turn_id = self.turn_id,
+            .call_id = call.id,
+        };
+        const display_target = if (self.deps.resolve_tool_action_display_target) |resolve|
+            try resolve(self.deps.ctx, self.arena, call)
+        else
+            null;
+        const status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
+            self.deps,
+            self.arena,
+            self.turn_id,
+            self.presentation_group_id,
+            call,
+            display_target,
+            self.advertised_dynamic_tool_names,
+        );
+        debug_trace.eventf(
+            "tool",
+            "before_tool_execution",
+            self.step_ctx,
+            "call_id={s} name={s} parent_call_id={s}",
+            .{ call.id, call.name, self.outer_call_id },
+        );
+        debug_trace.eventf(
+            "tool",
+            "execution_start",
+            self.step_ctx,
+            "call_id={s} name={s} parent_call_id={s}",
+            .{ call.id, call.name, self.outer_call_id },
+        );
+        const execution = try self.deps.execute_tool_call(self.deps.ctx, .{
+            .call_allocator = self.arena,
+            .result_allocator = self.arena,
+            .call = call,
+            .authority = authority,
+            .permission_mode = self.permission_mode,
+            .root_user_intent_context = self.root_user_intent_context,
+            .root_user_messages = &.{},
+            .root_user_evidence_complete = true,
+            .authorized_image_catalog = self.job.authorized_image_catalog,
+            .current_turn_messages = self.current_turn_messages,
+            .session_grants = self.session_grants,
+            .advertised_dynamic_tool_names = self.advertised_dynamic_tool_names,
+            .max_tool_result_bytes = self.config.max_tool_result_bytes,
+            .lifecycle_id = lifecycle_id,
+        });
+        var prepared = try runtime_execution_memory.prepareToolModelOutput(
+            self.arena,
+            self.config,
+            call,
+            execution.model_output,
+        );
+        runtime_execution_memory.applyToolResultMemory(
+            &prepared.memory,
+            execution.tool_result_memory,
+        );
+        try runtime_tool_presentation.finishExecutedToolStatus(
+            self.deps,
+            self.arena,
+            self.turn_id,
+            call,
+            status_started,
+            display_target,
+            execution,
+            prepared.model_output,
+            prepared.memory,
+            execution.diff_entry,
+            self.advertised_dynamic_tool_names,
+        );
+        debug_trace.eventf(
+            "tool",
+            "after_tool_execution",
+            self.step_ctx,
+            "call_id={s} name={s} parent_call_id={s} result_kind=model_output model_output_bytes={d}",
+            .{ call.id, call.name, self.outer_call_id, execution.model_output.len },
+        );
+        debug_trace.eventf(
+            "tool",
+            "execution_result",
+            self.step_ctx,
+            "call_id={s} name={s} parent_call_id={s} result_kind=model_output model_output_bytes={d}",
+            .{ call.id, call.name, self.outer_call_id, execution.model_output.len },
+        );
+        defer if (execution.command_replay_capture) |capture| {
+            capture.discard(self.arena);
+        };
+        if (execution.cancelled) return error.Cancelled;
+        if (runtime_tool_presentation.activityKindForCall(
+            self.arena,
+            self.deps.tool_registry,
+            call,
+        ) == .command) {
+            try self.deps.push_command_output_complete(self.deps.ctx, lifecycle_id);
+        }
+        runtime_parallel_execution.reportInnerToolUsage(
+            self.deps,
+            call.name,
+            execution,
+        );
+        if (execution.command_result_json) |command_result| {
+            if (commandResultIndeterminate(self.arena, command_result)) {
+                return .{ .indeterminate = execution.model_output };
+            }
+            if (execution.status == .failure) {
+                return .{ .failure = execution.model_output };
+            }
+            return .{ .success = try commandProgramValue(
+                self.arena,
+                command_result,
+                execution.model_output,
+            ) };
+        }
+        if (execution.status == .failure) {
+            return .{ .failure = execution.model_output };
+        }
+        return .{ .success = try jsonString(self.arena, execution.model_output) };
+    }
+};
+
+const CodeCallStatus = enum {
+    success,
+    failure,
+    approval_required,
+    indeterminate,
+};
+
+const CodeCallRecord = struct {
+    id: u8,
+    tool: []const u8,
+    status: CodeCallStatus,
+};
+
+fn canonicalProgrammaticRequest(
+    arena: Allocator,
+    request: runtime_code_controller.NestedRequest,
+) Allocator.Error!?runtime_code_controller.NestedRequest {
+    if (std.mem.eql(u8, request.name, "read_file") or
+        std.mem.eql(u8, request.name, "glob_files") or
+        std.mem.eql(u8, request.name, "grep_files") or
+        std.mem.eql(u8, request.name, "read_tool_result"))
+    {
+        return request;
+    }
+    if (!std.mem.eql(u8, request.name, "terminal")) return null;
+    const arguments_json = try canonicalProgramTerminalExec(
+        arena,
+        request.arguments_json,
+    ) orelse return null;
+    return .{
+        .id = request.id,
+        .name = request.name,
+        .arguments_json = arguments_json,
+    };
+}
+
+fn canonicalProgramTerminalExec(
+    alloc: Allocator,
+    arguments_json: []const u8,
+) Allocator.Error!?[]u8 {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        arguments_json,
+        .{},
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+
+    const value = if (parsed.value.object.count() == 1)
+        parsed.value.object.get("request") orelse parsed.value
+    else
+        parsed.value;
+    if (value != .object or !terminal_action_is(value.object, "exec")) {
+        return null;
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    std.json.Stringify.value(value, .{}, &out.writer) catch
+        return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+test "program terminal exec canonicalization accepts flat and wrapped forms" {
+    const alloc = std.testing.allocator;
+    const expected =
+        "{\"action\":\"exec\",\"command\":\"printf ok\",\"cwd\":null," ++
+        "\"profile\":\"clean\",\"timeout_ms\":10000}";
+    const flat = (try canonicalProgramTerminalExec(alloc, expected)).?;
+    defer alloc.free(flat);
+    try std.testing.expectEqualStrings(expected, flat);
+
+    const wrapped_input = "{\"request\":" ++ expected ++ "}";
+    const wrapped = (try canonicalProgramTerminalExec(alloc, wrapped_input)).?;
+    defer alloc.free(wrapped);
+    try std.testing.expectEqualStrings(expected, wrapped);
+
+    const repeated = (try canonicalProgramTerminalExec(alloc, wrapped)).?;
+    defer alloc.free(repeated);
+    try std.testing.expectEqualStrings(wrapped, repeated);
+}
+
+test "program terminal exec canonicalization rejects non-exec and ambiguous wrappers" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect((try canonicalProgramTerminalExec(
+        alloc,
+        "{\"action\":\"start\",\"command\":\"sleep 1\"}",
+    )) == null);
+    try std.testing.expect((try canonicalProgramTerminalExec(
+        alloc,
+        "{\"request\":{\"action\":\"start\"}}",
+    )) == null);
+    try std.testing.expect((try canonicalProgramTerminalExec(
+        alloc,
+        "{\"request\":{\"action\":\"exec\"},\"extra\":true}",
+    )) == null);
+    try std.testing.expect((try canonicalProgramTerminalExec(
+        alloc,
+        "not-json",
+    )) == null);
+}
+
+fn jsonString(alloc: Allocator, value: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    return out.toOwnedSlice();
+}
+
+fn commandProgramValue(
+    alloc: Allocator,
+    command_result_json: []const u8,
+    output: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"command_result\":");
+    try out.writer.writeAll(command_result_json);
+    try out.writer.writeAll(",\"output\":");
+    try std.json.Stringify.value(output, .{}, &out.writer);
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+fn commandResultIndeterminate(alloc: Allocator, value: []const u8) bool {
+    const parsed = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        alloc,
+        value,
+        .{},
+    ) catch return false;
+    if (parsed != .object) return false;
+    const field = parsed.object.get("termination_indeterminate") orelse
+        return false;
+    return field == .bool and field.bool;
+}
+
+fn codeProgramValue(
+    alloc: Allocator,
+    result_json: []const u8,
+    records: []const CodeCallRecord,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"result\":");
+    try out.writer.writeAll(result_json);
+    try out.writer.writeAll(",\"calls\":");
+    try writeCodeCallRecords(&out.writer, records);
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+fn writeCodeCallRecords(
+    writer: *std.Io.Writer,
+    records: []const CodeCallRecord,
+) !void {
+    try writer.writeByte('[');
+    for (records, 0..) |record, index| {
+        if (index > 0) try writer.writeByte(',');
+        try writer.print("{{\"id\":{d},\"tool\":", .{record.id});
+        try std.json.Stringify.value(record.tool, .{}, writer);
+        try writer.writeAll(",\"status\":");
+        try std.json.Stringify.value(
+            @tagName(record.status),
+            .{},
+            writer,
+        );
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
+}
+
+fn executeCodeTool(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    config: Config,
+    job: *const QueuedPrompt,
+    turn_id: u64,
+    step_ctx: TraceContext,
+    presentation_group_id: ?types.ToolPresentationGroupId,
+    call: ToolCall,
+    model: []const u8,
+    root_user_intent_context: []const u8,
+    current_turn_messages: []const ChatMessage,
+    pending_assistant: ChatMessage,
+    session_grants: []const PermissionGrant,
+    permission_mode: types.PermissionMode,
+    advertised_dynamic_tool_names: []const []const u8,
+) !ToolExecutionResult {
+    const parsed = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
+        call.arguments_json,
+        .{},
+    ) catch return error.InvalidToolArguments;
+    if (parsed != .object) return error.InvalidToolArguments;
+    const source_value = parsed.object.get("source") orelse
+        return error.InvalidToolArguments;
+    if (source_value != .string or
+        source_value.string.len == 0 or
+        source_value.string.len > code_impl.max_source_bytes)
+    {
+        return error.InvalidToolArguments;
+    }
+    const helper_path = try runtime_code_controller.resolveHelperPath(arena);
+    var records: std.ArrayList(CodeCallRecord) = .empty;
+    defer records.deinit(arena);
+    var nested = CodeNestedDispatchContext{
+        .deps = deps,
+        .arena = arena,
+        .config = config,
+        .job = job,
+        .turn_id = turn_id,
+        .step_ctx = step_ctx,
+        .presentation_group_id = presentation_group_id,
+        .outer_call_id = call.id,
+        .model = model,
+        .root_user_intent_context = root_user_intent_context,
+        .current_turn_messages = current_turn_messages,
+        .pending_assistant = pending_assistant,
+        .session_grants = session_grants,
+        .permission_mode = permission_mode,
+        .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
+        .records = &records,
+    };
+    const controller_result = runtime_code_controller.run(arena, .{
+        .helper_path = helper_path,
+        .source = source_value.string,
+        .cancel_flag = config.cancel_flag,
+        .dispatcher = .{
+            .context = &nested,
+            .dispatch = CodeNestedDispatchContext.dispatch,
+        },
+    }) catch |err| {
+        if (err == error.Cancelled) return error.Cancelled;
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        debug_trace.eventf(
+            "tool",
+            "code_host_failure",
+            step_ctx,
+            "call_id={s} outcome={s}",
+            .{ call.id, @errorName(err) },
+        );
+        return .{
+            .status = .failure,
+            .model_output = try codeControllerFailureJson(
+                arena,
+                err,
+                records.items,
+            ),
+        };
+    };
+    defer controller_result.deinit(arena);
+    return switch (controller_result) {
+        .completed => |output| .{ .model_output = try codeProgramValue(
+            arena,
+            output,
+            records.items,
+        ) },
+        .failed => |failure| .{
+            .status = .failure,
+            .model_output = try codeReportedFailureJson(
+                arena,
+                failure,
+                records.items,
+            ),
+        },
+    };
+}
+
+const CodeFailureInfo = struct {
+    code: []const u8,
+    message: []const u8,
+    suggestion: []const u8,
+};
+
+fn codeControllerFailureJson(
+    alloc: Allocator,
+    err: anyerror,
+    records: []const CodeCallRecord,
+) ![]u8 {
+    const failure: CodeFailureInfo = switch (err) {
+        error.FileNotFound,
+        error.CodeHostPathUnavailable,
+        => .{
+            .code = "code_host_unavailable",
+            .message = "The isolated code host is unavailable.",
+            .suggestion = "Use the same fx tools directly.",
+        },
+        else => .{
+            .code = "code_host_failed",
+            .message = "The isolated code host failed before producing a complete result.",
+            .suggestion = "Use direct tools; do not assume unfinished nested work succeeded.",
+        },
+    };
+    return writeCodeFailureJson(alloc, failure, null, records);
+}
+
+fn codeReportedFailureJson(
+    alloc: Allocator,
+    failure: runtime_code_controller.Failure,
+    records: []const CodeCallRecord,
+) ![]u8 {
+    const info: CodeFailureInfo = switch (failure.kind) {
+        .syntax => .{
+            .code = "code_syntax_error",
+            .message = "The restricted JavaScript program has a syntax error.",
+            .suggestion = "Correct the program or use direct tool calls.",
+        },
+        .runtime => .{
+            .code = "code_program_failed",
+            .message = "The restricted JavaScript program failed.",
+            .suggestion = "Correct the program or use direct tool calls.",
+        },
+        .limit => .{
+            .code = "code_limit_exceeded",
+            .message = "The code program exceeded a runtime or call limit.",
+            .suggestion = "Reduce the program or split the work into direct tool calls.",
+        },
+        .approval_required => .{
+            .code = "approval_required",
+            .message = "A nested code-mode action requires interactive approval.",
+            .suggestion = "Issue that exact tool call directly so fx can present approval.",
+        },
+        .indeterminate => .{
+            .code = "code_nested_outcome_indeterminate",
+            .message = "A nested action may have produced effects, but its final outcome is unknown.",
+            .suggestion = "Inspect current state before deciding whether to retry.",
+        },
+        .protocol => .{
+            .code = "code_host_failed",
+            .message = "The isolated code host failed before producing a complete result.",
+            .suggestion = "Use direct tools; do not assume unfinished nested work succeeded.",
+        },
+    };
+    return writeCodeFailureJson(alloc, info, failure.message, records);
+}
+
+fn writeCodeFailureJson(
+    alloc: Allocator,
+    failure: CodeFailureInfo,
+    detail: ?[]const u8,
+    records: []const CodeCallRecord,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"error\":{\"tool\":\"code\",\"code\":");
+    try std.json.Stringify.value(failure.code, .{}, &out.writer);
+    try out.writer.writeAll(",\"message\":");
+    try std.json.Stringify.value(failure.message, .{}, &out.writer);
+    try out.writer.writeAll(",\"suggestion\":");
+    try std.json.Stringify.value(failure.suggestion, .{}, &out.writer);
+    if (detail) |value| {
+        try out.writer.writeAll(",\"detail\":");
+        try std.json.Stringify.value(value, .{}, &out.writer);
+    }
+    try out.writer.writeByte('}');
+    try out.writer.writeAll(",\"calls\":");
+    try writeCodeCallRecords(&out.writer, records);
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
 }
 
 pub fn processQueuedPrompt(
@@ -7242,31 +8206,53 @@ fn processQueuedPromptLoop(
             const execution_lifecycle_id = types.ToolLifecycleId{ .turn_id = turn_id, .call_id = execution_call.id };
             const execution_is_command = runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, tool_call) == .command;
             var execution_error: ?anyerror = null;
-            var execution = deps.execute_tool_call(deps.ctx, .{
-                .call_allocator = call_allocator,
-                .result_allocator = arena,
-                .call = execution_call,
-                .authority = execution_authority,
-                .permission_mode = action_permission_mode,
-                .root_user_intent_context = tool_execution_root_user_context,
-                .root_user_messages = &.{},
-                .root_user_evidence_complete = true,
-                .authorized_image_catalog = job.authorized_image_catalog,
-                .current_turn_messages = within_turn_suffix.items,
-                .session_grants = execution_grants,
-                .live_authority = if (live_authority) |resolved| resolved.authority else null,
-                .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
-                .max_tool_result_bytes = config.max_tool_result_bytes,
-                .expected_mcp_runtime_generation = expected_mcp_runtime_generation,
-                .classification_complete = if (preparation_batch.preparations[tool_call_index]) |preparation|
-                    switch (preparation) {
-                        .candidate => |candidate| preparedCandidateClassificationComplete(candidate),
-                        .terminal => false,
-                    }
-                else
-                    false,
-                .lifecycle_id = execution_lifecycle_id,
-            }) catch |err| blk: {
+            const registered_execution_tool = deps.tool_registry.lookup(execution_call.name);
+            const code_execution = registered_execution_tool != null and
+                registered_execution_tool.?.executor_kind == .code;
+            var execution = (if (code_execution)
+                executeCodeTool(
+                    deps,
+                    arena,
+                    config,
+                    &job,
+                    turn_id,
+                    step_ctx,
+                    stream_ctx.provisional_statuses.presentation_group_id,
+                    execution_call,
+                    successful_gateway_model,
+                    tool_execution_root_user_context,
+                    within_turn_suffix.items,
+                    pending_assistant,
+                    execution_grants,
+                    action_permission_mode,
+                    advertised_dynamic_tool_names,
+                )
+            else
+                deps.execute_tool_call(deps.ctx, .{
+                    .call_allocator = call_allocator,
+                    .result_allocator = arena,
+                    .call = execution_call,
+                    .authority = execution_authority,
+                    .permission_mode = action_permission_mode,
+                    .root_user_intent_context = tool_execution_root_user_context,
+                    .root_user_messages = &.{},
+                    .root_user_evidence_complete = true,
+                    .authorized_image_catalog = job.authorized_image_catalog,
+                    .current_turn_messages = within_turn_suffix.items,
+                    .session_grants = execution_grants,
+                    .live_authority = if (live_authority) |resolved| resolved.authority else null,
+                    .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
+                    .max_tool_result_bytes = config.max_tool_result_bytes,
+                    .expected_mcp_runtime_generation = expected_mcp_runtime_generation,
+                    .classification_complete = if (preparation_batch.preparations[tool_call_index]) |preparation|
+                        switch (preparation) {
+                            .candidate => |candidate| preparedCandidateClassificationComplete(candidate),
+                            .terminal => false,
+                        }
+                    else
+                        false,
+                    .lifecycle_id = execution_lifecycle_id,
+                })) catch |err| blk: {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 if (err == error.Cancelled and config.cancel_flag.load(.seq_cst)) {
                     break :blk ToolExecutionResult{
@@ -7278,6 +8264,28 @@ fn processQueuedPromptLoop(
                 execution_error = err;
                 break :blk ToolExecutionResult{ .status = .failure, .model_output = try deps.format_tool_execution_error(deps.ctx, arena, tool_call.name, err) };
             };
+            if (code_execution) {
+                if (deps.record_composite_tool_execution) |record| {
+                    record(deps.ctx, .{
+                        .call_allocator = call_allocator,
+                        .result_allocator = arena,
+                        .call = execution_call,
+                        .authority = execution_authority,
+                        .permission_mode = action_permission_mode,
+                        .root_user_intent_context = tool_execution_root_user_context,
+                        .root_user_messages = &.{},
+                        .root_user_evidence_complete = true,
+                        .authorized_image_catalog = job.authorized_image_catalog,
+                        .current_turn_messages = within_turn_suffix.items,
+                        .session_grants = execution_grants,
+                        .live_authority = if (live_authority) |resolved| resolved.authority else null,
+                        .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
+                        .max_tool_result_bytes = config.max_tool_result_bytes,
+                        .expected_mcp_runtime_generation = expected_mcp_runtime_generation,
+                        .lifecycle_id = execution_lifecycle_id,
+                    }, execution);
+                }
+            }
 
             if (execution.cancelled and config.cancel_flag.load(.seq_cst)) {
                 runtime_telemetry.traceCancelObserved(step_ctx, true);

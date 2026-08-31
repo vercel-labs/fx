@@ -7,6 +7,7 @@
     "test": "bun test",
     "test:cli": "bun test cli.test.ts",
     "test:acp": "bun test acp.test.ts",
+    "test:shell-parity": "bun test shell-parity.test.ts",
     "test:tui": "bun test tui-*.test.ts"
   },
   "devDependencies": {

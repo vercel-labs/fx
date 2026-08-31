@@ -1953,6 +1953,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .describe_tool_action_denied = describeToolActionDenied,
         .permission_target_for_call = permissionTargetForCall,
         .execute_tool_call = executeToolCallAuthorized,
+        .record_composite_tool_execution = recordCompositeToolExecution,
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .propagate_history_turn = propagateHistoryTurn,
         .recovery_checkpoint = if (ctx.writable != null)
@@ -2513,6 +2514,15 @@ fn executeToolCallAuthorized(
     };
     captureToolExecutionResult(ctx, request, result);
     return result;
+}
+
+fn recordCompositeToolExecution(
+    raw_ctx: *anyopaque,
+    request: agent_runtime.ToolExecutionRequest,
+    result: ToolExecutionResult,
+) void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    captureToolExecutionResult(ctx, request, result);
 }
 
 fn captureToolExecutionError(

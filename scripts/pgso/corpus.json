@@ -97,6 +97,7 @@
     {"name": "e2e-mcp-stdio", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-stdio.test.ts"], "test_file": "mcp-stdio.test.ts"},
     {"name": "e2e-mcp-auth", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-auth.test.ts"], "test_file": "mcp-auth.test.ts", "allow_keychain": true},
     {"name": "e2e-session-recovery", "argv": ["bun", "test", "--max-concurrency", "1", "./session-recovery.test.ts"], "test_file": "session-recovery.test.ts"},
+    {"name": "e2e-shell-parity", "argv": ["bun", "test", "--max-concurrency", "1", "./shell-parity.test.ts"], "test_file": "shell-parity.test.ts", "requires_tmux": false},
     {"name": "e2e-terminal-host", "argv": ["bun", "test", "--max-concurrency", "1", "./terminal-host.test.ts"], "test_file": "terminal-host.test.ts"},
     {"name": "e2e-tui-startup", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-startup.test.ts"], "test_file": "tui-startup.test.ts"},
     {"name": "e2e-permission-errors", "argv": ["bun", "test", "--max-concurrency", "1", "./permission-errors.test.ts"], "test_file": "permission-errors.test.ts"},

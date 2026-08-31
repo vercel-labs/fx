@@ -1582,6 +1582,34 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "terminal normalizes one stringified request object before validation",
+  async () => {
+    const fixture = createFixture("fx-tui-terminal-stringified-request-");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("terminal_stringified_list", "terminal", {
+        request: JSON.stringify({ action: "list" }),
+      }),
+      (body) => {
+        const result = JSON.parse(
+          toolResultText(body, "terminal_stringified_list"),
+        );
+        expect(result.success.list.sessions).toEqual([]);
+        return fakeGatewayFinalText("Terminal stringified request verified");
+      },
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("List terminal sessions.");
+    await active.waitForText("Terminal stringified request verified", TIMEOUT);
+    expect(gateway.requests).toHaveLength(2);
+    expect(terminalRecords(fixture.home)).toEqual([]);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
   "terminal repeated unknown correction with a valid neighbor stops without request three",
   async () => {
     const fixture = createFixture("fx-tui-terminal-correction-loop-");

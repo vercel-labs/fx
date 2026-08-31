@@ -19,6 +19,7 @@
   { "file": "permission-errors.test.ts", "weight": 1 },
   { "file": "prompt-history.test.ts", "weight": 14 },
   { "file": "session-recovery.test.ts", "weight": 13 },
+  { "file": "shell-parity.test.ts", "weight": 3 },
   { "file": "terminal-host.test.ts", "weight": 273 },
   { "file": "tmux-helpers.test.ts", "weight": 2 },
   { "file": "tui-agent.test.ts", "weight": 1 },
