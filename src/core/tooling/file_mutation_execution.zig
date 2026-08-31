@@ -123,7 +123,8 @@ pub fn execute(input: Input) Error!ToolExecutionResult {
             break :blk .{
                 .status = .success,
                 .model_output = prepared_result.model_output,
-                .prepared_result_memory = prepared_result.memory,
+                .tool_result_memory = prepared_result.memory,
+                .tool_result_memory_prepared = true,
                 .committed_file_handoff = handoff,
             };
         },

@@ -979,12 +979,21 @@ fn propagateGrant(hooks: *const AgentRuntimeDeps, grant: PermissionGrant) !void 
 }
 
 pub fn registeredToolValidationFailure(hooks: *const AgentRuntimeDeps, arena: Allocator, call: ToolCall) !?ToolExecutionResult {
-    if (call.provider_result != null) return null;
-    const validate = hooks.validate_tool_call orelse return null;
-    return switch (try validate(hooks.ctx, arena, call)) {
-        .not_registered, .valid => null,
+    return switch (try toolCallValidation(hooks, arena, call)) {
+        .not_registered => null,
+        .valid => null,
         .failure => |reason| .{ .model_output = reason, .status = .failure },
     };
+}
+
+pub fn toolCallValidation(
+    hooks: *const AgentRuntimeDeps,
+    arena: Allocator,
+    call: ToolCall,
+) !runtime_tool_contracts.ToolCallValidationResult {
+    if (call.provider_result != null) return .{ .valid = .{} };
+    const validate = hooks.validate_tool_call orelse return .{ .valid = .{} };
+    return validate(hooks.ctx, arena, call);
 }
 
 pub fn toolAvailabilityFailure(hooks: *const AgentRuntimeDeps, arena: Allocator, call: ToolCall) !?ToolExecutionResult {

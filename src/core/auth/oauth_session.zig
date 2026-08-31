@@ -85,6 +85,9 @@ fn selectStorageBackend(os_tag: std.Target.Os.Tag, keychain_disabled: bool) Stor
 }
 
 fn storageBackend() StorageBackend {
+    // A temporary HOME does not isolate the host account's macOS Keychain.
+    // Keychain-specific tests inject their backend explicitly.
+    if (comptime builtin.is_test) return .profile_file;
     return selectStorageBackend(builtin.os.tag, native_keychain.isDisabled());
 }
 
@@ -985,6 +988,10 @@ test "OAuth storage backend selection is platform scoped and explicitly disablea
     try std.testing.expectEqual(StorageBackend.profile_file, selectStorageBackend(.macos, true));
     try std.testing.expectEqual(StorageBackend.profile_file, selectStorageBackend(.linux, false));
     try std.testing.expectEqual(StorageBackend.profile_file, selectStorageBackend(.windows, false));
+}
+
+test "OAuth test builds use profile file storage" {
+    try std.testing.expectEqual(StorageBackend.profile_file, storageBackend());
 }
 
 test "OAuth source resolution covers every file and Keychain state" {

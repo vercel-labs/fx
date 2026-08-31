@@ -361,14 +361,7 @@ fn prepareRegisteredApplicableTargets(
     };
     defer permission_targets.deinit(alloc);
 
-    const target_kind = switch (tool.executor_kind) {
-        .delete_file, .rename_file, .file_info, .open_file => existingFilesystemTargetKind(
-            tool.executor_kind,
-            permission_targets.items,
-        ) orelse
-            return .legacy_candidate,
-        else => filesystemTargetKind(tool.executor_kind),
-    };
+    const target_kind = filesystemTargetKind(tool.executor_kind);
     const applicable_targets: []context_contract.ApplicableTarget = if (target_kind) |kind|
         try applicableTargetsFromPermissionTargets(alloc, permission_targets.items, kind)
     else
@@ -481,35 +474,10 @@ fn applicableTargetsFromPermissionTargets(
 
 fn filesystemTargetKind(kind: tool_dispatch.ExecutorKind) ?context_contract.TargetKind {
     return switch (kind) {
-        .list_files, .glob_files, .grep_files, .semantic_search, .create_folder => .directory,
-        .read_file, .copy_file => .file,
+        .glob_files, .grep_files => .directory,
+        .read_file => .file,
         else => null,
     };
-}
-
-fn existingFilesystemTargetKind(
-    executor_kind: tool_dispatch.ExecutorKind,
-    permission_targets: []const permissions.PermissionCallTarget,
-) ?context_contract.TargetKind {
-    const path = switch (executor_kind) {
-        .delete_file, .file_info, .open_file => blk: {
-            if (permission_targets.len != 1) return null;
-            break :blk permission_targets[0].path;
-        },
-        .rename_file => blk: {
-            for (permission_targets) |target| {
-                if (std.mem.eql(u8, target.role, "source")) break :blk target.path;
-            }
-            return null;
-        },
-        else => unreachable,
-    };
-    const stat = std.Io.Dir.cwd().statFile(
-        io_mod.getIo(),
-        path,
-        .{},
-    ) catch return null;
-    return if (stat.kind == .directory) .directory else .file;
 }
 
 fn dupeSingleApplicableTarget(
@@ -741,7 +709,6 @@ test "registered candidates expose only authoritative canonical targets" {
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "workspace/build/pkg");
     try tmp.dir.createDirPath(std.testing.io, "workspace/segment::scope");
-    try tmp.dir.createDirPath(std.testing.io, "workspace/scoped-directory");
     {
         var file = try tmp.dir.createFile(std.testing.io, "workspace/build/pkg/existing.txt", .{});
         defer file.close(std.testing.io);
@@ -761,20 +728,11 @@ test "registered candidates expose only authoritative canonical targets" {
     defer alloc.free(delimiter_cwd_path);
     const new_path = try std.fs.path.join(alloc, &.{ workspace, "build/pkg/new.txt" });
     defer alloc.free(new_path);
-    const copied_path = try std.fs.path.join(alloc, &.{ workspace, "build/pkg/copied.txt" });
-    defer alloc.free(copied_path);
-    const renamed_directory_path = try std.fs.path.join(alloc, &.{ workspace, "renamed-directory" });
-    defer alloc.free(renamed_directory_path);
     const tools = [_]tool_dispatch.Tool{
         builtin_tools.read_file,
         builtin_tools.write_file,
         builtin_tools.edit_file,
         builtin_tools.terminal,
-        builtin_tools.delete_file,
-        builtin_tools.rename_file,
-        builtin_tools.copy_file,
-        builtin_tools.file_info,
-        builtin_tools.open_file,
     };
     const registry = tool_dispatch.Registry{ .tools = &tools };
 
@@ -787,18 +745,6 @@ test "registered candidates expose only authoritative canonical targets" {
     try std.testing.expectEqual(@as(usize, 1), read.candidate.applicable_targets.len);
     try std.testing.expectEqual(context_contract.TargetKind.file, read.candidate.applicable_targets[0].kind);
     try std.testing.expectEqualStrings(existing_path, read.candidate.applicable_targets[0].path);
-
-    var copy = try prepareReadyCall(alloc, .{
-        .id = "copy",
-        .name = "copy_file",
-        .arguments_json = "{\"source\":\"build/pkg/existing.txt\",\"destination\":\"build/pkg/copied.txt\"}",
-    }, .{ .tool_registry = registry, .workspace_root = workspace, .classifiers = test_classifiers });
-    defer copy.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), copy.candidate.applicable_targets.len);
-    try std.testing.expectEqual(context_contract.TargetKind.file, copy.candidate.applicable_targets[0].kind);
-    try std.testing.expectEqual(context_contract.TargetKind.file, copy.candidate.applicable_targets[1].kind);
-    try std.testing.expectEqualStrings(existing_path, copy.candidate.applicable_targets[0].path);
-    try std.testing.expectEqualStrings(copied_path, copy.candidate.applicable_targets[1].path);
 
     var missing = try prepareReadyCall(alloc, .{
         .id = "missing",
@@ -851,63 +797,6 @@ test "registered candidates expose only authoritative canonical targets" {
         delimiter_command.candidate.applicable_targets[0].path,
     );
 
-    const directory_path = try io_mod.dirRealpathAlloc(
-        alloc,
-        tmp.dir,
-        "workspace/scoped-directory",
-    );
-    defer alloc.free(directory_path);
-    const polymorphic_calls = [_]ToolCall{
-        .{
-            .id = "delete-directory",
-            .name = "delete_file",
-            .arguments_json = "{\"path\":\"scoped-directory\"}",
-        },
-        .{
-            .id = "inspect-directory",
-            .name = "file_info",
-            .arguments_json = "{\"path\":\"scoped-directory\"}",
-        },
-        .{
-            .id = "open-directory",
-            .name = "open_file",
-            .arguments_json = "{\"path\":\"scoped-directory\"}",
-        },
-    };
-    for (polymorphic_calls) |polymorphic_call| {
-        var prepared = try prepareReadyCall(
-            alloc,
-            polymorphic_call,
-            .{ .tool_registry = registry, .workspace_root = workspace, .classifiers = test_classifiers },
-        );
-        defer prepared.deinit(alloc);
-        try std.testing.expectEqual(
-            @as(usize, 1),
-            prepared.candidate.applicable_targets.len,
-        );
-        try std.testing.expectEqual(
-            context_contract.TargetKind.directory,
-            prepared.candidate.applicable_targets[0].kind,
-        );
-        try std.testing.expectEqualStrings(
-            directory_path,
-            prepared.candidate.applicable_targets[0].path,
-        );
-    }
-
-    var rename = try prepareReadyCall(alloc, .{
-        .id = "rename-directory",
-        .name = "rename_file",
-        .arguments_json = "{\"old_path\":\"scoped-directory\",\"new_path\":\"renamed-directory\"}",
-    }, .{ .tool_registry = registry, .workspace_root = workspace, .classifiers = test_classifiers });
-    defer rename.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), rename.candidate.applicable_targets.len);
-    for (rename.candidate.applicable_targets) |target| {
-        try std.testing.expectEqual(context_contract.TargetKind.directory, target.kind);
-    }
-    try std.testing.expectEqualStrings(directory_path, rename.candidate.applicable_targets[0].path);
-    try std.testing.expectEqualStrings(renamed_directory_path, rename.candidate.applicable_targets[1].path);
-
     var write = try prepareReadyCall(alloc, .{
         .id = "write",
         .name = "write_file",
@@ -945,9 +834,6 @@ test "ordinary applicable target freshness detects retarget and resolution failu
         var new_file = try tmp.dir.createFile(std.testing.io, "workspace/new/input.txt", .{});
         defer new_file.close(std.testing.io);
         try new_file.writeStreamingAll(std.testing.io, "new");
-        var kind_target = try tmp.dir.createFile(std.testing.io, "workspace/kind-target", .{});
-        defer kind_target.close(std.testing.io);
-        try kind_target.writeStreamingAll(std.testing.io, "file");
     }
     try tmp.dir.symLink(std.testing.io, "old", "workspace/link", .{ .is_directory = true });
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
@@ -955,7 +841,6 @@ test "ordinary applicable target freshness detects retarget and resolution failu
     const tools = [_]tool_dispatch.Tool{
         builtin_tools.read_file,
         builtin_tools.terminal,
-        builtin_tools.file_info,
     };
     const config: Config = .{
         .tool_registry = .{ .tools = &tools },
@@ -975,18 +860,6 @@ test "ordinary applicable target freshness detects retarget and resolution failu
         .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\",\"cwd\":\"link\"}",
     }, config);
     defer command.deinit(alloc);
-    const file_info_call: ToolCall = .{
-        .id = "kind",
-        .name = "file_info",
-        .arguments_json = "{\"path\":\"kind-target\"}",
-    };
-    var file_info_file = try prepareReadyCall(alloc, file_info_call, config);
-    defer file_info_file.deinit(alloc);
-    try std.testing.expectEqual(
-        context_contract.TargetKind.file,
-        file_info_file.candidate.applicable_targets[0].kind,
-    );
-
     try std.testing.expect(try ordinaryApplicableTargetsFresh(
         alloc,
         .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"link/input.txt\"}" },
@@ -1001,43 +874,6 @@ test "ordinary applicable target freshness detects retarget and resolution failu
         config.workspace_root,
         &command.candidate,
     ));
-    try std.testing.expect(try ordinaryApplicableTargetsFresh(
-        alloc,
-        file_info_call,
-        config.tool_registry,
-        config.workspace_root,
-        &file_info_file.candidate,
-    ));
-
-    try tmp.dir.deleteFile(std.testing.io, "workspace/kind-target");
-    try tmp.dir.createDir(std.testing.io, "workspace/kind-target", .default_dir);
-    try std.testing.expect(!try ordinaryApplicableTargetsFresh(
-        alloc,
-        file_info_call,
-        config.tool_registry,
-        config.workspace_root,
-        &file_info_file.candidate,
-    ));
-    var file_info_directory = try prepareReadyCall(alloc, file_info_call, config);
-    defer file_info_directory.deinit(alloc);
-    try std.testing.expectEqual(
-        context_contract.TargetKind.directory,
-        file_info_directory.candidate.applicable_targets[0].kind,
-    );
-    try tmp.dir.deleteDir(std.testing.io, "workspace/kind-target");
-    {
-        var kind_target = try tmp.dir.createFile(std.testing.io, "workspace/kind-target", .{});
-        defer kind_target.close(std.testing.io);
-        try kind_target.writeStreamingAll(std.testing.io, "file again");
-    }
-    try std.testing.expect(!try ordinaryApplicableTargetsFresh(
-        alloc,
-        file_info_call,
-        config.tool_registry,
-        config.workspace_root,
-        &file_info_directory.candidate,
-    ));
-
     try tmp.dir.deleteFile(std.testing.io, "workspace/link");
     try tmp.dir.symLink(std.testing.io, "new", "workspace/link", .{ .is_directory = true });
     try std.testing.expect(!try ordinaryApplicableTargetsFresh(

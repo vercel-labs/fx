@@ -507,6 +507,10 @@ pub const WriteLeaseIntent = enum {
     revoke,
 };
 
+fn write_payload_required(lease: WriteLeaseIntent) bool {
+    return lease == .use;
+}
+
 pub const WriteRequest = struct {
     session_id: []const u8,
     payload: ?WritePayload = null,
@@ -686,16 +690,10 @@ pub const ActionRequest = union(enum) {
             },
             .write => |request| {
                 try validate_session_id(request.session_id);
-                switch (request.lease) {
-                    .acquire, .release, .revoke => if (request.payload != null) {
-                        return error.InvalidWritePayload;
-                    },
-                    .use => if (request.payload) |payload| {
-                        try payload.validate();
-                    } else {
-                        return error.InvalidWritePayload;
-                    },
+                if (write_payload_required(request.lease) != (request.payload != null)) {
+                    return error.InvalidWritePayload;
                 }
+                if (request.payload) |payload| try payload.validate();
                 try validate_optional_authority_claim(request.authority);
             },
             .wait => |request| {
@@ -1937,6 +1935,7 @@ pub fn lifecycle_controls(lifecycle: Lifecycle) AllowedControls {
             .screen = true,
             .write = true,
             .wait = true,
+            .monitor = true,
             .inspect = true,
             .list = true,
             .resize = true,
@@ -3374,6 +3373,36 @@ test "action request validation enforces binding and bounded input rules" {
     );
 }
 
+test "write payload presence follows the lease intent" {
+    const cases = [_]struct {
+        lease: WriteLeaseIntent,
+        payload_present: bool,
+        accepted: bool,
+    }{
+        .{ .lease = .acquire, .payload_present = false, .accepted = true },
+        .{ .lease = .acquire, .payload_present = true, .accepted = false },
+        .{ .lease = .use, .payload_present = false, .accepted = false },
+        .{ .lease = .use, .payload_present = true, .accepted = true },
+        .{ .lease = .release, .payload_present = false, .accepted = true },
+        .{ .lease = .release, .payload_present = true, .accepted = false },
+        .{ .lease = .revoke, .payload_present = false, .accepted = true },
+        .{ .lease = .revoke, .payload_present = true, .accepted = false },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.accepted, write_payload_required(case.lease) == case.payload_present);
+        const request = ActionRequest{ .write = .{
+            .session_id = "terminal-1",
+            .lease = case.lease,
+            .payload = if (case.payload_present) .{ .text = "input" } else null,
+        } };
+        if (case.accepted) {
+            try request.validate();
+        } else {
+            try std.testing.expectError(error.InvalidWritePayload, request.validate());
+        }
+    }
+}
+
 test "start persistence binds authority to cwd backend and a nonzero proof" {
     const persistence = StartPersistence{
         .grant = .{
@@ -4079,6 +4108,26 @@ test "next actions are the pure lifecycle authority and lease intersection" {
         .{},
     );
     try std.testing.expectEqual(AllowedControls.observer(), observer);
+
+    const lifecycle_cases = [_]struct {
+        lifecycle: Lifecycle,
+        monitor: bool,
+    }{
+        .{ .lifecycle = .starting, .monitor = true },
+        .{ .lifecycle = .running, .monitor = true },
+        .{ .lifecycle = .exited, .monitor = false },
+        .{ .lifecycle = .lost, .monitor = false },
+        .{ .lifecycle = .closed, .monitor = false },
+    };
+    for (lifecycle_cases) |case| {
+        const projected = project_next_actions(
+            case.lifecycle,
+            .full(),
+            .agent,
+            .{},
+        );
+        try std.testing.expectEqual(case.monitor, projected.monitor);
+    }
 
     const leased = project_next_actions(
         .running,

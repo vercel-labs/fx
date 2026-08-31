@@ -48,7 +48,11 @@ export function startLegacyStreamableHttpFixture(
     urlRequiredOperation?: LegacyUrlRequiredOperation;
     completeBeforeElicitationResponse?: boolean;
     manualUrlCompletion?: boolean;
-    sdkDiscoveryError?: "uninitialized" | "unsupported-version";
+    initializeSse?: boolean;
+    sdkDiscoveryError?:
+      | "uninitialized"
+      | "unsupported-version"
+      | "unsupported-version-string-id";
   } = {},
 ) {
   const mode = options.mode ?? "normal";
@@ -269,12 +273,18 @@ export function startLegacyStreamableHttpFixture(
         if (options.sdkDiscoveryError) {
           return Response.json({
             jsonrpc: "2.0",
-            id: null,
+            id: options.sdkDiscoveryError === "unsupported-version-string-id"
+              ? "server-error"
+              : null,
             error: {
-              code: -32000,
+              code: options.sdkDiscoveryError === "unsupported-version-string-id"
+                ? -32600
+                : -32000,
               message: options.sdkDiscoveryError === "uninitialized"
                 ? "Server not initialized"
-                : "Bad Request: Unsupported protocol version: 2026-07-28",
+                : options.sdkDiscoveryError === "unsupported-version-string-id"
+                  ? "Bad Request: Unsupported protocol version: 2026-07-28. Supported versions: 2024-11-05, 2025-03-26, 2025-06-18, 2025-11-25"
+                  : "Bad Request: Unsupported protocol version: 2026-07-28",
             },
           }, { status: 400 });
         }
@@ -295,7 +305,7 @@ export function startLegacyStreamableHttpFixture(
             ? `session-${version}-${initializeCalls}`
             : `session-${version}`;
         }
-        return Response.json({
+        const initializeResponse = {
           jsonrpc: "2.0",
           id: message!.id,
           result: {
@@ -313,7 +323,11 @@ export function startLegacyStreamableHttpFixture(
             serverInfo: { name: "legacy-streamable-fixture", version: "1" },
             instructions: `Use the ${version} legacy HTTP fixture.`,
           },
-        }, {
+        };
+        if (options.initializeSse) {
+          return sseResponse([{ data: initializeResponse }]);
+        }
+        return Response.json(initializeResponse, {
           headers: sessionId ? { "MCP-Session-Id": sessionId } : undefined,
         });
       }

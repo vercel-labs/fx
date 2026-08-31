@@ -11,8 +11,10 @@ const file_index = @import("../../core/workspace/file_index.zig");
 const ui_render = @import("../render.zig");
 const input_presentation = @import("input_presentation.zig");
 const row_text = @import("row_text.zig");
+const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const Allocator = std.mem.Allocator;
+pub const inline_picker_column_gap_width: usize = 4;
 const team_query_prefix = "Vercel team · Search: ";
 const compact_team_query_prefix = "Search: ";
 
@@ -53,7 +55,13 @@ fn teamQueryProjection(query: []const u8, width: u16) TeamQueryProjection {
 }
 
 pub fn authPickerRowCount(view: auth_runtime.PickerView) u16 {
-    if (view.stage == .sign_in) return 7;
+    if (view.stage == .sign_in) {
+        return switch (view.sign_in_source) {
+            .chatgpt_subscription => 4,
+            .grok_subscription => if (view.sign_in_code_visible) 7 else 5,
+            else => 7,
+        };
+    }
     if (view.stage == .api_key) return 4;
     if (view.stage == .root and view.include_skip) return 18;
     if (isSetupListStage(view.stage)) return @intCast(2 + @max(view.choiceCount(), 1));
@@ -134,7 +142,7 @@ fn setupChoiceValue(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
     };
 }
 
-fn setupValueColumn(width: u16) usize {
+fn detailValueColumn(width: u16) usize {
     const width_usize: usize = width;
     const minimum = display_width.visibleWidth("  AI Gateway API key") + 2;
     return @min(width_usize, @max(width_usize * 2 / 3, minimum));
@@ -156,7 +164,7 @@ fn composeSetupChoiceRow(
     try row.appendSlice(alloc, style);
     try row.appendSlice(alloc, if (selected and enabled) "› " else "  ");
 
-    const value_col = setupValueColumn(width);
+    const value_col = detailValueColumn(width);
     const label_width = value_col -| 2;
     try row_text.appendSingleLineEllipsized(
         alloc,
@@ -266,14 +274,20 @@ pub noinline fn composeAuthPickerRow(
     width: u16,
 ) !std.ArrayList(u8) {
     if (view.stage == .sign_in) {
-        const source_row_index = signInProjectedRowIndex(view.sign_in, row_index, row_count);
+        const source_row_index = signInProjectedRowIndex(
+            view.sign_in,
+            view.sign_in_source,
+            view.sign_in_code_visible,
+            row_index,
+            row_count,
+        );
         return composeSignInPickerRow(
             alloc,
             view.sign_in,
             view.sign_in_source,
+            view.sign_in_code_visible,
             view.sign_in_code_mask_count,
             source_row_index,
-            row_count,
             width,
         );
     }
@@ -289,18 +303,40 @@ pub noinline fn composeAuthPickerRow(
     unreachable;
 }
 
-fn signInProjectedRowIndex(snapshot: login_flow.SignInSnapshot, row_index: u16, row_count: u16) u16 {
-    if (row_count >= 7) return row_index;
+fn signInProjectedRowIndex(
+    snapshot: login_flow.SignInSnapshot,
+    source: credentials.Source,
+    manual_code_visible: bool,
+    row_index: u16,
+    row_count: u16,
+) u16 {
+    const codex_priority = [_]u16{ 2, 0, 3, 1 };
+    if (source == .chatgpt_subscription) {
+        return prioritizedRowIndex(4, &codex_priority, row_index, row_count);
+    }
+    const grok_browser_priority = [_]u16{ 2, 3, 0, 4, 1 };
+    if (source == .grok_subscription and !manual_code_visible) {
+        return prioritizedRowIndex(5, &grok_browser_priority, row_index, row_count);
+    }
 
-    const manual_code_priority = [_]u16{ 4, 6, 3, 0, 2, 5, 1 };
+    const manual_code_priority = [_]u16{ 5, 4, 2, 0, 6, 3, 1 };
     const device_code_priority = [_]u16{ 2, 3, 6, 0, 5, 1, 4 };
     const priority = if (snapshot.accepts_manual_code)
-        manual_code_priority
+        &manual_code_priority
     else
-        device_code_priority;
+        &device_code_priority;
+    return prioritizedRowIndex(7, priority, row_index, row_count);
+}
 
+fn prioritizedRowIndex(
+    source_row_count: u16,
+    priority: []const u16,
+    row_index: u16,
+    row_count: u16,
+) u16 {
+    if (row_count >= source_row_count) return row_index;
     var projected_index: u16 = 0;
-    for (0..7) |source_row| {
+    for (0..source_row_count) |source_row| {
         for (priority[0..@min(row_count, priority.len)]) |included_row| {
             if (source_row != included_row) continue;
             if (projected_index == row_index) return @intCast(source_row);
@@ -308,7 +344,7 @@ fn signInProjectedRowIndex(snapshot: login_flow.SignInSnapshot, row_index: u16, 
             break;
         }
     }
-    return 6;
+    return source_row_count -| 1;
 }
 
 const onboarding_note = "   ⚠︎ Note: fx is experimental and defaults to auto mode.";
@@ -391,9 +427,9 @@ fn composeSignInPickerRow(
     alloc: Allocator,
     snapshot: login_flow.SignInSnapshot,
     source: credentials.Source,
+    manual_code_visible: bool,
     manual_code_mask_count: usize,
     row_index: u16,
-    row_count: u16,
     width: u16,
 ) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
@@ -401,50 +437,111 @@ fn composeSignInPickerRow(
     if (width == 0) return row;
     const accepts_manual_code = snapshot.accepts_manual_code;
 
-    try row.appendSlice(
-        alloc,
-        if ((accepts_manual_code and row_index == 4) or
-            (!accepts_manual_code and (row_index == 2 or row_index == 3)))
-            ui_render.selected_completion_style
-        else
-            ui_render.dim_style,
-    );
-    if (row_index == 2 and source == .chatgpt_subscription) {
-        const prefix = "   Open   ";
+    const subscription_source = source == .chatgpt_subscription or source == .grok_subscription;
+    if (subscription_source and row_index == 0) {
+        try row.appendSlice(alloc, ui_render.dim_style);
+        const value_col = detailValueColumn(width);
+        const status = switch (snapshot.state) {
+            .idle => "Preparing sign-in…",
+            .polling => "Waiting for authorization…",
+            .succeeded => "Authorization complete",
+            .failed => "Sign-in failed",
+            .cancelled => "Sign-in cancelled",
+        };
+        const status_col = @max(
+            value_col,
+            @as(usize, width) -| display_width.visibleWidth(status),
+        );
+        try row_text.appendSingleLineEllipsized(
+            alloc,
+            &row,
+            if (source == .chatgpt_subscription) "Sign in with Codex" else "Sign in with Grok",
+            value_col,
+        );
+        if (status_col < width) {
+            try row_text.appendSpacesToColumn(alloc, &row, status_col);
+            try row_text.appendSingleLineEllipsized(
+                alloc,
+                &row,
+                status,
+                @as(usize, width) - status_col,
+            );
+        }
+        try row.appendSlice(alloc, ui_render.reset_style);
+        return row;
+    }
+
+    if (subscription_source and row_index == 2) {
+        try row.appendSlice(alloc, ui_render.selected_completion_style);
+        const prefix = "  Open   ";
         try row_text.appendClipped(alloc, &row, prefix, width);
         const used: u16 = @intCast(@min(display_width.visibleWidth(prefix), width));
         const remaining = width -| used;
         if (remaining > 0) {
-            try row.appendSlice(alloc, "\x1b]8;id=fx-codex-auth;");
+            try row.appendSlice(
+                alloc,
+                if (source == .chatgpt_subscription)
+                    "\x1b]8;id=fx-codex-auth;"
+                else
+                    "\x1b]8;id=fx-grok-auth;",
+            );
             try row.appendSlice(alloc, snapshot.verification_uri);
             try row.appendSlice(alloc, "\x1b\\\x1b[4m");
-            try row_text.appendClipped(alloc, &row, "Authorize with Codex", remaining);
+            try row_text.appendClipped(
+                alloc,
+                &row,
+                if (source == .chatgpt_subscription) "Authorize with Codex" else "Authorize with Grok",
+                remaining,
+            );
             try row.appendSlice(alloc, "\x1b[24m\x1b]8;;\x1b\\");
         }
         try row.appendSlice(alloc, ui_render.reset_style);
         return row;
     }
-    if (accepts_manual_code and row_index == 3) {
-        try row_text.appendClipped(alloc, &row, "   Paste the code shown by xAI if the browser doesn't return", width);
+
+    if (source == .grok_subscription and !manual_code_visible) {
+        try row.appendSlice(alloc, ui_render.dim_style);
+        if (row_index == 3) {
+            try row_text.appendClipped(
+                alloc,
+                &row,
+                "  Browser didn't return? Press Tab to enter a code",
+                width,
+            );
+        }
         try row.appendSlice(alloc, ui_render.reset_style);
         return row;
     }
-    if (accepts_manual_code and row_index == 4) {
-        try row_text.appendClipped(alloc, &row, "   ┃ ", width);
-        var used: u16 = @min(5, width);
+
+    try row.appendSlice(
+        alloc,
+        if ((accepts_manual_code and row_index == 5) or
+            (!accepts_manual_code and (row_index == 2 or row_index == 3)))
+            ui_render.selected_completion_style
+        else
+            ui_render.dim_style,
+    );
+    if (source == .grok_subscription and manual_code_visible and row_index == 4) {
+        try row_text.appendClipped(alloc, &row, "  Paste the code shown by xAI", width);
+        try row.appendSlice(alloc, ui_render.reset_style);
+        return row;
+    }
+    if (source == .grok_subscription and manual_code_visible and row_index == 5) {
+        const prefix = "  ┃ ";
+        try row_text.appendClipped(alloc, &row, prefix, width);
+        const used: u16 = @intCast(@min(display_width.visibleWidth(prefix), width));
         if (manual_code_mask_count == 0) {
             try row.appendSlice(alloc, ui_render.dim_style);
             const placeholder = "Paste or type the code";
             try row_text.appendClipped(alloc, &row, placeholder, width -| used);
-            used +|= @intCast(@min(display_width.visibleWidth(placeholder), width -| used));
         } else {
             const visible_mask_count = @min(manual_code_mask_count, width -| used);
             for (0..visible_mask_count) |_| try row.appendSlice(alloc, "•");
-            used +|= @intCast(visible_mask_count);
         }
-        if (row_count == 1 and used < width) {
-            try row_text.appendClipped(alloc, &row, " · Enter submits · Esc cancels", width - used);
-        }
+        try row.appendSlice(alloc, ui_render.reset_style);
+        return row;
+    }
+    if (source == .grok_subscription and manual_code_visible and row_index == 6) {
         try row.appendSlice(alloc, ui_render.reset_style);
         return row;
     }
@@ -597,10 +694,7 @@ pub fn slashMenuLayout(
     const result_count = mixedSlashCompletionCount(registry, prefix, skills);
     if (result_count == 0) return null;
 
-    const fixed_rows: u16 = 5 +| input_extra +| banner_rows;
-    const minimum_transcript_rows: u16 = 5;
-    const available_picker_rows = (terminal_rows -| fixed_rows) -| minimum_transcript_rows;
-    const row_budget = @min(input_presentation.max_model_picker_rows + 2, @max(available_picker_rows, 1));
+    const row_budget = inlinePickerRowBudget(terminal_rows, input_extra, banner_rows);
     const show_header = row_budget > 2;
     const header_rows: u16 = if (show_header) 2 else 0;
     const selectable_rows = row_budget - header_rows;
@@ -617,6 +711,27 @@ pub fn slashMenuLayout(
         .result_count = result_count,
         .window = window,
     };
+}
+
+pub fn inlinePickerRowBudget(terminal_rows: u16, input_extra: u16, banner_rows: u16) u16 {
+    return inlinePickerRowBudgetCapped(
+        terminal_rows,
+        input_extra,
+        banner_rows,
+        input_presentation.max_model_picker_rows + 2,
+    );
+}
+
+pub fn inlinePickerRowBudgetCapped(
+    terminal_rows: u16,
+    input_extra: u16,
+    banner_rows: u16,
+    max_picker_rows: u16,
+) u16 {
+    const fixed_rows: u16 = 5 +| input_extra +| banner_rows;
+    const minimum_transcript_rows: u16 = 5;
+    const available_picker_rows = (terminal_rows -| fixed_rows) -| minimum_transcript_rows;
+    return @min(max_picker_rows, @max(available_picker_rows, 1));
 }
 
 pub noinline fn composePickerOptionRow(
@@ -636,8 +751,8 @@ pub noinline fn composePickerOptionRow(
     // selection by brightness alone, like the question panel; the other
     // pickers keep the filled row.
     const selected_style = switch (kind) {
-        .model_stage => ui_render.selected_completion_style,
-        .file, .slash, .auth => ui_render.approval_button_inactive_style,
+        .model_stage, .models => ui_render.selected_completion_style,
+        .file, .slash, .skills, .help, .settings, .sessions, .mcp, .auth => ui_render.approval_button_inactive_style,
     };
     try row.appendSlice(alloc, if (selected) selected_style else ui_render.dim_style);
 
@@ -699,6 +814,7 @@ pub fn composePickerStatusRow(
             .effort => "no matching effort",
             .fast => "no matching mode",
         },
+        .models => "no models available",
         .file => if (loading)
             "indexing files..."
         else if (failed)
@@ -706,6 +822,11 @@ pub fn composePickerStatusRow(
         else
             "no matching files",
         .slash => "no matching slash commands",
+        .skills => "no matching skills",
+        .help => "no matching commands",
+        .settings => "no matching settings",
+        .sessions => "no matching sessions",
+        .mcp => "no MCP items available",
         .auth => "authentication actions unavailable",
     };
 
@@ -1185,10 +1306,10 @@ const picker_test_slash_specs = [_]command_specs.SlashSpec{
     .{ .kind = .help, .command = "/help", .help_entry = "/help", .completion_description = "show available slash commands", .presentation_category = .general },
     .{ .kind = .clear_screen, .command = "/clear", .help_entry = "/clear", .completion_description = "clear the terminal transcript", .presentation_category = .general },
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true },
-    .{ .kind = .models, .command = "/models", .help_entry = "/models", .completion_description = "browse available models", .presentation_category = .model },
     .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|resource|prompt|add|remove]", .completion_description = "manage MCP servers, resources, and prompts", .presentation_category = .extensions, .has_args = true },
     .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|remember|revoke|yolo|reset]", .completion_description = "choose permission behavior", .presentation_category = .security, .has_args = true },
     .{ .kind = .credits, .command = "/credits", .aliases = &.{"/balance"}, .help_entry = "/credits (/balance)", .completion_description = "show gateway credits balance", .presentation_category = .account },
+    .{ .kind = .settings, .command = "/settings", .help_entry = "/settings", .completion_description = "configure fx", .presentation_category = .general },
 };
 const picker_test_slash_registry = command_specs.SlashRegistry{ .commands = picker_test_slash_specs[0..] };
 
@@ -1223,6 +1344,13 @@ test "slash menu layout keeps six selectable rows below its header" {
     const scrolled = slashMenuLayout(picker_test_slash_registry, "/", &.{}, 6, 0, 24, 0, 0).?;
     try std.testing.expectEqual(@as(usize, 1), scrolled.window.start);
     try std.testing.expectEqual(@as(usize, 7), scrolled.window.end);
+}
+
+test "inline picker row budget preserves six roomy choices and shrinks with height" {
+    try std.testing.expectEqual(@as(u16, 8), inlinePickerRowBudget(24, 0, 0));
+    try std.testing.expectEqual(@as(u16, 6), inlinePickerRowBudget(16, 0, 0));
+    try std.testing.expectEqual(@as(u16, 2), inlinePickerRowBudget(16, 0, 4));
+    try std.testing.expectEqual(@as(u16, 1), inlinePickerRowBudget(6, 0, 0));
 }
 
 test "slash menu layout prioritizes selection at short heights and excludes arguments" {
@@ -1270,7 +1398,7 @@ test "slash menu rows prioritize marker label description and category by width"
     const model_offset = std.mem.find(u8, wide.items, "Model") orelse return error.TestExpectedMetadata;
     const model_column = display_width.visibleWidthIgnoringAnsi(wide.items[0..model_offset]);
 
-    var extensions = try composeSlashMenuOptionRow(std.testing.allocator, picker_test_slash_registry, "/m", &.{}, 2, false, column_widths, 100, true);
+    var extensions = try composeSlashMenuOptionRow(std.testing.allocator, picker_test_slash_registry, "/m", &.{}, 1, false, column_widths, 100, true);
     defer extensions.deinit(std.testing.allocator);
     const extensions_offset = std.mem.find(u8, extensions.items, "Extensions") orelse return error.TestExpectedMetadata;
     try std.testing.expectEqual(model_column, display_width.visibleWidthIgnoringAnsi(extensions.items[0..extensions_offset]));
@@ -1313,7 +1441,7 @@ test "slash menu hides metadata for commands and skills" {
 test "slash menu keeps matching skill source labels" {
     const skills = [_]skill_runtime.Skill{.{
         .name = "fx-test-strategy",
-        .description = "choose focused regression coverage for the affected Fx behavior",
+        .description = "choose focused regression coverage for the affected fx behavior",
         .path = "/tmp/.codex/skills/fx-test-strategy",
         .source = .global_codex,
     }};
@@ -2110,7 +2238,7 @@ test "sign-in stage renders the complete device authorization screen" {
 test "Codex sign-in stage renders a bounded clickable authorization action" {
     const alloc = std.testing.allocator;
     const url = "https://auth.openai.test/oauth/authorize?response_type=code&client_id=test&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=full-state";
-    var view = auth_runtime.PickerView{
+    const view = auth_runtime.PickerView{
         .active = true,
         .available_sources = .empty,
         .selected_choice = null,
@@ -2126,25 +2254,198 @@ test "Codex sign-in stage renders a bounded clickable authorization action" {
 
     var row = try composeAuthPickerRow(alloc, view, 2, authPickerRowCount(view), 40);
     defer row.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, row.items, "   Open   ") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "  Open   ") != null);
     try std.testing.expect(std.mem.find(u8, row.items, "Authorize with Codex") != null);
     try std.testing.expect(std.mem.find(u8, row.items, "\x1b]8;") != null);
     try std.testing.expect(std.mem.find(u8, row.items, url) != null);
     try std.testing.expect(std.mem.find(u8, row.items, "\x1b]8;;\x1b\\") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 40);
-
-    view.sign_in.accepts_manual_code = true;
-    view.sign_in_code_mask_count = 3;
-    var manual = try composeAuthPickerRow(alloc, view, 4, authPickerRowCount(view), 40);
-    defer manual.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, manual.items, "•••") != null);
-    try std.testing.expect(std.mem.find(u8, manual.items, ui_render.selected_completion_style) != null);
-    var hint = try composeAuthPickerRow(alloc, view, 6, authPickerRowCount(view), 80);
-    defer hint.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, hint.items, "Enter submits or reopens browser") != null);
 }
 
-test "compact Grok sign-in keeps masked code entry and controls visible" {
+fn composeAuthPickerTestGrid(
+    alloc: Allocator,
+    view: auth_runtime.PickerView,
+    width: u16,
+) !vt_emulator.Grid {
+    const row_count = authPickerRowCount(view);
+    var screen: std.ArrayList(u8) = .empty;
+    defer screen.deinit(alloc);
+    for (0..row_count) |row_index| {
+        if (row_index > 0) try screen.appendSlice(alloc, "\r\n");
+        var row = try composeAuthPickerRow(alloc, view, @intCast(row_index), row_count, width);
+        defer row.deinit(alloc);
+        try screen.appendSlice(alloc, row.items);
+    }
+
+    var grid = try vt_emulator.Grid.init(alloc, width, row_count);
+    errdefer grid.deinit();
+    try grid.feed(screen.items);
+    return grid;
+}
+
+test "Codex sign-in projects the compact aligned footer through the VT emulator" {
+    const alloc = std.testing.allocator;
+    const url = "https://issuer.test/oauth/authorize?state=codex-state";
+    const view = auth_runtime.PickerView{
+        .active = true,
+        .available_sources = .empty,
+        .selected_choice = null,
+        .active_source = null,
+        .include_skip = false,
+        .stage = .sign_in,
+        .sign_in_source = .chatgpt_subscription,
+        .sign_in = .{
+            .state = .polling,
+            .verification_uri = url,
+        },
+    };
+
+    try std.testing.expectEqual(@as(u16, 4), authPickerRowCount(view));
+    var grid = try composeAuthPickerTestGrid(alloc, view, 80);
+    defer grid.deinit();
+
+    var row: std.ArrayList(u8) = .empty;
+    defer row.deinit(alloc);
+    try grid.rowTextTrimmed(1, &row);
+    try std.testing.expectEqualStrings(
+        "Sign in with Codex                                    Waiting for authorization…",
+        row.items,
+    );
+    row.clearRetainingCapacity();
+    try grid.rowTextTrimmed(2, &row);
+    try std.testing.expectEqualStrings("", row.items);
+    row.clearRetainingCapacity();
+    try grid.rowTextTrimmed(3, &row);
+    try std.testing.expectEqualStrings("  Open   Authorize with Codex", row.items);
+    row.clearRetainingCapacity();
+    try grid.rowTextTrimmed(4, &row);
+    try std.testing.expectEqualStrings("", row.items);
+
+    const link_cell = grid.cellAt(3, 10).?;
+    try std.testing.expect(link_cell.style.hyperlink_id != 0);
+    try std.testing.expectEqualStrings(url, grid.hyperlinkUrl(link_cell.style.hyperlink_id).?);
+}
+
+test "Grok sign-in starts with the collapsed browser flow in the VT emulator" {
+    const alloc = std.testing.allocator;
+    const url = "https://auth.x.ai/oauth2/authorize?state=grok-state";
+    const view = auth_runtime.PickerView{
+        .active = true,
+        .available_sources = .empty,
+        .selected_choice = null,
+        .active_source = null,
+        .include_skip = false,
+        .stage = .sign_in,
+        .sign_in_source = .grok_subscription,
+        .sign_in = .{
+            .state = .polling,
+            .verification_uri = url,
+            .accepts_manual_code = true,
+        },
+    };
+
+    try std.testing.expectEqual(@as(u16, 5), authPickerRowCount(view));
+    var grid = try composeAuthPickerTestGrid(alloc, view, 80);
+    defer grid.deinit();
+
+    var row: std.ArrayList(u8) = .empty;
+    defer row.deinit(alloc);
+    const expected_rows = [_][]const u8{
+        "Sign in with Grok                                     Waiting for authorization…",
+        "",
+        "  Open   Authorize with Grok",
+        "  Browser didn't return? Press Tab to enter a code",
+        "",
+    };
+    for (expected_rows, 1..) |expected, row_index| {
+        row.clearRetainingCapacity();
+        try grid.rowTextTrimmed(@intCast(row_index), &row);
+        try std.testing.expectEqualStrings(expected, row.items);
+    }
+
+    const link_cell = grid.cellAt(3, 10).?;
+    try std.testing.expect(link_cell.style.hyperlink_id != 0);
+    try std.testing.expectEqualStrings(url, grid.hyperlinkUrl(link_cell.style.hyperlink_id).?);
+}
+
+test "Grok manual fallback projects the approved expanded layout through the VT emulator" {
+    const alloc = std.testing.allocator;
+    const url = "https://auth.x.ai/oauth2/authorize?state=grok-manual-state";
+    const view = auth_runtime.PickerView{
+        .active = true,
+        .available_sources = .empty,
+        .selected_choice = null,
+        .active_source = null,
+        .include_skip = false,
+        .stage = .sign_in,
+        .sign_in_source = .grok_subscription,
+        .sign_in = .{
+            .state = .polling,
+            .verification_uri = url,
+            .accepts_manual_code = true,
+        },
+        .sign_in_code_visible = true,
+    };
+
+    try std.testing.expectEqual(@as(u16, 7), authPickerRowCount(view));
+    var grid = try composeAuthPickerTestGrid(alloc, view, 80);
+    defer grid.deinit();
+
+    var row: std.ArrayList(u8) = .empty;
+    defer row.deinit(alloc);
+    const expected_rows = [_][]const u8{
+        "Sign in with Grok                                     Waiting for authorization…",
+        "",
+        "  Open   Authorize with Grok",
+        "",
+        "  Paste the code shown by xAI",
+        "  ┃ Paste or type the code",
+        "",
+    };
+    for (expected_rows, 1..) |expected, row_index| {
+        row.clearRetainingCapacity();
+        try grid.rowTextTrimmed(@intCast(row_index), &row);
+        try std.testing.expectEqualStrings(expected, row.items);
+    }
+
+    const link_cell = grid.cellAt(3, 10).?;
+    try std.testing.expect(link_cell.style.hyperlink_id != 0);
+    try std.testing.expectEqualStrings(url, grid.hyperlinkUrl(link_cell.style.hyperlink_id).?);
+}
+
+test "compact subscription browser sign-in prioritizes the authorization action" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        source: credentials.Source,
+        label: []const u8,
+    }{
+        .{ .source = .chatgpt_subscription, .label = "Authorize with Codex" },
+        .{ .source = .grok_subscription, .label = "Authorize with Grok" },
+    };
+
+    for (cases) |case| {
+        const view = auth_runtime.PickerView{
+            .active = true,
+            .available_sources = .empty,
+            .selected_choice = null,
+            .active_source = null,
+            .include_skip = false,
+            .stage = .sign_in,
+            .sign_in_source = case.source,
+            .sign_in = .{
+                .state = .polling,
+                .verification_uri = "https://issuer.test/authorize",
+                .accepts_manual_code = case.source == .grok_subscription,
+            },
+        };
+
+        var row = try composeAuthPickerRow(alloc, view, 0, 1, 80);
+        defer row.deinit(alloc);
+        try std.testing.expect(std.mem.find(u8, row.items, case.label) != null);
+    }
+}
+
+test "compact Grok sign-in keeps masked code entry without duplicate controls" {
     const alloc = std.testing.allocator;
     const view = auth_runtime.PickerView{
         .active = true,
@@ -2159,14 +2460,15 @@ test "compact Grok sign-in keeps masked code entry and controls visible" {
             .verification_uri = "https://x.ai/authorize",
             .accepts_manual_code = true,
         },
+        .sign_in_code_visible = true,
         .sign_in_code_mask_count = 3,
     };
 
     var row = try composeAuthPickerRow(alloc, view, 0, 1, 80);
     defer row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, row.items, "•••") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "Enter submits") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "Esc cancels") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "Enter submits") == null);
+    try std.testing.expect(std.mem.find(u8, row.items, "Esc cancels") == null);
     try std.testing.expect(std.mem.find(u8, row.items, ui_render.selected_completion_style) != null);
 }
 

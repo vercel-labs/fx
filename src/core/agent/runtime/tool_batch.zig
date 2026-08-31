@@ -311,23 +311,23 @@ pub fn processCommittedFileResult(
     }
     const committed_contract_degraded =
         execution.status != .success or
-        execution.prepared_result_memory == null or
+        !execution.tool_result_memory_prepared or
+        execution.tool_result_memory == null or
         execution.diff_entry != null or
-        execution.display_output != null or
         execution.finish_turn;
     if (committed_contract_degraded) {
         debug_trace.eventf(
             "tool",
             "committed_result_contract_degraded",
             step_ctx,
-            "call_id={s} name={s} status={s} memory={s} diff={s} display={s} finish_turn={s}",
+            "call_id={s} name={s} status={s} memory={s} diff={s} finish_turn={s}",
             .{
                 tool_call.id,
                 tool_call.name,
                 @tagName(execution.status),
-                if (execution.prepared_result_memory != null) "true" else "false",
+                if (execution.tool_result_memory_prepared and
+                    execution.tool_result_memory != null) "true" else "false",
                 if (execution.diff_entry != null) "true" else "false",
-                if (execution.display_output != null) "true" else "false",
                 if (execution.finish_turn) "true" else "false",
             },
         );
@@ -336,11 +336,14 @@ pub fn processCommittedFileResult(
         }
     }
 
-    var prepared_memory = execution.prepared_result_memory orelse
-        types.ToolResultMemory{
-            .output_bytes = execution.model_output.len,
-            .stored_output_bytes = execution.model_output.len,
-        };
+    const fallback_memory = types.ToolResultMemory{
+        .output_bytes = execution.model_output.len,
+        .stored_output_bytes = execution.model_output.len,
+    };
+    var prepared_memory = if (execution.tool_result_memory_prepared)
+        execution.tool_result_memory orelse fallback_memory
+    else
+        fallback_memory;
     prepared_memory.committed_file_presentation = runtime_execution_memory.captureCommittedFilePresentation(
         history_allocator,
         handoff,

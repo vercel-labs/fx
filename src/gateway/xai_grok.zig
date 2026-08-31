@@ -120,25 +120,27 @@ fn streamCompletion(
     alloc: Allocator,
     request: stream_provider.ModelRequest,
 ) !stream_provider.Result {
-    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
     if (request.credential.source != .grok_subscription) {
-        return error.GrokSubscriptionCredentialRequired;
+        return stream_provider.failResult(error.GrokSubscriptionCredentialRequired);
     }
     const account_id = request.credential.account_id orelse
-        return error.GrokSubscriptionAccountRequired;
-    if (!grok_session.validAccountId(account_id)) return error.InvalidGrokSubscriptionAccount;
+        return stream_provider.failResult(error.GrokSubscriptionAccountRequired);
+    if (!grok_session.validAccountId(account_id)) {
+        return stream_provider.failResult(error.InvalidGrokSubscriptionAccount);
+    }
     try validateModel(request.model);
     const payload = try buildRequest(alloc, request.data());
     defer alloc.free(payload);
     var result = streamPrepared(alloc, request, payload) catch |err| {
-        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-        if (requestDeadlineExpired(request)) return error.Timeout;
+        if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
+        if (requestDeadlineExpired(request)) return stream_provider.failResult(error.Timeout);
         request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(err, request.delivery.load());
         return err;
     };
     if (requestDeadlineExpired(request)) {
         result.deinit(alloc);
-        return error.Timeout;
+        return stream_provider.failResult(error.Timeout);
     }
     return result;
 }
@@ -190,12 +192,14 @@ pub fn streamPrepared(
     request: stream_provider.ModelRequest,
     payload: []const u8,
 ) !stream_provider.Result {
-    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
     const account_id = request.credential.account_id.?;
     const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.credential.secret});
     defer secret.zeroAndFree(alloc, auth_header);
     const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
-        if (!gateway_client.isLoopbackHttpUrl(override)) return error.InvalidE2EXaiGrokEndpoint;
+        if (!gateway_client.isLoopbackHttpUrl(override)) {
+            return stream_provider.failResult(error.InvalidE2EXaiGrokEndpoint);
+        }
         break :endpoint override;
     } else endpoint;
     const uri = try std.Uri.parse(request_endpoint);
@@ -302,7 +306,7 @@ pub fn streamPrepared(
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
     var events = request.events;
-    const completion = try consumeSse(
+    var completion = try consumeSse(
         alloc,
         reader,
         &events,
@@ -313,9 +317,29 @@ pub fn streamPrepared(
         request.cancel_flag,
         request.content_capture_limit,
     );
+    errdefer {
+        var owned = stream_provider.Result{ .completed = .{
+            .completion = completion,
+            .ownership = .owned,
+        } };
+        owned.deinit(alloc);
+    }
+    const usage_outcome: stream_provider.UsageOutcome = usage: {
+        if (completion.generation_id == null) {
+            break :usage .{ .unavailable = .possibly_billed };
+        }
+        completion.billing = try responses_protocol.buildSubscriptionBilling(
+            alloc,
+            .grok,
+            request.model,
+            @max(io_mod.milliTimestamp(), 0),
+            completion.usage,
+        ) orelse break :usage .{ .unavailable = .possibly_billed };
+        break :usage .{ .exact = .grok };
+    };
     return .{ .completed = .{
         .completion = completion,
-        .usage = .{ .immediate = null },
+        .usage = usage_outcome,
         .ownership = .owned,
     } };
 }

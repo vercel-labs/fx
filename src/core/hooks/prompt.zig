@@ -1,7 +1,7 @@
 const std = @import("std");
 const definitions = @import("definitions.zig");
 
-const continuation_prefix = "Continue the turn. Fx hook context:\n";
+const continuation_prefix = "Continue the turn. fx hook context:\n";
 
 pub const StopInput = definitions.StopInput;
 pub const StopAction = definitions.StopAction;
@@ -39,7 +39,7 @@ test "Stop continuation message uses the shared hook prefix" {
     defer std.testing.allocator.free(message);
 
     try std.testing.expectEqualStrings(
-        "Continue the turn. Fx hook context:\nverify the answer",
+        "Continue the turn. fx hook context:\nverify the answer",
         message,
     );
 }

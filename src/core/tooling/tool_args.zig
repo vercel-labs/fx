@@ -1,4 +1,77 @@
 const std = @import("std");
+const lexical_relevance = @import("../shared/lexical_relevance.zig");
+
+pub const OwnedSearchQueryInput = struct {
+    query: []u8,
+    prepared: lexical_relevance.PreparedQuery,
+
+    pub fn deinit(self: *OwnedSearchQueryInput, alloc: std.mem.Allocator) void {
+        alloc.free(self.query);
+        self.* = undefined;
+    }
+};
+
+pub const OwnedSearchQueryDecode = union(enum) {
+    failure: []u8,
+    input: *OwnedSearchQueryInput,
+};
+
+pub noinline fn decodeOwnedSearchQuery(
+    alloc: std.mem.Allocator,
+    args_json: []const u8,
+    tool_name: []const u8,
+) error{OutOfMemory}!OwnedSearchQueryDecode {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, args_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .failure = try prefixedFailure(alloc, tool_name, " arguments must be valid JSON") },
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) {
+        return .{ .failure = try prefixedFailure(alloc, tool_name, " arguments must be an object") };
+    }
+    const query_value = parsed.value.object.get("query") orelse {
+        return .{ .failure = try prefixedFailure(alloc, tool_name, " field \"query\" is required") };
+    };
+    if (query_value != .string) {
+        return .{ .failure = try prefixedFailure(alloc, tool_name, " field \"query\" must be a string") };
+    }
+    if (query_value.string.len > lexical_relevance.max_query_bytes) {
+        return .{ .failure = try prefixedFailure(alloc, tool_name, " query must not exceed 4096 bytes") };
+    }
+
+    const query = try alloc.dupe(u8, query_value.string);
+    errdefer alloc.free(query);
+    const prepared = lexical_relevance.prepare(query) catch |err| switch (err) {
+        error.QueryTooLong => unreachable,
+        error.TooManyTokens => {
+            const body = try prefixedFailure(alloc, tool_name, " query must not exceed 64 tokens");
+            alloc.free(query);
+            return .{ .failure = body };
+        },
+    };
+    const input = try alloc.create(OwnedSearchQueryInput);
+    input.* = .{ .query = query, .prepared = prepared };
+    return .{ .input = input };
+}
+
+pub fn destroyOwnedSearchQueryInput(ptr: *anyopaque, alloc: std.mem.Allocator) void {
+    const input: *OwnedSearchQueryInput = @ptrCast(@alignCast(ptr));
+    input.deinit(alloc);
+    alloc.destroy(input);
+}
+
+noinline fn prefixedFailure(
+    alloc: std.mem.Allocator,
+    prefix: []const u8,
+    suffix: []const u8,
+) error{OutOfMemory}![]u8 {
+    const len = std.math.add(usize, prefix.len, suffix.len) catch return error.OutOfMemory;
+    const message = try alloc.alloc(u8, len);
+    @memcpy(message[0..prefix.len], prefix);
+    @memcpy(message[prefix.len..], suffix);
+    return message;
+}
 
 pub fn parseToolArgsObject(alloc: std.mem.Allocator, args_json: []const u8) !std.json.ObjectMap {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, args_json, .{});

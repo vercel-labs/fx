@@ -279,7 +279,7 @@ fn callbackPage(comptime title: []const u8, comptime detail: []const u8) []const
         "</style></head><body><main><h1>" ++ title ++ "</h1><p>" ++ detail ++ "</p></main></body></html>";
 }
 
-fn writeResponse(stream: std.Io.net.Stream, outcome: Response, cors_origin: ?[]const u8) !void {
+pub fn writeResponse(stream: std.Io.net.Stream, outcome: Response, cors_origin: ?[]const u8) !void {
     const reply: struct { status: []const u8, body: []const u8 } = switch (outcome) {
         .ok => .{
             .status = "200 OK",

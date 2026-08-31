@@ -9,6 +9,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -552,6 +553,7 @@ def _execute_scenario(
     command_runner: Callable[..., CommandResult],
     run_index: int = 0,
     run_count: int = 1,
+    attempt_index: int = 0,
 ) -> CommandResult:
     scenario_home = runtime_home / scenario.name
     _prepare_runtime_home(scenario_home, allow_keychain=scenario.allow_keychain)
@@ -573,6 +575,8 @@ def _execute_scenario(
             if run_count == 1
             else f"{scenario.name}-run-{run_index + 1:03d}"
         )
+        if attempt_index > 0:
+            log_name += f"-attempt-{attempt_index + 1}"
         return command_runner(
             _scenario_argv(scenario, canonical, bun),
             cwd=_resolve_cwd(corpus.repo_root, scenario.cwd),
@@ -590,6 +594,32 @@ def _execute_scenario(
             except Exception:
                 if primary_error is None:
                     raise
+
+
+def _reset_failed_tmux_e2e_attempt(
+    runtime_home: pathlib.Path,
+    scenario: Scenario,
+    environment: Mapping[str, str],
+    state: object,
+) -> None:
+    scenario_home = runtime_home / scenario.name
+    if scenario_home.parent != runtime_home or scenario_home.is_symlink():
+        raise PgsoError(f"refusing to reset unsafe scenario home: {scenario_home}")
+    shutil.rmtree(scenario_home, ignore_errors=False)
+
+    profile_pattern = environment.get("LLVM_PROFILE_FILE")
+    if profile_pattern is not None:
+        if not isinstance(state, set):
+            raise PgsoError("invalid training profile snapshot")
+        profile_dir = pathlib.Path(profile_pattern).parent
+        for profile in set(profile_dir.glob("*.profraw")) - state:
+            if profile.parent != profile_dir or profile.suffix != ".profraw":
+                raise PgsoError(f"refusing to remove unsafe profile path: {profile}")
+            profile.unlink()
+
+    trace_path = environment.get("FX_TRACE_LOG")
+    if trace_path is not None:
+        pathlib.Path(trace_path).unlink(missing_ok=True)
 
 
 def _run_scenarios(
@@ -617,18 +647,41 @@ def _run_scenarios(
                 state = prepare(scenario, environment)
                 run_count = scenario.profile_runs if repeat_profile_runs else 1
                 for run_index in range(run_count):
-                    command_result = _execute_scenario(
-                        corpus,
-                        scenario,
-                        canonical,
-                        bun,
-                        runtime_home,
-                        log_dir,
-                        environment,
-                        command_runner,
-                        run_index,
-                        run_count,
-                    )
+                    attempts = 2 if (
+                        scenario.test_file is not None and
+                        scenario.requires_tmux and
+                        run_count == 1
+                    ) else 1
+                    for attempt_index in range(attempts):
+                        try:
+                            command_result = _execute_scenario(
+                                corpus,
+                                scenario,
+                                canonical,
+                                bun,
+                                runtime_home,
+                                log_dir,
+                                environment,
+                                command_runner,
+                                run_index,
+                                run_count,
+                                attempt_index,
+                            )
+                            break
+                        except Exception:
+                            if attempt_index + 1 >= attempts:
+                                raise
+                            _reset_failed_tmux_e2e_attempt(
+                                runtime_home,
+                                scenario,
+                                environment,
+                                state,
+                            )
+                            print(
+                                f"[pgso] retrying failed tmux E2E scenario "
+                                f"after isolated state reset: {scenario.name}",
+                                file=sys.stderr,
+                            )
                     elapsed_seconds += command_result.elapsed_seconds
                 assert command_result is not None
                 raw_profiles = finish(scenario, command_result, state)

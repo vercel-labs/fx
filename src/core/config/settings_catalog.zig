@@ -27,6 +27,7 @@ pub const SettingId = enum {
     statusline_session,
     statusline_workspace,
     slash_menu_categories,
+    collapse_tool_calls,
     model,
     effort,
     fast_mode,
@@ -54,6 +55,7 @@ pub const Snapshot = struct {
     statusline_session: bool = false,
     statusline_workspace: bool = false,
     slash_menu_categories: bool = true,
+    collapse_tool_calls: bool = false,
     startup_scrollback: bool = true,
     prompt_history: bool = true,
     sound_level: []const u8 = "on",
@@ -68,6 +70,7 @@ pub const Snapshot = struct {
             .statusline_session => onOff(self.statusline_session),
             .statusline_workspace => onOff(self.statusline_workspace),
             .slash_menu_categories => onOff(self.slash_menu_categories),
+            .collapse_tool_calls => onOff(self.collapse_tool_calls),
             .startup_scrollback => onOff(self.startup_scrollback),
             .prompt_history => onOff(self.prompt_history),
             .sound_level => self.sound_level,
@@ -253,6 +256,7 @@ const specs = [_]Spec{
     .{ .id = .statusline_session, .category = .interface, .label = "Status line session", .description = "Show the session title in the status line" },
     .{ .id = .statusline_workspace, .category = .interface, .label = "Status line workspace", .description = "Show the workspace path and Git branch in the status line" },
     .{ .id = .slash_menu_categories, .category = .interface, .label = "Slash menu categories", .description = "Show categories and skill sources in slash-command results" },
+    .{ .id = .collapse_tool_calls, .category = .interface, .label = "Collapse tool calls", .description = "Show only a summary for each group of tool calls" },
     .{ .id = .model, .category = .agent, .label = "Model", .description = "Choose the model used for new turns" },
     .{ .id = .effort, .category = .agent, .label = "Reasoning effort", .description = "Control how much reasoning the model applies" },
     .{ .id = .fast_mode, .category = .agent, .label = "Fast mode", .description = "Use faster inference when the model supports it" },
@@ -367,6 +371,7 @@ fn staticOptionsFor(id: SettingId) []const []const u8 {
         .statusline_session,
         .statusline_workspace,
         .slash_menu_categories,
+        .collapse_tool_calls,
         .startup_scrollback,
         .prompt_history,
         => &on_off_options,
@@ -425,8 +430,8 @@ test "settings catalog projects grouped searchable preferences" {
         .sound_level = "on",
     };
 
-    try std.testing.expectEqual(@as(usize, 11), filteredCount(snapshot, .all, ""));
-    try std.testing.expectEqual(@as(usize, 4), filteredCount(snapshot, .interface, ""));
+    try std.testing.expectEqual(@as(usize, 12), filteredCount(snapshot, .all, ""));
+    try std.testing.expectEqual(@as(usize, 5), filteredCount(snapshot, .interface, ""));
     try std.testing.expectEqual(@as(usize, 4), filteredCount(snapshot, .agent, ""));
     try std.testing.expectEqual(@as(usize, 1), filteredCount(snapshot, .notifications, ""));
     try std.testing.expectEqual(@as(usize, 2), filteredCount(snapshot, .advanced, ""));
@@ -467,6 +472,18 @@ test "settings catalog returns typed edit choices without effects" {
     try std.testing.expectEqualStrings("future-tier", optionAt(&snapshot, .effort, 1).?);
     try std.testing.expectEqualStrings("high", optionAt(&snapshot, .effort, 2).?);
     try std.testing.expectEqual(@as(usize, 1), selectedOptionIndex(&snapshot, .effort).?);
+}
+
+test "settings catalog exposes collapse tool calls as an interface toggle" {
+    const expanded: Snapshot = .{ .collapse_tool_calls = false };
+    const item = itemAt(expanded, .interface, "collapse tool calls", 0).?;
+
+    try std.testing.expectEqual(SettingId.collapse_tool_calls, item.id);
+    try std.testing.expectEqualStrings("Collapse tool calls", item.label);
+    try std.testing.expectEqualStrings("off", item.value);
+    const collapse = changeAt(&expanded, .collapse_tool_calls, 1).?;
+    try std.testing.expectEqual(SettingId.collapse_tool_calls, collapse.setting);
+    try std.testing.expectEqualStrings("on", collapse.value);
 }
 
 test "settings catalog exposes slash menu categories as an interface toggle" {

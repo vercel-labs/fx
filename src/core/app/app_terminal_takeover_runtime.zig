@@ -423,7 +423,7 @@ pub const Controller = struct {
         const profile_user = identity.profileUser(&profile_user_buffer) orelse
             return self.restoreManagerAfterOpenFailure(App, app, "unsupported host");
         const durable_session_id = app_session_runtime.Runtime(App).activeSessionId(app) orelse
-            return self.restoreManagerAfterOpenFailure(App, app, "no durable Fx session");
+            return self.restoreManagerAfterOpenFailure(App, app, "no durable fx session");
         const owner = app_session_runtime.Runtime(App).childCapability(app) orelse
             return self.restoreManagerAfterOpenFailure(App, app, "durable session unavailable");
         var authority = store.reloadHumanTakeoverAuthorityClaim(app.alloc, owner, .{

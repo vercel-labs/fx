@@ -5,6 +5,7 @@ const elicitation = @import("elicitation.zig");
 const mcp_contract = @import("mcp_contract.zig");
 
 pub const legacy_protocol_version = "2024-11-05";
+pub const legacy_2025_03_protocol_version = "2025-03-26";
 pub const legacy_2025_06_protocol_version = "2025-06-18";
 pub const legacy_2025_11_protocol_version = "2025-11-25";
 pub const modern_protocol_version = "2026-07-28";
@@ -49,12 +50,14 @@ pub const HttpDiscoveryOutcome = enum {
 pub const LegacyStdioVersion = enum {
     v2025_11_25,
     v2025_06_18,
+    v2025_03_26,
     v2024_11_05,
 
     pub fn string(self: LegacyStdioVersion) []const u8 {
         return switch (self) {
             .v2025_11_25 => legacy_2025_11_protocol_version,
             .v2025_06_18 => legacy_2025_06_protocol_version,
+            .v2025_03_26 => legacy_2025_03_protocol_version,
             .v2024_11_05 => legacy_protocol_version,
         };
     }
@@ -63,13 +66,14 @@ pub const LegacyStdioVersion = enum {
         return switch (self) {
             .v2025_11_25 => .legacy_mcp_2025_11,
             .v2025_06_18 => .legacy_mcp_2025_06,
-            .v2024_11_05 => null,
+            .v2025_03_26, .v2024_11_05 => null,
         };
     }
 
     pub fn parse(value: []const u8) ?LegacyStdioVersion {
         if (std.mem.eql(u8, value, legacy_2025_11_protocol_version)) return .v2025_11_25;
         if (std.mem.eql(u8, value, legacy_2025_06_protocol_version)) return .v2025_06_18;
+        if (std.mem.eql(u8, value, legacy_2025_03_protocol_version)) return .v2025_03_26;
         if (std.mem.eql(u8, value, legacy_protocol_version)) return .v2024_11_05;
         return null;
     }
@@ -77,15 +81,17 @@ pub const LegacyStdioVersion = enum {
     pub fn older(self: LegacyStdioVersion) ?LegacyStdioVersion {
         return switch (self) {
             .v2025_11_25 => .v2025_06_18,
-            .v2025_06_18 => .v2024_11_05,
+            .v2025_06_18 => .v2025_03_26,
+            .v2025_03_26 => .v2024_11_05,
             .v2024_11_05 => null,
         };
     }
 
-    fn preference(self: LegacyStdioVersion) u2 {
+    fn preference(self: LegacyStdioVersion) u3 {
         return switch (self) {
-            .v2025_11_25 => 3,
-            .v2025_06_18 => 2,
+            .v2025_11_25 => 4,
+            .v2025_06_18 => 3,
+            .v2025_03_26 => 2,
             .v2024_11_05 => 1,
         };
     }
@@ -238,6 +244,7 @@ pub fn selectLegacyStdioVersionForRequest(
     inline for ([_]LegacyStdioVersion{
         .v2025_11_25,
         .v2025_06_18,
+        .v2025_03_26,
         .v2024_11_05,
     }) |version| {
         if (protocolErrorSupportsVersionForRequest(
@@ -316,11 +323,14 @@ test "legacy initialization transitions are bounded and monotonic" {
         .{ .offered = .v2025_11_25, .observation = .{ .accepted = .v2025_11_25 }, .expected = .{ .accept = .v2025_11_25 } },
         .{ .offered = .v2025_11_25, .observation = .{ .accepted = .v2024_11_05 }, .expected = .{ .accept = .v2024_11_05 } },
         .{ .offered = .v2025_06_18, .observation = .{ .accepted = .v2025_11_25 }, .expected = .{ .accept = .v2025_11_25 } },
+        .{ .offered = .v2025_03_26, .observation = .{ .accepted = .v2025_03_26 }, .expected = .{ .accept = .v2025_03_26 } },
         .{ .offered = .v2025_11_25, .observation = .connection_closed, .expected = .{ .retry = .v2025_06_18 } },
-        .{ .offered = .v2025_06_18, .observation = .connection_closed, .expected = .{ .retry = .v2024_11_05 } },
+        .{ .offered = .v2025_06_18, .observation = .connection_closed, .expected = .{ .retry = .v2025_03_26 } },
+        .{ .offered = .v2025_03_26, .observation = .connection_closed, .expected = .{ .retry = .v2024_11_05 } },
         .{ .offered = .v2024_11_05, .observation = .connection_closed, .expected = .fail },
         .{ .offered = .v2025_11_25, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2025_06_18 } },
-        .{ .offered = .v2025_06_18, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2024_11_05 } },
+        .{ .offered = .v2025_06_18, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2025_03_26 } },
+        .{ .offered = .v2025_03_26, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2024_11_05 } },
         .{ .offered = .v2024_11_05, .observation = .{ .unsupported = null }, .expected = .fail },
         .{ .offered = .v2025_11_25, .observation = .{ .unsupported = .v2024_11_05 }, .expected = .{ .retry = .v2024_11_05 } },
         .{ .offered = .v2025_11_25, .observation = .{ .unsupported = .v2025_11_25 }, .expected = .fail },
@@ -332,6 +342,21 @@ test "legacy initialization transitions are bounded and monotonic" {
             decideLegacyInitializeTransition(case.offered, case.observation),
         );
     }
+}
+
+test "MCP legacy stdio negotiation includes 2025-03-26" {
+    try std.testing.expectEqual(
+        LegacyStdioVersion.v2025_03_26,
+        LegacyStdioVersion.parse("2025-03-26").?,
+    );
+    try std.testing.expectEqual(
+        LegacyStdioVersion.v2025_03_26,
+        LegacyStdioVersion.v2025_06_18.older().?,
+    );
+    try std.testing.expectEqual(
+        LegacyStdioVersion.v2024_11_05,
+        LegacyStdioVersion.v2025_03_26.older().?,
+    );
 }
 
 test "method-not-found discovery begins fallback at the newest legacy version" {
@@ -400,6 +425,7 @@ test "HTTP discovery state machine accepts stock SDK null-id errors as legacy fa
         "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32000,\"message\":\"Server not initialized\"}}",
         "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32000,\"message\":\"Bad Request: Unsupported protocol version\"}}",
         "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}",
+        "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32004,\"message\":\"invalid request\"}}",
     };
     for (responses) |text| {
         var response = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});

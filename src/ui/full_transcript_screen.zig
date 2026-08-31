@@ -10,6 +10,7 @@ const result_store = @import("../core/session/result_store.zig");
 const session_child_store = @import("../core/session/session_child_store.zig");
 const diff_mod = @import("../core/output/diff.zig");
 const transcript_presentation = @import("../core/output/transcript_presentation.zig");
+const full_transcript_metadata = @import("../core/output/full_transcript_metadata.zig");
 const assistant_wrap = @import("render_engine/assistant_wrap.zig");
 const build_checkpoint = @import("render_engine/build_checkpoint.zig");
 const transcript_blocks = @import("render_engine/transcript_blocks.zig");
@@ -23,9 +24,6 @@ const Allocator = std.mem.Allocator;
 
 const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
 const BuildCheckpoint = build_checkpoint.BuildCheckpoint;
-
-pub const DetailDepth = enum { review, full };
-const review_detail_line_limit: usize = 3;
 
 const PendingInputProbe = struct {
     polls: usize = 0,
@@ -84,7 +82,7 @@ test "interruptible full projection checks inside one oversized assistant entry"
     var checkpoint = BuildCheckpoint.init(&probe, PendingInputProbe.pending);
     try std.testing.expectError(
         error.InputPending,
-        buildProjectionForDepthWithDiffResolverInterruptible(
+        buildProjectionWithDiffResolverInterruptible(
             alloc,
             &entries,
             &.{},
@@ -92,14 +90,13 @@ test "interruptible full projection checks inside one oversized assistant entry"
             .{},
             80,
             null,
-            .review,
             null,
             &checkpoint,
         ),
     );
     try std.testing.expectEqual(@as(usize, 1), probe.polls);
 
-    var retry = try buildProjectionForDepthWithDiffResolverInterruptible(
+    var retry = try buildProjectionWithDiffResolverInterruptible(
         alloc,
         &entries,
         &.{},
@@ -107,12 +104,11 @@ test "interruptible full projection checks inside one oversized assistant entry"
         .{},
         80,
         null,
-        .review,
         null,
         null,
     );
     defer retry.deinit(alloc);
-    var baseline = try buildProjectionForDepthWithDiffResolverInterruptible(
+    var baseline = try buildProjectionWithDiffResolverInterruptible(
         alloc,
         &entries,
         &.{},
@@ -120,7 +116,6 @@ test "interruptible full projection checks inside one oversized assistant entry"
         .{},
         80,
         null,
-        .review,
         null,
         null,
     );
@@ -305,12 +300,10 @@ const StoredResult = struct {
     fallback_handle: ?[]const u8 = null,
     fallback_artifact_handle: ?[]const u8 = null,
     retained_command_fallback: ?[]u8 = null,
-    retained_command_fallback_is_bounded_review: bool = false,
     start_record: usize = 0,
     end_record: ?usize = null,
     unavailable: bool = false,
     required_replay_unavailable: bool = false,
-    detail_depth: DetailDepth = .full,
     line_prefix: []const u8 = "  ",
 
     fn deinit(self: StoredResult, alloc: Allocator) void {
@@ -388,14 +381,6 @@ const ProjectionWindowStart = struct {
     checkpoint: ProjectionCheckpoint,
 };
 
-const ProjectionMeasurementPrefix = struct {
-    cols: u16,
-    segment_count: usize,
-    item_count: usize,
-    checkpoint: ProjectionCheckpoint,
-    anchor_row: ?u32,
-};
-
 /// A width-rendered Ctrl-O document. Static transcript bytes and retained
 /// command fallbacks are owned by the projection; stored-result handles remain
 /// borrowed and are read through the session capability only on demand.
@@ -408,44 +393,12 @@ pub const Projection = struct {
     measurement_cols: ?u16 = null,
     measured_total_rows: u32 = 0,
     measured_anchor_row: ?u32 = null,
-    measurement_prefix: ?ProjectionMeasurementPrefix = null,
     styles: transcript_blocks.Styles,
 
     fn invalidateMeasurement(self: *Projection) void {
         self.measurement_cols = null;
         self.measured_total_rows = 0;
         self.measured_anchor_row = null;
-        self.measurement_prefix = null;
-    }
-
-    fn reusableMeasurementPrefix(
-        self: *const Projection,
-        first_item: usize,
-        first_segment: usize,
-    ) ?ProjectionMeasurementPrefix {
-        if (self.measurement_cols) |cols| {
-            if (self.measured_item_rows.items.len == self.item_boundaries.items.len and
-                self.measured_segment_checkpoints.items.len == self.segments.items.len and
-                first_segment < self.measured_segment_checkpoints.items.len)
-            {
-                return .{
-                    .cols = cols,
-                    .segment_count = first_segment,
-                    .item_count = first_item,
-                    .checkpoint = self.measured_segment_checkpoints.items[first_segment],
-                    .anchor_row = if (self.anchor_segment_index) |anchor_index|
-                        if (anchor_index < first_segment) self.measured_anchor_row else null
-                    else
-                        null,
-                };
-            }
-        }
-        if (self.measurement_prefix) |prefix| {
-            if (first_segment >= prefix.segment_count and first_item >= prefix.item_count) {
-                return prefix;
-            }
-        }
-        return null;
     }
 
     fn windowStart(self: *const Projection, cols: u16, start_row: u32) ProjectionWindowStart {
@@ -482,118 +435,12 @@ pub const Projection = struct {
         self.measured_segment_checkpoints.deinit(alloc);
         self.* = undefined;
     }
-
-    fn boundaryIndexForEntry(self: *const Projection, entry_id: u32) ?usize {
-        var index = self.item_boundaries.items.len;
-        while (index > 0) {
-            index -= 1;
-            if (self.item_boundaries.items[index].entry_id == entry_id) return index;
-        }
-        return null;
-    }
-
-    fn boundaryHasContent(self: *const Projection, index: usize) bool {
-        const start = self.item_boundaries.items[index].segment_index;
-        const end = if (index + 1 < self.item_boundaries.items.len)
-            self.item_boundaries.items[index + 1].segment_index
-        else
-            self.segments.items.len;
-        for (self.segments.items[start..end]) |segment| switch (segment) {
-            .stored_result => return true,
-            .static => |bytes| if (std.mem.trim(u8, bytes, "\r\n").len > 0) return true,
-        };
-        return false;
-    }
-
-    pub fn retainedContextEntryId(self: *const Projection, entry_id: u32) ?u32 {
-        const index = self.boundaryIndexForEntry(entry_id) orelse return null;
-        if (self.boundaryHasContent(index)) return entry_id;
-        const segment_index = self.item_boundaries.items[index].segment_index;
-
-        var low: usize = 0;
-        var high = index;
-        while (low < high) {
-            const middle = low + (high - low) / 2;
-            if (self.item_boundaries.items[middle].segment_index < segment_index) {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        return if (low == 0) null else self.item_boundaries.items[low - 1].entry_id;
-    }
-
-    pub fn replaceFromEntry(
-        self: *Projection,
-        alloc: Allocator,
-        entry_id: u32,
-        suffix: *Projection,
-    ) !bool {
-        const first_item = self.boundaryIndexForEntry(entry_id) orelse return false;
-        const first_segment = self.item_boundaries.items[first_item].segment_index;
-        const measurement_prefix = self.reusableMeasurementPrefix(first_item, first_segment);
-        try self.segments.ensureTotalCapacity(
-            alloc,
-            first_segment + suffix.segments.items.len,
-        );
-        try self.item_boundaries.ensureTotalCapacity(
-            alloc,
-            first_item + suffix.item_boundaries.items.len,
-        );
-        try self.measured_item_rows.ensureTotalCapacity(
-            alloc,
-            first_item + suffix.item_boundaries.items.len,
-        );
-        try self.measured_segment_checkpoints.ensureTotalCapacity(
-            alloc,
-            first_segment + suffix.segments.items.len,
-        );
-        for (self.segments.items[first_segment..]) |segment| switch (segment) {
-            .static => |bytes| alloc.free(bytes),
-            .stored_result => |stored| stored.deinit(alloc),
-        };
-        self.segments.items.len = first_segment;
-        for (suffix.segments.items) |segment| self.segments.appendAssumeCapacity(segment);
-        suffix.segments.items.len = 0;
-
-        self.item_boundaries.items.len = first_item;
-        for (suffix.item_boundaries.items) |boundary| {
-            self.item_boundaries.appendAssumeCapacity(.{
-                .entry_id = boundary.entry_id,
-                .segment_index = first_segment + boundary.segment_index,
-            });
-        }
-        suffix.item_boundaries.items.len = 0;
-
-        self.anchor_segment_index = if (suffix.anchor_segment_index) |index|
-            first_segment + index
-        else if (self.anchor_segment_index) |index|
-            if (index < first_segment) index else null
-        else
-            null;
-        self.invalidateMeasurement();
-        self.measurement_prefix = measurement_prefix;
-        return true;
-    }
 };
 
 const ItemBoundary = struct {
     entry_id: u32,
     segment_index: usize,
 };
-
-test "projection finds a repositioned entry by transcript order" {
-    const alloc = std.testing.allocator;
-    var projection = Projection{ .styles = .{} };
-    defer projection.deinit(alloc);
-    try projection.item_boundaries.appendSlice(alloc, &.{
-        .{ .entry_id = 2, .segment_index = 0 },
-        .{ .entry_id = 3, .segment_index = 1 },
-        .{ .entry_id = 1, .segment_index = 2 },
-    });
-
-    try std.testing.expectEqual(@as(?usize, 2), projection.boundaryIndexForEntry(1));
-}
 
 test "projection applies actions by transcript position after lifecycle reposition" {
     const alloc = std.testing.allocator;
@@ -607,7 +454,7 @@ test "projection applies actions by transcript position after lifecycle repositi
         .keep,
         .{ .override = .{ .kind = .tool_status, .bytes = "new status\n" } },
     };
-    var projection = try buildProjectionForDepthWithEntryActionsInterruptible(
+    var projection = try buildProjectionWithEntryActionsInterruptible(
         alloc,
         &entries,
         &.{},
@@ -615,7 +462,6 @@ test "projection applies actions by transcript position after lifecycle repositi
         .{},
         80,
         null,
-        .full,
         null,
         &actions,
         null,
@@ -912,7 +758,7 @@ test "full projection matches file details to full diffs by marker and lifecycle
     };
     var resolver_context: u8 = 0;
     const styles: transcript_blocks.Styles = .{ .system_notice_label_style = "", .system_notice_text_style = "", .reset_style = "", .dim_style = "", .red_style = "" };
-    var projection = try buildProjectionWithDiffResolver(
+    var projection = try buildProjectionWithResolver(
         alloc,
         &entries,
         &details,
@@ -937,7 +783,7 @@ test "full projection matches file details to full diffs by marker and lifecycle
     try std.testing.expect(std.mem.indexOf(u8, source, "  │     COMPACT_SECOND_TAIL") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "RAW_SECOND") != null);
 
-    var wide_projection = try buildProjectionWithDiffResolver(
+    var wide_projection = try buildProjectionWithResolver(
         alloc,
         &entries,
         &details,
@@ -967,118 +813,6 @@ test "full projection matches file details to full diffs by marker and lifecycle
     try std.testing.expect(std.mem.indexOf(u8, wide_source, "COMPACT_SECOND_TAIL") != null);
     try std.testing.expect(std.mem.indexOf(u8, wide_source, "  │     ") == null);
     try std.testing.expect(std.mem.indexOf(u8, wide_source, "RAW_SECOND") != null);
-}
-
-test "review bounds compact diff without a full retained sidecar" {
-    const alloc = std.testing.allocator;
-    const compact = try diff_mod.wrapWithMarkers(
-        alloc,
-        103,
-        "\x1b[38;5;252m  │ \x1b[38;5;203m1 -\x1b[38;5;252m ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnCOMPACT_REVIEW_1_TAIL\x1b[0m\n" ++
-            "\x1b[38;5;252m  │ \x1b[38;5;77m2 +\x1b[38;5;252m ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnCOMPACT_REVIEW_2_TAIL\x1b[0m\n" ++
-            "\x1b[38;5;245m  │ 3   ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnCOMPACT_REVIEW_3_TAIL\x1b[0m\n" ++
-            "COMPACT_REVIEW_4\n" ++
-            "COMPACT_REVIEW_5\n" ++
-            "COMPACT_REVIEW_6\n" ++
-            "COMPACT_REVIEW_7\n" ++
-            "COMPACT_REVIEW_8\n" ++
-            "COMPACT_REVIEW_9\n" ++
-            "COMPACT_REVIEW_10\n",
-    );
-    defer alloc.free(compact);
-    const entries = [_]transcript_blocks.TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .created_at_ms = 0, .bytes = @constCast("● Write review.txt\n"), .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .created_at_ms = 0, .bytes = compact, .class = .diff_block } },
-    };
-    var details = [_]ToolDetailRecord{.{
-        .entry_id = 1,
-        .tool_name = try alloc.dupe(u8, "write_file"),
-        .arguments_json = try alloc.dupe(u8, "{\"path\":\"review.txt\",\"content\":\"FULL_ARGUMENT_TAIL\"}"),
-        .lifecycle_id = .{ .turn_id = 42, .call_id = try alloc.dupe(u8, "compact-only") },
-    }};
-    defer details[0].deinit(alloc);
-
-    const Resolver = struct {
-        fn fullForMarker(_: *anyopaque, _: u32) ?[]const u8 {
-            return null;
-        }
-
-        fn hasFullForLifecycle(_: *anyopaque, _: types.ToolLifecycleId) bool {
-            return false;
-        }
-    };
-    var resolver_context: u8 = 0;
-    var projection = try buildProjectionForDepthWithDiffResolverInterruptible(
-        alloc,
-        &entries,
-        &details,
-        &.{},
-        .{ .system_notice_label_style = "", .system_notice_text_style = "", .reset_style = "", .dim_style = "", .red_style = "" },
-        48,
-        null,
-        .review,
-        .{
-            .context = &resolver_context,
-            .full_for_marker = Resolver.fullForMarker,
-            .has_full_for_lifecycle = Resolver.hasFullForLifecycle,
-        },
-        null,
-    );
-    defer projection.deinit(alloc);
-    const measurement = try measureProjection(alloc, &projection, null, 48);
-    const source = try renderProjectionViewportSource(
-        alloc,
-        &projection,
-        null,
-        48,
-        @intCast(measurement.total_rows),
-        0,
-    );
-    defer alloc.free(source);
-
-    try std.testing.expect(std.mem.indexOf(u8, source, "  │     COMPACT_REVIEW_1_TAIL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "  │     COMPACT_REVIEW_2_TAIL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "  │     COMPACT_REVIEW_3_TAIL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "COMPACT_REVIEW_4") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "COMPACT_REVIEW_10") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "7 more lines · → to expand") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "\n  │  7 more lines · → to expand") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "\n│  7 more lines · → to expand") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "10 lines") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "FULL_ARGUMENT_TAIL") == null);
-
-    var full = try buildProjectionForDepthWithDiffResolverInterruptible(
-        alloc,
-        &entries,
-        &details,
-        &.{},
-        .{ .system_notice_label_style = "", .system_notice_text_style = "", .reset_style = "", .dim_style = "", .red_style = "" },
-        48,
-        null,
-        .full,
-        .{
-            .context = &resolver_context,
-            .full_for_marker = Resolver.fullForMarker,
-            .has_full_for_lifecycle = Resolver.hasFullForLifecycle,
-        },
-        null,
-    );
-    defer full.deinit(alloc);
-    const full_measurement = try measureProjection(alloc, &full, null, 48);
-    const full_source = try renderProjectionViewportSource(
-        alloc,
-        &full,
-        null,
-        48,
-        @intCast(full_measurement.total_rows),
-        0,
-    );
-    defer alloc.free(full_source);
-
-    try std.testing.expect(std.mem.indexOf(u8, full_source, "COMPACT_REVIEW_10") != null);
-    try std.testing.expect(std.mem.indexOf(u8, full_source, "  │     COMPACT_REVIEW_1_TAIL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, full_source, "FULL_ARGUMENT_TAIL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, full_source, "{\"path\"") == null);
 }
 
 test "full projection preserves inline block gaps around expanded tool detail" {
@@ -1125,115 +859,6 @@ test "full projection preserves inline block gaps around expanded tool detail" {
     try std.testing.expect(std.mem.indexOf(u8, source, "  value\n\n  Summary after tool") != null);
 }
 
-test "review and full share modern hierarchy with bounded and exhaustive detail" {
-    const alloc = std.testing.allocator;
-    var entries = [_]transcript_blocks.TranscriptEntry{.{ .raw_bytes = .{
-        .id = 1,
-        .bytes = try alloc.dupe(u8, "● Read notes.txt\n"),
-        .class = .tool_status,
-    } }};
-    defer entries[0].deinit(alloc);
-    var details = [_]ToolDetailRecord{.{
-        .entry_id = 1,
-        .tool_name = try alloc.dupe(u8, "read_file"),
-        .activity_kind = .read,
-        .arguments_json = try alloc.dupe(u8, "{\"path\":\"notes.txt\"}"),
-        .result = try alloc.dupe(u8, "1\tone\n2\ttwo\n3\tthree\n4\tfour\n5\tfive"),
-        .outcome = .completed,
-    }};
-    defer details[0].deinit(alloc);
-
-    var review = try buildProjectionForDepthWithDiffResolverInterruptible(
-        alloc,
-        &entries,
-        &details,
-        &.{},
-        .{},
-        80,
-        null,
-        .review,
-        null,
-        null,
-    );
-    defer review.deinit(alloc);
-    const review_source = try renderProjectionViewportSource(alloc, &review, null, 80, 20, 0);
-    defer alloc.free(review_source);
-    try std.testing.expect(std.mem.indexOf(u8, review_source, "1 tool call") != null);
-    try std.testing.expect(std.mem.indexOf(u8, review_source, "└ Read notes.txt") != null);
-    try std.testing.expect(std.mem.indexOf(u8, review_source, "│  5 lines") != null);
-    try std.testing.expect(std.mem.indexOf(u8, review_source, "│  1    one") != null);
-    try std.testing.expect(std.mem.indexOf(u8, review_source, "│  3    three") != null);
-    try std.testing.expect(std.mem.indexOf(u8, review_source, "4    four") == null);
-    try std.testing.expect(std.mem.indexOf(u8, review_source, "2 more lines · → to expand") != null);
-    try std.testing.expect(std.mem.indexOf(u8, review_source, "input") == null);
-    try std.testing.expect(std.mem.indexOf(u8, review_source, "result") == null);
-    try std.testing.expect(std.mem.indexOf(u8, review_source, "{\"path\"") == null);
-
-    var full = try buildProjectionForDepthWithDiffResolverInterruptible(
-        alloc,
-        &entries,
-        &details,
-        &.{},
-        .{},
-        80,
-        null,
-        .full,
-        null,
-        null,
-    );
-    defer full.deinit(alloc);
-    const full_source = try renderProjectionViewportSource(alloc, &full, null, 80, 20, 0);
-    defer alloc.free(full_source);
-    try std.testing.expect(std.mem.indexOf(u8, full_source, "1 tool call") != null);
-    try std.testing.expect(std.mem.indexOf(u8, full_source, "│  5    five") != null);
-    try std.testing.expect(std.mem.indexOf(u8, full_source, "→ to expand") == null);
-    try std.testing.expect(std.mem.indexOf(u8, full_source, "{\"path\"") == null);
-}
-
-test "review keeps connector rail primary while metadata stays secondary" {
-    const alloc = std.testing.allocator;
-    var entries = [_]transcript_blocks.TranscriptEntry{.{ .raw_bytes = .{
-        .id = 1,
-        .bytes = try alloc.dupe(u8, "● Read notes.txt\n"),
-        .class = .tool_status,
-    } }};
-    defer entries[0].deinit(alloc);
-    var details = [_]ToolDetailRecord{.{
-        .entry_id = 1,
-        .tool_name = try alloc.dupe(u8, "read_file"),
-        .activity_kind = .read,
-        .arguments_json = try alloc.dupe(u8, "{\"path\":\"notes.txt\"}"),
-        .result = try alloc.dupe(u8, "one\ntwo\nthree\nfour\nfive"),
-        .outcome = .completed,
-    }};
-    defer details[0].deinit(alloc);
-
-    const dim = "\x1b[38;5;245m";
-    const reset = "\x1b[39m";
-    var projection = try buildProjectionForDepthWithDiffResolverInterruptible(
-        alloc,
-        &entries,
-        &details,
-        &.{},
-        .{
-            .reset_style = reset,
-            .dim_style = dim,
-        },
-        80,
-        null,
-        .review,
-        null,
-        null,
-    );
-    defer projection.deinit(alloc);
-    const source = try renderProjectionViewportSource(alloc, &projection, null, 80, 20, 0);
-    defer alloc.free(source);
-
-    try std.testing.expect(std.mem.indexOf(u8, source, dim ++ "│") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "│" ++ dim ++ "  5 lines ·") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "│" ++ dim ++ "  2 more lines · → to expand" ++ reset) != null);
-}
-
 test "full tool detail keeps wrapped rails primary while output stays secondary" {
     const alloc = std.testing.allocator;
     const styles = transcript_blocks.Styles{
@@ -1258,53 +883,6 @@ test "full tool detail keeps wrapped rails primary while output stays secondary"
     );
 }
 
-test "review keeps connector rail primary around muted command output" {
-    const alloc = std.testing.allocator;
-    const entries = [_]transcript_blocks.TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = @constCast("● Ran printf rail\n"), .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = @constCast("│ compact\n"), .class = .command_output } },
-    };
-    var details = [_]ToolDetailRecord{.{
-        .entry_id = 1,
-        .tool_name = try alloc.dupe(u8, "run_command"),
-        .arguments_json = try alloc.dupe(u8, "{\"command\":\"printf rail\"}"),
-        .command_output_entry_id = 2,
-        .outcome = .completed,
-    }};
-    defer details[0].deinit(alloc);
-    var blocks = [_]command_output_runtime.CommandOutputBlock{.{ .entry_id = 2 }};
-    defer blocks[0].deinit(alloc);
-    try blocks[0].lines.append(alloc, .{
-        .stream = .stdout,
-        .text = try alloc.dupe(u8, "command output\n"),
-    });
-    blocks[0].total_lines = 1;
-
-    const dim = "\x1b[38;5;245m";
-    const reset = "\x1b[39m";
-    var projection = try buildProjectionForDepthWithDiffResolverInterruptible(
-        alloc,
-        &entries,
-        &details,
-        &blocks,
-        .{
-            .reset_style = reset,
-            .dim_style = dim,
-        },
-        80,
-        null,
-        .review,
-        null,
-        null,
-    );
-    defer projection.deinit(alloc);
-    const source = try renderProjectionViewportSource(alloc, &projection, null, 80, 20, 0);
-    defer alloc.free(source);
-
-    try std.testing.expect(std.mem.indexOf(u8, source, dim ++ "│") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "│" ++ dim ++ " command output" ++ reset) != null);
-}
-
 test "full projection retains consecutive in-memory tool details" {
     const alloc = std.testing.allocator;
     const entries = [_]transcript_blocks.TranscriptEntry{
@@ -1314,7 +892,7 @@ test "full projection retains consecutive in-memory tool details" {
     var details = [_]ToolDetailRecord{
         .{
             .entry_id = 1,
-            .tool_name = try alloc.dupe(u8, "list_files"),
+            .tool_name = try alloc.dupe(u8, "glob_files"),
             .arguments_json = try alloc.dupe(u8, "{\"path\":\".\"}"),
             .result = try alloc.dupe(u8, "LIST_FULL_DETAIL_MARKER"),
         },
@@ -1342,96 +920,6 @@ test "full projection retains consecutive in-memory tool details" {
 
     try std.testing.expect(std.mem.indexOf(u8, source, "LIST_FULL_DETAIL_MARKER") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "READ_FULL_DETAIL_MARKER") != null);
-}
-
-test "review projection preserves five hundred twelve dense tools in exact transcript order" {
-    const alloc = std.testing.allocator;
-    const tool_count = 512;
-    var entries: std.ArrayList(transcript_blocks.TranscriptEntry) = .empty;
-    defer {
-        for (entries.items) |*entry| entry.deinit(alloc);
-        entries.deinit(alloc);
-    }
-    var details: std.ArrayList(ToolDetailRecord) = .empty;
-    defer {
-        for (details.items) |*detail| detail.deinit(alloc);
-        details.deinit(alloc);
-    }
-
-    for (0..tool_count) |index| {
-        const status = try std.fmt.allocPrint(
-            alloc,
-            "● Read CTRL_O_DENSE_TOOL_{d:0>4}.txt\n",
-            .{index},
-        );
-        try entries.append(alloc, .{ .raw_bytes = .{
-            .id = @intCast(index + 1),
-            .created_at_ms = @intCast(index),
-            .bytes = status,
-            .class = .tool_status,
-        } });
-        try details.append(alloc, .{
-            .entry_id = @intCast(index + 1),
-            .tool_name = try alloc.dupe(u8, "read_file"),
-            .arguments_json = try std.fmt.allocPrint(
-                alloc,
-                "{{\"path\":\"CTRL_O_DENSE_TOOL_{d:0>4}.txt\"}}",
-                .{index},
-            ),
-            .result = try std.fmt.allocPrint(
-                alloc,
-                "DENSE_RESULT_{d:0>4}_ONE\nDENSE_RESULT_{d:0>4}_TWO\nDENSE_RESULT_{d:0>4}_THREE\nDENSE_RESULT_{d:0>4}_FOUR",
-                .{ index, index, index, index },
-            ),
-        });
-    }
-
-    var projection = try buildProjectionForDepthWithDiffResolverInterruptible(
-        alloc,
-        entries.items,
-        details.items,
-        &.{},
-        .{},
-        80,
-        null,
-        .review,
-        null,
-        null,
-    );
-    defer projection.deinit(alloc);
-    const measurement = try measureProjection(alloc, &projection, null, 80);
-    const source = try renderProjectionViewportSource(
-        alloc,
-        &projection,
-        null,
-        80,
-        @intCast(measurement.total_rows),
-        0,
-    );
-    defer alloc.free(source);
-
-    try std.testing.expect(std.mem.indexOf(u8, source, "512 tool calls") != null);
-    var cursor: usize = 0;
-    for (0..tool_count) |index| {
-        var marker_buf: [64]u8 = undefined;
-        const marker = try std.fmt.bufPrint(
-            &marker_buf,
-            "CTRL_O_DENSE_TOOL_{d:0>4}.txt",
-            .{index},
-        );
-        const relative = std.mem.indexOf(u8, source[cursor..], marker) orelse
-            return error.TestExpectedDenseToolMarker;
-        cursor += relative + marker.len;
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, marker));
-    }
-    try std.testing.expect(std.mem.indexOf(u8, source, "DENSE_RESULT_0000_THREE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "DENSE_RESULT_0256_THREE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "DENSE_RESULT_0511_THREE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "DENSE_RESULT_0000_FOUR") == null);
-    try std.testing.expectEqual(
-        tool_count,
-        std.mem.count(u8, source, "1 more line · → to expand"),
-    );
 }
 
 test "full projection applies modern width clipping to a tool status" {
@@ -1779,157 +1267,6 @@ test "stored tool result repeats its rail on every physical wrap row" {
     );
 }
 
-test "review stored result scans retained lines but emits only three" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "results");
-    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "results");
-    defer alloc.free(result_dir);
-    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(
-        alloc,
-        result_dir,
-        .tool_results,
-        .writable,
-    );
-    defer capability.deinit();
-    const retained = "1\tone\n2\ttwo\n3\tthree\n4\tfour\n5\tfive";
-    const handle = try result_store.storeLargeResultManaged(
-        alloc,
-        &capability,
-        "review-detail",
-        "read_file",
-        retained,
-    );
-    defer alloc.free(handle);
-    defer result_store.deleteManaged(&capability, handle) catch {};
-
-    var projection = Projection{ .styles = .{} };
-    defer projection.deinit(alloc);
-    try projection.segments.append(alloc, .{ .stored_result = .{
-        .handle = handle,
-        .preview = null,
-        .detail_depth = .review,
-        .line_prefix = "│  ",
-    } });
-
-    var bounded_memory: [128 * 1024]u8 = undefined;
-    var bounded_alloc = std.heap.FixedBufferAllocator.init(&bounded_memory);
-    const measurement = try measureProjection(
-        bounded_alloc.allocator(),
-        &projection,
-        &capability,
-        80,
-    );
-    const source = try renderProjectionViewportSource(
-        alloc,
-        &projection,
-        &capability,
-        80,
-        @intCast(measurement.total_rows),
-        0,
-    );
-    defer alloc.free(source);
-    try std.testing.expect(std.mem.indexOf(u8, source, "5 lines") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "│  1    one") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "│  3    three") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "4    four") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "2 more lines · → to expand") != null);
-}
-
-test "review stored result bounds one retained logical line" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "results");
-    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "results");
-    defer alloc.free(result_dir);
-    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(
-        alloc,
-        result_dir,
-        .tool_results,
-        .writable,
-    );
-    defer capability.deinit();
-
-    var retained: std.ArrayList(u8) = .empty;
-    defer retained.deinit(alloc);
-    try retained.appendNTimes(alloc, 'x', 512 * 1024);
-    const handle = try result_store.storeLargeResultManaged(
-        alloc,
-        &capability,
-        "review-long-line",
-        "read_file",
-        retained.items,
-    );
-    defer alloc.free(handle);
-    defer result_store.deleteManaged(&capability, handle) catch {};
-
-    var projection = Projection{ .styles = .{} };
-    defer projection.deinit(alloc);
-    try projection.segments.append(alloc, .{ .stored_result = .{
-        .handle = handle,
-        .preview = null,
-        .detail_depth = .review,
-        .line_prefix = "│  ",
-    } });
-
-    var bounded_memory: [256 * 1024]u8 = undefined;
-    var bounded_alloc = std.heap.FixedBufferAllocator.init(&bounded_memory);
-    const measurement = try measureProjection(
-        bounded_alloc.allocator(),
-        &projection,
-        &capability,
-        80,
-    );
-    const source = try renderProjectionViewportSource(
-        alloc,
-        &projection,
-        &capability,
-        80,
-        @intCast(measurement.total_rows),
-        0,
-    );
-    defer alloc.free(source);
-    try std.testing.expect(std.mem.indexOf(u8, source, "1 line · 524288 B") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "line clipped · → to expand") != null);
-    try std.testing.expect(source.len < 4096);
-}
-
-test "review line accounting keeps blank rows and unterminated tails exact" {
-    const cases = [_]struct {
-        bytes: []const u8,
-        lines: usize,
-    }{
-        .{ .bytes = "", .lines = 0 },
-        .{ .bytes = "\n", .lines = 1 },
-        .{ .bytes = "\n\n", .lines = 2 },
-        .{ .bytes = "one\n\n", .lines = 2 },
-        .{ .bytes = "one\n\nthree", .lines = 3 },
-        .{ .bytes = "one\n\nthree\nfour", .lines = 4 },
-        .{ .bytes = "one\n\nthree\nfour\n", .lines = 4 },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqual(case.lines, logicalLineCount(case.bytes));
-    }
-
-    var rendered: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer rendered.deinit();
-    try std.testing.expect(try appendReviewTerminalSafe(
-        &rendered,
-        std.testing.allocator,
-        "one\n\nthree\nfour\n",
-        .{},
-        12,
-    ));
-    const source = rendered.written();
-    try std.testing.expect(std.mem.indexOf(u8, source, "4 lines") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "one") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "three") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "four") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "1 more line · → to expand") != null);
-}
-
 test "projection measurement cache is reused at one width and recomputed after resize" {
     const alloc = std.testing.allocator;
     var projection = Projection{ .styles = .{} };
@@ -2100,119 +1437,6 @@ test "viewport selector sees the degraded measurement when a stored segment is u
     try std.testing.expect(std.mem.indexOf(u8, selected, dim ++ "│") == null);
     try std.testing.expect(std.mem.indexOf(u8, selected, reset ++ "│" ++ dim ++ "  preview-line" ++ reset) != null);
     try std.testing.expect(std.mem.indexOf(u8, selected, reset ++ "│" ++ dim ++ "  Full saved result unavailable." ++ reset) != null);
-}
-
-test "review keeps an unavailable stored result fallback to three logical lines" {
-    const alloc = std.testing.allocator;
-
-    const dim = "\x1b[38;5;245m";
-    const reset = "\x1b[39m";
-
-    var projection = Projection{ .styles = .{
-        .system_notice_label_style = "",
-        .system_notice_text_style = "",
-        .reset_style = reset,
-        .dim_style = dim,
-        .red_style = "",
-    } };
-    defer projection.deinit(alloc);
-    try projection.segments.append(alloc, .{ .stored_result = .{
-        .handle = "missing-review-handle",
-        .preview = "FALLBACK_ONE\nFALLBACK_TWO\nFALLBACK_THREE\nFALLBACK_FOUR\nFALLBACK_FIVE",
-        .detail_depth = .review,
-        .line_prefix = "│  ",
-    } });
-
-    const measurement = try measureProjection(alloc, &projection, null, 80);
-    const source = try renderProjectionViewportSource(
-        alloc,
-        &projection,
-        null,
-        80,
-        @intCast(measurement.total_rows),
-        0,
-    );
-    defer alloc.free(source);
-
-    try std.testing.expect(std.mem.indexOf(u8, source, "FALLBACK_ONE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "FALLBACK_THREE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "FALLBACK_FOUR") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "FALLBACK_FIVE") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "2 more lines · → to expand") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "Full saved result unavailable.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, dim ++ "│") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, reset ++ "│" ++ dim ++ "  FALLBACK_ONE" ++ reset) != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, reset ++ "│" ++ dim ++ "  FALLBACK_TWO" ++ reset) != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, reset ++ "│" ++ dim ++ "  FALLBACK_THREE" ++ reset) != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, reset ++ "│" ++ dim ++ "  Full saved result unavailable." ++ reset) != null);
-}
-
-test "review projection bounds a missing command sidecar fallback before allocation" {
-    const alloc = std.testing.allocator;
-    var command_text: std.Io.Writer.Allocating = .init(alloc);
-    defer command_text.deinit();
-    for (0..20_000) |line_index| {
-        try command_text.writer.print("COMMAND_LINE_{d}\n", .{line_index});
-    }
-
-    const entries = [_]transcript_blocks.TranscriptEntry{.{ .raw_bytes = .{
-        .id = 1,
-        .created_at_ms = 0,
-        .bytes = @constCast("● Ran command\n"),
-        .class = .tool_status,
-    } }};
-    var blocks = [_]command_output_runtime.CommandOutputBlock{.{
-        .entry_id = 2,
-        .total_lines = 20_000,
-    }};
-    defer blocks[0].deinit(alloc);
-    try blocks[0].lines.append(alloc, .{
-        .stream = .stdout,
-        .text = try alloc.dupe(u8, command_text.written()),
-    });
-    var details = [_]ToolDetailRecord{.{
-        .entry_id = 1,
-        .tool_name = try alloc.dupe(u8, "run_command"),
-        .command_output_replay = try types.dupeCommandOutputReplay(alloc, .{ .available = .{
-            .handle = "missing-command-replay.bin",
-            .framed_bytes = command_text.written().len,
-        } }),
-        .command_output_entry_id = 2,
-        .outcome = .completed,
-    }};
-    defer details[0].deinit(alloc);
-
-    var bounded_memory: [64 * 1024]u8 = undefined;
-    var bounded = std.heap.FixedBufferAllocator.init(&bounded_memory);
-    var projection = try buildProjectionForDepthWithDiffResolverInterruptible(
-        bounded.allocator(),
-        &entries,
-        &details,
-        &blocks,
-        .{ .system_notice_label_style = "", .system_notice_text_style = "", .reset_style = "", .dim_style = "", .red_style = "" },
-        80,
-        null,
-        .review,
-        null,
-        null,
-    );
-    defer projection.deinit(bounded.allocator());
-
-    const measurement = try measureProjection(alloc, &projection, null, 80);
-    const source = try renderProjectionViewportSource(
-        alloc,
-        &projection,
-        null,
-        80,
-        @intCast(measurement.total_rows),
-        0,
-    );
-    defer alloc.free(source);
-    try std.testing.expect(std.mem.indexOf(u8, source, "COMMAND_LINE_0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "COMMAND_LINE_2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "COMMAND_LINE_3") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "19997 more lines · → to expand") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "│ … full output unavailable") != null);
 }
 
 test "a window walk degrade re-selects the offset in the same frame" {
@@ -2590,95 +1814,6 @@ test "full projection prefers ordered replay and omits command envelopes and inp
     try std.testing.expect(std.mem.indexOf(u8, source, "<stdout>") == null);
     try std.testing.expect(std.mem.indexOf(u8, source, "  input") == null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "│ exit code 7"));
-}
-
-test "review command replay emits three logical lines and the exact remainder" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDir(
-        io_mod.getIo(),
-        "session",
-        std.Io.File.Permissions.fromMode(0o700),
-    );
-    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
-        .iterate = true,
-        .follow_symlinks = false,
-    });
-    defer session_dir.close(io_mod.getIo());
-    const session_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
-    defer alloc.free(session_path);
-    var capability = try session_child_store.SessionChildCapability.initForTesting(
-        alloc,
-        session_dir,
-        session_path,
-        .writable,
-        .{},
-    );
-    defer capability.deinit();
-
-    var capture_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer capture_arena.deinit();
-    const capture_alloc = capture_arena.allocator();
-    const capture = try command_replay_store.Capture.create(capture_alloc, 8, &capability);
-    capture.appendAccepted(
-        capture_alloc,
-        .stdout,
-        "REVIEW_REPLAY_1\nREVIEW_REPLAY_2\nREVIEW_REPLAY_3\nREVIEW_REPLAY_4\nREVIEW_REPLAY_5\n",
-    );
-    const replay = capture.retain(capture_alloc) orelse return error.TestExpectedReplay;
-    const descriptor = switch (replay) {
-        .available => |value| value,
-        .unavailable => return error.TestExpectedAvailableReplay,
-    };
-    defer capability.delete(.command_artifacts, descriptor.handle) catch {};
-
-    const entries = [_]transcript_blocks.TranscriptEntry{.{ .raw_bytes = .{
-        .id = 1,
-        .created_at_ms = 0,
-        .bytes = @constCast("● Ran printf review\n"),
-        .class = .tool_status,
-    } }};
-    var details = [_]ToolDetailRecord{.{
-        .entry_id = 1,
-        .tool_name = try alloc.dupe(u8, "run_command"),
-        .arguments_json = try alloc.dupe(u8, "{\"command\":\"printf review\"}"),
-        .result = try alloc.dupe(u8, "exit_code=0\n<stdout>\nWRONG_REVIEW_ENVELOPE\n</stdout>\n"),
-        .command_output_replay = try types.dupeCommandOutputReplay(alloc, replay),
-        .outcome = .completed,
-    }};
-    defer details[0].deinit(alloc);
-
-    var projection = try buildProjectionForDepthWithDiffResolverInterruptible(
-        alloc,
-        &entries,
-        &details,
-        &.{},
-        .{},
-        80,
-        null,
-        .review,
-        null,
-        null,
-    );
-    defer projection.deinit(alloc);
-    const measurement = try measureProjection(alloc, &projection, &capability, 80);
-    const source = try renderProjectionViewportSource(
-        alloc,
-        &projection,
-        &capability,
-        80,
-        @intCast(measurement.total_rows),
-        0,
-    );
-    defer alloc.free(source);
-
-    try std.testing.expect(std.mem.indexOf(u8, source, "│ REVIEW_REPLAY_1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "│ REVIEW_REPLAY_3") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "REVIEW_REPLAY_4") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "2 more lines · → to expand") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "WRONG_REVIEW_ENVELOPE") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "<stdout>") == null);
 }
 
 test "cancelled command detail keeps its semantic heading without raw arguments" {
@@ -3856,47 +2991,44 @@ test "stored tool result keeps every physical rail primary and body secondary" {
 
     const reset = "\x1b[39m";
     const dim = "\x1b[38;5;245m";
-    for ([_]DetailDepth{ .review, .full }) |depth| {
-        var projection = Projection{ .styles = .{
-            .system_notice_label_style = "",
-            .system_notice_text_style = "",
-            .reset_style = reset,
-            .dim_style = dim,
-            .red_style = "",
-        } };
-        defer projection.deinit(alloc);
-        try projection.segments.append(alloc, .{ .stored_result = .{
-            .kind = .tool_result,
-            .handle = handle,
-            .preview = null,
-            .detail_depth = depth,
-            .line_prefix = "│  ",
-        } });
+    var projection = Projection{ .styles = .{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = reset,
+        .dim_style = dim,
+        .red_style = "",
+    } };
+    defer projection.deinit(alloc);
+    try projection.segments.append(alloc, .{ .stored_result = .{
+        .kind = .tool_result,
+        .handle = handle,
+        .preview = null,
+        .line_prefix = "│  ",
+    } });
 
-        const measurement = try measureProjection(alloc, &projection, &capability, 16);
-        const source = try renderProjectionViewportSource(
-            alloc,
-            &projection,
-            &capability,
-            16,
-            @intCast(measurement.total_rows),
-            0,
-        );
-        defer alloc.free(source);
+    const measurement = try measureProjection(alloc, &projection, &capability, 16);
+    const source = try renderProjectionViewportSource(
+        alloc,
+        &projection,
+        &capability,
+        16,
+        @intCast(measurement.total_rows),
+        0,
+    );
+    defer alloc.free(source);
 
-        try std.testing.expect(measurement.total_rows >= 3);
-        const styled_rows = std.mem.count(u8, source, reset ++ "│" ++ dim);
-        try std.testing.expectEqual(
-            @as(usize, measurement.total_rows),
-            styled_rows,
-        );
-        try std.testing.expect(std.mem.indexOf(u8, source, dim ++ "│") == null);
-        try std.testing.expect(std.mem.endsWith(
-            u8,
-            std.mem.trimEnd(u8, source, "\n"),
-            reset,
-        ));
-    }
+    try std.testing.expect(measurement.total_rows >= 3);
+    const styled_rows = std.mem.count(u8, source, reset ++ "│" ++ dim);
+    try std.testing.expectEqual(
+        @as(usize, measurement.total_rows),
+        styled_rows,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, source, dim ++ "│") == null);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        std.mem.trimEnd(u8, source, "\n"),
+        reset,
+    ));
 }
 
 test "missing stored result renders the retained preview and partial notice" {
@@ -4308,7 +3440,7 @@ pub fn buildProjection(
     cols: u16,
     anchor_entry_id: ?u32,
 ) !Projection {
-    return buildProjectionForDepthWithDiffResolverInterruptible(
+    return buildProjectionWithDiffResolverInterruptible(
         alloc,
         entries,
         details,
@@ -4316,7 +3448,6 @@ pub fn buildProjection(
         styles,
         cols,
         anchor_entry_id,
-        .full,
         null,
         null,
     ) catch |err| switch (err) {
@@ -4325,7 +3456,7 @@ pub fn buildProjection(
     };
 }
 
-fn buildProjectionWithDiffResolver(
+pub fn buildProjectionWithResolver(
     alloc: Allocator,
     entries: []const transcript_blocks.TranscriptEntry,
     details: []const ToolDetailRecord,
@@ -4335,7 +3466,7 @@ fn buildProjectionWithDiffResolver(
     anchor_entry_id: ?u32,
     full_diff_resolver: ?FullDiffResolver,
 ) !Projection {
-    return buildProjectionForDepthWithDiffResolverInterruptible(
+    return buildProjectionWithDiffResolverInterruptible(
         alloc,
         entries,
         details,
@@ -4343,7 +3474,6 @@ fn buildProjectionWithDiffResolver(
         styles,
         cols,
         anchor_entry_id,
-        .full,
         full_diff_resolver,
         null,
     ) catch |err| switch (err) {
@@ -4352,7 +3482,7 @@ fn buildProjectionWithDiffResolver(
     };
 }
 
-fn buildProjectionForDepthWithDiffResolverInterruptible(
+fn buildProjectionWithDiffResolverInterruptible(
     alloc: Allocator,
     entries: []const transcript_blocks.TranscriptEntry,
     details: []const ToolDetailRecord,
@@ -4360,7 +3490,6 @@ fn buildProjectionForDepthWithDiffResolverInterruptible(
     styles: transcript_blocks.Styles,
     cols: u16,
     anchor_entry_id: ?u32,
-    depth: DetailDepth,
     full_diff_resolver: ?FullDiffResolver,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !Projection {
@@ -4378,7 +3507,7 @@ fn buildProjectionForDepthWithDiffResolverInterruptible(
         checkpoint,
     );
     defer group_projection.deinit(alloc);
-    return buildProjectionForDepthWithEntryActionsInterruptible(
+    return buildProjectionWithEntryActionsInterruptible(
         alloc,
         entries,
         details,
@@ -4386,14 +3515,13 @@ fn buildProjectionForDepthWithDiffResolverInterruptible(
         styles,
         cols,
         anchor_entry_id,
-        depth,
         full_diff_resolver,
         group_projection.entry_actions.items,
         checkpoint,
     );
 }
 
-pub fn buildProjectionForDepthWithEntryActionsInterruptible(
+pub fn buildProjectionWithEntryActionsInterruptible(
     alloc: Allocator,
     entries: []const transcript_blocks.TranscriptEntry,
     details: []const ToolDetailRecord,
@@ -4401,7 +3529,6 @@ pub fn buildProjectionForDepthWithEntryActionsInterruptible(
     styles: transcript_blocks.Styles,
     cols: u16,
     anchor_entry_id: ?u32,
-    depth: DetailDepth,
     full_diff_resolver: ?FullDiffResolver,
     entry_actions: []const transcript_blocks.EntryRenderAction,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
@@ -4421,7 +3548,6 @@ pub fn buildProjectionForDepthWithEntryActionsInterruptible(
         .entries = entries,
         .source_index = &source_index,
         .entry_actions = entry_actions,
-        .depth = depth,
         .anchor_entry_id = anchor_entry_id,
         .emitted_command_blocks = emitted_command_blocks,
         .full_diff_resolver = full_diff_resolver,
@@ -4475,21 +3601,10 @@ pub fn measureProjectionInterruptible(
         .item_rows = projection.measured_item_rows.items,
     };
     while (true) {
-        const prefix = if (projection.measurement_prefix) |candidate|
-            if (candidate.cols == cols and
-                candidate.segment_count <= projection.segments.items.len and
-                candidate.item_count <= projection.item_boundaries.items.len)
-                candidate
-            else
-                null
-        else
-            null;
         var item_rows: std.ArrayList(transcript_presentation.ItemRow) = .empty;
         defer item_rows.deinit(alloc);
         var segment_checkpoints: std.ArrayList(ProjectionCheckpoint) = .empty;
         defer segment_checkpoints.deinit(alloc);
-        const start_segment_index = if (prefix) |retained| retained.segment_count else 0;
-        const start_item_index = if (prefix) |retained| retained.item_count else 0;
         const capture_item_rows = projection.measured_item_rows.capacity >=
             projection.item_boundaries.items.len;
         const capture_segment_checkpoints = projection.measured_segment_checkpoints.capacity >=
@@ -4497,47 +3612,39 @@ pub fn measureProjectionInterruptible(
         if (capture_item_rows) {
             try item_rows.ensureTotalCapacity(
                 alloc,
-                projection.item_boundaries.items.len - start_item_index,
+                projection.item_boundaries.items.len,
             );
         }
         if (capture_segment_checkpoints) {
             try segment_checkpoints.ensureTotalCapacity(
                 alloc,
-                projection.segments.items.len - start_segment_index,
+                projection.segments.items.len,
             );
         }
 
-        var walker = if (prefix) |retained|
-            ProjectionRowWalker.initMeasureAt(cols, retained.checkpoint, checkpoint)
-        else
-            ProjectionRowWalker.initMeasure(cols, checkpoint);
-        const suffix_anchor_row = walkProjectionSegments(
+        var walker = ProjectionRowWalker.initMeasure(cols, checkpoint);
+        const anchor_row = walkProjectionSegments(
             alloc,
             projection,
             capability,
             &walker,
-            start_segment_index,
-            start_item_index,
+            0,
+            0,
             if (capture_item_rows) &item_rows else null,
             if (capture_segment_checkpoints) &segment_checkpoints else null,
         ) catch |err| switch (err) {
             error.StoredSegmentDegraded => continue,
             else => |other| return other,
         };
-        const anchor_row = suffix_anchor_row orelse if (prefix) |retained| retained.anchor_row else null;
-        projection.measured_item_rows.items.len = if (capture_item_rows) start_item_index else 0;
+        projection.measured_item_rows.items.len = 0;
         projection.measured_item_rows.appendSliceAssumeCapacity(item_rows.items);
-        projection.measured_segment_checkpoints.items.len = if (capture_segment_checkpoints)
-            start_segment_index
-        else
-            0;
+        projection.measured_segment_checkpoints.items.len = 0;
         projection.measured_segment_checkpoints.appendSliceAssumeCapacity(
             segment_checkpoints.items,
         );
         projection.measured_total_rows = walker.totalRows();
         projection.measured_anchor_row = anchor_row;
         projection.measurement_cols = cols;
-        projection.measurement_prefix = null;
         return .{
             .total_rows = projection.measured_total_rows,
             .anchor_row = projection.measured_anchor_row,
@@ -4622,20 +3729,6 @@ const ProjectionRowWalker = struct {
 
     fn initMeasure(cols: u16, build_checkpoint_ptr: ?*BuildCheckpoint) ProjectionRowWalker {
         return .{ .cols = @max(cols, 1), .build_checkpoint = build_checkpoint_ptr };
-    }
-
-    fn initMeasureAt(
-        cols: u16,
-        start_checkpoint: ProjectionCheckpoint,
-        build_checkpoint_ptr: ?*BuildCheckpoint,
-    ) ProjectionRowWalker {
-        return .{
-            .cols = @max(cols, 1),
-            .row = start_checkpoint.row,
-            .col = start_checkpoint.col,
-            .row_has_bytes = start_checkpoint.row_has_bytes,
-            .build_checkpoint = build_checkpoint_ptr,
-        };
     }
 
     fn initWindow(
@@ -5939,12 +5032,6 @@ fn appendStoredResultContent(
     styles: transcript_blocks.Styles,
     stored: StoredResult,
 ) !bool {
-    if (stored.detail_depth == .review) {
-        return if (stored.kind == .command_replay)
-            appendReviewCommandStoredResultContent(alloc, walker, capability, styles, stored)
-        else
-            appendReviewStoredResultContent(alloc, walker, capability, styles, stored);
-    }
     if (stored.kind != .tool_result) {
         if (!try appendCommandStoredResultContent(
             alloc,
@@ -6044,178 +5131,12 @@ fn writeSecondaryPrefixedLine(
     try writer.writeByte('\n');
 }
 
-fn appendReviewCommandStoredResultContent(
-    alloc: Allocator,
-    walker: *ProjectionRowWalker,
-    capability: ?*session_child_store.SessionChildCapability,
-    styles: transcript_blocks.Styles,
-    stored: StoredResult,
-) !bool {
-    const max_lines = review_detail_line_limit;
-    const total_lines = try countStoredCommandRecords(alloc, capability, stored, walker.build_checkpoint);
-    var metadata: std.Io.Writer.Allocating = .init(alloc);
-    defer metadata.deinit();
-    try beginSecondaryRailLine(&metadata.writer, styles);
-    try metadata.writer.print("  {d} output line{s}", .{
-        total_lines,
-        if (total_lines == 1) "" else "s",
-    });
-    try endSecondaryRailLine(&metadata.writer, styles);
-    if (!try walker.append(metadata.written())) return false;
-
-    var preview = stored;
-    preview.end_record = preview.start_record + @min(total_lines, max_lines);
-    if (!try appendCommandStoredResultContent(
-        alloc,
-        walker,
-        capability,
-        styles,
-        preview,
-    )) return false;
-
-    if (total_lines > max_lines) {
-        var hint: std.Io.Writer.Allocating = .init(alloc);
-        defer hint.deinit();
-        try beginSecondaryRailLine(&hint.writer, styles);
-        try hint.writer.print("  {d} more line{s} · → to expand", .{
-            total_lines - max_lines,
-            if (total_lines - max_lines == 1) "" else "s",
-        });
-        try endSecondaryRailLine(&hint.writer, styles);
-        if (!try walker.append(hint.written())) return false;
-    }
-    return true;
-}
-
-fn countStoredCommandRecords(
-    alloc: Allocator,
-    capability: ?*session_child_store.SessionChildCapability,
-    stored: StoredResult,
-    checkpoint: ?*BuildCheckpoint,
-) !usize {
-    var order = try RecordOrderReader.init(alloc, capability, stored, checkpoint);
-    defer order.deinit(alloc);
-    var generations = [2]StreamGenerationReader{
-        try .init(alloc, capability, stored, .stdout, checkpoint),
-        try .init(alloc, capability, stored, .stderr, checkpoint),
-    };
-    defer for (&generations) |*reader| reader.deinit(alloc);
-
-    var record_ordinal: usize = 0;
-    var selected: usize = 0;
-    while (try order.nextRecord(alloc)) |stream| {
-        const generation = try generations[@intFromEnum(stream)].nextRecord(alloc) orelse
-            return error.CommandProjectionRecordMissing;
-        if (!generation.valid) continue;
-        const in_range = record_ordinal >= stored.start_record and
-            (stored.end_record == null or record_ordinal < stored.end_record.?);
-        if (in_range) selected += 1;
-        record_ordinal += 1;
-    }
-    if (record_ordinal < stored.start_record) return error.CommandProjectionRecordMissing;
-    if (stored.end_record) |end_record| {
-        if (record_ordinal < end_record) return error.CommandProjectionRecordMissing;
-    }
-    return selected;
-}
-
-fn appendReviewStoredResultContent(
-    alloc: Allocator,
-    walker: *ProjectionRowWalker,
-    capability: ?*session_child_store.SessionChildCapability,
-    styles: transcript_blocks.Styles,
-    stored: StoredResult,
-) !bool {
-    const max_lines = review_detail_line_limit;
-    var source = try StoredResultSourceStream.init(alloc, capability, stored);
-    defer source.deinit();
-    const styled_prefix = try styledSecondaryLinePrefix(alloc, styles, stored.line_prefix);
-    defer alloc.free(styled_prefix);
-    var preview: std.Io.Writer.Allocating = .init(alloc);
-    defer preview.deinit();
-    var total_lines: usize = 0;
-    var has_bytes = false;
-    var last_was_newline = false;
-    var preview_line_bytes: usize = 0;
-    var preview_truncated = false;
-    const preview_line_byte_cap = @max(@as(usize, walker.cols) * 16, 256);
-    while (source.hasMore()) {
-        const page = try source.readNextPage(alloc);
-        defer alloc.free(page);
-        for (page) |byte| {
-            has_bytes = true;
-            last_was_newline = byte == '\n';
-            if (total_lines < max_lines) {
-                if (byte == '\n') {
-                    try preview.writer.writeByte(byte);
-                } else if (preview_line_bytes < preview_line_byte_cap) {
-                    try preview.writer.writeByte(byte);
-                    preview_line_bytes += 1;
-                } else {
-                    preview_truncated = true;
-                }
-            }
-            if (byte == '\n') {
-                total_lines += 1;
-                preview_line_bytes = 0;
-            }
-        }
-    }
-    if (has_bytes and !last_was_newline) total_lines += 1;
-
-    var metadata: std.Io.Writer.Allocating = .init(alloc);
-    defer metadata.deinit();
-    try beginSecondaryRailLine(&metadata.writer, styles);
-    try metadata.writer.print("  {d} line{s} · {d} B", .{
-        total_lines,
-        if (total_lines == 1) "" else "s",
-        source.range.end - source.range.start,
-    });
-    try endSecondaryRailLine(&metadata.writer, styles);
-    if (!try walker.appendWithSoftWrapPrefix(metadata.written(), styled_prefix)) return false;
-
-    var encoded: std.Io.Writer.Allocating = .init(alloc);
-    defer encoded.deinit();
-    var terminal_safe = TerminalSafeIndentedWriter{
-        .prefix = styled_prefix,
-        .line_suffix = styles.reset_style,
-    };
-    try terminal_safe.append(&encoded.writer, preview.written());
-    try terminal_safe.finish(&encoded.writer);
-    if (!terminal_safe.line_start) try encoded.writer.writeByte('\n');
-    if (!try walker.appendWithSoftWrapPrefix(encoded.written(), styled_prefix)) return false;
-    if (total_lines > max_lines) {
-        var hint: std.Io.Writer.Allocating = .init(alloc);
-        defer hint.deinit();
-        try beginSecondaryRailLine(&hint.writer, styles);
-        try hint.writer.print("  {d} more line{s} · → to expand", .{
-            total_lines - max_lines,
-            if (total_lines - max_lines == 1) "" else "s",
-        });
-        try endSecondaryRailLine(&hint.writer, styles);
-        if (!try walker.appendWithSoftWrapPrefix(hint.written(), styled_prefix)) return false;
-    } else if (preview_truncated) {
-        var hint: std.Io.Writer.Allocating = .init(alloc);
-        defer hint.deinit();
-        try writeSecondaryRailLine(
-            &hint.writer,
-            styles,
-            "  line clipped · → to expand",
-        );
-        if (!try walker.appendWithSoftWrapPrefix(hint.written(), styled_prefix)) return false;
-    }
-    return true;
-}
-
 fn appendStoredResultFallback(
     alloc: Allocator,
     walker: *ProjectionRowWalker,
     styles: transcript_blocks.Styles,
     stored: StoredResult,
 ) !bool {
-    if (stored.detail_depth == .review) {
-        return appendReviewStoredResultFallback(alloc, walker, styles, stored);
-    }
     const styled_prefix = try styledSecondaryLinePrefix(alloc, styles, stored.line_prefix);
     defer alloc.free(styled_prefix);
     if (stored.required_replay_unavailable) {
@@ -6242,125 +5163,6 @@ fn appendStoredResultFallback(
     defer alloc.free(fallback);
     if (!try walker.appendWithSoftWrapPrefix(fallback, styled_prefix)) return false;
     if (stored.retained_command_fallback) |retained| return walker.append(retained);
-    return true;
-}
-
-fn appendReviewStoredResultFallback(
-    alloc: Allocator,
-    walker: *ProjectionRowWalker,
-    styles: transcript_blocks.Styles,
-    stored: StoredResult,
-) !bool {
-    if (stored.retained_command_fallback_is_bounded_review) {
-        if (stored.retained_command_fallback) |retained| {
-            if (!try walker.append(retained)) return false;
-        }
-        return if (stored.required_replay_unavailable)
-            appendPermanentCommandUnavailable(walker, styles)
-        else
-            appendSavedResultUnavailable(alloc, walker, styles, stored.line_prefix);
-    }
-
-    const styled_prefix = try styledSecondaryLinePrefix(alloc, styles, stored.line_prefix);
-    defer alloc.free(styled_prefix);
-    var rendered: std.Io.Writer.Allocating = .init(alloc);
-    defer rendered.deinit();
-
-    if (stored.required_replay_unavailable and
-        stored.retained_command_fallback != null)
-    {
-        try rendered.writer.writeAll(stored.retained_command_fallback.?);
-    } else {
-        try rendered.writer.writeAll(styles.reset_style);
-        var terminal_safe = TerminalSafeIndentedWriter{
-            .prefix = styled_prefix,
-            .line_suffix = styles.reset_style,
-        };
-        try terminal_safe.append(
-            &rendered.writer,
-            tool_result_display.contentForDisplay(stored.preview orelse ""),
-        );
-        try terminal_safe.finish(&rendered.writer);
-        if (!terminal_safe.line_start) try rendered.writer.writeByte('\n');
-        if (!stored.required_replay_unavailable) {
-            if (stored.retained_command_fallback) |retained| {
-                try rendered.writer.writeAll(retained);
-            }
-        }
-    }
-
-    if (!try appendReviewFallbackLines(
-        alloc,
-        walker,
-        styles,
-        styled_prefix,
-        rendered.written(),
-    )) {
-        return false;
-    }
-    return if (stored.required_replay_unavailable)
-        appendPermanentCommandUnavailable(walker, styles)
-    else
-        appendSavedResultUnavailable(alloc, walker, styles, stored.line_prefix);
-}
-
-fn appendReviewFallbackLines(
-    alloc: Allocator,
-    walker: *ProjectionRowWalker,
-    styles: transcript_blocks.Styles,
-    soft_wrap_prefix: []const u8,
-    bytes: []const u8,
-) !bool {
-    const max_lines = review_detail_line_limit;
-    const total_lines = std.mem.count(u8, bytes, "\n") +
-        @intFromBool(bytes.len > 0 and !std.mem.endsWith(u8, bytes, "\n"));
-    const line_width_cap = @max(@as(usize, walker.cols) * 16, 256);
-    var preview: std.Io.Writer.Allocating = .init(alloc);
-    defer preview.deinit();
-    var start: usize = 0;
-    var emitted_lines: usize = 0;
-    var line_clipped = false;
-    while (start < bytes.len and emitted_lines < max_lines) : (emitted_lines += 1) {
-        const relative_end = std.mem.findScalar(u8, bytes[start..], '\n');
-        const end = if (relative_end) |offset| start + offset else bytes.len;
-        const line = bytes[start..end];
-        const clipped = display_width.prefixByWidthIgnoringAnsi(line, line_width_cap);
-        try preview.writer.writeAll(clipped);
-        if (clipped.len < line.len) {
-            line_clipped = true;
-            try preview.writer.writeAll(styles.reset_style);
-        }
-        try preview.writer.writeByte('\n');
-        if (relative_end == null) {
-            start = bytes.len;
-        } else {
-            start = end + 1;
-        }
-    }
-    if (!try walker.appendWithSoftWrapPrefix(preview.written(), soft_wrap_prefix)) return false;
-
-    if (total_lines > max_lines) {
-        var hint: std.Io.Writer.Allocating = .init(alloc);
-        defer hint.deinit();
-        const remaining = total_lines - max_lines;
-        try beginSecondaryRailLine(&hint.writer, styles);
-        try hint.writer.print("  {d} more line{s} · → to expand", .{
-            remaining,
-            if (remaining == 1) "" else "s",
-        });
-        try endSecondaryRailLine(&hint.writer, styles);
-        return walker.append(hint.written());
-    }
-    if (line_clipped) {
-        var hint: std.Io.Writer.Allocating = .init(alloc);
-        defer hint.deinit();
-        try writeSecondaryRailLine(
-            &hint.writer,
-            styles,
-            "  line clipped · → to expand",
-        );
-        return walker.append(hint.written());
-    }
     return true;
 }
 
@@ -6893,7 +5695,6 @@ const ProjectionComposeContext = struct {
     entries: []const transcript_blocks.TranscriptEntry,
     source_index: *const ProjectionSourceIndex,
     entry_actions: []const transcript_blocks.EntryRenderAction,
-    depth: DetailDepth,
     anchor_entry_id: ?u32,
     emitted_command_blocks: []bool,
     full_diff_resolver: ?FullDiffResolver,
@@ -6913,11 +5714,6 @@ const ProjectionComposeContext = struct {
         const self = fromOpaque(context);
         self.entry_index = entry_index;
         if (self.entryAction(entry) == .hide) return true;
-        if (self.depth == .review) switch (entry) {
-            .raw_bytes => |raw| if (raw.class == .command_output) return true,
-            else => {},
-        };
-        if (self.depth == .review and self.source_index.commandSourceOwned(entry.id())) return true;
         if (self.source_index.renderableCommandBlockIndexForEntry(entry.id()) != null) return false;
         if (self.source_index.commandSourceOwned(entry.id())) return true;
         return false;
@@ -6940,9 +5736,6 @@ const ProjectionComposeContext = struct {
     ) !bool {
         const self = fromOpaque(context);
         if (self.diffForEntry(entry)) |diff| {
-            if (self.depth == .review) {
-                return appendReviewDiffLines(out, self.alloc, diff, self.builder.styles(), self.cols);
-            }
             const reflowed = try transcript_blocks.reflowDiffBlock(self.alloc, diff, self.cols);
             defer self.alloc.free(reflowed);
             try out.writer.writeAll(reflowed);
@@ -6967,10 +5760,40 @@ const ProjectionComposeContext = struct {
     ) !void {
         const self = fromOpaque(context);
         try self.builder.markEntry(entry_id);
+        const entry = self.entries[self.entry_index];
+        std.debug.assert(entry.id() == entry_id);
+        if (metadataKind(entry)) |kind| {
+            var header_buf: [80]u8 = undefined;
+            if (full_transcript_metadata.formatHeader(
+                &header_buf,
+                self.metadataCreatedAtMs(entry),
+                kind,
+            )) |header| {
+                try out.writer.writeAll(self.builder.styles().dim_style);
+                try out.writer.writeAll("  ");
+                try out.writer.writeAll(header);
+                try out.writer.writeAll(self.builder.styles().reset_style);
+                try out.writer.writeByte('\n');
+            }
+        }
         if (self.anchor_entry_id != null and self.anchor_entry_id.? == entry_id) {
-            _ = out;
             try self.builder.markAnchor();
         }
+    }
+
+    fn metadataCreatedAtMs(
+        self: *const ProjectionComposeContext,
+        entry: transcript_blocks.TranscriptEntry,
+    ) i64 {
+        switch (entry) {
+            .raw_bytes => |raw| if (raw.class == .tool_status) {
+                if (self.source_index.detailForEntry(entry.id())) |detail| {
+                    if (detail.created_at_ms > 0) return detail.created_at_ms;
+                }
+            },
+            else => {},
+        }
+        return entry.createdAtMs();
     }
 
     fn appendDetail(
@@ -6987,7 +5810,6 @@ const ProjectionComposeContext = struct {
             detail,
             self.source_index,
             self.full_diff_resolver,
-            self.depth,
             self.checkpoint,
         );
     }
@@ -7024,6 +5846,36 @@ const ProjectionComposeContext = struct {
         return resolver.full_for_marker(resolver.context, id);
     }
 };
+
+fn metadataKind(
+    entry: transcript_blocks.TranscriptEntry,
+) ?full_transcript_metadata.Kind {
+    return switch (entry) {
+        .user_turn => |user| if (std.mem.startsWith(
+            u8,
+            std.mem.trimStart(u8, user.turn.text, " \t\r\n"),
+            "/issue",
+        ))
+            .issue
+        else
+            .prompt,
+        .assistant_turn => .response,
+        .semantic_notice => |notice| if (notice.tone == .@"error")
+            .error_notice
+        else
+            .notice,
+        .raw_bytes => |raw| switch (raw.class) {
+            .tool_status => .tool,
+            .subagent_status => .task,
+            .turn_summary => .usage,
+            else => null,
+        },
+        .assistant_table,
+        .assistant_code_block,
+        .assistant_thematic_rule,
+        => null,
+    };
+}
 
 fn markedDiffContent(bytes: []const u8) ?[]const u8 {
     _ = diff_mod.markedDiffBlockId(bytes) orelse return null;
@@ -7464,25 +6316,6 @@ fn storedResultForDetail(detail: *const ToolDetailRecord) ?StoredResult {
     return null;
 }
 
-fn reviewStoredResultForDetail(detail: *const ToolDetailRecord) ?StoredResult {
-    if (detail.command_artifact_handle) |handle| {
-        return .{
-            .kind = .command_artifact,
-            .handle = handle,
-            .preview = detail.result,
-            .fallback_handle = detail.result_handle,
-        };
-    }
-    if (detail.result_handle) |handle| {
-        return .{
-            .kind = if (isCapturedCommandDetail(detail)) .command_result else .tool_result,
-            .handle = handle,
-            .preview = detail.result,
-        };
-    }
-    return storedResultForDetail(detail);
-}
-
 fn transcriptHasEntry(
     entries: []const transcript_blocks.TranscriptEntry,
     entry_id: u32,
@@ -7491,76 +6324,6 @@ fn transcriptHasEntry(
         if (entry.id() == entry_id) return true;
     }
     return false;
-}
-
-fn logicalLineCount(bytes: []const u8) usize {
-    if (bytes.len == 0) return 0;
-    return std.mem.count(u8, bytes, "\n") + @intFromBool(bytes[bytes.len - 1] != '\n');
-}
-
-fn prefixThroughLogicalLines(bytes: []const u8, max_lines: usize) []const u8 {
-    if (max_lines == 0) return bytes[0..0];
-    var cursor: usize = 0;
-    var lines: usize = 0;
-    while (cursor < bytes.len and lines < max_lines) {
-        const newline = std.mem.findScalar(u8, bytes[cursor..], '\n') orelse return bytes;
-        cursor += newline + 1;
-        lines += 1;
-    }
-    return bytes[0..cursor];
-}
-
-fn appendReviewLines(
-    out: *std.Io.Writer.Allocating,
-    bytes: []const u8,
-    styles: transcript_blocks.Styles,
-) !bool {
-    const max_lines = review_detail_line_limit;
-    const total_lines = logicalLineCount(bytes);
-    const preview = prefixThroughLogicalLines(bytes, max_lines);
-    try beginSecondaryRailLine(&out.writer, styles);
-    try out.writer.print("  {d} line{s}", .{
-        total_lines,
-        if (total_lines == 1) "" else "s",
-    });
-    try endSecondaryRailLine(&out.writer, styles);
-    try out.writer.writeAll(preview);
-    if (preview.len > 0 and preview[preview.len - 1] != '\n') try out.writer.writeByte('\n');
-    if (total_lines > max_lines) {
-        try beginSecondaryRailLine(&out.writer, styles);
-        try out.writer.print("  {d} more line{s} · → to expand", .{
-            total_lines - max_lines,
-            if (total_lines - max_lines == 1) "" else "s",
-        });
-        try endSecondaryRailLine(&out.writer, styles);
-    }
-    return preview.len > 0 or total_lines > max_lines;
-}
-
-fn appendReviewDiffLines(
-    out: *std.Io.Writer.Allocating,
-    alloc: Allocator,
-    bytes: []const u8,
-    styles: transcript_blocks.Styles,
-    cols: u16,
-) !bool {
-    const max_lines = review_detail_line_limit;
-    const total_lines = logicalLineCount(bytes);
-    const preview = prefixThroughLogicalLines(bytes, max_lines);
-    const reflowed = try transcript_blocks.reflowDiffBlock(alloc, preview, cols);
-    defer alloc.free(reflowed);
-    try out.writer.writeAll(reflowed);
-    if (preview.len > 0 and preview[preview.len - 1] != '\n') try out.writer.writeByte('\n');
-    if (total_lines > max_lines) {
-        try out.writer.writeAll("  ");
-        try beginSecondaryRailLine(&out.writer, styles);
-        try out.writer.print("  {d} more line{s} · → to expand", .{
-            total_lines - max_lines,
-            if (total_lines - max_lines == 1) "" else "s",
-        });
-        try endSecondaryRailLine(&out.writer, styles);
-    }
-    return preview.len > 0 or total_lines > max_lines;
 }
 
 fn appendTerminalSafeToolOutput(
@@ -7628,126 +6391,6 @@ fn appendTerminalSafeToolOutputInterruptible(
         row_start = row_end + 1;
     }
     if (wrapped.len > 0 or ends_with_newline) try writer.writeByte('\n');
-}
-
-fn appendReviewTerminalSafe(
-    out: *std.Io.Writer.Allocating,
-    alloc: Allocator,
-    bytes: []const u8,
-    styles: transcript_blocks.Styles,
-    cols: u16,
-) !bool {
-    return appendReviewTerminalSafeInterruptible(
-        out,
-        alloc,
-        bytes,
-        styles,
-        cols,
-        null,
-    ) catch |err| switch (err) {
-        error.InputPending => unreachable,
-        else => |other| return other,
-    };
-}
-
-fn appendReviewTerminalSafeInterruptible(
-    out: *std.Io.Writer.Allocating,
-    alloc: Allocator,
-    bytes: []const u8,
-    styles: transcript_blocks.Styles,
-    cols: u16,
-    checkpoint: ?*BuildCheckpoint,
-) !bool {
-    const max_lines = review_detail_line_limit;
-    const total_lines = logicalLineCount(bytes);
-    try beginSecondaryRailLine(&out.writer, styles);
-    try out.writer.print("  {d} line{s} · {d} B", .{
-        total_lines,
-        if (total_lines == 1) "" else "s",
-        bytes.len,
-    });
-    try endSecondaryRailLine(&out.writer, styles);
-    try appendTerminalSafeToolOutputInterruptible(
-        &out.writer,
-        alloc,
-        styles,
-        prefixThroughLogicalLines(bytes, max_lines),
-        cols,
-        checkpoint,
-    );
-    if (total_lines > max_lines) {
-        try beginSecondaryRailLine(&out.writer, styles);
-        try out.writer.print("  {d} more line{s} · → to expand", .{
-            total_lines - max_lines,
-            if (total_lines - max_lines == 1) "" else "s",
-        });
-        try endSecondaryRailLine(&out.writer, styles);
-    }
-    return total_lines > 0;
-}
-
-fn appendReviewCommandBlock(
-    writer: *std.Io.Writer,
-    alloc: Allocator,
-    block: command_output_runtime.CommandOutputBlock,
-    styles: transcript_blocks.Styles,
-    cols: u16,
-    stable_only: bool,
-) !bool {
-    const max_lines = review_detail_line_limit;
-    const stable_end = if (stable_only)
-        @min(block.overflow_line_index orelse block.lines.items.len, block.lines.items.len)
-    else
-        block.lines.items.len;
-    var preview: std.Io.Writer.Allocating = .init(alloc);
-    defer preview.deinit();
-    var shown: usize = 0;
-    var retained_lines: usize = 0;
-    for (block.lines.items, 0..) |line, line_index| {
-        if (!line.visible) continue;
-        const line_count = logicalLineCount(line.text);
-        retained_lines += line_count;
-        if (line_index >= stable_end or shown >= max_lines) continue;
-
-        var cursor: usize = 0;
-        while (cursor < line.text.len and shown < max_lines) : (shown += 1) {
-            const relative_end = std.mem.findScalar(u8, line.text[cursor..], '\n');
-            const line_end = if (relative_end) |offset| cursor + offset else line.text.len;
-            const logical_line = line.text[cursor..line_end];
-            const byte_cap = @max(@as(usize, cols) * 16, 256);
-            const bounded_line = logical_line[0..@min(logical_line.len, byte_cap)];
-            const rendered = try command_output_runtime.renderCommandOutputRecordWithPrimaryGutter(
-                alloc,
-                styles,
-                bounded_line,
-                cols,
-            );
-            defer alloc.free(rendered);
-            const first_row_end = if (std.mem.findScalar(u8, rendered, '\n')) |newline|
-                newline + 1
-            else
-                rendered.len;
-            try preview.writer.writeAll(rendered[0..first_row_end]);
-            cursor = if (relative_end != null) line_end + 1 else line.text.len;
-        }
-    }
-    const total_lines = @max(block.total_lines, retained_lines);
-    try beginSecondaryRailLine(writer, styles);
-    try writer.print("  {d} output line{s}", .{
-        total_lines,
-        if (total_lines == 1) "" else "s",
-    });
-    try endSecondaryRailLine(writer, styles);
-    try writer.writeAll(preview.written());
-    if (total_lines > shown) {
-        try beginSecondaryRailLine(writer, styles);
-        try writer.print("  {d} more line{s} · → to expand", .{
-            total_lines - shown,
-            if (total_lines - shown == 1) "" else "s",
-        });
-        try endSecondaryRailLine(writer, styles);
-    }
-    return shown > 0 or total_lines > shown;
 }
 
 fn argumentVisibleInToolHeading(
@@ -7878,7 +6521,6 @@ fn appendDetailContent(
     detail: *const ToolDetailRecord,
     source_index: *const ProjectionSourceIndex,
     full_diff_resolver: ?FullDiffResolver,
-    depth: DetailDepth,
     checkpoint: ?*BuildCheckpoint,
 ) !transcript_blocks.FullDetailAppend {
     const alloc = builder.alloc;
@@ -7906,8 +6548,7 @@ fn appendDetailContent(
         false;
     var semantic_arguments: std.Io.Writer.Allocating = .init(alloc);
     defer semantic_arguments.deinit();
-    const has_semantic_arguments = depth == .full and
-        !full_diff_covers_arguments and
+    const has_semantic_arguments = !full_diff_covers_arguments and
         try appendFullSemanticArguments(
             &semantic_arguments.writer,
             alloc,
@@ -7918,15 +6559,11 @@ fn appendDetailContent(
             checkpoint,
         );
     const authoritative_stored_result = storedResultForDetail(detail);
-    const review_stored_result = reviewStoredResultForDetail(detail);
     const active_partial = if (owned_command_block_index) |block_index|
         isActivePartialCommand(detail, command_blocks[block_index])
     else
         false;
-    const stored_result = if (depth == .review and review_stored_result != null)
-        review_stored_result
-    else if (deferred_command_source or
-        (depth == .review and owned_command_block_index != null))
+    const stored_result = if (deferred_command_source)
         null
     else
         authoritative_stored_result;
@@ -7943,22 +6580,8 @@ fn appendDetailContent(
     if (has_semantic_arguments) try out.writer.writeAll(semantic_arguments.written());
     if (stored_result) |stored_value| {
         var stored = stored_value;
-        stored.detail_depth = depth;
         stored.line_prefix = "│  ";
-        if (depth == .review and
-            (isCapturedCommandDetail(detail) or owned_command_block_index != null))
-        {
-            stored.retained_command_fallback = try boundedReviewCommandFallback(
-                alloc,
-                detail,
-                command_blocks,
-                owned_command_block_index,
-                styles,
-                builder.projection_cols,
-                checkpoint,
-            );
-            stored.retained_command_fallback_is_bounded_review = true;
-        } else if (isCapturedCommandDetail(detail) and stored.kind == .command_replay) {
+        if (isCapturedCommandDetail(detail) and stored.kind == .command_replay) {
             stored.retained_command_fallback = try degradedInlineCommandFallback(
                 alloc,
                 entries,
@@ -7981,48 +6604,15 @@ fn appendDetailContent(
         try builder.appendStoredResult(stored);
         ends_with_newline = stored.kind != .tool_result;
     } else if (deferred_command_source) {
-        if (depth == .review) {
-            ends_with_newline = try appendReviewCommandBlock(
-                &out.writer,
-                alloc,
-                command_blocks[owned_command_block_index.?],
-                styles,
-                builder.projection_cols,
-                active_partial,
-            );
-            if (active_partial) {
-                try writeSecondaryRailLine(
-                    &out.writer,
-                    styles,
-                    " … full output available when command finishes",
-                );
-            }
-        }
         ends_with_newline = true;
     } else if (active_partial) {
-        if (depth == .review) {
-            _ = try appendReviewCommandBlock(
-                &out.writer,
-                alloc,
-                command_blocks[owned_command_block_index.?],
-                styles,
-                builder.projection_cols,
-                true,
-            );
-            try writeSecondaryRailLine(
-                &out.writer,
-                styles,
-                " … full output available when command finishes",
-            );
-        } else {
-            try appendStableActiveCommandPrefix(
-                &out.writer,
-                alloc,
-                command_blocks[owned_command_block_index.?],
-                styles,
-                builder.projection_cols,
-            );
-        }
+        try appendStableActiveCommandPrefix(
+            &out.writer,
+            alloc,
+            command_blocks[owned_command_block_index.?],
+            styles,
+            builder.projection_cols,
+        );
         ends_with_newline = true;
     } else if (detail.result) |result| {
         if (isCapturedCommandDetail(detail)) {
@@ -8037,23 +6627,13 @@ fn appendDetailContent(
             );
             if (!parsed) {
                 if (command_block_index) |block_index| {
-                    _ = if (depth == .review)
-                        try appendReviewCommandBlock(
-                            &rendered.writer,
-                            alloc,
-                            command_blocks[block_index],
-                            styles,
-                            builder.projection_cols,
-                            false,
-                        )
-                    else
-                        try appendCommandBlock(
-                            &rendered.writer,
-                            alloc,
-                            command_blocks[block_index],
-                            styles,
-                            builder.projection_cols,
-                        );
+                    _ = try appendCommandBlock(
+                        &rendered.writer,
+                        alloc,
+                        command_blocks[block_index],
+                        styles,
+                        builder.projection_cols,
+                    );
                 } else {
                     try appendTerminalSafeToolOutputInterruptible(
                         &rendered.writer,
@@ -8065,54 +6645,29 @@ fn appendDetailContent(
                     );
                 }
             }
-            if (depth == .review and (parsed or command_block_index == null)) {
-                ends_with_newline = try appendReviewLines(out, rendered.written(), styles);
-            } else {
-                try out.writer.writeAll(rendered.written());
-            }
+            try out.writer.writeAll(rendered.written());
         } else {
             const display = tool_result_display.contentForDisplay(result);
-            if (depth == .review) {
-                ends_with_newline = try appendReviewTerminalSafeInterruptible(
-                    out,
-                    alloc,
-                    display,
-                    styles,
-                    builder.projection_cols,
-                    checkpoint,
-                );
-            } else {
-                try appendTerminalSafeToolOutputInterruptible(
-                    &out.writer,
-                    alloc,
-                    styles,
-                    display,
-                    builder.projection_cols,
-                    checkpoint,
-                );
-            }
+            try appendTerminalSafeToolOutputInterruptible(
+                &out.writer,
+                alloc,
+                styles,
+                display,
+                builder.projection_cols,
+                checkpoint,
+            );
         }
         ends_with_newline = true;
     }
     if (!deferred_command_source and stored_result == null and detail.result == null and !active_partial) {
         if (command_block_index) |block_index| {
-            ends_with_newline = if (depth == .review)
-                try appendReviewCommandBlock(
-                    &out.writer,
-                    alloc,
-                    command_blocks[block_index],
-                    styles,
-                    builder.projection_cols,
-                    false,
-                )
-            else
-                try appendCommandBlock(
-                    &out.writer,
-                    alloc,
-                    command_blocks[block_index],
-                    styles,
-                    builder.projection_cols,
-                );
+            ends_with_newline = try appendCommandBlock(
+                &out.writer,
+                alloc,
+                command_blocks[block_index],
+                styles,
+                builder.projection_cols,
+            );
         }
     }
     if (!deferred_command_source) {
@@ -8128,43 +6683,6 @@ fn appendDetailContent(
         }
     }
     return .{ .attached = true, .ends_with_newline = ends_with_newline };
-}
-
-fn boundedReviewCommandFallback(
-    alloc: Allocator,
-    detail: *const ToolDetailRecord,
-    command_blocks: []const command_output_runtime.CommandOutputBlock,
-    owned_command_block_index: ?usize,
-    styles: transcript_blocks.Styles,
-    cols: u16,
-    checkpoint: ?*BuildCheckpoint,
-) ![]u8 {
-    var fallback: std.Io.Writer.Allocating = .init(alloc);
-    errdefer fallback.deinit();
-
-    if (owned_command_block_index) |block_index| {
-        _ = try appendReviewCommandBlock(
-            &fallback.writer,
-            alloc,
-            command_blocks[block_index],
-            styles,
-            cols,
-            false,
-        );
-        return fallback.toOwnedSlice();
-    }
-
-    if (detail.result) |result| {
-        _ = try appendReviewTerminalSafeInterruptible(
-            &fallback,
-            alloc,
-            tool_result_display.contentForDisplay(result),
-            styles,
-            cols,
-            checkpoint,
-        );
-    }
-    return fallback.toOwnedSlice();
 }
 
 fn degradedInlineCommandFallback(
@@ -8218,6 +6736,8 @@ fn appendCommandProcessPresentation(
     const text = switch (presentation) {
         .exit_code => |code| try std.fmt.allocPrint(alloc, "exit code {d}", .{code}),
         .signal => |signal| try std.fmt.allocPrint(alloc, "signal {d}", .{signal}),
+        .timed_out => try alloc.dupe(u8, "timed out"),
+        .output_capture_failed => try alloc.dupe(u8, "output capture failed"),
     };
     defer alloc.free(text);
     const rendered = try command_output_runtime.renderCommandOutputRecordWithPrimaryGutter(

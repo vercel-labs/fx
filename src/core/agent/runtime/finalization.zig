@@ -39,6 +39,8 @@ pub const TurnFinalizationGuard = struct {
     turn_id: u64,
     lifecycle: LifecycleContext,
     state: State = .open,
+    lease_allocator: Allocator = std.heap.c_allocator,
+    agent_terminal_leases: std.ArrayList([]u8) = .empty,
 
     pub fn init(
         deps: *const AgentRuntimeDeps,
@@ -51,6 +53,53 @@ pub const TurnFinalizationGuard = struct {
             .turn_id = turn_id,
             .lifecycle = lifecycle_context,
         };
+    }
+
+    pub fn deinit(self: *TurnFinalizationGuard) void {
+        for (self.agent_terminal_leases.items) |session_id| {
+            self.lease_allocator.free(session_id);
+        }
+        self.agent_terminal_leases.deinit(self.lease_allocator);
+        self.* = undefined;
+    }
+
+    pub fn track_agent_terminal_lease(
+        self: *TurnFinalizationGuard,
+        session_id: []const u8,
+    ) Allocator.Error!void {
+        for (self.agent_terminal_leases.items) |tracked| {
+            if (std.mem.eql(u8, tracked, session_id)) return;
+        }
+        const owned = try self.lease_allocator.dupe(u8, session_id);
+        errdefer self.lease_allocator.free(owned);
+        try self.agent_terminal_leases.append(self.lease_allocator, owned);
+    }
+
+    pub fn remove_agent_terminal_lease(
+        self: *TurnFinalizationGuard,
+        session_id: []const u8,
+    ) void {
+        for (self.agent_terminal_leases.items, 0..) |tracked, index| {
+            if (!std.mem.eql(u8, tracked, session_id)) continue;
+            const removed = self.agent_terminal_leases.swapRemove(index);
+            self.lease_allocator.free(removed);
+            return;
+        }
+    }
+
+    fn cleanup_agent_terminal_leases(self: *TurnFinalizationGuard) void {
+        for (self.agent_terminal_leases.items) |session_id| {
+            self.deps.release_agent_terminal_lease(
+                self.deps.ctx,
+                session_id,
+            ) catch |err| {
+                debug_trace.logf(
+                    "terminal",
+                    "turn lease cleanup failed turn_id={d} session_id={s} err={s}",
+                    .{ self.turn_id, session_id, @errorName(err) },
+                );
+            };
+        }
     }
 
     pub fn finish(
@@ -70,6 +119,8 @@ pub const TurnFinalizationGuard = struct {
             );
             return;
         }
+
+        self.cleanup_agent_terminal_leases();
 
         self.deps.finalize_turn(self.deps.ctx, self.turn_id, outcome, disposition) catch |err| {
             self.state = .fatal;
@@ -106,16 +157,18 @@ pub fn finishAssistantTerminalWithExecution(
     finish_trace: *PromptFinishTrace,
     trace_outcome: []const u8,
 ) !void {
-    const turn: HistoryTurn = .{ .assistant = .{
+    const completed_summary = summary.finish();
+    var turn: HistoryTurn = .{ .assistant = .{
         .user = .{ .text = job.prompt, .images = job.images },
         .assistant = @constCast(assistant_text),
         .execution = execution,
     } };
+    types.setHistoryTurnSummary(&turn, completed_summary);
     const finished = try types.dupeFinishedPrompt(
         std.heap.c_allocator,
         .{
             .turn = turn,
-            .summary = summary.finish(),
+            .summary = completed_summary,
         },
     );
 

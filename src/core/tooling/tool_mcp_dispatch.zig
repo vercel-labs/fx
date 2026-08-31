@@ -1,4 +1,5 @@
 const std = @import("std");
+const lexical_relevance = @import("../shared/lexical_relevance.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_result_errors = @import("tool_result_errors.zig");
@@ -7,11 +8,12 @@ const Allocator = std.mem.Allocator;
 
 const SearchInput = struct {
     query: []u8,
+    prepared: lexical_relevance.PreparedQuery,
     limit: usize,
 
     fn deinit(self: *SearchInput, alloc: Allocator) void {
         alloc.free(self.query);
-        self.* = .{ .query = &.{}, .limit = 0 };
+        self.* = undefined;
     }
 };
 
@@ -52,11 +54,29 @@ pub fn decodeSearch(
     else
         std.math.cast(usize, raw_limit) orelse std.math.maxInt(usize);
 
+    if (query_value.string.len > lexical_relevance.max_query_bytes) {
+        return .{ .failure = try ctx.allocator.dupe(
+            u8,
+            "mcp_search_tools query must not exceed 4096 bytes.",
+        ) };
+    }
+
     const query = try ctx.allocator.dupe(u8, query_value.string);
     errdefer ctx.allocator.free(query);
+    const prepared = lexical_relevance.prepare(query) catch |err| switch (err) {
+        error.QueryTooLong => unreachable,
+        error.TooManyTokens => {
+            const message = try ctx.allocator.dupe(
+                u8,
+                "mcp_search_tools query must not exceed 64 tokens.",
+            );
+            ctx.allocator.free(query);
+            return .{ .failure = message };
+        },
+    };
     const input = try ctx.allocator.create(SearchInput);
     errdefer ctx.allocator.destroy(input);
-    input.* = .{ .query = query, .limit = limit };
+    input.* = .{ .query = query, .prepared = prepared, .limit = limit };
     return .{ .input = .{ .ptr = input, .deinit_fn = searchInputDeinit } };
 }
 
@@ -110,7 +130,7 @@ pub fn callSearch(
     const result = search_tools(
         runtime_context,
         ctx.allocator,
-        input.query,
+        &input.prepared,
         input.limit,
         ctx.mcp_permission_rules,
         ctx.context_limits,
@@ -214,4 +234,90 @@ fn semanticFailure(
     message: []const u8,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     return .{ .failure = try ctx.allocator.dupe(u8, message) };
+}
+
+test "MCP search decoder enforces query byte and token bounds" {
+    const alloc = std.testing.allocator;
+    const ctx = tool_dispatch.DispatchContext{ .allocator = alloc };
+
+    const max_query = "a" ** 4096;
+    const accepted_json = try std.fmt.allocPrint(alloc, "{{\"query\":\"{s}\"}}", .{max_query});
+    defer alloc.free(accepted_json);
+    const accepted = try decodeSearch(ctx, accepted_json);
+    switch (accepted) {
+        .input => |input| input.deinit(alloc),
+        .failure => |message| {
+            defer alloc.free(message);
+            return error.TestUnexpectedResult;
+        },
+    }
+
+    const too_long_query = "a" ** 4097;
+    const too_long_json = try std.fmt.allocPrint(alloc, "{{\"query\":\"{s}\"}}", .{too_long_query});
+    defer alloc.free(too_long_json);
+    const too_long = try decodeSearch(ctx, too_long_json);
+    switch (too_long) {
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+        .failure => |message| {
+            defer alloc.free(message);
+            try std.testing.expect(std.mem.find(u8, message, "4096 bytes") != null);
+        },
+    }
+
+    var token_query: std.Io.Writer.Allocating = .init(alloc);
+    defer token_query.deinit();
+    for (0..65) |index| {
+        if (index > 0) try token_query.writer.writeByte(' ');
+        try token_query.writer.writeAll("token");
+    }
+    const too_many_tokens_json = try std.fmt.allocPrint(
+        alloc,
+        "{{\"query\":\"{s}\"}}",
+        .{token_query.written()},
+    );
+    defer alloc.free(too_many_tokens_json);
+    const too_many_tokens = try decodeSearch(ctx, too_many_tokens_json);
+    switch (too_many_tokens) {
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+        .failure => |message| {
+            defer alloc.free(message);
+            try std.testing.expect(std.mem.find(u8, message, "64 tokens") != null);
+        },
+    }
+}
+
+test "MCP search decoder releases every accepted-input allocation failure" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            const decoded = try decodeSearch(
+                .{ .allocator = alloc },
+                "{\"query\":\"linear public data\",\"limit\":8}",
+            );
+            switch (decoded) {
+                .input => |input| input.deinit(alloc),
+                .failure => |message| alloc.free(message),
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "MCP search decoder releases every rejected-input allocation failure" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            const args_json = "{\"query\":\"" ++ ("token " ** 64) ++ "token\"}";
+            const decoded = try decodeSearch(.{ .allocator = alloc }, args_json);
+            switch (decoded) {
+                .input => |input| input.deinit(alloc),
+                .failure => |message| alloc.free(message),
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

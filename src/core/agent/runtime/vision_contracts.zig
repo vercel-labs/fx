@@ -1144,7 +1144,7 @@ test "Vision provider parsing accepts one long evidence string within the total 
     try std.testing.expectEqual(@as(usize, 5000), parsed.images[0].outcome.ok.visible_text[0].len);
 }
 
-test "Vision result serialization emits the five Fx-owned diagnostics" {
+test "Vision result serialization emits the five fx-owned diagnostics" {
     const Case = struct {
         failure: VisionFailure,
         expected: []const u8,
@@ -1201,7 +1201,7 @@ test "Vision provider diagnostic prose cannot cross the trust boundary" {
     );
 }
 
-test "Vision provider cannot mint Fx-owned local diagnostic codes" {
+test "Vision provider cannot mint fx-owned local diagnostic codes" {
     inline for (.{
         "image_unavailable",
         "provider_response_invalid",

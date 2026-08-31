@@ -172,8 +172,22 @@ pub const ToolLifecycleEvent = union(enum) {
     turn_finished: TurnFinished,
 };
 
+pub const TurnPhase = enum {
+    thinking,
+    generating,
+    running,
+};
+
+pub const TurnPhaseUpdate = struct {
+    turn_id: u64,
+    step_id: u64,
+    phase: TurnPhase,
+};
+
 pub const StreamState = struct {
     active: bool = false,
+    phase: TurnPhase = .thinking,
+    phase_step_id: u64 = 0,
     chunks: usize = 0,
     read_count: usize = 0,
     list_count: usize = 0,
@@ -184,22 +198,13 @@ pub const StreamState = struct {
     subagent_count: usize = 0,
     token_progress: TurnTokenProgress = .{},
     last_activity_kind: ?ToolActivityKind = null,
-    /// When the turn started; 0 hides the Thinking elapsed counter and its
-    /// wall-clock blink. Monotonic for the whole turn: tool boundaries never
-    /// reset it.
+    /// When the turn started; 0 hides the elapsed counter and activity blink.
+    /// Monotonic for the whole turn: phase and tool boundaries never reset it.
     turn_started_ms: i64 = 0,
     /// When fx started waiting on user input (approval or question); 0 means
-    /// not waiting. While set, the Thinking clock freezes at this instant;
+    /// not waiting. While set, the turn clock freezes at this instant;
     /// on resume the wait is excluded by shifting turn_started_ms forward.
     waiting_since_ms: i64 = 0,
-    /// Assistant text reached the transcript in the current stretch: the
-    /// status row stays with the response instead of flipping back to Thinking
-    /// whenever the pacer catches up. A tool start opens the next stretch.
-    assistant_text_started: bool = false,
-    /// The model is streaming tool arguments that open no status row of their
-    /// own, so the turn is producing output the transcript cannot show yet.
-    /// Cleared as soon as assistant text resumes or the tool itself starts.
-    composing_tool_payload: bool = false,
 };
 
 pub const RouteRecoveryUnsafeReason = enum {
@@ -305,6 +310,7 @@ pub const RouteRecoveryStatus = struct {
     action: ?ModelRecoveryAction = null,
     required_action: ModelRecoveryRequiredAction = .none,
     delay_seconds: u64 = 0,
+    retry_deadline: ?std.Io.Clock.Timestamp = null,
     diagnostic: ?ModelFailureDiagnostic = null,
 
     pub fn tone(self: RouteRecoveryStatus) RouteRecoveryStatusTone {
@@ -733,6 +739,7 @@ pub const PersistedToolResult = struct {
     committed_file_presentation: ?CommittedFilePresentation = null,
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
+    terminal_action_presentation: ?TerminalActionPresentation = null,
 };
 
 pub const CommandOutputReplayDescriptor = struct {
@@ -753,6 +760,83 @@ pub const CancelledCommandPresentation = struct {
 pub const CommandProcessPresentation = union(enum) {
     exit_code: i64,
     signal: u32,
+    timed_out,
+    output_capture_failed,
+};
+
+pub const TerminalReturnPresentation = union(enum) {
+    started,
+    condition_met,
+    safety_ceiling,
+    cancelled,
+    exited: i32,
+    signal: u32,
+};
+
+pub const TerminalFailurePresentation = enum {
+    invalid_request,
+    path_outside_workspace,
+    unsupported_host,
+    shell_unavailable,
+    pty_unavailable,
+    startup_failed,
+    process_identity_unavailable,
+    session_lost,
+    session_not_found,
+    invalid_lifecycle,
+    authority_denied,
+    authority_retired,
+    lease_conflict,
+    cursor_gap,
+    screen_unavailable,
+    monitor_unavailable,
+    protocol_incompatible,
+    capacity_exceeded,
+    cancelled,
+
+    pub fn detail(self: TerminalFailurePresentation) []const u8 {
+        return switch (self) {
+            .invalid_request => "invalid request",
+            .path_outside_workspace => "path is outside the workspace",
+            .unsupported_host => "terminal host is unavailable",
+            .shell_unavailable => "terminal shell is unavailable",
+            .pty_unavailable => "terminal PTY is unavailable",
+            .startup_failed => "terminal startup failed",
+            .process_identity_unavailable => "terminal process identity is unavailable",
+            .session_lost => "terminal session was lost",
+            .session_not_found => "terminal session not found",
+            .invalid_lifecycle => "terminal session is in an invalid lifecycle state",
+            .authority_denied => "terminal authority denied",
+            .authority_retired => "saved terminal authority is from an older fx version; start a new terminal",
+            .lease_conflict => "terminal control lease conflict",
+            .cursor_gap => "terminal output cursor gap",
+            .screen_unavailable => "terminal screen is unavailable",
+            .monitor_unavailable => "terminal monitor is unavailable",
+            .protocol_incompatible => "terminal protocol is incompatible",
+            .capacity_exceeded => "terminal capacity exceeded",
+            .cancelled => "terminal action was cancelled",
+        };
+    }
+};
+
+pub const TerminalActionPresentation = union(enum) {
+    returned: TerminalReturnPresentation,
+    failed: TerminalFailurePresentation,
+
+    pub fn outcomeKind(self: TerminalActionPresentation) ToolOutcomeKind {
+        return switch (self) {
+            .returned => |returned| switch (returned) {
+                .started, .condition_met, .safety_ceiling => .completed,
+                .cancelled => .cancelled,
+                .exited => |code| if (code == 0) .completed else .failed,
+                .signal => .failed,
+            },
+            .failed => |failed| if (failed == .cancelled)
+                .cancelled
+            else
+                .failed,
+        };
+    }
 };
 
 pub const deferred_tool_result_output = "Not executed";
@@ -812,6 +896,7 @@ pub const ToolResultMemory = struct {
     committed_file_presentation: ?CommittedFilePresentation = null,
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
+    terminal_action_presentation: ?TerminalActionPresentation = null,
 };
 
 pub const ToolExecutionStep = struct {
@@ -834,9 +919,12 @@ pub const FileEvidence = struct {
 pub const ExecutionMemory = struct {
     tool_steps: []ToolExecutionStep = &.{},
     files: []FileEvidence = &.{},
+    /// User guidance consumed between model steps, in presentation order.
+    steering: [][]u8 = &.{},
+    turn_summary: ?TurnSummary = null,
 
     pub fn isEmpty(self: ExecutionMemory) bool {
-        return self.tool_steps.len == 0 and self.files.len == 0;
+        return self.tool_steps.len == 0 and self.files.len == 0 and self.steering.len == 0;
     }
 };
 
@@ -880,9 +968,12 @@ pub const ChatMessage = struct {
 pub const Usage = struct {
     input_tokens: ?u64 = null,
     output_tokens: ?u64 = null,
+    cache_read_tokens: ?u64 = null,
+    cache_write_tokens: ?u64 = null,
+    reasoning_tokens: ?u64 = null,
 };
 
-/// Exact usage metadata returned by a completed Gateway stream. `model` is
+/// Exact usage metadata returned by a completed provider stream. `model` is
 /// owned by the completion carrying this value.
 pub const ProviderBilling = struct {
     created_at_ms: i64,
@@ -912,6 +1003,8 @@ pub const ToolUsage = struct {
 };
 
 pub const TurnSummary = struct {
+    started_at_ms: i64 = 0,
+    completed_at_ms: i64 = 0,
     thinking_duration_ms: u64 = 0,
     turn_duration_ms: u64 = 0,
     token_progress: TurnTokenProgress = .{},
@@ -1475,12 +1568,32 @@ pub const HistoryTurn = union(enum) {
     interrupted: InterruptedHistoryTurn,
 };
 
+pub fn setHistoryTurnSummary(turn: *HistoryTurn, summary: TurnSummary) void {
+    switch (turn.*) {
+        .assistant => |*entry| entry.execution.turn_summary = summary,
+        .background_command => |*entry| entry.execution.turn_summary = summary,
+        .interrupted => |*entry| entry.execution.turn_summary = summary,
+        .compacted_summary => {},
+    }
+}
+
+pub fn historyTurnSummary(turn: HistoryTurn) ?TurnSummary {
+    return switch (turn) {
+        .assistant => |entry| entry.execution.turn_summary,
+        .background_command => |entry| entry.execution.turn_summary,
+        .interrupted => |entry| entry.execution.turn_summary,
+        .compacted_summary => null,
+    };
+}
+
 pub const FinishedPromptProjection = enum {
     history_default,
     assistant_text,
 };
 
 pub const SnapshotFileOwnership = struct {
+    /// Shared lifetime for snapshot files after worker completion. Copies must
+    /// retain/release; accepted history transfers deletion responsibility.
     ctx: *anyopaque,
     retain_fn: *const fn (*anyopaque) void,
     release_fn: *const fn (*anyopaque) void,
@@ -1929,15 +2042,20 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     const tool_steps = try dupeToolExecutionSteps(alloc, memory.tool_steps);
     errdefer freeToolExecutionSteps(alloc, tool_steps);
     const files = try dupeFileEvidenceSlice(alloc, memory.files);
+    errdefer freeFileEvidenceSlice(alloc, files);
+    const steering = try dupePermissionFeedback(alloc, memory.steering);
     return .{
         .tool_steps = tool_steps,
         .files = files,
+        .steering = steering,
+        .turn_summary = memory.turn_summary,
     };
 }
 
 pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) void {
     freeToolExecutionSteps(alloc, memory.tool_steps);
     freeFileEvidenceSlice(alloc, memory.files);
+    freePermissionFeedback(alloc, memory.steering);
 }
 
 pub fn dupeToolExecutionSteps(alloc: std.mem.Allocator, steps: []const ToolExecutionStep) ![]ToolExecutionStep {
@@ -2133,6 +2251,7 @@ fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
         .committed_file_presentation = committed_file_presentation,
         .command_output_replay = command_output_replay,
         .command_process_presentation = result.command_process_presentation,
+        .terminal_action_presentation = result.terminal_action_presentation,
     };
 }
 

@@ -173,8 +173,8 @@ globalThis.setTimeout = originalSetTimeout;
 const text = new TextDecoder().decode(Buffer.concat(output.map((chunk) => Buffer.from(chunk))));
 
 if (exitCode !== 0) throw new Error(`fx-term exited with code ${exitCode}`);
-if (!text.includes("𝒇x")) throw new Error("shared Fx welcome frame was not observed");
-if (!text.includes("Run /help for commands")) throw new Error("shared Fx welcome guidance was not observed");
+if (!text.includes("𝒇x")) throw new Error("shared fx welcome frame was not observed");
+if (!text.includes("Run /help for commands")) throw new Error("shared fx welcome guidance was not observed");
 if (requestedModel !== "sdk/term-model") throw new Error(`terminal prompt did not use the host-restored model: ${requestedModel}`);
 if (!(streamStartedAt < streamFinishedAt)) throw new Error("terminal fetch did not remain active for continuous streaming");
 if (!(draftVisibleAt < streamFinishedAt)) throw new Error("terminal rendered follow-up input only after continuous streaming finished");

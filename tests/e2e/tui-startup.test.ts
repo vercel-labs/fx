@@ -40,10 +40,11 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
       session = await TmuxSession.create();
       await session.waitForComposer(10_000);
       await session.sendText("/help");
-      const pane = await session.waitForText("Commands 37", 5_000);
-      expect(pane).toContain("General");
+      const pane = await session.waitForText("Commands 36", 5_000);
+      expect(pane).toContain("[All]");
+      expect(pane).toContain("Tab Category");
       expect(pane).toContain("Enter Open");
-      expect(pane).not.toContain("Run /help for commands");
+      expect(pane).toContain("Run /help for commands");
     },
     TIMEOUT,
   );
@@ -136,7 +137,8 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           (line) => line.includes("/help") && line.includes("show available slash commands"),
         );
         expect(wideHelp).toBeDefined();
-        expect(wideHelp!.indexOf("show available slash commands")).toBe(48);
+        const wideDescriptionColumn = wideHelp!.indexOf("show available slash commands");
+        expect(wideDescriptionColumn).toBe(18);
 
         await session.resizeWindow(60, 40);
         const narrow = await session.waitForPane(
@@ -149,7 +151,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           (line) => line.includes("/help") && line.includes("show available"),
         );
         expect(narrowHelp).toBeDefined();
-        expect(narrowHelp!.indexOf("show available")).toBe(40);
+        expect(narrowHelp!.indexOf("show available")).toBe(wideDescriptionColumn);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         if (session) {
@@ -344,8 +346,11 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
         expect(discoveryRequests).toBe(1);
 
         await session.sendText("/mcp");
-        const summary = await session.waitForText("1 connecting", 5_000);
-        expect(summary).toContain("Use /mcp list for details.");
+        const summary = await session.waitForText("MCP 1", 5_000);
+        expect(summary).toContain("pending");
+        expect(summary).toContain("Connecting");
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
         await session.sendText("/mcp list");
         const status = await session.waitForText("state=connecting", 5_000);
         expect(status).toContain("pending source=profile scope=profile policy=optional");

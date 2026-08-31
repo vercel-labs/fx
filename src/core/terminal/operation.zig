@@ -195,17 +195,42 @@ fn free_repeated_probes(
     alloc.free(probes);
 }
 
+inline fn failOwnedAuthorityClaim(err: anytype) @TypeOf(err)!OwnedAuthorityClaim {
+    return @errorCast(failOwnedAuthorityClaimDynamic(err));
+}
+
+noinline fn failOwnedAuthorityClaimDynamic(err: anyerror) anyerror!OwnedAuthorityClaim {
+    return err;
+}
+
+test "owned authority claim failures preserve exact error types and identities" {
+    const invalid = failOwnedAuthorityClaim(error.InvalidAuthorityGrant);
+    try std.testing.expect(
+        @TypeOf(invalid) == error{InvalidAuthorityGrant}!OwnedAuthorityClaim,
+    );
+    try std.testing.expectError(error.InvalidAuthorityGrant, invalid);
+    try std.testing.expectError(
+        error.OutOfMemory,
+        failOwnedAuthorityClaim(error.OutOfMemory),
+    );
+}
+
 pub fn ownAuthorityClaim(
     alloc: Allocator,
     authority_claim: contracts.AuthorityClaim,
     controls: contracts.AllowedControls,
 ) !OwnedAuthorityClaim {
-    try authority_claim.validate();
-    if (!controls.any()) return error.InvalidAuthorityGrant;
+    authority_claim.validate() catch |err|
+        return failOwnedAuthorityClaim(err);
+    if (!controls.any()) {
+        return failOwnedAuthorityClaim(error.InvalidAuthorityGrant);
+    }
+    const principal = dupe_principal(alloc, authority_claim.principal) catch |err|
+        return failOwnedAuthorityClaim(err);
     return .{
         .alloc = alloc,
         .value = .{
-            .principal = try dupe_principal(alloc, authority_claim.principal),
+            .principal = principal,
             .actor = authority_claim.actor,
             .generation = authority_claim.generation,
             .proof = authority_claim.proof,

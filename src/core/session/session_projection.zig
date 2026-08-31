@@ -75,6 +75,27 @@ pub const Checkpoint = struct {
     }
 };
 
+inline fn failCheckpoint(err: anytype) @TypeOf(err)!Checkpoint {
+    return @errorCast(failCheckpointDynamic(err));
+}
+
+noinline fn failCheckpointDynamic(err: anyerror) anyerror!Checkpoint {
+    return err;
+}
+
+test "checkpoint failures preserve exact error types and identities" {
+    const invalid = failCheckpoint(error.InvalidCheckpoint);
+    try std.testing.expect(
+        @TypeOf(invalid) == error{InvalidCheckpoint}!Checkpoint,
+    );
+    try std.testing.expectError(error.InvalidCheckpoint, invalid);
+    try std.testing.expectError(
+        error.CheckpointTooLarge,
+        failCheckpoint(error.CheckpointTooLarge),
+    );
+    try std.testing.expectError(error.OutOfMemory, failCheckpoint(error.OutOfMemory));
+}
+
 pub const EventBoundary = struct {
     log_generation: session_event.Identifier,
     seq: u64,
@@ -314,9 +335,9 @@ pub fn encodeCheckpoint(alloc: Allocator, checkpoint: Checkpoint) ![]u8 {
 
 pub fn decodeCheckpoint(alloc: Allocator, bytes: []const u8) !Checkpoint {
     return decodeCheckpointImpl(alloc, bytes) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.CheckpointTooLarge => return error.CheckpointTooLarge,
-        else => return error.InvalidCheckpoint,
+        error.OutOfMemory => return failCheckpoint(error.OutOfMemory),
+        error.CheckpointTooLarge => return failCheckpoint(error.CheckpointTooLarge),
+        else => return failCheckpoint(error.InvalidCheckpoint),
     };
 }
 

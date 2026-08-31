@@ -13,6 +13,7 @@ const State = struct {
 };
 
 const default_log_max_bytes: u64 = 2 * 1024 * 1024;
+const max_trace_line_bytes: usize = 64 * 1024;
 
 pub const Options = struct {
     file_path: ?[]const u8 = null,
@@ -30,6 +31,7 @@ var state_mutex: std.Io.Mutex = .init;
 var state: State = .{};
 var next_turn_id = std.atomic.Value(u64).init(1);
 var next_step_id = std.atomic.Value(u64).init(1);
+var next_subagent_id = std.atomic.Value(u64).init(1);
 
 pub fn configureFromEnv(alloc: Allocator, workspace_root: []const u8) void {
     const options = loadOptionsFromEnv(alloc, workspace_root) catch return;
@@ -65,6 +67,11 @@ pub fn nextTurnId() u64 {
 pub fn nextStepId() u64 {
     if (comptime @import("builtin").os.tag == .wasi) return 1;
     return next_step_id.fetchAdd(1, .seq_cst);
+}
+
+pub fn nextSubagentId() u64 {
+    if (comptime @import("builtin").os.tag == .wasi) return 1;
+    return next_subagent_id.fetchAdd(1, .seq_cst);
 }
 
 pub fn logf(scope: []const u8, comptime fmt: []const u8, args: anytype) void {
@@ -123,10 +130,31 @@ const TraceLine = struct {
     noinline fn end(line: *TraceLine) void {
         defer line.out.deinit();
         if (line.failed) return;
-        line.out.writer.writeByte('\n') catch return;
-        writeLine(line.out.written());
+        var safe: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+        defer safe.deinit();
+        writeTerminalSafeTraceLine(&safe.writer, line.out.written()) catch return;
+        safe.writer.writeByte('\n') catch return;
+        writeLine(safe.written());
     }
 };
+
+fn writeTerminalSafeTraceLine(writer: *std.Io.Writer, raw: []const u8) !void {
+    const marker = "...";
+    var index: usize = 0;
+    while (index < raw.len) : (index += 1) {
+        const byte = raw[index];
+        const encoded_len: usize = if (byte >= 0x20 and byte <= 0x7e) 1 else 4;
+        if (writer.buffered().len + encoded_len + marker.len > max_trace_line_bytes) {
+            try writer.writeAll(marker);
+            return;
+        }
+        if (encoded_len == 1) {
+            try writer.writeByte(byte);
+        } else {
+            try writer.print("\\x{x:0>2}", .{byte});
+        }
+    }
+}
 
 pub fn preview(text: []const u8, max_len: usize) []const u8 {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
@@ -288,6 +316,7 @@ pub fn resetForTest() void {
     shutdown();
     next_turn_id.store(1, .seq_cst);
     next_step_id.store(1, .seq_cst);
+    next_subagent_id.store(1, .seq_cst);
 }
 
 pub fn configureForTest(alloc: Allocator, path: []const u8) !void {
@@ -617,6 +646,19 @@ test "terminalPreview strips common terminal controls" {
     var buf: [64]u8 = undefined;
     const result = terminalPreview(buf[0..], "hi \x1b[31mred\x1b[0m \x1b]8;;https://example.com\x07link\x1b]8;;\x07\nnext");
     try std.testing.expectEqualStrings("hi red link", result);
+}
+
+test "trace lines encode every non-ASCII and control byte" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeTerminalSafeTraceLine(
+        &out.writer,
+        "server=bad\n\x1b]0;owned\x07\xff",
+    );
+    try std.testing.expectEqualStrings(
+        "server=bad\\x0a\\x1b]0;owned\\x07\\xff",
+        out.written(),
+    );
 }
 
 test "resolveLogPath resolves absolute and relative paths" {

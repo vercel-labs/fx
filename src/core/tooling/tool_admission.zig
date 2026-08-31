@@ -696,26 +696,6 @@ fn pathContainsComponentSequence(
     return false;
 }
 
-fn reversibleStructuredToolMayBypassAutoReview(
-    input: Input,
-    arena: Allocator,
-    call: ToolCall,
-) !bool {
-    const tool = registeredTool(input, call.name) orelse return false;
-    if (tool.executor_kind != .create_folder) return false;
-    const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
-    const path_arg = try tool_args.requiredStringArg(args, "path");
-    const target_path = accessScope(input).resolvePath(
-        arena,
-        path_arg,
-        .create,
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return false,
-    };
-    return !sensitiveAutoWriteTarget(target_path);
-}
-
 fn fileMutationPermissionTargets(
     arena: Allocator,
     policy_targets: file_mutation_contract.PolicyEvaluatedFileTargets,
@@ -1324,9 +1304,6 @@ fn requestPermissionOutcomeResolved(
     const permission_name = try permissionNameForCall(input, arena, call);
     const target_kind = try permissionTargetKindForCall(input, arena, call);
     var targets = permissionTargetsForCall(input, arena, call) catch |err| {
-        if (permissionTargetResolutionDecision(call.name, err)) |decision| {
-            return .{ .decision = decision };
-        }
         if (try permissionTargetResolutionFailureMessage(arena, call.name, err)) |failure| {
             return .{ .tool_failure = failure };
         }
@@ -1432,11 +1409,6 @@ fn requestPermissionOutcomeResolved(
             try permissionOutcomeForDecision(input, arena, call, .once, .session_grant),
             vision_path_authority,
         );
-    }
-    if (permission_mode == .auto and
-        try reversibleStructuredToolMayBypassAutoReview(input, arena, call))
-    {
-        return ordinaryPermissionOutcome(.once);
     }
     if (input.host_sandbox_default == .allow_sandboxed and
         try isRunCommandCall(input, arena, call))
@@ -2346,13 +2318,6 @@ fn noninteractivePermissionRequired(call: ToolCall, reason: []const u8) ToolPerm
     return .permission_required;
 }
 
-fn permissionTargetResolutionDecision(tool_name: []const u8, err: anyerror) ?ToolPermissionDecision {
-    return switch (err) {
-        error.PathOutsideWorkspace => if (std.mem.eql(u8, tool_name, "semantic_search")) .policy_denied else null,
-        else => null,
-    };
-}
-
 pub fn permissionTargetResolutionFailureMessage(
     arena: Allocator,
     tool_name: []const u8,
@@ -2457,10 +2422,7 @@ pub fn permissionTargetForLiveAuthority(
     return permissionTargetForCall(input, arena, call) catch |err| {
         if (!recoverableExistingPathResolutionFailure(err)) return err;
         const tool = registeredTool(input, call.name) orelse return err;
-        if (tool.permission_target_kind != .path_existing or
-            std.mem.eql(u8, call.name, "rename_file") or
-            std.mem.eql(u8, call.name, "copy_file"))
-        {
+        if (tool.permission_target_kind != .path_existing) {
             return err;
         }
         return permissions.missingPathTargetForCallInScope(
@@ -2499,11 +2461,7 @@ fn isAvailableDynamicTool(input: Input, name: []const u8) bool {
     }, name);
 }
 
-test "permission target resolution never grants authority for a missing home" {
-    try std.testing.expectEqual(
-        @as(?ToolPermissionDecision, null),
-        permissionTargetResolutionDecision("read_file", error.HomeNotSet),
-    );
+test "permission target resolution reports a missing home" {
     const failure = (try permissionTargetResolutionFailureMessage(
         std.testing.allocator,
         "read_file",
@@ -2907,7 +2865,7 @@ test "dynamic MCP admission checks built-in and advertised names before runtime 
         },
     };
 
-    try std.testing.expect(!isAvailableDynamicTool(input, "list_files"));
+    try std.testing.expect(!isAvailableDynamicTool(input, "glob_files"));
     try std.testing.expect(!isAvailableDynamicTool(input, "mcp_unadvertised"));
     try std.testing.expectEqual(@as(usize, 0), mcp.calls);
     try std.testing.expect(isAvailableDynamicTool(input, "mcp_example"));
@@ -2956,8 +2914,8 @@ test "interactive dynamic MCP approval projects bounded terminal-safe arguments 
 
     const non_dynamic = try interactivePermissionRequest(input, arena, .{
         .id = "builtin",
-        .name = "list_files",
-        .arguments_json = "{\"path\":\".\"}",
+        .name = "glob_files",
+        .arguments_json = "{\"pattern\":\"*\"}",
     }, null);
     try std.testing.expectEqual(@as(?[]const u8, null), non_dynamic.tool_arguments_preview);
 
@@ -3551,13 +3509,10 @@ const FakeAutoClassifier = struct {
 };
 
 const test_admission_registry = tool_dispatch.Registry{ .tools = &.{
-    test_builtin_tools.list_files,
+    test_builtin_tools.glob_files,
     test_builtin_tools.terminal,
     test_builtin_tools.write_file,
     test_builtin_tools.edit_file,
-    test_builtin_tools.delete_file,
-    test_builtin_tools.copy_file,
-    test_builtin_tools.create_folder,
 } };
 
 fn testInputWithClassifier(
@@ -4585,22 +4540,22 @@ test "permission rule display follows supplied registry metadata" {
         permission_auto_classifier.Classifier.disabled(),
     );
 
-    var provider_list = test_builtin_tools.list_files;
-    provider_list.name = "provider_list";
-    provider_list.model_schema.name = "provider_list";
-    const tools = [_]tool_dispatch.Tool{provider_list};
+    var provider_glob = test_builtin_tools.glob_files;
+    provider_glob.name = "provider_glob";
+    provider_glob.model_schema.name = "provider_glob";
+    const tools = [_]tool_dispatch.Tool{provider_glob};
     input.tool_registry = .{ .tools = tools[0..] };
     var rules = [_]types.PermissionRule{.{
-        .permission = @constCast("provider_list"),
+        .permission = @constCast("provider_glob"),
         .pattern = @constCast("."),
         .action = .deny,
     }};
     input.permission_rules = .{ .rules = rules[0..] };
 
     const outcome = try requestPermissionOutcome(input, arena_state.allocator(), .{
-        .id = "provider-list",
-        .name = "provider_list",
-        .arguments_json = "{}",
+        .id = "provider-glob",
+        .name = "provider_glob",
+        .arguments_json = "{\"pattern\":\"*\"}",
     }, .ask, &.{});
     try std.testing.expectEqual(ToolPermissionDecision.policy_denied, outcome.decision);
 }
@@ -4874,65 +4829,6 @@ test "delegated command effects remain reviewer owned" {
         try std.testing.expect(outcome.auto_review_result != null);
     }
     try std.testing.expectEqual(@as(usize, 14), fake.calls);
-}
-
-test "automatic delete reaches reviewer and clear mints exact authority" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "workspace");
-    var victim = try tmp.dir.createFile(
-        std.testing.io,
-        "workspace/victim.txt",
-        .{ .truncate = true },
-    );
-    defer victim.close(std.testing.io);
-    try victim.writeStreamingAll(std.testing.io, "keep\n");
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-    const target = try std.fs.path.join(alloc, &.{ workspace, "victim.txt" });
-    defer alloc.free(target);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    var worker: WorkerRuntime = .{};
-    defer worker.deinit(alloc);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(alloc);
-    var fake = FakeAutoClassifier{};
-    var input = testInputWithClassifier(
-        &worker,
-        &background,
-        permission_auto_classifier.Classifier.withOverride(
-            @ptrCast(&fake),
-            FakeAutoClassifier.classify,
-        ),
-    );
-    input.workspace_root = workspace;
-    const arguments_json = try std.fmt.allocPrint(
-        arena_state.allocator(),
-        "{{\"path\":{f}}}",
-        .{std.json.fmt(target, .{})},
-    );
-
-    const outcome = try requestPermissionOutcome(
-        input,
-        arena_state.allocator(),
-        .{
-            .id = "delete-victim",
-            .name = "delete_file",
-            .arguments_json = arguments_json,
-        },
-        .auto,
-        &.{},
-    );
-
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
-    try std.testing.expectEqual(
-        command_admission.ToolExecutionAuthority.ordinary,
-        outcome.execution_authority.?,
-    );
 }
 
 test "automatic reviewer caution returns a recoverable hold without a prompter" {
@@ -5928,80 +5824,4 @@ test "automatic trusted-root overwrite preserves configured read disclosure revi
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
-}
-
-test "automatic trusted-root folder creation bypasses reviewer while external does not" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try tmp.dir.createDirPath(io_mod.getIo(), "external");
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-    const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
-    defer alloc.free(external);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var worker: WorkerRuntime = .{};
-    defer worker.deinit(alloc);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(alloc);
-    var fake = FakeAutoClassifier{};
-    var input = testInputWithClassifier(
-        &worker,
-        &background,
-        permission_auto_classifier.Classifier.withOverride(
-            @ptrCast(&fake),
-            FakeAutoClassifier.classify,
-        ),
-    );
-    input.workspace_root = workspace;
-
-    const cases = [_]struct {
-        id: []const u8,
-        target: []const u8,
-        expected_review_calls: usize,
-    }{
-        .{
-            .id = "workspace-folder",
-            .target = try std.fs.path.join(arena, &.{ workspace, "generated" }),
-            .expected_review_calls = 0,
-        },
-        .{
-            .id = "git-hooks-folder",
-            .target = try std.fs.path.join(arena, &.{ workspace, ".git", "hooks" }),
-            .expected_review_calls = 1,
-        },
-        .{
-            .id = "external-folder",
-            .target = try std.fs.path.join(arena, &.{ external, "generated" }),
-            .expected_review_calls = 2,
-        },
-    };
-    for (cases) |case| {
-        const arguments_json = try std.fmt.allocPrint(
-            arena,
-            "{{\"path\":\"{s}\"}}",
-            .{case.target},
-        );
-        const outcome = try requestPermissionOutcome(
-            input,
-            arena,
-            .{
-                .id = case.id,
-                .name = "create_folder",
-                .arguments_json = arguments_json,
-            },
-            .auto,
-            &.{},
-        );
-        try std.testing.expectEqual(case.expected_review_calls, fake.calls);
-        try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
-        try std.testing.expectEqual(
-            command_admission.ToolExecutionAuthority.ordinary,
-            outcome.execution_authority.?,
-        );
-    }
 }

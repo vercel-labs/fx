@@ -141,6 +141,13 @@ pub const Controller = struct {
         return self.runtime.mainApprovalBinding(prompt_id);
     }
 
+    pub fn mainApprovalCardBinding(
+        self: *const Controller,
+        prompt_id: u64,
+    ) ?subagent_runtime.MainApprovalBinding {
+        return self.runtime.mainApprovalCardBinding(prompt_id);
+    }
+
     pub fn dismissMainApproval(self: *Controller) void {
         self.runtime.dismissMainApproval();
     }

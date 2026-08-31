@@ -5,6 +5,7 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const types = @import("../shared/types.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const context_limits = @import("context_limits.zig");
+const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
@@ -84,6 +85,11 @@ pub const WorkspaceDirectoryMutation = struct {
     command_line_directories: []const []const u8 = &.{},
 };
 
+pub const ProjectMcpMutation = struct {
+    workspace_root: []const u8,
+    action: project_config.ProjectMcpAction,
+};
+
 pub const UserSettingsPatch = struct {
     model_preference: ?ModelPreferencePatch = null,
     provider: ?model_provider.ProviderId = null,
@@ -96,6 +102,7 @@ pub const UserSettingsPatch = struct {
     effort: ?types.ReasoningEffort = null,
     fast_mode: ?bool = null,
     slash_menu_categories: ?bool = null,
+    collapse_tool_calls: ?bool = null,
     update_channel: ?update_target.Channel = null,
     startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
@@ -114,6 +121,7 @@ pub const UserSettingsPatch = struct {
             self.effort == null and
             self.fast_mode == null and
             self.slash_menu_categories == null and
+            self.collapse_tool_calls == null and
             self.update_channel == null and
             self.startup_scrollback == null and
             self.prompt_history_enabled == null and
@@ -152,6 +160,7 @@ pub const CommittedSettings = struct {
     scope: SettingsScope,
     cleanup: LegacyCleanup = .{},
     permission_rules_removed: usize = 0,
+    authority_reduced: bool = false,
 };
 
 pub const CommitOutcome = union(enum) {
@@ -192,6 +201,7 @@ const RawPrimary = union(enum) {
 
 const PatchApplication = struct {
     changed: bool = false,
+    authority_reduced: bool = false,
     permission_rules_removed: usize = 0,
     legacy_fields_removed: usize = 0,
     legacy_workspaces_changed: usize = 0,
@@ -204,6 +214,7 @@ const UserPreferenceField = enum(u4) {
     effort,
     fast_mode,
     slash_menu_categories,
+    collapse_tool_calls,
     update_channel,
     startup_scrollback,
     prompt_history_enabled,
@@ -221,6 +232,7 @@ const UserPreferenceField = enum(u4) {
             .effort => "settings.json.preference-migration.effort.json",
             .fast_mode => "settings.json.preference-migration.fast_mode.json",
             .slash_menu_categories => "settings.json.preference-migration.slash_menu_categories.json",
+            .collapse_tool_calls => "settings.json.preference-migration.collapse_tool_calls.json",
             .update_channel => "settings.json.preference-migration.update_channel.json",
             .startup_scrollback => "settings.json.preference-migration.startup_scrollback.json",
             .prompt_history_enabled => "settings.json.preference-migration.prompt_history_enabled.json",
@@ -236,6 +248,7 @@ const user_preference_fields = [_]UserPreferenceField{
     .effort,
     .fast_mode,
     .slash_menu_categories,
+    .collapse_tool_calls,
     .update_channel,
     .startup_scrollback,
     .prompt_history_enabled,
@@ -247,12 +260,14 @@ const SettingsMutation = union(enum) {
     user: UserSettingsPatch,
     workspace_directory: WorkspaceDirectoryMutation,
     permission: PermissionMutation,
+    project_mcp: ProjectMcpMutation,
 
     fn operation(self: SettingsMutation) []const u8 {
         return switch (self) {
             .user => "user_patch",
             .workspace_directory => "workspace_directory_patch",
             .permission => "permission_patch",
+            .project_mcp => "project_mcp_patch",
         };
     }
 
@@ -264,6 +279,7 @@ const SettingsMutation = union(enum) {
                 .user => .user,
                 .local => .local,
             },
+            .project_mcp => .local,
         };
     }
 
@@ -275,6 +291,7 @@ const SettingsMutation = union(enum) {
                 "runtime_first",
             .workspace_directory => "commit_first",
             .permission => "commit_first",
+            .project_mcp => "commit_first",
         };
     }
 
@@ -283,6 +300,7 @@ const SettingsMutation = union(enum) {
             .user => |patch| patch.isEmpty(),
             .workspace_directory => false,
             .permission => false,
+            .project_mcp => false,
         };
     }
 };
@@ -411,6 +429,14 @@ pub const Store = struct {
         mutation: WorkspaceDirectoryMutation,
     ) !CommitOutcome {
         return self.applyMutation(alloc, .{ .workspace_directory = mutation });
+    }
+
+    pub fn applyProjectMcpMutation(
+        self: *Store,
+        alloc: Allocator,
+        mutation: ProjectMcpMutation,
+    ) !CommitOutcome {
+        return self.applyMutation(alloc, .{ .project_mcp = mutation });
     }
 
     fn applyMutation(
@@ -581,6 +607,7 @@ pub const Store = struct {
                     .recovery_paths = recovery_paths,
                 },
                 .permission_rules_removed = application.permission_rules_removed,
+                .authority_reduced = application.authority_reduced,
             } };
         }
         return error.SettingsConcurrentModification;
@@ -836,6 +863,20 @@ fn validateMutation(mutation: SettingsMutation) !void {
                 try validateWorkspaceRoot(workspace_root);
             },
         },
+        .project_mcp => |project_mcp| {
+            try validateWorkspaceRoot(project_mcp.workspace_root);
+            switch (project_mcp.action) {
+                .approve, .reject => |name| {
+                    if (name.len == 0 or name.len > 1024 or
+                        !std.unicode.utf8ValidateSlice(name) or
+                        std.mem.findScalar(u8, name, 0) != null)
+                    {
+                        return error.InvalidDurableField;
+                    }
+                },
+                .approve_all, .reset => {},
+            }
+        },
     }
 }
 
@@ -879,6 +920,19 @@ test "clearing the credential choice removes the key rather than blanking it" {
     try std.testing.expect(!application.changed);
 }
 
+test "collapse tool calls user patch writes the profile preference" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), "{}", .{});
+    defer parsed.deinit();
+    var root = parsed.value;
+
+    const application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .collapse_tool_calls = true });
+    try std.testing.expect(application.changed);
+    try std.testing.expect(root.object.get("collapse_tool_calls").?.bool);
+}
+
 test "provider patch writes one bounded provider model collection" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -916,6 +970,7 @@ fn applyMutationToRoot(
             workspace,
         ),
         .permission => |permission| applyPermissionMutationToRoot(arena, root, permission),
+        .project_mcp => |project_mcp| applyProjectMcpMutationToRoot(arena, root, project_mcp),
     };
     application.changed = application.changed or retired_settings_removed;
     return application;
@@ -941,6 +996,7 @@ fn applyUserPatchToRoot(
     if (patch.effort) |value| application.changed = try putString(arena, &root.object, "effort", value.label()) or application.changed;
     if (patch.fast_mode) |value| application.changed = try putBool(arena, &root.object, "fast_mode", value) or application.changed;
     if (patch.slash_menu_categories) |value| application.changed = try putBool(arena, &root.object, "slash_menu_categories", value) or application.changed;
+    if (patch.collapse_tool_calls) |value| application.changed = try putBool(arena, &root.object, "collapse_tool_calls", value) or application.changed;
     if (patch.update_channel) |value| application.changed = try putString(arena, &root.object, "update_channel", value.label()) or application.changed;
     if (patch.startup_scrollback) |value| application.changed = try putBool(arena, &root.object, "startup_scrollback", value) or application.changed;
 
@@ -1064,6 +1120,13 @@ fn cleanupLegacyWorkspacePreferences(
             "slash_menu_categories",
             .slash_menu_categories,
             patch.slash_menu_categories != null,
+            application,
+        );
+        removeLegacyLeaf(
+            &entry.value_ptr.object,
+            "collapse_tool_calls",
+            .collapse_tool_calls,
+            patch.collapse_tool_calls != null,
             application,
         );
         removeLegacyLeaf(
@@ -1360,6 +1423,59 @@ fn applyPermissionMutationToRoot(
     return applyPermissionPatch(arena, target, mutation.patch);
 }
 
+fn applyProjectMcpMutationToRoot(
+    arena: Allocator,
+    root: *std.json.Value,
+    mutation: ProjectMcpMutation,
+) !PatchApplication {
+    const existing_workspace = if (root.object.get("workspaces")) |workspaces|
+        if (workspaces == .object) workspaces.object.get(mutation.workspace_root) else null
+    else
+        null;
+    var diagnostics: std.ArrayList(project_config.WorkspaceDiagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(arena);
+        diagnostics.deinit(arena);
+    }
+    var current = try project_config.parseChoices(arena, existing_workspace, &diagnostics);
+    defer current.deinit(arena);
+    var transition = try project_config.applyAction(arena, current, mutation.action);
+    defer transition.choices.deinit(arena);
+
+    const workspace = try workspaceObject(arena, root, mutation.workspace_root);
+    var changed = false;
+    if (transition.choices.approved.len == 0) {
+        changed = workspace.orderedRemove(project_config.enabled_servers_key) or changed;
+    } else {
+        changed = try putStringArray(
+            arena,
+            workspace,
+            project_config.enabled_servers_key,
+            transition.choices.approved,
+        ) or changed;
+    }
+    if (transition.choices.rejected.len == 0) {
+        changed = workspace.orderedRemove(project_config.disabled_servers_key) or changed;
+    } else {
+        changed = try putStringArray(
+            arena,
+            workspace,
+            project_config.disabled_servers_key,
+            transition.choices.rejected,
+        ) or changed;
+    }
+    if (transition.choices.enable_all) {
+        changed = try putBool(arena, workspace, project_config.enable_all_key, true) or changed;
+    } else {
+        changed = workspace.orderedRemove(project_config.enable_all_key) or changed;
+    }
+    removeWorkspaceIfEmpty(root, mutation.workspace_root);
+    return .{
+        .changed = changed,
+        .authority_reduced = transition.authority_reduced,
+    };
+}
+
 fn workspaceObject(
     arena: Allocator,
     root: *std.json.Value,
@@ -1388,6 +1504,31 @@ fn putString(arena: Allocator, object: *std.json.ObjectMap, key: []const u8, val
         if (existing == .string and std.mem.eql(u8, existing.string, value)) return false;
     }
     try object.put(arena, key, .{ .string = try arena.dupe(u8, value) });
+    return true;
+}
+
+fn putStringArray(
+    arena: Allocator,
+    object: *std.json.ObjectMap,
+    key: []const u8,
+    values: []const []const u8,
+) !bool {
+    if (object.get(key)) |existing| {
+        if (existing == .array and existing.array.items.len == values.len) {
+            var equal = true;
+            for (existing.array.items, values) |field, value| {
+                if (field != .string or !std.mem.eql(u8, field.string, value)) {
+                    equal = false;
+                    break;
+                }
+            }
+            if (equal) return false;
+        }
+    }
+    var array = std.json.Array.init(arena);
+    try array.ensureTotalCapacity(values.len);
+    for (values) |value| array.appendAssumeCapacity(.{ .string = try arena.dupe(u8, value) });
+    try object.put(arena, key, .{ .array = array });
     return true;
 }
 
@@ -1608,9 +1749,11 @@ fn validateCandidate(
             .user => return,
             .local => permission.workspace_root.?,
         },
+        .project_mcp => |project_mcp| project_mcp.workspace_root,
     };
     const workspace_may_be_absent = switch (mutation) {
         .workspace_directory => |workspace| workspace.patch != .add,
+        .project_mcp => |project_mcp| project_mcp.action == .reset,
         else => false,
     };
     const workspaces = parsed.value.object.get("workspaces") orelse {
@@ -1624,6 +1767,16 @@ fn validateCandidate(
     };
     if (workspace != .object) return error.InvalidSettingsFormat;
     try validateKnownSettingsObject(workspace.object, true);
+    if (mutation == .project_mcp) {
+        var diagnostics: std.ArrayList(project_config.WorkspaceDiagnostic) = .empty;
+        defer {
+            for (diagnostics.items) |*diagnostic| diagnostic.deinit(alloc);
+            diagnostics.deinit(alloc);
+        }
+        var choices = project_config.parseChoices(alloc, workspace, &diagnostics) catch
+            return error.InvalidSettingsFormat;
+        choices.deinit(alloc);
+    }
 }
 
 fn validateKnownSettingsObject(
@@ -3038,6 +3191,86 @@ test "post-rename failure returns SettingsCommitIndeterminate" {
         error.SettingsCommitIndeterminate,
         store.applyUserPatch(alloc, .{ .startup_scrollback = false }),
     );
+}
+
+test "project MCP mutation writes exact workspace keys and classifies reduction" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var approved = try store.applyProjectMcpMutation(alloc, .{
+        .workspace_root = workspace,
+        .action = .{ .approve = "docs" },
+    });
+    defer approved.deinit(alloc);
+    try std.testing.expect(approved == .committed);
+    try std.testing.expect(!approved.committed.authority_reduced);
+
+    var rejected = try store.applyProjectMcpMutation(alloc, .{
+        .workspace_root = workspace,
+        .action = .{ .reject = "docs" },
+    });
+    defer rejected.deinit(alloc);
+    try std.testing.expect(rejected == .committed);
+    try std.testing.expect(rejected.committed.authority_reduced);
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, project_config.disabled_servers_key) != null);
+    try std.testing.expect(std.mem.find(u8, bytes, project_config.enabled_servers_key) == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "projectMcp") == null);
+
+    var reset = try store.applyProjectMcpMutation(alloc, .{
+        .workspace_root = workspace,
+        .action = .reset,
+    });
+    defer reset.deinit(alloc);
+    try std.testing.expect(reset == .committed);
+    try std.testing.expect(!reset.committed.authority_reduced);
+    const reset_bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(reset_bytes);
+    try std.testing.expect(std.mem.find(u8, reset_bytes, project_config.enabled_servers_key) == null);
+    try std.testing.expect(std.mem.find(u8, reset_bytes, project_config.disabled_servers_key) == null);
+    try std.testing.expect(std.mem.find(u8, reset_bytes, project_config.enable_all_key) == null);
+}
+
+test "indeterminate project MCP rejection may expose reduced settings" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+    var approved = try store.applyProjectMcpMutation(alloc, .{
+        .workspace_root = workspace,
+        .action = .{ .approve = "docs" },
+    });
+    approved.deinit(alloc);
+    store.failParentSyncAfterRenameForTest();
+
+    try std.testing.expectError(
+        error.SettingsCommitIndeterminate,
+        store.applyProjectMcpMutation(alloc, .{
+            .workspace_root = workspace,
+            .action = .{ .reject = "docs" },
+        }),
+    );
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, project_config.disabled_servers_key) != null);
+    try std.testing.expect(std.mem.find(u8, bytes, project_config.enabled_servers_key) == null);
 }
 
 test "indeterminate migration retains recovery metadata for the caller" {

@@ -7,11 +7,6 @@ const types = @import("../../core/shared/types.zig");
 const HistoryTurn = types.HistoryTurn;
 const FinishedPrompt = types.FinishedPrompt;
 
-const base_chars_per_sec: u32 = 400;
-const max_chars_per_sec: u32 = 5000;
-const streaming_target_drain_ms: u32 = 1500;
-const finish_target_drain_ms: u32 = 200;
-
 pub const EmitFn = *const fn (*anyopaque, []const u8) anyerror!void;
 pub const FinishFn = *const fn (*anyopaque, FinishedPrompt) anyerror!void;
 
@@ -25,7 +20,7 @@ pub const DeferredPresentationCallbacks = struct {
     append_history: *const fn (*anyopaque, *const FinishedPrompt) anyerror!DeferredFinishCommit,
 };
 
-pub const FlushResult = enum {
+const FlushResult = enum {
     drained,
     blocked,
 };
@@ -109,8 +104,6 @@ pub const SgrState = struct {
 
 pub const AssistantPacer = struct {
     pending: std.ArrayList(u8) = .empty,
-    last_emit_ns: ?i128 = null,
-    finished: bool = false,
     deferred_turn: ?FinishedPrompt = null,
     deferred_started_ns: ?i128 = null,
     /// Tracks which SGR attributes the terminal should have active at the
@@ -150,11 +143,7 @@ pub const AssistantPacer = struct {
         try self.pending.appendSlice(alloc, text);
     }
 
-    pub fn pause(self: *AssistantPacer, now_ns: i128) void {
-        if (self.pending.items.len > 0 and self.last_emit_ns != null) {
-            self.last_emit_ns = now_ns;
-        }
-    }
+    pub fn pause(_: *AssistantPacer, _: i128) void {}
 
     pub fn rethemeInlineCode(self: *AssistantPacer, light: bool) void {
         const from = if (light) "\x1b[38;5;245m" else "\x1b[38;5;247m";
@@ -183,7 +172,6 @@ pub const AssistantPacer = struct {
         }
         self.deferred_turn = try types.dupeFinishedPrompt(alloc, finished);
         self.deferred_started_ns = null;
-        self.finished = true;
         return true;
     }
 
@@ -194,8 +182,6 @@ pub const AssistantPacer = struct {
             self.deferred_turn = null;
         }
         self.deferred_started_ns = null;
-        self.finished = false;
-        self.last_emit_ns = null;
         self.sgr = .{};
     }
 
@@ -211,8 +197,6 @@ pub const AssistantPacer = struct {
         types.freeFinishedPrompt(alloc, finished);
         self.pending.clearRetainingCapacity();
         self.deferred_started_ns = null;
-        self.finished = false;
-        self.last_emit_ns = null;
         self.sgr = .{};
         return true;
     }
@@ -227,47 +211,35 @@ pub const AssistantPacer = struct {
             self.deferred_started_ns = now_ns;
         }
 
-        if (self.last_emit_ns == null) {
-            self.last_emit_ns = now_ns;
-            try self.emitN(1, cb);
-        } else {
-            const elapsed_ns: i128 = now_ns - self.last_emit_ns.?;
-            if (elapsed_ns <= 0) return;
-
-            const cps = self.computeCps();
-            const budget: i128 = @divFloor(elapsed_ns * @as(i128, cps), 1_000_000_000);
-            if (budget <= 0) return;
-            try self.emitN(@intCast(budget), cb);
-            self.last_emit_ns = now_ns;
-        }
-
-        if (self.pending.items.len == 0) {
+        if (try self.emitPendingBlock(cb) == .drained) {
             try self.fireDeferredFinish(alloc, now_ns, cb);
         }
     }
 
-    pub fn flushPendingText(self: *AssistantPacer, cb: TickCallbacks) !FlushResult {
-        while (self.pending.items.len > 0) {
-            const before = self.pending.items.len;
-            try self.emitN(std.math.maxInt(usize), cb);
-            if (self.pending.items.len == before) break;
+    pub fn flushPresentationAtBoundary(
+        self: *AssistantPacer,
+        alloc: Allocator,
+        now_ns: i128,
+        cb: TickCallbacks,
+    ) !void {
+        if (self.pending.items.len > 0) {
+            switch (try self.emitPendingBlock(cb)) {
+                .drained => {},
+                .blocked => try self.neutralizeIncompleteTail(cb),
+            }
         }
+        try self.fireDeferredFinish(alloc, now_ns, cb);
+    }
+
+    fn emitPendingBlock(self: *AssistantPacer, cb: TickCallbacks) !FlushResult {
+        try self.emitCompletePrefix(cb);
         if (self.pending.items.len == 0) {
-            self.last_emit_ns = null;
             return .drained;
         }
         return .blocked;
     }
 
-    pub fn flushPendingTextAtBoundary(
-        self: *AssistantPacer,
-        cb: TickCallbacks,
-    ) !void {
-        switch (try self.flushPendingText(cb)) {
-            .drained => return,
-            .blocked => {},
-        }
-
+    fn neutralizeIncompleteTail(self: *AssistantPacer, cb: TickCallbacks) !void {
         const tail = self.pending.items;
         std.debug.assert(tail.len > 0);
         if (tail[0] == 0x1b) {
@@ -295,32 +267,12 @@ pub const AssistantPacer = struct {
         }
 
         self.pending.clearRetainingCapacity();
-        self.last_emit_ns = null;
         self.sgr = .{};
-    }
-
-    pub fn flushPresentationAtBoundary(
-        self: *AssistantPacer,
-        alloc: Allocator,
-        now_ns: i128,
-        cb: TickCallbacks,
-    ) !void {
-        try self.flushPendingTextAtBoundary(cb);
-        try self.fireDeferredFinish(alloc, now_ns, cb);
-    }
-
-    fn computeCps(self: *const AssistantPacer) u32 {
-        const target_ms: u32 = if (self.finished) finish_target_drain_ms else streaming_target_drain_ms;
-        const backlog_cps: u64 = @as(u64, self.pending.items.len) * 1000 / target_ms;
-        const clamped = std.math.clamp(backlog_cps, @as(u64, base_chars_per_sec), @as(u64, max_chars_per_sec));
-        return @intCast(clamped);
     }
 
     fn fireDeferredFinish(self: *AssistantPacer, alloc: Allocator, now_ns: i128, cb: TickCallbacks) !void {
         if (self.deferred_turn) |finished| {
             self.deferred_turn = null;
-            self.finished = false;
-            self.last_emit_ns = null;
             const started_ns = self.deferred_started_ns;
             self.deferred_started_ns = null;
             var callback_finished = finished;
@@ -335,27 +287,8 @@ pub const AssistantPacer = struct {
         }
     }
 
-    fn emitN(self: *AssistantPacer, count: usize, cb: TickCallbacks) !void {
-        if (count == 0) return;
-        var i: usize = 0;
-        var emitted: usize = 0;
-        while (emitted < count and i < self.pending.items.len) {
-            const first = self.pending.items[i];
-            if (first == 0x1b) {
-                // Emit ANSI sequences atomically; hold incomplete tails for a later tick.
-                const end = display_width.ansiSequenceEnd(self.pending.items, i);
-                if (end > i) {
-                    if (!ansiSequenceComplete(self.pending.items, i, end)) break;
-                    i = end;
-                    continue;
-                }
-            }
-            const len = std.unicode.utf8ByteSequenceLength(first) catch 1;
-            if (i + len > self.pending.items.len) break;
-            i += len;
-            emitted += 1;
-        }
-        // Leave trailing close sequences for the next emit so tracked SGR state stays open.
+    fn emitCompletePrefix(self: *AssistantPacer, cb: TickCallbacks) !void {
+        const i = self.emittablePrefixLen();
         if (i == 0) return;
 
         // Restore tracked SGR state because other renderers may reset it between ticks.
@@ -370,6 +303,26 @@ pub const AssistantPacer = struct {
         try cb.emit_fn(cb.emit_ctx, self.pending.items[0..i]);
         self.updateSgrFromEmitted(self.pending.items[0..i]);
         self.consume(i);
+    }
+
+    fn emittablePrefixLen(self: *const AssistantPacer) usize {
+        var i: usize = 0;
+        while (i < self.pending.items.len) {
+            const first = self.pending.items[i];
+            if (first == 0x1b) {
+                // Keep ANSI sequences atomic and hold incomplete tails for a later tick.
+                const end = display_width.ansiSequenceEnd(self.pending.items, i);
+                if (end > i) {
+                    if (!ansiSequenceComplete(self.pending.items, i, end)) break;
+                    i = end;
+                    continue;
+                }
+            }
+            const len = std.unicode.utf8ByteSequenceLength(first) catch 1;
+            if (i + len > self.pending.items.len) break;
+            i += len;
+        }
+        return i;
     }
 
     fn updateSgrFromEmitted(self: *AssistantPacer, bytes: []const u8) void {
@@ -464,40 +417,38 @@ fn makeBackgroundTurn(alloc: Allocator) !HistoryTurn {
     } };
 }
 
-test "enqueue and drain emits bytes paced by time" {
+test "tick emits one queued rendered block atomically" {
     const alloc = std.testing.allocator;
     var pacer = AssistantPacer{};
     defer pacer.deinit(alloc);
     var cap = TestCapture{};
     defer cap.deinit();
 
-    try pacer.enqueue(alloc, "hello world");
-    try std.testing.expect(pacer.hasPending());
+    const paragraph = "A complete rendered paragraph.\n\n";
+    try pacer.enqueue(alloc, paragraph);
 
     try pacer.tick(alloc, 0, cap.callbacks());
-    try std.testing.expectEqualStrings("h", cap.emitted.items);
 
-    try pacer.tick(alloc, 100_000_000, cap.callbacks());
-    try std.testing.expectEqualStrings("hello world", cap.emitted.items);
-    try std.testing.expectEqual(@as(usize, 0), pacer.pending.items.len);
+    try std.testing.expectEqualStrings(paragraph, cap.emitted.items);
+    try std.testing.expect(!pacer.hasPending());
 }
 
-test "tick emits only budget-many codepoints" {
+test "presentation boundary emits the queued block before continuing" {
     const alloc = std.testing.allocator;
     var pacer = AssistantPacer{};
     defer pacer.deinit(alloc);
     var cap = TestCapture{};
     defer cap.deinit();
 
-    try pacer.enqueue(alloc, "abcdefghij");
+    const paragraph = "Explanation before a tool.\n";
+    try pacer.enqueue(alloc, paragraph);
 
-    try pacer.tick(alloc, 0, cap.callbacks());
-    try pacer.tick(alloc, 10_000_000, cap.callbacks());
-    try std.testing.expectEqualStrings("abcde", cap.emitted.items);
-    try std.testing.expectEqual(@as(usize, 5), pacer.pending.items.len);
+    try pacer.flushPresentationAtBoundary(alloc, 0, cap.callbacks());
+    try std.testing.expectEqualStrings(paragraph, cap.emitted.items);
+    try std.testing.expect(!pacer.hasPending());
 }
 
-test "emit preserves UTF-8 multi-byte boundaries" {
+test "tick emits a complete UTF-8 block" {
     const alloc = std.testing.allocator;
     var pacer = AssistantPacer{};
     defer pacer.deinit(alloc);
@@ -507,8 +458,8 @@ test "emit preserves UTF-8 multi-byte boundaries" {
     try pacer.enqueue(alloc, "áñ");
 
     try pacer.tick(alloc, 0, cap.callbacks());
-    try std.testing.expectEqualStrings("á", cap.emitted.items);
-    try std.testing.expectEqual(@as(usize, 2), pacer.pending.items.len);
+    try std.testing.expectEqualStrings("áñ", cap.emitted.items);
+    try std.testing.expect(!pacer.hasPending());
 }
 
 test "partial UTF-8 at buffer tail is held until rest arrives" {
@@ -522,68 +473,28 @@ test "partial UTF-8 at buffer tail is held until rest arrives" {
     try pacer.enqueue(alloc, &[_]u8{0xc3});
 
     try pacer.tick(alloc, 0, cap.callbacks());
-    try pacer.tick(alloc, 100_000_000, cap.callbacks());
     try std.testing.expectEqual(@as(usize, 0), cap.emitted.items.len);
     try std.testing.expectEqual(@as(usize, 1), pacer.pending.items.len);
 
     try pacer.enqueue(alloc, &[_]u8{0xa1});
-    try pacer.tick(alloc, 200_000_000, cap.callbacks());
+    try pacer.tick(alloc, 1, cap.callbacks());
     try std.testing.expectEqualStrings("á", cap.emitted.items);
 }
 
-test "rate scales smoothly with backlog" {
+test "large rendered block emits in one tick" {
     const alloc = std.testing.allocator;
     var pacer = AssistantPacer{};
     defer pacer.deinit(alloc);
     var cap = TestCapture{};
     defer cap.deinit();
 
-    // A 999-character backlog yields 666 cps and six characters in 10 ms.
     var big: [1000]u8 = undefined;
     @memset(&big, 'x');
     try pacer.enqueue(alloc, &big);
 
     try pacer.tick(alloc, 0, cap.callbacks());
-    try pacer.tick(alloc, 10_000_000, cap.callbacks());
-    try std.testing.expectEqual(@as(usize, 7), cap.emitted.items.len);
-}
-
-test "large backlog paces without atomic dump" {
-    const alloc = std.testing.allocator;
-    var pacer = AssistantPacer{};
-    defer pacer.deinit(alloc);
-    var cap = TestCapture{};
-    defer cap.deinit();
-
-    var huge: [5000]u8 = undefined;
-    @memset(&huge, 'y');
-    try pacer.enqueue(alloc, &huge);
-
-    try pacer.tick(alloc, 0, cap.callbacks());
-    try pacer.tick(alloc, 1_000_000, cap.callbacks());
-
-    // The capped rate emits five characters in 1 ms after the initial tick.
-    try std.testing.expect(cap.emitted.items.len < 50);
-    try std.testing.expect(pacer.pending.items.len > 4900);
-}
-
-test "pause excludes decision prompt time from pacing budget" {
-    const alloc = std.testing.allocator;
-    var pacer = AssistantPacer{};
-    defer pacer.deinit(alloc);
-    var cap = TestCapture{};
-    defer cap.deinit();
-
-    var huge: [5000]u8 = undefined;
-    @memset(&huge, 'y');
-    try pacer.enqueue(alloc, &huge);
-
-    try pacer.tick(alloc, 0, cap.callbacks());
-    pacer.pause(10 * std.time.ns_per_s);
-    try pacer.tick(alloc, 10 * std.time.ns_per_s + std.time.ns_per_ms, cap.callbacks());
-
-    try std.testing.expect(cap.emitted.items.len < 50);
-    try std.testing.expect(pacer.pending.items.len > 4900);
+    try std.testing.expectEqualSlices(u8, &big, cap.emitted.items);
+    try std.testing.expect(!pacer.hasPending());
 }
 
 test "deferFinish returns false when buffer empty" {
@@ -599,28 +510,7 @@ test "deferFinish returns false when buffer empty" {
     try std.testing.expect(pacer.deferred_turn == null);
 }
 
-test "flushPendingText emits pending text immediately" {
-    const alloc = std.testing.allocator;
-    var pacer = AssistantPacer{};
-    defer pacer.deinit(alloc);
-    var cap = TestCapture{};
-    defer cap.deinit();
-
-    try pacer.enqueue(alloc, "hello world");
-    try std.testing.expectEqual(
-        FlushResult.drained,
-        try pacer.flushPendingText(cap.callbacks()),
-    );
-
-    try std.testing.expectEqualStrings("hello world", cap.emitted.items);
-    try std.testing.expect(!pacer.hasPending());
-    try std.testing.expectEqual(
-        FlushResult.drained,
-        try pacer.flushPendingText(cap.callbacks()),
-    );
-}
-
-test "flushPendingText reports blocked for incomplete ANSI and UTF-8 tails" {
+test "presentation boundary neutralizes only the incomplete ANSI or UTF-8 tail" {
     const alloc = std.testing.allocator;
 
     {
@@ -630,41 +520,10 @@ test "flushPendingText reports blocked for incomplete ANSI and UTF-8 tails" {
         defer cap.deinit();
 
         try pacer.enqueue(alloc, "visible\x1b[1");
-        try std.testing.expectEqual(
-            FlushResult.blocked,
-            try pacer.flushPendingText(cap.callbacks()),
-        );
+        try pacer.tick(alloc, 0, cap.callbacks());
+        try pacer.tick(alloc, 100 * std.time.ns_per_ms, cap.callbacks());
         try std.testing.expectEqualStrings("visible", cap.emitted.items);
-        try std.testing.expectEqualStrings("\x1b[1", pacer.pending.items);
-    }
-
-    {
-        var pacer = AssistantPacer{};
-        defer pacer.deinit(alloc);
-        var cap = TestCapture{};
-        defer cap.deinit();
-
-        try pacer.enqueue(alloc, &.{0xc3});
-        try std.testing.expectEqual(
-            FlushResult.blocked,
-            try pacer.flushPendingText(cap.callbacks()),
-        );
-        try std.testing.expectEqual(@as(usize, 0), cap.emitted.items.len);
-        try std.testing.expectEqualSlices(u8, &.{0xc3}, pacer.pending.items);
-    }
-}
-
-test "flushPendingTextAtBoundary neutralizes incomplete ANSI and UTF-8 tails" {
-    const alloc = std.testing.allocator;
-
-    {
-        var pacer = AssistantPacer{};
-        defer pacer.deinit(alloc);
-        var cap = TestCapture{};
-        defer cap.deinit();
-
-        try pacer.enqueue(alloc, "visible\x1b[1");
-        try pacer.flushPendingTextAtBoundary(cap.callbacks());
+        try pacer.flushPresentationAtBoundary(alloc, 100 * std.time.ns_per_ms, cap.callbacks());
 
         try std.testing.expectEqualStrings("visible\xef\xbf\xbd\x1b[0m", cap.emitted.items);
         try std.testing.expect(!pacer.hasPending());
@@ -678,7 +537,7 @@ test "flushPendingTextAtBoundary neutralizes incomplete ANSI and UTF-8 tails" {
         defer cap.deinit();
 
         try pacer.enqueue(alloc, &.{0xc3});
-        try pacer.flushPendingTextAtBoundary(cap.callbacks());
+        try pacer.flushPresentationAtBoundary(alloc, 0, cap.callbacks());
 
         try std.testing.expectEqualStrings("\xef\xbf\xbd\x1b[0m", cap.emitted.items);
         try std.testing.expect(!pacer.hasPending());
@@ -691,7 +550,9 @@ test "flushPendingTextAtBoundary neutralizes incomplete ANSI and UTF-8 tails" {
         defer cap.deinit();
 
         try pacer.enqueue(alloc, "visible\x1b]52;c;unsafe");
-        try pacer.flushPendingTextAtBoundary(cap.callbacks());
+        try pacer.tick(alloc, 0, cap.callbacks());
+        try pacer.tick(alloc, 100 * std.time.ns_per_ms, cap.callbacks());
+        try pacer.flushPresentationAtBoundary(alloc, 100 * std.time.ns_per_ms, cap.callbacks());
 
         try std.testing.expectEqualStrings("visible\xef\xbf\xbd\x1b[0m", cap.emitted.items);
         try std.testing.expect(std.mem.find(u8, cap.emitted.items, "52;c;unsafe") == null);
@@ -699,11 +560,11 @@ test "flushPendingTextAtBoundary neutralizes incomplete ANSI and UTF-8 tails" {
     }
 }
 
-test "flushPendingText preserves callback errors and pending bytes" {
+test "presentation boundary preserves callback errors and pending bytes" {
     const alloc = std.testing.allocator;
     var pacer = AssistantPacer{};
     defer pacer.deinit(alloc);
-    try pacer.enqueue(alloc, "pending");
+    try pacer.enqueue(alloc, "\x1b[1");
 
     const Failing = struct {
         fn emit(_: *anyopaque, _: []const u8) anyerror!void {
@@ -722,9 +583,9 @@ test "flushPendingText preserves callback errors and pending bytes" {
 
     try std.testing.expectError(
         error.InjectedEmitFailure,
-        pacer.flushPendingText(callbacks),
+        pacer.flushPresentationAtBoundary(alloc, 0, callbacks),
     );
-    try std.testing.expectEqualStrings("pending", pacer.pending.items);
+    try std.testing.expectEqualStrings("\x1b[1", pacer.pending.items);
 }
 
 test "deferFinish defers and fires when buffer drains" {
@@ -741,14 +602,11 @@ test "deferFinish defers and fires when buffer drains" {
 
     const deferred = try pacer.deferFinish(alloc, .{ .turn = turn });
     try std.testing.expect(deferred);
-    try std.testing.expect(pacer.finished);
 
     try pacer.tick(alloc, 0, cap.callbacks());
-    try pacer.tick(alloc, 10_000_000, cap.callbacks());
     try std.testing.expectEqualStrings("hi", cap.emitted.items);
     try std.testing.expectEqual(@as(usize, 1), cap.finish_count);
     try std.testing.expect(pacer.deferred_turn == null);
-    try std.testing.expect(!pacer.finished);
 }
 
 test "deferFinish carries summary only after pending text drains" {
@@ -772,16 +630,13 @@ test "deferFinish carries summary only after pending text drains" {
     try std.testing.expect(deferred);
 
     try pacer.tick(alloc, 0, cap.callbacks());
-    try std.testing.expectEqual(@as(usize, 0), cap.finish_count);
-    try pacer.tick(alloc, 50_000_000, cap.callbacks());
-
     try std.testing.expectEqualStrings("hi", cap.emitted.items);
     try std.testing.expectEqual(@as(usize, 1), cap.finish_count);
     try std.testing.expectEqual(@as(u64, 5_000), cap.finish_summary.?.token_progress.output_tokens);
-    try std.testing.expectEqual(@as(u64, 130_050), cap.finish_summary.?.turn_duration_ms);
+    try std.testing.expectEqual(@as(u64, 130_000), cap.finish_summary.?.turn_duration_ms);
 }
 
-test "flushPresentationAtBoundary emits pending text and deferred finish" {
+test "presentation boundary emits text before deferred finish" {
     const alloc = std.testing.allocator;
     var pacer = AssistantPacer{};
     defer pacer.deinit(alloc);
@@ -803,8 +658,7 @@ test "flushPresentationAtBoundary emits pending text and deferred finish" {
         .terminal_outcome = .completed,
     }));
 
-    try pacer.flushPresentationAtBoundary(alloc, 50_000_000, cap.callbacks());
-
+    try pacer.flushPresentationAtBoundary(alloc, 0, cap.callbacks());
     try std.testing.expectEqualStrings("tail", cap.emitted.items);
     try std.testing.expectEqual(@as(usize, 1), cap.finish_count);
     try std.testing.expectEqual(@as(u64, 3), cap.finish_summary.?.token_progress.output_tokens);
@@ -897,27 +751,6 @@ test "completed assistant summary is the only deferred presentation tail" {
     }
 }
 
-test "finish-drain mode uses higher rate" {
-    const alloc = std.testing.allocator;
-    var pacer = AssistantPacer{};
-    defer pacer.deinit(alloc);
-    var cap = TestCapture{};
-    defer cap.deinit();
-
-    var txt: [500]u8 = undefined;
-    @memset(&txt, 'z');
-    try pacer.enqueue(alloc, &txt);
-
-    const turn = try makeAssistantTurn(alloc);
-    defer types.freeHistoryTurn(alloc, turn);
-    _ = try pacer.deferFinish(alloc, .{ .turn = turn });
-
-    // At 2,495 cps, 10 ms emits 24 characters after the initial tick.
-    try pacer.tick(alloc, 0, cap.callbacks());
-    try pacer.tick(alloc, 10_000_000, cap.callbacks());
-    try std.testing.expectEqual(@as(usize, 25), cap.emitted.items.len);
-}
-
 test "clear drops pending and deferred turn" {
     const alloc = std.testing.allocator;
     var pacer = AssistantPacer{};
@@ -931,7 +764,6 @@ test "clear drops pending and deferred turn" {
     try std.testing.expect(pacer.hasPending());
     pacer.clear(alloc);
     try std.testing.expect(!pacer.hasPending());
-    try std.testing.expect(!pacer.finished);
 }
 
 test "visual epoch discard retains uncommitted deferred finish and drops committed presentation" {
@@ -969,7 +801,7 @@ test "visual epoch discard retains uncommitted deferred finish and drops committ
     try std.testing.expectEqual(@as(usize, 2), capture.calls);
 }
 
-test "ANSI escape sequences are emitted atomically without consuming codepoint budget" {
+test "ANSI-styled block emits atomically" {
     const alloc = std.testing.allocator;
     var pacer = AssistantPacer{};
     defer pacer.deinit(alloc);
@@ -979,11 +811,7 @@ test "ANSI escape sequences are emitted atomically without consuming codepoint b
     try pacer.enqueue(alloc, "\x1b[1mhi\x1b[22m!");
 
     try pacer.tick(alloc, 0, cap.callbacks());
-    try std.testing.expectEqualStrings("\x1b[1mh", cap.emitted.items);
-
-    // Each chunk restores open SGR state in case another renderer reset it.
-    try pacer.tick(alloc, 100_000_000, cap.callbacks());
-    try std.testing.expectEqualStrings("\x1b[1mh\x1b[0m\x1b[1mi\x1b[22m!", cap.emitted.items);
+    try std.testing.expectEqualStrings("\x1b[1mhi\x1b[22m!", cap.emitted.items);
     try std.testing.expectEqual(@as(usize, 0), pacer.pending.items.len);
 }
 
@@ -996,6 +824,7 @@ test "incomplete ANSI sequence at tail is held until completion arrives" {
 
     try pacer.enqueue(alloc, "x\x1b[1");
     try pacer.tick(alloc, 0, cap.callbacks());
+    try pacer.tick(alloc, 3_000_000, cap.callbacks());
     try std.testing.expectEqualStrings("x", cap.emitted.items);
     try std.testing.expectEqual(@as(usize, 3), pacer.pending.items.len);
 
@@ -1004,53 +833,56 @@ test "incomplete ANSI sequence at tail is held until completion arrives" {
     try std.testing.expectEqualStrings("x\x1b[1my", cap.emitted.items);
 }
 
-test "sgr state re-established after open sgr in prior emit" {
+test "code style is restored across rendered blocks" {
     const alloc = std.testing.allocator;
     var pacer = AssistantPacer{};
     defer pacer.deinit(alloc);
     var cap = TestCapture{};
     defer cap.deinit();
 
-    try pacer.enqueue(alloc, "\x1b[38;5;245mcode\x1b[39m done");
-    try pacer.tick(alloc, 0, cap.callbacks()); // emits `\x1b[38;5;245mc`
-    try pacer.tick(alloc, 100_000_000, cap.callbacks()); // emits rest
+    try pacer.enqueue(alloc, "\x1b[38;5;245mcode");
+    try pacer.tick(alloc, 0, cap.callbacks());
+    try pacer.enqueue(alloc, "\x1b[39m done");
+    try pacer.tick(alloc, 1, cap.callbacks());
 
-    try std.testing.expect(std.mem.indexOf(u8, cap.emitted.items, "\x1b[38;5;245mc\x1b[0m\x1b[38;5;245m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.emitted.items, "code\x1b[0m\x1b[38;5;245m\x1b[39m done") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.emitted.items, "\x1b[39m") != null);
 }
 
-test "light inline code foreground is re-established after open sgr in prior emit" {
+test "light code style is restored across rendered blocks" {
     const alloc = std.testing.allocator;
     var pacer = AssistantPacer{};
     defer pacer.deinit(alloc);
     var cap = TestCapture{};
     defer cap.deinit();
 
-    try pacer.enqueue(alloc, "\x1b[38;5;247mcode\x1b[39m done");
+    try pacer.enqueue(alloc, "\x1b[38;5;247mcode");
     try pacer.tick(alloc, 0, cap.callbacks());
-    try pacer.tick(alloc, 100_000_000, cap.callbacks());
+    try pacer.enqueue(alloc, "\x1b[39m done");
+    try pacer.tick(alloc, 1, cap.callbacks());
 
     try std.testing.expect(std.mem.indexOf(
         u8,
         cap.emitted.items,
-        "\x1b[38;5;247mc\x1b[0m\x1b[38;5;247m",
+        "code\x1b[0m\x1b[38;5;247m\x1b[39m done",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.emitted.items, "\x1b[39m") != null);
 }
 
-test "theme change retints an active inline code span before its next paced emit" {
+test "theme change retints active code before the next block" {
     const alloc = std.testing.allocator;
     var pacer = AssistantPacer{};
     defer pacer.deinit(alloc);
     var cap = TestCapture{};
     defer cap.deinit();
 
-    try pacer.enqueue(alloc, "\x1b[38;5;245mcode\x1b[39m");
+    try pacer.enqueue(alloc, "\x1b[38;5;245mcode");
     try pacer.tick(alloc, 0, cap.callbacks());
     const emitted_before_theme_change = cap.emitted.items.len;
 
     pacer.rethemeInlineCode(true);
-    try pacer.tick(alloc, 100_000_000, cap.callbacks());
+    try pacer.enqueue(alloc, "\x1b[39m");
+    try pacer.tick(alloc, 1, cap.callbacks());
 
     const after_theme_change = cap.emitted.items[emitted_before_theme_change..];
     try std.testing.expect(std.mem.indexOf(u8, after_theme_change, "\x1b[0m\x1b[38;5;247m") != null);
@@ -1065,32 +897,29 @@ test "theme change retints a queued inline code opener before it is emitted" {
     defer cap.deinit();
 
     try pacer.enqueue(alloc, "x\x1b[38;5;247mcode\x1b[39m");
-    try pacer.tick(alloc, 0, cap.callbacks());
-    const emitted_before_theme_change = cap.emitted.items.len;
-
     pacer.rethemeInlineCode(false);
-    try pacer.tick(alloc, 100_000_000, cap.callbacks());
+    try pacer.tick(alloc, 0, cap.callbacks());
 
-    const after_theme_change = cap.emitted.items[emitted_before_theme_change..];
-    try std.testing.expect(std.mem.indexOf(u8, after_theme_change, "\x1b[38;5;245m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, after_theme_change, "\x1b[38;5;247m") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.emitted.items, "\x1b[38;5;245m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.emitted.items, "\x1b[38;5;247m") == null);
 }
 
-test "underline SGR is tracked and restored between batches" {
+test "underline style is restored across rendered blocks" {
     const alloc = std.testing.allocator;
     var pacer = AssistantPacer{};
     defer pacer.deinit(alloc);
     var cap = TestCapture{};
     defer cap.deinit();
 
-    try pacer.enqueue(alloc, "\x1b[4mHeading\x1b[24m");
+    try pacer.enqueue(alloc, "\x1b[4mHeading");
     try pacer.tick(alloc, 0, cap.callbacks());
-    try pacer.tick(alloc, 100_000_000, cap.callbacks());
+    try pacer.enqueue(alloc, "\x1b[24m");
+    try pacer.tick(alloc, 1, cap.callbacks());
 
     try std.testing.expect(std.mem.indexOf(
         u8,
         cap.emitted.items,
-        "H\x1b[0m\x1b[4m",
+        "Heading\x1b[0m\x1b[4m\x1b[24m",
     ) != null);
 
     var sgr: SgrState = .{};
@@ -1124,10 +953,7 @@ test "sgr state clears after closing code" {
     defer cap.deinit();
 
     try pacer.enqueue(alloc, "\x1b[1mA\x1b[22mB");
-    try pacer.tick(alloc, 0, cap.callbacks()); // emits `\x1b[1mA`
-    try std.testing.expect(pacer.sgr.bold);
-
-    try pacer.tick(alloc, 100_000_000, cap.callbacks()); // emits `\x1b[0m\x1b[1m\x1b[22mB`
+    try pacer.tick(alloc, 0, cap.callbacks());
     try std.testing.expect(!pacer.sgr.bold);
 }
 

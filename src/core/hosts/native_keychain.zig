@@ -40,6 +40,58 @@ pub fn isDisabled() bool {
     return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true");
 }
 
+pub fn userDefaultKeychainAvailable(alloc: std.mem.Allocator) Error!bool {
+    return userDefaultKeychainAvailableControlled(alloc, null);
+}
+
+pub fn userDefaultKeychainAvailableCancellable(
+    alloc: std.mem.Allocator,
+    cancel_flag: *const std.atomic.Value(bool),
+) Error!bool {
+    return userDefaultKeychainAvailableControlled(alloc, cancel_flag);
+}
+
+fn userDefaultKeychainAvailableControlled(
+    alloc: std.mem.Allocator,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) Error!bool {
+    if (!isAvailable()) return false;
+    return userDefaultKeychainAvailableForCommand(
+        alloc,
+        &.{ "/usr/bin/security", "default-keychain", "-d", "user" },
+        cancel_flag,
+    );
+}
+
+fn userDefaultKeychainAvailableForCommand(
+    alloc: std.mem.Allocator,
+    argv: []const []const u8,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) Error!bool {
+    const result = runMcpKeychainProcess(
+        alloc,
+        argv,
+        cancel_flag,
+        .limited(4096),
+    ) catch |err| {
+        if (err == error.Cancelled) return error.Cancelled;
+        debug_trace.logf("keychain", "availability failed step=spawn err={s}", .{@errorName(err)});
+        return error.KeychainReadFailed;
+    };
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| {
+            if (code == 0) return true;
+            debug_trace.logf("keychain", "availability unavailable exit_code={d}", .{code});
+            return false;
+        },
+        else => {},
+    }
+    debug_trace.logf("keychain", "availability failed step=default term={t}", .{result.term});
+    return error.KeychainReadFailed;
+}
+
 /// Returns a slice borrowing `buf`. `USER` stays authoritative when set, because it
 /// is the only way to target a non-login account. ACP clients launched by GUI editors
 /// inherit a thinner environment than a shell, so the operating system supplies the
@@ -743,6 +795,35 @@ test "cancellable MCP Keychain runner interrupts and reaps a stalled child" {
             &.{ "/bin/sh", "-c", "exec sleep 60" },
             &cancel,
             .limited(16),
+        ),
+    );
+    thread.join();
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
+}
+
+test "default Keychain availability probe is cancellable" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const Canceller = struct {
+        flag: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            io_mod.sleep(25 * std.time.ns_per_ms);
+            self.flag.store(true, .release);
+        }
+    };
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var canceller = Canceller{ .flag = &cancel };
+    const thread = try std.Thread.spawn(.{}, Canceller.run, .{&canceller});
+    const started_ms = io_mod.milliTimestamp();
+    try std.testing.expectError(
+        error.Cancelled,
+        userDefaultKeychainAvailableForCommand(
+            std.testing.allocator,
+            &.{ "/bin/sh", "-c", "exec sleep 60" },
+            &cancel,
         ),
     );
     thread.join();

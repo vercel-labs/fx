@@ -14,6 +14,9 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "sign-and-notarize-macos.sh"
 RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release.yml"
+PUBLISH_LIBFX_WORKFLOW_PATH = (
+    REPO_ROOT / ".github" / "workflows" / "publish-libfx.yml"
+)
 PGSO_WORKFLOW_PATH = (
     REPO_ROOT / ".github" / "workflows" / "pgso-macos-arm64.yml"
 )
@@ -73,8 +76,34 @@ import pathlib
 import sys
 
 args = sys.argv[1:]
-with pathlib.Path(os.environ["FX_SIGNING_TEST_LOG"]).open("a") as log:
-    log.write("security " + " ".join(args[:1]) + "\\n")
+event_log = pathlib.Path(os.environ["FX_SIGNING_TEST_LOG"])
+with event_log.open("a") as log:
+    log.write("security " + " ".join(args) + "\\n")
+if args and args[0] == os.environ.get("FX_SIGNING_TEST_SECURITY_FAIL_COMMAND"):
+    print("injected security failure", file=sys.stderr)
+    raise SystemExit(1)
+if args and args[0] == "set-key-partition-list":
+    import_event = next(
+        line
+        for line in event_log.read_text(encoding="utf-8").splitlines()
+        if line.startswith("security import ")
+    )
+    partition_list = args[args.index("-S") + 1] if "-S" in args else ""
+    key_type = args[args.index("-t") + 1] if "-t" in args else ""
+    search_list_configured = any(
+        line.startswith("security list-keychains -d user -s ")
+        for line in event_log.read_text(encoding="utf-8").splitlines()
+    )
+    if (
+        "-s" in args
+        or partition_list != "apple-tool:,apple:"
+        or key_type != "private"
+        or "-l" in args
+        or not search_list_configured
+        or " -t cert " in f" {{import_event}} "
+    ):
+        print("error: The specified item could not be found in the keychain.", file=sys.stderr)
+        raise SystemExit(1)
 if args and args[0] == "find-identity":
     print('  1) HASH "{SIGNING_IDENTITY}"')
     print("     1 valid identities found")
@@ -91,6 +120,9 @@ import sys
 args = sys.argv[1:]
 with pathlib.Path(os.environ["FX_SIGNING_TEST_LOG"]).open("a") as log:
     log.write("codesign " + " ".join(args) + "\\n")
+if os.environ.get("FX_SIGNING_TEST_CODESIGN_FAIL_STAGE") == "sign" and "--force" in args:
+    print("injected codesign failure", file=sys.stderr)
+    raise SystemExit(1)
 if "--force" in args:
     binary = pathlib.Path(args[-1])
     binary.write_bytes(binary.read_bytes() + b"signed\\n")
@@ -128,6 +160,9 @@ import sys
 args = sys.argv[1:]
 with pathlib.Path(os.environ["FX_SIGNING_TEST_LOG"]).open("a") as log:
     log.write("xcrun " + " ".join(args[:2]) + "\\n")
+if len(args) > 1 and args[1] == os.environ.get("FX_SIGNING_TEST_XCRUN_FAIL_COMMAND"):
+    print("injected xcrun failure", file=sys.stderr)
+    raise SystemExit(1)
 if args[:2] == ["notarytool", "submit"]:
     status = os.environ.get("FX_SIGNING_TEST_SUBMISSION_STATUS", "Accepted")
     print(json.dumps({{"id": "test-submission", "status": status}}))
@@ -222,6 +257,91 @@ else:
             self.assertIn("--timestamp", events)
             self.assertIn("xcrun notarytool submit", events)
             self.assertIn("xcrun notarytool log", events)
+
+    def test_imports_pkcs12_private_key_for_codesign_and_security(self) -> None:
+        self.assertTrue(SCRIPT_PATH.is_file(), "macOS signing helper is missing")
+        with tempfile.TemporaryDirectory(prefix="fx-macos-signing-test-") as tmp:
+            root = pathlib.Path(tmp)
+            result, _, _, event_log = self.run_script(root)
+
+            output = result.stdout + result.stderr
+            self.assertEqual(0, result.returncode, output)
+            import_event = next(
+                line
+                for line in event_log.read_text(encoding="utf-8").splitlines()
+                if line.startswith("security import ")
+            )
+            self.assertNotIn(" -t cert ", f" {import_event} ")
+            self.assertIn(" -f pkcs12 ", f" {import_event} ")
+            self.assertIn(" -T /usr/bin/codesign ", f" {import_event} ")
+            self.assertIn(" -T /usr/bin/security ", f" {import_event} ")
+            partition_event = next(
+                line
+                for line in event_log.read_text(encoding="utf-8").splitlines()
+                if line.startswith("security set-key-partition-list ")
+            )
+            partition_args = partition_event.split()[2:]
+            self.assertEqual(
+                "apple-tool:,apple:",
+                partition_args[partition_args.index("-S") + 1],
+            )
+            self.assertEqual(
+                "private",
+                partition_args[partition_args.index("-t") + 1],
+            )
+            self.assertNotIn("-l", partition_args)
+            self.assertNotIn("-s", partition_args)
+            self.assertNotIn("codesign:", partition_args)
+            events = event_log.read_text(encoding="utf-8").splitlines()
+            search_index = next(
+                index
+                for index, line in enumerate(events)
+                if line.startswith("security list-keychains -d user -s ")
+            )
+            partition_index = events.index(partition_event)
+            self.assertLess(search_index, partition_index)
+
+    def test_reports_failing_signing_stage_without_printing_secrets(self) -> None:
+        self.assertTrue(SCRIPT_PATH.is_file(), "macOS signing helper is missing")
+        cases = (
+            (
+                {"FX_SIGNING_TEST_SECURITY_FAIL_COMMAND": "import"},
+                "PKCS#12 import",
+            ),
+            (
+                {"FX_SIGNING_TEST_SECURITY_FAIL_COMMAND": "list-keychains"},
+                "keychain search configuration",
+            ),
+            (
+                {"FX_SIGNING_TEST_SECURITY_FAIL_COMMAND": "set-key-partition-list"},
+                "private-key ACL configuration",
+            ),
+            (
+                {"FX_SIGNING_TEST_SECURITY_FAIL_COMMAND": "find-identity"},
+                "signing identity lookup",
+            ),
+            (
+                {"FX_SIGNING_TEST_CODESIGN_FAIL_STAGE": "sign"},
+                "code signing",
+            ),
+            (
+                {"FX_SIGNING_TEST_XCRUN_FAIL_COMMAND": "submit"},
+                "notarization submission",
+            ),
+        )
+        for extra_env, stage in cases:
+            with self.subTest(stage=stage):
+                with tempfile.TemporaryDirectory(
+                    prefix="fx-macos-signing-test-"
+                ) as tmp:
+                    root = pathlib.Path(tmp)
+                    result, _, _, _ = self.run_script(root, extra_env)
+
+                    output = result.stdout + result.stderr
+                    self.assertNotEqual(0, result.returncode, output)
+                    self.assertIn(f"Apple signing failed during {stage}", output)
+                    self.assertNotIn("p12-password", output)
+                    self.assertNotIn("p8-private-material", output)
 
     def test_rejects_notarization_log_issues_and_cleans_credentials(self) -> None:
         self.assertTrue(SCRIPT_PATH.is_file(), "macOS signing helper is missing")
@@ -340,6 +460,16 @@ else:
 
 
 class MacosSigningWorkflowTests(unittest.TestCase):
+    def test_every_privileged_publish_job_uses_an_environment_gate(self) -> None:
+        release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
+        publish_libfx = PUBLISH_LIBFX_WORKFLOW_PATH.read_text(encoding="utf-8")
+
+        release_job = release.split("  release:\n", 1)[1]
+        npm_publish_job = publish_libfx.split("  publish:\n", 1)[1]
+
+        self.assertIn("environment: release", release_job)
+        self.assertIn("environment: npm", npm_publish_job)
+
     def test_stable_release_is_the_only_workflow_with_signing_secrets(self) -> None:
         release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
         pgso = PGSO_WORKFLOW_PATH.read_text(encoding="utf-8")
@@ -347,26 +477,35 @@ class MacosSigningWorkflowTests(unittest.TestCase):
 
         self.assertIn("build-macos-x86_64:", release)
         self.assertIn("runs-on: macos-15-intel", release)
-        self.assertEqual(1, release.count("environment: apple-signing"))
+        self.assertIn("sign-macos-arm64:", release)
+        self.assertEqual(2, release.count("environment: apple-signing"))
         self.assertIn("scripts/sign-and-notarize-macos.sh zig-out/bin/fx", release)
-        self.assertIn("sign-stable-release:", pgso)
-        self.assertIn("needs: aggregate", pgso)
-        self.assertEqual(1, pgso.count("environment: apple-signing"))
+        self.assertNotIn("sign-stable-release:", pgso)
+        self.assertNotIn("package_release", pgso)
+        self.assertNotIn("environment: apple-signing", pgso)
         self.assertIn(
             "scripts/sign-and-notarize-macos.sh "
             '"$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx"',
-            pgso,
+            release,
         )
-        self.assertIn("if: inputs.package_release", pgso)
         arm64_caller = release.split("  build-macos-arm64:\n", 1)[1].split(
-            "\n  release:\n", 1
+            "\n  sign-macos-arm64:\n", 1
         )[0]
         self.assertNotIn("secrets:", arm64_caller)
+        self.assertNotIn("package_release", arm64_caller)
+        sign_release = release.split("  sign-macos-arm64:\n", 1)[1].split(
+            "\n  release:\n", 1
+        )[0]
+        self.assertIn("needs: [check-version, build-macos-arm64]", sign_release)
+        self.assertIn("environment: apple-signing", sign_release)
+        self.assertIn(
+            "needs: [check-version, build-linux, build-macos-x86_64, sign-macos-arm64]",
+            release,
+        )
         workflow_call = pgso.split("  workflow_dispatch:\n", 1)[0]
         aggregate = pgso.split("  aggregate:\n", 1)[1].split(
-            "\n  sign-stable-release:\n", 1
+            "\n  sign-macos-arm64:\n", 1
         )[0]
-        sign_release = pgso.split("  sign-stable-release:\n", 1)[1]
         self.assertIn(
             "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
             sign_release,
@@ -390,7 +529,9 @@ class MacosSigningWorkflowTests(unittest.TestCase):
             self.assertIn(secret_reference, sign_release)
             self.assertNotIn(secret_name, workflow_call)
             self.assertNotIn(secret_name, aggregate)
+            self.assertNotIn(secret_name, pgso)
             self.assertNotIn(secret_name, dev_release)
+        self.assertNotIn("sign-and-notarize-macos", pgso)
         self.assertNotIn("sign-and-notarize-macos", dev_release)
 
     def test_pgso_release_chain_pins_every_external_action(self) -> None:

@@ -4,6 +4,10 @@ const approval_prompt = @import("../../core/permissions/approval_prompt.zig");
 const auth_runtime = @import("../../core/auth/auth_runtime.zig");
 const activity_status = @import("../../core/output/activity_status.zig");
 const model_cache_runtime = @import("../../core/app/model_cache_runtime.zig");
+const app_mcp_runtime = @import("../../core/app/app_mcp_runtime.zig");
+const mcp_health = @import("../../core/mcp/health.zig");
+const mcp_menu_state = @import("../../core/mcp/menu_state.zig");
+const mcp_runtime = @import("../../core/mcp/mcp_runtime.zig");
 const picker_state = @import("../../core/input/picker_state.zig");
 const session_catalog = @import("../../core/session/session_catalog.zig");
 const session_store = @import("../../core/session/session_store.zig");
@@ -65,6 +69,120 @@ pub const ModelMenuProjection = struct {
     }
 };
 
+pub const McpMenuProjection = struct {
+    state: mcp_menu_state.State = .{},
+    servers: []const mcp_health.ServerSnapshot = &.{},
+    tools: []const []const u8 = &.{},
+    resources: []const mcp_runtime.ResourceSummary = &.{},
+    resource_templates: []const mcp_runtime.ResourceSummary = &.{},
+    prompts: []const mcp_runtime.PromptSummary = &.{},
+    configuration_issue_count: usize = 0,
+    preview: ?[]const u8 = null,
+    feedback: ?[]const u8 = null,
+    add_name: []const u8 = "",
+    add_target: []const u8 = "",
+    add_arguments: []const u8 = "",
+    add_draft: []const u8 = "",
+    arguments: []const app_mcp_runtime.MenuArgumentField = &.{},
+    argument_draft: []const u8 = "",
+
+    pub fn itemCount(self: McpMenuProjection) usize {
+        return switch (self.state.section) {
+            .servers => self.servers.len,
+            .tools => countMatchingTools(self.tools, self.state.queryText()),
+            .resources => countMatchingResources(
+                self.resources,
+                self.resource_templates,
+                self.state.queryText(),
+            ),
+            .prompts => countMatchingPrompts(self.prompts, self.state.queryText()),
+        };
+    }
+
+    pub fn selectedServer(self: McpMenuProjection) ?*const mcp_health.ServerSnapshot {
+        if (self.state.selected_server_index >= self.servers.len) return null;
+        return &self.servers[self.state.selected_server_index];
+    }
+
+    pub fn resourceAt(self: McpMenuProjection, index: usize) ?*const mcp_runtime.ResourceSummary {
+        var matched: usize = 0;
+        const query = self.state.queryText();
+        for (self.resources) |*item| {
+            if (!resourceMatches(item.*, query)) continue;
+            if (matched == index) return item;
+            matched += 1;
+        }
+        for (self.resource_templates) |*item| {
+            if (!resourceMatches(item.*, query)) continue;
+            if (matched == index) return item;
+            matched += 1;
+        }
+        return null;
+    }
+
+    pub fn toolAt(self: McpMenuProjection, index: usize) ?[]const u8 {
+        var matched: usize = 0;
+        const query = self.state.queryText();
+        for (self.tools) |item| {
+            if (!matches(item, query)) continue;
+            if (matched == index) return item;
+            matched += 1;
+        }
+        return null;
+    }
+
+    pub fn promptAt(self: McpMenuProjection, index: usize) ?*const mcp_runtime.PromptSummary {
+        var matched: usize = 0;
+        const query = self.state.queryText();
+        for (self.prompts) |*item| {
+            if (!promptMatches(item.*, query)) continue;
+            if (matched == index) return item;
+            matched += 1;
+        }
+        return null;
+    }
+};
+
+fn matches(text: []const u8, query: []const u8) bool {
+    return mcp_menu_state.textMatchesQuery(text, query);
+}
+
+fn countMatchingTools(items: []const []const u8, query: []const u8) usize {
+    var count: usize = 0;
+    for (items) |item| count += @intFromBool(matches(item, query));
+    return count;
+}
+
+fn resourceMatches(item: mcp_runtime.ResourceSummary, query: []const u8) bool {
+    return matches(item.uri, query) or
+        matches(item.name, query) or
+        (item.title != null and matches(item.title.?, query)) or
+        (item.description != null and matches(item.description.?, query));
+}
+
+fn countMatchingResources(
+    resources: []const mcp_runtime.ResourceSummary,
+    templates: []const mcp_runtime.ResourceSummary,
+    query: []const u8,
+) usize {
+    var count: usize = 0;
+    for (resources) |item| count += @intFromBool(resourceMatches(item, query));
+    for (templates) |item| count += @intFromBool(resourceMatches(item, query));
+    return count;
+}
+
+fn promptMatches(item: mcp_runtime.PromptSummary, query: []const u8) bool {
+    return matches(item.name, query) or
+        (item.title != null and matches(item.title.?, query)) or
+        (item.description != null and matches(item.description.?, query));
+}
+
+fn countMatchingPrompts(items: []const mcp_runtime.PromptSummary, query: []const u8) usize {
+    var count: usize = 0;
+    for (items) |item| count += @intFromBool(promptMatches(item, query));
+    return count;
+}
+
 pub const SessionMenuProjection = struct {
     active: bool = false,
     load_state: session_catalog.LoadState = .loading,
@@ -97,17 +215,18 @@ pub const SessionMenuProjection = struct {
 
 pub const HelpMenuProjection = struct {
     active: bool = false,
+    category: ?command_specs.SlashPresentationCategory = null,
     registry: command_specs.SlashRegistry = .{},
     selected_index: usize = 0,
     window_start: usize = 0,
     query: []const u8 = "",
 
     pub fn filteredItemCount(self: HelpMenuProjection) usize {
-        return command_specs.helpCatalogCount(self.registry, self.query);
+        return command_specs.helpCatalogCountForCategory(self.registry, self.category, self.query);
     }
 
     pub fn itemAt(self: HelpMenuProjection, display_index: usize) ?*const command_specs.SlashSpec {
-        return command_specs.helpCatalogSpecAt(self.registry, self.query, display_index);
+        return command_specs.helpCatalogSpecAtForCategory(self.registry, self.category, self.query, display_index);
     }
 };
 
@@ -220,6 +339,7 @@ pub fn helpMenuProjection(
 ) HelpMenuProjection {
     return .{
         .active = menu.active,
+        .category = menu.category,
         .registry = registry,
         .selected_index = menu.selected_index,
         .window_start = menu.window_start,
@@ -255,7 +375,6 @@ const max_static_status_activity_rows: u16 = 3;
 
 pub const QueuedPromptCard = struct {
     bytes: []const u8,
-    row_count: u16,
     editing: bool = false,
 };
 
@@ -271,6 +390,7 @@ pub const RenderContext = struct {
     composer_visible: bool = true,
     permission_mode: types.PermissionMode = .ask,
     queued_count: usize,
+    steering_count: usize = 0,
     queued_paused: bool = false,
     queued_cancel_all_available: bool = false,
     queued_prompt_cards: []const QueuedPromptCard = &.{},
@@ -314,6 +434,9 @@ pub const RenderContext = struct {
         .include_skip = false,
     },
     skills_menu: SkillsMenuProjection = .{},
+    mcp_menu: McpMenuProjection = .{},
+    help_menu: HelpMenuProjection = .{},
+    settings_menu: SettingsMenuProjection = .{},
     model_menu: ModelMenuProjection = .{},
     session_menu: SessionMenuProjection = .{},
     statusline_menu: StatuslineMenuProjection = .{},
@@ -357,16 +480,55 @@ pub fn queuedCardSpacerRows(ctx: RenderContext) u16 {
     return 1 +| above_hint;
 }
 
-pub fn queuedBannerRows(ctx: RenderContext) u16 {
-    if (ctx.queued_count == 0) return 0;
-    const paused_hint_rows: u16 = @intFromBool(ctx.queued_paused);
-    if (ctx.queued_prompt_card_rows > 0) {
-        return queuedCardContentRows(ctx) +|
-            paused_hint_rows +|
-            queuedCardSpacerRows(ctx);
+pub const QueuedBannerFacts = struct {
+    queued_count: usize = 0,
+    paused: bool = false,
+    card_count: usize = 0,
+    card_rows: u16 = 0,
+};
+
+pub fn queuedBannerRowsForFacts(facts: QueuedBannerFacts) u16 {
+    if (facts.queued_count == 0) return 0;
+    const paused_hint_rows: u16 = @intFromBool(facts.paused);
+    if (facts.card_rows > 0) {
+        const between_cards: u16 = @intCast(@min(
+            facts.card_count -| 1,
+            std.math.maxInt(u16),
+        ));
+        const spacer_rows: u16 = 1 +| paused_hint_rows;
+        return facts.card_rows +| between_cards +| paused_hint_rows +| spacer_rows;
     }
-    // No cards means the banner is collapsed to its single summary row.
     return 1 +| paused_hint_rows +| collapsed_queue_banner_gap_rows;
+}
+
+pub fn queuedBannerRows(ctx: RenderContext) u16 {
+    return queuedBannerRowsForFacts(.{
+        .queued_count = ctx.queued_count,
+        .paused = ctx.queued_paused,
+        .card_count = ctx.queued_prompt_cards.len,
+        .card_rows = ctx.queued_prompt_card_rows,
+    });
+}
+
+test "queued banner row policy consumes aggregate card facts" {
+    try std.testing.expectEqual(@as(u16, 2), queuedBannerRowsForFacts(.{
+        .queued_count = 2,
+    }));
+    try std.testing.expectEqual(@as(u16, 3), queuedBannerRowsForFacts(.{
+        .queued_count = 2,
+        .paused = true,
+    }));
+    try std.testing.expectEqual(@as(u16, 7), queuedBannerRowsForFacts(.{
+        .queued_count = 2,
+        .card_count = 2,
+        .card_rows = 5,
+    }));
+    try std.testing.expectEqual(@as(u16, 9), queuedBannerRowsForFacts(.{
+        .queued_count = 2,
+        .paused = true,
+        .card_count = 2,
+        .card_rows = 5,
+    }));
 }
 
 pub fn transientActivityGapRows(shell: *const TranscriptRuntime, tool_before_activity: bool) u16 {
@@ -439,54 +601,32 @@ pub fn frameOwnedActivityProjection(
 ) ActivityProjection {
     if (approval != null or ctx.question != null) return .none;
     switch (ctx.activity) {
-        .tool_slot => return thinkingActivityProjection(buf, shell, ctx),
+        .tool_slot => {},
         .turn_thinking => |thinking| {
             if (thinking.tone != .thinking) return ctx.activity;
-            return thinkingActivityProjection(buf, shell, ctx);
         },
-        .none => return thinkingActivityProjection(buf, shell, ctx),
+        .none => {},
     }
+    return turnActivityProjection(buf, shell, ctx);
 }
 
-fn thinkingActivityProjection(
+fn turnActivityProjection(
     buf: []u8,
     shell: *TranscriptRuntime,
     ctx: RenderContext,
 ) ActivityProjection {
     _ = shell;
-    // The markerless counter row belongs to the response: the text landing on
-    // screen is its own progress report, and it keeps the row through the gaps
-    // where the pacer waits on the next chunk. Once the model switches to a
-    // tool payload nothing will print for a while, so the row takes the marker
-    // back and starts blinking again.
-    if (ctx.stream.active and ctx.stream.assistant_text_started and ctx.stream.composing_tool_payload) {
-        return .{ .turn_thinking = .{
-            .label = activity_status.buildQuietTurnLabel(buf, ctx.stream, ctx.now_ms),
-        } };
-    }
-    if (ctx.writing_response or (ctx.stream.active and ctx.stream.assistant_text_started)) {
-        return .{ .turn_thinking = .{
-            .label = activity_status.buildStreamingLabel(buf, ctx.stream),
-            .tone = if (ctx.stream.active) .thinking else .neutral,
-        } };
-    }
     if (!ctx.stream.active) {
-        if (!ctx.completed_assistant_presentation_tail) return .none;
-        const presentation_stream: StreamState = .{ .active = true };
+        if (!ctx.writing_response and !ctx.completed_assistant_presentation_tail) return .none;
         return .{ .turn_thinking = .{
-            .label = activity_status.buildThinkingLabel(buf, presentation_stream, ctx.now_ms) orelse "• Thinking",
+            .label = activity_status.buildCompletedTurnLabel(buf, ctx.stream),
+            .tone = .neutral,
         } };
     }
-    var thinking_stream = ctx.stream;
-    thinking_stream.last_activity_kind = null;
-    thinking_stream.read_count = 0;
-    thinking_stream.list_count = 0;
-    thinking_stream.write_count = 0;
-    thinking_stream.edit_count = 0;
-    thinking_stream.open_count = 0;
-    thinking_stream.command_count = 0;
-    thinking_stream.subagent_count = 0;
-    if (activity_status.buildThinkingLabel(buf, thinking_stream, ctx.now_ms)) |label| {
+
+    var visible_stream = ctx.stream;
+    visible_stream.last_activity_kind = null;
+    if (activity_status.buildTurnLabel(buf, visible_stream, ctx.now_ms)) |label| {
         return .{ .turn_thinking = .{ .label = label } };
     }
     return .{ .turn_thinking = .{
@@ -753,6 +893,8 @@ test "current frame-owned activity leaves the focused tool in the transcript" {
     const ctx: RenderContext = .{
         .stream = .{
             .active = true,
+            .phase = .running,
+            .turn_started_ms = 1_000,
             .command_count = 1,
             .last_activity_kind = .command,
             .token_progress = .{
@@ -776,6 +918,7 @@ test "current frame-owned activity leaves the focused tool in the transcript" {
             .active = true,
             .kind = .command,
         } },
+        .now_ms = 13_000,
         .input = &input,
     };
 
@@ -783,7 +926,7 @@ test "current frame-owned activity leaves the focused tool in the transcript" {
     const projection = frameOwnedActivityProjection(&active_buf, &shell, ctx, null);
     switch (projection) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "• Thinking (↑50k ↓1.2k)",
+            "• Running (12s) (↑50k ↓1.2k)",
             thinking.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -791,10 +934,11 @@ test "current frame-owned activity leaves the focused tool in the transcript" {
 
     var streaming_buf: [256]u8 = undefined;
     var streaming_ctx = ctx;
+    streaming_ctx.stream.phase = .generating;
     streaming_ctx.writing_response = true;
     switch (frameOwnedActivityProjection(&streaming_buf, &shell, streaming_ctx, null)) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "  (↑50k ↓1.2k)",
+            "• Generating (12s) (↑50k ↓1.2k)",
             thinking.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -870,6 +1014,8 @@ test "frame-owned activity shows live streaming token progress" {
     const ctx: RenderContext = .{
         .stream = .{
             .active = true,
+            .phase = .generating,
+            .turn_started_ms = 1_000,
             .token_progress = .{
                 .input_tokens = 50_000,
                 .output_tokens = 1_250,
@@ -887,42 +1033,42 @@ test "frame-owned activity shows live streaming token progress" {
         .selected_subagent_label = null,
         .selected_subagent_status = null,
         .activity = .none,
+        .now_ms = 13_000,
         .input = &input,
     };
 
     var active_buf: [256]u8 = undefined;
     switch (frameOwnedActivityProjection(&active_buf, &shell, ctx, null)) {
         .turn_thinking => |thinking| {
-            try std.testing.expectEqualStrings("  (↑50k ↓1.2k)", thinking.label);
+            try std.testing.expectEqualStrings("• Generating (12s) (↑50k ↓1.2k)", thinking.label);
             try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
 
-    // Pacer caught up mid-response and is waiting on the next chunk: the quiet
-    // row holds for the whole response instead of flipping inside every gap.
+    // Pacer caught up mid-response and is waiting on the next chunk: the
+    // Generating phase holds instead of flipping inside every gap.
     var drained_ctx = ctx;
     drained_ctx.writing_response = false;
-    drained_ctx.stream.assistant_text_started = true;
     var drained_buf: [256]u8 = undefined;
     switch (frameOwnedActivityProjection(&drained_buf, &shell, drained_ctx, null)) {
         .turn_thinking => |thinking| {
-            try std.testing.expectEqualStrings("  (↑50k ↓1.2k)", thinking.label);
+            try std.testing.expectEqualStrings("• Generating (12s) (↑50k ↓1.2k)", thinking.label);
             try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
 
-    // The model moved on to a tool payload that prints nothing: the marker
-    // comes back with the turn clock so the row does not read as finished.
+    // The model moved on to a tool payload that prints nothing: only the phase
+    // word changes while the marker, turn clock, and token totals remain.
     var composing_ctx = drained_ctx;
-    composing_ctx.stream.composing_tool_payload = true;
+    composing_ctx.stream.phase = .running;
     composing_ctx.stream.turn_started_ms = 1_000;
     composing_ctx.now_ms = 13_000;
     var stalled_buf: [256]u8 = undefined;
     switch (frameOwnedActivityProjection(&stalled_buf, &shell, composing_ctx, null)) {
         .turn_thinking => |thinking| {
-            try std.testing.expectEqualStrings("• (12s) (↑50k ↓1.2k)", thinking.label);
+            try std.testing.expectEqualStrings("• Running (12s) (↑50k ↓1.2k)", thinking.label);
             try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,

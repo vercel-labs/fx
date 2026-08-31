@@ -1,8 +1,69 @@
 # fx
 
-## 0.0.6
+## 0.0.7
 
 <!-- release:start -->
+
+**MCP is safer, easier to manage and more compatible; project servers require explicit trust, `fx mcp` is now a top-level command, `Ctrl+Enter` can steer active turns and fx uses eight fewer tools to preserve context.**
+
+### Breaking Changes
+
+- **Model selection**: `/model` now handles the full selection flow, from quick choices to the complete catalog.
+- **Fewer filesystem tools**: fx now advertises eight fewer tools for better accuracy and more context, with `terminal` handling core filesystem operations.
+
+### New Features
+
+- **Active-turn steering**: While fx is working, `Ctrl+Enter` steers the active turn at the next model boundary. `Enter` still queues an ordinary follow-up, and late steering becomes the next queued turn.
+- **Collapsed tool calls**: `/settings` now includes `Collapse tool calls`, which shows one summary per tool-call group in the main transcript. Individual calls remain available in the full transcript with `Ctrl+O`.
+- **Project MCP configuration**: Workspaces can now define project MCP servers in `.mcp.json` alongside profile servers.
+- **Top-level MCP management**: `fx mcp` is now a top-level command with `add`, `list`, `path`, `remove`, `auth`, `logout`, and `trust`.
+- **Capability discovery**: fx can now search installed skills and configured MCP tools together from a natural-language request, then load or select the exact match before use.
+- **Passive MCP listings**: `fx mcp list` reports configuration and saved authentication without connecting to servers. Add `--connect` for live discovery and health checks.
+- **Structured final output**: In `fx ask --json`, `output` contains all assistant Markdown and `final_output` contains only a completed final response. Interrupted, failed, and background turns return an empty `final_output`.
+- **ACP session discovery**: ACP `session/list` now lists sessions across workspaces when `cwd` is omitted, includes saved titles, and paginates results in groups of 100.
+
+### Improvements
+
+- **Transcript visibility**: Menus now open inline, so the transcript stays visible while you browse.
+- **Focused menus**: Menus now use category, scope, and provider filters to show more relevant options.
+- **Usage visibility**: Usage data now loads without blocking the interface and tracks token and request totals without double counting.
+- **MCP diagnostics**: `fx status` and `fx doctor` now report configured servers and project configuration errors without starting servers or loading credentials.
+- **MCP profile compatibility**: `~/.fx/mcp.json` now accepts `mcpServers` as an alias for `mcp`, while every write uses `mcp`.
+- **Live turn feedback**: Submitted prompts, turn progress, elapsed time, and token usage now stay visible throughout the turn.
+- **Smoother response streaming**: Assistant output now appears in complete blocks instead of character by character.
+- **Code blocks**: Code blocks now use solid horizontal rules instead of side rails, keeping language labels and copied source clean.
+- **Subscription sign-in**: Sign-in stays clear and usable on compact terminals, while manual code entry appears only when needed.
+- **Automatic reviews**: Automatic permission reviews now allow more time before reporting that review is unavailable.
+- **System prompt overrides**: Command help now documents temporary system-prompt replacement while keeping tool, skill, project, and runtime context.
+
+### Bug Fixes
+
+- **Transcript stability**: Streaming responses no longer move scrollback or rewrite completed output.
+- **Environment compatibility**: Interactive input now works correctly on WSL, and browser-hosted fx stops unsupported network work instead of retrying it.
+- **Retry recovery**: Automatic retries now show progress, clear stale state, and stop silent Gateway attempts.
+- **Terminal cleanup**: Timed-out and cancelled commands stop cleanly, keep accurate outcomes after resume, and avoid unsafe retries when completion cannot be confirmed.
+- **Terminal recovery**: Sessions recover from host shutdown, accept input without a helper restart, and return control when the turn ends.
+- **Saved tool output**: Saved results remain readable when a generated handle omits its file suffix.
+- **MCP reliability**: MCP servers now start, stop, reconnect, and report errors more consistently across modern and legacy implementations.
+- **Subagents and approvals**: Subagents keep their reasoning settings, and visible child approvals continue receiving input while the view refreshes.
+- **ACP responses**: ACP clients receive clean Markdown, and resumed responses no longer repeat text already delivered.
+- **Undo safety**: `/undo` now keeps the original file intact when a restore cannot be completed and refuses attempts redirected through a new symlink.
+
+### Security
+
+- **Signed macOS releases**: Stable macOS releases are now signed and notarized before packaging.
+- **Project MCP protections**: Project servers and environment values remain inactive until approval, tool calls are checked again before reaching a server, and ambiguous configuration writes are refused.
+- **MCP credentials**: Valid credentials remain usable across non-expiring tokens and macOS accounts without a default Keychain, while malformed or rejected credentials are reported correctly.
+
+### Ecosystem highlights
+
+- [Notion](https://developers.notion.com/guides/mcp/overview)
+- [Exa](https://exa.ai/mcp)
+- [Hugging Face](https://huggingface.co/docs/hub/agents-mcp)
+
+<!-- release:end -->
+
+## 0.0.6
 
 **New Gateway sessions use Kimi K3 with Fast mode, foreground commands require timeouts, auto mode reviews exact pending actions, and the macOS arm64 binary is 0.3% smaller (6.12 MiB vs 6.13 MiB).**
 
@@ -55,8 +116,6 @@
 - **Sensitive command output**: Command output flagged as sensitive is not saved with the session, including secrets split across output chunks or oversized lines.
 - **OAuth callback validation**: OAuth authorization denials and successes apply only when the callback state matches the active sign-in attempt, and Grok browser callbacks accept only the expected xAI origin.
 - **MCP issuer validation**: MCP sign-in stops before exchanging a token or saving credentials when the authorization response comes from a different issuer than the server advertised.
-
-<!-- release:end -->
 
 ## 0.0.5
 

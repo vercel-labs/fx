@@ -68,7 +68,7 @@ describe("agent quality A/B harness helpers", () => {
         "Slash commands are defined in src/core/slash_commands/. command_specs.zig is the central registry.",
       session_id: "",
       steps: 1,
-      tool_calls: [{ name: "list_files", status: "success" }],
+      tool_calls: [{ name: "glob_files", status: "success" }],
     });
 
     expect(score.passed).toBe(true);

@@ -36,6 +36,15 @@ pub fn collectFromHome(
     alloc: Allocator,
     home_path: []const u8,
 ) !OwnedRecovery {
+    return collectFromHomeCancelable(alloc, home_path, null);
+}
+
+fn collectFromHomeCancelable(
+    alloc: Allocator,
+    home_path: []const u8,
+    cancel_requested: ?*const std.atomic.Value(bool),
+) !OwnedRecovery {
+    if (cancelRequested(cancel_requested)) return error.Cancelled;
     var store = session_store.Store.initReadOnlyFromHome(
         alloc,
         home_path,
@@ -67,6 +76,7 @@ pub fn collectFromHome(
     var unknown_pending = false;
 
     for (marked_sessions.items) |marked| {
+        if (cancelRequested(cancel_requested)) return error.Cancelled;
         var state = store.loadReadOnly(alloc, marked.id) catch {
             unknown_pending = true;
             continue;
@@ -160,6 +170,30 @@ pub fn collectFromHomeConservative(
     };
 }
 
+pub fn collectFromHomeConservativeCancelable(
+    alloc: Allocator,
+    home_path: []const u8,
+    cancel_requested: *const std.atomic.Value(bool),
+) !OwnedRecovery {
+    return collectFromHomeCancelable(
+        alloc,
+        home_path,
+        cancel_requested,
+    ) catch |err| {
+        if (err == error.OutOfMemory or err == error.Cancelled) return err;
+        debug_trace.logf(
+            "usage",
+            "local usage recovery incomplete reason={s}",
+            .{@errorName(err)},
+        );
+        return unknown(alloc);
+    };
+}
+
+fn cancelRequested(cancel_requested: ?*const std.atomic.Value(bool)) bool {
+    return if (cancel_requested) |flag| flag.load(.seq_cst) else false;
+}
+
 fn empty(alloc: Allocator) Allocator.Error!OwnedRecovery {
     return .{
         .facts = try alloc.alloc(usage_report.GenerationFact, 0),
@@ -183,6 +217,15 @@ test "empty recovery owns empty slices" {
     try std.testing.expectEqual(@as(usize, 0), recovery.incidents.len);
     try std.testing.expectEqual(@as(usize, 0), recovery.pending.len);
     try std.testing.expect(!recovery.unknown_pending);
+}
+
+test "cancelled recovery stops before opening profile state" {
+    const alloc = std.testing.allocator;
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Cancelled,
+        collectFromHomeConservativeCancelable(alloc, "/unused", &cancelled),
+    );
 }
 
 test "missing recovery registry is an empty bounded set" {

@@ -219,6 +219,21 @@ const SavedScreen = struct {
     }
 };
 
+inline fn failGrid(err: anytype) @TypeOf(err)!Grid {
+    return @errorCast(failGridDynamic(err));
+}
+
+noinline fn failGridDynamic(err: anyerror) anyerror!Grid {
+    return err;
+}
+
+test "grid failures preserve exact error types and identities" {
+    const invalid = failGrid(error.InvalidGridSize);
+    try std.testing.expect(@TypeOf(invalid) == error{InvalidGridSize}!Grid);
+    try std.testing.expectError(error.InvalidGridSize, invalid);
+    try std.testing.expectError(error.OutOfMemory, failGrid(error.OutOfMemory));
+}
+
 pub const Grid = struct {
     alloc: Allocator,
     rows: u16,
@@ -302,14 +317,14 @@ pub const Grid = struct {
     feed_result: ?*FeedResult = null,
 
     pub fn init(alloc: Allocator, cols: u16, rows: u16) !Grid {
-        if (cols == 0 or rows == 0) return error.InvalidGridSize;
+        if (cols == 0 or rows == 0) return failGrid(error.InvalidGridSize);
         const cell_count = std.math.mul(
             usize,
             @intCast(cols),
             @intCast(rows),
-        ) catch return error.InvalidGridSize;
+        ) catch return failGrid(error.InvalidGridSize);
         if (cell_count > contracts.max_render_cells) {
-            return error.InvalidGridSize;
+            return failGrid(error.InvalidGridSize);
         }
         const cells = try alloc.alloc(Cell, cell_count);
         errdefer alloc.free(cells);
@@ -1963,19 +1978,19 @@ pub const Grid = struct {
     /// reply effects. Callers replay later journal bytes observationally.
     pub fn restoreCheckpoint(alloc: Allocator, payload: []const u8) !Grid {
         if (payload.len > contracts.max_checkpoint_payload_bytes) {
-            return error.CheckpointTooLarge;
+            return failGrid(error.CheckpointTooLarge);
         }
         var decoder = CheckpointDecoder.init(payload);
         const magic = try decoder.fixed(checkpoint_magic.len);
         if (!std.mem.eql(u8, magic, checkpoint_magic)) {
-            return error.InvalidEngineCheckpoint;
+            return failGrid(error.InvalidEngineCheckpoint);
         }
         if (try decoder.int(u16) != checkpoint_schema_revision) {
-            return error.UnsupportedEngineRevision;
+            return failGrid(error.UnsupportedEngineRevision);
         }
         var grid = try decodeGridState(alloc, &decoder);
         errdefer grid.deinit();
-        if (!decoder.finished()) return error.InvalidEngineCheckpoint;
+        if (!decoder.finished()) return failGrid(error.InvalidEngineCheckpoint);
         try grid.validateCheckpointState();
         return grid;
     }
@@ -4527,7 +4542,7 @@ test "bounded deterministic corrupt checkpoint fuzz" {
     }
 }
 
-test "full snapshot painter owns the viewport without Fx chrome" {
+test "full snapshot painter owns the viewport without fx chrome" {
     const cells = [_]contracts.RenderCell{
         .{ .kind = .single, .text = "A", .style = .{
             .foreground = .{ .rgb = .{ .red = 1, .green = 2, .blue = 3 } },

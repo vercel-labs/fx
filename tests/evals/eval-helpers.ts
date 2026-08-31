@@ -130,12 +130,8 @@ function createEvalHome(): string {
       permission_mode: "auto",
       permission: {
         bash: "allow",
-        copy_file: "allow",
-        create_folder: "allow",
-        delete_file: "allow",
         edit: "allow",
         read: "allow",
-        rename_file: "allow",
       },
     }) + "\n",
     { mode: 0o600 },

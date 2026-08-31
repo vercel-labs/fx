@@ -254,7 +254,7 @@ pub const UsageUnavailable = enum {
 };
 
 pub const UsageOutcome = union(enum) {
-    immediate: ?DeferredUsageReference,
+    exact: model_provider.ProviderId,
     deferred: DeferredUsageReference,
     unavailable: UsageUnavailable,
 };
@@ -299,6 +299,20 @@ pub const Result = union(enum) {
     }
 };
 
+pub inline fn failResult(err: anytype) @TypeOf(err)!Result {
+    return @errorCast(failResultDynamic(err));
+}
+
+noinline fn failResultDynamic(err: anyerror) anyerror!Result {
+    return err;
+}
+
+test "result failure writer preserves exact error type and identity" {
+    const failure = failResult(error.Cancelled);
+    try std.testing.expect(@TypeOf(failure) == error{Cancelled}!Result);
+    try std.testing.expectError(error.Cancelled, failure);
+}
+
 pub const StreamFn = *const fn (
     context: ?*anyopaque,
     alloc: Allocator,
@@ -316,7 +330,7 @@ pub const Provider = struct {
 };
 
 fn unavailableStream(_: ?*anyopaque, _: Allocator, _: ModelRequest) anyerror!Result {
-    return error.AgentStreamProviderUnavailable;
+    return failResult(error.AgentStreamProviderUnavailable);
 }
 
 pub const unavailable_provider = Provider{
@@ -337,7 +351,7 @@ test "stream provider accepts one typed request and emits ordered neutral events
             request.events.emit(.{ .reasoning_delta = "second" });
             return .{ .completed = .{
                 .completion = .{ .content = "done" },
-                .usage = .{ .immediate = null },
+                .usage = .{ .exact = .gateway },
             } };
         }
     };
@@ -402,5 +416,5 @@ test "stream provider accepts one typed request and emits ordered neutral events
     try std.testing.expect(!capture.failed);
     try std.testing.expectEqualStrings("firstsecond", capture.chunks.items);
     try std.testing.expectEqualStrings("done", result.completed.completion.content.?);
-    try std.testing.expect(std.meta.activeTag(result.completed.usage) == .immediate);
+    try std.testing.expect(std.meta.activeTag(result.completed.usage) == .exact);
 }

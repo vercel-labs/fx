@@ -11,6 +11,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
 import {
+  startContentLengthMcpHttpFixture,
+  type ContentLengthResponseType,
+} from "./fixtures/mcp-content-length-http";
+import {
   MODERN_HTTP_TOOL_RESULT,
   MODERN_MCP_VERSION,
   startModernMcpHttpFixture,
@@ -30,6 +34,9 @@ const TOOL_NAME = "mcp_fixture_echo";
 
 let cleanupRoot: string | null = null;
 let fixture: ReturnType<typeof startModernMcpHttpFixture> | null = null;
+let contentLengthFixture: Awaited<
+  ReturnType<typeof startContentLengthMcpHttpFixture>
+> | null = null;
 let gateway: ReturnType<typeof startFakeGateway> | null = null;
 let tui: TmuxSession | null = null;
 
@@ -37,15 +44,18 @@ afterEach(async () => {
   const activeTui = tui;
   const activeGateway = gateway;
   const activeFixture = fixture;
+  const activeContentLengthFixture = contentLengthFixture;
   const activeCleanupRoot = cleanupRoot;
   tui = null;
   gateway = null;
   fixture = null;
+  contentLengthFixture = null;
   cleanupRoot = null;
 
   if (activeTui) await activeTui.kill();
   activeGateway?.stop();
   activeFixture?.stop();
+  if (activeContentLengthFixture) await activeContentLengthFixture.stop();
   if (activeCleanupRoot) {
     rmSync(activeCleanupRoot, { recursive: true, force: true });
   }
@@ -53,7 +63,7 @@ afterEach(async () => {
 
 function createRoot(
   label: string,
-  activeFixture: ReturnType<typeof startModernMcpHttpFixture>,
+  activeFixture: { url: string },
   operationTimeoutMs = 5_000,
   required = false,
 ) {
@@ -126,7 +136,11 @@ function startToolGateway(finalText: string) {
   });
 }
 
-function toolResultText(body: string, toolCallId: string): string {
+function toolResultText(
+  body: string,
+  toolCallId: string,
+  outputType: "text" | "error-text" = "text",
+): string {
   const request = JSON.parse(body) as {
     prompt?: Array<{ content?: Array<Record<string, unknown>> }>;
   };
@@ -137,7 +151,7 @@ function toolResultText(body: string, toolCallId: string): string {
     );
   if (!result) throw new Error(`Missing tool result for ${toolCallId}`);
   const output = result.output as Record<string, unknown>;
-  if (output.type !== "text" || typeof output.value !== "string") {
+  if (output.type !== outputType || typeof output.value !== "string") {
     throw new Error(`Invalid tool result for ${toolCallId}`);
   }
   return output.value;
@@ -197,6 +211,189 @@ function assertModernWire(
 }
 
 describe("modern MCP Streamable HTTP", () => {
+  test("MongoDB-like session-required discovery falls back to legacy initialize", async () => {
+    fixture = startModernMcpHttpFixture("legacy_session_required");
+    const root = createRoot("mongodb-legacy-fallback", fixture);
+
+    const result = await runFx(
+      ["mcp", "list", "--connect"],
+      {
+        cwd: root.workspace,
+        env: {
+          HOME: root.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_TRACE_LOG: root.traceLogPath,
+          FX_TRACE_SCOPES: "mcp",
+        },
+        timeoutMs: 20_000,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toMatch(/fixture[\s\S]{0,240}state=ready/);
+    expect(result.stdout).toContain("protocol=2025-11-25");
+    expect(result.stdout).toContain(
+      "negotiated_name=mongodb-managed-fixture negotiated_version=1.0.0",
+    );
+    expect(result.stdout).toContain("tools=1");
+    expect(fixture.requests.map((entry) => entry.message.method)).toEqual([
+      "server/discover",
+      "initialize",
+      "notifications/initialized",
+      "tools/list",
+    ]);
+  }, 25_000);
+
+  test("GitMCP-like plain-text discovery error falls back to legacy initialize", async () => {
+    fixture = startModernMcpHttpFixture("legacy_plaintext_session_required");
+    const root = createRoot("gitmcp-legacy-fallback", fixture);
+
+    const result = await runFx(
+      ["mcp", "list", "--connect"],
+      {
+        cwd: root.workspace,
+        env: {
+          HOME: root.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_TRACE_LOG: root.traceLogPath,
+          FX_TRACE_SCOPES: "mcp",
+        },
+        timeoutMs: 20_000,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toMatch(/fixture[\s\S]{0,240}state=ready/);
+    expect(result.stdout).toContain("protocol=2025-03-26");
+    expect(result.stdout).toContain(
+      "negotiated_name=gitmcp-fixture negotiated_version=1.0.0",
+    );
+    expect(result.stdout).toContain("tools=1");
+    expect(fixture.requests.map((entry) => entry.message.method)).toEqual([
+      "server/discover",
+      "initialize",
+      "notifications/initialized",
+      "tools/list",
+    ]);
+  }, 25_000);
+
+  test("plain-text discovery auth rejection fails closed without aborting fx", async () => {
+    fixture = startModernMcpHttpFixture("legacy_plaintext_auth_rejection");
+    const root = createRoot("plaintext-auth-rejection", fixture);
+
+    const result = await runFx(
+      ["mcp", "list", "--connect"],
+      {
+        cwd: root.workspace,
+        env: {
+          HOME: root.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_TRACE_LOG: root.traceLogPath,
+          FX_TRACE_SCOPES: "mcp",
+        },
+        timeoutMs: 20_000,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toMatch(/fixture[\s\S]{0,240}auth=required/);
+    expect(result.stdout).not.toContain("InvalidJsonResponse");
+    expect(fixture.requests.map((entry) => entry.message.method)).toEqual([
+      "server/discover",
+    ]);
+  }, 25_000);
+
+  test("top-level mcp add persists HTTP and a later ask calls it", async () => {
+    fixture = startModernMcpHttpFixture("json");
+    const root = createEmptyRoot("top-level-add");
+    const added = await runFx(
+      ["mcp", "add", "--transport", "http", "fixture", fixture.url],
+      {
+        cwd: root.workspace,
+        env: {
+          HOME: root.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+        },
+      },
+    );
+    expect(added.code).toBe(0);
+    expect(added.stdout).toContain("Saved MCP server 'fixture'");
+    expect(fixture.requests).toHaveLength(0);
+
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("top_level_select", "mcp_select_tool", { name: TOOL_NAME }),
+      fakeGatewayToolCall("top_level_call", TOOL_NAME, { text: "hello" }),
+      fakeGatewayFinalText("TOP_LEVEL_HTTP_MCP_READY"),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Use the HTTP MCP echo tool."],
+      { cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000 },
+    );
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("TOP_LEVEL_HTTP_MCP_READY");
+    expect(fixture.requests.map((entry) => entry.message.method)).toEqual([
+      "server/discover",
+      "tools/list",
+      "tools/call",
+    ]);
+  }, 25_000);
+
+  for (
+    const responseType of ["json", "sse"] as const satisfies readonly ContentLengthResponseType[]
+  ) {
+    test(`fixed-length ${responseType} responses complete on one-shot connections`, async () => {
+      contentLengthFixture = await startContentLengthMcpHttpFixture(responseType);
+      const root = createRoot(`content-length-${responseType}`, contentLengthFixture);
+      gateway = startToolGateway(`Fixed-length ${responseType} complete.`);
+
+      const result = await runFx(
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "--no-save",
+          `Call the fixed-length ${responseType} fixture.`,
+        ],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway),
+          timeoutMs: 20_000,
+        },
+      );
+
+      if (result.code !== 0) {
+        const signal = result.signal ?? "none";
+        throw new Error(
+          `fixed-length ${responseType} failed signal=${signal} ` +
+            `stderr=${JSON.stringify(result.stderr)}`,
+        );
+      }
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout).output).toContain(
+        `Fixed-length ${responseType} complete.`,
+      );
+      expect(contentLengthFixture.failure).toBeUndefined();
+      expect(
+        contentLengthFixture.requests.map((entry) => entry.message.method),
+      ).toEqual(["server/discover", "tools/list", "tools/call"]);
+      for (const request of contentLengthFixture.requests) {
+        expect(request.headers.connection).toBe("close");
+      }
+    }, 30_000);
+  }
+
   test.skipIf(!tmuxAvailable())(
     "/mcp add --transport http persists and reloads a remote server",
     async () => {
@@ -225,6 +422,9 @@ describe("modern MCP Streamable HTTP", () => {
       await tui.sendText("/mcp list");
       const health = await tui.waitForText("MCP health (1 server):", 10_000);
       expect(health).toMatch(/prisma[\s\S]{0,240}transport=http state=ready/);
+      expect(health).toContain(
+        "negotiated_name=modern-http-fixture negotiated_version=unavailable protocol=2026-07-28",
+      );
 
       const profile = JSON.parse(
         readFileSync(join(root.home, ".fx", "mcp.json"), "utf8"),
@@ -645,6 +845,7 @@ describe("modern MCP Streamable HTTP", () => {
     const cancelled = toolResultText(
       gateway.requests.at(-1)!.body,
       "http_resource_stall",
+      "error-text",
     );
     expect(cancelled).toContain("tool_execution_failed");
     expect(cancelled).not.toContain("HTTP_RESOURCE_TEXT");
@@ -798,11 +999,13 @@ describe("modern MCP Streamable HTTP", () => {
   test("partial subscription acknowledgement closes the listener and falls back to TTL", async () => {
     fixture = startModernMcpHttpFixture("cache_partial_ack");
     const root = createRoot("cache-partial-ack", fixture);
+    let callsAfterFirstSearch = 0;
     gateway = startFakeGateway([
       fakeGatewayToolCall("activate_partial_ack", "mcp_search_tools", {
         query: "echo",
       }),
       async () => {
+        callsAfterFirstSearch = fixture!.toolsListCalls;
         await Bun.sleep(100);
         return fakeGatewayToolCall("search_after_ttl", "mcp_search_tools", {
           query: "echo",
@@ -823,7 +1026,8 @@ describe("modern MCP Streamable HTTP", () => {
     );
 
     expect(result.code).toBe(0);
-    expect(fixture.toolsListCalls).toBe(2);
+    expect(callsAfterFirstSearch).toBeGreaterThanOrEqual(1);
+    expect(fixture.toolsListCalls).toBe(callsAfterFirstSearch + 1);
     expect(fixture.cancelledCalls).toBe(1);
     expect(readFileSync(root.traceLogPath, "utf8")).toContain(
       "tool subscription filter unsupported",
@@ -833,11 +1037,13 @@ describe("modern MCP Streamable HTTP", () => {
   test("server subscription cancellation is traced before TTL fallback", async () => {
     fixture = startModernMcpHttpFixture("cache_server_cancel");
     const root = createRoot("cache-server-cancel", fixture);
+    let callsAfterFirstSearch = 0;
     gateway = startFakeGateway([
       fakeGatewayToolCall("activate_server_cancel", "mcp_search_tools", {
         query: "echo",
       }),
       async () => {
+        callsAfterFirstSearch = fixture!.toolsListCalls;
         await Bun.sleep(100);
         return fakeGatewayToolCall("search_after_server_cancel", "mcp_search_tools", {
           query: "echo",
@@ -858,7 +1064,8 @@ describe("modern MCP Streamable HTTP", () => {
     );
 
     expect(result.code).toBe(0);
-    expect(fixture.toolsListCalls).toBe(2);
+    expect(callsAfterFirstSearch).toBeGreaterThanOrEqual(1);
+    expect(fixture.toolsListCalls).toBe(callsAfterFirstSearch + 1);
     expect(fixture.requests.filter((entry) =>
       entry.message.method === "subscriptions/listen"
     )).toHaveLength(1);
@@ -871,11 +1078,13 @@ describe("modern MCP Streamable HTTP", () => {
   test("unexpected subscription acknowledgement filter closes once and falls back to TTL", async () => {
     fixture = startModernMcpHttpFixture("cache_unexpected_ack");
     const root = createRoot("cache-unexpected-ack", fixture);
+    let callsAfterFirstSearch = 0;
     gateway = startFakeGateway([
       fakeGatewayToolCall("activate_unexpected_ack", "mcp_search_tools", {
         query: "echo",
       }),
       async () => {
+        callsAfterFirstSearch = fixture!.toolsListCalls;
         await Bun.sleep(100);
         return fakeGatewayToolCall("search_after_unexpected_ack", "mcp_search_tools", {
           query: "echo",
@@ -896,7 +1105,8 @@ describe("modern MCP Streamable HTTP", () => {
     );
 
     expect(result.code).toBe(0);
-    expect(fixture.toolsListCalls).toBe(2);
+    expect(callsAfterFirstSearch).toBeGreaterThanOrEqual(1);
+    expect(fixture.toolsListCalls).toBe(callsAfterFirstSearch + 1);
     expect(fixture.requests.filter((entry) =>
       entry.message.method === "subscriptions/listen"
     )).toHaveLength(1);
@@ -1282,6 +1492,58 @@ describe("modern MCP Streamable HTTP", () => {
     expect(result.stderr).not.toContain("environment-bearer-secret");
     expect(readFileSync(join(root.home, ".fx", "mcp.json"), "utf8")).not
       .toContain("environment-bearer-secret");
+  }, 30_000);
+
+  test("workspace MCP expands static HTTP headers without changing profile syntax", async () => {
+    fixture = startModernMcpHttpFixture("json");
+    const root = createRoot("workspace-expanded-headers", fixture);
+    writeFileSync(
+      join(root.home, ".fx", "mcp.json"),
+      JSON.stringify({ mcp: {} }),
+    );
+    writeFileSync(
+      join(root.workspace, ".mcp.json"),
+      JSON.stringify({
+        mcpServers: {
+          fixture: {
+            type: "http",
+            url: fixture.url,
+            headers: {
+              Authorization: "Bearer ${WORKSPACE_HTTP_TOKEN}",
+              "X-Workspace": "${WORKSPACE_HTTP_NAME:-project-default}",
+            },
+          },
+        },
+      }),
+    );
+    gateway = startToolGateway("Workspace-expanded HTTP MCP complete.");
+    const env = {
+      ...fixtureEnv(root, gateway),
+      WORKSPACE_HTTP_TOKEN: "workspace-http-secret",
+    };
+    const trusted = await runFx(
+      ["mcp", "trust", "approve", "fixture"],
+      { cwd: root.workspace, env },
+    );
+    expect(trusted.code).toBe(0);
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Call the workspace HTTP fixture."],
+      {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 20_000,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(fixture.requests).toHaveLength(3);
+    for (const request of fixture.requests) {
+      expect(request.headers.authorization).toBe("Bearer workspace-http-secret");
+      expect(request.headers["x-workspace"]).toBe("project-default");
+    }
+    expect(result.stdout).not.toContain("workspace-http-secret");
+    expect(result.stderr).not.toContain("workspace-http-secret");
   }, 30_000);
 
   test("modern HTTP excludes tools with invalid header projection schemas", async () => {

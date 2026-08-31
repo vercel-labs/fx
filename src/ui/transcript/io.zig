@@ -120,7 +120,7 @@ test "standalone presentation bell is written without changing the shadow grid" 
     try std.testing.expectEqual(@as(u21, ' '), shadow.cellAt(1, 1).?.codepoint);
 }
 
-test "enableShadowVt matches Fx's no-autowrap terminal mode" {
+test "enableShadowVt matches fx's no-autowrap terminal mode" {
     const FakeShell = struct {
         layout: types.Layout,
         shadow_vt: ?*vt_emulator.Grid = null,

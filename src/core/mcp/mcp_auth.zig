@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const operation_control = @import("operation_control.zig");
+const browser_callback = @import("../auth/browser_callback.zig");
 const secret = @import("../auth/secret.zig");
 
 const Allocator = std.mem.Allocator;
@@ -1328,17 +1329,13 @@ fn requestInteractiveAuthorization(
     if (!std.mem.startsWith(u8, target, "/callback?")) {
         return error.InvalidAuthorizationCallback;
     }
-    var writer_buffer: [1024]u8 = undefined;
-    var writer = stream.writer(io_mod.getIo(), &writer_buffer);
-    try writer.interface.writeAll(
-        "HTTP/1.1 200 OK\r\n" ++
-            "Content-Type: text/plain; charset=utf-8\r\n" ++
-            "Content-Length: 49\r\n" ++
-            "Connection: close\r\n\r\n" ++
-            "Authorization received. You can return to fx now.",
-    );
-    try writer.interface.flush();
-    return parseAuthorizationRedirect(alloc, target);
+    var response = parseAuthorizationRedirect(alloc, target) catch |err| {
+        browser_callback.writeResponse(stream, .failed, null) catch {};
+        return err;
+    };
+    errdefer response.deinit(alloc);
+    try browser_callback.writeResponse(stream, .ok, null);
+    return response;
 }
 
 fn validateRedirectTarget(location: []const u8, redirect_uri: []const u8) !void {

@@ -30,12 +30,13 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .ask,
         .token = "ask",
-        .usage = "ask [--auto|--yolo] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
+        .usage = "ask [--auto|--yolo] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
         .summary = "Run one noninteractive request",
         .options = &.{
             .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
             .{ .flag = "--yolo", .description = "Disable fx permission checks" },
             .{ .flag = "--image PATH", .description = "Attach an image file; repeat for multiple images" },
+            .{ .flag = "--system TEXT", .description = "Replace the built-in system prompt for this request" },
             json_option,
             .{ .flag = "--quiet", .description = "Suppress assistant output" },
             .{ .flag = "--prompt-permissions", .description = "Prompt for Y/N permission approval when stdin is a TTY" },
@@ -49,7 +50,8 @@ pub const top_level_specs = [_]TopLevelSpec{
         .details = &.{
             "The prompt may be passed as arguments or piped on stdin when no prompt args are given.",
             "TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.",
-            "Operational progress and diagnostics are written to stderr. JSON output keeps raw Markdown in `output`.",
+            "Operational progress and diagnostics are written to stderr. JSON `output` keeps accumulated assistant Markdown; `final_output` contains only the completed final response, or an empty string when absent.",
+            "--system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.",
             "With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.",
         },
     },
@@ -125,6 +127,27 @@ pub const top_level_specs = [_]TopLevelSpec{
             "",
             "Change the mode from the interactive shell with `/permissions [ask|auto|yolo|reset]`,",
             "and manage persistent allow rules with `/allowlist`.",
+        },
+    },
+    .{
+        .kind = .mcp,
+        .token = "mcp",
+        .usage = "mcp <command> ...",
+        .summary = "Manage MCP servers without opening the interactive shell",
+        .details = &.{
+            "Commands:",
+            "  fx mcp add NAME COMMAND [ARGS...]",
+            "  fx mcp add --transport http NAME URL",
+            "  fx mcp auth NAME",
+            "  fx mcp list [--connect]",
+            "  fx mcp logout NAME",
+            "  fx mcp path",
+            "  fx mcp remove NAME",
+            "  fx mcp trust approve|reject NAME",
+            "  fx mcp trust approve-all|reset",
+            "",
+            "By default, list reads configuration without opening MCP transports.",
+            "Use --connect to connect and discover servers before rendering health.",
         },
     },
     .{
@@ -303,6 +326,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .status, .usage = "status" },
         .{ .kind = .doctor, .usage = "doctor" },
+        .{ .kind = .mcp, .usage = "mcp <command> ..." },
         .{ .kind = .models, .usage = "models" },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
@@ -432,11 +456,10 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .image, .command = "/image", .aliases = &.{"/img"}, .help_entry = "/image <path> (/img)", .completion_description = "attach an image by path", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true, .accepts_payload = true },
-    .{ .kind = .models, .command = "/models", .help_entry = "/models", .completion_description = "browse available models", .presentation_category = .model },
     .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|yolo|reset]", .completion_description = "choose what fx is allowed to do", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .allowlist, .command = "/allowlist", .help_entry = "/allowlist [view [effective|local|user]|[local|user] add|remove|reset ...]", .completion_description = "manage trusted commands, tools, and URLs", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .undo, .command = "/undo", .help_entry = "/undo", .completion_description = "undo the latest tracked file operation", .presentation_category = .session },
-    .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|resource|prompt|add|remove|path|reload|auth|logout]", .completion_description = "manage local and remote MCP servers, resources, and prompts", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
+    .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|resource|prompt|add|remove|path|reload|auth|logout|trust]", .completion_description = "manage local and remote MCP servers, resources, prompts, and project trust", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .skills, .command = "/skills", .help_entry = "/skills [list|add|install|show|create|remove|path] [name|url|path] ($ opens skill search)", .completion_description = "browse and manage skills", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .copy, .command = "/copy", .help_entry = "/copy", .completion_description = "copy the last assistant response", .presentation_category = .session },
     .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "open the fx feedback form", .presentation_category = .product, .show_in_welcome = true },
@@ -533,7 +556,6 @@ test "built-in slash commands register exact active order" {
         "/image",
         "/images",
         "/model",
-        "/models",
         "/permissions",
         "/allowlist",
         "/undo",
@@ -578,10 +600,9 @@ test "built-in slash registry resolves primary commands and aliases" {
     const credits = slash_registry.lookup("/credits") orelse return error.TestExpectedEqual;
     try std.testing.expect(credits.requires_prompt_credential);
 
-    for ([_][]const u8{ "/model", "/models" }) |command| {
-        const catalog_command = slash_registry.lookup(command) orelse return error.TestExpectedEqual;
-        try std.testing.expect(!catalog_command.requires_prompt_credential);
-    }
+    const model_command = slash_registry.lookup("/model") orelse return error.TestExpectedEqual;
+    try std.testing.expect(!model_command.requires_prompt_credential);
+    try std.testing.expect(slash_registry.lookup("/models") == null);
 
     try std.testing.expect(command_specs.matchedSlashPrefix(slash_registry, "/model\nmodel-id", .model) == null);
 }

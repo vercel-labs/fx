@@ -1990,7 +1990,7 @@ test "host authority capture applies explicit mode and permission capability pol
 
         const tools = [_]tool_dispatch.Tool{
             seed,
-            renamed(seed, "list_files"),
+            renamed(seed, "glob_files"),
             renamed(seed, "mutate"),
         };
 
@@ -2007,8 +2007,8 @@ test "host authority capture applies explicit mode and permission capability pol
     };
     const tool_set = tool_set_contract.ToolSet{
         .registry = .{ .tools = Fixture.tools[0..] },
-        .order = &.{ "inspect", "list_files", "mutate" },
-        .read_only_tool_names = &.{ "inspect", "list_files" },
+        .order = &.{ "inspect", "glob_files", "mutate" },
+        .read_only_tool_names = &.{ "inspect", "glob_files" },
     };
     const registry = mode_registry.Registry{
         .default_mode_id = "full",
@@ -2025,11 +2025,11 @@ test "host authority capture applies explicit mode and permission capability pol
     defer full.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 3), full.tools.len);
     try std.testing.expectEqualStrings("inspect", full.tools[0]);
-    try std.testing.expectEqualStrings("list_files", full.tools[1]);
+    try std.testing.expectEqualStrings("glob_files", full.tools[1]);
     try std.testing.expectEqualStrings("mutate", full.tools[2]);
 
     var rules = [_]types.PermissionRule{.{
-        .permission = @constCast("list"),
+        .permission = @constCast("glob"),
         .pattern = @constCast("*"),
         .action = .deny,
     }};
@@ -2051,7 +2051,7 @@ test "host authority capture applies explicit mode and permission capability pol
     try std.testing.expectEqual(@as(usize, 1), restricted.tools.len);
     try std.testing.expectEqualStrings("inspect", restricted.tools[0]);
     try std.testing.expectEqualStrings("mcp__example", restricted.integrations[0]);
-    try std.testing.expectEqualStrings("list", restricted.rules.rules[0].permission);
+    try std.testing.expectEqualStrings("glob", restricted.rules.rules[0].permission);
     try std.testing.expectEqualStrings("inspect", restricted.grants[0].tool_name);
 }
 

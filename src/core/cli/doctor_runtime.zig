@@ -550,16 +550,39 @@ fn appendMcpConfigCheck(
     alloc: Allocator,
     diagnostic: mcp_contract.ProfileConfigDiagnostic,
 ) !void {
-    const err = switch (diagnostic) {
+    switch (diagnostic) {
         .clear => return,
-        .failed => |value| value,
-    };
-    const detail = try std.fmt.allocPrint(
-        alloc,
-        "failed to load ~/.fx/mcp.json: {s}",
-        .{@errorName(err)},
-    );
-    try appendCheckOwned(checks, alloc, "mcp_config", .fail, detail);
+        .warning => |warning| {
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            try out.writer.print(
+                "~/.fx/mcp.json warning: {s}",
+                .{@tagName(warning.cause)},
+            );
+            if (warning.key()) |key| try out.writer.print(" key={s}", .{key});
+            try out.writer.print(
+                " additional_matches={d}",
+                .{warning.additional_matches},
+            );
+            try appendCheckOwned(
+                checks,
+                alloc,
+                "mcp_config",
+                .warn,
+                try out.toOwnedSlice(),
+            );
+            return;
+        },
+        .failed => |err| {
+            const detail = try std.fmt.allocPrint(
+                alloc,
+                "failed to load ~/.fx/mcp.json: {s}",
+                .{@errorName(err)},
+            );
+            try appendCheckOwned(checks, alloc, "mcp_config", .fail, detail);
+            return;
+        },
+    }
 }
 
 fn formatConfigPresence(alloc: Allocator, user_exists: bool, repo_exists: bool) ![]u8 {

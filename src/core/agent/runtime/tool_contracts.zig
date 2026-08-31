@@ -1,6 +1,5 @@
 const std = @import("std");
 const command_admission = @import("../../permissions/command_admission.zig");
-const command_contract = @import("../../execution/command_contract.zig");
 const types = @import("../../shared/types.zig");
 const diff = @import("../../output/diff.zig");
 const file_mutation = @import("../../tooling/file_mutation.zig");
@@ -76,13 +75,11 @@ pub const ToolExecutionResult = struct {
     status: ToolExecutionStatus = .success,
     cancelled: bool = false,
     status_detail: ?[]const u8 = null,
-    display_output: ?[]const u8 = null,
     diff_entry: ?DiffEntryPayload = null,
     finish_turn: bool = false,
     system_notice: ?[]const u8 = null,
     interactive_notice: ?types.SemanticNotice = null,
     context_notices: []const []const u8 = &.{},
-    background_command: ?command_contract.BackgroundCommand = null,
     command_result_json: ?[]const u8 = null,
     web_search_completion: ?types.WebSearchCompletion = null,
     web_fetch_completion: ?types.WebFetchCompletion = null,
@@ -90,11 +87,33 @@ pub const ToolExecutionResult = struct {
     selected_dynamic_tool_name: ?[]const u8 = null,
     selected_dynamic_tool_schema_json: ?[]const u8 = null,
     tool_result_memory: ?types.ToolResultMemory = null,
-    prepared_result_memory: ?types.ToolResultMemory = null,
+    tool_result_memory_prepared: bool = false,
     committed_file_handoff: ?file_mutation.CommittedFileHandoff = null,
     deferred_tool_completion: ?DeferredToolCompletion = null,
     command_replay_capture: ?*command_replay_store.Capture = null,
 };
+
+test "tool result retains one memory payload across preparation" {
+    try std.testing.expect(@hasField(ToolExecutionResult, "tool_result_memory"));
+    try std.testing.expect(@hasField(ToolExecutionResult, "tool_result_memory_prepared"));
+    try std.testing.expect(!@hasField(ToolExecutionResult, "prepared_result_memory"));
+}
+
+pub inline fn failToolExecutionResult(err: anytype) @TypeOf(err)!ToolExecutionResult {
+    return @errorCast(failToolExecutionResultDynamic(err));
+}
+
+noinline fn failToolExecutionResultDynamic(err: anyerror) anyerror!ToolExecutionResult {
+    return err;
+}
+
+test "tool result failure writer preserves exact error type and identity" {
+    const failure = failToolExecutionResult(error.LiveToolAuthorityUnavailable);
+    try std.testing.expect(
+        @TypeOf(failure) == error{LiveToolAuthorityUnavailable}!ToolExecutionResult,
+    );
+    try std.testing.expectError(error.LiveToolAuthorityUnavailable, failure);
+}
 
 pub fn unavailableHostToolResult(alloc: Allocator) Allocator.Error!ToolExecutionResult {
     return .{
@@ -124,6 +143,7 @@ pub const ToolExecutionRequest = struct {
     current_turn_messages: []const ChatMessage = &.{},
     session_grants: []const PermissionGrant,
     live_authority: ?LiveToolAuthority = null,
+    expected_mcp_runtime_generation: ?u64 = null,
     advertised_dynamic_tool_names: []const []const u8,
     max_tool_result_bytes: usize,
     /// The owning agent loop already ran its policy-neutral idempotency and
@@ -141,8 +161,12 @@ pub const ToolExecutionRequest = struct {
 
 pub const DiffEntryPayload = diff.DiffEntryPayload;
 
+pub const ToolCallValidationWitness = struct {
+    mcp_runtime_generation: ?u64 = null,
+};
+
 pub const ToolCallValidationResult = union(enum) {
     not_registered,
-    valid,
+    valid: ToolCallValidationWitness,
     failure: []const u8,
 };

@@ -19,6 +19,12 @@ const compact_command_menu_presentation = @import("compact_command_menu_presenta
 const input_presentation = @import("input_presentation.zig");
 const interaction_state = @import("interaction_state.zig");
 const picker_presentation = @import("picker_presentation.zig");
+const model_menu_presentation = @import("model_menu_presentation.zig");
+const skills_menu_presentation = @import("skills_menu_presentation.zig");
+const help_menu_presentation = @import("help_menu_presentation.zig");
+const settings_menu_presentation = @import("settings_menu_presentation.zig");
+const mcp_menu_presentation = @import("mcp_menu_presentation.zig");
+const resume_menu_presentation = @import("resume_menu_presentation.zig");
 const question_ui = @import("question_ui.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
@@ -577,6 +583,7 @@ fn pushQueuedPromptBannerRows(
         var summary = try input_presentation.composeQueuedSummaryRow(
             alloc,
             ctx.queued_count,
+            ctx.steering_count,
             ctx.queued_paused,
             width,
         );
@@ -588,6 +595,7 @@ fn pushQueuedPromptBannerRows(
                 width,
                 false,
                 ctx.queued_cancel_all_available,
+                ctx.steering_count > 0,
             );
             try pushFooterBandRow(alloc, frame, plan, plan.footer.banner +| painted, &hint);
             painted +|= 1;
@@ -711,6 +719,7 @@ fn pushQueuedPromptBannerRows(
             width,
             empty_draft,
             ctx.queued_cancel_all_available,
+            ctx.steering_count > 0,
         );
         try pushFooterBandRow(alloc, frame, plan, hint_row, &hint);
     }
@@ -821,6 +830,89 @@ pub fn composeFooterFrame(
                     shell.layout.cols,
                 );
                 try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
+            }
+        } else if (input.picker_kind == .settings and ctx.settings_menu.active) {
+            var menu_row_index: u16 = 0;
+            while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
+                var menu_row = try settings_menu_presentation.composeSettingsMenuRow(
+                    alloc,
+                    ctx.settings_menu,
+                    menu_row_index,
+                    shell.layout.cols,
+                    input.picker_rows,
+                );
+                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
+            }
+        } else if (input.picker_kind == .mcp and ctx.mcp_menu.state.active) {
+            var menu_row_index: u16 = 0;
+            while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
+                var menu_row = try mcp_menu_presentation.composeMcpMenuRow(
+                    alloc,
+                    ctx.mcp_menu,
+                    menu_row_index,
+                    shell.layout.cols,
+                    input.picker_rows,
+                );
+                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
+            }
+        } else if (input.picker_kind == .help and ctx.help_menu.active) {
+            var menu_row_index: u16 = 0;
+            while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
+                var menu_row = try help_menu_presentation.composeHelpMenuRow(
+                    alloc,
+                    ctx.help_menu,
+                    menu_row_index,
+                    shell.layout.cols,
+                    input.picker_rows,
+                );
+                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
+            }
+        } else if (input.picker_kind == .sessions and ctx.session_menu.active) {
+            var menu_row_index: u16 = 0;
+            while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
+                var menu_row = try resume_menu_presentation.composeSessionMenuRow(
+                    alloc,
+                    ctx.session_menu,
+                    menu_row_index,
+                    shell.layout.cols,
+                    input.picker_rows,
+                );
+                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
+            }
+        } else if (input.picker_kind == .models and ctx.model_menu.active) {
+            var menu_row_index: u16 = 0;
+            while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
+                var menu_row = try model_menu_presentation.composeModelMenuRow(
+                    alloc,
+                    ctx.model_menu,
+                    menu_row_index,
+                    shell.layout.cols,
+                    input.picker_rows,
+                );
+                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
+            }
+        } else if (input.picker_kind == .skills and ctx.skills_menu.active) {
+            var prepared = try skills_menu_presentation.prepareInlineSkillsMenu(
+                alloc,
+                ctx.skills_menu,
+                input.picker_rows,
+            );
+            defer prepared.deinit(alloc);
+            var menu_row_index: u16 = 0;
+            while (menu_row_index < prepared.rowCount()) : (menu_row_index += 1) {
+                var menu_row = try skills_menu_presentation.composeSkillsMenuRow(
+                    alloc,
+                    prepared,
+                    menu_row_index,
+                    shell.layout.cols,
+                );
+                try pushFooterBandRow(
+                    alloc,
+                    &frame,
+                    plan,
+                    rows.picker_start + menu_row_index,
+                    &menu_row,
+                );
             }
         } else if (input.picker_kind == .auth and ctx.auth_picker.active) {
             var auth_row_index: u16 = 0;
@@ -935,16 +1027,24 @@ pub fn composeFooterFrame(
             shell.layout.cols,
         )
     else if (compact_command_menu) |menu|
-        switch (menu) {
-            .statusline => try input_presentation.composeHintRow(
-                alloc,
-                false,
-                input.active_label,
-                ctx,
-                shell.layout.cols,
-            ),
-            else => try input_presentation.composeCompactCommandMenuHintRow(alloc, shell.layout.cols, menu),
-        }
+        try input_presentation.composeCompactCommandMenuHintRow(alloc, shell.layout.cols, menu)
+    else if (input.show_picker and input.picker_kind == .skills)
+        try input_presentation.composeSkillsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+    else if (input.show_picker and input.picker_kind == .settings)
+        try input_presentation.composeSettingsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+    else if (input.show_picker and input.picker_kind == .mcp)
+        try input_presentation.composeMcpMenuHintRow(
+            alloc,
+            shell.layout.cols,
+            ctx.ctrl_c_pending,
+            ctx.mcp_menu.state,
+        )
+    else if (input.show_picker and input.picker_kind == .help)
+        try input_presentation.composeHelpMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+    else if (input.show_picker and input.picker_kind == .sessions)
+        try input_presentation.composeResumeMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+    else if (input.show_picker and input.picker_kind == .models)
+        try input_presentation.composeModelsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .slash and input.slash_menu_layout != null)
         try input_presentation.composeSlashMenuHintRow(alloc, shell.layout.cols)
     else blk: {
@@ -979,8 +1079,7 @@ fn composeTranscriptViewerFooterFrame(
     errdefer frame.deinit(alloc);
     const width = shell.layout.cols;
     const navigation = switch (input.ctx.transcript_depth) {
-        .review => "Review · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close",
-        .full => "Full detail · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close",
+        .full => "Full detail · ctrl o close · PgUp/PgDn scroll · Esc close",
         .inline_mode => unreachable,
     };
 
@@ -1271,7 +1370,7 @@ test "transcript viewer footer keeps navigation blank row and aligns main status
     };
     defer shell.deinit(alloc);
     var ctx = testContext(&input);
-    ctx.transcript_depth = .review;
+    ctx.transcript_depth = .full;
     const planner_input: FooterPlannerInput = .{
         .active_label = null,
         .ctx = ctx,
@@ -1290,7 +1389,7 @@ test "transcript viewer footer keeps navigation blank row and aligns main status
         &frame,
         frame_plan.paint.footer.top_divider,
         shell.layout.cols,
-        "┃ Review · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close",
+        "┃ Full detail · ctrl o close · PgUp/PgDn scroll · Esc close",
     );
     try expectFrameRowTextTrimmed(
         &frame,
@@ -1324,7 +1423,7 @@ test "transcript viewer footer keeps navigation blank row and aligns main status
         &full_frame,
         full_plan.paint.footer.top_divider,
         shell.layout.cols,
-        "┃ Full detail · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close",
+        "┃ Full detail · ctrl o close · PgUp/PgDn scroll · Esc close",
     );
 }
 
@@ -1540,8 +1639,8 @@ test "queued prompt cards stack above the composer with a paused hint" {
     const second = try user_message_card.buildUserPromptCard(alloc, "second queued\ncontinued", &.{}, shell.layout.cols);
     defer alloc.free(second);
     const cards = [_]render_input.QueuedPromptCard{
-        .{ .bytes = first, .row_count = 1 },
-        .{ .bytes = second, .row_count = 2 },
+        .{ .bytes = first },
+        .{ .bytes = second },
     };
 
     var ctx = testContext(&input);
@@ -1606,8 +1705,8 @@ test "queued editor paints and owns the cursor on its original card row" {
     const editing_bytes = try alloc.dupe(u8, "");
     defer alloc.free(editing_bytes);
     const cards = [_]render_input.QueuedPromptCard{
-        .{ .bytes = first, .row_count = 1 },
-        .{ .bytes = editing_bytes, .row_count = 1, .editing = true },
+        .{ .bytes = first },
+        .{ .bytes = editing_bytes, .editing = true },
     };
 
     var ctx = testContext(&input);
@@ -1678,7 +1777,7 @@ test "queued editor follows the cursor when its draft exceeds the card budget" {
     const editing_bytes = try alloc.dupe(u8, "");
     defer alloc.free(editing_bytes);
     const cards = [_]render_input.QueuedPromptCard{
-        .{ .bytes = editing_bytes, .row_count = 1, .editing = true },
+        .{ .bytes = editing_bytes, .editing = true },
     };
 
     var ctx = testContext(&input);

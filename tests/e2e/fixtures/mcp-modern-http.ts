@@ -36,7 +36,12 @@ export type ModernHttpMode =
   | "features_public"
   | "features_stale_read"
   | "features_ttl_expiry"
-  | "mrtr_form";
+  | "mrtr_form"
+  | "legacy_session_required"
+  | "legacy_json_session_required"
+  | "legacy_mongodb_session_required"
+  | "legacy_plaintext_auth_rejection"
+  | "legacy_plaintext_session_required";
 
 export type ModernHttpRequest = {
   message: {
@@ -82,6 +87,19 @@ export function startModernMcpHttpFixture(
     idleTimeout: 30,
     async fetch(request) {
       httpMethods.push(request.method);
+      const legacySessionRequired = mode === "legacy_session_required" ||
+        mode === "legacy_json_session_required" ||
+        mode === "legacy_mongodb_session_required" ||
+        mode === "legacy_plaintext_session_required";
+      if (legacySessionRequired && request.method === "GET") {
+        return new Response("Method Not Allowed", {
+          status: 405,
+          headers: { Allow: "POST, DELETE" },
+        });
+      }
+      if (legacySessionRequired && request.method === "DELETE") {
+        return new Response(null, { status: 200 });
+      }
       const message = await request.json() as ModernHttpRequest["message"];
       requests.push({
         message,
@@ -92,6 +110,140 @@ export function startModernMcpHttpFixture(
       if (message.method === "tools/list") toolsListCalls += 1;
       if (message.method === "resources/list") resourcesListCalls += 1;
       if (message.method === "resources/read") resourceReadCalls += 1;
+
+      if (
+        mode === "legacy_plaintext_auth_rejection" &&
+        message.method === "server/discover"
+      ) {
+        return new Response(
+          JSON.stringify({
+            error: 401,
+            reason: "Unauthorized",
+            detail: "You are not authorized for this resource.",
+          }),
+          {
+            status: 400,
+            headers: { "content-type": "text/plain;charset=UTF-8" },
+          },
+        );
+      }
+
+      if (legacySessionRequired) {
+        const sessionId = "mongodb-managed-session";
+        if (message.method === "server/discover") {
+          if (mode === "legacy_mongodb_session_required") {
+            return Response.json(
+              {
+                jsonrpc: "2.0",
+                error: {
+                  code: -32600,
+                  message:
+                    "Missing required Mcp-Session-Id header. Non-initialize requests must include a session ID.",
+                },
+              },
+              { status: 400 },
+            );
+          }
+          if (mode === "legacy_json_session_required") {
+            return Response.json(
+              {
+                jsonrpc: "2.0",
+                error: {
+                  code: -32000,
+                  message: "Bad Request: Mcp-Session-Id header is required",
+                },
+              },
+              { status: 400 },
+            );
+          }
+          if (mode === "legacy_plaintext_session_required") {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: null,
+                error: {
+                  code: -32000,
+                  message: "Bad Request: Mcp-Session-Id header is required",
+                },
+              }),
+              {
+                status: 400,
+                headers: { "content-type": "text/plain;charset=UTF-8" },
+              },
+            );
+          }
+          return Response.json(
+            {
+              jsonrpc: "2.0",
+              error: { code: -32004, message: "invalid request" },
+            },
+            { status: 400 },
+          );
+        }
+        if (message.method === "initialize") {
+          return Response.json(
+            {
+              jsonrpc: "2.0",
+              id: message.id,
+              result: {
+                protocolVersion: mode === "legacy_plaintext_session_required"
+                  ? "2025-03-26"
+                  : "2025-11-25",
+                capabilities: { tools: {} },
+                serverInfo: {
+                  name: mode === "legacy_plaintext_session_required"
+                    ? "gitmcp-fixture"
+                    : "mongodb-managed-fixture",
+                  version: "1.0.0",
+                },
+              },
+            },
+            { headers: { "mcp-session-id": sessionId } },
+          );
+        }
+        if (message.method === "notifications/initialized") {
+          return new Response(null, { status: 202 });
+        }
+        if (request.headers.get("mcp-session-id") !== sessionId) {
+          return Response.json(
+            {
+              jsonrpc: "2.0",
+              error: { code: -32001, message: "session id is required" },
+            },
+            { status: 400 },
+          );
+        }
+        if (message.method === "tools/list") {
+          return Response.json({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              tools: [{
+                name: "echo",
+                description: "MongoDB managed compatibility fixture",
+                inputSchema: {
+                  type: "object",
+                  properties: { text: { type: "string" } },
+                },
+              }],
+            },
+          });
+        }
+        if (message.method === "tools/call") {
+          return Response.json({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              content: [{ type: "text", text: MODERN_HTTP_TOOL_RESULT }],
+            },
+          });
+        }
+        return Response.json({
+          jsonrpc: "2.0",
+          id: message.id,
+          error: { code: -32601, message: "Method not found" },
+        });
+      }
 
       if (mode === "redirect") {
         return Response.redirect(
@@ -364,6 +516,12 @@ export function startModernMcpHttpFixture(
         result: {
           resultType: "complete",
           supportedVersions: [MODERN_MCP_VERSION],
+          _meta: {
+            "io.modelcontextprotocol/serverInfo": {
+              name: "modern-http-fixture",
+              version: "",
+            },
+          },
           capabilities: {
             tools: mode === "cache_subscription" ||
                 mode === "cache_server_cancel" ||

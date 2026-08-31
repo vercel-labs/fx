@@ -344,24 +344,29 @@ pub fn parseCallOutcome(
     }
     for (content.array.items) |item| try validateContentItem(alloc, item, limits);
 
-    if (result.object.get("isError")) |value| if (value != .bool) return error.InvalidCallResult;
+    const is_error = if (result.object.get("isError")) |value| blk: {
+        if (value != .bool) return error.InvalidCallResult;
+        break :blk value.bool;
+    } else false;
     const structured_content = result.object.get("structuredContent");
-    if (output_schema_json) |schema_json| {
-        const structured = structured_content orelse return error.InvalidStructuredContent;
-        var schema = std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{
-            .parse_numbers = false,
-        }) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvalidStructuredContent,
-        };
-        defer schema.deinit();
-        const validation = json_schema.validateValue(alloc, schema.value, structured, limits.schema) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvalidStructuredContent,
-        };
-        switch (validation) {
-            .valid, .server_authoritative => {},
-            .invalid => return error.InvalidStructuredContent,
+    if (!is_error) {
+        if (output_schema_json) |schema_json| {
+            const structured = structured_content orelse return error.InvalidStructuredContent;
+            var schema = std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{
+                .parse_numbers = false,
+            }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidStructuredContent,
+            };
+            defer schema.deinit();
+            const validation = json_schema.validateValue(alloc, schema.value, structured, limits.schema) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidStructuredContent,
+            };
+            switch (validation) {
+                .valid, .server_authoritative => {},
+                .invalid => return error.InvalidStructuredContent,
+            }
         }
     }
     const serialization_limit = std.math.add(usize, max_result_bytes, 16 * 1024) catch
@@ -369,7 +374,7 @@ pub fn parseCallOutcome(
     const result_json = try stringifyValueAlloc(alloc, result, serialization_limit);
     return .{ .complete = .{
         .result_json = result_json,
-        .is_error = if (result.object.get("isError")) |value| value.bool else false,
+        .is_error = is_error,
     } };
 }
 
@@ -996,7 +1001,7 @@ test "tools list rejects malformed schemas behind local references" {
     );
 }
 
-test "tool call results preserve every content type and validate structured content" {
+test "MCP tool call results preserve content types errors and structured validation" {
     const alloc = std.testing.allocator;
     var outcome = try parseCallOutcome(
         alloc,
@@ -1011,11 +1016,30 @@ test "tool call results preserve every content type and validate structured cont
     defer outcome.deinit(alloc);
     try std.testing.expect(!outcome.complete.is_error);
     try std.testing.expect(std.mem.find(u8, outcome.complete.result_json, "resource_link") != null);
+
+    var error_outcome = try parseCallOutcome(
+        alloc,
+        \\{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"No active project"}],"isError":true}}
+    ,
+        .legacy,
+        \\{"type":"object","properties":{"result":{"type":"string"}},"required":["result"]}
+    ,
+        64 * 1024,
+        .{},
+    );
+    defer error_outcome.deinit(alloc);
+    try std.testing.expect(error_outcome.complete.is_error);
+    try std.testing.expect(std.mem.find(
+        u8,
+        error_outcome.complete.result_json,
+        "No active project",
+    ) != null);
+
     try std.testing.expectError(
         error.InvalidStructuredContent,
         parseCallOutcome(
             alloc,
-            \\{"jsonrpc":"2.0","id":2,"result":{"content":[],"structuredContent":"wrong"}}
+            \\{"jsonrpc":"2.0","id":3,"result":{"content":[],"structuredContent":"wrong"}}
         ,
             .modern,
             \\{"type":"array"}
@@ -1028,7 +1052,7 @@ test "tool call results preserve every content type and validate structured cont
         error.InvalidStructuredContent,
         parseCallOutcome(
             alloc,
-            \\{"jsonrpc":"2.0","id":3,"result":{"content":[]}}
+            \\{"jsonrpc":"2.0","id":4,"result":{"content":[]}}
         ,
             .modern,
             \\{"type":"object"}

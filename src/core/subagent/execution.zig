@@ -1259,7 +1259,7 @@ fn livePresentationEventBytes(event: worker_runtime.WorkerEvent) ?usize {
         .clear_route_recovery_status,
         .route_recovery_status,
         .turn_token_update,
-        .tool_payload_started,
+        .turn_phase_update,
         => 1,
         .semantic_notice, .error_text => |notice| notice.topic.len +| notice.body.len,
         .command_output => |chunk| chunk.text.len +|
@@ -1282,6 +1282,7 @@ fn livePresentationEventBytes(event: worker_runtime.WorkerEvent) ?usize {
             if (payload.full) |full| full.content.len +| full.lifecycle_id.call_id.len else 0,
         .begin_prompt,
         .begin_prompt_with_skill_bindings,
+        .begin_presented_prompt,
         .finish_prompt,
         .notification,
         .question_requested,
@@ -4380,7 +4381,7 @@ const ApprovalBlockingExecution = struct {
             .source_id = request.source_id,
             .model = request.preferences.model,
             .effort = request.preferences.effort,
-            .tool_names = &.{"create_folder"},
+            .tool_names = &.{"write_file"},
             .rules = .{ .rules = &.{} },
             .grants = &.{},
             .integration_names = &.{},
@@ -4410,13 +4411,13 @@ const ApprovalBlockingExecution = struct {
         var response = turn.permissionPrompter().request(
             turn.alloc,
             .{
-                .label = "create_folder blocked",
-                .command = "mkdir blocked",
+                .label = "write_file blocked",
+                .command = "write blocked",
             },
             .{
                 .id = "approval-blocked-call",
-                .name = "create_folder",
-                .arguments_json = "{\"path\":\"blocked\"}",
+                .name = "write_file",
+                .arguments_json = "{\"path\":\"blocked\",\"content\":\"\"}",
             },
             null,
             null,
@@ -6887,7 +6888,7 @@ const ToolEffectExecution = struct {
             .source_id = request.source_id,
             .model = request.preferences.model,
             .effort = request.preferences.effort,
-            .tool_names = &.{"create_folder"},
+            .tool_names = &.{"write_file"},
         }) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.AdmissionFailed,
@@ -6903,12 +6904,13 @@ const ToolEffectExecution = struct {
     ) ServiceError!RunOutcome {
         const self: *ToolEffectExecution = @ptrCast(@alignCast(raw.?));
         const recorder = turn.toolActivityRecorder();
-        recorder.record("effect-call", "create_folder", .started) catch
+        recorder.record("effect-call", "write_file", .started) catch
             return error.ProviderFailed;
-        self.dir.createDirPath(io_mod.getIo(), "effect") catch
+        var file = self.dir.createFile(io_mod.getIo(), "effect", .{ .truncate = true }) catch
             return error.ProviderFailed;
+        file.close(io_mod.getIo());
         _ = self.effects.fetchAdd(1, .seq_cst);
-        recorder.record("effect-call", "create_folder", .succeeded) catch {};
+        recorder.record("effect-call", "write_file", .succeeded) catch {};
 
         var history_turn = session.makeAssistantTurn(
             turn.alloc,
@@ -6918,12 +6920,12 @@ const ToolEffectExecution = struct {
         defer session.freeHistoryTurn(turn.alloc, history_turn);
         const calls = [_]types.ToolCall{.{
             .id = "effect-call",
-            .name = "create_folder",
-            .arguments_json = "{\"path\":\"effect\"}",
+            .name = "write_file",
+            .arguments_json = "{\"path\":\"effect\",\"content\":\"\"}",
         }};
         const results = [_]types.PersistedToolResult{.{
             .tool_call_id = @constCast("effect-call"),
-            .tool_name = @constCast("create_folder"),
+            .tool_name = @constCast("write_file"),
             .status = .success,
             .output = @constCast("created"),
             .output_bytes = 7,
@@ -6952,7 +6954,7 @@ const ToolEffectAuthority = struct {
         alloc: Allocator,
         _: []const u8,
     ) !authority_mod.HostAuthority {
-        const tools = try cloneTestStrings(alloc, &.{"create_folder"});
+        const tools = try cloneTestStrings(alloc, &.{"write_file"});
         errdefer freeTestStrings(alloc, tools);
         const integrations = try alloc.alloc([]u8, 0);
         errdefer alloc.free(integrations);
@@ -7967,180 +7969,6 @@ test "owner deinit joins and preserves unfinished durable work for recovery" {
     resumed.deinit(alloc);
 }
 
-fn ownLiveRevalidationRule(
-    alloc: Allocator,
-    permission: []const u8,
-    pattern: []const u8,
-    action: types.PermissionAction,
-) !types.PermissionRule {
-    const owned_permission = try alloc.dupe(u8, permission);
-    errdefer alloc.free(owned_permission);
-    return .{
-        .permission = owned_permission,
-        .pattern = try alloc.dupe(u8, pattern),
-        .action = action,
-    };
-}
-
-const LiveRevalidationHost = struct {
-    generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
-    changed_action: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
-    tool_name: []const u8,
-    source_pattern: ?[]const u8 = null,
-    destination_pattern: ?[]const u8 = null,
-
-    fn action(code: u8) ?types.PermissionAction {
-        return switch (code) {
-            0 => null,
-            1 => .ask,
-            2 => .deny,
-            else => unreachable,
-        };
-    }
-
-    fn change(self: *@This(), next: types.PermissionAction) void {
-        self.changed_action.store(switch (next) {
-            .ask => 1,
-            .deny => 2,
-            .allow => unreachable,
-        }, .seq_cst);
-        self.generation.store(2, .seq_cst);
-    }
-
-    fn resolve(
-        raw: ?*anyopaque,
-        alloc: Allocator,
-        _: []const u8,
-    ) authority_mod.HostResolveError!authority_mod.HostAuthority {
-        const self: *@This() = @ptrCast(@alignCast(raw.?));
-        const generation = self.generation.load(.seq_cst);
-        const changed_action = if (generation == 1)
-            null
-        else
-            action(self.changed_action.load(.seq_cst));
-        const rule_count: usize = @as(usize, @intFromBool(self.source_pattern != null)) +
-            @as(usize, @intFromBool(changed_action != null));
-        const rules = try alloc.alloc(types.PermissionRule, rule_count);
-        errdefer alloc.free(rules);
-        var initialized: usize = 0;
-        errdefer for (rules[0..initialized]) |rule| {
-            alloc.free(rule.permission);
-            alloc.free(rule.pattern);
-        };
-
-        if (self.source_pattern) |source| {
-            rules[initialized] = try ownLiveRevalidationRule(
-                alloc,
-                self.tool_name,
-                source,
-                .allow,
-            );
-            initialized += 1;
-        }
-        if (changed_action) |value| {
-            rules[initialized] = try ownLiveRevalidationRule(
-                alloc,
-                self.tool_name,
-                self.destination_pattern.?,
-                value,
-            );
-            initialized += 1;
-        }
-
-        const tools = try cloneTestStrings(alloc, &.{self.tool_name});
-        errdefer freeTestStrings(alloc, tools);
-        const integrations = try alloc.alloc([]u8, 0);
-        errdefer alloc.free(integrations);
-        const grants = try alloc.alloc(types.PermissionGrant, 0);
-        errdefer types.freePermissionGrantSlice(alloc, grants);
-        return .{
-            .generation = generation,
-            .tools = tools,
-            .integrations = integrations,
-            .rules = .{ .rules = rules },
-            .grants = grants,
-        };
-    }
-};
-
-const ProductionPermissionAdapter = struct {
-    turn: *TurnContext,
-    background: *background_runtime.BackgroundRuntime,
-    workspace_root: []const u8,
-    tool_registry: tool_dispatch.Registry,
-
-    fn input(
-        self: *@This(),
-        review_turn: permission_auto_classifier.ReviewTurnContext,
-        live_authority: ?agent_runtime.LiveToolAuthority,
-    ) !tooling_tool_admission.Input {
-        const authority = live_authority orelse return error.HostAuthorityUnavailable;
-        return .{
-            .workspace_root = self.workspace_root,
-            .permission_review_turn = review_turn,
-            .permission_grants = authority.grants,
-            .permission_rules = authority.rules,
-            .tool_registry = self.tool_registry,
-            .worker = &self.turn.worker,
-            .permission_prompter = self.turn.permissionPrompter(),
-            .background = self.background,
-            .advertised_dynamic_tool_names = &.{},
-            .mcp_runtime = .{},
-        };
-    }
-
-    fn requestPermission(
-        raw: *anyopaque,
-        arena: Allocator,
-        call: types.ToolCall,
-        review_turn: permission_auto_classifier.ReviewTurnContext,
-        permission_mode: types.PermissionMode,
-        local_grants: []const types.PermissionGrant,
-        live_authority: ?agent_runtime.LiveToolAuthority,
-        revalidation: ?agent_runtime.LivePermissionRevalidation,
-        _: []const []const u8,
-    ) !command_admission.PermissionOutcome {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        const admission = try self.input(review_turn, live_authority);
-        return if (revalidation) |request| switch (request) {
-            .action => |action_request| tooling_tool_admission.revalidateLiveActionPermissionOutcome(
-                admission,
-                arena,
-                call,
-                permission_mode,
-                local_grants,
-                action_request.authority,
-                action_request.human_approval,
-            ),
-        } else tooling_tool_admission.requestPermissionOutcome(
-            admission,
-            arena,
-            call,
-            permission_mode,
-            local_grants,
-        );
-    }
-};
-
-const ProductionPromptThread = struct {
-    gateway: *agent_test_support.FakeGateway,
-    hooks: *agent_test_support.FakeAgentRuntimeDeps,
-    config: agent_runtime.Config,
-    job: worker_runtime.QueuedPrompt,
-    failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    fn run(self: *@This()) void {
-        defer self.finished.store(true, .seq_cst);
-        agent_test_support.runFakePrompt(
-            self.gateway,
-            self.hooks,
-            self.config,
-            self.job,
-        ) catch self.failed.store(true, .seq_cst);
-    }
-};
-
 fn waitForPendingToolApproval(
     alloc: Allocator,
     env: *TestEnvironment,
@@ -8244,207 +8072,6 @@ fn waitForObservedToolApproval(
         std.Thread.yield() catch std.atomic.spinLoopHint();
     }
     return error.TestApprovalNotRegistered;
-}
-
-fn runProductionActionGenerationCase(
-    tool_name: []const u8,
-    changed_action: types.PermissionAction,
-    approval_decision: types.ToolPermissionDecision,
-) !void {
-    const alloc = std.testing.allocator;
-    var env = try TestEnvironment.init(alloc);
-    defer env.deinit(alloc);
-    try env.createSession(alloc, "parent");
-    try env.createSession(alloc, "permission-child");
-    try env.installControl(
-        alloc,
-        "permission-child",
-        .persistent,
-        "model/permission",
-        types.ReasoningEffort.literal("medium"),
-        &.{"permission-work"},
-    );
-    try env.setPermissionMode(alloc, "permission-child", .ask);
-    {
-        var capability = try env.store.openSubagentControlCapabilityWritable(
-            alloc,
-            "permission-child",
-            .{},
-        );
-        defer capability.deinit();
-        const store = control_store.Store{
-            .capability = &capability,
-            .expected_child_id = "permission-child",
-        };
-        var lock = try store.acquireLock();
-        defer lock.release();
-        var record = try store.load(alloc);
-        defer record.deinit(alloc);
-        try admitWork(alloc, &record, 0, 2);
-        try store.save(alloc, record);
-    }
-    {
-        var source = try env.tmp.dir.createFile(
-            io_mod.getIo(),
-            "workspace/source.txt",
-            .{ .truncate = true },
-        );
-        defer source.close(io_mod.getIo());
-        try source.writeStreamingAll(io_mod.getIo(), "source\n");
-    }
-    const destination = try std.fs.path.join(
-        alloc,
-        &.{ env.home, "destination.txt" },
-    );
-    defer alloc.free(destination);
-    const arguments = if (std.mem.eql(u8, tool_name, "copy_file"))
-        try std.fmt.allocPrint(
-            alloc,
-            "{{\"source\":\"source.txt\",\"destination\":\"{s}\"}}",
-            .{destination},
-        )
-    else
-        try std.fmt.allocPrint(
-            alloc,
-            "{{\"old_path\":\"source.txt\",\"new_path\":\"{s}\"}}",
-            .{destination},
-        );
-    defer alloc.free(arguments);
-
-    var host = LiveRevalidationHost{
-        .tool_name = tool_name,
-        .source_pattern = "source.txt",
-        .destination_pattern = destination,
-    };
-    var authority = authority_mod.Resolver{
-        .sessions = &env.store,
-        .host = .{ .context = &host, .resolve_fn = LiveRevalidationHost.resolve },
-    };
-    var durable = approval_persistence.DurableRegistry{
-        .alloc = alloc,
-        .sessions = &env.store,
-    };
-    var registry = approval_registry_mod.Registry{
-        .alloc = alloc,
-        .persistence = durable.interface(),
-    };
-    defer registry.deinit();
-    var loaded = try env.store.resumeForWrite(alloc, "permission-child");
-    defer {
-        loaded.log.park();
-        loaded.deinit(alloc);
-    }
-    var turn = try TurnContext.init(alloc, &loaded, 8);
-    defer turn.deinit();
-    turn.live_authority = &authority;
-    turn.approval_registry = &registry;
-    turn.child_id = "permission-child";
-    turn.active_work_id = "permission-work";
-    turn.worker.worker_processing = true;
-    var background: background_runtime.BackgroundRuntime = .{};
-    defer background.deinit(alloc);
-    var hooks = agent_test_support.FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.live_tool_authority = turn.liveToolAuthorityProvider();
-    hooks.permission_target = try std.fs.path.join(
-        alloc,
-        &.{ env.workspace, "source.txt" },
-    );
-    defer alloc.free(@constCast(hooks.permission_target));
-    hooks.workspace_root = env.workspace;
-    hooks.exec_plans = &.{.{ .result = .{ .model_output = "effect" } }};
-    var adapter = ProductionPermissionAdapter{
-        .turn = &turn,
-        .background = &background,
-        .workspace_root = env.workspace,
-        .tool_registry = hooks.tool_registry,
-    };
-    hooks.permission_request_override = .{
-        .context = &adapter,
-        .request_fn = ProductionPermissionAdapter.requestPermission,
-    };
-
-    const calls = [_]types.ToolCall{.{
-        .id = "generation-bound-action",
-        .name = tool_name,
-        .arguments_json = arguments,
-    }};
-    const completions = [_]agent_test_support.FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .content = "done" },
-    };
-    var gateway = agent_test_support.FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var fixture = agent_test_support.PromptFixture{ .workspace_root = env.workspace };
-    var job = fixture.job();
-    // This fixture exercises live human-approval revalidation, not automatic
-    // recovery. Start it in ask mode so the initial approval is intentional.
-    job.permission_mode = .ask;
-    var config = fixture.config();
-    config.origin = .subagent;
-    config.session_child_capability = try turn.childCapability();
-    var prompt = ProductionPromptThread{
-        .gateway = &gateway,
-        .hooks = &hooks,
-        .config = config,
-        .job = job,
-    };
-    const thread = try std.Thread.spawn(.{}, ProductionPromptThread.run, .{&prompt});
-    var joined = false;
-    defer if (!joined) {
-        turn.worker.requestCancel();
-        thread.join();
-    };
-    const approval_id = try waitForPendingToolApproval(
-        alloc,
-        &env,
-        "permission-child",
-    );
-    defer alloc.free(approval_id);
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        hooks.successful_effect_count.load(.seq_cst),
-    );
-    host.change(changed_action);
-    try std.testing.expectEqual(
-        approval_registry_mod.ResolveResult.accepted,
-        try registry.resolve(
-            approval_id,
-            "permission-child",
-            approval_decision,
-            null,
-            3,
-        ),
-    );
-    thread.join();
-    joined = true;
-    try std.testing.expect(!prompt.failed.load(.seq_cst));
-    const expected_effects: usize = if (changed_action == .ask) 1 else 0;
-    try std.testing.expectEqual(
-        expected_effects,
-        hooks.successful_effect_count.load(.seq_cst),
-    );
-    var ledger = try env.loadCommunication(alloc, "permission-child");
-    defer ledger.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), ledger.approvals.len);
-    try std.testing.expectEqual(
-        if (approval_decision == .always)
-            communication.ApprovalStatus.allowed_always
-        else
-            communication.ApprovalStatus.allowed_once,
-        ledger.approvals[0].status,
-    );
-}
-
-test "production child action revalidation checks changed copy and rename destinations" {
-    for ([_][]const u8{ "copy_file", "rename_file" }) |tool_name| {
-        try runProductionActionGenerationCase(
-            tool_name,
-            .ask,
-            if (std.mem.eql(u8, tool_name, "rename_file")) .always else .once,
-        );
-        try runProductionActionGenerationCase(tool_name, .deny, .once);
-    }
 }
 
 const GatewayExecution = struct {

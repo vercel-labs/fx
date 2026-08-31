@@ -27,7 +27,7 @@ const baseline = resolve(packageRoot, "expected-failures.yml");
 const fxBin = resolve(packageRoot, "../../../zig-out/bin/fx");
 if (!existsSync(fxBin)) {
   throw new Error(
-    `missing freshly built Fx binary at ${fxBin}; run FX_SOUND=0 zig build from the repository root`,
+    `missing freshly built fx binary at ${fxBin}; run FX_SOUND=0 zig build from the repository root`,
   );
 }
 const resultRoot = mkdtempSync(join(tmpdir(), "fx-mcp-conformance-results-"));

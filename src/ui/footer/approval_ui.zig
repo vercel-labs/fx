@@ -1850,10 +1850,6 @@ fn approvalKind(label: []const u8, dynamic_mcp: bool) []const u8 {
     if (std.mem.startsWith(u8, label, "terminal.exec ")) return "Command";
     if (std.mem.startsWith(u8, label, "write_file ")) return "Write file";
     if (std.mem.startsWith(u8, label, "edit_file ")) return "Edit file";
-    if (std.mem.startsWith(u8, label, "delete_file ")) return "Delete file";
-    if (std.mem.startsWith(u8, label, "rename_file ")) return "Rename file";
-    if (std.mem.startsWith(u8, label, "copy_file ")) return "Copy file";
-    if (std.mem.startsWith(u8, label, "create_folder ")) return "Create folder";
     if (std.mem.startsWith(u8, label, "task ")) return "Subagent";
     if (std.mem.startsWith(u8, label, "skill ")) return "Skill";
     return "Tool";
@@ -1873,10 +1869,6 @@ fn approvalQuestion(label: []const u8, dynamic_mcp: bool) []const u8 {
     if (std.mem.startsWith(u8, label, "terminal.exec ")) return "Would you like to run the following command?";
     if (std.mem.startsWith(u8, label, "write_file ")) return "Would you like to create or update this file?";
     if (std.mem.startsWith(u8, label, "edit_file ")) return "Would you like to edit this file?";
-    if (std.mem.startsWith(u8, label, "delete_file ")) return "Would you like to delete this file?";
-    if (std.mem.startsWith(u8, label, "rename_file ")) return "Would you like to rename this file?";
-    if (std.mem.startsWith(u8, label, "copy_file ")) return "Would you like to copy this file?";
-    if (std.mem.startsWith(u8, label, "create_folder ")) return "Would you like to create this folder?";
     if (std.mem.startsWith(u8, label, "task ")) return "Would you like to start this subagent task?";
     if (std.mem.startsWith(u8, label, "skill ")) return "Would you like to run this skill?";
     return "Would you like to allow this action?";
@@ -1887,10 +1879,6 @@ fn approvalTarget(label: []const u8) []const u8 {
         "terminal.exec ",
         "write_file ",
         "edit_file ",
-        "delete_file ",
-        "rename_file ",
-        "copy_file ",
-        "create_folder ",
         "task ",
         "skill ",
     };
@@ -1929,11 +1917,7 @@ fn approvalReasonLine(
         return "";
     }
     if (std.mem.startsWith(u8, label, "write_file ") or
-        std.mem.startsWith(u8, label, "edit_file ") or
-        std.mem.startsWith(u8, label, "delete_file ") or
-        std.mem.startsWith(u8, label, "rename_file ") or
-        std.mem.startsWith(u8, label, "copy_file ") or
-        std.mem.startsWith(u8, label, "create_folder "))
+        std.mem.startsWith(u8, label, "edit_file "))
     {
         return std.fmt.bufPrint(buf, "  {s}Reason:{s} This action changes files in your workspace.", .{ dim, r }) catch "  Reason: file change requires approval";
     }

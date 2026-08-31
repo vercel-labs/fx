@@ -240,7 +240,7 @@ fn usageOutcome(
         ),
     };
     return if (completion.billing != null)
-        .{ .immediate = reference }
+        .{ .exact = .gateway }
     else
         .{ .deferred = reference };
 }
@@ -400,8 +400,8 @@ fn testRequest() permission_auto_classifier.ReviewRequest {
         .role = .assistant,
         .tool_calls = &.{.{
             .id = "call_1",
-            .name = "list_files",
-            .arguments_json = "{\"path\":\".\"}",
+            .name = "glob_files",
+            .arguments_json = "{\"pattern\":\"*\"}",
         }},
     };
     return .{
@@ -414,8 +414,8 @@ fn testRequest() permission_auto_classifier.ReviewRequest {
         },
         .targets = &.{},
         .action = .{ .tool = .{
-            .tool_name = "list_files",
-            .arguments_json = "{\"path\":\".\"}",
+            .tool_name = "glob_files",
+            .arguments_json = "{\"pattern\":\"*\"}",
         } },
     };
 }

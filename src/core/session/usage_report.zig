@@ -255,6 +255,31 @@ pub const Snapshot = struct {
         alloc.free(self.models);
         self.* = undefined;
     }
+
+    pub fn dupe(self: Snapshot, alloc: Allocator) Allocator.Error!Snapshot {
+        const models = try alloc.alloc(ModelUsage, self.models.len);
+        errdefer alloc.free(models);
+        var copied: usize = 0;
+        errdefer for (models[0..copied]) |*model| model.deinit(alloc);
+        for (self.models, 0..) |model, index| {
+            models[index] = .{
+                .model = try alloc.dupe(u8, model.model),
+                .totals = model.totals,
+            };
+            copied += 1;
+        }
+        return .{
+            .scope = self.scope,
+            .snapshot_time_ms = self.snapshot_time_ms,
+            .window_start_ms = self.window_start_ms,
+            .coverage_started_at_ms = self.coverage_started_at_ms,
+            .coverage = self.coverage,
+            .completeness = self.completeness,
+            .totals = self.totals,
+            .models = models,
+            .session_activity = self.session_activity,
+        };
+    }
 };
 
 pub const BuildError = Allocator.Error || error{

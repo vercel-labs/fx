@@ -312,7 +312,7 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writer.writeByte('}');
         },
         .background_command => |entry| {
-            const extended = entry.assistant != null or !entry.execution.isEmpty();
+            const extended = entry.assistant != null or hasDurableExecutionMemory(entry.execution);
             try writer.writeAll("{\"kind\":\"background_command\",\"user\":");
             try writeUserTurn(writer, entry.user);
             try writer.writeAll(",\"log_path\":");
@@ -354,7 +354,7 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writer.writeByte(']');
             try writer.writeAll(",\"terminal_reason\":");
             try writeJsonString(writer, @tagName(entry.terminal_reason));
-            if (!entry.execution.isEmpty()) {
+            if (hasDurableExecutionMemory(entry.execution)) {
                 try writer.writeAll(",\"execution\":");
                 try writeExecutionMemory(writer, entry.execution);
             }
@@ -555,6 +555,13 @@ fn validateStateWithPermissionMigration(
     for (state.history) |turn| {
         if (session.historyTurnWorkId(turn)) |id| {
             session.validateWorkId(id) catch return error.InvalidDurableField;
+        }
+        if (types.historyTurnSummary(turn)) |summary| {
+            if (summary.started_at_ms < 0 or
+                summary.completed_at_ms < summary.started_at_ms)
+            {
+                return error.InvalidDurableField;
+            }
         }
     }
     if (state.usage) |usage| try session_usage.validateSnapshot(usage);
@@ -1096,7 +1103,7 @@ fn writeSnapshotLocator(writer: *std.Io.Writer, value: ?[]const u8) !void {
 }
 
 fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
-    try writer.writeAll("{\"schema_version\":3,\"tool_steps\":[");
+    try writer.writeAll("{\"schema_version\":5,\"tool_steps\":[");
     for (execution.tool_steps, 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"assistant\":");
@@ -1118,7 +1125,33 @@ fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemo
         if (i > 0) try writer.writeByte(',');
         try writeFileEvidence(writer, file);
     }
-    try writer.writeAll("]}");
+    try writer.writeAll("],\"turn_summary\":");
+    if (execution.turn_summary) |summary| {
+        try writeTurnSummary(writer, summary);
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeByte('}');
+}
+
+fn hasDurableExecutionMemory(execution: session.ExecutionMemory) bool {
+    return !execution.isEmpty() or execution.turn_summary != null;
+}
+
+fn writeTurnSummary(writer: *std.Io.Writer, summary: types.TurnSummary) !void {
+    try writer.print(
+        "{{\"started_at_ms\":{d},\"completed_at_ms\":{d},\"thinking_duration_ms\":{d},\"turn_duration_ms\":{d},\"token_progress\":{{\"input_tokens\":{d},\"output_tokens\":{d},\"input_exact\":{s},\"output_exact\":{s}}}}}",
+        .{
+            summary.started_at_ms,
+            summary.completed_at_ms,
+            summary.thinking_duration_ms,
+            summary.turn_duration_ms,
+            summary.token_progress.input_tokens,
+            summary.token_progress.output_tokens,
+            if (summary.token_progress.input_exact) "true" else "false",
+            if (summary.token_progress.output_exact) "true" else "false",
+        },
+    );
 }
 
 fn writeToolCall(writer: *std.Io.Writer, tool_call: session.ToolCall) !void {
@@ -1173,6 +1206,11 @@ fn writePersistedToolResult(writer: *std.Io.Writer, result: session.PersistedToo
     try writeOptionalCommandProcessPresentation(
         writer,
         result.command_process_presentation,
+    );
+    try writer.writeAll(",\"terminal_action_presentation\":");
+    try writeOptionalTerminalActionPresentation(
+        writer,
+        result.terminal_action_presentation,
     );
     try writer.writeByte('}');
 }
@@ -1240,6 +1278,51 @@ fn writeOptionalCommandProcessPresentation(
         .exit_code => |exit_code| try writer.print(
             "{{\"kind\":\"exit_code\",\"value\":{d}}}",
             .{exit_code},
+        ),
+        .signal => |signal| try writer.print(
+            "{{\"kind\":\"signal\",\"value\":{d}}}",
+            .{signal},
+        ),
+        .timed_out => try writer.writeAll("{\"kind\":\"timed_out\",\"value\":null}"),
+        .output_capture_failed => try writer.writeAll("{\"kind\":\"output_capture_failed\",\"value\":null}"),
+    }
+}
+
+fn writeOptionalTerminalActionPresentation(
+    writer: *std.Io.Writer,
+    presentation: ?types.TerminalActionPresentation,
+) !void {
+    const value = presentation orelse {
+        try writer.writeAll("null");
+        return;
+    };
+    switch (value) {
+        .returned => |returned| {
+            try writer.writeAll("{\"kind\":\"returned\",\"outcome\":");
+            try writeTerminalReturnPresentation(writer, returned);
+            try writer.writeByte('}');
+        },
+        .failed => |failed| {
+            try writer.writeAll("{\"kind\":\"failed\",\"code\":");
+            try writeJsonString(writer, @tagName(failed));
+            try writer.writeByte('}');
+        },
+    }
+}
+
+fn writeTerminalReturnPresentation(
+    writer: *std.Io.Writer,
+    outcome: types.TerminalReturnPresentation,
+) !void {
+    switch (outcome) {
+        .started, .condition_met, .safety_ceiling, .cancelled => {
+            try writer.writeAll("{\"kind\":");
+            try writeJsonString(writer, @tagName(outcome));
+            try writer.writeAll(",\"value\":null}");
+        },
+        .exited => |code| try writer.print(
+            "{{\"kind\":\"exited\",\"value\":{d}}}",
+            .{code},
         ),
         .signal => |signal| try writer.print(
             "{{\"kind\":\"signal\",\"value\":{d}}}",
@@ -1392,9 +1475,16 @@ fn imageAttachmentObject(value: std.json.Value) !std.json.ObjectMap {
 }
 
 fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.ExecutionMemory {
-    const object = try exactObject(value, &.{ "schema_version", "tool_steps", "files" });
+    const source = try requireObject(value);
+    const has_turn_summary = source.get("turn_summary") != null;
+    const object = if (has_turn_summary)
+        try exactObject(value, &.{ "schema_version", "tool_steps", "files", "turn_summary" })
+    else
+        try exactObject(value, &.{ "schema_version", "tool_steps", "files" });
     const schema_version = try requireU64(object, "schema_version");
-    if (schema_version != 1 and schema_version != 2 and schema_version != 3) {
+    if (schema_version < 1 or schema_version > 5 or
+        (schema_version == 5) != has_turn_summary)
+    {
         return error.InvalidSessionFormat;
     }
     const tool_steps = try parseToolSteps(
@@ -1404,7 +1494,48 @@ fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.Execut
     );
     errdefer session.freeExecutionMemory(alloc, .{ .tool_steps = tool_steps });
     const files = try parseFiles(alloc, object.get("files") orelse return error.InvalidSessionFormat);
-    return .{ .tool_steps = tool_steps, .files = files };
+    const turn_summary = if (has_turn_summary)
+        try parseOptionalTurnSummary(object.get("turn_summary").?)
+    else
+        null;
+    return .{
+        .tool_steps = tool_steps,
+        .files = files,
+        .turn_summary = turn_summary,
+    };
+}
+
+fn parseOptionalTurnSummary(value: std.json.Value) !?types.TurnSummary {
+    if (value == .null) return null;
+    const object = try exactObject(value, &.{
+        "started_at_ms",
+        "completed_at_ms",
+        "thinking_duration_ms",
+        "turn_duration_ms",
+        "token_progress",
+    });
+    const token_progress = try exactObject(
+        object.get("token_progress") orelse return error.InvalidSessionFormat,
+        &.{ "input_tokens", "output_tokens", "input_exact", "output_exact" },
+    );
+    const summary = types.TurnSummary{
+        .started_at_ms = try requireI64(object, "started_at_ms"),
+        .completed_at_ms = try requireI64(object, "completed_at_ms"),
+        .thinking_duration_ms = try requireU64(object, "thinking_duration_ms"),
+        .turn_duration_ms = try requireU64(object, "turn_duration_ms"),
+        .token_progress = .{
+            .input_tokens = try requireU64(token_progress, "input_tokens"),
+            .output_tokens = try requireU64(token_progress, "output_tokens"),
+            .input_exact = try requireBool(token_progress, "input_exact"),
+            .output_exact = try requireBool(token_progress, "output_exact"),
+        },
+    };
+    if (summary.started_at_ms < 0 or
+        summary.completed_at_ms < summary.started_at_ms)
+    {
+        return error.InvalidSessionFormat;
+    }
+    return summary;
 }
 
 fn parseToolSteps(
@@ -1598,10 +1729,29 @@ fn parseToolResult(
         "command_output_replay",
         "command_process_presentation",
     };
+    const v4_keys = &.{
+        "tool_call_id",
+        "tool_name",
+        "status",
+        "output",
+        "output_handle",
+        "preview",
+        "output_bytes",
+        "stored_output_bytes",
+        "truncated",
+        "provider_native",
+        "created_at_ms",
+        "permission_feedback",
+        "committed_file_presentation",
+        "command_output_replay",
+        "command_process_presentation",
+        "terminal_action_presentation",
+    };
     const result_shape: ExactVariantObject = switch (schema_version) {
         1 => .{ .object = try exactObject(value, v1_keys), .extended = false },
         2 => try exactVariantObject(value, v2_keys, v2_extended_keys),
         3 => .{ .object = try exactObject(value, v3_keys), .extended = true },
+        4, 5 => .{ .object = try exactObject(value, v4_keys), .extended = true },
         else => return error.InvalidSessionFormat,
     };
     const object = result_shape.object;
@@ -1655,6 +1805,12 @@ fn parseToolResult(
         )
     else
         null;
+    const terminal_action_presentation = if (schema_version >= 4)
+        try parseOptionalTerminalActionPresentation(
+            object.get("terminal_action_presentation") orelse return error.InvalidSessionFormat,
+        )
+    else
+        null;
     return .{
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
@@ -1674,6 +1830,7 @@ fn parseToolResult(
         .committed_file_presentation = committed_file_presentation,
         .command_output_replay = command_output_replay,
         .command_process_presentation = command_process_presentation,
+        .terminal_action_presentation = terminal_action_presentation,
     };
 }
 
@@ -1713,6 +1870,67 @@ fn parseOptionalCommandProcessPresentation(
     if (std.mem.eql(u8, kind, "signal")) {
         const signal = try requireU64(object, "value");
         return .{ .signal = std.math.cast(u32, signal) orelse
+            return error.InvalidSessionFormat };
+    }
+    if (std.mem.eql(u8, kind, "timed_out")) {
+        if (object.get("value").? != .null) return error.InvalidSessionFormat;
+        return .timed_out;
+    }
+    if (std.mem.eql(u8, kind, "output_capture_failed")) {
+        if (object.get("value").? != .null) return error.InvalidSessionFormat;
+        return .output_capture_failed;
+    }
+    return error.InvalidSessionFormat;
+}
+
+fn parseOptionalTerminalActionPresentation(
+    value: std.json.Value,
+) !?types.TerminalActionPresentation {
+    if (value == .null) return null;
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidSessionFormat,
+    };
+    const kind = try requireString(object, "kind");
+    if (std.mem.eql(u8, kind, "returned")) {
+        _ = try exactObject(value, &.{ "kind", "outcome" });
+        return .{ .returned = try parseTerminalReturnPresentation(
+            object.get("outcome") orelse return error.InvalidSessionFormat,
+        ) };
+    }
+    if (std.mem.eql(u8, kind, "failed")) {
+        _ = try exactObject(value, &.{ "kind", "code" });
+        const code = std.meta.stringToEnum(
+            types.TerminalFailurePresentation,
+            try requireString(object, "code"),
+        ) orelse return error.InvalidSessionFormat;
+        return .{ .failed = code };
+    }
+    return error.InvalidSessionFormat;
+}
+
+fn parseTerminalReturnPresentation(
+    value: std.json.Value,
+) !types.TerminalReturnPresentation {
+    const object = try exactObject(value, &.{ "kind", "value" });
+    const kind = try requireString(object, "kind");
+    if (std.mem.eql(u8, kind, "started") or
+        std.mem.eql(u8, kind, "condition_met") or
+        std.mem.eql(u8, kind, "safety_ceiling") or
+        std.mem.eql(u8, kind, "cancelled"))
+    {
+        if (object.get("value").? != .null) return error.InvalidSessionFormat;
+        if (std.mem.eql(u8, kind, "started")) return .started;
+        if (std.mem.eql(u8, kind, "condition_met")) return .condition_met;
+        if (std.mem.eql(u8, kind, "safety_ceiling")) return .safety_ceiling;
+        return .cancelled;
+    }
+    if (std.mem.eql(u8, kind, "exited")) {
+        return .{ .exited = std.math.cast(i32, try requireI64(object, "value")) orelse
+            return error.InvalidSessionFormat };
+    }
+    if (std.mem.eql(u8, kind, "signal")) {
+        return .{ .signal = std.math.cast(u32, try requireU64(object, "value")) orelse
             return error.InvalidSessionFormat };
     }
     return error.InvalidSessionFormat;
@@ -2451,7 +2669,7 @@ test "durable state repairs duplicate-key execution and interrupted tool argumen
             .user = .{ .text = @constCast("continue") },
             .tool_call = .{
                 .id = "call_interrupted",
-                .name = "list_files",
+                .name = "glob_files",
                 .arguments_json = duplicate_arguments,
             },
         } },
@@ -2519,7 +2737,7 @@ test "current history decode rejects ambiguous malformed tool result pairings" {
     var mismatched_call = [_]session.ToolCall{
         .{ .id = "call_bad", .name = "read_file", .arguments_json = "{]" },
     };
-    var mismatched_result = [_]session.PersistedToolResult{persistedResultForTest("call_bad", "list_files")};
+    var mismatched_result = [_]session.PersistedToolResult{persistedResultForTest("call_bad", "glob_files")};
     try expectMalformedPairRejected(mismatched_call[0..], mismatched_result[0..]);
 }
 
@@ -2712,13 +2930,22 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     const turn: session.HistoryTurn = .{ .assistant = .{
         .user = .{ .text = @constCast("write a note") },
         .assistant = @constCast("done"),
-        .execution = .{ .tool_steps = steps[0..] },
+        .execution = .{
+            .tool_steps = steps[0..],
+            .turn_summary = .{
+                .started_at_ms = 100,
+                .completed_at_ms = 250,
+                .thinking_duration_ms = 40,
+                .turn_duration_ms = 150,
+                .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
+            },
+        },
     } };
 
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
     try writeHistoryTurn(&encoded.writer, turn);
-    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"schema_version\":3") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"schema_version\":5") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"permission_feedback\"") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"committed_file_presentation\"") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"command_output_replay\"") != null);
@@ -2729,6 +2956,10 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     const decoded = try parseHistoryTurn(alloc, parsed.value);
     defer session.freeHistoryTurn(alloc, decoded);
     const decoded_result = decoded.assistant.execution.tool_steps[0].tool_results[0];
+    try std.testing.expectEqual(
+        turn.assistant.execution.turn_summary,
+        decoded.assistant.execution.turn_summary,
+    );
     try std.testing.expectEqual(@as(usize, 1), decoded_result.permission_feedback.len);
     try std.testing.expectEqualStrings("read it after writing", decoded_result.permission_feedback[0]);
     const presentation = decoded_result.committed_file_presentation orelse return error.TestExpectedPresentation;
@@ -2775,6 +3006,90 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].committed_file_presentation == null);
     try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].command_output_replay == null);
     try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].command_process_presentation == null);
+}
+
+test "private codec preserves summary-only specialized turns" {
+    const alloc = std.testing.allocator;
+    const summary = types.TurnSummary{
+        .started_at_ms = 100,
+        .completed_at_ms = 250,
+        .thinking_duration_ms = 40,
+        .turn_duration_ms = 150,
+        .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
+    };
+
+    const turns = [_]session.HistoryTurn{
+        .{ .background_command = .{
+            .user = .{ .text = @constCast("start server") },
+            .execution = .{ .turn_summary = summary },
+            .log_path = @constCast("/tmp/server.log"),
+            .expect_url = false,
+        } },
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("inspect repository") },
+            .execution = .{ .turn_summary = summary },
+        } },
+    };
+
+    for (turns) |turn| {
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try writeHistoryTurn(&encoded.writer, turn);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+        defer parsed.deinit();
+        const decoded = try parseHistoryTurn(alloc, parsed.value);
+        defer session.freeHistoryTurn(alloc, decoded);
+        try std.testing.expectEqual(summary, types.historyTurnSummary(decoded).?);
+    }
+}
+
+test "command process presentation codec preserves every terminal cause" {
+    const alloc = std.testing.allocator;
+    const cases = [_]types.CommandProcessPresentation{
+        .{ .exit_code = 7 },
+        .{ .signal = 9 },
+        .timed_out,
+        .output_capture_failed,
+    };
+    for (cases) |case| {
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try writeOptionalCommandProcessPresentation(&encoded.writer, case);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(
+            case,
+            (try parseOptionalCommandProcessPresentation(parsed.value)).?,
+        );
+    }
+}
+
+test "terminal action presentation codec preserves return and failure causes" {
+    const alloc = std.testing.allocator;
+    const cases = [_]types.TerminalActionPresentation{
+        .{ .returned = .started },
+        .{ .returned = .condition_met },
+        .{ .returned = .safety_ceiling },
+        .{ .returned = .cancelled },
+        .{ .returned = .{ .exited = 7 } },
+        .{ .returned = .{ .signal = 9 } },
+        .{ .failed = .session_not_found },
+        .{ .failed = .capacity_exceeded },
+    };
+    for (cases) |case| {
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try writeOptionalTerminalActionPresentation(&encoded.writer, case);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(
+            case,
+            (try parseOptionalTerminalActionPresentation(parsed.value)).?,
+        );
+    }
 }
 
 test "durable history rejects unknown fields instead of silently dropping bytes" {
@@ -3195,6 +3510,7 @@ fn expectHistoryTurnEqual(expected: session.HistoryTurn, actual: session.History
 }
 
 fn expectExecutionMemoryEqual(expected: session.ExecutionMemory, actual: session.ExecutionMemory) !void {
+    try std.testing.expectEqual(expected.turn_summary, actual.turn_summary);
     try std.testing.expectEqual(expected.tool_steps.len, actual.tool_steps.len);
     for (expected.tool_steps, actual.tool_steps) |step, got_step| {
         try expectOptionalBytesEqual(step.assistant, got_step.assistant);

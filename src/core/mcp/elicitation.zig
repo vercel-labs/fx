@@ -994,7 +994,8 @@ fn parseFormSchemaValue(
             if (entry.key_ptr.len == 0 or entry.key_ptr.len > limits.max_name_bytes) {
                 return error.InvalidSchema;
             }
-            owned[field_count] = try parseField(
+            try parseFieldInto(
+                &owned[field_count],
                 alloc,
                 wire,
                 entry.key_ptr.*,
@@ -1023,14 +1024,15 @@ fn schemaNodeLimit(limits: Limits) usize {
         std.math.maxInt(usize);
 }
 
-fn parseField(
+fn parseFieldInto(
+    out: *Field,
     alloc: Allocator,
     wire: Wire,
     name: []const u8,
     schema: std.json.Value,
     required: bool,
     limits: Limits,
-) Error!Field {
+) Error!void {
     if (schema != .object) return error.InvalidSchema;
     if (wire == .acp and schema.object.get("enumNames") != null) {
         return error.UnsupportedSchema;
@@ -1083,7 +1085,7 @@ fn parseField(
         field.default_json = try stringifyBounded(alloc, default_value, limits.max_string_bytes);
         try validateFieldValue(alloc, field, default_value, limits);
     }
-    return field;
+    out.* = field;
 }
 
 fn parseStringConstraints(

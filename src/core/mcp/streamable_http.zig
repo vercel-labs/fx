@@ -270,6 +270,68 @@ const PreparedRequest = struct {
     }
 };
 
+// The pinned Zig 0.16 Response.reader has aborted on fixed-length MCP responses
+// by accessing body_remaining_content_length while its state was `.ready`.
+// Keep MCP framing in independent state and requests one-shot so teardown never
+// re-enters that body-state path. Remove this adapter when Response.reader
+// passes the fixed-length JSON and SSE regression cases on the pinned toolchain.
+const McpContentLengthReader = struct {
+    source: *std.Io.Reader,
+    remaining: u64,
+    interface: std.Io.Reader,
+
+    fn init(
+        source: *std.Io.Reader,
+        content_length: u64,
+        buffer: []u8,
+    ) McpContentLengthReader {
+        return .{
+            .source = source,
+            .remaining = content_length,
+            .interface = .{
+                .vtable = &.{
+                    .stream = stream,
+                },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn stream(
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
+        const self: *McpContentLengthReader = @alignCast(@fieldParentPtr("interface", reader));
+        if (self.remaining == 0) return error.EndOfStream;
+        const count = try self.source.stream(
+            writer,
+            limit.min(.limited64(self.remaining)),
+        );
+        const consumed: u64 = @intCast(count);
+        if (consumed > self.remaining) return error.ReadFailed;
+        self.remaining -= consumed;
+        return count;
+    }
+};
+
+const McpResponseBodyFraming = enum {
+    content_length,
+    standard,
+};
+
+fn mcpResponseBodyFraming(
+    transfer_encoding: std.http.TransferEncoding,
+    content_length: ?u64,
+) McpResponseBodyFraming {
+    if (transfer_encoding == .none and content_length != null) {
+        return .content_length;
+    }
+    return .standard;
+}
+
 fn postCore(alloc: Allocator, options: PostOptions) !PostResponse {
     var prepared = try prepareRequest(
         alloc,
@@ -288,6 +350,7 @@ fn postCore(alloc: Allocator, options: PostOptions) !PostResponse {
 
     var request = try client.request(.POST, uri, .{
         .redirect_behavior = .unhandled,
+        .keep_alive = false,
         .headers = .{
             .content_type = .{ .override = "application/json" },
             .accept_encoding = .omit,
@@ -313,19 +376,17 @@ fn postCore(alloc: Allocator, options: PostOptions) !PostResponse {
             response.head,
         );
         defer if (authenticate) |value| alloc.free(value);
-        if (status == .unauthorized or authenticate != null) {
-            return .{
-                .body = try alloc.dupe(u8, ""),
-                .auth_rejection = if (status == .unauthorized)
-                    .unauthorized
-                else
-                    .insufficient_scope,
-                .www_authenticate = if (authenticate) |value|
-                    try alloc.dupe(u8, value)
-                else
-                    null,
-            };
-        }
+        return .{
+            .body = try alloc.dupe(u8, ""),
+            .auth_rejection = if (status == .unauthorized)
+                .unauthorized
+            else
+                .insufficient_scope,
+            .www_authenticate = if (authenticate) |value|
+                try alloc.dupe(u8, value)
+            else
+                null,
+        };
     }
 
     const version_error = options.allow_version_error and status == .bad_request;
@@ -345,18 +406,48 @@ fn postCore(alloc: Allocator, options: PostOptions) !PostResponse {
     }
 
     const content_type = response.head.content_type orelse return error.MissingContentType;
-    const media_type = parseMediaType(content_type) orelse return error.UnsupportedContentType;
-    if (version_error and media_type != .json) return error.UnsupportedContentType;
+    const media_type = parseMediaType(content_type);
+    const legacy_plain_text_discovery = version_error and prepared.is_discovery and
+        isPlainTextMediaType(content_type);
+    if (media_type == null and !legacy_plain_text_discovery) return error.UnsupportedContentType;
+    if (version_error and media_type != .json and !legacy_plain_text_discovery) {
+        return error.UnsupportedContentType;
+    }
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
-    const reader = response.reader(&transfer_buffer);
-    const body = switch (media_type) {
-        .json => try readJsonResponse(
+    var content_length_reader: McpContentLengthReader = undefined;
+    const reader = switch (mcpResponseBodyFraming(
+        response.head.transfer_encoding,
+        response.head.content_length,
+    )) {
+        .content_length => reader: {
+            content_length_reader = .init(
+                response.request.reader.in,
+                response.head.content_length.?,
+                &transfer_buffer,
+            );
+            break :reader &content_length_reader.interface;
+        },
+        .standard => response.reader(&transfer_buffer),
+    };
+    var body_auth_rejection: AuthRejection = .none;
+    const body = if (legacy_plain_text_discovery)
+        try readJsonResponseClassified(
             alloc,
             reader,
             prepared.id,
             options.max_response_bytes,
             prepared.is_discovery,
+            &body_auth_rejection,
+        )
+    else switch (media_type.?) {
+        .json => try readJsonResponseClassified(
+            alloc,
+            reader,
+            prepared.id,
+            options.max_response_bytes,
+            prepared.is_discovery,
+            &body_auth_rejection,
         ),
         .sse => try readSseResponse(
             alloc,
@@ -370,10 +461,17 @@ fn postCore(alloc: Allocator, options: PostOptions) !PostResponse {
             options.control.cancellation(),
         ),
     };
+    errdefer alloc.free(body);
+    if (legacy_plain_text_discovery and body_auth_rejection == .none and
+        !try isLegacyDiscoveryCompatibilityResponse(alloc, body))
+    {
+        return error.UnsupportedContentType;
+    }
     return .{
         .body = body,
         .version_error = version_error,
         .discovery_mismatch_status = discovery_mismatch_status,
+        .auth_rejection = body_auth_rejection,
     };
 }
 
@@ -722,13 +820,44 @@ fn parseMediaType(value: []const u8) ?MediaType {
     return null;
 }
 
+fn isPlainTextMediaType(value: []const u8) bool {
+    const separator = std.mem.indexOfScalar(u8, value, ';') orelse value.len;
+    const media_type = std.mem.trim(u8, value[0..separator], " \t");
+    return std.ascii.eqlIgnoreCase(media_type, "text/plain");
+}
+
 fn readJsonResponse(
     alloc: Allocator,
     reader: *std.Io.Reader,
     request_id: i64,
     max_response_bytes: usize,
-    allow_null_error_id: bool,
+    allow_discovery_error_id_mismatch: bool,
 ) ![]u8 {
+    var auth_rejection: AuthRejection = .none;
+    const body = try readJsonResponseClassified(
+        alloc,
+        reader,
+        request_id,
+        max_response_bytes,
+        allow_discovery_error_id_mismatch,
+        &auth_rejection,
+    );
+    if (auth_rejection != .none) {
+        alloc.free(body);
+        return error.InvalidJsonResponse;
+    }
+    return body;
+}
+
+fn readJsonResponseClassified(
+    alloc: Allocator,
+    reader: *std.Io.Reader,
+    request_id: i64,
+    max_response_bytes: usize,
+    allow_discovery_error_id_mismatch: bool,
+    auth_rejection: *AuthRejection,
+) ![]u8 {
+    auth_rejection.* = .none;
     var body_list: std.ArrayList(u8) = .empty;
     defer body_list.deinit(alloc);
     var chunk: [16 * 1024]u8 = undefined;
@@ -742,8 +871,46 @@ fn readJsonResponse(
     }
     const body = try body_list.toOwnedSlice(alloc);
     errdefer alloc.free(body);
-    try validateFinalResponse(alloc, body, request_id, allow_null_error_id);
+    validateFinalResponse(
+        alloc,
+        body,
+        request_id,
+        allow_discovery_error_id_mismatch,
+    ) catch |err| {
+        if (allow_discovery_error_id_mismatch) {
+            const rejection = try discoveryAuthenticationRejection(alloc, body);
+            if (rejection != .none) {
+                auth_rejection.* = rejection;
+                return body;
+            }
+        }
+        return err;
+    };
     return body;
+}
+
+fn discoveryAuthenticationRejection(
+    alloc: Allocator,
+    body: []const u8,
+) Allocator.Error!AuthRejection {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .none,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object or parsed.value.object.contains("jsonrpc")) {
+        return .none;
+    }
+    const status = parsed.value.object.get("error") orelse return .none;
+    const reason = parsed.value.object.get("reason") orelse return .none;
+    if (status != .integer or reason != .string) return .none;
+    if (status.integer == 401 and std.mem.eql(u8, reason.string, "Unauthorized")) {
+        return .unauthorized;
+    }
+    if (status.integer == 403 and std.mem.eql(u8, reason.string, "Forbidden")) {
+        return .insufficient_scope;
+    }
+    return .none;
 }
 
 const SseEvent = struct {
@@ -985,7 +1152,7 @@ fn validateFinalResponse(
     alloc: Allocator,
     body: []const u8,
     request_id: i64,
-    allow_null_error_id: bool,
+    allow_discovery_error_id_mismatch: bool,
 ) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch {
         return error.InvalidJsonResponse;
@@ -996,10 +1163,13 @@ fn validateFinalResponse(
     if (jsonrpc != .string or !std.mem.eql(u8, jsonrpc.string, "2.0")) {
         return error.InvalidJsonResponse;
     }
-    const id_value = parsed.value.object.get("id") orelse return error.InvalidJsonResponse;
+    const id_value = parsed.value.object.get("id") orelse {
+        if (allow_discovery_error_id_mismatch and
+            isLegacyDiscoveryCompatibilityError(parsed.value.object)) return;
+        return error.InvalidJsonResponse;
+    };
     const matching_id = id_value == .integer and id_value.integer == request_id;
-    const classifiable_discovery_error = allow_null_error_id and
-        id_value == .null and
+    const classifiable_discovery_error = allow_discovery_error_id_mismatch and
         parsed.value.object.contains("error") and
         !parsed.value.object.contains("result");
     if (!matching_id and !classifiable_discovery_error) {
@@ -1008,6 +1178,39 @@ fn validateFinalResponse(
     if (!parsed.value.object.contains("result") and !parsed.value.object.contains("error")) {
         return error.InvalidJsonResponse;
     }
+}
+
+const legacy_sessionless_invalid_request_code: i64 = -32004;
+const legacy_session_required_code: i64 = -32000;
+const legacy_missing_session_header_code: i64 = -32600;
+
+fn isLegacyDiscoveryCompatibilityError(object: std.json.ObjectMap) bool {
+    if (object.contains("result")) return false;
+    const error_value = object.get("error") orelse return false;
+    if (error_value != .object) return false;
+    const code = error_value.object.get("code") orelse return false;
+    const message = error_value.object.get("message") orelse return false;
+    if (code != .integer or message != .string) return false;
+    return (code.integer == legacy_sessionless_invalid_request_code and
+        std.mem.eql(u8, message.string, "invalid request")) or
+        (code.integer == legacy_session_required_code and
+            std.mem.eql(u8, message.string, "Bad Request: Mcp-Session-Id header is required")) or
+        (code.integer == legacy_missing_session_header_code and
+            std.mem.eql(
+                u8,
+                message.string,
+                "Missing required Mcp-Session-Id header. Non-initialize requests must include a session ID.",
+            ));
+}
+
+fn isLegacyDiscoveryCompatibilityResponse(alloc: Allocator, body: []const u8) Allocator.Error!bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    return isLegacyDiscoveryCompatibilityError(parsed.value.object);
 }
 
 fn waitForCancellation(cancellation: operation_control.CancellationSources) anyerror!void {
@@ -1358,6 +1561,91 @@ test "modern MCP tool header annotation names are unique across nested propertie
     );
 }
 
+test "modern MCP content length reader leaves bytes after the declared body unread" {
+    var source = std.Io.Reader.fixed("bodyafter");
+    var reader_buffer: [3]u8 = undefined;
+    var bounded = McpContentLengthReader.init(&source, 4, &reader_buffer);
+
+    var body: [8]u8 = undefined;
+    const body_len = try bounded.interface.readSliceShort(&body);
+    try std.testing.expectEqual(@as(usize, 4), body_len);
+    try std.testing.expectEqualStrings("body", body[0..body_len]);
+    try std.testing.expectError(
+        error.EndOfStream,
+        bounded.interface.readSliceAll(body[0..1]),
+    );
+
+    var after: [5]u8 = undefined;
+    try source.readSliceAll(&after);
+    try std.testing.expectEqualStrings("after", &after);
+}
+
+test "modern MCP content length reader applies one bound across discard and read" {
+    var source = std.Io.Reader.fixed("abcdef");
+    var reader_buffer: [3]u8 = undefined;
+    var bounded = McpContentLengthReader.init(&source, 4, &reader_buffer);
+
+    try bounded.interface.discardAll(2);
+    var body: [2]u8 = undefined;
+    try bounded.interface.readSliceAll(&body);
+    try std.testing.expectEqualStrings("cd", &body);
+    try std.testing.expectError(
+        error.EndOfStream,
+        bounded.interface.discardAll(1),
+    );
+
+    var after: [2]u8 = undefined;
+    try source.readSliceAll(&after);
+    try std.testing.expectEqualStrings("ef", &after);
+}
+
+test "modern MCP zero content length does not consume the source" {
+    var source = std.Io.Reader.fixed("x");
+    var reader_buffer: [1]u8 = undefined;
+    var bounded = McpContentLengthReader.init(&source, 0, &reader_buffer);
+
+    var byte: [1]u8 = undefined;
+    try std.testing.expectError(
+        error.EndOfStream,
+        bounded.interface.readSliceAll(&byte),
+    );
+    try source.readSliceAll(&byte);
+    try std.testing.expectEqualStrings("x", &byte);
+}
+
+test "modern MCP content length reader supports incremental buffered reads" {
+    var source = std.Io.Reader.fixed("abcdef");
+    var reader_buffer: [2]u8 = undefined;
+    var bounded = McpContentLengthReader.init(&source, 4, &reader_buffer);
+
+    try bounded.interface.fillMore();
+    try std.testing.expectEqualStrings("ab", bounded.interface.buffered());
+    bounded.interface.toss(2);
+    try bounded.interface.fillMore();
+    try std.testing.expectEqualStrings("cd", bounded.interface.buffered());
+    bounded.interface.toss(2);
+    try std.testing.expectError(error.EndOfStream, bounded.interface.fillMore());
+
+    var after: [2]u8 = undefined;
+    try source.readSliceAll(&after);
+    try std.testing.expectEqualStrings("ef", &after);
+}
+
+test "modern MCP response framing isolates only known content length bodies" {
+    try std.testing.expectEqual(
+        McpResponseBodyFraming.content_length,
+        mcpResponseBodyFraming(.none, 42),
+    );
+    try std.testing.expectEqual(
+        McpResponseBodyFraming.standard,
+        mcpResponseBodyFraming(.none, null),
+    );
+    try std.testing.expectEqual(
+        McpResponseBodyFraming.standard,
+        mcpResponseBodyFraming(.chunked, 42),
+    );
+}
+
 test "modern MCP JSON responses are bounded and retain request ownership" {
     const alloc = std.testing.allocator;
     const payload = "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}";
@@ -1398,6 +1686,150 @@ test "modern MCP JSON responses are bounded and retain request ownership" {
     try std.testing.expectError(
         error.MismatchedResponseId,
         readJsonResponse(alloc, &strict_sdk_error_reader, 7, sdk_error.len, false),
+    );
+
+    const string_id_discovery_error =
+        "{\"jsonrpc\":\"2.0\",\"id\":\"server-error\",\"error\":{\"code\":-32600,\"message\":\"Unsupported protocol version\"}}";
+    var string_id_discovery_error_reader = std.Io.Reader.fixed(string_id_discovery_error);
+    const string_id_discovery_error_body = try readJsonResponse(
+        alloc,
+        &string_id_discovery_error_reader,
+        7,
+        string_id_discovery_error.len,
+        true,
+    );
+    defer alloc.free(string_id_discovery_error_body);
+    try std.testing.expectEqualStrings(
+        string_id_discovery_error,
+        string_id_discovery_error_body,
+    );
+
+    const mongodb_session_error =
+        "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32004,\"message\":\"invalid request\"}}";
+    var mongodb_session_error_reader = std.Io.Reader.fixed(mongodb_session_error);
+    const mongodb_session_error_body = try readJsonResponse(
+        alloc,
+        &mongodb_session_error_reader,
+        7,
+        mongodb_session_error.len,
+        true,
+    );
+    defer alloc.free(mongodb_session_error_body);
+    try std.testing.expectEqualStrings(
+        mongodb_session_error,
+        mongodb_session_error_body,
+    );
+
+    const gitmcp_session_error =
+        "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32000,\"message\":\"Bad Request: Mcp-Session-Id header is required\"}}";
+    var gitmcp_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        gitmcp_session_error,
+        .{},
+    );
+    defer gitmcp_parsed.deinit();
+    try std.testing.expect(isLegacyDiscoveryCompatibilityError(gitmcp_parsed.value.object));
+
+    const stock_session_error =
+        "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32000,\"message\":\"Bad Request: Mcp-Session-Id header is required\"}}";
+    var stock_session_error_reader = std.Io.Reader.fixed(stock_session_error);
+    const stock_session_error_body = try readJsonResponse(
+        alloc,
+        &stock_session_error_reader,
+        7,
+        stock_session_error.len,
+        true,
+    );
+    defer alloc.free(stock_session_error_body);
+    try std.testing.expectEqualStrings(stock_session_error, stock_session_error_body);
+
+    const mongodb_deployed_session_error =
+        "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32600,\"message\":\"Missing required Mcp-Session-Id header. Non-initialize requests must include a session ID.\"}}";
+    var mongodb_deployed_session_error_reader = std.Io.Reader.fixed(
+        mongodb_deployed_session_error,
+    );
+    const mongodb_deployed_session_error_body = try readJsonResponse(
+        alloc,
+        &mongodb_deployed_session_error_reader,
+        7,
+        mongodb_deployed_session_error.len,
+        true,
+    );
+    defer alloc.free(mongodb_deployed_session_error_body);
+    try std.testing.expectEqualStrings(
+        mongodb_deployed_session_error,
+        mongodb_deployed_session_error_body,
+    );
+
+    var unrelated_session_error = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32000,\"message\":\"Session expired\"}}",
+        .{},
+    );
+    defer unrelated_session_error.deinit();
+    try std.testing.expect(!isLegacyDiscoveryCompatibilityError(unrelated_session_error.value.object));
+
+    const unrelated_missing_id_error =
+        "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}";
+    var unrelated_missing_id_reader = std.Io.Reader.fixed(unrelated_missing_id_error);
+    try std.testing.expectError(
+        error.InvalidJsonResponse,
+        readJsonResponse(
+            alloc,
+            &unrelated_missing_id_reader,
+            7,
+            unrelated_missing_id_error.len,
+            true,
+        ),
+    );
+
+    const string_id_success =
+        "{\"jsonrpc\":\"2.0\",\"id\":\"server-error\",\"result\":{}}";
+    var string_id_success_reader = std.Io.Reader.fixed(string_id_success);
+    try std.testing.expectError(
+        error.MismatchedResponseId,
+        readJsonResponse(
+            alloc,
+            &string_id_success_reader,
+            7,
+            string_id_success.len,
+            true,
+        ),
+    );
+}
+
+test "MCP discovery recognizes bounded authorization error documents" {
+    const alloc = std.testing.allocator;
+    const unauthorized =
+        "{\"error\":401,\"reason\":\"Unauthorized\",\"detail\":\"You are not authorized for this resource.\"}";
+    try std.testing.expectEqual(
+        AuthRejection.unauthorized,
+        try discoveryAuthenticationRejection(alloc, unauthorized),
+    );
+    var strict_reader = std.Io.Reader.fixed(unauthorized);
+    try std.testing.expectError(
+        error.InvalidJsonResponse,
+        readJsonResponse(alloc, &strict_reader, 7, unauthorized.len, true),
+    );
+    try std.testing.expectEqual(
+        AuthRejection.insufficient_scope,
+        try discoveryAuthenticationRejection(
+            alloc,
+            "{\"error\":403,\"reason\":\"Forbidden\",\"detail\":\"Insufficient scope.\"}",
+        ),
+    );
+    try std.testing.expectEqual(
+        AuthRejection.none,
+        try discoveryAuthenticationRejection(
+            alloc,
+            "{\"error\":401,\"reason\":\"not an authorization response\"}",
+        ),
+    );
+    try std.testing.expectEqual(
+        AuthRejection.none,
+        try discoveryAuthenticationRejection(alloc, "not json"),
     );
 }
 

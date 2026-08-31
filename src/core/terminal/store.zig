@@ -2469,7 +2469,7 @@ pub fn reloadAuthorityClaim(
     ) or !std.mem.eql(u8, record.cwd, input.principal.cwd) or
         record.backend != input.principal.backend)
     {
-        return error.PrincipalMismatch;
+        return failReloadedAuthorityClaim(error.PrincipalMismatch);
     }
     const authority = try load_authority(
         alloc,
@@ -2482,21 +2482,21 @@ pub fn reloadAuthorityClaim(
         &authority.value,
     );
     if (record.authority_revoked or authority.value.revoked) {
-        return error.AuthorityRevoked;
+        return failReloadedAuthorityClaim(error.AuthorityRevoked);
     }
     const grant = authority.value.grant;
     if (!grant.principal.eql(input.principal)) {
-        return error.PrincipalMismatch;
+        return failReloadedAuthorityClaim(error.PrincipalMismatch);
     }
     if (record.authority_generation.value != input.generation.value or
         grant.generation.value != input.generation.value)
     {
-        return error.StaleAuthorityGeneration;
+        return failReloadedAuthorityClaim(error.StaleAuthorityGeneration);
     }
     const direct_model_observer = observer_policy and
         grant.actor == .human and input.actor == .agent;
     if (!direct_model_observer and grant.actor != input.actor) {
-        return error.ActorRoleMismatch;
+        return failReloadedAuthorityClaim(error.ActorRoleMismatch);
     }
     const controls = if (direct_model_observer)
         contracts.AllowedControls.observer()
@@ -2507,7 +2507,7 @@ pub fn reloadAuthorityClaim(
     defer std.crypto.secureZero(u8, @volatileCast(proof.bytes[0..]));
     const actual = proof_verifier(proof, grant, observer_policy);
     if (!std.mem.eql(u8, &actual, &authority.value.verifier)) {
-        return error.InvalidHolderProof;
+        return failReloadedAuthorityClaim(error.InvalidHolderProof);
     }
     return operation.ownAuthorityClaim(alloc, .{
         .principal = input.principal,
@@ -2515,6 +2515,26 @@ pub fn reloadAuthorityClaim(
         .generation = input.generation,
         .proof = proof,
     }, controls);
+}
+
+inline fn failReloadedAuthorityClaim(err: anytype) @TypeOf(err)!operation.OwnedAuthorityClaim {
+    return @errorCast(failReloadedAuthorityClaimDynamic(err));
+}
+
+noinline fn failReloadedAuthorityClaimDynamic(err: anyerror) anyerror!operation.OwnedAuthorityClaim {
+    return err;
+}
+
+test "reloaded authority failures preserve exact error types and identities" {
+    const revoked = failReloadedAuthorityClaim(error.AuthorityRevoked);
+    try std.testing.expect(
+        @TypeOf(revoked) == error{AuthorityRevoked}!operation.OwnedAuthorityClaim,
+    );
+    try std.testing.expectError(error.AuthorityRevoked, revoked);
+    try std.testing.expectError(
+        error.InvalidHolderProof,
+        failReloadedAuthorityClaim(error.InvalidHolderProof),
+    );
 }
 
 pub const RecoveredExecutionScope = struct {
@@ -4347,6 +4367,9 @@ pub const DurableSession = struct {
         }
         const previous_lifecycle = self.record.lifecycle;
         const previous_termination = self.record.termination;
+        const previous_attention = self.record.attention;
+        const previous_owner_pid = self.record.takeover_owner_pid;
+        const previous_owner_process_token = self.record.takeover_owner_process_token;
         const previous_updated_at_ms = self.record.updated_at_ms;
         if (self.record.lifecycle == .starting or self.record.lifecycle == .running) {
             self.record.lifecycle = try contracts.transition_lifecycle(
@@ -4355,6 +4378,9 @@ pub const DurableSession = struct {
             );
         }
         self.record.termination = termination;
+        self.record.attention = .{};
+        self.record.takeover_owner_pid = null;
+        self.record.takeover_owner_process_token = null;
         self.record.updated_at_ms = now_ms;
         save_record(
             self.profile.alloc,
@@ -4363,10 +4389,26 @@ pub const DurableSession = struct {
         ) catch |err| {
             self.record.lifecycle = previous_lifecycle;
             self.record.termination = previous_termination;
+            self.record.attention = previous_attention;
+            self.record.takeover_owner_pid = previous_owner_pid;
+            self.record.takeover_owner_process_token = previous_owner_process_token;
             self.record.updated_at_ms = previous_updated_at_ms;
             return err;
         };
+        if (previous_owner_pid) |value| self.profile.alloc.free(value);
+        if (previous_owner_process_token) |value| self.profile.alloc.free(value);
         _ = try self.append_event_locked(.lifecycle, now_ms);
+    }
+
+    pub fn termination_outcome(self: *DurableSession) ?contracts.ReturnOutcome {
+        const zio = io_mod.getIo();
+        self.profile.mutex.lockUncancelable(zio);
+        defer self.profile.mutex.unlock(zio);
+        const termination = self.record.termination orelse return null;
+        return switch (termination) {
+            .exited => |code| .{ .exited = code },
+            .signal => |signal| .{ .signal = signal },
+        };
     }
 
     pub fn persist_lost(self: *DurableSession, now_ms: i64) !void {
@@ -5991,28 +6033,46 @@ fn save_record(
     entry.deinit(alloc);
 }
 
+inline fn failRecord(err: anytype) @TypeOf(err)!Record {
+    return @errorCast(failRecordDynamic(err));
+}
+
+noinline fn failRecordDynamic(err: anyerror) anyerror!Record {
+    return err;
+}
+
+test "terminal record failures preserve exact error types and identities" {
+    const missing = failRecord(error.TerminalRecordNotFound);
+    try std.testing.expect(
+        @TypeOf(missing) == error{TerminalRecordNotFound}!Record,
+    );
+    try std.testing.expectError(error.TerminalRecordNotFound, missing);
+    try std.testing.expectError(error.OutOfMemory, failRecord(error.OutOfMemory));
+}
+
 fn load_record(
     alloc: Allocator,
     capability: *session_child_store.SessionChildCapability,
     session_id: []const u8,
 ) !Record {
-    const name = try record_name(alloc, session_id);
+    const name = record_name(alloc, session_id) catch |err|
+        return failRecord(err);
     defer alloc.free(name);
     var file = capability.openFileReadOnly(
         alloc,
         .terminal_state,
         name,
     ) catch |err| switch (err) {
-        error.FileNotFound => return error.TerminalRecordNotFound,
-        else => return err,
+        error.FileNotFound => return failRecord(error.TerminalRecordNotFound),
+        else => return failRecord(err),
     };
     defer file.deinit();
     const bytes = file.readToEnd(alloc, max_record_bytes) catch |err| switch (err) {
-        error.StreamTooLong => return error.TerminalRecordTooLarge,
-        else => return err,
+        error.StreamTooLong => return failRecord(error.TerminalRecordTooLarge),
+        else => return failRecord(err),
     };
     defer alloc.free(bytes);
-    return parse_record(alloc, bytes);
+    return parse_record(alloc, bytes) catch |err| return failRecord(err);
 }
 
 fn write_owner_catalog_proof(
@@ -8729,6 +8789,31 @@ test "write leases are exclusive durable and cancellation is actor scoped" {
     try std.testing.expectEqual(contracts.WriteLease.none, reopened.facts().attention.write_lease);
 }
 
+test "terminal completion clears attention and retains the termination outcome" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-completed-lease");
+    defer session.deinit();
+    const agent = test_claim(test_persistence());
+
+    _ = try session.acquire_write_lease(agent, 2);
+    try std.testing.expectEqual(
+        contracts.WriteLease.agent,
+        session.facts().attention.write_lease,
+    );
+    try session.persist_termination(.{ .exited = 0 }, 3);
+    try std.testing.expectEqual(contracts.AttentionState{}, session.facts().attention);
+    try std.testing.expectEqual(
+        contracts.ReturnOutcome{ .exited = 0 },
+        session.termination_outcome().?,
+    );
+
+    _ = try session.release_write_lease(agent, 4);
+    _ = try session.release_write_lease(agent, 5);
+    try std.testing.expectEqual(contracts.AttentionState{}, session.facts().attention);
+}
+
 test "cancellation persistence failure preserves the lease for a clean retry" {
     const alloc = std.testing.allocator;
     var fixture = try TestStoreFixture.init(alloc, test_options());
@@ -8825,7 +8910,7 @@ test "human owner takeover proof is narrow and excludes agent writes" {
     );
 }
 
-test "human takeover lease is reclaimable only after its Fx process owner is gone" {
+test "human takeover lease is reclaimable only after its fx process owner is gone" {
     const Match = struct {
         var result: process_supervisor.TokenMatch = .matched;
 

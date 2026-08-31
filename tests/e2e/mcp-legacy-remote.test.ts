@@ -176,6 +176,7 @@ describe("version-scoped legacy MCP remote transports", () => {
   for (const sdkDiscoveryError of [
     "uninitialized",
     "unsupported-version",
+    "unsupported-version-string-id",
   ] as const) {
     test(`stock SDK ${sdkDiscoveryError} discovery error falls back to Streamable HTTP initialization`, async () => {
       streamable = startLegacyStreamableHttpFixture("2025-11-25", {
@@ -496,6 +497,31 @@ describe("version-scoped legacy MCP remote transports", () => {
     const result = await runAsk(root, gateway, "Call the no-session fixture.");
 
     expect(result.code).toBe(0);
+    expect(streamable.deleteCalls).toBe(0);
+    for (const entry of streamable.requests) {
+      expect(entry.headers["mcp-session-id"]).toBeUndefined();
+    }
+  }, 30_000);
+
+  test("Clerk-like SSE initialization without a session remains searchable", async () => {
+    streamable = startLegacyStreamableHttpFixture("2025-11-25", {
+      initializeSse: true,
+      sdkDiscoveryError: "unsupported-version",
+      session: false,
+    });
+    const root = createRoot("clerk-like-sse-no-session", "http", streamable.url);
+    gateway = startToolGateway("Clerk-like search complete.");
+
+    const result = await runAsk(
+      root,
+      gateway,
+      "Find and call the legacy MCP tool.",
+    );
+
+    expect(result.code).toBe(0);
+    expect(streamable.initializeCalls).toBe(1);
+    expect(streamable.toolsListCalls).toBe(1);
+    expect(streamable.toolCallCalls).toBe(1);
     expect(streamable.deleteCalls).toBe(0);
     for (const entry of streamable.requests) {
       expect(entry.headers["mcp-session-id"]).toBeUndefined();

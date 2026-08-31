@@ -86,7 +86,8 @@ pub fn parse(alloc: Allocator, params_raw: ?[]const u8) ParseError!OwnedServerCo
     errdefer configs.deinit(alloc);
     try configs.items.ensureTotalCapacity(alloc, servers_value.array.items.len);
     for (servers_value.array.items) |server_value| {
-        const config = try parseServer(alloc, server_value);
+        var config: mcp_contract.McpServerConfig = undefined;
+        try parseServerInto(&config, alloc, server_value);
         configs.items.appendAssumeCapacity(config);
     }
     return configs;
@@ -122,14 +123,14 @@ pub fn prepare(
             config.deinit(alloc);
             return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
-                error.McpConfigScopeMismatch => unreachable,
+                error.McpConfigScopeMismatch, error.McpConfigAdmissionMismatch => unreachable,
             };
         };
     }
-    runtime.connectAll(builtin_tools.registry);
+    runtime.connectAllForAcp(builtin_tools.registry);
 
     for (runtime.servers.items) |server_state| {
-        if (server_state.state == .ready) continue;
+        if (server_state.state == .ready or !server_state.config.required) continue;
         const reason = server_state.last_error orelse @tagName(server_state.state);
         const acp_reason = if (std.mem.startsWith(
             u8,
@@ -174,7 +175,13 @@ pub fn parseErrorMessage(err: ParseError) []const u8 {
     };
 }
 
-fn parseServer(alloc: Allocator, server_value: std.json.Value) ParseError!mcp_contract.McpServerConfig {
+// Keep fallible config construction behind caller-owned storage so error
+// returns do not materialize the complete config payload.
+noinline fn parseServerInto(
+    out: *mcp_contract.McpServerConfig,
+    alloc: Allocator,
+    server_value: std.json.Value,
+) ParseError!void {
     if (server_value != .object) return error.InvalidMcpServer;
     const object = server_value.object;
 
@@ -185,13 +192,20 @@ fn parseServer(alloc: Allocator, server_value: std.json.Value) ParseError!mcp_co
 
     if (object.get("type")) |transport_value| {
         if (transport_value != .string) return error.InvalidTransport;
-        if (std.mem.eql(u8, transport_value.string, "http")) {
-            return parseRemoteServer(alloc, object, name_value.string, .http);
-        }
-        if (std.mem.eql(u8, transport_value.string, "sse")) {
-            return parseRemoteServer(alloc, object, name_value.string, .sse);
-        }
-        return error.InvalidTransport;
+        const transport: mcp_contract.McpTransport =
+            if (std.mem.eql(u8, transport_value.string, "http"))
+                .http
+            else if (std.mem.eql(u8, transport_value.string, "sse"))
+                .sse
+            else
+                return error.InvalidTransport;
+        return parseRemoteServerInto(
+            out,
+            alloc,
+            object,
+            name_value.string,
+            transport,
+        );
     }
 
     const command_value = object.get("command") orelse return error.MissingCommand;
@@ -213,7 +227,7 @@ fn parseServer(alloc: Allocator, server_value: std.json.Value) ParseError!mcp_co
     const owned_env = try parseEnv(alloc, env_value);
     errdefer mcp_contract.freeEnvVars(alloc, owned_env);
 
-    return .{
+    out.* = .{
         .name = owned_name,
         .source = .acp,
         .scope = .acp_session,
@@ -224,12 +238,13 @@ fn parseServer(alloc: Allocator, server_value: std.json.Value) ParseError!mcp_co
     };
 }
 
-fn parseRemoteServer(
+fn parseRemoteServerInto(
+    out: *mcp_contract.McpServerConfig,
     alloc: Allocator,
     object: std.json.ObjectMap,
     name: []const u8,
     transport: mcp_contract.McpTransport,
-) ParseError!mcp_contract.McpServerConfig {
+) ParseError!void {
     const url_value = object.get("url") orelse return error.MissingUrl;
     if (url_value != .string or url_value.string.len == 0) return error.InvalidUrl;
     streamable_http.validateEndpoint(url_value.string) catch return error.InvalidUrl;
@@ -242,7 +257,7 @@ fn parseRemoteServer(
     errdefer alloc.free(owned_name);
     const owned_url = try alloc.dupe(u8, url_value.string);
 
-    return .{
+    out.* = .{
         .name = owned_name,
         .source = .acp,
         .scope = .acp_session,

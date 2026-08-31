@@ -16,10 +16,8 @@ import {
 
 const TIMEOUT = 300_000;
 const LOCAL_FIRST_TOOLS = [
-  "list_files",
   "glob_files",
   "grep_files",
-  "semantic_search",
   "read_file",
   "terminal",
 ] as const;

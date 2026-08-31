@@ -345,6 +345,7 @@ fn subagentActionFromDecoded(action: input_action.Action) ?subagent_input.Action
         .toggle_full_transcript,
         .toggle_permission_mode,
         .open_all_sessions,
+        .steer_submit,
         .paste_start,
         .paste_end,
         .ignore,
@@ -528,7 +529,7 @@ test "terminal input carries typed question decisions and focused edits" {
     );
 }
 
-test "Fx terminal reply ownership survives takeover transition" {
+test "fx terminal reply ownership survives takeover transition" {
     const alloc = std.testing.allocator;
     var monitor = theme_monitor.Monitor{};
     monitor.start();
@@ -4921,6 +4922,20 @@ test "input escape parser handles cmd+arrow as home/end" {
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, ';'));
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '9'));
     try std.testing.expectEqual(@as(?InputEscapeAction, moveEscape(.draft_end, false)), consumeInputEscapeByte(&stage, &param, &param2, 'B'));
+    try std.testing.expectEqual(@as(u8, 0), stage);
+}
+
+test "input escape parser handles ctrl+enter as steering submit" {
+    // ESC[13;5u is Kitty's Ctrl+Enter encoding.
+    var stage: u8 = 1;
+    var param: u16 = 0;
+    var param2: u16 = 0;
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '['));
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '1'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '3'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, ';'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '5'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, .steer_submit), consumeInputEscapeByte(&stage, &param, &param2, 'u'));
     try std.testing.expectEqual(@as(u8, 0), stage);
 }
 

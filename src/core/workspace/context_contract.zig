@@ -476,7 +476,7 @@ const current_inventory = [_]EntrypointInventory{
         .static_context = "builtins/context captures one global/root/ancestor/applicable AGENTS.md snapshot before the prompt, then adds scoped deltas from effective structured tool targets",
         .transient_context = "tool_runtime transient context each model step with captured permission mode, noninteractive output callbacks, and no live user question path",
         .tools = "mode-filtered paired tool advertisement and included custom-provider guidance with permission rules and deferred MCP discovery",
-        .permission = "ask, --auto, or --yolo mode; approval-required actions fail with a noninteractive blocker instead of prompting unless yolo bypasses Fx policy",
+        .permission = "ask, --auto, or --yolo mode; approval-required actions fail with a noninteractive blocker instead of prompting unless yolo bypasses fx policy",
         .session = "fresh headless SessionRuntime, optional persisted session id, empty prior history, no local approval grants",
         .drift_status = .intentional,
         .drift = "noninteractive permission blockers and absent live clarification UI differ from interactive by design",
@@ -664,7 +664,7 @@ test "entrypoint context inventory snapshot documents current deltas" {
         \\  static_context: builtins/context captures one global/root/ancestor/applicable AGENTS.md snapshot before the prompt, then adds scoped deltas from effective structured tool targets
         \\  transient_context: tool_runtime transient context each model step with captured permission mode, noninteractive output callbacks, and no live user question path
         \\  tools: mode-filtered paired tool advertisement and included custom-provider guidance with permission rules and deferred MCP discovery
-        \\  permission: ask, --auto, or --yolo mode; approval-required actions fail with a noninteractive blocker instead of prompting unless yolo bypasses Fx policy
+        \\  permission: ask, --auto, or --yolo mode; approval-required actions fail with a noninteractive blocker instead of prompting unless yolo bypasses fx policy
         \\  session: fresh headless SessionRuntime, optional persisted session id, empty prior history, no local approval grants
         \\  drift_status: intentional
         \\  drift: noninteractive permission blockers and absent live clarification UI differ from interactive by design

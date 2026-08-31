@@ -11,6 +11,7 @@ const types = @import("../shared/types.zig");
 const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const app_commands = @import("app_commands.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
 const approval_registry = @import("../subagent/approval_registry.zig");
 const communication = @import("../subagent/communication.zig");
@@ -346,7 +347,19 @@ pub fn ApprovalRuntime(comptime App: type) type {
                 !@hasField(App, "session_persistence")) return false;
             if (comptime !@hasDecl(@TypeOf(app.subagents), "mainApprovalBinding")) return false;
             const request_id = app.approval_prompt.request.?.id;
-            const binding = app.subagents.mainApprovalBinding(request_id) orelse return false;
+            var maybe_binding = app.subagents.mainApprovalBinding(request_id);
+            if (maybe_binding == null) {
+                if (comptime @hasField(App, "approval_screen") and
+                    @hasDecl(@TypeOf(app.subagents), "mainApprovalCardBinding"))
+                {
+                    if (app.approval_screen.screen_commit) |commit| {
+                        if (commit.request_id == request_id) {
+                            maybe_binding = app.subagents.mainApprovalCardBinding(request_id);
+                        }
+                    }
+                }
+            }
+            const binding = maybe_binding orelse return false;
             const host = app_session_runtime.Runtime(App).subagentHost(app) orelse return true;
             var response = try app.approval_prompt.decision.materializeResponse(
                 app.alloc,
@@ -935,6 +948,23 @@ fn runApprovalBridgeScenario(
     const binding = app.subagents.mainApprovalBinding(main_request.id).?;
     try std.testing.expectEqualStrings(ApprovalBridgeWaiter.child_id, binding.child_id);
     try std.testing.expectEqualStrings(ApprovalBridgeWaiter.approval_id, binding.approval_id);
+
+    if (main_surface_wins) {
+        app.approval_screen.recordScreenCommit(main_request.id, .{
+            .request_id = main_request.id,
+            .rows = app.shell.layout.rows,
+            .cols = app.shell.layout.cols,
+            .file_identity_visible = true,
+            .all_decision_controls_visible = true,
+            .changed_or_notice_visible = true,
+            .document_scrollable = false,
+        });
+        app.subagents.markMainApprovalPresented(false);
+        try std.testing.expect(app.subagents.mainApprovalBinding(main_request.id) == null);
+        const card_binding = app.subagents.mainApprovalCardBinding(main_request.id).?;
+        try std.testing.expectEqualStrings(ApprovalBridgeWaiter.child_id, card_binding.child_id);
+        try std.testing.expectEqualStrings(ApprovalBridgeWaiter.approval_id, card_binding.approval_id);
+    }
 
     app.subagents.open(alloc);
     try std.testing.expectEqual(

@@ -32,13 +32,13 @@ pub fn command_safer_alternative_for(command: []const u8) ?[]const u8 {
         return "safer: use read_file for file inspection";
     }
     if (std.mem.eql(u8, base, "ls")) {
-        return "safer: use list_files or glob_files for discovery";
+        return "safer: use glob_files for discovery";
     }
     if (is_pattern_matcher(base)) {
         return "safer: use grep_files for exact local search";
     }
     if (std.mem.eql(u8, base, "find")) {
-        return "safer: use glob_files or list_files for discovery";
+        return "safer: use glob_files for discovery";
     }
     return null;
 }
@@ -53,7 +53,7 @@ fn risk_note_for(risk: DestructiveEffect) []const u8 {
 fn safer_alternative_for_risk(risk: DestructiveEffect) []const u8 {
     return switch (risk) {
         .discard_version_control_state => "safer: inspect git status first and revert only the intended files",
-        .remove_files => "safer: inspect targets first or use delete_file for explicit files",
+        .remove_files => "safer: inspect targets first",
     };
 }
 
@@ -561,14 +561,14 @@ test "command risk note detects git hard reset" {
 
 test "command safer alternative explains risky commands" {
     try std.testing.expectEqualStrings("safer: inspect git status first and revert only the intended files", command_safer_alternative_for("git reset --hard").?);
-    try std.testing.expectEqualStrings("safer: inspect targets first or use delete_file for explicit files", command_safer_alternative_for("rm -rf /tmp/x").?);
+    try std.testing.expectEqualStrings("safer: inspect targets first", command_safer_alternative_for("rm -rf /tmp/x").?);
 }
 
 test "command safer alternative maps shell inspection to dedicated tools" {
     try std.testing.expectEqualStrings("safer: use read_file for file inspection", command_safer_alternative_for("cat src/main.zig").?);
-    try std.testing.expectEqualStrings("safer: use list_files or glob_files for discovery", command_safer_alternative_for("ls src").?);
+    try std.testing.expectEqualStrings("safer: use glob_files for discovery", command_safer_alternative_for("ls src").?);
     try std.testing.expectEqualStrings("safer: use grep_files for exact local search", command_safer_alternative_for("rg needle src").?);
-    try std.testing.expectEqualStrings("safer: use glob_files or list_files for discovery", command_safer_alternative_for("find src -name '*.zig'").?);
+    try std.testing.expectEqualStrings("safer: use glob_files for discovery", command_safer_alternative_for("find src -name '*.zig'").?);
 }
 
 test "command safer alternative stays conservative for compound commands" {

@@ -57,6 +57,20 @@ pub const Completion = struct {
     }
 };
 
+inline fn failCompletion(err: anytype) @TypeOf(err)!Completion {
+    return @errorCast(failCompletionDynamic(err));
+}
+
+noinline fn failCompletionDynamic(err: anyerror) anyerror!Completion {
+    return err;
+}
+
+test "completion failure writer preserves exact error type and identity" {
+    const failure = failCompletion(error.InvalidHostMessage);
+    try std.testing.expect(@TypeOf(failure) == error{InvalidHostMessage}!Completion);
+    try std.testing.expectError(error.InvalidHostMessage, failure);
+}
+
 const Intent = struct {
     correlation_id: contracts.CorrelationId,
     request: contracts.OwnedActionRequest,
@@ -674,7 +688,7 @@ fn exchangeConnected(
                 const correlation_id = message.envelope.correlation_id.?;
                 if (correlation_id.value != intent.correlation_id.value) {
                     frame.deinit();
-                    return error.InvalidResponseCorrelation;
+                    return failCompletion(error.InvalidResponseCorrelation);
                 }
                 return .{
                     .kind = .response,
@@ -684,7 +698,7 @@ fn exchangeConnected(
             },
             .hello, .request, .cancel => {
                 frame.deinit();
-                return error.InvalidHostMessage;
+                return failCompletion(error.InvalidHostMessage);
             },
         }
     }

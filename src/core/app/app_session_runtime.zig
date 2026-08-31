@@ -1091,6 +1091,36 @@ pub const Persistence = struct {
     resume_handoff_intent: ResumeHandoffIntent = .none,
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
 
+    /// Fieldwise initialization avoids retaining undefined optional payloads
+    /// in a static release-binary template.
+    pub fn initInto(storage: *Persistence) void {
+        comptime {
+            if (std.meta.fields(Persistence).len != 19) {
+                @compileError("update Persistence.initInto for the changed field set");
+            }
+        }
+        storage.* = undefined;
+        storage.write_mutex = .init;
+        storage.store = null;
+        storage.writable = null;
+        storage.subagent_host = null;
+        storage.workspace_preferences = null;
+        storage.session_preferences = null;
+        storage.js_host_store = .{};
+        storage.js_host_session = null;
+        storage.process_model_override = null;
+        storage.session_picker = .{};
+        storage.session_picker_load = .{};
+        storage.session_picker_current_cache = .{};
+        storage.session_picker_all_cache = .{};
+        storage.degraded_warning_emitted = false;
+        storage.pending_cancelled_command = null;
+        storage.image_snapshot_temp_dir = null;
+        storage.resume_view_admission = null;
+        storage.resume_handoff_intent = .none;
+        storage.pending_live_session_policy = null;
+    }
+
     pub fn deinit(self: *Persistence, alloc: Allocator) void {
         if (self.pending_live_session_policy) |policy| {
             debug_trace.logf(
@@ -1116,9 +1146,24 @@ pub const Persistence = struct {
         self.session_picker_load.deinit();
         self.session_picker_current_cache.deinit();
         self.session_picker_all_cache.deinit();
-        self.* = .{};
+        self.* = undefined;
     }
 };
+
+test "persistence in-place initialization preserves empty ownership" {
+    var persistence: Persistence = undefined;
+    Persistence.initInto(&persistence);
+    defer persistence.deinit(std.testing.allocator);
+
+    try std.testing.expect(persistence.store == null);
+    try std.testing.expect(persistence.writable == null);
+    try std.testing.expect(persistence.subagent_host == null);
+    try std.testing.expect(!persistence.session_picker.active);
+    try std.testing.expect(persistence.session_picker_load.task == null);
+    try std.testing.expect(!persistence.session_picker_current_cache.ready);
+    try std.testing.expect(!persistence.session_picker_all_cache.ready);
+    try std.testing.expect(persistence.resume_handoff_intent == .none);
+}
 
 pub fn Runtime(comptime App: type) type {
     return struct {
@@ -1531,8 +1576,14 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "queued_prompt_review")) {
                 input_queue_runtime.Runtime(App).reset(app);
             }
-            app.shell.render_requests.finishSubmittedPromptTransition();
-            app.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
+            if (comptime @hasDecl(App, "clearPendingSubmissionForSessionTransition")) {
+                App.clearPendingSubmissionForSessionTransition(app);
+            } else {
+                if (comptime @hasDecl(App, "clearPendingSubmission")) {
+                    App.clearPendingSubmission(app, "session_transition");
+                }
+                app.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
+            }
         }
 
         fn applyIdleLiveSessionTransition(
@@ -1828,7 +1879,7 @@ pub fn Runtime(comptime App: type) type {
             log_options: session_log.Options,
         ) !session_store.LoadedWritableSession {
             const store = app.session_persistence.store orelse
-                return error.SessionStoreUnavailable;
+                return session_log.failLoadedWritableSession(error.SessionStoreUnavailable);
             return subagent_resume_admission.resumeForExternalPrompt(
                 store,
                 app.alloc,
@@ -2226,7 +2277,7 @@ pub fn Runtime(comptime App: type) type {
                     picker.has_more,
                 );
             }
-            input_completion_runtime.CompletionRuntime(App).syncSessionPickerWindowStart(app);
+            try input_completion_runtime.CompletionRuntime(App).syncSessionPickerWindowStart(app);
         }
 
         pub fn loadMoreSessionPicker(app: *App) !bool {
@@ -2365,9 +2416,13 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             finished: types.FinishedPrompt,
         ) !void {
+            var turn = finished.turn;
+            if (finished.summary) |summary| {
+                types.setHistoryTurnSummary(&turn, summary);
+            }
             _ = try appendHistoryTurnWithPendingPresentation(
                 app,
-                finished.turn,
+                turn,
                 .strict,
                 finished.snapshot_file_ownership,
             );
@@ -3206,6 +3261,20 @@ pub fn Runtime(comptime App: type) type {
                     try self.app.writeDomainNotice(notice, true);
                 }
 
+                fn setCreatedAtMs(_: *Self, _: i64) void {}
+
+                fn materializeCommandReplay(_: *const Self) bool {
+                    return true;
+                }
+
+                fn appendTurnSummary(self: *Self, summary: types.TurnSummary) !void {
+                    if (comptime @hasField(SinkApp, "shell")) {
+                        if (comptime @hasDecl(@TypeOf(self.app.shell), "appendTurnSummaryEntry")) {
+                            _ = try self.app.shell.appendTurnSummaryEntry(self.app.alloc, summary);
+                        }
+                    }
+                }
+
                 fn appendUserTurn(self: *Self, user: types.UserTurn, has_prior_turns: bool) !void {
                     try self.app.writeUserPromptCardWithSpacing(user, has_prior_turns);
                 }
@@ -3366,6 +3435,18 @@ pub fn Runtime(comptime App: type) type {
 
                 fn appendNotice(self: *Self, notice: types.SemanticNotice) !void {
                     _ = try self.projection.appendNotice(notice);
+                }
+
+                fn setCreatedAtMs(self: *Self, created_at_ms: i64) void {
+                    self.projection.setCreatedAtMs(created_at_ms);
+                }
+
+                fn materializeCommandReplay(_: *const Self) bool {
+                    return false;
+                }
+
+                fn appendTurnSummary(self: *Self, summary: types.TurnSummary) !void {
+                    try self.projection.appendTurnSummary(summary);
                 }
 
                 fn appendUserTurn(self: *Self, user: types.UserTurn, _: bool) !void {
@@ -3635,20 +3716,38 @@ pub fn Runtime(comptime App: type) type {
                         });
                     },
                     .assistant => |entry| {
+                        if (entry.execution.turn_summary) |summary| {
+                            sink.setCreatedAtMs(summary.started_at_ms);
+                        }
                         try sink.appendUserTurn(entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
                         try writeExecutionHistoryToSink(app, sink, entry.execution);
+                        if (entry.execution.turn_summary) |summary| {
+                            sink.setCreatedAtMs(summary.completed_at_ms);
+                        }
                         if (entry.assistant.len > 0) {
                             try writeAssistantHistoryMarkdownToSink(app, sink, entry.assistant);
                         }
+                        if (entry.execution.turn_summary) |summary| {
+                            try sink.appendTurnSummary(summary);
+                        }
                     },
                     .background_command => |entry| {
+                        if (entry.execution.turn_summary) |summary| {
+                            sink.setCreatedAtMs(summary.started_at_ms);
+                        }
                         try sink.appendUserTurn(entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
 
                         try writeExecutionHistoryToSink(app, sink, entry.execution);
+                        if (entry.execution.turn_summary) |summary| {
+                            sink.setCreatedAtMs(summary.completed_at_ms);
+                        }
                         if (entry.assistant) |assistant| {
                             if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
+                        }
+                        if (entry.execution.turn_summary) |summary| {
+                            try sink.appendTurnSummary(summary);
                         }
                         const text = try formatBackgroundReplayContext(app, entry);
                         defer app.alloc.free(text);
@@ -3659,9 +3758,15 @@ pub fn Runtime(comptime App: type) type {
                         });
                     },
                     .interrupted => |entry| {
+                        if (entry.execution.turn_summary) |summary| {
+                            sink.setCreatedAtMs(summary.started_at_ms);
+                        }
                         try sink.appendUserTurn(entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
                         try writeExecutionHistoryToSink(app, sink, entry.execution);
+                        if (entry.execution.turn_summary) |summary| {
+                            sink.setCreatedAtMs(summary.completed_at_ms);
+                        }
                         if (entry.assistant) |assistant| {
                             if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
                         }
@@ -3669,6 +3774,9 @@ pub fn Runtime(comptime App: type) type {
                             try writeCancelledCommandPresentation(app, sink, entry.tool_call.?, presentation);
                         }
                         try sink.appendNotice(session_runtime.interruptedTurnNotice(entry));
+                        if (entry.execution.turn_summary) |summary| {
+                            try sink.appendTurnSummary(summary);
+                        }
                     },
                 }
             }
@@ -3756,6 +3864,7 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
             }
+            try writePermissionFeedback(sink, execution.steering);
         }
 
         fn writePermissionFeedback(sink: anytype, feedback: []const []const u8) !void {
@@ -3804,11 +3913,25 @@ pub fn Runtime(comptime App: type) type {
             const context_deferred = types.isContextDeferredToolResult(result);
             const deferred = types.isDeferredToolResult(result);
             const permission_denial_reason = tool_result_errors.toolPermissionDenialReason(result.output);
-            const process_ran = result.command_process_presentation != null;
 
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
             defer action_arena.deinit();
-            const formatted_action = if (deferred)
+            const command_decision = if (is_command)
+                try tool_presentation.commandOutcomeDecision(
+                    action_arena.allocator(),
+                    result.command_process_presentation,
+                )
+            else
+                null;
+            const terminal_action_decision = if (std.mem.eql(u8, call.name, "terminal"))
+                try tool_presentation.terminalActionOutcomeDecision(
+                    action_arena.allocator(),
+                    result.terminal_action_presentation,
+                )
+            else
+                null;
+            const outcome_decision = command_decision orelse terminal_action_decision;
+            const formatted_action_base = if (deferred)
                 try app.describeToolActionDeniedWithAdvertised(
                     action_arena.allocator(),
                     call,
@@ -3827,7 +3950,15 @@ pub fn Runtime(comptime App: type) type {
                     tool_admission.permissionDeniedStatusLabel(reason),
                     &.{},
                 )
-            else if (result.status == .success or process_ran)
+            else if (outcome_decision) |decision|
+                try app.describeToolActionDeniedWithAdvertised(
+                    action_arena.allocator(),
+                    call,
+                    null,
+                    decision.label,
+                    &.{},
+                )
+            else if (result.status == .success)
                 try app.describeToolActionCompletedWithAdvertised(
                     action_arena.allocator(),
                     call,
@@ -3842,6 +3973,17 @@ pub fn Runtime(comptime App: type) type {
                     "Failed",
                     &.{},
                 );
+            const formatted_action = if (outcome_decision) |decision|
+                if (decision.detail) |detail|
+                    try std.fmt.allocPrint(
+                        action_arena.allocator(),
+                        "{s}: {s}",
+                        .{ formatted_action_base, detail },
+                    )
+                else
+                    formatted_action_base
+            else
+                formatted_action_base;
             const action = try app.alloc.dupe(u8, formatted_action);
             defer app.alloc.free(action);
 
@@ -3849,7 +3991,9 @@ pub fn Runtime(comptime App: type) type {
                 .deferred
             else if (deferred or permission_denial_reason != null)
                 .denied
-            else if (result.status == .success or process_ran)
+            else if (outcome_decision) |decision|
+                decision.outcome
+            else if (result.status == .success)
                 .completed
             else
                 .failed;
@@ -3859,6 +4003,10 @@ pub fn Runtime(comptime App: type) type {
                 action,
             );
             if (!is_command or deferred or permission_denial_reason != null) {
+                try sink.attachHistoricalToolDetail(entry_id, call, result);
+                return;
+            }
+            if (!sink.materializeCommandReplay()) {
                 try sink.attachHistoricalToolDetail(entry_id, call, result);
                 return;
             }
@@ -6739,7 +6887,7 @@ test "resume falls back to saved command output when replay contains an empty fr
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
 }
 
-test "historical command replay prefers tagged frames and preserves Ran outcome" {
+test "historical command replay prefers tagged frames and preserves exit outcome" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6794,7 +6942,7 @@ test "historical command replay prefers tagged frames and preserves Ran outcome"
 
     try Runtime(TestApp).writeExecutionHistory(&app, .{ .tool_steps = steps[0..] });
 
-    try std.testing.expectEqualStrings("● Ran pwd\n", app.completed_tool_statuses.items[0]);
+    try std.testing.expectEqualStrings("● Exited 7 run_command\n", app.completed_tool_statuses.items[0]);
     try std.testing.expectEqual(@as(usize, 3), app.command_output_writes.items.len);
     try std.testing.expectEqual(.stdout, app.command_output_writes.items[0].stream);
     try std.testing.expectEqualStrings("first", app.command_output_writes.items[0].text);
@@ -6813,6 +6961,126 @@ test "historical command replay prefers tagged frames and preserves Ran outcome"
             .command_output_summary_flush,
         },
         app.replay_events.items,
+    );
+}
+
+test "historical command timeout preserves its typed outcome" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    var calls = [_]types.ToolCall{.{
+        .id = "call_timeout",
+        .name = "run_command",
+        .arguments_json = "{\"command\":\"sleep 5\"}",
+    }};
+    const output =
+        "timeout=true\n" ++
+        "timeout_ms=25\n" ++
+        "cleanup_scope=process_group_and_tracked_descendants\n" ++
+        "cleanup_guarantee=best_effort\n";
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_timeout"),
+        .tool_name = @constCast("run_command"),
+        .status = .failure,
+        .output = @constCast(output),
+        .output_bytes = output.len,
+        .stored_output_bytes = output.len,
+        .command_process_presentation = .timed_out,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+
+    try Runtime(TestApp).writeExecutionHistory(&app, .{ .tool_steps = steps[0..] });
+
+    try std.testing.expectEqualStrings(
+        "● Timed out run_command\n",
+        app.completed_tool_statuses.items[0],
+    );
+    try std.testing.expectEqualSlices(
+        types.ToolOutcomeKind,
+        &.{.failed},
+        app.completed_tool_outcomes.items,
+    );
+}
+
+test "historical terminal actions preserve typed return and failure causes" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    var calls = [_]types.ToolCall{
+        .{
+            .id = "start_exit",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"start\",\"command\":\"true\"}",
+        },
+        .{
+            .id = "wait_ceiling",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"wait\",\"session_id\":\"terminal-1\"}",
+        },
+        .{
+            .id = "wait_missing",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"wait\",\"session_id\":\"terminal-2\"}",
+        },
+    };
+    var results = [_]types.PersistedToolResult{
+        .{
+            .tool_call_id = @constCast("start_exit"),
+            .tool_name = @constCast("terminal"),
+            .status = .success,
+            .output = @constCast("start exited"),
+            .output_bytes = 12,
+            .stored_output_bytes = 12,
+            .terminal_action_presentation = .{ .returned = .{ .exited = 0 } },
+        },
+        .{
+            .tool_call_id = @constCast("wait_ceiling"),
+            .tool_name = @constCast("terminal"),
+            .status = .success,
+            .output = @constCast("wait ceiling"),
+            .output_bytes = 12,
+            .stored_output_bytes = 12,
+            .terminal_action_presentation = .{ .returned = .safety_ceiling },
+        },
+        .{
+            .tool_call_id = @constCast("wait_missing"),
+            .tool_name = @constCast("terminal"),
+            .status = .failure,
+            .output = @constCast("wait missing"),
+            .output_bytes = 12,
+            .stored_output_bytes = 12,
+            .terminal_action_presentation = .{ .failed = .session_not_found },
+        },
+    };
+    var steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+
+    try Runtime(TestApp).writeExecutionHistory(&app, .{ .tool_steps = steps[0..] });
+
+    try std.testing.expectEqual(@as(usize, 3), app.completed_tool_statuses.items.len);
+    try std.testing.expectEqualStrings(
+        "● Exited 0 terminal\n",
+        app.completed_tool_statuses.items[0],
+    );
+    try std.testing.expectEqualStrings(
+        "● Wait limit reached for terminal\n",
+        app.completed_tool_statuses.items[1],
+    );
+    try std.testing.expectEqualStrings(
+        "● Failed terminal: terminal session not found\n",
+        app.completed_tool_statuses.items[2],
+    );
+    try std.testing.expectEqualSlices(
+        types.ToolOutcomeKind,
+        &.{ .completed, .completed, .failed },
+        app.completed_tool_outcomes.items,
     );
 }
 
@@ -8607,10 +8875,25 @@ test "appendFinishedPrompt transfers snapshot ownership after history acceptance
             .user = .{ .text = @constCast("inspect") },
             .assistant = @constCast("done"),
         } },
+        .summary = .{
+            .started_at_ms = 100,
+            .completed_at_ms = 250,
+            .turn_duration_ms = 150,
+            .token_progress = .{ .input_tokens = 2, .output_tokens = 3 },
+        },
         .snapshot_file_ownership = probe.handle(),
     });
 
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
+    try std.testing.expectEqual(
+        @as(?types.TurnSummary, .{
+            .started_at_ms = 100,
+            .completed_at_ms = 250,
+            .turn_duration_ms = 150,
+            .token_progress = .{ .input_tokens = 2, .output_tokens = 3 },
+        }),
+        types.historyTurnSummary(app.session.history.items[0]),
+    );
     try std.testing.expectEqual(@as(usize, 1), probe.transfers);
 }
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -12,9 +12,18 @@ const originalCwd = process.cwd();
 const processWorkspace = await mkdtemp(join(tmpdir(), "libfx-process-workspace-"));
 const runtimeHome = await mkdtemp(join(tmpdir(), "libfx-runtime-home-"));
 const runtimeWorkspace = await mkdtemp(join(tmpdir(), "libfx-runtime-workspace-"));
+const projectMcpMarker = join(runtimeWorkspace, "project-mcp-launched");
 await writeFile(join(processWorkspace, ".fx.json"), `${JSON.stringify({ context: false })}\n`);
 await writeFile(join(runtimeWorkspace, ".fx.json"), `${JSON.stringify({ context: true })}\n`);
 await writeFile(join(runtimeWorkspace, "AGENTS.md"), `# Context\n\n${marker}\n`);
+await writeFile(join(runtimeWorkspace, ".mcp.json"), `${JSON.stringify({
+  mcpServers: {
+    forbidden: {
+      command: "/bin/sh",
+      args: ["-c", `printf launched > '${projectMcpMarker}'`],
+    },
+  },
+})}\n`);
 
 let requestBody = "";
 const server = createServer((request, response) => {
@@ -46,6 +55,11 @@ try {
     },
   });
   const session = await agent.createSession();
+  await assert.rejects(
+    access(projectMcpMarker),
+    (error) => error?.code === "ENOENT",
+    "native addon host must not start workspace MCP",
+  );
   const turn = session.prompt("read the explicit workspace context");
   await turn.result;
   assert.match(requestBody, new RegExp(marker), "native startup must load context policy from workspaceRoot, not process.cwd()" );

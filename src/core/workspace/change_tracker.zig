@@ -8,31 +8,13 @@ const Allocator = std.mem.Allocator;
 pub const OperationKind = enum {
     write,
     edit,
-    delete,
-    rename,
 };
 
 pub const FileOperation = struct {
     kind: OperationKind,
     path: []u8,
     previous_content: ?[]u8,
-    new_path: ?[]u8 = null,
     timestamp_ms: i64,
-    /// Records why state required to reverse the mutation could not be retained.
-    /// The operation remains a barrier, so undo consumes it and says so rather than
-    /// silently undoing an older operation the user did not ask about.
-    unavailable_cause: ?UnavailableCause = null,
-};
-
-pub const UnavailableStage = enum {
-    capture_open,
-    capture_read,
-    new_path_clone,
-};
-
-pub const UnavailableCause = struct {
-    stage: UnavailableStage,
-    err: anyerror,
 };
 
 pub const UndoResult = union(enum) {
@@ -44,26 +26,6 @@ pub const UndoResult = union(enum) {
     unavailable: []const u8,
     empty,
 };
-
-/// The state of a file before a mutation. `absent` means the file was proven not to
-/// exist, which is the only case that licenses undo to delete it again; `unavailable`
-/// means the state could not be read (too large, permissions, IO error) and nothing
-/// about the file may be assumed.
-pub const CaptureResult = union(enum) {
-    captured: []u8,
-    absent,
-    unavailable: UnavailableCause,
-};
-
-const RollbackOutcome = union(enum) {
-    not_attempted,
-    succeeded,
-    failed: anyerror,
-};
-
-const UndoTestControl = if (builtin.is_test) struct {
-    before_rename_rollback: ?*const fn ([]const u8) void = null,
-} else struct {};
 
 pub const ChangeTracker = struct {
     stack: std.ArrayList(FileOperation) = .empty,
@@ -89,78 +51,16 @@ pub const ChangeTracker = struct {
     }
 
     pub fn undoLast(self: *ChangeTracker, alloc: Allocator) UndoResult {
-        return self.undoLastWithTestControl(alloc, .{});
-    }
-
-    fn undoLastWithTestControl(
-        self: *ChangeTracker,
-        alloc: Allocator,
-        test_control: UndoTestControl,
-    ) UndoResult {
         if (self.stack.items.len == 0) return .empty;
 
         const op = self.stack.pop().?;
-        defer if (op.new_path) |new_path| alloc.free(new_path);
-
-        if (op.unavailable_cause) |cause| {
-            if (op.previous_content) |content| alloc.free(content);
-            traceUnavailable(op, @tagName(cause.stage), cause.err, .not_attempted);
-            return .{ .unavailable = op.path };
-        }
 
         switch (op.kind) {
-            .delete => {
-                if (op.previous_content) |content| {
-                    defer alloc.free(content);
-                    restoreContent(alloc, op.path, content) catch |err| {
-                        traceUnavailable(op, "restore_deleted", err, .not_attempted);
-                        return .{ .unavailable = op.path };
-                    };
-                    return .{ .restored = op.path };
-                }
-                alloc.free(op.path);
-                return .empty;
-            },
-            .rename => {
-                if (op.new_path) |new_path| {
-                    std.Io.Dir.renameAbsolute(new_path, op.path, io_mod.getIo()) catch |err| {
-                        if (op.previous_content) |content| alloc.free(content);
-                        traceUnavailable(op, "rename_back", err, .not_attempted);
-                        return .{ .unavailable = op.path };
-                    };
-                    // previous_content holds the overwritten destination preimage.
-                    if (op.previous_content) |content| {
-                        defer alloc.free(content);
-                        restoreContent(alloc, new_path, content) catch |err| {
-                            // The rename back succeeded but the file it displaced could
-                            // not be put back. Undo the rename too, so the tree is left
-                            // as it was rather than half reversed under a success report.
-                            if (comptime builtin.is_test) {
-                                if (test_control.before_rename_rollback) |callback| callback(new_path);
-                            }
-                            const rollback: RollbackOutcome = if (std.Io.Dir.renameAbsolute(op.path, new_path, io_mod.getIo()))
-                                .succeeded
-                            else |rollback_err|
-                                .{ .failed = rollback_err };
-                            traceUnavailable(
-                                op,
-                                "restore_destination",
-                                err,
-                                rollback,
-                            );
-                            return .{ .unavailable = op.path };
-                        };
-                    }
-                    return .{ .restored = op.path };
-                }
-                if (op.previous_content) |content| alloc.free(content);
-                return .{ .restored = op.path };
-            },
             .write, .edit => {
                 if (op.previous_content) |content| {
                     defer alloc.free(content);
                     restoreContent(alloc, op.path, content) catch |err| {
-                        traceUnavailable(op, "restore_content", err, .not_attempted);
+                        traceUnavailable(op, "restore_content", err);
                         return .{ .unavailable = op.path };
                     };
                     return .{ .restored = op.path };
@@ -171,28 +71,13 @@ pub const ChangeTracker = struct {
                     // other failure leaves the file's state uncertain and must not
                     // be reported as a successful deletion.
                     if (err != error.FileNotFound) {
-                        traceUnavailable(op, "delete_created", err, .not_attempted);
+                        traceUnavailable(op, "delete_created", err);
                         return .{ .unavailable = op.path };
                     }
                 };
                 return .{ .deleted = op.path };
             },
         }
-    }
-
-    pub fn captureFileState(alloc: Allocator, absolute_path: []const u8) CaptureResult {
-        var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), absolute_path, .{}) catch |err| {
-            return if (err == error.FileNotFound) .absent else .{ .unavailable = .{
-                .stage = .capture_open,
-                .err = err,
-            } };
-        };
-        defer file.close(io_mod.getIo());
-        const content = io_mod.readFileToEnd(alloc, &file, 10 * 1024 * 1024) catch |err| return .{ .unavailable = .{
-            .stage = .capture_read,
-            .err = err,
-        } };
-        return .{ .captured = content };
     }
 
     /// Restores `content` at `absolute_path` without destroying what is already there
@@ -210,7 +95,6 @@ pub const ChangeTracker = struct {
     fn freeOperation(alloc: Allocator, op: FileOperation) void {
         alloc.free(op.path);
         if (op.previous_content) |content| alloc.free(content);
-        if (op.new_path) |new_path| alloc.free(new_path);
     }
 };
 
@@ -218,33 +102,16 @@ fn traceUnavailable(
     op: FileOperation,
     stage: []const u8,
     err: anyerror,
-    rollback: RollbackOutcome,
 ) void {
     var path_buf: [256]u8 = undefined;
     const path = debug_trace.terminalPreview(path_buf[0..], op.path);
-    switch (rollback) {
-        .not_attempted => debug_trace.eventf(
-            "undo",
-            "undo_unavailable",
-            .{},
-            "kind={s} path={s} stage={s} error={s} rollback=not_attempted",
-            .{ @tagName(op.kind), path, stage, @errorName(err) },
-        ),
-        .succeeded => debug_trace.eventf(
-            "undo",
-            "undo_unavailable",
-            .{},
-            "kind={s} path={s} stage={s} error={s} rollback=succeeded",
-            .{ @tagName(op.kind), path, stage, @errorName(err) },
-        ),
-        .failed => |rollback_err| debug_trace.eventf(
-            "undo",
-            "undo_unavailable",
-            .{},
-            "kind={s} path={s} stage={s} error={s} rollback=failed rollback_error={s}",
-            .{ @tagName(op.kind), path, stage, @errorName(err), @errorName(rollback_err) },
-        ),
-    }
+    debug_trace.eventf(
+        "undo",
+        "undo_unavailable",
+        .{},
+        "kind={s} path={s} stage={s} error={s}",
+        .{ @tagName(op.kind), path, stage, @errorName(err) },
+    );
 }
 
 fn tmpPath(alloc: Allocator, dir: std.Io.Dir, name: []const u8) ![]u8 {
@@ -362,10 +229,9 @@ test "clear releases operations and leaves the tracker empty" {
     defer tracker.deinit(alloc);
 
     try tracker.pushOperation(alloc, .{
-        .kind = .rename,
+        .kind = .edit,
         .path = try alloc.dupe(u8, "/workspace/a.txt"),
         .previous_content = try alloc.dupe(u8, "before"),
-        .new_path = try alloc.dupe(u8, "/workspace/b.txt"),
         .timestamp_ms = 1,
     });
 
@@ -536,182 +402,6 @@ test "undoLast reports unavailable when a new file cannot be deleted" {
     try std.testing.expectEqualStrings("new content", survived);
 }
 
-test "undoLast restores deleted files when previous content exists" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try tmpPath(alloc, tmp.dir, "deleted.txt");
-    defer alloc.free(path);
-    defer std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), path) catch {};
-
-    var tracker: ChangeTracker = .{};
-    defer tracker.deinit(alloc);
-    try tracker.pushOperation(alloc, .{
-        .kind = .delete,
-        .path = try alloc.dupe(u8, path),
-        .previous_content = try alloc.dupe(u8, "restored"),
-        .timestamp_ms = 1,
-    });
-
-    const result = tracker.undoLast(alloc);
-    switch (result) {
-        .restored => |restored_path| {
-            defer alloc.free(restored_path);
-            try std.testing.expectEqualStrings(path, restored_path);
-        },
-        else => return error.ExpectedRestore,
-    }
-
-    const content = try readAbsolute(alloc, path);
-    defer alloc.free(content);
-    try std.testing.expectEqualStrings("restored", content);
-}
-
-test "undoLast returns empty for deleted files without previous content" {
-    const alloc = std.testing.allocator;
-    var tracker: ChangeTracker = .{};
-    defer tracker.deinit(alloc);
-
-    try tracker.pushOperation(alloc, .{
-        .kind = .delete,
-        .path = try alloc.dupe(u8, "/workspace/deleted.txt"),
-        .previous_content = null,
-        .timestamp_ms = 1,
-    });
-
-    try std.testing.expect(tracker.undoLast(alloc) == .empty);
-}
-
-test "undoLast renames new_path back to path" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const old_path = try tmpPath(alloc, tmp.dir, "old.txt");
-    defer alloc.free(old_path);
-    const new_path = try tmpPath(alloc, tmp.dir, "new.txt");
-    defer alloc.free(new_path);
-    defer std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), old_path) catch {};
-    defer std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), new_path) catch {};
-
-    try writeAbsolute(new_path, "moved");
-    var tracker: ChangeTracker = .{};
-    defer tracker.deinit(alloc);
-    try tracker.pushOperation(alloc, .{
-        .kind = .rename,
-        .path = try alloc.dupe(u8, old_path),
-        .previous_content = null,
-        .new_path = try alloc.dupe(u8, new_path),
-        .timestamp_ms = 1,
-    });
-
-    const result = tracker.undoLast(alloc);
-    switch (result) {
-        .restored => |restored_path| {
-            defer alloc.free(restored_path);
-            try std.testing.expectEqualStrings(old_path, restored_path);
-        },
-        else => return error.ExpectedRestore,
-    }
-
-    const content = try readAbsolute(alloc, old_path);
-    defer alloc.free(content);
-    try std.testing.expectEqualStrings("moved", content);
-    try expectMissing(new_path);
-}
-
-test "undoLast restores destination preimage after overwrite rename" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const old_path = try tmpPath(alloc, tmp.dir, "source.txt");
-    defer alloc.free(old_path);
-    const new_path = try tmpPath(alloc, tmp.dir, "dest.txt");
-    defer alloc.free(new_path);
-    defer std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), old_path) catch {};
-    defer std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), new_path) catch {};
-
-    // After overwrite rename, only dest exists with the source bytes.
-    try writeAbsolute(new_path, "source-bytes");
-    var tracker: ChangeTracker = .{};
-    defer tracker.deinit(alloc);
-    try tracker.pushOperation(alloc, .{
-        .kind = .rename,
-        .path = try alloc.dupe(u8, old_path),
-        .previous_content = try alloc.dupe(u8, "dest-preimage"),
-        .new_path = try alloc.dupe(u8, new_path),
-        .timestamp_ms = 1,
-    });
-
-    const result = tracker.undoLast(alloc);
-    switch (result) {
-        .restored => |restored_path| {
-            defer alloc.free(restored_path);
-            try std.testing.expectEqualStrings(old_path, restored_path);
-        },
-        else => return error.ExpectedRestore,
-    }
-
-    const source = try readAbsolute(alloc, old_path);
-    defer alloc.free(source);
-    try std.testing.expectEqualStrings("source-bytes", source);
-    const dest = try readAbsolute(alloc, new_path);
-    defer alloc.free(dest);
-    try std.testing.expectEqualStrings("dest-preimage", dest);
-}
-
-test "undoLast reports unavailable when renaming back fails" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const old_path = try tmpPath(alloc, tmp.dir, "old-missing.txt");
-    defer alloc.free(old_path);
-    const new_path = try tmpPath(alloc, tmp.dir, "new-missing.txt");
-    defer alloc.free(new_path);
-
-    var tracker: ChangeTracker = .{};
-    defer tracker.deinit(alloc);
-    try tracker.pushOperation(alloc, .{
-        .kind = .rename,
-        .path = try alloc.dupe(u8, old_path),
-        .previous_content = try alloc.dupe(u8, "unused"),
-        .new_path = try alloc.dupe(u8, new_path),
-        .timestamp_ms = 1,
-    });
-
-    switch (tracker.undoLast(alloc)) {
-        .unavailable => |reported_path| {
-            defer alloc.free(reported_path);
-            try std.testing.expectEqualStrings(old_path, reported_path);
-        },
-        else => return error.ExpectedUnavailable,
-    }
-    try std.testing.expectEqual(@as(usize, 0), tracker.stack.items.len);
-    try std.testing.expect(tracker.undoLast(alloc) == .empty);
-}
-
-test "undoLast refuses rename operations without the required new_path" {
-    const alloc = std.testing.allocator;
-    var tracker: ChangeTracker = .{};
-    defer tracker.deinit(alloc);
-
-    try tracker.pushOperation(alloc, .{
-        .kind = .rename,
-        .path = try alloc.dupe(u8, "/workspace/original.txt"),
-        .previous_content = try alloc.dupe(u8, "previous"),
-        .timestamp_ms = 1,
-        .unavailable_cause = .{ .stage = .new_path_clone, .err = error.OutOfMemory },
-    });
-
-    const result = tracker.undoLast(alloc);
-    switch (result) {
-        .unavailable => |reported_path| {
-            defer alloc.free(reported_path);
-            try std.testing.expectEqualStrings("/workspace/original.txt", reported_path);
-        },
-        else => return error.ExpectedUnavailable,
-    }
-}
-
 test "undoLast pops before filesystem restore failures, reports them, and does not create parents" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -736,64 +426,6 @@ test "undoLast pops before filesystem restore failures, reports them, and does n
     try expectMissing(path);
     // The stack is empty now, which is a different answer from a failed restore.
     try std.testing.expect(tracker.undoLast(alloc) == .empty);
-}
-
-test "captureFileState captures existing files and returns null for missing files" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try tmpPath(alloc, tmp.dir, "capture.txt");
-    defer alloc.free(path);
-    defer std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), path) catch {};
-
-    try writeAbsolute(path, "snapshot");
-
-    const captured = switch (ChangeTracker.captureFileState(alloc, path)) {
-        .captured => |content| content,
-        else => return error.ExpectedCapture,
-    };
-    defer alloc.free(captured);
-    try std.testing.expectEqualStrings("snapshot", captured);
-
-    const missing_path = try tmpPath(alloc, tmp.dir, "missing.txt");
-    defer alloc.free(missing_path);
-    try std.testing.expect(ChangeTracker.captureFileState(alloc, missing_path) == .absent);
-}
-
-test "captureFileState reports unavailable for files at the size limit" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try tmpPath(alloc, tmp.dir, "limit.bin");
-    defer alloc.free(path);
-    defer std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), path) catch {};
-
-    var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{ .truncate = true });
-    defer file.close(io_mod.getIo());
-    try file.setLength(io_mod.getIo(), 10 * 1024 * 1024);
-
-    switch (ChangeTracker.captureFileState(alloc, path)) {
-        .unavailable => |cause| try std.testing.expectEqual(UnavailableStage.capture_read, cause.stage),
-        else => return error.ExpectedUnavailable,
-    }
-}
-
-test "captureFileState reports unavailable for files over the size limit" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try tmpPath(alloc, tmp.dir, "over-limit.bin");
-    defer alloc.free(path);
-    defer std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), path) catch {};
-
-    var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{ .truncate = true });
-    defer file.close(io_mod.getIo());
-    try file.setLength(io_mod.getIo(), 10 * 1024 * 1024 + 1);
-
-    switch (ChangeTracker.captureFileState(alloc, path)) {
-        .unavailable => |cause| try std.testing.expectEqual(UnavailableStage.capture_read, cause.stage),
-        else => return error.ExpectedUnavailable,
-    }
 }
 
 test "undoLast leaves the original file intact when the restore write fails" {
@@ -833,50 +465,6 @@ test "undoLast leaves the original file intact when the restore write fails" {
     const survived = try readAbsolute(alloc, path);
     defer alloc.free(survived);
     try std.testing.expectEqualStrings(current, survived);
-}
-
-test "undoLast refuses an operation whose preimage was never captured" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const trace_path = try tmpPath(alloc, tmp.dir, "preimage-unavailable.log");
-    defer alloc.free(trace_path);
-    debug_trace.resetForTest();
-    defer debug_trace.resetForTest();
-    try debug_trace.configureForTestWithScopes(alloc, trace_path, "undo");
-
-    const path = try tmpPath(alloc, tmp.dir, "uncaptured.txt");
-    defer alloc.free(path);
-    defer std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), path) catch {};
-
-    try writeAbsolute(path, "content the tool did not create");
-
-    var tracker: ChangeTracker = .{};
-    defer tracker.deinit(alloc);
-    try tracker.pushOperation(alloc, .{
-        .kind = .write,
-        .path = try alloc.dupe(u8, path),
-        .previous_content = null,
-        .timestamp_ms = 1,
-        .unavailable_cause = .{ .stage = .capture_read, .err = error.FileTooBig },
-    });
-
-    switch (tracker.undoLast(alloc)) {
-        .unavailable => |reported| alloc.free(reported),
-        else => return error.ExpectedUnavailable,
-    }
-
-    const survived = try readAbsolute(alloc, path);
-    defer alloc.free(survived);
-    try std.testing.expectEqualStrings("content the tool did not create", survived);
-
-    const trace = try readUndoTrace(alloc, tmp, "preimage-unavailable.log");
-    defer alloc.free(trace);
-    try std.testing.expect(std.mem.find(u8, trace, "event=undo_unavailable") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "kind=write") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "stage=capture_read") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "error=FileTooBig") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "rollback=not_attempted") != null);
 }
 
 test "undo refuses a file whose directory denies writes and leaves it intact" {
@@ -952,120 +540,6 @@ test "undo restore cannot be redirected by a symlink introduced after capture" {
     const untouched = try readAbsolute(alloc, redirect_target);
     defer alloc.free(untouched);
     try std.testing.expectEqualStrings("must stay untouched", untouched);
-}
-
-test "undo rolls back a rename when the displaced file cannot be restored" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const trace_path = try tmpPath(alloc, tmp.dir, "rename-rollback.log");
-    defer alloc.free(trace_path);
-    debug_trace.resetForTest();
-    defer debug_trace.resetForTest();
-    try debug_trace.configureForTestWithScopes(alloc, trace_path, "undo");
-
-    const old_path = try tmpPath(alloc, tmp.dir, "old.txt");
-    defer alloc.free(old_path);
-    const new_path = try tmpPath(alloc, tmp.dir, "new.txt");
-    defer alloc.free(new_path);
-    try writeAbsolute(new_path, "renamed content");
-
-    const preimage = try alloc.alloc(u8, 64 * 1024);
-    defer alloc.free(preimage);
-    @memset(preimage, 'D');
-
-    var tracker: ChangeTracker = .{};
-    defer tracker.deinit(alloc);
-    try tracker.pushOperation(alloc, .{
-        .kind = .rename,
-        .path = try alloc.dupe(u8, old_path),
-        .new_path = try alloc.dupe(u8, new_path),
-        .previous_content = try alloc.dupe(u8, preimage),
-        .timestamp_ms = 1,
-    });
-
-    const file_size_guard = try limitFileSizeForTest(4096, false);
-    defer file_size_guard.restore();
-
-    switch (tracker.undoLast(alloc)) {
-        .unavailable => |reported| alloc.free(reported),
-        else => return error.ExpectedUnavailable,
-    }
-
-    // The tree is left exactly as it was before the undo attempt.
-    const displaced = try readAbsolute(alloc, new_path);
-    defer alloc.free(displaced);
-    try std.testing.expectEqualStrings("renamed content", displaced);
-    try expectMissing(old_path);
-
-    const trace = try readUndoTrace(alloc, tmp, "rename-rollback.log");
-    defer alloc.free(trace);
-    try std.testing.expect(std.mem.find(u8, trace, "event=undo_unavailable") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "kind=rename") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "stage=restore_destination") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "rollback=succeeded") != null);
-}
-
-test "undo traces a failed rename rollback" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const trace_path = try tmpPath(alloc, tmp.dir, "rename-rollback-failure.log");
-    defer alloc.free(trace_path);
-    debug_trace.resetForTest();
-    defer debug_trace.resetForTest();
-    try debug_trace.configureForTestWithScopes(alloc, trace_path, "undo");
-
-    const old_path = try tmpPath(alloc, tmp.dir, "old.txt");
-    defer alloc.free(old_path);
-    const new_path = try tmpPath(alloc, tmp.dir, "new.txt");
-    defer alloc.free(new_path);
-    try writeAbsolute(new_path, "renamed content");
-
-    const preimage = try alloc.alloc(u8, 64 * 1024);
-    defer alloc.free(preimage);
-    @memset(preimage, 'D');
-
-    var tracker: ChangeTracker = .{};
-    defer tracker.deinit(alloc);
-    try tracker.pushOperation(alloc, .{
-        .kind = .rename,
-        .path = try alloc.dupe(u8, old_path),
-        .new_path = try alloc.dupe(u8, new_path),
-        .previous_content = try alloc.dupe(u8, preimage),
-        .timestamp_ms = 1,
-    });
-
-    const file_size_guard = try limitFileSizeForTest(4096, false);
-    defer file_size_guard.restore();
-
-    const InjectRollbackFailure = struct {
-        fn beforeRollback(path: []const u8) void {
-            std.Io.Dir.createDirAbsolute(io_mod.getIo(), path, .default_dir) catch unreachable;
-        }
-    };
-    switch (tracker.undoLastWithTestControl(alloc, .{
-        .before_rename_rollback = InjectRollbackFailure.beforeRollback,
-    })) {
-        .unavailable => |reported| alloc.free(reported),
-        else => return error.ExpectedUnavailable,
-    }
-
-    const source = try readAbsolute(alloc, old_path);
-    defer alloc.free(source);
-    try std.testing.expectEqualStrings("renamed content", source);
-    const blocked_target = try tmp.dir.statFile(io_mod.getIo(), "new.txt", .{ .follow_symlinks = false });
-    try std.testing.expectEqual(std.Io.File.Kind.directory, blocked_target.kind);
-
-    const trace = try readUndoTrace(alloc, tmp, "rename-rollback-failure.log");
-    defer alloc.free(trace);
-    try std.testing.expect(std.mem.find(u8, trace, "event=undo_unavailable") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "kind=rename") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "stage=restore_destination") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "rollback=failed") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "rollback_error=") != null);
 }
 
 test "a locked directory plus a failing write never leaves a half-replaced file" {

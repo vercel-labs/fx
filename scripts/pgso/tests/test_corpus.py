@@ -367,12 +367,17 @@ class PgsoCorpusTests(unittest.TestCase):
         self.assertEqual(36, len(corpus.scenarios))
         self.assertEqual(53, len(corpus.candidate_scenarios))
         self.assertEqual(
-            100,
-            next(
-                scenario.profile_runs
+            {
+                "direct-help": 100,
+                "direct-status": 100,
+                "direct-sessions": 100,
+            },
+            {
+                scenario.name: scenario.profile_runs
                 for scenario in corpus.scenarios
-                if scenario.name == "direct-sessions"
-            ),
+                if scenario.name
+                in ("direct-help", "direct-status", "direct-sessions")
+            },
         )
         self.assertEqual(
             ("e2e-cli", "e2e-mcp-auth"),
@@ -692,6 +697,129 @@ class PgsoCorpusTests(unittest.TestCase):
         self.assertLess(len(f"{tmux_tmp}/tmux-501/default".encode()), 104)
         self.assertFalse(tmux_tmp.exists())
 
+    def test_tmux_e2e_retries_once_with_fresh_state_and_profiles(self) -> None:
+        scenario = dataclasses_replace_test_file(
+            self.make_scenario("tui-retry", requires_tmux=True),
+            "tui-retry.test.ts",
+        )
+        corpus = self.make_corpus(scenario)
+        output = self.root / "retry-output"
+        profile_dir = output / "profiles" / "raw"
+        profile_dir.mkdir(parents=True)
+        binary = self.root / "retry-instrumented-fx"
+        binary.write_bytes(b"instrumented")
+        calls: list[dict[str, str]] = []
+        merged_profiles: list[str] = []
+        cleaned_tmux_dirs: list[pathlib.Path] = []
+
+        def command_runner(argv, **kwargs):
+            environment = dict(kwargs["env"])
+            calls.append(environment)
+            home = pathlib.Path(environment["HOME"])
+            stale = home / "failed-attempt"
+            pattern = environment["LLVM_PROFILE_FILE"]
+            raw = pathlib.Path(
+                pattern.replace("%m", "module")
+                .replace("%p", str(len(calls)))
+                .replace("%c", "")
+            )
+            raw.write_bytes(f"attempt-{len(calls)}".encode())
+            if len(calls) == 1:
+                stale.write_text("stale")
+                raise PgsoError("transient tmux failure")
+            self.assertFalse(stale.exists())
+            return CommandResult(
+                argv=tuple(argv),
+                returncode=0,
+                stdout="ok\n",
+                stderr="",
+                elapsed_seconds=0.25,
+            )
+
+        def profile_merger(_toolchain, raw_profiles, merged, _log_path):
+            merged_profiles.extend(path.name for path in raw_profiles)
+            merged.write_bytes(b"merged")
+            for raw in raw_profiles:
+                raw.unlink()
+            return len(raw_profiles)
+
+        def cleanup_tmux(_environment, tmux_dir):
+            cleaned_tmux_dirs.append(tmux_dir)
+            tmux_dir.rmdir()
+
+        with mock.patch("scripts.pgso.corpus._cleanup_tmux", cleanup_tmux):
+            result = run_corpus(
+                corpus,
+                binary,
+                profile_dir,
+                output / "profiles" / "merged.profdata",
+                toolchain=object(),
+                command_runner=command_runner,
+                profile_merger=profile_merger,
+            )
+
+        self.assertEqual(1, result.passed)
+        self.assertEqual(2, len(calls))
+        self.assertNotEqual(calls[0]["TMUX_TMPDIR"], calls[1]["TMUX_TMPDIR"])
+        self.assertEqual(2, len(cleaned_tmux_dirs))
+        self.assertEqual(["tui-retry-module-2-.profraw"], merged_profiles)
+
+    def test_tmux_e2e_second_failure_remains_fatal(self) -> None:
+        scenario = dataclasses_replace_test_file(
+            self.make_scenario("tui-fails", requires_tmux=True),
+            "tui-fails.test.ts",
+        )
+        corpus = self.make_corpus(scenario)
+        binary = self.root / "failed-candidate-fx"
+        binary.write_bytes(b"candidate")
+        calls = 0
+
+        def command_runner(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise PgsoError("persistent tmux failure")
+
+        def cleanup_tmux(_environment, tmux_dir):
+            tmux_dir.rmdir()
+
+        with (
+            mock.patch("scripts.pgso.corpus._cleanup_tmux", cleanup_tmux),
+            self.assertRaises(CorpusRunError),
+        ):
+            run_behavior_corpus(
+                corpus,
+                binary,
+                self.root / "failed-behavior-output",
+                command_runner=command_runner,
+            )
+
+        self.assertEqual(2, calls)
+
+    def test_non_tmux_e2e_failure_is_not_retried(self) -> None:
+        scenario = dataclasses_replace_test_file(
+            self.make_scenario("plain-e2e"),
+            "plain-e2e.test.ts",
+        )
+        corpus = self.make_corpus(scenario)
+        binary = self.root / "plain-candidate-fx"
+        binary.write_bytes(b"candidate")
+        calls = 0
+
+        def command_runner(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise PgsoError("plain failure")
+
+        with self.assertRaises(CorpusRunError):
+            run_behavior_corpus(
+                corpus,
+                binary,
+                self.root / "plain-behavior-output",
+                command_runner=command_runner,
+            )
+
+        self.assertEqual(1, calls)
+
     def test_keychain_access_is_scoped_to_the_declared_scenario_home(self) -> None:
         host_home = self.root / "host-home"
         host_keychains = host_home / "Library" / "Keychains"
@@ -870,6 +998,19 @@ def dataclasses_replace_allow_keychain(scenario: Scenario) -> Scenario:
     import dataclasses
 
     return dataclasses.replace(scenario, allow_keychain=True)
+
+
+def dataclasses_replace_test_file(
+    scenario: Scenario,
+    test_file: str,
+) -> Scenario:
+    import dataclasses
+
+    return dataclasses.replace(
+        scenario,
+        argv=("bun", "test", "--max-concurrency", "1", f"./{test_file}"),
+        test_file=test_file,
+    )
 
 
 if __name__ == "__main__":

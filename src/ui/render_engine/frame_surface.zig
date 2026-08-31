@@ -688,7 +688,7 @@ test "frame surface preserves shell rows from shadow" {
     try std.testing.expectEqual(paint_plan.CellOwner.preserved_shell, surface.cellAt(1, 1).?.owner);
 }
 
-test "frame surface presentation neutralization preserves shell cells and Fx geometry" {
+test "frame surface presentation neutralization preserves shell cells and fx geometry" {
     var shadow = try shadowGrid(std.testing.allocator, 8, 6);
     defer shadow.deinit();
     try shadow.feed("\x1b[1;1H\x1b[31mS\x1b]8;;https://shell.example\x1b\\H\x1b]8;;\x1b\\\x1b[0m");

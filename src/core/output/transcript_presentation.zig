@@ -8,14 +8,12 @@ pub const Event = enum {
 
 pub const Depth = enum {
     inline_mode,
-    review,
     full,
 
     pub fn transition(self: Depth, event: Event) Depth {
         return switch (event) {
-            .toggle => if (self == .inline_mode) .review else .inline_mode,
-            .left => if (self.active()) .review else .inline_mode,
-            .right => if (self.active()) .full else .inline_mode,
+            .toggle => if (self == .inline_mode) .full else .inline_mode,
+            .left, .right => if (self.active()) .full else .inline_mode,
         };
     }
 
@@ -66,22 +64,9 @@ pub const State = struct {
         if (self.depth == requested) return self;
 
         var next = self;
-        if (self.depth.active() and requested.active()) {
-            next = next.queue_bookmark();
-        }
         next = switch (requested) {
             .inline_mode => next.closed(),
-            .review => if (self.depth == .inline_mode)
-                next.open_review()
-            else blk: {
-                next.depth = .review;
-                break :blk next;
-            },
-            .full => blk: {
-                if (self.depth == .inline_mode) next = next.open_review();
-                next.depth = .full;
-                break :blk next;
-            },
+            .full => next.open_full(),
         };
         return next;
     }
@@ -113,6 +98,17 @@ pub const State = struct {
     pub fn retarget_anchor(self: State, entry_id: u32) State {
         var next = self;
         next.anchor_entry_id = entry_id;
+        return next;
+    }
+
+    pub fn select_page_boundary(self: State, entry_id: u32) State {
+        var next = self;
+        next.scroll_rows = 0;
+        next.follow_tail = false;
+        next.anchor_pending = false;
+        next.bookmark_entry_id = entry_id;
+        next.bookmark_intra_row = 0;
+        next.bookmark_pending = true;
         return next;
     }
 
@@ -202,9 +198,9 @@ pub const State = struct {
         };
     }
 
-    fn open_review(self: State) State {
+    fn open_full(self: State) State {
         var next = self.reset_viewport();
-        next.depth = .review;
+        next.depth = .full;
         // The identity remains available for retention retargeting, but a
         // normal open starts at the tail instead of consuming the old anchor.
         next.anchor_pending = false;
@@ -275,20 +271,18 @@ fn next_bookmark_item_row(item_rows: []const ItemRow, current_row: u32) ?u32 {
 }
 
 test "transcript presentation depth preserves viewer transitions" {
+    try std.testing.expect(std.meta.stringToEnum(Depth, "review") == null);
     const Case = struct {
         from: Depth,
         input: Event,
         expected: Depth,
     };
     const cases = [_]Case{
-        .{ .from = .inline_mode, .input = .toggle, .expected = .review },
-        .{ .from = .review, .input = .toggle, .expected = .inline_mode },
+        .{ .from = .inline_mode, .input = .toggle, .expected = .full },
         .{ .from = .full, .input = .toggle, .expected = .inline_mode },
         .{ .from = .inline_mode, .input = .left, .expected = .inline_mode },
-        .{ .from = .review, .input = .left, .expected = .review },
-        .{ .from = .full, .input = .left, .expected = .review },
+        .{ .from = .full, .input = .left, .expected = .full },
         .{ .from = .inline_mode, .input = .right, .expected = .inline_mode },
-        .{ .from = .review, .input = .right, .expected = .full },
         .{ .from = .full, .input = .right, .expected = .full },
     };
 
@@ -309,56 +303,6 @@ test "transcript presentation scroll saturates and leaves follow tail" {
     const near_end = State{ .scroll_rows = std.math.maxInt(u32) - 1 };
     const at_end = near_end.scroll(.down, 3);
     try std.testing.expectEqual(std.math.maxInt(u32), at_end.scroll_rows);
-}
-
-test "transcript presentation depth changes preserve viewport intent" {
-    const item_rows = [_]ItemRow{
-        .{ .entry_id = 10, .row = 0 },
-        .{ .entry_id = 20, .row = 4 },
-        .{ .entry_id = 30, .row = 10 },
-    };
-
-    for ([_]struct { from: Depth, to: Depth }{
-        .{ .from = .review, .to = .full },
-        .{ .from = .full, .to = .review },
-    }) |transition| {
-        const tail = (State{
-            .depth = transition.from,
-            .scroll_rows = 4,
-            .follow_tail = true,
-            .bookmark_entry_id = 20,
-            .bookmark_intra_row = 2,
-        }).with_depth(transition.to);
-        try std.testing.expect(!tail.bookmark_pending);
-
-        const tail_selected = tail.select_visual_offset(20, 5, &item_rows);
-        try std.testing.expectEqual(@as(u32, 15), tail_selected.offset);
-        try std.testing.expect(tail_selected.state.follow_tail);
-
-        const history = (State{
-            .depth = transition.from,
-            .scroll_rows = 6,
-            .follow_tail = false,
-            .bookmark_entry_id = 20,
-            .bookmark_intra_row = 2,
-        }).with_depth(transition.to);
-        try std.testing.expect(history.bookmark_pending);
-
-        const history_selected = history.select_visual_offset(20, 5, &item_rows);
-        try std.testing.expectEqual(@as(u32, 6), history_selected.offset);
-        try std.testing.expectEqual(@as(?u32, 20), history_selected.state.bookmark_entry_id);
-        try std.testing.expectEqual(@as(u32, 2), history_selected.state.bookmark_intra_row);
-        try std.testing.expect(!history_selected.state.bookmark_pending);
-    }
-
-    const no_bookmark = (State{
-        .depth = .review,
-        .scroll_rows = 99,
-        .follow_tail = false,
-    }).with_depth(.full);
-    try std.testing.expect(!no_bookmark.bookmark_pending);
-    const clamped = no_bookmark.select_visual_offset(20, 5, &item_rows);
-    try std.testing.expectEqual(@as(u32, 15), clamped.offset);
 }
 
 test "transcript presentation clamps bookmarks and selects retained neighbor" {

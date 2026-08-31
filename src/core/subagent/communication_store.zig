@@ -135,6 +135,126 @@ const WireRecordV6 = struct {
     ledger: WireLedgerV6,
 };
 
+const DecodedWireText = struct {
+    value: []u8,
+    encoding: enum { plain, base64 },
+
+    pub fn jsonParse(
+        alloc: Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !DecodedWireText {
+        return switch (try source.peekNextTokenType()) {
+            .string => .{
+                .value = try std.json.innerParse([]u8, alloc, source, options),
+                .encoding = .plain,
+            },
+            .object_begin => blk: {
+                const message = try std.json.innerParse(
+                    WireMessageV5,
+                    alloc,
+                    source,
+                    options,
+                );
+                if (!std.mem.eql(u8, message.encoding, "base64")) {
+                    return error.UnexpectedToken;
+                }
+                const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(
+                    message.data,
+                ) catch return error.UnexpectedToken;
+                const decoded = try alloc.alloc(u8, decoded_len);
+                std.base64.standard.Decoder.decode(decoded, message.data) catch
+                    return error.UnexpectedToken;
+                const canonical = try alloc.alloc(
+                    u8,
+                    std.base64.standard.Encoder.calcSize(decoded.len),
+                );
+                defer alloc.free(canonical);
+                const encoded = std.base64.standard.Encoder.encode(canonical, decoded);
+                if (!std.mem.eql(u8, encoded, message.data)) {
+                    return error.UnexpectedToken;
+                }
+                break :blk .{ .value = decoded, .encoding = .base64 };
+            },
+            else => error.UnexpectedToken,
+        };
+    }
+};
+
+const DecodedWirePermissionGrant = struct {
+    tool_name: []u8,
+    target_path: DecodedWireText,
+};
+
+const DecodedWireDeliveryPayload = union(communication.DeliveryKind) {
+    message: DecodedWireText,
+    milestone: []u8,
+    terminal: domain.State,
+    interval: struct {
+        state: domain.State,
+        coalesced_ticks: u32,
+    },
+    approval: []u8,
+    tool_activity: communication.ToolActivity,
+};
+
+const DecodedWireDelivery = struct {
+    sequence: u64,
+    revision: u64,
+    id: []u8,
+    source_id: []u8,
+    target_id: []u8,
+    work_id: ?[]u8 = null,
+    operation_id: ?[]u8 = null,
+    timestamp_ms: i64,
+    payload: DecodedWireDeliveryPayload,
+};
+
+const DecodedWireApproval = struct {
+    id: []u8,
+    kind: communication.ApprovalKind,
+    child_id: []u8,
+    root_id: []u8,
+    work_id: ?[]u8,
+    relationship: ?communication.RelationshipApproval = null,
+    prepared_fingerprint: [32]u8,
+    identity_fingerprint: ?[32]u8 = null,
+    label: []u8,
+    explanation: ?[]u8,
+    command: ?DecodedWireText = null,
+    file: ?permission_request.FileApprovalRequest = null,
+    grants: []DecodedWirePermissionGrant,
+    status: communication.ApprovalStatus,
+    created_at_ms: i64,
+    resolved_at_ms: ?i64 = null,
+    resolved_revision: ?u64 = null,
+};
+
+const DecodedWireLedger = struct {
+    session_id: []u8,
+    capacity_version: u64 = 0,
+    generation: u64 = 0,
+    next_sequence: u64 = 1,
+    deliveries: []DecodedWireDelivery,
+    cursors: []communication.ConsumerCursor,
+    retention_targets: ?[]communication.RetentionTarget = null,
+    work_notifications: []communication.WorkNotification,
+    approvals: []DecodedWireApproval,
+    parent_turn_evicted_through: u64 = 0,
+    authority_generation: u64 = 0,
+    authority_grants: []DecodedWirePermissionGrant,
+    legacy_operation_replay_closed: bool = false,
+    model_replay_floor: u64 = 0,
+    human_replay_floor: u64 = 0,
+    model_epoch_high: u64 = 0,
+    human_epoch_high: u64 = 0,
+};
+
+const DecodedWireRecord = struct {
+    schema_version: u64,
+    ledger: DecodedWireLedger,
+};
+
 comptime {
     // 224 KiB live state + 32 KiB metadata + one retained and one subsequent
     // 96 KiB delivery fit below 448 KiB, leaving 64 KiB below the file cap.
@@ -339,9 +459,6 @@ fn encodeWireCanonical(
 ) error{OutOfMemory}![]u8 {
     if (version == schema_version) {
         return encodeWireCanonicalV6(alloc, ledger);
-    }
-    if (version == base64_delivery_schema_version) {
-        return encodeWireCanonicalV5(alloc, ledger);
     }
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -549,22 +666,19 @@ fn encodeWireCanonicalV5(
 
 fn decode(alloc: Allocator, bytes: []const u8) LoadError!communication.Ledger {
     if (bytes.len > max_record_bytes) return error.CommunicationRecordTooLarge;
-    var header = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch |err| switch (err) {
+    var parsed = std.json.parseFromSlice(DecodedWireRecord, alloc, bytes, .{
+        .allocate = .alloc_always,
+    }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidCommunicationRecord,
+        else => {
+            if (try hasUnsupportedSchemaVersion(alloc, bytes)) {
+                return error.UnsupportedCommunicationSchema;
+            }
+            return error.InvalidCommunicationRecord;
+        },
     };
-    defer header.deinit();
-    const header_object = switch (header.value) {
-        .object => |object| object,
-        else => return error.InvalidCommunicationRecord,
-    };
-    const version_value = header_object.get("schema_version") orelse
-        return error.InvalidCommunicationRecord;
-    const version = switch (version_value) {
-        .integer => |value| std.math.cast(u64, value) orelse
-            return error.InvalidCommunicationRecord,
-        else => return error.InvalidCommunicationRecord,
-    };
+    defer parsed.deinit();
+    const version = parsed.value.schema_version;
     if (version != schema_version and
         version != base64_delivery_schema_version and
         version != previous_capacity_schema_version and
@@ -573,85 +687,38 @@ fn decode(alloc: Allocator, bytes: []const u8) LoadError!communication.Ledger {
     {
         return error.UnsupportedCommunicationSchema;
     }
-    if (version == schema_version) return decodeV6(alloc, bytes);
-    if (version == base64_delivery_schema_version) return decodeV5(alloc, bytes);
-    var parsed = std.json.parseFromSlice(WireRecord, alloc, bytes, .{
-        .allocate = .alloc_always,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidCommunicationRecord,
-    };
-    defer parsed.deinit();
-    if (version == process_epoch_schema_version or
-        version == legacy_schema_version)
-    {
-        parsed.value.ledger.legacy_operation_replay_closed = true;
-        parsed.value.ledger.model_replay_floor = 0;
-        parsed.value.ledger.human_replay_floor = 0;
-        parsed.value.ledger.model_epoch_high = 0;
-        parsed.value.ledger.human_epoch_high = 0;
-    }
-    if (version == legacy_schema_version) {
-        for (parsed.value.ledger.approvals) |*approval| {
-            if (approval.status != .pending and approval.resolved_revision == null) {
-                approval.resolved_revision = parsed.value.ledger.generation;
-            }
-        }
-    }
-    parsed.value.ledger.capacity_version = 0;
-    communication.validateLedger(parsed.value.ledger) catch
-        return error.InvalidCommunicationRecord;
-    if (communication.capacityContractSatisfied(parsed.value.ledger)) {
-        parsed.value.ledger.capacity_version =
-            communication.capacity_contract_version;
-        const migrated_bytes = canonicalWireByteCount(
-            alloc,
-            schema_version,
-            parsed.value.ledger,
-        ) catch return error.OutOfMemory;
-        if (migrated_bytes > max_canonical_record_bytes) {
-            parsed.value.ledger.capacity_version = 0;
-        }
-    }
-    return parsed.value.ledger.clone(alloc) catch return error.OutOfMemory;
-}
-
-fn decodeV6(
-    alloc: Allocator,
-    bytes: []const u8,
-) LoadError!communication.Ledger {
-    var parsed = std.json.parseFromSlice(WireRecordV6, alloc, bytes, .{
-        .allocate = .alloc_always,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidCommunicationRecord,
-    };
-    defer parsed.deinit();
-    if (parsed.value.schema_version != schema_version or
+    if (version >= base64_delivery_schema_version and
         parsed.value.ledger.capacity_version !=
             communication.capacity_contract_version)
     {
         return error.InvalidCommunicationRecord;
     }
-    const deliveries = try decodeV5Deliveries(
+    const deliveries = try decodeWireDeliveries(
         alloc,
         parsed.value.ledger.deliveries,
+        version >= base64_delivery_schema_version,
     );
-    defer freeBorrowedV5Deliveries(alloc, deliveries);
-    const approvals = try decodeApprovalsV6(
+    defer alloc.free(deliveries);
+    const encoded_private_text = version == schema_version;
+    const approvals = try decodeApprovalsV5V6(
         alloc,
         parsed.value.ledger.approvals,
+        encoded_private_text,
     );
-    defer freeBorrowedApprovalsV6(alloc, approvals);
-    const authority_grants = try decodeWireGrantsV6(
+    defer freeBorrowedApprovalsV5V6(alloc, approvals);
+    const authority_grants = try decodeWireGrantsV5V6(
         alloc,
         parsed.value.ledger.authority_grants,
+        encoded_private_text,
     );
-    defer freeBorrowedWireGrantsV6(alloc, authority_grants);
+    defer alloc.free(authority_grants);
     const wire = parsed.value.ledger;
-    const borrowed = communication.Ledger{
+    var borrowed = communication.Ledger{
         .session_id = wire.session_id,
-        .capacity_version = wire.capacity_version,
+        .capacity_version = if (version == schema_version)
+            wire.capacity_version
+        else
+            0,
         .generation = wire.generation,
         .next_sequence = wire.next_sequence,
         .deliveries = deliveries,
@@ -668,64 +735,33 @@ fn decodeV6(
         .model_epoch_high = wire.model_epoch_high,
         .human_epoch_high = wire.human_epoch_high,
     };
-    communication.validateLedger(borrowed) catch
-        return error.InvalidCommunicationRecord;
-    const canonical_bytes = canonicalWireByteCount(
-        alloc,
-        schema_version,
-        borrowed,
-    ) catch return error.OutOfMemory;
-    if (canonical_bytes > max_canonical_record_bytes) {
-        return error.InvalidCommunicationRecord;
-    }
-    return borrowed.clone(alloc) catch return error.OutOfMemory;
-}
-
-fn decodeV5(
-    alloc: Allocator,
-    bytes: []const u8,
-) LoadError!communication.Ledger {
-    var parsed = std.json.parseFromSlice(WireRecordV5, alloc, bytes, .{
-        .allocate = .alloc_always,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidCommunicationRecord,
-    };
-    defer parsed.deinit();
-    if (parsed.value.schema_version != base64_delivery_schema_version or
-        parsed.value.ledger.capacity_version !=
-            communication.capacity_contract_version)
+    if (version == process_epoch_schema_version or
+        version == legacy_schema_version)
     {
-        return error.InvalidCommunicationRecord;
+        borrowed.legacy_operation_replay_closed = true;
+        borrowed.model_replay_floor = 0;
+        borrowed.human_replay_floor = 0;
+        borrowed.model_epoch_high = 0;
+        borrowed.human_epoch_high = 0;
     }
-    const deliveries = try decodeV5Deliveries(
-        alloc,
-        parsed.value.ledger.deliveries,
-    );
-    defer freeBorrowedV5Deliveries(alloc, deliveries);
-    const wire = parsed.value.ledger;
-    var borrowed = communication.Ledger{
-        .session_id = wire.session_id,
-        .capacity_version = 0,
-        .generation = wire.generation,
-        .next_sequence = wire.next_sequence,
-        .deliveries = deliveries,
-        .cursors = wire.cursors,
-        .retention_targets = wire.retention_targets,
-        .work_notifications = wire.work_notifications,
-        .approvals = wire.approvals,
-        .parent_turn_evicted_through = wire.parent_turn_evicted_through,
-        .authority_generation = wire.authority_generation,
-        .authority_grants = wire.authority_grants,
-        .legacy_operation_replay_closed = wire.legacy_operation_replay_closed,
-        .model_replay_floor = wire.model_replay_floor,
-        .human_replay_floor = wire.human_replay_floor,
-        .model_epoch_high = wire.model_epoch_high,
-        .human_epoch_high = wire.human_epoch_high,
-    };
-    communication.validateLedger(borrowed) catch
-        return error.InvalidCommunicationRecord;
-    if (communication.capacityContractSatisfied(borrowed)) {
+    if (version == legacy_schema_version) {
+        for (borrowed.approvals) |*approval| {
+            if (approval.status != .pending and approval.resolved_revision == null) {
+                approval.resolved_revision = borrowed.generation;
+            }
+        }
+    }
+    communication.validateLedger(borrowed) catch return error.InvalidCommunicationRecord;
+    if (version == schema_version) {
+        const canonical_bytes = canonicalWireByteCount(
+            alloc,
+            schema_version,
+            borrowed,
+        ) catch return error.OutOfMemory;
+        if (canonical_bytes > max_canonical_record_bytes) {
+            return error.InvalidCommunicationRecord;
+        }
+    } else if (communication.capacityContractSatisfied(borrowed)) {
         borrowed.capacity_version = communication.capacity_contract_version;
         const canonical_bytes = canonicalWireByteCount(
             alloc,
@@ -739,28 +775,53 @@ fn decodeV5(
     return borrowed.clone(alloc) catch return error.OutOfMemory;
 }
 
-fn decodeApprovalsV6(
+fn hasUnsupportedSchemaVersion(alloc: Allocator, bytes: []const u8) error{OutOfMemory}!bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const value = parsed.value.object.get("schema_version") orelse return false;
+    if (value != .integer or value.integer < 0) return false;
+    const version = std.math.cast(u64, value.integer) orelse return false;
+    return version != schema_version and
+        version != base64_delivery_schema_version and
+        version != previous_capacity_schema_version and
+        version != pre_capacity_schema_version and
+        version != process_epoch_schema_version and
+        version != legacy_schema_version;
+}
+
+fn decodeApprovalsV5V6(
     alloc: Allocator,
-    approvals: []const WireApprovalV6,
+    approvals: []const DecodedWireApproval,
+    encoded_private_text: bool,
 ) LoadError![]communication.Approval {
     const decoded = try alloc.alloc(communication.Approval, approvals.len);
     var built: usize = 0;
     errdefer {
         for (decoded[0..built]) |approval| {
-            if (approval.command) |command| alloc.free(command);
-            freeBorrowedWireGrantsV6(alloc, approval.grants);
+            alloc.free(approval.grants);
         }
         alloc.free(decoded);
     }
     for (approvals) |approval| {
-        const command = if (approval.command) |command|
-            try decodeCanonicalMessage(alloc, command)
-        else
-            null;
-        const grants = decodeWireGrantsV6(alloc, approval.grants) catch |err| {
-            if (command) |value| alloc.free(value);
-            return err;
-        };
+        if (approval.command) |command| {
+            if ((command.encoding == .base64) != encoded_private_text) {
+                return error.InvalidCommunicationRecord;
+            }
+        }
+        const identity_fingerprint = approval.identity_fingerprint orelse
+            if (encoded_private_text)
+                return error.InvalidCommunicationRecord
+            else
+                [_]u8{0} ** 32;
+        const grants = try decodeWireGrantsV5V6(
+            alloc,
+            approval.grants,
+            encoded_private_text,
+        );
         decoded[built] = .{
             .id = approval.id,
             .kind = approval.kind,
@@ -769,10 +830,10 @@ fn decodeApprovalsV6(
             .work_id = approval.work_id,
             .relationship = approval.relationship,
             .prepared_fingerprint = approval.prepared_fingerprint,
-            .identity_fingerprint = approval.identity_fingerprint,
+            .identity_fingerprint = identity_fingerprint,
             .label = approval.label,
             .explanation = approval.explanation,
-            .command = command,
+            .command = if (approval.command) |command| command.value else null,
             .file = approval.file,
             .grants = grants,
             .status = approval.status,
@@ -785,61 +846,49 @@ fn decodeApprovalsV6(
     return decoded;
 }
 
-fn decodeWireGrantsV6(
+fn decodeWireGrantsV5V6(
     alloc: Allocator,
-    grants: []const WirePermissionGrantV6,
+    grants: []const DecodedWirePermissionGrant,
+    encoded_private_text: bool,
 ) LoadError![]types.PermissionGrant {
     const decoded = try alloc.alloc(types.PermissionGrant, grants.len);
-    var built: usize = 0;
-    errdefer {
-        for (decoded[0..built]) |grant| alloc.free(grant.target_path);
-        alloc.free(decoded);
-    }
-    for (grants) |grant| {
-        decoded[built] = .{
+    errdefer alloc.free(decoded);
+    for (grants, decoded) |grant, *output| {
+        if ((grant.target_path.encoding == .base64) != encoded_private_text) {
+            return error.InvalidCommunicationRecord;
+        }
+        output.* = .{
             .tool_name = grant.tool_name,
-            .target_path = try decodeCanonicalMessage(alloc, grant.target_path),
+            .target_path = grant.target_path.value,
         };
-        built += 1;
     }
     return decoded;
 }
 
-fn freeBorrowedApprovalsV6(
+fn freeBorrowedApprovalsV5V6(
     alloc: Allocator,
     approvals: []communication.Approval,
 ) void {
     for (approvals) |approval| {
-        if (approval.command) |command| alloc.free(command);
-        freeBorrowedWireGrantsV6(alloc, approval.grants);
+        alloc.free(approval.grants);
     }
     alloc.free(approvals);
 }
 
-fn freeBorrowedWireGrantsV6(
+fn decodeWireDeliveries(
     alloc: Allocator,
-    grants: []types.PermissionGrant,
-) void {
-    for (grants) |grant| alloc.free(grant.target_path);
-    alloc.free(grants);
-}
-
-fn decodeV5Deliveries(
-    alloc: Allocator,
-    deliveries: []const WireDeliveryV5,
+    deliveries: []const DecodedWireDelivery,
+    encoded_message_text: bool,
 ) LoadError![]communication.Delivery {
     const decoded = try alloc.alloc(communication.Delivery, deliveries.len);
-    var built: usize = 0;
-    errdefer {
-        for (decoded[0..built]) |delivery| {
-            if (delivery.payload == .message) {
-                alloc.free(delivery.payload.message);
-            }
+    errdefer alloc.free(decoded);
+    for (deliveries, decoded) |delivery, *output| {
+        if (delivery.payload == .message and
+            (delivery.payload.message.encoding == .base64) != encoded_message_text)
+        {
+            return error.InvalidCommunicationRecord;
         }
-        alloc.free(decoded);
-    }
-    for (deliveries) |delivery| {
-        decoded[built] = .{
+        output.* = .{
             .sequence = delivery.sequence,
             .revision = delivery.revision,
             .id = delivery.id,
@@ -849,10 +898,7 @@ fn decodeV5Deliveries(
             .operation_id = delivery.operation_id,
             .timestamp_ms = delivery.timestamp_ms,
             .payload = switch (delivery.payload) {
-                .message => |message| .{ .message = try decodeCanonicalMessage(
-                    alloc,
-                    message,
-                ) },
+                .message => |message| .{ .message = message.value },
                 .milestone => |value| .{ .milestone = value },
                 .terminal => |value| .{ .terminal = value },
                 .interval => |value| .{ .interval = .{
@@ -863,45 +909,8 @@ fn decodeV5Deliveries(
                 .tool_activity => |value| .{ .tool_activity = value },
             },
         };
-        built += 1;
     }
     return decoded;
-}
-
-fn decodeCanonicalMessage(
-    alloc: Allocator,
-    message: WireMessageV5,
-) LoadError![]u8 {
-    if (!std.mem.eql(u8, message.encoding, "base64")) {
-        return error.InvalidCommunicationRecord;
-    }
-    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(
-        message.data,
-    ) catch return error.InvalidCommunicationRecord;
-    const decoded = try alloc.alloc(u8, decoded_len);
-    errdefer alloc.free(decoded);
-    std.base64.standard.Decoder.decode(decoded, message.data) catch
-        return error.InvalidCommunicationRecord;
-    const canonical = try alloc.alloc(
-        u8,
-        std.base64.standard.Encoder.calcSize(decoded.len),
-    );
-    defer alloc.free(canonical);
-    const encoded = std.base64.standard.Encoder.encode(canonical, decoded);
-    if (!std.mem.eql(u8, encoded, message.data)) {
-        return error.InvalidCommunicationRecord;
-    }
-    return decoded;
-}
-
-fn freeBorrowedV5Deliveries(
-    alloc: Allocator,
-    deliveries: []communication.Delivery,
-) void {
-    for (deliveries) |delivery| {
-        if (delivery.payload == .message) alloc.free(delivery.payload.message);
-    }
-    alloc.free(deliveries);
 }
 
 fn canonicalWireByteCount(
@@ -930,6 +939,25 @@ test "communication codec rejects malformed oversized and unknown version record
     try std.testing.expectError(
         error.CommunicationRecordTooLarge,
         decode(alloc, oversized),
+    );
+}
+
+test "versioned communication message encodings remain strict" {
+    const alloc = std.testing.allocator;
+    const v6_with_plain_message =
+        \\{"schema_version":6,"ledger":{"session_id":"child","capacity_version":2,"next_sequence":2,"deliveries":[{"sequence":1,"revision":1,"id":"message","source_id":"child","target_id":"parent","timestamp_ms":1,"payload":{"message":"plain"}}],"cursors":[],"work_notifications":[],"approvals":[],"authority_grants":[]}}
+    ;
+    try std.testing.expectError(
+        error.InvalidCommunicationRecord,
+        decode(alloc, v6_with_plain_message),
+    );
+
+    const v4_with_base64_message =
+        \\{"schema_version":4,"ledger":{"session_id":"child","next_sequence":2,"deliveries":[{"sequence":1,"revision":1,"id":"message","source_id":"child","target_id":"parent","timestamp_ms":1,"payload":{"message":{"encoding":"base64","data":"cGxhaW4="}}}],"cursors":[],"work_notifications":[],"approvals":[],"authority_grants":[]}}
+    ;
+    try std.testing.expectError(
+        error.InvalidCommunicationRecord,
+        decode(alloc, v4_with_base64_message),
     );
 }
 
@@ -1176,11 +1204,7 @@ test "schema v5 approvals without file projection remain compatible" {
         .created_at_ms = 1,
     });
     ledger.capacity_version = communication.capacity_contract_version;
-    const current = try encodeWireCanonical(
-        alloc,
-        base64_delivery_schema_version,
-        ledger,
-    );
+    const current = try encodeWireCanonicalV5(alloc, ledger);
     defer alloc.free(current);
     try std.testing.expect(std.mem.find(u8, current, "\"file\":null,") != null);
     const legacy = try std.mem.replaceOwned(

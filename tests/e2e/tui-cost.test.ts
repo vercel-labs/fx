@@ -501,11 +501,12 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
         await waitForProfileUsage(home, GENERATION_ID);
 
         await session.sendText("/cost");
-        const cost = await session.waitForText(/\$0\.0123/, TIMEOUT);
-        expect(cost).toMatch(/Total tokens +155/);
-        expect(cost).toMatch(/Input +130/);
-        expect(cost).toMatch(/Output +25/);
-        expect(cost).toMatch(/Cache +20 read · 10 write/);
+        const cost = await session.waitForText(/\$0\.01 spent/, TIMEOUT);
+        expect(cost).toMatch(/155 tokens/);
+        expect(cost).toMatch(/130 input/);
+        expect(cost).toMatch(/25 output/);
+        expect(cost).toMatch(/20 cache read/);
+        expect(cost).toMatch(/10 cache write/);
         await session.sendKeys("Escape");
         await session.waitForComposer(TIMEOUT);
         await session.sendText("Confirm resumed input still works.");
@@ -595,19 +596,20 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
       expect(gateway.generationRequests).toEqual([GENERATION_ID, GENERATION_ID]);
       await Bun.sleep(50);
       await session.sendText("/cost");
-      const firstCost = await session.waitForText(/\$0\.0123/, TIMEOUT);
-      expect(firstCost).toMatch(/Total tokens +155/);
-      expect(firstCost).toMatch(/Input +130/);
-      expect(firstCost).toMatch(/Output +25/);
-      expect(firstCost).toMatch(/Cache +20 read · 10 write/);
+      const firstCost = await session.waitForText(/\$0\.01 spent/, TIMEOUT);
+      expect(firstCost).toMatch(/155 tokens/);
+      expect(firstCost).toMatch(/130 input/);
+      expect(firstCost).toMatch(/25 output/);
+      expect(firstCost).toMatch(/20 cache read/);
+      expect(firstCost).toMatch(/10 cache write/);
       await session.sendKeys("Left");
-      await session.waitForText("Usage · 7 days", TIMEOUT);
+      await session.waitForText("[7 days]", TIMEOUT);
       await session.sendKeys("Left");
-      await session.waitForText("Usage · 24 hours", TIMEOUT);
+      await session.waitForText("[24 hours]", TIMEOUT);
       await session.sendKeys("Left");
-      const firstSession = await session.waitForText("Usage · Session", TIMEOUT);
-      expect(firstSession).toMatch(/Reasoning +5/);
-      expect(firstSession).toMatch(/Requests +1/);
+      const firstSession = await session.waitForText("[Session]", TIMEOUT);
+      expect(firstSession).toMatch(/5 reasoning/);
+      expect(firstSession).toMatch(/1 request/);
       await session.sendKeys("Escape");
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/quit");
@@ -621,22 +623,23 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
       });
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/cost");
-      const resumedCost = await session.waitForText(/\$0\.0123/, TIMEOUT);
-      expect(resumedCost).toMatch(/Total tokens +155/);
-      expect(resumedCost).toMatch(/Input +130/);
-      expect(resumedCost).toMatch(/Output +25/);
-      expect(resumedCost).toMatch(/Cache +20 read · 10 write/);
+      const resumedCost = await session.waitForText(/\$0\.01 spent/, TIMEOUT);
+      expect(resumedCost).toMatch(/155 tokens/);
+      expect(resumedCost).toMatch(/130 input/);
+      expect(resumedCost).toMatch(/25 output/);
+      expect(resumedCost).toMatch(/20 cache read/);
+      expect(resumedCost).toMatch(/10 cache write/);
       await session.sendKeys("Left");
-      await session.waitForText("Usage · 7 days", TIMEOUT);
+      await session.waitForText("[7 days]", TIMEOUT);
       await session.sendKeys("Left");
-      await session.waitForText("Usage · 24 hours", TIMEOUT);
+      await session.waitForText("[24 hours]", TIMEOUT);
       await session.sendKeys("Left");
       const resumedSession = await session.waitForText(
-        "Usage · Session",
+        "[Session]",
         TIMEOUT,
       );
-      expect(resumedSession).toMatch(/Reasoning +5/);
-      expect(resumedSession).toMatch(/Requests +1/);
+      expect(resumedSession).toMatch(/5 reasoning/);
+      expect(resumedSession).toMatch(/1 request/);
       expect(gateway.generationRequests).toEqual([GENERATION_ID, GENERATION_ID]);
     },
     TIMEOUT * 3,

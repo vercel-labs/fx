@@ -325,9 +325,6 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     if (spec.executor_kind == .web_search) {
         return std.fmt.allocPrint(alloc, "{s} {s}", .{ presentation.action_label, try formatWebSearchActionDetail(scratch, args) });
     }
-    if (try copyRenameLabel(scratch, call.name, args)) |value| {
-        return std.fmt.allocPrint(alloc, "{s} {s}", .{ presentation.action_label, value });
-    }
     const value = input.display_target orelse
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         presentation.label_arg_default;
@@ -358,9 +355,6 @@ pub fn formatPermissionLabel(alloc: Allocator, registry: tool_dispatch.Registry,
             "{s} {s}",
             .{ call.name, spec.label_arg_default },
         );
-    }
-    if (try copyRenameLabel(scratch, call.name, args)) |value| {
-        return std.fmt.allocPrint(alloc, "{s} {s}", .{ call.name, value });
     }
     const value = tool_dispatch.toolLabelValue(spec.*, args) orelse return try alloc.dupe(u8, call.name);
 
@@ -488,20 +482,6 @@ fn isCapturedCommandCall(
     return std.mem.eql(u8, action, expected);
 }
 
-fn copyRenameLabel(alloc: Allocator, tool_name: []const u8, args: std.json.ObjectMap) !?[]const u8 {
-    if (std.mem.eql(u8, tool_name, "copy_file")) {
-        const source = tool_args.optionalStringArg(args, "source") orelse return null;
-        const destination = tool_args.optionalStringArg(args, "destination") orelse return null;
-        return try std.fmt.allocPrint(alloc, "{s} -> {s}", .{ source, destination });
-    }
-    if (std.mem.eql(u8, tool_name, "rename_file")) {
-        const old_path = tool_args.optionalStringArg(args, "old_path") orelse return null;
-        const new_path = tool_args.optionalStringArg(args, "new_path") orelse return null;
-        return try std.fmt.allocPrint(alloc, "{s} -> {s}", .{ old_path, new_path });
-    }
-    return null;
-}
-
 fn matchesTestSkillInstall(command: []const u8) bool {
     return std.mem.startsWith(u8, command, "npx skills add ");
 }
@@ -547,8 +527,6 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.read_file,
     test_builtin_tools.write_file,
     test_builtin_tools.edit_file,
-    test_builtin_tools.rename_file,
-    test_builtin_tools.copy_file,
     test_web_search,
     test_builtin_tools.terminal,
     test_builtin_tools.memory,
@@ -857,8 +835,6 @@ test "tool presentation preserves plain action fallbacks" {
         .{ .call = .{ .id = "memory", .name = "memory", .arguments_json = "{\"action\":\"save\"}" }, .expected = "Remembering save" },
         .{ .call = .{ .id = "skill", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" }, .expected = "Loading skill workflow" },
         .{ .call = .{ .id = "install", .name = "install_skill", .arguments_json = "{\"source\":\"vercel-labs/agent-skills\",\"skill\":\"workflow\"}" }, .expected = "Installing skill vercel-labs/agent-skills" },
-        .{ .call = .{ .id = "copy", .name = "copy_file", .arguments_json = "{\"source\":\"src/a.zig\",\"destination\":\"src/b.zig\"}" }, .expected = "Copying src/a.zig -> src/b.zig" },
-        .{ .call = .{ .id = "rename", .name = "rename_file", .arguments_json = "{\"old_path\":\"src/a.zig\",\"new_path\":\"src/b.zig\"}" }, .expected = "Renaming src/a.zig -> src/b.zig" },
         .{ .call = .{ .id = "unknown", .name = "unknown_tool", .arguments_json = "{}" }, .expected = "Working: unknown_tool" },
     };
 
@@ -959,17 +935,6 @@ test "tool presentation frees all formatted output with a normal allocator" {
     });
     defer alloc.free(provider_search);
     try std.testing.expectEqualStrings("Searching web", provider_search);
-
-    const copy = try formatPlainAction(alloc, .{
-        .tool_registry = test_tool_registry,
-        .call = .{
-            .id = "copy",
-            .name = "copy_file",
-            .arguments_json = "{\"source\":\"src/a.zig\",\"destination\":\"src/b.zig\"}",
-        },
-    });
-    defer alloc.free(copy);
-    try std.testing.expectEqualStrings("Copying src/a.zig -> src/b.zig", copy);
 
     const command = try formatPermissionLabel(alloc, test_tool_registry, .{
         .id = "command",

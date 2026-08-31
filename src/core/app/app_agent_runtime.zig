@@ -197,7 +197,7 @@ pub fn Runtime(comptime App: type) type {
             const provider_capabilities = if (comptime @hasDecl(App, "providerSet"))
                 app.providerSet().select(selected_provider).capabilities
             else if (selected_provider == .gateway)
-                provider_set.Bundle.Capabilities{ .fx_search = true, .vision_fallback = true, .deferred_usage = true }
+                provider_set.Bundle.Capabilities{ .fx_search = true, .vision_fallback = true }
             else
                 provider_set.Bundle.Capabilities{};
             var ctx: tool_runtime.Context = .{
@@ -441,7 +441,7 @@ pub fn Runtime(comptime App: type) type {
             return app.callMcpTool(arena, name, arguments_json, max_tool_result_bytes, options);
         }
 
-        fn searchMcpTools(raw_ctx: *anyopaque, arena: Allocator, query: []const u8, limit: usize, permission_rules: types.PermissionRuleSet, _: @import("../config/context_limits.zig").Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
+        fn searchMcpTools(raw_ctx: *anyopaque, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, limit: usize, permission_rules: types.PermissionRuleSet, _: @import("../config/context_limits.zig").Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
             const app: *App = @ptrCast(@alignCast(raw_ctx));
             if (comptime @hasDecl(App, "searchMcpTools")) {
                 return app.searchMcpTools(arena, query, limit, permission_rules, access);
@@ -492,6 +492,34 @@ pub fn Runtime(comptime App: type) type {
                 ctx.workspace_root,
                 ctx.terminal_client,
                 call,
+            );
+        }
+
+        pub fn releaseAgentTerminalLease(
+            app: *App,
+            session_id: []const u8,
+            ignored_list_entries: []const []const u8,
+            max_list_entries: usize,
+            max_read_file_bytes: usize,
+            max_read_file_lines: usize,
+            max_read_file_line_len: usize,
+            max_command_output_bytes: usize,
+            gateway_retry_count: usize,
+            gateway_chat_url: []const u8,
+        ) !void {
+            return tool_runtime.release_agent_terminal_lease(
+                toolContext(
+                    app,
+                    ignored_list_entries,
+                    max_list_entries,
+                    max_read_file_bytes,
+                    max_read_file_lines,
+                    max_read_file_line_len,
+                    max_command_output_bytes,
+                    gateway_retry_count,
+                    gateway_chat_url,
+                ),
+                session_id,
             );
         }
 
@@ -833,12 +861,12 @@ pub fn Runtime(comptime App: type) type {
                     if (should_emit) {
                         const body = try types.renderContextNoticeBody(app.alloc, notice);
                         defer app.alloc.free(body);
-                        try app.writeDomainNotice(.{
+                        app.writeDomainNotice(.{
                             .topic = "context",
                             .tone = .warning,
                             .body = body,
                             .visibility = .full_only,
-                        }, true);
+                        }, true) catch return error.WriteFailed;
                     }
                 }
             }
@@ -1097,7 +1125,7 @@ pub fn Runtime(comptime App: type) type {
                 .provider_capabilities = if (comptime @hasDecl(App, "providerSet"))
                     app.providerSet().select(job.provider).capabilities
                 else if (job.provider == .gateway)
-                    .{ .fx_search = true, .vision_fallback = true, .deferred_usage = true }
+                    .{ .fx_search = true, .vision_fallback = true }
                 else
                     .{},
                 .custom_tool_guidance = tool_projection.custom_guidance,
@@ -1265,7 +1293,7 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.web_search,
     test_builtin_tools.terminal,
     test_builtin_tools.memory,
-    test_builtin_tools.semantic_search,
+    test_builtin_tools.grep_files,
     test_builtin_tools.skill,
     test_builtin_tools.install_skill,
     test_builtin_tools.subagent,
@@ -2186,38 +2214,6 @@ test "tool labels preserve memory action value and invalid argument fallback" {
     };
     const invalid = try app.describeToolAction(arena, invalid_call);
     try std.testing.expect(std.mem.find(u8, invalid, "Working") != null);
-}
-
-test "tool labels preserve semantic_search query value and default fallback" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-
-    const search_call: ToolCall = .{
-        .id = "semantic_search",
-        .name = "semantic_search",
-        .arguments_json = "{\"query\":\"state machines\"}",
-    };
-    const active = try app.describeToolAction(arena, search_call);
-    try std.testing.expect(std.mem.find(u8, active, "Searching") != null);
-    try std.testing.expect(std.mem.find(u8, active, "state machines") != null);
-
-    const completed = try app.describeToolActionCompleted(arena, search_call);
-    try std.testing.expect(std.mem.find(u8, completed, "Searched") != null);
-    try std.testing.expect(std.mem.find(u8, completed, "state machines") != null);
-
-    const defaulted_call: ToolCall = .{
-        .id = "semantic_search_default",
-        .name = "semantic_search",
-        .arguments_json = "{\"query\":3}",
-    };
-    const defaulted = try app.describeToolAction(arena, defaulted_call);
-    try std.testing.expect(std.mem.find(u8, defaulted, "Searching") != null);
-    try std.testing.expect(std.mem.find(u8, defaulted, "query") != null);
 }
 
 test "native web_search labels preserve bounded query and domain filters" {

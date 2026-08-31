@@ -44,7 +44,7 @@ export function writeReport(manifest: RenderLabManifest): void {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Fx Render Lab - ${escapeHtml(manifest.scenario)}</title>
+<title>fx Render Lab - ${escapeHtml(manifest.scenario)}</title>
 <style>
 :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
 body { margin: 0; background: #101214; color: #e9eef2; }
@@ -79,7 +79,7 @@ th { background: #15191d; color: #c8d2dc; }
 </head>
 <body>
 <header>
-<h1>Fx Render Lab: ${escapeHtml(manifest.scenario)}</h1>
+<h1>fx Render Lab: ${escapeHtml(manifest.scenario)}</h1>
 <div class="meta">
 <div>Run: ${escapeHtml(manifest.runId)}</div>
 <div>Binary: ${escapeHtml(manifest.binaryPath)} (${escapeHtml(manifest.binarySha256.slice(0, 12))})</div>

@@ -269,20 +269,35 @@ pub fn encodeFrame(alloc: Allocator, envelope: Envelope) ![]u8 {
     return try out.toOwnedSlice();
 }
 
+inline fn failEnvelope(err: anytype) @TypeOf(err)!Envelope {
+    return @errorCast(failEnvelopeDynamic(err));
+}
+
+noinline fn failEnvelopeDynamic(err: anyerror) anyerror!Envelope {
+    return err;
+}
+
+test "session envelope failures preserve exact error types and identities" {
+    const invalid = failEnvelope(error.InvalidEventFrame);
+    try std.testing.expect(@TypeOf(invalid) == error{InvalidEventFrame}!Envelope);
+    try std.testing.expectError(error.InvalidEventFrame, invalid);
+    try std.testing.expectError(error.OutOfMemory, failEnvelope(error.OutOfMemory));
+}
+
 pub fn decodeFrame(alloc: Allocator, line: []const u8) !Envelope {
-    if (line.len > event_frame_max_bytes) return error.EventFrameTooLarge;
+    if (line.len > event_frame_max_bytes) return failEnvelope(error.EventFrameTooLarge);
     if (line.len == 0 or line[line.len - 1] != '\n') {
-        return error.InvalidEventFrame;
+        return failEnvelope(error.InvalidEventFrame);
     }
     if (std.mem.indexOfScalar(u8, line[0 .. line.len - 1], '\n') != null) {
-        return error.InvalidEventFrame;
+        return failEnvelope(error.InvalidEventFrame);
     }
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, line[0 .. line.len - 1], .{
         .parse_numbers = false,
     }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidEventFrame,
+        error.OutOfMemory => return failEnvelope(error.OutOfMemory),
+        else => return failEnvelope(error.InvalidEventFrame),
     };
     defer parsed.deinit();
     const root = try exactObject(parsed.value, &.{
@@ -294,15 +309,15 @@ pub fn decodeFrame(alloc: Allocator, line: []const u8) !Envelope {
         "kind",
         "payload",
     });
-    if (try requireU64(root, "schema_version") != 1) return error.UnsupportedEventSchema;
+    if (try requireU64(root, "schema_version") != 1) return failEnvelope(error.UnsupportedEventSchema);
     const kind = std.meta.stringToEnum(Kind, try requireString(root, "kind")) orelse
-        return error.InvalidEventFrame;
+        return failEnvelope(error.InvalidEventFrame);
     var envelope = Envelope{
         .log_generation = try parseIdentifier(try requireString(root, "log_generation")),
         .seq = try requireU64(root, "seq"),
         .event_id = try parseIdentifier(try requireString(root, "event_id")),
         .timestamp_ms = try requireI64(root, "timestamp_ms"),
-        .event = try parsePayload(alloc, kind, root.get("payload") orelse return error.InvalidEventFrame),
+        .event = try parsePayload(alloc, kind, root.get("payload") orelse return failEnvelope(error.InvalidEventFrame)),
     };
     errdefer envelope.deinit(alloc);
     try validateEnvelope(envelope);
@@ -433,6 +448,23 @@ pub fn applyEventFrame(
     return reductionBoundary(envelope, frame_bytes);
 }
 
+inline fn failReduction(err: anytype) @TypeOf(err)!Reduction {
+    return @errorCast(failReductionDynamic(err));
+}
+
+noinline fn failReductionDynamic(err: anyerror) anyerror!Reduction {
+    return err;
+}
+
+test "session event reduction failures preserve exact error types and identities" {
+    const invalid = failReduction(error.InvalidReductionStart);
+    try std.testing.expect(
+        @TypeOf(invalid) == error{InvalidReductionStart}!Reduction,
+    );
+    try std.testing.expectError(error.InvalidReductionStart, invalid);
+    try std.testing.expectError(error.MissingSessionStarted, failReduction(error.MissingSessionStarted));
+}
+
 pub fn reduceJsonlFrom(
     alloc: Allocator,
     source: *std.Io.Reader,
@@ -444,7 +476,7 @@ pub fn reduceJsonlFrom(
     if (start.next_seq == 0 or
         (state == null and (start.generation != null or start.next_seq != 1)))
     {
-        return error.InvalidReductionStart;
+        return failReduction(error.InvalidReductionStart);
     }
     var validator = SequenceValidator{
         .generation = start.generation,
@@ -467,7 +499,7 @@ pub fn reduceJsonlFrom(
         try validator.validate(envelope);
 
         if (envelope.kind() == .state_replacement_started) {
-            if (state == null) return error.InvalidReplacement;
+            if (state == null) return failReduction(error.InvalidReplacement);
             const replacement = try reduceReplacement(
                 alloc,
                 source,
@@ -493,14 +525,14 @@ pub fn reduceJsonlFrom(
         if (envelope.kind() == .state_replacement_chunk or
             envelope.kind() == .state_replacement_committed)
         {
-            return error.InvalidReplacement;
+            return failReduction(error.InvalidReplacement);
         }
         try applyDelta(alloc, &state, envelope);
         through = reductionBoundary(envelope, byte_offset);
     }
 
     return .{
-        .state = state orelse return error.MissingSessionStarted,
+        .state = state orelse return failReduction(error.MissingSessionStarted),
         .through = through,
         .bytes_consumed = byte_offset,
     };

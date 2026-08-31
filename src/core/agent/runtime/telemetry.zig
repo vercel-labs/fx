@@ -171,6 +171,8 @@ pub const TurnSummaryAccumulator = struct {
         const now_ms = io_mod.milliTimestamp();
         const elapsed = if (now_ms > self.turn_started_at_ms) now_ms - self.turn_started_at_ms else 0;
         return .{
+            .started_at_ms = self.turn_started_at_ms,
+            .completed_at_ms = now_ms,
             .thinking_duration_ms = self.thinking_duration_ms,
             .turn_duration_ms = @intCast(elapsed),
             .token_progress = self.tokenProgress(),
@@ -320,7 +322,6 @@ pub fn traceGatewayProviderOptions(ctx: TraceContext, model: []const u8, fast_mo
 pub fn toolExecutionResultKind(result: ToolExecutionResult) []const u8 {
     if (result.status == .failure) return "error";
     if (result.diff_entry != null) return "diff";
-    if (result.display_output != null) return "display";
     return "model_output";
 }
 

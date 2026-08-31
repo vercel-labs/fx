@@ -4,6 +4,7 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const model_provider = @import("../config/model_provider.zig");
+const model_capabilities = @import("../config/model_capabilities.zig");
 const provider_set = @import("../gateway/provider_set.zig");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -21,6 +22,7 @@ const context_contract = @import("../workspace/context_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
 const execution_memory = @import("../agent/execution_memory.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session_codec = @import("../session/session_codec.zig");
 const types = @import("../shared/types.zig");
@@ -31,6 +33,12 @@ const parent_delivery_projector = @import("parent_delivery_projector.zig");
 const tool_host = @import("tool_host.zig");
 
 const Allocator = std.mem.Allocator;
+
+fn childModelCapabilityResolver(
+    parent: ?model_capabilities.Resolver,
+) ?model_capabilities.Resolver {
+    return parent;
+}
 
 pub const Config = struct {
     host: *tool_host.Runtime,
@@ -54,6 +62,7 @@ const Context = struct {
     turn: *execution.TurnContext,
     admission: domain.AdmissionSnapshot,
     cancel: *std.atomic.Value(bool),
+    subagent_id: u64,
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
     turn_outcome: ?types.TurnPresentationOutcome = null,
@@ -89,12 +98,15 @@ const Context = struct {
         result.on_web_search_progress = null;
         result.web_fetch_progress_ctx = null;
         result.on_web_fetch_progress = null;
-        result.model_capability_resolver = null;
+        result.model_capability_resolver = childModelCapabilityResolver(
+            result.model_capability_resolver,
+        );
         result.lifecycle_view = self.config.lifecycle_view;
         result.lifecycle_scope = .{
             .kind = .subagent,
             .workspace_root = result.workspace_root,
             .session_id = self.turn.child_id,
+            .subagent_id = self.subagent_id,
         };
         return result;
     }
@@ -168,17 +180,22 @@ pub fn run(
         routed_config.tool_context.web_search_backend = null;
         routed_config.tool_context.web_search_runtime_ready = false;
     }
+    const trace_context = debug_trace.TraceContext{
+        .turn_id = debug_trace.nextTurnId(),
+        .subagent_id = debug_trace.nextSubagentId(),
+    };
     var context = Context{
         .config = routed_config,
         .turn = turn,
         .admission = admission,
         .cancel = cancel,
+        .subagent_id = trace_context.subagent_id,
     };
     const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
     const recovery_checkpoint = turn.snapshotRecoveryCheckpoint(arena) catch
         return error.OutOfMemory;
     const prompt = worker_runtime.QueuedPrompt{
-        .turn_id = 1,
+        .turn_id = trace_context.turn_id,
         .prompt = arena.dupe(u8, message.content) catch return error.OutOfMemory,
         .images = &.{},
         .model = arena.dupe(u8, admission.model) catch return error.OutOfMemory,
@@ -209,6 +226,17 @@ pub fn run(
         .recovery_checkpoint = recovery_checkpoint,
         .recovery_source_already_presented = recovery_checkpoint != null,
     };
+    debug_trace.eventf(
+        "subagent",
+        "trace_identity",
+        trace_context,
+        "child_id={s} parent_id={s} work_id={s}",
+        .{
+            turn.child_id orelse "unknown",
+            admission.parent_id,
+            turn.active_work_id orelse "unknown",
+        },
+    );
     const deps = runtimeDeps(&context);
     execution.runNormalAgentTurn(
         &deps,
@@ -219,6 +247,7 @@ pub fn run(
                 .kind = .subagent,
                 .workspace_root = config.tool_context.workspace_root,
                 .session_id = turn.child_id,
+                .subagent_id = trace_context.subagent_id,
             },
             .outcome_allocator = turn.alloc,
         },
@@ -246,6 +275,7 @@ pub fn run(
             .root_user_messages = message.root_user_messages,
             .root_user_evidence_complete = message.root_user_evidence_complete,
             .session_child_capability = turn.childCapability() catch null,
+            .subagent_id = trace_context.subagent_id,
             .context_limits = config.tool_context.context_limits,
         },
         prompt,
@@ -272,6 +302,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .context_registry = context.config.context_registry,
         .context_enabled = context.config.context_enabled,
         .finalize_turn = finalizeTurn,
+        .release_agent_terminal_lease = releaseAgentTerminalLease,
         .live_tool_authority = context.turn.liveToolAuthorityProvider(),
         .tool_activity_recorder = context.turn.toolActivityRecorder(),
         .prepare_parent_turn_context = prepareParentTurnContext,
@@ -308,6 +339,11 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .usage = &context.turn.sessionRuntime().usage,
         .usage_allocator = context.turn.alloc,
     };
+}
+
+fn releaseAgentTerminalLease(raw: *anyopaque, session_id: []const u8) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return tool_runtime.release_agent_terminal_lease(context.toolContext(), session_id);
 }
 
 fn refreshGatewayCredential(
@@ -456,6 +492,27 @@ test "subagent model catalog counts only tools in the captured MCP view" {
     try std.testing.expectEqualStrings("chrome-devtools", snapshot.servers[0].name);
     try std.testing.expectEqual(model_catalog.Availability.ready, snapshot.servers[0].availability);
     try std.testing.expectEqual(@as(?usize, 2), snapshot.servers[0].tool_count);
+}
+
+test "subagent inherits model capabilities" {
+    const ResolverFixture = struct {
+        fn resolve(
+            _: *anyopaque,
+            _: Allocator,
+            _: []const u8,
+        ) model_capabilities.ResolveError!model_capabilities.Capabilities {
+            return .{};
+        }
+    };
+    var resolver_context: u8 = 0;
+    const resolver = model_capabilities.Resolver{
+        .ctx = &resolver_context,
+        .resolve_fn = ResolverFixture.resolve,
+    };
+    const inherited = childModelCapabilityResolver(resolver);
+    try std.testing.expect(inherited != null);
+    try std.testing.expectEqual(resolver.ctx, inherited.?.ctx);
+    try std.testing.expectEqual(resolver.resolve_fn, inherited.?.resolve_fn);
 }
 
 fn validateToolCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !agent_runtime.ToolCallValidationResult {

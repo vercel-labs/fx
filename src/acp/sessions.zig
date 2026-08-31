@@ -12,6 +12,10 @@ const session_store = @import("../core/session/session_store.zig");
 const js_host_session_store = @import("../core/session/js_host_session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
+const mcp_contract = @import("../core/mcp/mcp_contract.zig");
+const project_config = @import("../core/mcp/project_config.zig");
+const workspace_config = @import("../core/mcp/workspace_config.zig");
+const config_runtime = @import("../core/config/config_runtime.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
 const host = @import("../core/hosts/host.zig");
@@ -141,6 +145,8 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
             .message = "MCP servers are unavailable in this runtime",
         });
     }
+    if (state.cfg.allow_acp_mcp) try appendProjectMcpConfigs(state, alloc, &mcp_configs);
+    retireReducedActiveMcp(state, alloc, mcp_configs.items.items);
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
         &mcp_configs,
@@ -456,6 +462,17 @@ fn handleRestoreSession(
         }),
     };
     defer mcp_configs.deinit(alloc);
+    if (!state.cfg.allow_acp_mcp) {
+        if (mcp_configs.items.items.len > 0) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "MCP servers are unavailable in this runtime",
+            });
+        }
+    } else {
+        try appendProjectMcpConfigs(state, alloc, &mcp_configs);
+    }
+    retireReducedActiveMcp(state, alloc, mcp_configs.items.items);
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
         &mcp_configs,
@@ -642,6 +659,90 @@ fn handleRestoreSession(
         alloc,
         msg,
         state.active_session.?.model,
+    );
+}
+
+fn detachActiveMcpForAuthorityReduction(
+    state: *server.ServerState,
+    active: *server.ActiveSessionState,
+) *mcp_runtime.McpRuntime {
+    server.cancelAndReapActivePrompt(state);
+    server.disableSubagentHost(state);
+    state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+    const previous = active.mcp.?;
+    active.mcp = null;
+    state.subagent_authority_mutex.unlock(io_mod.getIo());
+    return previous;
+}
+
+fn retireReducedActiveMcp(
+    state: *server.ServerState,
+    alloc: Allocator,
+    next_configs: []const mcp_contract.McpServerConfig,
+) void {
+    const active = if (state.active_session) |*value| value else return;
+    const runtime = active.mcp orelse return;
+    if (!runtime.workspaceAuthorityReducedAgainstConfigs(
+        next_configs,
+        .acp_startup,
+    )) return;
+    const previous = detachActiveMcpForAuthorityReduction(state, active);
+    previous.retireAndWait();
+    previous.deinit();
+    alloc.destroy(previous);
+    server.enableSubagentHost(state);
+}
+
+fn appendProjectMcpConfigs(
+    state: *server.ServerState,
+    alloc: Allocator,
+    configs: *mcp_servers.OwnedServerConfigs,
+) !void {
+    var choices = if (state.cfg.home_override) |home|
+        config_runtime.loadProjectMcpChoicesFromHome(alloc, home, state.workspace_root) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            debug_trace.logf("mcp", "ACP workspace MCP choices unavailable err={s}", .{@errorName(err)});
+            return;
+        }
+    else
+        config_runtime.loadProjectMcpChoices(alloc, state.workspace_root) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            debug_trace.logf("mcp", "ACP workspace MCP choices unavailable err={s}", .{@errorName(err)});
+            return;
+        };
+    defer choices.deinit(alloc);
+
+    var workspace = try workspace_config.load(
+        alloc,
+        state.workspace_root,
+        .workspace,
+        choices.choices,
+    );
+    defer workspace.deinit(alloc);
+    for (workspace.diagnostics.items) |diagnostic| {
+        var name_buf: [256]u8 = undefined;
+        var variable_buf: [160]u8 = undefined;
+        debug_trace.logf(
+            "mcp",
+            "ACP workspace MCP config skipped cause={s} server={s} field={s} variable={s}",
+            .{
+                @tagName(diagnostic.cause),
+                if (diagnostic.server_name) |name|
+                    debug_trace.terminalPreview(name_buf[0..], name)
+                else
+                    "none",
+                if (diagnostic.environment_field) |field| @tagName(field) else "none",
+                if (diagnostic.environment_variable) |name|
+                    debug_trace.terminalPreview(variable_buf[0..], name)
+                else
+                    "none",
+            },
+        );
+    }
+    try project_config.appendWorkspaceAfterAcpPrimary(
+        alloc,
+        &configs.items,
+        &workspace.configs,
     );
 }
 
@@ -896,43 +997,136 @@ fn handleLoadFailure(
 }
 
 pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
-    var store = session_store.Store.initReadOnly(
-        alloc,
-        state.workspace_root,
-    ) catch {
+    var params_arena = std.heap.ArenaAllocator.init(alloc);
+    defer params_arena.deinit();
+    const params = parseListSessionsParams(params_arena.allocator(), msg) catch
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Invalid params",
+        });
+    var store = (if (state.cfg.home_override) |home|
+        session_store.Store.initReadOnlyFromHome(alloc, home, params.cwd orelse state.workspace_root)
+    else
+        session_store.Store.initReadOnly(alloc, params.cwd orelse state.workspace_root)) catch {
         try state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
         return;
     };
     defer store.deinit(alloc);
 
-    var session_list = store.listForWorkspace(alloc) catch {
+    var page = store.listSessionPage(
+        alloc,
+        if (params.cwd != null) .current_workspace else .all_workspaces,
+        params.continuation,
+        session_store.session_list_default_limit,
+    ) catch {
         try state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
         return;
     };
-    defer {
-        for (session_list.items) |*s| s.deinit(alloc);
-        session_list.deinit(alloc);
-    }
+    defer page.deinit(alloc);
+    var next_cursor_buf: [320]u8 = undefined;
+    const next_cursor = if (page.has_more and page.summaries.items.len > 0)
+        try std.fmt.bufPrint(&next_cursor_buf, "v1:{d}:{s}", .{
+            page.summaries.items[page.summaries.items.len - 1].updated_at_ms,
+            page.summaries.items[page.summaries.items.len - 1].id,
+        })
+    else
+        null;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
     try out.writer.writeAll("{\"sessions\":[");
-    for (session_list.items, 0..) |summary, i| {
-        if (i > 0) try out.writer.writeAll(",");
+    var wrote_session = false;
+    for (page.summaries.items) |summary| {
+        const workspace_root = summary.workspace_root orelse {
+            debug_trace.logf(
+                "acp",
+                "session operation=list outcome=omitted id={s} reason=workspace_unknown",
+                .{summary.id},
+            );
+            continue;
+        };
+        if (!std.fs.path.isAbsolute(workspace_root)) {
+            debug_trace.logf(
+                "acp",
+                "session operation=list outcome=omitted id={s} reason=workspace_not_absolute",
+                .{summary.id},
+            );
+            continue;
+        }
+        if (wrote_session) try out.writer.writeAll(",");
+        wrote_session = true;
         try out.writer.writeAll("{\"sessionId\":");
         try writeJsonStr(summary.id, &out.writer);
         try out.writer.writeAll(",\"cwd\":");
-        try writeJsonStr(state.workspace_root, &out.writer);
+        try writeJsonStr(workspace_root, &out.writer);
+        if (summary.title) |title| {
+            try out.writer.writeAll(",\"title\":");
+            try writeJsonStr(title, &out.writer);
+        }
         try out.writer.writeAll(",\"updatedAt\":");
         const iso = try formatIso8601(alloc, summary.updated_at_ms);
         defer alloc.free(iso);
         try writeJsonStr(iso, &out.writer);
         try out.writer.writeAll("}");
     }
-    try out.writer.writeAll("]}");
+    try out.writer.writeAll("]");
+    if (next_cursor) |cursor| {
+        try out.writer.writeAll(",\"nextCursor\":");
+        try writeJsonStr(cursor, &out.writer);
+    }
+    try out.writer.writeAll("}");
 
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+}
+
+const ListSessionsParams = struct {
+    cwd: ?[]const u8 = null,
+    continuation: ?session_store.ResumableSessionContinuation = null,
+};
+
+fn parseListSessionsParams(
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+) !ListSessionsParams {
+    const raw = msg.params_raw orelse return .{};
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch
+        return error.InvalidParams;
+    if (parsed.value != .object) return error.InvalidParams;
+    var result = ListSessionsParams{};
+    if (parsed.value.object.get("cwd")) |cwd| {
+        if (cwd != .null) {
+            if (cwd != .string or !std.fs.path.isAbsolute(cwd.string)) {
+                return error.InvalidParams;
+            }
+            result.cwd = cwd.string;
+        }
+    }
+    if (parsed.value.object.get("cursor")) |cursor| {
+        if (cursor != .null) {
+            if (cursor != .string) return error.InvalidParams;
+            result.continuation = parseListCursor(cursor.string) catch
+                return error.InvalidParams;
+        }
+    }
+    return result;
+}
+
+fn parseListCursor(raw: []const u8) !session_store.ResumableSessionContinuation {
+    if (raw.len == 0 or raw.len > 320) return error.InvalidParams;
+    var fields = std.mem.splitScalar(u8, raw, ':');
+    if (!std.mem.eql(u8, fields.next() orelse return error.InvalidParams, "v1")) {
+        return error.InvalidParams;
+    }
+    const updated_at_ms = std.fmt.parseInt(
+        i64,
+        fields.next() orelse return error.InvalidParams,
+        10,
+    ) catch return error.InvalidParams;
+    const id = fields.next() orelse return error.InvalidParams;
+    if (updated_at_ms < 0 or fields.next() != null) return error.InvalidParams;
+    session_store.validateSessionId(id) catch return error.InvalidParams;
+    return .{ .updated_at_ms = updated_at_ms, .id = id };
 }
 
 fn sendHistoryTurnAsUpdates(state: *server.ServerState, alloc: Allocator, session_id: []const u8, turn: types.HistoryTurn) !void {
@@ -1499,6 +1693,180 @@ fn initAcpSessionTestState(
         .agent_step_limit = 8,
         .max_tool_result_bytes = 64 * 1024,
     };
+}
+
+test "ACP project MCP loading expands workspace environment templates" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "workspace/.mcp.json",
+        .data =
+        \\{"mcpServers":{"expanded":{"command":"${ACP_MCP_COMMAND}","args":["${ACP_MCP_ARG:-fallback}"],"env":{"TOKEN":"${ACP_MCP_TOKEN}"}}}}
+        ,
+    });
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "workspace",
+    );
+    defer alloc.free(workspace_path);
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+    try test_home.map.put("ACP_MCP_COMMAND", "node");
+    try test_home.map.put("ACP_MCP_TOKEN", "secret-value");
+    var approved_names = [_][]u8{@constCast("expanded")};
+
+    var result = try workspace_config.load(
+        alloc,
+        workspace_path,
+        .workspace,
+        .{ .approved = &approved_names },
+    );
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
+    const config = result.configs.items[0];
+    try std.testing.expectEqualStrings("node", config.command.?);
+    try std.testing.expectEqualStrings("fallback", config.args[0]);
+    try std.testing.expectEqualStrings("secret-value", config.env[0].value);
+}
+
+test "ACP host-disabled new load and resume skip project MCP effects" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "workspace",
+    );
+    defer alloc.free(workspace_path);
+    const marker_path = try std.fs.path.join(
+        alloc,
+        &.{ workspace_path, "project-mcp-launched" },
+    );
+    defer alloc.free(marker_path);
+    const project_json = try std.fmt.allocPrint(
+        alloc,
+        "{{\"mcpServers\":{{\"fixture\":{{\"command\":\"/bin/sh\",\"args\":[\"-c\",\"printf launched > {s}\"]}},\"remote\":{{\"type\":\"http\",\"url\":\"http://127.0.0.1:1/mcp\",\"startup_timeout_ms\":5000}}}}}}",
+        .{marker_path},
+    );
+    defer alloc.free(project_json);
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "workspace/.mcp.json",
+        .data = project_json,
+    });
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "home/.fx/settings.json",
+        .data = "{}",
+    });
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+
+    var capture = try tmp.dir.createFile(
+        io_mod.getIo(),
+        "acp-host-disabled.jsonl",
+        .{ .read = true },
+    );
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.cfg.allow_acp_mcp = false;
+
+    var new_msg = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/new",
+        .params_raw = "{\"mcpServers\":[]}",
+    };
+    try handleNewSession(&state, arena, &new_msg);
+    try std.testing.expect(state.active_session.?.mcp == null);
+    const session_id = try alloc.dupe(u8, state.active_session.?.session_id);
+    defer alloc.free(session_id);
+
+    inline for (.{
+        .{ .method = "session/load", .handler = handleLoadSession },
+        .{ .method = "session/resume", .handler = handleResumeSession },
+    }, 0..) |restore, index| {
+        const params = try std.fmt.allocPrint(
+            arena,
+            "{{\"sessionId\":\"{s}\",\"mcpServers\":[]}}",
+            .{session_id},
+        );
+        var msg = jsonrpc.Message{
+            .id = .{ .integer = @intCast(index + 2) },
+            .method = restore.method,
+            .params_raw = params,
+        };
+        try restore.handler(&state, arena, &msg);
+        try std.testing.expect(state.active_session.?.mcp == null);
+    }
+
+    const local_request = try std.fmt.allocPrint(
+        arena,
+        "{{\"name\":\"request-local\",\"command\":\"/bin/sh\",\"args\":[\"-c\",\"printf launched > {s}\"],\"env\":[]}}",
+        .{marker_path},
+    );
+    const remote_request =
+        "{\"type\":\"http\",\"name\":\"request-remote\",\"url\":\"http://127.0.0.1:1/mcp\",\"headers\":[]}";
+    inline for (.{
+        .{ .method = "session/new", .handler = handleNewSession, .server = local_request },
+        .{ .method = "session/load", .handler = handleLoadSession, .server = remote_request },
+        .{ .method = "session/resume", .handler = handleResumeSession, .server = local_request },
+    }, 0..) |request, index| {
+        const params = if (std.mem.eql(u8, request.method, "session/new"))
+            try std.fmt.allocPrint(
+                arena,
+                "{{\"mcpServers\":[{s}]}}",
+                .{request.server},
+            )
+        else
+            try std.fmt.allocPrint(
+                arena,
+                "{{\"sessionId\":\"{s}\",\"mcpServers\":[{s}]}}",
+                .{ session_id, request.server },
+            );
+        var msg = jsonrpc.Message{
+            .id = .{ .integer = @intCast(index + 10) },
+            .method = request.method,
+            .params_raw = params,
+        };
+        try request.handler(&state, arena, &msg);
+        try std.testing.expect(state.active_session.?.mcp == null);
+        try std.testing.expectEqualStrings(
+            session_id,
+            state.active_session.?.session_id,
+        );
+    }
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.openFile(io_mod.getIo(), "workspace/project-mcp-launched", .{}),
+    );
+    try capture.sync(io_mod.getIo());
+    var captured_file = try tmp.dir.openFile(
+        io_mod.getIo(),
+        "acp-host-disabled.jsonl",
+        .{},
+    );
+    defer captured_file.close(io_mod.getIo());
+    const captured = try io_mod.readFileToEnd(alloc, &captured_file, 64 * 1024);
+    defer alloc.free(captured);
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        std.mem.count(u8, captured, "MCP servers are unavailable in this runtime"),
+    );
 }
 
 test "ACP new and loaded sessions provide a writable subagent host" {

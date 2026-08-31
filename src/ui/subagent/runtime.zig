@@ -6,6 +6,7 @@ const types = @import("../../core/shared/types.zig");
 const domain = @import("../../core/subagent/domain.zig");
 const execution = @import("../../core/subagent/execution.zig");
 const diff_mod = @import("../../core/output/diff.zig");
+const full_transcript_page = @import("../../core/output/full_transcript_page.zig");
 const transcript_presentation = @import("../../core/output/transcript_presentation.zig");
 const worker_runtime = @import("../../core/agent/worker_runtime.zig");
 const io_mod = @import("../../core/shared/io.zig");
@@ -824,7 +825,7 @@ pub const ChildPresentationView = struct {
 const ChildViewportBookmark = struct {
     rows_from_bottom: usize,
     prior_total_rows: ?usize,
-    full_transcript: ?transcript_presentation.Snapshot,
+    full_transcript: ?transcript_runtime.TranscriptRuntime.FullTranscriptViewportSnapshot,
 };
 
 const ChildDraft = struct {
@@ -966,11 +967,15 @@ pub const Runtime = struct {
         return self.main_approval_presented;
     }
 
-    pub fn mainApprovalBinding(self: *const Runtime, prompt_id: u64) ?MainApprovalBinding {
-        if (!self.main_approval_presented) return null;
+    pub fn mainApprovalCardBinding(self: *const Runtime, prompt_id: u64) ?MainApprovalBinding {
         const card = self.main_approval_card orelse return null;
         if (card.prompt_id != prompt_id) return null;
         return .{ .child_id = card.child_id, .approval_id = card.approval_id };
+    }
+
+    pub fn mainApprovalBinding(self: *const Runtime, prompt_id: u64) ?MainApprovalBinding {
+        if (!self.main_approval_presented) return null;
+        return self.mainApprovalCardBinding(prompt_id);
     }
 
     pub fn dismissMainApproval(self: *Runtime) void {
@@ -1944,6 +1949,11 @@ pub const Runtime = struct {
             _ = try runtime.setTranscriptPresentationDepth(alloc, requested);
         }
         self.child.presentation_transcript_depth = requested;
+        if (requested == .inline_mode) {
+            if (self.selected_child_viewport) |*viewport| {
+                viewport.full_transcript = null;
+            }
+        }
         return requested;
     }
 
@@ -1957,6 +1967,9 @@ pub const Runtime = struct {
             _ = try runtime.setTranscriptPresentationDepth(alloc, .inline_mode);
         }
         self.child.presentation_transcript_depth = .inline_mode;
+        if (self.selected_child_viewport) |*viewport| {
+            viewport.full_transcript = null;
+        }
         return true;
     }
 
@@ -2006,9 +2019,17 @@ pub const Runtime = struct {
         errdefer if (live_work_id) |work_id| alloc.free(work_id);
         const full_transcript_bookmark = self.selectedChildFullTranscriptBookmark();
         if (full_transcript_bookmark) |bookmark| {
+            debug_trace.logf(
+                "subagent",
+                "child_full_viewport_restore depth={s} scroll_rows={d} follow_tail={}",
+                .{
+                    @tagName(bookmark.presentation.depth),
+                    bookmark.presentation.scroll_rows,
+                    bookmark.presentation.follow_tail,
+                },
+            );
             runtime.restoreFullTranscriptViewport(bookmark);
-            self.child.presentation_transcript_depth = bookmark.depth;
-            self.selected_child_viewport.?.full_transcript = null;
+            self.child.presentation_transcript_depth = bookmark.presentation.depth;
         } else if (runtime.transcriptPresentationDepth() !=
             self.child.presentation_transcript_depth)
         {
@@ -3834,19 +3855,31 @@ pub const Runtime = struct {
         const child_id = self.childRouteId() orelse return;
         const selected_id = self.selected_id orelse return;
         if (!std.mem.eql(u8, selected_id, child_id)) return;
+        const full_transcript = if (self.child.presentation) |*runtime|
+            runtime.snapshotFullTranscriptViewport()
+        else
+            null;
+        if (full_transcript) |bookmark| {
+            debug_trace.logf(
+                "subagent",
+                "child_full_viewport_remember depth={s} scroll_rows={d} follow_tail={}",
+                .{
+                    @tagName(bookmark.presentation.depth),
+                    bookmark.presentation.scroll_rows,
+                    bookmark.presentation.follow_tail,
+                },
+            );
+        }
         self.selected_child_viewport = .{
             .rows_from_bottom = self.child.scroll_from_bottom,
             .prior_total_rows = self.child.rendered_chat_rows,
-            .full_transcript = if (self.child.presentation) |*runtime|
-                runtime.snapshotFullTranscriptViewport()
-            else
-                null,
+            .full_transcript = full_transcript,
         };
     }
 
     fn selectedChildFullTranscriptBookmark(
         self: *const Runtime,
-    ) ?transcript_presentation.Snapshot {
+    ) ?transcript_runtime.TranscriptRuntime.FullTranscriptViewportSnapshot {
         const child_id = self.childRouteId() orelse return null;
         const selected_id = self.selected_id orelse return null;
         if (!std.mem.eql(u8, selected_id, child_id)) return null;
@@ -4997,7 +5030,7 @@ fn paintActions(
     try writeLine(alloc, writer, cols, row, limit, "R Retry queued external work or resume interrupted work");
     switch (projection.cancellationCapability(node.state, node.external_busy)) {
         .available => try writeLine(alloc, writer, cols, row, limit, "C Cancel active/queued work; preserve persistent chat and return idle"),
-        .external_owner => try writeLine(alloc, writer, cols, row, limit, "Cancel unavailable: another Fx process owns this child."),
+        .external_owner => try writeLine(alloc, writer, cols, row, limit, "Cancel unavailable: another fx process owns this child."),
         .inactive => try writeLine(alloc, writer, cols, row, limit, "Cancel unavailable: this child has no active or queued work."),
     }
     try writeLine(alloc, writer, cols, row, limit, "X Close and archive chat (separate from navigation)");
@@ -7004,7 +7037,7 @@ test "external owner makes manager cancellation unavailable" {
     );
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "Current state: external busy") != null);
-    try std.testing.expect(std.mem.find(u8, rendered, "another Fx process owns this child") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "another fx process owns this child") != null);
     try std.testing.expect(std.mem.find(u8, rendered, "C cancel") == null);
     try std.testing.expectEqual(Command.none, try runtime.handleByte(alloc, 'c', null));
     try std.testing.expect(runtime.lifecycle_action == null);
@@ -8002,8 +8035,8 @@ test "child transcript depth survives transient presentation rebuilds" {
         try runtime.handle(alloc, .enter),
     );
     try std.testing.expectEqual(
-        transcript_presentation.Depth.review,
-        try runtime.setChildTranscriptPresentationDepth(alloc, .review),
+        transcript_presentation.Depth.full,
+        try runtime.setChildTranscriptPresentationDepth(alloc, .full),
     );
     try std.testing.expect(runtime.childFullTranscriptRequested());
     try std.testing.expect(runtime.childConversationRuntime() == null);
@@ -8071,6 +8104,49 @@ test "child transcript depth survives transient presentation rebuilds" {
     );
     runtime.child.clear(alloc);
     try std.testing.expect(!runtime.childFullTranscriptRequested());
+}
+
+test "child full transcript viewport survives manager close and reopen" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime{};
+    defer runtime.deinit(alloc);
+
+    try std.testing.expect(try runtime.replaceSnapshot(
+        alloc,
+        try testSnapshot(alloc, 1, &.{"child"}),
+    ));
+    try std.testing.expectEqual(Command.child_changed, try runtime.handle(alloc, .enter));
+
+    var first: transcript_runtime.TranscriptRuntime = .{};
+    first.layout.cols = 80;
+    try runtime.installChildConversationRuntime(alloc, first, .empty, null, 1);
+    _ = try runtime.setChildTranscriptPresentationDepth(alloc, .full);
+    const child = runtime.childConversationRuntime().?;
+    child.full_transcript.scroll_rows = 37;
+    child.full_transcript.follow_tail = false;
+    child.full_transcript_page_anchor = .{ .entry_index = 17 };
+
+    runtime.resetForOpen(alloc);
+    try std.testing.expectEqual(Command.child_changed, try runtime.handle(alloc, .enter));
+
+    var restored: transcript_runtime.TranscriptRuntime = .{};
+    restored.layout.cols = 80;
+    try runtime.installChildConversationRuntime(alloc, restored, .empty, null, 1);
+    const reopened = runtime.childConversationRuntime().?;
+    try std.testing.expectEqual(@as(u32, 37), reopened.full_transcript.scroll_rows);
+    try std.testing.expect(!reopened.full_transcript.follow_tail);
+    try std.testing.expect(std.meta.eql(
+        @as(full_transcript_page.Anchor, .{ .entry_index = 17 }),
+        reopened.full_transcript_page_anchor,
+    ));
+
+    runtime.child.clearPresentation(alloc);
+    var rebuilt: transcript_runtime.TranscriptRuntime = .{};
+    rebuilt.layout.cols = 80;
+    try runtime.installChildConversationRuntime(alloc, rebuilt, .empty, null, 1);
+    const after_rebuild = runtime.childConversationRuntime().?;
+    try std.testing.expectEqual(@as(u32, 37), after_rebuild.full_transcript.scroll_rows);
+    try std.testing.expect(!after_rebuild.full_transcript.follow_tail);
 }
 
 test "child paste is bounded UTF-8 safe atomic and retry stable" {

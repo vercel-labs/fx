@@ -177,10 +177,8 @@ describe("agent quality baseline matrix", () => {
     const largeOutput = matrixRowById("large-output-retained");
 
     expect(slashCommand?.expectedFirstTool.tools).toEqual([
-      "list_files",
       "glob_files",
       "grep_files",
-      "semantic_search",
       "read_file",
     ]);
     expect(slashCommand?.targetResult).toContain(
@@ -209,7 +207,7 @@ describe("agent quality baseline matrix", () => {
       "web_search",
     ]);
 
-    expect(mcpConcept?.expectedFirstTool.tools).toContain("semantic_search");
+    expect(mcpConcept?.expectedFirstTool.tools).toContain("glob_files");
     expect(mcpConcept?.targetResult).toContain("local inspection");
 
     expect(largeOutput?.failureCategory).toBe("large output");
@@ -266,9 +264,15 @@ describe("agent quality baseline matrix", () => {
     expect(ghBlockerRow?.forbiddenTools).toContain("ask_user_question");
 
     expect(firstToolMatchesExpectation(destructiveRow!, { name: "ask_user_question" })).toBe(true);
-    expect(firstToolMatchesExpectation(destructiveRow!, { name: "delete_file" })).toBe(false);
-    expect(forbiddenToolsUsed(destructiveRow!, [{ name: "delete_file" }])).toEqual([
-      "delete_file",
+    expect(firstToolMatchesExpectation(destructiveRow!, {
+      name: "terminal",
+      command_result: { command: "rm -rf logs" },
+    })).toBe(false);
+    expect(forbiddenToolsUsed(destructiveRow!, [{
+      name: "terminal",
+      command_result: { command: "rm -rf logs" },
+    }])).toEqual([
+      "terminal",
     ]);
     expect(destructiveRow?.targetResult).toContain("precise multiple-choice question");
 

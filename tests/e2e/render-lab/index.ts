@@ -512,10 +512,9 @@ async function runActiveToolPlacement(
 
     await session.sendKeys("C-o");
     await session.waitForPane(
-      (pane) => pane.includes("┃ Review · ←/→ switch · ctrl o close"),
+      (pane) => pane.includes("┃ Full detail · ctrl o close"),
       10_000,
     );
-    await session.sendKeys("Right");
     await captureMatching(
       context,
       session,
@@ -538,7 +537,7 @@ async function runActiveToolPlacement(
       session,
       "active-tool-command-output-expanded-shrink",
       (pane) =>
-        pane.includes("┃ Full detail · ←/→ switch · ctrl o close") &&
+        pane.includes("┃ Full detail · ctrl o close") &&
         commandMoreCount(pane) === null,
       ACTIVE_TOOL_RESIZE_CAPTURE_TIMEOUT_MS,
     );

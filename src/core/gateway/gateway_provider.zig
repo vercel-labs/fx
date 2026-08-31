@@ -174,7 +174,7 @@ pub const CapabilityResolver = struct {
                             "model catalog lookup outcome=cancelled model={s}",
                             .{model},
                         );
-                        return error.Cancelled;
+                        return failCapabilities(error.Cancelled);
                     }
                     self.state = .failed;
                     debug_trace.logf(
@@ -252,6 +252,22 @@ pub const CapabilityResolver = struct {
         self.state = .ready;
     }
 };
+
+inline fn failCapabilities(err: anytype) @TypeOf(err)!model_capabilities.Capabilities {
+    return @errorCast(failCapabilitiesDynamic(err));
+}
+
+noinline fn failCapabilitiesDynamic(err: anyerror) anyerror!model_capabilities.Capabilities {
+    return err;
+}
+
+test "capability failure writer preserves exact error type and identity" {
+    const failure = failCapabilities(error.Cancelled);
+    try std.testing.expect(
+        @TypeOf(failure) == error{Cancelled}!model_capabilities.Capabilities,
+    );
+    try std.testing.expectError(error.Cancelled, failure);
+}
 
 const FakeCatalog = struct {
     outcome: enum {

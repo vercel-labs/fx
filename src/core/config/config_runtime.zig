@@ -7,6 +7,7 @@ const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const settings_store = @import("settings_store.zig");
+const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
 const model_preferences = @import("model_preferences.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -48,6 +49,7 @@ pub const Settings = struct {
     context: ?bool = null,
     fast_mode: ?bool = null,
     slash_menu_categories: ?bool = null,
+    collapse_tool_calls: ?bool = null,
     auto_upgrade: ?bool = null,
     update_channel: ?update_target.Channel = null,
     startup_scrollback: ?bool = null,
@@ -66,6 +68,18 @@ pub const Settings = struct {
         self.models.deinit(alloc);
         self.permission_rules.deinit(alloc);
         self.* = .{};
+    }
+};
+
+pub const ProjectMcpChoiceLoad = struct {
+    choices: project_config.ProjectMcpChoices = .{},
+    diagnostics: std.ArrayList(project_config.WorkspaceDiagnostic) = .empty,
+
+    pub fn deinit(self: *ProjectMcpChoiceLoad, alloc: Allocator) void {
+        self.choices.deinit(alloc);
+        for (self.diagnostics.items) |*diagnostic| diagnostic.deinit(alloc);
+        self.diagnostics.deinit(alloc);
+        self.* = undefined;
     }
 };
 
@@ -102,6 +116,7 @@ pub const ConfigSources = struct {
     effort: ConfigSource = .compiled_default,
     fast_mode: ConfigSource = .compiled_default,
     slash_menu_categories: ConfigSource = .compiled_default,
+    collapse_tool_calls: ConfigSource = .compiled_default,
     startup_scrollback: ConfigSource = .compiled_default,
     prompt_history_enabled: ConfigSource = .compiled_default,
     statusline_context: ConfigSource = .compiled_default,
@@ -226,6 +241,47 @@ pub fn loadMergedSettings(alloc: Allocator, workspace_root: []const u8) !Setting
     var paths = try discoverPaths(alloc, workspace_root);
     defer paths.deinit(alloc);
     return loadMergedSettingsFromPaths(alloc, paths);
+}
+
+pub fn loadProjectMcpChoices(
+    alloc: Allocator,
+    workspace_root: []const u8,
+) !ProjectMcpChoiceLoad {
+    const home = io_mod.getenv("HOME") orelse return .{};
+    return loadProjectMcpChoicesFromHome(alloc, home, workspace_root);
+}
+
+pub fn loadProjectMcpChoicesFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    workspace_root: []const u8,
+) !ProjectMcpChoiceLoad {
+    var store = try settings_store.Store.initFromHome(alloc, home, .read_only);
+    defer store.deinit(alloc);
+    var primary = try store.loadPrimary(alloc);
+    defer primary.deinit(alloc);
+    const bytes = switch (primary) {
+        .absent => return .{},
+        .valid => |value| value,
+        .invalid => return error.InvalidSettingsFormat,
+        .oversized => return error.SettingsPrimaryTooLarge,
+    };
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSettingsFormat;
+    const workspaces = parsed.value.object.get("workspaces") orelse return .{};
+    if (workspaces != .object) return error.InvalidSettingsFormat;
+    const normalized_root = normalizeWorkspaceRoot(workspace_root);
+    const workspace = workspaces.object.get(normalized_root) orelse return .{};
+
+    var result: ProjectMcpChoiceLoad = .{};
+    errdefer result.deinit(alloc);
+    result.choices = project_config.parseChoices(
+        alloc,
+        workspace,
+        &result.diagnostics,
+    ) catch return error.InvalidSettingsFormat;
+    return result;
 }
 
 pub fn loadMergedSettingsFromHome(alloc: Allocator, home_dir: []const u8, workspace_root: []const u8) !Settings {
@@ -519,6 +575,7 @@ fn hasLegacyWorkspacePreferences(root: std.json.Value) bool {
             "effort",
             "fast_mode",
             "slash_menu_categories",
+            "collapse_tool_calls",
             "startup_scrollback",
         }) |key| {
             if (workspace.contains(key)) return true;
@@ -548,6 +605,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "effort",
         "fast_mode",
         "slash_menu_categories",
+        "collapse_tool_calls",
         "startup_scrollback",
         "prompt_history",
         "statusLine",
@@ -594,6 +652,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.effort != null) sources.effort = source;
     if (settings.fast_mode != null) sources.fast_mode = source;
     if (settings.slash_menu_categories != null) sources.slash_menu_categories = source;
+    if (settings.collapse_tool_calls != null) sources.collapse_tool_calls = source;
     if (settings.startup_scrollback != null) sources.startup_scrollback = source;
     if (settings.prompt_history_enabled != null) sources.prompt_history_enabled = source;
     if (settings.statusline_context != null) sources.statusline_context = source;
@@ -795,6 +854,26 @@ pub fn attemptUserPreferences(
             .cleanup = store.takeFailureCleanup(),
         } };
     };
+    return .{ .outcome = outcome };
+}
+
+pub fn attemptProjectMcpMutation(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    action: project_config.ProjectMcpAction,
+) CommitAttempt {
+    const home = io_mod.getenv("HOME") orelse return .{ .failure = .{ .err = error.HomeNotSet } };
+    var store = settings_store.Store.initFromHome(alloc, home, .writable) catch |err| {
+        return .{ .failure = .{ .err = err } };
+    };
+    defer store.deinit(alloc);
+    const outcome = store.applyProjectMcpMutation(alloc, .{
+        .workspace_root = workspace_root,
+        .action = action,
+    }) catch |err| return .{ .failure = .{
+        .err = err,
+        .cleanup = store.takeFailureCleanup(),
+    } };
     return .{ .outcome = outcome };
 }
 
@@ -1345,6 +1424,12 @@ fn parseProfileOnlyFields(
         settings.slash_menu_categories = value.bool;
     }
 
+    if (root.object.get("collapse_tool_calls")) |collapse_tool_calls_value| {
+        const value = collapse_tool_calls_value;
+        if (value != .bool) return error.InvalidCollapseToolCallsType;
+        settings.collapse_tool_calls = value.bool;
+    }
+
     if (root.object.get("auto_upgrade")) |auto_upgrade_value| {
         const value = auto_upgrade_value;
         if (value != .bool) return error.InvalidAutoUpgradeType;
@@ -1462,6 +1547,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
     if (incoming.context) |value| target.context = value;
     if (incoming.fast_mode) |value| target.fast_mode = value;
     if (incoming.slash_menu_categories) |value| target.slash_menu_categories = value;
+    if (incoming.collapse_tool_calls) |value| target.collapse_tool_calls = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
     if (incoming.update_channel) |value| target.update_channel = value;
     if (incoming.startup_scrollback) |value| target.startup_scrollback = value;
@@ -2076,6 +2162,26 @@ test "startup_scrollback parses merges rejects invalid type and round trips" {
     const json = try serializeJsonObject(std.testing.allocator, parsed.value);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"startup_scrollback\":false") != null);
+}
+
+test "collapse tool calls parses merges and rejects invalid types" {
+    var absent = try parseSettingsJson(std.testing.allocator, "{}");
+    defer absent.deinit(std.testing.allocator);
+    try std.testing.expect(absent.collapse_tool_calls == null);
+
+    var first = try parseSettingsJson(std.testing.allocator, "{\"collapse_tool_calls\":true}");
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expect(first.collapse_tool_calls.?);
+
+    var second = try parseSettingsJson(std.testing.allocator, "{\"collapse_tool_calls\":false}");
+    defer second.deinit(std.testing.allocator);
+    mergeSettings(&first, &second, std.testing.allocator);
+    try std.testing.expect(!first.collapse_tool_calls.?);
+
+    try std.testing.expectError(
+        error.InvalidCollapseToolCallsType,
+        parseSettingsJson(std.testing.allocator, "{\"collapse_tool_calls\":\"off\"}"),
+    );
 }
 
 test "slash menu categories parses merges and rejects invalid types" {

@@ -2,6 +2,7 @@ const std = @import("std");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const io_mod = @import("../core/shared/io.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
+const tool_result_errors = @import("../core/tooling/tool_result_errors.zig");
 const types = @import("../core/shared/types.zig");
 
 pub const ChatRole = types.ChatRole;
@@ -636,12 +637,20 @@ fn writeChatMessageJsonInner(
             } else {
                 try writer.writeAll("\"unknown\"");
             }
-            try writer.writeAll(",\"output\":{\"type\":\"text\",\"value\":");
-            if (message.content) |content| {
-                try std.json.Stringify.value(content, .{}, writer);
+            const content = message.content orelse "";
+            const failed = if (message.tool_result_status) |status|
+                status == .failure
+            else
+                false;
+            const denied = failed and tool_result_errors.toolPermissionDenialReason(content) != null;
+            if (denied) {
+                try writer.writeAll(",\"output\":{\"type\":\"execution-denied\",\"reason\":");
+            } else if (failed) {
+                try writer.writeAll(",\"output\":{\"type\":\"error-text\",\"value\":");
             } else {
-                try writer.writeAll("\"\"");
+                try writer.writeAll(",\"output\":{\"type\":\"text\",\"value\":");
             }
+            try std.json.Stringify.value(content, .{}, writer);
             try writer.writeAll("}}]");
         },
     }
@@ -1032,6 +1041,56 @@ test "writeChatMessageJson serializes tool-result fallbacks and escaped output" 
     try std.testing.expect(std.mem.find(u8, json, "\"toolCallId\":\"\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"toolName\":\"unknown\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"value\":\"line\\n\\ttext\"") != null);
+}
+
+test "writeChatMessageJson maps tool result status to the Vercel output variant" {
+    const denial = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"policy_denied\"}}";
+    const review_hold = "{\"error\":{\"type\":\"tool_review_held\",\"reason\":\"review_caution\"}}";
+    const malformed_denial = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"review_caution\"}}";
+    const cases = [_]struct {
+        status: ?types.PersistedToolStatus,
+        content: []const u8,
+        output_type: []const u8,
+        content_field: []const u8,
+    }{
+        .{ .status = null, .content = "untyped result", .output_type = "text", .content_field = "value" },
+        .{ .status = .success, .content = "successful result", .output_type = "text", .content_field = "value" },
+        .{ .status = .failure, .content = "ordinary failure", .output_type = "error-text", .content_field = "value" },
+        .{ .status = .failure, .content = denial, .output_type = "execution-denied", .content_field = "reason" },
+        .{ .status = .failure, .content = review_hold, .output_type = "execution-denied", .content_field = "reason" },
+        .{ .status = .success, .content = denial, .output_type = "text", .content_field = "value" },
+        .{ .status = .failure, .content = malformed_denial, .output_type = "error-text", .content_field = "value" },
+    };
+
+    for (cases) |case| {
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+
+        try writeChatMessageJson(std.testing.allocator, &out.writer, .{
+            .role = .tool,
+            .content = case.content,
+            .tool_call_id = "call_1",
+            .tool_name = "terminal",
+            .tool_result_status = case.status,
+        });
+
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            out.written(),
+            .{},
+        );
+        defer parsed.deinit();
+        const result = parsed.value.object.get("content").?.array.items[0].object;
+        const output = result.get("output").?.object;
+
+        try std.testing.expectEqualStrings("call_1", result.get("toolCallId").?.string);
+        try std.testing.expectEqualStrings("terminal", result.get("toolName").?.string);
+        try std.testing.expectEqualStrings(case.output_type, output.get("type").?.string);
+        try std.testing.expectEqualStrings(case.content, output.get(case.content_field).?.string);
+        const absent_field = if (std.mem.eql(u8, case.content_field, "value")) "reason" else "value";
+        try std.testing.expect(output.get(absent_field) == null);
+    }
 }
 
 test "writeChatMessageJsonCached adds provider options and non-cached omits them" {
@@ -1481,13 +1540,13 @@ test "gateway request validation accepts out-of-order tool results by id" {
         },
         .{
             .id = "call_2",
-            .name = "list_files",
-            .arguments_json = "{\"path\":\".\"}",
+            .name = "glob_files",
+            .arguments_json = "{\"pattern\":\"*\"}",
         },
     };
     const messages = [_]ChatMessage{
         .{ .role = .assistant, .tool_calls = calls[0..] },
-        .{ .role = .tool, .content = "second", .tool_call_id = "call_2", .tool_name = "list_files" },
+        .{ .role = .tool, .content = "second", .tool_call_id = "call_2", .tool_name = "glob_files" },
         .{ .role = .tool, .content = "first", .tool_call_id = "call_1", .tool_name = "read_file" },
     };
 
@@ -1507,8 +1566,8 @@ test "gateway request validation rejects duplicate tool result ids" {
         },
         .{
             .id = "call_2",
-            .name = "list_files",
-            .arguments_json = "{\"path\":\".\"}",
+            .name = "glob_files",
+            .arguments_json = "{\"pattern\":\"*\"}",
         },
     };
     const messages = [_]ChatMessage{

@@ -15,6 +15,16 @@ import { EVAL_MODEL, HAS_API_KEY, runFx } from "../evals/eval-helpers";
 
 const TIMEOUT = 20_000;
 const MODEL = "openai/gpt-5";
+const REMOVED_FILESYSTEM_TOOLS = [
+  "list_files",
+  "file_info",
+  "delete_file",
+  "rename_file",
+  "copy_file",
+  "create_folder",
+  "semantic_search",
+  "open_file",
+] as const;
 const liveTest = test.skipIf(
   !HAS_API_KEY || process.env.FX_E2E_REAL_API !== "1",
 );
@@ -98,6 +108,23 @@ function toolResultOutput(body: string, callId: string): string {
   );
   if (!result) throw new Error(`Missing tool result for ${callId}`);
   return contentText(result.output);
+}
+
+function toolResultReason(body: string, callId: string): string {
+  const request = JSON.parse(body) as {
+    prompt: Array<{ content: unknown }>;
+  };
+  const parts = request.prompt.flatMap((message) =>
+    Array.isArray(message.content) ? message.content : []
+  ) as Array<Record<string, unknown>>;
+  const result = parts.find((part) =>
+    part.type === "tool-result" && part.toolCallId === callId
+  );
+  if (!result) throw new Error(`Missing tool result for ${callId}`);
+  const output = result.output as Record<string, unknown>;
+  expect(output.type).toBe("execution-denied");
+  expect(typeof output.reason).toBe("string");
+  return output.reason as string;
 }
 
 function occurrenceCount(text: string, needle: string) {
@@ -428,8 +455,8 @@ describe("filesystem path handling", () => {
           },
           {
             id: "added_search_1",
-            name: "semantic_search",
-            input: { query: "ADDED_ROOT_NEEDLE", path: root.external },
+            name: "grep_files",
+            input: { pattern: "ADDED_ROOT_NEEDLE", path: root.external },
             expected: "fixture.txt",
           },
           {
@@ -979,7 +1006,7 @@ describe("filesystem path handling", () => {
           content,
         }),
         (body) => {
-          const resultOutput = toolResultOutput(body, "write_large_review");
+          const resultOutput = toolResultReason(body, "write_large_review");
           expect(resultOutput).toContain('"reason":"review_caution"');
           expect(resultOutput).toContain("Action held after safety review");
           return finalText("large reviewed write blocked");
@@ -1179,13 +1206,6 @@ describe("filesystem path handling", () => {
 
         const cases = [
           {
-            id: "list_external_1",
-            name: "list_files",
-            input: { path: "../external" },
-            expectedContext: [root.external],
-            expectedResult: [root.external, "fixture.txt"],
-          },
-          {
             id: "glob_external_1",
             name: "glob_files",
             input: { pattern: "*.txt", path: "../external" },
@@ -1198,13 +1218,6 @@ describe("filesystem path handling", () => {
             input: { pattern: "EDGE_NEEDLE", path: "../external" },
             expectedContext: [root.external],
             expectedResult: [externalFile, "EDGE_NEEDLE"],
-          },
-          {
-            id: "info_external_1",
-            name: "file_info",
-            input: { path: "../external/fixture.txt" },
-            expectedContext: [externalFile],
-            expectedResult: [externalFile],
           },
         ];
 
@@ -1247,133 +1260,18 @@ describe("filesystem path handling", () => {
   );
 
   test(
-    "configured copy and rename cross the workspace boundary in both directions",
-    async () => {
-      const root = createIsolatedRoot();
-      try {
-        const copyIntoWorkspaceSource = join(root.external, "copy-in.txt");
-        const renameIntoWorkspaceSource = join(root.external, "rename-in.txt");
-        writeFileSync(join(root.workspace, "copy-out.txt"), "COPY_OUT\n");
-        writeFileSync(join(root.workspace, "rename-out.txt"), "RENAME_OUT\n");
-        writeFileSync(copyIntoWorkspaceSource, "COPY_IN\n");
-        writeFileSync(renameIntoWorkspaceSource, "RENAME_IN\n");
-        writeFileSync(
-          join(root.home, ".fx", "settings.json"),
-          JSON.stringify({
-            permission: {
-              copy_file: {
-                [`${root.external}/**`]: "allow",
-              },
-              rename_file: {
-                [`${root.external}/**`]: "allow",
-              },
-            },
-          }),
-        );
-
-        const copyOutTarget = join(root.external, "copied-out.txt");
-        await runFirstCallToolScenario({
-          root,
-          id: "copy_out_1",
-          name: "copy_file",
-          input: {
-            source: "copy-out.txt",
-            destination: "../external/copied-out.txt",
-          },
-          expectedResultRequest: [copyOutTarget],
-          expectedResultOutput: [copyOutTarget],
-          expectedClassifierRequests: 1,
-          beforeToolCall: () => expect(existsSync(copyOutTarget)).toBe(false),
-        });
-        expect(readFileSync(copyOutTarget, "utf8")).toBe("COPY_OUT\n");
-
-        const copyInTarget = join(root.workspace, "copied-in.txt");
-        await runFirstCallToolScenario({
-          root,
-          id: "copy_in_1",
-          name: "copy_file",
-          input: {
-            source: "../external/copy-in.txt",
-            destination: "copied-in.txt",
-          },
-          expectedResultRequest: [copyIntoWorkspaceSource],
-          expectedResultOutput: [copyIntoWorkspaceSource, "copied-in.txt"],
-          expectedClassifierRequests: 1,
-          beforeToolCall: () => {
-            expect(existsSync(copyIntoWorkspaceSource)).toBe(true);
-            expect(existsSync(copyInTarget)).toBe(false);
-          },
-        });
-        expect(readFileSync(copyInTarget, "utf8")).toBe("COPY_IN\n");
-
-        const renameOutTarget = join(root.external, "renamed-out.txt");
-        await runFirstCallToolScenario({
-          root,
-          id: "rename_out_1",
-          name: "rename_file",
-          input: {
-            old_path: "rename-out.txt",
-            new_path: "../external/renamed-out.txt",
-          },
-          expectedResultRequest: [renameOutTarget],
-          expectedResultOutput: [renameOutTarget],
-          expectedClassifierRequests: 1,
-          beforeToolCall: () => {
-            expect(existsSync(join(root.workspace, "rename-out.txt"))).toBe(true);
-            expect(existsSync(renameOutTarget)).toBe(false);
-          },
-        });
-        expect(readFileSync(renameOutTarget, "utf8")).toBe("RENAME_OUT\n");
-        expect(existsSync(join(root.workspace, "rename-out.txt"))).toBe(false);
-
-        const renameInTarget = join(root.workspace, "renamed-in.txt");
-        await runFirstCallToolScenario({
-          root,
-          id: "rename_in_1",
-          name: "rename_file",
-          input: {
-            old_path: "../external/rename-in.txt",
-            new_path: "renamed-in.txt",
-          },
-          expectedResultRequest: [renameIntoWorkspaceSource],
-          expectedResultOutput: [renameIntoWorkspaceSource, "renamed-in.txt"],
-          expectedClassifierRequests: 1,
-          beforeToolCall: () => {
-            expect(existsSync(renameIntoWorkspaceSource)).toBe(true);
-            expect(existsSync(renameInTarget)).toBe(false);
-          },
-        });
-        expect(readFileSync(renameInTarget, "utf8")).toBe("RENAME_IN\n");
-        expect(existsSync(renameIntoWorkspaceSource)).toBe(false);
-      } finally {
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "remaining mutation tools honor canonical external and home permission targets",
+    "retained edit tool honors canonical external permission targets",
     async () => {
       const root = createIsolatedRoot();
       try {
         const editTarget = join(root.external, "edit.txt");
-        const deleteTarget = join(root.external, "delete.txt");
-        const createdFolder = join(root.home, "created", "nested");
         writeFileSync(editTarget, "BEFORE_EDIT\n");
-        writeFileSync(deleteTarget, "DELETE_ME\n");
         writeFileSync(
           join(root.home, ".fx", "settings.json"),
           JSON.stringify({
             permission: {
               edit: {
                 [`${root.external}/**`]: "allow",
-              },
-              delete_file: {
-                [`${root.external}/**`]: "allow",
-              },
-              create_folder: {
-                [`${root.home}/**`]: "allow",
               },
             },
           }),
@@ -1437,28 +1335,6 @@ describe("filesystem path handling", () => {
         } finally {
           editGateway.stop();
         }
-
-        await runFirstCallToolScenario({
-          root,
-          id: "delete_external_1",
-          name: "delete_file",
-          input: { path: "../external/delete.txt" },
-          expectedResultRequest: [deleteTarget],
-          expectedResultOutput: [deleteTarget],
-          beforeToolCall: () => expect(existsSync(deleteTarget)).toBe(true),
-        });
-        expect(existsSync(deleteTarget)).toBe(false);
-
-        await runFirstCallToolScenario({
-          root,
-          id: "create_home_1",
-          name: "create_folder",
-          input: { path: "~/created/nested" },
-          expectedResultRequest: [createdFolder],
-          expectedResultOutput: [createdFolder],
-          beforeToolCall: () => expect(existsSync(createdFolder)).toBe(false),
-        });
-        expect(existsSync(createdFolder)).toBe(true);
       } finally {
         rmSync(root.root, { recursive: true, force: true });
       }
@@ -1494,60 +1370,129 @@ describe("filesystem path handling", () => {
   );
 
   test(
-    "explicit external delete_file reaches review and executes once on clear",
+    "removed filesystem tools are absent and terminal completes the fallback flow",
     async () => {
       const root = createIsolatedRoot();
+      const command =
+        "mkdir -p fallback-dir && " +
+        "printf fallback > fallback-source.txt && " +
+        "cp fallback-source.txt fallback-dir/copied.txt && " +
+        "mv fallback-dir/copied.txt fallback-dir/renamed.txt && " +
+        "ls fallback-dir && " +
+        "stat fallback-dir/renamed.txt && " +
+        "grep -n fallback fallback-dir/renamed.txt && " +
+        "rm -rf fallback-dir fallback-source.txt && " +
+        "test ! -e fallback-dir && printf fallback-complete";
+      const gateway = startFakeGateway([
+        (body) => {
+          const request = JSON.parse(body) as {
+            tools: Array<{ name: string }>;
+          };
+          const names = request.tools.map((tool) => tool.name);
+          for (const removed of REMOVED_FILESYSTEM_TOOLS) {
+            expect(names).not.toContain(removed);
+          }
+          expect(names).toEqual(expect.arrayContaining([
+            "read_file",
+            "write_file",
+            "edit_file",
+            "glob_files",
+            "grep_files",
+            "terminal",
+          ]));
+          return toolCall("terminal_fallback_1", "terminal", {
+            action: "exec",
+            command,
+            timeout_ms: 600_000,
+          });
+        },
+        (body) => {
+          const output = toolResultOutput(body, "terminal_fallback_1");
+          expect(output).toContain("renamed.txt");
+          expect(output).toContain("fallback");
+          expect(output).toContain("fallback-complete");
+          expect(existsSync(join(root.workspace, "fallback-dir"))).toBe(false);
+          expect(existsSync(join(root.workspace, "fallback-source.txt"))).toBe(false);
+          return finalText("terminal fallback complete");
+        },
+      ], { classifierDecision: "clear" });
+
       try {
-        const desktop = join(root.home, "Desktop");
-        mkdirSync(desktop, { recursive: true });
-        const target = join(desktop, "test.txt");
-        writeFileSync(target, "delete\n");
-        const gateway = startFakeGateway([
-          (body) => {
-            expect(body).toContain("Execute the requested file tool once.");
-            expect(existsSync(target)).toBe(true);
-            return toolCall("delete_external_1", "delete_file", {
-              path: target,
-            });
+        const result = await runFx(
+          [
+            "ask",
+            "--auto",
+            "--json",
+            "--no-save",
+            "Use the terminal to create, inspect, search, copy, rename, and remove disposable files.",
+          ],
+          {
+            cwd: root.workspace,
+            env: gatewayEnv(root, gateway, root.home),
+            timeoutMs: TIMEOUT,
           },
-          (body) => {
-            const resultOutput = toolResultOutput(body, "delete_external_1");
-            expect(body).toContain(target);
-            expect(resultOutput).toContain("deleted");
-            expect(existsSync(target)).toBe(false);
-            return finalText("external delete completed");
-          },
-        ], { classifierDecision: "clear" });
-        try {
-          const result = await runFx(
-            [
-              "ask",
-              "--auto",
-              "--json",
-              "--no-save",
-              "Execute the requested file tool once.",
-            ],
-            {
-              cwd: root.workspace,
-              env: gatewayEnv(root, gateway, root.home),
-              timeoutMs: TIMEOUT,
-            },
-          );
-          const json = parseFxJson(result);
-          expect(gateway.requests).toHaveLength(2);
-          expect(gateway.classifierRequests).toHaveLength(1);
-          expect(gateway.remainingResponseCount()).toBe(0);
-          expect(json.tool_calls).toEqual([
-            { name: "delete_file", status: "success" },
-          ]);
-          expect(existsSync(target)).toBe(false);
-        } finally {
-          gateway.stop();
-        }
+        );
+        const json = parseFxJson(result);
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.classifierRequests).toHaveLength(1);
+        expect(gateway.remainingResponseCount()).toBe(0);
+        expect(json.tool_calls).toEqual([
+          expect.objectContaining({ name: "terminal", status: "success" }),
+        ]);
       } finally {
+        gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
     },
     TIMEOUT,
   );
+
+  liveTest(
+    "live Gateway uses terminal for removed filesystem operations",
+    async () => {
+      const root = createIsolatedRoot();
+      const completion = `LIVE_FILESYSTEM_FALLBACK_COMPLETE_${Date.now()}`;
+      try {
+        const result = await runFx(
+          [
+            "ask",
+            "--auto",
+            "--json",
+            "--no-save",
+            [
+              "Use terminal for this exact disposable filesystem task in the current workspace.",
+              "In one command, create live-fallback/source.txt containing live-fallback-data,",
+              "copy it to copied.txt, rename that file to renamed.txt, list the directory,",
+              "stat and grep the renamed file, then remove the live-fallback directory.",
+              `After the command succeeds and the directory is gone, reply with ${completion}.`,
+            ].join(" "),
+          ],
+          {
+            cwd: root.workspace,
+            env: {
+              HOME: root.home,
+              FX_AUTO_UPGRADE: "0",
+              FX_GATEWAY_BASE_URL: undefined,
+              FX_GATEWAY_CHAT_URL: undefined,
+              FX_MODEL: process.env.FX_WORKSPACE_ACCESS_LIVE_MODEL ?? EVAL_MODEL,
+            },
+            timeoutMs: 120_000,
+          },
+        );
+        const json = parseFxJson(result);
+        expect(json.output).toContain(completion);
+        expect(json.tool_calls.some(({ name, status }) =>
+          name === "terminal" && status === "success"
+        )).toBe(true);
+        for (const removed of REMOVED_FILESYSTEM_TOOLS) {
+          expect(json.tool_calls.some(({ name }) => name === removed)).toBe(false);
+        }
+        expect(existsSync(join(root.workspace, "live-fallback"))).toBe(false);
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    120_000,
+  );
+
 });

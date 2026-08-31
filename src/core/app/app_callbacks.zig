@@ -284,6 +284,7 @@ pub fn Bindings(comptime App: type) type {
                 else
                     null,
                 .finalize_turn = agentFinalizeTurn,
+                .take_steering = if (comptime @hasDecl(@TypeOf(app.worker), "takeSteering")) agentTakeSteering else null,
                 .prepare_parent_turn_context = agentPrepareParentTurnContext,
                 .acknowledge_parent_turn_context = agentAcknowledgeParentTurnContext,
                 .append_runtime_context = agentAppendRuntimeContext,
@@ -360,7 +361,15 @@ pub fn Bindings(comptime App: type) type {
                     );
                 }
             }
+            if (comptime @hasDecl(App, "releaseAgentTerminalLease")) {
+                deps.release_agent_terminal_lease = agentReleaseTerminalLease;
+            }
             return deps;
+        }
+
+        fn agentReleaseTerminalLease(ctx: *anyopaque, session_id: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            return app.releaseAgentTerminalLease(session_id);
         }
 
         fn refreshGatewayCredential(
@@ -553,6 +562,19 @@ pub fn Bindings(comptime App: type) type {
                 .turn_id = turn_id,
                 .outcome = outcome,
             });
+        }
+
+        fn agentTakeSteering(ctx: *anyopaque, arena: std.mem.Allocator, turn_id: u64) ![]const []const u8 {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const owned = try app.worker.takeSteering(std.heap.c_allocator, turn_id);
+            if (owned.len == 0) return &.{};
+            defer {
+                for (owned) |text| std.heap.c_allocator.free(text);
+                std.heap.c_allocator.free(owned);
+            }
+            const result = try arena.alloc([]const u8, owned.len);
+            for (owned, result) |text, *dest| dest.* = try arena.dupe(u8, text);
+            return result;
         }
 
         fn agentAppendStaticContext(ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
@@ -1245,7 +1267,6 @@ const FakePacer = struct {
     defer_history: bool = false,
     enqueue_count: usize = 0,
     flush_count: usize = 0,
-    flush_result: assistant_pacer.FlushResult = .drained,
 
     fn deinit(self: *FakePacer, alloc: std.mem.Allocator) void {
         self.text.deinit(alloc);
@@ -1262,18 +1283,6 @@ const FakePacer = struct {
         return self.defer_history;
     }
 
-    pub fn flushPendingText(self: *FakePacer, callbacks: anytype) !assistant_pacer.FlushResult {
-        _ = callbacks;
-        self.flush_count += 1;
-        if (self.flush_result == .drained) self.text.clearRetainingCapacity();
-        return self.flush_result;
-    }
-
-    pub fn flushPendingTextAtBoundary(self: *FakePacer, callbacks: anytype) !void {
-        _ = try self.flushPendingText(callbacks);
-        self.text.clearRetainingCapacity();
-    }
-
     pub fn flushPresentationAtBoundary(
         self: *FakePacer,
         alloc: std.mem.Allocator,
@@ -1282,7 +1291,9 @@ const FakePacer = struct {
     ) !void {
         _ = alloc;
         _ = now_ns;
-        try self.flushPendingTextAtBoundary(callbacks);
+        _ = callbacks;
+        self.flush_count += 1;
+        self.text.clearRetainingCapacity();
     }
 };
 

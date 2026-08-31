@@ -788,6 +788,26 @@ pub const SessionChildCapability = struct {
         self.* = undefined;
     }
 
+    pub fn cloneReadOnly(
+        self: *const SessionChildCapability,
+        alloc: Allocator,
+    ) !SessionChildCapability {
+        if (self.impl.legacy_direct_kind != null or
+            self.impl.legacy_background_root)
+        {
+            return error.SessionChildStoreFailed;
+        }
+        var cloned = try initWithOptions(
+            alloc,
+            self.impl.session_dir.dir,
+            self.impl.display_session_path,
+            .read_only,
+            .{},
+        );
+        cloned.impl.allowed_kind = self.impl.allowed_kind;
+        return cloned;
+    }
+
     pub fn createExclusiveFile(
         self: *SessionChildCapability,
         alloc: Allocator,
@@ -1413,6 +1433,53 @@ test "managed child capability rejects invalid names and unsafe routes" {
     try std.testing.expectError(
         error.SessionPathUnsafe,
         capability.iterate(alloc, .browser_artifacts),
+    );
+}
+
+test "read-only capability clone owns independent retained routes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try openTestSession(alloc, &tmp);
+    defer session.dir.close(io_mod.getIo());
+    defer alloc.free(session.display_path);
+    var original = try SessionChildCapability.initForTesting(
+        alloc,
+        session.dir,
+        session.display_path,
+        .writable,
+        .{},
+    );
+    var original_open = true;
+    defer if (original_open) original.deinit();
+
+    var file = try original.createExclusiveFile(
+        alloc,
+        .tool_results,
+        "result.txt",
+    );
+    try file.writeAll("retained result");
+    try file.sync();
+    file.deinit();
+
+    var cloned = try original.cloneReadOnly(alloc);
+    defer cloned.deinit();
+    original.deinit();
+    original_open = false;
+
+    var retained = try cloned.openFileReadOnly(
+        alloc,
+        .tool_results,
+        "result.txt",
+    );
+    defer retained.deinit();
+    const bytes = try retained.readToEnd(alloc, 64);
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings("retained result", bytes);
+    try std.testing.expectError(
+        error.SessionChildReadOnly,
+        cloned.createExclusiveFile(alloc, .tool_results, "blocked.txt"),
     );
 }
 

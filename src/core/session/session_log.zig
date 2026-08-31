@@ -984,6 +984,23 @@ pub const LoadedWritableSession = struct {
     }
 };
 
+/// Preserves each call's exact error set while sharing one dynamic return ABI.
+pub inline fn failLoadedWritableSession(err: anytype) @TypeOf(err)!LoadedWritableSession {
+    return @errorCast(failLoadedWritableSessionDynamic(err));
+}
+
+noinline fn failLoadedWritableSessionDynamic(err: anyerror) anyerror!LoadedWritableSession {
+    return err;
+}
+
+test "large session errors preserve their exact error type and identity" {
+    const result = failLoadedWritableSession(error.NoSavedSessions);
+    try std.testing.expect(
+        @TypeOf(result) == error{NoSavedSessions}!LoadedWritableSession,
+    );
+    try std.testing.expectError(error.NoSavedSessions, result);
+}
+
 pub const Root = struct {
     sessions: ?io_mod.VerifiedDir,
     display_root: []u8,
@@ -1123,21 +1140,24 @@ pub const Root = struct {
         var lifecycle_value = lifecycle;
         errdefer if (lifecycle_value) |*value| value.deinit(alloc);
         if (self.mode != .writable or self.sessions == null) {
-            return error.SessionStoreUnavailable;
+            return failLoadedWritableSession(error.SessionStoreUnavailable);
         }
         try session_codec.validateState(initial_state);
         const sessions = &self.sessions.?;
-        if (try entryExists(sessions, initial_state.id)) return error.SessionAlreadyExists;
+        if (try entryExists(sessions, initial_state.id)) {
+            return failLoadedWritableSession(error.SessionAlreadyExists);
+        }
 
         sessions.dir.createDir(
             io_mod.getIo(),
             initial_state.id,
             private_dir_permissions,
         ) catch |err| switch (err) {
-            error.PathAlreadyExists => return error.SessionAlreadyExists,
-            else => return error.SessionStartFailed,
+            error.PathAlreadyExists => return failLoadedWritableSession(error.SessionAlreadyExists),
+            else => return failLoadedWritableSession(error.SessionStartFailed),
         };
-        io_mod.syncVerifiedDir(sessions.dir) catch return error.SessionStartFailed;
+        io_mod.syncVerifiedDir(sessions.dir) catch
+            return failLoadedWritableSession(error.SessionStartFailed);
 
         var session_dir = try openSessionDir(sessions, initial_state.id, .writable);
         options.test_controls.lock(.session);
@@ -2337,7 +2357,9 @@ fn openWritableSession(
     var event_log = try openManagedFile(&writable.dir, events_file, .read_write);
     defer event_log.close(io_mod.getIo());
     const length = try event_log.length(io_mod.getIo());
-    if (length < position.through_event_log_bytes) return error.InvalidSessionFormat;
+    if (length < position.through_event_log_bytes) {
+        return failLoadedWritableSession(error.InvalidSessionFormat);
+    }
     const replay_started_ns = io_mod.nanoTimestamp();
     var open_state = loadOpenState(
         alloc,
@@ -2347,7 +2369,7 @@ fn openWritableSession(
         event_log,
         position,
     ) catch |err| switch (err) {
-        error.OutOfMemory => return error.SessionReplayResourceExhausted,
+        error.OutOfMemory => return failLoadedWritableSession(error.SessionReplayResourceExhausted),
         else => return err,
     };
     errdefer open_state.state.deinit(alloc);
@@ -5073,6 +5095,163 @@ test "usage sidecar publication stays inside the canonical commit boundary" {
     defer read_only.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), read_only.usage.?.next_sequence);
     try std.testing.expectEqual(@as(usize, 0), read_only.usage.?.incidents.len);
+}
+
+test "torn exact settlement restores stale sidecar backlog over settled rollback" {
+    const Checkpoint = struct {
+        fn persist(_: *anyopaque, _: session_usage.Snapshot) !void {}
+    };
+    const RejectPublication = struct {
+        fn publish(_: *anyopaque, event: session_usage.usage_report.ProfileEvent) !void {
+            if (event == .generation) return error.InjectedPublicationFailure;
+        }
+    };
+    const PublicationProbe = struct {
+        generations: usize = 0,
+
+        fn publish(raw: *anyopaque, event: session_usage.usage_report.ProfileEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (event == .generation) self.generations += 1;
+        }
+    };
+    const TearSidecar = struct {
+        dir: *io_mod.VerifiedDir,
+        torn: bool = false,
+        const stale_file = "usage-v2.stale-test";
+
+        fn boundary(raw: ?*anyopaque, point: Boundary) !void {
+            if (point != .before_usage_sidecar_write) return;
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try self.dir.dir.rename(
+                session_usage_sidecar.sidecar_file,
+                self.dir.dir,
+                stale_file,
+                io_mod.getIo(),
+            );
+            try self.dir.dir.createDir(
+                io_mod.getIo(),
+                session_usage_sidecar.sidecar_file,
+                std.Io.File.Permissions.fromMode(0o700),
+            );
+            self.torn = true;
+        }
+
+        fn restore(self: *@This()) !void {
+            try self.dir.dir.deleteDir(
+                io_mod.getIo(),
+                session_usage_sidecar.sidecar_file,
+            );
+            try self.dir.dir.rename(
+                stale_file,
+                self.dir.dir,
+                session_usage_sidecar.sidecar_file,
+                io_mod.getIo(),
+            );
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-usage-torn-exact", 10);
+    defer initial.deinit(alloc);
+    {
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        const completion: types.ModelCompletion = .{
+            .generation_id = "response-torn-log",
+            .billing = .{
+                .created_at_ms = 100,
+                .model = "codex/gpt-test",
+                .total_cost = 0,
+                .input_tokens = 17,
+                .output_tokens = 7,
+                .cache_read_tokens = 2,
+                .cache_write_tokens = 0,
+                .reasoning_tokens = 1,
+                .billable_web_search_calls = 0,
+            },
+        };
+
+        var checkpoint_context: u8 = 0;
+        var publication_context: u8 = 0;
+        var bridge = session_usage.Usage.initFresh();
+        defer bridge.deinit(alloc);
+        bridge.configureCheckpointSink(.{
+            .context = &checkpoint_context,
+            .allocator = alloc,
+            .persist = Checkpoint.persist,
+        });
+        bridge.configurePublicationSink(.{
+            .context = &publication_context,
+            .allocator = alloc,
+            .publish = RejectPublication.publish,
+        });
+        const bridge_observation = try session_usage.InvocationObservation.begin(&bridge);
+        try bridge_observation.complete(alloc, completion, .{ .exact = .codex });
+        var bridge_snapshot = try bridge.snapshot(alloc);
+        defer bridge_snapshot.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), bridge_snapshot.pending.len);
+        try std.testing.expectEqual(@as(usize, 1), bridge_snapshot.publication_backlog.len);
+        _ = try loaded.appendEvent(
+            alloc,
+            .{ .usage_checkpointed = .{ .usage = bridge_snapshot } },
+            20,
+            .retry_expected_tail,
+            .{},
+        );
+
+        var settled = session_usage.Usage.initFresh();
+        defer settled.deinit(alloc);
+        const settled_observation = try session_usage.InvocationObservation.begin(&settled);
+        try settled_observation.complete(alloc, completion, .{ .exact = .codex });
+        var settled_snapshot = try settled.snapshot(alloc);
+        defer settled_snapshot.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 17), settled_snapshot.input_tokens);
+        try std.testing.expectEqual(@as(usize, 0), settled_snapshot.pending.len);
+
+        var tear = TearSidecar{ .dir = &loaded.log.dir };
+        _ = try loaded.appendEvent(
+            alloc,
+            .{ .usage_checkpointed = .{ .usage = settled_snapshot } },
+            30,
+            .retry_expected_tail,
+            .{ .test_controls = .{
+                .context = &tear,
+                .boundary_fn = TearSidecar.boundary,
+            } },
+        );
+        try std.testing.expect(tear.torn);
+        try tear.restore();
+    }
+
+    var read_only = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer read_only.deinit(alloc);
+    const recovered = read_only.usage.?;
+    try std.testing.expectEqual(@as(u64, 17), recovered.input_tokens);
+    try std.testing.expectEqual(@as(u64, 7), recovered.output_tokens);
+    try std.testing.expectEqual(@as(?u64, null), recovered.request_count);
+    try std.testing.expectEqual(@as(usize, 0), recovered.pending.len);
+    try std.testing.expectEqual(@as(usize, 1), recovered.publication_backlog.len);
+    try std.testing.expectEqual(@as(usize, 1), recovered.incidents.len);
+
+    var publication = PublicationProbe{};
+    var resumed = session_usage.Usage.initFresh();
+    defer resumed.deinit(alloc);
+    resumed.configurePublicationSink(.{
+        .context = &publication,
+        .allocator = alloc,
+        .publish = PublicationProbe.publish,
+    });
+    try resumed.restore(alloc, recovered, 1);
+    var final = try resumed.snapshot(alloc);
+    defer final.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), publication.generations);
+    try std.testing.expectEqual(@as(u64, 17), final.input_tokens);
+    try std.testing.expectEqual(@as(u64, 7), final.output_tokens);
+    try std.testing.expectEqual(@as(?u64, null), final.request_count);
+    try std.testing.expectEqual(@as(usize, 0), final.pending.len);
+    try std.testing.expectEqual(@as(usize, 0), final.publication_backlog.len);
 }
 
 test "indeterminate canonical usage retry repairs the rich sidecar" {

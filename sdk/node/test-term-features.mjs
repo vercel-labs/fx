@@ -97,10 +97,10 @@ await command("/resume", "Session resume is owned by the embedding SDK");
 await command("/mcp list", "No MCP servers configured");
 await command("/skills list", "Skills are unavailable in this host");
 
-runtime.write("/models\r");
+runtime.write("/model\r");
 await waitFor(() => grid().includes("feature-model") && grid().includes("other-model"), "model catalog menu");
 runtime.write("\x1b");
-await waitFor(() => terminal.buffer.active.type === "normal", "model catalog close");
+await waitFor(() => !grid().includes("Tab Provider"), "model catalog close");
 
 runtime.write("/exit\r");
 const code = await Promise.race([runtime.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("exit timeout")), 5000))]);

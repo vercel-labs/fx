@@ -146,6 +146,8 @@ test "dynamic MCP descriptor executes through registered dispatch" {
     const tools = [_]tool_dispatch.Tool{tool};
     const registry = tool_dispatch.Registry{ .tools = tools[0..] };
     var execution_error: ?anyerror = null;
+    var status_detail: ?[]u8 = null;
+    defer if (status_detail) |detail| std.testing.allocator.free(detail);
     const result = try tool_dispatch.dispatchAuthorizedToolCall(.{
         .allocator = std.testing.allocator,
         .tool_call_name = "mcp_fs_read",
@@ -156,7 +158,7 @@ test "dynamic MCP descriptor executes through registered dispatch" {
         .id = "dynamic-test",
         .name = "mcp_fs_read",
         .arguments_json = "{\"path\":\"README.md\"}",
-    });
+    }, &status_detail);
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expect(execution_error == null);

@@ -122,6 +122,21 @@ pub const LockError = error{
     ControlStoreFailed,
 };
 
+inline fn failOptionalRecord(err: anytype) @TypeOf(err)!?Record {
+    return @errorCast(failOptionalRecordDynamic(err));
+}
+
+noinline fn failOptionalRecordDynamic(err: anyerror) anyerror!?Record {
+    return err;
+}
+
+test "optional control record failures preserve exact error types and identities" {
+    const invalid = failOptionalRecord(error.InvalidControlRecord);
+    try std.testing.expect(@TypeOf(invalid) == error{InvalidControlRecord}!?Record);
+    try std.testing.expectError(error.InvalidControlRecord, invalid);
+    try std.testing.expectError(error.OutOfMemory, failOptionalRecord(error.OutOfMemory));
+}
+
 pub const Store = struct {
     capability: *session_child_store.SessionChildCapability,
     expected_child_id: []const u8,
@@ -149,24 +164,25 @@ pub const Store = struct {
             record_file,
         ) catch |err| switch (err) {
             error.FileNotFound => return null,
-            error.OutOfMemory => return error.OutOfMemory,
-            error.SessionPathUnsafe => return error.ControlPathUnsafe,
+            error.OutOfMemory => return failOptionalRecord(error.OutOfMemory),
+            error.SessionPathUnsafe => return failOptionalRecord(error.ControlPathUnsafe),
             error.PrivateStatePermissionsUnsupported => {
-                return error.PrivateStatePermissionsUnsupported;
+                return failOptionalRecord(error.PrivateStatePermissionsUnsupported);
             },
-            else => return error.ControlStoreFailed,
+            else => return failOptionalRecord(error.ControlStoreFailed),
         };
         defer file.deinit();
         const bytes = file.readToEnd(alloc, max_record_bytes) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.StreamTooLong => return error.ControlRecordTooLarge,
-            else => return error.ControlStoreFailed,
+            error.OutOfMemory => return failOptionalRecord(error.OutOfMemory),
+            error.StreamTooLong => return failOptionalRecord(error.ControlRecordTooLarge),
+            else => return failOptionalRecord(error.ControlStoreFailed),
         };
         defer alloc.free(bytes);
-        var record = try parseRecord(alloc, bytes);
+        var record = parseRecord(alloc, bytes) catch |err|
+            return failOptionalRecord(err);
         errdefer record.deinit(alloc);
         if (!std.mem.eql(u8, record.child_id, self.expected_child_id)) {
-            return error.InvalidControlRecord;
+            return failOptionalRecord(error.InvalidControlRecord);
         }
         return record;
     }

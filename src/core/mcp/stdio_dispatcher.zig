@@ -4,11 +4,13 @@ const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const mcp_contract = @import("mcp_contract.zig");
+const docker_run = @import("docker_run.zig");
 const operation_control = @import("operation_control.zig");
 
 const Allocator = std.mem.Allocator;
 const request_poll_ns: u64 = 5 * std.time.ns_per_ms;
 const shutdown_grace_ms: i64 = 1_000;
+const termination_grace_ms: i64 = 1_000;
 const cancellation_write_timeout_ms: u32 = 100;
 const server_request_write_timeout_ms: u32 = 1_000;
 
@@ -249,6 +251,7 @@ pub const StdioDispatcher = struct {
     next_request_id: u64 = 0,
     generation: u64,
     max_frame_bytes: std.atomic.Value(usize),
+    docker_cleanup: ?docker_run.Cleanup = null,
     notification_sink: ?NotificationSink = null,
     notification_callback_active: bool = false,
     active_server_request_workers: usize = 0,
@@ -324,7 +327,16 @@ pub const StdioDispatcher = struct {
         self.destroy();
     }
 
+    pub fn installDockerCleanup(
+        self: *StdioDispatcher,
+        cleanup: docker_run.Cleanup,
+    ) void {
+        std.debug.assert(self.docker_cleanup == null);
+        self.docker_cleanup = cleanup;
+    }
+
     fn destroy(self: *StdioDispatcher) void {
+        std.debug.assert(self.docker_cleanup == null);
         self.pending.deinit();
         const owner_allocator = self.owner_allocator;
         owner_allocator.destroy(self);
@@ -800,6 +812,7 @@ pub const StdioDispatcher = struct {
         self.closeStdin();
         if (!should_join) {
             self.markStopped();
+            self.runDockerCleanupOnce();
             return;
         }
 
@@ -808,6 +821,22 @@ pub const StdioDispatcher = struct {
                 i64,
                 io_mod.milliTimestamp(),
                 shutdown_grace_ms,
+            ) catch std.math.maxInt(i64);
+            while (!self.readerIsDone() and io_mod.milliTimestamp() < deadline_ms) {
+                io_mod.sleep(request_poll_ns);
+            }
+        }
+        if (!self.readerIsDone()) {
+            debug_trace.logf(
+                "mcp",
+                "stdio dispatcher requesting child termination generation={d}",
+                .{self.generation},
+            );
+            terminateChildGracefully(self.child_id);
+            const deadline_ms = std.math.add(
+                i64,
+                io_mod.milliTimestamp(),
+                termination_grace_ms,
             ) catch std.math.maxInt(i64);
             while (!self.readerIsDone() and io_mod.milliTimestamp() < deadline_ms) {
                 io_mod.sleep(request_poll_ns);
@@ -830,11 +859,19 @@ pub const StdioDispatcher = struct {
         while (!self.usersDone()) io_mod.sleep(request_poll_ns);
         self.stdout = null;
         self.markStopped();
+        self.runDockerCleanupOnce();
         debug_trace.logf(
             "mcp",
             "stdio dispatcher stopped generation={d} reader_joined=true",
             .{self.generation},
         );
+    }
+
+    fn runDockerCleanupOnce(self: *StdioDispatcher) void {
+        var cleanup = self.docker_cleanup orelse return;
+        self.docker_cleanup = null;
+        defer cleanup.deinit(self.owner_allocator);
+        cleanup.run(self.owner_allocator);
     }
 
     fn registerPending(
@@ -1683,6 +1720,21 @@ fn terminateChild(child_id: std.process.Child.Id) void {
     }
 }
 
+fn terminateChildGracefully(child_id: std.process.Child.Id) void {
+    switch (builtin.os.tag) {
+        .windows => terminateChild(child_id),
+        .wasi => {},
+        else => std.posix.kill(child_id, .TERM) catch |err| switch (err) {
+            error.ProcessNotFound => {},
+            else => debug_trace.logf(
+                "mcp",
+                "failed to request stdio child termination pid={d} err={s}",
+                .{ child_id, @errorName(err) },
+            ),
+        },
+    }
+}
+
 test "classifyInbound separates responses notifications progress and requests" {
     const alloc = std.testing.allocator;
     const cases = [_]struct {
@@ -2312,6 +2364,71 @@ test "operation timeout returns and shutdown joins an uncooperative child" {
     );
 
     dispatcher.shutdown();
+    try expectProcessReaped(fixture.pid);
+}
+
+test "MCP normal shutdown gives a cooperative child TERM before forced cleanup" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const sentinel = try std.fmt.allocPrint(alloc, "{s}/term-sentinel", .{root});
+    defer alloc.free(sentinel);
+    const ready = try std.fmt.allocPrint(alloc, "{s}/ready", .{root});
+    defer alloc.free(ready);
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "trap 'printf term > \"{s}\"; exit 0' TERM\nprintf ready > \"{s}\"\nwhile :; do :; done",
+        .{ sentinel, ready },
+    );
+    defer alloc.free(script);
+
+    const fixture = try createShellDispatcher(script);
+    const dispatcher = fixture.dispatcher;
+    defer dispatcher.deinit();
+
+    dispatcher.shutdown();
+    try std.Io.Dir.accessAbsolute(std.testing.io, sentinel, .{});
+    try expectProcessReaped(fixture.pid);
+}
+
+test "MCP forced shutdown gives launchers bounded TERM before KILL" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const sentinel = try std.fmt.allocPrint(alloc, "{s}/term-sentinel", .{root});
+    defer alloc.free(sentinel);
+    const ready = try std.fmt.allocPrint(alloc, "{s}/ready", .{root});
+    defer alloc.free(ready);
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "trap 'printf term > \"{s}\"; exit 0' TERM\nprintf ready > \"{s}\"\nwhile :; do :; done",
+        .{ sentinel, ready },
+    );
+    defer alloc.free(script);
+
+    const fixture = try createShellDispatcher(script);
+    const dispatcher = fixture.dispatcher;
+    defer dispatcher.deinit();
+
+    for (0..100) |_| {
+        std.Io.Dir.accessAbsolute(std.testing.io, ready, .{}) catch {
+            io_mod.sleep(5 * std.time.ns_per_ms);
+            continue;
+        };
+        break;
+    } else return error.TestExpectedReady;
+    dispatcher.shutdownForced();
+    try std.Io.Dir.accessAbsolute(std.testing.io, sentinel, .{});
     try expectProcessReaped(fixture.pid);
 }
 

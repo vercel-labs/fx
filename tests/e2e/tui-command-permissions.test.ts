@@ -1524,8 +1524,7 @@ describe("effect-aware command permissions", () => {
       expectNoOutputRows(completed);
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
-      await activeSession.sendKeys("Right");
+      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
       await activeSession.waitForText("FXC110_FAILED_STDERR", TIMEOUT);
       const full = await activeSession.capturePane();
       expect(full).toContain("FXC110_FAST_STDOUT");
@@ -1556,8 +1555,7 @@ describe("effect-aware command permissions", () => {
       expectNoOutputRows(await activeSession.captureFullScrollback());
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
-      await activeSession.sendKeys("Right");
+      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
       await activeSession.waitForText("FXC110_FAILED_STDERR", TIMEOUT);
       let resumedFull = await activeSession.capturePane();
       await activeSession.sendHexBytes(["1b", "5b", "35", "7e"]);
@@ -1657,8 +1655,7 @@ describe("effect-aware command permissions", () => {
       const losslessGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
-      await activeSession.sendKeys("Right");
+      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
       await activeSession.waitForText(losslessRows[6]!, TIMEOUT);
       const losslessFull = await activeSession.capturePane();
       const losslessFullOutput = commandOutputText(losslessFull);
@@ -1687,8 +1684,7 @@ describe("effect-aware command permissions", () => {
       const lossyGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
-      await activeSession.sendKeys("Right");
+      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
       await activeSession.sendHexBytes(["1b", "5b", "36", "7e"]);
       await activeSession.waitForText(lossyRows[7]!, TIMEOUT);
       const lossyFull = await activeSession.capturePane();
@@ -1757,8 +1753,7 @@ describe("effect-aware command permissions", () => {
       expect(resumedCompactOutput).toBe("");
       for (const row of lossyRows) expect(resumedCompact).not.toContain(`│ ${row}`);
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
-      await activeSession.sendKeys("Right");
+      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
       await activeSession.sendHexBytes(["1b", "5b", "36", "7e"]);
       await activeSession.waitForText(lossyRows[7]!, TIMEOUT);
       const resumedFull = await activeSession.capturePane();
@@ -1825,8 +1820,7 @@ describe("effect-aware command permissions", () => {
       for (const row of commandRows) expect(compact).not.toContain(`│ ${row}`);
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
-      await activeSession.sendKeys("Right");
+      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
       await activeSession.waitForText(commandRows.at(-1)!, TIMEOUT);
       const full = await activeSession.capturePane();
       for (const row of commandRows) expect(full).toContain(`│ ${row}`);
@@ -2138,13 +2132,7 @@ describe("effect-aware command permissions", () => {
       const compactGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
-      const reviewTranscript = await activeSession.capturePane();
-      expect(reviewTranscript).not.toContain("Auto agent approved this request");
-      expect(reviewTranscript.indexOf("└ Ran")).toBeGreaterThanOrEqual(0);
-
-      await activeSession.sendKeys("Right");
-      await activeSession.waitForText("Full detail · ←/→ switch · ctrl o close", TIMEOUT);
+      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
       const fullTranscript = await activeSession.capturePane();
       expect(fullTranscript).not.toContain("Auto agent approved this request");
       expect(fullTranscript.indexOf("└ Ran")).toBeGreaterThanOrEqual(0);
@@ -2443,8 +2431,7 @@ describe("effect-aware command permissions", () => {
         expect(scrollback).not.toContain("FX_FOREGROUND_EXEC_FAILED");
 
         await activeSession.sendKeys("C-o");
-        await activeSession.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
-        await activeSession.sendKeys("Right");
+        await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
         await activeSession.waitForText("TTY_SESSION_STDERR", TIMEOUT);
         const full = await activeSession.capturePane();
         expect(full).toContain("TTY_SESSION_STDOUT_BEGIN");
@@ -2586,132 +2573,6 @@ describe("effect-aware command permissions", () => {
       activeSession = null;
     },
     TIMEOUT * 2,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "TUI auto mode holds an open_file reviewer caution without prompting or launching",
-    async () => {
-      const root = createIsolatedRoot();
-      const target = join(root.workspace, "open-file-reviewer-ask.txt");
-      const launchMarker = join(root.root, "open-file-launcher-used");
-      writeFileSync(target, "must stay closed\n");
-      const openPath = join(
-        root.hostileBin,
-        process.platform === "darwin" ? "open" : "xdg-open",
-      );
-      writeFileSync(
-        openPath,
-        `#!/bin/sh\nprintf launched > ${JSON.stringify(launchMarker)}\n`,
-      );
-      chmodSync(openPath, 0o755);
-
-      const gateway = startFakeGateway(
-        [
-          gatewayToolCall("open_file", { path: target }, "open_file_reviewer_ask"),
-          finalText("open file reviewer caution handled"),
-        ],
-        { classifierDecision: "caution" },
-      );
-      const tracePath = join(root.root, "trace.log");
-      const stderrPath = join(root.root, "stderr.log");
-      writeFileSync(stderrPath, "");
-
-      activeSession = await TmuxSession.create({
-        cmd: FX_BIN,
-        cwd: root.workspace,
-        env: gatewayEnv(root, gateway, {
-          FX_PERMISSION_MODE: "auto",
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "permission,tool",
-          PATH: hostilePath(root),
-        }),
-        stderrPath,
-        width: 120,
-        height: 40,
-      });
-      await activeSession.waitForComposer(TIMEOUT);
-      await activeSession.sendText("Open the reviewer caution fixture.");
-      const pane = await activeSession.waitForText(
-        "open file reviewer caution handled",
-        TIMEOUT,
-      );
-
-      expect(pane).not.toContain("Would you like to allow this action?");
-      expect(existsSync(launchMarker)).toBe(false);
-      expect(gateway.classifierRequests).toHaveLength(1);
-      expect(gateway.requests).toHaveLength(2);
-      const permissionResultRequest = gateway.requests[1]!.body;
-      expect(permissionResultRequest).toContain("tool_review_held");
-      expect(permissionResultRequest).toContain("review_caution");
-      expect(permissionResultRequest).not.toContain("user_denied");
-      const trace = readFileSync(tracePath, "utf8");
-      expect(trace).toContain("auto_review_result tool_name=open_file decision=caution");
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-
-      await activeSession.sendText("/quit");
-      expect(await activeSession.waitForSessionEnd()).toBe(true);
-      await activeSession.kill();
-      activeSession = null;
-    },
-    TIMEOUT,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "TUI auto mode launches open_file once after reviewer clear",
-    async () => {
-      const root = createIsolatedRoot();
-      const target = join(root.workspace, "open-file-reviewer-allow.txt");
-      const launchMarker = join(root.root, "open-file-launcher-argv");
-      writeFileSync(target, "open after allow\n");
-      const openPath = join(
-        root.hostileBin,
-        process.platform === "darwin" ? "open" : "xdg-open",
-      );
-      writeFileSync(
-        openPath,
-        `#!/bin/sh\nprintf '%s\\n' "$1" >> ${JSON.stringify(launchMarker)}\n`,
-      );
-      chmodSync(openPath, 0o755);
-
-      const gateway = startFakeGateway([
-        gatewayToolCall("open_file", { path: target }, "open_file_reviewer_allow"),
-        finalText("open file reviewer clear handled"),
-      ]);
-      const stderrPath = join(root.root, "stderr.log");
-      writeFileSync(stderrPath, "");
-
-      activeSession = await TmuxSession.create({
-        cmd: FX_BIN,
-        cwd: root.workspace,
-        env: gatewayEnv(root, gateway, {
-          FX_PERMISSION_MODE: "auto",
-          PATH: hostilePath(root),
-        }),
-        stderrPath,
-        width: 120,
-        height: 40,
-      });
-      await activeSession.waitForComposer(TIMEOUT);
-      await activeSession.sendText("Open the reviewer clear fixture.");
-      const pane = await activeSession.waitForText(
-        "open file reviewer clear handled",
-        TIMEOUT,
-      );
-
-      expect(pane).not.toContain("Would you like to allow this action?");
-      expect(readFileSync(launchMarker, "utf8")).toBe(`${target}\n`);
-      expect(gateway.classifierRequests).toHaveLength(1);
-      expect(gateway.requests).toHaveLength(2);
-      expect(toolResultText(gateway.requests[1]!.body, "open_file_reviewer_allow"))
-        .toContain("opened open-file-reviewer-allow.txt");
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-
-      await activeSession.sendText("/quit");
-      expect(await activeSession.waitForSessionEnd()).toBe(true);
-      await activeSession.kill();
-      activeSession = null;
-    },
-    TIMEOUT,
   );
 
   test.skipIf(!tmuxAvailable())(
@@ -4626,7 +4487,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "interactive Fx advertises and executes the canonical subagent tool",
+    "interactive fx advertises and executes the canonical subagent tool",
     async () => {
       const root = createIsolatedRoot();
       const stderrPath = join(root.root, "interactive-subagent-stderr.log");
@@ -4952,7 +4813,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "interactive Fx delivers periodic child notifications at the next available parent step",
+    "interactive fx delivers periodic child notifications at the next available parent step",
     async () => {
       const root = createIsolatedRoot();
       const stderrPath = join(root.root, "interactive-parent-delivery-stderr.log");
@@ -5105,7 +4966,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "interactive Fx delivers a 64 KiB child message in five bounded projections",
+    "interactive fx delivers a 64 KiB child message in five bounded projections",
     async () => {
       const root = createIsolatedRoot();
       const stderrPath = join(root.root, "interactive-64k-delivery-stderr.log");

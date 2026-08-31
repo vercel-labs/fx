@@ -292,6 +292,7 @@ pub fn Runtime(comptime App: type) type {
             app.context_enabled = startup.context_enabled;
             app.fast_mode = startup.fast_mode;
             app.input_runtime.slash_menu_categories = startup.slash_menu_categories;
+            app.shell.collapse_tool_calls = startup.collapse_tool_calls;
             app.auto_upgrade_enabled = startup.auto_upgrade;
             app.upgrader.configure_channel(startup.update_channel);
             app.effort = startup.effort;
@@ -320,7 +321,11 @@ pub fn Runtime(comptime App: type) type {
                 deps.stage_requested_resume_view(app)
             else
                 app_session_runtime.ResumeViewStage.none;
-            const profile_mcp = try deps.load_mcp_runtime(app.alloc, .{ .form = true, .url = true });
+            const profile_mcp = try deps.load_mcp_runtime(
+                app.alloc,
+                app.workspace_root,
+                .{ .form = true, .url = true },
+            );
             if (comptime @hasDecl(App, "installInitialMcpRuntime")) {
                 app.installInitialMcpRuntime(profile_mcp);
             } else {
@@ -353,6 +358,9 @@ pub fn Runtime(comptime App: type) type {
                     },
                 );
                 try app.writeTranscriptClassified(welcome_message, true, .welcome);
+                if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
+                    try app.presentProjectMcpPrompt();
+                }
             }
             if (app.skills.diagnostics.len > 0) {
                 var notice_writer: std.Io.Writer.Allocating = .init(app.alloc);
@@ -741,7 +749,7 @@ fn publishStagedResumeViewForTest(_: *TestApp, entry_id: u32) !void {
     active_capture.?.recordEvent("resume_view_publish");
 }
 
-fn loadMcpRuntimeForTest(_: Allocator, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
+fn loadMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
     active_capture.?.recordEvent("load_mcp");
     return null;
 }

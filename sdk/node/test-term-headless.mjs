@@ -96,8 +96,8 @@ const exitCode = await Promise.race([
 ]);
 
 if (exitCode !== 0) throw new Error(`fx-term exited with code ${exitCode}`);
-if (!grid.includes("𝒇x")) throw new Error(`shared Fx welcome frame was not visible in xterm grid:\n${grid}`);
-if (!grid.includes("Run /help for commands")) throw new Error(`shared Fx welcome guidance was not visible in xterm grid:\n${grid}`);
+if (!grid.includes("𝒇x")) throw new Error(`shared fx welcome frame was not visible in xterm grid:\n${grid}`);
+if (!grid.includes("Run /help for commands")) throw new Error(`shared fx welcome guidance was not visible in xterm grid:\n${grid}`);
 if (terminal.buffer.active.baseY !== 0 || terminal.buffer.active.viewportY !== 0) {
   throw new Error(`fresh xterm startup created blank scrollback: baseY=${terminal.buffer.active.baseY}, viewportY=${terminal.buffer.active.viewportY}`);
 }
@@ -110,4 +110,4 @@ if (!grid.includes("streamed response")) throw new Error(`terminal prompt did no
 if (requestedModel !== "sdk/accepted-model") throw new Error(`terminal prompt used unexpected accepted model: ${requestedModel}`);
 if (!(firstChunkAt >= startedAt)) throw new Error("terminal fetch did not produce a first stream chunk");
 
-console.log("headless xterm smoke passed: shared Fx frame used the 96x30 host cell grid");
+console.log("headless xterm smoke passed: shared fx frame used the 96x30 host cell grid");

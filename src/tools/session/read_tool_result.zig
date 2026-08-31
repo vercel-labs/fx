@@ -7,6 +7,11 @@ const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 
 const Allocator = std.mem.Allocator;
 
+const HandleNormalization = struct {
+    trimmed: []const u8,
+    suffix: []const u8,
+};
+
 pub const Input = struct {
     handle: []u8,
     start_byte: usize = 1,
@@ -74,12 +79,22 @@ fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
     alloc.destroy(input);
 }
 
+fn classifyHandleNormalization(handle: []const u8) HandleNormalization {
+    const trimmed = std.mem.trim(u8, handle, " \t\r\n");
+    const suffix = if (std.mem.startsWith(u8, trimmed, "result-") and
+        std.mem.findScalar(u8, trimmed, '.') == null)
+        ".txt"
+    else
+        "";
+    return .{ .trimmed = trimmed, .suffix = suffix };
+}
+
 pub fn validate(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!?[]u8 {
     const input = erased.as(Input);
-    const trimmed = std.mem.trim(u8, input.handle, " \t\r\n");
-    if (trimmed.len == 0) return try ctx.allocator.dupe(u8, "read_tool_result field \"handle\" must not be empty");
-    if (!std.mem.eql(u8, input.handle, trimmed)) {
-        const owned = try ctx.allocator.dupe(u8, trimmed);
+    const normalization = classifyHandleNormalization(input.handle);
+    if (normalization.trimmed.len == 0) return try ctx.allocator.dupe(u8, "read_tool_result field \"handle\" must not be empty");
+    if (normalization.suffix.len > 0 or !std.mem.eql(u8, input.handle, normalization.trimmed)) {
+        const owned = try std.mem.concat(ctx.allocator, u8, &.{ normalization.trimmed, normalization.suffix });
         ctx.allocator.free(input.handle);
         input.handle = owned;
     }
@@ -186,6 +201,45 @@ test "read_tool_result decodes range and query inputs" {
     try std.testing.expectEqual(@as(usize, 2), typed.start_byte);
     try std.testing.expectEqual(@as(usize, 9), typed.byte_count);
     try std.testing.expectEqualStrings("needle", typed.query.?);
+}
+
+test "read_tool_result admission restores only omitted stored-result suffixes" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        arguments_json: []const u8,
+        expected_handle: []const u8,
+    }{
+        .{
+            .arguments_json = "{\"handle\":\"result-web_fetch-1705079ba6e278c4-553514ccf082aeb9\"}",
+            .expected_handle = "result-web_fetch-1705079ba6e278c4-553514ccf082aeb9.txt",
+        },
+        .{
+            .arguments_json = "{\"handle\":\"result-web_fetch-1705079ba6e278c4-553514ccf082aeb9.txt\"}",
+            .expected_handle = "result-web_fetch-1705079ba6e278c4-553514ccf082aeb9.txt",
+        },
+        .{
+            .arguments_json = "{\"handle\":\"fx-command-replay-canonical.bin\"}",
+            .expected_handle = "fx-command-replay-canonical.bin",
+        },
+        .{
+            .arguments_json = "{\"handle\":\"unknown-dogfood-handle\"}",
+            .expected_handle = "unknown-dogfood-handle",
+        },
+    };
+
+    for (cases) |case| {
+        const decoded = try decode(.{ .allocator = alloc }, case.arguments_json);
+        const input = switch (decoded) {
+            .input => |value| value,
+            .failure => return error.TestUnexpectedDecodeFailure,
+        };
+        defer input.deinit(alloc);
+        if (try validate(.{ .allocator = alloc }, input)) |failure| {
+            defer alloc.free(failure);
+            return error.TestUnexpectedDecodeFailure;
+        }
+        try std.testing.expectEqualStrings(case.expected_handle, input.as(Input).handle);
+    }
 }
 
 test "unknown read_tool_result handle returns failure for legacy and managed stores" {

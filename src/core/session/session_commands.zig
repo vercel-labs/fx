@@ -1239,17 +1239,11 @@ fn isKnownAllowlistTool(tool_registry: tool_dispatch.Registry, name: []const u8)
 
     const categories = [_][]const u8{
         "edit",
-        "create_folder",
-        "open_file",
-        "rename_file",
-        "copy_file",
         "read",
-        "list",
         "glob",
         "grep",
         "skill",
         "memory",
-        "semantic_search",
         permissions.web_search_permission,
     };
     for (categories) |category| {
@@ -1412,12 +1406,7 @@ fn writeAllowlistPattern(writer: *std.Io.Writer, group: AllowlistRuleGroup, patt
 fn isWorkspacePathToolPermission(permission: []const u8) bool {
     const path_permissions = [_][]const u8{
         "edit",
-        "create_folder",
-        "open_file",
-        "rename_file",
-        "copy_file",
         "read",
-        "list",
         "glob",
         "grep",
     };

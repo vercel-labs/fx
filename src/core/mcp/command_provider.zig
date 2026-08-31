@@ -1,6 +1,100 @@
 const std = @import("std");
+const mcp_contract = @import("mcp_contract.zig");
+const project_config = @import("project_config.zig");
+const streamable_http = @import("streamable_http.zig");
 
 const Allocator = std.mem.Allocator;
+
+pub const AddIntent = union(enum) {
+    local: struct {
+        name: []const u8,
+        command: []const u8,
+        args: []const []const u8,
+    },
+    http: struct {
+        name: []const u8,
+        url: []const u8,
+    },
+};
+
+pub const AddIntentError = error{
+    McpAddUsage,
+    McpInvalidServerName,
+    McpConfigInvalidUrl,
+};
+
+pub const ProfileAddResult = struct {
+    profile_path: []u8,
+    warning: ?mcp_contract.ProfileConfigWarning = null,
+
+    pub fn deinit(self: *ProfileAddResult, alloc: Allocator) void {
+        alloc.free(self.profile_path);
+        self.* = undefined;
+    }
+};
+
+pub const AddProfileServerFn = *const fn (
+    alloc: Allocator,
+    intent: AddIntent,
+) anyerror!ProfileAddResult;
+
+pub fn addProfileServerUnavailable(
+    _: Allocator,
+    _: AddIntent,
+) anyerror!ProfileAddResult {
+    return error.McpProfileMutationUnavailable;
+}
+
+pub const ProfileRemoveResult = struct {
+    profile_path: []u8,
+    removed: bool,
+    warning: ?mcp_contract.ProfileConfigWarning = null,
+
+    pub fn deinit(self: *ProfileRemoveResult, alloc: Allocator) void {
+        alloc.free(self.profile_path);
+        self.* = undefined;
+    }
+};
+
+pub const RemoveProfileServerFn = *const fn (
+    alloc: Allocator,
+    name: []const u8,
+) anyerror!ProfileRemoveResult;
+
+pub fn removeProfileServerUnavailable(
+    _: Allocator,
+    _: []const u8,
+) anyerror!ProfileRemoveResult {
+    return error.McpProfileMutationUnavailable;
+}
+
+pub fn parseAddIntent(tokens: []const []const u8) AddIntentError!AddIntent {
+    if (tokens.len == 0) return error.McpAddUsage;
+    if (std.mem.eql(u8, tokens[0], "--transport")) {
+        if (tokens.len != 4 or !std.mem.eql(u8, tokens[1], "http")) {
+            return error.McpAddUsage;
+        }
+        if (!isValidServerName(tokens[2])) return error.McpInvalidServerName;
+        streamable_http.validateEndpoint(tokens[3]) catch return error.McpConfigInvalidUrl;
+        return .{ .http = .{ .name = tokens[2], .url = tokens[3] } };
+    }
+    if (tokens.len < 2) return error.McpAddUsage;
+    if (!isValidServerName(tokens[0])) return error.McpInvalidServerName;
+    return .{ .local = .{
+        .name = tokens[0],
+        .command = tokens[1],
+        .args = tokens[2..],
+    } };
+}
+
+pub fn isValidServerName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-') continue;
+        return false;
+    }
+    return true;
+}
 
 pub const AuthenticationStart = enum {
     started,
@@ -23,6 +117,7 @@ pub const LogoutResult = struct {
     removed: bool = false,
     revocation_failed: bool = false,
     repaired_entries: usize = 0,
+    local_only: bool = false,
 };
 
 pub const LogoutServerFn = *const fn (
@@ -100,6 +195,7 @@ pub const Result = struct {
     display: Display,
     reload: bool = false,
     report_reload: bool = false,
+    project_action: ?project_config.ProjectMcpAction = null,
 
     pub fn deinit(self: Result, alloc: Allocator) void {
         switch (self.display) {
@@ -149,4 +245,42 @@ test "MCP command provider delegates requests and returns owned display text" {
         .line => return error.TestExpectedEqual,
     }
     try std.testing.expect(!result.reload);
+}
+
+test "MCP add intent parses local and HTTP argv without allocation" {
+    const local = try parseAddIntent(&.{ "fixture", "node", "server.js", "--stdio" });
+    switch (local) {
+        .local => |intent| {
+            try std.testing.expectEqualStrings("fixture", intent.name);
+            try std.testing.expectEqualStrings("node", intent.command);
+            try std.testing.expectEqualSlices([]const u8, &.{ "server.js", "--stdio" }, intent.args);
+        },
+        .http => return error.TestUnexpectedResult,
+    }
+
+    const remote = try parseAddIntent(&.{ "--transport", "http", "docs", "https://example.test/mcp" });
+    switch (remote) {
+        .local => return error.TestUnexpectedResult,
+        .http => |intent| {
+            try std.testing.expectEqualStrings("docs", intent.name);
+            try std.testing.expectEqualStrings("https://example.test/mcp", intent.url);
+        },
+    }
+}
+
+test "MCP add intent rejects invalid syntax names and URLs" {
+    try std.testing.expectError(error.McpAddUsage, parseAddIntent(&.{}));
+    try std.testing.expectError(error.McpAddUsage, parseAddIntent(&.{"only-name"}));
+    try std.testing.expectError(
+        error.McpAddUsage,
+        parseAddIntent(&.{ "--transport", "sse", "docs", "https://example.test/mcp" }),
+    );
+    try std.testing.expectError(
+        error.McpInvalidServerName,
+        parseAddIntent(&.{ "bad/name", "node" }),
+    );
+    try std.testing.expectError(
+        error.McpConfigInvalidUrl,
+        parseAddIntent(&.{ "--transport", "http", "docs", "file:///tmp/socket" }),
+    );
 }

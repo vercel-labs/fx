@@ -24,7 +24,6 @@ pub const ParsedCommand = union(enum) {
     image: []const u8,
     images: []const u8,
     model: []const u8,
-    models,
     permissions: []const u8,
     allowlist: []const u8,
     stats,
@@ -68,7 +67,6 @@ pub const CommandHandlers = struct {
     attach_image: *const fn (ctx: *anyopaque, path: []const u8) anyerror!void,
     manage_images: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_model: *const fn (ctx: *anyopaque, query: []const u8) anyerror!void,
-    show_models: *const fn (ctx: *anyopaque) anyerror!void,
     handle_permissions: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_allowlist: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_stats: *const fn (ctx: *anyopaque) anyerror!void,
@@ -118,7 +116,6 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .images => .{ .images = payload },
         .image => .{ .image = payload },
         .model => .{ .model = payload },
-        .models => .models,
         .permissions => .{ .permissions = payload },
         .allowlist => .{ .allowlist = payload },
         .stats => .stats,
@@ -176,7 +173,6 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .image => |path| try handlers.attach_image(handlers.ctx, path),
         .images => |rest| try handlers.manage_images(handlers.ctx, rest),
         .model => |query| try handlers.handle_model(handlers.ctx, query),
-        .models => try handlers.show_models(handlers.ctx),
         .permissions => |rest| try handlers.handle_permissions(handlers.ctx, rest),
         .allowlist => |rest| try handlers.handle_allowlist(handlers.ctx, rest),
         .stats => try handlers.show_stats(handlers.ctx),
@@ -221,11 +217,8 @@ test "parse extracts an optional logout provider" {
     }
 }
 
-test "parse recognizes models" {
-    switch (parse(testSlashRegistry(), "/models")) {
-        .unknown => return error.TestExpectedModelsCommand,
-        else => {},
-    }
+test "parse rejects removed plural model command" {
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/models"));
 }
 
 test "parse leaves provider selection to setup" {
@@ -492,11 +485,6 @@ fn recordUnknown(ctx: *anyopaque, value: []const u8) anyerror!void {
     test_context.payload = value;
 }
 
-fn recordModels(ctx: *anyopaque) anyerror!void {
-    const test_context = testContext(ctx);
-    test_context.called = "models";
-}
-
 fn failStatus(ctx: *anyopaque) anyerror!void {
     _ = ctx;
     return error.TestRouteFailure;
@@ -523,7 +511,6 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .attach_image = unexpectedPayload,
         .manage_images = unexpectedPayload,
         .handle_model = unexpectedPayload,
-        .show_models = unexpectedNoPayload,
         .handle_permissions = unexpectedPayload,
         .handle_allowlist = unexpectedPayload,
         .show_stats = unexpectedNoPayload,
@@ -558,16 +545,6 @@ test "route calls expected no-payload handler" {
 
     try std.testing.expectEqualStrings("copy", ctx.called);
     try std.testing.expectEqualStrings("", ctx.payload);
-}
-
-test "route calls models handler" {
-    var ctx: TestContext = .{};
-    var handlers = testHandlers(&ctx);
-    handlers.show_models = recordModels;
-
-    try route(testSlashRegistry(), &handlers, "/models");
-
-    try std.testing.expectEqualStrings("models", ctx.called);
 }
 
 test "route calls interactive resume handler" {

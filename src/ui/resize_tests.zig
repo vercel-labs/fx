@@ -9,6 +9,8 @@ const display_width = @import("../core/shared/display_width.zig");
 const diff_mod = @import("../core/output/diff.zig");
 const io_mod = @import("../core/shared/io.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
+const usage_report = @import("../core/session/usage_report.zig");
+const workspace_access = @import("../core/workspace/workspace_access.zig");
 const types = @import("../core/shared/types.zig");
 const assistant_presentation = @import("../core/agent/assistant_presentation.zig");
 const builtin_commands = @import("../builtins/commands.zig");
@@ -995,6 +997,185 @@ fn expectGridContains(h: *Harness, needle: []const u8) !void {
     return error.TestExpectedGridText;
 }
 
+test "responsive compact menus stay inline across the VT width matrix" {
+    const alloc = std.testing.allocator;
+    var models: [25]usage_report.ModelUsage = undefined;
+    for (&models) |*model| {
+        model.* = .{
+            .model = @constCast("provider/model"),
+            .totals = .{
+                .total_tokens = 1,
+                .input_tokens = 1,
+                .output_tokens = 0,
+                .cache_read_tokens = 0,
+                .cache_write_tokens = 0,
+                .reasoning_tokens = null,
+                .request_count = 1,
+                .total_cost = 0.0001,
+            },
+        };
+    }
+    const usage_snapshot = usage_report.Snapshot{
+        .scope = .days_30,
+        .snapshot_time_ms = 100,
+        .window_start_ms = 0,
+        .coverage_started_at_ms = 0,
+        .coverage = .full,
+        .completeness = .complete,
+        .totals = .{
+            .total_tokens = 25,
+            .input_tokens = 25,
+            .output_tokens = 0,
+            .cache_read_tokens = 0,
+            .cache_write_tokens = 0,
+            .reasoning_tokens = null,
+            .request_count = 25,
+            .total_cost = 0.0025,
+        },
+        .models = &models,
+    };
+    var entries = [_]workspace_access.Entry{.{
+        .path = @constCast("/workspace/long-additional-directory"),
+        .saved = true,
+        .command_line = false,
+        .available = true,
+        .active = true,
+    }};
+
+    for ([_]u16{ 50, 80, 120, 180 }) |width| {
+        var h = try Harness.init(alloc, width, 36, 4);
+        defer h.deinit();
+        var input = InputRuntime{};
+        defer input.deinit(alloc);
+        var approval = approval_prompt.ApprovalPrompt{};
+        defer approval.deinit(alloc);
+        try h.shell.initViewport(&h.metrics, 1);
+        try h.shell.writeTranscript(
+            alloc,
+            &h.metrics,
+            "compact menu transcript remains visible\n",
+            true,
+        );
+
+        var ctx = defaultFooterContext(&input);
+        ctx.statusline_menu = .{
+            .active = true,
+            .selected_index = 2,
+            .snapshot = .{
+                .statusline_context = false,
+                .statusline_session = true,
+                .statusline_workspace = false,
+            },
+        };
+        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+        try h.flush();
+        try expectGridContains(&h, "compact menu transcript remains visible");
+        try expectGridContains(&h, "Status line");
+        try expectGridContains(&h, "Workspace");
+
+        ctx.statusline_menu = .{};
+        ctx.usage_menu = .{
+            .active = true,
+            .scope = .days_30,
+            .selected_model = models.len - 1,
+            .model_window_start = models.len - 1,
+            .snapshot = &usage_snapshot,
+        };
+        h.frame_redraw = true;
+        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+        try h.flush();
+        try expectGridContains(&h, "[30 days]");
+        try std.testing.expectEqual(
+            @as(usize, 20),
+            try countGridOccurrences(&h, "provider/model"),
+        );
+
+        ctx.usage_menu = .{};
+        ctx.workspace_menu = .{
+            .active = true,
+            .selected_row = 1,
+            .primary_directory = "/workspace",
+            .entries = &entries,
+        };
+        h.frame_redraw = true;
+        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+        try h.flush();
+        try expectGridContains(&h, "Workspace");
+        try expectGridContains(&h, "Additional directories");
+        try std.testing.expectEqual(
+            @as(usize, 0),
+            try countGridOccurrences(&h, "provider/model"),
+        );
+    }
+}
+
+test "MCP menu stays inline across the VT width matrix and restores the composer" {
+    const alloc = std.testing.allocator;
+    const tools = [_][]const u8{
+        "mcp_fixture_echo",
+        "mcp_fixture_read_resource",
+    };
+
+    for ([_]u16{ 50, 80, 120 }) |width| {
+        var h = try Harness.init(alloc, width, 28, 4);
+        defer h.deinit();
+        var input = InputRuntime{};
+        defer input.deinit(alloc);
+        var approval = approval_prompt.ApprovalPrompt{};
+        defer approval.deinit(alloc);
+        try h.shell.initViewport(&h.metrics, 1);
+        try h.shell.writeTranscript(
+            alloc,
+            &h.metrics,
+            "MCP menu transcript remains visible\n",
+            true,
+        );
+
+        var ctx = defaultFooterContext(&input);
+        ctx.mcp_menu = .{
+            .state = .{
+                .active = true,
+                .section = .tools,
+                .selected_index = 1,
+                .load_state = .ready,
+            },
+            .tools = &tools,
+        };
+        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+        try h.flush();
+        try expectGridContains(&h, "MCP menu transcript remains visible");
+        try expectGridContains(&h, "MCP 0");
+        try expectGridContains(&h, "[Tools]");
+        try expectGridContains(&h, "mcp_fixture_read_resource");
+        try expectGridContains(&h, "Tab");
+        try expectGridContains(&h, "Esc");
+
+        ctx.mcp_menu = .{
+            .state = .{
+                .active = true,
+                .section = .resources,
+                .screen = .preview,
+                .load_state = .ready,
+            },
+            .preview = "MCP resource · untrusted content\n\nRESOURCE_TEXT: preview remains wrapped and scrollable",
+        };
+        h.frame_redraw = true;
+        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+        try h.flush();
+        try expectGridContains(&h, "untrusted content");
+        try expectGridContains(&h, "RESOURCE_TEXT:");
+        try expectGridContains(&h, "I Insert");
+
+        ctx.mcp_menu = .{};
+        h.frame_redraw = true;
+        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+        try h.flush();
+        try expectGridContains(&h, "MCP menu transcript remains visible");
+        try expectGridNotContains(&h, "[Resources]");
+        try expectGridNotContains(&h, "I Insert");
+    }
+}
+
 fn expectGridNotContains(h: *Harness, needle: []const u8) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(h.alloc);
@@ -1939,13 +2120,11 @@ test "semantic code block colors source and keeps current footer rail styled thr
     try h.flush();
 
     var code_row = try findRowContaining(&h, "const hook");
-    var code_cell = h.vt.cellAt(code_row, 5) orelse return error.TestMissingCodeCell;
+    var code_cell = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'c'), code_cell.codepoint);
     try std.testing.expect(code_cell.style.fg.eql(.{ .indexed = 252 }));
-    const code_border = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeBorder;
-    try std.testing.expect(code_border.style.fg.eql(.default));
     var python_row = try findRowContaining(&h, "def ready");
-    var python_cell = h.vt.cellAt(python_row, 5) orelse return error.TestMissingCodeCell;
+    var python_cell = h.vt.cellAt(python_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'd'), python_cell.codepoint);
     try std.testing.expect(python_cell.style.fg.eql(.{ .indexed = 252 }));
     const initial_footer = try findFirstDividerRowAfter(&h, code_row);
@@ -1959,11 +2138,9 @@ test "semantic code block colors source and keeps current footer rail styled thr
     try h.flush();
 
     code_row = try findRowContaining(&h, "const hook");
-    code_cell = h.vt.cellAt(code_row, 5) orelse return error.TestMissingCodeCell;
+    code_cell = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'c'), code_cell.codepoint);
     try std.testing.expect(code_cell.style.fg.eql(.{ .indexed = 252 }));
-    const resized_border = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeBorder;
-    try std.testing.expect(resized_border.style.fg.eql(.default));
     python_row = try findRowContaining(&h, "def ready");
     python_cell = h.vt.cellAt(python_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'd'), python_cell.codepoint);
@@ -1992,18 +2169,18 @@ test "semantic code block keeps readable light theme colors through resize" {
     try h.flush();
 
     var code_row = try findRowContaining(&h, "const value");
-    var keyword_cell = h.vt.cellAt(code_row, 5) orelse return error.TestMissingCodeCell;
+    var keyword_cell = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'c'), keyword_cell.codepoint);
     try std.testing.expect(keyword_cell.style.fg.eql(.{ .indexed = 238 }));
 
     try h.driveResize(20, 40, 4, true);
     code_row = try findRowContaining(&h, "const value");
-    keyword_cell = h.vt.cellAt(code_row, 5) orelse return error.TestMissingCodeCell;
+    keyword_cell = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'c'), keyword_cell.codepoint);
     try std.testing.expect(keyword_cell.style.fg.eql(.{ .indexed = 238 }));
 }
 
-test "semantic code block drops its frame before wrapping source that fits" {
+test "semantic code block keeps solid rules while source reflows" {
     var h = try Harness.init(std.testing.allocator, 44, 40, 4);
     defer h.deinit();
     try h.shell.initViewport(&h.metrics, 1);
@@ -2023,20 +2200,20 @@ test "semantic code block drops its frame before wrapping source that fits" {
     }
     try h.renderTranscriptFrame();
     try h.flush();
-    try expectGridContains(&h, "┌ text");
+    try expectGridContains(&h, "─ text");
 
     try h.driveResize(40, 40, 4, true);
-    try expectGridNotContains(&h, "┌ text");
+    try expectGridContains(&h, "─ text");
     const first_source_row = try findRowContaining(&h, "┌────────────────────────────────┐");
     try expectRowTrimmedEquals(&h, first_source_row, "      ┌────────────────────────────────┐");
     try expectRowTrimmedEquals(&h, first_source_row + 1, "      │ ROOT                           │");
     try expectRowTrimmedEquals(&h, first_source_row + 2, "      └────────────────────────────────┘");
 
     try h.driveResize(39, 40, 4, true);
-    try expectGridContains(&h, "┌ text");
+    try expectGridContains(&h, "─ text");
 
     try h.driveResize(44, 40, 4, true);
-    try expectGridContains(&h, "┌ text");
+    try expectGridContains(&h, "─ text");
 }
 
 test "streamed paragraphs keep words together through shrink and grow" {
@@ -2370,7 +2547,7 @@ test "thinking shimmer reserves assistant-gap rows and clears back to stable foo
     try std.testing.expectEqual(footer_idle, footer_after);
 }
 
-test "completed presentation tail keeps thinking slot until turn summary" {
+test "completed presentation tail keeps activity slot until turn summary" {
     var h = try Harness.init(std.testing.allocator, 80, 22, 4);
     defer h.deinit();
 
@@ -2405,11 +2582,9 @@ test "completed presentation tail keeps thinking slot until turn summary" {
     try h.flush();
 
     const assistant_row = try findRowContaining(&h, "assistant starts here");
-    const thinking_after_provider_finish = try findRowContaining(&h, "Thinking");
-    try std.testing.expect(thinking_after_provider_finish > thinking_row);
-    try expectExactlyOneBlankRowBetween(&h, assistant_row, thinking_after_provider_finish);
-    const footer_after_assistant = try findFirstDividerRowAfter(&h, thinking_after_provider_finish);
-    try expectExactlyOneBlankRowBetween(&h, thinking_after_provider_finish, footer_after_assistant);
+    try expectGridNotContains(&h, "Thinking");
+    const footer_after_assistant = try findFirstDividerRowAfter(&h, assistant_row);
+    try expectOnlyBlankRowsBetween(&h, assistant_row, footer_after_assistant);
 
     _ = try h.shell.appendTurnSummaryEntry(h.alloc, .{
         .thinking_duration_ms = 1_000,
@@ -3438,6 +3613,92 @@ test "closed tool group finality flows through fixed point resolution and sealin
     try expectGridContains(&h, "SECOND_GROUP_INTRO");
 }
 
+test "completed tool group lets streamed assistant hard lines enter history" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 80, 14, 3);
+    defer h.deinit();
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+
+    try h.shell.initViewport(&h.metrics, 8);
+    for (0..4) |index| {
+        var line: [32]u8 = undefined;
+        const text = try std.fmt.bufPrint(&line, "startup row {d}\n", .{index});
+        _ = try h.shell.appendRawTranscriptEntry(alloc, text);
+    }
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    const group = types.ToolPresentationGroupId{ .turn_id = 93, .anchor_step_id = 1 };
+    var call_ids: [18][20]u8 = undefined;
+    for (0..call_ids.len - 1) |index| {
+        const call_id = try std.fmt.bufPrint(
+            &call_ids[index],
+            "answer-a-{d:0>2}",
+            .{index},
+        );
+        try applyCompletedReadForGroupFinalityResizeTest(&h, 93, call_id, group);
+    }
+    const active_call_id = try std.fmt.bufPrint(
+        &call_ids[call_ids.len - 1],
+        "answer-a-{d:0>2}",
+        .{call_ids.len - 1},
+    );
+    const active_id = types.ToolLifecycleId{ .turn_id = 93, .call_id = active_call_id };
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = active_id,
+        .presentation_group_id = group,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+    } });
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    var held_source = try h.shell.prepareTranscriptSource(alloc, null);
+    defer held_source.deinit(alloc);
+    const held = h.shell.stableTranscriptProjectionForFlow(held_source.bytes) orelse
+        return error.TestExpectedStableTranscript;
+    try std.testing.expect(held.visual_offset > held.history_visual_offset);
+
+    _ = try h.shell.streamAssistantChunk(
+        alloc,
+        &h.metrics,
+        "FINAL_LINE_01\nFINAL_LINE_02\nFINAL_LINE_03\npartial tail",
+    );
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
+
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = active_id,
+        .outcome = .{ .kind = .completed, .summary = "Read fixed-point fixture" },
+    } });
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    try std.testing.expect(h.last_frame.planned_scroll_rows > 0);
+    try std.testing.expect(h.last_frame.committed_scroll_rows > 0);
+    try std.testing.expect(h.last_frame.document_append_bytes > 0);
+    try std.testing.expect(h.last_frame.transcript_history_floor_respected);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
+
+    var released_source = try h.shell.prepareTranscriptSource(alloc, null);
+    defer released_source.deinit(alloc);
+    const released = h.shell.stableTranscriptProjectionForFlow(released_source.bytes) orelse
+        return error.TestExpectedStableTranscript;
+    try std.testing.expect(released.history_visual_offset > held.visual_offset);
+    try expectGridContains(&h, "partial tail");
+}
+
 test "hidden auto approval lifecycle reposition adds no compact scroll rows" {
     var h = try Harness.init(std.testing.allocator, 80, 12, 4);
     defer h.deinit();
@@ -3572,7 +3833,7 @@ test "completed replay tool entries fit a constrained terminal" {
     try expectGridContains(&h, "TOOL_REPLAY_FINISHED");
     try std.testing.expect(h.shell.last_visible_transcript_last_row <= h.shell.layout.rows);
 
-    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(h.alloc, .review));
+    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(h.alloc, .full));
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -3773,7 +4034,7 @@ test "approval banner keeps one blank row after bottom assistant line" {
     }
     try body.appendSlice(h.alloc, "final assistant tail");
     _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, body.items);
-    _ = try approval.syncRequest(h.alloc, .{ .label = "open_file" });
+    _ = try approval.syncRequest(h.alloc, .{ .label = "read_file" });
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -3804,7 +4065,7 @@ test "approval banner frames prompt after completed tool status" {
     }
     _ = try h.shell.appendRawTranscriptEntryClassified(h.alloc, body.items, .subagent_status);
     _ = try appendCompletedToolStatus(&h, "Listed project");
-    _ = try approval.syncRequest(h.alloc, .{ .label = "open_file" });
+    _ = try approval.syncRequest(h.alloc, .{ .label = "read_file" });
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -4108,7 +4369,7 @@ test "runtime decomposition preserves command output state and replaceable paint
     try std.testing.expect(h.shell.replaceable_last_line);
     try std.testing.expectEqual(status_id, h.shell.replaceableEntryId().?);
 
-    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(h.alloc, .review));
+    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(h.alloc, .full));
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -4179,7 +4440,7 @@ fn checkQueuedPromptAdmissionPreservesCommittedHistory(resize_before_cancel: boo
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .review));
+    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .full));
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -4301,7 +4562,7 @@ test "long context notice survives full transcript growth and later compact resi
     try expectGridContains(&h, "compact marker");
     try expectGridNotContains(&h, "xxxxxxxx");
 
-    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .review));
+    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .full));
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -4393,7 +4654,7 @@ test "folded command output survives canonical resize repaint" {
         true,
     );
     try std.testing.expect(
-        try h.shell.setTranscriptPresentationDepth(alloc, .review),
+        try h.shell.setTranscriptPresentationDepth(alloc, .full),
     );
     try h.shell.writeTranscript(
         alloc,
@@ -5686,7 +5947,7 @@ test "slash main page renders header categories selection range and contextual c
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridContains(&h, "Commands 37 · Type to filter");
+    try expectGridContains(&h, "Commands 36 · Type to filter");
     try expectGridContains(&h, "1–6");
     try expectGridContains(&h, "/help");
     try expectGridContains(&h, "General");
@@ -5707,7 +5968,7 @@ test "slash main page renders header categories selection range and contextual c
 
     try expectGridContains(&h, "ask");
     try expectGridContains(&h, "test-model");
-    try expectGridNotContains(&h, "Commands 37");
+    try expectGridNotContains(&h, "Commands 36");
     try expectGridNotContains(&h, "↑↓ Navigate");
 }
 
@@ -5728,7 +5989,7 @@ test "slash main page drops categories and ellipsizes descriptions when narrow" 
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridContains(&h, "Commands 2");
+    try expectGridContains(&h, "Commands 1");
     try expectGridContains(&h, "/model");
     try expectGridContains(&h, "…");
     try expectGridNotContains(&h, "Model");
@@ -6246,12 +6507,12 @@ test "inline approval footer reflow preserves concurrent transcript progress" {
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    // The assistant producer is still open, so the streamed rows are not
-    // final: the viewport follows them through an in-place repaint and no
-    // transcript row is released into scrollback.
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
+    // Complete streamed rows are final even while the producer remains open,
+    // so they enter history instead of sliding the viewport by repaint.
+    try std.testing.expectEqual(@as(u16, 2), h.last_frame.planned_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 2), h.last_frame.committed_scroll_rows);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
+    try std.testing.expect(h.last_frame.document_append_bytes > 0);
     try std.testing.expectEqual(
         @as(usize, 1),
         std.mem.count(u8, h.shell.transcript.items, append_one),
@@ -6263,20 +6524,13 @@ test "inline approval footer reflow preserves concurrent transcript progress" {
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_one));
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_two));
 
-    // Closing the producer finalizes the tail; the held rows settle through
-    // the catch-up replay, possibly across frames.
+    // Closing the producer has no completed-row debt left to settle.
     h.shell.transcript_release = h.shell.transcript_release.with_assistant_tail_writable(false);
-    var settle_frames: usize = 0;
-    var settled_scroll_rows: u32 = 0;
-    while (settle_frames < 8) : (settle_frames += 1) {
-        h.frame_redraw = true;
-        try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
-        try h.flush();
-        try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
-        if (h.last_frame.planned_scroll_rows == 0) break;
-        settled_scroll_rows += h.last_frame.planned_scroll_rows;
-    }
-    try std.testing.expect(settled_scroll_rows > 0);
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_one));
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_two));
 

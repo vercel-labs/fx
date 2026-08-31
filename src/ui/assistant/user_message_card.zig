@@ -136,6 +136,30 @@ pub fn buildUserPromptCardWithSkillTokensForTerminalPresentationInterruptible(
         skill_tokens,
         true,
         checkpoint,
+        null,
+    );
+}
+
+pub fn buildUserPromptCardTailForTerminalPresentationInterruptible(
+    alloc: std.mem.Allocator,
+    text: []const u8,
+    images: []const types.ImageAttachment,
+    cols: u16,
+    skill_tokens: []const visual_layout.SkillTokenSpan,
+    max_rows: usize,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) ![]u8 {
+    // The pending-frame path retains only the newest rows that fit its current
+    // transcript band; canonical formatting remains shared with ordinary turns.
+    return buildUserPromptCardWithSkillTokensAndLinksInterruptible(
+        alloc,
+        text,
+        images,
+        cols,
+        skill_tokens,
+        true,
+        checkpoint,
+        max_rows,
     );
 }
 
@@ -155,6 +179,7 @@ fn buildUserPromptCardWithSkillTokensAndLinks(
         skill_tokens,
         linked_images,
         null,
+        null,
     ) catch |err| switch (err) {
         error.InputPending => unreachable,
         else => |other| return other,
@@ -169,6 +194,7 @@ fn buildUserPromptCardWithSkillTokensAndLinksInterruptible(
     skill_tokens: []const visual_layout.SkillTokenSpan,
     linked_images: bool,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
+    max_rows: ?usize,
 ) ![]u8 {
     const window: usize = if (cols > 2) @as(usize, cols) - 2 else 0;
 
@@ -229,6 +255,7 @@ fn buildUserPromptCardWithSkillTokensAndLinksInterruptible(
         display_text,
         window,
         checkpoint,
+        max_rows,
     );
 
     for (rows.items) |content| {
@@ -276,6 +303,21 @@ fn appendRow(
     try rows.append(alloc, dup);
 }
 
+fn appendVisibleRow(
+    alloc: std.mem.Allocator,
+    rows: *std.ArrayList([]const u8),
+    content: []const u8,
+    max_rows: ?usize,
+) !void {
+    if (max_rows) |limit| {
+        if (limit == 0) return;
+        if (rows.items.len == limit) {
+            alloc.free(rows.orderedRemove(0));
+        }
+    }
+    try appendRow(alloc, rows, content);
+}
+
 fn writeRowPrefix(writer: *std.Io.Writer) !void {
     try writer.writeAll(marker_style);
     try writer.writeAll(user_turn_rail);
@@ -313,6 +355,7 @@ fn collectLogicalLinesWithFirstPrefix(
     text: []const u8,
     window: usize,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
+    max_rows: ?usize,
 ) !void {
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |line| {
@@ -322,7 +365,7 @@ fn collectLogicalLinesWithFirstPrefix(
         if (remaining.len == 0) {
             row_buf.clearRetainingCapacity();
             try writeRowPrefix(&row_buf.writer);
-            try appendRow(alloc, rows, row_buf.written());
+            try appendVisibleRow(alloc, rows, row_buf.written(), max_rows);
             continue;
         }
         while (remaining.len > 0) {
@@ -335,7 +378,7 @@ fn collectLogicalLinesWithFirstPrefix(
             try row_buf.writer.writeAll(fragment);
             active_hyperlink = hyperlinkStateAfter(fragment, active_hyperlink);
             if (active_hyperlink != null) try row_buf.writer.writeAll(osc8_close);
-            try appendRow(alloc, rows, row_buf.written());
+            try appendVisibleRow(alloc, rows, row_buf.written(), max_rows);
             remaining = remaining[c.skip_bytes..];
         }
     }
@@ -777,4 +820,24 @@ test "buildUserPromptCard handles leading newline with image" {
     try assertRowStructure(card);
     try std.testing.expect(std.mem.find(u8, card, "[Image 1]") != null);
     try std.testing.expect(std.mem.find(u8, card, "after") != null);
+}
+
+test "pending terminal card keeps only the visible tail rows" {
+    const alloc = std.testing.allocator;
+    const card = try buildUserPromptCardTailForTerminalPresentationInterruptible(
+        alloc,
+        "row0\nrow1\nrow2\nrow3\nrow4",
+        &.{},
+        80,
+        &.{},
+        2,
+        null,
+    );
+    defer alloc.free(card);
+
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, card, "\n"));
+    try std.testing.expect(std.mem.find(u8, card, "row0") == null);
+    try std.testing.expect(std.mem.find(u8, card, "row2") == null);
+    try std.testing.expect(std.mem.find(u8, card, "row3") != null);
+    try std.testing.expect(std.mem.find(u8, card, "row4") != null);
 }

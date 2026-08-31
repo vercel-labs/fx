@@ -87,10 +87,8 @@ export interface RecordedToolCall {
 }
 
 const LOCAL_FILE_TOOLS = [
-  "list_files",
   "glob_files",
   "grep_files",
-  "semantic_search",
   "read_file",
 ] as const;
 
@@ -108,7 +106,6 @@ const MCP_DISCOVERY_TOOLS = [
 ] as const;
 
 const DESTRUCTIVE_OR_MUTATING_TOOLS = [
-  "delete_file",
   "write_file",
   "edit_file",
   "terminal",
@@ -244,7 +241,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "provider-search misuse",
     expectedFirstTool: {
       category: "local exact search",
-      tools: ["grep_files", "semantic_search", "glob_files"],
+      tools: ["grep_files", "glob_files"],
     },
     forbiddenTools: [WEB_SEARCH_TOOL, "ask_user_question"],
     expectedUserVisibleBehavior:
@@ -274,7 +271,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "approval loop",
     expectedFirstTool: {
       category: "local command-policy investigation",
-      tools: ["read_file", "grep_files", "semantic_search", "glob_files"],
+      tools: ["read_file", "grep_files", "glob_files"],
       notes:
         "The investigation should stay on local source evidence and stop once equivalent searches stop adding information.",
     },
@@ -310,7 +307,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "ask-user misuse",
     expectedFirstTool: {
       category: "local concept discovery",
-      tools: ["semantic_search", "glob_files", "grep_files", "read_file"],
+      tools: ["glob_files", "grep_files", "read_file"],
     },
     forbiddenTools: [WEB_SEARCH_TOOL, "ask_user_question"],
     expectedUserVisibleBehavior:
@@ -892,7 +889,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
       notes:
         "No known URL is provided, so broad current web research should use web_search instead of local repo tools or web_fetch.",
     },
-    forbiddenTools: [WEB_FETCH_TOOL, "read_file", "glob_files", "grep_files", "semantic_search", "ask_user_question"],
+    forbiddenTools: [WEB_FETCH_TOOL, "read_file", "glob_files", "grep_files", "ask_user_question"],
     expectedUserVisibleBehavior:
       "Uses web_search for current web research, treats search results as untrusted, cites linked sources, and does not invent local repo facts.",
     deterministicCoverage: {

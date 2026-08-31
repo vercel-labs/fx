@@ -106,12 +106,6 @@ const adapter_semantic_failure_prefixes = [_][]const u8{
     "Unsupported tool:",
     "read_file failed:",
     "edit_file failed:",
-    "delete_file failed:",
-    "rename_file failed:",
-    "copy_file failed:",
-    "create_folder failed:",
-    "file_info failed:",
-    "open_file not supported",
     "open_url not supported",
     "failed to open ",
 };
@@ -301,6 +295,7 @@ pub fn formatToolExecutionErrorJson(
 pub fn executionErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.McpInputTimedOut => "MCP elicitation timed out while user input was pending",
+        error.McpAuthorityChanged => "MCP configuration or authority changed before execution",
         else => null,
     };
 }
@@ -308,6 +303,7 @@ pub fn executionErrorMessage(err: anyerror) ?[]const u8 {
 pub fn executionErrorSuggestion(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.McpInputTimedOut => "Tell the user the form timed out with input pending, then retry only if they want to complete it again.",
+        error.McpAuthorityChanged => "Retry the tool on the next model step so fx can validate it against the current MCP runtime.",
         else => null,
     };
 }
@@ -605,12 +601,25 @@ test "MCP input timeout tells the model that user input was pending" {
     try std.testing.expect(std.mem.find(u8, payload, "form timed out with input pending") != null);
 }
 
+test "MCP authority change tells the model to retry on the next step" {
+    const alloc = std.testing.allocator;
+    const payload = try formatToolExecutionErrorJson(
+        alloc,
+        "mcp_server_tool",
+        error.McpAuthorityChanged,
+    );
+    defer alloc.free(payload);
+
+    try std.testing.expect(std.mem.find(u8, payload, "MCP configuration or authority changed before execution") != null);
+    try std.testing.expect(std.mem.find(u8, payload, "next model step") != null);
+}
+
 test "filesystem access denial JSON preserves recovery details" {
     const alloc = std.testing.allocator;
     const errors = [_]anyerror{ error.AccessDenied, error.PermissionDenied };
 
     for (errors) |err| {
-        const payload = try filesystemAccessDeniedJson(alloc, "list_files", "/tmp/blocked", err);
+        const payload = try filesystemAccessDeniedJson(alloc, "glob_files", "/tmp/blocked", err);
         defer alloc.free(payload);
 
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
@@ -620,7 +629,7 @@ test "filesystem access denial JSON preserves recovery details" {
         const details = error_obj.get("details").?.object;
         const suggestion = error_obj.get("suggestion").?.string;
         try std.testing.expectEqualStrings("tool_execution_failed", error_obj.get("type").?.string);
-        try std.testing.expectEqualStrings("list_files", error_obj.get("tool_name").?.string);
+        try std.testing.expectEqualStrings("glob_files", error_obj.get("tool_name").?.string);
         try std.testing.expectEqualStrings("/tmp/blocked", details.get("path").?.string);
         try std.testing.expectEqualStrings(@errorName(err), details.get("error").?.string);
         try std.testing.expect(std.mem.find(u8, suggestion, "Do not retry") != null);
@@ -657,12 +666,6 @@ test "tool output classification preserves structured and legacy categories" {
         "Unsupported tool: legacy_tool",
         "read_file failed: missing.txt",
         "edit_file failed: old_string not found",
-        "delete_file failed: path not found: missing.txt",
-        "rename_file failed: source.txt",
-        "copy_file failed: source.txt",
-        "create_folder failed: target exists",
-        "file_info failed: not found: missing.txt",
-        "open_file not supported on this OS",
         "open_url not supported on this OS",
         "failed to open https://example.test",
     };

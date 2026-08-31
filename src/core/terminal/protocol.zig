@@ -193,13 +193,30 @@ pub fn projectResultForCapabilities(
     return .{ .failure = compatible };
 }
 
+inline fn failDecodedFrame(err: anytype) @TypeOf(err)!DecodedFrame {
+    return @errorCast(failDecodedFrameDynamic(err));
+}
+
+noinline fn failDecodedFrameDynamic(err: anyerror) anyerror!DecodedFrame {
+    return err;
+}
+
+test "decoded frame failures preserve exact error types and identities" {
+    const truncated = failDecodedFrame(error.TruncatedFrame);
+    try std.testing.expect(
+        @TypeOf(truncated) == error{TruncatedFrame}!DecodedFrame,
+    );
+    try std.testing.expectError(error.TruncatedFrame, truncated);
+    try std.testing.expectError(error.OutOfMemory, failDecodedFrame(error.OutOfMemory));
+}
+
 pub fn decodeFrame(alloc: Allocator, bytes: []const u8) DecodeError!DecodedFrame {
     const header = try Header.decode(bytes);
     const payload_len: usize = header.envelope.payload_len;
     const expected_len = std.math.add(usize, header_len, payload_len) catch
-        return error.HostFrameTooLarge;
-    if (bytes.len < expected_len) return error.TruncatedFrame;
-    if (bytes.len != expected_len) return error.InvalidHostFrame;
+        return failDecodedFrame(error.HostFrameTooLarge);
+    if (bytes.len < expected_len) return failDecodedFrame(error.TruncatedFrame);
+    if (bytes.len != expected_len) return failDecodedFrame(error.InvalidHostFrame);
 
     var parsed = std.json.parseFromSlice(
         contracts.MessagePayload,
@@ -207,8 +224,8 @@ pub fn decodeFrame(alloc: Allocator, bytes: []const u8) DecodeError!DecodedFrame
         bytes[header_len..],
         .{ .allocate = .alloc_always },
     ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidPayload,
+        error.OutOfMemory => return failDecodedFrame(error.OutOfMemory),
+        else => return failDecodedFrame(error.InvalidPayload),
     };
     errdefer parsed.deinit();
     try (contracts.HostMessage{
@@ -227,18 +244,18 @@ pub fn readFrame(
 ) (DecodeError || std.Io.Reader.Error)!DecodedFrame {
     var header_bytes: [header_len]u8 = undefined;
     reader.readSliceAll(&header_bytes) catch |err| switch (err) {
-        error.EndOfStream => return error.TruncatedFrame,
+        error.EndOfStream => return failDecodedFrame(error.TruncatedFrame),
         else => return err,
     };
     const header = try Header.decode(&header_bytes);
     const payload_len: usize = header.envelope.payload_len;
     const total_len = std.math.add(usize, header_len, payload_len) catch
-        return error.HostFrameTooLarge;
+        return failDecodedFrame(error.HostFrameTooLarge);
     var bytes = try alloc.alloc(u8, total_len);
     defer alloc.free(bytes);
     @memcpy(bytes[0..header_len], &header_bytes);
     reader.readSliceAll(bytes[header_len..]) catch |err| switch (err) {
-        error.EndOfStream => return error.TruncatedFrame,
+        error.EndOfStream => return failDecodedFrame(error.TruncatedFrame),
         else => return err,
     };
     return decodeFrame(alloc, bytes);

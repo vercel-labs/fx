@@ -1301,7 +1301,7 @@ pub const Store = struct {
             alloc,
             workspace_root,
             options,
-        ) orelse return error.NoSavedSessions;
+        ) orelse return session_log.failLoadedWritableSession(error.NoSavedSessions);
         defer alloc.free(selected);
         var loaded = try self.resumeExactForWrite(
             alloc,
@@ -3227,7 +3227,9 @@ pub const Store = struct {
         if (std.mem.eql(u8, loaded.state.workspace_root, workspace_root)) {
             return loaded;
         }
-        if (!allow_rebind) return error.SessionTargetChanged;
+        if (!allow_rebind) {
+            return session_log.failLoadedWritableSession(error.SessionTargetChanged);
+        }
 
         const rebound = session_event.Event{ .workspace_rebound = .{
             .previous_workspace_root = loaded.state.workspace_root,
@@ -3240,7 +3242,7 @@ pub const Store = struct {
             .rollback_before_adapter_continue,
             options.log,
         ) catch |err| switch (err) {
-            error.SessionPersistenceDegraded => return error.SessionWorkspaceRebindFailed,
+            error.SessionPersistenceDegraded => return session_log.failLoadedWritableSession(error.SessionWorkspaceRebindFailed),
             else => return err,
         };
         return loaded;
@@ -3453,6 +3455,29 @@ pub const Store = struct {
         preference_source: MigrationPreferenceSource,
         options: ResumeOptions,
     ) !LoadedWritableSession {
+        var loaded: LoadedWritableSession = undefined;
+        try self.migrateLegacyForWriteInto(
+            &loaded,
+            alloc,
+            session_id,
+            workspace_root,
+            preference_source,
+            options,
+        );
+        return loaded;
+    }
+
+    // Keep cold fallible constructors behind noinline out-parameter boundaries
+    // so error returns do not materialize the full LoadedWritableSession payload.
+    noinline fn migrateLegacyForWriteInto(
+        self: Store,
+        out: *LoadedWritableSession,
+        alloc: Allocator,
+        session_id: []const u8,
+        workspace_root: []const u8,
+        preference_source: MigrationPreferenceSource,
+        options: ResumeOptions,
+    ) !void {
         if (self.canonical_root.mode != .writable or
             self.canonical_root.sessions == null)
         {
@@ -3494,7 +3519,7 @@ pub const Store = struct {
             .writer_lock = writer_lock,
             .session_id = owned_id,
         };
-        return self.migrateLegacyWithLatestCache(
+        const loaded = self.migrateLegacyWithLatestCache(
             alloc,
             &writable,
             workspace_root,
@@ -3504,6 +3529,7 @@ pub const Store = struct {
             writable.deinit(alloc);
             return err;
         };
+        out.* = loaded;
     }
 
     fn migrateLegacyWithLatestCache(
@@ -3539,6 +3565,27 @@ pub const Store = struct {
         preference_source: MigrationPreferenceSource,
         options: ResumeOptions,
     ) !LoadedWritableSession {
+        var loaded: LoadedWritableSession = undefined;
+        try self.resolveAuthorityTransitionForWriteInto(
+            &loaded,
+            alloc,
+            session_id,
+            workspace_root,
+            preference_source,
+            options,
+        );
+        return loaded;
+    }
+
+    noinline fn resolveAuthorityTransitionForWriteInto(
+        self: Store,
+        out: *LoadedWritableSession,
+        alloc: Allocator,
+        session_id: []const u8,
+        workspace_root: []const u8,
+        preference_source: MigrationPreferenceSource,
+        options: ResumeOptions,
+    ) !void {
         var read_dir = try self.openSessionDir(session_id);
         var transition = (try loadAuthorityTransitionOptional(
             alloc,
@@ -3553,11 +3600,13 @@ pub const Store = struct {
 
         if (transition.kind == .session_create) {
             var root = self.canonical_root;
-            return root.resumeForWrite(
+            const loaded = try root.resumeForWrite(
                 alloc,
                 session_id,
                 options.log,
             );
+            out.* = loaded;
+            return;
         }
 
         var writable = try self.openWritableSessionDir(
@@ -3635,7 +3684,8 @@ pub const Store = struct {
             errdefer loaded.deinit(alloc);
             try loaded.installCommitLifecycle(lifecycle);
             _ = loaded.publishCommitLifecycle(alloc);
-            return loaded;
+            out.* = loaded;
+            return;
         }
 
         try restoreLegacyAuthority(alloc, &writable, current);
@@ -3648,7 +3698,7 @@ pub const Store = struct {
             preference_source,
             options,
         );
-        return loaded;
+        out.* = loaded;
     }
 
     fn openWritableSessionDir(
@@ -8726,12 +8776,12 @@ test "schema v3 load repairs duplicate-key tool arguments before gateway project
 
     var calls = [_]session.ToolCall{.{
         .id = @constCast("persisted_duplicate_call"),
-        .name = @constCast("list_files"),
+        .name = @constCast("glob_files"),
         .arguments_json = @constCast(duplicate_arguments),
     }};
     var results = [_]session.PersistedToolResult{.{
         .tool_call_id = @constCast("persisted_duplicate_call"),
-        .tool_name = @constCast("list_files"),
+        .tool_name = @constCast("glob_files"),
         .status = .success,
         .output = @constCast("stale success"),
         .output_bytes = 13,

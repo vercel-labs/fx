@@ -104,7 +104,11 @@ function cleanCommandCall(command: string, id: string) {
   });
 }
 
-function toolResultText(body: string, toolCallId: string): string {
+function toolResultText(
+  body: string,
+  toolCallId: string,
+  outputType: "text" | "execution-denied" = "text",
+): string {
   const request = JSON.parse(body) as {
     prompt?: Array<{ content?: Array<Record<string, unknown>> }>;
   };
@@ -113,9 +117,10 @@ function toolResultText(body: string, toolCallId: string): string {
     .find((part) => part.type === "tool-result" && part.toolCallId === toolCallId);
   expect(result).toBeDefined();
   const output = result!.output as Record<string, unknown>;
-  expect(output.type).toBe("text");
-  expect(typeof output.value).toBe("string");
-  return output.value as string;
+  expect(output.type).toBe(outputType);
+  const content = outputType === "execution-denied" ? output.reason : output.value;
+  expect(typeof content).toBe("string");
+  return content as string;
 }
 
 function installRecorder(root: IsolatedRoot, name: string, marker: string) {
@@ -353,7 +358,7 @@ describe("lean auto mode reliability", () => {
           (body) => {
             expect(toolResultText(body, "clean_direct_pwd")).toContain("exit_code=0");
             expect(toolResultText(body, "clean_direct_git_status")).toContain("exit_code=0");
-            expect(toolResultText(body, "clean_blocked_reset")).toContain("review_caution");
+            expect(toolResultText(body, "clean_blocked_reset", "execution-denied")).toContain("review_caution");
             return fakeGatewayFinalText("Clean command group complete.");
           },
         ],
@@ -453,39 +458,6 @@ describe("lean auto mode reliability", () => {
         expect(gateway.requests).toHaveLength(2);
         expect(existsSync(marker)).toBe(true);
       }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "an explicit delete_file request reaches the reviewer and clears the exact deletion",
-    async () => {
-      const root = createIsolatedRoot();
-      const target = join(root.workspace, "keep.txt");
-      writeFileSync(target, "keep\n");
-      const gateway = startGateway(
-        [
-          fakeGatewayToolCall("deterministic_delete", "delete_file", {
-            path: target,
-          }),
-          fakeGatewayFinalText("delete completed"),
-        ],
-        [fakeGatewayPermissionDecision("clear", "delete_review_clear")],
-      );
-
-      const result = await runFx(
-        ["ask", "--quiet", "--json", "--no-save", "Delete keep.txt as requested."],
-        {
-          cwd: root.workspace,
-          env: gatewayEnv(root, gateway),
-          timeoutMs: TIMEOUT,
-        },
-      );
-
-      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-      expect(result.stdout).toContain("delete completed");
-      expect(gateway.classifierRequests).toHaveLength(1);
-      expect(existsSync(target)).toBe(false);
     },
     TIMEOUT,
   );
@@ -658,48 +630,24 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
-    "existing replacement and startup targets remain reviewer owned",
+    "existing startup targets remain reviewer owned",
     async () => {
       const root = createIsolatedRoot();
-      const copySource = join(root.root, "copy-source.txt");
-      const copyDestination = join(root.root, "copy-destination.txt");
-      const renameSource = join(root.root, "rename-source.txt");
-      const renameDestination = join(root.root, "rename-destination.txt");
       const startup = join(root.home, ".zshrc");
-      writeFileSync(copySource, "copy source\n");
-      writeFileSync(copyDestination, "copy destination\n");
-      writeFileSync(renameSource, "rename source\n");
-      writeFileSync(renameDestination, "rename destination\n");
       writeFileSync(startup, "startup before\n");
 
       const gateway = startGateway(
         [
-          fakeGatewayToolCall("review_copy", "copy_file", {
-            source: copySource,
-            destination: copyDestination,
-          }),
-          (body) => {
-            expect(body).toContain("review_caution");
-            return fakeGatewayToolCall("review_rename", "rename_file", {
-              old_path: renameSource,
-              new_path: renameDestination,
-            });
-          },
-          (body) => {
-            expect(body).toContain("review_caution");
-            return fakeGatewayToolCall("review_startup", "write_file", {
+          fakeGatewayToolCall("review_startup", "write_file", {
               path: startup,
               content: "startup after\n",
-            });
-          },
+          }),
           (body) => {
             expect(body).toContain("review_caution");
             return fakeGatewayFinalText("replacement effects stayed blocked");
           },
         ],
         [
-          fakeGatewayPermissionDecision("caution", "copy_review"),
-          fakeGatewayPermissionDecision("caution", "rename_review"),
           fakeGatewayPermissionDecision("caution", "startup_review"),
         ],
       );
@@ -714,11 +662,7 @@ describe("lean auto mode reliability", () => {
       );
 
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-      expect(gateway.classifierRequests).toHaveLength(3);
-      expect(readFileSync(copySource, "utf8")).toBe("copy source\n");
-      expect(readFileSync(copyDestination, "utf8")).toBe("copy destination\n");
-      expect(readFileSync(renameSource, "utf8")).toBe("rename source\n");
-      expect(readFileSync(renameDestination, "utf8")).toBe("rename destination\n");
+      expect(gateway.classifierRequests).toHaveLength(1);
       expect(readFileSync(startup, "utf8")).toBe("startup before\n");
     },
     TIMEOUT,
@@ -986,7 +930,7 @@ describe("lean auto mode reliability", () => {
             return userCommandCall(rebuildCommand, "injected_rebuild");
           },
           (body) => {
-            expect(toolResultText(body, "injected_rebuild")).toContain("review_caution");
+            expect(toolResultText(body, "injected_rebuild", "execution-denied")).toContain("review_caution");
             expect(body).not.toContain("approval_request_id");
             return commandCall("pwd", "safe_after_injection");
           },

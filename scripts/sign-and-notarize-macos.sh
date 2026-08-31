@@ -45,6 +45,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
+fail_stage() {
+    echo "Apple signing failed during $1" >&2
+    exit 1
+}
+
 printf '%s' "${APPLE_DEVELOPER_ID_P12_BASE64}" \
     | "${openssl_bin}" base64 -d -A -out "${certificate_path}"
 printf '%s' "${APPLE_NOTARY_KEY_P8_BASE64}" \
@@ -53,37 +58,55 @@ printf '%s' "${APPLE_NOTARY_KEY_P8_BASE64}" \
 "${security_bin}" create-keychain -p "${keychain_password}" "${signing_keychain}"
 "${security_bin}" set-keychain-settings -lut 21600 "${signing_keychain}"
 "${security_bin}" unlock-keychain -p "${keychain_password}" "${signing_keychain}"
-"${security_bin}" import "${certificate_path}" \
+if ! "${security_bin}" import "${certificate_path}" \
     -k "${signing_keychain}" \
     -P "${APPLE_DEVELOPER_ID_P12_PASSWORD}" \
-    -T /usr/bin/codesign
-"${security_bin}" set-key-partition-list \
-    -S apple-tool:,apple:,codesign: \
-    -s \
-    -k "${keychain_password}" \
-    "${signing_keychain}" >/dev/null
+    -f pkcs12 \
+    -T /usr/bin/codesign \
+    -T /usr/bin/security; then
+    fail_stage "PKCS#12 import"
+fi
+if ! "${security_bin}" list-keychains -d user -s "${signing_keychain}"; then
+    fail_stage "keychain search configuration"
+fi
 
-signing_identities="$(
+if ! signing_identities="$(
     "${security_bin}" find-identity -v -p codesigning "${signing_keychain}"
-)"
+)"; then
+    fail_stage "signing identity lookup"
+fi
 if [[ "${signing_identities}" != *"${signing_identity}"* ]]; then
     echo "Developer ID signing identity is unavailable" >&2
     exit 1
 fi
 
-"${codesign_bin}" \
+if ! "${security_bin}" set-key-partition-list \
+    -S apple-tool:,apple: \
+    -t private \
+    -k "${keychain_password}" \
+    "${signing_keychain}" >/dev/null; then
+    fail_stage "private-key ACL configuration"
+fi
+
+if ! "${codesign_bin}" \
     --force \
     --sign "${signing_identity}" \
     --keychain "${signing_keychain}" \
     --identifier "${signing_identifier}" \
     --options runtime \
     --timestamp \
-    "${binary_path}"
-"${codesign_bin}" --verify --strict --verbose=4 "${binary_path}"
+    "${binary_path}"; then
+    fail_stage "code signing"
+fi
+if ! "${codesign_bin}" --verify --strict --verbose=4 "${binary_path}"; then
+    fail_stage "signature verification"
+fi
 
-signature_details="$(
+if ! signature_details="$(
     "${codesign_bin}" --display --verbose=4 "${binary_path}" 2>&1
-)"
+)"; then
+    fail_stage "signature inspection"
+fi
 if [[ "${signature_details}" != *"Identifier=${signing_identifier}"* ]]; then
     echo "Signed binary has the wrong signing identifier" >&2
     exit 1
@@ -102,12 +125,14 @@ if [[ -z "${signed_cdhash}" ]]; then
 fi
 
 "${ditto_bin}" -c -k "${binary_path}" "${notary_archive_path}"
-"${xcrun_bin}" notarytool submit "${notary_archive_path}" \
+if ! "${xcrun_bin}" notarytool submit "${notary_archive_path}" \
     --key "${notary_key_path}" \
     --key-id "${APPLE_NOTARY_KEY_ID}" \
     --issuer "${APPLE_NOTARY_ISSUER_ID}" \
     --wait \
-    --output-format json >"${notary_result_path}"
+    --output-format json >"${notary_result_path}"; then
+    fail_stage "notarization submission"
+fi
 
 notary_status="$("${jq_bin}" -r '.status' "${notary_result_path}")"
 submission_id="$("${jq_bin}" -r '.id' "${notary_result_path}")"
@@ -116,11 +141,13 @@ if [[ "${notary_status}" != "Accepted" || -z "${submission_id}" ]]; then
     exit 1
 fi
 
-"${xcrun_bin}" notarytool log "${submission_id}" \
+if ! "${xcrun_bin}" notarytool log "${submission_id}" \
     --key "${notary_key_path}" \
     --key-id "${APPLE_NOTARY_KEY_ID}" \
     --issuer "${APPLE_NOTARY_ISSUER_ID}" \
-    "${notary_log_path}"
+    "${notary_log_path}"; then
+    fail_stage "notarization log retrieval"
+fi
 if ! "${jq_bin}" -e \
     '.status == "Accepted" and ((.issues // []) | length == 0)' \
     "${notary_log_path}" >/dev/null; then

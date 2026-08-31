@@ -309,14 +309,15 @@ pub const AuthorizedCallAdapterFn = *const fn (
     DispatchContext,
     Registry,
     message.ToolCall,
-) DispatchError!DispatchResult;
+) DispatchError!AuthorizedDispatchResult;
 
 /// Optional Core mapper selected by a registered tool descriptor after an
 /// authorized call has produced its structured dispatch result.
 pub const AuthorizedResultMapperFn = *const fn (
     Allocator,
-    DispatchResult,
-) Allocator.Error!DispatchResult;
+    AuthorizedDispatchResult,
+    *?[]u8,
+) Allocator.Error!AuthorizedDispatchResult;
 
 pub const RunCommandCompatibility = struct {
     matches: *const fn ([]const u8) bool,
@@ -358,7 +359,6 @@ pub const LabelArgKind = enum {
     command,
     description,
     source,
-    old_path,
     action,
     query,
     selector,
@@ -368,21 +368,13 @@ pub const LabelArgKind = enum {
 pub const PermissionTargetKind = core_permissions.PermissionTargetKind;
 
 pub const ExecutorKind = enum {
-    list_files,
     glob_files,
     grep_files,
     read_file,
     read_tool_result,
     write_file,
     edit_file,
-    delete_file,
-    rename_file,
-    copy_file,
-    create_folder,
-    file_info,
     memory,
-    semantic_search,
-    open_file,
     web_fetch,
     web_search,
     run_command,
@@ -429,12 +421,13 @@ pub const Tool = struct {
     name: []const u8,
     description: []const u8,
     model_schema: model_tool_schema.FunctionSchema,
+    model_visible: bool = true,
     write_provider_advertisement_fn: ?WriteProviderAdvertisementFn = null,
     /// Set when the provider runs the tool instead of fx dispatch. Such a tool
     /// never reaches a call-time permission check, so advertisement is its only
     /// enforcement point and requires an already-settled allow.
     provider_executed: bool = false,
-    executor_kind: ExecutorKind = .list_files,
+    executor_kind: ExecutorKind = .read_file,
     activity_kind: core_types.ToolActivityKind = .read,
     requires_approval: bool = false,
     approval_policy: ApprovalPolicy = .standard,
@@ -585,7 +578,6 @@ fn labelValueForKind(kind: LabelArgKind, args: std.json.ObjectMap) ?[]const u8 {
         .command => optionalStringArg(args, "command"),
         .description => optionalStringArg(args, "description"),
         .source => optionalStringArg(args, "source"),
-        .old_path => optionalStringArg(args, "old_path"),
         .action => optionalStringArg(args, "action"),
         .query => optionalStringArg(args, "query"),
         .selector => optionalStringArg(args, "selector"),
@@ -778,6 +770,18 @@ pub const DispatchResult = struct {
     }
 };
 
+/// Owned authorized-dispatch result. Runtime metadata is published through
+/// the caller-provided sinks in `DispatchContext` instead of being copied into
+/// this transport result.
+pub const AuthorizedDispatchResult = struct {
+    status: DispatchResult.Status,
+    body: []u8,
+
+    pub fn deinit(self: AuthorizedDispatchResult, alloc: Allocator) void {
+        alloc.free(self.body);
+    }
+};
+
 /// Runs one model-requested tool call through lookup, validation, gate, and call.
 pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.ToolCall) DispatchError!DispatchResult {
     var captured_usage: ?core_types.ToolUsage = null;
@@ -825,16 +829,22 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
 }
 
 /// Runs one already-authorized registered tool call through lookup, validation, and call.
-pub fn dispatchAuthorizedToolCall(ctx: DispatchContext, registry: Registry, call: message.ToolCall) DispatchError!DispatchResult {
-    const tool = registry.lookup(call.name) orelse return failure(
-        try std.fmt.allocPrint(ctx.allocator, "unknown tool: {s}", .{call.name}),
-    );
+pub fn dispatchAuthorizedToolCall(
+    ctx: DispatchContext,
+    registry: Registry,
+    call: message.ToolCall,
+    status_detail: *?[]u8,
+) DispatchError!AuthorizedDispatchResult {
+    const tool = registry.lookup(call.name) orelse return .{
+        .status = .failure,
+        .body = try std.fmt.allocPrint(ctx.allocator, "unknown tool: {s}", .{call.name}),
+    };
     const result = if (tool.authorized_call_adapter) |adapter|
         try adapter(ctx, registry, call)
     else
         try dispatchAuthorizedToolCallDefault(ctx, registry, call);
     if (tool.authorized_result_mapper) |mapper| {
-        return mapper(ctx.allocator, result) catch |err| {
+        return mapper(ctx.allocator, result, status_detail) catch |err| {
             result.deinit(ctx.allocator);
             return err;
         };
@@ -845,52 +855,30 @@ pub fn dispatchAuthorizedToolCall(ctx: DispatchContext, registry: Registry, call
 /// Runs the ordinary authorized decode/validate/call path without consulting a
 /// descriptor's lifecycle adapter. Focused adapters use this to wrap one call
 /// without recursively selecting themselves again.
-pub fn dispatchAuthorizedToolCallDefault(ctx: DispatchContext, registry: Registry, call: message.ToolCall) DispatchError!DispatchResult {
-    var captured_usage: ?core_types.ToolUsage = null;
-    var captured_web_search_completion: ?core_types.WebSearchCompletion = null;
-    var captured_web_fetch_completion: ?core_types.WebFetchCompletion = null;
-    var captured_tool_result_memory: ?core_types.ToolResultMemory = null;
-    var call_ctx = ctx;
-    if (call_ctx.inner_usage_sink == null) call_ctx.inner_usage_sink = &captured_usage;
-    if (call_ctx.web_search_completion_sink == null) call_ctx.web_search_completion_sink = &captured_web_search_completion;
-    if (call_ctx.web_fetch_completion_sink == null) call_ctx.web_fetch_completion_sink = &captured_web_fetch_completion;
-    if (call_ctx.tool_result_memory_sink == null) call_ctx.tool_result_memory_sink = &captured_tool_result_memory;
-
-    const validated = try decodeAndValidateRegisteredToolCall(call_ctx, registry, call);
+pub fn dispatchAuthorizedToolCallDefault(ctx: DispatchContext, registry: Registry, call: message.ToolCall) DispatchError!AuthorizedDispatchResult {
+    const validated = try decodeAndValidateRegisteredToolCall(ctx, registry, call);
     switch (validated) {
-        .not_registered => return failure(try std.fmt.allocPrint(call_ctx.allocator, "unknown tool: {s}", .{call.name})),
-        .failure => |reason| return failure(reason),
+        .not_registered => return .{ .status = .failure, .body = try std.fmt.allocPrint(ctx.allocator, "unknown tool: {s}", .{call.name}) },
+        .failure => |reason| return .{ .status = .failure, .body = reason },
         .input => |input| {
-            defer input.value.deinit(call_ctx.allocator);
+            defer input.value.deinit(ctx.allocator);
 
-            const result = try input.tool.call(call_ctx, input.value);
+            const result = try input.tool.call(ctx, input.value);
             if (input.tool.cancel_if_requested_after_call and
-                call_ctx.cancel_flag != null and
-                call_ctx.cancel_flag.?.load(.seq_cst))
+                ctx.cancel_flag != null and
+                ctx.cancel_flag.?.load(.seq_cst))
             {
-                result.deinit(call_ctx.allocator);
+                result.deinit(ctx.allocator);
                 return error.Cancelled;
             }
-            const inner_usage = if (call_ctx.inner_usage_sink) |slot| slot.* else captured_usage;
-            const web_search_completion = if (call_ctx.web_search_completion_sink) |slot| slot.* else captured_web_search_completion;
-            const web_fetch_completion = if (call_ctx.web_fetch_completion_sink) |slot| slot.* else captured_web_fetch_completion;
-            const tool_result_memory = if (call_ctx.tool_result_memory_sink) |slot| slot.* else captured_tool_result_memory;
             return switch (result) {
                 .success => |body| .{
                     .status = .success,
                     .body = body,
-                    .inner_usage = inner_usage,
-                    .web_search_completion = web_search_completion,
-                    .web_fetch_completion = web_fetch_completion,
-                    .tool_result_memory = tool_result_memory,
                 },
                 .failure => |body| .{
                     .status = .failure,
                     .body = body,
-                    .inner_usage = inner_usage,
-                    .web_search_completion = web_search_completion,
-                    .web_fetch_completion = web_fetch_completion,
-                    .tool_result_memory = tool_result_memory,
                 },
             };
         },

@@ -19,6 +19,10 @@ const resourcesSubscribe = process.env.FX_MCP_RESOURCES_SUBSCRIBE !== "0";
 const resourceTtlMs = process.env.FX_MCP_RESOURCE_TTL_MS === undefined
   ? null
   : Number(process.env.FX_MCP_RESOURCE_TTL_MS);
+const catalogDelayMs = Math.max(
+  0,
+  Number(process.env.FX_MCP_CATALOG_DELAY_MS ?? "0") || 0,
+);
 const elicitationUrl = process.env.FX_MCP_ELICITATION_URL ?? "https://example.test/connect";
 const collidingChoices = [
   { const: "Skip", title: "Skip" },
@@ -49,6 +53,14 @@ if (stallRecovery) setInterval(() => {}, 1000);
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
+}
+
+function sendCatalogResponse(message) {
+  if (catalogDelayMs === 0) {
+    send(message);
+    return;
+  }
+  setTimeout(() => send(message), catalogDelayMs);
 }
 
 function log(message) {
@@ -168,6 +180,11 @@ function handle(message) {
       result: {
         resultType: "complete",
         supportedVersions: [protocolVersion],
+        _meta: {
+          "io.modelcontextprotocol/serverInfo": {
+            name: "modern-stdio-fixture",
+          },
+        },
         capabilities: {
           tools: mode === "subscription_cache" || mode === "crash_once_new_tool" || mode === "features"
             ? { listChanged: true }
@@ -248,6 +265,15 @@ function handle(message) {
                 properties: { text: { type: "string" } },
                 required: ["text"],
               },
+              ...(mode === "tool_failure"
+                ? {
+                    outputSchema: {
+                      type: "object",
+                      properties: { result: { type: "string" } },
+                      required: ["result"],
+                    },
+                  }
+                : {}),
             }],
         ttlMs: 60_000,
         cacheScope: "public",
@@ -269,7 +295,7 @@ function handle(message) {
   }
   if (message.method === "resources/list") {
     const secondPage = message.params?.cursor === "";
-    send({
+    sendCatalogResponse({
       jsonrpc: "2.0",
       id: message.id,
       result: {
@@ -304,7 +330,7 @@ function handle(message) {
     return;
   }
   if (message.method === "resources/templates/list") {
-    send({
+    sendCatalogResponse({
       jsonrpc: "2.0",
       id: message.id,
       result: {
@@ -317,6 +343,12 @@ function handle(message) {
           mimeType: "text/plain",
           annotations: { audience: ["assistant"], priority: 0.7 },
           _meta: { fixture: "template" },
+        }, {
+          uriTemplate: "custom://project/{project}/{path}",
+          name: "project-file-multi",
+          title: "Project file with project",
+          description: "Read a fixture path from a selected project",
+          mimeType: "text/plain",
         }],
         ttlMs: 60_000,
         cacheScope: "public",
@@ -395,7 +427,7 @@ function handle(message) {
   }
   if (message.method === "prompts/list") {
     const secondPage = message.params?.cursor === "";
-    send({
+    sendCatalogResponse({
       jsonrpc: "2.0",
       id: message.id,
       result: {
@@ -405,6 +437,14 @@ function handle(message) {
               { name: "collision", title: "Collision prompt" },
               { name: "mrtr", title: "MRTR prompt" },
               { name: "stall", title: "Stalled prompt" },
+              {
+                name: "multi",
+                title: "Multi prompt",
+                arguments: [
+                  { name: "topic", required: true },
+                  { name: "tone", required: true },
+                ],
+              },
             ]
           : [{
               name: "review",

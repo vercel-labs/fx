@@ -1007,6 +1007,31 @@ function writeAcpSession(
   );
 }
 
+function writeLegacyAcpSessionWithoutWorkspace(
+  home: string,
+  sessionId: string,
+  updatedAtMs: number,
+): void {
+  const sessionDir = join(home, ".fx", "sessions", sessionId);
+  mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+  chmodSync(join(home, ".fx"), 0o700);
+  chmodSync(join(home, ".fx", "sessions"), 0o700);
+  chmodSync(sessionDir, 0o700);
+  writeFileSync(
+    join(sessionDir, "session.json"),
+    JSON.stringify({
+      schema_version: 1,
+      id: sessionId,
+      created_at_ms: 1,
+      updated_at_ms: updatedAtMs,
+      conversation_language: "en",
+      history_len: 0,
+      history: [],
+    }) + "\n",
+    { mode: 0o600 },
+  );
+}
+
 function createPromptTerminalBoundary(root: string) {
   const terminalReady = join(root, "prompt-terminal.ready");
   const reapReady = join(root, "prompt-reap.ready");
@@ -1416,7 +1441,7 @@ describe("acp: model-independent", () => {
           .map((message) => acpContentText(message.content))
           .join("\n");
         expect(prompt).toContain(submitted);
-        expect(request.tools).toHaveLength(26);
+        expect(request.tools).toHaveLength(18);
         const toolNames = serializedToolNames(oracleRequest);
         expect(toolNames).toEqual(
           AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
@@ -1426,7 +1451,7 @@ describe("acp: model-independent", () => {
           .toHaveLength(1);
         expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
         expect(customProviderGuidanceState(oracleRequest)).toEqual({
-          providerToolIndices: [23],
+          providerToolIndices: [15],
           guidanceMessageIndices: [1],
         });
         expect(gateway.requests[0]!.body).not.toContain(
@@ -1479,6 +1504,60 @@ describe("acp: model-independent", () => {
         );
         expect(toolResult).toContain("NotRegularFile");
         expect(toolResult).toContain("regular file");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP forwards exact Markdown source without rendered duplicates",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-markdown-source-");
+      const markdown = [
+        "# Heading\n\n- **bold** item\n\n",
+        "| A | B |\n| - | - |\n| 1 | 2 |\n\n",
+        "```zig\nconst x = 1;\n```\n",
+      ];
+      const gateway = startFakeGateway([
+        fakeGatewaySse([
+          ...markdown.map((delta) => ({
+            type: "text-delta",
+            id: "answer_1",
+            delta,
+          })),
+          {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: {
+              inputTokens: { total: 3 },
+              outputTokens: { total: 5 },
+            },
+          },
+        ]),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+
+        const result = await runPrompt(client, "Return the Markdown fixture.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        const responseText = result.messages
+          .filter((message) =>
+            message.method === "session/update" &&
+            message.params?.update?.sessionUpdate === "agent_message_chunk"
+          )
+          .map((message) => message.params.update.content.text)
+          .join("");
+        expect(responseText).toBe(markdown.join(""));
+        expect(responseText).not.toContain("\u001b");
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -2112,6 +2191,507 @@ describe("acp: model-independent", () => {
       }
     },
     LIVE_TIMEOUT,
+  );
+
+  test(
+    "ACP skips pending workspace MCP and loads it after explicit trust",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-project-mcp-");
+      const pidPath = join(root.root, "project-mcp.pid");
+      const wirePath = join(root.root, "project-mcp-wire.jsonl");
+      writeFileSync(
+        join(root.workspace, ".mcp.json"),
+        JSON.stringify({
+          mcpServers: {
+            fixture: {
+              command: "${ACP_PROJECT_COMMAND}",
+              args: ["${ACP_PROJECT_FIXTURE}"],
+              env: {
+                FX_MCP_RESULT_TEXT: "${ACP_PROJECT_RESULT:-ACP_PROJECT_MCP_RESULT}",
+                FX_MCP_PID_PATH: "${ACP_PROJECT_PID}",
+                FX_MCP_WIRE_LOG: "${ACP_PROJECT_WIRE}",
+              },
+            },
+          },
+        }),
+      );
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("select_project", "mcp_select_tool", {
+          name: MCP_TOOL_NAME,
+        }),
+        fakeGatewayToolCall("call_project", MCP_TOOL_NAME, { text: "acp" }),
+        finalText("ACP project MCP complete"),
+      ]);
+      const env = {
+        ...fakeGatewayEnv(root, gateway),
+        ACP_PROJECT_COMMAND: process.execPath,
+        ACP_PROJECT_FIXTURE: MCP_STDIO_FIXTURE,
+        ACP_PROJECT_PID: pidPath,
+        ACP_PROJECT_WIRE: wirePath,
+      };
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env,
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request(
+          "session/new",
+          { cwd: root.workspace, mcpServers: [] },
+          2,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        expect(existsSync(pidPath)).toBe(false);
+        expect(existsSync(wirePath)).toBe(false);
+        await client.close();
+        client = null;
+
+        const trusted = await runFx(
+          ["mcp", "trust", "approve", "fixture"],
+          { cwd: root.workspace, env },
+        );
+        expect(trusted.code).toBe(0);
+
+        client = await AcpClient.create({ cwd: root.workspace, env });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        const trustedSession = await client.request(
+          "session/new",
+          { cwd: root.workspace, mcpServers: [] },
+          11,
+        ) as any;
+        expect(trustedSession.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "code" }, 12);
+        await runMcpToolPrompt(
+          client,
+          gateway,
+          "call_project",
+          "ACP_PROJECT_MCP_RESULT",
+        );
+        expect(existsSync(pidPath)).toBe(true);
+        const settingsPath = join(root.home, ".fx", "settings.json");
+        expect(readFileSync(settingsPath, "utf8")).toContain(
+          "enabledMcpjsonServers",
+        );
+      } finally {
+        await client?.close();
+        client = null;
+        gateway.stop();
+        if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP keeps duplicate primary server names and excludes a workspace collision",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-project-mcp-collision-");
+      const firstPid = join(root.root, "primary-first.pid");
+      const secondPid = join(root.root, "primary-second.pid");
+      const projectPid = join(root.root, "project-collision.pid");
+      writeFileSync(
+        join(root.workspace, ".mcp.json"),
+        JSON.stringify({
+          mcpServers: {
+            fixture: {
+              command: process.execPath,
+              args: [MCP_STDIO_FIXTURE],
+              env: { FX_MCP_PID_PATH: projectPid },
+            },
+          },
+        }),
+      );
+      const gateway = startFakeGateway([]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request(
+          "session/new",
+          {
+            cwd: root.workspace,
+            mcpServers: [
+              acpStdioServer("PRIMARY_FIRST", firstPid),
+              acpStdioServer("PRIMARY_SECOND", secondPid),
+            ],
+          },
+          2,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await waitForPath(firstPid, 5_000);
+        await waitForPath(secondPid, 5_000);
+        expect(existsSync(projectPid)).toBe(false);
+      } finally {
+        await client?.close();
+        client = null;
+        gateway.stop();
+        if (existsSync(firstPid)) await expectMcpProcessExited(firstPid);
+        if (existsSync(secondPid)) await expectMcpProcessExited(secondPid);
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP session/new keeps rejected and pending workspace MCP inert",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-project-mcp-optional-");
+      const pidPath = join(root.root, "rejected-project-mcp.pid");
+      let unavailableAttempts = 0;
+      const unavailable = Bun.serve({
+        port: 0,
+        fetch() {
+          unavailableAttempts += 1;
+          return new Response("optional failure", { status: 500 });
+        },
+      });
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          workspaces: {
+            [root.workspace]: { disabledMcpjsonServers: ["fixture"] },
+          },
+        }),
+      );
+      writeFileSync(
+        join(root.workspace, ".mcp.json"),
+        JSON.stringify({
+          mcpServers: {
+            fixture: {
+              command: process.execPath,
+              args: [MCP_STDIO_FIXTURE],
+              env: { FX_MCP_PID_PATH: pidPath },
+            },
+            unavailable: {
+              type: "http",
+              url: `http://127.0.0.1:${unavailable.port}/mcp`,
+              startup_timeout_ms: 100,
+            },
+          },
+        }),
+      );
+      const gateway = startFakeGateway([]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request(
+          "session/new",
+          { cwd: root.workspace, mcpServers: [] },
+          2,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        expect(created.result.sessionId).toBeTruthy();
+        expect(existsSync(pidPath)).toBe(false);
+        expect(unavailableAttempts).toBe(0);
+      } finally {
+        await client?.close();
+        client = null;
+        gateway.stop();
+        unavailable.stop(true);
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP cross-session restore retires reduced project authority before required failure",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-project-mcp-reduce-");
+      const pidPath = join(root.root, "active-project-mcp.pid");
+      const wirePath = join(root.root, "active-project-mcp-wire.jsonl");
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          workspaces: {
+            [root.workspace]: { enabledMcpjsonServers: ["fixture"] },
+          },
+        }),
+      );
+      writeFileSync(
+        join(root.workspace, ".mcp.json"),
+        JSON.stringify({
+          mcpServers: {
+            fixture: {
+              command: process.execPath,
+              args: [MCP_STDIO_FIXTURE],
+              env: {
+                FX_MCP_PID_PATH: pidPath,
+                FX_MCP_WIRE_LOG: wirePath,
+                FX_MCP_MODE: "stall_operation",
+              },
+            },
+          },
+        }),
+      );
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("select_reducing", "mcp_select_tool", {
+          name: MCP_TOOL_NAME,
+        }),
+        fakeGatewayToolCall("call_reducing", MCP_TOOL_NAME, { text: "stall" }),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request(
+          "session/new",
+          { cwd: root.workspace, mcpServers: [] },
+          2,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await waitForPath(pidPath, 5_000);
+        sendPrompt(client, 4, "Start the project MCP operation.");
+        await waitForCondition(
+          "stalled project MCP call",
+          () => existsSync(wirePath) &&
+            readFileSync(wirePath, "utf8").includes("tools/call"),
+          5_000,
+        );
+
+        const targetSession = "project-reduction-target";
+        writeAcpSession(root.home, root.workspace, targetSession, Date.now());
+        writeFileSync(
+          join(root.home, ".fx", "settings.json"),
+          JSON.stringify({
+            workspaces: {
+              [root.workspace]: { disabledMcpjsonServers: ["fixture"] },
+            },
+          }),
+        );
+        client.send({
+          jsonrpc: "2.0",
+          id: 5,
+          method: "session/load",
+          params: {
+            sessionId: targetSession,
+            cwd: root.workspace,
+            mcpServers: [{
+              name: "required-failure",
+              command: "/bin/false",
+              args: [],
+              env: [],
+            }],
+          },
+        });
+        const loaded = await readResponse(client, 5, TIMEOUT);
+        expect(loaded.error?.message).toContain("Required MCP server");
+        await expectMcpProcessExited(pidPath);
+      } finally {
+        await client?.close();
+        client = null;
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP session/new retires reduced active project authority before required failure",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-project-mcp-new-reduce-");
+      const pidPath = join(root.root, "active-project-mcp.pid");
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          workspaces: {
+            [root.workspace]: { enabledMcpjsonServers: ["fixture"] },
+          },
+        }),
+      );
+      writeFileSync(
+        join(root.workspace, ".mcp.json"),
+        JSON.stringify({
+          mcpServers: {
+            fixture: {
+              command: process.execPath,
+              args: [MCP_STDIO_FIXTURE],
+              env: { FX_MCP_PID_PATH: pidPath },
+            },
+          },
+        }),
+      );
+      const gateway = startFakeGateway([]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request(
+          "session/new",
+          { cwd: root.workspace, mcpServers: [] },
+          2,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await waitForPath(pidPath, 5_000);
+        writeFileSync(
+          join(root.home, ".fx", "settings.json"),
+          JSON.stringify({
+            workspaces: {
+              [root.workspace]: { disabledMcpjsonServers: ["fixture"] },
+            },
+          }),
+        );
+        const replacement = await client.request(
+          "session/new",
+          {
+            cwd: root.workspace,
+            mcpServers: [{
+              name: "required-failure",
+              command: "/bin/false",
+              args: [],
+              env: [],
+            }],
+          },
+          3,
+        ) as any;
+        expect(replacement.error?.message).toContain("Required MCP server");
+        await expectMcpProcessExited(pidPath);
+      } finally {
+        await client?.close();
+        client = null;
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP project authority reduction reaps subagent-owned stalled MCP work",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-project-mcp-subagent-reduce-");
+      const pidPath = join(root.root, "subagent-project-mcp.pid");
+      const wirePath = join(root.root, "subagent-project-mcp-wire.jsonl");
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          workspaces: {
+            [root.workspace]: { enabledMcpjsonServers: ["fixture"] },
+          },
+        }),
+      );
+      writeFileSync(
+        join(root.workspace, ".mcp.json"),
+        JSON.stringify({
+          mcpServers: {
+            fixture: {
+              command: process.execPath,
+              args: [MCP_STDIO_FIXTURE],
+              env: {
+                FX_MCP_PID_PATH: pidPath,
+                FX_MCP_WIRE_LOG: wirePath,
+                FX_MCP_MODE: "stall_operation",
+              },
+            },
+          },
+        }),
+      );
+      const parentPrompt = "Create a child that exercises project MCP.";
+      const childPrompt = "Call the project MCP and wait for its result.";
+      const createId = "project_reduce_child_create";
+      const selectId = "project_reduce_child_select";
+      const callId = "project_reduce_child_call";
+      let childId = "";
+      const gateway = startDynamicFakeGateway((body) => {
+        if (
+          body.includes(`"toolCallId":"${selectId}"`) &&
+          body.includes('"type":"tool-result"')
+        ) {
+          return fakeGatewayToolCall(callId, MCP_TOOL_NAME, { text: "stall" });
+        }
+        if (
+          body.includes(`"toolCallId":"${createId}"`) &&
+          body.includes('"type":"tool-result"')
+        ) {
+          const created = JSON.parse(acpToolResultText(body, createId)) as {
+            child_id: string;
+          };
+          childId = created.child_id;
+          return finalText("ACP project MCP subagent started");
+        }
+        if (acpPromptText(body).includes(childPrompt)) {
+          return fakeGatewayToolCall(selectId, "mcp_select_tool", {
+            name: MCP_TOOL_NAME,
+          });
+        }
+        expect(acpPromptText(body)).toContain(parentPrompt);
+        return fakeGatewayToolCall(createId, "subagent", {
+          command: { create: {
+            name: "project-mcp-reduction-child",
+            mode: "persistent",
+            prompt: childPrompt,
+          } },
+        });
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request(
+          "session/new",
+          { cwd: root.workspace, mcpServers: [] },
+          2,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "code" }, 3);
+
+        sendPrompt(client, 4, parentPrompt);
+        await waitForCondition(
+          "subagent-owned stalled project MCP call",
+          () => childId.length > 0 && existsSync(wirePath) &&
+            readFileSync(wirePath, "utf8").includes("tools/call"),
+          TIMEOUT,
+        );
+        expect(acpSubagentState(root, childId)).toBe("running");
+
+        writeFileSync(
+          join(root.home, ".fx", "settings.json"),
+          JSON.stringify({
+            workspaces: {
+              [root.workspace]: { disabledMcpjsonServers: ["fixture"] },
+            },
+          }),
+        );
+        client.send({
+          jsonrpc: "2.0",
+          id: 5,
+          method: "session/new",
+          params: { cwd: root.workspace, mcpServers: [] },
+        });
+        const replacement = await readResponse(client, 5, TIMEOUT);
+        expect(replacement.error).toBeUndefined();
+        expect(replacement.result.sessionId).toBeTruthy();
+        await expectMcpProcessExited(pidPath);
+        expect(acpSubagentState(root, childId)).not.toBe("running");
+      } finally {
+        await client?.close();
+        client = null;
+        gateway.stop();
+        if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
   );
 
   test(
@@ -5198,7 +5778,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "session/list is scoped to the server workspace and exact load still works",
+    "session/list without cwd returns all sessions and filters by absolute cwd",
     async () => {
       const root = createIsolatedRoot("fx-acp-workspace-session-list-");
       const gateway = startFakeGateway([]);
@@ -5215,21 +5795,31 @@ describe("acp: model-independent", () => {
         const listed = await client.request("session/list", {}, 2) as any;
         expect(listed.result?.sessions).toEqual([
           expect.objectContaining({
+            sessionId: "workspace-b-session",
+            cwd: root.external,
+          }),
+          expect.objectContaining({
             sessionId: "workspace-a-session",
             cwd: root.workspace,
           }),
         ]);
-        expect(
-          listed.result.sessions.some(
-            (session: { sessionId: string }) =>
-              session.sessionId === "workspace-b-session",
-          ),
-        ).toBe(false);
+
+        const filtered = await client.request(
+          "session/list",
+          { cwd: root.workspace },
+          3,
+        ) as any;
+        expect(filtered.result?.sessions).toEqual([
+          expect.objectContaining({
+            sessionId: "workspace-a-session",
+            cwd: root.workspace,
+          }),
+        ]);
 
         const loaded = await client.request(
           "session/load",
           { sessionId: "workspace-b-session", mcpServers: [] },
-          3,
+          4,
         ) as any;
         expect(loaded.error).toBeUndefined();
         expect(Array.isArray(loaded.result?.configOptions)).toBe(true);
@@ -5237,6 +5827,187 @@ describe("acp: model-independent", () => {
       } finally {
         await client?.close();
         gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "session/list exposes bounded titled pages",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-paged-session-list-");
+      const gateway = startFakeGateway([
+        finalText("ACP titled session created"),
+      ]);
+      const title = "Paginated ACP session title";
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const titledSessionId = await startCodeSession(client);
+        const prompted = await runPrompt(client, title);
+        expect(prompted.promptResult.error).toBeUndefined();
+        await client.close();
+        client = null;
+
+        for (let index = 0; index < 100; index += 1) {
+          writeAcpSession(
+            root.home,
+            root.workspace,
+            `paged-session-${String(index).padStart(3, "0")}`,
+            index + 1,
+          );
+        }
+
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+
+        const first = await client.request("session/list", {}, 11) as any;
+        expect(first.result?.sessions).toHaveLength(100);
+        expect(first.result?.nextCursor).toEqual(expect.any(String));
+        const titledSession = first.result.sessions.find(
+          (session: { sessionId: string }) =>
+            session.sessionId === titledSessionId
+        );
+        expect(titledSession?.title).toBe(title);
+
+        const second = await client.request(
+          "session/list",
+          { cursor: first.result.nextCursor },
+          12,
+        ) as any;
+        expect(second.result?.sessions).toHaveLength(1);
+        expect(second.result?.nextCursor).toBeUndefined();
+        const firstIds = new Set(
+          first.result.sessions.map((session: { sessionId: string }) =>
+            session.sessionId
+          ),
+        );
+        expect(firstIds.has(second.result.sessions[0].sessionId)).toBe(false);
+        const listed = await client.request(
+          "session/list",
+          { cursor: "not-a-session-cursor" },
+          13,
+        ) as any;
+        expect(listed.error).toEqual({
+          code: -32602,
+          message: "Invalid params",
+        });
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "session/list treats null cwd as omitted",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-null-session-list-");
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            HOME: root.home,
+            AI_GATEWAY_API_KEY: "e2e-placeholder",
+            VERCEL_OIDC_TOKEN: "",
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+
+        const listed = await client.request("session/list", {}, 2) as any;
+        const listedWithNull = await client.request(
+          "session/list",
+          { cwd: null },
+          3,
+        ) as any;
+        expect(listedWithNull).toEqual({
+          jsonrpc: "2.0",
+          id: 3,
+          result: listed.result,
+        });
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "session/list rejects relative cwd",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-relative-session-list-");
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            HOME: root.home,
+            AI_GATEWAY_API_KEY: "e2e-placeholder",
+            VERCEL_OIDC_TOKEN: "",
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+
+        const relative = await client.request(
+          "session/list",
+          { cwd: "workspace-a" },
+          2,
+        ) as any;
+        expect(relative.error).toEqual({
+          code: -32602,
+          message: "Invalid params",
+        });
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "session/list omits legacy sessions without a workspace",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-legacy-session-list-");
+      try {
+        writeAcpSession(root.home, root.workspace, "workspace-session", 20);
+        writeLegacyAcpSessionWithoutWorkspace(
+          root.home,
+          "legacy-unknown-workspace",
+          40,
+        );
+
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            HOME: root.home,
+            AI_GATEWAY_API_KEY: "e2e-placeholder",
+            VERCEL_OIDC_TOKEN: "",
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+
+        const listed = await client.request("session/list", {}, 2) as any;
+        expect(listed.result?.sessions).toEqual([
+          expect.objectContaining({
+            sessionId: "workspace-session",
+            cwd: root.workspace,
+          }),
+        ]);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
         rmSync(root.root, { recursive: true, force: true });
       }
     },
@@ -5447,6 +6218,76 @@ describe("acp: model-independent", () => {
       } finally {
         await client?.close();
         rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "session load omits synthetic execution for summary-only turns",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-load-summary-only-");
+      const answer = "ACP summary-only load complete.";
+      const promptText = "Return the prepared summary-only answer.";
+      const gateway = startFakeGateway([finalText(answer)]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const newResponse = await client.request("session/new", { mcpServers: [] }, 2) as any;
+        await client.readLine();
+        const sessionId = newResponse.result.sessionId;
+        await client.request("session/set_mode", { modeId: "code" }, 3);
+        const prompt = await runPrompt(client, promptText, TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        await client.close();
+
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 4);
+        client.send({
+          jsonrpc: "2.0",
+          id: 5,
+          method: "session/load",
+          params: { sessionId, mcpServers: [] },
+        });
+
+        const loadMessages: any[] = [];
+        let loadResponse: any = null;
+        while (loadResponse === null) {
+          const message = await client.readLine() as any;
+          if (message.id === 5) {
+            loadResponse = message;
+          } else {
+            loadMessages.push(message);
+          }
+        }
+
+        expect(loadResponse.error).toBeUndefined();
+        const userText = loadMessages
+          .filter((message) =>
+            message.method === "session/update" &&
+            message.params?.update?.sessionUpdate === "user_message_chunk"
+          )
+          .map((message) => message.params.update.content.text);
+        const agentText = loadMessages
+          .filter((message) =>
+            message.method === "session/update" &&
+            message.params?.update?.sessionUpdate === "agent_message_chunk"
+          )
+          .map((message) => message.params.update.content.text);
+        expect(userText).toEqual([promptText]);
+        expect(agentText).toEqual([answer]);
+        expect(JSON.stringify(loadMessages)).not.toContain("Previous tool execution:");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
       }
     },
     TIMEOUT,

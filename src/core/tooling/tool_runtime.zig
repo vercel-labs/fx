@@ -61,6 +61,7 @@ const tool_mcp_registry = @import("tool_mcp_registry.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const tool_mcp_feature_dispatch = @import("tool_mcp_feature_dispatch.zig");
 const tool_presentation = @import("tool_presentation.zig");
+const terminal_impl = @import("../../tools/terminal/terminal.zig");
 const web_fetch_runtime = @import("web_fetch_runtime.zig");
 const web_search_contract = @import("web_search_contract.zig");
 const web_fetch_artifacts = @import("../session/web_fetch_artifacts.zig");
@@ -200,6 +201,7 @@ pub const Context = struct {
     mcp_call_tool: ?tool_mcp_runtime.CallToolFn = null,
     mcp_search_tools: ?tool_mcp_runtime.SearchToolsFn = null,
     mcp_tool_schema: ?tool_mcp_runtime.ToolSchemaFn = null,
+    expected_mcp_runtime_generation: ?u64 = null,
     mcp_call_feature: ?tool_mcp_runtime.FeatureCallFn = null,
     mcp_access: tool_mcp_runtime.Access = .unrestricted,
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
@@ -320,16 +322,16 @@ pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_co
             .advertised_dynamic_tool_names = ctx.advertised_dynamic_tool_names,
             .runtime = mcpRuntimeCapabilities(ctx),
         }, arena, call.name, call.arguments_json)) {
-            .valid => .valid,
+            .valid => |generation| .{ .valid = .{ .mcp_runtime_generation = generation } },
             .invalid => |reason| .{ .failure = reason },
             .not_available => .not_registered,
         };
     };
     switch (spec.executor_kind) {
         // Preserve execution-time argument failures for MCP control tool calls.
-        .mcp_search_tools, .mcp_select_tool, .mcp_features => return .valid,
+        .mcp_search_tools, .mcp_select_tool, .mcp_features => return .{ .valid = .{} },
         // File mutation arguments are decoded once by shared permission preflight.
-        .write_file, .edit_file => return .valid,
+        .write_file, .edit_file => return .{ .valid = .{} },
         else => {},
     }
 
@@ -337,7 +339,7 @@ pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_co
     dispatch_ctx.captured_command_host = spec.captured_command_host;
     return switch (try tool_dispatch.validateRegisteredToolCall(dispatch_ctx, ctx.tool_registry, call)) {
         .not_registered => .not_registered,
-        .valid => .valid,
+        .valid => .{ .valid = .{} },
         .failure => |reason| .{ .failure = reason },
     };
 }
@@ -369,7 +371,9 @@ pub fn executeToolCallAuthorized(
         if (!containsName(authority.tools, request.call.name) and
             !containsName(authority.integrations, request.call.name))
         {
-            return error.LiveToolAuthorityUnavailable;
+            return tool_contracts.failToolExecutionResult(
+                error.LiveToolAuthorityUnavailable,
+            );
         }
         execution_ctx.permission_mode = authority.permission_mode;
         execution_ctx.permission_grants = authority.grants;
@@ -386,6 +390,7 @@ pub fn executeToolCallAuthorized(
             request.advertised_dynamic_tool_names;
     }
     execution_ctx.max_tool_result_bytes = request.max_tool_result_bytes;
+    execution_ctx.expected_mcp_runtime_generation = request.expected_mcp_runtime_generation;
     execution_ctx.current_turn_messages = request.current_turn_messages;
     execution_ctx.output_chunk_lifecycle_id = request.lifecycle_id;
     execution_ctx.command_timeout_started_ms = request.command_timeout_started_ms;
@@ -560,7 +565,9 @@ fn executeWorkspaceToolCallInner(
     }
 
     var command_backend = RunCommandBackendState{ .runtime = ctx };
+    var dispatch_metadata: DispatchMetadata = .{};
     var dispatch_ctx = typedDispatchContextForCall(ctx, arena, call);
+    dispatch_metadata.attach(&dispatch_ctx);
     dispatch_ctx.execution_authority = authority;
     dispatch_ctx.captured_command_host = spec.captured_command_host;
     dispatch_ctx.run_command_backend = .{
@@ -571,15 +578,16 @@ fn executeWorkspaceToolCallInner(
         dispatch_ctx,
         ctx.tool_registry,
         call,
+        &dispatch_metadata.status_detail,
     );
     if (command_backend.execution_error) |err| {
         dispatched.deinit(arena);
         return err;
     }
     var execution = command_backend.completion orelse
-        toolExecutionResultFromDispatch(dispatched);
+        toolExecutionResultFromDispatch(dispatched, dispatch_metadata);
     execution.model_output = dispatched.body;
-    if (dispatched.status_detail) |detail| execution.status_detail = detail;
+    if (dispatch_metadata.status_detail) |detail| execution.status_detail = detail;
     return execution;
 }
 
@@ -672,9 +680,12 @@ fn executeRegisteredTool(
     var mcp_progress_bridge = McpProgressBridge{ .ctx = ctx };
     var mcp_call_status: ?tool_mcp_runtime.CallStatus = null;
     var mcp_execution_error: ?anyerror = null;
+    var dispatch_metadata: DispatchMetadata = .{};
     var dispatch_ctx = typedDispatchContextForCall(ctx, arena, call);
+    dispatch_metadata.attach(&dispatch_ctx);
     dispatch_ctx.execution_authority = authority;
     dispatch_ctx.mcp_call_options = .{
+        .expected_runtime_generation = ctx.expected_mcp_runtime_generation,
         .cancel_flag = dispatch_ctx.cancel_flag,
         .progress = .{
             .context = @ptrCast(&mcp_progress_bridge),
@@ -713,6 +724,7 @@ fn executeRegisteredTool(
         dispatch_ctx,
         registry,
         call,
+        &dispatch_metadata.status_detail,
     );
     if (command_backend.execution_error) |err| {
         dispatched.deinit(arena);
@@ -732,9 +744,9 @@ fn executeRegisteredTool(
     else if (vision_provider.completion) |completion|
         completion
     else
-        toolExecutionResultFromDispatch(dispatched);
+        toolExecutionResultFromDispatch(dispatched, dispatch_metadata);
     execution.model_output = dispatched.body;
-    if (dispatched.status_detail) |detail| execution.status_detail = detail;
+    if (dispatch_metadata.status_detail) |detail| execution.status_detail = detail;
     if (mcp_call_status == .input_required or
         (execution.status == .failure and
             tool_mcp_feature_dispatch.isInputRequiredFailure(execution.model_output)))
@@ -787,24 +799,42 @@ fn executeRunCommandBackend(
     };
 }
 
-fn toolExecutionResultFromDispatch(result: tool_dispatch.DispatchResult) ToolExecutionResult {
+const DispatchMetadata = struct {
+    status_detail: ?[]u8 = null,
+    inner_usage: ?types.ToolUsage = null,
+    web_search_completion: ?types.WebSearchCompletion = null,
+    web_fetch_completion: ?types.WebFetchCompletion = null,
+    tool_result_memory: ?types.ToolResultMemory = null,
+
+    fn attach(self: *DispatchMetadata, ctx: *tool_dispatch.DispatchContext) void {
+        ctx.inner_usage_sink = &self.inner_usage;
+        ctx.web_search_completion_sink = &self.web_search_completion;
+        ctx.web_fetch_completion_sink = &self.web_fetch_completion;
+        ctx.tool_result_memory_sink = &self.tool_result_memory;
+    }
+};
+
+fn toolExecutionResultFromDispatch(
+    result: tool_dispatch.AuthorizedDispatchResult,
+    metadata: DispatchMetadata,
+) ToolExecutionResult {
     return switch (result.status) {
         .success => .{
             .model_output = result.body,
-            .status_detail = result.status_detail,
-            .inner_usage = result.inner_usage,
-            .web_search_completion = result.web_search_completion,
-            .web_fetch_completion = result.web_fetch_completion,
-            .tool_result_memory = result.tool_result_memory,
+            .status_detail = metadata.status_detail,
+            .inner_usage = metadata.inner_usage,
+            .web_search_completion = metadata.web_search_completion,
+            .web_fetch_completion = metadata.web_fetch_completion,
+            .tool_result_memory = metadata.tool_result_memory,
         },
         .failure => .{
             .status = .failure,
             .model_output = result.body,
-            .status_detail = result.status_detail,
-            .inner_usage = result.inner_usage,
-            .web_search_completion = result.web_search_completion,
-            .web_fetch_completion = result.web_fetch_completion,
-            .tool_result_memory = result.tool_result_memory,
+            .status_detail = metadata.status_detail,
+            .inner_usage = metadata.inner_usage,
+            .web_search_completion = metadata.web_search_completion,
+            .web_fetch_completion = metadata.web_fetch_completion,
+            .tool_result_memory = metadata.tool_result_memory,
         },
     };
 }
@@ -914,6 +944,24 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         else
             ctx.permission_rules,
     };
+}
+
+fn terminal_lease_cleanup_dispatch_context(
+    ctx: Context,
+    arena: Allocator,
+) tool_dispatch.DispatchContext {
+    var dispatch = typedDispatchContext(ctx, arena);
+    dispatch.cancel_flag = null;
+    return dispatch;
+}
+
+pub fn release_agent_terminal_lease(ctx: Context, session_id: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.session_allocator);
+    defer arena_state.deinit();
+    return terminal_impl.release_agent_write_lease(
+        terminal_lease_cleanup_dispatch_context(ctx, arena_state.allocator()),
+        session_id,
+    );
 }
 
 fn requestQuestionBatchWithWorker(
@@ -1658,6 +1706,7 @@ fn commandProcessPresentation(
         .foreground => |value| value,
         .background => return null,
     };
+    if (foreground.timed_out) return .timed_out;
     if (foreground.signal) |signal| return .{ .signal = signal };
     if (foreground.exit_code) |exit_code| {
         if (exit_code != 0) return .{ .exit_code = exit_code };
@@ -2070,20 +2119,12 @@ fn noopOutput(_: *anyopaque, _: ?types.ToolLifecycleId, _: command_contract.Comm
 fn noopBackgroundReady(_: *anyopaque, _: u64, _: []const u8) void {}
 
 const test_tool_registry = tool_dispatch.Registry{ .tools = &.{
-    test_builtin_tools.list_files,
     test_builtin_tools.glob_files,
     test_builtin_tools.grep_files,
     test_builtin_tools.read_file,
     test_builtin_tools.write_file,
     test_builtin_tools.edit_file,
-    test_builtin_tools.delete_file,
-    test_builtin_tools.rename_file,
-    test_builtin_tools.copy_file,
-    test_builtin_tools.create_folder,
-    test_builtin_tools.file_info,
     test_builtin_tools.memory,
-    test_builtin_tools.semantic_search,
-    test_builtin_tools.open_file,
     test_builtin_tools.web_fetch,
     test_builtin_tools.web_search,
     test_builtin_tools.terminal,
@@ -3752,17 +3793,29 @@ test "tool runtime explicit cancellation source overrides worker fallback" {
     try std.testing.expect(typedDispatchContext(rt.context(), arena_state.allocator()).cancel_flag.? == &cancel_flag);
 }
 
+test "agent terminal lease cleanup ignores preexisting turn cancellation" {
+    var cancel_flag = std.atomic.Value(bool).init(true);
+    var rt = TestRuntime{ .cancel_flag = &cancel_flag };
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const cleanup = terminal_lease_cleanup_dispatch_context(
+        rt.context(),
+        arena_state.allocator(),
+    );
+    try std.testing.expect(cleanup.cancel_flag == null);
+}
+
 test "read-only local runtime tools are registered in built-in registry" {
     const cases = [_]struct {
         name: []const u8,
         kind: tool_specs.ExecutorKind,
     }{
-        .{ .name = "list_files", .kind = .list_files },
         .{ .name = "glob_files", .kind = .glob_files },
         .{ .name = "grep_files", .kind = .grep_files },
         .{ .name = "read_file", .kind = .read_file },
         .{ .name = "read_tool_result", .kind = .read_tool_result },
-        .{ .name = "file_info", .kind = .file_info },
     };
 
     var rt = TestRuntime{};
@@ -3786,9 +3839,9 @@ test "tool runtime validates and executes only tools from supplied registry" {
     const arena = arena_state.allocator();
 
     const call = ToolCall{
-        .id = "list",
-        .name = "list_files",
-        .arguments_json = "{}",
+        .id = "read",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"README.md\"}",
     };
     try std.testing.expectEqual(
         tool_contracts.ToolCallValidationResult.not_registered,
@@ -3797,15 +3850,12 @@ test "tool runtime validates and executes only tools from supplied registry" {
 
     const missing = try executeToolCall(empty_rt.context(), arena, call);
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, missing.status);
-    try std.testing.expectEqualStrings("Unsupported tool: list_files", missing.model_output);
+    try std.testing.expectEqualStrings("Unsupported tool: read_file", missing.model_output);
 
-    const list_only_registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.list_files} };
-    var list_rt = TestRuntime{ .tool_registry = list_only_registry };
-    defer list_rt.deinit(alloc);
-    try std.testing.expectEqual(
-        tool_contracts.ToolCallValidationResult.valid,
-        try validateToolCall(list_rt.context(), arena, call),
-    );
+    const read_only_registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.read_file} };
+    var read_rt = TestRuntime{ .tool_registry = read_only_registry };
+    defer read_rt.deinit(alloc);
+    try std.testing.expect((try validateToolCall(read_rt.context(), arena, call)) == .valid);
 }
 
 fn registryOwnedWebFetchCall(
@@ -3832,23 +3882,6 @@ fn registryOwnedTerminalExecCall(
     return .{ .success = try ctx.allocator.dupe(u8, "registry-owned terminal exec") };
 }
 
-fn registryOwnedFileInfoCall(
-    ctx: tool_dispatch.DispatchContext,
-    input: tool_dispatch.ToolInput,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    _ = input;
-    return .{ .success = try ctx.allocator.dupe(u8, "registry-owned file_info") };
-}
-
-fn registryOwnedCreateFolderCall(
-    ctx: tool_dispatch.DispatchContext,
-    input: tool_dispatch.ToolInput,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    _ = input;
-    if (ctx.subagent_provider != null) return error.InvalidToolArguments;
-    return .{ .success = try ctx.allocator.dupe(u8, "registry-owned create_folder") };
-}
-
 fn registryOwnedAskQuestionCall(
     ctx: tool_dispatch.DispatchContext,
     input: tool_dispatch.ToolInput,
@@ -3858,41 +3891,6 @@ fn registryOwnedAskQuestionCall(
         return error.InvalidToolArguments;
     }
     return .{ .success = try ctx.allocator.dupe(u8, "registry-owned ask_user_question") };
-}
-
-fn registryOwnedSemanticSearchCall(
-    ctx: tool_dispatch.DispatchContext,
-    input: tool_dispatch.ToolInput,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    _ = input;
-    return .{ .success = try ctx.allocator.dupe(u8, "registry-owned semantic_search") };
-}
-
-const RegistryOwnedLauncherInput = struct {};
-
-fn decodeRegistryOwnedLauncher(
-    ctx: tool_dispatch.DispatchContext,
-    _: []const u8,
-) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-    const input = try ctx.allocator.create(RegistryOwnedLauncherInput);
-    input.* = .{};
-    return .{ .input = .{
-        .ptr = input,
-        .deinit_fn = deinitRegistryOwnedLauncherInput,
-    } };
-}
-
-fn deinitRegistryOwnedLauncherInput(ptr: *anyopaque, alloc: Allocator) void {
-    const input: *RegistryOwnedLauncherInput = @ptrCast(@alignCast(ptr));
-    alloc.destroy(input);
-}
-
-fn registryOwnedLauncherCall(
-    ctx: tool_dispatch.DispatchContext,
-    input: tool_dispatch.ToolInput,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    _ = input;
-    return .{ .success = try ctx.allocator.dupe(u8, "registry-owned launcher") };
 }
 
 fn registryOwnedMemoryCall(
@@ -4040,207 +4038,6 @@ test "ask_user_question execution uses supplied registry entry and interactive h
         .advertised_dynamic_tool_names = &.{},
         .max_tool_result_bytes = rt.max_tool_result_bytes,
     }));
-}
-
-test "file_info execution uses supplied registry entry" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var registered_file_info = test_builtin_tools.file_info;
-    registered_file_info.call = registryOwnedFileInfoCall;
-    const tools = [_]tool_dispatch.Tool{registered_file_info};
-    const registry = tool_dispatch.Registry{ .tools = tools[0..] };
-    const call = ToolCall{
-        .id = "info",
-        .name = "file_info",
-        .arguments_json = "{\"path\":\".\"}",
-    };
-
-    var rt = TestRuntime{ .tool_registry = registry };
-    defer rt.deinit(alloc);
-    const direct = try executeToolCall(rt.context(), arena, call);
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, direct.status);
-    try std.testing.expectEqualStrings("registry-owned file_info", direct.model_output);
-}
-
-test "create_folder supplied registry entry has no subagent capability" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var registered_create_folder = test_builtin_tools.create_folder;
-    registered_create_folder.call = registryOwnedCreateFolderCall;
-    const tools = [_]tool_dispatch.Tool{registered_create_folder};
-    const registry = tool_dispatch.Registry{ .tools = tools[0..] };
-    const call = ToolCall{
-        .id = "create-folder-registry",
-        .name = "create_folder",
-        .arguments_json = "{\"path\":\"created\"}",
-    };
-
-    var rt = TestRuntime{
-        .tool_registry = registry,
-        .workspace_root = workspace,
-    };
-    defer rt.deinit(alloc);
-    const result = try executeToolCallAuthorized(rt.context(), .{
-        .call_allocator = arena,
-        .result_allocator = arena,
-        .call = call,
-        .authority = .ordinary,
-        .session_grants = &.{},
-        .advertised_dynamic_tool_names = &.{},
-        .max_tool_result_bytes = rt.max_tool_result_bytes,
-    });
-
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
-    try std.testing.expectEqualStrings("registry-owned create_folder", result.model_output);
-    try std.testing.expectError(
-        error.FileNotFound,
-        tmp.dir.statFile(io_mod.getIo(), "created", .{}),
-    );
-}
-
-test "real tool runtime enforces refreshed live authority before filesystem effect" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-    var rt = TestRuntime{ .workspace_root = workspace };
-    defer rt.deinit(alloc);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const call = ToolCall{
-        .id = "live-create",
-        .name = "create_folder",
-        .arguments_json = "{\"path\":\"created\"}",
-    };
-    const denied_tools = [_][]const u8{"read_file"};
-    try std.testing.expectError(
-        error.LiveToolAuthorityUnavailable,
-        executeToolCallAuthorized(rt.context(), .{
-            .call_allocator = arena,
-            .result_allocator = arena,
-            .call = call,
-            .authority = .ordinary,
-            .session_grants = &.{},
-            .live_authority = .{
-                .generation = 2,
-                .root_id = "root",
-                .tools = &denied_tools,
-                .integrations = &.{},
-                .rules = .{},
-                .grants = &.{},
-                .permission_mode = .auto,
-            },
-            .advertised_dynamic_tool_names = &.{},
-            .max_tool_result_bytes = rt.max_tool_result_bytes,
-        }),
-    );
-    try std.testing.expectError(
-        error.FileNotFound,
-        tmp.dir.statFile(io_mod.getIo(), "created", .{}),
-    );
-
-    const allowed_tools = [_][]const u8{"create_folder"};
-    const result = try executeToolCallAuthorized(rt.context(), .{
-        .call_allocator = arena,
-        .result_allocator = arena,
-        .call = call,
-        .authority = .ordinary,
-        .session_grants = &.{},
-        .live_authority = .{
-            .generation = 3,
-            .root_id = "root",
-            .tools = &allowed_tools,
-            .integrations = &.{},
-            .rules = .{},
-            .grants = &.{},
-            .permission_mode = .auto,
-        },
-        .advertised_dynamic_tool_names = &.{},
-        .max_tool_result_bytes = rt.max_tool_result_bytes,
-    });
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
-    _ = try tmp.dir.statFile(io_mod.getIo(), "created", .{});
-}
-
-test "semantic_search execution uses supplied registry entry" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var registered_semantic_search = test_builtin_tools.semantic_search;
-    registered_semantic_search.call = registryOwnedSemanticSearchCall;
-    const tools = [_]tool_dispatch.Tool{registered_semantic_search};
-    const registry = tool_dispatch.Registry{ .tools = tools[0..] };
-    const call = ToolCall{
-        .id = "semantic-search",
-        .name = "semantic_search",
-        .arguments_json = "{\"query\":\"registry\"}",
-    };
-
-    var rt = TestRuntime{
-        .tool_registry = registry,
-        .workspace_root = workspace,
-    };
-    defer rt.deinit(alloc);
-    const result = try executeToolCall(rt.context(), arena, call);
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
-    try std.testing.expectEqualStrings("registry-owned semantic_search", result.model_output);
-}
-
-test "launcher execution uses supplied registry entries after ordinary authorization" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var registered_open_file = test_builtin_tools.open_file;
-    registered_open_file.decode = decodeRegistryOwnedLauncher;
-    registered_open_file.validate = null;
-    registered_open_file.call = registryOwnedLauncherCall;
-    const tools = [_]tool_dispatch.Tool{
-        registered_open_file,
-    };
-    const registry = tool_dispatch.Registry{ .tools = tools[0..] };
-
-    var rt = TestRuntime{ .tool_registry = registry };
-    defer rt.deinit(alloc);
-    for ([_][]const u8{"open_file"}) |name| {
-        const result = try executeToolCallAuthorized(rt.context(), .{
-            .call_allocator = arena,
-            .result_allocator = arena,
-            .call = .{
-                .id = "launcher-registry",
-                .name = name,
-                .arguments_json = "{}",
-            },
-            .authority = .ordinary,
-            .session_grants = &.{},
-            .advertised_dynamic_tool_names = &.{},
-            .max_tool_result_bytes = rt.max_tool_result_bytes,
-        });
-
-        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
-        try std.testing.expectEqualStrings("registry-owned launcher", result.model_output);
-    }
 }
 
 test "web_fetch execution uses supplied registry entry" {
@@ -4468,14 +4265,11 @@ test "validateToolCall preserves the registered captured command host" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
 
-    try std.testing.expectEqual(
-        tool_contracts.ToolCallValidationResult.valid,
-        try validateToolCall(rt.context(), arena_state.allocator(), .{
-            .id = "workspace-terminal",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"printf ok\"}",
-        }),
-    );
+    try std.testing.expect((try validateToolCall(rt.context(), arena_state.allocator(), .{
+        .id = "workspace-terminal",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf ok\"}",
+    })) == .valid);
 }
 
 test "validateToolCall rejects selected MCP arguments through runtime capability" {
@@ -4498,6 +4292,19 @@ test "validateToolCall rejects selected MCP arguments through runtime capability
     });
     try std.testing.expect(invalid == .failure);
     try std.testing.expectEqualStrings("path must be a string", invalid.failure);
+
+    const valid = try validateToolCall(rt.context(), arena_state.allocator(), .{
+        .id = "mcp-valid",
+        .name = "mcp_fs_read",
+        .arguments_json = "{\"path\":\"README.md\"}",
+    });
+    switch (valid) {
+        .valid => |witness| try std.testing.expectEqual(
+            @as(?u64, 41),
+            witness.mcp_runtime_generation,
+        ),
+        .not_registered, .failure => return error.TestUnexpectedResult,
+    }
 }
 
 test "checkToolAvailability rejects missing web_search runtime without catalog or network work" {
@@ -4772,8 +4579,8 @@ test "request tool permission keeps safe defaults while local writes bypass revi
 
     try std.testing.expectEqual(ToolPermissionDecision.once, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
         .id = "1",
-        .name = "list_files",
-        .arguments_json = "{}",
+        .name = "glob_files",
+        .arguments_json = "{\"pattern\":\"*\"}",
     }, .ask, &.{})).decision);
 
     try std.testing.expectEqual(ToolPermissionDecision.once, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
@@ -4781,82 +4588,6 @@ test "request tool permission keeps safe defaults while local writes bypass revi
         .name = "ask_user_question",
         .arguments_json = "{}",
     }, .ask, &.{})).decision);
-}
-
-test "CLI headless ordinary admission preserves multi-target deny precedence" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    {
-        var source = try tmp.dir.createFile(io_mod.getIo(), "workspace/source.txt", .{ .truncate = true });
-        defer source.close(io_mod.getIo());
-        try source.writeStreamingAll(io_mod.getIo(), "source\n");
-    }
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-
-    var rt = TestRuntime{ .workspace_root = root, .interactive = false };
-    defer rt.deinit(alloc);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const cases = [_]struct {
-        tool_name: []const u8,
-        arguments_json: []const u8,
-        source_action: types.PermissionAction,
-        destination_action: types.PermissionAction,
-    }{
-        .{
-            .tool_name = "copy_file",
-            .arguments_json = "{\"source\":\"source.txt\",\"destination\":\"destination.txt\"}",
-            .source_action = .ask,
-            .destination_action = .deny,
-        },
-        .{
-            .tool_name = "copy_file",
-            .arguments_json = "{\"source\":\"source.txt\",\"destination\":\"destination.txt\"}",
-            .source_action = .deny,
-            .destination_action = .ask,
-        },
-        .{
-            .tool_name = "rename_file",
-            .arguments_json = "{\"old_path\":\"source.txt\",\"new_path\":\"destination.txt\"}",
-            .source_action = .ask,
-            .destination_action = .deny,
-        },
-        .{
-            .tool_name = "rename_file",
-            .arguments_json = "{\"old_path\":\"source.txt\",\"new_path\":\"destination.txt\"}",
-            .source_action = .deny,
-            .destination_action = .ask,
-        },
-    };
-
-    for (cases, 0..) |case, index| {
-        var rules = [_]types.PermissionRule{
-            .{
-                .permission = @constCast(case.tool_name),
-                .pattern = @constCast("source.txt"),
-                .action = case.source_action,
-            },
-            .{
-                .permission = @constCast(case.tool_name),
-                .pattern = @constCast("destination.txt"),
-                .action = case.destination_action,
-            },
-        };
-        rt.permission_rules = .{ .rules = &rules };
-
-        const outcome = try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
-            .id = try std.fmt.allocPrint(arena, "multi-target-{d}", .{index}),
-            .name = case.tool_name,
-            .arguments_json = case.arguments_json,
-        }, .ask, &.{});
-        try std.testing.expectEqual(ToolPermissionDecision.policy_denied, outcome.decision);
-        try std.testing.expect(outcome.execution_authority == null);
-    }
 }
 
 test "run_command default user profile requires configured or reviewed shell authority" {
@@ -5501,7 +5232,8 @@ test "file mutation lifecycle decodes each call at most once" {
         applied.status,
     );
     try std.testing.expect(applied.committed_file_handoff != null);
-    try std.testing.expect(applied.prepared_result_memory != null);
+    try std.testing.expect(applied.tool_result_memory_prepared);
+    try std.testing.expect(applied.tool_result_memory != null);
     call_arena_state.deinit();
     call_arena_live = false;
     try std.testing.expectEqualStrings(
@@ -5661,53 +5393,6 @@ test "file mutation preflight separates edit approval from equality disclosure" 
     }
 }
 
-test "request tool permission combines configured external copy target with workspace automatic review" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try tmp.dir.createDirPath(io_mod.getIo(), "external");
-    {
-        var source = try tmp.dir.createFile(io_mod.getIo(), "workspace/source.txt", .{ .truncate = true });
-        defer source.close(io_mod.getIo());
-        try source.writeStreamingAll(io_mod.getIo(), "source\n");
-    }
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-    const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
-    defer alloc.free(external);
-    const pattern = try std.fmt.allocPrint(alloc, "{s}/**", .{external});
-    defer alloc.free(pattern);
-    var rules = [_]types.PermissionRule{
-        .{
-            .permission = @constCast("copy_file"),
-            .pattern = pattern,
-            .action = .allow,
-        },
-    };
-
-    var reviewer = TestAutoReview{};
-    var rt = TestRuntime{
-        .workspace_root = root,
-        .permission_mode = .auto,
-        .permission_rules = .{ .rules = &rules },
-        .interactive = false,
-        .auto_classifier = reviewer.classifier(),
-    };
-    defer rt.deinit(alloc);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    try std.testing.expectEqual(ToolPermissionDecision.once, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
-        .id = "copy-external",
-        .name = "copy_file",
-        .arguments_json = "{\"source\":\"source.txt\",\"destination\":\"../external/copied.txt\"}",
-    }, .auto, &.{})).decision);
-    try std.testing.expectEqual(@as(usize, 1), reviewer.calls);
-    try std.testing.expect(rt.worker.pending_permission_request_shared == null);
-}
-
 test "disabled automatic reviewer returns a recoverable denial without a human prompt" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5836,41 +5521,6 @@ test "request tool permission honors configured deny and allow rules" {
         .name = "read_file",
         .arguments_json = "{\"path\":\"src/app.zig\"}",
     }, .ask, &.{})).decision);
-}
-
-test "request tool permission denies semantic_search outside workspace target" {
-    const alloc = std.testing.allocator;
-    var workspace_tmp = std.testing.tmpDir(.{});
-    defer workspace_tmp.cleanup();
-    try workspace_tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    var external_tmp = std.testing.tmpDir(.{});
-    defer external_tmp.cleanup();
-    {
-        var file = try external_tmp.dir.createFile(io_mod.getIo(), "outside.txt", .{ .truncate = true });
-        defer file.close(io_mod.getIo());
-        try file.writeStreamingAll(io_mod.getIo(), "needle external\n");
-    }
-    const root = try io_mod.dirRealpathAlloc(alloc, workspace_tmp.dir, "workspace");
-    defer alloc.free(root);
-    const external = try io_mod.dirRealpathAlloc(alloc, external_tmp.dir, ".");
-    defer alloc.free(external);
-
-    var rt = TestRuntime{
-        .workspace_root = root,
-        .permission_mode = .auto,
-    };
-    defer rt.deinit(alloc);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const args = try std.fmt.allocPrint(arena, "{{\"query\":\"needle\",\"path\":\"{s}\"}}", .{external});
-
-    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
-        .id = "semantic",
-        .name = "semantic_search",
-        .arguments_json = args,
-    }, .auto, &.{})).decision);
 }
 
 test "executeToolCall rejects overlong glob pattern with failure status" {
@@ -6113,47 +5763,6 @@ test "executeToolCall preserves explicit ignored directory grep roots" {
     try expectContains(result.model_output, "node_modules/pkg/index.js:1: needle module");
 }
 
-test "request tool permission checks copy and rename destinations" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/src");
-    {
-        var file = try tmp.dir.createFile(io_mod.getIo(), "workspace/src/source.txt", .{ .truncate = true });
-        defer file.close(io_mod.getIo());
-        try file.writeStreamingAll(io_mod.getIo(), "source\n");
-    }
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-
-    var rt = TestRuntime{ .workspace_root = root };
-    defer rt.deinit(std.testing.allocator);
-    var rules = [_]types.PermissionRule{
-        .{ .permission = @constCast("copy_file"), .pattern = @constCast("blocked/*"), .action = .deny },
-        .{ .permission = @constCast("rename_file"), .pattern = @constCast("blocked/*"), .action = .deny },
-    };
-    rt.permission_rules = .{ .rules = &rules };
-
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
-        .id = "copy",
-        .name = "copy_file",
-        .arguments_json = "{\"source\":\"src/source.txt\",\"destination\":\"blocked/copied.txt\"}",
-    }, .auto, &.{})).decision);
-    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
-        .id = "rename",
-        .name = "rename_file",
-        .arguments_json = "{\"old_path\":\"src/source.txt\",\"new_path\":\"blocked/renamed.txt\"}",
-    }, .auto, &.{})).decision);
-
-    try std.testing.expect(!absolutePathExists(try std.fs.path.join(arena, &.{ root, "blocked/copied.txt" })));
-    try std.testing.expect(!absolutePathExists(try std.fs.path.join(arena, &.{ root, "blocked/renamed.txt" })));
-    try std.testing.expect(absolutePathExists(try std.fs.path.join(arena, &.{ root, "src/source.txt" })));
-}
-
 test "effective command timeout uses the earlier remaining budget" {
     try std.testing.expectEqual(
         EffectiveCommandTimeout{ .timeout_ms = 5000, .started_ms = 700 },
@@ -6306,6 +5915,65 @@ test "saved noninteractive terminal exec captures replay by capability" {
         command_replay_store.CapturePolicy.required,
         result.command_replay_capture.?.policy(),
     );
+}
+
+test "registered read_tool_result restores an omitted stored-result suffix" {
+    const result_store = @import("../session/result_store.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const session_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(session_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        session_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+
+    const handle = try result_store.storeLargeResultManaged(
+        alloc,
+        &capability,
+        "integration-call",
+        "web_fetch",
+        "integration suffix needle",
+    );
+    defer alloc.free(handle);
+    try std.testing.expect(std.mem.endsWith(u8, handle, ".txt"));
+    const suffixless_handle = handle[0 .. handle.len - ".txt".len];
+
+    var rt = TestRuntime{ .session_child_capability = &capability };
+    defer rt.deinit(alloc);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const arguments_json = try std.fmt.allocPrint(
+        arena,
+        "{{\"handle\":\"{s}\",\"query\":\"suffix needle\"}}",
+        .{suffixless_handle},
+    );
+
+    const result = try executeToolCall(rt.context(), arena, .{
+        .id = "suffixless-result-read",
+        .name = "read_tool_result",
+        .arguments_json = arguments_json,
+    });
+
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
+    try expectContains(result.model_output, "integration suffix needle");
+    try expectContains(result.model_output, handle);
 }
 
 test "no-save terminal exec publishes one readable ephemeral replay" {
@@ -6479,7 +6147,13 @@ test "run_command timeout returns model-visible failure" {
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
     try expectContains(result.model_output, "timeout=true\n");
     try expectContains(result.model_output, "timeout_ms=1000\n");
-    try expectContains(result.model_output, "command timed out and was terminated\n");
+    try expectContains(
+        result.model_output,
+        "cleanup_scope=process_group_and_tracked_descendants\n",
+    );
+    try expectContains(result.model_output, "cleanup_guarantee=best_effort\n");
+    try expectContains(result.model_output, "fully detached descendants may remain\n");
+    try expectNotContains(result.model_output, "command timed out and was terminated");
     try expectNotContains(result.model_output, "PRE-TIMEOUT-OUT");
     try expectNotContains(result.model_output, "PRE-TIMEOUT-ERR");
     const structured = result.command_result_json orelse return error.TestExpectedEqual;
@@ -7237,17 +6911,7 @@ fn fileGrantOfferMatchesExpectation(
     expected_target: []const u8,
     expected_workspace: bool,
 ) bool {
-    const workspace_permissions = [_][]const u8{
-        "edit",
-        "create_folder",
-        "open_file",
-        "rename_file",
-        "copy_file",
-        "read",
-        "list",
-        "glob",
-        "grep",
-    };
+    const workspace_permissions = [_][]const u8{ "edit", "read", "glob", "grep" };
     for (offer.grants) |grant| {
         if (!std.mem.eql(u8, grant.target_path, expected_target)) return false;
     }
@@ -7351,7 +7015,7 @@ fn waitForPermissionPrompt(worker: *WorkerRuntime, expected: []const u8) !u64 {
 
 test "configured ask rule prompts the worker" {
     var rules = [_]types.PermissionRule{
-        .{ .permission = @constCast("list"), .pattern = @constCast("."), .action = .ask },
+        .{ .permission = @constCast("glob"), .pattern = @constCast("."), .action = .ask },
     };
     var rt = TestRuntime{
         .workspace_root = "/tmp/workspace",
@@ -7361,7 +7025,7 @@ test "configured ask rule prompts the worker" {
     defer rt.deinit(std.testing.allocator);
 
     var state = PermissionThreadState{};
-    const thread = try std.Thread.spawn(.{}, runPermissionRequest, .{ &state, rt.context(), ToolCall{ .id = "1", .name = "list_files", .arguments_json = "{}" }, PermissionMode.auto });
+    const thread = try std.Thread.spawn(.{}, runPermissionRequest, .{ &state, rt.context(), ToolCall{ .id = "1", .name = "glob_files", .arguments_json = "{\"pattern\":\"*\"}" }, PermissionMode.auto });
     var thread_joined = false;
     defer if (!thread_joined) {
         rt.worker.requestShutdown();
@@ -7369,7 +7033,7 @@ test "configured ask rule prompts the worker" {
     };
 
     rt.worker.worker_processing = true;
-    const request_id = try waitForPermissionPrompt(&rt.worker, "list_files");
+    const request_id = try waitForPermissionPrompt(&rt.worker, "glob_files");
     try std.testing.expectEqual(
         worker_runtime.PermissionSubmissionResult.accepted,
         rt.worker.submitPermissionResponse(
@@ -7386,6 +7050,7 @@ test "configured ask rule prompts the worker" {
 const McpFixture = struct {
     const CountingContext = struct {
         calls: usize = 0,
+        runtime_generation: u64 = 41,
     };
 
     const PermissionContext = struct {
@@ -7397,6 +7062,7 @@ const McpFixture = struct {
         calls: usize = 0,
         admission_generation: u64 = 0,
         action_generation: u64 = 0,
+        expected_runtime_generation: ?u64 = null,
     };
 
     fn hasTrue(_: *anyopaque, _: []const u8, _: tool_mcp_runtime.Access) bool {
@@ -7407,11 +7073,12 @@ const McpFixture = struct {
         return false;
     }
 
-    fn validateArguments(_: *anyopaque, arena: Allocator, _: []const u8, arguments_json: []const u8, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.ValidationResult {
+    fn validateArguments(raw_ctx: *anyopaque, arena: Allocator, _: []const u8, arguments_json: []const u8, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.ValidationResult {
         if (std.mem.eql(u8, arguments_json, "{\"path\":7}")) {
             return .{ .invalid = try arena.dupe(u8, "path must be a string") };
         }
-        return .valid;
+        const ctx: *CountingContext = @ptrCast(@alignCast(raw_ctx));
+        return .{ .valid = ctx.runtime_generation };
     }
 
     fn callOk(_: *anyopaque, arena: Allocator, _: []const u8, _: []const u8, _: usize, _: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
@@ -7433,6 +7100,7 @@ const McpFixture = struct {
         ctx.calls += 1;
         ctx.admission_generation = scope.admission_authority_generation;
         ctx.action_generation = scope.action_authority_generation;
+        ctx.expected_runtime_generation = options.expected_runtime_generation;
         return .{ .model_output = try arena.dupe(u8, "mcp ok") };
     }
 
@@ -7444,8 +7112,8 @@ const McpFixture = struct {
         return error.McpFixtureFailure;
     }
 
-    fn search(_: *anyopaque, arena: Allocator, query: []const u8, _: usize, _: types.PermissionRuleSet, _: context_limits.Values) anyerror!tool_mcp_runtime.SearchResult {
-        return .{ .model_output = try std.fmt.allocPrint(arena, "{{\"query\":\"{s}\",\"tools\":[{{\"name\":\"mcp_fs_read\",\"server\":\"fs\",\"description\":\"Read\",\"input_schema\":{{\"type\":\"object\"}},\"tags\":[\"fs\",\"read\"]}}],\"count\":1}}", .{query}) };
+    fn search(_: *anyopaque, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, _: usize, _: types.PermissionRuleSet, _: context_limits.Values) anyerror!tool_mcp_runtime.SearchResult {
+        return .{ .model_output = try std.fmt.allocPrint(arena, "{{\"query\":\"{s}\",\"tools\":[{{\"name\":\"mcp_fs_read\",\"server\":\"fs\",\"description\":\"Read\",\"input_schema\":{{\"type\":\"object\"}},\"tags\":[\"fs\",\"read\"]}}],\"count\":1}}", .{query.raw}) };
     }
 
     fn schema(_: *anyopaque, arena: Allocator, name: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!?tool_mcp_runtime.ToolSchemaResult {
@@ -7453,7 +7121,7 @@ const McpFixture = struct {
         return .{ .selected = .{ .model_output = try arena.dupe(u8, "{\"type\":\"function\",\"name\":\"mcp_fs_read\",\"description\":\"Read <context_limit action='literal' />\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"context_limit_rejection\":{\"type\":\"string\"}}}}") } };
     }
 
-    fn searchRecordingRules(raw_ctx: *anyopaque, arena: Allocator, query: []const u8, _: usize, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
+    fn searchRecordingRules(raw_ctx: *anyopaque, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, _: usize, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
         const ctx: *PermissionContext = @ptrCast(@alignCast(raw_ctx));
         ctx.search_rule_count = permission_rules.rules.len;
         return search(raw_ctx, arena, query, 0, permission_rules, limits);
@@ -7666,6 +7334,7 @@ test "MCP execution binds the last live action generation before transport" {
         },
         .advertised_dynamic_tool_names = &integrations,
         .max_tool_result_bytes = rt.max_tool_result_bytes,
+        .expected_mcp_runtime_generation = 73,
     });
     defer alloc.free(result.model_output);
 
@@ -7674,6 +7343,7 @@ test "MCP execution binds the last live action generation before transport" {
     try std.testing.expectEqual(@as(usize, 1), authority.calls);
     try std.testing.expectEqual(@as(u64, 17), authority.admission_generation);
     try std.testing.expectEqual(@as(u64, 41), authority.action_generation);
+    try std.testing.expectEqual(@as(?u64, 73), authority.expected_runtime_generation);
     const original_scope = switch (tool_ctx.mcp_access) {
         .scoped => |scope| scope,
         else => return error.McpScopedAccessExpected,
@@ -7816,157 +7486,6 @@ test "terminal exec cannot reuse or replace a persisted legacy background task" 
     defer tasks.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), tasks.items.len);
     try std.testing.expectEqual(task_id, tasks.items[0].id);
-}
-
-test "external absolute non-write tracked mutations capture resolved paths" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try tmp.dir.createDirPath(io_mod.getIo(), "external");
-
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-    const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
-    defer alloc.free(external);
-    var tracker: change_tracker.ChangeTracker = .{};
-    defer tracker.deinit(std.heap.c_allocator);
-    var allow_rules = [_]types.PermissionRule{
-        .{ .permission = @constCast("*"), .pattern = @constCast("*"), .action = .allow },
-    };
-    var rt = TestRuntime{ .workspace_root = root, .tracker = &tracker };
-    rt.permission_rules = .{ .rules = &allow_rules };
-    defer rt.deinit(alloc);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    try writeTestFile(tmp.dir, "external/delete.txt", "delete\n");
-    const delete_path = try std.fs.path.join(arena, &.{ external, "delete.txt" });
-    const delete_args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{delete_path});
-    _ = try executeToolCall(rt.context(), arena, .{
-        .id = "external-delete",
-        .name = "delete_file",
-        .arguments_json = delete_args,
-    });
-    try std.testing.expectEqual(@as(usize, 1), tracker.stack.items.len);
-    try std.testing.expectEqual(change_tracker.OperationKind.delete, tracker.stack.items[0].kind);
-    try std.testing.expectEqualStrings(delete_path, tracker.stack.items[0].path);
-    try std.testing.expectEqualStrings("delete\n", tracker.stack.items[0].previous_content.?);
-
-    try writeTestFile(tmp.dir, "external/rename.txt", "rename\n");
-    const rename_source = try std.fs.path.join(arena, &.{ external, "rename.txt" });
-    const rename_dest = try std.fs.path.join(arena, &.{ external, "renamed.txt" });
-    const rename_args = try std.fmt.allocPrint(arena, "{{\"old_path\":\"{s}\",\"new_path\":\"{s}\"}}", .{ rename_source, rename_dest });
-    _ = try executeToolCall(rt.context(), arena, .{
-        .id = "external-rename",
-        .name = "rename_file",
-        .arguments_json = rename_args,
-    });
-    try std.testing.expectEqual(@as(usize, 2), tracker.stack.items.len);
-    try std.testing.expectEqual(change_tracker.OperationKind.rename, tracker.stack.items[1].kind);
-    try std.testing.expectEqualStrings(rename_source, tracker.stack.items[1].path);
-    try std.testing.expectEqualStrings(rename_dest, tracker.stack.items[1].new_path.?);
-
-    try writeTestFile(tmp.dir, "external/copy-source.txt", "copy\n");
-    const copy_source = try std.fs.path.join(arena, &.{ external, "copy-source.txt" });
-    const copy_dest = try std.fs.path.join(arena, &.{ external, "copy-dest.txt" });
-    const copy_args = try std.fmt.allocPrint(arena, "{{\"source\":\"{s}\",\"destination\":\"{s}\"}}", .{ copy_source, copy_dest });
-    _ = try executeToolCall(rt.context(), arena, .{
-        .id = "external-copy",
-        .name = "copy_file",
-        .arguments_json = copy_args,
-    });
-    try std.testing.expectEqual(@as(usize, 3), tracker.stack.items.len);
-    try std.testing.expectEqual(change_tracker.OperationKind.write, tracker.stack.items[2].kind);
-    try std.testing.expectEqualStrings(copy_dest, tracker.stack.items[2].path);
-}
-
-test "invalid tracked mutations do not push tracker operations" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-
-    var tracker: change_tracker.ChangeTracker = .{};
-    defer tracker.deinit(std.heap.c_allocator);
-    var rt = TestRuntime{ .workspace_root = root, .tracker = &tracker };
-    defer rt.deinit(alloc);
-
-    const calls = [_]struct { name: []const u8, args: []const u8 }{
-        .{ .name = "delete_file", .args = "{}" },
-        .{ .name = "rename_file", .args = "{}" },
-        .{ .name = "copy_file", .args = "{}" },
-    };
-
-    for (calls) |call| {
-        var arena_state = std.heap.ArenaAllocator.init(alloc);
-        defer arena_state.deinit();
-        try std.testing.expectError(error.InvalidToolArguments, executeToolCall(rt.context(), arena_state.allocator(), .{
-            .id = "1",
-            .name = call.name,
-            .arguments_json = call.args,
-        }));
-        try std.testing.expectEqual(@as(usize, 0), tracker.stack.items.len);
-    }
-}
-
-test "failed tracked delete rename and copy skip tracker publication" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/non-empty");
-    try writeTestFile(tmp.dir, "workspace/non-empty/child.txt", "keep\n");
-    try writeTestFile(tmp.dir, "workspace/rename-source.txt", "rename\n");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/rename-destination");
-    try writeTestFile(tmp.dir, "workspace/rename-destination/child.txt", "keep\n");
-    try writeTestFile(tmp.dir, "workspace/copy-source.txt", "copy\n");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/copy-destination");
-
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-    var tracker: change_tracker.ChangeTracker = .{};
-    defer tracker.deinit(std.heap.c_allocator);
-    var rt = TestRuntime{ .workspace_root = root, .tracker = &tracker };
-    defer rt.deinit(alloc);
-
-    const calls = [_]struct {
-        name: []const u8,
-        args: []const u8,
-        failure_prefix: []const u8,
-    }{
-        .{
-            .name = "delete_file",
-            .args = "{\"path\":\"non-empty\"}",
-            .failure_prefix = "delete_file failed:",
-        },
-        .{
-            .name = "rename_file",
-            .args = "{\"old_path\":\"rename-source.txt\",\"new_path\":\"rename-destination\"}",
-            .failure_prefix = "rename_file failed:",
-        },
-        .{
-            .name = "copy_file",
-            .args = "{\"source\":\"copy-source.txt\",\"destination\":\"copy-destination\"}",
-            .failure_prefix = "copy_file failed:",
-        },
-    };
-
-    for (calls) |call| {
-        var arena_state = std.heap.ArenaAllocator.init(alloc);
-        defer arena_state.deinit();
-        const result = try executeToolCall(rt.context(), arena_state.allocator(), .{
-            .id = "tracked-failure",
-            .name = call.name,
-            .arguments_json = call.args,
-        });
-        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-        try std.testing.expect(std.mem.startsWith(u8, result.model_output, call.failure_prefix));
-        try std.testing.expectEqual(@as(usize, 0), tracker.stack.items.len);
-    }
 }
 
 test "memory tool uses isolated HOME and preserves outputs" {

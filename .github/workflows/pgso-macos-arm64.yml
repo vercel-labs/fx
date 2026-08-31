@@ -2,12 +2,6 @@ name: macOS arm64 PGSO candidate
 
 on:
   workflow_call:
-    inputs:
-      package_release:
-        description: Package the eligible candidate as the stable macOS arm64 artifact
-        required: false
-        type: boolean
-        default: false
   workflow_dispatch:
   pull_request:
     paths:
@@ -463,56 +457,3 @@ jobs:
           path: ${{ runner.temp }}/fx-pgso-aggregate
           if-no-files-found: error
           retention-days: 14
-
-  sign-stable-release:
-    name: Sign stable macOS arm64 release
-    needs: aggregate
-    if: inputs.package_release
-    runs-on: macos-15
-    environment: apple-signing
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Require native arm64 host
-        run: test "$(uname -m)" = arm64
-
-      - name: Download eligible candidate
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: pgso-evidence-macos-arm64-${{ github.sha }}
-          path: ${{ runner.temp }}/fx-pgso-aggregate
-
-      - name: Restore executable mode
-        run: chmod +x "$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx"
-
-      - name: Confirm release eligibility
-        run: python3 -m scripts.pgso report --output-dir "$RUNNER_TEMP/fx-pgso-aggregate" >/dev/null
-
-      - name: Sign and notarize stable release candidate
-        env:
-          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
-          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
-          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-        run: scripts/sign-and-notarize-macos.sh "$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx"
-
-      - name: Package stable release candidate
-        run: |
-          archive="$RUNNER_TEMP/fx-macos-aarch64.tar.gz"
-          package_dir="$RUNNER_TEMP/fx-release-package"
-          mkdir -p "$package_dir"
-          cp "$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx" LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
-          tar -czf "$archive" -C "$package_dir" fx LICENSE THIRD_PARTY_NOTICES.md
-          cd "$RUNNER_TEMP"
-          shasum -a 256 fx-macos-aarch64.tar.gz > fx-macos-aarch64.tar.gz.sha256
-
-      - name: Upload stable release artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: fx-macos-aarch64
-          path: |
-            ${{ runner.temp }}/fx-macos-aarch64.tar.gz
-            ${{ runner.temp }}/fx-macos-aarch64.tar.gz.sha256
-          if-no-files-found: error

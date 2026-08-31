@@ -3,19 +3,6 @@ const usage_report = @import("usage_report.zig");
 
 const Allocator = std.mem.Allocator;
 
-const terminal_reserved_rows: usize = 3;
-pub const usage_summary_start: usize = 2;
-pub const usage_summary_rows: usize = 7;
-pub const usage_activity_rows: usize = 5;
-const usage_model_header_rows: usize = 1;
-
-pub fn usagePinnedRowCount(snapshot: usage_report.Snapshot) usize {
-    return usage_summary_start +
-        usage_summary_rows +
-        (if (snapshot.session_activity != null) usage_activity_rows else 0) +
-        usage_model_header_rows;
-}
-
 pub const State = struct {
     active: bool = false,
     requested_scope: usage_report.Scope = .days_30,
@@ -51,6 +38,33 @@ pub const State = struct {
             .requested_scope = scope_value,
             .refresh_error = try alloc.dupe(u8, message),
         };
+    }
+
+    pub fn openLoading(
+        self: *State,
+        alloc: Allocator,
+        scope_value: usage_report.Scope,
+    ) void {
+        self.close(alloc);
+        self.* = .{
+            .active = true,
+            .requested_scope = scope_value,
+        };
+    }
+
+    pub fn setLoadingScope(
+        self: *State,
+        alloc: Allocator,
+        scope_value: usage_report.Scope,
+    ) void {
+        if (self.snapshot) |*snapshot| snapshot.deinit(alloc);
+        if (self.refresh_error) |message| alloc.free(message);
+        self.snapshot = null;
+        self.refresh_error = null;
+        self.requested_scope = scope_value;
+        self.selected_model = 0;
+        self.expanded_model = null;
+        self.model_window_start = 0;
     }
 
     pub fn close(self: *State, alloc: Allocator) void {
@@ -109,7 +123,7 @@ pub const State = struct {
     pub fn moveModel(
         self: *State,
         delta: i32,
-        terminal_rows: usize,
+        visible_model_rows: usize,
     ) bool {
         if (!self.active or delta == 0) return false;
         const snapshot = self.snapshot orelse return false;
@@ -120,25 +134,17 @@ pub const State = struct {
             self.selected_model -| 1;
         if (next == self.selected_model) return false;
         self.selected_model = next;
-        self.keepSelectionVisible(visibleModelRows(
-            snapshot,
-            terminal_rows,
-            self.expanded_model != null,
-        ));
+        self.keepSelectionVisible(visible_model_rows);
         return true;
     }
 
-    pub fn toggleExpanded(self: *State, terminal_rows: usize) bool {
+    pub fn toggleExpanded(self: *State, visible_model_rows: usize) bool {
         if (!self.active) return false;
         const snapshot = self.snapshot orelse return false;
         if (snapshot.models.len == 0) return false;
         const selected = @min(self.selected_model, snapshot.models.len - 1);
         self.expanded_model = if (self.expanded_model == selected) null else selected;
-        self.keepSelectionVisible(visibleModelRows(
-            snapshot,
-            terminal_rows,
-            self.expanded_model != null,
-        ));
+        self.keepSelectionVisible(visible_model_rows);
         return true;
     }
 
@@ -159,17 +165,6 @@ pub const State = struct {
         }
     }
 };
-
-fn visibleModelRows(
-    snapshot: usage_report.Snapshot,
-    terminal_rows: usize,
-    expanded: bool,
-) usize {
-    const panel_rows = terminal_rows -| terminal_reserved_rows;
-    return panel_rows -|
-        usagePinnedRowCount(snapshot) -|
-        @intFromBool(expanded);
-}
 
 fn findModel(
     models: []const usage_report.ModelUsage,
@@ -290,6 +285,21 @@ test "usage menu advances failed scopes while retaining its last snapshot" {
     });
     try std.testing.expectEqual(usage_report.Scope.session, menu.scope());
     try std.testing.expectEqual(usage_report.Scope.session, menu.navigationScope());
+}
+
+test "usage menu can publish a loading scope before data arrives" {
+    const alloc = std.testing.allocator;
+    var menu = State{};
+    defer menu.close(alloc);
+
+    menu.openLoading(alloc, .days_30);
+    try std.testing.expect(menu.active);
+    try std.testing.expectEqual(usage_report.Scope.days_30, menu.navigationScope());
+    try std.testing.expect(menu.snapshot == null);
+    try std.testing.expect(menu.refresh_error == null);
+
+    menu.setLoadingScope(alloc, .days_7);
+    try std.testing.expectEqual(usage_report.Scope.days_7, menu.navigationScope());
 }
 
 test "usage menu keeps session model selection inside the rendered viewport" {

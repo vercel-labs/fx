@@ -182,17 +182,26 @@ pub const ModelMenu = struct {
     }
 
     pub fn moveProvider(self: *ModelMenu, delta: i32) bool {
-        if (!self.active or self.load_state != .ready) return false;
+        if (!self.active or self.load_state != .ready or delta == 0) return false;
         const filter_count = model_provider_filter_count;
         if (filter_count <= 1) return false;
 
-        var next = @as(i32, @intCast(self.provider_index)) + delta;
-        if (next < 0) next = @as(i32, @intCast(filter_count)) - 1;
-        if (next >= @as(i32, @intCast(filter_count))) next = 0;
-        self.provider_index = @intCast(next);
-        self.selected_index = 0;
-        self.window_start = 0;
-        return true;
+        const current = @min(self.provider_index, filter_count - 1);
+        const direction: i32 = if (delta < 0) -1 else 1;
+        var next: i32 = @intCast(current);
+        for (0..filter_count) |_| {
+            next += direction;
+            if (next < 0) next = @as(i32, @intCast(filter_count)) - 1;
+            if (next >= @as(i32, @intCast(filter_count))) next = 0;
+            const filter: ModelProviderFilter = @enumFromInt(@as(usize, @intCast(next)));
+            if (!modelProviderFilterAvailable(self.items.items, filter)) continue;
+            if (next == current) return false;
+            self.provider_index = @intCast(next);
+            self.selected_index = 0;
+            self.window_start = 0;
+            return true;
+        }
+        return false;
     }
 
     pub fn selectedModelAlloc(self: *const ModelMenu, alloc: Allocator) !?[]u8 {
@@ -250,8 +259,8 @@ fn modelMenuItemMatches(
         text_utils.containsIgnoreCase(item.provider, query_text);
 }
 
-fn providerMatchesFilter(provider: []const u8, filter: ModelProviderFilter) bool {
-    const known_filter: ?ModelProviderFilter = if (std.ascii.eqlIgnoreCase(provider, "anthropic"))
+fn providerFilter(provider: []const u8) ModelProviderFilter {
+    return if (std.ascii.eqlIgnoreCase(provider, "anthropic"))
         .anthropic
     else if (std.ascii.eqlIgnoreCase(provider, "openai"))
         .openai
@@ -260,12 +269,21 @@ fn providerMatchesFilter(provider: []const u8, filter: ModelProviderFilter) bool
     else if (std.ascii.eqlIgnoreCase(provider, "zai"))
         .zai
     else
-        null;
-    return switch (filter) {
-        .all => true,
-        .anthropic, .openai, .xai, .zai => known_filter == filter,
-        .others => known_filter == null,
-    };
+        .others;
+}
+
+pub fn modelProviderFilterAvailable(items: []const ModelMenuItem, filter: ModelProviderFilter) bool {
+    if (filter == .all) return true;
+    var seen = [_]bool{false} ** model_provider_filter_count;
+    for (items) |item| seen[@intFromEnum(providerFilter(item.provider))] = true;
+
+    var specific_count: usize = 0;
+    for (seen[1..]) |available| specific_count += @intFromBool(available);
+    return specific_count > 1 and seen[@intFromEnum(filter)];
+}
+
+fn providerMatchesFilter(provider: []const u8, filter: ModelProviderFilter) bool {
+    return filter == .all or providerFilter(provider) == filter;
 }
 
 pub const Runtime = struct {
@@ -1087,7 +1105,7 @@ test "model cache refetches effective access across auth and team changes" {
     try std.testing.expectEqual(@as(usize, cases.len), provider.calls);
 }
 
-test "model cache reloads a ready authenticated catalog after Fx login access downgrades" {
+test "model cache reloads a ready authenticated catalog after fx login access downgrades" {
     const cases = [_]struct {
         access: credentials.CatalogAccess,
         reason: credentials.CatalogPublicOnlyReason,
@@ -1380,6 +1398,37 @@ test "model menu owns resolved catalog state and filters without changing catalo
     const selected = (try runtime.menu.selectedModelAlloc(alloc)).?;
     defer alloc.free(selected);
     try std.testing.expectEqualStrings("standalone", selected);
+}
+
+test "model menu provider navigation skips absent and redundant filters" {
+    const alloc = std.testing.allocator;
+    const mixed_entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("openai/gpt-5"), .model_type = @constCast("language") },
+        .{ .id = @constCast("xai/grok-4"), .model_type = @constCast("language") },
+    };
+    var mixed: ModelMenu = .{};
+    defer mixed.deinit(alloc);
+    try hydrateMenuSnapshot(alloc, &mixed, &mixed_entries);
+    mixed.active = true;
+
+    try std.testing.expect(mixed.moveProvider(1));
+    try std.testing.expectEqual(ModelProviderFilter.openai, mixed.providerFilter());
+    try std.testing.expect(mixed.moveProvider(1));
+    try std.testing.expectEqual(ModelProviderFilter.xai, mixed.providerFilter());
+    try std.testing.expect(mixed.moveProvider(1));
+    try std.testing.expectEqual(ModelProviderFilter.all, mixed.providerFilter());
+
+    const codex_entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("gpt-5.6-sol"), .model_type = @constCast("language") },
+        .{ .id = @constCast("gpt-5.4-mini"), .model_type = @constCast("language") },
+    };
+    var codex: ModelMenu = .{};
+    defer codex.deinit(alloc);
+    try hydrateMenuSnapshot(alloc, &codex, &codex_entries);
+    codex.active = true;
+
+    try std.testing.expect(!codex.moveProvider(1));
+    try std.testing.expectEqual(ModelProviderFilter.all, codex.providerFilter());
 }
 
 test "model menu snapshot construction cleans every allocation failure" {

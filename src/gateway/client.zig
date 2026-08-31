@@ -56,6 +56,16 @@ fn connectedIoFailure(
     return transport_error;
 }
 
+fn connectedIoFailureWithWatch(
+    watch: ?*ConnectedRequestWatch,
+    cancelled: bool,
+    system_resumed: bool,
+    transport_error: anyerror,
+) anyerror {
+    const mapped = connectedIoFailure(cancelled, system_resumed, transport_error);
+    return if (watch) |state| state.finish_error(mapped) else mapped;
+}
+
 test "connected request failures prefer cancellation then wake evidence" {
     try std.testing.expectEqual(
         error.Cancelled,
@@ -535,7 +545,7 @@ fn fetchGatewayJsonAtUrlCore(
 
     var cancel_watch_done = std.atomic.Value(bool).init(false);
     const cancel_watcher = if (req.connection) |conn|
-        try spawn_gateway_cancel_watcher(&cancel_watch_done, cancel_flag, null, null, conn.stream_writer.stream)
+        try spawn_gateway_cancel_watcher(&cancel_watch_done, cancel_flag, null, null, null, conn.stream_writer.stream)
     else
         null;
     defer {
@@ -729,8 +739,18 @@ const ConnectionSetupTiming = struct {
     timeout_ms: i64 = gateway_connection_setup_timeout_ms,
 };
 
+const ResponseHeadTiming = struct {
+    timeout_ms: i64 = 30_000,
+};
+
 test "connection setup keeps the production timeout" {
     const timing = ConnectionSetupTiming{};
+
+    try std.testing.expectEqual(@as(i64, 30_000), timing.timeout_ms);
+}
+
+test "response head wait keeps the production timeout" {
+    const timing = ResponseHeadTiming{};
 
     try std.testing.expectEqual(@as(i64, 30_000), timing.timeout_ms);
 }
@@ -762,7 +782,135 @@ const RequestOpenOverride = struct {
 
 const StreamCoreOptions = struct {
     setup_timing: ConnectionSetupTiming = .{},
+    response_head_timing: ResponseHeadTiming = .{},
     request_open_override: ?RequestOpenOverride = null,
+};
+
+const ConnectedRequestWatch = struct {
+    const Phase = enum(u8) {
+        sending,
+        awaiting_head,
+        streaming,
+        completed,
+        timed_out,
+        cancelled,
+        system_resumed,
+    };
+
+    phase: std.atomic.Value(Phase) = .init(.sending),
+    response_head_deadline: std.Io.Clock.Timestamp = undefined,
+    timing: ResponseHeadTiming,
+
+    fn init(timing: ResponseHeadTiming) ConnectedRequestWatch {
+        return .{ .timing = timing };
+    }
+
+    fn arm_response_head(self: *ConnectedRequestWatch) ?anyerror {
+        self.response_head_deadline = std.Io.Clock.Timestamp.fromNow(
+            io_mod.getIo(),
+            .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(self.timing.timeout_ms),
+            },
+        );
+        if (self.phase.cmpxchgStrong(
+            .sending,
+            .awaiting_head,
+            .seq_cst,
+            .seq_cst,
+        )) |winner| return phase_error(winner);
+        return null;
+    }
+
+    fn commit_response_head(self: *ConnectedRequestWatch) ?anyerror {
+        if (self.phase.cmpxchgStrong(
+            .awaiting_head,
+            .streaming,
+            .seq_cst,
+            .seq_cst,
+        )) |winner| return phase_error(winner);
+        return null;
+    }
+
+    fn finish(self: *ConnectedRequestWatch) ?anyerror {
+        var current = self.phase.load(.seq_cst);
+        while (is_active(current)) {
+            if (self.phase.cmpxchgWeak(
+                current,
+                .completed,
+                .seq_cst,
+                .seq_cst,
+            )) |observed| {
+                current = observed;
+                continue;
+            }
+            return null;
+        }
+        return phase_error(current);
+    }
+
+    fn finish_error(
+        self: *ConnectedRequestWatch,
+        transport_error: anyerror,
+    ) anyerror {
+        return self.finish() orelse transport_error;
+    }
+
+    fn win(self: *ConnectedRequestWatch, winner: Phase) bool {
+        std.debug.assert(!is_active(winner));
+        std.debug.assert(winner != .completed);
+        var current = self.phase.load(.seq_cst);
+        while (is_active(current)) {
+            if (self.phase.cmpxchgWeak(
+                current,
+                winner,
+                .seq_cst,
+                .seq_cst,
+            )) |observed| {
+                current = observed;
+                continue;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    fn win_response_head_timeout(self: *ConnectedRequestWatch) bool {
+        return self.phase.cmpxchgStrong(
+            .awaiting_head,
+            .timed_out,
+            .seq_cst,
+            .seq_cst,
+        ) == null;
+    }
+
+    fn response_head_expired(
+        self: *const ConnectedRequestWatch,
+        now: std.Io.Clock.Timestamp,
+    ) bool {
+        if (self.phase.load(.seq_cst) != .awaiting_head) return false;
+        return !std.Io.Clock.Timestamp.compare(
+            now,
+            .lt,
+            self.response_head_deadline,
+        );
+    }
+
+    fn is_active(phase: Phase) bool {
+        return switch (phase) {
+            .sending, .awaiting_head, .streaming => true,
+            .completed, .timed_out, .cancelled, .system_resumed => false,
+        };
+    }
+
+    fn phase_error(phase: Phase) ?anyerror {
+        return switch (phase) {
+            .timed_out => error.Timeout,
+            .cancelled => error.Cancelled,
+            .system_resumed => error.SystemResumed,
+            .sending, .awaiting_head, .streaming, .completed => null,
+        };
+    }
 };
 
 const RequestOpenOperation = struct {
@@ -1207,8 +1355,8 @@ fn streamGatewayCompletionCoreWithOptions(
         else
             .definitely_unsent;
 
-        debug_trace.eventf("gateway", "before_http_open_connect", trace_ctx, "attempt={d} retry_count={d}", .{ attempt + 1, retry_count });
-        debug_trace.eventf("gateway", "before_request_open", trace_ctx, "attempt={d} retry_count={d} payload_bytes={d}", .{ attempt + 1, retry_count, payload.len });
+        debug_trace.eventf("gateway", "before_http_open_connect", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d}", .{ attempt + 1, retry_count, attempt });
+        debug_trace.eventf("gateway", "before_request_open", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d} payload_bytes={d}", .{ attempt + 1, retry_count, attempt, payload.len });
         var req = openGatewayRequestBounded(&client, uri, .{
             .headers = .{
                 .content_type = .{ .override = "application/json" },
@@ -1272,14 +1420,19 @@ fn streamGatewayCompletionCoreWithOptions(
 
         var cancel_watch_done = std.atomic.Value(bool).init(false);
         var system_resumed = std.atomic.Value(bool).init(false);
+        var connected_watch = ConnectedRequestWatch.init(core_options.response_head_timing);
         const cancel_watcher = if (watch_connected_socket)
             if (req.connection) |conn|
-                spawn_gateway_cancel_watcher(&cancel_watch_done, cancel_flag, &system_resumed, null, conn.stream_writer.stream) catch |err| {
+                spawn_gateway_cancel_watcher(&cancel_watch_done, cancel_flag, &system_resumed, null, &connected_watch, conn.stream_writer.stream) catch |err| {
                     debug_trace.eventf("gateway", "cancel_watcher_spawn_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
                     return @as(anyerror!StreamResult, err);
                 }
             else
                 null
+        else
+            null;
+        const active_connected_watch: ?*ConnectedRequestWatch = if (cancel_watcher != null)
+            &connected_watch
         else
             null;
         defer {
@@ -1295,7 +1448,8 @@ fn streamGatewayCompletionCoreWithOptions(
         if (request.delivery) |delivery| delivery.markPossiblySent();
         var body_writer = req.sendBodyUnflushed(&send_buf) catch |err| {
             debug_trace.eventf("gateway", "request_send_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
-            return @as(anyerror!StreamResult, connectedIoFailure(
+            return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
+                active_connected_watch,
                 cancel_flag.load(.seq_cst),
                 system_resumed.load(.seq_cst),
                 err,
@@ -1303,7 +1457,8 @@ fn streamGatewayCompletionCoreWithOptions(
         };
         body_writer.writer.writeAll(payload) catch |err| {
             debug_trace.eventf("gateway", "request_send_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
-            return @as(anyerror!StreamResult, connectedIoFailure(
+            return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
+                active_connected_watch,
                 cancel_flag.load(.seq_cst),
                 system_resumed.load(.seq_cst),
                 err,
@@ -1311,7 +1466,8 @@ fn streamGatewayCompletionCoreWithOptions(
         };
         body_writer.end() catch |err| {
             debug_trace.eventf("gateway", "request_send_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
-            return @as(anyerror!StreamResult, connectedIoFailure(
+            return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
+                active_connected_watch,
                 cancel_flag.load(.seq_cst),
                 system_resumed.load(.seq_cst),
                 err,
@@ -1319,7 +1475,8 @@ fn streamGatewayCompletionCoreWithOptions(
         };
         req.connection.?.flush() catch |err| {
             debug_trace.eventf("gateway", "request_send_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
-            return @as(anyerror!StreamResult, connectedIoFailure(
+            return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
+                active_connected_watch,
                 cancel_flag.load(.seq_cst),
                 system_resumed.load(.seq_cst),
                 err,
@@ -1328,10 +1485,14 @@ fn streamGatewayCompletionCoreWithOptions(
         debug_trace.eventf("gateway", "after_request_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
         debug_trace.eventf("gateway", "after_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
 
+        if (active_connected_watch) |watch| {
+            if (watch.arm_response_head()) |err| return @as(anyerror!StreamResult, err);
+        }
         debug_trace.eventf("gateway", "before_receive_head", trace_ctx, "attempt={d}", .{attempt + 1});
         var response = req.receiveHead(&.{}) catch |err| {
             debug_trace.eventf("gateway", "receive_head_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
-            const mapped = connectedIoFailure(
+            const mapped = connectedIoFailureWithWatch(
+                active_connected_watch,
                 cancel_flag.load(.seq_cst),
                 system_resumed.load(.seq_cst),
                 err,
@@ -1348,6 +1509,9 @@ fn streamGatewayCompletionCoreWithOptions(
             }
             return @as(anyerror!StreamResult, mapped);
         };
+        if (active_connected_watch) |watch| {
+            if (watch.commit_response_head()) |err| return @as(anyerror!StreamResult, err);
+        }
         debug_trace.eventf("gateway", "after_receive_head", trace_ctx, "attempt={d} status={d}", .{ attempt + 1, @intFromEnum(response.head.status) });
         const resolved_model_seen_in_head = traceResolvedModelHeader(response.head, model, trace_ctx);
 
@@ -1403,12 +1567,19 @@ fn streamGatewayCompletionCoreWithOptions(
             request.content_capture_limit,
         ) catch |err| {
             debug_trace.eventf("gateway", "sse_consume_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
-            return @as(anyerror!StreamResult, connectedIoFailure(
+            return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
+                active_connected_watch,
                 cancel_flag.load(.seq_cst),
                 system_resumed.load(.seq_cst),
                 err,
             ));
         };
+        if (active_connected_watch) |watch| {
+            if (watch.finish()) |err| {
+                deinitGatewayCompletion(alloc, &completion);
+                return @as(anyerror!StreamResult, err);
+            }
+        }
         if (cancel_flag.load(.seq_cst)) {
             deinitGatewayCompletion(alloc, &completion);
             return error.Cancelled;
@@ -1695,12 +1866,29 @@ const GatewayCancelWatcher = struct {
         cancel_flag: *std.atomic.Value(bool),
         system_resumed: ?*std.atomic.Value(bool),
         deadline: ?std.Io.Clock.Timestamp,
+        connected_watch: ?*ConnectedRequestWatch,
         stream: std.Io.net.Stream,
     ) void {
         var previous = SuspendClockSample.now();
         while (!done.load(.seq_cst)) {
             if (cancel_flag.load(.seq_cst)) {
-                stream.shutdown(io_mod.getIo(), .both) catch {};
+                if (connected_watch == null or connected_watch.?.win(.cancelled)) {
+                    stream.shutdown(io_mod.getIo(), .both) catch {};
+                }
+                return;
+            }
+            const current = SuspendClockSample.now();
+            if (system_resumed != null and suspendGapDetected(previous, current)) {
+                if (cancel_flag.load(.seq_cst)) {
+                    if (connected_watch == null or connected_watch.?.win(.cancelled)) {
+                        stream.shutdown(io_mod.getIo(), .both) catch {};
+                    }
+                    return;
+                }
+                if (connected_watch == null or connected_watch.?.win(.system_resumed)) {
+                    system_resumed.?.store(true, .seq_cst);
+                    stream.shutdown(io_mod.getIo(), .both) catch {};
+                }
                 return;
             }
             if (deadline) |limit| {
@@ -1710,18 +1898,16 @@ const GatewayCancelWatcher = struct {
                     return;
                 }
             }
-            io_mod.sleep(10 * std.time.ns_per_ms);
-            const current = SuspendClockSample.now();
-            if (system_resumed != null and suspendGapDetected(previous, current)) {
-                if (cancel_flag.load(.seq_cst)) {
+            if (connected_watch) |watch| {
+                const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+                if (watch.response_head_expired(now) and watch.win_response_head_timeout()) {
                     stream.shutdown(io_mod.getIo(), .both) catch {};
                     return;
                 }
-                system_resumed.?.store(true, .seq_cst);
-                stream.shutdown(io_mod.getIo(), .both) catch {};
-                return;
+                if (watch.phase.load(.seq_cst) == .completed) return;
             }
             previous = current;
+            io_mod.sleep(10 * std.time.ns_per_ms);
         }
     }
 };
@@ -1753,7 +1939,7 @@ pub fn spawnHttpCancelWatcher(
     cancel_flag: *std.atomic.Value(bool),
     stream: std.Io.net.Stream,
 ) !std.Thread {
-    return spawn_gateway_cancel_watcher(done, cancel_flag, null, null, stream);
+    return spawn_gateway_cancel_watcher(done, cancel_flag, null, null, null, stream);
 }
 
 pub fn spawnHttpCancelWatcherBounded(
@@ -1762,7 +1948,7 @@ pub fn spawnHttpCancelWatcherBounded(
     deadline: std.Io.Clock.Timestamp,
     stream: std.Io.net.Stream,
 ) !std.Thread {
-    return spawn_gateway_cancel_watcher(done, cancel_flag, null, deadline, stream);
+    return spawn_gateway_cancel_watcher(done, cancel_flag, null, deadline, null, stream);
 }
 
 fn spawn_gateway_cancel_watcher(
@@ -1770,6 +1956,7 @@ fn spawn_gateway_cancel_watcher(
     cancel_flag: *std.atomic.Value(bool),
     system_resumed: ?*std.atomic.Value(bool),
     deadline: ?std.Io.Clock.Timestamp,
+    connected_watch: ?*ConnectedRequestWatch,
     stream: std.Io.net.Stream,
 ) !std.Thread {
     if (builtin.is_test) {
@@ -1780,6 +1967,7 @@ fn spawn_gateway_cancel_watcher(
         cancel_flag,
         system_resumed,
         deadline,
+        connected_watch,
         stream,
     });
 }
@@ -1798,6 +1986,30 @@ test "suspend gap classification compares boot and awake clocks" {
         .awake_ns = before.awake_ns + 10 * std.time.ns_per_ms,
         .boot_ns = before.boot_ns + 10 * std.time.ns_per_ms + suspend_gap_tolerance_ns + 1,
     }));
+}
+
+test "connected request watch keeps the first terminal winner" {
+    var cancelled = ConnectedRequestWatch.init(.{});
+    try std.testing.expect(cancelled.win(.cancelled));
+    try std.testing.expect(!cancelled.win_response_head_timeout());
+    try std.testing.expectEqual(error.Cancelled, cancelled.finish().?);
+
+    var resumed = ConnectedRequestWatch.init(.{});
+    try std.testing.expect(resumed.win(.system_resumed));
+    try std.testing.expect(!resumed.win(.cancelled));
+    try std.testing.expectEqual(error.SystemResumed, resumed.finish().?);
+
+    var ordinary = ConnectedRequestWatch.init(.{});
+    try std.testing.expect(ordinary.finish() == null);
+    try std.testing.expect(!ordinary.win(.cancelled));
+}
+
+test "connected request watch disarms timeout at response head" {
+    var watch = ConnectedRequestWatch.init(.{ .timeout_ms = 1 });
+    try std.testing.expect(watch.arm_response_head() == null);
+    try std.testing.expect(watch.commit_response_head() == null);
+    try std.testing.expect(!watch.win_response_head_timeout());
+    try std.testing.expect(watch.finish() == null);
 }
 
 fn resolveE2eGatewayUrl(env_name: []const u8, default_url: []const u8) ![]const u8 {
@@ -4688,7 +4900,7 @@ test "consumeSseStream rejects a final tool name that conflicts with streamed id
             "data: {{\"type\":\"tool-input-start\",\"id\":\"A\",\"toolName\":\"read_file\"}}\n\n" ++
                 "data: {{\"type\":\"tool-input-delta\",\"id\":\"A\",\"delta\":\"{{\\\"path\\\":\\\"victim.txt\\\"}}\"}}\n\n" ++
                 "data: {{\"type\":\"tool-input-end\",\"id\":\"A\"}}\n\n" ++
-                "data: {{\"type\":\"tool-call\",\"toolCallId\":\"A\",\"toolName\":\"delete_file\"{s}}}\n\n" ++
+                "data: {{\"type\":\"tool-call\",\"toolCallId\":\"A\",\"toolName\":\"edit_file\"{s}}}\n\n" ++
                 "data: [DONE]\n\n",
             .{final_input},
         );
@@ -5492,6 +5704,7 @@ const LoopbackGatewayMode = enum {
     request_send_stall,
     response_head_stall,
     response_body_stall,
+    response_body_delayed_success,
     response_body_progress,
     retry_once,
     retry_once_then_success,
@@ -5679,6 +5892,24 @@ const LoopbackGatewayFixture = struct {
                 );
                 self.markStage();
                 self.hold();
+            },
+            .response_body_delayed_success => {
+                try readLoopbackGatewayRequest(zio, stream, self);
+                try writeLoopbackGatewayBytes(
+                    zio,
+                    stream,
+                    "HTTP/1.1 200 OK\r\n" ++
+                        "Content-Type: text/event-stream\r\n" ++
+                        "Connection: close\r\n\r\n",
+                );
+                self.markStage();
+                self.hold();
+                try writeLoopbackGatewayBytes(
+                    zio,
+                    stream,
+                    "data: {\"type\":\"text-delta\",\"id\":\"answer\",\"delta\":\"ok\"}\n\n" ++
+                        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n",
+                );
             },
             .response_body_progress => {
                 try readLoopbackGatewayRequest(zio, stream, self);
@@ -6044,6 +6275,67 @@ test "transport-owned TLS setup retries before send" {
 
     try std.testing.expectEqual(@as(usize, 2), probe.attempts);
     try std.testing.expectEqualStrings("ok", result.completion.content.?);
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+}
+
+test "gateway setup trace distinguishes attempt limits from retries used" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "gateway-attempts.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "gateway");
+
+    var harness = try ConnectionSetupHarness.init(.success, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var probe = RequestOpenProbe{ .tls_failure_attempt = 0 };
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var callback_ctx: u8 = 0;
+    var result = try streamGatewayCompletionCoreWithOptions(
+        alloc,
+        .{
+            .api_key = "test-key",
+            .model = "test/model",
+            .retry_count = 2,
+            .chat_url = harness.url,
+            .payload = "{}",
+        },
+        @ptrCast(&callback_ctx),
+        discardConnectionSetupTestChunk,
+        null,
+        &cancel_flag,
+        null,
+        false,
+        .{
+            .setup_timing = .{ .timeout_ms = 1000 },
+            .request_open_override = probe.requestOpenOverride(),
+        },
+    );
+    defer result.deinit(alloc);
+    debug_trace.shutdown();
+
+    const trace = try readTraceFileForTest(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(
+        u8,
+        trace,
+        "attempt=1 attempt_limit=2 retries_used=0",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        trace,
+        "attempt=2 attempt_limit=2 retries_used=1",
+    ) != null);
+    try std.testing.expect(std.mem.find(u8, trace, "retry_count=") == null);
+
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
 }
@@ -7187,6 +7479,91 @@ fn expectDirectLoopbackCancellation(
 
 test "direct gateway cancellation closes a stalled response body promptly" {
     try expectDirectLoopbackCancellation(.response_body_stall, "{}", 20, 800, 500);
+}
+
+test "direct gateway times out only while awaiting the response head" {
+    const zio = io_mod.getIo();
+    var fixture = try LoopbackGatewayFixture.init(.response_head_stall, 500);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+
+    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{fixture.port()});
+    defer std.testing.allocator.free(url);
+    const Noop = struct {
+        fn onChunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var callback_ctx: u8 = 0;
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var delivery = DeliveryCertainty.init();
+    const started = std.Io.Clock.Timestamp.now(zio, .awake);
+    const result = streamGatewayCompletionCoreWithOptions(
+        std.testing.allocator,
+        .{
+            .api_key = "test-key",
+            .model = "test/model",
+            .retry_count = 1,
+            .chat_url = url,
+            .payload = "{}",
+            .delivery = &delivery,
+        },
+        @ptrCast(&callback_ctx),
+        Noop.onChunk,
+        null,
+        &cancel_flag,
+        null,
+        true,
+        .{ .response_head_timing = .{ .timeout_ms = 80 } },
+    );
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
+
+    fixture.deinit();
+    try std.testing.expectError(error.Timeout, result);
+    if (fixture.failure) |err| return err;
+    try std.testing.expectEqual(DeliveryCertainty.State.possibly_sent, delivery.load());
+    try std.testing.expect(elapsed_ms < 500);
+}
+
+test "direct gateway response head timeout does not limit a delayed SSE body" {
+    const zio = io_mod.getIo();
+    var fixture = try LoopbackGatewayFixture.init(.response_body_delayed_success, 150);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+
+    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{fixture.port()});
+    defer std.testing.allocator.free(url);
+    const Noop = struct {
+        fn onChunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var callback_ctx: u8 = 0;
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const started = std.Io.Clock.Timestamp.now(zio, .awake);
+    var result = try streamGatewayCompletionCoreWithOptions(
+        std.testing.allocator,
+        .{
+            .api_key = "test-key",
+            .model = "test/model",
+            .retry_count = 1,
+            .chat_url = url,
+            .payload = "{}",
+        },
+        @ptrCast(&callback_ctx),
+        Noop.onChunk,
+        null,
+        &cancel_flag,
+        null,
+        true,
+        .{ .response_head_timing = .{ .timeout_ms = 40 } },
+    );
+    defer result.deinit(std.testing.allocator);
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
+
+    fixture.deinit();
+    if (fixture.failure) |err| return err;
+    try std.testing.expectEqual(std.http.Status.ok, result.status);
+    try std.testing.expectEqualStrings("ok", result.completion.content.?);
+    try std.testing.expect(elapsed_ms >= 100);
 }
 
 test "direct gateway cancellation closes a stalled request send promptly" {

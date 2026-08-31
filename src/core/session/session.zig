@@ -2964,6 +2964,23 @@ pub fn formatExecutionReplayContext(
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
+test "turn summary alone does not create model execution replay context" {
+    const execution = ExecutionMemory{ .turn_summary = .{
+        .started_at_ms = 100,
+        .completed_at_ms = 250,
+        .thinking_duration_ms = 40,
+        .turn_duration_ms = 150,
+        .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
+    } };
+
+    const context = try formatExecutionReplayContext(
+        std.testing.allocator,
+        execution,
+    );
+    defer if (context) |value| std.testing.allocator.free(value);
+    try std.testing.expect(context == null);
+}
+
 pub fn formatInterruptedHistoryContext(alloc: Allocator, entry: InterruptedHistoryTurn) ![]u8 {
     _ = entry;
     return alloc.dupe(u8, interrupted_turn_context);
@@ -4702,7 +4719,7 @@ test "partial-text interrupted history projects partial assistant with closure b
 
 test "completed-tool interrupted history projects summary before marker" {
     const alloc = std.testing.allocator;
-    var completed_tool_names = [_][]u8{ @constCast("list_files"), @constCast("glob_files") };
+    var completed_tool_names = [_][]u8{ @constCast("glob_files"), @constCast("glob_files") };
     const history = [_]HistoryTurn{.{ .interrupted = .{
         .user = .{ .text = @constCast("use all ur tools 1 by 1 - I need u to test them") },
         .completed_tool_names = completed_tool_names[0..],
@@ -4716,7 +4733,7 @@ test "completed-tool interrupted history projects summary before marker" {
     try std.testing.expectEqual(.user, messages.items[0].role);
     try std.testing.expectEqualStrings("use all ur tools 1 by 1 - I need u to test them", messages.items[0].content.?.asText());
     try std.testing.expectEqual(.assistant, messages.items[1].role);
-    try std.testing.expectEqualStrings("Interrupted by user after completing 2 tool calls: list_files, glob_files.", messages.items[1].content.?.asText());
+    try std.testing.expectEqualStrings("Interrupted by user after completing 2 tool calls: glob_files, glob_files.", messages.items[1].content.?.asText());
     try std.testing.expectEqual(.user, messages.items[2].role);
     try std.testing.expect(std.mem.find(u8, messages.items[2].content.?.asText(), "<turn_aborted>") != null);
 
@@ -4731,7 +4748,7 @@ test "completed-tool interrupted history projects summary before marker" {
     try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[0].role);
     try std.testing.expectEqualStrings("use all ur tools 1 by 1 - I need u to test them", chat_messages.items[0].content.?);
     try std.testing.expectEqual(core_types.ChatRole.assistant, chat_messages.items[1].role);
-    try std.testing.expectEqualStrings("Interrupted by user after completing 2 tool calls: list_files, glob_files.", chat_messages.items[1].content.?);
+    try std.testing.expectEqualStrings("Interrupted by user after completing 2 tool calls: glob_files, glob_files.", chat_messages.items[1].content.?);
     try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[2].role);
     try std.testing.expect(std.mem.find(u8, chat_messages.items[2].content.?, "<turn_aborted>") != null);
 }

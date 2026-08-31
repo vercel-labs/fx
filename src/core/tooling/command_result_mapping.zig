@@ -41,6 +41,23 @@ pub const Foreground = struct {
             .foreground => |foreground| foreground,
             .background => return null,
         };
+        if (foreground.termination_indeterminate) {
+            const details = [_]tool_result_errors.Detail{
+                .{ .name = "command", .value = .{ .string = foreground.command } },
+                .{ .name = "cwd", .value = .{ .string = foreground.cwd } },
+                .{ .name = "termination_indeterminate", .value = .{ .boolean = true } },
+            };
+            return .{
+                .status = .failure,
+                .model_output = try tool_result_errors.toolExecutionFailureJson(arena, .{
+                    .tool_name = "terminal",
+                    .message = "Command started, but its final process status could not be confirmed",
+                    .details = &details,
+                    .suggestion = "Do not retry the command unchanged because its side effects may already exist. Inspect the resulting state first.",
+                }),
+                .command_result_json = try command_result.toJson(arena),
+            };
+        }
         if ((foreground.exit_code == null or foreground.exit_code.? == 0) and
             foreground.signal == null and
             !foreground.timed_out) return null;
@@ -84,10 +101,18 @@ pub const Foreground = struct {
         timeout_ms: ?usize,
         started_ms: ?i64,
     ) !ToolExecutionResult {
+        const cleanup =
+            "cleanup_scope=process_group_and_tracked_descendants\n" ++
+            "cleanup_guarantee=best_effort\n" ++
+            "message=command timed out; cleanup was attempted for the process group and tracked descendants, but fully detached descendants may remain\n";
         const output = if (timeout_ms) |ms|
-            try std.fmt.allocPrint(arena, "timeout=true\ntimeout_ms={d}\ncommand timed out and was terminated\n", .{ms})
+            try std.fmt.allocPrint(
+                arena,
+                "timeout=true\ntimeout_ms={d}\n" ++ cleanup,
+                .{ms},
+            )
         else
-            try arena.dupe(u8, "timeout=true\ncommand timed out and was terminated\n");
+            try arena.dupe(u8, "timeout=true\n" ++ cleanup);
         return .{
             .status = .failure,
             .model_output = output,
@@ -97,6 +122,9 @@ pub const Foreground = struct {
                 .timed_out = true,
                 .duration_ms = if (started_ms) |started| elapsedMs(started, io_mod.milliTimestamp()) else null,
             } }).toJson(arena),
+            .tool_result_memory = .{
+                .command_process_presentation = .timed_out,
+            },
         };
     }
 
@@ -112,6 +140,9 @@ pub const Foreground = struct {
                 .details = &details,
                 .suggestion = "Do not retry unchanged. Inspect available command evidence, free storage if needed, or explain that complete output capture failed.",
             }),
+            .tool_result_memory = .{
+                .command_process_presentation = .output_capture_failed,
+            },
         };
     }
 };
@@ -363,6 +394,25 @@ test "command result mapping preserves non-zero stderr envelope and JSON" {
     try expectContains(result.command_result_json.?, "\"exit_code\":7");
 }
 
+test "command result mapping reports indeterminate termination with structured evidence" {
+    const alloc = std.testing.allocator;
+    const result = try Foreground.nonZeroFailure(alloc, .{
+        .output = "termination_indeterminate=true\n",
+        .command_result = .{ .foreground = .{
+            .command = "printf effect > marker",
+            .cwd = "/tmp/workspace",
+            .termination_indeterminate = true,
+        } },
+    }) orelse return error.TestExpectedEqual;
+    defer alloc.free(result.model_output);
+    defer alloc.free(result.command_result_json.?);
+
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+    try expectContains(result.model_output, "could not be confirmed");
+    try expectContains(result.model_output, "Do not retry");
+    try expectContains(result.command_result_json.?, "\"termination_indeterminate\":true");
+}
+
 test "cancelled command mapping survives metadata serialization failure" {
     var failing = std.testing.FailingAllocator.init(
         std.testing.allocator,
@@ -394,10 +444,18 @@ test "command result mapping preserves timeout JSON" {
     defer alloc.free(timeout.model_output);
     defer alloc.free(timeout.command_result_json.?);
     try std.testing.expectEqualStrings(
-        "timeout=true\ntimeout_ms=5\ncommand timed out and was terminated\n",
+        "timeout=true\n" ++
+            "timeout_ms=5\n" ++
+            "cleanup_scope=process_group_and_tracked_descendants\n" ++
+            "cleanup_guarantee=best_effort\n" ++
+            "message=command timed out; cleanup was attempted for the process group and tracked descendants, but fully detached descendants may remain\n",
         timeout.model_output,
     );
     try expectContains(timeout.command_result_json.?, "\"timed_out\":true");
+    try std.testing.expectEqual(
+        types.CommandProcessPresentation.timed_out,
+        timeout.tool_result_memory.?.command_process_presentation.?,
+    );
 }
 
 test "foreground output capture failure is structured and recoverable" {
@@ -407,6 +465,10 @@ test "foreground output capture failure is structured and recoverable" {
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
     try expectContains(result.model_output, "\"output_capture_failed\":true");
     try expectContains(result.model_output, "Command output could not be retained");
+    try std.testing.expectEqual(
+        types.CommandProcessPresentation.output_capture_failed,
+        result.tool_result_memory.?.command_process_presentation.?,
+    );
 }
 
 test "command result mapping projects background reuse output and JSON" {
