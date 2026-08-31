@@ -80,6 +80,7 @@ fn buildReviewPayload(
     defer alloc.free(expanded);
     return runtime.adapter.build_fn(alloc, .{
         .model = model,
+        .session_id = runtime.input.session_id,
         .messages = expanded,
         .tools = .{ .additional_functions = &.{permission_auto_classifier.function_schema} },
         .tool_choice = .required,

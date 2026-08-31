@@ -159,6 +159,8 @@ pub const CredentialLease = struct {
 /// Every slice and JSON value is borrowed for the call.
 pub const RequestData = struct {
     model: []const u8,
+    /// Saved session identity, borrowed for the serializer call.
+    session_id: ?[]const u8 = null,
     messages: []const types.ChatMessage,
     tools: ToolSelection = .{},
     tool_choice: types.ToolChoice,
@@ -202,6 +204,7 @@ pub const ModelRequest = struct {
     pub fn data(self: ModelRequest) RequestData {
         return .{
             .model = self.model,
+            .session_id = self.session_id,
             .messages = self.messages,
             .tools = self.tools,
             .tool_choice = self.tool_choice,
