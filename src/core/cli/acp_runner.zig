@@ -42,6 +42,7 @@ pub const Config = struct {
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
+    launch_request: config_runtime.LaunchResolutionRequest = .{},
     allow_acp_mcp: bool = true,
     allow_native_tools: bool = true,
 };

@@ -487,6 +487,22 @@ pub const WorkspaceAccess = struct {
         return paths.toOwnedSlice(alloc);
     }
 
+    pub fn activeDirectoriesAlloc(
+        self: *const WorkspaceAccess,
+        alloc: Allocator,
+    ) Allocator.Error![][]u8 {
+        var paths: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (paths.items) |path| alloc.free(path);
+            paths.deinit(alloc);
+        }
+        for (self.entries) |entry| {
+            if (!entry.active) continue;
+            try paths.append(alloc, try alloc.dupe(u8, entry.path));
+        }
+        return paths.toOwnedSlice(alloc);
+    }
+
     fn recomputeActive(self: *WorkspaceAccess) void {
         for (self.entries) |*entry| {
             const source_active = entry.command_line or (entry.saved and !self.saved_suppressed);

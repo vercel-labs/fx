@@ -40,6 +40,10 @@ class BudgetContractTests(unittest.TestCase):
             check_budgets.command_budget("Linux", "fx sessions --json"),
             0.002,
         )
+        self.assertEqual(
+            check_budgets.command_budget("Linux", "fx config resolve --json"),
+            0.002,
+        )
 
     def test_darwin_has_no_local_product_budget(self) -> None:
         self.assertIsNone(

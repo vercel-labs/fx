@@ -20,6 +20,7 @@ pub const TopLevelKind = enum {
     models,
     provider,
     doctor,
+    config,
     background,
     teams,
     session,

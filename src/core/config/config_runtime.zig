@@ -12,6 +12,7 @@ const model_provider = @import("model_provider.zig");
 const model_preferences = @import("model_preferences.zig");
 const update_target = @import("../upgrade/update_target.zig");
 pub const context_limits = @import("context_limits.zig");
+pub const launch_config = @import("launch_config.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
@@ -113,6 +114,11 @@ pub const ConfigSources = struct {
     models: ProviderModelSources = .{},
     provider: ConfigSource = .compiled_default,
     permission_mode: ConfigSource = .compiled_default,
+    max_agent_steps: ConfigSource = .compiled_default,
+    max_tool_result_bytes: ConfigSource = .compiled_default,
+    first_call_tool_choice: ConfigSource = .compiled_default,
+    context_enabled: ConfigSource = .compiled_default,
+    context_limits: ConfigSource = .compiled_default,
     effort: ConfigSource = .compiled_default,
     fast_mode: ConfigSource = .compiled_default,
     slash_menu_categories: ConfigSource = .compiled_default,
@@ -215,18 +221,59 @@ pub const DetailedSettings = struct {
     prompt_history_store_allowed: bool = true,
     additional_directories: ?[][]u8 = null,
     additional_directory_sources: ?[][]u8 = null,
+    launch_policy: launch_config.OwnedLaunchPolicy = .{},
 
     pub fn deinit(self: *DetailedSettings, alloc: Allocator) void {
         self.settings.deinit(alloc);
         self.permission_sources.deinit(alloc);
         if (self.additional_directories) |paths| freeStringSlice(alloc, paths);
         if (self.additional_directory_sources) |paths| freeStringSlice(alloc, paths);
+        self.launch_policy.deinit(alloc);
         if (self.diagnostics.len > 0) {
             for (self.diagnostics) |*diagnostic| diagnostic.deinit(alloc);
             alloc.free(self.diagnostics);
         }
         self.* = undefined;
     }
+};
+
+pub const LaunchResolutionRequest = struct {
+    explicit_files: []const []const u8 = &.{},
+    no_config: bool = false,
+    overrides: []const LaunchOverride = &.{},
+    available_tool_names: []const []const u8 = &.{},
+    builtin_system_prompt: ?[]const u8 = null,
+    context_limit_overrides: []const context_limits.Override = &.{},
+    additional_directories: []const []const u8 = &.{},
+    saved_directories_suppressed: bool = false,
+    context_limit_argument_index: ?usize = null,
+    additional_directories_argument_index: ?usize = null,
+    /// The caller owns a non-null result and deinitializes it with the request allocator.
+    failure_out: ?*?LaunchFailure = null,
+    /// The caller owns a non-null result and deinitializes it with the request allocator.
+    validation_diagnostics_out: ?*?launch_config.ValidationDiagnostics = null,
+};
+
+pub const LaunchFailure = struct {
+    source: launch_config.Source,
+
+    pub fn deinit(self: *LaunchFailure, alloc: Allocator) void {
+        self.source.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const LaunchOverride = struct {
+    name: []const u8,
+    value: []const u8,
+    source: union(enum) {
+        environment: []const u8,
+        command: usize,
+    },
+};
+
+const ProfileAuthSelection = struct {
+    credential_source: ?types.CredentialSource = null,
 };
 
 pub fn discoverPaths(alloc: Allocator, workspace_root: []const u8) !Paths {
@@ -295,17 +342,538 @@ pub fn loadMergedSettingsDetailedFromHome(
     home_dir: []const u8,
     workspace_root: []const u8,
 ) !DetailedSettings {
-    return loadMergedSettingsDetailedWithOptionalHome(alloc, home_dir, workspace_root);
+    return loadMergedSettingsDetailedWithOptionalHome(alloc, home_dir, workspace_root, true);
 }
 
 pub fn loadMergedSettingsDetailed(alloc: Allocator, workspace_root: []const u8) !DetailedSettings {
-    return loadMergedSettingsDetailedWithOptionalHome(alloc, io_mod.getenv("HOME"), workspace_root);
+    return loadMergedSettingsDetailedWithOptionalHome(alloc, io_mod.getenv("HOME"), workspace_root, true);
+}
+
+pub fn loadMergedSettingsDetailedForLaunch(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    request: LaunchResolutionRequest,
+) !DetailedSettings {
+    return loadMergedSettingsDetailedForLaunchWithOptionalHome(
+        alloc,
+        io_mod.getenv("HOME"),
+        workspace_root,
+        request,
+    );
+}
+
+pub fn loadMergedSettingsDetailedForLaunchFromHome(
+    alloc: Allocator,
+    home_dir: []const u8,
+    workspace_root: []const u8,
+    request: LaunchResolutionRequest,
+) !DetailedSettings {
+    return loadMergedSettingsDetailedForLaunchWithOptionalHome(
+        alloc,
+        home_dir,
+        workspace_root,
+        request,
+    );
+}
+
+fn loadMergedSettingsDetailedForLaunchWithOptionalHome(
+    alloc: Allocator,
+    home_dir: ?[]const u8,
+    workspace_root: []const u8,
+    request: LaunchResolutionRequest,
+) !DetailedSettings {
+    if (request.no_config and request.explicit_files.len > 0) {
+        return error.ConflictingConfigSources;
+    }
+
+    const isolates_implicit_launch_policy = request.no_config or request.explicit_files.len > 0;
+    const auth_selection = if (isolates_implicit_launch_policy)
+        try loadProfileAuthSelectionWithOptionalHome(alloc, home_dir)
+    else
+        ProfileAuthSelection{};
+
+    var detailed = try loadMergedSettingsDetailedWithOptionalHome(
+        alloc,
+        home_dir,
+        workspace_root,
+        !isolates_implicit_launch_policy,
+    );
+    errdefer detailed.deinit(alloc);
+    var launch_model: ?[]u8 = null;
+    defer if (launch_model) |value| alloc.free(value);
+    seedLaunchPolicySources(&detailed);
+
+    if (request.no_config or request.explicit_files.len > 0) {
+        clearRetainedLaunchSettings(alloc, &detailed);
+        detailed.settings.credential_source = auth_selection.credential_source;
+    }
+
+    for (request.explicit_files, 0..) |path, layer| {
+        const source: launch_config.Source = .{ .explicit_file = .{ .path = path, .layer = layer } };
+        const bytes = readRequiredExplicitConfig(alloc, path) catch |err| {
+            try recordLaunchFailure(alloc, request.failure_out, source);
+            return err;
+        };
+        defer alloc.free(bytes);
+        if (request.validation_diagnostics_out) |diagnostics_out| {
+            var validation = launch_config.collectValidationDiagnostics(alloc, bytes) catch |err| {
+                try recordLaunchFailure(alloc, request.failure_out, source);
+                return err;
+            };
+            if (validation.items.len > 0) {
+                if (diagnostics_out.*) |*previous| previous.deinit(alloc);
+                diagnostics_out.* = validation;
+                validation = .{};
+                try recordLaunchFailure(alloc, request.failure_out, source);
+                return error.InvalidLaunchConfiguration;
+            }
+            validation.deinit(alloc);
+        }
+        var parsed = launch_config.parseDocument(alloc, bytes, .{ .regular_file = path }) catch |err| {
+            try recordLaunchFailure(alloc, request.failure_out, source);
+            return err;
+        };
+        defer parsed.deinit(alloc);
+        applyExplicitDocument(
+            alloc,
+            workspace_root,
+            &detailed,
+            &parsed,
+            &launch_model,
+            source,
+            request.available_tool_names,
+        ) catch |err| {
+            try recordLaunchFailure(alloc, request.failure_out, source);
+            return err;
+        };
+    }
+
+    applyRetainedEnvironmentAliases(
+        alloc,
+        workspace_root,
+        &detailed,
+        &launch_model,
+        request.available_tool_names,
+        request.failure_out,
+        request.validation_diagnostics_out,
+    ) catch |err| return err;
+    for (request.overrides) |override| {
+        const source: launch_config.Source = switch (override.source) {
+            .environment => |name| .{ .environment = .{ .name = name } },
+            .command => |argument_index| .{ .command = .{ .argument_index = argument_index } },
+        };
+        var parsed = parseLaunchOverride(
+            alloc,
+            override.name,
+            override.value,
+            request.validation_diagnostics_out,
+        ) catch |err| {
+            try recordLaunchFailure(alloc, request.failure_out, source);
+            return err;
+        };
+        defer parsed.deinit(alloc);
+        applyExplicitDocument(
+            alloc,
+            workspace_root,
+            &detailed,
+            &parsed,
+            &launch_model,
+            source,
+            request.available_tool_names,
+        ) catch |err| {
+            try recordLaunchFailure(alloc, request.failure_out, source);
+            return err;
+        };
+    }
+    if (launch_model) |value| {
+        const provider = detailed.settings.provider orelse .gateway;
+        detailed.settings.models.putOwned(alloc, provider, value);
+        detailed.sources.models.set(provider, .process_override);
+        detailed.model_source = .process_override;
+        launch_model = null;
+    }
+    if (request.context_limit_overrides.len > 0) {
+        for (request.context_limit_overrides) |override| {
+            detailed.settings.context_limits.set(override.name, .{
+                .value = override.value,
+                .source = .command_line,
+            });
+        }
+        detailed.sources.context_limits = .process_override;
+        detailed.launch_policy.setSource(
+            alloc,
+            .context_limits,
+            .{ .command = .{
+                .argument_index = request.context_limit_argument_index orelse 0,
+            } },
+            true,
+        ) catch |err| {
+            const source: launch_config.Source = .{ .command = .{
+                .argument_index = request.context_limit_argument_index orelse 0,
+            } };
+            try recordLaunchFailure(alloc, request.failure_out, source);
+            return err;
+        };
+    }
+    if (request.additional_directories.len > 0 or request.saved_directories_suppressed) {
+        detailed.launch_policy.setSource(
+            alloc,
+            .additional_directories,
+            .{ .command = .{
+                .argument_index = request.additional_directories_argument_index orelse 0,
+            } },
+            true,
+        ) catch |err| {
+            const source: launch_config.Source = .{ .command = .{
+                .argument_index = request.additional_directories_argument_index orelse 0,
+            } };
+            try recordLaunchFailure(alloc, request.failure_out, source);
+            return err;
+        };
+    }
+    if (request.builtin_system_prompt) |builtin_prompt| {
+        detailed.launch_policy.composeSystemPrompt(alloc, builtin_prompt) catch |err| {
+            try recordLaunchFailure(
+                alloc,
+                request.failure_out,
+                detailed.launch_policy.source(.system_parts),
+            );
+            return err;
+        };
+    }
+
+    const final_model_source = detailed.sources.models.get(detailed.settings.provider orelse .gateway);
+    detailed.model_source = final_model_source;
+    if (!detailed.launch_policy.explicit_fields.contains(.model)) {
+        try detailed.launch_policy.setSource(
+            alloc,
+            .model,
+            legacyLaunchSource(final_model_source),
+            false,
+        );
+    }
+    return detailed;
+}
+
+fn recordLaunchFailure(
+    alloc: Allocator,
+    output: ?*?LaunchFailure,
+    source: launch_config.Source,
+) !void {
+    const value = output orelse return;
+    const owned_source = try source.clone(alloc);
+    if (value.*) |*previous| previous.deinit(alloc);
+    value.* = .{ .source = owned_source };
+}
+
+fn loadProfileAuthSelectionWithOptionalHome(
+    alloc: Allocator,
+    home_dir: ?[]const u8,
+) !ProfileAuthSelection {
+    const home = home_dir orelse return .{};
+    var store = settings_store.Store.initFromHome(alloc, home, .read_only) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{},
+    };
+    defer store.deinit(alloc);
+    var primary = store.loadPrimary(alloc) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{},
+    };
+    defer primary.deinit(alloc);
+    const bytes = switch (primary) {
+        .valid => |value| value,
+        .absent, .invalid, .oversized => return .{},
+    };
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{},
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{};
+    const value = parsed.value.object.get("credential_source") orelse return .{};
+    if (value != .string) return .{};
+    return .{
+        .credential_source = types.parseCredentialSource(value.string),
+    };
+}
+
+fn applyRetainedEnvironmentAliases(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    detailed: *DetailedSettings,
+    launch_model: *?[]u8,
+    available_tool_names: []const []const u8,
+    failure_out: ?*?LaunchFailure,
+    validation_diagnostics_out: ?*?launch_config.ValidationDiagnostics,
+) !void {
+    const Mapping = struct { environment: []const u8, field: []const u8 };
+    const mappings = [_]Mapping{
+        .{ .environment = "FX_MODEL", .field = "agent.model" },
+        .{ .environment = "FX_PERMISSION_MODE", .field = "runtime.permission_mode" },
+        .{ .environment = "FX_MAX_AGENT_STEPS", .field = "agent.max_steps" },
+    };
+    for (&mappings) |mapping| {
+        const value = io_mod.getenv(mapping.environment) orelse continue;
+        if (std.mem.trim(u8, value, " \t\r\n").len == 0) continue;
+        const source: launch_config.Source = .{ .environment = .{ .name = mapping.environment } };
+        var parsed = parseLaunchOverride(
+            alloc,
+            mapping.field,
+            value,
+            validation_diagnostics_out,
+        ) catch |err| {
+            try recordLaunchFailure(alloc, failure_out, source);
+            return err;
+        };
+        defer parsed.deinit(alloc);
+        applyExplicitDocument(
+            alloc,
+            workspace_root,
+            detailed,
+            &parsed,
+            launch_model,
+            source,
+            available_tool_names,
+        ) catch |err| {
+            try recordLaunchFailure(alloc, failure_out, source);
+            return err;
+        };
+    }
+}
+
+fn parseLaunchOverride(
+    alloc: Allocator,
+    name: []const u8,
+    value: []const u8,
+    validation_diagnostics_out: ?*?launch_config.ValidationDiagnostics,
+) !launch_config.ParsedDocument {
+    const diagnostics_out = validation_diagnostics_out orelse
+        return launch_config.parseOverride(alloc, name, value);
+    var encoded = try launch_config.encodeOverrideDocument(alloc, name, value);
+    defer encoded.deinit(alloc);
+    var validation = try encoded.collectDiagnostics(alloc);
+    if (validation.items.len == 0) {
+        validation.deinit(alloc);
+        return launch_config.parseDocument(alloc, encoded.bytes, .non_file);
+    }
+    if (diagnostics_out.*) |*previous| previous.deinit(alloc);
+    diagnostics_out.* = validation;
+    validation = .{};
+    return error.InvalidLaunchConfiguration;
+}
+
+pub fn readRequiredExplicitConfig(alloc: Allocator, path: []const u8) ![]u8 {
+    if (path.len == 0 or path.len > std.fs.max_path_bytes or
+        !std.unicode.utf8ValidateSlice(path) or std.mem.findScalar(u8, path, 0) != null)
+    {
+        return error.InvalidConfigPath;
+    }
+    var file = io_mod.openExistingRegularFile(std.Io.Dir.cwd(), path, .read_only) catch |err| switch (err) {
+        error.FileNotFound => return error.ConfigSourceMissing,
+        else => return error.ConfigSourceUnsafe,
+    };
+    defer file.close(io_mod.getIo());
+    const stat = try file.stat(io_mod.getIo());
+    if (stat.kind != .file) return error.ConfigSourceUnsafe;
+    if (stat.size > launch_config.max_config_file_bytes) return error.ConfigFileTooLarge;
+    const bytes = io_mod.readFileToEnd(alloc, &file, launch_config.max_config_file_bytes + 1) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.ConfigFileTooLarge,
+    };
+    errdefer alloc.free(bytes);
+    if (bytes.len > launch_config.max_config_file_bytes) return error.ConfigFileTooLarge;
+    return bytes;
+}
+
+fn seedLaunchPolicySources(detailed: *DetailedSettings) void {
+    setBorrowedLaunchSource(&detailed.launch_policy, .provider, legacyLaunchSource(detailed.sources.provider));
+    setBorrowedLaunchSource(
+        &detailed.launch_policy,
+        .model,
+        legacyLaunchSource(detailed.model_source orelse .compiled_default),
+    );
+    setBorrowedLaunchSource(&detailed.launch_policy, .effort, legacyLaunchSource(detailed.sources.effort));
+    setBorrowedLaunchSource(&detailed.launch_policy, .fast_mode, legacyLaunchSource(detailed.sources.fast_mode));
+    setBorrowedLaunchSource(&detailed.launch_policy, .max_steps, legacyLaunchSource(detailed.sources.max_agent_steps));
+    setBorrowedLaunchSource(&detailed.launch_policy, .first_call_tool_choice, legacyLaunchSource(detailed.sources.first_call_tool_choice));
+    setBorrowedLaunchSource(
+        &detailed.launch_policy,
+        .permission_mode,
+        legacyLaunchSource(detailed.sources.permission_mode),
+    );
+    setBorrowedLaunchSource(&detailed.launch_policy, .max_tool_result_bytes, legacyLaunchSource(detailed.sources.max_tool_result_bytes));
+    setBorrowedLaunchSource(&detailed.launch_policy, .context_enabled, legacyLaunchSource(detailed.sources.context_enabled));
+    setBorrowedLaunchSource(&detailed.launch_policy, .context_limits, legacyLaunchSource(detailed.sources.context_limits));
+    if (detailed.additional_directories != null) {
+        setBorrowedLaunchSource(&detailed.launch_policy, .additional_directories, .profile_workspace);
+    }
+}
+
+fn legacyLaunchSource(source: ConfigSource) launch_config.Source {
+    return switch (source) {
+        .compiled_default => .compiled_default,
+        .project => .project_file,
+        .user_global => .profile_global,
+        .user_workspace => .profile_workspace,
+        .process_override => .compiled_default,
+    };
+}
+
+fn setBorrowedLaunchSource(
+    policy: *launch_config.OwnedLaunchPolicy,
+    field: launch_config.Field,
+    source: launch_config.Source,
+) void {
+    policy.sources[@intFromEnum(field)] = source;
+}
+
+fn clearRetainedLaunchSettings(alloc: Allocator, detailed: *DetailedSettings) void {
+    detailed.settings.models.deinit(alloc);
+    detailed.settings.models = .{};
+    detailed.settings.provider = null;
+    detailed.settings.permission_mode = null;
+    detailed.settings.max_agent_steps = null;
+    detailed.settings.max_tool_result_bytes = null;
+    detailed.settings.context_limits = .{};
+    detailed.settings.first_call_tool_choice = null;
+    detailed.settings.context = null;
+    detailed.settings.fast_mode = null;
+    detailed.settings.effort = null;
+    detailed.sources.provider = .compiled_default;
+    detailed.sources.permission_mode = .compiled_default;
+    detailed.sources.max_agent_steps = .compiled_default;
+    detailed.sources.max_tool_result_bytes = .compiled_default;
+    detailed.sources.first_call_tool_choice = .compiled_default;
+    detailed.sources.context_enabled = .compiled_default;
+    detailed.sources.context_limits = .compiled_default;
+    detailed.sources.effort = .compiled_default;
+    detailed.sources.fast_mode = .compiled_default;
+    detailed.sources.models = .{};
+    detailed.model_source = .compiled_default;
+    if (detailed.additional_directories) |paths| freeStringSlice(alloc, paths);
+    detailed.additional_directories = null;
+    if (detailed.additional_directory_sources) |paths| freeStringSlice(alloc, paths);
+    detailed.additional_directory_sources = null;
+    if (detailed.diagnostics.len > 0) {
+        for (detailed.diagnostics) |*diagnostic| diagnostic.deinit(alloc);
+        alloc.free(detailed.diagnostics);
+        detailed.diagnostics = &.{};
+    }
+    detailed.launch_policy.deinit(alloc);
+}
+
+fn applyExplicitDocument(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    detailed: *DetailedSettings,
+    parsed: *launch_config.ParsedDocument,
+    launch_model: *?[]u8,
+    source: launch_config.Source,
+    available_tool_names: []const []const u8,
+) !void {
+    const explicit = switch (source) {
+        .explicit_file, .stdin, .environment, .command => true,
+        else => false,
+    };
+    if (parsed.provider) |value| {
+        detailed.settings.provider = value;
+        detailed.sources.provider = .process_override;
+        try detailed.launch_policy.setSource(alloc, .provider, source, explicit);
+    }
+    if (parsed.model) |value| {
+        if (launch_model.*) |old| alloc.free(old);
+        launch_model.* = value;
+        parsed.model = null;
+        try detailed.launch_policy.setSource(alloc, .model, source, explicit);
+    }
+    if (parsed.effort) |value| {
+        detailed.settings.effort = value;
+        detailed.sources.effort = .process_override;
+        try detailed.launch_policy.setSource(alloc, .effort, source, explicit);
+    }
+    if (parsed.fast_mode) |value| {
+        detailed.settings.fast_mode = value;
+        detailed.sources.fast_mode = .process_override;
+        try detailed.launch_policy.setSource(alloc, .fast_mode, source, explicit);
+    }
+    if (parsed.max_steps) |value| {
+        detailed.settings.max_agent_steps = value;
+        detailed.sources.max_agent_steps = .process_override;
+        try detailed.launch_policy.setSource(alloc, .max_steps, source, explicit);
+    }
+    if (parsed.first_call_tool_choice) |value| {
+        detailed.settings.first_call_tool_choice = value;
+        detailed.sources.first_call_tool_choice = .process_override;
+        try detailed.launch_policy.setSource(alloc, .first_call_tool_choice, source, explicit);
+    }
+    if (parsed.enabled_tools) |names| {
+        if (available_tool_names.len > 0) try parsed.validateEnabledTools(available_tool_names);
+        if (detailed.launch_policy.enabled_tools) |old| freeStringSlice(alloc, old);
+        detailed.launch_policy.enabled_tools = names;
+        parsed.enabled_tools = null;
+        try detailed.launch_policy.setSource(alloc, .enabled_tools, source, explicit);
+    }
+    if (parsed.system_parts) |parts| {
+        if (detailed.launch_policy.system_parts) |old| {
+            for (old) |*part| part.deinit(alloc);
+            alloc.free(old);
+        }
+        detailed.launch_policy.system_parts = parts;
+        parsed.system_parts = null;
+        try detailed.launch_policy.setSource(alloc, .system_parts, source, explicit);
+    }
+    if (parsed.permission_mode) |value| {
+        detailed.settings.permission_mode = value;
+        detailed.sources.permission_mode = .process_override;
+        try detailed.launch_policy.setSource(alloc, .permission_mode, source, explicit);
+    }
+    if (parsed.max_tool_result_bytes) |value| {
+        detailed.settings.max_tool_result_bytes = value;
+        detailed.sources.max_tool_result_bytes = .process_override;
+        try detailed.launch_policy.setSource(alloc, .max_tool_result_bytes, source, explicit);
+    }
+    if (parsed.context_enabled) |value| {
+        detailed.settings.context = value;
+        detailed.sources.context_enabled = .process_override;
+        try detailed.launch_policy.setSource(alloc, .context_enabled, source, explicit);
+    }
+    if (parsed.context_limit_overrides) |overrides| {
+        var tagged = overrides;
+        tagged.retag(.command_line);
+        detailed.settings.context_limits.merge(tagged);
+        detailed.sources.context_limits = .process_override;
+        try detailed.launch_policy.setSource(alloc, .context_limits, source, explicit);
+    }
+    if (parsed.additional_directories) |paths| {
+        var access = workspace_access.WorkspaceAccess.init(
+            alloc,
+            workspace_root,
+            paths,
+            &.{},
+            false,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidAdditionalDirectories,
+        };
+        defer access.deinit(alloc);
+        const canonical = try access.savedDirectoriesAlloc(alloc);
+        errdefer freeStringSlice(alloc, canonical);
+        const source_paths = try access.savedSourcePathsAlloc(alloc);
+        errdefer freeStringSlice(alloc, source_paths);
+        if (detailed.additional_directories) |old| freeStringSlice(alloc, old);
+        if (detailed.additional_directory_sources) |old| freeStringSlice(alloc, old);
+        detailed.additional_directories = canonical;
+        detailed.additional_directory_sources = source_paths;
+        try detailed.launch_policy.setSource(alloc, .additional_directories, source, explicit);
+    }
 }
 
 fn loadMergedSettingsDetailedWithOptionalHome(
     alloc: Allocator,
     home_dir: ?[]const u8,
     workspace_root: []const u8,
+    include_project: bool,
 ) !DetailedSettings {
     var settings = Settings{};
     errdefer settings.deinit(alloc);
@@ -392,7 +960,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
 
     const project_path = try std.fs.path.join(alloc, &.{ workspace_root, ".fx.json" });
     defer alloc.free(project_path);
-    const project_text = readOptionalFile(alloc, project_path) catch |err| blk: {
+    const project_text = if (include_project) readOptionalFile(alloc, project_path) catch |err| blk: {
         if (err == error.OutOfMemory) return err;
         try diagnostics.append(alloc, .{
             .layer = .project,
@@ -403,7 +971,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
             },
         });
         break :blk null;
-    };
+    } else null;
     defer if (project_text) |text| alloc.free(text);
     if (project_text) |text| {
         if (std.json.parseFromSlice(std.json.Value, alloc, text, .{})) |parsed_value| {
@@ -649,6 +1217,13 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     }
     if (settings.provider != null) sources.provider = source;
     if (settings.permission_mode != null) sources.permission_mode = source;
+    if (settings.max_agent_steps != null) sources.max_agent_steps = source;
+    if (settings.max_tool_result_bytes != null) sources.max_tool_result_bytes = source;
+    if (settings.first_call_tool_choice != null) sources.first_call_tool_choice = source;
+    if (settings.context != null) sources.context_enabled = source;
+    inline for (std.meta.fields(context_limits.Overrides)) |field| {
+        if (@field(settings.context_limits, field.name) != null) sources.context_limits = source;
+    }
     if (settings.effort != null) sources.effort = source;
     if (settings.fast_mode != null) sources.fast_mode = source;
     if (settings.slash_menu_categories != null) sources.slash_menu_categories = source;
@@ -1971,6 +2546,233 @@ test "context limits resolve command line over workspace and global profile valu
         context_limits.Name.project_instruction_file_bytes.defaultBytes(),
         resolved.project_instruction_file_bytes.effectiveBytes(),
     );
+}
+
+test "explicit launch files replace retained implicit settings in order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"model\":\"profile/model\",\"fast_mode\":true,\"max_agent_steps\":9,\"credential_source\":\"fx_login\"}",
+    );
+    try writeFixtureFile(
+        tmp.dir,
+        "workspace/.fx.json",
+        "{\"max_agent_steps\":12}",
+    );
+    try writeFixtureFile(
+        tmp.dir,
+        "base.json",
+        "{\"schema_version\":1,\"agent\":{\"model\":\"base/model\",\"fast_mode\":false}}",
+    );
+    try writeFixtureFile(
+        tmp.dir,
+        "override.json",
+        "{\"schema_version\":1,\"agent\":{\"model\":\"override/model\"}}",
+    );
+
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    const base_path = try std.fs.path.join(alloc, &.{ home_root, "../base.json" });
+    defer alloc.free(base_path);
+    const override_path = try std.fs.path.join(alloc, &.{ home_root, "../override.json" });
+    defer alloc.free(override_path);
+    const files = [_][]const u8{ base_path, override_path };
+    const overrides = [_]LaunchOverride{.{
+        .name = "agent.max_steps",
+        .value = "20",
+        .source = .{ .command = 5 },
+    }};
+
+    var detailed = try loadMergedSettingsDetailedForLaunchFromHome(
+        alloc,
+        home_root,
+        workspace_root,
+        .{ .explicit_files = &files, .overrides = &overrides },
+    );
+    defer detailed.deinit(alloc);
+
+    try std.testing.expectEqualStrings("override/model", detailed.settings.models.get(.gateway).?);
+    try std.testing.expectEqual(false, detailed.settings.fast_mode.?);
+    try std.testing.expectEqual(@as(usize, 20), detailed.settings.max_agent_steps.?);
+    try std.testing.expectEqual(types.CredentialSource.fx_login, detailed.settings.credential_source.?);
+    try std.testing.expect(detailed.launch_policy.explicit_fields.contains(.model));
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        detailed.launch_policy.source(.model).explicit_file.layer,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        detailed.launch_policy.source(.fast_mode).explicit_file.layer,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 5),
+        detailed.launch_policy.source(.max_steps).command.argument_index,
+    );
+}
+
+test "launch failure owns explicit source after resolution cleanup" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    try writeFixtureFile(
+        tmp.dir,
+        "launch.json",
+        "{\"schema_version\":1,\"prompt\":{\"system_parts\":[{\"type\":\"builtin\",\"id\":\"default\"}]}}",
+    );
+
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    const config_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "launch.json");
+    defer alloc.free(config_path);
+    const files = [_][]const u8{config_path};
+    const builtin_prompt = try alloc.alloc(u8, launch_config.max_system_prompt_total_bytes + 1);
+    defer alloc.free(builtin_prompt);
+    @memset(builtin_prompt, 'x');
+    var failure: ?LaunchFailure = null;
+    defer if (failure) |*value| value.deinit(alloc);
+
+    try std.testing.expectError(
+        error.SystemPromptTooLarge,
+        loadMergedSettingsDetailedForLaunchFromHome(
+            alloc,
+            home_root,
+            workspace_root,
+            .{
+                .explicit_files = &files,
+                .builtin_system_prompt = builtin_prompt,
+                .failure_out = &failure,
+            },
+        ),
+    );
+    try std.testing.expect(failure != null);
+    const source = failure.?.source.explicit_file;
+    try std.testing.expectEqualStrings(config_path, source.path);
+    try std.testing.expectEqual(@as(usize, 0), source.layer);
+}
+
+test "explicit launch model survives a later provider-only layer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    try writeFixtureFile(
+        tmp.dir,
+        "base.json",
+        "{\"schema_version\":1,\"agent\":{\"provider\":\"codex\",\"model\":\"codex/model\"}}",
+    );
+    try writeFixtureFile(
+        tmp.dir,
+        "override.json",
+        "{\"schema_version\":1,\"agent\":{\"provider\":\"gateway\"}}",
+    );
+
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    const base_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "base.json");
+    defer alloc.free(base_path);
+    const override_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "override.json");
+    defer alloc.free(override_path);
+    const files = [_][]const u8{ base_path, override_path };
+
+    var detailed = try loadMergedSettingsDetailedForLaunchFromHome(
+        alloc,
+        home_root,
+        workspace_root,
+        .{ .explicit_files = &files },
+    );
+    defer detailed.deinit(alloc);
+
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, detailed.settings.provider.?);
+    try std.testing.expectEqualStrings("codex/model", detailed.settings.models.get(.gateway).?);
+    try std.testing.expect(detailed.settings.models.get(.codex) == null);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        detailed.launch_policy.source(.model).explicit_file.layer,
+    );
+}
+
+test "implicit provider override refreshes model provenance for the final provider" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"provider\":\"codex\",\"codex_model\":\"codex/model\"}",
+    );
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    const overrides = [_]LaunchOverride{.{
+        .name = "agent.provider",
+        .value = "gateway",
+        .source = .{ .command = 0 },
+    }};
+
+    var detailed = try loadMergedSettingsDetailedForLaunchFromHome(
+        alloc,
+        home_root,
+        workspace_root,
+        .{ .overrides = &overrides },
+    );
+    defer detailed.deinit(alloc);
+
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, detailed.settings.provider.?);
+    try std.testing.expect(detailed.settings.models.get(.gateway) == null);
+    try std.testing.expectEqual(ModelSource.compiled_default, detailed.model_source.?);
+    try std.testing.expectEqual(
+        launch_config.Source.compiled_default,
+        detailed.launch_policy.source(.model),
+    );
+}
+
+test "no-config keeps credential selection through unrelated malformed settings" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"model\":\"profile/model\",\"fast_mode\":\"broken\",\"credential_source\":\"stored_key\"}",
+    );
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    var detailed = try loadMergedSettingsDetailedForLaunchFromHome(
+        alloc,
+        home_root,
+        workspace_root,
+        .{ .no_config = true },
+    );
+    defer detailed.deinit(alloc);
+    try std.testing.expect(detailed.settings.models.isEmpty());
+    try std.testing.expect(detailed.settings.fast_mode == null);
+    try std.testing.expectEqual(types.CredentialSource.stored_key, detailed.settings.credential_source.?);
 }
 
 test "invalid context limit settings produce a specific diagnostic" {

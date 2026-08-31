@@ -569,11 +569,13 @@ fn handleRestoreSession(
     const sid_copy = try alloc.dupe(u8, writable.state.id);
     var sid_owned = true;
     defer if (sid_owned) alloc.free(sid_copy);
-    const effective_provider = if (state.process_model_override)
+    const launch_mask = state.launch_policy.explicit_fields;
+    const explicit_selection = launch_mask.contains(.provider) or launch_mask.contains(.model);
+    const effective_provider = if (explicit_selection or state.process_model_override)
         state.provider
     else
         writable.state.preferences.provider;
-    const effective_model = if (state.process_model_override)
+    const effective_model = if (explicit_selection or state.process_model_override)
         state.selected_model
     else
         writable.state.preferences.model;
@@ -627,8 +629,8 @@ fn handleRestoreSession(
         .writable = writable,
         .model = model_copy,
         .provider = effective_provider,
-        .fast_mode = writable.state.preferences.fast_mode,
-        .effort = writable.state.preferences.effort,
+        .fast_mode = if (launch_mask.contains(.fast_mode)) state.fast_mode else writable.state.preferences.fast_mode,
+        .effort = if (launch_mask.contains(.effort)) state.effort else writable.state.preferences.effort,
         .session_rt = session_rt,
         .mcp = session_mcp,
     }) catch

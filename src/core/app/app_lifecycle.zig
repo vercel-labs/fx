@@ -149,6 +149,7 @@ pub const StartupState = struct {
     notification_attention_required: bool = false,
     notification_max: bool = false,
     theme_monitor_enabled: bool = false,
+    launch_policy: config_runtime.launch_config.OwnedLaunchPolicy = .{},
 
     pub fn deinit(self: *StartupState, alloc: Allocator) void {
         self.workspace_access.deinit(alloc);
@@ -161,6 +162,7 @@ pub const StartupState = struct {
             for (self.config_diagnostics) |*diagnostic| diagnostic.deinit(alloc);
             alloc.free(self.config_diagnostics);
         }
+        self.launch_policy.deinit(alloc);
         self.* = .{ .agent_step_limit = self.agent_step_limit };
     }
 
@@ -174,6 +176,10 @@ pub const StartupState = struct {
         const value = self.workspace_access;
         self.workspace_access = .{};
         return value;
+    }
+
+    pub fn takeLaunchPolicy(self: *StartupState) config_runtime.launch_config.OwnedLaunchPolicy {
+        return self.launch_policy.take();
     }
 
     pub fn apiKey(self: *const StartupState) ?[]const u8 {
@@ -253,6 +259,7 @@ pub const BootstrapConfig = struct {
     resize_handler: ResizeHandler,
     fx_version: []const u8 = "",
     record_requested: bool = false,
+    launch_request: config_runtime.LaunchResolutionRequest = .{},
 };
 
 pub fn loadStartupState(
@@ -263,12 +270,54 @@ pub fn loadStartupState(
     default_agent_step_limit: usize,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, null, .refresh_if_needed);
+    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, null, .refresh_if_needed, null);
+}
+
+pub fn loadStartupStateForLaunch(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+    request: config_runtime.LaunchResolutionRequest,
+) !StartupState {
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    return loadStartupStateFromOwnedWorkspace(
+        alloc,
+        transport,
+        secret_store,
+        workspace_root,
+        default_model,
+        default_agent_step_limit,
+        null,
+        .refresh_if_needed,
+        request,
+    );
 }
 
 pub fn loadStartupStateWithoutCredentials(alloc: Allocator, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_agent_step_limit, null, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_agent_step_limit, null, null, null);
+}
+
+pub fn loadStartupStateWithoutCredentialsForLaunch(
+    alloc: Allocator,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+    request: config_runtime.LaunchResolutionRequest,
+) !StartupState {
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    return loadStartupStateFromOwnedWorkspace(
+        alloc,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        workspace_root,
+        default_model,
+        default_agent_step_limit,
+        null,
+        null,
+        request,
+    );
 }
 
 pub fn loadEmbeddedStartupState(
@@ -288,6 +337,29 @@ pub fn loadEmbeddedStartupState(
         default_agent_step_limit,
         home_dir,
         null,
+        null,
+    );
+}
+
+pub fn loadEmbeddedStartupStateForLaunch(
+    alloc: Allocator,
+    home_dir: []const u8,
+    workspace_root: []const u8,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+    request: config_runtime.LaunchResolutionRequest,
+) !StartupState {
+    const owned_workspace_root = try io_mod.realpathAlloc(alloc, workspace_root);
+    return loadStartupStateFromOwnedWorkspace(
+        alloc,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        owned_workspace_root,
+        default_model,
+        default_agent_step_limit,
+        home_dir,
+        null,
+        request,
     );
 }
 
@@ -298,7 +370,28 @@ pub fn loadCatalogStartupState(
     default_agent_step_limit: usize,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, null, .stored);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, null, .stored, null);
+}
+
+pub fn loadCatalogStartupStateForLaunch(
+    alloc: Allocator,
+    secret_store: host.SecretStore,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+    request: config_runtime.LaunchResolutionRequest,
+) !StartupState {
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    return loadStartupStateFromOwnedWorkspace(
+        alloc,
+        oauth_transport.unavailable_provider,
+        secret_store,
+        workspace_root,
+        default_model,
+        default_agent_step_limit,
+        null,
+        .stored,
+        request,
+    );
 }
 
 pub fn loadStartupStatus(
@@ -359,7 +452,7 @@ pub fn applyWorkspaceLaunch(
 
 fn loadStartupStateForWorkspace(alloc: Allocator, workspace_root: []const u8, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const owned_workspace_root = try alloc.dupe(u8, workspace_root);
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, default_agent_step_limit, null, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, default_agent_step_limit, null, null, null);
 }
 
 const CredentialLoadMode = credentials.LoadMode;
@@ -373,13 +466,19 @@ fn loadStartupStateFromOwnedWorkspace(
     default_agent_step_limit: usize,
     profile_home: ?[]const u8,
     credential_mode: ?CredentialLoadMode,
+    launch_request: ?config_runtime.LaunchResolutionRequest,
 ) !StartupState {
     var state = StartupState{ .agent_step_limit = default_agent_step_limit };
     errdefer state.deinit(alloc);
 
     state.workspace_root = owned_workspace_root;
     debug_trace.configureFromEnv(alloc, state.workspace_root);
-    var detailed = if (profile_home) |home_dir|
+    var detailed = if (launch_request) |request|
+        if (profile_home) |home_dir|
+            try config_runtime.loadMergedSettingsDetailedForLaunchFromHome(alloc, home_dir, state.workspace_root, request)
+        else
+            try config_runtime.loadMergedSettingsDetailedForLaunch(alloc, state.workspace_root, request)
+    else if (profile_home) |home_dir|
         try config_runtime.loadMergedSettingsDetailedFromHome(alloc, home_dir, state.workspace_root)
     else
         try config_runtime.loadMergedSettingsDetailed(alloc, state.workspace_root);
@@ -390,16 +489,19 @@ fn loadStartupStateFromOwnedWorkspace(
         alloc,
         state.workspace_root,
         detailed.additional_directory_sources orelse &.{},
-        &.{},
-        false,
+        if (launch_request) |request| request.additional_directories else &.{},
+        if (launch_request) |request| request.saved_directories_suppressed else false,
     );
 
     const configured_selection = try configuredProviderSelection(default_model, settings);
     state.provider = configured_selection.provider;
     state.configured_model = try alloc.dupe(u8, configured_selection.model);
     state.model_source = detailed.model_source orelse .compiled_default;
-    state.selected_model = try loadInitialModel(alloc, configured_selection.model, null);
-    if (hasProcessModelOverride()) state.model_source = .process_override;
+    state.selected_model = if (launch_request != null)
+        try alloc.dupe(u8, configured_selection.model)
+    else
+        try loadInitialModel(alloc, configured_selection.model, null);
+    if (launch_request == null and hasProcessModelOverride()) state.model_source = .process_override;
     state.config_diagnostics = detailed.diagnostics;
     detailed.diagnostics = &.{};
     state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
@@ -416,10 +518,16 @@ fn loadStartupStateFromOwnedWorkspace(
         state.credential = resolution.credential;
         state.stored_key_status = resolution.stored_key_status;
     }
-    state.permission_mode = loadPermissionMode(settings.permission_mode);
+    state.permission_mode = if (launch_request != null)
+        settings.permission_mode orelse default_permission_mode
+    else
+        loadPermissionMode(settings.permission_mode);
     state.yolo_acknowledged = settings.yolo_acknowledged orelse false;
     state.permission_rules = try types.dupePermissionRuleSet(alloc, settings.permission_rules);
-    state.agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps);
+    state.agent_step_limit = if (launch_request != null)
+        agent_steps.resolveMaxAgentSteps(settings.max_agent_steps, default_agent_step_limit)
+    else
+        loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps);
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});
     state.context_enabled = settings.context orelse true;
@@ -442,6 +550,7 @@ fn loadStartupStateFromOwnedWorkspace(
     state.notification_turn_end = sound_on_override orelse settings.notification_turn_end orelse notification_sound.default_enabled;
     state.notification_attention_required = sound_on_override orelse settings.notification_attention_required orelse notification_sound.default_enabled;
     state.notification_max = max_override orelse settings.notification_max orelse false;
+    state.launch_policy = detailed.launch_policy.take();
 
     return state;
 }
@@ -455,11 +564,12 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     cfg.shell.layout = minimalLayout();
     try cfg.shell.initBacking(cfg.alloc);
 
-    var state = try loadCatalogStartupState(
+    var state = try loadCatalogStartupStateForLaunch(
         cfg.alloc,
         cfg.secret_store,
         cfg.default_model,
         cfg.default_agent_step_limit,
+        cfg.launch_request,
     );
     errdefer state.deinit(cfg.alloc);
 
@@ -1096,6 +1206,20 @@ fn loadPermissionMode(configured: ?PermissionMode) PermissionMode {
     const fallback = configured orelse default_permission_mode;
     const mode = io_mod.getenv("FX_PERMISSION_MODE") orelse return fallback;
     return config_runtime.parsePermissionMode(mode) orelse fallback;
+}
+
+test "startup launch policy transfer survives startup deinit" {
+    const alloc = std.testing.allocator;
+    var state = StartupState{ .agent_step_limit = 1 };
+    const names = try alloc.alloc([]u8, 1);
+    errdefer alloc.free(names);
+    names[0] = try alloc.dupe(u8, "read_file");
+    state.launch_policy.enabled_tools = names;
+    var policy = state.takeLaunchPolicy();
+    defer policy.deinit(alloc);
+
+    state.deinit(alloc);
+    try std.testing.expectEqualStrings("read_file", policy.enabled_tools.?[0]);
 }
 
 fn loadAgentStepLimit(fallback: usize, configured: ?usize) usize {

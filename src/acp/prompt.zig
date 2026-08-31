@@ -320,7 +320,8 @@ const AcpContext = struct {
 
 fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
     if (comptime host_target.is_wasm) return tool_set_contract.empty;
-    return if (state.cfg.allow_native_tools) builtin_tools.advertisement_set else tool_set_contract.empty;
+    const available = if (state.cfg.allow_native_tools) builtin_tools.advertisement_set else tool_set_contract.empty;
+    return state.launchToolSet(available);
 }
 
 const AcpElicitationResponderContext = struct {
@@ -682,7 +683,7 @@ pub fn runSubagentChild(
     defer ctx.deinitPublishedToolCalls();
     var child_projection = state.cfg.mode_registry.buildModelToolProjection(
         alloc,
-        builtin_tools.advertisement_set,
+        activeToolSet(state),
         captured_mode,
         .{
             .permission_mode = admission.permission_mode,

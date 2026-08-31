@@ -1233,6 +1233,65 @@ describe("acp: model-independent", () => {
   });
 
   test(
+    "ACP applies explicit launch prompt and tool policy",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-launch-config-");
+      const gateway = startFakeGateway([finalText("ACP_CONFIG_COMPLETE")]);
+      try {
+        const configPath = join(root.root, "launch.json");
+        writeFileSync(
+          configPath,
+          JSON.stringify({
+            schema_version: 1,
+            agent: {
+              provider: "gateway",
+              model: FAKE_GATEWAY_MODEL,
+              fast_mode: false,
+              max_steps: 4,
+              enabled_tools: ["read_file"],
+            },
+            prompt: {
+              system_parts: [
+                { type: "inline", text: "ACP CONFIGURED SYSTEM PROMPT" },
+              ],
+            },
+            runtime: { permission_mode: "auto" },
+          }) + "\n",
+        );
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          args: [`--config=${configPath}`, "acp"],
+          env: {
+            HOME: root.home,
+            AI_GATEWAY_API_KEY: "fake-acp-config-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          },
+        });
+        await startCodeSession(client);
+        const result = await runPrompt(client, "Use ACP launch config.", TIMEOUT);
+        expect(JSON.stringify(result)).toContain("ACP_CONFIG_COMPLETE");
+        expect(gateway.requests).toHaveLength(1);
+        const request = JSON.parse(gateway.requests[0]!.body) as {
+          prompt: unknown;
+          tools?: unknown;
+        };
+        expect(JSON.stringify(request.prompt)).toContain(
+          "ACP CONFIGURED SYSTEM PROMPT",
+        );
+        expect(JSON.stringify(request.tools)).toContain("read_file");
+        expect(JSON.stringify(request.tools)).not.toContain("grep_files");
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "active ACP session uses typed MCP Resources Prompts and Completion state",
     async () => {
       const root = createIsolatedRoot("fx-acp-mcp-features-");

@@ -1090,6 +1090,8 @@ pub const Persistence = struct {
     resume_view_admission: ?session_store.ResumeViewAdmission = null,
     resume_handoff_intent: ResumeHandoffIntent = .none,
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
+    launch_policy: config_runtime.launch_config.OwnedLaunchPolicy = .{},
+    narrowed_tools: ?tool_set_contract.Narrowed = null,
 
     /// Fieldwise initialization avoids retaining undefined optional payloads
     /// in a static release-binary template.
@@ -1142,6 +1144,8 @@ pub const Persistence = struct {
         if (self.session_preferences) |*preferences| preferences.deinit(alloc);
         if (self.js_host_session) |*owner| owner.deinit(alloc);
         if (self.process_model_override) |model| alloc.free(model);
+        self.launch_policy.deinit(alloc);
+        if (self.narrowed_tools) |*tools| tools.deinit(alloc);
         self.session_picker.deinit(alloc);
         self.session_picker_load.deinit();
         self.session_picker_current_cache.deinit();
@@ -4909,7 +4913,10 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             preferences: session_codec.DurableSessionPreferences,
         ) !void {
-            try provider_runtime.replaceSelection(app, preferences.provider, preferences.model);
+            const mask = app.session_persistence.launch_policy.explicit_fields;
+            if (!mask.contains(.provider) and !mask.contains(.model)) {
+                try provider_runtime.replaceSelection(app, preferences.provider, preferences.model);
+            }
             if (app.session_persistence.process_model_override) |model| {
                 try provider_runtime.replaceModel(app, model);
             }
@@ -4917,10 +4924,10 @@ pub fn Runtime(comptime App: type) type {
                 std.heap.c_allocator,
                 provider_runtime.model(app),
             );
-            app.effort = preferences.effort;
-            app.fast_mode = preferences.fast_mode;
-            app.worker.syncQueuedPromptEffort(preferences.effort);
-            app.worker.syncQueuedPromptFastMode(preferences.fast_mode);
+            if (!mask.contains(.effort)) app.effort = preferences.effort;
+            if (!mask.contains(.fast_mode)) app.fast_mode = preferences.fast_mode;
+            app.worker.syncQueuedPromptEffort(app.effort);
+            app.worker.syncQueuedPromptFastMode(app.fast_mode);
         }
 
         fn applySessionPreferencePatch(
@@ -7552,6 +7559,11 @@ test "upgrade resume restores active session with the installed version notice" 
         types.ReasoningEffort.literal("high"),
         true,
     );
+    app.session_persistence.launch_policy.explicit_fields.set(.model);
+    app.session_persistence.launch_policy.explicit_fields.set(.effort);
+    app.session_persistence.launch_policy.explicit_fields.set(.fast_mode);
+    app.effort = types.ReasoningEffort.literal("high");
+    app.fast_mode = true;
     try Runtime(TestApp).initializePersistence(&app, true);
     var calls = [_]types.ToolCall{.{
         .id = "call_read",
@@ -7662,8 +7674,8 @@ test "upgrade resume restores active session with the installed version notice" 
         "saved/model",
         app.session_persistence.session_preferences.?.model,
     );
-    try std.testing.expectEqual(types.ReasoningEffort.literal("medium"), app.effort);
-    try std.testing.expect(!app.fast_mode);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
+    try std.testing.expect(app.fast_mode);
 }
 
 test "resumed recovery checkpoint replays its unfinished turn once" {

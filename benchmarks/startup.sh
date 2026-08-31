@@ -56,6 +56,7 @@ fi
 
 mkdir -p "$RESULTS_DIR"
 rm -f "${RESULTS_DIR}/tasks.json"
+rm -f "${RESULTS_DIR}/config-schema.json" "${RESULTS_DIR}/config-capabilities.json" "${RESULTS_DIR}/config-resolve.json"
 mkdir -p "$SESSION_FIXTURE_HOME" "$SESSION_FIXTURE_WORKSPACE" "$GENERAL_FIXTURE_HOME"
 mkdir -p "$GENERAL_FIXTURE_HOME/.fx"
 chmod 700 "$GENERAL_FIXTURE_HOME/.fx"
@@ -114,6 +115,40 @@ HOME="$GENERAL_FIXTURE_HOME" hyperfine \
   --export-json "${RESULTS_DIR}/help.json" \
   --command-name "fx help" \
   "$FX_BIN help"
+
+echo ""
+
+# Config inspection: offline schema, capabilities, and effective resolution.
+echo "--- fx config schema --json ---"
+HOME="$GENERAL_FIXTURE_HOME" hyperfine \
+  "${SHELL_OPTS[@]}" \
+  --runs "$RUNS" \
+  --warmup "$WARMUP" \
+  --export-json "${RESULTS_DIR}/config-schema.json" \
+  --command-name "fx config schema --json" \
+  "$FX_BIN config schema --json"
+
+echo ""
+
+echo "--- fx config capabilities --json ---"
+HOME="$GENERAL_FIXTURE_HOME" hyperfine \
+  "${SHELL_OPTS[@]}" \
+  --runs "$RUNS" \
+  --warmup "$WARMUP" \
+  --export-json "${RESULTS_DIR}/config-capabilities.json" \
+  --command-name "fx config capabilities --json" \
+  "$FX_BIN config capabilities --json"
+
+echo ""
+
+echo "--- fx config resolve --json ---"
+HOME="$GENERAL_FIXTURE_HOME" hyperfine \
+  "${SHELL_OPTS[@]}" \
+  --runs "$RUNS" \
+  --warmup "$WARMUP" \
+  --export-json "${RESULTS_DIR}/config-resolve.json" \
+  --command-name "fx config resolve --json" \
+  "$FX_BIN config resolve --json"
 
 echo ""
 

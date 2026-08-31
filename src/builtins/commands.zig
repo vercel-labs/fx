@@ -171,6 +171,17 @@ pub const top_level_specs = [_]TopLevelSpec{
         .options = &.{json_option},
     },
     .{
+        .kind = .config,
+        .token = "config",
+        .usage = "config <schema|capabilities|validate|resolve> [--json]",
+        .summary = "Inspect and validate launch configuration",
+        .options = &.{json_option},
+        .details = &.{
+            "schema and capabilities are offline. validate checks one file or stdin.",
+            "resolve uses the same global --config, --no-config, --set, and --config-env stack as launch.",
+        },
+    },
+    .{
         .kind = .background,
         .token = "background",
         .usage = "background [last|<id>] [--json]",
@@ -326,6 +337,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .status, .usage = "status" },
         .{ .kind = .doctor, .usage = "doctor" },
+        .{ .kind = .config, .usage = "config <operation>" },
         .{ .kind = .mcp, .usage = "mcp <command> ..." },
         .{ .kind = .models, .usage = "models" },
         .{ .kind = .permissions, .usage = "permissions" },
@@ -352,6 +364,22 @@ pub const top_level_flags = [_]TopLevelFlag{
     .{
         .usage = "--no-additional-dirs",
         .description = "Ignore saved additional directories",
+    },
+    .{
+        .usage = "--config=<file>",
+        .description = "Use an explicit launch config; repeatable",
+    },
+    .{
+        .usage = "--no-config",
+        .description = "Suppress implicit launch config files",
+    },
+    .{
+        .usage = "--set=<spec>",
+        .description = "Override one typed launch field; repeatable",
+    },
+    .{
+        .usage = "--config-env=<spec>",
+        .description = "Read a name=ENV typed launch override",
     },
     .{
         .usage = "-c, --continue",

@@ -3,6 +3,7 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const background_store = @import("../background/background_store.zig");
 const doctor_runtime = @import("../cli/doctor_runtime.zig");
+const config_runtime = @import("../config/config_runtime.zig");
 const model_provider = @import("../config/model_provider.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_health = @import("../mcp/health.zig");
@@ -16,6 +17,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
+const launch_config = config_runtime.launch_config;
 
 const Allocator = std.mem.Allocator;
 
@@ -27,6 +29,294 @@ pub const OutputFormat = enum {
     text,
     json,
 };
+
+pub const ConfigCapabilitiesSnapshot = struct {
+    fx_version: []const u8,
+    revision: []const u8,
+    os: []const u8,
+    arch: []const u8,
+    providers: []const []const u8,
+    built_in_tools: []const []const u8,
+    fields: []const []const u8,
+
+    pub fn renderJson(self: ConfigCapabilitiesSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"output_version\":1,\"schema_version\":1,\"fx_version\":");
+        try std.json.Stringify.value(self.fx_version, .{}, &out.writer);
+        try out.writer.writeAll(",\"revision\":");
+        try std.json.Stringify.value(self.revision, .{}, &out.writer);
+        try out.writer.writeAll(",\"platform\":{\"os\":");
+        try std.json.Stringify.value(self.os, .{}, &out.writer);
+        try out.writer.writeAll(",\"arch\":");
+        try std.json.Stringify.value(self.arch, .{}, &out.writer);
+        try out.writer.writeAll("},\"providers\":[");
+        try writeStringArray(&out.writer, self.providers);
+        try out.writer.writeAll("],\"built_in_tools\":[");
+        try writeStringArray(&out.writer, self.built_in_tools);
+        try out.writer.writeAll("],\"fields\":[");
+        try writeStringArray(&out.writer, self.fields);
+        try out.writer.print(
+            "],\"limits\":{{\"config_file_bytes\":{d},\"system_prompt_parts\":{d},\"system_prompt_part_bytes\":{d},\"system_prompt_total_bytes\":{d}}}}}",
+            .{
+                launch_config.max_config_file_bytes,
+                launch_config.max_system_prompt_parts,
+                launch_config.max_system_prompt_part_bytes,
+                launch_config.max_system_prompt_total_bytes,
+            },
+        );
+        return out.toOwnedSlice();
+    }
+};
+
+pub const ConfigDiagnosticSnapshot = struct {
+    source: launch_config.Source,
+    instance_location: []const u8,
+    severity: enum { warning, @"error" },
+    code: []const u8,
+    message: []const u8,
+};
+
+pub const ConfigReportSnapshot = struct {
+    ok: bool,
+    config_json: ?[]const u8 = null,
+    provenance_json: []const u8 = "[]",
+    diagnostics: []const ConfigDiagnosticSnapshot = &.{},
+    truncated: bool = false,
+
+    pub fn renderJson(self: ConfigReportSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.print("{{\"output_version\":1,\"ok\":{},\"config\":", .{self.ok});
+        if (self.config_json) |config_json| {
+            try out.writer.writeAll(config_json);
+        } else {
+            try out.writer.writeAll("null");
+        }
+        try out.writer.writeAll(",\"provenance\":");
+        try out.writer.writeAll(self.provenance_json);
+        try out.writer.writeAll(",\"diagnostics\":[");
+        for (self.diagnostics, 0..) |diagnostic, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("{\"source\":");
+            try writeConfigSourceJson(&out.writer, diagnostic.source);
+            try out.writer.writeAll(",\"instance_location\":");
+            try std.json.Stringify.value(diagnostic.instance_location, .{}, &out.writer);
+            try out.writer.writeAll(",\"severity\":");
+            try std.json.Stringify.value(@tagName(diagnostic.severity), .{}, &out.writer);
+            try out.writer.writeAll(",\"code\":");
+            try std.json.Stringify.value(diagnostic.code, .{}, &out.writer);
+            try out.writer.writeAll(",\"message\":");
+            try std.json.Stringify.value(diagnostic.message, .{}, &out.writer);
+            try out.writer.writeByte('}');
+        }
+        try out.writer.print("],\"truncated\":{}}}", .{self.truncated});
+        return out.toOwnedSlice();
+    }
+};
+
+pub const ResolvedConfigSnapshot = struct {
+    provider: model_provider.ProviderId,
+    configured_model: []const u8,
+    effort: types.ReasoningEffort,
+    fast_mode: bool,
+    agent_step_limit: usize,
+    first_call_tool_choice: types.ToolChoice,
+    enabled_tools: []const []const u8,
+    system_parts: ?[]const launch_config.SystemPart,
+    permission_mode: types.PermissionMode,
+    max_tool_result_bytes: usize,
+    context_enabled: bool,
+    context_limits: config_runtime.context_limits.Values,
+    additional_directories: []const []const u8,
+    launch_policy: *const launch_config.OwnedLaunchPolicy,
+    config_diagnostics: []const config_runtime.ConfigDiagnostic,
+
+    pub fn renderJson(self: ResolvedConfigSnapshot, alloc: Allocator) ![]u8 {
+        const config_json = try self.renderConfigObject(alloc);
+        defer alloc.free(config_json);
+        const provenance_json = try self.renderProvenance(alloc);
+        defer alloc.free(provenance_json);
+        const diagnostics = try alloc.alloc(
+            ConfigDiagnosticSnapshot,
+            self.config_diagnostics.len,
+        );
+        defer alloc.free(diagnostics);
+        const locations = try alloc.alloc(?[]u8, diagnostics.len);
+        @memset(locations, null);
+        defer {
+            for (locations) |location| if (location) |value| alloc.free(value);
+            alloc.free(locations);
+        }
+        for (self.config_diagnostics, 0..) |diagnostic, index| {
+            if (diagnostic.setting_key) |key| {
+                locations[index] = try std.fmt.allocPrint(alloc, "/{s}", .{key});
+            }
+            diagnostics[index] = .{
+                .source = if (diagnostic.layer == .project) .project_file else .profile_global,
+                .instance_location = locations[index] orelse "",
+                .severity = .warning,
+                .code = @tagName(diagnostic.cause),
+                .message = @tagName(diagnostic.cause),
+            };
+        }
+        return (ConfigReportSnapshot{
+            .ok = true,
+            .config_json = config_json,
+            .provenance_json = provenance_json,
+            .diagnostics = diagnostics,
+        }).renderJson(alloc);
+    }
+
+    fn renderConfigObject(self: ResolvedConfigSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"schema_version\":1,\"agent\":{\"provider\":");
+        try std.json.Stringify.value(@tagName(self.provider), .{}, &out.writer);
+        try out.writer.writeAll(",\"model\":");
+        try std.json.Stringify.value(self.configured_model, .{}, &out.writer);
+        try out.writer.writeAll(",\"effort\":");
+        try std.json.Stringify.value(self.effort.label(), .{}, &out.writer);
+        try out.writer.print(",\"fast_mode\":{s},\"max_steps\":{d},\"first_call_tool_choice\":", .{
+            if (self.fast_mode) "true" else "false",
+            self.agent_step_limit,
+        });
+        try std.json.Stringify.value(@tagName(self.first_call_tool_choice), .{}, &out.writer);
+        try out.writer.writeAll(",\"enabled_tools\":[");
+        try writeStringArray(&out.writer, self.enabled_tools);
+        try out.writer.writeAll("]},\"prompt\":{\"system_parts\":[");
+        if (self.system_parts) |parts| {
+            for (parts, 0..) |part, index| {
+                if (index > 0) try out.writer.writeByte(',');
+                switch (part) {
+                    .builtin => try out.writer.writeAll("{\"type\":\"builtin\",\"id\":\"default\"}"),
+                    .@"inline" => |text| {
+                        try out.writer.writeAll("{\"type\":\"inline\",\"text\":");
+                        try std.json.Stringify.value(text, .{}, &out.writer);
+                        try out.writer.writeByte('}');
+                    },
+                    .file => |file| {
+                        try out.writer.writeAll("{\"type\":\"file\",\"path\":");
+                        try std.json.Stringify.value(file.path, .{}, &out.writer);
+                        try out.writer.writeByte('}');
+                    },
+                }
+            }
+        } else {
+            try out.writer.writeAll("{\"type\":\"builtin\",\"id\":\"default\"}");
+        }
+        try out.writer.writeAll("]},\"runtime\":{\"permission_mode\":");
+        try std.json.Stringify.value(@tagName(self.permission_mode), .{}, &out.writer);
+        try out.writer.print(",\"max_tool_result_bytes\":{d},\"context_enabled\":{s},\"context_limits\":{{", .{
+            self.max_tool_result_bytes,
+            if (self.context_enabled) "true" else "false",
+        });
+        inline for (std.meta.tags(config_runtime.context_limits.Name), 0..) |name, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try std.json.Stringify.value(@tagName(name), .{}, &out.writer);
+            try out.writer.writeByte(':');
+            switch (self.context_limits.get(name).value) {
+                .bytes => |bytes| try out.writer.print("{d}", .{bytes}),
+                .off => try std.json.Stringify.value("off", .{}, &out.writer),
+            }
+        }
+        try out.writer.writeAll("},\"additional_directories\":[");
+        try writeStringArray(&out.writer, self.additional_directories);
+        try out.writer.writeAll("]}}");
+        return out.toOwnedSlice();
+    }
+
+    fn renderProvenance(self: ResolvedConfigSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeByte('[');
+        inline for (std.meta.tags(launch_config.Field), 0..) |field, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("{\"instance_location\":");
+            try std.json.Stringify.value(field.jsonPointer(), .{}, &out.writer);
+            try out.writer.writeAll(",\"source\":");
+            try writeConfigSourceJson(&out.writer, self.launch_policy.source(field));
+            try out.writer.writeByte('}');
+        }
+        try out.writer.writeByte(']');
+        return out.toOwnedSlice();
+    }
+};
+
+fn writeStringArray(writer: *std.Io.Writer, values: []const []const u8) !void {
+    for (values, 0..) |value, index| {
+        if (index > 0) try writer.writeByte(',');
+        try std.json.Stringify.value(value, .{}, writer);
+    }
+}
+
+fn writeConfigSourceJson(writer: *std.Io.Writer, source: launch_config.Source) !void {
+    switch (source) {
+        .compiled_default => try writer.writeAll("{\"kind\":\"compiled_default\"}"),
+        .project_file => try writer.writeAll("{\"kind\":\"project_file\"}"),
+        .profile_global => try writer.writeAll("{\"kind\":\"profile_global\"}"),
+        .profile_workspace => try writer.writeAll("{\"kind\":\"profile_workspace\"}"),
+        .stdin => try writer.writeAll("{\"kind\":\"stdin\"}"),
+        .explicit_file => |value| {
+            try writer.writeAll("{\"kind\":\"explicit_file\",\"path\":");
+            try std.json.Stringify.value(value.path, .{}, writer);
+            try writer.print(",\"layer\":{d}}}", .{value.layer});
+        },
+        .environment => |value| {
+            try writer.writeAll("{\"kind\":\"environment\",\"name\":");
+            try std.json.Stringify.value(value.name, .{}, writer);
+            try writer.writeByte('}');
+        },
+        .command => |value| try writer.print(
+            "{{\"kind\":\"command\",\"argument_index\":{d}}}",
+            .{value.argument_index},
+        ),
+    }
+}
+
+test "config machine snapshots keep command-specific output shapes" {
+    const capabilities = try (ConfigCapabilitiesSnapshot{
+        .fx_version = "1.2.3",
+        .revision = "abc",
+        .os = "macos",
+        .arch = "aarch64",
+        .providers = &.{"gateway"},
+        .built_in_tools = &.{"read_file"},
+        .fields = &.{"agent.model"},
+    }).renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(capabilities);
+    var parsed_capabilities = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        capabilities,
+        .{},
+    );
+    defer parsed_capabilities.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_capabilities.value.object.get("output_version").?.integer);
+
+    const diagnostics = [_]ConfigDiagnosticSnapshot{.{
+        .source = .{ .command = .{ .argument_index = 2 } },
+        .instance_location = "/agent/model",
+        .severity = .@"error",
+        .code = "invalid_value",
+        .message = "invalid model",
+    }};
+    const report = try (ConfigReportSnapshot{
+        .ok = false,
+        .diagnostics = &diagnostics,
+        .truncated = true,
+    }).renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(report);
+    var parsed_report = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        report,
+        .{},
+    );
+    defer parsed_report.deinit();
+    try std.testing.expectEqual(false, parsed_report.value.object.get("ok").?.bool);
+    try std.testing.expectEqual(@as(i64, 2), parsed_report.value.object.get("diagnostics").?.array.items[0].object.get("source").?.object.get("argument_index").?.integer);
+}
 
 pub const CommandFailureSnapshot = struct {
     kind: []const u8,

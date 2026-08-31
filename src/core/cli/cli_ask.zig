@@ -245,6 +245,7 @@ pub const Config = struct {
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
+    launch_request: config_runtime.LaunchResolutionRequest = .{},
 };
 
 fn runAskChild(
@@ -394,7 +395,7 @@ const PermissionApprovalPromptResult = enum {
 const NotifyAttentionFn = *const fn (?*anyopaque) void;
 const PermissionApprovalPromptFn = *const fn (?*anyopaque, ?*anyopaque, WriteFn, []const u8, ?*anyopaque, NotifyAttentionFn) anyerror!PermissionApprovalPromptResult;
 const IsTtyFn = *const fn (?*anyopaque) bool;
-const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupState;
+const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize, config_runtime.LaunchResolutionRequest) anyerror!app_lifecycle.StartupState;
 const InitializeSessionStoresFn = *const fn (*AskContext) anyerror!void;
 const LoadSkillsFn = *const fn (
     Allocator,
@@ -591,6 +592,8 @@ const AskContext = struct {
     image_snapshot_temp_dir: ?[]u8 = null,
     prompt_snapshot_committed: bool = false,
     last_recovery_status: ?types.RouteRecoveryStatus = null,
+    launch_policy: config_runtime.launch_config.OwnedLaunchPolicy = .{},
+    narrowed_tools: ?tool_set_contract.Narrowed = null,
 
     fn init(alloc: Allocator, cfg: Config, deps: RunDeps, workspace_root: []const u8) AskContext {
         const lifecycle_runtime = hooks.Runtime.init(alloc);
@@ -756,6 +759,8 @@ const AskContext = struct {
         self.tool_call_records.deinit(self.alloc);
         if (self.subagent_skills_prompt.len > 0) self.alloc.free(self.subagent_skills_prompt);
         if (self.subagent_explicit_skills_prompt.len > 0) self.alloc.free(self.subagent_explicit_skills_prompt);
+        self.launch_policy.deinit(self.alloc);
+        if (self.narrowed_tools) |*tools| tools.deinit(self.alloc);
     }
 
     fn lifecycleContext(self: *AskContext) agent_runtime.LifecycleContext {
@@ -898,10 +903,13 @@ const AskContext = struct {
 
         if (self.requested_resume != null) {
             const preferences = self.writable.?.state.preferences;
-            self.provider = preferences.provider;
-            self.model = preferences.model;
-            self.effort = preferences.effort;
-            self.fast_mode = preferences.fast_mode;
+            const mask = self.launch_policy.explicit_fields;
+            if (!mask.contains(.provider) and !mask.contains(.model)) {
+                self.provider = preferences.provider;
+                self.model = preferences.model;
+            }
+            if (!mask.contains(.effort)) self.effort = preferences.effort;
+            if (!mask.contains(.fast_mode)) self.fast_mode = preferences.fast_mode;
         }
         self.subagent_host = try subagent_tool_host.Runtime.create(
             self.alloc,
@@ -1141,7 +1149,7 @@ fn freshAskState(
 
 pub fn run(alloc: Allocator, args: []const [:0]const u8, cfg: Config, context_registry: context_contract.Registry, tool_set: tool_set_contract.ToolSet) !u8 {
     return runWithDeps(alloc, args, cfg, .{
-        .load_startup_state = app_lifecycle.loadStartupState,
+        .load_startup_state = app_lifecycle.loadStartupStateForLaunch,
         .context_registry = context_registry,
         .tool_set = tool_set,
         .load_mcp_runtime = cfg.load_mcp_runtime,
@@ -1271,8 +1279,43 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
     if (interrupt_scope.requested()) return headless_interrupt.exitCode();
 
     var effective_cfg = cfg;
-    if (options.system_prompt_override) |sp| {
-        effective_cfg.prompt_policy.system_prompt = sp;
+    const extra_override_count =
+        @as(usize, @intFromBool(options.system_prompt_override != null)) +
+        @as(usize, @intFromBool(options.permission_override != null));
+    var merged_overrides: ?[]config_runtime.LaunchOverride = null;
+    defer if (merged_overrides) |overrides| alloc.free(overrides);
+    var system_parts_json: ?[]u8 = null;
+    defer if (system_parts_json) |json| alloc.free(json);
+    if (extra_override_count > 0) {
+        const overrides = try alloc.alloc(
+            config_runtime.LaunchOverride,
+            cfg.launch_request.overrides.len + extra_override_count,
+        );
+        @memcpy(overrides[0..cfg.launch_request.overrides.len], cfg.launch_request.overrides);
+        var next = cfg.launch_request.overrides.len;
+        if (options.system_prompt_override) |system_prompt| {
+            var encoded: std.Io.Writer.Allocating = .init(alloc);
+            defer encoded.deinit();
+            try encoded.writer.writeAll("[{\"type\":\"inline\",\"text\":");
+            try std.json.Stringify.value(system_prompt, .{}, &encoded.writer);
+            try encoded.writer.writeAll("}]");
+            system_parts_json = try encoded.toOwnedSlice();
+            overrides[next] = .{
+                .name = "prompt.system_parts",
+                .value = system_parts_json.?,
+                .source = .{ .command = findAskOptionIndex(args, "--system") },
+            };
+            next += 1;
+        }
+        if (options.permission_override) |permission_mode| {
+            overrides[next] = .{
+                .name = "runtime.permission_mode",
+                .value = @tagName(permission_mode),
+                .source = .{ .command = findAskPermissionOptionIndex(args) },
+            };
+        }
+        merged_overrides = overrides;
+        effective_cfg.launch_request.overrides = overrides;
     }
 
     const output_mode = selectOutputMode(
@@ -1373,6 +1416,22 @@ fn preflightAskImages(
     return true;
 }
 
+fn findAskOptionIndex(args: []const [:0]const u8, option: []const u8) usize {
+    for (args, 0..) |arg, index| {
+        if (std.mem.eql(u8, arg, option)) return index + 1;
+    }
+    unreachable;
+}
+
+fn findAskPermissionOptionIndex(args: []const [:0]const u8) usize {
+    for (args, 0..) |arg, index| {
+        if (std.mem.eql(u8, arg, "--auto") or std.mem.eql(u8, arg, "--yolo")) {
+            return index + 1;
+        }
+    }
+    unreachable;
+}
+
 pub fn runPrompt(alloc: Allocator, prompt: []const u8, auto_permission: bool, cfg: Config, context_registry: context_contract.Registry, tool_set: tool_set_contract.ToolSet) !u8 {
     const result = try runPromptInternal(alloc, prompt, if (auto_permission) .auto else null, cfg, .{
         .output_mode = .raw,
@@ -1425,19 +1484,30 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer alloc.free(owned_prompt);
 
     try checkHeadlessCancellation(options.deps);
+    var launch_request = cfg.launch_request;
+    launch_request.available_tool_names = options.deps.tool_set.order;
+    launch_request.builtin_system_prompt = cfg.prompt_policy.system_prompt;
+    launch_request.context_limit_overrides = cfg.context_limit_overrides;
+    launch_request.additional_directories = cfg.additional_directories;
+    launch_request.saved_directories_suppressed = cfg.saved_directories_suppressed;
     var startup = try options.deps.load_startup_state(
         alloc,
         cfg.gateway_provider.oauth_transport,
         cfg.secret_store,
         cfg.default_model,
         cfg.default_agent_step_limit,
+        launch_request,
     );
     defer startup.deinit(alloc);
     try checkHeadlessCancellation(options.deps);
 
     var permission_mode = toCorePermissionMode(startup.permission_mode);
     const mode_id: []const u8 = cfg.mode_registry.default_mode_id;
-    if (permission_override) |explicit| permission_mode = explicit;
+    if (permission_override) |explicit| {
+        if (!startup.launch_policy.explicit_fields.contains(.permission_mode)) {
+            permission_mode = explicit;
+        }
+    }
 
     if (permission_mode == .yolo and !startup.yolo_acknowledged) {
         try emitHeadlessYoloWarning(alloc, options);
@@ -1457,14 +1527,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         try options.deps.write_stderr(options.deps.stderr_ctx, notice);
     }
 
-    try app_lifecycle.applyWorkspaceLaunch(
-        &startup,
-        alloc,
-        cfg.additional_directories,
-        cfg.saved_directories_suppressed,
-    );
-    try checkHeadlessCancellation(options.deps);
-
     if (!options.continue_recovery and options.resume_target == null and startup.credential == null) {
         return missingCredentialResult(alloc, options, startup.provider);
     }
@@ -1473,6 +1535,19 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer if (owned_resumed_model) |model| alloc.free(model);
     var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
     defer ctx.deinit();
+    ctx.launch_policy = startup.takeLaunchPolicy();
+    try ctx.launch_policy.composeSystemPrompt(alloc, ctx.cfg.prompt_policy.system_prompt);
+    if (comptime std_builtin.os.tag != .wasi) {
+        ctx.narrowed_tools = try tool_set_contract.narrow(
+            alloc,
+            ctx.deps.tool_set,
+            ctx.launch_policy.enabled_tools,
+        );
+    }
+    if (ctx.launch_policy.system_prompt) |system_prompt| {
+        ctx.cfg.prompt_policy.system_prompt = system_prompt;
+    }
+    if (ctx.narrowed_tools) |*tools| ctx.deps.tool_set = tools.view();
     if (options.save_session) {
         _ = try ctx.session.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
         ctx.session.attachProfileUsagePublisher(alloc);
@@ -1498,7 +1573,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.agent_step_limit = startup.agent_step_limit;
     ctx.max_tool_result_bytes = startup.max_tool_result_bytes;
     ctx.context_limits = startup.context_limits;
-    ctx.context_limits.applyCommandLine(cfg.context_limit_overrides);
     ctx.fast_mode = startup.fast_mode;
     ctx.effort = toCoreReasoningEffort(startup.effort);
     ctx.first_call_tool_choice = startup.first_call_tool_choice;
@@ -1522,7 +1596,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         try ctx.checkCancellation();
         try options.deps.initialize_session_stores(&ctx);
         try ctx.checkCancellation();
-        if (startup.model_source == .process_override) {
+        if (ctx.launch_policy.explicit_fields.contains(.provider) or
+            ctx.launch_policy.explicit_fields.contains(.model) or
+            startup.model_source == .process_override)
+        {
             ctx.model = startup.selected_model;
         } else if (ctx.requested_resume != null) {
             owned_resumed_model = try alloc.dupe(u8, ctx.model);
@@ -1691,7 +1768,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         writable.childCapability() catch null
     else
         null;
-    var tool_projection = try buildAskGatewayToolProjection(alloc, ctx.cfg.mode_registry, options.deps.tool_set, ctx.mode_id, .{
+    var tool_projection = try buildAskGatewayToolProjection(alloc, ctx.cfg.mode_registry, ctx.deps.tool_set, ctx.mode_id, .{
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
         .mcp_runtime = ctx.mcp,
@@ -1758,8 +1835,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     const semantic_presentation = if (ctx.presenter) |value| value.semanticSink() else null;
     try ctx.checkCancellation();
     options.deps.process_queued_prompt(&deps, semantic_presentation, ctx.lifecycleContext(), .{
-        .system_prompt = cfg.prompt_policy.system_prompt,
-        .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
+        .system_prompt = ctx.cfg.prompt_policy.system_prompt,
+        .model_prompt_overlay = ctx.cfg.prompt_policy.modelPromptOverlay(ctx.model),
         .skills_prompt_section = skills_section,
         .explicit_skills_prompt_section = explicit_skills.text,
         .gateway_retry_count = cfg.gateway_retry_count,
@@ -3708,13 +3785,15 @@ fn loadStartupStateDefault(
     secret_store: host.SecretStore,
     default_model: []const u8,
     default_agent_step_limit: usize,
+    request: config_runtime.LaunchResolutionRequest,
 ) !app_lifecycle.StartupState {
-    return app_lifecycle.loadStartupState(
+    return app_lifecycle.loadStartupStateForLaunch(
         alloc,
         transport,
         secret_store,
         default_model,
         default_agent_step_limit,
+        request,
     );
 }
 
@@ -3918,7 +3997,7 @@ fn testConfig() Config {
     };
 }
 
-fn testMissingKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
+fn testMissingKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: config_runtime.LaunchResolutionRequest) !app_lifecycle.StartupState {
     var state = app_lifecycle.StartupState{ .agent_step_limit = default_agent_step_limit };
     errdefer state.deinit(alloc);
     state.workspace_root = try alloc.dupe(u8, "/tmp/fx-test");
@@ -3927,7 +4006,7 @@ fn testMissingKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.
     return state;
 }
 
-fn testPresentKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
+fn testPresentKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: config_runtime.LaunchResolutionRequest) !app_lifecycle.StartupState {
     var state = app_lifecycle.StartupState{ .agent_step_limit = default_agent_step_limit };
     errdefer state.deinit(alloc);
     state.workspace_root = try alloc.dupe(u8, "/tmp/fx-test");
@@ -3940,14 +4019,14 @@ fn testPresentKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.
     return state;
 }
 
-fn testMissingKeyAcknowledgedStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
-    var state = try testMissingKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
+fn testMissingKeyAcknowledgedStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, request: config_runtime.LaunchResolutionRequest) !app_lifecycle.StartupState {
+    var state = try testMissingKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit, request);
     state.yolo_acknowledged = true;
     return state;
 }
 
-fn testMissingKeyDiagnosticStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
-    var state = try testMissingKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
+fn testMissingKeyDiagnosticStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, request: config_runtime.LaunchResolutionRequest) !app_lifecycle.StartupState {
+    var state = try testMissingKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit, request);
     errdefer state.deinit(alloc);
     state.config_diagnostics = try alloc.alloc(config_runtime.ConfigDiagnostic, 1);
     state.config_diagnostics[0] = .{
@@ -3957,8 +4036,8 @@ fn testMissingKeyDiagnosticStartup(alloc: Allocator, transport: oauth_transport.
     return state;
 }
 
-fn testPresentKeySavedStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
-    var state = try testPresentKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
+fn testPresentKeySavedStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, request: config_runtime.LaunchResolutionRequest) !app_lifecycle.StartupState {
+    var state = try testPresentKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit, request);
     errdefer state.deinit(alloc);
     state.configured_model = try alloc.dupe(u8, default_model);
     return state;
@@ -4180,9 +4259,9 @@ var test_initialize_session_store_calls: usize = 0;
 var test_image_preflight_startup_calls: usize = 0;
 var test_image_preflight_process_calls: usize = 0;
 
-fn testCountImagePreflightStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
+fn testCountImagePreflightStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, request: config_runtime.LaunchResolutionRequest) !app_lifecycle.StartupState {
     test_image_preflight_startup_calls += 1;
-    return testPresentKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
+    return testPresentKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit, request);
 }
 
 fn testCountImagePreflightProcess(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
@@ -4283,8 +4362,8 @@ fn testLoadTruncatedSkillsWithDiagnostic(
     };
 }
 
-fn testPresentKeyTruncatedSkillCatalogStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
-    var state = try testPresentKeyNoContextStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
+fn testPresentKeyTruncatedSkillCatalogStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, request: config_runtime.LaunchResolutionRequest) !app_lifecycle.StartupState {
+    var state = try testPresentKeyNoContextStartup(alloc, transport, secret_store, default_model, default_agent_step_limit, request);
     state.context_limits.skill_catalog_bytes = .{
         .value = .{ .bytes = 0 },
         .source = .command_line,
@@ -4457,8 +4536,8 @@ const test_cli_context_registry = context_contract.Registry{ .default_provider =
     .append_transient_fn = TestContextRegistryFixture.appendTransient,
 } };
 
-fn testPresentKeyNoContextStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
-    var state = try testPresentKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
+fn testPresentKeyNoContextStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, request: config_runtime.LaunchResolutionRequest) !app_lifecycle.StartupState {
+    var state = try testPresentKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit, request);
     state.context_enabled = false;
     return state;
 }
@@ -5579,6 +5658,7 @@ fn testLoadStartupStateWithCancellation(
     secret_store: host.SecretStore,
     default_model: []const u8,
     default_agent_step_limit: usize,
+    request: config_runtime.LaunchResolutionRequest,
 ) !app_lifecycle.StartupState {
     const state = try testPresentKeyStartup(
         alloc,
@@ -5586,6 +5666,7 @@ fn testLoadStartupStateWithCancellation(
         secret_store,
         default_model,
         default_agent_step_limit,
+        request,
     );
     if (test_startup_cancellation_stage == .after_startup_state) {
         requestTestHeadlessInterrupt();

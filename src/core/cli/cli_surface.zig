@@ -74,6 +74,7 @@ pub const Command = union(enum) {
     models: []const [:0]const u8,
     provider: []const [:0]const u8,
     doctor: []const [:0]const u8,
+    config: []const [:0]const u8,
     background: []const [:0]const u8,
     teams: []const [:0]const u8,
     session: []const [:0]const u8,
@@ -117,18 +118,51 @@ pub const LaunchModifiers = struct {
     context_limit_overrides: []config_runtime.context_limits.Override = &.{},
     additional_directories: [][]u8 = &.{},
     saved_directories_suppressed: bool = false,
+    config_files: [][]u8 = &.{},
+    config_overrides: []config_runtime.LaunchOverride = &.{},
+    no_config: bool = false,
+    context_limit_argument_index: ?usize = null,
+    additional_directories_argument_index: ?usize = null,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
-        for (self.additional_directories) |path| alloc.free(path);
-        if (self.additional_directories.len > 0) alloc.free(self.additional_directories);
+        freeOwnedStrings(alloc, self.additional_directories);
+        freeOwnedStrings(alloc, self.config_files);
+        freeLaunchOverrides(alloc, self.config_overrides);
         self.* = .{};
     }
 
     pub fn hasWorkspaceModifiers(self: LaunchModifiers) bool {
         return self.additional_directories.len > 0 or self.saved_directories_suppressed;
     }
+
+    pub fn hasConfigModifiers(self: LaunchModifiers) bool {
+        return self.config_files.len > 0 or self.no_config or self.config_overrides.len > 0;
+    }
+
+    pub fn resolutionRequest(self: LaunchModifiers) config_runtime.LaunchResolutionRequest {
+        return .{
+            .explicit_files = self.config_files,
+            .no_config = self.no_config,
+            .overrides = self.config_overrides,
+            .context_limit_overrides = self.context_limit_overrides,
+            .additional_directories = self.additional_directories,
+            .saved_directories_suppressed = self.saved_directories_suppressed,
+            .context_limit_argument_index = self.context_limit_argument_index,
+            .additional_directories_argument_index = self.additional_directories_argument_index,
+        };
+    }
 };
+
+fn freeOwnedStrings(alloc: Allocator, values: [][]u8) void {
+    for (values) |value| alloc.free(value);
+    if (values.len > 0) alloc.free(values);
+}
+
+fn freeLaunchOverrides(alloc: Allocator, overrides: []config_runtime.LaunchOverride) void {
+    for (overrides) |override| freeLaunchOverrideFields(alloc, override);
+    if (overrides.len > 0) alloc.free(overrides);
+}
 
 pub const InteractiveLaunch = struct {
     requested_resume: ?ResumeTarget = null,
@@ -358,6 +392,7 @@ const RunDeps = struct {
 const GlobalLaunchArgs = struct {
     remaining: []const [:0]const u8,
     modifiers: LaunchModifiers = .{},
+    argument_offset: usize = 0,
 
     fn deinit(self: *GlobalLaunchArgs, alloc: Allocator) void {
         self.modifiers.deinit(alloc);
@@ -383,44 +418,162 @@ fn parseGlobalLaunchArgs(
         directories.deinit(alloc);
     }
     var suppress_saved = false;
+    var config_files: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (config_files.items) |path| alloc.free(path);
+        config_files.deinit(alloc);
+    }
+    var config_overrides: std.ArrayList(config_runtime.LaunchOverride) = .empty;
+    errdefer {
+        for (config_overrides.items) |override| freeLaunchOverrideFields(alloc, override);
+        config_overrides.deinit(alloc);
+    }
+    var no_config = false;
+    var context_limit_argument_index: ?usize = null;
+    var additional_directories_argument_index: ?usize = null;
 
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--context-limit")) {
+            context_limit_argument_index = index;
             index += 1;
             if (index >= args.len) return error.MissingContextLimitValue;
             try overrides.append(alloc, try config_runtime.context_limits.parseOverride(args[index]));
         } else if (std.mem.startsWith(u8, arg, "--context-limit=")) {
+            context_limit_argument_index = index;
             try overrides.append(alloc, try config_runtime.context_limits.parseOverride(arg["--context-limit=".len..]));
         } else if (std.mem.eql(u8, arg, "--add-dir")) {
+            additional_directories_argument_index = index;
             index += 1;
             if (index >= args.len or args[index].len == 0) return error.MissingAddDirectoryValue;
             try directories.append(alloc, try alloc.dupe(u8, args[index]));
         } else if (std.mem.startsWith(u8, arg, "--add-dir=")) {
+            additional_directories_argument_index = index;
             const value = arg["--add-dir=".len..];
             if (value.len == 0) return error.MissingAddDirectoryValue;
             try directories.append(alloc, try alloc.dupe(u8, value));
         } else if (std.mem.eql(u8, arg, "--no-additional-dirs")) {
+            additional_directories_argument_index = index;
             if (suppress_saved) return error.DuplicateAdditionalDirectorySuppression;
             suppress_saved = true;
+        } else if (std.mem.eql(u8, arg, "--config")) {
+            if (comptime !hostSupportsNativeConfig(builtin.os.tag)) return error.ConfigUnsupportedHost;
+            index += 1;
+            if (index >= args.len or args[index].len == 0) return error.MissingConfigPath;
+            try config_files.append(alloc, try alloc.dupe(u8, args[index]));
+        } else if (std.mem.startsWith(u8, arg, "--config=")) {
+            if (comptime !hostSupportsNativeConfig(builtin.os.tag)) return error.ConfigUnsupportedHost;
+            const path = arg["--config=".len..];
+            if (path.len == 0) return error.MissingConfigPath;
+            try config_files.append(alloc, try alloc.dupe(u8, path));
+        } else if (std.mem.eql(u8, arg, "--no-config")) {
+            if (comptime !hostSupportsNativeConfig(builtin.os.tag)) return error.ConfigUnsupportedHost;
+            if (no_config) return error.DuplicateNoConfig;
+            no_config = true;
+        } else if (std.mem.startsWith(u8, arg, "--set=")) {
+            if (comptime !hostSupportsNativeConfig(builtin.os.tag)) return error.ConfigUnsupportedHost;
+            try appendCommandConfigOverride(
+                alloc,
+                &config_overrides,
+                arg["--set=".len..],
+                index,
+            );
+        } else if (std.mem.startsWith(u8, arg, "--config-env=")) {
+            if (comptime !hostSupportsNativeConfig(builtin.os.tag)) return error.ConfigUnsupportedHost;
+            try appendEnvironmentConfigOverride(
+                alloc,
+                &config_overrides,
+                arg["--config-env=".len..],
+            );
         } else {
             break;
         }
         index += 1;
     }
 
+    if (no_config and config_files.items.len > 0) return error.ConflictingConfigSources;
+
     const override_slice = try overrides.toOwnedSlice(alloc);
     errdefer if (override_slice.len > 0) alloc.free(override_slice);
     const directory_slice = try directories.toOwnedSlice(alloc);
+    errdefer freeOwnedStrings(alloc, directory_slice);
+    const config_file_slice = try config_files.toOwnedSlice(alloc);
+    errdefer freeOwnedStrings(alloc, config_file_slice);
+    const config_override_slice = try config_overrides.toOwnedSlice(alloc);
     return .{
         .remaining = args[index..],
+        .argument_offset = index,
         .modifiers = .{
             .context_limit_overrides = override_slice,
             .additional_directories = directory_slice,
             .saved_directories_suppressed = suppress_saved,
+            .config_files = config_file_slice,
+            .config_overrides = config_override_slice,
+            .no_config = no_config,
+            .context_limit_argument_index = context_limit_argument_index,
+            .additional_directories_argument_index = additional_directories_argument_index,
         },
     };
+}
+
+fn hostSupportsNativeConfig(comptime os_tag: std.Target.Os.Tag) bool {
+    return os_tag == .linux or os_tag == .macos;
+}
+
+fn freeLaunchOverrideFields(alloc: Allocator, override: config_runtime.LaunchOverride) void {
+    alloc.free(override.name);
+    alloc.free(override.value);
+    switch (override.source) {
+        .environment => |name| alloc.free(name),
+        .command => {},
+    }
+}
+
+fn appendCommandConfigOverride(
+    alloc: Allocator,
+    overrides: *std.ArrayList(config_runtime.LaunchOverride),
+    assignment: []const u8,
+    argument_index: usize,
+) !void {
+    const separator = std.mem.indexOfScalar(u8, assignment, '=') orelse
+        return error.InvalidConfigAssignment;
+    const name = assignment[0..separator];
+    const value = assignment[separator + 1 ..];
+    if (name.len == 0) return error.InvalidConfigAssignment;
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+    try overrides.append(alloc, .{
+        .name = owned_name,
+        .value = owned_value,
+        .source = .{ .command = argument_index },
+    });
+}
+
+fn appendEnvironmentConfigOverride(
+    alloc: Allocator,
+    overrides: *std.ArrayList(config_runtime.LaunchOverride),
+    assignment: []const u8,
+) !void {
+    const separator = std.mem.indexOfScalar(u8, assignment, '=') orelse
+        return error.InvalidConfigEnvironmentAssignment;
+    const field = assignment[0..separator];
+    const environment = assignment[separator + 1 ..];
+    if (field.len == 0 or environment.len == 0) return error.InvalidConfigEnvironmentAssignment;
+    const value = io_mod.getenv(environment) orelse return error.ConfigEnvironmentMissing;
+    const owned_field = try alloc.dupe(u8, field);
+    errdefer alloc.free(owned_field);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+    const owned_environment = try alloc.dupe(u8, environment);
+    errdefer alloc.free(owned_environment);
+    try overrides.append(alloc, .{
+        .name = owned_field,
+        .value = owned_value,
+        .source = .{ .environment = owned_environment },
+    });
 }
 
 /// Returns the command that follows the supported global launch modifiers.
@@ -435,11 +588,18 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir")) {
+        if (std.mem.eql(u8, arg, "--context-limit") or
+            std.mem.eql(u8, arg, "--add-dir") or
+            std.mem.eql(u8, arg, "--config"))
+        {
             index += 1;
             if (index >= args.len) return &.{};
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
+            !std.mem.startsWith(u8, arg, "--config=") and
+            !std.mem.startsWith(u8, arg, "--set=") and
+            !std.mem.startsWith(u8, arg, "--config-env=") and
+            !std.mem.eql(u8, arg, "--no-config") and
             !std.mem.eql(u8, arg, "--no-additional-dirs"))
         {
             return args[index..];
@@ -477,6 +637,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         },
         'c' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .credits)) return .{ .credits = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .config)) return .{ .config = args[1..] };
         },
         'd' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .doctor)) return .{ .doctor = args[1..] };
@@ -832,7 +993,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         } else {
             try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] <command>\n");
+        try writer.writer.writeAll("usage: fx [--config=FILE]... [--no-config] [--set=NAME=VALUE]... [--config-env=NAME=ENV]... [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
@@ -863,6 +1024,12 @@ fn runNonInteractiveWithDeps(
         !commandSupportsWorkspaceModifiers(parsed_command))
     {
         try writeWorkspaceModifierUsage(deps);
+        return .handled_failure;
+    }
+    if (global_args.modifiers.hasConfigModifiers() and
+        !commandSupportsConfigModifiers(parsed_command))
+    {
+        try writeConfigModifierUsage(deps);
         return .handled_failure;
     }
 
@@ -899,6 +1066,28 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, "usage: fx acp [--model <id>] [--log-file <path>]\n");
                 return .handled_failure;
             };
+            var launch_request = global_args.modifiers.resolutionRequest();
+            launch_request.available_tool_names = cfg.tool_set.order;
+            launch_request.builtin_system_prompt = cfg.prompt_policy.system_prompt;
+            var acp_overrides: ?[]config_runtime.LaunchOverride = null;
+            defer if (acp_overrides) |overrides| alloc.free(overrides);
+            if (acp_opts.model) |model| {
+                const overrides = try alloc.alloc(
+                    config_runtime.LaunchOverride,
+                    launch_request.overrides.len + 1,
+                );
+                @memcpy(overrides[0..launch_request.overrides.len], launch_request.overrides);
+                const local_index = for (rest, 0..) |arg, index| {
+                    if (std.mem.eql(u8, arg, "--model")) break index;
+                } else unreachable;
+                overrides[overrides.len - 1] = .{
+                    .name = "agent.model",
+                    .value = model,
+                    .source = .{ .command = global_args.argument_offset + 1 + local_index },
+                };
+                acp_overrides = overrides;
+                launch_request.overrides = overrides;
+            }
             try cfg.acp_runner.run(alloc, .{
                 .default_model = cfg.default_model,
                 .default_agent_step_limit = cfg.default_agent_step_limit,
@@ -923,13 +1112,14 @@ fn runNonInteractiveWithDeps(
                 .context_limit_overrides = global_args.modifiers.context_limit_overrides,
                 .additional_directories = global_args.modifiers.additional_directories,
                 .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
+                .launch_request = launch_request,
                 .model_override = acp_opts.model,
                 .log_file = acp_opts.log_file,
             });
             return .handled_success;
         },
-        .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
-        .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
+        .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, global_args.argument_offset, deps, .pull_request),
+        .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, global_args.argument_offset, deps, .issue),
         .login => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
                 try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
@@ -1259,6 +1449,13 @@ fn runNonInteractiveWithDeps(
             try writeFormattedOutput(deps, text, opts.format);
             return .handled_success;
         },
+        .config => |rest| return runConfigCommand(
+            alloc,
+            rest,
+            cfg,
+            global_args.modifiers,
+            deps,
+        ),
         .background => |rest| {
             const opts = parsePersistedRecordArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .background, "background", err, rest);
@@ -1742,6 +1939,7 @@ fn runGithubWorkflow(
     args: []const [:0]const u8,
     cfg: Config,
     launch_modifiers: LaunchModifiers,
+    argument_offset: usize,
     deps: RunDeps,
     workflow: github_workflows.Workflow,
 ) !RunResult {
@@ -1760,7 +1958,26 @@ fn runGithubWorkflow(
     };
     defer alloc.free(prompt);
 
-    const workflow_cfg = workflowConfigWithLaunchModifiers(cfg, launch_modifiers);
+    var workflow_cfg = workflowConfigWithLaunchModifiers(cfg, launch_modifiers);
+    var permission_overrides: ?[]config_runtime.LaunchOverride = null;
+    defer if (permission_overrides) |overrides| alloc.free(overrides);
+    if (opts.auto_permission) {
+        const overrides = try alloc.alloc(
+            config_runtime.LaunchOverride,
+            workflow_cfg.launch_request.overrides.len + 1,
+        );
+        @memcpy(overrides[0..workflow_cfg.launch_request.overrides.len], workflow_cfg.launch_request.overrides);
+        const local_index = for (args, 0..) |arg, index| {
+            if (std.mem.eql(u8, arg, "--auto")) break index;
+        } else unreachable;
+        overrides[overrides.len - 1] = .{
+            .name = "runtime.permission_mode",
+            .value = "auto",
+            .source = .{ .command = argument_offset + 1 + local_index },
+        };
+        permission_overrides = overrides;
+        workflow_cfg.launch_request.overrides = overrides;
+    }
     if (!opts.create) {
         const exit_code = try cli_ask.runPrompt(alloc, prompt, opts.auto_permission, workflow_cfg, cfg.context_registry, cfg.tool_set);
         return if (exit_code == 0) .handled_success else .handled_failure;
@@ -3430,6 +3647,362 @@ test "session recovery boundary failures keep stable text and json guidance" {
     );
 }
 
+fn runConfigCommand(
+    alloc: Allocator,
+    args: []const [:0]const u8,
+    cfg: Config,
+    modifiers: LaunchModifiers,
+    deps: RunDeps,
+) !RunResult {
+    if (comptime hostSupportsNativeConfig(builtin.os.tag)) {
+        return runConfigCommandNative(alloc, args, cfg, modifiers, deps);
+    } else {
+        try writeStderr(deps, "fx config is unavailable on this host\n");
+        return .handled_failure;
+    }
+}
+
+fn runConfigCommandNative(
+    alloc: Allocator,
+    args: []const [:0]const u8,
+    cfg: Config,
+    modifiers: LaunchModifiers,
+    deps: RunDeps,
+) !RunResult {
+    if (args.len == 0) {
+        try writeStderr(deps, "usage: fx config <schema|capabilities|validate|resolve> [--json]\n");
+        return .handled_failure;
+    }
+    const operation = args[0];
+    const has_non_config_launch_modifiers = modifiers.hasWorkspaceModifiers() or
+        modifiers.context_limit_overrides.len > 0;
+
+    if (std.mem.eql(u8, operation, "schema")) {
+        if (args.len != 2 or !std.mem.eql(u8, args[1], "--json") or
+            modifiers.hasConfigModifiers() or has_non_config_launch_modifiers)
+        {
+            try writeStderr(deps, "usage: fx config schema --json\n");
+            return .handled_failure;
+        }
+        try writeStdout(deps, config_runtime.launch_config.json_schema);
+        return .handled_success;
+    }
+    if (std.mem.eql(u8, operation, "capabilities")) {
+        if (args.len != 2 or !std.mem.eql(u8, args[1], "--json") or
+            modifiers.hasConfigModifiers() or has_non_config_launch_modifiers)
+        {
+            try writeStderr(deps, "usage: fx config capabilities --json\n");
+            return .handled_failure;
+        }
+        const json = try renderConfigCapabilities(alloc, cfg);
+        defer alloc.free(json);
+        try writeStdout(deps, json);
+        return .handled_success;
+    }
+    if (std.mem.eql(u8, operation, "validate")) {
+        if (args.len != 3 or !std.mem.eql(u8, args[2], "--json") or
+            modifiers.hasConfigModifiers() or has_non_config_launch_modifiers)
+        {
+            try writeStderr(deps, "usage: fx config validate <file|-> --json\n");
+            return .handled_failure;
+        }
+        return validateConfigCandidate(
+            alloc,
+            args[1],
+            cfg.tool_set,
+            cfg.prompt_policy.system_prompt,
+            deps,
+        );
+    }
+    if (std.mem.eql(u8, operation, "resolve")) {
+        if (args.len != 2 or !std.mem.eql(u8, args[1], "--json")) {
+            try writeStderr(deps, "usage: fx [launch-options] config resolve --json\n");
+            return .handled_failure;
+        }
+        return resolveLaunchConfig(alloc, cfg, modifiers, deps);
+    }
+    try writeStderr(deps, "usage: fx config <schema|capabilities|validate|resolve> [--json]\n");
+    return .handled_failure;
+}
+
+fn renderConfigCapabilities(alloc: Allocator, cfg: Config) ![]u8 {
+    var providers: [std.meta.fields(model_provider.ProviderId).len][]const u8 = undefined;
+    inline for (std.meta.tags(model_provider.ProviderId), 0..) |provider, index| {
+        providers[index] = @tagName(provider);
+    }
+    var fields: [config_runtime.launch_config.field_count][]const u8 = undefined;
+    inline for (std.meta.tags(config_runtime.launch_config.Field), 0..) |field, index| {
+        fields[index] = field.dottedName();
+    }
+    const json = try (output_contracts.ConfigCapabilitiesSnapshot{
+        .fx_version = cfg.version,
+        .revision = cfg.revision,
+        .os = @tagName(builtin.os.tag),
+        .arch = @tagName(builtin.cpu.arch),
+        .providers = &providers,
+        .built_in_tools = cfg.tool_set.order,
+        .fields = &fields,
+    }).renderJson(alloc);
+    defer alloc.free(json);
+    return std.fmt.allocPrint(alloc, "{s}\n", .{json});
+}
+
+fn validateConfigCandidate(
+    alloc: Allocator,
+    candidate: []const u8,
+    tool_set: tool_set_contract.ToolSet,
+    builtin_system_prompt: []const u8,
+    deps: RunDeps,
+) !RunResult {
+    const from_stdin = std.mem.eql(u8, candidate, "-");
+    const bytes = if (from_stdin)
+        readConfigStdin(alloc)
+    else
+        config_runtime.readRequiredExplicitConfig(alloc, candidate);
+    const owned = bytes catch |err| {
+        const json = try renderConfigFailure(
+            alloc,
+            if (from_stdin) .stdin else .{ .explicit_file = .{ .path = candidate, .layer = 0 } },
+            err,
+        );
+        defer alloc.free(json);
+        try writeStdout(deps, json);
+        return .handled_failure;
+    };
+    defer alloc.free(owned);
+
+    var validation = try config_runtime.launch_config.collectValidationDiagnostics(alloc, owned);
+    defer validation.deinit(alloc);
+    if (validation.items.len > 0) {
+        const json = try renderConfigValidationFailure(
+            alloc,
+            if (from_stdin) .stdin else .{ .explicit_file = .{ .path = candidate, .layer = 0 } },
+            validation,
+        );
+        defer alloc.free(json);
+        try writeStdout(deps, json);
+        return .handled_failure;
+    }
+
+    var parsed = config_runtime.launch_config.parseDocument(
+        alloc,
+        owned,
+        if (from_stdin) .non_file else .{ .regular_file = candidate },
+    ) catch |err| {
+        const json = try renderConfigFailure(
+            alloc,
+            if (from_stdin) .stdin else .{ .explicit_file = .{ .path = candidate, .layer = 0 } },
+            err,
+        );
+        defer alloc.free(json);
+        try writeStdout(deps, json);
+        return .handled_failure;
+    };
+    parsed.validateEnabledTools(tool_set.order) catch |err| {
+        parsed.deinit(alloc);
+        const json = try renderConfigFailure(
+            alloc,
+            if (from_stdin) .stdin else .{ .explicit_file = .{ .path = candidate, .layer = 0 } },
+            err,
+        );
+        defer alloc.free(json);
+        try writeStdout(deps, json);
+        return .handled_failure;
+    };
+    parsed.validateSystemPromptTotal(builtin_system_prompt) catch |err| {
+        parsed.deinit(alloc);
+        const json = try renderConfigFailure(
+            alloc,
+            if (from_stdin) .stdin else .{ .explicit_file = .{ .path = candidate, .layer = 0 } },
+            err,
+        );
+        defer alloc.free(json);
+        try writeStdout(deps, json);
+        return .handled_failure;
+    };
+    parsed.deinit(alloc);
+    const success_json = try renderConfigReportLine(alloc, .{ .ok = true });
+    defer alloc.free(success_json);
+    try writeStdout(deps, success_json);
+    return .handled_success;
+}
+
+fn readConfigStdin(alloc: Allocator) ![]u8 {
+    var read_buffer: [8192]u8 = undefined;
+    var reader = std.Io.File.stdin().reader(io_mod.getIo(), &read_buffer);
+    const bytes = try reader.interface.allocRemaining(
+        alloc,
+        .limited(config_runtime.launch_config.max_config_file_bytes + 1),
+    );
+    errdefer alloc.free(bytes);
+    if (bytes.len > config_runtime.launch_config.max_config_file_bytes) {
+        return error.ConfigFileTooLarge;
+    }
+    return bytes;
+}
+
+fn resolveLaunchConfig(
+    alloc: Allocator,
+    cfg: Config,
+    modifiers: LaunchModifiers,
+    deps: RunDeps,
+) !RunResult {
+    var request = modifiers.resolutionRequest();
+    request.available_tool_names = cfg.tool_set.order;
+    request.builtin_system_prompt = cfg.prompt_policy.system_prompt;
+    var failure: ?config_runtime.LaunchFailure = null;
+    defer if (failure) |*value| value.deinit(alloc);
+    request.failure_out = &failure;
+    var validation: ?config_runtime.launch_config.ValidationDiagnostics = null;
+    defer if (validation) |*diagnostics| diagnostics.deinit(alloc);
+    request.validation_diagnostics_out = &validation;
+    var startup = app_lifecycle.loadStartupStateWithoutCredentialsForLaunch(
+        alloc,
+        cfg.default_model,
+        cfg.default_agent_step_limit,
+        request,
+    ) catch |err| {
+        const source = if (failure) |value| value.source else .compiled_default;
+        const json = if (validation) |diagnostics|
+            try renderConfigValidationFailure(alloc, source, diagnostics)
+        else
+            try renderConfigFailure(alloc, source, err);
+        defer alloc.free(json);
+        try writeStdout(deps, json);
+        return .handled_failure;
+    };
+    defer startup.deinit(alloc);
+    try startup.launch_policy.composeSystemPrompt(alloc, cfg.prompt_policy.system_prompt);
+    var narrowed_tools = try tool_set_contract.narrow(
+        alloc,
+        cfg.tool_set,
+        startup.launch_policy.enabled_tools,
+    );
+    defer if (narrowed_tools) |*tools| tools.deinit(alloc);
+    const active_directories = try startup.workspace_access.activeDirectoriesAlloc(alloc);
+    defer freeOwnedStrings(alloc, active_directories);
+    const effective_tools = if (narrowed_tools) |*tools| tools.view() else cfg.tool_set;
+    const report = try (output_contracts.ResolvedConfigSnapshot{
+        .provider = startup.provider,
+        .configured_model = startup.configured_model,
+        .effort = startup.effort,
+        .fast_mode = startup.fast_mode,
+        .agent_step_limit = startup.agent_step_limit,
+        .first_call_tool_choice = startup.first_call_tool_choice,
+        .enabled_tools = effective_tools.order,
+        .system_parts = startup.launch_policy.system_parts,
+        .permission_mode = startup.permission_mode,
+        .max_tool_result_bytes = startup.max_tool_result_bytes,
+        .context_enabled = startup.context_enabled,
+        .context_limits = startup.context_limits,
+        .additional_directories = active_directories,
+        .launch_policy = &startup.launch_policy,
+        .config_diagnostics = startup.config_diagnostics,
+    }).renderJson(alloc);
+    defer alloc.free(report);
+    try writeStdout(deps, report);
+    try writeStdout(deps, "\n");
+    return .handled_success;
+}
+
+fn renderConfigFailure(
+    alloc: Allocator,
+    source: config_runtime.launch_config.Source,
+    err: anyerror,
+) ![]u8 {
+    const diagnostics = [_]output_contracts.ConfigDiagnosticSnapshot{.{
+        .source = source,
+        .instance_location = configErrorLocation(err),
+        .severity = .@"error",
+        .code = configErrorCode(err),
+        .message = @errorName(err),
+    }};
+    return renderConfigReportLine(alloc, .{
+        .ok = false,
+        .diagnostics = &diagnostics,
+        .truncated = false,
+    });
+}
+
+fn renderConfigValidationFailure(
+    alloc: Allocator,
+    source: config_runtime.launch_config.Source,
+    validation: config_runtime.launch_config.ValidationDiagnostics,
+) ![]u8 {
+    const diagnostics = try alloc.alloc(
+        output_contracts.ConfigDiagnosticSnapshot,
+        validation.items.len,
+    );
+    defer alloc.free(diagnostics);
+    for (validation.items, 0..) |item, index| {
+        diagnostics[index] = .{
+            .source = source,
+            .instance_location = item.instance_location,
+            .severity = .@"error",
+            .code = @tagName(item.code),
+            .message = item.code.message(),
+        };
+    }
+    return renderConfigReportLine(alloc, .{
+        .ok = false,
+        .diagnostics = diagnostics,
+        .truncated = validation.truncated,
+    });
+}
+
+fn configErrorLocation(err: anyerror) []const u8 {
+    return switch (err) {
+        error.InvalidProvider => "/agent/provider",
+        error.InvalidModel => "/agent/model",
+        error.InvalidEffort => "/agent/effort",
+        error.InvalidToolChoice => "/agent/first_call_tool_choice",
+        error.InvalidToolName, error.DuplicateToolName, error.ToolCapabilityUnavailable => "/agent/enabled_tools",
+        error.InvalidSystemPromptPart,
+        error.InvalidSystemPromptText,
+        error.SystemPromptPartTooLarge,
+        error.SystemPromptTooLarge,
+        error.TooManySystemPromptParts,
+        error.FilePartRequiresRegularConfigSource,
+        error.PromptFileMissing,
+        error.UnsafePromptFile,
+        => "/prompt/system_parts",
+        error.InvalidPermissionMode => "/runtime/permission_mode",
+        error.InvalidMaxToolResultBytes => "/runtime/max_tool_result_bytes",
+        error.InvalidContextLimit => "/runtime/context_limits",
+        error.InvalidAdditionalDirectory,
+        error.DuplicateAdditionalDirectory,
+        error.TooManyAdditionalDirectories,
+        error.InvalidAdditionalDirectories,
+        => "/runtime/additional_directories",
+        error.UnsupportedSchemaVersion => "/schema_version",
+        else => "",
+    };
+}
+
+fn renderConfigReportLine(
+    alloc: Allocator,
+    snapshot: output_contracts.ConfigReportSnapshot,
+) ![]u8 {
+    const json = try snapshot.renderJson(alloc);
+    defer alloc.free(json);
+    return std.fmt.allocPrint(alloc, "{s}\n", .{json});
+}
+
+fn configErrorCode(err: anyerror) []const u8 {
+    return switch (err) {
+        error.DuplicateField => "duplicate_field",
+        error.UnknownField => "unknown_field",
+        error.UnsupportedSchemaVersion => "unsupported_schema_version",
+        error.ConfigFileTooLarge, error.SystemPromptPartTooLarge, error.SystemPromptTooLarge, error.TooManySystemPromptParts => "too_large",
+        error.ConfigSourceUnsafe, error.UnsafePromptFile, error.InvalidConfigPath => "source_unsafe",
+        error.FilePartRequiresRegularConfigSource => "file_part_requires_regular_config_source",
+        error.ToolCapabilityUnavailable => "capability_unavailable",
+        error.FileNotFound, error.ConfigSourceMissing, error.PromptFileMissing => "source_missing",
+        error.SyntaxError, error.UnexpectedToken => "invalid_json",
+        else => "invalid_value",
+    };
+}
+
 fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
     return .{
         .command_usage = command_specs.topLevelUsage(cfg.command_catalog, .ask),
@@ -3465,12 +4038,20 @@ fn workflowConfigWithLaunchModifiers(
     result.context_limit_overrides = modifiers.context_limit_overrides;
     result.additional_directories = modifiers.additional_directories;
     result.saved_directories_suppressed = modifiers.saved_directories_suppressed;
+    result.launch_request = modifiers.resolutionRequest();
     return result;
 }
 
 fn commandSupportsWorkspaceModifiers(command: Command) bool {
     return switch (command) {
-        .interactive, .ask, .acp, .pr, .issue, .resume_session => true,
+        .interactive, .ask, .acp, .pr, .issue, .resume_session, .config => true,
+        else => false,
+    };
+}
+
+fn commandSupportsConfigModifiers(command: Command) bool {
+    return switch (command) {
+        .interactive, .ask, .acp, .pr, .issue, .resume_session, .config => true,
         else => false,
     };
 }
@@ -3482,10 +4063,24 @@ fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     );
 }
 
+fn writeConfigModifierUsage(deps: RunDeps) !void {
+    try writeStderr(
+        deps,
+        "fx: --config, --no-config, --set, and --config-env are only supported for launches and config resolve\n",
+    );
+}
+
 fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
         error.DuplicateAdditionalDirectorySuppression => "--no-additional-dirs may only be specified once",
+        error.MissingConfigPath => "--config requires a regular file path",
+        error.DuplicateNoConfig => "--no-config may only be specified once",
+        error.ConflictingConfigSources => "--config and --no-config are mutually exclusive",
+        error.InvalidConfigAssignment => "--set requires NAME=VALUE",
+        error.InvalidConfigEnvironmentAssignment => "--config-env requires NAME=ENV",
+        error.ConfigEnvironmentMissing => "--config-env names a missing environment variable",
+        error.ConfigUnsupportedHost => "launch configuration is unavailable on this host",
         else => null,
     };
 }
@@ -4009,6 +4604,20 @@ test "parse recognizes every top-level command and preserves unknown commands" {
     }
 }
 
+test "config launch modifiers fail closed for every top-level command" {
+    const catalog = testCommandCatalog();
+    for (catalog.specs) |spec| {
+        const token = try std.testing.allocator.dupeZ(u8, spec.token);
+        defer std.testing.allocator.free(token);
+        const command = parse(catalog, &.{token});
+        const expected = switch (spec.kind) {
+            .ask, .acp, .pr, .issue, .@"resume", .config => true,
+            else => false,
+        };
+        try std.testing.expectEqual(expected, commandSupportsConfigModifiers(command));
+    }
+}
+
 test "help aliases route to help" {
     const command_catalog = testCommandCatalog();
     try std.testing.expectEqual(Command.help, parse(command_catalog, &.{@constCast("--help")}));
@@ -4105,6 +4714,53 @@ test "additional directory flags fail closed when malformed" {
         error.DuplicateAdditionalDirectorySuppression,
         parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--no-additional-dirs"), @constCast("--no-additional-dirs") }),
     );
+}
+
+test "global config modifiers preserve file and command override order" {
+    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("--config=base.json"),
+        @constCast("--config"),
+        @constCast("review.json"),
+        @constCast("--set=agent.fast_mode=true"),
+        @constCast("--set=agent.max_steps=20"),
+        @constCast("ask"),
+    });
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.modifiers.config_files.len);
+    try std.testing.expectEqualStrings("base.json", parsed.modifiers.config_files[0]);
+    try std.testing.expectEqualStrings("review.json", parsed.modifiers.config_files[1]);
+    try std.testing.expectEqual(@as(usize, 2), parsed.modifiers.config_overrides.len);
+    try std.testing.expectEqualStrings("agent.fast_mode", parsed.modifiers.config_overrides[0].name);
+    try std.testing.expectEqualStrings("true", parsed.modifiers.config_overrides[0].value);
+    try std.testing.expectEqual(@as(usize, 3), parsed.modifiers.config_overrides[0].source.command);
+    try std.testing.expectEqual(@as(usize, 4), parsed.modifiers.config_overrides[1].source.command);
+    try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
+}
+
+test "global config modifiers reject conflicts and malformed assignments" {
+    try std.testing.expectError(
+        error.ConflictingConfigSources,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{
+            @constCast("--config=a.json"),
+            @constCast("--no-config"),
+        }),
+    );
+    try std.testing.expectError(
+        error.MissingConfigPath,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--config=")}),
+    );
+    try std.testing.expectError(
+        error.InvalidConfigAssignment,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--set=agent.fast_mode")}),
+    );
+}
+
+test "filesystem launch configuration is native Linux and macOS only" {
+    try std.testing.expect(hostSupportsNativeConfig(.linux));
+    try std.testing.expect(hostSupportsNativeConfig(.macos));
+    try std.testing.expect(!hostSupportsNativeConfig(.wasi));
+    try std.testing.expect(!hostSupportsNativeConfig(.windows));
 }
 
 test "parse acp args extracts known flags and rejects invalid arguments" {

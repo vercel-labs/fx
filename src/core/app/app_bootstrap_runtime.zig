@@ -84,6 +84,7 @@ pub fn Runtime(comptime App: type) type {
             default_agent_step_limit: usize,
             resize_handler: app_lifecycle.ResizeHandler,
             record_requested: bool,
+            launch_request: config_runtime.LaunchResolutionRequest,
             capability_providers: CapabilityProviders,
         ) !void {
             try bootstrapWithDeps(
@@ -93,6 +94,7 @@ pub fn Runtime(comptime App: type) type {
                 default_agent_step_limit,
                 resize_handler,
                 record_requested,
+                launch_request,
                 defaultDeps(capability_providers),
             );
         }
@@ -183,6 +185,7 @@ pub fn Runtime(comptime App: type) type {
             default_agent_step_limit: usize,
             resize_handler: app_lifecycle.ResizeHandler,
             record_requested: bool,
+            launch_request: config_runtime.LaunchResolutionRequest,
             deps: BootstrapDeps(App),
         ) !void {
             errdefer app.deinit();
@@ -204,12 +207,17 @@ pub fn Runtime(comptime App: type) type {
                 .resize_handler = resize_handler,
                 .fx_version = App.app_version,
                 .record_requested = record_requested,
+                .launch_request = launch_request,
             });
             defer startup.deinit(app.alloc);
 
             app.workspace_root = startup.takeWorkspaceRoot();
             if (comptime @hasDecl(App, "adoptWorkspaceAccess")) {
                 app.adoptWorkspaceAccess(startup.takeWorkspaceAccess());
+            }
+            if (comptime @hasField(App, "session_persistence")) {
+                app.session_persistence.launch_policy.deinit(app.alloc);
+                app.session_persistence.launch_policy = startup.takeLaunchPolicy();
             }
             if (startup.takeCredential()) |credential_value| {
                 var credential = credential_value;
@@ -857,6 +865,7 @@ fn runBootstrapForTest(app: *TestApp, capture: *TestCapture) !void {
         24,
         resizeHandlerForTest,
         false,
+        .{},
         testDeps(),
     );
 }
