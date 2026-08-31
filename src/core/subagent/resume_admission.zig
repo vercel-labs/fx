@@ -232,15 +232,19 @@ pub fn resumeAdmittedForExternalPrompt(
     store: session_store.Store,
     alloc: Allocator,
     admission: *session_store.ResumeViewAdmission,
-    session_id: []const u8,
+    target: session_store.ResumeTarget,
     workspace_root: []const u8,
     options: session_store.ResumeOptions,
 ) !session_store.LoadedWritableSession {
+    const session_id = switch (target) {
+        .id => |id| id,
+        .last => admission.sessionId(),
+    };
     try ensureExternalPromptAllowed(store, alloc, session_id, true);
     var loaded = try store.resumeAdmittedForWrite(
         alloc,
         admission,
-        session_id,
+        target,
         workspace_root,
         options,
     );
@@ -562,7 +566,7 @@ test "persistent child with missing root evidence stays incomplete after externa
     );
 }
 
-test "external prompt last target rechecks the selected one-off child" {
+test "external prompt last skips a one-off child for its resumable parent" {
     const alloc = std.testing.allocator;
     var env = try TestEnvironment.init(alloc);
     defer env.deinit(alloc);
@@ -570,13 +574,15 @@ test "external prompt last target rechecks the selected one-off child" {
     try env.createSession(alloc, "latest-one-off");
     try env.createControl(alloc, "latest-one-off", .one_off);
 
-    try expectResumeError(alloc, error.OneOffSessionNotResumable, resumeForExternalPrompt(
+    var loaded = try resumeForExternalPrompt(
         env.store,
         alloc,
         .last,
         env.workspace,
         .{},
-    ));
+    );
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqualStrings("parent", loaded.active_id);
 }
 
 test "exact one-off denial does not rebind its workspace" {
@@ -772,7 +778,7 @@ const TestEnvironment = struct {
             self.store,
             alloc,
             &admission,
-            session_id,
+            .{ .id = session_id },
             self.workspace,
             .{},
         ));

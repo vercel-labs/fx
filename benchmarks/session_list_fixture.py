@@ -39,6 +39,7 @@ def generate(home: Path, workspace: Path, count: int, log_size: int, deny_event_
         session_id = f"benchmark-session-{index:02d}"
         authority_id = f"{index + 1:032x}"
         generation = f"{index + 101:032x}"
+        event_seq = max(2, index + 1)
         session_dir = sessions_root / session_id
         session_dir.mkdir(mode=0o700)
 
@@ -69,7 +70,7 @@ def generate(home: Path, workspace: Path, count: int, log_size: int, deny_event_
                 "schema_version": 1,
                 "session_id": session_id,
                 "log_generation": generation,
-                "through_seq": 1,
+                "through_seq": event_seq,
                 "through_event_id": f"{index + 201:032x}",
                 "through_event_log_bytes": log_size,
             },
@@ -92,7 +93,7 @@ def generate(home: Path, workspace: Path, count: int, log_size: int, deny_event_
                 "history_len": index,
                 "total_input_tokens": 0,
                 "total_output_tokens": 0,
-                "last_event_seq": 1,
+                "last_event_seq": event_seq,
                 "event_log_bytes": log_size,
                 "event_log_stat_fingerprint": stat_fingerprint(event_log, log_size),
                 "generation_base_seq": 1,

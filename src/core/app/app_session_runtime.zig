@@ -398,8 +398,6 @@ pub const SessionPicker = struct {
         alloc: Allocator,
         source: *const session_store.SessionSummary,
     ) !void {
-        if (source.history_len == 0 and !source.has_managed_children) return;
-
         var summary = try session_summary_codec.cloneSessionSummary(alloc, source.*);
         errdefer summary.deinit(alloc);
         try self.summaries.append(alloc, summary);
@@ -592,7 +590,6 @@ fn replaceSessionPickerPage(
         replacement.deinit(alloc);
     }
     for (source.summaries.items) |*summary| {
-        if (summary.history_len == 0 and !summary.has_managed_children) continue;
         var copied = try session_summary_codec.cloneSessionSummary(alloc, summary.*);
         replacement.append(alloc, copied) catch |err| {
             copied.deinit(alloc);
@@ -1196,13 +1193,6 @@ pub fn Runtime(comptime App: type) type {
                     .{@tagName(admission.view)},
                 ),
                 .exact, .older => |view| {
-                    switch (requested) {
-                        .last => app.requested_resume = .{ .id = app.alloc.dupe(u8, view.session_id) catch |err| {
-                            traceResumeViewUnavailable(err);
-                            return .none;
-                        } },
-                        .pick, .id => {},
-                    }
                     const freshness = std.meta.activeTag(admission.view);
                     const paint_safe = freshness == .exact and view.capture.canPaintAt(
                         app.shell.layout.rows,
@@ -1672,17 +1662,13 @@ pub fn Runtime(comptime App: type) type {
                 var admission = saved;
                 app.session_persistence.resume_view_admission = null;
                 defer admission.deinit(app.alloc);
-                const session_id = switch (resume_target) {
-                    .id => |id| id,
-                    .last => return error.SessionTargetChanged,
-                };
                 const store = app.session_persistence.store orelse
                     return error.SessionStoreUnavailable;
                 break :admitted try subagent_resume_admission.resumeAdmittedForExternalPrompt(
                     store,
                     app.alloc,
                     &admission,
-                    session_id,
+                    resume_target,
                     app.workspace_root,
                     .{ .seed_preferences = app.session_persistence.workspace_preferences },
                 );
@@ -4477,11 +4463,12 @@ pub fn Runtime(comptime App: type) type {
                     .{ loaded.active_id, @errorName(err) },
                 );
             };
+            const pristine = session_store.isPristineStartedSession(loaded);
             const should_create_handoff = resume_boundary_valid and
                 shouldCreateResumeHandoff(.{
                     .intent = handoff_intent,
                     .has_writable_session = true,
-                    .is_pristine = session_store.isPristineStartedSession(loaded),
+                    .is_pristine = pristine,
                     .has_unresolved_degraded_tail = loaded.degradedTail() != null,
                 });
             const handoff: ?ResumeHandoff = if (should_create_handoff) blk: {
@@ -4510,6 +4497,13 @@ pub fn Runtime(comptime App: type) type {
                 app.session.clearWebFetchArtifacts();
             }
             disableSubagentHost(app);
+            if (pristine) {
+                if (app.session_persistence.store) |store| {
+                    _ = store.discardPristineStartedSession(app.alloc, loaded);
+                    app.session_persistence.writable = null;
+                    return handoff;
+                }
+            }
             loaded.deinit(app.alloc);
             app.session_persistence.writable = null;
             return handoff;
@@ -7357,7 +7351,7 @@ test "execution replay keeps failed and unpaired persisted results visible witho
     );
 }
 
-test "safe last resume view paints and pins authoritative resume to its session id" {
+test "safe last resume view paints and retains authoritative last admission" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7402,8 +7396,8 @@ test "safe last resume view paints and pins authoritative resume to its session 
 
     try std.testing.expectEqualStrings("cached transcript\n", app.shell.transcript.items);
     switch (app.requested_resume.?) {
-        .id => |session_id| try std.testing.expectEqualStrings("cached-session", session_id),
-        .pick, .last => return error.TestExpectedPinnedResumeSession,
+        .last => {},
+        .pick, .id => return error.TestExpectedPinnedResumeSession,
     }
     try std.testing.expectError(
         error.SessionBusy,
@@ -9162,6 +9156,14 @@ test "session picker owns non-current session summaries" {
         &history,
         0,
     );
+    const eventful_id = "eventful-zero-history";
+    try writeSessionFixture(
+        alloc,
+        app.session_persistence.store.?,
+        eventful_id,
+        &.{},
+        0,
+    );
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     const active_id = app.session_persistence.writable.?.active_id;
 
@@ -9171,11 +9173,16 @@ test "session picker owns non-current session summaries" {
 
     const picker = &app.session_persistence.session_picker;
     try std.testing.expect(picker.active);
-    try std.testing.expectEqual(@as(usize, 1), picker.summaries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), picker.summaries.items.len);
     try std.testing.expectEqualStrings(prior_id, picker.selectedId().?);
     try std.testing.expect(!std.mem.eql(u8, picker.selectedId().?, active_id));
     try std.testing.expectEqualStrings("saved prompt", picker.summaries.items[0].title.?);
     try std.testing.expectEqualStrings(paths.workspace, picker.summaries.items[0].workspace_root.?);
+    var found_eventful = false;
+    for (picker.summaries.items) |summary| {
+        if (std.mem.eql(u8, summary.id, eventful_id)) found_eventful = true;
+    }
+    try std.testing.expect(found_eventful);
 
     Runtime(TestApp).cancelSessionPicker(&app);
     try std.testing.expect(!picker.active);
@@ -9424,25 +9431,6 @@ test "session picker current mode filters workspace and all mode includes every 
     }
     try std.testing.expect(found_workspace_a);
     try std.testing.expect(found_workspace_b);
-}
-
-test "session picker excludes empty sessions and reports loading" {
-    const alloc = std.testing.allocator;
-    var picker: SessionPicker = .{ .active = true, .load_state = .loading };
-    defer picker.deinit(alloc);
-
-    try std.testing.expect(picker.isLoading());
-    var empty_summary = session_store.SessionSummary{
-        .id = try alloc.dupe(u8, "empty-session"),
-        .created_at_ms = 0,
-        .updated_at_ms = 0,
-        .conversation_language = session_runtime.ConversationLanguage.literal("en"),
-        .history_len = 0,
-    };
-    defer empty_summary.deinit(alloc);
-    try picker.appendSummary(alloc, &empty_summary);
-
-    try std.testing.expectEqual(@as(usize, 0), picker.summaries.items.len);
 }
 
 test "session picker navigation clamps at both ends instead of wrapping" {

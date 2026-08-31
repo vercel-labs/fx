@@ -50,12 +50,6 @@ const DiscoveryOutcome = enum {
     skipped,
 };
 
-pub const DiscoveryCandidateMetadata = struct {
-    id: []const u8,
-    storage: CandidateStorage,
-    projection_state: ProjectionState,
-};
-
 pub const ReadOnlyCandidate = struct {
     summary: SessionSummary,
     storage: CandidateStorage,
@@ -71,8 +65,29 @@ pub const WritableCandidate = struct {
     id: []u8,
     workspace_root: []u8,
     updated_at_ms: i64,
+    history_len: usize,
+    is_resume_candidate: bool,
     storage: CandidateStorage,
     projection_state: ProjectionState,
+
+    pub fn isResumable(self: WritableCandidate) bool {
+        return self.history_len != 0 or self.is_resume_candidate;
+    }
+
+    pub fn resumeRank(
+        self: WritableCandidate,
+        preferred_id: ?[]const u8,
+    ) ResumeCandidateRank {
+        return .{
+            .id = self.id,
+            .updated_at_ms = self.updated_at_ms,
+            .resumable = self.isResumable(),
+            .preferred_pointer = if (preferred_id) |id|
+                std.mem.eql(u8, self.id, id)
+            else
+                false,
+        };
+    }
 
     pub fn deinit(self: *WritableCandidate, alloc: Allocator) void {
         alloc.free(self.id);
@@ -91,6 +106,10 @@ const LegacyCandidateSummary = struct {
     schema_version: session_json.LegacySchemaVersion = .v1,
 
     fn intoSessionSummary(self: *LegacyCandidateSummary) SessionSummary {
+        // Legacy snapshots cannot distinguish a pristine start from a
+        // zero-history session with durable activity. Preserve zero-history
+        // legacy sessions conservatively; schema-v3 projections can prove the
+        // pristine case from their event sequence.
         const summary = SessionSummary{
             .id = self.id,
             .workspace_root = self.workspace_root,
@@ -98,6 +117,7 @@ const LegacyCandidateSummary = struct {
             .updated_at_ms = self.updated_at_ms,
             .conversation_language = self.conversation_language,
             .history_len = self.history_len,
+            .has_durable_activity = self.history_len == 0,
         };
         self.id = undefined;
         self.workspace_root = null;
@@ -110,6 +130,22 @@ const LegacyCandidateSummary = struct {
         self.* = undefined;
     }
 };
+
+test "legacy zero-history summaries remain conservatively resumable" {
+    const alloc = std.testing.allocator;
+    var legacy = LegacyCandidateSummary{
+        .id = try alloc.dupe(u8, "legacy-zero-history"),
+        .workspace_root = try alloc.dupe(u8, "/tmp/workspace"),
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .history_len = 0,
+    };
+    var summary = legacy.intoSessionSummary();
+    defer summary.deinit(alloc);
+
+    try std.testing.expect(summary.has_durable_activity);
+}
 
 /// Frees every diagnostic in the list and the list itself. Call once on the
 /// slice returned by `Store.inspectForDoctor`.
@@ -602,6 +638,7 @@ pub fn classifySchemaV3Candidate(
             .updated_at_ms = manifest.updated_at_ms,
             .conversation_language = manifest.conversation_language,
             .history_len = history_len,
+            .has_durable_activity = manifest.last_event_seq > 1,
         },
         .storage = .schema_v3,
         .projection_state = projection_state,
@@ -682,6 +719,8 @@ pub fn dupeWritableCandidate(
     id_source: []const u8,
     workspace_source: []const u8,
     updated_at_ms: i64,
+    history_len: usize,
+    is_resume_candidate: bool,
     storage: CandidateStorage,
     projection_state: ProjectionState,
 ) !WritableCandidate {
@@ -692,6 +731,8 @@ pub fn dupeWritableCandidate(
         .id = id,
         .workspace_root = workspace_root,
         .updated_at_ms = updated_at_ms,
+        .history_len = history_len,
+        .is_resume_candidate = is_resume_candidate,
         .storage = storage,
         .projection_state = projection_state,
     };
@@ -716,14 +757,31 @@ pub fn storageFormatForLegacy(
     };
 }
 
-/// Orders writable candidates: newer `updated_at_ms` wins, ties broken by
-/// descending id. Used to select the most recent writable session.
-pub fn writableCandidateNewer(
-    candidate: WritableCandidate,
-    current: WritableCandidate,
+pub const ResumeCandidateRank = struct {
+    id: []const u8,
+    updated_at_ms: i64,
+    resumable: bool,
+    preferred_pointer: bool,
+};
+
+/// Orders `last` candidates. Resumable sessions outrank pristine sessions;
+/// recency wins within that class, with the latest pointer breaking ties. The
+/// pointer remains authoritative when every candidate is pristine.
+pub fn resumeCandidateOutranks(
+    candidate: ResumeCandidateRank,
+    current: ResumeCandidateRank,
 ) bool {
+    if (candidate.resumable != current.resumable) return candidate.resumable;
+    if (!candidate.resumable and
+        candidate.preferred_pointer != current.preferred_pointer)
+    {
+        return candidate.preferred_pointer;
+    }
     if (candidate.updated_at_ms != current.updated_at_ms) {
         return candidate.updated_at_ms > current.updated_at_ms;
+    }
+    if (candidate.preferred_pointer != current.preferred_pointer) {
+        return candidate.preferred_pointer;
     }
     return std.mem.order(u8, candidate.id, current.id) == .gt;
 }

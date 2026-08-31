@@ -289,6 +289,7 @@ pub const LatestCache = struct {
         }
         if (self.prior_index) |*index| {
             var summary = try summaryFromState(alloc, state);
+            summary.has_durable_activity = position.through_seq > 1;
             var summary_owned = true;
             errdefer if (summary_owned) summary.deinit(alloc);
             try summary_codec.preserveIndexedDisplayMetadata(alloc, index.items, &summary);
