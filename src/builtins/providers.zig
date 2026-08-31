@@ -8,6 +8,8 @@ const xai_grok_models = @import("../gateway/xai_grok_models.zig");
 const xai_grok_permission_reviewer = @import("../gateway/xai_grok_permission_reviewer.zig");
 const anthropic = @import("../gateway/anthropic.zig");
 const anthropic_models = @import("../gateway/anthropic_models.zig");
+const openai_compatible = @import("../gateway/openai_compatible.zig");
+const openai_compatible_models = @import("../gateway/openai_compatible_models.zig");
 const provider_catalog = @import("../core/auth/provider_catalog.zig");
 
 pub const native = provider_set.Set{
@@ -34,8 +36,10 @@ pub const native = provider_set.Set{
         .cli_model_catalog = anthropic_models.cli_model_catalog_provider,
         .model_catalog = anthropic_models.model_catalog_provider,
     },
-    // TODO: wire the openai-compatible transport in the gateway/runtime commits.
     .openai_compatible = .{
         .presentation = provider_catalog.find(.openai_compatible),
+        .agent_stream = openai_compatible.agent_stream_provider,
+        .cli_model_catalog = openai_compatible_models.cli_model_catalog_provider,
+        .model_catalog = openai_compatible_models.model_catalog_provider,
     },
 };
