@@ -3932,6 +3932,75 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 20_000);
 
+  test("backgrounded ask preserves SIGINT cancellation as exit 130", async () => {
+    const root = createFixtureRoot("background-sigint");
+    const tracePath = join(root.root, "trace.log");
+    const pidPath = join(root.root, "fx.pid");
+    const gateway = startGateway(delayedSuccessfulResponse);
+    const shell = Bun.spawn([
+      "/bin/bash",
+      "-c",
+      [
+        '"$1" ask --quiet --json --auto --no-save "Wait for the provider fixture." &',
+        "fx_pid=$!",
+        'printf "%s" "$fx_pid" > "$2"',
+        'wait "$fx_pid"',
+      ].join("\n"),
+      "fxc-170-background",
+      FX_BIN,
+      pidPath,
+    ], {
+      cwd: root.workspace,
+      env: {
+        ...process.env,
+        ...fixtureEnv(root, gateway, tracePath),
+        FX_AUTO_UPGRADE: "0",
+        FX_TRACE_SCOPES: "agent,gateway,stream,interrupt",
+      },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    let fxPid: number | null = null;
+    try {
+      const startDeadline = Date.now() + 10_000;
+      while (!existsSync(pidPath) || gateway.requestCount() === 0) {
+        if (Date.now() >= startDeadline) {
+          throw new Error("backgrounded ask did not reach the Gateway request");
+        }
+        await Bun.sleep(10);
+      }
+      fxPid = Number(readFileSync(pidPath, "utf8"));
+      expect(Number.isSafeInteger(fxPid) && fxPid > 0).toBe(true);
+      expect(isProcessAlive(fxPid)).toBe(true);
+
+      process.kill(fxPid, "SIGINT");
+      const exitCode = await shell.exited;
+      const stdout = await new Response(shell.stdout).text();
+      const stderr = await new Response(shell.stderr).text();
+
+      expect(exitCode).toBe(130);
+      expect(shell.signalCode).toBeNull();
+      expect(stdout).toBe("");
+      expect(stderr).not.toContain("panic:");
+      expect(isProcessAlive(fxPid)).toBe(false);
+
+      const trace = readFileSync(tracePath, "utf8");
+      expect(occurrenceCount(trace, "event=cancel_observed")).toBe(1);
+      expect(occurrenceCount(trace, "event=finish_event_emitted")).toBe(1);
+      expect(trace).toContain("outcome_kind=interrupted");
+    } finally {
+      shell.kill("SIGKILL");
+      if (fxPid !== null && isProcessAlive(fxPid)) {
+        try {
+          process.kill(fxPid, "SIGKILL");
+        } catch {}
+      }
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
   test("saved SIGINT retains cancelled terminal output for resume without re-execution", async () => {
     const root = createFixtureRoot("saved-cancelled-terminal-replay");
     const firstTracePath = join(root.root, "first-trace.log");

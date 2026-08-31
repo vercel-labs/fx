@@ -150,6 +150,13 @@ pub const RunResult = union(enum) {
     handled_exit: u8,
 };
 
+fn ask_run_result(exit_code: u8) RunResult {
+    return if (exit_code == 0)
+        .handled_success
+    else
+        .{ .handled_exit = exit_code };
+}
+
 pub const record_modifier_usage = "usage: fx --record is only supported for interactive startup\n";
 const version_usage = "usage: fx --version\n";
 
@@ -892,7 +899,7 @@ fn runNonInteractiveWithDeps(
         .ask => |rest| {
             try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
             const exit_code = try cli_ask.run(alloc, rest, workflowConfigWithLaunchModifiers(cfg, global_args.modifiers), cfg.context_registry, cfg.tool_set);
-            return if (exit_code == 0) .handled_success else .handled_failure;
+            return ask_run_result(exit_code);
         },
         .acp => |rest| {
             const acp_opts = parseAcpArgs(rest) catch {
@@ -2965,6 +2972,12 @@ fn cloneBackgroundRecord(alloc: Allocator, record: background_store.Record) !bac
         .state = record.state,
         .diagnostic = diagnostic,
     };
+}
+
+test "ask run results preserve detailed exit codes" {
+    try std.testing.expectEqual(RunResult.handled_success, ask_run_result(0));
+    try std.testing.expectEqual(RunResult{ .handled_exit = 1 }, ask_run_result(1));
+    try std.testing.expectEqual(RunResult{ .handled_exit = 130 }, ask_run_result(130));
 }
 
 test "direct background ranking uses updated time source session and stable id" {
