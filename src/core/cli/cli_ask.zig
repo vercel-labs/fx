@@ -2,6 +2,7 @@ const std = @import("std");
 const std_builtin = @import("builtin");
 const command_admission = @import("../permissions/command_admission.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
+const x9_editor = @import("../agent/x9_editor.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
@@ -255,8 +256,9 @@ fn runAskChild(
     cancel: *std.atomic.Value(bool),
 ) subagent_execution.ServiceError!subagent_execution.RunOutcome {
     const ctx: *AskContext = @ptrCast(@alignCast(raw.?));
-    var child_projection = ctx.cfg.mode_registry.buildModelToolProjection(
+    var child_projection = buildAskGatewayToolProjection(
         ctx.alloc,
+        ctx.cfg.mode_registry,
         ctx.deps.tool_set,
         ctx.mode_id,
         .{
@@ -264,7 +266,9 @@ fn runAskChild(
             .permission_rules = admission.rules,
             .mcp_runtime = ctx.mcp,
             .subagent_available = true,
+            .additional_visible_tool_names = ctx.x9_editor_arms.additionalVisibleToolNames(),
         },
+        true,
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
     return subagent_agent_adapter.run(.{
@@ -591,6 +595,7 @@ const AskContext = struct {
     image_snapshot_temp_dir: ?[]u8 = null,
     prompt_snapshot_committed: bool = false,
     last_recovery_status: ?types.RouteRecoveryStatus = null,
+    x9_editor_arms: x9_editor.Arms = .{},
 
     fn init(alloc: Allocator, cfg: Config, deps: RunDeps, workspace_root: []const u8) AskContext {
         const lifecycle_runtime = hooks.Runtime.init(alloc);
@@ -1473,6 +1478,12 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer if (owned_resumed_model) |model| alloc.free(model);
     var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
     defer ctx.deinit();
+    ctx.x9_editor_arms = try x9_editor.currentArms();
+    debug_trace.logf(
+        "quality",
+        "event=x9_editor editor={s}",
+        .{@tagName(ctx.x9_editor_arms.editor)},
+    );
     if (options.save_session) {
         _ = try ctx.session.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
         ctx.session.attachProfileUsagePublisher(alloc);
@@ -1696,6 +1707,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .permission_rules = ctx.permission_rules,
         .mcp_runtime = ctx.mcp,
         .subagent_available = ctx.subagent_host != null,
+        .additional_visible_tool_names = ctx.x9_editor_arms.additionalVisibleToolNames(),
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
 

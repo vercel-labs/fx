@@ -2363,6 +2363,9 @@ fn permissionTargetsForCall(input: Input, arena: Allocator, call: ToolCall) !per
         };
         return .{ .items = items };
     }
+    if (tool.permission_targets_fn) |resolve| {
+        return resolve(arena, input.workspace_root, call.arguments_json);
+    }
     return permissions.permissionTargetsForCallInScope(
         arena,
         accessScope(input),
@@ -2402,6 +2405,12 @@ pub fn permissionTargetForCall(input: Input, arena: Allocator, call: ToolCall) !
     const tool = registeredTool(input, call.name) orelse return error.UnsupportedTool;
     if (try isRunCommandCall(input, arena, call)) {
         return commandPermissionTarget(input, arena, call);
+    }
+    if (tool.permission_targets_fn != null) {
+        var targets = try permissionTargetsForCall(input, arena, call);
+        defer targets.deinit(arena);
+        if (targets.items.len == 0) return error.InvalidToolArguments;
+        return arena.dupe(u8, targets.items[0].path);
     }
     return permissions.permissionTargetForCallInScope(
         arena,
@@ -3513,7 +3522,76 @@ const test_admission_registry = tool_dispatch.Registry{ .tools = &.{
     test_builtin_tools.terminal,
     test_builtin_tools.write_file,
     test_builtin_tools.edit_file,
+    test_builtin_tools.apply_patch,
 } };
+
+test "apply_patch permission admission denies every affected path atomically" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    for ([_][]const u8{ "update.txt", "move.txt", "delete.txt" }) |name| {
+        const path = try std.fmt.allocPrint(alloc, "workspace/{s}", .{name});
+        defer alloc.free(path);
+        try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = path, .data = "old\n" });
+    }
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var background: BackgroundRuntime = .{};
+    defer background.deinit(alloc);
+    var input = testInputWithClassifier(
+        &worker,
+        &background,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.workspace_root = workspace;
+
+    const call: ToolCall = .{
+        .id = "multi-path-patch",
+        .name = "apply_patch",
+        .arguments_json =
+        \\{"patch":"*** Begin Patch\n*** Update File: update.txt\n@@\n-old\n+new\n*** Update File: move.txt\n*** Move to: moved.txt\n@@\n-old\n+moved\n*** Add File: added.txt\n+added\n*** Delete File: delete.txt\n*** End Patch"}
+        ,
+    };
+    var rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("edit"), .pattern = @constCast("**"), .action = .allow },
+        .{ .permission = @constCast("edit"), .pattern = undefined, .action = .deny },
+    };
+    for ([_][]const u8{
+        "update.txt",
+        "move.txt",
+        "moved.txt",
+        "added.txt",
+        "delete.txt",
+    }) |denied_path| {
+        rules[1].pattern = @constCast(denied_path);
+        input.permission_rules = .{ .rules = &rules };
+        const outcome = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+        try std.testing.expectEqual(ToolPermissionDecision.policy_denied, outcome.decision);
+        try std.testing.expect(outcome.execution_authority == null);
+    }
+
+    for ([_][]const u8{ "update.txt", "move.txt", "delete.txt" }) |name| {
+        var file = try tmp.dir.openFile(io_mod.getIo(), try std.fmt.allocPrint(arena, "workspace/{s}", .{name}), .{});
+        defer file.close(io_mod.getIo());
+        const content = try io_mod.readFileToEnd(arena, &file, 16);
+        try std.testing.expectEqualStrings("old\n", content);
+    }
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.openFile(io_mod.getIo(), "workspace/added.txt", .{}),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.openFile(io_mod.getIo(), "workspace/moved.txt", .{}),
+    );
+}
 
 fn testInputWithClassifier(
     worker: *WorkerRuntime,

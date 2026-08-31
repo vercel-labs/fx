@@ -348,12 +348,15 @@ fn prepareRegisteredApplicableTargets(
         ) };
     }
 
-    var permission_targets = permissions.permissionTargetsForCallInScope(
-        alloc,
-        access_scope orelse workspace_access.AccessScope.primaryOnly(workspace_root),
-        call,
-        tool.permission_target_kind,
-    ) catch |err| {
+    var permission_targets = (if (tool.permission_targets_fn) |resolve|
+        resolve(alloc, workspace_root, call.arguments_json)
+    else
+        permissions.permissionTargetsForCallInScope(
+            alloc,
+            access_scope orelse workspace_access.AccessScope.primaryOnly(workspace_root),
+            call,
+            tool.permission_target_kind,
+        )) catch |err| {
         return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => .legacy_candidate,
@@ -475,7 +478,7 @@ fn applicableTargetsFromPermissionTargets(
 fn filesystemTargetKind(kind: tool_dispatch.ExecutorKind) ?context_contract.TargetKind {
     return switch (kind) {
         .glob_files, .grep_files => .directory,
-        .read_file => .file,
+        .read_file, .apply_patch => .file,
         else => null,
     };
 }
@@ -732,6 +735,7 @@ test "registered candidates expose only authoritative canonical targets" {
         builtin_tools.read_file,
         builtin_tools.write_file,
         builtin_tools.edit_file,
+        builtin_tools.apply_patch,
         builtin_tools.terminal,
     };
     const registry = tool_dispatch.Registry{ .tools = &tools };
@@ -818,6 +822,19 @@ test "registered candidates expose only authoritative canonical targets" {
     const unchanged = try io_mod.readFileToEnd(alloc, &unchanged_file, 1024);
     defer alloc.free(unchanged);
     try std.testing.expectEqualStrings("old contents", unchanged);
+
+    var patch = try prepareReadyCall(alloc, .{
+        .id = "patch",
+        .name = "apply_patch",
+        .arguments_json =
+        \\{"patch":"*** Begin Patch\n*** Update File: build/pkg/existing.txt\n@@\n-old contents\n+new contents\n*** Add File: build/pkg/new.txt\n+new contents\n*** End Patch"}
+        ,
+    }, .{ .tool_registry = registry, .workspace_root = workspace, .classifiers = test_classifiers });
+    defer patch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), patch.candidate.applicable_targets.len);
+    try std.testing.expectEqual(context_contract.TargetKind.file, patch.candidate.applicable_targets[0].kind);
+    try std.testing.expectEqualStrings(existing_path, patch.candidate.applicable_targets[0].path);
+    try std.testing.expectEqualStrings(new_path, patch.candidate.applicable_targets[1].path);
 }
 
 test "ordinary applicable target freshness detects retarget and resolution failure" {

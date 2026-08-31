@@ -88,6 +88,8 @@ pub const PermissionTargetKind = enum {
     path_optional_existing,
     path_create_parent,
     path_existing_parent,
+    /// The tool resolves one or more exact canonical filesystem targets.
+    path_set,
     command_cwd,
     url,
 };
@@ -210,6 +212,7 @@ pub fn permissionTargetForCall(
             const path_arg = try tool_args.requiredStringArg(args, "path");
             break :blk try resolveFileToolPath(arena, workspace_root, call.name, path_arg, .existing);
         },
+        .path_set => error.CustomPermissionTargetsRequired,
         .none => try arena.dupe(u8, call.name),
     };
 }
@@ -1089,19 +1092,26 @@ test "allowsExternalPath preserves the exact eligible tool set" {
         try std.testing.expectEqualStrings(expected_name, actual_name);
         try std.testing.expect(allowsExternalPath(expected_name));
     }
+    try std.testing.expect(!allowsExternalPath("apply_patch"));
     try std.testing.expect(!allowsExternalPath("run_command"));
     try std.testing.expect(!allowsExternalPath("missing_tool"));
 }
 
+test "apply_patch uses edit permission while remaining a filesystem mutation" {
+    try std.testing.expectEqualStrings("edit", permissionNameForTool("apply_patch"));
+    try std.testing.expect(isFilesystemMutationTool("apply_patch"));
+}
+
 pub fn isFilesystemMutationTool(tool_name: []const u8) bool {
     return std.mem.eql(u8, tool_name, "write_file") or
-        std.mem.eql(u8, tool_name, "edit_file");
+        std.mem.eql(u8, tool_name, "edit_file") or
+        std.mem.eql(u8, tool_name, "apply_patch");
 }
 
 pub fn displayTargetForPolicy(alloc: std.mem.Allocator, workspace_root: []const u8, target_path: []const u8, target_kind: PermissionTargetKind) ![]u8 {
     return switch (target_kind) {
         .command_cwd => displayCommandTarget(alloc, workspace_root, target_path),
-        .path_existing, .path_optional_existing, .path_create_parent, .path_existing_parent => displayPathTarget(alloc, workspace_root, target_path),
+        .path_existing, .path_optional_existing, .path_create_parent, .path_existing_parent, .path_set => displayPathTarget(alloc, workspace_root, target_path),
         else => alloc.dupe(u8, target_path),
     };
 }
@@ -1411,7 +1421,9 @@ pub fn formatPermissionsStatus(
 
 pub fn permissionNameForTool(tool_name: []const u8) []const u8 {
     if (std.mem.eql(u8, tool_name, "read_file")) return "read";
-    if (std.mem.eql(u8, tool_name, "write_file") or std.mem.eql(u8, tool_name, "edit_file")) return "edit";
+    if (std.mem.eql(u8, tool_name, "write_file") or
+        std.mem.eql(u8, tool_name, "edit_file") or
+        std.mem.eql(u8, tool_name, "apply_patch")) return "edit";
     if (std.mem.eql(u8, tool_name, "glob_files")) return "glob";
     if (std.mem.eql(u8, tool_name, "grep_files")) return "grep";
     if (std.mem.eql(u8, tool_name, "run_command")) return "bash";
@@ -1489,7 +1501,7 @@ pub fn patternForSessionGrantMatch(tool_name: []const u8, target_path: []const u
 
 fn isPathBasedTool(target_kind: PermissionTargetKind) bool {
     return switch (target_kind) {
-        .path_existing, .path_optional_existing, .path_create_parent, .path_existing_parent => true,
+        .path_existing, .path_optional_existing, .path_create_parent, .path_existing_parent, .path_set => true,
         else => false,
     };
 }

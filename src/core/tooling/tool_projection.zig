@@ -13,6 +13,7 @@ pub const Options = struct {
     permission_rules: types.PermissionRuleSet = .{},
     mcp_runtime: ?*mcp_runtime.McpRuntime = null,
     subagent_available: bool = false,
+    additional_visible_tool_names: ?[]const []const u8 = null,
 };
 
 const BuildKind = enum { full, read_only };
@@ -155,6 +156,29 @@ const test_edit_file = blk: {
     spec.label_arg_kind = .path;
     spec.label_arg_default = "file";
     spec.permission_target_kind = .path_existing_parent;
+    break :blk spec;
+};
+
+const test_apply_patch = blk: {
+    var spec = test_edit_file;
+    spec.name = "apply_patch";
+    spec.description = "Test transactional patching. When to use: exercise hidden-tool promotion. When NOT to use: assert product-specific patch behavior.";
+    spec.model_schema = .{
+        .name = "apply_patch",
+        .description = spec.description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "patch", .json_type = .string },
+            },
+            .required = &.{"patch"},
+        },
+    };
+    spec.model_visible = false;
+    spec.executor_kind = .apply_patch;
+    spec.action_label = "Applying patch";
+    spec.completed_action_label = "Applied patch";
+    spec.label_arg_kind = .none;
+    spec.permission_target_kind = .none;
     break :blk spec;
 };
 
@@ -533,6 +557,7 @@ const test_all_tools = [_]tool_dispatch.Tool{
     test_read_file,
     test_write_file,
     test_edit_file,
+    test_apply_patch,
     test_memory,
     test_web_fetch,
     test_web_search,
@@ -552,6 +577,7 @@ const test_order = [_][]const u8{
     "glob_files",
     "grep_files",
     "edit_file",
+    "apply_patch",
     "write_file",
     "terminal",
     "subagent",
@@ -693,7 +719,13 @@ fn appendBuiltinTool(
     tool_set: tool_set_contract.ToolSet,
     options: Options,
 ) !void {
-    if (!tool.model_visible) return;
+    if (!tool.model_visible) {
+        const promoted = if (options.additional_visible_tool_names) |names|
+            toolNameInSet(names, tool.name)
+        else
+            false;
+        if (!promoted) return;
+    }
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
@@ -889,6 +921,21 @@ test "yolo advertisement ignores permission filtering" {
     try expectContainsName(projection.advertised_names, "terminal");
     try expectContainsName(projection.advertised_names, "write_file");
     try expectContainsName(projection.advertised_names, "web_search");
+}
+
+test "experiment options promote apply_patch alongside edit_file" {
+    var control = try buildTestModelToolProjection(std.testing.allocator, .{});
+    defer control.deinit(std.testing.allocator);
+    try expectNotContainsName(control.advertised_names, "apply_patch");
+    try expectContainsName(control.advertised_names, "edit_file");
+
+    const promoted = [_][]const u8{"apply_patch"};
+    var patch_v3 = try buildTestModelToolProjection(std.testing.allocator, .{
+        .additional_visible_tool_names = &promoted,
+    });
+    defer patch_v3.deinit(std.testing.allocator);
+    try expectContainsName(patch_v3.advertised_names, "apply_patch");
+    try expectContainsName(patch_v3.advertised_names, "edit_file");
 }
 
 test "category-wide denies and later overrides select the expected tools" {

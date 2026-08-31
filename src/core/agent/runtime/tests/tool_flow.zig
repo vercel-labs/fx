@@ -2597,6 +2597,81 @@ test "same-batch file mutation retarget stops before permission and execution" {
     );
 }
 
+test "same-batch mutation failure defers later mutations until the model observes it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "workspace/b.txt", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "before\n");
+    }
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    const calls = [_]ToolCall{
+        toolCall(
+            "failed_patch",
+            "apply_patch",
+            "{\"patch\":\"*** Begin Patch\\n*** Add File: a.txt\\n+new\\n*** End Patch\"}",
+        ),
+        toolCall(
+            "fallback_edit",
+            "edit_file",
+            "{\"path\":\"b.txt\",\"old_string\":\"before\",\"new_string\":\"after\"}",
+        ),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Final" },
+    };
+    const tools = [_]tool_dispatch.Tool{
+        builtin_tools.apply_patch,
+        builtin_tools.edit_file,
+    };
+    const advertised_names = [_][]const u8{ "apply_patch", "edit_file" };
+    const advertised_functions = [_]model_tool_schema.FunctionSchema{
+        builtin_tools.apply_patch.model_schema,
+        builtin_tools.edit_file.model_schema,
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.tool_registry = .{ .tools = &tools };
+    hooks.exec_plans = &.{.{ .result = .{
+        .status = .failure,
+        .model_output = "PATCH_CONTEXT_MISSING hunk=1: re-read before another mutation; file=a.txt",
+    } }};
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var config = fixture.config();
+    config.advertised_tool_names = &advertised_names;
+    config.advertised_functions = &advertised_functions;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("apply_patch", hooks.executed_names.items[0]);
+    const execution = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 2), execution.tool_steps[0].tool_results.len);
+    try std.testing.expectEqualStrings(
+        "PATCH_CONTEXT_MISSING hunk=1: re-read before another mutation; file=a.txt",
+        execution.tool_steps[0].tool_results[0].output,
+    );
+    try std.testing.expectEqualStrings(
+        "Not executed: a prior mutation in this batch failed; inspect current files before retrying",
+        execution.tool_steps[0].tool_results[1].output,
+    );
+
+    var file = try tmp.dir.openFile(std.testing.io, "workspace/b.txt", .{});
+    defer file.close(std.testing.io);
+    const content = try io_mod.readFileToEnd(alloc, &file, 64);
+    defer alloc.free(content);
+    try std.testing.expectEqualStrings("before\n", content);
+}
+
 test "same-batch missing target defers newly resolvable scope until reissue" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
