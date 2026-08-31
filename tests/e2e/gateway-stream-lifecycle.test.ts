@@ -4192,19 +4192,55 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
   );
 
   test.skipIf(!tmuxAvailable())(
-    "manual context compaction survives restart without changing canonical history",
+    "manual compaction preserves canonical history for session-history recovery after restart",
     async () => {
       const root = createFixtureRoot("manual-compaction-restart");
       const tracePath = join(root.root, "trace.log");
       const stderrPath = join(root.root, "stderr.log");
-      const responses = [
-        fakeGatewayFinalText("FIRST_REPLY_COMPACTION_SENTINEL"),
-        fakeGatewayFinalText("SECOND_REPLY_COMPACTION_SENTINEL"),
-        fakeGatewayFinalText("compaction restart complete"),
-      ];
-      const gateway = startGateway(() =>
-        responses.shift() ?? new Response("unexpected request", { status: 500 })
-      );
+      const searchCallId = "compaction_history_search";
+      const readCallId = "compaction_history_read";
+      let requestIndex = 0;
+      const gateway = startDynamicFakeGateway((body) => {
+        switch (requestIndex++) {
+          case 0:
+            return fakeGatewayFinalText("FIRST_REPLY_COMPACTION_SENTINEL");
+          case 1:
+            return fakeGatewayFinalText("SECOND_REPLY_COMPACTION_SENTINEL");
+          case 2:
+            expect(body).toContain('"name":"session_history_search"');
+            expect(body).toContain('"name":"session_history_read"');
+            return fakeGatewayToolCall(searchCallId, "session_history_search", {
+              query: "FIRST_PROMPT_COMPACTION_SENTINEL",
+              limit: 4,
+            });
+          case 3: {
+            const output = JSON.parse(toolResultOutput(body, searchCallId));
+            expect(output.kind).toBe("session_history_search");
+            expect(output.workspace_scope).toBe("same_project");
+            expect(output.hits.length).toBeGreaterThanOrEqual(1);
+            expect(output.hits[0].session_relation).toBe("current");
+            expect(output.hits[0].excerpt).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
+            return fakeGatewayToolCall(readCallId, "session_history_read", {
+              reference: output.hits[0].reference,
+            });
+          }
+          case 4: {
+            const output = JSON.parse(toolResultOutput(body, readCallId));
+            expect(output.kind).toBe("session_history_record");
+            expect(output.workspace_scope).toBe("same_project");
+            expect(output.session_relation).toBe("current");
+            expect(output.content_authority).toBe("untrusted_historical_context");
+            expect(output.conversation.user).toBe("FIRST_PROMPT_COMPACTION_SENTINEL");
+            expect(output.conversation.assistant).toBe("FIRST_REPLY_COMPACTION_SENTINEL");
+            return fakeGatewayFinalText("compaction restart complete");
+          }
+          default:
+            return new Response("unexpected request", { status: 500 });
+        }
+      }, {
+        classifierDecision: "clear",
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
       let tui: TmuxSession | null = null;
       try {
         tui = await TmuxSession.create({
@@ -4272,8 +4308,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           },
         );
         expect(resumed.code).toBe(0);
-        expect(resumed.stderr).toBe("");
-        expect(gateway.requests).toHaveLength(3);
+        expect(resumed.stderr).toContain("Searching FIRST_PROMPT_COMPACTION_SENTINEL");
+        expect(resumed.stderr).toContain("Reading session history");
+        expect(resumed.stderr).not.toContain("failed:");
+        expect(resumed.stderr).not.toContain("panic");
+        expect(gateway.requests).toHaveLength(5);
 
         const request = JSON.parse(gateway.requests[2].body) as {
           prompt: Array<{ role: string; content: unknown }>;
@@ -4292,6 +4331,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(systemText).toContain("Conversation summary:");
         expect(systemText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
         expect(systemText).toContain("FIRST_REPLY_COMPACTION_SENTINEL");
+        expect(systemText).toContain(
+          "Earlier canonical turns may be absent from this prompt but remain available through session_history_search and session_history_read.",
+        );
         expect(readFileSync(stderrPath, "utf8")).toBe("");
 
         const afterResume = await runFx(

@@ -21,6 +21,8 @@ pub fn isReadOnlyCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
         .glob_files => tool.activity_kind == .list,
         .read_file,
         .read_tool_result,
+        .session_history_search,
+        .session_history_read,
         .grep_files,
         .skill,
         .web_fetch,

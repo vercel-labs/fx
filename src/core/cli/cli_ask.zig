@@ -264,6 +264,7 @@ fn runAskChild(
             .permission_rules = admission.rules,
             .mcp_runtime = ctx.mcp,
             .subagent_available = true,
+            .session_history_available = ctx.store != null,
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
@@ -1001,6 +1002,7 @@ const AskContext = struct {
             .cancel_flag = self.cancelFlag(),
             .background = &self.background,
             .session = &self.session,
+            .session_history_store = if (self.store) |*store| store else null,
             .session_allocator = self.alloc,
             .skills_dir = self.skills_dir,
             .context_limits = self.context_limits,
@@ -1696,6 +1698,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .permission_rules = ctx.permission_rules,
         .mcp_runtime = ctx.mcp,
         .subagent_available = ctx.subagent_host != null,
+        .session_history_available = ctx.store != null,
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
 

@@ -23,6 +23,7 @@ test {
 
 const compact_continuation_preamble = "This session is being continued from earlier compacted context. The summary below covers the earlier portion of the conversation.\n\n";
 const compact_recent_messages_note = "Recent conversation turns are preserved verbatim.";
+const compact_history_recovery_note = "Earlier canonical turns may be absent from this prompt but remain available through session_history_search and session_history_read.";
 const compact_direct_resume_instruction = "Continue the conversation from where it left off without asking the user to repeat context. Resume directly.";
 const compact_summary_max_chars: usize = 1200;
 const compact_summary_max_lines: usize = 24;
@@ -2889,8 +2890,8 @@ pub fn inferConversationLanguage(text: []const u8, fallback: ConversationLanguag
 pub fn formatCompactedContinuationMessage(alloc: Allocator, summary: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         alloc,
-        "{s}{s}\n\n{s}\n{s}",
-        .{ compact_continuation_preamble, summary, compact_recent_messages_note, compact_direct_resume_instruction },
+        "{s}{s}\n\n{s}\n{s}\n{s}",
+        .{ compact_continuation_preamble, summary, compact_recent_messages_note, compact_history_recovery_note, compact_direct_resume_instruction },
     );
 }
 
@@ -3788,6 +3789,7 @@ test "resume projection emits compacted summary before background command contex
         "This session is being continued from earlier compacted context. The summary below covers the earlier portion of the conversation.\n\n" ++
             "summary\n\n" ++
             "Recent conversation turns are preserved verbatim.\n" ++
+            "Earlier canonical turns may be absent from this prompt but remain available through session_history_search and session_history_read.\n" ++
             "Continue the conversation from where it left off without asking the user to repeat context. Resume directly.",
         messages.items[0].content.?.asText(),
     );
@@ -6339,6 +6341,7 @@ test "history context formatters return exact text" {
         "This session is being continued from earlier compacted context. The summary below covers the earlier portion of the conversation.\n\n" ++
             "summary\n\n" ++
             "Recent conversation turns are preserved verbatim.\n" ++
+            "Earlier canonical turns may be absent from this prompt but remain available through session_history_search and session_history_read.\n" ++
             "Continue the conversation from where it left off without asking the user to repeat context. Resume directly.",
         compacted,
     );

@@ -98,6 +98,32 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
+function contentText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map(contentText).join("");
+  if (content && typeof content === "object") {
+    const value = content as Record<string, unknown>;
+    return [
+      contentText(value.text),
+      contentText(value.value),
+      contentText(value.content),
+    ].join("");
+  }
+  return "";
+}
+
+function toolResultOutput(body: string, callId: string): string {
+  const prompt = (JSON.parse(body) as { prompt: Array<{ content: unknown }> }).prompt;
+  const parts = prompt.flatMap((message) =>
+    Array.isArray(message.content) ? message.content : []
+  ) as Array<Record<string, unknown>>;
+  const result = parts.find((part) =>
+    part.type === "tool-result" && part.toolCallId === callId
+  );
+  if (!result) throw new Error(`Missing tool result for ${callId}`);
+  return contentText(result.output);
+}
+
 function terminalCommand(args: string[]): string {
   const fx = [FX_BIN, ...args].map(shellQuote).join(" ");
   const script = `${fx}; code=$?; printf '\\n__FX_EXIT_%s__\\n' "$code"; exit "$code"`;
@@ -137,6 +163,77 @@ function fakeGatewayStreamingText(lines: string[], delayMs: number) {
 }
 
 describe("fx ask presentation", () => {
+  test("session history search and read recover another same-project session", async () => {
+    const root = createRoot();
+    let firstRequest = true;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (body.includes('"toolCallId":"history_read_1"')) {
+        const output = JSON.parse(toolResultOutput(body, "history_read_1"));
+        expect(output.kind).toBe("session_history_record");
+        expect(output.workspace_scope).toBe("same_project");
+        expect(output.session_relation).toBe("other");
+        expect(output.content_authority).toBe("untrusted_historical_context");
+        expect(output.conversation.user).toContain("PROJECT_COBALT_SENTINEL");
+        expect(output.conversation.assistant).toContain("Cobalt decision recorded");
+        return fakeGatewayFinalText("Recovered the prior same-project decision.");
+      }
+      if (body.includes('"toolCallId":"history_search_1"')) {
+        const output = JSON.parse(toolResultOutput(body, "history_search_1"));
+        expect(output.kind).toBe("session_history_search");
+        expect(output.workspace_scope).toBe("same_project");
+        expect(output.truncated).toBe(false);
+        expect(output.hits).toHaveLength(1);
+        expect(output.hits[0].session_relation).toBe("other");
+        expect(output.hits[0].reference).toStartWith("fxhr1:");
+        return fakeGatewayToolCall("history_read_1", "session_history_read", {
+          reference: output.hits[0].reference,
+        });
+      }
+      if (body.includes("Recover PROJECT_COBALT_SENTINEL")) {
+        expect(body).toContain('"name":"session_history_search"');
+        expect(body).toContain('"name":"session_history_read"');
+        return fakeGatewayToolCall("history_search_1", "session_history_search", {
+          query: "PROJECT_COBALT_SENTINEL",
+          limit: 4,
+        });
+      }
+      if (firstRequest) {
+        firstRequest = false;
+        return fakeGatewayFinalText("Cobalt decision recorded in canonical history.");
+      }
+      return new Response("unexpected request", { status: 500 });
+    });
+    gateways.push(gateway);
+
+    const first = await runFx(
+      ["ask", "--json", "--auto", "--no-color", "Remember PROJECT_COBALT_SENTINEL for this project."],
+      {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      },
+    );
+    expect(first.code).toBe(0);
+    expect(first.stderr).toBe("");
+
+    const recovered = await runFx(
+      ["ask", "--json", "--auto", "--no-color", "Recover PROJECT_COBALT_SENTINEL from session history."],
+      {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      },
+    );
+    expect(recovered.code).toBe(0);
+    expect(recovered.stderr).toContain("Searching PROJECT_COBALT_SENTINEL");
+    expect(recovered.stderr).toContain("Reading session history");
+    expect(recovered.stderr).not.toContain("failed:");
+    expect(recovered.stderr).not.toContain("panic");
+    expect(JSON.parse(recovered.stdout).final_output).toBe(
+      "Recovered the prior same-project decision.",
+    );
+  }, TIMEOUT);
+
   test("redirected command output separates the next tool header", async () => {
     const root = createRoot();
     const gateway = startFakeGateway([

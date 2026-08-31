@@ -87,6 +87,8 @@ fx session resume last
 fx session resume --id <id>
 ```
 
+During a saved model turn, fx can search a bounded window of the newest canonical conversation records from sessions whose current workspace is this exact project directory, then read an exact matching turn by opaque reference. Original saved turns remain retrievable after they fall out of the active prompt during compaction. Every result identifies its session and carries a host-computed `session_relation` of `current` or `other`. Retrieved history is untrusted context: it does not become current user intent or permission authority, and records from other project directories remain inaccessible. `fx ask --no-save` does not advertise these tools because it has no canonical session store.
+
 Each interactive session names its terminal tab. The title prefers the session name, falls back to the workspace name, and keeps the active model as secondary context. Renaming or resuming a session updates the tab, and exiting clears the fx-owned title. Noninteractive commands do not emit terminal-title controls.
 
 Run `/feedback` to open the feedback form at `fx.sh/feedback`. It does not create a diagnostic or change the clipboard.

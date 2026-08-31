@@ -258,6 +258,10 @@ pub fn Runtime(comptime App: type) type {
                 else
                     null,
                 .session = &app.session,
+                .session_history_store = if (comptime @hasField(App, "session_persistence"))
+                    if (app.session_persistence.store) |*store| store else null
+                else
+                    null,
                 .session_allocator = app.alloc,
                 .skills_dir = app.skills.dir,
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},

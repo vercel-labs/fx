@@ -2,6 +2,8 @@ export const CANONICAL_BUILTIN_NAMES = [
   "read_file",
   "glob_files",
   "grep_files",
+  "session_history_search",
+  "session_history_read",
   "edit_file",
   "write_file",
   "terminal",
@@ -23,6 +25,8 @@ export const READ_ONLY_SERIALIZED_TOOL_NAMES = [
   "read_file",
   "glob_files",
   "grep_files",
+  "session_history_search",
+  "session_history_read",
 ] as const;
 
 export const VERIFY_SERIALIZED_TOOL_NAMES = [
@@ -44,7 +48,9 @@ export const AUTO_EXA_SERIALIZED_TOOL_NAMES = CANONICAL_BUILTIN_NAMES.map(
 // remains available because its exec action does not require a session store.
 export const AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES =
   AUTO_EXA_SERIALIZED_TOOL_NAMES.filter((name) =>
-    name !== "subagent"
+    name !== "subagent" &&
+    name !== "session_history_search" &&
+    name !== "session_history_read"
   );
 
 export const WEB_SEARCH_GUIDANCE =

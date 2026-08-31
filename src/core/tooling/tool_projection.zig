@@ -13,6 +13,7 @@ pub const Options = struct {
     permission_rules: types.PermissionRuleSet = .{},
     mcp_runtime: ?*mcp_runtime.McpRuntime = null,
     subagent_available: bool = false,
+    session_history_available: bool = false,
 };
 
 const BuildKind = enum { full, read_only };
@@ -696,6 +697,7 @@ fn appendBuiltinTool(
     if (!tool.model_visible) return;
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
+    if (tool.runtime_provider == .session_history and !options.session_history_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
     if (options.permission_mode != .yolo) {
         if (tool.provider_executed and !providerExecutionIsAllowed(tool.name, options.permission_rules)) return;
@@ -976,4 +978,28 @@ test "subagent and terminal selection follow host capability" {
     try expectContainsName(available.advertised_names, "subagent");
     try expectNotContainsName(available.advertised_names, "task");
     try expectContainsName(available.advertised_names, "terminal");
+}
+
+test "session history advertisement requires a canonical store" {
+    var history_tool = test_read_file;
+    history_tool.name = "session_history_search";
+    history_tool.model_schema.name = history_tool.name;
+    history_tool.runtime_provider = .session_history;
+    const tools = [_]tool_dispatch.Tool{history_tool};
+
+    var unavailable = try buildTestModelToolProjectionForRegistry(
+        std.testing.allocator,
+        &tools,
+        .{ .session_history_available = false },
+    );
+    defer unavailable.deinit(std.testing.allocator);
+    try expectNotContainsName(unavailable.advertised_names, history_tool.name);
+
+    var available = try buildTestModelToolProjectionForRegistry(
+        std.testing.allocator,
+        &tools,
+        .{ .session_history_available = true },
+    );
+    defer available.deinit(std.testing.allocator);
+    try expectContainsName(available.advertised_names, history_tool.name);
 }

@@ -1102,7 +1102,7 @@ fn writeSnapshotLocator(writer: *std.Io.Writer, value: ?[]const u8) !void {
     try writeDurableBytes(writer, locator);
 }
 
-fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
+pub fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
     try writer.writeAll("{\"schema_version\":5,\"tool_steps\":[");
     for (execution.tool_steps, 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');

@@ -13,6 +13,7 @@ const permission_gate = @import("../permissions/permission_gate.zig");
 const change_tracker = @import("../workspace/change_tracker.zig");
 const read_tracker_mod = @import("../workspace/read_tracker.zig");
 const session_child_store = @import("../session/session_child_store.zig");
+const session_history_provider = @import("../session/session_history_provider.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const command_runner = @import("../execution/command_runner.zig");
 const subagent_tool_provider = @import("../subagent/tool_provider.zig");
@@ -233,6 +234,7 @@ pub const DispatchContext = struct {
     captured_command_host: command_environment.Host = .native,
     run_command_backend: ?RunCommandBackend = null,
     subagent_provider: ?subagent_tool_provider.Provider = null,
+    session_history_provider: ?session_history_provider.Provider = null,
     vision_provider: ?VisionProvider = null,
     ask_question_ctx: ?*anyopaque = null,
     ask_question_batch: ?AskQuestionBatchFn = null,
@@ -374,6 +376,8 @@ pub const ExecutorKind = enum {
     grep_files,
     read_file,
     read_tool_result,
+    session_history_search,
+    session_history_read,
     write_file,
     edit_file,
     memory,
@@ -400,6 +404,7 @@ pub const RuntimeProviderKind = enum {
     none,
     run_command,
     subagent,
+    session_history,
     vision,
 };
 

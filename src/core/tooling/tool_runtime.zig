@@ -40,6 +40,8 @@ const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_tool_provider = @import("../subagent/tool_provider.zig");
 const subagent_tool_result = @import("../subagent/tool_result.zig");
 const session_runtime = @import("../session/session.zig");
+const session_history_provider = @import("../session/session_history_provider.zig");
+const session_history_query = @import("../session/session_history_query.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const session_codec_mod = @import("../session/session_codec.zig");
 const task_helpers = @import("../tasks/task_helpers.zig");
@@ -176,6 +178,7 @@ pub const Context = struct {
     cancel_flag: ?*std.atomic.Value(bool) = null,
     background: *BackgroundRuntime,
     session: *SessionRuntime,
+    session_history_store: ?*const session_store.Store = null,
     session_allocator: Allocator = std.heap.c_allocator,
     skills_dir: []const u8 = "",
     context_limits: context_limits.Values = .{},
@@ -678,6 +681,7 @@ fn executeRegisteredTool(
         .authorized_image_catalog = authorized_image_catalog,
     };
     var subagent_provider = SubagentProviderState{ .runtime = ctx };
+    var session_history_provider_state: SessionHistoryProviderState = undefined;
     var mcp_progress_bridge = McpProgressBridge{ .ctx = ctx };
     var mcp_call_status: ?tool_mcp_runtime.CallStatus = null;
     var mcp_execution_error: ?anyerror = null;
@@ -716,6 +720,18 @@ fn executeRegisteredTool(
         .subagent => dispatch_ctx.subagent_provider = .{
             .context = &subagent_provider,
             .execute_fn = executeSubagentProvider,
+        },
+        .session_history => if (ctx.session_history_store) |store| {
+            session_history_provider_state = .{
+                .store = store,
+                .scratch_allocator = ctx.session_allocator,
+                .current_session_id = ctx.lifecycle_scope.session_id,
+            };
+            dispatch_ctx.session_history_provider = .{
+                .context = &session_history_provider_state,
+                .search_fn = searchSessionHistoryProvider,
+                .read_fn = readSessionHistoryProvider,
+            };
         },
     }
     dispatch_ctx.mcp_execution_error_sink = &mcp_execution_error;
@@ -1773,6 +1789,60 @@ const SubagentProviderState = struct {
     runtime: Context,
 };
 
+const SessionHistoryProviderState = struct {
+    store: *const session_store.Store,
+    scratch_allocator: Allocator,
+    current_session_id: ?[]const u8,
+};
+
+fn searchSessionHistoryProvider(
+    raw_context: ?*anyopaque,
+    alloc: Allocator,
+    request: session_history_provider.SearchRequest,
+) error{OutOfMemory}!session_history_provider.Result {
+    const state: *SessionHistoryProviderState = @ptrCast(@alignCast(raw_context.?));
+    const body = session_history_query.searchAlloc(
+        alloc,
+        state.scratch_allocator,
+        state.store,
+        state.current_session_id,
+        request.query,
+        request.limit,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .failure = try std.fmt.allocPrint(
+            alloc,
+            "session_history_search failed: {s}",
+            .{@errorName(err)},
+        ) },
+    };
+    return .{ .success = body };
+}
+
+fn readSessionHistoryProvider(
+    raw_context: ?*anyopaque,
+    alloc: Allocator,
+    request: session_history_provider.ReadRequest,
+) error{OutOfMemory}!session_history_provider.Result {
+    const state: *SessionHistoryProviderState = @ptrCast(@alignCast(raw_context.?));
+    const body = session_history_query.readAlloc(
+        alloc,
+        state.scratch_allocator,
+        state.store,
+        state.current_session_id,
+        request.reference,
+        request.include_execution,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .failure = try std.fmt.allocPrint(
+            alloc,
+            "session_history_read failed: {s}",
+            .{@errorName(err)},
+        ) },
+    };
+    return .{ .success = body };
+}
+
 fn subagentProviderFailure(
     alloc: Allocator,
     operation_id: []const u8,
@@ -2136,6 +2206,8 @@ const test_tool_registry = tool_dispatch.Registry{ .tools = &.{
     test_builtin_tools.mcp_select_tool,
     test_builtin_tools.ask_user_question,
     test_builtin_tools.read_tool_result,
+    test_builtin_tools.session_history_search,
+    test_builtin_tools.session_history_read,
 } };
 
 fn matchesTestRunCommandCompatibility(command: []const u8) bool {
@@ -3817,6 +3889,8 @@ test "read-only local runtime tools are registered in built-in registry" {
         .{ .name = "grep_files", .kind = .grep_files },
         .{ .name = "read_file", .kind = .read_file },
         .{ .name = "read_tool_result", .kind = .read_tool_result },
+        .{ .name = "session_history_search", .kind = .session_history_search },
+        .{ .name = "session_history_read", .kind = .session_history_read },
     };
 
     var rt = TestRuntime{};

@@ -3,6 +3,12 @@ const std = @import("std");
 pub const max_query_bytes: usize = 4 * 1024;
 pub const max_query_tokens: usize = 64;
 
+comptime {
+    if (max_query_tokens > @bitSizeOf(u64)) {
+        @compileError("ScoreAccumulator token masks must cover max_query_tokens");
+    }
+}
+
 pub const PrepareError = error{
     QueryTooLong,
     TooManyTokens,
@@ -38,6 +44,68 @@ pub const Score = struct {
     weak_hits: usize = 0,
 };
 
+pub const ScoreAccumulator = struct {
+    exact_identity: bool,
+    strong_tokens: u64 = 0,
+    weak_tokens: u64 = 0,
+
+    pub fn init(
+        query: *const PreparedQuery,
+        exact_identities: []const []const u8,
+    ) ScoreAccumulator {
+        return .{
+            .exact_identity = containsCompleteIdentity(query.raw, exact_identities),
+        };
+    }
+
+    pub fn add_strong_field(
+        self: *ScoreAccumulator,
+        query: *const PreparedQuery,
+        field: []const u8,
+    ) bool {
+        var matched = false;
+        for (query.tokenSlice(), 0..) |token, index| {
+            if (!containsCompleteTokenIgnoreCase(field, token)) continue;
+            matched = true;
+            const token_bit = @as(u64, 1) << @intCast(index);
+            self.strong_tokens |= token_bit;
+            self.weak_tokens &= ~token_bit;
+        }
+        return matched;
+    }
+
+    pub fn add_weak_field(
+        self: *ScoreAccumulator,
+        query: *const PreparedQuery,
+        field: []const u8,
+    ) bool {
+        var matched = false;
+        for (query.tokenSlice(), 0..) |token, index| {
+            if (!containsIgnoreCase(field, token)) continue;
+            matched = true;
+            const token_bit = @as(u64, 1) << @intCast(index);
+            if (self.strong_tokens & token_bit == 0) self.weak_tokens |= token_bit;
+        }
+        return matched;
+    }
+
+    pub fn finish(self: ScoreAccumulator, query: *const PreparedQuery) ?Score {
+        const result = Score{
+            .exact_identity = self.exact_identity,
+            .strong_hits = @popCount(self.strong_tokens),
+            .weak_hits = @popCount(self.weak_tokens),
+        };
+        if (!result.exact_identity and
+            result.strong_hits == 0 and
+            result.weak_hits == 0 and
+            query.raw.len != 0)
+        {
+            return null;
+        }
+        return result;
+    }
+};
+
 pub fn prepare(query: []const u8) PrepareError!PreparedQuery {
     if (query.len > max_query_bytes) return failPreparedQuery(error.QueryTooLong);
 
@@ -70,26 +138,10 @@ pub fn score(
     strong_fields: []const []const u8,
     weak_fields: []const []const u8,
 ) ?Score {
-    var result = Score{
-        .exact_identity = containsCompleteIdentity(query.raw, exact_identities),
-    };
-
-    for (query.tokenSlice()) |token| {
-        if (containsAnyCompleteToken(strong_fields, token)) {
-            result.strong_hits += 1;
-        } else if (containsAnySubstring(weak_fields, token)) {
-            result.weak_hits += 1;
-        }
-    }
-
-    if (!result.exact_identity and
-        result.strong_hits == 0 and
-        result.weak_hits == 0 and
-        query.raw.len != 0)
-    {
-        return null;
-    }
-    return result;
+    var accumulator = ScoreAccumulator.init(query, exact_identities);
+    for (strong_fields) |field| _ = accumulator.add_strong_field(query, field);
+    for (weak_fields) |field| _ = accumulator.add_weak_field(query, field);
+    return accumulator.finish(query);
 }
 
 pub fn order(a: Score, b: Score) std.math.Order {
@@ -113,20 +165,6 @@ fn appendToken(
     }
     prepared.tokens[prepared.token_count] = token;
     prepared.token_count += 1;
-}
-
-fn containsAnyCompleteToken(fields: []const []const u8, token: []const u8) bool {
-    for (fields) |field| {
-        if (containsCompleteTokenIgnoreCase(field, token)) return true;
-    }
-    return false;
-}
-
-fn containsAnySubstring(fields: []const []const u8, token: []const u8) bool {
-    for (fields) |field| {
-        if (containsIgnoreCase(field, token)) return true;
-    }
-    return false;
 }
 
 fn containsCompleteTokenIgnoreCase(field: []const u8, token: []const u8) bool {
@@ -229,6 +267,21 @@ test "scores count distinct strong and weak hits with stable ordering" {
 
     const large = Score{ .strong_hits = 65_536 };
     try std.testing.expectEqual(.gt, order(large, .{ .strong_hits = 65_535 }));
+}
+
+test "streamed score fields count each query token once and upgrade weak matches" {
+    const query = try prepare("alpha beta gamma");
+    var accumulator = ScoreAccumulator.init(&query, &.{});
+
+    try std.testing.expect(accumulator.add_strong_field(&query, "alpha beta"));
+    try std.testing.expect(accumulator.add_strong_field(&query, "alpha beta repeated"));
+    try std.testing.expect(accumulator.add_weak_field(&query, "alpha-preview"));
+    try std.testing.expect(accumulator.add_weak_field(&query, "gamma-preview"));
+    try std.testing.expect(accumulator.add_strong_field(&query, "gamma final"));
+
+    const relevance = accumulator.finish(&query).?;
+    try std.testing.expectEqual(@as(usize, 3), relevance.strong_hits);
+    try std.testing.expectEqual(@as(usize, 0), relevance.weak_hits);
 }
 
 test "strong fields require complete normalized query tokens" {

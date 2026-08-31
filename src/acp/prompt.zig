@@ -261,6 +261,7 @@ const AcpContext = struct {
             .cancel_flag = &session.cancel_flag,
             .background = &self.state.background,
             .session = &session.session_rt,
+            .session_history_store = if (session.store) |*store| store else null,
             .session_allocator = self.alloc,
             .skills_dir = self.state.skills.dir,
             .context_limits = self.state.context_limits,
@@ -531,6 +532,7 @@ pub fn handlePrompt(
         .permission_rules = session.permission_rules,
         .mcp_runtime = session.mcp,
         .subagent_available = state.subagent_host != null,
+        .session_history_available = session.store != null,
     });
     defer tool_projection.deinit(alloc);
 
@@ -671,6 +673,7 @@ pub fn runSubagentChild(
     const session_id = active.session_id;
     const captured_mode = active.mode;
     const mcp = active.mcp;
+    const session_history_available = active.store != null;
     state.subagent_authority_mutex.unlock(io_mod.getIo());
     var ctx = AcpContext{
         .alloc = alloc,
@@ -689,6 +692,7 @@ pub fn runSubagentChild(
             .permission_rules = admission.rules,
             .mcp_runtime = mcp,
             .subagent_available = true,
+            .session_history_available = session_history_available,
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(alloc);
