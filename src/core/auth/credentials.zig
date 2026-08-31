@@ -1238,6 +1238,7 @@ test "resolveForProvider anthropic never returns a gateway credential" {
         .refresh_if_needed,
         .anthropic,
         null,
+        null,
     );
     defer if (resolution.credential) |*credential| credential.deinit(alloc);
 

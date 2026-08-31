@@ -812,10 +812,10 @@ test "Anthropic request hoists system text and maps messages and tools" {
         },
         .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "contents" },
     };
-    const body = try agent_stream_provider.build(std.testing.allocator, .{
+    const body = try buildRequest(std.testing.allocator, .{
         .model = "claude-sonnet-4-5",
-        .serialized_tools = "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\"}}]",
         .messages = &messages,
+        .tools = .{ .additional_functions = &.{.{ .name = "read_file", .description = "Read" }} },
         .tool_choice = .auto,
         .provider_options = .{},
         .max_output_tokens = 4096,
@@ -828,15 +828,14 @@ test "Anthropic request hoists system text and maps messages and tools" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"read_file\",\"input\":{\"path\":\"README.md\"}}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "{\"type\":\"tool_result\",\"tool_use_id\":\"call_1\",\"content\":\"contents\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"input_schema\":{\"type\":\"object\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"input_schema\":{\"type\":\"object\",\"properties\":{}}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":{\"type\":\"auto\"}") != null);
 }
 
 test "Anthropic request applies default max tokens and maps tool choice variants" {
     const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Hello." }};
-    const body = try agent_stream_provider.build(std.testing.allocator, .{
+    const body = try buildRequest(std.testing.allocator, .{
         .model = "claude-sonnet-4-5",
-        .serialized_tools = "[]",
         .messages = &messages,
         .tool_choice = .required,
         .provider_options = .{},
@@ -848,9 +847,8 @@ test "Anthropic request applies default max tokens and maps tool choice variants
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\"") == null);
 
-    const none_body = try agent_stream_provider.build(std.testing.allocator, .{
+    const none_body = try buildRequest(std.testing.allocator, .{
         .model = "claude-sonnet-4-5",
-        .serialized_tools = "[]",
         .messages = &messages,
         .tool_choice = .none,
         .provider_options = .{},

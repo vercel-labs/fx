@@ -1065,8 +1065,8 @@ pub fn Runtime(comptime App: type) type {
                         .permission_reviewer = tool_context.permission_reviewer_provider,
                     },
                     .anthropic = .{
-                        .agent_stream_provider = tool_context.agent_stream_provider,
-                        .permission_reviewer_provider = null,
+                        .agent_stream = tool_context.agent_stream_provider,
+                        .permission_reviewer = null,
                     },
                 };
             return subagent_agent_adapter.run(.{
