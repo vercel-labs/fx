@@ -3,6 +3,15 @@ const command_specs = @import("command_specs.zig");
 
 const SlashKind = command_specs.SlashKind;
 const SlashRegistry = command_specs.SlashRegistry;
+const SlashSpec = command_specs.SlashSpec;
+
+/// A `.custom` command is addressed by its position in the registry that parsed
+/// it. An index survives a registry replacement as a value that can be range
+/// checked, where a borrowed spec pointer would dangle.
+pub const CustomInvocation = struct {
+    index: usize,
+    args: []const u8,
+};
 
 pub const ParsedCommand = union(enum) {
     quit,
@@ -44,6 +53,7 @@ pub const ParsedCommand = union(enum) {
     notifications: []const u8,
     workspace: []const u8,
     version,
+    custom: CustomInvocation,
     unknown,
 };
 
@@ -88,6 +98,7 @@ pub const CommandHandlers = struct {
     handle_notifications: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_workspace: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
+    run_custom: *const fn (ctx: *anyopaque, index: usize, args: []const u8) anyerror!void,
     unknown: *const fn (ctx: *anyopaque, cmd: []const u8) anyerror!void,
 };
 
@@ -95,7 +106,7 @@ fn command_payload(cmd: []const u8, prefix: []const u8) []const u8 {
     return std.mem.trim(u8, cmd[prefix.len..], " \t");
 }
 
-fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
+fn parsedCommand(kind: SlashKind, index: usize, payload: []const u8) ParsedCommand {
     return switch (kind) {
         .quit => .quit,
         .clear_screen => .clear_screen,
@@ -136,17 +147,28 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .notifications => .{ .notifications = payload },
         .workspace => .{ .workspace = payload },
         .version => .version,
+        .custom => .{ .custom = .{ .index = index, .args = payload } },
     };
 }
 
+/// Exact match anchored on `spec` rather than on its kind. `matchExact` returns
+/// the first registry entry carrying the token, so an entry that duplicates an
+/// earlier token never wins here.
+fn matchesSpecExact(registry: SlashRegistry, cmd: []const u8, spec: *const SlashSpec) bool {
+    const matched = registry.matchExact(cmd) orelse return false;
+    return matched.command == spec;
+}
+
+/// Matches against the entry being iterated, by identity. Resolving a kind back
+/// to a spec would collapse every entry sharing a kind onto the first one.
 pub fn parse(registry: SlashRegistry, cmd: []const u8) ParsedCommand {
-    for (registry.commands) |spec| {
+    for (registry.commands, 0..) |*spec, index| {
         if (spec.accepts_payload) {
-            if (command_specs.matchedSlashPrefix(registry, cmd, spec.kind)) |prefix| {
-                return parsedCommand(spec.kind, command_payload(cmd, prefix));
+            if (registry.matchEntryPrefix(cmd, spec)) |prefix| {
+                return parsedCommand(spec.kind, index, command_payload(cmd, prefix));
             }
-        } else if (command_specs.matchesSlashExact(registry, cmd, spec.kind)) {
-            return parsedCommand(spec.kind, "");
+        } else if (matchesSpecExact(registry, cmd, spec)) {
+            return parsedCommand(spec.kind, index, "");
         }
     }
     return .unknown;
@@ -193,6 +215,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .notifications => |rest| try handlers.handle_notifications(handlers.ctx, rest),
         .workspace => |rest| try handlers.handle_workspace(handlers.ctx, rest),
         .version => try handlers.show_version(handlers.ctx),
+        .custom => |invocation| try handlers.run_custom(handlers.ctx, invocation.index, invocation.args),
         .unknown => try handlers.unknown(handlers.ctx, cmd),
     }
 }
@@ -394,6 +417,182 @@ test "parse trims only spaces and tabs around payload" {
     }
 }
 
+const ParseBaselineCase = struct {
+    input: []const u8,
+    tag: []const u8,
+};
+
+/// Captured from the kind-based parser before it was anchored on spec identity.
+/// Two rows per token: bare, and followed by a payload.
+const builtin_parse_baseline = [_]ParseBaselineCase{
+    .{ .input = "/help", .tag = "help" },
+    .{ .input = "/help sample", .tag = "unknown" },
+    .{ .input = "/clear", .tag = "clear_screen" },
+    .{ .input = "/clear sample", .tag = "unknown" },
+    .{ .input = "/new", .tag = "new_session" },
+    .{ .input = "/new sample", .tag = "unknown" },
+    .{ .input = "/reset", .tag = "reset_session" },
+    .{ .input = "/reset sample", .tag = "unknown" },
+    .{ .input = "/resume", .tag = "resume_session" },
+    .{ .input = "/resume sample", .tag = "unknown" },
+    .{ .input = "/continue", .tag = "continue_recovery" },
+    .{ .input = "/continue sample", .tag = "unknown" },
+    .{ .input = "/rename", .tag = "rename_session" },
+    .{ .input = "/rename sample", .tag = "rename_session" },
+    .{ .input = "/login", .tag = "login" },
+    .{ .input = "/login sample", .tag = "unknown" },
+    .{ .input = "/logout", .tag = "logout" },
+    .{ .input = "/logout sample", .tag = "logout" },
+    .{ .input = "/setup", .tag = "setup" },
+    .{ .input = "/setup sample", .tag = "unknown" },
+    .{ .input = "/stats", .tag = "stats" },
+    .{ .input = "/stats sample", .tag = "unknown" },
+    .{ .input = "/usage", .tag = "usage" },
+    .{ .input = "/usage sample", .tag = "unknown" },
+    .{ .input = "/cost", .tag = "usage" },
+    .{ .input = "/cost sample", .tag = "unknown" },
+    .{ .input = "/status", .tag = "status" },
+    .{ .input = "/status sample", .tag = "unknown" },
+    .{ .input = "/background", .tag = "background" },
+    .{ .input = "/background sample", .tag = "unknown" },
+    .{ .input = "/background stop", .tag = "background_stop" },
+    .{ .input = "/background stop sample", .tag = "background_stop" },
+    .{ .input = "/background open", .tag = "background_open" },
+    .{ .input = "/background open sample", .tag = "background_open" },
+    .{ .input = "/background logs", .tag = "background_logs" },
+    .{ .input = "/background logs sample", .tag = "background_logs" },
+    .{ .input = "/image", .tag = "image" },
+    .{ .input = "/image sample", .tag = "image" },
+    .{ .input = "/img", .tag = "image" },
+    .{ .input = "/img sample", .tag = "image" },
+    .{ .input = "/images", .tag = "images" },
+    .{ .input = "/images sample", .tag = "images" },
+    .{ .input = "/model", .tag = "model" },
+    .{ .input = "/model sample", .tag = "model" },
+    .{ .input = "/models", .tag = "models" },
+    .{ .input = "/models sample", .tag = "unknown" },
+    .{ .input = "/permissions", .tag = "permissions" },
+    .{ .input = "/permissions sample", .tag = "permissions" },
+    .{ .input = "/allowlist", .tag = "allowlist" },
+    .{ .input = "/allowlist sample", .tag = "allowlist" },
+    .{ .input = "/undo", .tag = "undo" },
+    .{ .input = "/undo sample", .tag = "unknown" },
+    .{ .input = "/mcp", .tag = "mcp" },
+    .{ .input = "/mcp sample", .tag = "mcp" },
+    .{ .input = "/skills", .tag = "skills" },
+    .{ .input = "/skills sample", .tag = "skills" },
+    .{ .input = "/copy", .tag = "copy" },
+    .{ .input = "/copy sample", .tag = "unknown" },
+    .{ .input = "/feedback", .tag = "feedback" },
+    .{ .input = "/feedback sample", .tag = "unknown" },
+    .{ .input = "/trace", .tag = "trace" },
+    .{ .input = "/trace sample", .tag = "unknown" },
+    .{ .input = "/compact", .tag = "compact" },
+    .{ .input = "/compact sample", .tag = "unknown" },
+    .{ .input = "/settings", .tag = "settings" },
+    .{ .input = "/settings sample", .tag = "settings" },
+    .{ .input = "/alias", .tag = "alias" },
+    .{ .input = "/alias sample", .tag = "alias" },
+    .{ .input = "/credits", .tag = "credits" },
+    .{ .input = "/credits sample", .tag = "unknown" },
+    .{ .input = "/balance", .tag = "credits" },
+    .{ .input = "/balance sample", .tag = "unknown" },
+    .{ .input = "/paste", .tag = "paste" },
+    .{ .input = "/paste sample", .tag = "unknown" },
+    .{ .input = "/fast", .tag = "fast" },
+    .{ .input = "/fast sample", .tag = "unknown" },
+    .{ .input = "/statusline", .tag = "statusline" },
+    .{ .input = "/statusline sample", .tag = "statusline" },
+    .{ .input = "/sound", .tag = "notifications" },
+    .{ .input = "/sound sample", .tag = "notifications" },
+    .{ .input = "/workspace", .tag = "workspace" },
+    .{ .input = "/workspace sample", .tag = "workspace" },
+    .{ .input = "/version", .tag = "version" },
+    .{ .input = "/version sample", .tag = "unknown" },
+    .{ .input = "/quit", .tag = "quit" },
+    .{ .input = "/quit sample", .tag = "unknown" },
+    .{ .input = "/exit", .tag = "quit" },
+    .{ .input = "/exit sample", .tag = "unknown" },
+};
+
+test "parse resolves every builtin token and alias to its pre-refactor variant" {
+    const registry = testSlashRegistry();
+    for (builtin_parse_baseline) |case| {
+        try std.testing.expectEqualStrings(case.tag, @tagName(parse(registry, case.input)));
+    }
+
+    var expected_rows: usize = 0;
+    for (registry.commands) |spec| expected_rows += 2 * (1 + spec.aliases.len);
+    try std.testing.expectEqual(expected_rows, builtin_parse_baseline.len);
+}
+
+const same_kind_payload_specs = [_]command_specs.SlashSpec{
+    .{ .kind = .custom, .command = "/alpha", .accepts_payload = true },
+    .{ .kind = .custom, .command = "/beta", .accepts_payload = true },
+    .{ .kind = .custom, .command = "/gamma", .accepts_payload = true },
+};
+
+const same_kind_exact_specs = [_]command_specs.SlashSpec{
+    .{ .kind = .custom, .command = "/alpha" },
+    .{ .kind = .custom, .command = "/beta" },
+    .{ .kind = .custom, .command = "/gamma" },
+};
+
+fn expectCustomAt(parsed: ParsedCommand, index: usize, args: []const u8) !void {
+    switch (parsed) {
+        .custom => |invocation| {
+            try std.testing.expectEqual(index, invocation.index);
+            try std.testing.expectEqualStrings(args, invocation.args);
+        },
+        else => return error.TestExpectedCustomCommand,
+    }
+}
+
+test "parse dispatches payload specs sharing one slash kind to their own entry" {
+    const registry = SlashRegistry{ .commands = same_kind_payload_specs[0..] };
+
+    try expectCustomAt(parse(registry, "/alpha one"), 0, "one");
+    try expectCustomAt(parse(registry, "/beta two"), 1, "two");
+    try expectCustomAt(parse(registry, "/gamma three"), 2, "three");
+    try expectCustomAt(parse(registry, "/gamma"), 2, "");
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(registry, "/delta"));
+}
+
+test "parse dispatches non-payload specs sharing one slash kind to their own entry" {
+    const registry = SlashRegistry{ .commands = same_kind_exact_specs[0..] };
+
+    try expectCustomAt(parse(registry, "/alpha"), 0, "");
+    try expectCustomAt(parse(registry, "/beta"), 1, "");
+    try expectCustomAt(parse(registry, "/gamma"), 2, "");
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(registry, "/beta payload"));
+}
+
+test "parse returns unknown for kinds absent from a filtered registry" {
+    var storage: [command_specs.child_chat_slash_command_count]command_specs.SlashSpec = undefined;
+    const child = command_specs.childChatSlashRegistry(testSlashRegistry(), &storage);
+
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(child, "/help"));
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(child, "/model claude-opus"));
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(child, "/mcp list"));
+    try std.testing.expectEqual(ParsedCommand.quit, parse(child, "/quit"));
+}
+
+test "parse keeps the whitespace boundary between a builtin and a longer token" {
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/model-review 512"));
+
+    var merged: [2]command_specs.SlashSpec = .{
+        (testSlashRegistry().lookup("/model") orelse return error.TestExpectedEqual).*,
+        .{ .kind = .custom, .command = "/model-review", .accepts_payload = true },
+    };
+    const registry = SlashRegistry{ .commands = merged[0..] };
+
+    try expectCustomAt(parse(registry, "/model-review 512"), 1, "512");
+    switch (parse(registry, "/model claude-opus")) {
+        .model => |query| try std.testing.expectEqualStrings("claude-opus", query),
+        else => return error.TestExpectedModelCommand,
+    }
+}
+
 fn parsedIsUnknown(parsed: ParsedCommand) bool {
     return switch (parsed) {
         .unknown => true,
@@ -426,6 +625,7 @@ test "parse payload acceptance follows slash spec metadata" {
 const TestContext = struct {
     called: []const u8 = "",
     payload: []const u8 = "",
+    custom_index: usize = std.math.maxInt(usize),
 };
 
 fn testContext(ctx: *anyopaque) *TestContext {
@@ -440,6 +640,13 @@ fn unexpectedNoPayload(ctx: *anyopaque) anyerror!void {
 fn unexpectedPayload(ctx: *anyopaque, value: []const u8) anyerror!void {
     _ = ctx;
     _ = value;
+    return error.UnexpectedCallback;
+}
+
+fn unexpectedCustom(ctx: *anyopaque, index: usize, args: []const u8) anyerror!void {
+    _ = ctx;
+    _ = index;
+    _ = args;
     return error.UnexpectedCallback;
 }
 
@@ -532,6 +739,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .handle_notifications = unexpectedPayload,
         .handle_workspace = unexpectedPayload,
         .show_version = unexpectedNoPayload,
+        .run_custom = unexpectedCustom,
         .unknown = unexpectedPayload,
     };
 }
@@ -627,6 +835,31 @@ test "route sends original command string to unknown handler" {
     try std.testing.expectEqualStrings("unknown", ctx.called);
     try std.testing.expectEqualStrings(cmd, ctx.payload);
     try std.testing.expect(ctx.payload.ptr == cmd.ptr);
+}
+
+fn recordCustom(ctx: *anyopaque, index: usize, args: []const u8) anyerror!void {
+    const test_context = testContext(ctx);
+    test_context.called = "custom";
+    test_context.custom_index = index;
+    test_context.payload = args;
+}
+
+test "route dispatches each same-kind custom entry to the custom handler" {
+    const registry = SlashRegistry{ .commands = same_kind_payload_specs[0..] };
+
+    for ([_][]const u8{ "/alpha", "/beta", "/gamma" }, 0..) |token, expected_index| {
+        var ctx: TestContext = .{};
+        var handlers = testHandlers(&ctx);
+        handlers.run_custom = recordCustom;
+        var buf: [64]u8 = undefined;
+        const cmd = try std.fmt.bufPrint(&buf, "{s} payload", .{token});
+
+        try route(registry, &handlers, cmd);
+
+        try std.testing.expectEqualStrings("custom", ctx.called);
+        try std.testing.expectEqual(expected_index, ctx.custom_index);
+        try std.testing.expectEqualStrings("payload", ctx.payload);
+    }
 }
 
 test "route propagates callback errors" {

@@ -72,6 +72,9 @@ pub const SlashKind = enum {
     notifications,
     workspace,
     version,
+    /// Runtime-registered command. Several specs share this kind, so it is the
+    /// one kind that never resolves through a kind-to-spec lookup.
+    custom,
 };
 
 pub const OptionDoc = struct {
@@ -163,6 +166,9 @@ pub const SlashSpec = struct {
     aliases: []const []const u8 = &.{},
     show_aliases_in_completion: bool = true,
     help_entry: ?[]const u8 = null,
+    /// Display-only override for the completion row. Insertion always uses
+    /// `command`, so a decorated label cannot corrupt what gets typed.
+    completion_label: ?[]const u8 = null,
     completion_description: ?[]const u8 = null,
     presentation_category: ?SlashPresentationCategory = null,
     show_in_welcome: bool = false,
@@ -652,7 +658,14 @@ pub fn nthSlashCompletionLabel(registry: SlashRegistry, prefix: []const u8, n: u
     if (workspaceArgCompletionPrefix(prefix)) |query| {
         return nthWorkspaceArgLabel(query, n);
     }
-    return nthSlashCompletion(registry, prefix, n);
+    if (prefix.len == 0 or prefix[0] != '/') return null;
+    const match = nthSlashCommandCompletionMatch(registry, prefix, n) orelse return null;
+    // An alias keeps its own bare form: the decorated label describes the
+    // primary token only.
+    if (match.spec.completion_label) |label| {
+        if (std.mem.eql(u8, match.command, match.spec.command)) return label;
+    }
+    return match.command;
 }
 
 pub fn nthSlashCompletionDescription(registry: SlashRegistry, prefix: []const u8, n: usize) ?[]const u8 {
@@ -1480,7 +1493,9 @@ fn topLevelTokenOccurrences(registry: TopLevelRegistry, token: []const u8) usize
     return count;
 }
 
-fn slashTokenOccurrences(registry: SlashRegistry, token: []const u8) usize {
+/// Counts how many entries publish `token`. The merged runtime registry has to
+/// hold the same uniqueness invariant the builtin array is asserted against.
+pub fn slashTokenOccurrences(registry: SlashRegistry, token: []const u8) usize {
     var count: usize = 0;
     for (registry.commands) |spec| {
         if (std.mem.eql(u8, token, spec.command)) count += 1;
@@ -1838,7 +1853,7 @@ test "top-level specs cover every TopLevelKind" {
     }
 }
 
-test "slash specs cover every SlashKind" {
+test "slash specs cover every builtin SlashKind" {
     var seen = [_]bool{false} ** std.meta.fields(SlashKind).len;
     const registry = testSlashRegistry();
     for (registry.commands) |spec| {
@@ -1848,6 +1863,12 @@ test "slash specs cover every SlashKind" {
     }
     inline for (std.meta.fields(SlashKind)) |field| {
         const kind: SlashKind = @enumFromInt(field.value);
+        // `.custom` is registered at runtime by several specs at once, so the
+        // builtin array neither carries it nor supports a kind-to-spec lookup.
+        if (kind == .custom) {
+            try std.testing.expect(!seen[@intFromEnum(kind)]);
+            continue;
+        }
         try std.testing.expect(seen[@intFromEnum(kind)]);
         _ = slashSpec(registry, kind);
     }

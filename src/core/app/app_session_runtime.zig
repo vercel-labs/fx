@@ -1526,7 +1526,7 @@ pub fn Runtime(comptime App: type) type {
             switch (decision.action) {
                 .apply_pending => |policy| {
                     applyIdleLiveSessionTransition(app, policy, .{});
-                    try installFreshLiveSession(app);
+                    try installFreshLiveSession(app, policy);
                 },
                 .none => {},
                 .apply_now, .cancel_and_defer => unreachable,
@@ -1538,14 +1538,36 @@ pub fn Runtime(comptime App: type) type {
             background_policy: BackgroundSessionPolicy,
         ) !void {
             try prepareLiveSessionTransition(app, background_policy, .{});
-            try installFreshLiveSession(app);
+            try installFreshLiveSession(app, background_policy);
         }
 
-        fn installFreshLiveSession(app: *App) !void {
+        fn installFreshLiveSession(app: *App, background_policy: BackgroundSessionPolicy) !void {
             try beginFreshPersistedSession(app);
             enableSessionStores(app);
             refreshSubagentProjectionAfterSessionInstall(app);
             try finishLiveSessionTransition(app);
+            reloadCustomCommandsAtSessionBoundary(app, background_policy);
+        }
+
+        /// `/new` and `/clear` use `.carry_forward`; `/reset` deliberately does
+        /// not reload commands. A deferred transition only lands once the
+        /// worker is idle, so rebuilding here never invalidates a parsed
+        /// `.custom` index while a turn is holding one. A failed rebuild keeps
+        /// the previous registry rather than degrading the session.
+        fn reloadCustomCommandsAtSessionBoundary(
+            app: *App,
+            background_policy: BackgroundSessionPolicy,
+        ) void {
+            if (comptime !@hasDecl(App, "reloadCustomCommands")) return;
+            if (background_policy != .carry_forward) return;
+            if (app.worker.isProcessing()) return;
+            app.reloadCustomCommands("session_boundary") catch |err| {
+                debug_trace.logf(
+                    "commands",
+                    "reload_failed surface=session_boundary error={s}",
+                    .{@errorName(err)},
+                );
+            };
         }
 
         pub fn prepareLiveSessionResume(
@@ -10150,4 +10172,60 @@ test "terminal title bounds session and model context" {
     try std.testing.expect(label.len <= Runtime(TestApp).terminal_title_label_max_bytes);
     try std.testing.expect(std.mem.find(u8, label, "...") != null);
     try std.testing.expect(std.mem.find(u8, label, " · provider/") != null);
+}
+
+const CommandReloadFakeApp = struct {
+    const Worker = struct {
+        processing: bool = false,
+
+        fn isProcessing(self: Worker) bool {
+            return self.processing;
+        }
+    };
+
+    worker: Worker = .{},
+    reloads: usize = 0,
+    surface: []const u8 = "",
+    fail: bool = false,
+
+    noinline fn reloadCustomCommands(self: *CommandReloadFakeApp, surface: []const u8) !void {
+        self.reloads += 1;
+        self.surface = surface;
+        if (self.fail) return error.OutOfMemory;
+    }
+};
+
+test "new and clear rebuild the command registry only while the worker is idle" {
+    var app: CommandReloadFakeApp = .{};
+
+    Runtime(CommandReloadFakeApp).reloadCustomCommandsAtSessionBoundary(&app, .carry_forward);
+    try std.testing.expectEqual(@as(usize, 1), app.reloads);
+    try std.testing.expectEqualStrings("session_boundary", app.surface);
+
+    app.worker.processing = true;
+    Runtime(CommandReloadFakeApp).reloadCustomCommandsAtSessionBoundary(&app, .carry_forward);
+    try std.testing.expectEqual(@as(usize, 1), app.reloads);
+
+    app.worker.processing = false;
+    Runtime(CommandReloadFakeApp).reloadCustomCommandsAtSessionBoundary(&app, .stop_forget);
+    try std.testing.expectEqual(@as(usize, 1), app.reloads);
+
+    // A failed rebuild is traced, never propagated, so the session transition
+    // that triggered it still completes with the previous registry in place.
+    app.fail = true;
+    Runtime(CommandReloadFakeApp).reloadCustomCommandsAtSessionBoundary(&app, .carry_forward);
+    try std.testing.expectEqual(@as(usize, 2), app.reloads);
+}
+
+const NoCommandReloadFakeApp = struct {
+    worker: struct {
+        fn isProcessing(_: @This()) bool {
+            return false;
+        }
+    } = .{},
+};
+
+test "a host without command discovery skips the session boundary rebuild" {
+    var app: NoCommandReloadFakeApp = .{};
+    Runtime(NoCommandReloadFakeApp).reloadCustomCommandsAtSessionBoundary(&app, .carry_forward);
 }

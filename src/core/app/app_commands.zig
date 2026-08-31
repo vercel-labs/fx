@@ -9,6 +9,7 @@ const background_commands = @import("../background/background_commands.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
+const command_expansion = @import("../slash_commands/command_expansion.zig");
 const command_router = @import("../slash_commands/command_router.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -384,6 +385,7 @@ pub fn Handlers(comptime App: type) type {
                 .handle_notifications = commandHandleNotifications,
                 .handle_workspace = commandHandleWorkspace,
                 .show_version = commandShowVersion,
+                .run_custom = commandRunCustom,
                 .unknown = commandUnknown,
             };
         }
@@ -2042,6 +2044,34 @@ pub fn Handlers(comptime App: type) type {
                 .tone = .@"error",
                 .body = "Unknown command. Try /help.",
             }, true);
+        }
+
+        /// Expands a discovered command body against the typed arguments and
+        /// enqueues the result through the same prompt path a typed message
+        /// takes. The expanded text is owned here and copied by the queue, so
+        /// no registry memory outlives the call.
+        pub fn commandRunCustom(ctx: *anyopaque, index: usize, args: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime !@hasDecl(App, "customCommandBody")) return commandUnknown(ctx, "");
+
+            // A reload can retire the index a queued invocation carries; the
+            // lookup is bounds-checked and reports the same message a typo does.
+            const body = app.customCommandBody(index) orelse return commandUnknown(ctx, "");
+
+            const expanded = command_expansion.expand(app.alloc, body, args) catch |err| switch (err) {
+                error.ExpandedCommandTooLarge => {
+                    try app.writeDomainNotice(.{
+                        .topic = "command",
+                        .tone = .@"error",
+                        .body = command_expansion.too_large_notice,
+                    }, true);
+                    return;
+                },
+                else => |other| return other,
+            };
+            defer app.alloc.free(expanded);
+
+            _ = try app.enqueuePrompt(expanded);
         }
     };
 }
@@ -4215,6 +4245,106 @@ test "trace renders gateway schema diagnostics without raw payload content" {
     try std.testing.expect(std.mem.find(u8, text, "gateway_schema=\"path=prompt.0.content expected=string received=array\"") != null);
     try std.testing.expect(std.mem.find(u8, text, "request_shape=\"bytes=123 prompt_count=1 prompt.0 role=system content=array") != null);
     try std.testing.expect(std.mem.find(u8, text, "SECRET_RAW_PROMPT") == null);
+}
+
+/// Stands in for the real `App` with only what `commandRunCustom` touches: a
+/// bounds-checked body lookup, an allocator, the prompt queue, and notices.
+const CustomCommandFakeApp = struct {
+    alloc: std.mem.Allocator = std.testing.allocator,
+    bodies: []const []const u8 = &.{},
+    /// Mirrors production: builtin specs occupy the low indices of the merged
+    /// registry, so a custom index starts past them.
+    first_custom_index: usize = 42,
+    enqueued: ?[]u8 = null,
+    tone: ?types.NoticeTone = null,
+    topic: ?[]const u8 = null,
+    body: ?[]const u8 = null,
+
+    fn deinit(self: *CustomCommandFakeApp) void {
+        if (self.enqueued) |prompt| self.alloc.free(prompt);
+        self.enqueued = null;
+    }
+
+    noinline fn customCommandBody(self: *const CustomCommandFakeApp, index: usize) ?[]const u8 {
+        if (index < self.first_custom_index) return null;
+        const offset = index - self.first_custom_index;
+        if (offset >= self.bodies.len) return null;
+        return self.bodies[offset];
+    }
+
+    /// Copies like the real queue does, so a borrowed expansion buffer that
+    /// outlived the handler would surface as a use-after-free under the
+    /// testing allocator.
+    noinline fn enqueuePrompt(self: *CustomCommandFakeApp, prompt: []const u8) !bool {
+        if (self.enqueued) |previous| self.alloc.free(previous);
+        self.enqueued = try self.alloc.dupe(u8, prompt);
+        return true;
+    }
+
+    noinline fn writeDomainNotice(self: *CustomCommandFakeApp, notice: types.SemanticNotice, _: bool) !void {
+        self.tone = notice.tone;
+        self.topic = notice.topic;
+        self.body = notice.body;
+    }
+};
+
+const custom_command_bodies = [_][]const u8{"Hello $1, full input was $ARGUMENTS"};
+
+test "custom command dispatch enqueues the expanded body" {
+    var app = CustomCommandFakeApp{ .bodies = &custom_command_bodies };
+    defer app.deinit();
+
+    try Handlers(CustomCommandFakeApp).commandRunCustom(@ptrCast(&app), 42, "Ada Lovelace");
+
+    try std.testing.expectEqualStrings(
+        "Hello Ada, full input was Ada Lovelace",
+        app.enqueued.?,
+    );
+    try std.testing.expectEqual(@as(?types.NoticeTone, null), app.tone);
+}
+
+test "a custom command invoked with no arguments expands to empty placeholders" {
+    var app = CustomCommandFakeApp{ .bodies = &custom_command_bodies };
+    defer app.deinit();
+
+    try Handlers(CustomCommandFakeApp).commandRunCustom(@ptrCast(&app), 42, "");
+
+    try std.testing.expectEqualStrings("Hello , full input was ", app.enqueued.?);
+}
+
+test "custom command dispatch reports an unknown command without reading the index" {
+    for ([_]usize{ 0, 41, 43, std.math.maxInt(usize) }) |index| {
+        var app = CustomCommandFakeApp{ .bodies = &custom_command_bodies };
+        defer app.deinit();
+
+        try Handlers(CustomCommandFakeApp).commandRunCustom(@ptrCast(&app), index, "arguments");
+
+        try std.testing.expectEqual(@as(?[]u8, null), app.enqueued);
+        try std.testing.expectEqual(types.NoticeTone.@"error", app.tone.?);
+        try std.testing.expectEqualStrings("command", app.topic.?);
+        try std.testing.expectEqualStrings("Unknown command. Try /help.", app.body.?);
+    }
+}
+
+test "an oversized expansion is refused with a diagnostic instead of enqueued" {
+    const alloc = std.testing.allocator;
+    const args = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(args);
+    @memset(args, 'x');
+
+    const bodies = [_][]const u8{"$1$1$1$1$1$1$1$1$1"};
+    var app = CustomCommandFakeApp{ .bodies = &bodies };
+    defer app.deinit();
+
+    try Handlers(CustomCommandFakeApp).commandRunCustom(@ptrCast(&app), 42, args);
+
+    try std.testing.expectEqual(@as(?[]u8, null), app.enqueued);
+    try std.testing.expectEqual(types.NoticeTone.@"error", app.tone.?);
+    try std.testing.expectEqualStrings("command", app.topic.?);
+    try std.testing.expectEqualStrings(
+        command_expansion.too_large_notice,
+        app.body.?,
+    );
 }
 
 test "app_commands exposes active handler API surface" {

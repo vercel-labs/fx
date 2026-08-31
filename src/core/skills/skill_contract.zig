@@ -78,8 +78,28 @@ pub const ParsedSkillFile = struct {
     name: ?[]const u8,
     description: ?[]const u8,
     description_block: ?BlockDescription = null,
+    /// Value of `options.additional_scalar_key` when the document declares it.
+    /// Borrowed from the parsed content like every other field.
+    additional_scalar: ?[]const u8 = null,
     body: []const u8,
     status: MetadataStatus,
+};
+
+pub const NameMode = enum {
+    required,
+    ignored,
+};
+
+/// Caller-owned relaxations for documents that are not skills. The defaults
+/// reproduce skill parsing exactly.
+pub const ParseOptions = struct {
+    name_mode: NameMode = .required,
+    /// Additional recognized scalar key returned as
+    /// `ParsedSkillFile.additional_scalar`.
+    additional_scalar_key: ?[]const u8 = null,
+    /// Preserve blank lines immediately following the closing frontmatter
+    /// delimiter. Skills retain their established normalized body behavior.
+    preserve_body_prefix: bool = false,
 };
 
 pub const SkillMetadata = struct {
@@ -122,6 +142,10 @@ pub fn resolveMetadata(parsed: ParsedSkillFile, fallback_name: []const u8) Skill
 }
 
 pub fn parseSkillFile(content: []const u8) ParsedSkillFile {
+    return parseSkillFileWithOptions(content, .{});
+}
+
+pub fn parseSkillFileWithOptions(content: []const u8, options: ParseOptions) ParsedSkillFile {
     const header_start = frontmatterHeaderStart(content) orelse {
         return .{
             .name = null,
@@ -140,14 +164,20 @@ pub fn parseSkillFile(content: []const u8) ParsedSkillFile {
     };
 
     const header = content[header_start..closing.header_end];
-    const body = std.mem.trimStart(u8, content[closing.body_start..], "\r\n");
+    const raw_body = content[closing.body_start..];
+    const body = if (options.preserve_body_prefix)
+        raw_body
+    else
+        std.mem.trimStart(u8, raw_body, "\r\n");
 
     var name: ?[]const u8 = null;
     var description: ?[]const u8 = null;
     var description_block: ?BlockDescription = null;
+    var additional_scalar: ?[]const u8 = null;
     var invalid_cause: ?InvalidMetadataCause = null;
     var saw_name = false;
     var saw_description = false;
+    var saw_additional_scalar = false;
     var previous_line_recognized = false;
 
     var line_offset: usize = 0;
@@ -168,7 +198,7 @@ pub fn parseSkillFile(content: []const u8) ParsedSkillFile {
         const key = std.mem.trim(u8, trimmed[0..colon_idx], " \t");
         const raw_value = std.mem.trim(u8, trimmed[colon_idx + 1 ..], " \t");
 
-        if (std.mem.eql(u8, key, "name")) {
+        if (options.name_mode != .ignored and std.mem.eql(u8, key, "name")) {
             previous_line_recognized = true;
             if (saw_name) setFirstInvalidCause(&invalid_cause, .duplicate_recognized_key);
             saw_name = true;
@@ -192,6 +222,13 @@ pub fn parseSkillFile(content: []const u8) ParsedSkillFile {
                 description_block = null;
                 if (parsed_value.invalid_cause) |cause| setFirstInvalidCause(&invalid_cause, cause);
             }
+        } else if (options.additional_scalar_key != null and std.mem.eql(u8, key, options.additional_scalar_key.?)) {
+            previous_line_recognized = true;
+            if (saw_additional_scalar) setFirstInvalidCause(&invalid_cause, .duplicate_recognized_key);
+            saw_additional_scalar = true;
+            const parsed_value = parseRecognizedValue(raw_value);
+            additional_scalar = parsed_value.value;
+            if (parsed_value.invalid_cause) |cause| setFirstInvalidCause(&invalid_cause, cause);
         } else {
             previous_line_recognized = false;
         }
@@ -199,7 +236,7 @@ pub fn parseSkillFile(content: []const u8) ParsedSkillFile {
 
     if (name) |skill_name| {
         if (invalidSkillNameCause(skill_name)) |cause| setFirstInvalidCause(&invalid_cause, cause);
-    } else {
+    } else if (options.name_mode == .required) {
         setFirstInvalidCause(&invalid_cause, .missing_name);
     }
     if (description_block == null) {
@@ -217,6 +254,7 @@ pub fn parseSkillFile(content: []const u8) ParsedSkillFile {
         .name = name,
         .description = description,
         .description_block = description_block,
+        .additional_scalar = additional_scalar,
         .body = body,
         .status = if (invalid_cause) |cause| .{ .invalid = cause } else .valid,
     };

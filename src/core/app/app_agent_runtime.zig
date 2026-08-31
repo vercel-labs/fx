@@ -59,6 +59,7 @@ const workspace_access = @import("../workspace/workspace_access.zig");
 const js_host_workspace = @import("../hosts/js_host_workspace.zig");
 
 const Allocator = std.mem.Allocator;
+const RefreshProjectContextError = context_contract.ProviderError || error{PaintGuardViolated};
 const ChatMessage = types.ChatMessage;
 const PermissionGrant = types.PermissionGrant;
 const PermissionMode = types.PermissionMode;
@@ -839,7 +840,7 @@ pub fn Runtime(comptime App: type) type {
             }, arena, messages);
         }
 
-        pub fn refreshProjectContext(app: *App, targets: []const context_contract.ApplicableTarget) context_contract.ProviderError!void {
+        pub fn refreshProjectContext(app: *App, targets: []const context_contract.ApplicableTarget) RefreshProjectContextError!void {
             app.context_snapshot.deinit(app.alloc);
             if (!app.context_enabled) return;
 

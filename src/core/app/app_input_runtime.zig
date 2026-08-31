@@ -11794,9 +11794,12 @@ const FakeSubmitApp = struct {
     fail_pending_finalization: bool = false,
     fail_command_after_pending_clear: bool = false,
     snapshot_dir: ?[]const u8 = null,
+    /// Lets a test serve the merged registry a discovered command produces,
+    /// the way `App.slashRegistry()` does in production.
+    slash_registry_override: ?command_specs.SlashRegistry = null,
 
-    pub fn slashRegistry(_: *const FakeSubmitApp) command_specs.SlashRegistry {
-        return routing_test_slash_registry;
+    pub fn slashRegistry(self: *const FakeSubmitApp) command_specs.SlashRegistry {
+        return self.slash_registry_override orelse routing_test_slash_registry;
     }
 
     fn deinit(self: *FakeSubmitApp) void {
@@ -12404,6 +12407,80 @@ test "app_input_runtime submit preserves a dismissed slash query" {
 
     try std.testing.expect(app.last_command == null);
     try std.testing.expectEqualStrings("/he", app.last_prompt.?);
+}
+
+/// A merged registry shaped like the one `custom_commands.buildRuntime`
+/// produces: the routing builtins first, then one custom spec.
+const custom_submit_slash_specs = routing_test_slash_specs ++ [_]command_specs.SlashSpec{
+    .{ .kind = .custom, .command = "/greet", .help_entry = "/greet <name>", .completion_label = "/greet <name>", .completion_description = "greet someone (/tmp/workspace/.fx/prompts)", .presentation_category = .extensions, .has_args = true, .accepts_payload = true, .requires_prompt_credential = true },
+};
+const custom_submit_slash_registry = command_specs.SlashRegistry{ .commands = custom_submit_slash_specs[0..] };
+
+test "app_input_runtime intercepts a custom command before enqueueing a prompt" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{ .alloc = alloc, .slash_registry_override = custom_submit_slash_registry };
+    defer app.deinit();
+
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "/greet Ada Lovelace");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+
+    try std.testing.expectEqualStrings("/greet Ada Lovelace", app.last_command.?);
+    try std.testing.expect(app.last_prompt == null);
+    try std.testing.expectEqual(@as(usize, 1), app.preflight_count);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
+}
+
+test "app_input_runtime matches a custom command typed with trailing whitespace only" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{ .alloc = alloc, .slash_registry_override = custom_submit_slash_registry };
+    defer app.deinit();
+
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "/greet ");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+
+    // Submission forwards the draft verbatim; the router is what tolerates the
+    // trailing blank, so the proof is the parse, not the recorded text.
+    try std.testing.expectEqualStrings("/greet ", app.last_command.?);
+    try std.testing.expectEqual(@as(usize, 1), app.command_count);
+    try std.testing.expect(app.last_prompt == null);
+
+    const command_router = @import("../slash_commands/command_router.zig");
+    switch (command_router.parse(custom_submit_slash_registry, app.last_command.?)) {
+        .custom => |custom| {
+            try std.testing.expectEqual(
+                @as(usize, custom_submit_slash_specs.len - 1),
+                custom.index,
+            );
+            try std.testing.expectEqualStrings("", custom.args);
+        },
+        else => return error.CustomCommandNotMatched,
+    }
+}
+
+test "a custom command is refused when no prompt credential is usable" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{
+        .alloc = alloc,
+        .slash_registry_override = custom_submit_slash_registry,
+        .prompt_admitted = false,
+    };
+    defer app.deinit();
+
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "/greet Ada");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+
+    try std.testing.expectEqual(@as(usize, 1), app.preflight_count);
+    try std.testing.expectEqual(@as(usize, 0), app.command_count);
+    try std.testing.expect(app.last_prompt == null);
+    // The refusal leaves the draft intact, exactly as a credential-requiring
+    // builtin does.
+    try std.testing.expectEqualStrings("/greet Ada", app.input_runtime.edit_state.input.items);
 }
 
 test "app_input_runtime routes an unmatched visible slash query as an unknown command" {

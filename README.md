@@ -131,6 +131,30 @@ Use `fx mcp list`, `fx mcp path`, and `fx mcp remove NAME` for noninteractive pr
 
 MCP servers have a 30-second startup timeout by default; set `startup_timeout_ms` on a server when its cold start needs a different bound. For direct `docker run` stdio entries, fx uses a private container ID file to remove the owned container after shutdown or startup failure. A configuration that already supplies `--cidfile` keeps ownership of its own cleanup policy.
 
+### Custom slash commands
+
+Put personal commands in `~/.fx/prompts` or commit project commands to `.fx/prompts` in a workspace. fx scans only regular `.md` files directly inside each prompts directory. The scan is flat: subdirectories are not read. A filename such as `review-pr.md` always defines `/review-pr`; optional frontmatter can provide `description` and `argument-hint`:
+
+```markdown
+---
+description: Review a pull request
+argument-hint: <number> [focus]
+---
+Review pull request $1, focusing on ${2:-correctness}.
+The complete input was: $ARGUMENTS
+```
+
+`/review-pr 512 security` sends `Review pull request 512, focusing on security.` followed by `The complete input was: 512 security`. Placeholder expansion is single-pass and supports:
+
+- `$ARGUMENTS`: all invocation arguments, preserving their internal spacing. Example: `/echo one two` expands `Input: $ARGUMENTS` to `Input: one two`.
+- `$1` through `$9`: the corresponding whitespace-separated argument, or an empty string when missing. Example: `/greet Ada` expands `Hello $1` to `Hello Ada`.
+- `$$`: one literal dollar sign. Example: `Cost: $$5` expands to `Cost: $5`.
+- `${N:-default}` for `N` from 1 through 9: the positional argument or the literal fallback when missing. Example: `/base` expands `Branch: ${1:-main}` to `Branch: main`.
+
+Built-in slash commands have precedence over custom commands, and custom commands have precedence over skills when the same token exists. Among custom commands, the nearest workspace directory wins, followed by parent workspace directories and then `~/.fx/prompts`. Help and completion display the exact source directory for every command. This differs from Claude Code's personal-wins rule. A rejected file does not stop fx or prevent other commands from loading. To inspect discovery diagnostics for missing commands, start fx with `FX_TRACE_LOG=/path/to/trace.log FX_TRACE_SCOPES=commands` and read the trace.
+
+Treat a repository's `.fx/prompts` files with the same trust as its `AGENTS.md` and `.fx/skills`. fx adds no workspace trust prompt. Invoking a custom command sends its expanded body as prompt text on your behalf. Expansion itself does not execute shell commands, read referenced files, or make network requests.
+
 ## Documentation
 
 Read the [fx documentation](https://fx.sh/docs).

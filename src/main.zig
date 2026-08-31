@@ -50,6 +50,7 @@ const model_capabilities = @import("core/config/model_capabilities.zig");
 const prompt_policy = @import("core/config/prompt_policy.zig");
 const builtin_commands = @import("builtins/commands.zig");
 const command_specs = @import("core/slash_commands/command_specs.zig");
+const custom_commands = @import("core/slash_commands/custom_commands.zig");
 const builtin_context = @import("builtins/context.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_providers = @import("builtins/providers.zig");
@@ -62,6 +63,7 @@ const agent_stream_provider = @import("core/agent/stream_provider.zig");
 const builtin_hooks = @import("builtins/hooks.zig");
 const builtin_mcp = @import("builtins/mcp.zig");
 const builtin_modes = @import("builtins/modes.zig");
+const builtin_custom_commands = @import("builtins/custom_commands.zig");
 const builtin_skills = @import("builtins/skills.zig");
 const host = @import("core/hosts/host.zig");
 const host_runtime_profile = @import("core/hosts/runtime_profile.zig");
@@ -375,6 +377,12 @@ else
 const wasm_skill_root_policy: @import("core/skills/skill_contract.zig").RootPolicy = .{
     .managed_root_source = null,
 };
+/// The wasm host has no profile directory, so command discovery keeps only the
+/// workspace roots there.
+const wasm_command_root_policy: @import("core/skills/skill_contract.zig").RootPolicy = .{
+    .workspace_roots = builtin_custom_commands.root_policy.workspace_roots,
+    .managed_root_source = null,
+};
 fn currentBuild() update_target.CurrentBuild {
     return .{
         .channel = compiled_update_channel,
@@ -425,8 +433,22 @@ const App = struct {
         return builtin_context.prompt_policy;
     }
 
-    pub fn slashRegistry(_: *const Self) command_specs.SlashRegistry {
-        return builtin_commands.slash_registry;
+    /// The only production injection point for the slash registry. Builtins
+    /// come first in the merged slice, and a load with no discovered command
+    /// serves `builtin_commands.slash_registry` itself.
+    pub fn slashRegistry(self: *const Self) command_specs.SlashRegistry {
+        return self.custom_commands.registry(builtin_commands.slash_registry);
+    }
+
+    /// Resolves a merged-registry index parsed by `command_router` back to the
+    /// discovered body it names. Returns null when the index no longer resolves,
+    /// which is what a reload racing a queued invocation looks like.
+    pub fn customCommandBody(self: *const Self, index: usize) ?[]const u8 {
+        const command = self.custom_commands.commandAt(
+            builtin_commands.slash_registry,
+            index,
+        ) orelse return null;
+        return command.body;
     }
 
     pub fn mcpCommandProvider(_: *const Self) mcp_command_provider.Provider {
@@ -566,6 +588,7 @@ const App = struct {
     change_tracker: change_tracker_mod.ChangeTracker = .{},
     mcp: app_mcp_runtime.State = .{},
     skills: skill_runtime.Runtime = .{},
+    custom_commands: custom_commands.CommandRuntime = .{},
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     file_index: file_index_mod.FileIndex = .{},
     context_enabled: bool = true,
@@ -657,6 +680,7 @@ const App = struct {
             },
         );
         errdefer app.deinit();
+        try app.reloadCustomCommands("interactive_startup");
         try WorkspaceAppRuntime.applyLaunch(
             &app,
             launch.modifiers.additional_directories,
@@ -890,6 +914,7 @@ const App = struct {
         self.diff_entries.deinit(std.heap.c_allocator);
         self.mcp.deinit(self.alloc);
         self.skills.deinit(std.heap.c_allocator);
+        self.custom_commands.deinit(self.alloc);
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
         self.lifecycle_runtime.deinit();
@@ -1886,6 +1911,21 @@ const App = struct {
         const loaded = try app_runtime_setup.loadSkills(std.heap.c_allocator, self.workspace_root, builtin_skills.root_policy);
         skill_runtime.traceDiagnostics("interactive_reload", loaded.diagnostics);
         self.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
+    }
+
+    pub fn reloadCustomCommands(self: *App, surface: []const u8) !void {
+        const policy = if (comptime host_target.is_wasm)
+            wasm_command_root_policy
+        else
+            builtin_custom_commands.root_policy;
+        try app_runtime_setup.reloadCustomCommandRuntime(
+            self.alloc,
+            &self.custom_commands,
+            self.workspace_root,
+            policy,
+            builtin_commands.slash_registry,
+            surface,
+        );
     }
 
     pub fn allowToolForSession(self: *App, tool_name: []const u8, target_path: []const u8) !void {
@@ -4189,8 +4229,10 @@ test {
     _ = @import("core/cli/cli_surface.zig");
     _ = @import("core/workspace/change_tracker.zig");
     _ = @import("core/shared/collections.zig");
+    _ = @import("core/slash_commands/command_expansion.zig");
     _ = @import("core/slash_commands/command_router.zig");
     _ = @import("core/slash_commands/command_specs.zig");
+    _ = @import("core/slash_commands/custom_commands.zig");
     _ = @import("core/config/config_runtime.zig");
     _ = @import("core/config/settings_store.zig");
     _ = @import("ui/footer/compact_command_menu_presentation.zig");
@@ -4305,6 +4347,7 @@ test {
     _ = @import("core/tooling/tool_runtime.zig");
     _ = @import("core/tooling/tool_specs.zig");
     _ = @import("builtins/commands.zig");
+    _ = @import("builtins/custom_commands.zig");
     _ = @import("builtins/mcp.zig");
     _ = @import("builtins/modes.zig");
     _ = @import("builtins/tools.zig");
