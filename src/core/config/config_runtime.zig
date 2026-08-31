@@ -41,6 +41,7 @@ pub const Settings = struct {
     provider: ?model_provider.ProviderId = null,
     codex_model: ?[]u8 = null,
     anthropic_model: ?[]u8 = null,
+    openai_model: ?[]u8 = null,
     grok_model: ?[]u8 = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
@@ -608,6 +609,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "provider",
         "codex_model",
         "anthropic_model",
+        "openai_model",
         "grok_model",
         "effort",
         "fast_mode",
@@ -1377,6 +1379,12 @@ fn parseProfileOnlyFields(
         settings.anthropic_model = try alloc.dupe(u8, model_value.string);
     }
 
+    if (root.object.get("openai_model")) |model_value| {
+        if (model_value != .string) return error.InvalidOpenAiModelType;
+        settings_store.validateModel(model_value.string) catch return error.InvalidOpenAiModelValue;
+        settings.openai_model = try alloc.dupe(u8, model_value.string);
+    }
+
     if (root.object.get("grok_model")) |model_value| {
         if (model_value != .string) return error.InvalidGrokModelType;
         settings_store.validateModel(model_value.string) catch return error.InvalidGrokModelValue;
@@ -1566,6 +1574,11 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
         if (target.anthropic_model) |current| alloc.free(current);
         target.anthropic_model = value;
         incoming.anthropic_model = null;
+    }
+    if (incoming.openai_model) |value| {
+        if (target.openai_model) |current| alloc.free(current);
+        target.openai_model = value;
+        incoming.openai_model = null;
     }
     if (incoming.grok_model) |value| {
         if (target.grok_model) |current| alloc.free(current);

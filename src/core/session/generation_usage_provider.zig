@@ -86,6 +86,7 @@ pub const Set = struct {
     codex: ?Provider = null,
     grok: ?Provider = null,
     anthropic: ?Provider = null,
+    openai_compatible: ?Provider = null,
 
     pub fn gatewayOnly(provider: Provider) Set {
         return .{ .gateway = provider };
@@ -97,6 +98,7 @@ pub const Set = struct {
             .codex => self.codex,
             .grok => self.grok,
             .anthropic => self.anthropic,
+            .openai_compatible => self.openai_compatible,
         };
     }
 };

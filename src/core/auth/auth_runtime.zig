@@ -1646,6 +1646,15 @@ pub const Runtime = struct {
                     self,
                     loadRuntimeCredentialSource,
                 ),
+            .openai_compatible => if (self.credentialSource() == .stored_key)
+                false
+            else
+                self.selectSourceWithLoader(
+                    alloc,
+                    .stored_key,
+                    self,
+                    loadRuntimeCredentialSource,
+                ),
             .gateway => if (self.credentialSource() != .chatgpt_subscription and self.credentialSource() != .grok_subscription)
                 false
             else

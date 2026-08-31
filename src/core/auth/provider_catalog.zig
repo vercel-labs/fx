@@ -45,6 +45,14 @@ pub const entries = [_]Entry{
         .description = "Anthropic API key via ANTHROPIC_API_KEY",
         .subscription = false,
     },
+    .{
+        .id = .openai_compatible,
+        .slug = "openai-compatible",
+        .name = "OpenAI Compatible",
+        .route_name = "OpenAI Compatible",
+        .description = "OpenAI-compatible Chat Completions API key via OPENAI_API_KEY",
+        .subscription = false,
+    },
 };
 
 pub fn parse(value: []const u8) ?model_provider.ProviderId {
@@ -66,12 +74,14 @@ test "auth provider catalog uses the model provider identity and explicit aliase
     try std.testing.expectEqual(model_provider.ProviderId.codex, parse("codex").?);
     try std.testing.expectEqual(model_provider.ProviderId.grok, parse("grok").?);
     try std.testing.expectEqual(model_provider.ProviderId.anthropic, parse("anthropic").?);
-    try std.testing.expect(parse("openai-codex") == null);
+    try std.testing.expectEqual(model_provider.ProviderId.openai_compatible, parse("openai-compatible").?);
+    try std.testing.expectEqual(model_provider.ProviderId.openai_compatible, parse("openai").?);
     try std.testing.expect(parse("chatgpt") == null);
     try std.testing.expect(parse("unknown") == null);
     try std.testing.expect(find(.codex).subscription);
     try std.testing.expect(find(.grok).subscription);
     try std.testing.expect(!find(.anthropic).subscription);
+    try std.testing.expect(!find(.openai_compatible).subscription);
 }
 
 pub fn label(id: model_provider.ProviderId) []const u8 {

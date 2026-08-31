@@ -52,6 +52,7 @@ pub const Set = struct {
     codex: Bundle,
     grok: Bundle,
     anthropic: Bundle,
+    openai_compatible: Bundle,
 
     pub fn select(self: Set, provider: model_provider.ProviderId) Bundle {
         return switch (provider) {
@@ -59,6 +60,7 @@ pub const Set = struct {
             .codex => self.codex,
             .grok => self.grok,
             .anthropic => self.anthropic,
+            .openai_compatible => self.openai_compatible,
         };
     }
 
@@ -68,6 +70,7 @@ pub const Set = struct {
             .codex = self.codex.deferred_usage,
             .grok = self.grok.deferred_usage,
             .anthropic = self.anthropic.deferred_usage,
+            .openai_compatible = self.openai_compatible.deferred_usage,
         };
     }
 };

@@ -1124,10 +1124,11 @@ fn configuredProviderSelection(
     const provider = settings.provider orelse .gateway;
     const model = settings.models.get(provider) orelse switch (provider) {
         .gateway => default_model,
-        .codex, .grok, .anthropic => switchModelFromEnv() orelse switch (provider) {
+        .codex, .grok, .anthropic, .openai_compatible => switchModelFromEnv() orelse switch (provider) {
             .codex => return error.CodexModelNotSelected,
             .grok => return error.GrokModelNotSelected,
             .anthropic => return error.AnthropicModelNotSelected,
+            .openai_compatible => return error.OpenAiModelNotSelected,
             .gateway => unreachable,
         },
     };

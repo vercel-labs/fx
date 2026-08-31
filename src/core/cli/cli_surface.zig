@@ -705,6 +705,7 @@ fn activateProviderSelection(
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
             .anthropic => "Anthropic is already selected.\n",
+            .openai_compatible => "OpenAI Compatible is already selected.\n",
         });
         return true;
     }
@@ -754,6 +755,7 @@ fn activateProviderSelection(
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
                 .anthropic => "Anthropic credential is unavailable",
+                .openai_compatible => "OpenAI Compatible credential is unavailable",
                 .gateway => "configure a Gateway credential first",
             },
         );
@@ -764,6 +766,7 @@ fn activateProviderSelection(
             .codex => "Codex model catalog is unavailable",
             .grok => "Grok model catalog is unavailable",
             .anthropic => "Anthropic model catalog is unavailable",
+            .openai_compatible => "OpenAI Compatible model catalog is unavailable",
             .gateway => "Gateway model catalog is unavailable",
         });
         return false;
@@ -809,7 +812,7 @@ fn activateProviderSelection(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
-        .gateway, .anthropic => unreachable,
+        .gateway, .anthropic, .openai_compatible => unreachable,
     };
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
@@ -817,6 +820,7 @@ fn activateProviderSelection(
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
             .anthropic => "Provider set to Anthropic.\n",
+            .openai_compatible => "Provider set to OpenAI Compatible.\n",
         });
     }
     return true;
@@ -995,6 +999,10 @@ fn runNonInteractiveWithDeps(
                 },
                 .anthropic => {
                     try writeStderr(deps, "fx login: Anthropic uses API keys; set ANTHROPIC_API_KEY or run fx api-key anthropic\n");
+                    return .handled_failure;
+                },
+                .openai_compatible => {
+                    try writeStderr(deps, "fx login: OpenAI Compatible uses API keys; set OPENAI_API_KEY or run fx api-key openai\n");
                     return .handled_failure;
                 },
             }
@@ -1192,6 +1200,7 @@ fn runNonInteractiveWithDeps(
                     .codex => "fx models: Codex model catalog is unavailable\n",
                     .grok => "fx models: Grok model catalog is unavailable\n",
                     .anthropic => "fx models: Anthropic model catalog is unavailable\n",
+                    .openai_compatible => "fx models: OpenAI Compatible model catalog is unavailable\n",
                 });
                 return .handled_failure;
             };

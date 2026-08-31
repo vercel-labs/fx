@@ -34,4 +34,8 @@ pub const native = provider_set.Set{
         .cli_model_catalog = anthropic_models.cli_model_catalog_provider,
         .model_catalog = anthropic_models.model_catalog_provider,
     },
+    // TODO: wire the openai-compatible transport in the gateway/runtime commits.
+    .openai_compatible = .{
+        .presentation = provider_catalog.find(.openai_compatible),
+    },
 };

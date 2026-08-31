@@ -326,6 +326,7 @@ pub fn resolveForProvider(
         },
         .gateway => {},
         .anthropic => return .{ .credential = try loadAnthropicApiKeyCredential(alloc, profile_anthropic_api_key) },
+        .openai_compatible => {}, // TODO: env/stored-key resolution lands in the auth commit
     }
     return resolvePreferring(
         alloc,

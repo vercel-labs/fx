@@ -6,6 +6,7 @@ pub const ProviderId = enum {
     codex,
     grok,
     anthropic,
+    openai_compatible,
 };
 
 pub const ProviderSelection = struct {
@@ -18,6 +19,7 @@ pub fn parse(value: []const u8) ?ProviderId {
     if (std.ascii.eqlIgnoreCase(value, "codex")) return .codex;
     if (std.ascii.eqlIgnoreCase(value, "grok")) return .grok;
     if (std.ascii.eqlIgnoreCase(value, "anthropic")) return .anthropic;
+    if (std.ascii.eqlIgnoreCase(value, "openai-compatible") or std.ascii.eqlIgnoreCase(value, "openai")) return .openai_compatible;
     return null;
 }
 
@@ -27,6 +29,7 @@ pub fn label(provider: ProviderId) []const u8 {
         .codex => "Codex subscription",
         .grok => "Grok subscription",
         .anthropic => "Anthropic",
+        .openai_compatible => "OpenAI Compatible",
     };
 }
 
@@ -37,6 +40,7 @@ pub fn authorizesCredential(provider: ProviderId, source: ?types.CredentialSourc
         .codex => selected == .chatgpt_subscription,
         .grok => selected == .grok_subscription,
         .anthropic => selected == .anthropic_api_key,
+        .openai_compatible => selected == .stored_key,
     };
 }
 
@@ -54,6 +58,9 @@ test "explicit providers authorize only their own credential origins" {
     try std.testing.expect(!authorizesCredential(.anthropic, .ai_gateway_api_key));
     try std.testing.expect(!authorizesCredential(.anthropic, .chatgpt_subscription));
     try std.testing.expect(!authorizesCredential(.gateway, .anthropic_api_key));
+    try std.testing.expect(authorizesCredential(.openai_compatible, .stored_key));
+    try std.testing.expect(!authorizesCredential(.openai_compatible, .anthropic_api_key));
+    try std.testing.expect(!authorizesCredential(.openai_compatible, null));
 }
 
 test "provider parsing exposes gateway codex grok and anthropic" {
@@ -61,6 +68,8 @@ test "provider parsing exposes gateway codex grok and anthropic" {
     try std.testing.expectEqual(ProviderId.codex, parse("CODEX").?);
     try std.testing.expectEqual(ProviderId.grok, parse("GROK").?);
     try std.testing.expectEqual(ProviderId.anthropic, parse("anthropic").?);
+    try std.testing.expectEqual(ProviderId.openai_compatible, parse("openai-compatible").?);
+    try std.testing.expectEqual(ProviderId.openai_compatible, parse("OpenAI").?);
     try std.testing.expect(parse("openai-codex") == null);
     try std.testing.expect(parse("") == null);
 }
