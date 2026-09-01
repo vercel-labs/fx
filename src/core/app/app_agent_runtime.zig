@@ -1168,6 +1168,7 @@ pub fn Runtime(comptime App: type) type {
                     false,
                 .session_child_capability = session_child_capability,
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
+                .gateway_provider_routing = if (comptime @hasField(App, "provider_routing")) &app.provider_routing else null,
             };
         }
     };

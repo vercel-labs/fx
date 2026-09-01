@@ -6,6 +6,10 @@ pub const ResolvedProviderOptions = struct {
     fast: bool = false,
     parallel_tool_calls: ?bool = null,
     prompt_caching: bool = false,
+    /// AI Gateway provider-routing slugs. Borrowed from config-owned
+    /// state and not owned here.
+    gateway_order: []const []const u8 = &.{},
+    gateway_only: []const []const u8 = &.{},
 };
 
 pub const ReasoningEffortOptions = struct {

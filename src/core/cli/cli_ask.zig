@@ -534,6 +534,7 @@ const AskContext = struct {
     agent_step_limit: usize = 0,
     max_tool_result_bytes: usize = 64 * 1024,
     context_limits: config_runtime.context_limits.Values = .{},
+    provider_routing: config_runtime.provider_routing.Map = .{},
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
@@ -732,6 +733,7 @@ const AskContext = struct {
         if (self.store) |*store| store.deinit(self.alloc);
         self.ephemeral_command_replay.deinit();
         self.permission_rules.deinit(self.alloc);
+        self.provider_routing.deinit(self.alloc);
         self.session.deinit(self.alloc);
         if (self.skills_dir.len > 0) self.alloc.free(self.skills_dir);
         self.context_snapshot.deinit(self.alloc);
@@ -1499,6 +1501,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.max_tool_result_bytes = startup.max_tool_result_bytes;
     ctx.context_limits = startup.context_limits;
     ctx.context_limits.applyCommandLine(cfg.context_limit_overrides);
+    ctx.provider_routing = startup.takeProviderRouting();
     ctx.fast_mode = startup.fast_mode;
     ctx.effort = toCoreReasoningEffort(startup.effort);
     ctx.first_call_tool_choice = startup.first_call_tool_choice;
@@ -1797,6 +1800,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         else
             false,
         .context_limits = ctx.context_limits,
+        .gateway_provider_routing = &ctx.provider_routing,
         .session_child_capability = session_child_capability,
         .ephemeral_command_replay = if (session_child_capability == null)
             &ctx.ephemeral_command_replay

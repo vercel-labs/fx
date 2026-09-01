@@ -3678,7 +3678,15 @@ fn processQueuedPromptLoop(
                 projected_request_messages,
             );
             last_gateway_message_count = request_messages.len;
-            const provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
+            var provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
+            if (job.provider == .gateway) {
+                if (config.gateway_provider_routing) |routing| {
+                    if (routing.lookup(gateway_model)) |route| {
+                        provider_opts.gateway_order = route.order;
+                        provider_opts.gateway_only = route.only;
+                    }
+                }
+            }
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);
             const tool_choice: types.ToolChoice = if (recovery_strategy == .reconcile_tool)
                 .none

@@ -448,17 +448,71 @@ fn validatePendingToolReviewMessages(
 }
 
 pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.ResolvedProviderOptions) !void {
-    if (!options.fast and options.parallel_tool_calls == null) return;
+    const has_gateway = options.fast or
+        options.gateway_order.len > 0 or
+        options.gateway_only.len > 0;
+    if (!has_gateway and options.parallel_tool_calls == null) return;
 
     try writer.writeAll(",\"providerOptions\":{");
-    if (options.fast) try writer.writeAll("\"gateway\":{\"speed\":\"fast\"}");
+    if (has_gateway) {
+        try writer.writeAll("\"gateway\":{");
+        var wrote_field = false;
+        if (options.fast) {
+            try writer.writeAll("\"speed\":\"fast\"");
+            wrote_field = true;
+        }
+        if (options.gateway_order.len > 0) {
+            if (wrote_field) try writer.writeByte(',');
+            try writer.writeAll("\"order\":[");
+            for (options.gateway_order, 0..) |slug, index| {
+                if (index > 0) try writer.writeByte(',');
+                try std.json.Stringify.value(slug, .{}, writer);
+            }
+            try writer.writeByte(']');
+            wrote_field = true;
+        }
+        if (options.gateway_only.len > 0) {
+            if (wrote_field) try writer.writeByte(',');
+            try writer.writeAll("\"only\":[");
+            for (options.gateway_only, 0..) |slug, index| {
+                if (index > 0) try writer.writeByte(',');
+                try std.json.Stringify.value(slug, .{}, writer);
+            }
+            try writer.writeByte(']');
+        }
+        try writer.writeByte('}');
+    }
     if (options.parallel_tool_calls) |parallel_tool_calls| {
-        if (options.fast) try writer.writeByte(',');
+        if (has_gateway) try writer.writeByte(',');
         try writer.writeAll("\"xai\":{\"parallelToolCalls\":");
         try writer.writeAll(if (parallel_tool_calls) "true" else "false");
         try writer.writeByte('}');
     }
     try writer.writeByte('}');
+    // Chat Completions / REST also accept a top-level `provider` object.
+    if (options.gateway_order.len > 0 or options.gateway_only.len > 0) {
+        try writer.writeAll(",\"provider\":{");
+        var wrote_provider_field = false;
+        if (options.gateway_order.len > 0) {
+            try writer.writeAll("\"order\":[");
+            for (options.gateway_order, 0..) |slug, index| {
+                if (index > 0) try writer.writeByte(',');
+                try std.json.Stringify.value(slug, .{}, writer);
+            }
+            try writer.writeByte(']');
+            wrote_provider_field = true;
+        }
+        if (options.gateway_only.len > 0) {
+            if (wrote_provider_field) try writer.writeByte(',');
+            try writer.writeAll("\"only\":[");
+            for (options.gateway_only, 0..) |slug, index| {
+                if (index > 0) try writer.writeByte(',');
+                try std.json.Stringify.value(slug, .{}, writer);
+            }
+            try writer.writeByte(']');
+        }
+        try writer.writeByte('}');
+    }
 }
 
 pub fn validateToolMessageHistory(alloc: std.mem.Allocator, messages: []const ChatMessage) !void {
@@ -1327,6 +1381,45 @@ test "buildGatewayRequestBodyWithOptions combines Gateway Fast and xai options" 
     defer alloc.free(body);
 
     try std.testing.expect(std.mem.find(u8, body, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\"},\"xai\":{\"parallelToolCalls\":true}}") != null);
+}
+
+test "buildGatewayRequestBodyWithOptions emits gateway provider routing" {
+    const alloc = std.testing.allocator;
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "question" },
+    };
+
+    const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{
+        .gateway_order = &.{ "wafer", "baseten" },
+        .gateway_only = &.{"baseten"},
+    }, .auto);
+    defer alloc.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"providerOptions\":{\"gateway\":{\"order\":[\"wafer\",\"baseten\"],\"only\":[\"baseten\"]}}") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"provider\":{\"order\":[\"wafer\",\"baseten\"],\"only\":[\"baseten\"]}") != null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const gateway = parsed.value.object.get("providerOptions").?.object.get("gateway").?;
+    try std.testing.expectEqual(@as(usize, 2), gateway.object.get("order").?.array.items.len);
+    try std.testing.expectEqualStrings("baseten", gateway.object.get("only").?.array.items[0].string);
+}
+
+test "buildGatewayRequestBodyWithOptions merges routing with fast mode" {
+    const alloc = std.testing.allocator;
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "question" },
+    };
+
+    const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{
+        .fast = true,
+        .gateway_order = &.{"bedrock"},
+    }, .auto);
+    defer alloc.free(body);
+
+    try std.testing.expect(
+        std.mem.find(u8, body, "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\",\"order\":[\"bedrock\"]}}") != null,
+    );
 }
 
 test "formatGatewayRequestShapeSummary reports content kinds without request content" {

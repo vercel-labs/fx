@@ -215,6 +215,124 @@ test "processQueuedPrompt accounts exact direct-provider usage without deferred 
     try std.testing.expectEqual(@as(?u64, 1), snapshot.request_count);
 }
 
+test "processQueuedPrompt applies gateway provider routing to request bodies" {
+    const alloc = std.testing.allocator;
+    const provider_routing = @import("../../../config/provider_routing.zig");
+
+    const completions = [_]FakeCompletion{.{ .content = "ok" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+
+    const exact_text =
+        \\{"default": {"only": ["wafer"]}, "anthropic/claude-opus-4.6": {"order": ["baseten", "bedrock"]}}
+    ;
+    const exact_parsed = try std.json.parseFromSlice(std.json.Value, alloc, exact_text, .{});
+    defer exact_parsed.deinit();
+    var routing = try provider_routing.parseJsonObject(exact_parsed.value, alloc);
+    defer routing.deinit(alloc);
+
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.gateway_provider_routing = &routing;
+
+    try test_support.runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try expectBodyContains(
+        &gateway,
+        0,
+        "\"providerOptions\":{\"gateway\":{\"order\":[\"baseten\",\"bedrock\"]}}",
+    );
+    try expectBodyNotContains(&gateway, 0, "\"only\"");
+}
+
+test "processQueuedPrompt pins glm-5.3 to togetherai from settings-shaped routing" {
+    const alloc = std.testing.allocator;
+    const provider_routing = @import("../../../config/provider_routing.zig");
+
+    const completions = [_]FakeCompletion{.{ .content = "ok" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+
+    const routing_text =
+        \\{"default": {"order": ["wafer"]}, "deepseek/deepseek-v4-flash-0731": {"only": ["wafer"]}, "zai/glm-5.3": {"only": ["togetherai"], "order": ["togetherai"]}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, routing_text, .{});
+    defer parsed.deinit();
+    var routing = try provider_routing.parseJsonObject(parsed.value, alloc);
+    defer routing.deinit(alloc);
+
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.gateway_provider_routing = &routing;
+    var job = fixture.job();
+    job.model = @constCast("zai/glm-5.3");
+
+    try test_support.runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try expectBodyContains(
+        &gateway,
+        0,
+        "\"providerOptions\":{\"gateway\":{\"order\":[\"togetherai\"],\"only\":[\"togetherai\"]}}",
+    );
+    try expectBodyContains(&gateway, 0, "\"provider\":{\"order\":[\"togetherai\"],\"only\":[\"togetherai\"]}");
+}
+
+test "processQueuedPrompt falls back to default gateway provider routing" {
+    const alloc = std.testing.allocator;
+    const provider_routing = @import("../../../config/provider_routing.zig");
+
+    const completions = [_]FakeCompletion{.{ .content = "ok" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+
+    const default_text =
+        \\{"default": {"order": ["wafer"], "only": ["wafer"]}}
+    ;
+    const default_parsed = try std.json.parseFromSlice(std.json.Value, alloc, default_text, .{});
+    defer default_parsed.deinit();
+    var routing = try provider_routing.parseJsonObject(default_parsed.value, alloc);
+    defer routing.deinit(alloc);
+
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.gateway_provider_routing = &routing;
+
+    try test_support.runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try expectBodyContains(
+        &gateway,
+        0,
+        "\"providerOptions\":{\"gateway\":{\"order\":[\"wafer\"],\"only\":[\"wafer\"]}}",
+    );
+}
+
+test "processQueuedPrompt omits providerOptions without configured routing" {
+    const alloc = std.testing.allocator;
+
+    const completions = [_]FakeCompletion{.{ .content = "ok" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+
+    var fixture = PromptFixture{};
+    const config = fixture.config();
+
+    try test_support.runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 0, "\"providerOptions\":{\"gateway\"");
+}
+
 fn makeOwnedProviderPrompt(alloc: Allocator, text: []const u8, model: []const u8) !QueuedPrompt {
     const prompt = try alloc.dupe(u8, text);
     errdefer alloc.free(prompt);
@@ -2648,6 +2766,8 @@ test "processQueuedPrompt traces selected live controls without request payloads
     try std.testing.expect(std.mem.find(u8, trace, "effort=max") != null);
     try std.testing.expect(std.mem.find(u8, trace, "reasoning=selected") != null);
     try std.testing.expect(std.mem.find(u8, trace, "fast=selected") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "gateway_order_count=0") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "gateway_only_count=0") != null);
     try std.testing.expect(std.mem.find(u8, trace, "\"reasoning\"") == null);
     try std.testing.expect(std.mem.find(u8, trace, "api-key") == null);
     try std.testing.expect(std.mem.find(u8, trace, "user prompt") == null);

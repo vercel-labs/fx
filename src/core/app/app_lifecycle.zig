@@ -129,6 +129,7 @@ pub const StartupState = struct {
     agent_step_limit: usize,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     context_limits: config_runtime.context_limits.Values = .{},
+    provider_routing: config_runtime.provider_routing.Map = .{},
     context_enabled: bool = true,
     fast_mode: bool = false,
     fast_mode_source: config_runtime.ConfigSource = .compiled_default,
@@ -157,6 +158,7 @@ pub const StartupState = struct {
         if (self.selected_model.len > 0) alloc.free(self.selected_model);
         if (self.configured_model.len > 0) alloc.free(self.configured_model);
         self.permission_rules.deinit(alloc);
+        self.provider_routing.deinit(alloc);
         if (self.config_diagnostics.len > 0) {
             for (self.config_diagnostics) |*diagnostic| diagnostic.deinit(alloc);
             alloc.free(self.config_diagnostics);
@@ -173,6 +175,12 @@ pub const StartupState = struct {
     pub fn takeWorkspaceAccess(self: *StartupState) workspace_access.WorkspaceAccess {
         const value = self.workspace_access;
         self.workspace_access = .{};
+        return value;
+    }
+
+    pub fn takeProviderRouting(self: *StartupState) config_runtime.provider_routing.Map {
+        const value = self.provider_routing;
+        self.provider_routing = .{};
         return value;
     }
 
@@ -421,6 +429,7 @@ fn loadStartupStateFromOwnedWorkspace(
     state.agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps);
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});
+    state.provider_routing = try settings.provider_routing.dupe(alloc);
     state.context_enabled = settings.context orelse true;
     state.fast_mode = settings.fast_mode orelse
         (state.provider == .gateway and state.model_source == .compiled_default);

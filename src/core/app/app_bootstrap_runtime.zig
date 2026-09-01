@@ -282,6 +282,7 @@ pub fn Runtime(comptime App: type) type {
             app.agent_step_limit = startup.agent_step_limit;
             app.worker.agent_turn_settings.max_tool_result_bytes = startup.max_tool_result_bytes;
             if (comptime @hasField(App, "context_limits")) app.context_limits = startup.context_limits;
+            if (comptime @hasField(App, "provider_routing")) app.provider_routing = startup.takeProviderRouting();
             app.worker.agent_turn_settings.first_call_tool_choice = startup.first_call_tool_choice;
             app.worker.agent_turn_settings.fast_mode = startup.fast_mode;
             app.worker.agent_turn_settings.effort = startup.effort;
