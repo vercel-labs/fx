@@ -1034,6 +1034,41 @@ describe("MCP remote authentication lifecycle", () => {
     ]);
   }, 30_000);
 
+  test("configured OAuth redirect URI binds the exact loopback callback", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const reservation = Bun.serve({
+      port: 0,
+      fetch: () => new Response("reserved"),
+    });
+    const callbackPort = reservation.port;
+    reservation.stop(true);
+    const redirectUri = `http://localhost:${callbackPort}/oauth/callback`;
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    profile.mcp.fixture.oauth.redirect_uri = redirectUri;
+    writeFileSync(profilePath, JSON.stringify(profile));
+
+    const authenticated = await runFx(["mcp", "auth", "fixture"], {
+      cwd: root.workspace,
+      env: { ...baseEnv(root), AI_GATEWAY_API_KEY: undefined },
+      timeoutMs: 20_000,
+    });
+    expect(authenticated.code).toBe(0);
+    expect(authenticated.stdout).toContain("Authenticated MCP server 'fixture'");
+    expect(auth.authorizationRequests).toBe(1);
+    expect(auth.tokenExchanges).toBe(1);
+
+    const authorizationUrl = new URL(readFileSync(root.openLog, "utf8").trim());
+    expect(authorizationUrl.searchParams.get("redirect_uri")).toBe(redirectUri);
+    const tokenRequest = auth.requests.find((request) => request.path === "/token");
+    expect(tokenRequest).toBeDefined();
+    expect(new URLSearchParams(tokenRequest!.body).get("redirect_uri")).toBe(
+      redirectUri,
+    );
+  }, 30_000);
+
   test("MongoDB-like REST authorization document rejects stored credentials", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url, {

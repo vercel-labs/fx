@@ -61,6 +61,7 @@ pub const ClientConfig = struct {
     client_id: ?[]const u8 = null,
     client_secret: ?[]const u8 = null,
     client_metadata_url: ?[]const u8 = null,
+    redirect_uri: ?[]const u8 = null,
     scopes: []const []const u8 = &.{},
 };
 
@@ -435,6 +436,21 @@ pub fn canonicalResource(alloc: Allocator, endpoint: []const u8) ![]u8 {
 pub fn isLoopbackEndpoint(endpoint: []const u8) bool {
     const uri = std.Uri.parse(endpoint) catch return false;
     return isLoopbackUri(uri);
+}
+
+pub fn validateInteractiveRedirectUri(value: []const u8) !void {
+    if (!std.mem.eql(u8, value, std.mem.trim(u8, value, " \t\r\n"))) {
+        return error.InvalidMcpOAuthRedirectUri;
+    }
+    const uri = std.Uri.parse(value) catch return error.InvalidMcpOAuthRedirectUri;
+    if (uri.user != null or uri.password != null or uri.query != null or uri.fragment != null or
+        !isLoopbackUri(uri))
+    {
+        return error.InvalidMcpOAuthRedirectUri;
+    }
+    var path_buffer: [4096]u8 = undefined;
+    const path = uri.path.toRaw(&path_buffer) catch return error.InvalidMcpOAuthRedirectUri;
+    if (path.len == 0 or path[0] != '/') return error.InvalidMcpOAuthRedirectUri;
 }
 
 fn isLoopbackUri(uri: std.Uri) bool {
@@ -1014,6 +1030,21 @@ pub fn authorizeAutomated(
     );
 }
 
+fn interactiveRedirectUri(alloc: Allocator, port: u16) ![]u8 {
+    return std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/callback", .{port});
+}
+
+fn redirectBindHost(uri: std.Uri) ![]const u8 {
+    const host_component = uri.host orelse return error.InvalidMcpOAuthRedirectUri;
+    var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = host_component.toRaw(&host_buffer) catch return error.InvalidMcpOAuthRedirectUri;
+    if (std.mem.eql(u8, host, "[::1]")) return "::1";
+    if (std.mem.eql(u8, host, "127.0.0.1") or std.ascii.eqlIgnoreCase(host, "localhost")) {
+        return "127.0.0.1";
+    }
+    return error.InvalidMcpOAuthRedirectUri;
+}
+
 pub fn authorizeInteractive(
     alloc: Allocator,
     options: InteractiveAuthorizationOptions,
@@ -1021,17 +1052,29 @@ pub fn authorizeInteractive(
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return error.InteractiveMcpAuthorizationUnsupported;
     }
-    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    const configured_redirect = options.config.redirect_uri;
+    const configured_uri = if (configured_redirect) |value| blk: {
+        try validateInteractiveRedirectUri(value);
+        break :blk try std.Uri.parse(value);
+    } else null;
+    const bind_host = if (configured_uri) |uri| try redirectBindHost(uri) else "127.0.0.1";
+    const bind_port = if (configured_uri) |uri| uri.port.? else 0;
+    var address = try std.Io.net.IpAddress.parse(bind_host, bind_port);
     var listener = try address.listen(io_mod.getIo(), .{ .reuse_address = true });
     defer listener.deinit(io_mod.getIo());
-    const redirect_uri = try std.fmt.allocPrint(
-        alloc,
-        "http://127.0.0.1:{d}/callback",
-        .{listener.socket.address.getPort()},
-    );
+    const redirect_uri = if (configured_redirect) |value|
+        try alloc.dupe(u8, value)
+    else
+        try interactiveRedirectUri(alloc, listener.socket.address.getPort());
     defer alloc.free(redirect_uri);
+    const callback_path = if (configured_uri) |uri|
+        try rawPathAlloc(alloc, uri)
+    else
+        try alloc.dupe(u8, "/callback");
+    defer alloc.free(callback_path);
     var context = InteractiveAuthorizationContext{
         .listener = &listener,
+        .callback_path = callback_path,
         .open_ctx = options.open_ctx,
         .open_url = options.open_url,
         .cancellation = .{
@@ -1247,6 +1290,7 @@ fn requestAutomatedAuthorization(
 
 const InteractiveAuthorizationContext = struct {
     listener: *std.Io.net.Server,
+    callback_path: []const u8,
     open_ctx: ?*anyopaque,
     open_url: OpenUrlFn,
     cancellation: operation_control.CancellationSources,
@@ -1288,6 +1332,14 @@ fn waitForInteractiveCallback(
     return error.McpAuthorizationCallbackTimedOut;
 }
 
+fn validateInteractiveCallbackTarget(target: []const u8, callback_path: []const u8) !void {
+    const query_start = std.mem.indexOfScalar(u8, target, '?') orelse
+        return error.InvalidAuthorizationCallback;
+    if (!std.mem.eql(u8, target[0..query_start], callback_path)) {
+        return error.InvalidAuthorizationCallback;
+    }
+}
+
 fn requestInteractiveAuthorization(
     raw_ctx: ?*anyopaque,
     alloc: Allocator,
@@ -1326,9 +1378,7 @@ fn requestInteractiveAuthorization(
     const target_end = std.mem.indexOfScalarPos(u8, request_line, 4, ' ') orelse
         return error.InvalidAuthorizationCallback;
     const target = request_line[4..target_end];
-    if (!std.mem.startsWith(u8, target, "/callback?")) {
-        return error.InvalidAuthorizationCallback;
-    }
+    try validateInteractiveCallbackTarget(target, ctx.callback_path);
     var response = parseAuthorizationRedirect(alloc, target) catch |err| {
         browser_callback.writeResponse(stream, .failed, null) catch {};
         return err;
@@ -2448,6 +2498,42 @@ test "authorization response uses exact state and issuer comparison" {
             true,
             response,
         ),
+    );
+}
+
+test "interactive OAuth callback preserves the default and validates overrides" {
+    const alloc = std.testing.allocator;
+    const redirect_uri = try interactiveRedirectUri(alloc, 4321);
+    defer alloc.free(redirect_uri);
+
+    try std.testing.expectEqualStrings("http://127.0.0.1:4321/callback", redirect_uri);
+    try validateInteractiveRedirectUri("http://localhost:3118/callback");
+    try validateInteractiveRedirectUri("http://127.0.0.1:3118/oauth/callback");
+    try validateInteractiveRedirectUri("http://[::1]:3118/callback");
+
+    const invalid = [_][]const u8{
+        "https://localhost:3118/callback",
+        "http://example.com:3118/callback",
+        "http://localhost/callback",
+        "http://localhost:3118",
+        "http://localhost:3118/callback?fixed=query",
+    };
+    for (invalid) |value| {
+        try std.testing.expectError(
+            error.InvalidMcpOAuthRedirectUri,
+            validateInteractiveRedirectUri(value),
+        );
+    }
+}
+
+test "interactive callback target honors a configured path" {
+    try validateInteractiveCallbackTarget(
+        "/oauth/callback?code=one&state=two",
+        "/oauth/callback",
+    );
+    try std.testing.expectError(
+        error.InvalidAuthorizationCallback,
+        validateInteractiveCallbackTarget("/callback?code=one", "/oauth/callback"),
     );
 }
 
