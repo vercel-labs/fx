@@ -2897,6 +2897,7 @@ fn themeOwnsRawEntry(class: RawEntryClass) bool {
     return switch (class) {
         .welcome,
         .turn_summary,
+        .worker_status,
         .tool_status,
         .diff_block,
         .question_resolution,
