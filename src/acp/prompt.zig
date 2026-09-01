@@ -7,6 +7,7 @@ const model_provider = @import("../core/config/model_provider.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const io_mod = @import("../core/shared/io.zig");
+const image_attachments = @import("../core/images/image_attachments.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const server = @import("server.zig");
@@ -504,10 +505,16 @@ pub fn handlePrompt(
     };
 
     var prompt_input = parsePromptInput(alloc, params) catch |err| switch (err) {
-        error.UnsupportedPromptImage => return .{
+        error.InvalidPromptImage => return .{
             .rpc_error = .{
                 .code = ErrorCode.invalid_params,
-                .message = "Image prompt blocks are not supported",
+                .message = "Image prompt blocks require base64 data and a mimeType matching the decoded bytes (png, jpeg, gif, or webp)",
+            },
+        },
+        error.PromptImageTooLarge => return .{
+            .rpc_error = .{
+                .code = ErrorCode.invalid_params,
+                .message = image_attachments.image_too_large_notice,
             },
         },
         else => return err,
@@ -515,7 +522,9 @@ pub fn handlePrompt(
     defer prompt_input.deinit(alloc);
     const prompt_text = prompt_input.text;
 
-    if (prompt_input.continue_recovery and prompt_text.len != 0) {
+    if (prompt_input.continue_recovery and
+        (prompt_text.len != 0 or prompt_input.images.len != 0))
+    {
         return .{
             .rpc_error = .{
                 .code = ErrorCode.invalid_params,
@@ -523,7 +532,10 @@ pub fn handlePrompt(
             },
         };
     }
-    if (!prompt_input.continue_recovery and prompt_text.len == 0) {
+    if (!prompt_input.continue_recovery and
+        prompt_text.len == 0 and
+        prompt_input.images.len == 0)
+    {
         return .{
             .rpc_error = .{
                 .code = ErrorCode.invalid_params,
@@ -614,7 +626,29 @@ pub fn handlePrompt(
     );
     defer alloc.free(root_user_intent_context);
 
-    const current_images = if (recovery_checkpoint) |checkpoint| checkpoint.user.images else &.{};
+    const current_images = if (recovery_checkpoint) |checkpoint|
+        checkpoint.user.images
+    else
+        prompt_input.images;
+    // A continuation reuses the snapshots the paused turn owns, so only a
+    // prompt that captured its own may release them.
+    defer if (recovery_checkpoint == null and current_images.len > 0)
+        deleteUnreferencedPromptSnapshots(alloc, session, current_images);
+    if (recovery_checkpoint == null and current_images.len > 0) {
+        var next_id = try nextPromptImageId(alloc, session);
+        for (current_images) |*image| {
+            image.id = next_id;
+            next_id = std.math.add(usize, next_id, 1) catch return error.ImageIdOverflow;
+        }
+        const snapshot_dir = try imageSnapshotStorageDir(session, alloc);
+        defer alloc.free(snapshot_dir);
+        try image_attachments.captureImageSnapshots(
+            alloc,
+            current_images,
+            snapshot_dir,
+            .{ .cancel_flag = &session.cancel_flag },
+        );
+    }
     const authorized_image_catalog = try session.session_rt.snapshotImageCatalog(alloc, current_images);
     defer types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
 
@@ -768,6 +802,338 @@ pub fn runSubagentChild(
     }, turn, message, admission, cancel);
 }
 
+fn outstandingRecoveryCheckpoint(
+    session: *server.ActiveSessionState,
+) ?*const session_codec.RecoveryCheckpoint {
+    const writable = if (session.writable) |*value| value else return null;
+    return if (writable.state.recovery_checkpoint) |*checkpoint| checkpoint else null;
+}
+
+/// Ids must stay distinct from history turns and from the checkpoint of a
+/// paused turn, which both hold live ids.
+fn nextPromptImageId(alloc: Allocator, session: *server.ActiveSessionState) !usize {
+    const catalog = try session.session_rt.snapshotImageCatalog(alloc, &.{});
+    defer types.freeImageAttachmentSlice(alloc, catalog);
+    const history_bounds = try image_attachments.calculate_next_image_id(catalog);
+    const checkpoint = outstandingRecoveryCheckpoint(session) orelse return history_bounds.next_id;
+    const checkpoint_bounds = try image_attachments.calculate_next_image_id(checkpoint.user.images);
+    return @max(history_bounds.next_id, checkpoint_bounds.next_id);
+}
+
+/// A checkpoint still outstanding holds every image of this turn, and the event
+/// that replaces or clears it releases them. When the reference set cannot be
+/// read every snapshot stays: an orphan file costs disk, while a missing file
+/// breaks a session that still points at it.
+fn deleteUnreferencedPromptSnapshots(
+    alloc: Allocator,
+    session: *server.ActiveSessionState,
+    images: []const types.ImageAttachment,
+) void {
+    if (outstandingRecoveryCheckpoint(session) != null) return;
+    const catalog = session.session_rt.snapshotImageCatalog(alloc, &.{}) catch return;
+    defer types.freeImageAttachmentSlice(alloc, catalog);
+    image_attachments.deleteUnreferencedImageSnapshots(images, catalog);
+}
+
+/// The copy outlives the event that replaces or clears the checkpoint, which
+/// frees the references it holds.
+fn dupeOutstandingCheckpointImages(
+    alloc: Allocator,
+    session: *server.ActiveSessionState,
+) ![]types.ImageAttachment {
+    const checkpoint = outstandingRecoveryCheckpoint(session) orelse return &.{};
+    return types.dupeImageAttachmentSlice(alloc, checkpoint.user.images);
+}
+
+/// Call this only after the replacement or clearing persists: while the old
+/// checkpoint can still come back, every file it names must stay.
+///
+/// A durable checkpoint names its snapshots relative to the session image
+/// directory while runtime history names them absolutely, and every snapshot of
+/// a session lives in that one directory, so the leaf name identifies the file
+/// on both sides.
+fn releaseReplacedCheckpointSnapshots(
+    alloc: Allocator,
+    session: *server.ActiveSessionState,
+    replaced_images: []const types.ImageAttachment,
+) void {
+    if (replaced_images.len == 0) return;
+    const current: []const types.ImageAttachment =
+        if (outstandingRecoveryCheckpoint(session)) |checkpoint|
+            checkpoint.user.images
+        else
+            &.{};
+    const catalog = session.session_rt.snapshotImageCatalog(alloc, current) catch return;
+    defer types.freeImageAttachmentSlice(alloc, catalog);
+    const snapshot_dir = imageSnapshotStorageDir(session, alloc) catch return;
+    defer alloc.free(snapshot_dir);
+
+    for (replaced_images) |replaced| {
+        const leaf = snapshotLeafName(replaced) orelse continue;
+        if (holdsSnapshotLeaf(catalog, leaf)) continue;
+        const path = std.fs.path.join(alloc, &.{ snapshot_dir, leaf }) catch continue;
+        defer alloc.free(path);
+        image_attachments.deleteSnapshotPath(path, "replaced_checkpoint_snapshot");
+    }
+}
+
+fn snapshotLeafName(image: types.ImageAttachment) ?[]const u8 {
+    const path = image.snapshot_path orelse return null;
+    return std.fs.path.basename(path);
+}
+
+fn holdsSnapshotLeaf(images: []const types.ImageAttachment, leaf: []const u8) bool {
+    for (images) |image| {
+        const other = snapshotLeafName(image) orelse continue;
+        if (std.mem.eql(u8, leaf, other)) return true;
+    }
+    return false;
+}
+
+const TestImageSession = struct {
+    session: server.ActiveSessionState,
+
+    fn init(
+        alloc: Allocator,
+        home: []const u8,
+        workspace: []const u8,
+        id: []const u8,
+    ) !TestImageSession {
+        var store = try session_store.Store.initFromHome(alloc, home, workspace);
+        var state = session_codec.DurableSessionState{
+            .id = try alloc.dupe(u8, id),
+            .origin_workspace_root = try alloc.dupe(u8, workspace),
+            .workspace_root = try alloc.dupe(u8, workspace),
+            .created_at_ms = 1,
+            .updated_at_ms = 1,
+            .conversation_language = session_runtime.ConversationLanguage.literal("en"),
+            .preferences = .{
+                .model = try alloc.dupe(u8, "test/model"),
+                .effort = .auto,
+                .fast_mode = false,
+            },
+            .history = try alloc.alloc(HistoryTurn, 0),
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+        };
+        defer state.deinit(alloc);
+        return .{ .session = .{
+            .session_id = try alloc.dupe(u8, state.id),
+            .store = store,
+            .writable = try store.startWritableSession(alloc, state),
+            .model = try alloc.dupe(u8, state.preferences.model),
+            .mode = "code",
+            .workspace_root = workspace,
+            .api_key = "",
+            .agent_step_limit = 1,
+            .max_tool_result_bytes = 1024,
+            .fast_mode = false,
+            .effort = .auto,
+            .first_call_tool_choice = .auto,
+            .permission_mode = .auto,
+            .permission_rules = .{},
+            .session_rt = .{ .max_history_turns = 8 },
+            .cancel_flag = std.atomic.Value(bool).init(false),
+            .pending_prompt_id = null,
+        } };
+    }
+
+    fn deinit(self: *TestImageSession, alloc: Allocator) void {
+        self.session.session_rt.deinit(alloc);
+        self.session.writable.?.deinit(alloc);
+        self.session.store.?.deinit(alloc);
+        alloc.free(self.session.model);
+        alloc.free(self.session.session_id);
+    }
+};
+
+fn appendTestCheckpoint(
+    alloc: Allocator,
+    session: *server.ActiveSessionState,
+    turn_id: u64,
+    text: []const u8,
+    images: []const types.ImageAttachment,
+    timestamp_ms: i64,
+) !void {
+    _ = try session.writable.?.appendEvent(
+        alloc,
+        .{ .recovery_checkpoint_set = .{ .checkpoint = .{
+            .turn_id = turn_id,
+            .user = .{ .text = @constCast(text), .images = @constCast(images) },
+            .assistant_source = @constCast(""),
+            .cause = .network_interrupted,
+            .action = .retrying_request,
+            .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+            .requested_fast_mode = false,
+            .fast_mode = false,
+            .max_provider_attempts = 10,
+            .consumed_provider_attempts = 0,
+        } } },
+        timestamp_ms,
+        .retry_expected_tail,
+        .{},
+    );
+}
+
+fn snapshotFileExists(path: []const u8) bool {
+    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch return false;
+    file.close(io_mod.getIo());
+    return true;
+}
+
+test "ACP prompt snapshots outlive the prompt only while history or a checkpoint holds them" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    const Reference = enum { none, history, checkpoint };
+    const cases = [_]struct { reference: Reference, retained: bool }{
+        .{ .reference = .none, .retained = false },
+        .{ .reference = .history, .retained = true },
+        .{ .reference = .checkpoint, .retained = true },
+    };
+    for (cases, 0..) |case, index| {
+        var name_buffer: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "snapshot-{d}.bin", .{index});
+        {
+            var file = try tmp.dir.createFile(io_mod.getIo(), name, .{});
+            defer file.close(io_mod.getIo());
+            try file.writeStreamingAll(io_mod.getIo(), "snapshot");
+        }
+        const snapshot_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
+        defer alloc.free(snapshot_path);
+        const images = [_]types.ImageAttachment{.{
+            .id = 3,
+            .path = @constCast("/tmp/source.png"),
+            .media_type = @constCast("image/png"),
+            .snapshot_path = @constCast(snapshot_path),
+            .snapshot_sha256 = @constCast("digest"),
+        }};
+
+        const id = try std.fmt.allocPrint(alloc, "acp-image-ownership-{d}", .{index});
+        defer alloc.free(id);
+        var owned = try TestImageSession.init(alloc, home, workspace, id);
+        defer owned.deinit(alloc);
+        const session = &owned.session;
+
+        switch (case.reference) {
+            .none => {},
+            .history => {
+                var turn = try session_runtime.makeAssistantTurn(alloc, "look", "done");
+                defer types.freeHistoryTurn(alloc, turn);
+                turn.assistant.user.images = try types.dupeImageAttachmentSlice(alloc, &images);
+                try session.session_rt.appendHistoryEntry(alloc, turn);
+            },
+            .checkpoint => try appendTestCheckpoint(alloc, session, 1, "look", &images, 2),
+        }
+
+        deleteUnreferencedPromptSnapshots(alloc, session, &images);
+        try std.testing.expectEqual(case.retained, snapshotFileExists(snapshot_path));
+    }
+}
+
+test "ACP checkpoint replacement releases the snapshots the old checkpoint held" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var owned = try TestImageSession.init(alloc, home, workspace, "acp-image-replacement");
+    defer owned.deinit(alloc);
+    const session = &owned.session;
+
+    const snapshot_dir = try imageSnapshotStorageDir(session, alloc);
+    defer alloc.free(snapshot_dir);
+    try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), snapshot_dir);
+    var paths: [2][]u8 = undefined;
+    for (&paths, 0..) |*path, index| {
+        path.* = try std.fmt.allocPrint(
+            alloc,
+            "{s}/replaced-{d}.bin",
+            .{ snapshot_dir, index },
+        );
+        var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path.*, .{});
+        file.close(io_mod.getIo());
+    }
+    defer for (paths) |path| alloc.free(path);
+
+    for (paths, 0..) |path, index| {
+        const images = [_]types.ImageAttachment{.{
+            .id = index + 1,
+            .path = @constCast("/tmp/source.png"),
+            .media_type = @constCast("image/png"),
+            .snapshot_path = @constCast(path),
+            .snapshot_sha256 = @constCast("digest"),
+        }};
+        const replaced_images = try dupeOutstandingCheckpointImages(alloc, session);
+        defer types.freeImageAttachmentSlice(alloc, replaced_images);
+        try appendTestCheckpoint(
+            alloc,
+            session,
+            index + 1,
+            "look",
+            &images,
+            @intCast(index + 2),
+        );
+        releaseReplacedCheckpointSnapshots(alloc, session, replaced_images);
+    }
+
+    try std.testing.expect(!snapshotFileExists(paths[0]));
+    try std.testing.expect(snapshotFileExists(paths[1]));
+}
+
+test "ACP prompt image ids start above an outstanding recovery checkpoint" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var owned = try TestImageSession.init(alloc, home, workspace, "acp-image-ids");
+    defer owned.deinit(alloc);
+    const session = &owned.session;
+
+    const checkpoint_images = [_]types.ImageAttachment{.{
+        .id = 7,
+        .path = @constCast("/tmp/paused.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = @constCast("/tmp/paused-snapshot.bin"),
+        .snapshot_sha256 = @constCast("digest"),
+    }};
+    try appendTestCheckpoint(alloc, session, 1, "paused", &checkpoint_images, 2);
+
+    try std.testing.expectEqual(@as(usize, 8), try nextPromptImageId(alloc, session));
+}
+
+fn imageSnapshotStorageDir(
+    session: *server.ActiveSessionState,
+    alloc: Allocator,
+) ![]u8 {
+    const sessions_dir = if (session.store) |*store| store.sessions_dir else null;
+    const session_id = if (session.writable) |*writable| writable.active_id else null;
+    return session_store.imageSnapshotStorageDir(
+        alloc,
+        sessions_dir,
+        session_id,
+        &session.image_snapshot_temp_dir,
+    );
+}
+
 fn refreshProjectContext(
     state: *server.ServerState,
     alloc: Allocator,
@@ -845,6 +1211,11 @@ const ParsedPromptInput = struct {
     targets: []context_contract.ApplicableTarget = &.{},
     omissions: []context_contract.ContextOmissionInput = &.{},
     omission_summary: ?context_contract.ContextOmissionSummary = null,
+    images: []types.ImageAttachment = &.{},
+    /// Scratch directory holding the decoded image bytes. The prompt copies each
+    /// image into the session snapshot store, so this directory is removed when
+    /// the prompt input is released.
+    image_source_dir: ?[]u8 = null,
 
     fn deinit(self: *ParsedPromptInput, alloc: Allocator) void {
         alloc.free(self.text);
@@ -852,9 +1223,67 @@ const ParsedPromptInput = struct {
         if (self.targets.len > 0) alloc.free(self.targets);
         for (self.omissions) |omission| alloc.free(@constCast(omission.source));
         if (self.omissions.len > 0) alloc.free(self.omissions);
+        types.freeImageAttachmentSlice(alloc, self.images);
+        if (self.image_source_dir) |dir| {
+            image_attachments.cleanupSnapshotDir(dir);
+            alloc.free(dir);
+        }
         self.* = undefined;
     }
 };
+
+/// Decoded byte count of one base64 image block. The transport bounds prompt
+/// images first: a frame above `jsonrpc.Reader.frame_resource_byte_limit` never
+/// reaches this parser and the reader answers `request_frame_too_large`. This
+/// limit stays because every image path enforces it, wherever the bytes come
+/// from.
+fn promptImageDecodedSize(data: []const u8) error{ InvalidPromptImage, PromptImageTooLarge }!usize {
+    const size = std.base64.standard.Decoder.calcSizeForSlice(data) catch
+        return error.InvalidPromptImage;
+    if (size == 0) return error.InvalidPromptImage;
+    if (size > image_attachments.max_image_bytes) return error.PromptImageTooLarge;
+    return size;
+}
+
+/// Decodes one ACP image block into a file under `source_dir` and loads it
+/// through the shared attachment path, which reads the media type from the
+/// bytes. The declared MIME type must describe those bytes.
+fn decodePromptImageBlock(
+    alloc: Allocator,
+    block: std.json.Value,
+    source_dir: []const u8,
+    index: usize,
+) !types.ImageAttachment {
+    const data_value = block.object.get("data") orelse return error.InvalidPromptImage;
+    const mime_value = block.object.get("mimeType") orelse return error.InvalidPromptImage;
+    if (data_value != .string or mime_value != .string) return error.InvalidPromptImage;
+
+    const decoded_size = try promptImageDecodedSize(data_value.string);
+    const bytes = try alloc.alloc(u8, decoded_size);
+    defer alloc.free(bytes);
+    std.base64.standard.Decoder.decode(bytes, data_value.string) catch
+        return error.InvalidPromptImage;
+
+    const file_name = try std.fmt.allocPrint(alloc, "acp-image-{d}.bin", .{index});
+    defer alloc.free(file_name);
+    const file_path = try std.fs.path.join(alloc, &.{ source_dir, file_name });
+    defer alloc.free(file_path);
+
+    const zio = io_mod.getIo();
+    var file = try std.Io.Dir.createFileAbsolute(zio, file_path, .{});
+    {
+        defer file.close(zio);
+        try file.writeStreamingAll(zio, bytes);
+    }
+
+    const attachment = image_attachments.loadImageAttachment(alloc, file_path) catch
+        return error.InvalidPromptImage;
+    errdefer types.freeImageAttachment(alloc, attachment);
+    if (!std.mem.eql(u8, attachment.media_type, mime_value.string)) {
+        return error.InvalidPromptImage;
+    }
+    return attachment;
+}
 
 fn parsePromptInput(alloc: Allocator, params_json: []const u8) !ParsedPromptInput {
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, params_json, .{}) catch
@@ -890,6 +1319,18 @@ fn parsePromptInput(alloc: Allocator, params_json: []const u8) !ParsedPromptInpu
         omissions.deinit(alloc);
     }
 
+    var images: std.ArrayList(types.ImageAttachment) = .empty;
+    var image_source_dir: ?[]u8 = null;
+    var own_images = true;
+    defer if (own_images) {
+        for (images.items) |image| types.freeImageAttachment(alloc, image);
+        images.deinit(alloc);
+        if (image_source_dir) |dir| {
+            image_attachments.cleanupSnapshotDir(dir);
+            alloc.free(dir);
+        }
+    };
+
     for (prompt_arr.array.items) |block| {
         if (block != .object) continue;
         const block_type = block.object.get("type") orelse continue;
@@ -903,7 +1344,17 @@ fn parsePromptInput(alloc: Allocator, params_json: []const u8) !ParsedPromptInpu
                 }
             }
         } else if (std.mem.eql(u8, block_type.string, "image")) {
-            return error.UnsupportedPromptImage;
+            if (image_source_dir == null) {
+                image_source_dir = try image_attachments.createTempSnapshotDir(alloc);
+            }
+            const attachment = try decodePromptImageBlock(
+                alloc,
+                block,
+                image_source_dir.?,
+                images.items.len,
+            );
+            errdefer types.freeImageAttachment(alloc, attachment);
+            try images.append(alloc, attachment);
         } else if (std.mem.eql(u8, block_type.string, "resource")) {
             if (block.object.get("resource")) |resource| {
                 if (resource == .object) {
@@ -961,6 +1412,9 @@ fn parsePromptInput(alloc: Allocator, params_json: []const u8) !ParsedPromptInpu
     result.targets = try targets.toOwnedSlice(alloc);
     result.omissions = try omissions.toOwnedSlice(alloc);
     result.omission_summary = omission_summary.finish();
+    result.images = try images.toOwnedSlice(alloc);
+    result.image_source_dir = image_source_dir;
+    own_images = false;
     return result;
 }
 
@@ -1716,6 +2170,18 @@ fn persistAcpHistoryTurn(
         return;
     }
     const writable = if (session.writable) |*value| value else return;
+    const replaced_images = try dupeOutstandingCheckpointImages(alloc, session);
+    defer types.freeImageAttachmentSlice(alloc, replaced_images);
+    try commitAcpHistoryTurnEvent(alloc, session, writable, turn);
+    releaseReplacedCheckpointSnapshots(alloc, session, replaced_images);
+}
+
+fn commitAcpHistoryTurnEvent(
+    alloc: Allocator,
+    session: *server.ActiveSessionState,
+    writable: *session_store.LoadedWritableSession,
+    turn: HistoryTurn,
+) !void {
     try subagent_resume_admission.retainExternalRootUserTurn(
         alloc,
         writable,
@@ -1851,6 +2317,8 @@ fn setRecoveryCheckpoint(
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const writable = if (session.writable) |*value| value else return error.SessionPersistenceUnavailable;
     const now_ms = io_mod.milliTimestamp();
+    const replaced_images = try dupeOutstandingCheckpointImages(ctx.alloc, session);
+    defer types.freeImageAttachmentSlice(ctx.alloc, replaced_images);
     _ = writable.appendEvent(
         ctx.alloc,
         .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
@@ -1873,6 +2341,7 @@ fn setRecoveryCheckpoint(
         },
         else => return err,
     };
+    releaseReplacedCheckpointSnapshots(ctx.alloc, session, replaced_images);
 }
 
 fn currentAcpState(
@@ -2886,10 +3355,79 @@ test "parsePromptInput accepts explicit recovery continuation metadata" {
     try std.testing.expect(result.continue_recovery);
 }
 
-test "parsePromptInput rejects image blocks" {
+test "parsePromptInput decodes image blocks into attachments" {
     const alloc = std.testing.allocator;
-    const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"Only text\"},{\"type\":\"image\",\"data\":\"aGVsbG8=\",\"mimeType\":\"image/png\"}]}";
-    try std.testing.expectError(error.UnsupportedPromptImage, parsePromptInput(alloc, params));
+    const png = "\x89PNG\r\n\x1a\nfx-acp-image";
+    var encoded_buf: [64]u8 = undefined;
+    const encoded = std.base64.standard.Encoder.encode(&encoded_buf, png);
+    const params = try std.fmt.allocPrint(
+        alloc,
+        "{{\"sessionId\":\"s1\",\"prompt\":[" ++
+            "{{\"type\":\"text\",\"text\":\"Only text\"}}," ++
+            "{{\"type\":\"image\",\"data\":\"{s}\",\"mimeType\":\"image/png\"}}]}}",
+        .{encoded},
+    );
+    defer alloc.free(params);
+
+    var result = try parsePromptInput(alloc, params);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("Only text", result.text);
+    try std.testing.expectEqual(@as(usize, 1), result.images.len);
+    try std.testing.expectEqualStrings("image/png", result.images[0].media_type);
+
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), result.images[0].path, .{});
+    defer file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(alloc, &file, 1024);
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings(png, bytes);
+}
+
+test "parsePromptInput accepts an image-only prompt" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\nfx";
+    var encoded_buf: [64]u8 = undefined;
+    const encoded = std.base64.standard.Encoder.encode(&encoded_buf, png);
+    const params = try std.fmt.allocPrint(
+        alloc,
+        "{{\"sessionId\":\"s1\",\"prompt\":[" ++
+            "{{\"type\":\"image\",\"data\":\"{s}\",\"mimeType\":\"image/png\"}}]}}",
+        .{encoded},
+    );
+    defer alloc.free(params);
+
+    var result = try parsePromptInput(alloc, params);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), result.text.len);
+    try std.testing.expectEqual(@as(usize, 1), result.images.len);
+}
+
+test "parsePromptInput rejects malformed image blocks" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        "{\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\"}]}",
+        "{\"prompt\":[{\"type\":\"image\",\"data\":\"aGVsbG8=\"}]}",
+        "{\"prompt\":[{\"type\":\"image\",\"data\":\"not base64!\",\"mimeType\":\"image/png\"}]}",
+        "{\"prompt\":[{\"type\":\"image\",\"data\":\"aGVsbG8=\",\"mimeType\":\"application/pdf\"}]}",
+        "{\"prompt\":[{\"type\":\"image\",\"data\":\"aGVsbG8=\",\"mimeType\":\"image/png\"}]}",
+        "{\"prompt\":[{\"type\":\"image\",\"data\":\"iVBORw0KGgpmeA==\",\"mimeType\":\"image/jpeg\"}]}",
+    };
+    for (cases) |params| {
+        try std.testing.expectError(
+            error.InvalidPromptImage,
+            parsePromptInput(alloc, params),
+        );
+    }
+}
+
+test "prompt image data at the image limit is admitted and one byte over is rejected" {
+    const alloc = std.testing.allocator;
+    const data = try alloc.alloc(u8, 27_962_028);
+    defer alloc.free(data);
+    @memset(data, 'A');
+    try std.testing.expectError(error.PromptImageTooLarge, promptImageDecodedSize(data));
+    data[data.len - 1] = '=';
+    try std.testing.expectEqual(@as(usize, 20_971_520), try promptImageDecodedSize(data));
+    try std.testing.expectError(error.InvalidPromptImage, promptImageDecodedSize("abc"));
 }
 
 test "parsePromptInput preserves resource text and accepts only local absolute file targets" {

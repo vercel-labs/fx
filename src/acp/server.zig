@@ -2,6 +2,7 @@ const std = @import("std");
 const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const io_mod = @import("../core/shared/io.zig");
+const image_attachments = @import("../core/images/image_attachments.zig");
 const host_target = @import("../core/hosts/target.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
@@ -167,6 +168,9 @@ pub const ActiveSessionState = struct {
     /// profile or project configuration.
     session_grants: []types.PermissionGrant = &.{},
     session_rt: session_runtime.SessionRuntime,
+    /// Snapshot directory used when the session has no durable store. Removed
+    /// with the session.
+    image_snapshot_temp_dir: ?[]u8 = null,
     mcp: ?*mcp_runtime.McpRuntime = null,
     cancel_flag: std.atomic.Value(bool),
     pending_prompt_id: ?jsonrpc.RequestId,
@@ -484,6 +488,10 @@ fn destroyActiveSession(state: *ServerState) void {
         }
     }
     active.session_rt.deinit(state.alloc);
+    if (active.image_snapshot_temp_dir) |path| {
+        image_attachments.cleanupSnapshotDir(path);
+        state.alloc.free(path);
+    }
     if (active.writable) |*writable| writable.deinit(state.alloc);
     if (active.store) |*store| store.deinit(state.alloc);
     if (active.wasm_state) |*wasm_state| wasm_state.deinit(state.alloc);

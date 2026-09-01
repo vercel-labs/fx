@@ -2100,7 +2100,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "initialize reports that image prompt blocks are unsupported",
+    "initialize reports image prompt block support",
     async () => {
       const root = createIsolatedRoot("fx-acp-initialize-");
       try {
@@ -2134,7 +2134,8 @@ describe("acp: model-independent", () => {
         expect(resp.result.agentInfo.name).toBe("fx");
         expect(resp.result.agentInfo.version).toBe(version.stdout.trim());
         expect(resp.result.agentCapabilities.loadSession).toBe(true);
-        expect(resp.result.agentCapabilities.promptCapabilities.image).toBe(false);
+        expect(resp.result.agentCapabilities.promptCapabilities.image).toBe(true);
+        expect(resp.result.agentCapabilities.promptCapabilities.audio).toBe(false);
         expect(resp.result.agentCapabilities.mcpCapabilities.http).toBe(true);
         expect(resp.result.agentCapabilities.mcpCapabilities.sse).toBe(true);
         expect(resp.result.agentCapabilities.sessionCapabilities.resume).toEqual({});
@@ -5024,7 +5025,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "image prompt rejection preserves history and admits the next text prompt",
+    "malformed image prompt rejection preserves history and admits the next text prompt",
     async () => {
       const root = createIsolatedRoot("fx-acp-image-rejection-");
       const boundary = createPromptTerminalBoundary(root.root);
@@ -5053,7 +5054,8 @@ describe("acp: model-independent", () => {
         const invalid = await readResponse(client, 94);
         expect(invalid.error).toEqual({
           code: -32602,
-          message: "Image prompt blocks are not supported",
+          message:
+            "Image prompt blocks require base64 data and a mimeType matching the decoded bytes (png, jpeg, gif, or webp)",
         });
         expect(gateway.requests).toHaveLength(0);
         const detailBefore = await runFx(["session", "--id", sessionId, "--json"], {
@@ -5076,6 +5078,150 @@ describe("acp: model-independent", () => {
         expect(client.stderr).toBe("");
       } finally {
         releasePromptBoundary(boundary);
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "an image prompt block is admitted and readable by the vision tool",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-image-prompt-");
+      let served = 0;
+      const gateway = startDynamicFakeGateway(() => {
+        served += 1;
+        return served === 1
+          ? fakeGatewayToolCall("vision_1", "vision", {
+              image_ids: [1],
+              focus: "visible text",
+            })
+          : finalText("image inspected");
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+        const png = Buffer.concat([
+          Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+          Buffer.from("fx-acp-image"),
+        ]);
+        const encoded = png.toString("base64");
+        client.send({
+          jsonrpc: "2.0",
+          id: 96,
+          method: "session/prompt",
+          params: {
+            prompt: [{ type: "image", data: encoded, mimeType: "image/png" }],
+          },
+        });
+
+        await waitForCondition(
+          "prompt and vision requests",
+          () => gateway.requests.length >= 2,
+          TIMEOUT,
+        );
+        expect(gateway.requests[0]!.body).toContain("[Image #1]");
+        expect(gateway.requests[1]!.body).toContain(encoded);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a replaced checkpoint releases the previous image snapshot and keeps image ids monotonic",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-image-cleanup-");
+      const refusal = () =>
+        new Response(JSON.stringify({ error: { message: "rejected" } }), {
+          status: 401,
+          headers: { "content-type": "application/json" },
+        });
+      const gateway = startFakeGateway([refusal(), refusal()]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const sessionId = await startCodeSession(client);
+        const png = Buffer.concat([
+          Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+          Buffer.from("fx-acp-image-cleanup"),
+        ]);
+        client.send({
+          jsonrpc: "2.0",
+          id: 97,
+          method: "session/prompt",
+          params: {
+            prompt: [
+              { type: "image", data: png.toString("base64"), mimeType: "image/png" },
+            ],
+          },
+        });
+
+        let response: any = null;
+        while (!response) {
+          const message = await client.readLine(TIMEOUT) as any;
+          if (message.id === 97) response = message;
+        }
+        expect(response.result.stopReason).toBe("refused");
+        expect(gateway.requests).toHaveLength(1);
+        expect(gateway.requests[0]!.body).toContain("[Image #1]");
+
+        const sessionDir = join(root.home, ".fx", "sessions", sessionId);
+        const remaining = readdirSync(join(sessionDir, "images"));
+        expect(remaining).toHaveLength(1);
+        const checkpoints = readFileSync(join(sessionDir, "events.jsonl"), "utf8")
+          .split("\n")
+          .filter((line) => line.length > 0)
+          .map((line) => JSON.parse(line))
+          .filter((event) => event.kind === "recovery_checkpoint_set");
+        expect(checkpoints.length).toBeGreaterThan(0);
+        const checkpointImages = checkpoints.at(-1)!.payload.checkpoint.user.images;
+        expect(checkpointImages).toHaveLength(1);
+        expect(checkpointImages[0].snapshot_path).toBe(`images/${remaining[0]}`);
+
+        client.send({
+          jsonrpc: "2.0",
+          id: 98,
+          method: "session/prompt",
+          params: {
+            prompt: [
+              { type: "image", data: png.toString("base64"), mimeType: "image/png" },
+            ],
+          },
+        });
+        let second: any = null;
+        while (!second) {
+          const message = await client.readLine(TIMEOUT) as any;
+          if (message.id === 98) second = message;
+        }
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[1]!.body).toContain("[Image #2]");
+        const afterReplacement = readdirSync(join(sessionDir, "images"));
+        expect(afterReplacement).toHaveLength(1);
+        expect(afterReplacement[0]).toStartWith("image-2-");
+        expect(afterReplacement[0]).not.toBe(remaining[0]);
+        const replacement = readFileSync(join(sessionDir, "events.jsonl"), "utf8")
+          .split("\n")
+          .filter((line) => line.length > 0)
+          .map((line) => JSON.parse(line))
+          .filter((event) => event.kind === "recovery_checkpoint_set")
+          .at(-1)!.payload.checkpoint.user.images;
+        expect(replacement).toHaveLength(1);
+        expect(replacement[0].id).toBe(2);
+        expect(replacement[0].snapshot_path).toBe(`images/${afterReplacement[0]}`);
+        expect(client.stderr).toBe("");
+      } finally {
         await client?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
