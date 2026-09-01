@@ -5,6 +5,8 @@ pub const ProviderId = enum {
     gateway,
     codex,
     grok,
+    anthropic,
+    openai_compatible,
 };
 
 pub const ProviderSelection = struct {
@@ -16,15 +18,29 @@ pub fn parse(value: []const u8) ?ProviderId {
     if (std.ascii.eqlIgnoreCase(value, "gateway")) return .gateway;
     if (std.ascii.eqlIgnoreCase(value, "codex")) return .codex;
     if (std.ascii.eqlIgnoreCase(value, "grok")) return .grok;
+    if (std.ascii.eqlIgnoreCase(value, "anthropic")) return .anthropic;
+    if (std.ascii.eqlIgnoreCase(value, "openai-compatible") or std.ascii.eqlIgnoreCase(value, "openai")) return .openai_compatible;
     return null;
+}
+
+pub fn label(provider: ProviderId) []const u8 {
+    return switch (provider) {
+        .gateway => "Vercel AI Gateway",
+        .codex => "Codex subscription",
+        .grok => "Grok subscription",
+        .anthropic => "Anthropic",
+        .openai_compatible => "OpenAI Compatible",
+    };
 }
 
 pub fn authorizesCredential(provider: ProviderId, source: ?types.CredentialSource) bool {
     const selected = source orelse return false;
     return switch (provider) {
-        .gateway => selected != .chatgpt_subscription and selected != .grok_subscription,
+        .gateway => selected != .chatgpt_subscription and selected != .grok_subscription and selected != .anthropic_api_key,
         .codex => selected == .chatgpt_subscription,
         .grok => selected == .grok_subscription,
+        .anthropic => selected == .anthropic_api_key,
+        .openai_compatible => selected == .stored_key,
     };
 }
 
@@ -38,12 +54,22 @@ test "explicit providers authorize only their own credential origins" {
     try std.testing.expect(authorizesCredential(.grok, .grok_subscription));
     try std.testing.expect(!authorizesCredential(.grok, .chatgpt_subscription));
     try std.testing.expect(!authorizesCredential(.gateway, .grok_subscription));
+    try std.testing.expect(authorizesCredential(.anthropic, .anthropic_api_key));
+    try std.testing.expect(!authorizesCredential(.anthropic, .ai_gateway_api_key));
+    try std.testing.expect(!authorizesCredential(.anthropic, .chatgpt_subscription));
+    try std.testing.expect(!authorizesCredential(.gateway, .anthropic_api_key));
+    try std.testing.expect(authorizesCredential(.openai_compatible, .stored_key));
+    try std.testing.expect(!authorizesCredential(.openai_compatible, .anthropic_api_key));
+    try std.testing.expect(!authorizesCredential(.openai_compatible, null));
 }
 
-test "provider parsing exposes gateway codex and grok" {
+test "provider parsing exposes gateway codex grok and anthropic" {
     try std.testing.expectEqual(ProviderId.gateway, parse("gateway").?);
     try std.testing.expectEqual(ProviderId.codex, parse("CODEX").?);
     try std.testing.expectEqual(ProviderId.grok, parse("GROK").?);
+    try std.testing.expectEqual(ProviderId.anthropic, parse("anthropic").?);
+    try std.testing.expectEqual(ProviderId.openai_compatible, parse("openai-compatible").?);
+    try std.testing.expectEqual(ProviderId.openai_compatible, parse("OpenAI").?);
     try std.testing.expect(parse("openai-codex") == null);
     try std.testing.expect(parse("") == null);
 }

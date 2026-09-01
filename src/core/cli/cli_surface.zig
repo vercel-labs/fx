@@ -657,6 +657,7 @@ fn activateProviderSelection(
         .refresh_if_needed,
         target,
         settings.credential_source,
+        null,
     );
     defer if (resolution.credential) |*credential| credential.deinit(alloc);
 
@@ -666,6 +667,8 @@ fn activateProviderSelection(
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
+            .anthropic => "Anthropic is already selected.\n",
+            .openai_compatible => "OpenAI Compatible is already selected.\n",
         });
         return true;
     }
@@ -685,6 +688,7 @@ fn activateProviderSelection(
             .refresh_if_needed,
             target,
             settings.credential_source,
+            null,
         );
     }
     if (resolution.credential == null and target == .grok and caller == .provider_command) {
@@ -701,6 +705,7 @@ fn activateProviderSelection(
             .refresh_if_needed,
             target,
             settings.credential_source,
+            null,
         );
     }
 
@@ -712,6 +717,8 @@ fn activateProviderSelection(
             switch (target) {
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
+                .anthropic => "Anthropic credential is unavailable",
+                .openai_compatible => "OpenAI Compatible credential is unavailable",
                 .gateway => "configure a Gateway credential first",
             },
         );
@@ -721,6 +728,8 @@ fn activateProviderSelection(
         try writeProviderActivationError(alloc, deps, caller, switch (target) {
             .codex => "Codex model catalog is unavailable",
             .grok => "Grok model catalog is unavailable",
+            .anthropic => "Anthropic model catalog is unavailable",
+            .openai_compatible => "OpenAI Compatible model catalog is unavailable",
             .gateway => "Gateway model catalog is unavailable",
         });
         return false;
@@ -766,13 +775,15 @@ fn activateProviderSelection(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
-        .gateway => unreachable,
+        .gateway, .anthropic, .openai_compatible => unreachable,
     };
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
+            .anthropic => "Provider set to Anthropic.\n",
+            .openai_compatible => "Provider set to OpenAI Compatible.\n",
         });
     }
     return true;
@@ -944,6 +955,14 @@ fn runNonInteractiveWithDeps(
                         return .handled_failure;
                     }
                     try writeStdout(deps, "Signed in with Grok.\n");
+                },
+                .anthropic => {
+                    try writeStderr(deps, "fx login: Anthropic uses API keys; set ANTHROPIC_API_KEY or run fx api-key anthropic\n");
+                    return .handled_failure;
+                },
+                .openai_compatible => {
+                    try writeStderr(deps, "fx login: OpenAI Compatible uses API keys; set OPENAI_API_KEY or run fx api-key openai\n");
+                    return .handled_failure;
                 },
             }
             return .handled_success;
@@ -1139,6 +1158,8 @@ fn runNonInteractiveWithDeps(
                     .gateway => "fx models: Gateway model catalog is unavailable\n",
                     .codex => "fx models: Codex model catalog is unavailable\n",
                     .grok => "fx models: Grok model catalog is unavailable\n",
+                    .anthropic => "fx models: Anthropic model catalog is unavailable\n",
+                    .openai_compatible => "fx models: OpenAI Compatible model catalog is unavailable\n",
                 });
                 return .handled_failure;
             };

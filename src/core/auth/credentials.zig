@@ -43,6 +43,7 @@ pub const CatalogAuthenticatedSource = enum {
     fx_login,
     stored_key,
     chatgpt_subscription,
+    anthropic_api_key,
     grok_subscription,
 
     fn credentialSource(self: CatalogAuthenticatedSource) Source {
@@ -52,6 +53,7 @@ pub const CatalogAuthenticatedSource = enum {
             .fx_login => .fx_login,
             .stored_key => .stored_key,
             .chatgpt_subscription => .chatgpt_subscription,
+            .anthropic_api_key => .anthropic_api_key,
             .grok_subscription => .grok_subscription,
         };
     }
@@ -167,6 +169,7 @@ pub fn catalogAccessForCredentialAndAccount(
         .ai_gateway_api_key => .ai_gateway_api_key,
         .stored_key => .stored_key,
         .chatgpt_subscription => .chatgpt_subscription,
+        .anthropic_api_key => .anthropic_api_key,
         .grok_subscription => .grok_subscription,
         .fx_login => blk: {
             const team = team_context orelse
@@ -198,11 +201,40 @@ const FxLoginRefreshMode = enum { if_needed, force };
 
 pub const missing_credential_message = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_interactive_credential_message = "fx needs access to Vercel AI Gateway. Run /login to sign in, /setup to use an API key, or set AI_GATEWAY_API_KEY.";
+pub const missing_anthropic_credential_message = "fx needs an Anthropic API key. Set ANTHROPIC_API_KEY, or anthropic_api_key in ~/.fx/settings.json.";
+pub const missing_anthropic_interactive_credential_message = "fx needs an Anthropic API key. Set ANTHROPIC_API_KEY, or anthropic_api_key in ~/.fx/settings.json.";
+pub const missing_openai_credential_message = "fx needs an OpenAI-compatible API key. Set OPENAI_API_KEY (or LITELLM_API_KEY), or save a key with fx api-key.";
+pub const missing_openai_interactive_credential_message = missing_openai_credential_message;
 pub const missing_chatgpt_credential_message = "fx needs a Codex subscription login for this model. Run fx login codex.";
 pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login, open Connections, then choose Codex subscription.";
 pub const missing_grok_credential_message = "fx needs a Grok subscription login for this model. Run fx login grok.";
 pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login, open Connections, then choose Grok subscription.";
 pub const unreadable_store_message = "fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
+
+pub fn missingCredentialMessage(provider: model_provider.ProviderId, interactive: bool) []const u8 {
+    return switch (provider) {
+        .codex => if (interactive)
+            missing_chatgpt_interactive_credential_message
+        else
+            missing_chatgpt_credential_message,
+        .grok => if (interactive)
+            missing_grok_interactive_credential_message
+        else
+            missing_grok_credential_message,
+        .anthropic => if (interactive)
+            missing_anthropic_interactive_credential_message
+        else
+            missing_anthropic_credential_message,
+        .openai_compatible => if (interactive)
+            missing_openai_interactive_credential_message
+        else
+            missing_openai_credential_message,
+        .gateway => if (interactive)
+            missing_interactive_credential_message
+        else
+            missing_credential_message,
+    };
+}
 
 test "public credential guidance spells fx lowercase" {
     try std.testing.expect(std.mem.startsWith(u8, missing_credential_message, "fx needs"));
@@ -281,6 +313,7 @@ pub fn resolveForProvider(
     mode: LoadMode,
     provider: model_provider.ProviderId,
     preferred: ?Source,
+    profile_anthropic_api_key: ?[]const u8,
 ) !Resolution {
     switch (provider) {
         .codex => {
@@ -298,6 +331,8 @@ pub fn resolveForProvider(
             return .{ .credential = credential };
         },
         .gateway => {},
+        .anthropic => return .{ .credential = try loadAnthropicApiKeyCredential(alloc, profile_anthropic_api_key) },
+        .openai_compatible => return .{ .credential = try loadOpenAiCompatibleApiKeyCredential(alloc, secret_store) },
     }
     return resolvePreferring(
         alloc,
@@ -404,12 +439,23 @@ pub fn loadSource(
     secret_store: host.SecretStore,
     source: Source,
 ) !?Credential {
+    return loadSourceWithProfile(alloc, transport, secret_store, source, null);
+}
+
+pub fn loadSourceWithProfile(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    source: Source,
+    profile_anthropic_api_key: ?[]const u8,
+) !?Credential {
     return switch (source) {
         .vercel_oidc_token => loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", source),
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
         .fx_login => loadFxLoginCredential(alloc, transport),
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
         .chatgpt_subscription => loadChatGptCredential(alloc, transport, .if_needed),
+        .anthropic_api_key => loadAnthropicApiKeyCredential(alloc, profile_anthropic_api_key),
         .grok_subscription => loadGrokCredential(alloc, transport, .if_needed),
     };
 }
@@ -418,6 +464,15 @@ pub fn sourceExists(
     alloc: std.mem.Allocator,
     secret_store: host.SecretStore,
     source: Source,
+) !bool {
+    return sourceExistsWithProfile(alloc, secret_store, source, null);
+}
+
+pub fn sourceExistsWithProfile(
+    alloc: std.mem.Allocator,
+    secret_store: host.SecretStore,
+    source: Source,
+    profile_anthropic_api_key: ?[]const u8,
 ) !bool {
     return switch (source) {
         .vercel_oidc_token => nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
@@ -435,6 +490,7 @@ pub fn sourceExists(
             break :blk true;
         },
         .chatgpt_subscription => chatgpt_oauth.sourceExists(alloc),
+        .anthropic_api_key => anthropicApiKeyConfigured(profile_anthropic_api_key),
         .grok_subscription => grok_oauth.sourceExists(alloc),
         .stored_key => blk: {
             if (secret_store.isDisabled()) break :blk false;
@@ -462,6 +518,45 @@ fn loadEnvCredential(
         .token = try alloc.dupe(u8, value),
         .source = source,
     };
+}
+
+pub fn anthropicApiKeyConfigured(profile_key: ?[]const u8) bool {
+    if (nonEmptyEnvValue("ANTHROPIC_API_KEY") != null) return true;
+    if (profile_key) |value| {
+        return std.mem.trim(u8, value, " \t\r\n").len > 0;
+    }
+    return false;
+}
+
+fn loadAnthropicApiKeyCredential(alloc: std.mem.Allocator, profile_key: ?[]const u8) !?Credential {
+    if (nonEmptyEnvValue("ANTHROPIC_API_KEY")) |value| {
+        return .{
+            .token = try alloc.dupe(u8, value),
+            .source = .anthropic_api_key,
+        };
+    }
+    if (profile_key) |value| {
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        if (trimmed.len > 0) {
+            return .{
+                .token = try alloc.dupe(u8, trimmed),
+                .source = .anthropic_api_key,
+            };
+        }
+    }
+    return null;
+}
+
+fn loadOpenAiCompatibleApiKeyCredential(alloc: std.mem.Allocator, secret_store: host.SecretStore) !?Credential {
+    if (nonEmptyEnvValue("OPENAI_API_KEY")) |value| {
+        return .{ .token = try alloc.dupe(u8, value), .source = .stored_key };
+    }
+    if (nonEmptyEnvValue("LITELLM_API_KEY")) |value| {
+        return .{ .token = try alloc.dupe(u8, value), .source = .stored_key };
+    }
+    if (secret_store.isDisabled()) return null;
+    const value = (try secret_store.load(alloc)) orelse return null;
+    return .{ .token = value, .source = .stored_key };
 }
 
 fn loadStoredKeyCredential(
@@ -661,6 +756,7 @@ pub fn sourceLabel(source: Source) []const u8 {
         .fx_login => "fx login",
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
         .chatgpt_subscription => "Codex subscription",
+        .anthropic_api_key => "Anthropic API key",
         .grok_subscription => "Grok subscription",
     };
 }
@@ -1147,4 +1243,41 @@ test "a disabled store still reports why the fx login was silent" {
     try std.testing.expect(resolution.credential == null);
     try std.testing.expectEqual(FxLoginReadStatus.unavailable, resolution.fx_login_status);
     try std.testing.expectEqual(StoredKeyReadStatus.not_attempted, resolution.stored_key_status);
+}
+
+test "resolveForProvider anthropic never returns a gateway credential" {
+    const alloc = std.testing.allocator;
+    var env = try CredentialTestEnv.install(alloc, &.{.{ "ANTHROPIC_API_KEY", "sk-test-anthropic" }});
+    defer env.deinit();
+
+    var resolution = try resolveForProvider(
+        alloc,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        .refresh_if_needed,
+        .anthropic,
+        null,
+        null,
+    );
+    defer if (resolution.credential) |*credential| credential.deinit(alloc);
+
+    const credential = resolution.credential orelse return error.TestExpectedCredential;
+    try std.testing.expectEqual(Source.anthropic_api_key, credential.source);
+    try std.testing.expect(!model_provider.authorizesCredential(.gateway, credential.source));
+}
+
+test "sourceExistsWithProfile honors profile anthropic_api_key" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try sourceExistsWithProfile(
+        alloc,
+        host.unavailable_secret_store,
+        .anthropic_api_key,
+        "profile-anthropic-key",
+    ));
+    try std.testing.expect(!(try sourceExistsWithProfile(
+        alloc,
+        host.unavailable_secret_store,
+        .anthropic_api_key,
+        null,
+    )));
 }

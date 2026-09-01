@@ -852,6 +852,8 @@ pub const ModelListSnapshot = struct {
             .gateway => "gateway",
             .codex => provider_catalog.label(.codex),
             .grok => provider_catalog.label(.grok),
+            .anthropic => provider_catalog.label(.anthropic),
+            .openai_compatible => provider_catalog.label(.openai_compatible),
         };
     }
 

@@ -93,6 +93,10 @@ pub const ProjectMcpMutation = struct {
 pub const UserSettingsPatch = struct {
     model_preference: ?ModelPreferencePatch = null,
     provider: ?model_provider.ProviderId = null,
+    codex_model: ?[]const u8 = null,
+    grok_model: ?[]const u8 = null,
+    anthropic_model: ?[]const u8 = null,
+    openai_model: ?[]const u8 = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     /// Removes the key entirely so resolution returns to plain precedence.
@@ -114,6 +118,10 @@ pub const UserSettingsPatch = struct {
     fn isEmpty(self: UserSettingsPatch) bool {
         return self.model_preference == null and
             self.provider == null and
+            self.codex_model == null and
+            self.grok_model == null and
+            self.anthropic_model == null and
+            self.openai_model == null and
             self.permission_mode == null and
             self.credential_source == null and
             !self.clear_credential_source and
@@ -986,6 +994,10 @@ fn applyUserPatchToRoot(
         application.changed = try putModelPreference(arena, &root.object, preference) or application.changed;
     }
     if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", @tagName(value)) or application.changed;
+    if (patch.codex_model) |value| application.changed = try putString(arena, &root.object, "codex_model", value) or application.changed;
+    if (patch.grok_model) |value| application.changed = try putString(arena, &root.object, "grok_model", value) or application.changed;
+    if (patch.anthropic_model) |value| application.changed = try putString(arena, &root.object, "anthropic_model", value) or application.changed;
+    if (patch.openai_model) |value| application.changed = try putString(arena, &root.object, "openai_model", value) or application.changed;
     if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", @tagName(value)) or application.changed;
     if (patch.credential_source) |value| application.changed = try putString(arena, &root.object, "credential_source", @tagName(value)) or application.changed;
     if (patch.clear_credential_source and root.object.contains("credential_source")) {
@@ -1552,6 +1564,8 @@ fn putModelPreference(
         .gateway => "model",
         .codex => "codex_model",
         .grok => "grok_model",
+        .anthropic => "anthropic_model",
+        .openai_compatible => "openai_model",
     };
     if (root.contains(legacy_key)) {
         _ = root.orderedRemove(legacy_key);
@@ -1813,6 +1827,14 @@ fn validateKnownSettingsObject(
             }
             try validateModel(entry.value_ptr.string);
         }
+    }
+    if (object.get("anthropic_model")) |value| {
+        if (value != .string) return error.InvalidSettingsFormat;
+        try validateModel(value.string);
+    }
+    if (object.get("openai_model")) |value| {
+        if (value != .string) return error.InvalidSettingsFormat;
+        try validateModel(value.string);
     }
     if (object.get("permission_mode")) |value| {
         if (value != .string or

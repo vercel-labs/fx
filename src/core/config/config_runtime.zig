@@ -39,6 +39,10 @@ pub const Paths = struct {
 pub const Settings = struct {
     models: model_preferences.Preferences = .{},
     provider: ?model_provider.ProviderId = null,
+    codex_model: ?[]u8 = null,
+    anthropic_model: ?[]u8 = null,
+    openai_model: ?[]u8 = null,
+    grok_model: ?[]u8 = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     yolo_acknowledged: ?bool = null,
@@ -63,9 +67,12 @@ pub const Settings = struct {
     notification_max: ?bool = null,
     permission_rules: types.PermissionRuleSet = .{},
     has_permission_rules: bool = false,
+    anthropic_api_key: ?[]u8 = null,
 
     pub fn deinit(self: *Settings, alloc: Allocator) void {
         self.models.deinit(alloc);
+        if (self.anthropic_model) |value| alloc.free(value);
+        if (self.anthropic_api_key) |value| alloc.free(value);
         self.permission_rules.deinit(alloc);
         self.* = .{};
     }
@@ -601,6 +608,8 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "models",
         "provider",
         "codex_model",
+        "anthropic_model",
+        "openai_model",
         "grok_model",
         "effort",
         "fast_mode",
@@ -617,6 +626,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "update_channel",
         "permission_mode",
         "credential_source",
+        "anthropic_api_key",
         "yolo_acknowledged",
         "permission",
         "additional_directories",
@@ -1363,6 +1373,18 @@ fn parseProfileOnlyFields(
         try settings.models.putCopy(alloc, .codex, model_value.string);
     }
 
+    if (root.object.get("anthropic_model")) |model_value| {
+        if (model_value != .string) return error.InvalidAnthropicModelType;
+        settings_store.validateModel(model_value.string) catch return error.InvalidAnthropicModelValue;
+        settings.anthropic_model = try alloc.dupe(u8, model_value.string);
+    }
+
+    if (root.object.get("openai_model")) |model_value| {
+        if (model_value != .string) return error.InvalidOpenAiModelType;
+        settings_store.validateModel(model_value.string) catch return error.InvalidOpenAiModelValue;
+        settings.openai_model = try alloc.dupe(u8, model_value.string);
+    }
+
     if (root.object.get("grok_model")) |model_value| {
         if (model_value != .string) return error.InvalidGrokModelType;
         settings_store.validateModel(model_value.string) catch return error.InvalidGrokModelValue;
@@ -1390,6 +1412,12 @@ fn parseProfileOnlyFields(
         if (credential_source_value != .string) return error.InvalidCredentialSourceType;
         settings.credential_source = types.parseCredentialSource(credential_source_value.string) orelse
             return error.InvalidCredentialSource;
+    }
+
+    if (root.object.get("anthropic_api_key")) |anthropic_api_key_value| {
+        if (anthropic_api_key_value != .string) return error.InvalidAnthropicApiKeyType;
+        const trimmed = std.mem.trim(u8, anthropic_api_key_value.string, " \t\r\n");
+        if (trimmed.len > 0) settings.anthropic_api_key = try alloc.dupe(u8, trimmed);
     }
 
     if (root.object.get("yolo_acknowledged")) |acknowledged_value| {
@@ -1537,8 +1565,33 @@ fn parseProjectSafeFields(settings: *Settings, root: std.json.Value) !void {
 fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void {
     target.models.mergeOwnedFrom(alloc, &incoming.models);
     if (incoming.provider) |value| target.provider = value;
+    if (incoming.codex_model) |value| {
+        if (target.codex_model) |current| alloc.free(current);
+        target.codex_model = value;
+        incoming.codex_model = null;
+    }
+    if (incoming.anthropic_model) |value| {
+        if (target.anthropic_model) |current| alloc.free(current);
+        target.anthropic_model = value;
+        incoming.anthropic_model = null;
+    }
+    if (incoming.openai_model) |value| {
+        if (target.openai_model) |current| alloc.free(current);
+        target.openai_model = value;
+        incoming.openai_model = null;
+    }
+    if (incoming.grok_model) |value| {
+        if (target.grok_model) |current| alloc.free(current);
+        target.grok_model = value;
+        incoming.grok_model = null;
+    }
     if (incoming.permission_mode) |value| target.permission_mode = value;
     if (incoming.credential_source) |value| target.credential_source = value;
+    if (incoming.anthropic_api_key) |value| {
+        if (target.anthropic_api_key) |current| alloc.free(current);
+        target.anthropic_api_key = value;
+        incoming.anthropic_api_key = null;
+    }
     if (incoming.yolo_acknowledged) |value| target.yolo_acknowledged = value;
     if (incoming.max_agent_steps) |value| target.max_agent_steps = value;
     if (incoming.max_tool_result_bytes) |value| target.max_tool_result_bytes = value;
