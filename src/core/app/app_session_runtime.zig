@@ -1591,6 +1591,7 @@ pub fn Runtime(comptime App: type) type {
             background_policy: BackgroundSessionPolicy,
             log_options: session_log.Options,
         ) void {
+            if (comptime @hasDecl(App, "stopSessionTitleGeneration")) app.stopSessionTitleGeneration();
             clearCachedSessionTitle(app);
             app.worker.discardEvents(std.heap.c_allocator);
 
@@ -1799,6 +1800,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn continueWithFreshJsHostSession(app: *App) !void {
+            if (comptime @hasDecl(App, "stopSessionTitleGeneration")) app.stopSessionTitleGeneration();
             app.session.reset(app.alloc);
             app.shell.clearTranscript(app.alloc);
             clearCachedSessionTitle(app);
@@ -2684,9 +2686,15 @@ pub fn Runtime(comptime App: type) type {
                 };
             };
             if (snapshot_file_ownership) |ownership| ownership.transfer();
-            // The footer title freezes at the first usable prompt, matching the
-            // sidecar derivation the resume picker shows.
-            ensureCachedSessionTitle(app) catch {};
+            // While model-generated naming is active, keep the deterministic
+            // title in persistence only so the footer does not flash it first.
+            if (comptime @hasField(App, "session_title_generation")) {
+                if (app.session_title_generation.thread == null) {
+                    ensureCachedSessionTitle(app) catch {};
+                }
+            } else {
+                ensureCachedSessionTitle(app) catch {};
+            }
             commitJsHostSnapshot(app, "history_turn");
             if (comptime !@hasField(App, "session_persistence")) return .committed;
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
@@ -2997,6 +3005,34 @@ pub fn Runtime(comptime App: type) type {
         /// resume picker does not keep serving the derived title.
         pub fn renameActiveSession(app: *App, raw: []const u8) !void {
             const title = try validateSessionTitle(raw);
+            try applyActiveSessionTitle(app, title);
+        }
+
+        /// Applies a generated title only while the originating session is
+        /// still active and no visible title has appeared. A manual rename
+        /// therefore wins without exposing the deterministic provisional title.
+        pub fn applyGeneratedSessionTitle(
+            app: *App,
+            source_session_id: []const u8,
+            generated_title: []const u8,
+        ) !void {
+            const active_id = activeSessionId(app) orelse return;
+            if (!shouldApplyGeneratedTitle(active_id, cachedSessionTitle(app), source_session_id)) return;
+            const title = validateSessionTitle(generated_title) catch return;
+            try applyActiveSessionTitle(app, title);
+            app.shell.render_requests.request(.footer);
+        }
+
+        fn shouldApplyGeneratedTitle(
+            active_session_id: []const u8,
+            current_title: ?[]const u8,
+            source_session_id: []const u8,
+        ) bool {
+            return std.mem.eql(u8, active_session_id, source_session_id) and
+                current_title == null;
+        }
+
+        fn applyActiveSessionTitle(app: *App, title: []const u8) !void {
             if (comptime !@hasField(App, "session_persistence")) return error.NoActiveSession;
             if (app.session_persistence.writable == null) return error.NoActiveSession;
 
@@ -9908,6 +9944,13 @@ test "renameActiveSession requires an active session" {
         error.NoActiveSession,
         Runtime(TestApp).renameActiveSession(&app, "no session yet"),
     );
+}
+
+test "generated session title requires matching session and no visible title" {
+    const should_apply = Runtime(TestApp).shouldApplyGeneratedTitle;
+    try std.testing.expect(should_apply("session-a", null, "session-a"));
+    try std.testing.expect(!should_apply("session-b", null, "session-a"));
+    try std.testing.expect(!should_apply("session-a", "Manual title", "session-a"));
 }
 
 test "renameActiveSession persists the title to the sidecar and session index" {

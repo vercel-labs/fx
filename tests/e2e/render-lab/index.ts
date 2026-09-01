@@ -2301,6 +2301,7 @@ function testEnv(fixture: Fixture, manifest: RenderLabManifest): NodeJS.ProcessE
   delete env.VERCEL_OIDC_TOKEN;
   env.FX_DISABLE_KEYCHAIN = "1";
   env.FX_SKIP_ONBOARDING = "1";
+  env.FX_E2E_DISABLE_SESSION_TITLE_GENERATION = "1";
   env.HOME = fixture.home;
   env.ZDOTDIR = fixture.zdotdir;
   env.HISTFILE = fixture.histfile;

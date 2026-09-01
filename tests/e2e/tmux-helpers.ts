@@ -495,6 +495,7 @@ export class TmuxSession {
       ["FX_DISABLE_KEYCHAIN", "1"],
       ["FX_SKIP_ONBOARDING", "1"],
       ["FX_SOUND", "0"],
+      ["FX_E2E_DISABLE_SESSION_TITLE_GENERATION", "1"],
     ].flatMap(([key, value]) =>
       Object.prototype.hasOwnProperty.call(env, key) ? [] : [shellQuote(`${key}=${value}`)]
     );

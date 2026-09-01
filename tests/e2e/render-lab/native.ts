@@ -746,6 +746,7 @@ function startShellCommand(
     `HISTFILE=${shQuote(fixture.histfile)}`,
     `SHELL=${shQuote(zshPath())}`,
     `TERM_PROGRAM=${shQuote(scenario.termProgram)}`,
+    "FX_E2E_DISABLE_SESSION_TITLE_GENERATION=1",
     `FX_TRACE_LOG=${shQuote(manifest.traceLogPath)}`,
     `FX_TRACE_SCOPES=${shQuote(TRACE_SCOPES)}`,
     ...markerEnv,
