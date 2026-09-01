@@ -156,6 +156,7 @@ pub fn run(
             .refresh_if_needed,
             admission.provider,
             config.tool_context.credential_source,
+            null,
         ) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             turn.setFailureDiagnostic("model_credential_resolution_failed", @errorName(err)) catch

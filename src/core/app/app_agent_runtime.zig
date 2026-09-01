@@ -1076,6 +1076,10 @@ pub fn Runtime(comptime App: type) type {
                         .agent_stream = tool_context.agent_stream_provider,
                         .permission_reviewer = tool_context.permission_reviewer_provider,
                     },
+                    .anthropic = .{
+                        .agent_stream = tool_context.agent_stream_provider,
+                        .permission_reviewer = null,
+                    },
                 };
             return subagent_agent_adapter.run(.{
                 .host = app_session_runtime.Runtime(App).subagentHost(app) orelse

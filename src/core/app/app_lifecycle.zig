@@ -149,6 +149,13 @@ pub const StartupState = struct {
     notification_attention_required: bool = false,
     notification_max: bool = false,
     theme_monitor_enabled: bool = false,
+    profile_anthropic_api_key: []u8 = &.{},
+
+    pub fn takeProfileAnthropicApiKey(self: *StartupState) []u8 {
+        const value = self.profile_anthropic_api_key;
+        self.profile_anthropic_api_key = &.{};
+        return value;
+    }
 
     pub fn deinit(self: *StartupState, alloc: Allocator) void {
         self.workspace_access.deinit(alloc);
@@ -399,6 +406,9 @@ fn loadStartupStateFromOwnedWorkspace(
     state.model_source = detailed.model_source orelse .compiled_default;
     state.selected_model = try loadInitialModel(alloc, configured_selection.model, null);
     if (hasProcessModelOverride()) state.model_source = .process_override;
+    if (settings.anthropic_api_key) |profile_key| {
+        state.profile_anthropic_api_key = try alloc.dupe(u8, profile_key);
+    }
     state.config_diagnostics = detailed.diagnostics;
     detailed.diagnostics = &.{};
     state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
@@ -411,6 +421,7 @@ fn loadStartupStateFromOwnedWorkspace(
             mode,
             state.provider,
             settings.credential_source,
+            settings.anthropic_api_key,
         );
         state.credential = resolution.credential;
         state.stored_key_status = resolution.stored_key_status;
@@ -1110,10 +1121,20 @@ fn configuredProviderSelection(
     const provider = settings.provider orelse .gateway;
     const model = settings.models.get(provider) orelse switch (provider) {
         .gateway => default_model,
-        .codex => return error.CodexModelNotSelected,
-        .grok => return error.GrokModelNotSelected,
+        .codex, .grok, .anthropic => switchModelFromEnv() orelse switch (provider) {
+            .codex => return error.CodexModelNotSelected,
+            .grok => return error.GrokModelNotSelected,
+            .anthropic => return error.AnthropicModelNotSelected,
+            .gateway => unreachable,
+        },
     };
     return .{ .provider = provider, .model = model };
+}
+
+fn switchModelFromEnv() ?[]const u8 {
+    const raw = io_mod.getenv("FX_MODEL") orelse return null;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    return if (trimmed.len > 0) trimmed else null;
 }
 
 fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8 {
@@ -1148,6 +1169,17 @@ test "startup provider chooses only its provider-scoped model" {
     const grok = try configuredProviderSelection("default/model", &grok_settings);
     try std.testing.expectEqual(model_provider.ProviderId.grok, grok.provider);
     try std.testing.expectEqualStrings("grok-model", grok.model);
+    var anthropic_settings = config_runtime.Settings{ .provider = .anthropic };
+    anthropic_settings.models.values[@intFromEnum(model_provider.ProviderId.anthropic)] = @constCast("claude-opus-5");
+    const anthropic = try configuredProviderSelection("default/model", &anthropic_settings);
+    try std.testing.expectEqual(model_provider.ProviderId.anthropic, anthropic.provider);
+    try std.testing.expectEqualStrings("claude-opus-5", anthropic.model);
+
+    const missing_anthropic = config_runtime.Settings{ .provider = .anthropic };
+    try std.testing.expectError(
+        error.AnthropicModelNotSelected,
+        configuredProviderSelection("default/model", &missing_anthropic),
+    );
 }
 
 fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) ![]u8 {

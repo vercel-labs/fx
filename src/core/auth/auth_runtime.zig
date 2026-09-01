@@ -761,6 +761,7 @@ pub fn loadStatusSnapshotForProvider(
             .stored,
             selected_provider,
             preferred,
+            null,
         )
     else
         credentials.resolvePreferring(
@@ -1775,6 +1776,15 @@ pub const Runtime = struct {
                 self.selectSourceWithLoader(
                     alloc,
                     .grok_subscription,
+                    self,
+                    loadRuntimeCredentialSource,
+                ),
+            .anthropic => if (self.credentialSource() == .anthropic_api_key)
+                false
+            else
+                self.selectSourceWithLoader(
+                    alloc,
+                    .anthropic_api_key,
                     self,
                     loadRuntimeCredentialSource,
                 ),

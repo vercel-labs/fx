@@ -73,6 +73,7 @@ pub fn signInCompletion(
             .{ .switch_provider = .grok }
         else
             .{ .activate_source = .grok_subscription },
+        .anthropic => .{ .activate_source = .anthropic_api_key },
     };
 }
 
