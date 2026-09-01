@@ -69,8 +69,10 @@ const latestCachePublish = latest_pointer.latestCachePublish;
 const latestCacheWriteDeferred = latest_pointer.latestCacheWriteDeferred;
 const latest_sessions_lock_file = latest_pointer.latest_sessions_lock_file;
 const latest_sessions_dir = latest_pointer.latest_sessions_dir;
-const recovery_staging_dir = "recovery+staging";
-const recovery_staging_lock_file = "recovery-staging.lock";
+// The on-disk names stay `recovery+staging` so staged directories written by
+// earlier versions are still found and cleaned up.
+const staging_dir = "recovery+staging";
+const staging_lock_file = "recovery-staging.lock";
 const usage_recovery_dir = profile_paths.usage_recovery_dir_name;
 const usage_recovery_marker_prefix = "v1 ";
 const max_usage_recovery_marker_bytes =
@@ -657,7 +659,7 @@ pub const Store = struct {
         return loaded;
     }
 
-    fn startRecoveryStagedSession(
+    fn startStagedSession(
         self: Store,
         alloc: Allocator,
         staging_root: *session_log.Root,
@@ -675,7 +677,7 @@ pub const Store = struct {
         return loaded;
     }
 
-    fn initRecoveryStagingRoot(
+    fn initStagingRoot(
         self: Store,
         alloc: Allocator,
     ) !session_log.Root {
@@ -684,20 +686,20 @@ pub const Store = struct {
             return error.SessionStoreUnavailable);
         var staging = try io_mod.openOrCreateVerifiedPrivateDir(
             sessions,
-            recovery_staging_dir,
+            staging_dir,
         );
         errdefer staging.close();
         return .{
             .sessions = staging,
             .display_root = try std.fs.path.join(
                 alloc,
-                &.{ self.sessions_dir, recovery_staging_dir },
+                &.{ self.sessions_dir, staging_dir },
             ),
             .mode = .writable,
         };
     }
 
-    fn deinitRecoveryStagingRoot(
+    fn deinitStagingRoot(
         self: Store,
         alloc: Allocator,
         staging_root: *session_log.Root,
@@ -706,18 +708,18 @@ pub const Store = struct {
         const sessions = &(self.canonical_root.sessions orelse return);
         sessions.dir.deleteDir(
             io_mod.getIo(),
-            recovery_staging_dir,
+            staging_dir,
         ) catch return;
         io_mod.syncVerifiedDir(sessions.dir) catch |err| {
             debug_trace.logf(
                 "session",
-                "event=recovery_staging_cleanup disposition=indeterminate err={s}",
+                "event=session_staging_cleanup disposition=indeterminate err={s}",
                 .{@errorName(err)},
             );
         };
     }
 
-    fn acquireRecoveryStagingLock(
+    fn acquireStagingLock(
         self: Store,
         deadline_ms: u64,
     ) !io_mod.TimedAdvisoryLock {
@@ -726,7 +728,7 @@ pub const Store = struct {
             return error.SessionStoreUnavailable);
         return io_mod.acquireTimedAdvisoryLock(
             sessions,
-            recovery_staging_lock_file,
+            staging_lock_file,
             deadline_ms,
         ) catch |err| switch (err) {
             error.LockBusy => error.SessionBusy,
@@ -735,7 +737,7 @@ pub const Store = struct {
         };
     }
 
-    fn cleanupAbandonedRecoveryStages(
+    fn cleanupAbandonedStages(
         staging_root: *session_log.Root,
     ) !void {
         const staging = &(staging_root.sessions orelse
@@ -749,18 +751,18 @@ pub const Store = struct {
             changed = true;
             debug_trace.logf(
                 "session",
-                "event=recovery_staging_abandoned_target_removed",
+                "event=session_staging_abandoned_target_removed",
                 .{},
             );
         }
         if (changed) try io_mod.syncVerifiedDir(staging.dir);
     }
 
-    fn promoteRecoveryStagedSession(
+    fn promoteStagedSession(
         self: Store,
         staging_root: *session_log.Root,
         session_id: []const u8,
-    ) !RecoveryPromotionStatus {
+    ) !StagingPromotionStatus {
         const staging = &(staging_root.sessions orelse
             return error.SessionStoreUnavailable);
         const sessions = &(self.canonical_root.sessions orelse
@@ -779,7 +781,7 @@ pub const Store = struct {
     }
 
     /// Consumes `loaded` on every return.
-    fn discardRecoveryStagedSession(
+    fn discardStagedSession(
         staging_root: *session_log.Root,
         alloc: Allocator,
         loaded: *LoadedWritableSession,
@@ -790,7 +792,7 @@ pub const Store = struct {
         {
             debug_trace.logf(
                 "session",
-                "event=recovery_staging_discard disposition=retained reason=guard_failed",
+                "event=session_staging_discard disposition=retained reason=guard_failed",
                 .{},
             );
             return .retained;
@@ -802,7 +804,7 @@ pub const Store = struct {
         ) catch |err| {
             debug_trace.logf(
                 "session",
-                "event=recovery_staging_discard disposition=retained reason=store_root_unverified err={s}",
+                "event=session_staging_discard disposition=retained reason=store_root_unverified err={s}",
                 .{@errorName(err)},
             );
             return .retained;
@@ -810,7 +812,7 @@ pub const Store = struct {
         if (!writer_belongs_to_store) {
             debug_trace.logf(
                 "session",
-                "event=recovery_staging_discard disposition=retained reason=store_root_mismatch",
+                "event=session_staging_discard disposition=retained reason=store_root_mismatch",
                 .{},
             );
             return .retained;
@@ -818,7 +820,7 @@ pub const Store = struct {
         const sessions = &(staging_root.sessions orelse {
             debug_trace.logf(
                 "session",
-                "event=recovery_staging_discard disposition=indeterminate stage=sessions_root",
+                "event=session_staging_discard disposition=indeterminate stage=sessions_root",
                 .{},
             );
             return .indeterminate;
@@ -826,7 +828,7 @@ pub const Store = struct {
         sessions.dir.deleteTree(io_mod.getIo(), loaded.active_id) catch |err| {
             debug_trace.logf(
                 "session",
-                "event=recovery_staging_discard disposition=indeterminate stage=delete err={s}",
+                "event=session_staging_discard disposition=indeterminate stage=delete err={s}",
                 .{@errorName(err)},
             );
             return .indeterminate;
@@ -834,14 +836,14 @@ pub const Store = struct {
         io_mod.syncVerifiedDir(sessions.dir) catch |err| {
             debug_trace.logf(
                 "session",
-                "event=recovery_staging_discard disposition=indeterminate stage=sync err={s}",
+                "event=session_staging_discard disposition=indeterminate stage=sync err={s}",
                 .{@errorName(err)},
             );
             return .indeterminate;
         };
         debug_trace.logf(
             "session",
-            "event=recovery_staging_discard disposition=discarded",
+            "event=session_staging_discard disposition=discarded",
             .{},
         );
         return .discarded;
@@ -3945,14 +3947,14 @@ pub const Store = struct {
 
         var initial = try recoveryInitialState(alloc, recovered);
         defer initial.deinit(alloc);
-        var staging_lock = try self.acquireRecoveryStagingLock(
+        var staging_lock = try self.acquireStagingLock(
             options.session_lock_deadline_ms,
         );
         defer staging_lock.release();
-        var staging_root = try self.initRecoveryStagingRoot(alloc);
-        defer self.deinitRecoveryStagingRoot(alloc, &staging_root);
-        try cleanupAbandonedRecoveryStages(&staging_root);
-        var target = try self.startRecoveryStagedSession(
+        var staging_root = try self.initStagingRoot(alloc);
+        defer self.deinitStagingRoot(alloc, &staging_root);
+        try cleanupAbandonedStages(&staging_root);
+        var target = try self.startStagedSession(
             alloc,
             &staging_root,
             initial,
@@ -3964,7 +3966,7 @@ pub const Store = struct {
             if (target_promoted) {
                 target.deinit(alloc);
             } else {
-                const disposition = discardRecoveryStagedSession(
+                const disposition = discardStagedSession(
                     &staging_root,
                     alloc,
                     &target,
@@ -4038,7 +4040,7 @@ pub const Store = struct {
                         @errorName(resolve_err),
                     },
                 );
-                const disposition = discardRecoveryStagedSession(
+                const disposition = discardStagedSession(
                     &staging_root,
                     alloc,
                     &target,
@@ -4055,7 +4057,7 @@ pub const Store = struct {
             };
         };
         if (!try session_log.durableStatesEqual(target.state, recovered)) {
-            const disposition = discardRecoveryStagedSession(
+            const disposition = discardStagedSession(
                 &staging_root,
                 alloc,
                 &target,
@@ -4076,7 +4078,7 @@ pub const Store = struct {
                 "event=session_recovery_target_indeterminate target={s} validation_err={s}",
                 .{ recovered_id, @errorName(err) },
             );
-            const disposition = discardRecoveryStagedSession(
+            const disposition = discardStagedSession(
                 &staging_root,
                 alloc,
                 &target,
@@ -4091,7 +4093,7 @@ pub const Store = struct {
             }
             return error.SessionRecoveryIndeterminate;
         };
-        const promotion = self.promoteRecoveryStagedSession(
+        const promotion = self.promoteStagedSession(
             &staging_root,
             recovered_id,
         ) catch |err| {
@@ -4187,7 +4189,7 @@ pub const PristineDiscardDisposition = enum {
     indeterminate,
 };
 
-const RecoveryPromotionStatus = enum {
+const StagingPromotionStatus = enum {
     promoted,
     indeterminate,
 };
@@ -9678,14 +9680,14 @@ test "abandoned recovery staging stays invisible and does not replace unrelated 
         ctx.workspace,
     );
     defer staged_state.deinit(alloc);
-    var staging_root = try ctx.store.initRecoveryStagingRoot(alloc);
+    var staging_root = try ctx.store.initStagingRoot(alloc);
     const abandoned_path = try sessionDirPath(
         alloc,
         staging_root.display_root,
         staged_state.id,
     );
     defer alloc.free(abandoned_path);
-    var abandoned = try ctx.store.startRecoveryStagedSession(
+    var abandoned = try ctx.store.startStagedSession(
         alloc,
         &staging_root,
         staged_state,
