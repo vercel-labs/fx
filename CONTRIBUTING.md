@@ -127,6 +127,8 @@ Config precedence (highest wins):
 
 Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `update_channel`, `permission_mode`, and `permission` are ignored from project config before their values are parsed.
 
+`effort` is catalog-gated: fx sends it to the gateway only when the active model's catalog entry declares that effort tier. When it does not, fx reports this once via a system notice instead of silently discarding the setting.
+
 Runtime state lives under `~/.fx/`:
 
 * `~/.fx/sessions/<session-id>/session.json`

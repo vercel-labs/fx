@@ -3308,6 +3308,7 @@ fn processQueuedPromptLoop(
     var last_tool_call_name: []const u8 = "none";
     var last_tool_call_id: []const u8 = "none";
     var last_gateway_message_count: usize = stable_prefix.items.len + history_messages.items.len + 1;
+    var last_dropped_effort_notice: ?struct { model: []const u8, effort: types.ReasoningEffort } = null;
     var selected_dynamic_tool_names: std.ArrayList([]const u8) = .empty;
     var selected_dynamic_tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
     const current_user_effective = current_user_message;
@@ -3679,7 +3680,22 @@ fn processQueuedPromptLoop(
             );
             last_gateway_message_count = request_messages.len;
             const provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
-            runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);
+            runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, request_capabilities, provider_opts);
+            if (model_capabilities.reasoningEffortDropped(request_capabilities, config.effort)) {
+                const already_notified = if (last_dropped_effort_notice) |pair|
+                    pair.effort.eql(config.effort) and std.mem.eql(u8, pair.model, gateway_model)
+                else
+                    false;
+                if (!already_notified) {
+                    last_dropped_effort_notice = .{ .model = gateway_model, .effort = config.effort };
+                    const notice = try std.fmt.allocPrint(
+                        arena,
+                        "reasoning effort \"{s}\" is not available for {s}; the model's catalog entry does not declare that effort tier, so the request uses the provider default",
+                        .{ config.effort.displayLabel(), gateway_model },
+                    );
+                    try deps.push_system_notice(deps.ctx, notice);
+                }
+            }
             const tool_choice: types.ToolChoice = if (recovery_strategy == .reconcile_tool)
                 .none
             else if (configured_first_tool_choice_pending and vision_mode != .required)

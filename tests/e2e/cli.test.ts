@@ -4148,6 +4148,75 @@ describe("cli: ask success", () => {
     60_000,
   );
 
+  test(
+    "fx ask reports a dropped reasoning effort instead of silently discarding it",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-dropped-reasoning-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const model = "provider/no-effort-tiers-model";
+      const gateway = startFakeGateway(
+        [fakeGatewayFinalText("dropped effort ask complete")],
+        {
+          models: [{
+            id: model,
+            type: "language",
+            tags: ["tool-use"],
+            context_window: 750_000,
+            max_tokens: 64_000,
+          }],
+        },
+      );
+      try {
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        writeFileSync(
+          join(home, ".fx", "settings.json"),
+          `${JSON.stringify({ model, effort: "high" })}\n`,
+        );
+
+        const result = await runFx(
+          ["ask", "--json", "--auto", "--no-save", "Use portable reasoning."],
+          {
+            cwd: realpathSync(workspace),
+            env: {
+              HOME: home,
+              AI_GATEWAY_API_KEY: "fake-dropped-ask-key",
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_GATEWAY_BASE_URL: gateway.baseUrl,
+              FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            },
+            timeoutMs: 60_000,
+          },
+        );
+
+        expect(result.code).toBe(0);
+        expect(JSON.parse(result.stdout).output.trim()).toBe("dropped effort ask complete");
+        expect(gateway.requests).toHaveLength(1);
+        const request = JSON.parse(gateway.requests[0]!.body);
+        expect(request).not.toHaveProperty("reasoning");
+        expect(
+          result.stderr
+            .replace(
+              /fx ask: warning: skipped \d+ invalid or unreadable skill candidates?; relaunch with FX_TRACE=1 to write a trace log\n/g,
+              "",
+            )
+            .replace(
+              /\[notice\] skill discovery warning: [^\n]*; relaunch with FX_TRACE=1 to write a trace log\n/g,
+              "",
+            ),
+        ).toBe(
+          `[notice] reasoning effort "high" is not available for ${model}; the model's catalog entry does not declare that effort tier, so the request uses the provider default\n`,
+        );
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
   test.skipIf(!HAS_API_KEY)(
     "live Gateway accepts catalog-backed portable reasoning",
     async () => {

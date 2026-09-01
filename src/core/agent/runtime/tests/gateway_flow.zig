@@ -2852,6 +2852,78 @@ test "processQueuedPrompt traces why stale controls are omitted" {
     defer alloc.free(trace);
     try std.testing.expect(std.mem.find(u8, trace, "reasoning=unsupported_or_missing") != null);
     try std.testing.expect(std.mem.find(u8, trace, "fast=unsupported_or_missing") != null);
+    try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
+    try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[0], "stale-tier") != null);
+    try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[0], "provider/no-live-controls") != null);
+}
+
+test "processQueuedPrompt pushes the dropped-effort notice once across multiple Gateway steps" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_read_stale_effort", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.effort = types.ReasoningEffort.literal("stale-tier");
+    var job = fixture.job();
+    job.model = @constCast("provider/no-live-controls");
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
+    try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[0], "stale-tier") != null);
+}
+
+test "processQueuedPrompt does not push a dropped-effort notice for the default effort" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "Done" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.effort = .auto;
+    var job = fixture.job();
+    job.model = @constCast("provider/no-live-controls");
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
+}
+
+test "processQueuedPrompt does not push a dropped-effort notice when the catalog declares the tier" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "Done" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("future-tier")};
+    const capability_overrides = [_]ModelCapabilityOverride{.{
+        .model = "provider/new-reasoning-model",
+        .capabilities = model_capabilities.resolveCapabilities(
+            "provider/new-reasoning-model",
+            .{ .reasoning_efforts = .fromSlice(&efforts) },
+        ),
+    }};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.capability_overrides = &capability_overrides;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.effort = types.ReasoningEffort.literal("future-tier");
+    var job = fixture.job();
+    job.model = @constCast("provider/new-reasoning-model");
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
 }
 
 test "processQueuedPrompt persists interruption when capability resolution returns cancellation" {
