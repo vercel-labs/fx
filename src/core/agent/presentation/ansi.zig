@@ -1,5 +1,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const presentation_palette = @import("../../shared/presentation_palette.zig");
+
+pub const ColorPalette = presentation_palette.ColorPalette;
 
 pub const bold_open = "\x1b[1m";
 pub const bold_close = "\x1b[22m";
@@ -21,8 +24,37 @@ pub var inline_code_open: []const u8 = inline_code_dark_open;
 pub const inline_code_close = "\x1b[39m";
 
 pub fn setInlineCodeTheme(light: bool) void {
-    inline_code_open = if (light) inline_code_light_open else inline_code_dark_open;
-    task_completed_open = if (light) task_completed_light_open else task_completed_dark_open;
+    setInlineCodePalette(light, .fx);
+}
+
+/// Set the markdown colors for an explicit presentation palette.  The
+/// one-argument `setInlineCodeTheme` wrapper above intentionally retains the
+/// historical .fx bytes for callers that do not participate in palette
+/// configuration yet.
+pub fn setInlineCodePalette(light: bool, palette: ColorPalette) void {
+    const styles = presentation_palette.styles(light, palette);
+    inline_code_open = styles.inline_code;
+    task_completed_open = styles.task_completed;
+}
+
+pub fn inlineCodeStyle(light: bool, palette: ColorPalette) []const u8 {
+    return presentation_palette.styles(light, palette).inline_code;
+}
+
+pub fn taskCompletedStyle(light: bool, palette: ColorPalette) []const u8 {
+    return presentation_palette.styles(light, palette).task_completed;
+}
+
+pub fn isInlineCodeOpen(seq: []const u8) bool {
+    return std.mem.eql(u8, seq, inline_code_dark_open) or
+        std.mem.eql(u8, seq, inline_code_light_open) or
+        std.mem.eql(u8, seq, presentation_palette.styles(false, .terminal).inline_code);
+}
+
+pub fn isTaskCompletedOpen(seq: []const u8) bool {
+    return std.mem.eql(u8, seq, task_completed_dark_open) or
+        std.mem.eql(u8, seq, task_completed_light_open) or
+        std.mem.eql(u8, seq, presentation_palette.styles(false, .terminal).task_completed);
 }
 
 // Keeps table intersections aligned with row separators.
@@ -50,4 +82,12 @@ pub fn writeHorizontalRule(alloc: Allocator, out: *std.ArrayList(u8)) !void {
     var i: usize = 0;
     while (i < horizontal_rule_width) : (i += 1) try out.appendSlice(alloc, table_horiz);
     try out.appendSlice(alloc, dim_close);
+}
+
+test "terminal palette selects ANSI-16 markdown styles" {
+    setInlineCodePalette(false, .terminal);
+    defer setInlineCodeTheme(false);
+
+    try std.testing.expectEqualStrings("\x1b[90m", inline_code_open);
+    try std.testing.expectEqualStrings("\x1b[32m", task_completed_open);
 }

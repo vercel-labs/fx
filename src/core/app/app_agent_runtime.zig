@@ -31,6 +31,7 @@ const subagent_agent_adapter = @import("../subagent/agent_adapter.zig");
 const subagent_domain = @import("../subagent/domain.zig");
 const subagent_execution = @import("../subagent/execution.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const presentation_palette = @import("../shared/presentation_palette.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("../tooling/tool_args.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
@@ -1399,7 +1400,11 @@ fn formatInvalidArgsToolAction(arena: Allocator, state: ToolActionState, denied_
 }
 
 fn formatToolActionValue(arena: Allocator, label: []const u8, value: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "● {s}\x1b[0m \x1b[38;5;245m{s}\x1b[0m", .{ label, value });
+    return std.fmt.allocPrint(
+        arena,
+        "● {s}\x1b[0m {s}{s}\x1b[0m",
+        .{ label, presentation_palette.currentStyles().dim, value },
+    );
 }
 
 fn specLabel(spec: *const tool_dispatch.Tool, state: ToolActionState, denied_label: ?[]const u8) []const u8 {

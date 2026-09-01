@@ -1039,13 +1039,13 @@ fn formatWebSearchProgress(alloc: std.mem.Allocator, progress: types.WebSearchPr
     return switch (progress) {
         .query_started => |query| std.fmt.allocPrint(
             alloc,
-            "● Searching\x1b[0m \x1b[38;5;245m{s}\x1b[0m",
-            .{text_utils.clippedLabel(&query_buf, query, 120)},
+            "● Searching\x1b[0m {s}{s}\x1b[0m",
+            .{ ui_render.dim_style, text_utils.clippedLabel(&query_buf, query, 120) },
         ),
         .results_received => |entry| std.fmt.allocPrint(
             alloc,
-            "● Found {d} result{s}\x1b[0m \x1b[38;5;245m{s}\x1b[0m",
-            .{ entry.result_count, if (entry.result_count == 1) "" else "s", text_utils.clippedLabel(&query_buf, entry.query, 120) },
+            "● Found {d} result{s}\x1b[0m {s}{s}\x1b[0m",
+            .{ entry.result_count, if (entry.result_count == 1) "" else "s", ui_render.dim_style, text_utils.clippedLabel(&query_buf, entry.query, 120) },
         ),
     };
 }
@@ -1055,13 +1055,13 @@ fn formatWebFetchProgress(alloc: std.mem.Allocator, progress: types.WebFetchProg
     return switch (progress) {
         .fetching => |url| std.fmt.allocPrint(
             alloc,
-            "● Fetching\x1b[0m \x1b[38;5;245m{s}\x1b[0m",
-            .{text_utils.clippedLabel(&url_buf, url, 120)},
+            "● Fetching\x1b[0m {s}{s}\x1b[0m",
+            .{ ui_render.dim_style, text_utils.clippedLabel(&url_buf, url, 120) },
         ),
         .converting => |url| std.fmt.allocPrint(
             alloc,
-            "● Converting\x1b[0m \x1b[38;5;245m{s}\x1b[0m",
-            .{text_utils.clippedLabel(&url_buf, url, 120)},
+            "● Converting\x1b[0m {s}{s}\x1b[0m",
+            .{ ui_render.dim_style, text_utils.clippedLabel(&url_buf, url, 120) },
         ),
     };
 }

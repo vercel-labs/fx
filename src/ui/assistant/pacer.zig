@@ -4,6 +4,8 @@ const Allocator = std.mem.Allocator;
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const types = @import("../../core/shared/types.zig");
+const assistant_ansi = @import("../../core/agent/presentation/ansi.zig");
+const presentation_palette = @import("../../core/shared/presentation_palette.zig");
 const HistoryTurn = types.HistoryTurn;
 const FinishedPrompt = types.FinishedPrompt;
 
@@ -37,6 +39,7 @@ pub const SgrState = struct {
         none,
         dark,
         light,
+        terminal,
     };
 
     bold: bool = false,
@@ -72,7 +75,14 @@ pub const SgrState = struct {
             self.dim = false;
         } else if (std.mem.eql(u8, body, "23")) self.italic = false else if (std.mem.eql(u8, body, "24")) self.underline = false else if (std.mem.eql(u8, body, "29")) self.strike = false else if (std.mem.eql(u8, body, "39")) {
             self.code_fg = .none;
-        } else if (std.mem.eql(u8, body, "38;5;245")) self.code_fg = .dark else if (std.mem.eql(u8, body, "38;5;247")) self.code_fg = .light;
+        } else if (assistant_ansi.isInlineCodeOpen(seq)) {
+            self.code_fg = if (std.mem.eql(u8, seq, presentation_palette.styles(false, .terminal).inline_code))
+                .terminal
+            else if (std.mem.eql(u8, seq, "\x1b[38;5;247m"))
+                .light
+            else
+                .dark;
+        }
     }
 
     /// Serialize open codes for the currently-active attributes into `buf`.
@@ -97,6 +107,7 @@ pub const SgrState = struct {
             .none => {},
             .dark => append(buf, &n, "\x1b[38;5;245m"),
             .light => append(buf, &n, "\x1b[38;5;247m"),
+            .terminal => append(buf, &n, presentation_palette.styles(false, .terminal).inline_code),
         }
         return n;
     }
@@ -161,6 +172,63 @@ pub const AssistantPacer = struct {
 
         if (self.sgr.code_fg != .none) {
             self.sgr.code_fg = if (light) .light else .dark;
+        }
+    }
+
+    /// Retint queued and active inline-code state when a configurable color
+    /// palette changes. The explicit allocator is required because ANSI-16
+    /// sequences are shorter than the historical 256-color sequences.
+    pub fn rethemeInlineCodeForPalette(
+        self: *AssistantPacer,
+        alloc: Allocator,
+        light: bool,
+        palette: presentation_palette.ColorPalette,
+    ) !void {
+        const target = assistant_ansi.inlineCodeStyle(light, palette);
+        const old_styles = [_][]const u8{
+            assistant_ansi.inlineCodeStyle(false, .fx),
+            assistant_ansi.inlineCodeStyle(true, .fx),
+            assistant_ansi.inlineCodeStyle(false, .terminal),
+        };
+
+        var rewritten: std.ArrayList(u8) = .empty;
+        errdefer rewritten.deinit(alloc);
+        var changed = false;
+        var index: usize = 0;
+        while (index < self.pending.items.len) {
+            var matched: ?[]const u8 = null;
+            for (old_styles) |old| {
+                if (std.mem.eql(u8, old, target)) continue;
+                if (std.mem.startsWith(u8, self.pending.items[index..], old)) {
+                    matched = old;
+                    break;
+                }
+            }
+            if (matched) |old| {
+                try rewritten.appendSlice(alloc, target);
+                index += old.len;
+                changed = true;
+            } else {
+                try rewritten.append(alloc, self.pending.items[index]);
+                index += 1;
+            }
+        }
+
+        if (changed) {
+            const replacement = try rewritten.toOwnedSlice(alloc);
+            self.pending.deinit(alloc);
+            self.pending = .fromOwnedSlice(replacement);
+        } else {
+            rewritten.deinit(alloc);
+        }
+
+        if (self.sgr.code_fg != .none) {
+            self.sgr.code_fg = if (palette == .terminal)
+                .terminal
+            else if (light)
+                .light
+            else
+                .dark;
         }
     }
 
@@ -899,6 +967,26 @@ test "theme change retints a queued inline code opener before it is emitted" {
 
     try std.testing.expect(std.mem.indexOf(u8, cap.emitted.items, "\x1b[38;5;245m") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.emitted.items, "\x1b[38;5;247m") == null);
+}
+
+test "terminal palette retints queued and active inline code" {
+    const alloc = std.testing.allocator;
+    var pacer = AssistantPacer{};
+    defer pacer.deinit(alloc);
+    var cap = TestCapture{};
+    defer cap.deinit();
+
+    try pacer.enqueue(alloc, "x\x1b[38;5;245mcode");
+    try pacer.tick(alloc, 0, cap.callbacks());
+    const emitted_before_theme_change = cap.emitted.items.len;
+
+    try pacer.rethemeInlineCodeForPalette(alloc, false, .terminal);
+    try pacer.enqueue(alloc, "\x1b[39m");
+    try pacer.tick(alloc, 1, cap.callbacks());
+
+    const after_theme_change = cap.emitted.items[emitted_before_theme_change..];
+    try std.testing.expect(std.mem.indexOf(u8, after_theme_change, "\x1b[0m\x1b[90m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_theme_change, "38;5;") == null);
 }
 
 test "underline style is restored across rendered blocks" {

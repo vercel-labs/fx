@@ -2,6 +2,7 @@ const std = @import("std");
 const build_checkpoint = @import("build_checkpoint.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const assistant_pacer = @import("../assistant/pacer.zig");
+const assistant_ansi = @import("../../core/agent/presentation/ansi.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -986,7 +987,11 @@ fn dimTaskMarkerWidth(text: []const u8, start: usize) ?usize {
 
 fn taskMarkerWidth(text: []const u8, start: usize) ?usize {
     const dim_open = "\x1b[2m";
-    const completed_opens = [_][]const u8{ "\x1b[38;5;252m", "\x1b[38;5;238m" };
+    const completed_opens = [_][]const u8{
+        "\x1b[38;5;252m",
+        "\x1b[38;5;238m",
+        assistant_ansi.taskCompletedStyle(false, .terminal),
+    };
     const completed_close = "\x1b[39m";
     const completed = "\xe2\x9c\x93";
 

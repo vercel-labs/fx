@@ -3,6 +3,7 @@ const command_admission = @import("../../permissions/command_admission.zig");
 const managed_execution = @import("../../execution/managed_execution.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const types = @import("../../shared/types.zig");
+const presentation_palette = @import("../../shared/presentation_palette.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const tool_specs = @import("../../tooling/tool_specs.zig");
@@ -703,7 +704,11 @@ fn formatProvisionalProgressLabel(
     label_value: ?[]const u8,
 ) ![]const u8 {
     if (label_value) |value| {
-        return std.fmt.bufPrint(buf, "● {s}\x1b[0m \x1b[38;5;245m{s}\x1b[0m", .{ action_label, value });
+        return std.fmt.bufPrint(
+            buf,
+            "● {s}\x1b[0m {s}{s}\x1b[0m",
+            .{ action_label, presentation_palette.currentStyles().dim, value },
+        );
     }
     return std.fmt.bufPrint(buf, "● {s}\x1b[0m", .{action_label});
 }
@@ -1365,14 +1370,16 @@ pub fn finishCommittedFileStatus(
 }
 
 fn formatWebSearchCompletion(arena: Allocator, base: []const u8, completion: types.WebSearchCompletion) ![]const u8 {
+    const dim = presentation_palette.currentStyles().dim;
     return std.fmt.allocPrint(
         arena,
-        "{s} \x1b[38;5;245m| {d} search{s} | {d}ms\x1b[0m",
-        .{ base, completion.searches, if (completion.searches == 1) "" else "es", completion.duration_ms },
+        "{s} {s}| {d} search{s} | {d}ms\x1b[0m",
+        .{ base, dim, completion.searches, if (completion.searches == 1) "" else "es", completion.duration_ms },
     );
 }
 
 fn formatWebFetchCompletion(arena: Allocator, base: []const u8, completion: types.WebFetchCompletion) ![]const u8 {
+    const dim = presentation_palette.currentStyles().dim;
     const cache = if (completion.cache_hit) "cache hit" else "fetched";
     const artifact = switch (completion.artifact_state) {
         .none => "",
@@ -1381,8 +1388,8 @@ fn formatWebFetchCompletion(arena: Allocator, base: []const u8, completion: type
     };
     return std.fmt.allocPrint(
         arena,
-        "{s} \x1b[38;5;245m| {s} | {d} bytes | HTTP {d} | {d}ms | {s}{s}\x1b[0m",
-        .{ base, completion.url(), completion.bytes, completion.status, completion.duration_ms, cache, artifact },
+        "{s} {s}| {s} | {d} bytes | HTTP {d} | {d}ms | {s}{s}\x1b[0m",
+        .{ base, dim, completion.url(), completion.bytes, completion.status, completion.duration_ms, cache, artifact },
     );
 }
 
@@ -1393,8 +1400,9 @@ pub fn formatToolStatusWithStats(
     deletions: usize,
     markers: runtime_deps.DiffMarkerStyles,
 ) ![]const u8 {
-    const accent = "\x1b[38;5;252m";
-    const dim = "\x1b[38;5;245m";
+    const styles = presentation_palette.currentStyles();
+    const accent = styles.user_accent;
+    const dim = styles.dim;
     const reset = "\x1b[0m";
     // Fall back to the neutral accent when no marker color is supplied.
     const add_style = if (markers.added.len != 0) markers.added else accent;

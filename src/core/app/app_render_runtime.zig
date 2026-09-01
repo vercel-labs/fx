@@ -498,15 +498,34 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn applyThemeUpdate(app: *App, light: bool, rgb: ?ui_render.TerminalRgb) !void {
-            if (!ui_render.themeNeedsUpdate(light, rgb)) return;
+            return applyThemeUpdateForPalette(app, light, rgb, ui_render.currentColorPalette());
+        }
+
+        pub fn applyThemeUpdateForPalette(
+            app: *App,
+            light: bool,
+            rgb: ?ui_render.TerminalRgb,
+            palette: ui_render.ColorPalette,
+        ) !void {
+            if (!ui_render.themeNeedsUpdateForPalette(light, rgb, palette)) return;
 
             const prior_light = ui_render.is_light;
-            app.shell.retintEntriesForTheme(app.alloc, prior_light, light) catch |err| {
+            const prior_palette = ui_render.currentColorPalette();
+            app.shell.retintEntriesForPalette(
+                app.alloc,
+                prior_light,
+                light,
+                prior_palette,
+                palette,
+            ) catch |err| {
                 debug_trace.logf("theme", "theme_transcript_retint_failed err={s}", .{@errorName(err)});
                 return;
             };
-            app.pacer.rethemeInlineCode(light);
-            ui_render.initTheme(light, rgb);
+            app.pacer.rethemeInlineCodeForPalette(app.alloc, light, palette) catch |err| {
+                debug_trace.logf("theme", "theme_pacer_retint_failed err={s}", .{@errorName(err)});
+                return;
+            };
+            ui_render.initThemeForPalette(light, rgb, palette);
             app.shell.setCommandOutputRenderPolicy(shellStyles());
             try app.shell.requestTerminalReset(&app.metrics);
             app.shell.render_requests.request(.transcript);
@@ -525,7 +544,12 @@ pub fn Runtime(comptime App: type) type {
                 .notice_warning_style = ui_render.warning_style,
                 .notice_error_style = ui_render.red_style,
                 .notice_cancelled_style = ui_render.dim_style,
-                .code_highlight_theme = if (ui_render.is_light) .light else .dark,
+                .code_highlight_theme = if (ui_render.currentColorPalette() == .terminal)
+                    .terminal
+                else if (ui_render.is_light)
+                    .light
+                else
+                    .dark,
             };
         }
 

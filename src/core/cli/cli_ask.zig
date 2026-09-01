@@ -21,6 +21,7 @@ const host = @import("../hosts/host.zig");
 const pathing = @import("../workspace/pathing.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const presentation_palette = @import("../shared/presentation_palette.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation = @import("../tooling/file_mutation.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
@@ -1512,10 +1513,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.permission_rules = try takeCorePermissionRules(alloc, &startup);
     ctx.context_enabled = startup.context_enabled;
     if (options.output_mode.isTerminal()) {
-        presenter = try ask_presentation.Runtime.init(alloc, .{
+        presenter = try ask_presentation.Runtime.initForPalette(alloc, .{
             .text = owned_prompt,
             .images = @constCast(options.images),
-        }, options.output_mode == .terminal_no_color);
+        }, options.output_mode == .terminal_no_color, startup.color_palette);
         ctx.presenter = &presenter.?;
     }
     try ctx.configureNotifications(
@@ -3656,9 +3657,16 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
 
 fn emitHeadlessYoloWarning(alloc: Allocator, options: RunOptions) !void {
     if (options.color_enabled and options.deps.stderr_is_tty(options.deps.stderr_ctx)) {
+        const warning_style = presentation_palette.currentStyles().warning;
+        const warning = try std.fmt.allocPrint(
+            alloc,
+            "{s}{s}\x1b[0m\n",
+            .{ warning_style, permissions.yolo_warning_text },
+        );
+        defer alloc.free(warning);
         try options.deps.write_stderr(
             options.deps.stderr_ctx,
-            "\x1b[38;5;252m" ++ permissions.yolo_warning_text ++ "\x1b[0m\n",
+            warning,
         );
     } else {
         try options.deps.write_stderr(options.deps.stderr_ctx, permissions.yolo_warning_text ++ "\n");

@@ -6129,6 +6129,24 @@ pub const TranscriptRuntime = struct {
         return transcript_store.retintEntriesForTheme(self, alloc, from_light, to_light);
     }
 
+    pub fn retintEntriesForPalette(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        from_light: bool,
+        to_light: bool,
+        from_palette: ui_render.ColorPalette,
+        to_palette: ui_render.ColorPalette,
+    ) !void {
+        return transcript_store.retintEntriesForPalette(
+            self,
+            alloc,
+            from_light,
+            to_light,
+            from_palette,
+            to_palette,
+        );
+    }
+
     pub fn setTranscriptPresentationDepth(
         self: *TranscriptRuntime,
         alloc: Allocator,

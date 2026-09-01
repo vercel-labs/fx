@@ -3651,6 +3651,7 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     if (comptime @hasField(App, "shell") and @hasField(@TypeOf(app.shell), "collapse_tool_calls")) {
         snapshot.collapse_tool_calls = app.shell.collapse_tool_calls;
     }
+    if (comptime @hasDecl(App, "colorPalette")) snapshot.color_palette = app.colorPalette().label();
     if (comptime @hasField(App, "statusline_context")) snapshot.statusline_context = app.statusline_context;
     if (comptime @hasField(App, "statusline_session")) snapshot.statusline_session = app.statusline_session;
     if (comptime @hasField(App, "workspace_identity")) snapshot.statusline_workspace = app.workspace_identity.enabled;
@@ -3724,6 +3725,24 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
                 app,
                 "collapse tool calls",
                 .{ .collapse_tool_calls = enabled },
+                runtime_changed,
+            );
+        },
+        .color_palette => {
+            const palette = config_runtime.ColorPalette.parse(change.value) orelse
+                return error.InvalidSettingsCatalogValue;
+            const App = @TypeOf(app.*);
+            const runtime_changed = if (comptime @hasDecl(App, "colorPalette"))
+                palette != app.colorPalette()
+            else
+                false;
+            if (runtime_changed and comptime @hasDecl(App, "applyColorPaletteUpdate")) {
+                try app.applyColorPaletteUpdate(palette);
+            }
+            try persistUserPreferences(
+                app,
+                "color palette",
+                .{ .color_palette = palette },
                 runtime_changed,
             );
         },

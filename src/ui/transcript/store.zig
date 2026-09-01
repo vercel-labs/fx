@@ -31,6 +31,7 @@ const Allocator = std.mem.Allocator;
 const Metrics = types.Metrics;
 const transcript_blocks = render_engine.transcript_blocks;
 const assistant_presentation = @import("../../core/agent/assistant_presentation.zig");
+const presentation_palette = @import("../../core/shared/presentation_palette.zig");
 
 const AssistantTurnSegments = transcript_blocks.AssistantTurnSegments;
 const RawEntryClass = transcript_blocks.RawEntryClass;
@@ -2835,7 +2836,18 @@ pub fn retintEntriesForTheme(
     from_light: bool,
     to_light: bool,
 ) !void {
-    if (from_light == to_light) return;
+    return retintEntriesForPalette(self, alloc, from_light, to_light, .fx, .fx);
+}
+
+pub fn retintEntriesForPalette(
+    self: anytype,
+    alloc: Allocator,
+    from_light: bool,
+    to_light: bool,
+    from_palette: presentation_palette.ColorPalette,
+    to_palette: presentation_palette.ColorPalette,
+) !void {
+    if (from_light == to_light and from_palette == to_palette) return;
     try self.assertCanMutateTranscript();
 
     var shadow = try cloneMutationState(self, alloc);
@@ -2845,13 +2857,27 @@ pub fn retintEntriesForTheme(
         switch (entry.*) {
             .raw_bytes => |*raw| {
                 if (!themeOwnsRawEntry(raw.class)) continue;
-                if (try retintThemeBytes(alloc, raw.bytes, from_light, to_light)) |replacement| {
+                if (try retintThemeBytes(
+                    alloc,
+                    raw.bytes,
+                    from_light,
+                    to_light,
+                    from_palette,
+                    to_palette,
+                )) |replacement| {
                     alloc.free(raw.bytes);
                     raw.bytes = replacement;
                 }
             },
             .assistant_turn => |*assistant| {
-                if (try retintThemeBytes(alloc, assistant.segments.text.items, from_light, to_light)) |replacement| {
+                if (try retintThemeBytes(
+                    alloc,
+                    assistant.segments.text.items,
+                    from_light,
+                    to_light,
+                    from_palette,
+                    to_palette,
+                )) |replacement| {
                     assistant.segments.text.deinit(alloc);
                     assistant.segments.text = .fromOwnedSlice(replacement);
                 }
@@ -2877,29 +2903,6 @@ pub fn retintEntriesForTheme(
     );
 }
 
-const ThemeToken = struct {
-    from: []const u8,
-    to: []const u8,
-};
-
-const dark_to_light_theme_tokens = [_]ThemeToken{
-    .{ .from = "\x1b[1;38;5;255m", .to = "\x1b[1;38;5;235m" },
-    .{ .from = "\x1b[38;5;255m", .to = "\x1b[38;5;235m" },
-    .{ .from = "\x1b[1;38;5;252m", .to = "\x1b[1;38;5;238m" },
-    .{ .from = "\x1b[38;5;252m", .to = "\x1b[38;5;238m" },
-    .{ .from = "\x1b[38;5;250m", .to = "\x1b[38;5;241m" },
-    .{ .from = "\x1b[38;5;245m", .to = "\x1b[38;5;247m" },
-};
-
-const light_to_dark_theme_tokens = [_]ThemeToken{
-    .{ .from = "\x1b[1;38;5;235m", .to = "\x1b[1;38;5;255m" },
-    .{ .from = "\x1b[38;5;235m", .to = "\x1b[38;5;255m" },
-    .{ .from = "\x1b[1;38;5;238m", .to = "\x1b[1;38;5;252m" },
-    .{ .from = "\x1b[38;5;238m", .to = "\x1b[38;5;252m" },
-    .{ .from = "\x1b[38;5;241m", .to = "\x1b[38;5;250m" },
-    .{ .from = "\x1b[38;5;247m", .to = "\x1b[38;5;245m" },
-};
-
 fn themeOwnsRawEntry(class: RawEntryClass) bool {
     return switch (class) {
         .welcome,
@@ -2918,9 +2921,60 @@ fn retintThemeBytes(
     bytes: []const u8,
     from_light: bool,
     to_light: bool,
+    from_palette: presentation_palette.ColorPalette,
+    to_palette: presentation_palette.ColorPalette,
 ) !?[]u8 {
-    if (from_light == to_light) return null;
-    const tokens = if (to_light) dark_to_light_theme_tokens[0..] else light_to_dark_theme_tokens[0..];
+    if (from_light == to_light and from_palette == to_palette) return null;
+
+    const from_styles = presentation_palette.styles(from_light, from_palette);
+    const to_styles = presentation_palette.styles(to_light, to_palette);
+    const ThemeToken = struct { from: []const u8, to: []const u8 };
+    var token_storage: [16]ThemeToken = undefined;
+    var token_count: usize = 0;
+
+    const appendToken = struct {
+        fn add(storage: []ThemeToken, count: *usize, from: []const u8, to: []const u8) void {
+            if (std.mem.eql(u8, from, to)) return;
+            if (count.* >= storage.len) return;
+            storage[count.*] = .{ .from = from, .to = to };
+            count.* += 1;
+        }
+    }.add;
+
+    if (from_palette == .fx and to_palette == .fx) {
+        // Keep the historical light/dark retint map byte-for-byte identical.
+        appendToken(token_storage[0..], &token_count, from_styles.tag, to_styles.tag);
+        appendToken(token_storage[0..], &token_count, from_styles.user_marker, to_styles.user_marker);
+        appendToken(token_storage[0..], &token_count, from_styles.system_notice_label, to_styles.system_notice_label);
+        appendToken(token_storage[0..], &token_count, from_styles.user_accent, to_styles.user_accent);
+        appendToken(token_storage[0..], &token_count, from_styles.system_notice_text, to_styles.system_notice_text);
+        appendToken(token_storage[0..], &token_count, from_styles.dim, to_styles.dim);
+    } else if (from_palette == .fx and to_palette == .terminal) {
+        // .fx intentionally shares a neutral foreground for several semantic
+        // roles. Retained bytes cannot recover that lost distinction, so move
+        // those roles to the terminal default foreground while preserving
+        // marker, label, and muted roles that remain unambiguous.
+        appendToken(token_storage[0..], &token_count, from_styles.tag, to_styles.tag);
+        appendToken(token_storage[0..], &token_count, from_styles.user_marker, to_styles.user_marker);
+        appendToken(token_storage[0..], &token_count, from_styles.system_notice_label, to_styles.system_notice_label);
+        appendToken(token_storage[0..], &token_count, from_styles.user_accent, to_styles.system_notice_text);
+        appendToken(token_storage[0..], &token_count, from_styles.system_notice_text, to_styles.system_notice_text);
+        appendToken(token_storage[0..], &token_count, from_styles.dim, to_styles.dim);
+    } else if (from_palette == .terminal and to_palette == .fx) {
+        appendToken(token_storage[0..], &token_count, from_styles.user_marker, to_styles.user_marker);
+        appendToken(token_storage[0..], &token_count, from_styles.user_accent, to_styles.user_accent);
+        appendToken(token_storage[0..], &token_count, from_styles.code_keyword, to_styles.code_keyword);
+        appendToken(token_storage[0..], &token_count, from_styles.green, to_styles.green);
+        appendToken(token_storage[0..], &token_count, from_styles.red, to_styles.red);
+        appendToken(token_storage[0..], &token_count, from_styles.warning, to_styles.warning);
+        appendToken(token_storage[0..], &token_count, from_styles.system_notice_text, to_styles.system_notice_text);
+        appendToken(token_storage[0..], &token_count, from_styles.dim, to_styles.dim);
+    } else {
+        // Both terminal palettes are independent of light/dark detection.
+        return null;
+    }
+
+    const tokens = token_storage[0..token_count];
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
 
@@ -3290,4 +3344,23 @@ test "refreshFoldedCommandSummaryIndices uses final preparation indices" {
     for (runtime.folded_command_blocks.items, expected.folded_summary_indices) |block, index| {
         try std.testing.expectEqual(index, block.summary_transcript_index);
     }
+}
+
+test "retintThemeBytes maps fx-owned presentation into terminal defaults" {
+    const source = "\x1b[38;5;252mowned\x1b[0m \x1b[38;5;245mmuted\x1b[0m";
+    const converted = try retintThemeBytes(
+        std.testing.allocator,
+        source,
+        false,
+        false,
+        .fx,
+        .terminal,
+    );
+    defer if (converted) |bytes| std.testing.allocator.free(bytes);
+
+    try std.testing.expect(converted != null);
+    try std.testing.expectEqualStrings(
+        "\x1b[39mowned\x1b[0m \x1b[90mmuted\x1b[0m",
+        converted.?,
+    );
 }

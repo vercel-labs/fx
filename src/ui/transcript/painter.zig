@@ -289,7 +289,12 @@ fn renderTranscriptRows(
                 rendered.last_visible_row_blank = blank;
             },
             .folded_line => |folded| {
-                var folded_bytes = try foldedLineBytes(alloc, folded.text, folded.stream);
+                var folded_bytes = try foldedLineBytes(
+                    alloc,
+                    folded.text,
+                    folded.stream,
+                    commandOutputStyles(self),
+                );
                 var folded_bytes_needs_free = true;
                 errdefer if (folded_bytes_needs_free) alloc.free(folded_bytes);
                 const rows_touched = visualRowsForLine(folded_bytes, self.layout.cols);
@@ -376,8 +381,26 @@ fn foldedPartialTailBytes(self: anytype, bytes: []const u8, partial_skip_rows: u
     return if (offset < bytes.len) bytes[offset..] else "";
 }
 
-fn foldedLineBytes(alloc: Allocator, text: []const u8, stream: command_output_content.Stream) ![]u8 {
-    const style = if (stream == .stderr) "\x1b[38;5;252m" else "\x1b[38;5;245m";
+fn commandOutputStyles(self: anytype) transcript_blocks.Styles {
+    const Runtime = @TypeOf(self.*);
+    if (comptime @hasField(Runtime, "command_output_render")) {
+        return self.command_output_render.styles;
+    }
+    return .{};
+}
+
+fn foldedLineBytes(
+    alloc: Allocator,
+    text: []const u8,
+    stream: command_output_content.Stream,
+    styles: transcript_blocks.Styles,
+) ![]u8 {
+    const style = if (stream == .stderr)
+        if (styles.red_style.len > 0) styles.red_style else "\x1b[38;5;252m"
+    else if (styles.dim_style.len > 0)
+        styles.dim_style
+    else
+        "\x1b[38;5;245m";
     const trimmed = stripTrailingNewline(text);
     const reset = "\x1b[0m";
     const bytes = try alloc.alloc(u8, style.len + "│ ".len + trimmed.len + reset.len);

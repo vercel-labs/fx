@@ -417,6 +417,19 @@ const App = struct {
     const WorkerAppRuntime = app_worker_runtime.Runtime(Self);
     const WorkspaceAppRuntime = app_workspace_runtime.Runtime(Self);
 
+    pub fn colorPalette(_: *const Self) config_runtime.ColorPalette {
+        return ui_render.currentColorPalette();
+    }
+
+    pub fn applyColorPaletteUpdate(self: *Self, palette: config_runtime.ColorPalette) !void {
+        try RenderAppRuntime.applyThemeUpdateForPalette(
+            self,
+            ui_render.is_light,
+            null,
+            palette,
+        );
+    }
+
     pub fn contextRegistry(_: *const Self) context_contract.Registry {
         return default_context_registry;
     }

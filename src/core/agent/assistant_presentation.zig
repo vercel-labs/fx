@@ -13,6 +13,7 @@ const block_render = @import("presentation/block_render.zig");
 var link_id_counter: u32 = 1;
 
 pub const setInlineCodeTheme = ansi.setInlineCodeTheme;
+pub const setInlineCodePalette = ansi.setInlineCodePalette;
 pub const writeHorizontalRule = ansi.writeHorizontalRule;
 
 pub const TableColumnAlign = payload.TableColumnAlign;

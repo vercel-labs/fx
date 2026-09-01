@@ -10,6 +10,7 @@ const model_provider = @import("model_provider.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const update_target = @import("../upgrade/update_target.zig");
+const color_palette = @import("color_palette.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
@@ -93,6 +94,7 @@ pub const ProjectMcpMutation = struct {
 pub const UserSettingsPatch = struct {
     model_preference: ?ModelPreferencePatch = null,
     provider: ?model_provider.ProviderId = null,
+    color_palette: ?color_palette.ColorPalette = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     /// Removes the key entirely so resolution returns to plain precedence.
@@ -114,6 +116,7 @@ pub const UserSettingsPatch = struct {
     fn isEmpty(self: UserSettingsPatch) bool {
         return self.model_preference == null and
             self.provider == null and
+            self.color_palette == null and
             self.permission_mode == null and
             self.credential_source == null and
             !self.clear_credential_source and
@@ -210,6 +213,7 @@ const PatchApplication = struct {
 
 const UserPreferenceField = enum(u4) {
     model,
+    color_palette,
     permission_mode,
     effort,
     fast_mode,
@@ -228,6 +232,7 @@ const UserPreferenceField = enum(u4) {
     fn snapshotName(self: UserPreferenceField) []const u8 {
         return switch (self) {
             .model => "settings.json.preference-migration.model.json",
+            .color_palette => "settings.json.preference-migration.color_palette.json",
             .permission_mode => "settings.json.preference-migration.permission_mode.json",
             .effort => "settings.json.preference-migration.effort.json",
             .fast_mode => "settings.json.preference-migration.fast_mode.json",
@@ -244,6 +249,7 @@ const UserPreferenceField = enum(u4) {
 
 const user_preference_fields = [_]UserPreferenceField{
     .model,
+    .color_palette,
     .permission_mode,
     .effort,
     .fast_mode,
@@ -933,6 +939,18 @@ test "collapse tool calls user patch writes the profile preference" {
     try std.testing.expect(root.object.get("collapse_tool_calls").?.bool);
 }
 
+test "color palette user patch writes the profile preference" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var root = try std.json.parseFromSlice(std.json.Value, arena.allocator(), "{}", .{});
+    defer root.deinit();
+
+    const application = try applyUserPatchToRoot(arena.allocator(), &root.value, .{ .color_palette = .terminal });
+    try std.testing.expect(application.changed);
+    try std.testing.expectEqualStrings("terminal", root.value.object.get("color_palette").?.string);
+}
+
 test "provider patch writes one bounded provider model collection" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -1011,6 +1029,7 @@ fn applyUserPatchToRoot(
         application.changed = try putModelPreference(arena, &root.object, preference) or application.changed;
     }
     if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", @tagName(value)) or application.changed;
+    if (patch.color_palette) |value| application.changed = try putString(arena, &root.object, "color_palette", value.label()) or application.changed;
     if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", @tagName(value)) or application.changed;
     if (patch.credential_source) |value| application.changed = try putString(arena, &root.object, "credential_source", @tagName(value)) or application.changed;
     if (patch.clear_credential_source and root.object.contains("credential_source")) {
@@ -1123,6 +1142,13 @@ fn cleanupLegacyWorkspacePreferences(
             "model",
             .model,
             patch.model_preference != null and patch.model_preference.?.provider == .gateway,
+            application,
+        );
+        removeLegacyLeaf(
+            &entry.value_ptr.object,
+            "color_palette",
+            .color_palette,
+            patch.color_palette != null,
             application,
         );
         removeLegacyLeaf(
@@ -1829,6 +1855,11 @@ fn validateKnownSettingsObject(
             return error.InvalidSettingsFormat;
         }
     }
+    if (object.get("color_palette")) |value| {
+        if (value != .string or color_palette.ColorPalette.parse(value.string) == null) {
+            return error.InvalidSettingsFormat;
+        }
+    }
     if (object.get("codex_model")) |value| {
         if (value != .string) return error.InvalidSettingsFormat;
         try validateModel(value.string);
@@ -2122,6 +2153,28 @@ test "user patch writes user preferences at top level" {
     try std.testing.expect(std.mem.find(u8, bytes, "\"notifications\":{\"turn_end\":true,\"attention_required\":false}") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"future\":{\"nested\":7}") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"workspaces\"") == null);
+}
+
+test "color palette user patch persists the canonical global value" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", "{\"future\":true}\n");
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var outcome = try store.applyUserPatch(alloc, .{ .color_palette = .terminal });
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .committed);
+
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"color_palette\":\"terminal\"") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"future\":true") != null);
 }
 
 test "user patch retires presentation settings without rejecting their values" {
@@ -3017,6 +3070,46 @@ test "startup scrollback user patch removes matching legacy workspace value" {
     try std.testing.expect(outcome == .committed);
     try std.testing.expectEqual(@as(usize, 1), outcome.committed.cleanup.fields_removed);
     try std.testing.expectEqual(@as(usize, 1), outcome.committed.cleanup.workspaces_changed);
+}
+
+test "color palette user patch removes matching legacy workspace value" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    const fixture = try std.fmt.allocPrint(
+        alloc,
+        "{{\"color_palette\":\"fx\",\"workspaces\":{{\"{s}\":{{\"color_palette\":\"terminal\",\"future\":8}}}}}}\n",
+        .{workspace},
+    );
+    defer alloc.free(fixture);
+    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
+
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+    var outcome = try store.applyUserPatch(alloc, .{ .color_palette = .terminal });
+    defer outcome.deinit(alloc);
+
+    try std.testing.expect(outcome == .committed);
+    try std.testing.expectEqual(@as(usize, 1), outcome.committed.cleanup.fields_removed);
+    try std.testing.expectEqual(@as(usize, 1), outcome.committed.cleanup.workspaces_changed);
+    try std.testing.expectEqual(@as(usize, 1), outcome.committed.cleanup.recovery_paths.len);
+
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("terminal", parsed.value.object.get("color_palette").?.string);
+    const workspaces = parsed.value.object.get("workspaces").?.object;
+    const workspace_value = workspaces.get(workspace).?.object;
+    try std.testing.expect(workspace_value.get("color_palette") == null);
+    try std.testing.expectEqual(@as(i64, 8), workspace_value.get("future").?.integer);
 }
 
 test "unrelated user patch preserves inert output level values" {

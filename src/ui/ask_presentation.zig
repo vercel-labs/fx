@@ -32,6 +32,16 @@ pub const Runtime = struct {
         user: types.UserTurn,
         no_color: bool,
     ) !Runtime {
+        return initForPalette(alloc, user, no_color, .fx);
+    }
+
+    pub fn initForPalette(
+        alloc: Allocator,
+        user: types.UserTurn,
+        no_color: bool,
+        color_palette: ui_render.ColorPalette,
+    ) !Runtime {
+        ui_render.setColorPalette(color_palette);
         const layout = zeroFooterLayout(try ui_terminal.queryLayout(std.posix.STDOUT_FILENO, 0));
         var terminal = shell_runtime.TerminalState{};
         const cursor = probeTerminal(&terminal, layout, no_color);
@@ -71,7 +81,12 @@ pub const Runtime = struct {
         try self.shell.initBacking(alloc);
         try self.shell.enableShadowVt(alloc);
         self.shell.setCommandOutputRenderPolicy(.{
-            .code_highlight_theme = if (ui_render.is_light) .light else .dark,
+            .code_highlight_theme = if (ui_render.currentColorPalette() == .terminal)
+                .terminal
+            else if (ui_render.is_light)
+                .light
+            else
+                .dark,
         });
         const start = normalizeStartCursor(layout, cursor);
         self.shell.shadow_vt.?.cursor_row = start.row;
@@ -399,7 +414,7 @@ fn probeTerminal(
 ) shell_runtime.CursorPosition {
     const fallback = shell_runtime.CursorPosition{ .row = layout.rows, .col = 1 };
     const fallback_light = if (no_color) false else ui_render.explicitThemeOverride() orelse false;
-    ui_render.initTheme(fallback_light, null);
+    ui_render.initThemeForPalette(fallback_light, null, ui_render.currentColorPalette());
     if (std.c.isatty(std.posix.STDIN_FILENO) == 0) return fallback;
     terminal.captureOriginalTermios() catch return fallback;
     terminal.enableRawMode() catch return fallback;
@@ -407,7 +422,7 @@ fn probeTerminal(
 
     if (!no_color) {
         const theme = ui_render.detectTheme(std.heap.c_allocator, terminal);
-        ui_render.initTheme(theme.light, theme.rgb);
+        ui_render.initThemeForPalette(theme.light, theme.rgb, ui_render.currentColorPalette());
     }
     return terminal.queryCursorPosition() catch fallback;
 }

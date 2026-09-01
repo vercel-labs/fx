@@ -6,6 +6,7 @@ const types = @import("../../core/shared/types.zig");
 const image_attachments = @import("../../core/images/image_attachments.zig");
 const visual_layout = @import("../input/visual_layout.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
+const presentation_palette = @import("../../core/shared/presentation_palette.zig");
 
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
 
@@ -25,9 +26,14 @@ var accent_style: []const u8 = accent_dark;
 
 var marker_style: []const u8 = dark_marker_style;
 
-pub fn setStyle(light: bool, _: ?Rgb) void {
-    marker_style = if (light) light_marker_style else dark_marker_style;
-    accent_style = if (light) accent_light else accent_dark;
+pub fn setStyle(light: bool, terminal_bg: ?Rgb) void {
+    setStyleForPalette(light, terminal_bg, .fx);
+}
+
+pub fn setStyleForPalette(light: bool, _: ?Rgb, palette: presentation_palette.ColorPalette) void {
+    const styles = presentation_palette.styles(light, palette);
+    marker_style = styles.user_marker;
+    accent_style = styles.user_accent;
 }
 
 pub fn promptMarkerStyle() []const u8 {
@@ -474,6 +480,18 @@ test "current presentation uses a theme-aware prompt rail" {
     const light_card = try buildUserPromptCard(alloc, "hello", &.{}, 80);
     defer alloc.free(light_card);
     try std.testing.expect(std.mem.startsWith(u8, light_card, "\x1b[38;5;235m┃\x1b[0m \x1b[1mhello"));
+}
+
+test "terminal presentation uses ANSI-16 prompt accents" {
+    const alloc = std.testing.allocator;
+    defer setStyle(false, null);
+
+    setStyleForPalette(false, null, .terminal);
+    const card = try buildUserPromptCard(alloc, "hello $review", &.{}, 80);
+    defer alloc.free(card);
+
+    try std.testing.expect(std.mem.startsWith(u8, card, "\x1b[96m┃\x1b[0m \x1b[1mhello"));
+    try std.testing.expect(std.mem.indexOf(u8, card, "38;5;") == null);
 }
 
 test "current presentation restores bold prompt text after skill tokens" {

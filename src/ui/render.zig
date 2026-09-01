@@ -7,6 +7,7 @@ const text_utils = @import("../core/shared/text_utils.zig");
 const types = @import("../core/shared/types.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const assistant_presentation = @import("../core/agent/assistant_presentation.zig");
+const presentation_palette = @import("../core/shared/presentation_palette.zig");
 const main = @import("../main.zig");
 const theme_detection = @import("terminal/theme_detection.zig");
 const theme_protocol = @import("terminal/theme_protocol.zig");
@@ -15,6 +16,7 @@ const update_target = @import("../core/upgrade/update_target.zig");
 
 pub const input_prefix = "❯ ";
 pub const TerminalRgb = user_message_card.Rgb;
+pub const ColorPalette = presentation_palette.ColorPalette;
 pub const reset_style = "\x1b[0m";
 pub const bold_style = "\x1b[1m";
 pub const app_name = "fx";
@@ -55,6 +57,7 @@ pub var selected_completion_style: []const u8 = "\x1b[1;38;5;255m";
 // Statusbar permissions "auto": a step brighter than the statusline gray.
 pub var permission_auto_style: []const u8 = "\x1b[38;5;252m";
 var active_terminal_background: ?TerminalRgb = null;
+var active_color_palette: ColorPalette = .fx;
 
 var truecolor_enabled: bool = true;
 
@@ -62,51 +65,47 @@ pub fn setTruecolorSupport(enabled: bool) void {
     truecolor_enabled = enabled;
 }
 
+/// Compatibility entry point for callers that predate configurable palettes.
+/// It intentionally always selects the historical .fx palette.
 pub fn initTheme(light: bool, terminal_bg: ?TerminalRgb) void {
+    initThemeForPalette(light, terminal_bg, .fx);
+}
+
+pub fn initThemeForPalette(
+    light: bool,
+    terminal_bg: ?TerminalRgb,
+    palette: ColorPalette,
+) void {
     is_light = light;
     active_terminal_background = terminal_bg;
-    assistant_presentation.setInlineCodeTheme(light);
-    if (light) {
-        divider_style = "\x1b[38;5;250m";
-        hint_style = "\x1b[38;5;235m";
-        statusline_style = "\x1b[38;5;241m";
-        tag_style = "\x1b[1;38;5;235m";
-        subtitle_style = "\x1b[1;38;5;235m";
-        system_notice_label_style = "\x1b[1;38;5;238m";
-        system_notice_text_style = "\x1b[38;5;241m";
-        dim_style = "\x1b[38;5;247m";
-        warning_style = "\x1b[38;5;238m";
-        green_style = "\x1b[38;5;238m";
-        red_style = "\x1b[38;5;238m";
-        diff_added_style = "\x1b[38;5;238m";
-        diff_removed_style = "\x1b[38;5;238m";
-        approval_button_active_style = "\x1b[48;5;236m\x1b[38;5;255m\x1b[1m";
-        approval_button_inactive_style = "\x1b[48;5;251m\x1b[38;5;237m";
-        selected_completion_style = "\x1b[1;38;5;235m";
-        permission_auto_style = "\x1b[38;5;238m";
-    } else {
-        divider_style = "\x1b[38;5;240m";
-        hint_style = "\x1b[38;5;255m";
-        statusline_style = "\x1b[38;5;245m";
-        tag_style = "\x1b[1;38;5;255m";
-        subtitle_style = "\x1b[1;38;5;255m";
-        system_notice_label_style = "\x1b[1;38;5;252m";
-        system_notice_text_style = "\x1b[38;5;250m";
-        dim_style = "\x1b[38;5;245m";
-        warning_style = "\x1b[38;5;252m";
-        green_style = "\x1b[38;5;252m";
-        red_style = "\x1b[38;5;252m";
-        diff_added_style = "\x1b[38;5;252m";
-        diff_removed_style = "\x1b[38;5;252m";
-        approval_button_active_style = "\x1b[48;5;255m\x1b[38;5;235m\x1b[1m";
-        approval_button_inactive_style = "\x1b[48;5;239m\x1b[38;5;255m";
-        selected_completion_style = "\x1b[1;38;5;255m";
-        permission_auto_style = "\x1b[38;5;252m";
-    }
+    active_color_palette = palette;
+    presentation_palette.setActive(light, palette);
+    const styles = presentation_palette.styles(light, palette);
+    divider_style = styles.divider;
+    hint_style = styles.hint;
+    statusline_style = styles.statusline;
+    tag_style = styles.tag;
+    subtitle_style = styles.subtitle;
+    system_notice_label_style = styles.system_notice_label;
+    system_notice_text_style = styles.system_notice_text;
+    dim_style = styles.dim;
+    warning_style = styles.warning;
+    green_style = styles.green;
+    red_style = styles.red;
+    diff_added_style = styles.diff_added;
+    diff_removed_style = styles.diff_removed;
+    approval_button_active_style = styles.approval_active;
+    approval_button_inactive_style = styles.approval_inactive;
+    selected_completion_style = styles.selected_completion;
+    permission_auto_style = styles.permission_auto;
+    assistant_presentation.setInlineCodePalette(light, palette);
 
     // The diff marker green/red reads the same on light and dark, so it is set
     // once here rather than per-theme.
-    if (truecolor_enabled) {
+    if (palette == .terminal) {
+        diff_added_marker_style = styles.diff_added_marker;
+        diff_removed_marker_style = styles.diff_removed_marker;
+    } else if (truecolor_enabled) {
         diff_added_marker_style = diff_added_marker_truecolor;
         diff_removed_marker_style = diff_removed_marker_truecolor;
     } else {
@@ -114,14 +113,32 @@ pub fn initTheme(light: bool, terminal_bg: ?TerminalRgb) void {
         diff_removed_marker_style = diff_removed_marker_fallback;
     }
 
-    user_message_card.setStyle(light, terminal_bg);
+    user_message_card.setStyleForPalette(light, terminal_bg, palette);
 }
 
 pub fn themeNeedsUpdate(light: bool, terminal_bg: ?TerminalRgb) bool {
+    return themeNeedsUpdateForPalette(light, terminal_bg, .fx);
+}
+
+pub fn themeNeedsUpdateForPalette(
+    light: bool,
+    terminal_bg: ?TerminalRgb,
+    palette: ColorPalette,
+) bool {
+    if (palette != active_color_palette) return true;
     if (light != is_light) return true;
     const background = terminal_bg orelse return false;
     const current = active_terminal_background orelse return true;
     return current.r != background.r or current.g != background.g or current.b != background.b;
+}
+
+pub fn setColorPalette(palette: ColorPalette) void {
+    active_color_palette = palette;
+    presentation_palette.setActive(is_light, palette);
+}
+
+pub fn currentColorPalette() ColorPalette {
+    return active_color_palette;
 }
 
 // Explicit theme overrides skip OSC 11, leaving `rgb` null for fallback shading.
@@ -867,6 +884,19 @@ test "initTheme selects the light inline code foreground" {
 
     try processor.push(alloc, "run `zig build` now\n", &out);
     try std.testing.expectEqualStrings("run \x1b[38;5;247mzig build\x1b[39m now\n", out.items);
+}
+
+test "terminal palette uses default foreground and ANSI-16 semantic styles" {
+    initThemeForPalette(false, null, .terminal);
+    defer initTheme(false, null);
+
+    try std.testing.expectEqual(ColorPalette.terminal, currentColorPalette());
+    try std.testing.expectEqualStrings("\x1b[39m", system_notice_text_style);
+    try std.testing.expectEqualStrings("\x1b[32m", green_style);
+    try std.testing.expectEqualStrings("\x1b[31m", red_style);
+    try std.testing.expectEqualStrings("\x1b[90m", dim_style);
+    try std.testing.expect(std.mem.indexOf(u8, approval_button_active_style, "38;5;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, approval_button_active_style, "48;5;") == null);
 }
 
 test "welcomeMessage shows version and help hint" {

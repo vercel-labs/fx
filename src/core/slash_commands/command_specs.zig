@@ -1,5 +1,6 @@
 const std = @import("std");
 const display_width = @import("../shared/display_width.zig");
+const presentation_palette = @import("../shared/presentation_palette.zig");
 const list_window = @import("../shared/list_window.zig");
 const mod_registry = @import("../mods/registry.zig");
 
@@ -1404,7 +1405,10 @@ fn styleStart(style: HelpStyle, role: HelpRole) []const u8 {
         .brand => "\x1b[1m",
         .heading, .label => "\x1b[1m",
         .syntax => "\x1b[39m",
-        .muted => "\x1b[38;5;243m",
+        .muted => if (presentation_palette.currentPalette() == .terminal)
+            "\x1b[90m"
+        else
+            "\x1b[38;5;243m",
         .link => "\x1b[4m",
     };
 }
