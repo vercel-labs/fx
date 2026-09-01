@@ -1176,12 +1176,13 @@ pub const Persistence = struct {
     resume_view_admission: ?session_store.ResumeViewAdmission = null,
     resume_handoff_intent: ResumeHandoffIntent = .none,
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
+    rewind_gate: RewindGate = .idle,
 
     /// Fieldwise initialization avoids retaining undefined optional payloads
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 19) {
+            if (std.meta.fields(Persistence).len != 20) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1205,6 +1206,7 @@ pub const Persistence = struct {
         storage.resume_view_admission = null;
         storage.resume_handoff_intent = .none;
         storage.pending_live_session_policy = null;
+        storage.rewind_gate = .idle;
     }
 
     pub fn deinit(self: *Persistence, alloc: Allocator) void {
@@ -2840,6 +2842,58 @@ pub fn Runtime(comptime App: type) type {
                 },
             };
             return .committed;
+        }
+
+        /// Answer to one `/rewind <count>`. The gate makes the confirm step a
+        /// state of the request rather than a flag the caller has to track.
+        pub const RewindOutcome = union(enum) {
+            unavailable_during_stream,
+            out_of_range: usize,
+            confirm: RewindTarget,
+            rewound: RewindTarget,
+        };
+
+        /// Drops trailing turns from the live conversation once the same
+        /// request has been made twice. This process holds the session writer
+        /// lock, so the truncation runs here and commits through the live path
+        /// rather than through `Store.rewindSession`, which would deadlock
+        /// against the lock this shell already owns.
+        pub fn rewindLiveSession(
+            app: *App,
+            requested_turns: usize,
+        ) !RewindOutcome {
+            if (app.stream.active) return .unavailable_during_stream;
+
+            const history_len = app.session.historyLen();
+            if (requested_turns == 0 or requested_turns > history_len) {
+                return .{ .out_of_range = history_len };
+            }
+
+            const target = RewindTarget{
+                .history_len = history_len,
+                .retained_turns = history_len - requested_turns,
+            };
+            switch (app.session_persistence.rewind_gate.request(target)) {
+                .confirm => return .{ .confirm = target },
+                .execute => {},
+            }
+
+            app.session.truncateHistory(app.alloc, target.retained_turns);
+            commitJsHostSnapshot(app, "rewind");
+
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            if (app.session_persistence.writable) |*loaded| {
+                try convergeDegraded(app, loaded, .{});
+                // A paused response always belongs to the tail this rewind just
+                // dropped, so its checkpoint cannot outlive the turns.
+                try commitCurrentStateReplacement(app, loaded, .rewind, .{}, true);
+            }
+            return .{ .rewound = target };
+        }
+
+        pub fn disarmRewind(app: *App) void {
+            app.session_persistence.rewind_gate.disarm();
         }
 
         pub fn compactHistory(app: *App) !void {
