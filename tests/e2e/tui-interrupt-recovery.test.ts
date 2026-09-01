@@ -14,9 +14,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readTrace } from "./tui-render-assertions";
 import {
+  composerContains,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewayToolCall,
+  hasEmptyComposer,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -150,6 +152,68 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       const events = readFileSync(eventsPath!, "utf8");
       expect(events).not.toContain('"kind":"interrupted"');
       expect(events).toContain(queuedText);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "double Escape clears an active-turn draft without cancelling",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-active-draft-clear-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+
+      const held: HoldState = {
+        started: false,
+        cancelled: false,
+        cancelCount: 0,
+        released: false,
+      };
+      gateway = startFakeGateway([
+        () => heldUntilReleasedResponse(held),
+      ]);
+      session = await TmuxSession.create({
+        cwd: realpathSync(workspace),
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-active-draft-clear-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+        },
+      });
+      await session.waitForComposer(TIMEOUT);
+
+      await session.sendText("Hold this response while I clear a draft.");
+      await waitForCondition(() => held.started, "held response start");
+      await session.sendLiteral("discard this draft");
+      await session.waitForPane(
+        (pane) => composerContains(pane, "discard this draft"),
+        TIMEOUT,
+      );
+
+      await session.sendKeys("Escape");
+      await session.sendKeys("Escape");
+      await session.waitForPane(hasEmptyComposer, TIMEOUT);
+
+      expect(held.cancelled).toBe(false);
+      expect(held.cancelCount).toBe(0);
+      expect(session.isAlive()).toBe(true);
+      expect(session.isPaneAlive()).toBe(true);
+
+      held.release!();
+      await session.waitForStableComposer(TIMEOUT);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT * 2,
   );
