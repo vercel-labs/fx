@@ -89,6 +89,7 @@
     {"name": "e2e-file-tool-paths", "argv": ["bun", "test", "--max-concurrency", "1", "./file-tool-paths.test.ts"], "test_file": "file-tool-paths.test.ts"},
     {"name": "e2e-file-tool-permissions", "argv": ["bun", "test", "--max-concurrency", "1", "./file-tool-permissions.test.ts"], "test_file": "file-tool-permissions.test.ts"},
     {"name": "e2e-gateway-stream-lifecycle", "argv": ["bun", "test", "--max-concurrency", "1", "./gateway-stream-lifecycle.test.ts"], "test_file": "gateway-stream-lifecycle.test.ts"},
+    {"name": "e2e-grep-trusted-git", "argv": ["bun", "test", "--max-concurrency", "1", "./grep-trusted-git.test.ts"], "test_file": "grep-trusted-git.test.ts"},
     {"name": "e2e-web-fetch-fake-network", "argv": ["bun", "test", "--max-concurrency", "1", "./web-fetch-fake-network.test.ts"], "test_file": "web-fetch-fake-network.test.ts"},
     {"name": "e2e-web-search-fake-gateway", "argv": ["bun", "test", "--max-concurrency", "1", "./web-search-fake-gateway.test.ts"], "test_file": "web-search-fake-gateway.test.ts"},
     {"name": "e2e-vision-route-fake-gateway", "argv": ["bun", "test", "--max-concurrency", "1", "./vision-route-fake-gateway.test.ts"], "test_file": "vision-route-fake-gateway.test.ts"},

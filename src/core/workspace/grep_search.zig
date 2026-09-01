@@ -72,7 +72,7 @@ pub fn collectDirectoryMatchesWithIgnored(
     ignored_names: []const []const u8,
     include: ?glob_pattern.Pattern,
 ) !Result {
-    return collectDirectoryMatchesWithOptions(arena, workspace_root, absolute_root, pattern, case_insensitive, ignored_names, include, .{});
+    return collectDirectoryMatchesWithOptions(arena, workspace_root, absolute_root, pattern, case_insensitive, ignored_names, include, .{}, workspace_files.trustedGitExecutable());
 }
 
 pub fn countDirectoryMatchesWithIgnored(
@@ -84,7 +84,7 @@ pub fn countDirectoryMatchesWithIgnored(
     ignored_names: []const []const u8,
     include: ?glob_pattern.Pattern,
 ) !CountResult {
-    return countDirectoryMatchesWithOptions(arena, workspace_root, absolute_root, pattern, case_insensitive, ignored_names, include, .{});
+    return countDirectoryMatchesWithOptions(arena, workspace_root, absolute_root, pattern, case_insensitive, ignored_names, include, .{}, workspace_files.trustedGitExecutable());
 }
 
 fn collectDirectoryMatchesWithOptions(
@@ -96,6 +96,7 @@ fn collectDirectoryMatchesWithOptions(
     ignored_names: []const []const u8,
     include: ?glob_pattern.Pattern,
     workspace_options: workspace_files.Options,
+    git_executable_override: ?[]const u8,
 ) !Result {
     var matches: std.ArrayList(Match) = .empty;
     errdefer matches.deinit(arena);
@@ -103,8 +104,13 @@ fn collectDirectoryMatchesWithOptions(
     var truncated_reason: ?TruncatedReason = null;
     var stats: CandidateStats = .{ .cap = workspace_options.candidate_cap };
 
-    if (!workspace_options.force_fallback and !gitIgnoresRoot(arena, absolute_root)) git: {
-        const tracked = gitGrepTrackedMatches(arena, workspace_root, absolute_root, pattern, case_insensitive, include, &matches) catch |err| {
+    if (!workspace_options.force_fallback) git: {
+        const git_executable = git_executable_override orelse {
+            debug_trace.logf("core", "grep_files trusted Git unavailable; falling back root={s}", .{absolute_root});
+            break :git;
+        };
+        if (gitIgnoresRoot(arena, absolute_root, git_executable)) break :git;
+        const tracked = gitGrepTrackedMatches(arena, workspace_root, absolute_root, pattern, case_insensitive, include, &matches, git_executable) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             debug_trace.logf("core", "grep_files git grep fallback root={s} err={s}", .{ absolute_root, @errorName(err) });
             break :git;
@@ -147,12 +153,18 @@ fn countDirectoryMatchesWithOptions(
     ignored_names: []const []const u8,
     include: ?glob_pattern.Pattern,
     workspace_options: workspace_files.Options,
+    git_executable_override: ?[]const u8,
 ) !CountResult {
     var count_result: CountResult = .{ .candidate_cap = workspace_options.candidate_cap };
     var stats: CandidateStats = .{ .cap = workspace_options.candidate_cap };
 
-    if (!workspace_options.force_fallback and !gitIgnoresRoot(arena, absolute_root)) git: {
-        const tracked = gitGrepTrackedCounts(arena, workspace_root, absolute_root, pattern, case_insensitive, include) catch |err| {
+    if (!workspace_options.force_fallback) git: {
+        const git_executable = git_executable_override orelse {
+            debug_trace.logf("core", "grep_files trusted Git unavailable; falling back root={s}", .{absolute_root});
+            break :git;
+        };
+        if (gitIgnoresRoot(arena, absolute_root, git_executable)) break :git;
+        const tracked = gitGrepTrackedCounts(arena, workspace_root, absolute_root, pattern, case_insensitive, include, git_executable) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             debug_trace.logf("core", "grep_files git grep count fallback root={s} err={s}", .{ absolute_root, @errorName(err) });
             break :git;
@@ -185,8 +197,8 @@ fn countDirectoryMatchesWithOptions(
     return finishCount(count_result, stats);
 }
 
-fn gitIgnoresRoot(arena: Allocator, absolute_root: []const u8) bool {
-    const argv = [_][]const u8{ "git", "--no-optional-locks", "check-ignore", "-q", "--", "." };
+fn gitIgnoresRoot(arena: Allocator, absolute_root: []const u8, git_executable: []const u8) bool {
+    const argv = [_][]const u8{ git_executable, "--no-optional-locks", "check-ignore", "-q", "--", "." };
     const result = std.process.run(arena, io_mod.getIo(), .{
         .argv = &argv,
         .cwd = .{ .path = absolute_root },
@@ -399,8 +411,8 @@ fn countCandidateList(
     }
 }
 
-pub fn gitGrepArgvForTest() [9][]const u8 {
-    return .{ "git", "--no-optional-locks", "grep", "-n", "-I", "-F", "-z", "-e", "needle" };
+pub fn gitGrepArgvForTest(git_executable: []const u8) [9][]const u8 {
+    return .{ git_executable, "--no-optional-locks", "grep", "-n", "-I", "-F", "-z", "-e", "needle" };
 }
 
 const GitGrepMatchesResult = struct {
@@ -420,12 +432,13 @@ fn gitGrepTrackedMatches(
     case_insensitive: bool,
     include: ?glob_pattern.Pattern,
     matches: *std.ArrayList(Match),
+    git_executable: []const u8,
 ) !GitGrepMatchesResult {
     if (pattern.len == 0) return error.GitGrepUnsupported;
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(arena);
-    try argv.appendSlice(arena, &.{ "git", "--no-optional-locks", "grep", "-n", "-I", "-F", "-z" });
+    try argv.appendSlice(arena, &.{ git_executable, "--no-optional-locks", "grep", "-n", "-I", "-F", "-z" });
     if (case_insensitive) try argv.append(arena, "-i");
     try argv.appendSlice(arena, &.{ "-e", pattern, "--" });
     if (safeGitIncludePathspec(include)) |pathspec| {
@@ -463,12 +476,13 @@ fn gitGrepTrackedCounts(
     pattern: []const u8,
     case_insensitive: bool,
     include: ?glob_pattern.Pattern,
+    git_executable: []const u8,
 ) !CountResult {
     if (pattern.len == 0) return error.GitGrepUnsupported;
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(arena);
-    try argv.appendSlice(arena, &.{ "git", "--no-optional-locks", "grep", "--count", "-I", "-F", "-z" });
+    try argv.appendSlice(arena, &.{ git_executable, "--no-optional-locks", "grep", "--count", "-I", "-F", "-z" });
     if (case_insensitive) try argv.append(arena, "-i");
     try argv.appendSlice(arena, &.{ "-e", pattern, "--" });
     if (safeGitIncludePathspec(include)) |pathspec| {
@@ -848,7 +862,9 @@ fn readTrace(alloc: Allocator, trace_path: []const u8) ![]u8 {
 fn runGitForTest(alloc: Allocator, cwd: []const u8, args: []const []const u8) !void {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(alloc);
-    try argv.append(alloc, "git");
+    // Test setup resolves Git the same way production does, so this file holds
+    // no bare executable name for the argv guard below to have to except.
+    try argv.append(alloc, workspace_files.trustedGitExecutable() orelse return error.SkipZigTest);
     try argv.appendSlice(alloc, args);
 
     const result = std.process.run(alloc, std.testing.io, .{
@@ -867,9 +883,9 @@ fn runGitForTest(alloc: Allocator, cwd: []const u8, args: []const []const u8) !v
 }
 
 test "grep search git grep argv uses literal fixed-string flags" {
-    const argv = gitGrepArgvForTest();
+    const argv = gitGrepArgvForTest("/usr/bin/git");
 
-    try std.testing.expectEqualStrings("git", argv[0]);
+    try std.testing.expectEqualStrings("/usr/bin/git", argv[0]);
     try std.testing.expectEqualStrings("--no-optional-locks", argv[1]);
     try std.testing.expectEqualStrings("grep", argv[2]);
     try std.testing.expectEqualStrings("-n", argv[3]);
@@ -933,6 +949,206 @@ test "grep search does not ignore workspace because ignored name is outside work
     try std.testing.expectEqual(@as(usize, 1), result.matches.len);
     try std.testing.expect(result.truncated_reason == null);
     try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "src/file.txt"));
+}
+
+/// The argv of every spawn the injected executable received, one per line.
+/// A site that resolves its own name through PATH runs the real Git instead
+/// and leaves nothing here, so the caller asserts on content rather than a
+/// count: a tally cannot tell a missing spawn from an unrecorded one.
+fn recordedSpawns(alloc: Allocator, marker_path: []const u8) ![]u8 {
+    return readFileToEndForTest(alloc, marker_path, 4096) catch |err| switch (err) {
+        error.FileNotFound => return alloc.alloc(u8, 0),
+        else => return err,
+    };
+}
+
+fn writeExecutableScript(tmp: *std.testing.TmpDir, sub_path: []const u8, body: []const u8) !void {
+    var file = try tmp.dir.createFile(std.testing.io, sub_path, .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(), body);
+    try file.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o755));
+}
+
+test "grep search spawns the selected Git executable rather than resolving one from PATH" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+
+    const tracked = try writeTempFile(alloc, &tmp, "tracked.txt", "needle tracked\n");
+    defer alloc.free(tracked);
+
+    const marker = try std.fs.path.join(alloc, &.{ workspace, "spawned.log" });
+    defer alloc.free(marker);
+    const script = try std.fmt.allocPrint(alloc, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{s}\"\nexit 1\n", .{marker});
+    defer alloc.free(script);
+    try writeExecutableScript(&tmp, "fake-git", script);
+    const fake_git = try std.fs.path.join(alloc, &.{ workspace, "fake-git" });
+    defer alloc.free(fake_git);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    _ = try collectDirectoryMatchesWithOptions(
+        arena_state.allocator(),
+        workspace,
+        workspace,
+        "needle",
+        false,
+        ignored_dirs.ignored_directory_names,
+        null,
+        .{},
+        fake_git,
+    );
+
+    // Assert what the selection was asked to run, not how often it ran. A
+    // bare argv0 at either site resolves through PATH to the real Git and
+    // records nothing, so a missing line is the regression this catches.
+    const spawns = try recordedSpawns(alloc, marker);
+    defer alloc.free(spawns);
+    try std.testing.expect(std.mem.find(u8, spawns, "check-ignore") != null);
+    try std.testing.expect(std.mem.find(u8, spawns, "grep -n") != null);
+}
+
+test "grep search count path spawns the selected Git executable rather than resolving one from PATH" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+
+    const tracked = try writeTempFile(alloc, &tmp, "tracked.txt", "needle tracked\n");
+    defer alloc.free(tracked);
+
+    const marker = try std.fs.path.join(alloc, &.{ workspace, "spawned.log" });
+    defer alloc.free(marker);
+    const script = try std.fmt.allocPrint(alloc, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{s}\"\nexit 1\n", .{marker});
+    defer alloc.free(script);
+    try writeExecutableScript(&tmp, "fake-git", script);
+    const fake_git = try std.fs.path.join(alloc, &.{ workspace, "fake-git" });
+    defer alloc.free(fake_git);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    _ = try countDirectoryMatchesWithOptions(
+        arena_state.allocator(),
+        workspace,
+        workspace,
+        "needle",
+        false,
+        ignored_dirs.ignored_directory_names,
+        null,
+        .{},
+        fake_git,
+    );
+
+    const spawns = try recordedSpawns(alloc, marker);
+    defer alloc.free(spawns);
+    try std.testing.expect(std.mem.find(u8, spawns, "check-ignore") != null);
+    try std.testing.expect(std.mem.find(u8, spawns, "grep --count") != null);
+}
+
+test "grep search refuses to resolve Git when no trusted executable is available" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+
+    const tracked = try writeTempFile(alloc, &tmp, "tracked.txt", "needle tracked\n");
+    defer alloc.free(tracked);
+    const trace_path = try std.fs.path.join(alloc, &.{ workspace, "trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectDirectoryMatchesWithOptions(
+        arena_state.allocator(),
+        workspace,
+        workspace,
+        "needle",
+        false,
+        ignored_dirs.ignored_directory_names,
+        null,
+        .{},
+        null,
+    );
+
+    // The trace line is what separates a refusal from a fallback reached by
+    // some other route: substituting a name for the missing executable would
+    // still land in the scanner, but never emits this.
+    const trace = try readTrace(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "trusted Git unavailable") != null);
+
+    try std.testing.expectEqual(@as(usize, 1), result.matches.len);
+    try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "tracked.txt"));
+}
+
+test "grep search builds no Git argv from a bare executable name" {
+    const alloc = std.testing.allocator;
+    var file = try std.Io.Dir.cwd().openFile(io_mod.getIo(), "src/core/workspace/grep_search.zig", .{});
+    defer file.close(io_mod.getIo());
+    const source = try io_mod.readFileToEnd(alloc, &file, 256 * 1024);
+    defer alloc.free(source);
+
+    // No argv in this file may name the executable instead of resolving it.
+    // Keyed on the bare literal, not on any argv shape, so a future spawn
+    // that skips the usual flags cannot slip past. Split so the needle does
+    // not match itself in this test's own source.
+    const bare = "\"gi" ++ "t\"";
+    try std.testing.expect(std.mem.find(u8, source, bare) == null);
+}
+
+test "grep search public entry points resolve a trusted Git rather than skipping it" {
+    _ = workspace_files.trustedGitExecutable() orelse return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const tracked = try writeTempFile(alloc, &tmp, "tracked.txt", "needle tracked\n");
+    defer alloc.free(tracked);
+    const trace_path = try std.fs.path.join(alloc, &.{ workspace, "trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    _ = try collectDirectoryMatchesWithIgnored(
+        arena_state.allocator(),
+        workspace,
+        workspace,
+        "needle",
+        false,
+        ignored_dirs.ignored_directory_names,
+        null,
+    );
+
+    // The wrappers are the only place the trusted executable is looked up, and
+    // handing the search a null there degrades every grep to the scanner while
+    // still returning the same matches. The refusal trace is the one signal
+    // that separates "resolved it" from "never asked".
+    const trace = try readTrace(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "trusted Git unavailable") == null);
+}
+
+test "workspace grep only ever selects an absolute Git executable" {
+    const executable = workspace_files.trustedGitExecutable() orelse return error.SkipZigTest;
+    try std.testing.expect(std.fs.path.isAbsolute(executable));
 }
 
 test "grep search falls back to Zig scanner outside git repositories" {
@@ -1292,6 +1508,7 @@ test "grep_files path narrowing applies before candidate cap" {
             .candidate_cap = 1,
             .force_fallback = true,
         },
+        workspace_files.trustedGitExecutable(),
     );
 
     try std.testing.expectEqual(@as(usize, 1), result.candidate_count);
