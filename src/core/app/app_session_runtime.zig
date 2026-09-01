@@ -60,6 +60,92 @@ const BackgroundSessionPolicy = enum {
     stop_forget,
 };
 
+/// The exact rewind a confirmation prompt described: how long the history was
+/// when it was previewed, and how many turns would survive.
+pub const RewindTarget = struct {
+    history_len: usize,
+    retained_turns: usize,
+
+    pub fn removedTurnCount(self: RewindTarget) usize {
+        return self.history_len - self.retained_turns;
+    }
+};
+
+pub const RewindRequest = enum {
+    confirm,
+    execute,
+};
+
+/// `/rewind` destroys turns, so it runs only when the identical request is
+/// repeated. Arming on the whole target rather than the raw count means a turn
+/// arriving between the two requests re-arms instead of silently firing a
+/// rewind the user never previewed.
+pub const RewindGate = union(enum) {
+    idle,
+    armed: RewindTarget,
+
+    pub fn request(self: *RewindGate, target: RewindTarget) RewindRequest {
+        switch (self.*) {
+            .armed => |pending| if (std.meta.eql(pending, target)) {
+                self.* = .idle;
+                return .execute;
+            },
+            .idle => {},
+        }
+        self.* = .{ .armed = target };
+        return .confirm;
+    }
+
+    pub fn disarm(self: *RewindGate) void {
+        self.* = .idle;
+    }
+};
+
+test "rewind gate executes only an identical repeated request" {
+    var gate: RewindGate = .idle;
+    const target = RewindTarget{ .history_len = 5, .retained_turns = 3 };
+
+    try std.testing.expectEqual(RewindRequest.confirm, gate.request(target));
+    try std.testing.expectEqual(RewindRequest.execute, gate.request(target));
+    try std.testing.expectEqual(RewindGate.idle, gate);
+    try std.testing.expectEqual(RewindRequest.confirm, gate.request(target));
+}
+
+test "rewind gate re-arms when the request changes" {
+    var gate: RewindGate = .idle;
+
+    try std.testing.expectEqual(
+        RewindRequest.confirm,
+        gate.request(.{ .history_len = 5, .retained_turns = 3 }),
+    );
+    try std.testing.expectEqual(
+        RewindRequest.confirm,
+        gate.request(.{ .history_len = 5, .retained_turns = 4 }),
+    );
+    try std.testing.expectEqual(
+        RewindRequest.confirm,
+        gate.request(.{ .history_len = 6, .retained_turns = 4 }),
+    );
+    try std.testing.expectEqual(
+        RewindRequest.execute,
+        gate.request(.{ .history_len = 6, .retained_turns = 4 }),
+    );
+}
+
+test "rewind gate disarms on an intervening command" {
+    var gate: RewindGate = .idle;
+    const target = RewindTarget{ .history_len = 5, .retained_turns = 3 };
+
+    try std.testing.expectEqual(RewindRequest.confirm, gate.request(target));
+    gate.disarm();
+    try std.testing.expectEqual(RewindRequest.confirm, gate.request(target));
+}
+
+test "rewind target reports the turns it drops" {
+    const target = RewindTarget{ .history_len = 7, .retained_turns = 4 };
+    try std.testing.expectEqual(@as(usize, 3), target.removedTurnCount());
+}
+
 const LiveSessionTransitionEvent = union(enum) {
     request: BackgroundSessionPolicy,
     settle,
