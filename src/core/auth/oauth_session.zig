@@ -856,9 +856,22 @@ pub fn parse(alloc: Allocator, bytes: []const u8) !Session {
 }
 
 pub fn stringify(alloc: Allocator, session: Session) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
+    // Measure first and reserve the exact size, so the buffer holding the tokens
+    // never grows. A growing buffer copies the plaintext into a larger block and
+    // releases the smaller one unwiped, and the caller can only wipe the slice it
+    // gets back. Same reason auth_runtime reserves the API-key entry ceiling up
+    // front rather than letting the input buffer reallocate.
+    var counter: std.Io.Writer.Discarding = .init(&.{});
+    try writeSession(&counter.writer, session);
+    const exact = std.math.cast(usize, counter.fullCount()) orelse return error.OutOfMemory;
+
+    var out: std.Io.Writer.Allocating = try .initCapacity(alloc, exact);
     errdefer out.deinit();
-    const writer = &out.writer;
+    try writeSession(&out.writer, session);
+    return out.toOwnedSlice();
+}
+
+fn writeSession(writer: *std.Io.Writer, session: Session) !void {
     try writer.writeAll("{\"version\":1");
     try writeField(writer, "issuer", session.issuer);
     try writeField(writer, "client_id", session.client_id);
@@ -870,7 +883,6 @@ pub fn stringify(alloc: Allocator, session: Session) ![]u8 {
     if (session.team_slug) |value| try writeField(writer, "team_slug", value);
     if (session.team_id) |value| try writeField(writer, "team_id", value);
     try writer.writeAll("}\n");
-    return out.toOwnedSlice();
 }
 
 fn writeField(writer: *std.Io.Writer, name: []const u8, value: []const u8) !void {
@@ -1000,6 +1012,200 @@ test "oauth session stringifies and parses" {
     try std.testing.expectEqualStrings("access", parsed.access_token);
     try std.testing.expectEqualStrings("vercel-labs", parsed.team_slug.?);
     try std.testing.expectEqualStrings("team_123", parsed.team_id.?);
+}
+
+const StringifyCase = struct {
+    name: []const u8,
+    access: []const u8,
+    refresh: []const u8,
+    scope: []const u8,
+    team_slug: ?[]const u8,
+    team_id: ?[]const u8,
+};
+
+/// Every combination that changes what `stringify` writes: the optional fields
+/// present and absent, and values whose JSON encoding is longer than the input.
+/// The two passes must agree on all of them, because the first sizes the buffer
+/// the second writes into.
+const stringify_cases = [_]StringifyCase{
+    .{
+        .name = "all optional fields present",
+        .access = "access-token-long-enough-to-grow-the-buffer",
+        .refresh = "refresh-token-long-enough-to-grow-the-buffer",
+        .scope = "openid offline_access",
+        .team_slug = "vercel-labs",
+        .team_id = "team_123",
+    },
+    .{
+        .name = "both optional fields absent",
+        .access = "access-token-long-enough-to-grow-the-buffer",
+        .refresh = "refresh-token-long-enough-to-grow-the-buffer",
+        .scope = "openid offline_access",
+        .team_slug = null,
+        .team_id = null,
+    },
+    .{
+        .name = "team_slug present, team_id absent",
+        .access = "access-token-long-enough-to-grow-the-buffer",
+        .refresh = "refresh-token-long-enough-to-grow-the-buffer",
+        .scope = "openid offline_access",
+        .team_slug = "vercel-labs",
+        .team_id = null,
+    },
+    .{
+        .name = "team_id present, team_slug absent",
+        .access = "access-token-long-enough-to-grow-the-buffer",
+        .refresh = "refresh-token-long-enough-to-grow-the-buffer",
+        .scope = "openid offline_access",
+        .team_slug = null,
+        .team_id = "team_123",
+    },
+    .{
+        .name = "values whose JSON encoding is longer than the input",
+        .access = "quote\" backslash\\ newline\n tab\t",
+        .refresh = "control\x01\x02 and \"more\"",
+        .scope = "openid \"offline_access\"",
+        .team_slug = "slug\\with\\backslashes",
+        .team_id = "id\"with\"quotes",
+    },
+    .{
+        .name = "multibyte values",
+        .access = "\u{e9}\u{4e2d}\u{6587}\u{1f512}-access-token-value",
+        .refresh = "\u{e9}\u{4e2d}\u{6587}\u{1f512}-refresh-token-value",
+        .scope = "openid \u{4e2d}\u{6587}",
+        .team_slug = "\u{1f512}",
+        .team_id = "\u{e9}",
+    },
+};
+
+fn sessionForCase(alloc: Allocator, case: StringifyCase) !Session {
+    const owned_issuer = try alloc.dupe(u8, issuer);
+    errdefer alloc.free(owned_issuer);
+    const client_id = try alloc.dupe(u8, "client");
+    errdefer alloc.free(client_id);
+    const access_token = try alloc.dupe(u8, case.access);
+    errdefer secret.zeroAndFree(alloc, access_token);
+    const refresh_token = try alloc.dupe(u8, case.refresh);
+    errdefer secret.zeroAndFree(alloc, refresh_token);
+    const scope = try alloc.dupe(u8, case.scope);
+    errdefer alloc.free(scope);
+    const token_type = try alloc.dupe(u8, "Bearer");
+    errdefer alloc.free(token_type);
+    const team_slug = if (case.team_slug) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (team_slug) |value| alloc.free(value);
+    const team_id = if (case.team_id) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (team_id) |value| alloc.free(value);
+
+    return .{
+        .issuer = owned_issuer,
+        .client_id = client_id,
+        .access_token = access_token,
+        .refresh_token = refresh_token,
+        .expires_at_ms = 1234,
+        .scope = scope,
+        .token_type = token_type,
+        .team_slug = team_slug,
+        .team_id = team_id,
+    };
+}
+
+/// Counts the blocks a wrapped allocator releases, so a test can assert that
+/// serializing a secret never abandons a buffer holding it. Scanning freed memory
+/// for the token cannot be the assertion here: a test build overwrites every block
+/// with `undefined` inside `Allocator.free` before the allocator sees it, so the
+/// scan reads clean whether or not the bug is present.
+const ReleaseCounter = struct {
+    child: std.mem.Allocator,
+    releases: usize = 0,
+
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *ReleaseCounter = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, alignment, ra);
+    }
+
+    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *ReleaseCounter = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *ReleaseCounter = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, ra);
+    }
+
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *ReleaseCounter = @ptrCast(@alignCast(ctx));
+        self.releases += 1;
+        self.child.rawFree(memory, alignment, ra);
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = allocFn,
+        .resize = resizeFn,
+        .remap = remapFn,
+        .free = freeFn,
+    };
+
+    fn allocator(self: *ReleaseCounter) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "stringify never abandons a buffer holding the session tokens" {
+    for (stringify_cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+
+        var counter: ReleaseCounter = .{ .child = std.testing.allocator };
+        const alloc = counter.allocator();
+
+        var session = try sessionForCase(alloc, case);
+        defer session.deinit(alloc);
+
+        counter.releases = 0;
+        const text = try stringify(alloc, session);
+        const releases_during_stringify = counter.releases;
+        defer secret.zeroAndFree(alloc, text);
+
+        // Every block released while the tokens are in flight is one the caller's
+        // zeroAndFree on the returned slice cannot reach.
+        try std.testing.expectEqual(@as(usize, 0), releases_during_stringify);
+
+        // The sizing pass and the writing pass must agree, or the buffer either
+        // grows (releasing a copy) or carries a tail the caller never asked for.
+        var parsed = try parse(std.testing.allocator, text);
+        defer parsed.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(case.access, parsed.access_token);
+        try std.testing.expectEqualStrings(case.refresh, parsed.refresh_token);
+        try std.testing.expectEqualStrings(case.scope, parsed.scope);
+        if (case.team_slug) |value| {
+            try std.testing.expectEqualStrings(value, parsed.team_slug.?);
+        } else {
+            try std.testing.expect(parsed.team_slug == null);
+        }
+        if (case.team_id) |value| {
+            try std.testing.expectEqualStrings(value, parsed.team_id.?);
+        } else {
+            try std.testing.expect(parsed.team_id == null);
+        }
+    }
+}
+
+fn stringifyUnderAllocationFailure(alloc: Allocator, case: StringifyCase) !void {
+    var session = try sessionForCase(alloc, case);
+    defer session.deinit(alloc);
+    const text = try stringify(alloc, session);
+    secret.zeroAndFree(alloc, text);
+}
+
+test "stringify releases everything it allocated when an allocation fails" {
+    for (stringify_cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        try std.testing.checkAllAllocationFailures(
+            std.testing.allocator,
+            stringifyUnderAllocationFailure,
+            .{case},
+        );
+    }
 }
 
 test "OAuth storage backend selection is platform scoped and explicitly disableable" {

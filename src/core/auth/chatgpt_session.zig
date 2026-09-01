@@ -224,16 +224,28 @@ pub fn parse(alloc: Allocator, bytes: []const u8) !Session {
 }
 
 pub fn stringify(alloc: Allocator, session: Session) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
+    // Measure first and reserve the exact size, so the buffer holding the tokens
+    // never grows. A growing buffer copies the plaintext into a larger block and
+    // releases the smaller one unwiped, and the caller can only wipe the slice it
+    // gets back.
+    var counter: std.Io.Writer.Discarding = .init(&.{});
+    try writeSession(&counter.writer, session);
+    const exact = std.math.cast(usize, counter.fullCount()) orelse return error.OutOfMemory;
+
+    var out: std.Io.Writer.Allocating = try .initCapacity(alloc, exact);
     errdefer out.deinit();
-    try out.writer.writeAll("{\"version\":1,\"access_token\":");
-    try std.json.Stringify.value(session.access_token, .{}, &out.writer);
-    try out.writer.writeAll(",\"refresh_token\":");
-    try std.json.Stringify.value(session.refresh_token, .{}, &out.writer);
-    try out.writer.print(",\"expires_at_ms\":{d},\"account_id\":", .{session.expires_at_ms});
-    try std.json.Stringify.value(session.account_id, .{}, &out.writer);
-    try out.writer.writeAll("}\n");
+    try writeSession(&out.writer, session);
     return out.toOwnedSlice();
+}
+
+fn writeSession(writer: *std.Io.Writer, session: Session) !void {
+    try writer.writeAll("{\"version\":1,\"access_token\":");
+    try std.json.Stringify.value(session.access_token, .{}, writer);
+    try writer.writeAll(",\"refresh_token\":");
+    try std.json.Stringify.value(session.refresh_token, .{}, writer);
+    try writer.print(",\"expires_at_ms\":{d},\"account_id\":", .{session.expires_at_ms});
+    try std.json.Stringify.value(session.account_id, .{}, writer);
+    try writer.writeAll("}\n");
 }
 
 fn dupeRequiredString(alloc: Allocator, object: std.json.ObjectMap, key: []const u8) ![]u8 {
@@ -272,4 +284,71 @@ test "ChatGPT auth session round trips without exposing token fields to structur
 test "ChatGPT session refresh deadline keeps a one minute safety margin" {
     try std.testing.expectEqual(@as(i64, 40_000), refreshDeadlineMs(100_000));
     try std.testing.expectEqual(@as(i64, 0), refreshDeadlineMs(10_000));
+}
+
+/// Counts the blocks a wrapped allocator releases, so a test can assert that
+/// serializing a secret never abandons a buffer holding it. Scanning freed memory
+/// for the token cannot be the assertion here: a test build overwrites every block
+/// with `undefined` inside `Allocator.free` before the allocator sees it, so the
+/// scan reads clean whether or not the bug is present.
+const ReleaseCounter = struct {
+    child: std.mem.Allocator,
+    releases: usize = 0,
+
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *ReleaseCounter = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, alignment, ra);
+    }
+
+    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *ReleaseCounter = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *ReleaseCounter = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, ra);
+    }
+
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *ReleaseCounter = @ptrCast(@alignCast(ctx));
+        self.releases += 1;
+        self.child.rawFree(memory, alignment, ra);
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = allocFn,
+        .resize = resizeFn,
+        .remap = remapFn,
+        .free = freeFn,
+    };
+
+    fn allocator(self: *ReleaseCounter) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "stringify never abandons a buffer holding the session tokens" {
+    var counter: ReleaseCounter = .{ .child = std.testing.allocator };
+    const alloc = counter.allocator();
+
+    var session = Session{
+        // Realistic length: these are JWTs in production, and a short token fits
+        // inside the first allocation, so a shorter fixture would pass whether or
+        // not the buffer is sized up front.
+        .access_token = try alloc.dupe(u8, "header." ++ "a" ** 200 ++ ".signature"),
+        .refresh_token = try alloc.dupe(u8, "refresh." ++ "b" ** 200),
+        .expires_at_ms = 1234,
+        .account_id = try alloc.dupe(u8, "acct_1234567890"),
+    };
+    defer session.deinit(alloc);
+
+    counter.releases = 0;
+    const text = try stringify(alloc, session);
+    const releases_during_stringify = counter.releases;
+    defer secret.zeroAndFree(alloc, text);
+
+    // Every block released while the tokens are in flight is one the caller's
+    // zeroAndFree on the returned slice cannot reach.
+    try std.testing.expectEqual(@as(usize, 0), releases_during_stringify);
 }
