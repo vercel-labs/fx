@@ -218,6 +218,45 @@ pub const SessionRecoveryResult = struct {
     }
 };
 
+pub const SessionForkStatus = enum {
+    forked,
+    forked_with_unverified_artifacts,
+    indeterminate,
+};
+
+/// Result of branching a session at an absolute turn boundary. Owns both ids.
+pub const SessionForkResult = struct {
+    source_session_id: []u8,
+    forked_session_id: []u8,
+    history_len: usize,
+    source_history_len: usize,
+    status: SessionForkStatus = .forked,
+
+    pub fn deinit(self: *SessionForkResult, alloc: Allocator) void {
+        alloc.free(self.source_session_id);
+        alloc.free(self.forked_session_id);
+        self.* = undefined;
+    }
+};
+
+pub const SessionRewindStatus = enum {
+    rewound,
+    already_at_target,
+};
+
+/// Result of dropping trailing turns from a session in place. Owns its id.
+pub const SessionRewindResult = struct {
+    session_id: []u8,
+    history_len: usize,
+    removed_turn_count: usize,
+    status: SessionRewindStatus = .rewound,
+
+    pub fn deinit(self: *SessionRewindResult, alloc: Allocator) void {
+        alloc.free(self.session_id);
+        self.* = undefined;
+    }
+};
+
 /// One class of integrity problem `doctor` can report for a session.
 pub const DoctorIssueKind = enum {
     authority_less_creation_orphan,

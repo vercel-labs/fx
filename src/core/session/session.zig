@@ -1859,6 +1859,22 @@ pub const SessionRuntime = struct {
         self.context_history_start = 0;
     }
 
+    /// Drops the trailing turns from the live conversation. The turns are gone
+    /// from this process; persisting the shorter history is the caller's job.
+    pub fn truncateHistory(
+        self: *SessionRuntime,
+        alloc: Allocator,
+        retained_turns: usize,
+    ) void {
+        dropHistoryTurnsAfter(
+            alloc,
+            self.history.items,
+            &self.context_history_start,
+            retained_turns,
+        );
+        self.history.shrinkRetainingCapacity(retained_turns);
+    }
+
     pub fn historyLen(self: *const SessionRuntime) usize {
         return self.history.items.len;
     }
@@ -2092,6 +2108,20 @@ pub fn freeImageAttachmentSlice(alloc: Allocator, attachments: []ImageAttachment
     }
     if (attachments.len > 0) alloc.free(attachments);
 }
+/// Frees the turns after `retained_turns` and clamps the model-context cursor
+/// so it can never point past the shortened history. The caller shrinks its own
+/// container; only the freeing and the clamp are shared.
+pub fn dropHistoryTurnsAfter(
+    alloc: Allocator,
+    history: []const HistoryTurn,
+    context_history_start: *usize,
+    retained_turns: usize,
+) void {
+    std.debug.assert(retained_turns <= history.len);
+    context_history_start.* = @min(context_history_start.*, retained_turns);
+    for (history[retained_turns..]) |turn| freeHistoryTurn(alloc, turn);
+}
+
 /// Frees an owned history slice; callers pass slices returned by session helpers.
 pub fn freeHistoryTurnSlice(alloc: Allocator, turns: []HistoryTurn) void {
     for (turns) |turn| freeHistoryTurn(alloc, turn);

@@ -40,6 +40,8 @@ pub const SlashKind = enum {
     resume_session,
     continue_recovery,
     rename_session,
+    fork_session,
+    rewind_session,
     help,
     login,
     logout,
@@ -1801,7 +1803,7 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 36), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 38), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
     try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));

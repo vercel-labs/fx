@@ -31,6 +31,8 @@ pub const ReplacementReason = enum {
     migration,
     recovery,
     log_compaction,
+    fork,
+    rewind,
 };
 
 pub const SessionStarted = struct {

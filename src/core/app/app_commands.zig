@@ -339,8 +339,15 @@ fn requestResumeExit(app: anytype) void {
 pub fn Handlers(comptime App: type) type {
     return struct {
         pub fn route(app: *App, cmd: []const u8) !void {
+            const parsed = command_router.parse(app.slashRegistry(), cmd);
+            if (comptime @hasField(App, "session_persistence")) {
+                switch (parsed) {
+                    .rewind_session => {},
+                    else => app_session_runtime.Runtime(App).disarmRewind(app),
+                }
+            }
             const handlers = commandHandlers(app);
-            try command_router.route(app.slashRegistry(), &handlers, cmd);
+            try command_router.dispatch(&handlers, parsed, cmd);
         }
 
         pub fn commandHandlers(app: *App) command_router.CommandHandlers {
@@ -382,6 +389,8 @@ pub fn Handlers(comptime App: type) type {
                 .toggle_fast = commandToggleFast,
                 .handle_statusline = commandHandleStatusline,
                 .rename_session = commandRenameSession,
+                .fork_session = commandForkSession,
+                .rewind_session = commandRewindSession,
                 .handle_notifications = commandHandleNotifications,
                 .handle_workspace = commandHandleWorkspace,
                 .show_version = commandShowVersion,
@@ -681,6 +690,16 @@ pub fn Handlers(comptime App: type) type {
         fn commandRenameSession(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try handleRenameCommand(app, rest);
+        }
+
+        fn commandForkSession(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try handleForkCommand(app, rest);
+        }
+
+        fn commandRewindSession(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try handleRewindCommand(app, rest);
         }
 
         fn commandShowHelp(ctx: *anyopaque) !void {
@@ -3429,6 +3448,218 @@ fn handleRenameCommand(app: anytype, rest: []const u8) !void {
     const msg = try std.fmt.allocPrint(app.alloc, "renamed: {s}", .{title});
     defer app.alloc.free(msg);
     try app.writeDomainNotice(.{ .topic = "session", .tone = .neutral, .body = msg }, true);
+}
+
+fn turnPlural(count: usize) []const u8 {
+    return if (count == 1) "" else "s";
+}
+
+fn parsedTurnCount(rest: []const u8) ?usize {
+    const trimmed = std.mem.trim(u8, rest, " \t");
+    if (trimmed.len == 0) return null;
+    const value = std.fmt.parseInt(usize, trimmed, 10) catch return null;
+    return if (value == 0) null else value;
+}
+
+/// Points at the command that lists the turn numbers, naming the live session
+/// so the reader can paste the line as written.
+fn writeTurnArgumentUsage(app: anytype, usage: []const u8) !void {
+    const App = @TypeOf(app.*);
+    const id = app_session_runtime.Runtime(App).activeSessionId(app) orelse "<id>";
+    const body = try std.fmt.allocPrint(
+        app.alloc,
+        "Use: {s}. Run `fx session {s}` to see turn numbers.",
+        .{ usage, id },
+    );
+    defer app.alloc.free(body);
+    try app.writeDomainNotice(
+        .{ .topic = "session", .tone = .@"error", .body = body },
+        true,
+    );
+}
+
+fn handleForkCommand(app: anytype, rest: []const u8) !void {
+    const App = @TypeOf(app.*);
+    const SessionRuntime = app_session_runtime.Runtime(App);
+
+    const at_turn = parsedTurnCount(rest) orelse {
+        try writeTurnArgumentUsage(app, "/fork <turn>");
+        return;
+    };
+
+    var outcome = try SessionRuntime.forkLiveSession(app, at_turn);
+    defer outcome.deinit(app.alloc);
+
+    switch (outcome) {
+        .unavailable_during_stream => try app.writeDomainNotice(.{
+            .topic = "session",
+            .tone = .neutral,
+            .body = "fork is unavailable until the response finishes",
+        }, true),
+        .unavailable => try app.writeDomainNotice(.{
+            .topic = "session",
+            .tone = .@"error",
+            .body = "no saved session to fork",
+        }, true),
+        .out_of_range => |history_len| {
+            const body = try std.fmt.allocPrint(
+                app.alloc,
+                "turn {d} is out of range; session has {d} turn{s}",
+                .{ at_turn, history_len, turnPlural(history_len) },
+            );
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(
+                .{ .topic = "session", .tone = .@"error", .body = body },
+                true,
+            );
+        },
+        .branched => |branch| {
+            var out: std.Io.Writer.Allocating = .init(app.alloc);
+            defer out.deinit();
+            try out.writer.print(
+                "Forked {s} at turn {d} into {s}. " ++
+                    "You are now in the branch; {s} is unchanged.",
+                .{
+                    branch.source_id,
+                    branch.retained_turns,
+                    branch.forked_id,
+                    branch.source_id,
+                },
+            );
+            if (branch.unverified_artifacts) {
+                try out.writer.writeAll(
+                    " Some legacy command artifacts could not be authenticated.",
+                );
+            }
+            try app.writeDomainNotice(
+                .{ .topic = "session", .tone = .neutral, .body = out.written() },
+                true,
+            );
+            app.shell.render_requests.request(.footer);
+        },
+        .failed => |failure| try writeForkFailureNotice(app, failure),
+    }
+}
+
+/// A failed fork still names every id involved, because the reader has to know
+/// whether a branch exists and which session this shell ended up on.
+fn writeForkFailureNotice(
+    app: anytype,
+    failure: app_session_runtime.Runtime(@TypeOf(app.*)).ForkOutcome.Failure,
+) !void {
+    var out: std.Io.Writer.Allocating = .init(app.alloc);
+    defer out.deinit();
+
+    if (failure.forked_id) |forked_id| {
+        try out.writer.print(
+            "Forked {s} into {s} but could not open it ({s}); run `fx --resume {s}`.",
+            .{
+                failure.source_id,
+                forked_id,
+                @errorName(failure.problem),
+                forked_id,
+            },
+        );
+    } else {
+        try out.writer.print(
+            "Could not fork {s} ({s}).",
+            .{ failure.source_id, @errorName(failure.problem) },
+        );
+    }
+
+    switch (failure.landing) {
+        .source => try out.writer.print(
+            " This shell is still on {s}.",
+            .{failure.source_id},
+        ),
+        .fresh_session => try out.writer.writeAll(
+            " This shell is on a new empty session.",
+        ),
+        .no_session => try out.writer.writeAll(
+            " This shell has no session; run /resume to open one.",
+        ),
+    }
+
+    try app.writeDomainNotice(
+        .{ .topic = "session", .tone = .warning, .body = out.written() },
+        true,
+    );
+    app.shell.render_requests.request(.footer);
+}
+
+fn handleRewindCommand(app: anytype, rest: []const u8) !void {
+    const App = @TypeOf(app.*);
+    const SessionRuntime = app_session_runtime.Runtime(App);
+
+    const requested = parsedTurnCount(rest) orelse {
+        try writeTurnArgumentUsage(app, "/rewind <count>");
+        return;
+    };
+
+    switch (try SessionRuntime.rewindLiveSession(app, requested)) {
+        .unavailable_during_stream => try app.writeDomainNotice(.{
+            .topic = "session",
+            .tone = .neutral,
+            .body = "rewind is unavailable until the response finishes",
+        }, true),
+        .out_of_range => |history_len| {
+            const body = try std.fmt.allocPrint(
+                app.alloc,
+                "cannot rewind {d} turn{s}; session has {d} turn{s}",
+                .{
+                    requested,
+                    turnPlural(requested),
+                    history_len,
+                    turnPlural(history_len),
+                },
+            );
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(
+                .{ .topic = "session", .tone = .@"error", .body = body },
+                true,
+            );
+        },
+        .confirm => |target| {
+            var count_buf: [40]u8 = undefined;
+            const dropped = if (target.removedTurnCount() == 1)
+                "the last turn"
+            else
+                try std.fmt.bufPrint(
+                    &count_buf,
+                    "the last {d} turns",
+                    .{target.removedTurnCount()},
+                );
+            const body = try std.fmt.allocPrint(
+                app.alloc,
+                "/rewind {d} drops {s} and leaves {d}. " ++
+                    "Run /rewind {d} again to confirm. File changes are not reverted.",
+                .{ requested, dropped, target.retained_turns, requested },
+            );
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(
+                .{ .topic = "session", .tone = .warning, .body = body },
+                true,
+            );
+        },
+        .rewound => |target| {
+            const body = try std.fmt.allocPrint(
+                app.alloc,
+                "Rewound {d} turn{s}; {d} turn{s} left. File changes were not reverted.",
+                .{
+                    target.removedTurnCount(),
+                    turnPlural(target.removedTurnCount()),
+                    target.retained_turns,
+                    turnPlural(target.retained_turns),
+                },
+            );
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(
+                .{ .topic = "session", .tone = .neutral, .body = body },
+                true,
+            );
+            app.shell.render_requests.request(.footer);
+        },
+    }
 }
 
 const StatuslineFeedback = enum { announce, silent };

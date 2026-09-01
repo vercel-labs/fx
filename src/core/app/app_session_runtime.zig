@@ -60,6 +60,108 @@ const BackgroundSessionPolicy = enum {
     stop_forget,
 };
 
+/// `/fork <turn>` and `/rewind <count>` both accept 1 through the live history
+/// length and differ only in which end they count from. Returns null when the
+/// argument falls outside it.
+fn checkedTurnArgument(history_len: usize, requested: usize) ?usize {
+    if (requested == 0 or requested > history_len) return null;
+    return requested;
+}
+
+test "turn arguments are bounded by the live history length" {
+    try std.testing.expectEqual(@as(?usize, null), checkedTurnArgument(0, 1));
+    try std.testing.expectEqual(@as(?usize, null), checkedTurnArgument(3, 0));
+    try std.testing.expectEqual(@as(?usize, null), checkedTurnArgument(3, 4));
+    try std.testing.expectEqual(@as(?usize, 1), checkedTurnArgument(3, 1));
+    try std.testing.expectEqual(@as(?usize, 3), checkedTurnArgument(3, 3));
+}
+
+/// The exact rewind a confirmation prompt described: how long the history was
+/// when it was previewed, and how many turns would survive.
+pub const RewindTarget = struct {
+    history_len: usize,
+    retained_turns: usize,
+
+    pub fn removedTurnCount(self: RewindTarget) usize {
+        return self.history_len - self.retained_turns;
+    }
+};
+
+const RewindRequest = enum {
+    confirm,
+    execute,
+};
+
+/// `/rewind` destroys turns, so it runs only when the identical request is
+/// repeated. Arming on the whole target rather than the raw count means a turn
+/// arriving between the two requests re-arms instead of silently firing a
+/// rewind the user never previewed.
+const RewindGate = union(enum) {
+    idle,
+    armed: RewindTarget,
+
+    pub fn request(self: *RewindGate, target: RewindTarget) RewindRequest {
+        switch (self.*) {
+            .armed => |pending| if (std.meta.eql(pending, target)) {
+                self.* = .idle;
+                return .execute;
+            },
+            .idle => {},
+        }
+        self.* = .{ .armed = target };
+        return .confirm;
+    }
+
+    pub fn disarm(self: *RewindGate) void {
+        self.* = .idle;
+    }
+};
+
+test "rewind gate executes only an identical repeated request" {
+    var gate: RewindGate = .idle;
+    const target = RewindTarget{ .history_len = 5, .retained_turns = 3 };
+
+    try std.testing.expectEqual(RewindRequest.confirm, gate.request(target));
+    try std.testing.expectEqual(RewindRequest.execute, gate.request(target));
+    try std.testing.expectEqual(RewindGate.idle, gate);
+    try std.testing.expectEqual(RewindRequest.confirm, gate.request(target));
+}
+
+test "rewind gate re-arms when the request changes" {
+    var gate: RewindGate = .idle;
+
+    try std.testing.expectEqual(
+        RewindRequest.confirm,
+        gate.request(.{ .history_len = 5, .retained_turns = 3 }),
+    );
+    try std.testing.expectEqual(
+        RewindRequest.confirm,
+        gate.request(.{ .history_len = 5, .retained_turns = 4 }),
+    );
+    try std.testing.expectEqual(
+        RewindRequest.confirm,
+        gate.request(.{ .history_len = 6, .retained_turns = 4 }),
+    );
+    try std.testing.expectEqual(
+        RewindRequest.execute,
+        gate.request(.{ .history_len = 6, .retained_turns = 4 }),
+    );
+}
+
+test "rewind gate disarms on an intervening command" {
+    var gate: RewindGate = .idle;
+    const target = RewindTarget{ .history_len = 5, .retained_turns = 3 };
+
+    try std.testing.expectEqual(RewindRequest.confirm, gate.request(target));
+    gate.disarm();
+    try std.testing.expectEqual(RewindRequest.confirm, gate.request(target));
+}
+
+test "rewind target reports the turns it drops" {
+    const target = RewindTarget{ .history_len = 7, .retained_turns = 4 };
+    try std.testing.expectEqual(@as(usize, 3), target.removedTurnCount());
+}
+
 const LiveSessionTransitionEvent = union(enum) {
     request: BackgroundSessionPolicy,
     settle,
@@ -1090,12 +1192,13 @@ pub const Persistence = struct {
     resume_view_admission: ?session_store.ResumeViewAdmission = null,
     resume_handoff_intent: ResumeHandoffIntent = .none,
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
+    rewind_gate: RewindGate = .idle,
 
     /// Fieldwise initialization avoids retaining undefined optional payloads
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 19) {
+            if (std.meta.fields(Persistence).len != 20) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1119,6 +1222,7 @@ pub const Persistence = struct {
         storage.resume_view_admission = null;
         storage.resume_handoff_intent = .none;
         storage.pending_live_session_policy = null;
+        storage.rewind_gate = .idle;
     }
 
     pub fn deinit(self: *Persistence, alloc: Allocator) void {
@@ -2754,6 +2858,223 @@ pub fn Runtime(comptime App: type) type {
                 },
             };
             return .committed;
+        }
+
+        /// Where the shell ended up when a fork did not finish. A fork has to
+        /// close the live session before it can run, so "which session am I in
+        /// now" is part of every failing answer.
+        pub const ForkLanding = enum {
+            source,
+            fresh_session,
+            no_session,
+        };
+
+        pub const ForkOutcome = union(enum) {
+            unavailable_during_stream,
+            unavailable,
+            out_of_range: usize,
+            branched: Branch,
+            failed: Failure,
+
+            pub const Branch = struct {
+                source_id: []u8,
+                forked_id: []u8,
+                retained_turns: usize,
+                unverified_artifacts: bool,
+            };
+
+            pub const Failure = struct {
+                source_id: []u8,
+                /// Set when the branch exists but this shell could not enter it.
+                forked_id: ?[]u8,
+                problem: anyerror,
+                landing: ForkLanding,
+            };
+
+            pub fn deinit(self: *ForkOutcome, alloc: Allocator) void {
+                switch (self.*) {
+                    .branched => |branch| {
+                        alloc.free(branch.source_id);
+                        alloc.free(branch.forked_id);
+                    },
+                    .failed => |failure| {
+                        alloc.free(failure.source_id);
+                        if (failure.forked_id) |id| alloc.free(id);
+                    },
+                    else => {},
+                }
+                self.* = undefined;
+            }
+        };
+
+        /// Branches the live session at an absolute turn and moves this shell
+        /// into the branch. `forkSessionCopy` takes the source's writer lock,
+        /// which this process holds for as long as the session is open, so the
+        /// session is closed first. Every failure after that point runs through
+        /// `forkFailure`, which puts a session back before answering.
+        pub fn forkLiveSession(app: *App, at_turn: usize) !ForkOutcome {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) {
+                return .unavailable;
+            }
+            if (app.stream.active) return .unavailable_during_stream;
+            if (app.session_persistence.store == null) return .unavailable;
+            const active = app.session_persistence.writable orelse return .unavailable;
+
+            const history_len = app.session.historyLen();
+            const retained_turns = checkedTurnArgument(history_len, at_turn) orelse
+                return .{ .out_of_range = history_len };
+
+            const source_id = try app.alloc.dupe(u8, active.active_id);
+            errdefer app.alloc.free(source_id);
+
+            const log_options = session_log.Options{
+                .session_lock_deadline_ms = 0,
+                .commit_lock_deadline_ms = 0,
+            };
+            try prepareLiveSessionTransition(app, .carry_forward, log_options);
+
+            const store = app.session_persistence.store orelse
+                return forkFailure(app, source_id, null, log_options, error.SessionStoreUnavailable);
+
+            var copy = store.forkSessionCopy(
+                app.alloc,
+                source_id,
+                retained_turns,
+                .{},
+            ) catch |err| return forkFailure(app, source_id, null, log_options, err);
+            defer copy.deinit(app.alloc);
+
+            const forked_id = app.alloc.dupe(u8, copy.forked_session_id) catch |err|
+                return forkFailure(app, source_id, null, log_options, err);
+
+            if (copy.status == .indeterminate) {
+                return forkFailure(
+                    app,
+                    source_id,
+                    forked_id,
+                    log_options,
+                    error.SessionForkUnconfirmed,
+                );
+            }
+
+            enterSessionForWrite(app, forked_id, log_options) catch |err|
+                return forkFailure(app, source_id, forked_id, log_options, err);
+
+            return .{ .branched = .{
+                .source_id = source_id,
+                .forked_id = forked_id,
+                .retained_turns = retained_turns,
+                .unverified_artifacts = copy.status == .forked_with_unverified_artifacts,
+            } };
+        }
+
+        /// The fork released the source's writer lock by closing the session, so
+        /// a failure past that point leaves the shell with no session at all.
+        /// Put one back before reporting.
+        fn forkFailure(
+            app: *App,
+            source_id: []u8,
+            forked_id: ?[]u8,
+            log_options: session_log.Options,
+            problem: anyerror,
+        ) ForkOutcome {
+            return .{ .failed = .{
+                .source_id = source_id,
+                .forked_id = forked_id,
+                .problem = problem,
+                .landing = reopenSourceAfterFork(app, source_id, log_options),
+            } };
+        }
+
+        fn enterSessionForWrite(
+            app: *App,
+            session_id: []const u8,
+            log_options: session_log.Options,
+        ) !void {
+            var loaded = try loadResumeTargetForWrite(
+                app,
+                .{ .id = session_id },
+                log_options,
+            );
+            try installResumedSession(app, &loaded, .session);
+            requestSubagentBackgroundRecovery(app);
+            startResumedSessionReconciliation(app);
+            try app.finishLiveSessionResume();
+        }
+
+        fn reopenSourceAfterFork(
+            app: *App,
+            source_id: []const u8,
+            log_options: session_log.Options,
+        ) ForkLanding {
+            enterSessionForWrite(app, source_id, log_options) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event=session_fork_source_reopen_failed id={s} err={s}",
+                    .{ source_id, @errorName(err) },
+                );
+                installFreshLiveSession(app) catch |fresh_err| {
+                    debug_trace.logf(
+                        "session",
+                        "event=session_fork_fresh_session_failed err={s}",
+                        .{@errorName(fresh_err)},
+                    );
+                    return .no_session;
+                };
+                return .fresh_session;
+            };
+            return .source;
+        }
+
+        /// Answer to one `/rewind <count>`. The gate makes the confirm step a
+        /// state of the request rather than a flag the caller has to track.
+        pub const RewindOutcome = union(enum) {
+            unavailable_during_stream,
+            out_of_range: usize,
+            confirm: RewindTarget,
+            rewound: RewindTarget,
+        };
+
+        /// Drops trailing turns from the live conversation once the same
+        /// request has been made twice. This process holds the session writer
+        /// lock, so the truncation runs here and commits through the live path
+        /// rather than through `Store.rewindSession`, which would deadlock
+        /// against the lock this shell already owns.
+        pub fn rewindLiveSession(
+            app: *App,
+            requested_turns: usize,
+        ) !RewindOutcome {
+            if (app.stream.active) return .unavailable_during_stream;
+
+            const history_len = app.session.historyLen();
+            const dropped_turns = checkedTurnArgument(history_len, requested_turns) orelse
+                return .{ .out_of_range = history_len };
+
+            const target = RewindTarget{
+                .history_len = history_len,
+                .retained_turns = history_len - dropped_turns,
+            };
+            switch (app.session_persistence.rewind_gate.request(target)) {
+                .confirm => return .{ .confirm = target },
+                .execute => {},
+            }
+
+            app.session.truncateHistory(app.alloc, target.retained_turns);
+            commitJsHostSnapshot(app, "rewind");
+
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            if (app.session_persistence.writable) |*loaded| {
+                try convergeDegraded(app, loaded, .{});
+                // A paused response always belongs to the tail this rewind just
+                // dropped, so its checkpoint cannot outlive the turns.
+                try commitCurrentStateReplacement(app, loaded, .rewind, .{}, true);
+            }
+            return .{ .rewound = target };
+        }
+
+        pub fn disarmRewind(app: *App) void {
+            app.session_persistence.rewind_gate.disarm();
         }
 
         pub fn compactHistory(app: *App) !void {

@@ -12,6 +12,8 @@ pub const ParsedCommand = union(enum) {
     resume_session,
     continue_recovery,
     rename_session: []const u8,
+    fork_session: []const u8,
+    rewind_session: []const u8,
     help,
     login,
     logout: []const u8,
@@ -85,6 +87,8 @@ pub const CommandHandlers = struct {
     toggle_fast: *const fn (ctx: *anyopaque) anyerror!void,
     handle_statusline: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     rename_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    fork_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    rewind_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_notifications: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_workspace: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
@@ -104,6 +108,8 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .resume_session => .resume_session,
         .continue_recovery => .continue_recovery,
         .rename_session => .{ .rename_session = payload },
+        .fork_session => .{ .fork_session = payload },
+        .rewind_session => .{ .rewind_session = payload },
         .help => .help,
         .login => .login,
         .logout => .{ .logout = payload },
@@ -153,7 +159,15 @@ pub fn parse(registry: SlashRegistry, cmd: []const u8) ParsedCommand {
 }
 
 pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []const u8) !void {
-    switch (parse(registry, cmd)) {
+    return dispatch(handlers, parse(registry, cmd), cmd);
+}
+
+pub fn dispatch(
+    handlers: *const CommandHandlers,
+    parsed: ParsedCommand,
+    cmd: []const u8,
+) !void {
+    switch (parsed) {
         .quit => try handlers.quit(handlers.ctx),
         .clear_screen => try handlers.clear_screen(handlers.ctx),
         .new_session => try handlers.new_session(handlers.ctx),
@@ -161,6 +175,8 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .resume_session => try handlers.resume_session(handlers.ctx),
         .continue_recovery => try handlers.continue_recovery(handlers.ctx),
         .rename_session => |rest| try handlers.rename_session(handlers.ctx, rest),
+        .fork_session => |rest| try handlers.fork_session(handlers.ctx, rest),
+        .rewind_session => |rest| try handlers.rewind_session(handlers.ctx, rest),
         .help => try handlers.show_help(handlers.ctx),
         .login => try handlers.login(handlers.ctx),
         .logout => |rest| try handlers.logout(handlers.ctx, rest),
@@ -529,6 +545,8 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .toggle_fast = unexpectedNoPayload,
         .handle_statusline = unexpectedPayload,
         .rename_session = unexpectedPayload,
+        .fork_session = unexpectedPayload,
+        .rewind_session = unexpectedPayload,
         .handle_notifications = unexpectedPayload,
         .handle_workspace = unexpectedPayload,
         .show_version = unexpectedNoPayload,

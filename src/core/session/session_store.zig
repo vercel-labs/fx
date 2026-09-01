@@ -69,8 +69,10 @@ const latestCachePublish = latest_pointer.latestCachePublish;
 const latestCacheWriteDeferred = latest_pointer.latestCacheWriteDeferred;
 const latest_sessions_lock_file = latest_pointer.latest_sessions_lock_file;
 const latest_sessions_dir = latest_pointer.latest_sessions_dir;
-const recovery_staging_dir = "recovery+staging";
-const recovery_staging_lock_file = "recovery-staging.lock";
+// The on-disk names stay `recovery+staging` so staged directories written by
+// earlier versions are still found and cleaned up.
+const staging_dir = "recovery+staging";
+const staging_lock_file = "recovery-staging.lock";
 const usage_recovery_dir = profile_paths.usage_recovery_dir_name;
 const usage_recovery_marker_prefix = "v1 ";
 const max_usage_recovery_marker_bytes =
@@ -144,8 +146,12 @@ pub const ResumeTarget = store_types.ResumeTarget;
 pub const ResumeViewAdmission = session_log.ResumeViewAdmission;
 pub const SessionMigrationResult = store_types.SessionMigrationResult;
 pub const SessionMigrationStatus = store_types.SessionMigrationStatus;
+pub const SessionForkResult = store_types.SessionForkResult;
+pub const SessionForkStatus = store_types.SessionForkStatus;
 pub const SessionRecoveryResult = store_types.SessionRecoveryResult;
 pub const SessionRecoveryStatus = store_types.SessionRecoveryStatus;
+pub const SessionRewindResult = store_types.SessionRewindResult;
+pub const SessionRewindStatus = store_types.SessionRewindStatus;
 pub const SessionSummary = store_types.SessionSummary;
 pub const HistoryPage = store_types.HistoryPage;
 
@@ -657,7 +663,7 @@ pub const Store = struct {
         return loaded;
     }
 
-    fn startRecoveryStagedSession(
+    fn startStagedSession(
         self: Store,
         alloc: Allocator,
         staging_root: *session_log.Root,
@@ -675,7 +681,7 @@ pub const Store = struct {
         return loaded;
     }
 
-    fn initRecoveryStagingRoot(
+    fn initStagingRoot(
         self: Store,
         alloc: Allocator,
     ) !session_log.Root {
@@ -684,20 +690,20 @@ pub const Store = struct {
             return error.SessionStoreUnavailable);
         var staging = try io_mod.openOrCreateVerifiedPrivateDir(
             sessions,
-            recovery_staging_dir,
+            staging_dir,
         );
         errdefer staging.close();
         return .{
             .sessions = staging,
             .display_root = try std.fs.path.join(
                 alloc,
-                &.{ self.sessions_dir, recovery_staging_dir },
+                &.{ self.sessions_dir, staging_dir },
             ),
             .mode = .writable,
         };
     }
 
-    fn deinitRecoveryStagingRoot(
+    fn deinitStagingRoot(
         self: Store,
         alloc: Allocator,
         staging_root: *session_log.Root,
@@ -706,18 +712,18 @@ pub const Store = struct {
         const sessions = &(self.canonical_root.sessions orelse return);
         sessions.dir.deleteDir(
             io_mod.getIo(),
-            recovery_staging_dir,
+            staging_dir,
         ) catch return;
         io_mod.syncVerifiedDir(sessions.dir) catch |err| {
             debug_trace.logf(
                 "session",
-                "event=recovery_staging_cleanup disposition=indeterminate err={s}",
+                "event=session_staging_cleanup disposition=indeterminate err={s}",
                 .{@errorName(err)},
             );
         };
     }
 
-    fn acquireRecoveryStagingLock(
+    fn acquireStagingLock(
         self: Store,
         deadline_ms: u64,
     ) !io_mod.TimedAdvisoryLock {
@@ -726,7 +732,7 @@ pub const Store = struct {
             return error.SessionStoreUnavailable);
         return io_mod.acquireTimedAdvisoryLock(
             sessions,
-            recovery_staging_lock_file,
+            staging_lock_file,
             deadline_ms,
         ) catch |err| switch (err) {
             error.LockBusy => error.SessionBusy,
@@ -735,7 +741,7 @@ pub const Store = struct {
         };
     }
 
-    fn cleanupAbandonedRecoveryStages(
+    fn cleanupAbandonedStages(
         staging_root: *session_log.Root,
     ) !void {
         const staging = &(staging_root.sessions orelse
@@ -749,18 +755,18 @@ pub const Store = struct {
             changed = true;
             debug_trace.logf(
                 "session",
-                "event=recovery_staging_abandoned_target_removed",
+                "event=session_staging_abandoned_target_removed",
                 .{},
             );
         }
         if (changed) try io_mod.syncVerifiedDir(staging.dir);
     }
 
-    fn promoteRecoveryStagedSession(
+    fn promoteStagedSession(
         self: Store,
         staging_root: *session_log.Root,
         session_id: []const u8,
-    ) !RecoveryPromotionStatus {
+    ) !StagingPromotionStatus {
         const staging = &(staging_root.sessions orelse
             return error.SessionStoreUnavailable);
         const sessions = &(self.canonical_root.sessions orelse
@@ -779,7 +785,7 @@ pub const Store = struct {
     }
 
     /// Consumes `loaded` on every return.
-    fn discardRecoveryStagedSession(
+    fn discardStagedSession(
         staging_root: *session_log.Root,
         alloc: Allocator,
         loaded: *LoadedWritableSession,
@@ -790,7 +796,7 @@ pub const Store = struct {
         {
             debug_trace.logf(
                 "session",
-                "event=recovery_staging_discard disposition=retained reason=guard_failed",
+                "event=session_staging_discard disposition=retained reason=guard_failed",
                 .{},
             );
             return .retained;
@@ -802,7 +808,7 @@ pub const Store = struct {
         ) catch |err| {
             debug_trace.logf(
                 "session",
-                "event=recovery_staging_discard disposition=retained reason=store_root_unverified err={s}",
+                "event=session_staging_discard disposition=retained reason=store_root_unverified err={s}",
                 .{@errorName(err)},
             );
             return .retained;
@@ -810,7 +816,7 @@ pub const Store = struct {
         if (!writer_belongs_to_store) {
             debug_trace.logf(
                 "session",
-                "event=recovery_staging_discard disposition=retained reason=store_root_mismatch",
+                "event=session_staging_discard disposition=retained reason=store_root_mismatch",
                 .{},
             );
             return .retained;
@@ -818,7 +824,7 @@ pub const Store = struct {
         const sessions = &(staging_root.sessions orelse {
             debug_trace.logf(
                 "session",
-                "event=recovery_staging_discard disposition=indeterminate stage=sessions_root",
+                "event=session_staging_discard disposition=indeterminate stage=sessions_root",
                 .{},
             );
             return .indeterminate;
@@ -826,7 +832,7 @@ pub const Store = struct {
         sessions.dir.deleteTree(io_mod.getIo(), loaded.active_id) catch |err| {
             debug_trace.logf(
                 "session",
-                "event=recovery_staging_discard disposition=indeterminate stage=delete err={s}",
+                "event=session_staging_discard disposition=indeterminate stage=delete err={s}",
                 .{@errorName(err)},
             );
             return .indeterminate;
@@ -834,14 +840,14 @@ pub const Store = struct {
         io_mod.syncVerifiedDir(sessions.dir) catch |err| {
             debug_trace.logf(
                 "session",
-                "event=recovery_staging_discard disposition=indeterminate stage=sync err={s}",
+                "event=session_staging_discard disposition=indeterminate stage=sync err={s}",
                 .{@errorName(err)},
             );
             return .indeterminate;
         };
         debug_trace.logf(
             "session",
-            "event=recovery_staging_discard disposition=discarded",
+            "event=session_staging_discard disposition=discarded",
             .{},
         );
         return .discarded;
@@ -3943,16 +3949,16 @@ pub const Store = struct {
         alloc.free(recovered.id);
         recovered.id = replacement_id;
 
-        var initial = try recoveryInitialState(alloc, recovered);
+        var initial = try initialSeedState(alloc, recovered);
         defer initial.deinit(alloc);
-        var staging_lock = try self.acquireRecoveryStagingLock(
+        var staging_lock = try self.acquireStagingLock(
             options.session_lock_deadline_ms,
         );
         defer staging_lock.release();
-        var staging_root = try self.initRecoveryStagingRoot(alloc);
-        defer self.deinitRecoveryStagingRoot(alloc, &staging_root);
-        try cleanupAbandonedRecoveryStages(&staging_root);
-        var target = try self.startRecoveryStagedSession(
+        var staging_root = try self.initStagingRoot(alloc);
+        defer self.deinitStagingRoot(alloc, &staging_root);
+        try cleanupAbandonedStages(&staging_root);
+        var target = try self.startStagedSession(
             alloc,
             &staging_root,
             initial,
@@ -3964,7 +3970,7 @@ pub const Store = struct {
             if (target_promoted) {
                 target.deinit(alloc);
             } else {
-                const disposition = discardRecoveryStagedSession(
+                const disposition = discardStagedSession(
                     &staging_root,
                     alloc,
                     &target,
@@ -4038,7 +4044,7 @@ pub const Store = struct {
                         @errorName(resolve_err),
                     },
                 );
-                const disposition = discardRecoveryStagedSession(
+                const disposition = discardStagedSession(
                     &staging_root,
                     alloc,
                     &target,
@@ -4055,7 +4061,7 @@ pub const Store = struct {
             };
         };
         if (!try session_log.durableStatesEqual(target.state, recovered)) {
-            const disposition = discardRecoveryStagedSession(
+            const disposition = discardStagedSession(
                 &staging_root,
                 alloc,
                 &target,
@@ -4076,7 +4082,7 @@ pub const Store = struct {
                 "event=session_recovery_target_indeterminate target={s} validation_err={s}",
                 .{ recovered_id, @errorName(err) },
             );
-            const disposition = discardRecoveryStagedSession(
+            const disposition = discardStagedSession(
                 &staging_root,
                 alloc,
                 &target,
@@ -4091,7 +4097,7 @@ pub const Store = struct {
             }
             return error.SessionRecoveryIndeterminate;
         };
-        const promotion = self.promoteRecoveryStagedSession(
+        const promotion = self.promoteStagedSession(
             &staging_root,
             recovered_id,
         ) catch |err| {
@@ -4179,6 +4185,369 @@ pub const Store = struct {
                 .recovered,
         };
     }
+
+    /// Creates a new session holding the first `retained_turns` turns of a
+    /// healthy source. The source is locked for the read and never modified.
+    pub fn forkSessionCopy(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+        retained_turns: usize,
+        options: session_log.Options,
+    ) !SessionForkResult {
+        try validateSessionId(session_id);
+        var source = try self.openWritableSessionDir(
+            alloc,
+            session_id,
+            options.session_lock_deadline_ms,
+        );
+        defer source.deinit(alloc);
+        const authority = try classifyAuthority(
+            alloc,
+            &source.dir,
+            session_id,
+        );
+        if (authority != .schema_v3) {
+            return error.SessionForkRequiresCurrentSchema;
+        }
+
+        var forked = blk: {
+            var root = self.canonical_root;
+            var state = root.loadReadOnly(
+                alloc,
+                session_id,
+                options,
+            ) catch |err| return mapReplayError(err);
+            errdefer state.deinit(alloc);
+            try resolveSessionSnapshotLocators(
+                alloc,
+                state.history,
+                self.sessions_dir,
+                session_id,
+            );
+            break :blk state;
+        };
+        defer forked.deinit(alloc);
+
+        const source_history_len = forked.history.len;
+        if (retained_turns == 0 or retained_turns > source_history_len) {
+            return error.SessionTurnOutOfRange;
+        }
+        try truncateSessionHistory(alloc, &forked, retained_turns);
+        // The branch inherits the source token totals. There is no per-turn
+        // usage ledger to recompute a truncated total from, and zeroing would
+        // misreport what producing this history actually cost.
+        if (forked.recovery_checkpoint) |*checkpoint| {
+            checkpoint.deinit(alloc);
+            forked.recovery_checkpoint = null;
+        }
+        const forked_at_ms = io_mod.milliTimestamp();
+        forked.created_at_ms = forked_at_ms;
+        forked.updated_at_ms = forked_at_ms;
+
+        const source_dir_path = try sessionDirPath(
+            alloc,
+            self.sessions_dir,
+            session_id,
+        );
+        defer alloc.free(source_dir_path);
+        var source_children = try session_child_store.SessionChildCapability.init(
+            alloc,
+            source.dir.dir,
+            source_dir_path,
+            .read_only,
+        );
+        defer source_children.deinit();
+
+        const source_id = try alloc.dupe(u8, session_id);
+        errdefer alloc.free(source_id);
+        const forked_id = try generateSessionId(alloc);
+        errdefer alloc.free(forked_id);
+        const replacement_id = try alloc.dupe(u8, forked_id);
+        alloc.free(forked.id);
+        forked.id = replacement_id;
+
+        var initial = try initialSeedState(alloc, forked);
+        defer initial.deinit(alloc);
+        var staging_lock = try self.acquireStagingLock(
+            options.session_lock_deadline_ms,
+        );
+        defer staging_lock.release();
+        var staging_root = try self.initStagingRoot(alloc);
+        defer self.deinitStagingRoot(alloc, &staging_root);
+        try cleanupAbandonedStages(&staging_root);
+        var target = try self.startStagedSession(
+            alloc,
+            &staging_root,
+            initial,
+            options,
+        );
+        var target_owned = true;
+        var target_promoted = false;
+        errdefer if (target_owned) {
+            if (target_promoted) {
+                target.deinit(alloc);
+            } else {
+                const disposition = discardStagedSession(
+                    &staging_root,
+                    alloc,
+                    &target,
+                );
+                if (disposition != .discarded) {
+                    debug_trace.logf(
+                        "session",
+                        "event=session_fork_unpublished_target_cleanup disposition={s}",
+                        .{@tagName(disposition)},
+                    );
+                }
+            }
+            target_owned = false;
+        };
+
+        const staged_target_dir = try sessionDirPath(
+            alloc,
+            staging_root.display_root,
+            forked_id,
+        );
+        defer alloc.free(staged_target_dir);
+        const staged_target_images = try std.fs.path.join(
+            alloc,
+            &.{ staged_target_dir, "images" },
+        );
+        defer alloc.free(staged_target_images);
+        const target_dir = try sessionDirPath(
+            alloc,
+            self.sessions_dir,
+            forked_id,
+        );
+        defer alloc.free(target_dir);
+        const target_images = try std.fs.path.join(
+            alloc,
+            &.{ target_dir, "images" },
+        );
+        defer alloc.free(target_images);
+        copyRecoveredImageSnapshots(
+            alloc,
+            forked.history,
+            staged_target_images,
+        ) catch |err| return mapForkArtifactError(err);
+        rebaseRecoveredImageSnapshots(
+            alloc,
+            forked.history,
+            staged_target_images,
+            target_images,
+        ) catch |err| return mapForkArtifactError(err);
+        const contains_unverified_artifacts = copyRecoveredManagedChildren(
+            alloc,
+            forked.history,
+            &source_children,
+            target.child_capability orelse
+                return error.SessionChildStoreFailed,
+        ) catch |err| return mapForkArtifactError(err);
+        _ = target.commitStateReplacement(
+            alloc,
+            forked,
+            .fork,
+            .rollback_before_adapter_continue,
+            options,
+        ) catch |commit_err| {
+            target.namespace_confirmation_required = true;
+            target.validateResumeBoundary(alloc, options) catch |resolve_err| {
+                debug_trace.logf(
+                    "session",
+                    "event=session_fork_target_indeterminate target={s} commit_err={s} resolve_err={s}",
+                    .{
+                        forked_id,
+                        @errorName(commit_err),
+                        @errorName(resolve_err),
+                    },
+                );
+                discardForkTarget(&staging_root, alloc, &target);
+                target_owned = false;
+                return error.SessionForkIndeterminate;
+            };
+        };
+        if (!try session_log.durableStatesEqual(target.state, forked)) {
+            discardForkTarget(&staging_root, alloc, &target);
+            target_owned = false;
+            return error.SessionForkIndeterminate;
+        }
+        target.validateResumeBoundary(alloc, options) catch |err| {
+            debug_trace.logf(
+                "session",
+                "event=session_fork_target_indeterminate target={s} validation_err={s}",
+                .{ forked_id, @errorName(err) },
+            );
+            discardForkTarget(&staging_root, alloc, &target);
+            target_owned = false;
+            return error.SessionForkIndeterminate;
+        };
+        const promotion = self.promoteStagedSession(
+            &staging_root,
+            forked_id,
+        ) catch |err| {
+            debug_trace.logf(
+                "session",
+                "event=session_fork_target_promotion_failed target={s} err={s}",
+                .{ forked_id, @errorName(err) },
+            );
+            return error.SessionForkIndeterminate;
+        };
+        target_promoted = true;
+        const indeterminate = SessionForkResult{
+            .source_session_id = source_id,
+            .forked_session_id = forked_id,
+            .history_len = forked.history.len,
+            .source_history_len = source_history_len,
+            .status = .indeterminate,
+        };
+        if (promotion == .indeterminate) {
+            target.deinit(alloc);
+            target_owned = false;
+            return indeterminate;
+        }
+        self.publishRecoveredLatestPointer(
+            alloc,
+            forked,
+            target.position,
+            source_id,
+            options,
+        ) catch |err| {
+            debug_trace.logf(
+                "session",
+                "event=session_fork_target_indeterminate target={s} latest_err={s}",
+                .{ forked_id, @errorName(err) },
+            );
+            target.deinit(alloc);
+            target_owned = false;
+            return indeterminate;
+        };
+        target.deinit(alloc);
+        target_owned = false;
+
+        var verified = self.resumeExactForWrite(
+            alloc,
+            forked_id,
+            forked.workspace_root,
+            false,
+            .{ .log = options },
+        ) catch |err| {
+            debug_trace.logf(
+                "session",
+                "event=session_fork_target_indeterminate target={s} verify_err={s}",
+                .{ forked_id, @errorName(err) },
+            );
+            return indeterminate;
+        };
+        defer verified.deinit(alloc);
+        if (!try session_log.durableStatesEqual(verified.state, forked)) {
+            return indeterminate;
+        }
+
+        return .{
+            .source_session_id = source_id,
+            .forked_session_id = forked_id,
+            .history_len = forked.history.len,
+            .source_history_len = source_history_len,
+            .status = if (contains_unverified_artifacts)
+                .forked_with_unverified_artifacts
+            else
+                .forked,
+        };
+    }
+
+    /// Drops every turn after `retained_turns` from a session in place, keeping
+    /// its id. The rewind is recorded as a state replacement, so the dropped
+    /// turns stay in the event log until it is compacted and their artifacts
+    /// are left on disk. Any paused response is cleared too, since it describes
+    /// a turn past the retained tail.
+    pub fn rewindSession(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+        retained_turns: usize,
+        options: session_log.Options,
+    ) !SessionRewindResult {
+        var loaded = try self.openSchemaV3ForWriteInPlace(
+            alloc,
+            session_id,
+            options,
+        );
+        defer loaded.deinit(alloc);
+
+        const history_len = loaded.state.history.len;
+        if (retained_turns > history_len) return error.SessionTurnOutOfRange;
+        if (retained_turns == history_len) {
+            return .{
+                .session_id = try alloc.dupe(u8, loaded.active_id),
+                .history_len = history_len,
+                .removed_turn_count = 0,
+                .status = .already_at_target,
+            };
+        }
+
+        var rewound = try loaded.state.dupe(alloc);
+        defer rewound.deinit(alloc);
+        try truncateSessionHistory(alloc, &rewound, retained_turns);
+        if (rewound.recovery_checkpoint) |*checkpoint| {
+            checkpoint.deinit(alloc);
+            rewound.recovery_checkpoint = null;
+        }
+        rewound.updated_at_ms = io_mod.milliTimestamp();
+        _ = try loaded.commitStateReplacement(
+            alloc,
+            rewound,
+            .rewind,
+            .rollback_before_adapter_continue,
+            options,
+        );
+
+        return .{
+            .session_id = try alloc.dupe(u8, loaded.active_id),
+            .history_len = retained_turns,
+            .removed_turn_count = history_len - retained_turns,
+            .status = .rewound,
+        };
+    }
+
+    /// Opens a current-schema session for writing without touching its
+    /// workspace binding, so a session saved from another workspace can still
+    /// be rewritten in place.
+    fn openSchemaV3ForWriteInPlace(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+        options: session_log.Options,
+    ) !LoadedWritableSession {
+        try validateSessionId(session_id);
+        var session_dir = try self.openSessionDir(session_id);
+        defer session_dir.close();
+        const authority = try classifyAuthority(alloc, &session_dir, session_id);
+        if (authority != .schema_v3) {
+            return error.SessionRewindRequiresCurrentSchema;
+        }
+        var root = self.canonical_root;
+        var loaded = root.resumeForWrite(
+            alloc,
+            session_id,
+            options,
+        ) catch |err| return mapReplayError(err);
+        errdefer loaded.deinit(alloc);
+        try resolveSessionSnapshotLocators(
+            alloc,
+            loaded.state.history,
+            self.sessions_dir,
+            loaded.active_id,
+        );
+        if (loaded.commit_lifecycle == null) {
+            try self.installLatestCacheLifecycle(
+                alloc,
+                &loaded,
+                options.test_controls,
+            );
+        }
+        return loaded;
+    }
 };
 
 pub const PristineDiscardDisposition = enum {
@@ -4187,12 +4556,55 @@ pub const PristineDiscardDisposition = enum {
     indeterminate,
 };
 
-const RecoveryPromotionStatus = enum {
+const StagingPromotionStatus = enum {
     promoted,
     indeterminate,
 };
 
-fn recoveryInitialState(
+fn truncateSessionHistory(
+    alloc: Allocator,
+    state: *session_codec.DurableSessionState,
+    retained_turns: usize,
+) !void {
+    const dropped = state.history;
+    const retained: []session.HistoryTurn = if (retained_turns == dropped.len)
+        dropped
+    else if (retained_turns == 0)
+        &.{}
+    else
+        try alloc.dupe(session.HistoryTurn, dropped[0..retained_turns]);
+    session.dropHistoryTurnsAfter(
+        alloc,
+        dropped,
+        &state.context_history_start,
+        retained_turns,
+    );
+    if (retained_turns != dropped.len) alloc.free(dropped);
+    state.history = retained;
+}
+
+fn mapForkArtifactError(err: anyerror) anyerror {
+    return switch (err) {
+        error.SessionRecoveryBoundaryInvalid => error.SessionForkArtifactsUnavailable,
+        else => err,
+    };
+}
+
+fn discardForkTarget(
+    staging_root: *session_log.Root,
+    alloc: Allocator,
+    target: *LoadedWritableSession,
+) void {
+    const disposition = Store.discardStagedSession(staging_root, alloc, target);
+    if (disposition == .discarded) return;
+    debug_trace.logf(
+        "session",
+        "event=session_fork_staged_target_cleanup disposition={s}",
+        .{@tagName(disposition)},
+    );
+}
+
+fn initialSeedState(
     alloc: Allocator,
     recovered: session_codec.DurableSessionState,
 ) !session_codec.DurableSessionState {
@@ -9678,14 +10090,14 @@ test "abandoned recovery staging stays invisible and does not replace unrelated 
         ctx.workspace,
     );
     defer staged_state.deinit(alloc);
-    var staging_root = try ctx.store.initRecoveryStagingRoot(alloc);
+    var staging_root = try ctx.store.initStagingRoot(alloc);
     const abandoned_path = try sessionDirPath(
         alloc,
         staging_root.display_root,
         staged_state.id,
     );
     defer alloc.free(abandoned_path);
-    var abandoned = try ctx.store.startRecoveryStagedSession(
+    var abandoned = try ctx.store.startStagedSession(
         alloc,
         &staging_root,
         staged_state,
@@ -13868,4 +14280,402 @@ test "history page allocation failure sweep frees replay and page ownership" {
         try std.testing.expect(failing.has_induced_failure);
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
+}
+
+fn writeForkSourceFixture(
+    alloc: Allocator,
+    store: Store,
+    id: []const u8,
+    workspace_root: []const u8,
+    count: usize,
+    context_history_start: usize,
+) !void {
+    var state = try testDurableState(alloc, id, workspace_root);
+    defer state.deinit(alloc);
+    var created = try store.startWritableSession(alloc, state);
+    created.deinit(alloc);
+    if (count == 0 and context_history_start == 0) return;
+
+    var writable = try store.resumeForWrite(alloc, id);
+    defer writable.deinit(alloc);
+    const history = try makeTaggedHistoryPageTurns(alloc, count, "turn");
+    defer session.freeHistoryTurnSlice(alloc, history);
+    const desired = session_codec.DurableSessionState{
+        .id = writable.state.id,
+        .origin_workspace_root = writable.state.origin_workspace_root,
+        .workspace_root = writable.state.workspace_root,
+        .created_at_ms = writable.state.created_at_ms,
+        .updated_at_ms = 20,
+        .conversation_language = writable.state.conversation_language,
+        .preferences = writable.state.preferences,
+        .history = history,
+        .context_history_start = context_history_start,
+        .total_input_tokens = 4321,
+        .total_output_tokens = 8765,
+    };
+    _ = try writable.commitStateReplacement(
+        alloc,
+        desired,
+        .recovery,
+        .retry_expected_tail,
+        .{},
+    );
+}
+
+fn expectHistoryPrompts(
+    state: session_codec.DurableSessionState,
+    expected: []const []const u8,
+) !void {
+    try std.testing.expectEqual(expected.len, state.history.len);
+    for (state.history, expected) |turn, prompt| {
+        try std.testing.expectEqualStrings(prompt, turn.assistant.user.text);
+    }
+}
+
+fn readSessionDurableBytes(
+    alloc: Allocator,
+    store: Store,
+    id: []const u8,
+) ![2][]u8 {
+    const events = try readFixtureFile(
+        alloc,
+        store,
+        id,
+        "events.jsonl",
+        1024 * 1024,
+    );
+    errdefer alloc.free(events);
+    const manifest = try readFixtureFile(
+        alloc,
+        store,
+        id,
+        "session.json",
+        session_projection.manifest_max_bytes,
+    );
+    return .{ events, manifest };
+}
+
+test "fork copies a turn prefix into a new session and leaves the source unchanged" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const source_id = "fork-prefix-source";
+    try writeForkSourceFixture(alloc, ctx.store, source_id, ctx.workspace, 5, 1);
+
+    const before = try readSessionDurableBytes(alloc, ctx.store, source_id);
+    defer alloc.free(before[0]);
+    defer alloc.free(before[1]);
+
+    var result = try ctx.store.forkSessionCopy(alloc, source_id, 3, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings(source_id, result.source_session_id);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        source_id,
+        result.forked_session_id,
+    ));
+    try std.testing.expectEqual(@as(usize, 3), result.history_len);
+    try std.testing.expectEqual(@as(usize, 5), result.source_history_len);
+    try std.testing.expectEqual(
+        store_types.SessionForkStatus.forked,
+        result.status,
+    );
+
+    const after = try readSessionDurableBytes(alloc, ctx.store, source_id);
+    defer alloc.free(after[0]);
+    defer alloc.free(after[1]);
+    try std.testing.expectEqualSlices(u8, before[0], after[0]);
+    try std.testing.expectEqualSlices(u8, before[1], after[1]);
+
+    var forked = try ctx.store.loadReadOnly(alloc, result.forked_session_id);
+    defer forked.deinit(alloc);
+    try expectHistoryPrompts(forked, &.{ "turn-0", "turn-1", "turn-2" });
+    try std.testing.expectEqual(@as(usize, 1), forked.context_history_start);
+    try std.testing.expectEqual(@as(u64, 4321), forked.total_input_tokens);
+    try std.testing.expectEqual(@as(u64, 8765), forked.total_output_tokens);
+    try std.testing.expect(forked.recovery_checkpoint == null);
+    try std.testing.expectEqualStrings(ctx.workspace, forked.workspace_root);
+}
+
+test "fork clamps a model context cursor that outruns the retained turns" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const source_id = "fork-cursor-source";
+    try writeForkSourceFixture(alloc, ctx.store, source_id, ctx.workspace, 5, 4);
+
+    var result = try ctx.store.forkSessionCopy(alloc, source_id, 2, .{});
+    defer result.deinit(alloc);
+
+    var forked = try ctx.store.loadReadOnly(alloc, result.forked_session_id);
+    defer forked.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), forked.history.len);
+    try std.testing.expectEqual(@as(usize, 2), forked.context_history_start);
+}
+
+test "fork rejects turn counts outside the source history" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const source_id = "fork-range-source";
+    try writeForkSourceFixture(alloc, ctx.store, source_id, ctx.workspace, 3, 0);
+    try std.testing.expectError(
+        error.SessionTurnOutOfRange,
+        ctx.store.forkSessionCopy(alloc, source_id, 0, .{}),
+    );
+    try std.testing.expectError(
+        error.SessionTurnOutOfRange,
+        ctx.store.forkSessionCopy(alloc, source_id, 4, .{}),
+    );
+
+    const empty_id = "fork-empty-source";
+    try writeForkSourceFixture(alloc, ctx.store, empty_id, ctx.workspace, 0, 0);
+    try std.testing.expectError(
+        error.SessionTurnOutOfRange,
+        ctx.store.forkSessionCopy(alloc, empty_id, 1, .{}),
+    );
+}
+
+test "rewind drops trailing turns in place and keeps the session id" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const session_id = "rewind-in-place";
+    try writeForkSourceFixture(alloc, ctx.store, session_id, ctx.workspace, 5, 4);
+
+    var result = try ctx.store.rewindSession(alloc, session_id, 2, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings(session_id, result.session_id);
+    try std.testing.expectEqual(@as(usize, 2), result.history_len);
+    try std.testing.expectEqual(@as(usize, 3), result.removed_turn_count);
+    try std.testing.expectEqual(
+        store_types.SessionRewindStatus.rewound,
+        result.status,
+    );
+
+    var state = try ctx.store.loadReadOnly(alloc, session_id);
+    defer state.deinit(alloc);
+    try expectHistoryPrompts(state, &.{ "turn-0", "turn-1" });
+    try std.testing.expectEqual(@as(usize, 2), state.context_history_start);
+}
+
+test "rewind to an empty conversation is allowed" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const session_id = "rewind-to-empty";
+    try writeForkSourceFixture(alloc, ctx.store, session_id, ctx.workspace, 3, 3);
+
+    var result = try ctx.store.rewindSession(alloc, session_id, 0, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), result.history_len);
+    try std.testing.expectEqual(@as(usize, 3), result.removed_turn_count);
+
+    var state = try ctx.store.loadReadOnly(alloc, session_id);
+    defer state.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), state.history.len);
+    try std.testing.expectEqual(@as(usize, 0), state.context_history_start);
+}
+
+test "rewind reports already_at_target without writing the log" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const session_id = "rewind-noop";
+    try writeForkSourceFixture(alloc, ctx.store, session_id, ctx.workspace, 3, 0);
+
+    const before = try readFixtureFile(
+        alloc,
+        ctx.store,
+        session_id,
+        "events.jsonl",
+        1024 * 1024,
+    );
+    defer alloc.free(before);
+
+    var result = try ctx.store.rewindSession(alloc, session_id, 3, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(
+        store_types.SessionRewindStatus.already_at_target,
+        result.status,
+    );
+    try std.testing.expectEqual(@as(usize, 3), result.history_len);
+    try std.testing.expectEqual(@as(usize, 0), result.removed_turn_count);
+
+    const after = try readFixtureFile(
+        alloc,
+        ctx.store,
+        session_id,
+        "events.jsonl",
+        1024 * 1024,
+    );
+    defer alloc.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+}
+
+test "rewind rejects retaining more turns than the session holds" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const session_id = "rewind-range";
+    try writeForkSourceFixture(alloc, ctx.store, session_id, ctx.workspace, 2, 0);
+    try std.testing.expectError(
+        error.SessionTurnOutOfRange,
+        ctx.store.rewindSession(alloc, session_id, 3, .{}),
+    );
+}
+
+test "rewind appends to the log and keeps the frames that hold the dropped turns" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const session_id = "rewind-log-retention";
+    try writeForkSourceFixture(alloc, ctx.store, session_id, ctx.workspace, 3, 0);
+
+    const before = try readFixtureFile(
+        alloc,
+        ctx.store,
+        session_id,
+        "events.jsonl",
+        1024 * 1024,
+    );
+    defer alloc.free(before);
+
+    var result = try ctx.store.rewindSession(alloc, session_id, 1, .{});
+    defer result.deinit(alloc);
+
+    const after = try readFixtureFile(
+        alloc,
+        ctx.store,
+        session_id,
+        "events.jsonl",
+        1024 * 1024,
+    );
+    defer alloc.free(after);
+    try std.testing.expect(after.len > before.len);
+    try std.testing.expectEqualSlices(u8, before, after[0..before.len]);
+}
+
+test "rewind refuses a session that is already open for writing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const session_id = "rewind-busy";
+    try writeForkSourceFixture(alloc, ctx.store, session_id, ctx.workspace, 3, 0);
+
+    var holder = try ctx.store.resumeForWrite(alloc, session_id);
+    defer holder.deinit(alloc);
+    try std.testing.expectError(
+        error.SessionBusy,
+        ctx.store.rewindSession(
+            alloc,
+            session_id,
+            1,
+            .{ .session_lock_deadline_ms = 0 },
+        ),
+    );
+}
+
+fn testRecoveryCheckpoint() session_codec.RecoveryCheckpoint {
+    return .{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("prompt") },
+        .assistant_source = @constCast(""),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 1,
+    };
+}
+
+test "rewind clears a paused response because it belongs to the dropped tail" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const session_id = "rewind-clears-checkpoint";
+    try writeForkSourceFixture(alloc, ctx.store, session_id, ctx.workspace, 3, 0);
+
+    var writable = try ctx.store.resumeForWrite(alloc, session_id);
+    _ = try writable.appendEvent(
+        alloc,
+        .{ .recovery_checkpoint_set = .{ .checkpoint = testRecoveryCheckpoint() } },
+        20,
+        .retry_expected_tail,
+        .{},
+    );
+    writable.deinit(alloc);
+
+    var result = try ctx.store.rewindSession(alloc, session_id, 1, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), result.removed_turn_count);
+
+    var state = try ctx.store.loadReadOnly(alloc, session_id);
+    defer state.deinit(alloc);
+    try std.testing.expect(state.recovery_checkpoint == null);
+}
+
+test "rewind leaves a paused response untouched when already at target" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const session_id = "rewind-noop-keeps-checkpoint";
+    try writeForkSourceFixture(alloc, ctx.store, session_id, ctx.workspace, 3, 0);
+
+    var writable = try ctx.store.resumeForWrite(alloc, session_id);
+    _ = try writable.appendEvent(
+        alloc,
+        .{ .recovery_checkpoint_set = .{ .checkpoint = testRecoveryCheckpoint() } },
+        20,
+        .retry_expected_tail,
+        .{},
+    );
+    writable.deinit(alloc);
+
+    var result = try ctx.store.rewindSession(alloc, session_id, 3, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(
+        store_types.SessionRewindStatus.already_at_target,
+        result.status,
+    );
+
+    var state = try ctx.store.loadReadOnly(alloc, session_id);
+    defer state.deinit(alloc);
+    try std.testing.expect(state.recovery_checkpoint != null);
+    try std.testing.expectEqual(@as(u64, 1), state.recovery_checkpoint.?.turn_id);
 }
