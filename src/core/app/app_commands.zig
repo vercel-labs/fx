@@ -694,12 +694,7 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandForkSession(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            _ = rest;
-            try app.writeDomainNotice(.{
-                .topic = "session",
-                .tone = .neutral,
-                .body = "not implemented",
-            }, true);
+            try handleForkCommand(app, rest);
         }
 
         fn commandRewindSession(ctx: *anyopaque, rest: []const u8) !void {
@@ -3481,6 +3476,102 @@ fn writeTurnArgumentUsage(app: anytype, usage: []const u8) !void {
         .{ .topic = "session", .tone = .@"error", .body = body },
         true,
     );
+}
+
+fn handleForkCommand(app: anytype, rest: []const u8) !void {
+    const App = @TypeOf(app.*);
+    const SessionRuntime = app_session_runtime.Runtime(App);
+
+    const at_turn = parsedTurnCount(rest) orelse {
+        try writeTurnArgumentUsage(app, "/fork <turn>");
+        return;
+    };
+
+    var outcome = try SessionRuntime.forkLiveSession(app, at_turn);
+    defer outcome.deinit(app.alloc);
+
+    switch (outcome) {
+        .unavailable_during_stream => try app.writeDomainNotice(.{
+            .topic = "session",
+            .tone = .neutral,
+            .body = "fork is unavailable until the response finishes",
+        }, true),
+        .unavailable => try app.writeDomainNotice(.{
+            .topic = "session",
+            .tone = .@"error",
+            .body = "no saved session to fork",
+        }, true),
+        .out_of_range => |history_len| {
+            const body = try std.fmt.allocPrint(
+                app.alloc,
+                "turn {d} is out of range; session has {d} turn{s}",
+                .{ at_turn, history_len, turnPlural(history_len) },
+            );
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(
+                .{ .topic = "session", .tone = .@"error", .body = body },
+                true,
+            );
+        },
+        .forked => |fork| try writeForkNotice(app, fork),
+    }
+}
+
+/// Both ids are named on every path, because after a fork the reader has to
+/// know which session they left and which one they can still reach.
+fn writeForkNotice(
+    app: anytype,
+    fork: app_session_runtime.Runtime(@TypeOf(app.*)).ForkOutcome.Fork,
+) !void {
+    var out: std.Io.Writer.Allocating = .init(app.alloc);
+    defer out.deinit();
+
+    if (fork.forked_id) |forked_id| {
+        try out.writer.print(
+            "Forked {s} at turn {d} into {s}.",
+            .{ fork.source_id, fork.retained_turns, forked_id },
+        );
+        if (fork.problem) |err| {
+            try out.writer.print(
+                " The branch could not be opened ({s}); run `fx --resume {s}`.",
+                .{ @errorName(err), forked_id },
+            );
+        }
+    } else {
+        try out.writer.print(
+            "Could not fork {s} ({s}).",
+            .{ fork.source_id, @errorName(fork.problem orelse error.Unknown) },
+        );
+    }
+
+    switch (fork.landing) {
+        .branch => try out.writer.print(
+            " You are now in the branch; {s} is unchanged.",
+            .{fork.source_id},
+        ),
+        .source => try out.writer.print(
+            " This shell is still on {s}.",
+            .{fork.source_id},
+        ),
+        .fresh_session => try out.writer.writeAll(
+            " This shell is on a new empty session.",
+        ),
+        .no_session => try out.writer.writeAll(
+            " This shell has no session; run /resume to open one.",
+        ),
+    }
+    if (fork.unverified_artifacts) {
+        try out.writer.writeAll(
+            " Some legacy command artifacts could not be authenticated.",
+        );
+    }
+
+    try app.writeDomainNotice(.{
+        .topic = "session",
+        .tone = if (fork.landing == .branch) .neutral else .warning,
+        .body = out.written(),
+    }, true);
+    app.shell.render_requests.request(.footer);
 }
 
 fn handleRewindCommand(app: anytype, rest: []const u8) !void {

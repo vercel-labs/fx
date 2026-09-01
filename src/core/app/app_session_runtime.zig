@@ -2844,6 +2844,159 @@ pub fn Runtime(comptime App: type) type {
             return .committed;
         }
 
+        /// Where the shell ended up after a `/fork`. A fork has to close the
+        /// live session before it can run, so "which session am I in now" is
+        /// part of every answer, not just the failing ones.
+        pub const ForkLanding = enum {
+            branch,
+            source,
+            fresh_session,
+            no_session,
+        };
+
+        pub const ForkOutcome = union(enum) {
+            unavailable_during_stream,
+            unavailable,
+            out_of_range: usize,
+            forked: Fork,
+
+            pub const Fork = struct {
+                source_id: []u8,
+                /// Null when no branch was created.
+                forked_id: ?[]u8,
+                retained_turns: usize,
+                landing: ForkLanding,
+                /// Set when the fork or the handoff into the branch failed.
+                problem: ?anyerror = null,
+                unverified_artifacts: bool = false,
+            };
+
+            pub fn deinit(self: *ForkOutcome, alloc: Allocator) void {
+                switch (self.*) {
+                    .forked => |*fork| {
+                        alloc.free(fork.source_id);
+                        if (fork.forked_id) |id| alloc.free(id);
+                    },
+                    else => {},
+                }
+                self.* = undefined;
+            }
+        };
+
+        /// Branches the live session at an absolute turn and moves this shell
+        /// into the branch. `forkSessionCopy` takes the source's writer lock,
+        /// which this process holds for as long as the session is open, so the
+        /// session is closed first. Everything after that point has to leave
+        /// the shell with some session open again.
+        pub fn forkLiveSession(app: *App, at_turn: usize) !ForkOutcome {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) {
+                return .unavailable;
+            }
+            if (app.stream.active) return .unavailable_during_stream;
+            if (app.session_persistence.store == null) return .unavailable;
+            const active = app.session_persistence.writable orelse return .unavailable;
+
+            const history_len = app.session.historyLen();
+            if (at_turn == 0 or at_turn > history_len) {
+                return .{ .out_of_range = history_len };
+            }
+
+            const source_id = try app.alloc.dupe(u8, active.active_id);
+            errdefer app.alloc.free(source_id);
+
+            const log_options = session_log.Options{
+                .session_lock_deadline_ms = 0,
+                .commit_lock_deadline_ms = 0,
+            };
+            try prepareLiveSessionTransition(app, .carry_forward, log_options);
+
+            const store = app.session_persistence.store.?;
+            var copy = store.forkSessionCopy(
+                app.alloc,
+                source_id,
+                at_turn,
+                .{},
+            ) catch |err| return .{ .forked = .{
+                .source_id = source_id,
+                .forked_id = null,
+                .retained_turns = at_turn,
+                .landing = reopenSourceAfterFork(app, source_id, log_options),
+                .problem = err,
+            } };
+            defer copy.deinit(app.alloc);
+
+            const forked_id = try app.alloc.dupe(u8, copy.forked_session_id);
+            errdefer app.alloc.free(forked_id);
+
+            if (copy.status == .indeterminate) {
+                return .{ .forked = .{
+                    .source_id = source_id,
+                    .forked_id = forked_id,
+                    .retained_turns = at_turn,
+                    .landing = reopenSourceAfterFork(app, source_id, log_options),
+                    .problem = error.SessionForkUnconfirmed,
+                } };
+            }
+
+            enterSessionForWrite(app, forked_id, log_options) catch |err| {
+                return .{ .forked = .{
+                    .source_id = source_id,
+                    .forked_id = forked_id,
+                    .retained_turns = at_turn,
+                    .landing = reopenSourceAfterFork(app, source_id, log_options),
+                    .problem = err,
+                } };
+            };
+
+            return .{ .forked = .{
+                .source_id = source_id,
+                .forked_id = forked_id,
+                .retained_turns = at_turn,
+                .landing = .branch,
+                .unverified_artifacts = copy.status == .forked_with_unverified_artifacts,
+            } };
+        }
+
+        fn enterSessionForWrite(
+            app: *App,
+            session_id: []const u8,
+            log_options: session_log.Options,
+        ) !void {
+            var loaded = try loadResumeTargetForWrite(
+                app,
+                .{ .id = session_id },
+                log_options,
+            );
+            try installResumedSession(app, &loaded, .session);
+            requestSubagentBackgroundRecovery(app);
+            startResumedSessionReconciliation(app);
+            try app.finishLiveSessionResume();
+        }
+
+        fn reopenSourceAfterFork(
+            app: *App,
+            source_id: []const u8,
+            log_options: session_log.Options,
+        ) ForkLanding {
+            enterSessionForWrite(app, source_id, log_options) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event=session_fork_source_reopen_failed id={s} err={s}",
+                    .{ source_id, @errorName(err) },
+                );
+                installFreshLiveSession(app) catch |fresh_err| {
+                    debug_trace.logf(
+                        "session",
+                        "event=session_fork_fresh_session_failed err={s}",
+                        .{@errorName(fresh_err)},
+                    );
+                    return .no_session;
+                };
+                return .fresh_session;
+            };
+            return .source;
+        }
+
         /// Answer to one `/rewind <count>`. The gate makes the confirm step a
         /// state of the request rather than a flag the caller has to track.
         pub const RewindOutcome = union(enum) {
